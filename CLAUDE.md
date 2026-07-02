@@ -94,6 +94,19 @@ the sim-capable IO layer comes first because it cannot be retrofitted.
   engine (restart-and-recover). Property-tested under the fault matrix including the
   dual-write invariant (jobs ≡ committed txns, exactly), plus a meta-test proving the
   harness catches apply-before-sync ordering.
-- Next: M0 step 5 per PLAN.md — HTTP layer: `#[route]` over a hyper-based server, typed
-  params/body/response, minimal sessions; edge concurrency scheduled through a
-  deterministic executor in sim (the cost accepted in DECISIONS §10).
+- **M0 step 5 done**: HTTP layer. Deterministic kernel in `charpente::http` (typed
+  `Request`/`Response`, router with mount-time conflict panic, `#[route]` argument
+  convention enforced by the macro, 1 MiB body cap fencing the record-size assert,
+  sessions inside the commit point via the platform `Session` table — raw tokens, M1
+  hashes); one transaction per request, 200 only after the WAL sync (ack-after-durable).
+  hyper/tokio confined to `charpente::serve` (wire↔struct + channel into the kernel
+  thread); tokio's ambient APIs deny-listed. Sim suite includes the request-level crash
+  property (a 200 survives kill-at-any-point; jobs ≡ acked requests) and a determinism
+  check; loopback smoke test drives real HTTP/1.1 bytes. `#[route]` emits
+  `::charpente` paths, so it works in dependent crates (and integration tests), not in
+  charpente's own src. `Disk` and `Entropy` gained a `Send` supertrait (the kernel
+  thread owns the App), mirroring `File`'s earlier `Send + Sync`.
+- Next: M0 step 6 per PLAN.md — queue + cron: post-commit lease/dispatch off the
+  `charpente.jobs` table, idempotency keys, typed retry policy, cron ticks as
+  transactions; this is where the deterministic edge executor (DECISIONS §10) lands —
+  the kernel loop gains its second and third event sources.

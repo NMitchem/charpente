@@ -86,6 +86,10 @@ scheduled through the deterministic executor in sim mode. Throughput comes from 
 of network hops and lock contention, not from parallel mutation. This mirrors TigerBeetle
 and Redis: a single thread applying a log is astonishingly fast when it never waits.
 
+The HTTP kernel (`charpente::http`) lives inside the boundary — the sim drives
+`App::handle` directly; hyper only translates wire↔struct at the edge
+(`charpente::serve`) and feeds the single-threaded kernel loop.
+
 ## 2. The write model: transactions as pure functions over a log **[IRREVERSIBLE]**
 
 **Decision.** A transaction is a deterministic function `fn(&mut Tx) -> Result<T, E>` that
@@ -147,8 +151,11 @@ Every contract in the system is a Rust item; every contract violation is a compi
 - **Migrations.** A schema change generates a migration as a log record (schema versions
   live in the log like everything else). Incompatible changes — dropping a field a query
   still uses — fail at compile time because the query is code referencing the field.
-- **Routes.** `#[route(POST "/invoices/:id/finalize")]` — path params, body, and response
-  are typed; the OpenAPI description is *derived from* the types, never hand-written.
+- **Routes (v0 implemented).** `#[route(METHOD "/path/:param"[, auth])]` — handler args:
+  `tx: &mut Tx`, one per `:param` (same name, path order), at most one JSON body arg,
+  optional trailing `ctx: &Ctx` (session access); return `Result<T: Serialize, ApiError>`.
+  Handlers run inside one transaction; 200 is emitted only after the commit is durable.
+  The OpenAPI description will be *derived from* the types, never hand-written (step 7).
 - **Jobs.** `#[job]` structs with typed payloads and typed retry policy. Enqueue sites and
   handler signatures are checked against each other.
 - **Events.** `#[event]` structs; `tx.emit(...)` is typed; subscribers (server-side and
