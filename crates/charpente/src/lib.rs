@@ -9,3 +9,4 @@ pub use charpente_macros::{route, table};
 
 pub mod http;
 pub mod prod;
+pub mod serve;

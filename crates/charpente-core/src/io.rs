@@ -64,7 +64,11 @@ pub trait Clock {
 }
 
 /// Randomness. Seeded and replayable in simulation; OS entropy in production.
-pub trait Entropy {
+///
+/// `Send` because `App` (which owns a `Box<dyn Entropy>`) crosses into the
+/// kernel thread in `charpente::serve`; simulation impls satisfy it honestly
+/// (same reasoning as `File`, below).
+pub trait Entropy: Send {
     fn fill(&self, buf: &mut [u8]);
 
     fn next_u64(&self) -> u64 {
@@ -77,7 +81,11 @@ pub trait Entropy {
 /// Durable storage, shaped to carry both the write-ahead log and redb's
 /// `StorageBackend` (sync, `&self`, offset-addressed — DESIGN.md §4). Paths
 /// are a flat namespace of names, not a directory tree.
-pub trait Disk {
+///
+/// `Send` because `App` (which owns a `Db`, which owns a `Box<dyn Disk>`)
+/// crosses into the kernel thread in `charpente::serve`; simulation impls
+/// satisfy it honestly (same reasoning as `File`, below).
+pub trait Disk: Send {
     /// Opens the named file, creating it empty if absent.
     fn open(&self, path: &str) -> io::Result<Box<dyn File>>;
 
