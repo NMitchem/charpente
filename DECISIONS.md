@@ -79,7 +79,8 @@ Reopen (on schedule): M2.
 `socle` (first pick) proved taken on crates.io — ironically by an axum/telemetry server-
 bootstrap crate, active June 2026. Availability snapshot 2026-07-01: taken = socle, massif,
 menhir, chassis, armature; free = charpente, monolithe, granit, batisse, ossature,
-soubassement. **TODO: reserve `charpente` on crates.io with an empty publish.**
+soubassement. Reserved: `charpente` v0.0.0 published to crates.io 2026-07-01 (empty
+placeholder, MIT OR Apache-2.0).
 
 ## 9. License — MIT OR Apache-2.0 (decided 2026-07-01)
 
