@@ -5,6 +5,12 @@
 //! module never touches a socket. `App::handle(Request) -> Response` is the
 //! whole surface, which is exactly what the sim drives.
 
+mod app;
+mod router;
+
+pub use app::{App, AppConfig, Ctx, Session};
+pub use router::{Glue, Route, RouteDef, RouteMatch, Router};
+
 use std::collections::BTreeMap;
 use std::io;
 
@@ -186,7 +192,6 @@ pub fn decode_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Api
         .map_err(|e| ApiError::BadRequest(format!("invalid JSON body for {type_name}: {e}")))
 }
 
-#[allow(dead_code)] // wired up by Ctx::create_session in the next task, which removes this allow
 pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     bytes
