@@ -64,8 +64,8 @@ charpente-macros
 #[route(POST "/invoices/:id/finalize", auth)]
 fn finalize(tx: &mut Tx, id: Id<Invoice>, body: FinalizeReq, ctx: &Ctx) -> Result<Invoice, ApiError> { … }
 
-let mut app = App::new(db, entropy, AppConfig::default())
-    .mount(routes![finalize, create_invoice, list_invoices]);
+let mut app = App::open(disk, schema, entropy, AppConfig::default())?  // registers the
+    .mount(routes![finalize, create_invoice, list_invoices]);          // Session table itself
 let response = app.handle(request);   // &mut self — serializable by construction
 ```
 
