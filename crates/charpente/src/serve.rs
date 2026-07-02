@@ -207,4 +207,53 @@ mod tests {
 
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    // Hard rule 5: the 413 is product surface — it must name the cap and the
+    // fix, and it must fire at the edge (before routing: this POST would be a
+    // kernel 405 otherwise).
+    #[test]
+    fn serve_caps_bodies_at_the_edge() {
+        let mut suffix = [0u8; 8];
+        ProdEntropy::new().unwrap().fill(&mut suffix);
+        let root = std::env::temp_dir().join(format!(
+            "charpente-serve-cap-{:016x}",
+            u64::from_le_bytes(suffix)
+        ));
+        let app = App::open(
+            Box::new(ProdDisk::new(&root).unwrap()),
+            Schema::new(),
+            Box::new(ProdEntropy::new().unwrap()),
+            AppConfig {
+                body_cap: 64,
+                ..AppConfig::default()
+            },
+        )
+        .unwrap()
+        .mount(vec![Route {
+            method: Method::Get,
+            pattern: "/hello",
+            auth: false,
+            name: "hello",
+            glue: hello_glue,
+        }]);
+
+        let server = serve("127.0.0.1:0", app).unwrap();
+        let mut stream = std::net::TcpStream::connect(server.local_addr()).unwrap();
+        stream
+            .write_all(
+                b"POST /hello HTTP/1.1\r\nHost: localhost\r\nContent-Length: 65\r\n\
+                  Connection: close\r\n\r\n",
+            )
+            .unwrap();
+        stream.write_all(&[b'x'; 65]).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+        assert!(
+            response.contains("body_cap") && response.contains("64"),
+            "the 413 body must name the cap and the fix — got: {response}"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
