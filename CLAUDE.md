@@ -84,6 +84,16 @@ the sim-capable IO layer comes first because it cannot be retrofitted.
   Sim-established: redb's layout is deterministic; `Database::drop` is a graceful
   close, so crash tests must crash with the db open. `File` gained a `Send + Sync`
   supertrait; the sim world is now `Arc<Mutex>` (honest, uncontended).
-- Next: M0 step 4 per PLAN.md — transactions: `fn(&mut Tx) -> Result<T, E>`, reads
-  from a snapshot, writes/enqueues/emits recorded into one log record, applied to the
-  store post-commit; serializable by construction on the single-threaded core.
+- **M0 step 4 done**: typed transactions (`charpente-core::db`). `Db::transact(fn(&mut
+  Tx) -> Result<T, E>)`: reads via the `View` trait (snapshot + read-your-own-writes
+  overlay), writes/enqueues/emits buffered and committed as ONE effects record (payload
+  format in DESIGN §2), applied to the store post-sync through the `Schema` registry;
+  `TxError::{App, Io}` separates app rejection from platform failure. Enqueues
+  materialize in the built-in `charpente.jobs` table (step 6's substrate); emits stay
+  log-only. `StateMachine::apply` is fallible; a post-sync apply failure poisons the
+  engine (restart-and-recover). Property-tested under the fault matrix including the
+  dual-write invariant (jobs ≡ committed txns, exactly), plus a meta-test proving the
+  harness catches apply-before-sync ordering.
+- Next: M0 step 5 per PLAN.md — HTTP layer: `#[route]` over a hyper-based server, typed
+  params/body/response, minimal sessions; edge concurrency scheduled through a
+  deterministic executor in sim (the cost accepted in DECISIONS §10).
