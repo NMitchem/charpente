@@ -32,6 +32,11 @@ disallowed-methods = [
     { path = "std::net::TcpStream::connect", reason = "ambient network — use the Net trait (DESIGN.md §1)" },
     { path = "std::net::TcpListener::bind", reason = "ambient network — use the Net trait (DESIGN.md §1)" },
     { path = "std::net::UdpSocket::bind", reason = "ambient network — use the Net trait (DESIGN.md §1)" },
+    { path = "tokio::spawn", reason = "ambient task spawning — edge modules only; core scheduling goes through the deterministic executor (DESIGN.md §1)" },
+    { path = "tokio::task::spawn_blocking", reason = "ambient task spawning — edge modules only (DESIGN.md §1)" },
+    { path = "tokio::time::sleep", reason = "ambient time — use Clock::sleep (DESIGN.md §1)" },
+    { path = "tokio::net::TcpListener::bind", reason = "ambient network — use the Net trait (DESIGN.md §1)" },
+    { path = "tokio::net::TcpStream::connect", reason = "ambient network — use the Net trait (DESIGN.md §1)" },
 ]
 
 disallowed-types = [
@@ -44,4 +49,7 @@ disallowed-types = [
     { path = "std::net::UdpSocket", reason = "ambient network — use the Net trait (DESIGN.md §1)" },
     { path = "std::time::SystemTime", reason = "ambient wall clock — use the Clock trait (DESIGN.md §1)" },
     { path = "std::thread::Builder", reason = "ambient task spawning — scheduling goes through the deterministic executor (DESIGN.md §1)" },
+    { path = "tokio::net::TcpListener", reason = "ambient network — Net trait, or edge modules only (DESIGN.md §1)" },
+    { path = "tokio::net::TcpStream", reason = "ambient network — Net trait, or edge modules only (DESIGN.md §1)" },
+    { path = "tokio::time::Instant", reason = "ambient monotonic clock — use the Clock trait (DESIGN.md §1)" },
 ]
