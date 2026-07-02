@@ -2,10 +2,8 @@
 //! sessions, error mapping — unit tests here; the macro end-to-end tests and
 //! the request-level crash property are appended by later plan tasks.
 
-use charpente::http::{
-    ApiError, App, AppConfig, Ctx, Method, Request, Response, Route, decode_body,
-};
-use charpente::{Schema, Tx, table};
+use charpente::http::{ApiError, App, AppConfig, Ctx, Method, Request, Response, Route};
+use charpente::{Schema, Tx, route, routes, table};
 use charpente_core::table::Id;
 use charpente_sim::{FaultConfig, Sim};
 use serde::{Deserialize, Serialize};
@@ -24,6 +22,7 @@ struct CreateNote {
     text: String,
 }
 
+#[route(POST "/notes")]
 fn create_note(tx: &mut Tx, body: CreateNote, ctx: &Ctx) -> Result<u64, ApiError> {
     let owner = ctx
         .session()
@@ -37,101 +36,31 @@ fn create_note(tx: &mut Tx, body: CreateNote, ctx: &Ctx) -> Result<u64, ApiError
     Ok(body.id)
 }
 
-// Hand-written glue mirroring what #[route] generates (Task 4 swaps these).
-fn create_note_glue(
-    tx: &mut Tx,
-    ctx: &Ctx,
-    _captures: &[String],
-    body: &[u8],
-) -> Result<Response, ApiError> {
-    let body: CreateNote = decode_body(body)?;
-    Ok(Response::json(200, &create_note(tx, body, ctx)?))
-}
-
-fn get_note_glue(
-    tx: &mut Tx,
-    _ctx: &Ctx,
-    captures: &[String],
-    _body: &[u8],
-) -> Result<Response, ApiError> {
-    use charpente::http::FromParam;
+#[route(GET "/notes/:id")]
+fn get_note(tx: &mut Tx, id: Id<Note>) -> Result<String, ApiError> {
     use charpente_core::table::View;
-    let id: Id<Note> = Id::from_param("id", &captures[0])?;
-    let note = tx.get(id)?.ok_or(ApiError::NotFound)?;
-    Ok(Response::json(200, &note.text))
+    Ok(tx.get(id)?.ok_or(ApiError::NotFound)?.text)
 }
 
-fn login_glue(
-    tx: &mut Tx,
-    ctx: &Ctx,
-    _captures: &[String],
-    body: &[u8],
-) -> Result<Response, ApiError> {
-    let subject: String = decode_body(body)?;
-    let token = ctx.create_session(tx, subject);
-    Ok(Response::json(200, &token))
+#[route(POST "/login")]
+fn login(tx: &mut Tx, subject: String, ctx: &Ctx) -> Result<String, ApiError> {
+    Ok(ctx.create_session(tx, subject))
 }
 
-fn whoami_glue(
-    _tx: &mut Tx,
-    ctx: &Ctx,
-    _captures: &[String],
-    _body: &[u8],
-) -> Result<Response, ApiError> {
-    Ok(Response::json(
-        200,
-        &ctx.session().expect("auth route").subject,
-    ))
+#[route(GET "/me", auth)]
+fn whoami(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
+    let _ = tx;
+    Ok(ctx.session().expect("auth route").subject.clone())
 }
 
-fn logout_glue(
-    tx: &mut Tx,
-    ctx: &Ctx,
-    _captures: &[String],
-    _body: &[u8],
-) -> Result<Response, ApiError> {
+#[route(POST "/logout", auth)]
+fn logout(tx: &mut Tx, ctx: &Ctx) -> Result<&'static str, ApiError> {
     ctx.revoke(tx);
-    Ok(Response::json(200, &"bye"))
+    Ok("bye")
 }
 
 fn note_routes() -> Vec<Route> {
-    vec![
-        Route {
-            method: Method::Post,
-            pattern: "/notes",
-            auth: false,
-            name: "create_note",
-            glue: create_note_glue,
-        },
-        Route {
-            method: Method::Get,
-            pattern: "/notes/:id",
-            auth: false,
-            name: "get_note",
-            glue: get_note_glue,
-        },
-        Route {
-            method: Method::Post,
-            pattern: "/login",
-            auth: false,
-            name: "login",
-            glue: login_glue,
-        },
-        Route {
-            method: Method::Get,
-            pattern: "/me",
-            auth: true,
-            name: "whoami",
-            glue: whoami_glue,
-        },
-        Route {
-            method: Method::Post,
-            pattern: "/logout",
-            auth: true,
-            name: "logout",
-            glue: logout_glue,
-        },
-    ]
+    routes![create_note, get_note, login, whoami, logout]
 }
 
 fn quiet_app(seed: u64) -> (Sim, App) {
@@ -326,4 +255,12 @@ fn handler_api_errors_map_to_statuses() {
     let (_sim, mut app) = quiet_app(0x47E);
     let resp = app.handle(Request::new(Method::Get, "/notes/12345"));
     assert_eq!(resp.status, 404, "handler NotFound becomes 404");
+}
+
+#[test]
+fn routes_macro_collects_descriptors() {
+    let all = note_routes();
+    assert_eq!(all.len(), 5);
+    assert!(all.iter().any(|r| r.pattern == "/me" && r.auth));
+    assert!(all.iter().any(|r| r.pattern == "/notes/:id" && !r.auth));
 }
