@@ -124,6 +124,15 @@ cannot honestly be retried (fsyncgate); the only exit from poison is restart-and
 and recovery is idempotent. The apply loop (`Engine`) holds the standing invariant:
 machine state ≡ fold(apply, durable records) — submit is append → sync → apply → ack.
 
+**Record payload (v0, implemented).** A committed transaction's effects:
+`[n: u32]` then n tagged effects — put `0x00 [table][row]`, delete
+`0x01 [table][id]`, enqueue `0x02 [job][payload]`, emit `0x03 [event][payload]`,
+strings and byte fields length-prefixed per the row codec. Table effects are
+the transaction's collapsed write set in (table, id) order — intermediate
+overwrites inside a transaction are observable by no one and are not logged;
+enqueues and emits keep call order. Replay resolves table names through the
+`Schema` registry passed to `Db::open`.
+
 **Isolation.** Serializable, trivially: transactions apply one at a time to the
 single-threaded core. Read-only queries run against consistent snapshots (see §4) and never
 block writes. Long transactions are rejected by construction — a transaction is CPU-bound

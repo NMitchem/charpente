@@ -40,11 +40,11 @@ struct Invoice {
 
 #[route(POST "/invoices/:id/finalize")]
 fn finalize(tx: &mut Tx, id: Id<Invoice>) -> Result<Invoice, ApiError> {
-    let mut inv = tx.get(id)?;                  // typed row, no SQL string
+    let mut inv = tx.get(id)?.ok_or(ApiError::NotFound)?; // typed row, no SQL string
     inv.state = InvoiceState::Final;
-    tx.put(&inv)?;
-    tx.enqueue(SendReceipt { invoice: id })?;   // job enqueued IN the same transaction
-    tx.emit(InvoiceFinalized { invoice: id })?; // realtime event, same transaction
+    tx.put(&inv);
+    tx.enqueue(SendReceipt { invoice: id });   // job enqueued IN the same transaction
+    tx.emit(InvoiceFinalized { invoice: id }); // realtime event, same transaction
     Ok(inv)
 }
 ```

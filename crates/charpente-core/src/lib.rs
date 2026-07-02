@@ -4,6 +4,7 @@
 //! threads — enforced by the clippy deny-list at the workspace root.
 
 pub mod crc;
+pub mod db;
 pub mod engine;
 pub mod io;
 pub mod log;
