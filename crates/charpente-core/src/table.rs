@@ -210,6 +210,23 @@ pub trait Row: Sized + 'static {
     fn decode_row(bytes: &[u8]) -> io::Result<Self>;
 }
 
+// ---------------------------------------------------------------- View
+
+/// Read access to table state — implemented by `Snapshot` (reads outside
+/// transactions) and `Tx` (reads inside one, which also see the
+/// transaction's own writes). The `#[table]` accessors are generated
+/// against this trait.
+pub trait View {
+    fn get<R: Row>(&self, id: Id<R>) -> io::Result<Option<R>>;
+
+    /// Every row, in id order.
+    fn scan<R: Row>(&self) -> io::Result<Vec<R>>;
+
+    /// Exact-match secondary index lookup, in id order. Called through the
+    /// typed accessors `#[table]` generates (`Invoice::by_org(...)`).
+    fn scan_by<R: Row>(&self, index_name: &str, key: &impl Codec) -> io::Result<Vec<R>>;
+}
+
 // ---------------------------------------------------------------- Store
 
 /// redb mounted behind the `Disk` trait. This is the only sanctioned way to
@@ -220,6 +237,11 @@ pub struct Store {
 }
 
 const META: TableDefinition<&str, u64> = TableDefinition::new("charpente.meta");
+
+/// Transactional enqueues, materialized in the same apply as the state
+/// change they committed with (DESIGN.md §6). Key is (record seq, call
+/// order); value is `[name][payload]` in the `Codec` length-prefix layout.
+const JOBS: TableDefinition<(u64, u32), &[u8]> = TableDefinition::new("charpente.jobs");
 
 fn rows_def(table: &str) -> TableDefinition<'_, u64, &'static [u8]> {
     TableDefinition::new(table)
@@ -367,6 +389,27 @@ impl Writer<'_> {
         Ok(())
     }
 
+    /// Records a job enqueued by the record at `seq`, in call order via
+    /// `idx`. Platform apply-path surface — applications enqueue through a
+    /// transaction, never here.
+    pub fn enqueue_raw(
+        &mut self,
+        seq: u64,
+        idx: u32,
+        name: &str,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let mut value = Vec::with_capacity(8 + name.len() + payload.len());
+        (u32::try_from(name.len()).expect("job name exceeds u32 length")).encode(&mut value);
+        value.extend_from_slice(name.as_bytes());
+        (u32::try_from(payload.len()).expect("job payload exceeds u32 length")).encode(&mut value);
+        value.extend_from_slice(payload);
+        let mut jobs = self.txn.open_table(JOBS).map_err(redb_err)?;
+        jobs.insert((seq, idx), value.as_slice())
+            .map_err(redb_err)?;
+        Ok(())
+    }
+
     fn replace_row<R: Row>(&mut self, row: &R, id: u64) -> io::Result<Option<R>> {
         let mut rows = self.txn.open_table(rows_def(R::TABLE)).map_err(redb_err)?;
         let old = match rows.get(id).map_err(redb_err)? {
@@ -390,8 +433,8 @@ pub struct Snapshot {
     txn: redb::ReadTransaction,
 }
 
-impl Snapshot {
-    pub fn get<R: Row>(&self, id: Id<R>) -> io::Result<Option<R>> {
+impl View for Snapshot {
+    fn get<R: Row>(&self, id: Id<R>) -> io::Result<Option<R>> {
         let rows = match self.txn.open_table(rows_def(R::TABLE)) {
             Ok(rows) => rows,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -403,9 +446,7 @@ impl Snapshot {
         }
     }
 
-    /// Every row, in id order. A `Vec` for now; iterators when a real
-    /// workload shows the allocation matters.
-    pub fn scan<R: Row>(&self) -> io::Result<Vec<R>> {
+    fn scan<R: Row>(&self) -> io::Result<Vec<R>> {
         let rows = match self.txn.open_table(rows_def(R::TABLE)) {
             Ok(rows) => rows,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -419,9 +460,7 @@ impl Snapshot {
         Ok(out)
     }
 
-    /// Exact-match secondary index lookup, in id order. Called through the
-    /// typed accessors `#[table]` generates (`Invoice::by_org(...)`).
-    pub fn scan_by<R: Row>(&self, index_name: &str, key: &impl Codec) -> io::Result<Vec<R>> {
+    fn scan_by<R: Row>(&self, index_name: &str, key: &impl Codec) -> io::Result<Vec<R>> {
         let index = R::INDEXES
             .iter()
             .find(|i| i.name == index_name)
@@ -454,6 +493,33 @@ impl Snapshot {
                 )
             });
             out.push(row);
+        }
+        Ok(out)
+    }
+}
+
+impl Snapshot {
+    /// Every job recorded by committed transactions, in (seq, idx) order:
+    /// `(seq, idx, job name, payload)`. The queue dispatcher's substrate
+    /// (PLAN.md M0 step 6); tests use it to observe enqueue atomicity.
+    #[allow(clippy::type_complexity)] // the tuple is the raw record; the typed job surface names it (M0 step 6)
+    pub fn jobs(&self) -> io::Result<Vec<(u64, u32, String, Vec<u8>)>> {
+        let table = match self.txn.open_table(JOBS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(redb_err(e)),
+        };
+        let mut out = Vec::new();
+        for entry in table
+            .range((0u64, 0u32)..=(u64::MAX, u32::MAX))
+            .map_err(redb_err)?
+        {
+            let (key, value) = entry.map_err(redb_err)?;
+            let (seq, idx) = key.value();
+            let mut bytes = value.value();
+            let name = String::decode(&mut bytes)?;
+            let payload = Vec::<u8>::decode(&mut bytes)?;
+            out.push((seq, idx, name, payload));
         }
         Ok(out)
     }

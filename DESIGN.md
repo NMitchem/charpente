@@ -154,7 +154,9 @@ Every contract in the system is a Rust item; every contract violation is a compi
 secondary indexes — deliberately KV-shaped, not relational. Rich predicates, joins, and
 aggregation arrive as typed combinators once real usage shows which ones matter. A
 read-only Postgres-wire endpoint (for BI/analytics tools) is a later, separate surface and
-never the primary API.
+never the primary API. Read accessors are generated against the `View` trait —
+implemented by both `Snapshot` (outside transactions) and `Tx` (inside one, where reads
+also see the transaction's own writes).
 
 ## 4. Storage engine [reversible — staged]
 
@@ -182,7 +184,9 @@ deterministic under identical op sequences (raw-fingerprint replay holds), and
 crash is only a crash if the process dies with the database open, which is exactly what
 the sim models. Index entries are `[key len: u32][key bytes][id: u64 be]` (length prefix
 prevents prefix-collision ambiguity); exact-match lookups only until a real query
-pattern demands order-preserving key encoding.
+pattern demands order-preserving key encoding. A built-in `charpente.jobs` table (key
+`(seq, idx)`, value `[name][payload]`) materializes transactional enqueues in the same
+apply — the queue dispatcher's substrate (§6).
 
 **Snapshots & reads.** MVCC snapshots at log positions; read-only queries (and follower
 reads) run against snapshots without touching the write path. Blob columns over a

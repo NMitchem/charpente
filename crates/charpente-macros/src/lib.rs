@@ -171,11 +171,13 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 }
 
                 /// Exact-match lookup on the `#[index]` field, in id order.
+                /// Works on any `View`: a `Snapshot` outside transactions or
+                /// a `Tx` inside one.
                 #vis fn #by_fn_idents(
-                    snapshot: &::charpente_core::table::Snapshot,
+                    view: &impl ::charpente_core::table::View,
                     key: &#index_field_types,
                 ) -> ::std::io::Result<::std::vec::Vec<Self>> {
-                    snapshot.scan_by::<Self>(#index_names, key)
+                    view.scan_by::<Self>(#index_names, key)
                 }
             )*
         }

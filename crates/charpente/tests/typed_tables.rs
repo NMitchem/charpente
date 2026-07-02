@@ -12,7 +12,7 @@ use charpente::table;
 use charpente_core::engine::{Engine, StateMachine};
 use charpente_core::io::Entropy;
 use charpente_core::log::WalConfig;
-use charpente_core::table::{Codec, Id, Snapshot, Store};
+use charpente_core::table::{Codec, Id, Snapshot, Store, View};
 use charpente_sim::{FaultConfig, Sim, run_universes};
 
 #[table]
@@ -451,4 +451,28 @@ fn tables_replay_identically_for_the_same_seed() {
     for seed in [0x7, 0xBEEF_CAFE, 0x0F1E_2D3C_4B5A_6978] {
         assert_eq!(trace(seed), trace(seed));
     }
+}
+
+#[test]
+fn jobs_table_records_in_order() {
+    let (_sim, store) = quiet_store();
+    store
+        .apply(0, |w| {
+            w.enqueue_raw(0, 0, "send_receipt", b"invoice-10")?;
+            w.enqueue_raw(0, 1, "audit", b"")
+        })
+        .unwrap();
+    store
+        .apply(1, |w| w.enqueue_raw(1, 0, "audit", b"x"))
+        .unwrap();
+
+    let jobs = store.snapshot().unwrap().jobs().unwrap();
+    assert_eq!(
+        jobs,
+        vec![
+            (0, 0, "send_receipt".to_string(), b"invoice-10".to_vec()),
+            (0, 1, "audit".to_string(), Vec::new()),
+            (1, 0, "audit".to_string(), b"x".to_vec()),
+        ]
+    );
 }
