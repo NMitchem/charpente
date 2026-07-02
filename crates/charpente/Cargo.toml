@@ -11,3 +11,6 @@ charpente-macros.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+charpente-sim = { path = "../charpente-sim" }

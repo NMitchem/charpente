@@ -174,7 +174,7 @@ fn crash_workload(sim: &mut Sim, checked: bool) -> Result<(), String> {
 /// upholds the durability invariant under the full fault matrix.
 #[test]
 fn checked_recovery_survives_the_fault_matrix() {
-    run_universes("crash_recovery", 512, |sim| crash_workload(sim, true));
+    run_universes!(512, |sim: &mut Sim| crash_workload(sim, true));
 }
 
 /// The meta-test: the harness MUST catch naive recovery. Runs the naive
@@ -223,7 +223,7 @@ fn regression_torn_write_seed() {
 #[test]
 fn failure_output_names_seed_and_repro() {
     let result = std::panic::catch_unwind(|| {
-        run_universes_from("crash_recovery", META_TEST_BASE, 400, |sim| {
+        run_universes_from!(META_TEST_BASE, 400, |sim: &mut Sim| {
             crash_workload(sim, false)
         });
     });

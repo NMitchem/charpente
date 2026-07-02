@@ -76,6 +76,14 @@ the sim-capable IO layer comes first because it cannot be retrofitted.
   with fixed-size payloads); IO failure poisons the log (fsyncgate). Sim found one
   workload-model bug — recovery itself can hit injected fsync faults and must be
   restart-retried (seed 0x5cafb3ac016dccf9, noted in tests/wal.rs).
-- Next: M0 step 3 per PLAN.md — typed tables on redb behind the `Disk` boundary
-  (`#[table]`, `Id<T>`, get/put/scan, one secondary-index form, MVCC snapshots).
-  redb's `StorageBackend` maps 1:1 onto `File` (DECISIONS §10) — the adapter is thin.
+- **M0 step 3 done**: typed tables on redb behind `Disk` (`charpente-core::table`:
+  `Id<T>`, `Row`, `Store`/`Snapshot`/`Writer`, exact-match secondary indexes) + the
+  `#[table]` macro in charpente-macros. Durability model in DESIGN §4: apply at
+  Durability::None + applied_seq meta key, checkpoint persists, WAL replays the gap.
+  redb's raw-path constructors are deny-listed (Store::open is the only mount).
+  Sim-established: redb's layout is deterministic; `Database::drop` is a graceful
+  close, so crash tests must crash with the db open. `File` gained a `Send + Sync`
+  supertrait; the sim world is now `Arc<Mutex>` (honest, uncontended).
+- Next: M0 step 4 per PLAN.md — transactions: `fn(&mut Tx) -> Result<T, E>`, reads
+  from a snapshot, writes/enqueues/emits recorded into one log record, applied to the
+  store post-commit; serializable by construction on the single-threaded core.

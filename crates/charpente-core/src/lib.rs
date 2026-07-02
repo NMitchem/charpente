@@ -7,3 +7,4 @@ pub mod crc;
 pub mod engine;
 pub mod io;
 pub mod log;
+pub mod table;

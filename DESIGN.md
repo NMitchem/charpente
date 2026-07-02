@@ -170,6 +170,20 @@ harness exists to prove it. Sequence accordingly: harness first, engine second. 
 engines under the trait is a contained change because nothing above the `Disk`/table layer
 knows tree shape.
 
+**Table store (v0, implemented).** redb mounts behind `Disk` via a `StorageBackend`
+adapter (`table::Store::open` — the raw-path constructors are deny-listed). The store is
+a materialization of the log, never a second source of truth: every `apply(seq, …)`
+commits row effects atomically with the `applied_seq` meta key at `Durability::None`
+(no fsync — the WAL is the durability story); `checkpoint()` persists everything at
+once; after a crash the store reverts to its last checkpoint and recovery replays the
+WAL from `applied_seq + 1`. Two redb facts the sim established: its byte layout is
+deterministic under identical op sequences (raw-fingerprint replay holds), and
+`Database::drop` is a *graceful close* that durably flushes non-durable commits — a
+crash is only a crash if the process dies with the database open, which is exactly what
+the sim models. Index entries are `[key len: u32][key bytes][id: u64 be]` (length prefix
+prevents prefix-collision ambiguity); exact-match lookups only until a real query
+pattern demands order-preserving key encoding.
+
 **Snapshots & reads.** MVCC snapshots at log positions; read-only queries (and follower
 reads) run against snapshots without touching the write path. Blob columns over a
 configurable size spill to a content-addressed blob store (same log-commit discipline for

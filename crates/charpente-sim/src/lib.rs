@@ -4,16 +4,18 @@
 //! disk operations, partitions). A failure prints its seed; the seed is the
 //! reproduction.
 //!
-//! The world is single-threaded and every container with order-dependent
-//! iteration is a BTree — replaying a seed must be byte-identical, forever.
+//! The world is a single `Mutex<State>` — not for parallelism (the simulation
+//! is strictly single-threaded; the lock is never contended) but because
+//! storage engines mounted behind the boundary require `Send + Sync` handles
+//! (`File`'s supertrait). Every container with order-dependent iteration is a
+//! BTree — replaying a seed must be byte-identical, forever.
 
 mod disk;
 mod net;
 pub mod rng;
 
-use std::cell::{Cell, RefCell};
 use std::io;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use charpente_core::io::{Clock, Conn, Disk, Entropy, File, Instant, Listener, Net};
@@ -90,58 +92,66 @@ impl FaultConfig {
     }
 }
 
-struct World {
-    seed: u64,
-    cfg: FaultConfig,
+struct State {
     /// Virtual time, nanoseconds since universe start.
-    now: Cell<u64>,
+    now: u64,
     /// Independent streams so app-visible entropy draws don't perturb fault
     /// decisions and vice versa.
-    faults: RefCell<Rng>,
-    entropy: RefCell<Rng>,
-    latency: RefCell<Rng>,
-    disk: RefCell<DiskWorld>,
-    net: RefCell<NetWorld>,
+    faults: Rng,
+    entropy: Rng,
+    latency: Rng,
+    disk: DiskWorld,
+    net: NetWorld,
 }
 
-impl World {
-    fn advance(&self, (lo, hi): (Duration, Duration)) {
+impl State {
+    fn advance(&mut self, (lo, hi): (Duration, Duration)) {
         let lo = u64::try_from(lo.as_nanos()).expect("latency exceeds u64 nanos");
         let hi = u64::try_from(hi.as_nanos()).expect("latency exceeds u64 nanos");
         if hi == 0 {
             return;
         }
-        let step = self.latency.borrow_mut().between(lo, hi);
+        let step = self.latency.between(lo, hi);
         self.advance_by(step);
     }
 
-    fn advance_by(&self, nanos: u64) {
-        let now = self
+    fn advance_by(&mut self, nanos: u64) {
+        self.now = self
             .now
-            .get()
             .checked_add(nanos)
             .expect("virtual clock overflowed u64 nanos");
-        self.now.set(now);
     }
 
     /// Charged by every disk operation: the injected-crash countdown ticks
     /// here, so a crash can land between any two operations.
-    fn disk_op(&self) -> io::Result<()> {
-        {
-            let mut d = self.disk.borrow_mut();
-            if d.crashed {
+    fn disk_op(&mut self, cfg: &FaultConfig) -> io::Result<()> {
+        if self.disk.crashed {
+            return Err(crashed_error());
+        }
+        if let Some(countdown) = self.disk.crash_countdown {
+            if countdown == 0 {
+                self.disk.crashed = true;
                 return Err(crashed_error());
             }
-            if let Some(countdown) = d.crash_countdown {
-                if countdown == 0 {
-                    d.crashed = true;
-                    return Err(crashed_error());
-                }
-                d.crash_countdown = Some(countdown - 1);
-            }
+            self.disk.crash_countdown = Some(countdown - 1);
         }
-        self.advance(self.cfg.disk_latency);
+        self.advance(cfg.disk_latency);
         Ok(())
+    }
+}
+
+struct World {
+    seed: u64,
+    cfg: FaultConfig,
+    state: Mutex<State>,
+}
+
+impl World {
+    fn lock(&self) -> MutexGuard<'_, State> {
+        // Single-threaded: never contended; poison only follows a panic.
+        self.state
+            .lock()
+            .expect("sim world lock poisoned by an earlier panic")
     }
 }
 
@@ -150,7 +160,7 @@ fn crashed_error() -> io::Error {
 }
 
 pub struct Sim {
-    world: Rc<World>,
+    world: Arc<World>,
 }
 
 impl Sim {
@@ -165,15 +175,17 @@ impl Sim {
         let entropy = Rng::new(splitmix64(&mut sm));
         let latency = Rng::new(splitmix64(&mut sm));
         Sim {
-            world: Rc::new(World {
+            world: Arc::new(World {
                 seed,
                 cfg,
-                now: Cell::new(0),
-                faults: RefCell::new(faults),
-                entropy: RefCell::new(entropy),
-                latency: RefCell::new(latency),
-                disk: RefCell::new(DiskWorld::default()),
-                net: RefCell::new(NetWorld::default()),
+                state: Mutex::new(State {
+                    now: 0,
+                    faults,
+                    entropy,
+                    latency,
+                    disk: DiskWorld::default(),
+                    net: NetWorld::default(),
+                }),
             }),
         }
     }
@@ -183,7 +195,7 @@ impl Sim {
     }
 
     pub fn now(&self) -> Instant {
-        Instant::from_nanos(self.world.now.get())
+        Instant::from_nanos(self.world.lock().now)
     }
 
     pub fn clock(&self) -> SimClock {
@@ -215,11 +227,11 @@ impl Sim {
     /// Injects a crash on the `ops`-th subsequent disk operation (0 = the
     /// very next one). The op fails, and the disk is gone until `restart()`.
     pub fn crash_disk_after(&self, ops: u64) {
-        self.world.disk.borrow_mut().crash_countdown = Some(ops);
+        self.world.lock().disk.crash_countdown = Some(ops);
     }
 
     pub fn crash_disk_now(&self) {
-        self.world.disk.borrow_mut().crashed = true;
+        self.world.lock().disk.crashed = true;
     }
 
     /// Power-cycles the disk: every unsynced write independently survives,
@@ -227,43 +239,35 @@ impl Sim {
     /// pending crash countdown is cleared. Called after a crash — or without
     /// one; a clean power cycle collapses the page cache the same way.
     pub fn restart(&self) {
-        let mut d = self.world.disk.borrow_mut();
-        let mut rng = self.world.faults.borrow_mut();
-        for file in d.files.values_mut() {
-            disk::collapse(file, &mut rng, &self.world.cfg);
+        let mut guard = self.world.lock();
+        let State { disk, faults, .. } = &mut *guard;
+        for file in disk.files.values_mut() {
+            crate::disk::collapse(file, faults, &self.world.cfg);
         }
-        d.epoch += 1;
-        d.crashed = false;
-        d.crash_countdown = None;
+        disk.epoch += 1;
+        disk.crashed = false;
+        disk.crash_countdown = None;
     }
 
     pub fn partition(&self, a: &str, b: &str) {
-        self.world
-            .net
-            .borrow_mut()
-            .partitions
-            .insert(normalize(a, b));
+        self.world.lock().net.partitions.insert(normalize(a, b));
     }
 
     pub fn repair(&self, a: &str, b: &str) {
-        self.world
-            .net
-            .borrow_mut()
-            .partitions
-            .remove(&normalize(a, b));
+        self.world.lock().net.partitions.remove(&normalize(a, b));
     }
 
     /// FNV-1a over all durable file contents — for determinism assertions:
     /// the same seed must produce the same fingerprint, forever.
     pub fn durable_fingerprint(&self) -> u64 {
-        let d = self.world.disk.borrow();
+        let guard = self.world.lock();
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         let mut eat = |bytes: &[u8]| {
             for &b in bytes {
                 hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
             }
         };
-        for (name, file) in &d.files {
+        for (name, file) in &guard.disk.files {
             eat(name.as_bytes());
             eat(&(file.durable.len() as u64).to_le_bytes());
             eat(&file.durable);
@@ -275,54 +279,55 @@ impl Sim {
 // ---------------------------------------------------------------- Clock
 
 pub struct SimClock {
-    world: Rc<World>,
+    world: Arc<World>,
 }
 
 impl Clock for SimClock {
     fn now(&self) -> Instant {
-        Instant::from_nanos(self.world.now.get())
+        Instant::from_nanos(self.world.lock().now)
     }
 
     fn sleep(&self, duration: Duration) {
         let nanos = u64::try_from(duration.as_nanos()).expect("sleep exceeds u64 nanos");
-        self.world.advance_by(nanos);
+        self.world.lock().advance_by(nanos);
     }
 }
 
 // ---------------------------------------------------------------- Entropy
 
 pub struct SimEntropy {
-    world: Rc<World>,
+    world: Arc<World>,
 }
 
 impl Entropy for SimEntropy {
     fn fill(&self, buf: &mut [u8]) {
-        self.world.entropy.borrow_mut().fill(buf);
+        self.world.lock().entropy.fill(buf);
     }
 }
 
 // ---------------------------------------------------------------- Disk
 
 pub struct SimDisk {
-    world: Rc<World>,
+    world: Arc<World>,
 }
 
 impl Disk for SimDisk {
     fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
-        self.world.disk_op()?;
-        let mut d = self.world.disk.borrow_mut();
-        d.files.entry(path.to_string()).or_default();
+        let mut guard = self.world.lock();
+        guard.disk_op(&self.world.cfg)?;
+        guard.disk.files.entry(path.to_string()).or_default();
+        let epoch = guard.disk.epoch;
         Ok(Box::new(SimFile {
             world: self.world.clone(),
             path: path.to_string(),
-            epoch: d.epoch,
+            epoch,
         }))
     }
 
     fn remove(&self, path: &str) -> io::Result<()> {
-        self.world.disk_op()?;
-        let mut d = self.world.disk.borrow_mut();
-        if d.files.remove(path).is_none() {
+        let mut guard = self.world.lock();
+        guard.disk_op(&self.world.cfg)?;
+        if guard.disk.files.remove(path).is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("remove(\"{path}\"): no such simulated file"),
@@ -332,9 +337,11 @@ impl Disk for SimDisk {
     }
 
     fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
-        self.world.disk_op()?;
-        let d = self.world.disk.borrow();
-        Ok(d.files
+        let mut guard = self.world.lock();
+        guard.disk_op(&self.world.cfg)?;
+        Ok(guard
+            .disk
+            .files
             .keys()
             .filter(|k| k.starts_with(prefix))
             .cloned()
@@ -343,56 +350,51 @@ impl Disk for SimDisk {
 }
 
 pub struct SimFile {
-    world: Rc<World>,
+    world: Arc<World>,
     path: String,
     epoch: u64,
 }
 
 impl SimFile {
-    fn check_epoch(&self) -> io::Result<()> {
-        let d = self.world.disk.borrow();
-        if d.epoch != self.epoch {
+    /// Epoch check + op charge, then the file state — one lock for the op.
+    fn op<T>(
+        &self,
+        f: impl FnOnce(&mut State, &FaultConfig, &str) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let mut guard = self.world.lock();
+        if guard.disk.epoch != self.epoch {
             return Err(io::Error::other(format!(
                 "file handle for \"{}\" predates a simulated crash — contract: reopen files after Sim::restart()",
                 self.path
             )));
         }
-        Ok(())
+        guard.disk_op(&self.world.cfg)?;
+        f(&mut guard, &self.world.cfg, &self.path)
     }
+}
 
-    fn with_state<T>(&self, f: impl FnOnce(&mut disk::FileState) -> T) -> T {
-        let mut d = self.world.disk.borrow_mut();
-        let state = d.files.get_mut(&self.path).unwrap_or_else(|| {
-            panic!(
-                "simulated file \"{}\" removed while a handle was open",
-                self.path
-            )
-        });
-        f(state)
-    }
+fn file_state<'a>(state: &'a mut State, path: &str) -> &'a mut disk::FileState {
+    state
+        .disk
+        .files
+        .get_mut(path)
+        .unwrap_or_else(|| panic!("simulated file \"{path}\" removed while a handle was open"))
 }
 
 impl File for SimFile {
     fn len(&self) -> io::Result<u64> {
-        self.check_epoch()?;
-        self.world.disk_op()?;
-        Ok(self.with_state(|s| s.view().len() as u64))
+        self.op(|state, _, path| Ok(file_state(state, path).view().len() as u64))
     }
 
     fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
-        self.check_epoch()?;
-        self.world.disk_op()?;
-        self.with_state(|s| {
-            let view = s.view();
-            let end = offset
-                .checked_add(out.len() as u64)
-                .expect("read_at range overflowed u64");
+        self.op(|state, _, path| {
+            let view = file_state(state, path).view();
+            let end = offset.checked_add(out.len() as u64).expect("read_at range overflowed u64");
             if end > view.len() as u64 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     format!(
-                        "read_at past end of \"{}\": requested [{offset}, {end}) but len is {} — contract: read_at reads exactly out.len() bytes inside the file",
-                        self.path,
+                        "read_at past end of \"{path}\": requested [{offset}, {end}) but len is {} — contract: read_at reads exactly out.len() bytes inside the file",
                         view.len()
                     ),
                 ));
@@ -403,64 +405,53 @@ impl File for SimFile {
     }
 
     fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-        self.check_epoch()?;
-        self.world.disk_op()?;
-        if data.is_empty() {
-            return Ok(());
-        }
-        if self
-            .world
-            .faults
-            .borrow_mut()
-            .chance(self.world.cfg.write_error)
-        {
-            return Err(io::Error::other(
-                "simulated disk write error (injected fault)",
-            ));
-        }
-        self.with_state(|s| {
-            s.pending.push(PendingOp::Write {
+        self.op(|state, cfg, path| {
+            if data.is_empty() {
+                return Ok(());
+            }
+            if state.faults.chance(cfg.write_error) {
+                return Err(io::Error::other(
+                    "simulated disk write error (injected fault)",
+                ));
+            }
+            file_state(state, path).pending.push(PendingOp::Write {
                 offset,
                 data: data.to_vec(),
             });
-        });
-        Ok(())
+            Ok(())
+        })
     }
 
     fn set_len(&self, len: u64) -> io::Result<()> {
-        self.check_epoch()?;
-        self.world.disk_op()?;
-        self.with_state(|s| s.pending.push(PendingOp::SetLen { len }));
-        Ok(())
+        self.op(|state, _, path| {
+            file_state(state, path)
+                .pending
+                .push(PendingOp::SetLen { len });
+            Ok(())
+        })
     }
 
     fn sync(&self) -> io::Result<()> {
-        self.check_epoch()?;
-        self.world.disk_op()?;
-        if self
-            .world
-            .faults
-            .borrow_mut()
-            .chance(self.world.cfg.sync_error)
-        {
-            // Real fsync failure semantics: nothing can be assumed. The
-            // buffer stays volatile; a later crash collapses it as usual.
-            return Err(io::Error::other(
-                "simulated fsync failure — durability of writes since the last successful sync is unknown",
-            ));
-        }
-        self.with_state(|s| {
-            s.durable = s.view();
-            s.pending.clear();
-        });
-        Ok(())
+        self.op(|state, cfg, path| {
+            if state.faults.chance(cfg.sync_error) {
+                // Real fsync failure semantics: nothing can be assumed. The
+                // buffer stays volatile; a later crash collapses it as usual.
+                return Err(io::Error::other(
+                    "simulated fsync failure — durability of writes since the last successful sync is unknown",
+                ));
+            }
+            let file = file_state(state, path);
+            file.durable = file.view();
+            file.pending.clear();
+            Ok(())
+        })
     }
 }
 
 // ---------------------------------------------------------------- Net
 
 pub struct SimNet {
-    world: Rc<World>,
+    world: Arc<World>,
     host: String,
 }
 
@@ -471,14 +462,17 @@ impl Net for SimNet {
             self.host,
             "a simulated host can only listen on its own name"
         );
-        let mut n = self.world.net.borrow_mut();
-        if n.listeners.contains_key(addr) {
+        let mut guard = self.world.lock();
+        if guard.net.listeners.contains_key(addr) {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 format!("\"{addr}\" already has a simulated listener"),
             ));
         }
-        n.listeners.insert(addr.to_string(), Default::default());
+        guard
+            .net
+            .listeners
+            .insert(addr.to_string(), Default::default());
         Ok(Box::new(SimListener {
             world: self.world.clone(),
             addr: addr.to_string(),
@@ -487,8 +481,8 @@ impl Net for SimNet {
 
     fn connect(&self, addr: &str) -> io::Result<Box<dyn Conn>> {
         let target = host_of(addr).to_string();
-        let mut n = self.world.net.borrow_mut();
-        if n.partitioned(&self.host, &target) {
+        let mut guard = self.world.lock();
+        if guard.net.partitioned(&self.host, &target) {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 format!(
@@ -497,15 +491,15 @@ impl Net for SimNet {
                 ),
             ));
         }
-        if !n.listeners.contains_key(addr) {
+        if !guard.net.listeners.contains_key(addr) {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 format!("nothing is listening on \"{addr}\" in this simulation"),
             ));
         }
-        let id = n.next_conn;
-        n.next_conn += 1;
-        n.conns.insert(
+        let id = guard.net.next_conn;
+        guard.net.next_conn += 1;
+        guard.net.conns.insert(
             id,
             ConnState {
                 host_a: self.host.clone(),
@@ -517,7 +511,9 @@ impl Net for SimNet {
                 open_b: true,
             },
         );
-        n.listeners
+        guard
+            .net
+            .listeners
             .get_mut(addr)
             .expect("checked above")
             .push_back(id);
@@ -530,14 +526,15 @@ impl Net for SimNet {
 }
 
 pub struct SimListener {
-    world: Rc<World>,
+    world: Arc<World>,
     addr: String,
 }
 
 impl Listener for SimListener {
     fn accept(&self) -> io::Result<Option<Box<dyn Conn>>> {
-        let mut n = self.world.net.borrow_mut();
-        let backlog = n
+        let mut guard = self.world.lock();
+        let backlog = guard
+            .net
             .listeners
             .get_mut(&self.addr)
             .expect("listener state removed while the handle was open");
@@ -558,29 +555,19 @@ impl Listener for SimListener {
 
 impl Drop for SimListener {
     fn drop(&mut self) {
-        self.world.net.borrow_mut().listeners.remove(&self.addr);
+        self.world.lock().net.listeners.remove(&self.addr);
     }
 }
 
 pub struct SimConn {
-    world: Rc<World>,
+    world: Arc<World>,
     id: u64,
     is_a: bool,
 }
 
-impl SimConn {
-    fn with_state<T>(&self, f: impl FnOnce(&mut ConnState, &World) -> T) -> T {
-        let mut n = self.world.net.borrow_mut();
-        let state = n
-            .conns
-            .get_mut(&self.id)
-            .expect("connection state removed while a handle was open");
-        f(state, &self.world)
-    }
-}
-
 impl Conn for SimConn {
     fn send(&self, data: &[u8]) -> io::Result<()> {
+        let mut guard = self.world.lock();
         let deliver_at = {
             let (lo, hi) = self.world.cfg.net_latency;
             let lo = u64::try_from(lo.as_nanos()).expect("latency exceeds u64 nanos");
@@ -588,86 +575,97 @@ impl Conn for SimConn {
             let latency = if hi == 0 {
                 0
             } else {
-                self.world.latency.borrow_mut().between(lo, hi)
+                guard.latency.between(lo, hi)
             };
-            self.world.now.get() + latency
+            guard.now + latency
         };
-        let partitioned = {
-            let n = self.world.net.borrow();
-            let state = n.conns.get(&self.id).expect("connection state removed");
-            n.partitioned(&state.host_a, &state.host_b)
+        let state = guard
+            .net
+            .conns
+            .get(&self.id)
+            .expect("connection state removed");
+        let partitioned = guard.net.partitioned(&state.host_a, &state.host_b);
+        let state = guard
+            .net
+            .conns
+            .get_mut(&self.id)
+            .expect("connection state removed");
+        let (my_open, peer_open) = if self.is_a {
+            (state.open_a, state.open_b)
+        } else {
+            (state.open_b, state.open_a)
         };
-        self.with_state(|state, _| {
-            let (my_open, peer_open) = if self.is_a {
-                (state.open_a, state.open_b)
-            } else {
-                (state.open_b, state.open_a)
-            };
-            assert!(my_open, "send on a connection this side already closed");
-            if !peer_open {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "simulated peer closed the connection",
-                ));
-            }
-            if partitioned {
-                // Partition semantics: the send succeeds locally and the
-                // packet is lost, like the real thing.
-                return Ok(());
-            }
-            let queue = if self.is_a {
-                &mut state.to_b
-            } else {
-                &mut state.to_a
-            };
-            queue.push_back((deliver_at, data.to_vec()));
-            Ok(())
-        })
+        assert!(my_open, "send on a connection this side already closed");
+        if !peer_open {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "simulated peer closed the connection",
+            ));
+        }
+        if partitioned {
+            // Partition semantics: the send succeeds locally and the packet
+            // is lost, like the real thing.
+            return Ok(());
+        }
+        let queue = if self.is_a {
+            &mut state.to_b
+        } else {
+            &mut state.to_a
+        };
+        queue.push_back((deliver_at, data.to_vec()));
+        Ok(())
     }
 
     fn recv(&self, out: &mut [u8]) -> io::Result<Option<usize>> {
-        let now = self.world.now.get();
-        self.with_state(|state, _| {
-            let (queue, peer_open) = if self.is_a {
-                (&mut state.to_a, state.open_b)
-            } else {
-                (&mut state.to_b, state.open_a)
-            };
-            match queue.front() {
-                Some((deliver_at, data)) if *deliver_at <= now => {
-                    assert!(
-                        out.len() >= data.len(),
-                        "recv buffer ({}) smaller than message ({}) — sim Net is message-oriented; size the buffer to the protocol's largest message",
-                        out.len(),
-                        data.len()
-                    );
-                    let n = data.len();
-                    out[..n].copy_from_slice(data);
-                    queue.pop_front();
-                    Ok(Some(n))
-                }
-                Some(_) => Ok(None), // in flight; virtual time hasn't reached it
-                None if !peer_open => Ok(Some(0)),
-                None => Ok(None),
+        let mut guard = self.world.lock();
+        let now = guard.now;
+        let state = guard
+            .net
+            .conns
+            .get_mut(&self.id)
+            .expect("connection state removed");
+        let (queue, peer_open) = if self.is_a {
+            (&mut state.to_a, state.open_b)
+        } else {
+            (&mut state.to_b, state.open_a)
+        };
+        match queue.front() {
+            Some((deliver_at, data)) if *deliver_at <= now => {
+                assert!(
+                    out.len() >= data.len(),
+                    "recv buffer ({}) smaller than message ({}) — sim Net is message-oriented; size the buffer to the protocol's largest message",
+                    out.len(),
+                    data.len()
+                );
+                let n = data.len();
+                out[..n].copy_from_slice(data);
+                queue.pop_front();
+                Ok(Some(n))
             }
-        })
+            Some(_) => Ok(None), // in flight; virtual time hasn't reached it
+            None if !peer_open => Ok(Some(0)),
+            None => Ok(None),
+        }
     }
 
     fn peer_addr(&self) -> String {
-        self.with_state(|state, _| {
-            if self.is_a {
-                state.listen_addr.clone()
-            } else {
-                state.host_a.clone()
-            }
-        })
+        let guard = self.world.lock();
+        let state = guard
+            .net
+            .conns
+            .get(&self.id)
+            .expect("connection state removed");
+        if self.is_a {
+            state.listen_addr.clone()
+        } else {
+            state.host_a.clone()
+        }
     }
 }
 
 impl Drop for SimConn {
     fn drop(&mut self) {
-        let mut n = self.world.net.borrow_mut();
-        if let Some(state) = n.conns.get_mut(&self.id) {
+        if let Some(state) = self.world.lock().net.conns.get_mut(&self.id) {
             if self.is_a {
                 state.open_a = false;
             } else {
@@ -681,42 +679,73 @@ impl Drop for SimConn {
 
 /// Runs `universes` seeded universes from a fresh base seed. A failure panics
 /// with the seed and a one-command repro (DESIGN.md §7: the failure message
-/// IS the reproduction). Set `CHARPENTE_SEED=0x…` to replay one universe.
-pub fn run_universes(test_file: &str, universes: u64, f: impl Fn(&mut Sim) -> Result<(), String>) {
-    run_universes_from(test_file, ambient_base_seed(), universes, f);
+/// IS the reproduction) — call as `run_universes!(N, f)`; the macro fills in
+/// the calling package and test file so the repro command is exact. Set
+/// `CHARPENTE_SEED=0x…` to replay one universe.
+#[macro_export]
+macro_rules! run_universes {
+    ($universes:expr, $f:expr) => {
+        $crate::run_universes_in(env!("CARGO_PKG_NAME"), file!(), $universes, $f)
+    };
 }
 
-/// `run_universes` with a caller-chosen base seed, for tests that must be
+/// `run_universes!` with a caller-chosen base seed, for tests that must be
 /// deterministic in CI (e.g. the harness-catches-the-bug meta-tests).
-pub fn run_universes_from(
-    test_file: &str,
+#[macro_export]
+macro_rules! run_universes_from {
+    ($base:expr, $universes:expr, $f:expr) => {
+        $crate::run_universes_from_in(env!("CARGO_PKG_NAME"), file!(), $base, $universes, $f)
+    };
+}
+
+#[doc(hidden)]
+pub fn run_universes_in(
+    package: &str,
+    file: &str,
+    universes: u64,
+    f: impl Fn(&mut Sim) -> Result<(), String>,
+) {
+    run_universes_from_in(package, file, ambient_base_seed(), universes, f);
+}
+
+#[doc(hidden)]
+pub fn run_universes_from_in(
+    package: &str,
+    file: &str,
     base: u64,
     universes: u64,
     f: impl Fn(&mut Sim) -> Result<(), String>,
 ) {
+    let test_file = test_name(file);
     if let Ok(seed_var) = std::env::var("CHARPENTE_SEED") {
         let seed = parse_seed(&seed_var);
         eprintln!("charpente-sim [{test_file}]: replaying seed {seed:#018x}");
-        run_one(test_file, seed, &f);
+        run_one(package, test_file, seed, &f);
         return;
     }
     eprintln!("charpente-sim [{test_file}]: {universes} universes from base seed {base:#018x}");
     let mut state = base;
     for _ in 0..universes {
-        run_one(test_file, splitmix64(&mut state), &f);
+        run_one(package, test_file, splitmix64(&mut state), &f);
     }
 }
 
-fn run_one(test_file: &str, seed: u64, f: &impl Fn(&mut Sim) -> Result<(), String>) {
+/// `"crates/charpente/tests/typed_tables.rs"` → `"typed_tables"`.
+fn test_name(file: &str) -> &str {
+    let stem = file.rsplit('/').next().unwrap_or(file);
+    stem.strip_suffix(".rs").unwrap_or(stem)
+}
+
+fn run_one(package: &str, test_file: &str, seed: u64, f: &impl Fn(&mut Sim) -> Result<(), String>) {
     let mut sim = Sim::new(seed);
     if let Err(msg) = f(&mut sim) {
-        panic!("{}", failure_report(test_file, seed, &msg));
+        panic!("{}", failure_report(package, test_file, seed, &msg));
     }
 }
 
-fn failure_report(test_file: &str, seed: u64, msg: &str) -> String {
+fn failure_report(package: &str, test_file: &str, seed: u64, msg: &str) -> String {
     format!(
-        "\nsim failure in {test_file}: {msg}\n  seed:  {seed:#018x}\n  repro: CHARPENTE_SEED={seed:#x} cargo test -p charpente-sim --test {test_file} -- --nocapture\n"
+        "\nsim failure in {test_file}: {msg}\n  seed:  {seed:#018x}\n  repro: CHARPENTE_SEED={seed:#x} cargo test -p {package} --test {test_file} -- --nocapture\n"
     )
 }
 
@@ -763,6 +792,14 @@ mod tests {
         let before = sim.now();
         disk.open("f").unwrap();
         assert!(sim.now() > before, "a disk op must cost virtual latency");
+    }
+
+    #[test]
+    fn sim_file_handles_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>(_: &T) {}
+        let sim = Sim::new(5);
+        let file = sim.disk().open("f").unwrap();
+        assert_send_sync(&file);
     }
 
     #[test]
@@ -824,7 +861,12 @@ mod tests {
 
     #[test]
     fn failure_report_contains_seed_and_repro() {
-        let report = failure_report("crash_recovery", 0xABCD, "record 3 corrupt");
+        let report = failure_report(
+            "charpente-sim",
+            "crash_recovery",
+            0xABCD,
+            "record 3 corrupt",
+        );
         assert!(report.contains("seed:  0x000000000000abcd"), "{report}");
         assert!(
             report.contains(
@@ -832,5 +874,14 @@ mod tests {
             ),
             "{report}"
         );
+    }
+
+    #[test]
+    fn test_name_strips_path_and_extension() {
+        assert_eq!(
+            test_name("crates/charpente/tests/typed_tables.rs"),
+            "typed_tables"
+        );
+        assert_eq!(test_name("wal.rs"), "wal");
     }
 }

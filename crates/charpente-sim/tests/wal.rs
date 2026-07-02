@@ -137,7 +137,7 @@ fn wal_workload(sim: &mut Sim, payload_len: impl Fn(&dyn Entropy) -> usize) -> R
 
 #[test]
 fn wal_survives_the_fault_matrix() {
-    run_universes("wal", 512, |sim| {
+    run_universes!(512, |sim: &mut Sim| {
         wal_workload(sim, |entropy| 100 + (entropy.next_u64() % 1400) as usize)
     });
 }
@@ -148,7 +148,7 @@ fn wal_survives_the_fault_matrix() {
 /// recovery truncates (and syncs) at the cut point.
 #[test]
 fn wal_fixed_size_payloads_cannot_resurrect_stale_frames() {
-    run_universes("wal", 512, |sim| wal_workload(sim, |_| 512));
+    run_universes!(512, |sim: &mut Sim| wal_workload(sim, |_| 512));
 }
 
 #[test]

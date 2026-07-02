@@ -3,5 +3,6 @@
 //! Re-exports the deterministic core and the derive macros.
 
 pub use charpente_core as core;
+pub use charpente_macros::table;
 
 pub mod prod;

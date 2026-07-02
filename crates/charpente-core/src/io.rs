@@ -91,8 +91,11 @@ pub trait Disk {
 /// An open file. Writes are volatile until `sync` returns `Ok`: after a crash,
 /// unsynced writes may be applied in full, in part (torn), or not at all, in
 /// any combination — that is the contract recovery code is tested against.
+///
+/// `Send + Sync` because storage engines mounted behind the boundary (redb's
+/// `StorageBackend`) require it; simulation impls satisfy it honestly.
 #[allow(clippy::len_without_is_empty)] // a file size, not a container
-pub trait File {
+pub trait File: Send + Sync {
     fn len(&self) -> io::Result<u64>;
 
     /// Reads exactly `out.len()` bytes at `offset`; error if that range
