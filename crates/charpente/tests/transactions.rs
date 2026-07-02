@@ -8,8 +8,8 @@ use std::io;
 
 use charpente::{Db, DbConfig, Event, Job, Schema, TxError, View, table};
 use charpente_core::io::Entropy;
-use charpente_core::log::WalConfig;
-use charpente_core::table::{Codec, Id, Snapshot};
+use charpente_core::log::{Wal, WalConfig};
+use charpente_core::table::{Codec, Id, Snapshot, Store};
 use charpente_sim::{FaultConfig, Sim, run_universes};
 
 #[table]
@@ -543,4 +543,120 @@ fn transactions_replay_identically_for_the_same_seed() {
     for seed in [0x42, 0xDEAD_BEEF, 0x0BAD_5EED_0BAD_5EED] {
         assert_eq!(trace(seed), trace(seed));
     }
+}
+
+// ---------------------------------------------------- negative space
+
+/// The classic dual-write bug, reconstructed on purpose: apply to the store
+/// and checkpoint BEFORE the WAL record is synced. The harness must catch
+/// the store outrunning durable truth — if it ever stops catching it, the
+/// crash injection has regressed (same contract as crash_recovery.rs's
+/// harness_catches_naive_recovery).
+fn broken_ordering_workload(sim: &mut Sim) -> Result<(), String> {
+    let entropy = sim.entropy();
+    let cfg = WalConfig {
+        dir: "wal".to_string(),
+        segment_bytes: 4096,
+    };
+
+    for _round in 0..3 {
+        sim.crash_disk_after(32 + entropy.next_u64() % 256);
+        let opened = (|| {
+            let mut durable = 0u64;
+            let wal = Wal::open(Box::new(sim.disk()), cfg.clone(), |_, _| {
+                durable += 1;
+                Ok(())
+            })?;
+            let store = Store::open(&sim.disk(), "tables.redb")?;
+            io::Result::Ok((wal, store, durable))
+        })();
+        let (mut wal, store, durable) = match opened {
+            Ok(t) => t,
+            Err(_) => {
+                sim.restart();
+                continue;
+            }
+        };
+        let applied = match store.applied_seq() {
+            Ok(a) => a,
+            Err(_) => {
+                sim.restart();
+                continue;
+            }
+        };
+
+        // THE invariant this workload exists to violate:
+        let next = applied.map_or(0, |s| s + 1);
+        if next > durable {
+            return Err(format!(
+                "store applied_seq {applied:?} outran the durable log ({durable} records) — \
+                 phantom state a conventional dual-write stack would serve as truth"
+            ));
+        }
+
+        // Catch the store up to durable truth (content-free: only the seq
+        // bump matters to this workload).
+        let mut alive = true;
+        for s in next..durable {
+            if store.apply(s, |_| Ok(())).is_err() {
+                alive = false;
+                break;
+            }
+        }
+        if !alive {
+            sim.restart();
+            continue;
+        }
+
+        // New traffic, in the BROKEN order: append → apply → checkpoint →
+        // (only now) sync. A crash in the window makes the store a liar.
+        let rounds = 1 + entropy.next_u64() % 6;
+        for seq in durable..durable + rounds {
+            if wal.append(&[0xAB; 64]).is_err() {
+                break;
+            }
+            if store.apply(seq, |_| Ok(())).is_err() {
+                break;
+            }
+            if store.checkpoint().is_err() {
+                break;
+            }
+            if wal.sync().is_err() {
+                break;
+            }
+        }
+        sim.restart();
+    }
+    Ok(())
+}
+
+/// Fixed base so CI is deterministic (the positive property uses fresh
+/// seeds every run).
+const META_TEST_BASE: u64 = 0x7C4A_2026_0004;
+
+#[test]
+fn harness_catches_apply_before_sync() {
+    let mut state = META_TEST_BASE;
+    let mut caught = None;
+    for _ in 0..400 {
+        let seed = charpente_sim::rng::splitmix64(&mut state);
+        let mut sim = Sim::new(seed);
+        if let Err(msg) = broken_ordering_workload(&mut sim) {
+            caught = Some((seed, msg));
+            break;
+        }
+    }
+    let (seed, msg) = caught.expect(
+        "the harness no longer catches store-apply-before-WAL-sync — \
+         the crash injection itself has regressed",
+    );
+    eprintln!("caught broken ordering: seed {seed:#018x}: {msg}");
+
+    // The seed IS the reproduction.
+    let mut replay = Sim::new(seed);
+    assert_eq!(
+        broken_ordering_workload(&mut replay),
+        Err(msg),
+        "replaying the seed must reproduce the identical failure"
+    );
 }
