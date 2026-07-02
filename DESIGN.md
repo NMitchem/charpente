@@ -51,19 +51,34 @@ simulation testing only works if the system is designed for it from the first li
 replay determinism is gone — and with it the entire verification story that justifies the
 platform. Retrofitting determinism onto a nondeterministic codebase is a rewrite.
 
-**Shape.**
+**Shape.** Synchronous and poll-shaped, not async futures (DECISIONS §10). `Instant` is
+charpente's own nanosecond type — std's is opaque and cannot be fabricated from virtual
+time.
 
 ```rust
-trait Clock   { fn now(&self) -> Instant; fn sleep(&self, d: Duration) -> Sleep; }
+trait Clock   { fn now(&self) -> Instant; fn sleep(&self, d: Duration); }
 trait Entropy { fn fill(&self, buf: &mut [u8]); }
-trait Disk    { fn read(&self, ...) -> IoFuture<...>; fn write(&self, ...) -> IoFuture<...>;
-                fn sync(&self, ...) -> IoFuture<()>; }
-trait Net     { fn listen(&self, ...) -> ...; fn connect(&self, ...) -> ...; }
+trait Disk    { fn open(&self, path: &str) -> Result<Box<dyn File>>;
+                fn remove(&self, path: &str) -> Result<()>;
+                fn list(&self, prefix: &str) -> Result<Vec<String>>; }   // always sorted
+trait File    { fn len(&self) -> Result<u64>;
+                fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<()>;
+                fn write_at(&self, offset: u64, data: &[u8]) -> Result<()>;
+                fn set_len(&self, len: u64) -> Result<()>;
+                fn sync(&self) -> Result<()>; }  // the durability barrier
+trait Net     { fn listen(&self, addr: &str) -> Result<Box<dyn Listener>>;
+                fn connect(&self, addr: &str) -> Result<Box<dyn Conn>>; }
+// Listener::accept and Conn::recv are non-blocking polls; Net is
+// message-oriented until the HTTP edge demands byte streams.
 ```
 
-The simulator implements all four with a seeded PRNG driving: IO completion order, latency
-distributions, fault injection (torn writes, failed syncs, partitions, crash-restart at
-arbitrary points), and virtual time (a simulated year of heartbeats runs in seconds).
+The simulator implements all of it with one seed driving: latency distributions, virtual
+time (a simulated year of heartbeats runs in seconds), and the fault matrix — injected
+write/sync errors, crash-restart between any two disk operations, partitions, and
+crash-time write-buffer collapse in which every unsynced write independently survives,
+tears (an arbitrary strict subset of its sectors), or vanishes. Subset tears matter: they
+produce the file-extends-past-garbage layouts that defeat length-prefix-only recovery,
+which prefix-only tearing never catches (found while building the first meta-test).
 
 **Consequence for the concurrency model.** The core state machine is single-threaded —
 concurrency lives at the edges (HTTP handling, queue workers, replication) and is itself

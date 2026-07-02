@@ -95,3 +95,18 @@ keeping the control plane separate proprietary code, not by the framework licens
 "the moat is the platform, the business is not-having-to-operate-it." Reopen if: a
 competitor commercially hosts charpente at meaningful scale before the control plane
 ships.
+
+## 10. Sync poll-shaped IO traits, not async futures (2026-07-01)
+
+DESIGN §1 originally sketched `IoFuture`-returning traits. Implemented synchronous
+(`&self`, blocking-style, non-blocking polls for net accept/recv) after studying the
+neighbors (NEIGHBORS.md): madsim/turmoil are async only because they retrofit determinism
+onto tokio ecosystems; TigerBeetle's VOPR drives poll-based state machines on one thread.
+Reasons: (a) the core apply loop is single-threaded and its IO is sequential by design —
+async buys Send-bound and boxed-future costs with zero determinism payoff inside the
+boundary; (b) redb's `StorageBackend` is sync and `&self` — the `Disk`/`File` traits
+mirror it, so mounting redb (M0 step 3) is a thin adapter; (c) the bug-finding
+interleaving exploration comes from crash-time write-buffer collapse, not async completion
+shuffling. Costs accepted: concurrency at the edges needs its own deterministic executor
+when HTTP/queue land (M0 steps 5–6); tokio-flavored async stays outside the deterministic
+boundary. Reopen if: the edge executor proves the core traits must be awaitable.

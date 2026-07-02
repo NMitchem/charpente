@@ -31,6 +31,8 @@ disallowed-methods = [
 ]
 
 disallowed-types = [
+    { path = "std::collections::HashMap", reason = "nondeterministic iteration order and an ambient hash seed — use BTreeMap; #[allow] at the edges only where order provably cannot matter" },
+    { path = "std::collections::HashSet", reason = "nondeterministic iteration order and an ambient hash seed — use BTreeSet; #[allow] at the edges only where order provably cannot matter" },
     { path = "std::fs::File", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },
     { path = "std::fs::OpenOptions", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },
     { path = "std::net::TcpStream", reason = "ambient network — use the Net trait (DESIGN.md §1)" },

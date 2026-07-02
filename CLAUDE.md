@@ -58,12 +58,17 @@ the sim-capable IO layer comes first because it cannot be retrofitted.
 
 ## Current state / immediate next steps
 
-- Founding + knowledge docs committed. License decided: MIT OR Apache-2.0 (DECISIONS §9).
-  All five crate names reserved on crates.io as v0.0.0 placeholders (DECISIONS §8).
-- Workspace scaffolded: five empty crates under `crates/`, nondeterminism deny-list in
-  `clippy.toml` (verified to reject an injected `SystemTime::now`), CI running
-  fmt/clippy/test. New nondeterminism sources (tokio, rand, …) get deny-list entries in
-  the same commit that adds the dependency.
-- Next: M0 step 1 per PLAN.md — the IO traits + simulator skeleton, with a first
-  crash-recovery property test proving the harness catches an injected torn write.
-  Study `madsim`/`turmoil` APIs first (NEIGHBORS.md) before designing the traits.
+- Founding + knowledge docs committed. License: MIT OR Apache-2.0 (DECISIONS §9). All
+  five crate names reserved on crates.io (DECISIONS §8). Workspace scaffolded with the
+  nondeterminism deny-list in `clippy.toml` enforced in CI; new nondeterminism sources
+  (tokio, rand, …) get deny-list entries in the same commit that adds the dependency.
+- **M0 step 1 done**: sync poll-shaped IO traits in `charpente-core::io` (DECISIONS §10),
+  full simulator in `charpente-sim` (seeded xoshiro256++, virtual time, fault matrix:
+  injected write/sync errors, crash between any two disk ops, subset-of-sectors torn
+  writes, partitions), production impls in `charpente::prod` (the one deny-list-allowed
+  module). Crash-recovery property tests prove the harness catches what it must: naive
+  length-prefix recovery fails under torn writes (regression seed 0x8bee1752811ae873
+  pinned in tests/crash_recovery.rs), checked recovery holds over fresh seeds every run.
+  `CHARPENTE_SEED=0x… cargo test -p charpente-sim --test <file>` replays any universe.
+- Next: M0 step 2 per PLAN.md — the WAL + single-threaded apply loop, with its
+  crash-recovery invariants under the (now existing) simulator from the first week.
