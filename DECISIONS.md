@@ -81,8 +81,16 @@ bootstrap crate, active June 2026. Availability snapshot 2026-07-01: taken = soc
 menhir, chassis, armature; free = charpente, monolithe, granit, batisse, ossature,
 soubassement. **TODO: reserve `charpente` on crates.io with an empty publish.**
 
-## 9. License — UNDECIDED
+## 9. License — MIT OR Apache-2.0 (decided 2026-07-01)
 
-Options on the table: MIT/Apache-2.0 dual (Rust convention, maximal adoption) vs.
-FSL/BUSL-style source-available (protects a future hosted-control-plane business; Convex
-precedent). Decide before anything is pushed public. Owner: Noah.
+Rust-convention dual license. Rejected: FSL/BUSL-style source-available (Convex
+precedent). Reasoning: adoption is the whole strategy (MANIFESTO §3 — distribution rides
+agent preference), and charpente's shape punishes source-available harder than a service
+would be — apps *link against* the platform and compile into one binary, so the
+framework's license sits inside every adopter's shipped artifact and legal review.
+Convex's mitigation (permissive clients, FSL backend) is unavailable here: the platform
+*is* the app's binary. The hosted-control-plane business (PLAN M2) is protected by
+keeping the control plane separate proprietary code, not by the framework license —
+"the moat is the platform, the business is not-having-to-operate-it." Reopen if: a
+competitor commercially hosts charpente at meaningful scale before the control plane
+ships.
