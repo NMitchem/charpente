@@ -219,7 +219,8 @@ pub trait Row: Sized + 'static {
 pub trait View {
     fn get<R: Row>(&self, id: Id<R>) -> io::Result<Option<R>>;
 
-    /// Every row, in id order.
+    /// Every row, in id order. A `Vec` for now; iterators when a real
+    /// workload shows the allocation matters.
     fn scan<R: Row>(&self) -> io::Result<Vec<R>>;
 
     /// Exact-match secondary index lookup, in id order. Called through the

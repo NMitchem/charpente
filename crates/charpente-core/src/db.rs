@@ -393,9 +393,26 @@ pub struct Db {
 impl Db {
     /// Opens the store, then recovers the WAL, replaying every durable
     /// record past the store's checkpoint into it. Recovery can fail under
-    /// IO faults; it is idempotent — restart and retry.
+    /// IO faults; it is idempotent — restart and retry. A store that cannot
+    /// open at all is discarded and rebuilt from the WAL — the store is a
+    /// materialization of the log, never a second source of truth (DESIGN §4).
     pub fn open(disk: Box<dyn Disk>, cfg: DbConfig, schema: Schema) -> io::Result<Db> {
-        let store = Store::open(&*disk, &cfg.store_path)?;
+        let store = match Store::open(&*disk, &cfg.store_path) {
+            Ok(store) => store,
+            Err(_) => {
+                // A store that cannot open is discarded and rebuilt from the
+                // WAL — it is a materialization of the log, never a second
+                // source of truth (DESIGN §4). E.g. a crash can tear the
+                // store's creation, leaving durable bytes redb rejects on
+                // every later open (found by seed 0x1f733f8d9eebf822).
+                match disk.remove(&cfg.store_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+                Store::open(&*disk, &cfg.store_path)?
+            }
+        };
         let skip_through = store.applied_seq()?;
         let machine = TableMachine {
             store,

@@ -195,7 +195,9 @@ the sim models. Index entries are `[key len: u32][key bytes][id: u64 be]` (lengt
 prevents prefix-collision ambiguity); exact-match lookups only until a real query
 pattern demands order-preserving key encoding. A built-in `charpente.jobs` table (key
 `(seq, idx)`, value `[name][payload]`) materializes transactional enqueues in the same
-apply — the queue dispatcher's substrate (§6).
+apply — the queue dispatcher's substrate (§6). A store that cannot open at all — e.g. a
+crash tore its creation — is discarded at `Db::open` and rebuilt by replaying the WAL
+from scratch; the log is the only source of truth.
 
 **Snapshots & reads.** MVCC snapshots at log positions; read-only queries (and follower
 reads) run against snapshots without touching the write path. Blob columns over a

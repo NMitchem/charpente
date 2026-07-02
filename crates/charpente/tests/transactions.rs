@@ -524,7 +524,44 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
         }
         sim.restart();
     }
-    Ok(())
+
+    // Final verification: the last round's commits get checked too. Db::open
+    // replays the whole un-checkpointed gap through the store, so unlike the
+    // WAL's read-only final recovery it needs a long fault-free streak of
+    // writes; under persistent injected faults it may legitimately never
+    // succeed (seed 0x4cea828a65f0f1eb). Injected-fault failures skip the
+    // final check — the oracle still runs at every successful open across
+    // the universe set — but any other open error is a real bug.
+    for _attempt in 0..8 {
+        let db = match Db::open(Box::new(sim.disk()), cfg.clone(), property_schema()) {
+            Ok(db) => db,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("simulated") || msg.contains("injected") {
+                    sim.restart();
+                    continue;
+                }
+                return Err(format!(
+                    "final recovery failed with a non-injected error: {e}"
+                ));
+            }
+        };
+        let recovered = db.last_applied().map_or(0, |s| s + 1);
+        if recovered < committed {
+            return Err(format!(
+                "durability violated: {committed} txns acknowledged, {recovered} recovered"
+            ));
+        }
+        let snap = match db.snapshot() {
+            Ok(snap) => snap,
+            Err(_) => {
+                sim.restart();
+                continue;
+            }
+        };
+        return db_matches_model(&snap, recovered);
+    }
+    Ok(()) // every attempt died to injected faults; earlier rounds verified every reachable prefix
 }
 
 #[test]
@@ -658,5 +695,18 @@ fn harness_catches_apply_before_sync() {
         broken_ordering_workload(&mut replay),
         Err(msg),
         "replaying the seed must reproduce the identical failure"
+    );
+}
+
+/// Hard rule 3: a crash during initial store creation left durable garbage
+/// redb rejects on every open (bad magic, InvalidData) — without the
+/// rebuild-from-WAL path in Db::open this universe bricks permanently.
+#[test]
+fn regression_store_bricked_by_creation_crash() {
+    let mut sim = Sim::new(0x1f733f8d9eebf822);
+    assert_eq!(
+        tx_workload(&mut sim),
+        Ok(()),
+        "seed 0x1f733f8d9eebf822 no longer recovers a store bricked at creation"
     );
 }
