@@ -405,6 +405,8 @@ impl Db {
                 // source of truth (DESIGN §4). E.g. a crash can tear the
                 // store's creation, leaving durable bytes redb rejects on
                 // every later open (found by seed 0x1f733f8d9eebf822).
+                // Safe only because the WAL is never compacted and retains
+                // seq 0; WAL segment GC must revisit this rebuild.
                 match disk.remove(&cfg.store_path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}

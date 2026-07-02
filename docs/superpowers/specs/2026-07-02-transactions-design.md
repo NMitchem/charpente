@@ -1,7 +1,8 @@
 # M0 step 4 — Transactions: design
 
-Status: awaiting Noah's review. Scope decisions marked **[FLAGGED]** were made without
-sign-off (Noah was away when asked); everything else follows DESIGN.md §2 directly.
+Status: approved and implemented (2026-07-02). Noah signed off after the **[FLAGGED]**
+decisions below were presented explicitly ("Let's do the implementation"); the markers
+are kept for the record. Everything else follows DESIGN.md §2 directly.
 
 ## Goal
 

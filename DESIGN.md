@@ -197,7 +197,8 @@ pattern demands order-preserving key encoding. A built-in `charpente.jobs` table
 `(seq, idx)`, value `[name][payload]`) materializes transactional enqueues in the same
 apply — the queue dispatcher's substrate (§6). A store that cannot open at all — e.g. a
 crash tore its creation — is discarded at `Db::open` and rebuilt by replaying the WAL
-from scratch; the log is the only source of truth.
+from scratch; the log is the only source of truth. That rebuild is safe only while the
+WAL is never compacted (it retains seq 0); WAL segment GC must revisit it.
 
 **Snapshots & reads.** MVCC snapshots at log positions; read-only queries (and follower
 reads) run against snapshots without touching the write path. Blob columns over a
