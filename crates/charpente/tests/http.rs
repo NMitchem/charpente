@@ -264,3 +264,220 @@ fn routes_macro_collects_descriptors() {
     assert!(all.iter().any(|r| r.pattern == "/me" && r.auth));
     assert!(all.iter().any(|r| r.pattern == "/notes/:id" && !r.auth));
 }
+
+// ---------------------------------------------------- crash property
+
+use std::io;
+
+use charpente::{Db, Job};
+use charpente_core::io::Entropy;
+use charpente_core::log::WalConfig;
+use charpente_core::table::{Codec, View};
+use charpente_sim::run_universes;
+
+#[table]
+struct Item {
+    id: Id<Item>,
+    content: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PutItem {
+    i: u64,
+}
+
+struct Ping {
+    i: u64,
+}
+
+impl Codec for Ping {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.i.encode(out);
+    }
+    fn decode(input: &mut &[u8]) -> io::Result<Ping> {
+        Ok(Ping {
+            i: u64::decode(input)?,
+        })
+    }
+}
+
+impl Job for Ping {
+    const NAME: &'static str = "ping";
+}
+
+#[route(POST "/items")]
+fn put_item(tx: &mut Tx, body: PutItem) -> Result<u64, ApiError> {
+    tx.put(&Item {
+        id: Id::from_raw(body.i),
+        content: body.i * 7,
+    });
+    tx.enqueue(Ping { i: body.i });
+    Ok(body.i)
+}
+
+fn crash_app_config() -> AppConfig {
+    AppConfig {
+        body_cap: 1 << 20,
+        db: charpente::DbConfig {
+            wal: WalConfig {
+                dir: "wal".to_string(),
+                segment_bytes: 4096,
+            },
+            store_path: "tables.redb".to_string(),
+        },
+    }
+}
+
+fn open_crash_app(sim: &Sim) -> io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Item>(),
+        Box::new(sim.entropy()),
+        crash_app_config(),
+    )?
+    .mount(routes![put_item]))
+}
+
+/// Requests 0..n each wrote Item{i, 7i} and one ping job — verify exactly.
+fn http_state_matches(db: &Db, n: u64) -> Result<(), String> {
+    let snap = db.snapshot().map_err(|e| format!("snapshot: {e}"))?;
+    let items = snap.scan::<Item>().map_err(|e| format!("scan: {e}"))?;
+    if items.len() as u64 != n {
+        return Err(format!("{n} requests acked but {} items", items.len()));
+    }
+    for (i, item) in items.iter().enumerate() {
+        if (item.id.raw(), item.content) != (i as u64, i as u64 * 7) {
+            return Err(format!(
+                "item {i} diverges: {:?}",
+                (item.id.raw(), item.content)
+            ));
+        }
+    }
+    let jobs = snap.jobs().map_err(|e| format!("jobs: {e}"))?;
+    if jobs.len() as u64 != n {
+        return Err(format!(
+            "dual-write torn over HTTP: {n} acked but {} jobs",
+            jobs.len()
+        ));
+    }
+    for (i, (seq, idx, name, payload)) in jobs.iter().enumerate() {
+        let ping = Ping::decode(&mut payload.as_slice()).map_err(|e| format!("job decode: {e}"))?;
+        if (*seq, *idx, name.as_str(), ping.i) != (i as u64, 0, "ping", i as u64) {
+            return Err(format!(
+                "job {i} diverges: seq {seq} idx {idx} {name} i={}",
+                ping.i
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_injected(text: &str) -> bool {
+    text.contains("simulated") || text.contains("injected")
+}
+
+/// One universe: recover → verify → requests through App::handle (an acked
+/// 200 must survive anything) → crash. A 500 whose body is not an injected
+/// fault is a real bug and fails the universe.
+fn http_workload(sim: &mut Sim) -> Result<(), String> {
+    let entropy = sim.entropy();
+    let mut acked = 0u64;
+
+    for _round in 0..3 {
+        sim.crash_disk_after(64 + entropy.next_u64() % 512);
+        let mut app = match open_crash_app(sim) {
+            Ok(app) => app,
+            Err(e) => {
+                if !is_injected(&e.to_string()) {
+                    return Err(format!("recovery failed with a non-injected error: {e}"));
+                }
+                sim.restart();
+                continue;
+            }
+        };
+        let recovered = app.db().last_applied().map_or(0, |s| s + 1);
+        if recovered < acked {
+            return Err(format!(
+                "durability violated: {acked} acked over HTTP, {recovered} recovered"
+            ));
+        }
+        acked = recovered;
+        http_state_matches(app.db(), acked)?;
+
+        for _ in 0..1 + entropy.next_u64() % 8 {
+            // Sprinkle guaranteed-no-write requests: they must not consume a seq.
+            if entropy.next_u64().is_multiple_of(5) {
+                let before = app.db().last_applied();
+                let resp = app.handle(Request::new(Method::Get, "/items"));
+                if resp.status != 404 && resp.status != 405 {
+                    return Err(format!(
+                        "GET /items must be unroutable, got {}",
+                        resp.status
+                    ));
+                }
+                if app.db().last_applied() != before {
+                    return Err("an unrouted request consumed a seq".to_string());
+                }
+            }
+            let resp = app.handle(Request::new(Method::Post, "/items").json(&PutItem { i: acked }));
+            match resp.status {
+                200 => acked += 1,
+                500 => {
+                    let text = String::from_utf8_lossy(&resp.body).to_string();
+                    if !is_injected(&text) {
+                        return Err(format!("non-injected 500: {text}"));
+                    }
+                    break; // died mid-commit; durable or not, next round decides
+                }
+                other => return Err(format!("unexpected status {other}")),
+            }
+            if entropy.next_u64().is_multiple_of(4) && app.db().checkpoint().is_err() {
+                break;
+            }
+        }
+        sim.restart();
+    }
+
+    // Final verification (step-4 convention): injected-fault failures skip,
+    // anything else is real.
+    for _attempt in 0..8 {
+        let app = match open_crash_app(sim) {
+            Ok(app) => app,
+            Err(e) => {
+                if !is_injected(&e.to_string()) {
+                    return Err(format!(
+                        "final recovery failed with a non-injected error: {e}"
+                    ));
+                }
+                sim.restart();
+                continue;
+            }
+        };
+        let recovered = app.db().last_applied().map_or(0, |s| s + 1);
+        if recovered < acked {
+            return Err(format!(
+                "durability violated: {acked} acked over HTTP, {recovered} recovered"
+            ));
+        }
+        return http_state_matches(app.db(), recovered);
+    }
+    Ok(()) // every attempt died to injected faults; earlier rounds verified every reachable prefix
+}
+
+#[test]
+fn http_requests_survive_the_fault_matrix() {
+    run_universes!(256, http_workload);
+}
+
+#[test]
+fn http_replays_identically_for_the_same_seed() {
+    let trace = |seed: u64| {
+        let mut sim = Sim::new(seed);
+        let result = http_workload(&mut sim);
+        assert_eq!(result, Ok(()), "seed {seed:#x}");
+        (sim.durable_fingerprint(), sim.now())
+    };
+    for seed in [0x51, 0xFACE_0FF5, 0x1DEA_C0DE_1DEA_C0DE] {
+        assert_eq!(trace(seed), trace(seed));
+    }
+}
