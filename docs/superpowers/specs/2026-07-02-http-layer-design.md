@@ -31,10 +31,13 @@ routing/decode/session logic outside the sim, breaking MANIFESTO §6.
 
 **Deterministic executor: deferred to step 6.** Step 5's kernel loop has exactly one
 event source (incoming requests); serialization comes from `&mut App` (which owns
-`Db`), not from a scheduler. The loop is written as "drain event sources in order" so
-step 6's queue/cron sources slot in without reshaping. DECISIONS §10 anticipated the
-executor "when HTTP/queue land (M0 steps 5–6)" — the need materializes at 6, when
-multiple task kinds first compete.
+`Db`), not from a scheduler. DECISIONS §10 anticipated the executor "when HTTP/queue
+land (M0 steps 5–6)" — the need materializes at 6, when multiple task kinds first
+compete. *Post-implementation correction (final review):* the shipped loop is a single
+blocking `recv` on the request channel — step 6 must restructure it (recv-with-timeout
+or the deterministic executor) to add queue/cron wakeups. What actually leaves the
+room is `App` owning the `Db` behind `&mut self` entry points; the loop itself will
+reshape.
 
 ## Module layout
 
