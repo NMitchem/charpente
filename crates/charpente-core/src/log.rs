@@ -54,11 +54,12 @@ pub struct Wal {
 
 impl Wal {
     /// Opens the log, replaying every recovered record into `on_record` in
-    /// seq order, and leaves the log ready to append after the last one.
+    /// seq order, and leaves the log ready to append after the last one. An
+    /// `on_record` error aborts recovery.
     pub fn open(
         disk: Box<dyn Disk>,
         cfg: WalConfig,
-        mut on_record: impl FnMut(u64, &[u8]),
+        mut on_record: impl FnMut(u64, &[u8]) -> io::Result<()>,
     ) -> io::Result<Wal> {
         assert!(
             !cfg.dir.is_empty() && !cfg.dir.contains(':'),
@@ -95,7 +96,7 @@ impl Wal {
             let cut = loop {
                 match read_frame(&*file, len, offset, expected_seq)? {
                     Frame::Valid { payload } => {
-                        on_record(expected_seq, &payload);
+                        on_record(expected_seq, &payload)?;
                         expected_seq += 1;
                         offset += HEADER_BYTES + payload.len() as u64;
                     }

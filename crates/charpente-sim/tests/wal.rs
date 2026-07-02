@@ -5,6 +5,8 @@
 //! `fold(apply, <prefix of submitted records>)`, the prefix is at least every
 //! acknowledged record, and nothing is ever corrupt, reordered, or invented.
 
+use std::io;
+
 use charpente_core::engine::{Engine, StateMachine};
 use charpente_core::io::{Disk, Entropy};
 use charpente_core::log::{Wal, WalConfig};
@@ -26,7 +28,7 @@ struct Ledger {
 }
 
 impl StateMachine for Ledger {
-    fn apply(&mut self, seq: u64, payload: &[u8]) {
+    fn apply(&mut self, seq: u64, payload: &[u8]) -> io::Result<()> {
         assert_eq!(seq, self.records.len() as u64, "apply stream skipped a seq");
         let mut hash = if self.hash == 0 {
             0xcbf2_9ce4_8422_2325
@@ -38,6 +40,7 @@ impl StateMachine for Ledger {
         }
         self.hash = hash;
         self.records.push(payload.to_vec());
+        Ok(())
     }
 }
 
@@ -127,7 +130,7 @@ fn wal_workload(sim: &mut Sim, payload_len: impl Fn(&dyn Entropy) -> usize) -> R
     // state is a function of the log and nothing else.
     let mut replay = Ledger::default();
     for (seq, record) in engine.machine().records.iter().enumerate() {
-        replay.apply(seq as u64, record);
+        replay.apply(seq as u64, record).unwrap();
     }
     if replay.hash != engine.machine().hash {
         return Err("machine hash diverged from a clean replay of its own records".to_string());
@@ -314,6 +317,76 @@ fn empty_directory_starts_at_seq_zero() {
 #[should_panic(expected = "WAL records are 1..=")]
 fn empty_records_are_a_contract_violation() {
     let sim = quiet_sim();
-    let mut wal = Wal::open(Box::new(sim.disk()), small_segments(), |_, _| {}).unwrap();
+    let mut wal = Wal::open(Box::new(sim.disk()), small_segments(), |_, _| Ok(())).unwrap();
     let _ = wal.append(b"");
+}
+
+/// A machine that refuses one specific seq — the hook for proving the
+/// engine's poison-on-apply-failure contract.
+struct Balky {
+    ledger: Ledger,
+    refuse_seq: Option<u64>,
+}
+
+impl StateMachine for Balky {
+    fn apply(&mut self, seq: u64, payload: &[u8]) -> io::Result<()> {
+        if self.refuse_seq == Some(seq) {
+            return Err(io::Error::other("injected apply failure"));
+        }
+        self.ledger.apply(seq, payload)
+    }
+}
+
+#[test]
+fn apply_failure_poisons_the_engine_until_recovery() {
+    let sim = quiet_sim();
+    let mut engine = Engine::recover(
+        Box::new(sim.disk()),
+        small_segments(),
+        Balky {
+            ledger: Ledger::default(),
+            refuse_seq: Some(1),
+        },
+    )
+    .unwrap();
+    engine.submit(b"zero").unwrap();
+
+    let err = engine.submit(b"one").unwrap_err();
+    assert_eq!(err.to_string(), "injected apply failure");
+
+    // Poisoned: even a healthy record must be refused now.
+    let err = engine.submit(b"two").unwrap_err();
+    assert!(err.to_string().contains("restart and recover"), "{err}");
+
+    // The refused record was durable before apply failed: recovery (with a
+    // machine that accepts it) surfaces it — durable but unacknowledged.
+    let engine = Engine::recover(
+        Box::new(sim.disk()),
+        small_segments(),
+        Balky {
+            ledger: Ledger::default(),
+            refuse_seq: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        engine.machine().ledger.records,
+        vec![b"zero".to_vec(), b"one".to_vec()]
+    );
+}
+
+#[test]
+fn recovery_propagates_apply_failure() {
+    let sim = quiet_sim();
+    build_log(&sim, &[b"x"]);
+    let err = Engine::recover(
+        Box::new(sim.disk()),
+        small_segments(),
+        Balky {
+            ledger: Ledger::default(),
+            refuse_seq: Some(0),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err.to_string(), "injected apply failure");
 }

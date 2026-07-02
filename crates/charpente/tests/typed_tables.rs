@@ -255,9 +255,10 @@ struct OpLog {
 }
 
 impl StateMachine for OpLog {
-    fn apply(&mut self, seq: u64, payload: &[u8]) {
+    fn apply(&mut self, seq: u64, payload: &[u8]) -> io::Result<()> {
         assert_eq!(seq, self.ops.len() as u64);
         self.ops.push(payload.to_vec());
+        Ok(())
     }
 }
 
