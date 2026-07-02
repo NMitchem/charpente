@@ -7,4 +7,5 @@ pub use charpente_core::db::{Db, DbConfig, Event, Job, Schema, Tx, TxError};
 pub use charpente_core::table::{Id, Snapshot, View};
 pub use charpente_macros::table;
 
+pub mod http;
 pub mod prod;
