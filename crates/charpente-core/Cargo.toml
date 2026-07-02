@@ -1,0 +1,9 @@
+[package]
+name = "charpente-core"
+description = "Deterministic core of charpente: IO traits, log, transaction engine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

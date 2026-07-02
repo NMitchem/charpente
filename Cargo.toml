@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/charpente-core",
+    "crates/charpente",
+    "crates/charpente-macros",
+    "crates/charpente-sim",
+    "crates/charpente-cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+charpente-core = { path = "crates/charpente-core", version = "0.0.0" }
+charpente-macros = { path = "crates/charpente-macros", version = "0.0.0" }
+charpente = { path = "crates/charpente", version = "0.0.0" }
+
+# Hard rule 1 (CLAUDE.md): ambient nondeterminism is banned mechanically, not by
+# review. The deny-list itself lives in clippy.toml at the workspace root.
+[workspace.lints.clippy]
+disallowed_methods = "deny"
+disallowed_types = "deny"

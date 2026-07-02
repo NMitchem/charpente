@@ -58,13 +58,12 @@ the sim-capable IO layer comes first because it cannot be retrofitted.
 
 ## Current state / immediate next steps
 
-- Founding + knowledge docs committed; **no code yet**.
-- Next actions, in order:
-  1. Reserve the `charpente` crate name on crates.io (empty publish). Check DECISIONS §9
-     (license) with Noah first — publish requires a license field.
-  2. Scaffold the workspace: `crates/charpente-core` (deterministic core: IO traits, log,
-     tx engine), `crates/charpente` (platform: tables/routes/jobs/HTTP), `crates/charpente-
-     macros` (derives), `crates/charpente-sim` (simulator + fault matrix), `crates/
-     charpente-cli`.
-  3. M0 step 1 per PLAN.md: the IO traits + simulator skeleton, with a first
-     crash-recovery property test proving the harness catches an injected torn write.
+- Founding + knowledge docs committed. License decided: MIT OR Apache-2.0 (DECISIONS §9).
+  All five crate names reserved on crates.io as v0.0.0 placeholders (DECISIONS §8).
+- Workspace scaffolded: five empty crates under `crates/`, nondeterminism deny-list in
+  `clippy.toml` (verified to reject an injected `SystemTime::now`), CI running
+  fmt/clippy/test. New nondeterminism sources (tokio, rand, …) get deny-list entries in
+  the same commit that adds the dependency.
+- Next: M0 step 1 per PLAN.md — the IO traits + simulator skeleton, with a first
+  crash-recovery property test proving the harness catches an injected torn write.
+  Study `madsim`/`turmoil` APIs first (NEIGHBORS.md) before designing the traits.

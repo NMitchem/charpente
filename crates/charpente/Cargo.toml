@@ -1,0 +1,13 @@
+[package]
+name = "charpente"
+description = "The load-bearing frame for the whole backend: tables, routes, jobs, events, HTTP."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+charpente-core.workspace = true
+charpente-macros.workspace = true
+
+[lints]
+workspace = true

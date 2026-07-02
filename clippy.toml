@@ -1,0 +1,41 @@
+# The mechanical fence around the deterministic core (CLAUDE.md hard rule 1,
+# DESIGN.md §1): no ambient time, randomness, filesystem, network, or thread
+# spawning anywhere in the workspace. All IO goes through the Clock/Entropy/
+# Disk/Net traits. Production trait impls are the one sanctioned boundary and
+# opt out site-locally with #[allow(clippy::disallowed_methods)] plus a
+# rationale comment.
+#
+# Entries for tokio/rand/etc. are added in the same commit that adds the
+# dependency.
+
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "ambient wall clock — use the Clock trait (DESIGN.md §1)" },
+    { path = "std::time::Instant::now", reason = "ambient monotonic clock — use the Clock trait (DESIGN.md §1)" },
+    { path = "std::thread::sleep", reason = "ambient time — use Clock::sleep (DESIGN.md §1)" },
+    { path = "std::thread::spawn", reason = "ambient task spawning — scheduling goes through the deterministic executor (DESIGN.md §1)" },
+    { path = "std::fs::read", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },
+    { path = "std::fs::read_to_string", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },
+    { path = "std::fs::write", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },
+    { path = "std::fs::copy", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },
+    { path = "std::fs::rename", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },
+    { path = "std::fs::remove_file", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },
+    { path = "std::fs::create_dir", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },
+    { path = "std::fs::create_dir_all", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },
+    { path = "std::fs::remove_dir", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },
+    { path = "std::fs::remove_dir_all", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },
+    { path = "std::fs::read_dir", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },
+    { path = "std::fs::metadata", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },
+    { path = "std::net::TcpStream::connect", reason = "ambient network — use the Net trait (DESIGN.md §1)" },
+    { path = "std::net::TcpListener::bind", reason = "ambient network — use the Net trait (DESIGN.md §1)" },
+    { path = "std::net::UdpSocket::bind", reason = "ambient network — use the Net trait (DESIGN.md §1)" },
+]
+
+disallowed-types = [
+    { path = "std::fs::File", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },
+    { path = "std::fs::OpenOptions", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },
+    { path = "std::net::TcpStream", reason = "ambient network — use the Net trait (DESIGN.md §1)" },
+    { path = "std::net::TcpListener", reason = "ambient network — use the Net trait (DESIGN.md §1)" },
+    { path = "std::net::UdpSocket", reason = "ambient network — use the Net trait (DESIGN.md §1)" },
+    { path = "std::time::SystemTime", reason = "ambient wall clock — use the Clock trait (DESIGN.md §1)" },
+    { path = "std::thread::Builder", reason = "ambient task spawning — scheduling goes through the deterministic executor (DESIGN.md §1)" },
+]

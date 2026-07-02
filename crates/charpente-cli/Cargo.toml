@@ -1,0 +1,16 @@
+[package]
+name = "charpente-cli"
+description = "The charpente CLI: test --sim, describe, serve."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "charpente"
+path = "src/main.rs"
+
+[dependencies]
+charpente.workspace = true
+
+[lints]
+workspace = true
