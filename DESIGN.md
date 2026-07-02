@@ -113,6 +113,17 @@ and mechanical instead of optional and artisanal. Agents handle this discipline 
 humans do — it is a rule a compiler can enforce (`Tx` is `!Send` into IO contexts, and no IO
 capability is in scope inside a transaction).
 
+**Log format (v0, implemented).** Frames of `[seq u64][len u32][crc32 u32][payload]`
+(crc over all three) in segments named `wal/<base_seq:020>.log`; rotation syncs the old
+segment before the new one takes writes, so a tail `sync` is a whole-log durability
+barrier. Recovery scans in order, cuts at the first invalid frame, truncates there and
+syncs the truncation before accepting appends (load-bearing: without it, a same-length
+discarded frame beyond the cut can be resurrected by a later recovery, checksum-valid and
+seq-correct), and deletes later segments. Any IO failure poisons the log — fsync results
+cannot honestly be retried (fsyncgate); the only exit from poison is restart-and-recover,
+and recovery is idempotent. The apply loop (`Engine`) holds the standing invariant:
+machine state ≡ fold(apply, durable records) — submit is append → sync → apply → ack.
+
 **Isolation.** Serializable, trivially: transactions apply one at a time to the
 single-threaded core. Read-only queries run against consistent snapshots (see §4) and never
 block writes. Long transactions are rejected by construction — a transaction is CPU-bound

@@ -70,5 +70,12 @@ the sim-capable IO layer comes first because it cannot be retrofitted.
   length-prefix recovery fails under torn writes (regression seed 0x8bee1752811ae873
   pinned in tests/crash_recovery.rs), checked recovery holds over fresh seeds every run.
   `CHARPENTE_SEED=0x… cargo test -p charpente-sim --test <file>` replays any universe.
-- Next: M0 step 2 per PLAN.md — the WAL + single-threaded apply loop, with its
-  crash-recovery invariants under the (now existing) simulator from the first week.
+- **M0 step 2 done**: segmented checksummed WAL (`charpente-core::log`, format in DESIGN
+  §2) + `StateMachine`/`Engine` apply loop (`charpente-core::engine`). Recovery truncates
+  at the cut and syncs it before appends (stale-frame-resurrection guard, property-tested
+  with fixed-size payloads); IO failure poisons the log (fsyncgate). Sim found one
+  workload-model bug — recovery itself can hit injected fsync faults and must be
+  restart-retried (seed 0x5cafb3ac016dccf9, noted in tests/wal.rs).
+- Next: M0 step 3 per PLAN.md — typed tables on redb behind the `Disk` boundary
+  (`#[table]`, `Id<T>`, get/put/scan, one secondary-index form, MVCC snapshots).
+  redb's `StorageBackend` maps 1:1 onto `File` (DECISIONS §10) — the adapter is thin.
