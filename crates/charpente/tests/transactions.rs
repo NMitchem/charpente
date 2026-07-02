@@ -3,11 +3,14 @@
 //! violations — unit tests first; the crash-property suite follows in the
 //! same file (added by the next plan task).
 
+use std::collections::BTreeMap;
 use std::io;
 
 use charpente::{Db, DbConfig, Event, Job, Schema, TxError, View, table};
-use charpente_core::table::{Codec, Id};
-use charpente_sim::{FaultConfig, Sim};
+use charpente_core::io::Entropy;
+use charpente_core::log::WalConfig;
+use charpente_core::table::{Codec, Id, Snapshot};
+use charpente_sim::{FaultConfig, Sim, run_universes};
 
 #[table]
 struct Org {
@@ -291,4 +294,253 @@ fn oversized_transactions_are_a_contract_violation() {
         });
         Ok::<_, io::Error>(())
     });
+}
+
+// ---------------------------------------------------- crash property
+
+#[table]
+struct Account {
+    id: Id<Account>,
+    #[index]
+    bucket: u8,
+    balance: i64,
+}
+
+#[table]
+struct EntryRow {
+    id: Id<EntryRow>,
+    account: Id<Account>,
+    amount: i64,
+}
+
+struct Audit {
+    txn: u64,
+}
+
+impl Codec for Audit {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.txn.encode(out);
+    }
+    fn decode(input: &mut &[u8]) -> io::Result<Audit> {
+        Ok(Audit {
+            txn: u64::decode(input)?,
+        })
+    }
+}
+
+impl Job for Audit {
+    const NAME: &'static str = "audit";
+}
+
+fn property_schema() -> Schema {
+    Schema::new().table::<Account>().table::<EntryRow>()
+}
+
+/// Transaction number `i`, derived from `i` alone so the oracle can
+/// reconstruct any committed prefix: an account balance bump (read-modify-
+/// write), a ledger entry keyed by `i`, sometimes a delete of an older
+/// entry, and always exactly one audit job carrying `i`.
+fn txn_shape(i: u64) -> (u64, i64, Option<u64>) {
+    let account = i % 8;
+    let amount = ((i as i64) * 7) % 1000;
+    let delete_entry = if i > 0 && i.is_multiple_of(3) {
+        Some(i / 2)
+    } else {
+        None
+    };
+    (account, amount, delete_entry)
+}
+
+fn apply_txn(tx: &mut charpente::Tx, i: u64) -> io::Result<()> {
+    let (account, amount, delete_entry) = txn_shape(i);
+    let balance = tx
+        .get::<Account>(Id::from_raw(account))?
+        .map_or(0, |a| a.balance);
+    tx.put(&Account {
+        id: Id::from_raw(account),
+        bucket: (account % 4) as u8,
+        balance: balance + amount,
+    });
+    tx.put(&EntryRow {
+        id: Id::from_raw(i),
+        account: Id::from_raw(account),
+        amount,
+    });
+    if let Some(e) = delete_entry {
+        tx.delete::<EntryRow>(Id::from_raw(e));
+    }
+    tx.enqueue(Audit { txn: i });
+    Ok(())
+}
+
+struct Model {
+    accounts: BTreeMap<u64, i64>,
+    entries: BTreeMap<u64, u64>, // entry id -> account id
+}
+
+fn model_after(n: u64) -> Model {
+    let mut model = Model {
+        accounts: BTreeMap::new(),
+        entries: BTreeMap::new(),
+    };
+    for i in 0..n {
+        let (account, amount, delete_entry) = txn_shape(i);
+        *model.accounts.entry(account).or_insert(0) += amount;
+        model.entries.insert(i, account);
+        if let Some(e) = delete_entry {
+            model.entries.remove(&e);
+        }
+    }
+    model
+}
+
+fn db_matches_model(snap: &Snapshot, n: u64) -> Result<(), String> {
+    let model = model_after(n);
+
+    let accounts = snap.scan::<Account>().map_err(|e| format!("scan: {e}"))?;
+    let got: BTreeMap<u64, i64> = accounts.iter().map(|a| (a.id.raw(), a.balance)).collect();
+    if got != model.accounts {
+        return Err(format!(
+            "accounts diverge from the model after {n} txns: {got:?} != {:?}",
+            model.accounts
+        ));
+    }
+
+    let entries = snap.scan::<EntryRow>().map_err(|e| format!("scan: {e}"))?;
+    let got: BTreeMap<u64, u64> = entries
+        .iter()
+        .map(|e| (e.id.raw(), e.account.raw()))
+        .collect();
+    if got != model.entries {
+        return Err(format!(
+            "entries diverge from the model after {n} txns: {got:?} != {:?}",
+            model.entries
+        ));
+    }
+
+    for bucket in 0..4u8 {
+        let by_index = Account::by_bucket(snap, &bucket).map_err(|e| format!("index: {e}"))?;
+        let got: Vec<u64> = by_index.iter().map(|a| a.id.raw()).collect();
+        let expected: Vec<u64> = model
+            .accounts
+            .keys()
+            .copied()
+            .filter(|a| (a % 4) as u8 == bucket)
+            .collect();
+        if got != expected {
+            return Err(format!(
+                "index bucket {bucket}: {got:?} != model {expected:?}"
+            ));
+        }
+    }
+
+    // The dual-write invariant: exactly one audit job per committed txn,
+    // never a state change without its job or a job without its state.
+    let jobs = snap.jobs().map_err(|e| format!("jobs: {e}"))?;
+    if jobs.len() as u64 != n {
+        return Err(format!(
+            "dual-write torn: {n} committed txns but {} jobs",
+            jobs.len()
+        ));
+    }
+    for (i, (seq, idx, name, payload)) in jobs.iter().enumerate() {
+        let audit =
+            Audit::decode(&mut payload.as_slice()).map_err(|e| format!("job decode: {e}"))?;
+        if (*seq, *idx, name.as_str(), audit.txn) != (i as u64, 0, "audit", i as u64) {
+            return Err(format!(
+                "job {i} diverges: seq {seq} idx {idx} name {name} txn {}",
+                audit.txn
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One universe: recover → verify against the oracle → mixed commits and
+/// aborts → random checkpoint → crash, everything seeded.
+fn tx_workload(sim: &mut Sim) -> Result<(), String> {
+    let entropy = sim.entropy();
+    let cfg = DbConfig {
+        wal: WalConfig {
+            dir: "wal".to_string(),
+            segment_bytes: 4096,
+        },
+        store_path: "tables.redb".to_string(),
+    };
+    let mut committed = 0u64; // acknowledged transactions
+
+    for _round in 0..3 {
+        sim.crash_disk_after(64 + entropy.next_u64() % 512);
+        let mut db = match Db::open(Box::new(sim.disk()), cfg.clone(), property_schema()) {
+            Ok(db) => db,
+            Err(_) => {
+                sim.restart();
+                continue;
+            }
+        };
+
+        let recovered = db.last_applied().map_or(0, |s| s + 1);
+        if recovered < committed {
+            return Err(format!(
+                "durability violated: {committed} txns acknowledged, {recovered} recovered"
+            ));
+        }
+        committed = recovered; // unacked survivors are history now
+        match db.snapshot() {
+            Ok(snap) => db_matches_model(&snap, committed)?,
+            Err(_) => {
+                sim.restart();
+                continue;
+            }
+        }
+
+        for _ in 0..1 + entropy.next_u64() % 8 {
+            let i = committed;
+            if entropy.next_u64().is_multiple_of(5) {
+                // An abort must leave no trace and consume no seq.
+                let before = db.last_applied();
+                match db.transact(|tx| -> Result<(), &str> {
+                    let _ = apply_txn(tx, i);
+                    Err("aborted on purpose")
+                }) {
+                    Err(TxError::App(_)) => {}
+                    Err(TxError::Io(_)) => break, // snapshot failed: died here
+                    Ok(()) => unreachable!("the closure always aborts"),
+                }
+                if db.last_applied() != before {
+                    return Err("aborted transaction consumed a seq".to_string());
+                }
+            }
+            match db.transact(|tx| apply_txn(tx, i)) {
+                Ok(()) => committed += 1,
+                // a tx read hit an injected fault; nothing was written
+                // (found by seed 0x5e713efe41f78d1a)
+                Err(TxError::App(_)) => break,
+                Err(TxError::Io(_)) => break, // died mid-commit; durable or not
+            }
+            if entropy.next_u64().is_multiple_of(4) && db.checkpoint().is_err() {
+                break;
+            }
+        }
+        sim.restart();
+    }
+    Ok(())
+}
+
+#[test]
+fn transactions_survive_the_fault_matrix() {
+    run_universes!(256, tx_workload);
+}
+
+#[test]
+fn transactions_replay_identically_for_the_same_seed() {
+    let trace = |seed: u64| {
+        let mut sim = Sim::new(seed);
+        let result = tx_workload(&mut sim);
+        assert_eq!(result, Ok(()), "seed {seed:#x}");
+        (sim.durable_fingerprint(), sim.now())
+    };
+    for seed in [0x42, 0xDEAD_BEEF, 0x0BAD_5EED_0BAD_5EED] {
+        assert_eq!(trace(seed), trace(seed));
+    }
 }
