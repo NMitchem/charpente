@@ -105,13 +105,17 @@ impl FaultConfig {
             Duration::from_millis(20),
             Duration::from_millis(250),
         ];
+        // The draw order (disk, then net) is part of the frozen replay
+        // contract — hoisted so a struct-field reorder cannot change it.
+        let disk_hi = DISK_HI[rng.below(4) as usize];
+        let net_hi = NET_HI[rng.below(4) as usize];
         let cfg = FaultConfig {
             write_error,
             sync_error,
             crash_apply,
             crash_torn,
-            disk_latency: (Duration::ZERO, DISK_HI[rng.below(4) as usize]),
-            net_latency: (Duration::ZERO, NET_HI[rng.below(4) as usize]),
+            disk_latency: (Duration::ZERO, disk_hi),
+            net_latency: (Duration::ZERO, net_hi),
         };
         cfg.validate(); // a sampler that produces an invalid config is a harness bug
         cfg
@@ -304,7 +308,13 @@ impl Sim {
     }
 
     pub fn crash_disk_now(&self) {
-        self.world.lock().disk.crashed = true;
+        let mut guard = self.world.lock();
+        if !guard.disk.crashed {
+            // Same contract as the countdown path: fault:crash marks the
+            // transition into the crashed state, once.
+            guard.cover("fault:crash");
+        }
+        guard.disk.crashed = true;
     }
 
     /// Power-cycles the disk: every unsynced write independently survives,
@@ -1038,6 +1048,14 @@ mod tests {
         // Everything after the crash fails too.
         assert!(file.len().is_err());
         assert!(disk.open("g").is_err());
+    }
+
+    #[test]
+    fn crash_disk_now_covers_the_transition_once() {
+        let sim = Sim::with_faults(6, FaultConfig::none());
+        sim.crash_disk_now();
+        sim.crash_disk_now(); // already crashed: not a second transition
+        assert_eq!(sim.coverage().get("fault:crash"), Some(&1));
     }
 
     #[test]
