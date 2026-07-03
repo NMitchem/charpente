@@ -296,6 +296,36 @@ fn oversized_transactions_are_a_contract_violation() {
     });
 }
 
+struct Ping {
+    i: u64,
+}
+
+impl Codec for Ping {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.i.encode(out);
+    }
+    fn decode(input: &mut &[u8]) -> io::Result<Ping> {
+        Ok(Ping {
+            i: u64::decode(input)?,
+        })
+    }
+}
+
+impl Job for Ping {
+    const NAME: &'static str = "ping";
+}
+
+#[test]
+#[should_panic(expected = "cannot be empty")]
+fn empty_idempotency_key_is_a_contract_violation() {
+    let sim = Sim::with_faults(0x601, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    let _ = db.transact(|tx| {
+        tx.enqueue_keyed("", Ping { i: 0 });
+        Ok::<(), std::io::Error>(())
+    });
+}
+
 // ---------------------------------------------------- crash property
 
 #[table]

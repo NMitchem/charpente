@@ -7,11 +7,13 @@
 //!
 //! Record payload v0: `[n: u32 le]` then n tagged effects —
 //! `0x00 [table][row]` put, `0x01 [table][id: u64 le]` delete,
-//! `0x02 [job][payload]` enqueue, `0x03 [event][payload]` emit — strings and
-//! byte fields length-prefixed per the `Codec` layout. Table effects are the
-//! transaction's collapsed overlay in (table, id) order: intermediate
-//! overwrites inside a transaction are invisible to every observer and are
-//! not logged. Enqueues and emits keep call order.
+//! `0x02 [job][payload][key: Option<String>]` enqueue, `0x03 [event][payload]`
+//! emit — strings and byte fields length-prefixed per the `Codec` layout.
+//! Table effects are the transaction's collapsed overlay in (table, id)
+//! order: intermediate overwrites inside a transaction are invisible to
+//! every observer and are not logged. Enqueues and emits keep call order.
+//! The enqueue key is the job's idempotency identity to the world outside
+//! the log — carried, never interpreted inside the deterministic boundary.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -126,10 +128,23 @@ impl Schema {
 
 #[derive(Debug, PartialEq)]
 enum Effect {
-    Put { table: String, row: Vec<u8> },
-    Delete { table: String, id: u64 },
-    Enqueue { job: String, payload: Vec<u8> },
-    Emit { event: String, payload: Vec<u8> },
+    Put {
+        table: String,
+        row: Vec<u8>,
+    },
+    Delete {
+        table: String,
+        id: u64,
+    },
+    Enqueue {
+        job: String,
+        payload: Vec<u8>,
+        key: Option<String>,
+    },
+    Emit {
+        event: String,
+        payload: Vec<u8>,
+    },
 }
 
 /// A transaction's buffered effects: the collapsed per-table overlay
@@ -137,7 +152,7 @@ enum Effect {
 #[derive(Default)]
 struct TxEffects {
     overlay: BTreeMap<&'static str, BTreeMap<u64, Option<Vec<u8>>>>,
-    enqueues: Vec<(&'static str, Vec<u8>)>,
+    enqueues: Vec<(&'static str, Vec<u8>, Option<String>)>,
     emits: Vec<(&'static str, Vec<u8>)>,
 }
 
@@ -176,10 +191,11 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
             }
         }
     }
-    for (job, payload) in &effects.enqueues {
+    for (job, payload, key) in &effects.enqueues {
         out.push(2);
         encode_bytes(job.as_bytes(), &mut out);
         encode_bytes(payload, &mut out);
+        key.encode(&mut out);
     }
     for (event, payload) in &effects.emits {
         out.push(3);
@@ -207,6 +223,7 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
             2 => Effect::Enqueue {
                 job: String::decode(input)?,
                 payload: Vec::<u8>::decode(input)?,
+                key: Option::<String>::decode(input)?,
             },
             3 => Effect::Emit {
                 event: String::decode(input)?,
@@ -268,7 +285,22 @@ impl Tx {
     pub fn enqueue<J: Job>(&mut self, job: J) {
         let mut payload = Vec::new();
         job.encode(&mut payload);
-        self.effects.enqueues.push((J::NAME, payload));
+        self.effects.enqueues.push((J::NAME, payload, None));
+    }
+
+    /// Enqueues with an idempotency key: the job's stable identity to the world
+    /// OUTSIDE the log (consumed by M1's external-IO surface). Inside the
+    /// deterministic boundary the key means nothing — exactly-once state effects
+    /// are structural, so the platform neither indexes nor dedupes on it.
+    pub fn enqueue_keyed<J: Job>(&mut self, key: impl Into<String>, job: J) {
+        let key = key.into();
+        assert!(
+            !key.is_empty(),
+            "contract: an idempotency key names the job's external identity — it cannot be empty"
+        );
+        let mut payload = Vec::new();
+        job.encode(&mut payload);
+        self.effects.enqueues.push((J::NAME, payload, Some(key)));
     }
 
     pub fn emit<Ev: Event>(&mut self, event: Ev) {
@@ -366,8 +398,9 @@ impl StateMachine for TableMachine {
                 match effect {
                     Effect::Put { table, row } => (self.schema.ops(table)?.apply_put)(w, row)?,
                     Effect::Delete { table, id } => (self.schema.ops(table)?.apply_delete)(w, *id)?,
-                    Effect::Enqueue { job, payload } => {
+                    Effect::Enqueue { job, payload, key } => {
                         w.enqueue_raw(seq, job_idx, job, payload)?;
+                        let _ = key;
                         job_idx += 1;
                     }
                     Effect::Emit { .. } => {} // the log itself is the event feed
@@ -495,7 +528,7 @@ mod tests {
             .entry("org")
             .or_default()
             .insert(1, Some(vec![9]));
-        effects.enqueues.push(("send_receipt", vec![10, 0]));
+        effects.enqueues.push(("send_receipt", vec![10, 0], None));
         effects.emits.push(("invoice_finalized", vec![7]));
         effects
     }
@@ -520,11 +553,37 @@ mod tests {
                 },
                 Effect::Enqueue {
                     job: "send_receipt".into(),
-                    payload: vec![10, 0]
+                    payload: vec![10, 0],
+                    key: None
                 },
                 Effect::Emit {
                     event: "invoice_finalized".into(),
                     payload: vec![7]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn keyed_enqueue_roundtrips() {
+        let mut effects = TxEffects::default();
+        effects
+            .enqueues
+            .push(("send_receipt", vec![1], Some("receipt:10".to_string())));
+        effects.enqueues.push(("ping", vec![2], None));
+        let decoded = decode_record(&encode_record(&effects)).unwrap();
+        assert_eq!(
+            decoded,
+            vec![
+                Effect::Enqueue {
+                    job: "send_receipt".into(),
+                    payload: vec![1],
+                    key: Some("receipt:10".into())
+                },
+                Effect::Enqueue {
+                    job: "ping".into(),
+                    payload: vec![2],
+                    key: None
                 },
             ]
         );
