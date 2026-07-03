@@ -69,8 +69,11 @@ Prod: `serve.rs`'s kernel thread becomes `Kernel::run(ProdSource { rx })` — `p
 `try_recv`, `wait_until` = `recv_timeout`/`recv` (stashing an arriving request),
 `Shutdown` on channel disconnect. The hyper side is unchanged. Sim: a `SimSource` the
 workload scripts (queue of requests + Reply closures capturing responses);
-`wait_until` advances virtual time to the deadline; `Shutdown` when the script is
-exhausted and no deadlines remain — universes quiesce naturally.
+`wait_until` advances virtual time to the deadline; `Shutdown` when the next wake
+(arrival or deadline) lies beyond the source's explicit **horizon** (a mandatory
+`SimSource` parameter — a registered cron always has a `next_due`, so deadlines never
+drain on their own; the horizon is the universe's end-of-time, and every cron-mounting
+sim test must choose one).
 
 Time as data: transactions still never read a clock. The kernel computes `now` and
 backoff/next-due values *outside* the transaction and writes them in as row data —
@@ -143,7 +146,19 @@ impl SendReceipt {
   parsed at macro expansion), and a `JobDef` marker for the registry.
 - Backoff schedule: `backoff * 2^(attempts - 1)`, attempts counted from 1. Dead at
   `attempts == max`.
-- `JobError(String)`, with `From<io::Error>`; handler `?` works on tx reads.
+- `JobError` preserves the App/Io distinction `TxError` exists for (review finding,
+  2026-07-02): `enum JobError { App(String), Io(io::Error) }`, `From<io::Error>` → `Io`,
+  so handler `?` on tx reads works AND platform faults stay platform faults. The
+  dispatcher routes `TxError::Io` and `TxError::App(JobError::Io)` identically: **not an
+  attempt** — the heap entry is restored, the row stays Pending untouched, no ledger
+  write, the error bubbles (restart-and-recover). Only `JobError::App` feeds
+  retry/Dead. Rationale: platform faults must not consume retry budget — at-least-once
+  execution would silently break, and once latent read errors land in the fault matrix
+  (DESIGN §1 tracked extension) injected faults would Dead-letter healthy jobs with the
+  failure misattributed. Two deliberate App-side assignments: handler panics (a panic is
+  the handler's own deterministic bug — the poison-pill-absorption policy) and payload
+  decode failures (schema drift is deterministic; retrying it forever would be worse
+  than dead-lettering it with a named message).
 - Registration mirrors routes (distributed registration stays rejected):
   `jobs![SendReceipt, Nightly]` → `Vec<JobDef>` where
   `JobDef { name, retry, glue: fn(&mut Tx, payload: &[u8]) -> Result<(), JobError> }`;
