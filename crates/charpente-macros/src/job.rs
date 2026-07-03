@@ -125,9 +125,12 @@ fn parse_backoff(lit: &LitStr) -> syn::Result<u64> {
             format!("backoff \"{raw}\": \"{digits}\" is not a whole number — {ACCEPTED_FORMS}"),
         )
     })?;
-    Ok(count
-        .checked_mul(millis_per_unit)
-        .unwrap_or_else(|| panic!("backoff \"{raw}\" overflows u64 milliseconds")))
+    count.checked_mul(millis_per_unit).ok_or_else(|| {
+        Error::new(
+            lit.span(),
+            format!("backoff \"{raw}\" overflows u64 milliseconds — {ACCEPTED_FORMS}"),
+        )
+    })
 }
 
 // ---------------------------------------------------------------- expand
