@@ -13,7 +13,7 @@ use charpente_core::engine::{Engine, StateMachine};
 use charpente_core::io::Entropy;
 use charpente_core::log::WalConfig;
 use charpente_core::table::{Codec, Id, Snapshot, Store, View};
-use charpente_sim::{FaultConfig, Sim, run_universes};
+use charpente_sim::{FaultConfig, Sim, run_universes_swarm};
 
 #[table]
 struct Org {
@@ -437,7 +437,19 @@ fn tables_workload(sim: &mut Sim) -> Result<(), String> {
 
 #[test]
 fn tables_and_log_survive_the_fault_matrix() {
-    run_universes!(256, tables_workload);
+    run_universes_swarm!(
+        256,
+        tables_workload,
+        require: [
+            "fault:write_error",
+            "fault:sync_error",
+            "fault:crash",
+            "crash:applied",
+            "crash:torn",
+            "crash:dropped",
+            "restart",
+        ]
+    );
 }
 
 #[test]
