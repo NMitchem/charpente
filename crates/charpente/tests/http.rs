@@ -271,6 +271,7 @@ use std::io;
 
 use charpente::{Db, Job};
 use charpente_core::io::Entropy;
+use charpente_core::job::JobRow;
 use charpente_core::log::WalConfig;
 use charpente_core::table::{Codec, View};
 use charpente_sim::run_universes_swarm;
@@ -353,18 +354,21 @@ fn http_state_matches(db: &Db, n: u64) -> Result<(), String> {
             ));
         }
     }
-    let jobs = snap.jobs().map_err(|e| format!("jobs: {e}"))?;
+    let jobs = snap.scan::<JobRow>().map_err(|e| format!("jobs: {e}"))?;
     if jobs.len() as u64 != n {
         return Err(format!(
             "dual-write torn over HTTP: {n} acked but {} jobs",
             jobs.len()
         ));
     }
-    for (i, (seq, idx, name, payload)) in jobs.iter().enumerate() {
-        let ping = Ping::decode(&mut payload.as_slice()).map_err(|e| format!("job decode: {e}"))?;
-        if (*seq, *idx, name.as_str(), ping.i) != (i as u64, 0, "ping", i as u64) {
+    for (i, job) in jobs.iter().enumerate() {
+        let ping =
+            Ping::decode(&mut job.payload.as_slice()).map_err(|e| format!("job decode: {e}"))?;
+        if (job.id.raw(), job.name.as_str(), ping.i) != (i as u64, "ping", i as u64) {
             return Err(format!(
-                "job {i} diverges: seq {seq} idx {idx} {name} i={}",
+                "job {i} diverges: id {} {} i={}",
+                job.id.raw(),
+                job.name,
                 ping.i
             ));
         }

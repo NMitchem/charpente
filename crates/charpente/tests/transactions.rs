@@ -8,6 +8,7 @@ use std::io;
 
 use charpente::{Db, DbConfig, Event, Job, Schema, TxError, View, table};
 use charpente_core::io::Entropy;
+use charpente_core::job::JobRow;
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::table::{Codec, Id, Snapshot, Store};
 use charpente_sim::{FaultConfig, Sim, run_universes_swarm};
@@ -176,7 +177,7 @@ fn abort_discards_everything_and_consumes_no_seq() {
     let snap = db.snapshot().unwrap();
     assert_eq!(snap.scan::<Invoice>().unwrap().len(), 1);
     assert!(
-        snap.jobs().unwrap().is_empty(),
+        snap.scan::<JobRow>().unwrap().is_empty(),
         "aborted enqueue left no trace"
     );
 }
@@ -227,12 +228,12 @@ fn effects_commit_as_one_record_and_recovery_replays_them() {
         1,
         "replay rebuilt the row"
     );
-    let jobs = snap.jobs().unwrap();
+    let jobs = snap.scan::<JobRow>().unwrap();
     assert_eq!(jobs.len(), 1, "replay rebuilt the job with the row");
-    let (seq, idx, name, payload) = &jobs[0];
-    assert_eq!((*seq, *idx, name.as_str()), (0, 0, "send_receipt"));
+    let job = &jobs[0];
+    assert_eq!((job.id.raw(), job.name.as_str()), (0, "send_receipt"));
     assert_eq!(
-        SendReceipt::decode(&mut payload.as_slice())
+        SendReceipt::decode(&mut job.payload.as_slice())
             .unwrap()
             .invoice,
         10
@@ -466,19 +467,21 @@ fn db_matches_model(snap: &Snapshot, n: u64) -> Result<(), String> {
 
     // The dual-write invariant: exactly one audit job per committed txn,
     // never a state change without its job or a job without its state.
-    let jobs = snap.jobs().map_err(|e| format!("jobs: {e}"))?;
+    let jobs = snap.scan::<JobRow>().map_err(|e| format!("jobs: {e}"))?;
     if jobs.len() as u64 != n {
         return Err(format!(
             "dual-write torn: {n} committed txns but {} jobs",
             jobs.len()
         ));
     }
-    for (i, (seq, idx, name, payload)) in jobs.iter().enumerate() {
+    for (i, job) in jobs.iter().enumerate() {
         let audit =
-            Audit::decode(&mut payload.as_slice()).map_err(|e| format!("job decode: {e}"))?;
-        if (*seq, *idx, name.as_str(), audit.txn) != (i as u64, 0, "audit", i as u64) {
+            Audit::decode(&mut job.payload.as_slice()).map_err(|e| format!("job decode: {e}"))?;
+        if (job.id.raw(), job.name.as_str(), audit.txn) != (i as u64, "audit", i as u64) {
             return Err(format!(
-                "job {i} diverges: seq {seq} idx {idx} name {name} txn {}",
+                "job {i} diverges: id {} {} txn {}",
+                job.id.raw(),
+                job.name,
                 audit.txn
             ));
         }

@@ -11,6 +11,7 @@ use std::io;
 use charpente::table;
 use charpente_core::engine::{Engine, StateMachine};
 use charpente_core::io::Entropy;
+use charpente_core::job::JobRow;
 use charpente_core::log::WalConfig;
 use charpente_core::table::{Codec, Id, Snapshot, Store, View};
 use charpente_sim::{FaultConfig, Sim, run_universes_swarm};
@@ -466,25 +467,33 @@ fn tables_replay_identically_for_the_same_seed() {
 }
 
 #[test]
-fn jobs_table_records_in_order() {
+fn jobs_materialize_with_counter_ids_in_order() {
     let (_sim, store) = quiet_store();
     store
         .apply(0, |w| {
-            w.enqueue_raw(0, 0, "send_receipt", b"invoice-10")?;
-            w.enqueue_raw(0, 1, "audit", b"")
+            w.materialize_job("send_receipt", b"invoice-10", None)?;
+            w.materialize_job("audit", b"", Some("k:1"))?;
+            Ok(())
         })
         .unwrap();
     store
-        .apply(1, |w| w.enqueue_raw(1, 0, "audit", b"x"))
+        .apply(1, |w| w.materialize_job("audit", b"x", None).map(|_| ()))
         .unwrap();
 
-    let jobs = store.snapshot().unwrap().jobs().unwrap();
+    let jobs = store.snapshot().unwrap().scan::<JobRow>().unwrap();
     assert_eq!(
-        jobs,
+        jobs.iter()
+            .map(|j| (
+                j.id.raw(),
+                j.name.as_str(),
+                j.payload.as_slice(),
+                j.key.as_deref()
+            ))
+            .collect::<Vec<_>>(),
         vec![
-            (0, 0, "send_receipt".to_string(), b"invoice-10".to_vec()),
-            (0, 1, "audit".to_string(), Vec::new()),
-            (1, 0, "audit".to_string(), b"x".to_vec()),
+            (0, "send_receipt", b"invoice-10".as_slice(), None),
+            (1, "audit", b"".as_slice(), Some("k:1")),
+            (2, "audit", b"x".as_slice(), None),
         ]
     );
 }

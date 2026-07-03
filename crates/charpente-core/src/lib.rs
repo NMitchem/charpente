@@ -7,5 +7,6 @@ pub mod crc;
 pub mod db;
 pub mod engine;
 pub mod io;
+pub mod job;
 pub mod log;
 pub mod table;

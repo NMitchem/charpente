@@ -10,3 +10,6 @@ workspace = true
 
 [dependencies]
 redb = "4.1.0"
+
+[dev-dependencies]
+charpente-sim = { path = "../charpente-sim" }

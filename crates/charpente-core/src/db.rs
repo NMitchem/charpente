@@ -20,6 +20,7 @@ use std::io;
 
 use crate::engine::{Engine, StateMachine};
 use crate::io::Disk;
+use crate::job::JobRow;
 use crate::log::{MAX_RECORD_BYTES, WalConfig};
 use crate::table::{Codec, Id, Row, Snapshot, Store, View, Writer};
 
@@ -384,6 +385,9 @@ struct TableMachine {
     store: Store,
     schema: Schema,
     skip_through: Option<u64>,
+    /// Ids of jobs materialized since the last `Db::drain_enqueued` — the
+    /// kernel's incremental feed for its due-heap.
+    enqueued: Vec<u64>,
 }
 
 impl StateMachine for TableMachine {
@@ -392,22 +396,26 @@ impl StateMachine for TableMachine {
             return Ok(());
         }
         let effects = decode_record(payload)?;
-        self.store.apply(seq, |w| {
-            let mut job_idx = 0u32;
+        let schema = &self.schema;
+        // `w.materialize_job` returns the new id; collected locally because
+        // the closure can't also hold `&mut self.enqueued` while `schema`
+        // (borrowed from `self`) is captured — extend after the store commits.
+        let new_ids = self.store.apply(seq, |w| {
+            let mut ids = Vec::new();
             for effect in &effects {
                 match effect {
-                    Effect::Put { table, row } => (self.schema.ops(table)?.apply_put)(w, row)?,
-                    Effect::Delete { table, id } => (self.schema.ops(table)?.apply_delete)(w, *id)?,
+                    Effect::Put { table, row } => (schema.ops(table)?.apply_put)(w, row)?,
+                    Effect::Delete { table, id } => (schema.ops(table)?.apply_delete)(w, *id)?,
                     Effect::Enqueue { job, payload, key } => {
-                        w.enqueue_raw(seq, job_idx, job, payload)?;
-                        let _ = key;
-                        job_idx += 1;
+                        ids.push(w.materialize_job(job, payload, key.as_deref())?);
                     }
                     Effect::Emit { .. } => {} // the log itself is the event feed
                 }
             }
-            Ok(())
-        })
+            Ok(ids)
+        })?;
+        self.enqueued.extend(new_ids);
+        Ok(())
     }
 }
 
@@ -430,6 +438,9 @@ impl Db {
     /// open at all is discarded and rebuilt from the WAL — the store is a
     /// materialization of the log, never a second source of truth (DESIGN §4).
     pub fn open(disk: Box<dyn Disk>, cfg: DbConfig, schema: Schema) -> io::Result<Db> {
+        // The jobs table is platform-owned; an app registering it itself
+        // hits the existing duplicate-registration assert.
+        let schema = schema.table::<JobRow>();
         let store = match Store::open(&*disk, &cfg.store_path) {
             Ok(store) => store,
             Err(_) => {
@@ -453,8 +464,12 @@ impl Db {
             store,
             schema,
             skip_through,
+            enqueued: Vec::new(),
         };
-        let engine = Engine::recover(disk, cfg.wal, machine)?;
+        let mut engine = Engine::recover(disk, cfg.wal, machine)?;
+        // Recovery replay must not leak into the kernel's incremental feed —
+        // the dispatcher rebuilds its due-heap from a Pending scan at open.
+        engine.machine_mut().enqueued.clear();
         if let Some(applied) = skip_through {
             let durable = engine.last_applied();
             assert!(
@@ -502,6 +517,18 @@ impl Db {
     /// A consistent read-only view for queries outside transactions.
     pub fn snapshot(&self) -> io::Result<Snapshot> {
         self.engine.machine().store.snapshot()
+    }
+
+    /// Ids of jobs materialized by transactions since the last drain — the
+    /// kernel's incremental feed for its due-heap. Recovery replay does not
+    /// appear here; the dispatcher rebuilds from a Pending scan at open.
+    pub fn drain_enqueued(&mut self) -> Vec<Id<JobRow>> {
+        self.engine
+            .machine_mut()
+            .enqueued
+            .drain(..)
+            .map(Id::from_raw)
+            .collect()
     }
 
     /// Durably persists the store, bounding recovery replay at this seq.

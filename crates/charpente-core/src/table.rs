@@ -239,11 +239,6 @@ pub struct Store {
 
 const META: TableDefinition<&str, u64> = TableDefinition::new("charpente.meta");
 
-/// Transactional enqueues, materialized in the same apply as the state
-/// change they committed with (DESIGN.md §6). Key is (record seq, call
-/// order); value is `[name][payload]` in the `Codec` length-prefix layout.
-const JOBS: TableDefinition<(u64, u32), &[u8]> = TableDefinition::new("charpente.jobs");
-
 fn rows_def(table: &str) -> TableDefinition<'_, u64, &'static [u8]> {
     TableDefinition::new(table)
 }
@@ -289,12 +284,15 @@ impl Store {
 
     /// Applies one log record's table effects, atomically with the seq bump.
     /// Not durable by itself — the WAL is the durability story; `checkpoint`
-    /// persists. Seqs must be gapless: replay the WAL in order.
-    pub fn apply(
+    /// persists. Seqs must be gapless: replay the WAL in order. `f` returns
+    /// whatever the caller needs out of the transaction (e.g. materialized
+    /// job ids) — generic so it can't be tempted to smuggle that state out
+    /// through a captured `&mut`, which would alias the store's own borrows.
+    pub fn apply<T>(
         &self,
         seq: u64,
-        f: impl FnOnce(&mut Writer<'_>) -> io::Result<()>,
-    ) -> io::Result<()> {
+        f: impl FnOnce(&mut Writer<'_>) -> io::Result<T>,
+    ) -> io::Result<T> {
         let applied = self.applied_seq()?;
         assert_eq!(
             seq,
@@ -303,14 +301,15 @@ impl Store {
         );
         let mut txn = self.db.begin_write().map_err(redb_err)?;
         txn.set_durability(Durability::None).map_err(redb_err)?;
-        {
+        let out = {
             let mut writer = Writer { txn: &txn };
-            f(&mut writer)?;
+            let out = f(&mut writer)?;
             let mut meta = txn.open_table(META).map_err(redb_err)?;
             meta.insert("applied_seq", seq).map_err(redb_err)?;
-        }
+            out
+        };
         txn.commit().map_err(redb_err)?;
-        Ok(())
+        Ok(out)
     }
 
     /// Durably persists everything applied so far. After a crash the store
@@ -390,25 +389,33 @@ impl Writer<'_> {
         Ok(())
     }
 
-    /// Records a job enqueued by the record at `seq`, in call order via
-    /// `idx`. Platform apply-path surface — applications enqueue through a
-    /// transaction, never here.
-    pub fn enqueue_raw(
+    /// Materializes one enqueue effect as a `JobRow`, id from the monotonic
+    /// `next_job_id` meta counter — bumped in this same store transaction, so
+    /// ids are deterministic across replay. Platform apply-path surface.
+    pub fn materialize_job(
         &mut self,
-        seq: u64,
-        idx: u32,
         name: &str,
         payload: &[u8],
-    ) -> io::Result<()> {
-        let mut value = Vec::with_capacity(8 + name.len() + payload.len());
-        (u32::try_from(name.len()).expect("job name exceeds u32 length")).encode(&mut value);
-        value.extend_from_slice(name.as_bytes());
-        (u32::try_from(payload.len()).expect("job payload exceeds u32 length")).encode(&mut value);
-        value.extend_from_slice(payload);
-        let mut jobs = self.txn.open_table(JOBS).map_err(redb_err)?;
-        jobs.insert((seq, idx), value.as_slice())
-            .map_err(redb_err)?;
-        Ok(())
+        key: Option<&str>,
+    ) -> io::Result<u64> {
+        let mut meta = self.txn.open_table(META).map_err(redb_err)?;
+        let id = meta
+            .get("next_job_id")
+            .map_err(redb_err)?
+            .map_or(0, |g| g.value());
+        meta.insert("next_job_id", id + 1).map_err(redb_err)?;
+        drop(meta);
+        self.put(&crate::job::JobRow {
+            id: crate::table::Id::from_raw(id),
+            name: name.to_string(),
+            payload: payload.to_vec(),
+            key: key.map(str::to_string),
+            status: crate::job::JobStatus::Pending,
+            attempts: 0,
+            due_at: 0,
+            last_error: None,
+        })?;
+        Ok(id)
     }
 
     fn replace_row<R: Row>(&mut self, row: &R, id: u64) -> io::Result<Option<R>> {
@@ -494,33 +501,6 @@ impl View for Snapshot {
                 )
             });
             out.push(row);
-        }
-        Ok(out)
-    }
-}
-
-impl Snapshot {
-    /// Every job recorded by committed transactions, in (seq, idx) order:
-    /// `(seq, idx, job name, payload)`. The queue dispatcher's substrate
-    /// (PLAN.md M0 step 6); tests use it to observe enqueue atomicity.
-    #[allow(clippy::type_complexity)] // the tuple is the raw record; the typed job surface names it (M0 step 6)
-    pub fn jobs(&self) -> io::Result<Vec<(u64, u32, String, Vec<u8>)>> {
-        let table = match self.txn.open_table(JOBS) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(e) => return Err(redb_err(e)),
-        };
-        let mut out = Vec::new();
-        for entry in table
-            .range((0u64, 0u32)..=(u64::MAX, u32::MAX))
-            .map_err(redb_err)?
-        {
-            let (key, value) = entry.map_err(redb_err)?;
-            let (seq, idx) = key.value();
-            let mut bytes = value.value();
-            let name = String::decode(&mut bytes)?;
-            let payload = Vec::<u8>::decode(&mut bytes)?;
-            out.push((seq, idx, name, payload));
         }
         Ok(out)
     }

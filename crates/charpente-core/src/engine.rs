@@ -91,6 +91,10 @@ impl<S: StateMachine> Engine<S> {
         &self.machine
     }
 
+    pub fn machine_mut(&mut self) -> &mut S {
+        &mut self.machine
+    }
+
     pub fn last_applied(&self) -> Option<u64> {
         self.last_applied
     }
