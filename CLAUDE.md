@@ -106,7 +106,21 @@ the sim-capable IO layer comes first because it cannot be retrofitted.
   `::charpente` paths, so it works in dependent crates (and integration tests), not in
   charpente's own src. `Disk` and `Entropy` gained a `Send` supertrait (the kernel
   thread owns the App), mirroring `File`'s earlier `Send + Sync`.
+- **Pre-step-6 harness upgrade done** (from the 2026-07-02 DST research pass): swarm-
+  sampled `FaultConfig` per universe (`run_universes_swarm!`; sampling order is frozen
+  replay contract) + sometimes-coverage (`Sim::cover`, auto-covered `fault:*`/`crash:*`/
+  `restart`, batch-level `require:` keys that fail by name when never hit). The swarm
+  runner catches in-universe panics and reports seed+config+repro — the old
+  panic-bypasses-seed-printing gap is closed for migrated tests (it remains on the
+  frozen legacy runner). All four fault-matrix property tests migrated; `run_universes!`
+  and every pinned seed are frozen forever. DESIGN now records the executor same-shape
+  rule (the "which ready source next" decision is identical code in prod and sim),
+  tracked fault-matrix extensions (bit-level durable corruption, misdirected writes,
+  latent read errors), and two log durability fences (recovery-horizon rule for mid-log
+  corruption; directory-entry durability at rotation) — all land with WAL segment
+  management. NEIGHBORS carries the 2026-07 quarterly intel (quadrant still empty).
 - Next: M0 step 6 per PLAN.md — queue + cron: post-commit lease/dispatch off the
   `charpente.jobs` table, idempotency keys, typed retry policy, cron ticks as
   transactions; this is where the deterministic edge executor (DECISIONS §10) lands —
-  the kernel loop gains its second and third event sources.
+  the kernel loop gains its second and third event sources. Its spec must carry the
+  executor same-shape rule (DESIGN §1).
