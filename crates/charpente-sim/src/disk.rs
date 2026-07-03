@@ -67,22 +67,37 @@ impl FileState {
 }
 
 /// Crash-collapses one file: every pending op independently survives, tears,
-/// or vanishes, then the survivors become the durable image.
-pub(crate) fn collapse(file: &mut FileState, rng: &mut Rng, cfg: &FaultConfig) {
+/// or vanishes, then the survivors become the durable image. Each op's fate
+/// is marked into `coverage` (`crash:applied` / `crash:torn` / `crash:dropped`,
+/// sometimes-coverage accounting — see the sim-swarm-coverage spec).
+pub(crate) fn collapse(
+    file: &mut FileState,
+    rng: &mut Rng,
+    cfg: &FaultConfig,
+    coverage: &mut BTreeMap<&'static str, u64>,
+) {
+    let mut mark = |key: &'static str| *coverage.entry(key).or_insert(0) += 1;
     let mut survivors = Vec::new();
     for op in file.pending.drain(..) {
         match op {
             PendingOp::SetLen { len } => {
                 if rng.chance(cfg.crash_apply + cfg.crash_torn) {
+                    mark("crash:applied");
                     survivors.push(PendingOp::SetLen { len });
+                } else {
+                    mark("crash:dropped");
                 }
             }
             PendingOp::Write { offset, data } => {
                 let roll = rng.chance(cfg.crash_apply);
                 if roll {
+                    mark("crash:applied");
                     survivors.push(PendingOp::Write { offset, data });
                 } else if rng.chance(cfg.crash_torn / (1.0 - cfg.crash_apply)) {
+                    mark("crash:torn");
                     tear(offset, data, rng, &mut survivors);
+                } else {
+                    mark("crash:dropped");
                 }
             }
         }
@@ -177,9 +192,11 @@ mod tests {
                 data: vec![1, 2, 3],
             }],
         };
-        collapse(&mut file, &mut Rng::new(0), &cfg(1.0, 0.0));
+        let mut coverage = BTreeMap::new();
+        collapse(&mut file, &mut Rng::new(0), &cfg(1.0, 0.0), &mut coverage);
         assert_eq!(file.durable, vec![1, 2, 3]);
         assert!(file.pending.is_empty());
+        assert_eq!(coverage["crash:applied"], 1);
     }
 
     #[test]
@@ -191,8 +208,10 @@ mod tests {
                 data: vec![1, 2, 3],
             }],
         };
-        collapse(&mut file, &mut Rng::new(0), &cfg(0.0, 0.0));
+        let mut coverage = BTreeMap::new();
+        collapse(&mut file, &mut Rng::new(0), &cfg(0.0, 0.0), &mut coverage);
         assert_eq!(file.durable, vec![9], "durable data must survive any crash");
+        assert_eq!(coverage["crash:dropped"], 1);
     }
 
     #[test]

@@ -14,6 +14,7 @@ mod disk;
 mod net;
 pub mod rng;
 
+use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -65,6 +66,57 @@ impl FaultConfig {
         }
     }
 
+    /// Samples a per-universe fault configuration (swarm testing: Groce 2012,
+    /// TigerBeetle VOPR's default). Each fault axis is independently in or out
+    /// of play; active axes draw rates from wide ranges, including extremes
+    /// `default()` never visits. Deterministic in `rng`; the draw order below
+    /// is part of the replay contract once shipped (docs/superpowers/specs/
+    /// 2026-07-02-sim-swarm-coverage.md) — do not reorder.
+    pub fn swarm(rng: &mut Rng) -> FaultConfig {
+        let write_error = if rng.chance(0.5) {
+            rng.below(150) as f64 / 1000.0
+        } else {
+            0.0
+        };
+        let sync_error = if rng.chance(0.5) {
+            rng.below(150) as f64 / 1000.0
+        } else {
+            0.0
+        };
+        let (crash_apply, crash_torn) = match rng.below(4) {
+            0 => (1.0, 0.0), // all-survive
+            1 => (0.0, 0.0), // all-drop
+            2 => (0.0, 1.0), // all-torn
+            _ => {
+                let crash_apply = rng.below(1001) as f64 / 1000.0;
+                let crash_torn = (rng.below(1001) as f64 / 1000.0) * (1.0 - crash_apply);
+                (crash_apply, crash_torn)
+            }
+        };
+        const DISK_HI: [Duration; 4] = [
+            Duration::ZERO,
+            Duration::from_micros(100),
+            Duration::from_millis(2),
+            Duration::from_millis(50),
+        ];
+        const NET_HI: [Duration; 4] = [
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_millis(20),
+            Duration::from_millis(250),
+        ];
+        let cfg = FaultConfig {
+            write_error,
+            sync_error,
+            crash_apply,
+            crash_torn,
+            disk_latency: (Duration::ZERO, DISK_HI[rng.below(4) as usize]),
+            net_latency: (Duration::ZERO, NET_HI[rng.below(4) as usize]),
+        };
+        cfg.validate(); // a sampler that produces an invalid config is a harness bug
+        cfg
+    }
+
     fn validate(&self) {
         for (name, p) in [
             ("write_error", self.write_error),
@@ -102,9 +154,16 @@ struct State {
     latency: Rng,
     disk: DiskWorld,
     net: NetWorld,
+    /// Sometimes-coverage: named-event counts across the universe (Antithesis
+    /// "sometimes assertions", adapted) — see `Sim::cover`.
+    coverage: BTreeMap<&'static str, u64>,
 }
 
 impl State {
+    fn cover(&mut self, key: &'static str) {
+        *self.coverage.entry(key).or_insert(0) += 1;
+    }
+
     fn advance(&mut self, (lo, hi): (Duration, Duration)) {
         let lo = u64::try_from(lo.as_nanos()).expect("latency exceeds u64 nanos");
         let hi = u64::try_from(hi.as_nanos()).expect("latency exceeds u64 nanos");
@@ -131,6 +190,7 @@ impl State {
         if let Some(countdown) = self.disk.crash_countdown {
             if countdown == 0 {
                 self.disk.crashed = true;
+                self.cover("fault:crash"); // count the transition only
                 return Err(crashed_error());
             }
             self.disk.crash_countdown = Some(countdown - 1);
@@ -185,6 +245,7 @@ impl Sim {
                     latency,
                     disk: DiskWorld::default(),
                     net: NetWorld::default(),
+                    coverage: BTreeMap::new(),
                 }),
             }),
         }
@@ -192,6 +253,18 @@ impl Sim {
 
     pub fn seed(&self) -> u64 {
         self.world.seed
+    }
+
+    /// Marks a named event for sometimes-coverage accounting. Workload-side
+    /// marks use an "<area>:" prefix by convention (e.g. `"wal:recovered"`).
+    pub fn cover(&self, what: &'static str) {
+        self.world.lock().cover(what);
+    }
+
+    /// The event counts marked so far in this universe (`cover` plus the
+    /// sim-internal auto-coverage: `fault:*`, `crash:*`, `restart`).
+    pub fn coverage(&self) -> BTreeMap<&'static str, u64> {
+        self.world.lock().coverage.clone()
     }
 
     pub fn now(&self) -> Instant {
@@ -240,9 +313,15 @@ impl Sim {
     /// one; a clean power cycle collapses the page cache the same way.
     pub fn restart(&self) {
         let mut guard = self.world.lock();
-        let State { disk, faults, .. } = &mut *guard;
+        guard.cover("restart");
+        let State {
+            disk,
+            faults,
+            coverage,
+            ..
+        } = &mut *guard;
         for file in disk.files.values_mut() {
-            crate::disk::collapse(file, faults, &self.world.cfg);
+            crate::disk::collapse(file, faults, &self.world.cfg, coverage);
         }
         disk.epoch += 1;
         disk.crashed = false;
@@ -410,6 +489,7 @@ impl File for SimFile {
                 return Ok(());
             }
             if state.faults.chance(cfg.write_error) {
+                state.cover("fault:write_error");
                 return Err(io::Error::other(
                     "simulated disk write error (injected fault)",
                 ));
@@ -434,6 +514,7 @@ impl File for SimFile {
     fn sync(&self) -> io::Result<()> {
         self.op(|state, cfg, path| {
             if state.faults.chance(cfg.sync_error) {
+                state.cover("fault:sync_error");
                 // Real fsync failure semantics: nothing can be assumed. The
                 // buffer stays volatile; a later crash collapses it as usual.
                 return Err(io::Error::other(
@@ -773,6 +854,122 @@ fn ambient_base_seed() -> u64 {
     splitmix64(&mut state)
 }
 
+// -------------------------------------------------------- Swarm harness
+
+/// Runs `universes` seeded universes, each sampling its own `FaultConfig` via
+/// `FaultConfig::swarm` (swarm testing) instead of one fixed matrix for every
+/// universe, and accumulating sometimes-coverage across the batch. Add
+/// `require: [...]` to assert each named key was covered at least once in the
+/// batch — call as `run_universes_swarm!(N, f)` or `run_universes_swarm!(N,
+/// f, require: ["key", ...])`. `run_universes!`/`run_one` are a separate,
+/// frozen runner — this one is new. Set `CHARPENTE_SEED=0x…` to replay one
+/// universe (its config re-derives from the seed; the coverage requirement
+/// check is skipped, since one universe can't be expected to hit everything).
+#[macro_export]
+macro_rules! run_universes_swarm {
+    ($universes:expr, $f:expr) => {
+        $crate::run_universes_swarm_in(env!("CARGO_PKG_NAME"), file!(), $universes, &[], $f)
+    };
+    ($universes:expr, $f:expr, require: [$($key:expr),* $(,)?]) => {
+        $crate::run_universes_swarm_in(env!("CARGO_PKG_NAME"), file!(), $universes, &[$($key),*], $f)
+    };
+}
+
+#[doc(hidden)]
+pub fn run_universes_swarm_in(
+    package: &str,
+    file: &str,
+    universes: u64,
+    require: &[&str],
+    f: impl Fn(&mut Sim) -> Result<(), String>,
+) {
+    let test_file = test_name(file);
+    if let Ok(seed_var) = std::env::var("CHARPENTE_SEED") {
+        let seed = parse_seed(&seed_var);
+        eprintln!(
+            "charpente-sim [{test_file}]: replaying seed {seed:#018x} — coverage requirements skipped under CHARPENTE_SEED"
+        );
+        run_one_swarm(package, test_file, seed, &f);
+        return;
+    }
+    let base = ambient_base_seed();
+    eprintln!(
+        "charpente-sim [{test_file}]: {universes} swarm universes from base seed {base:#018x}"
+    );
+    let mut state = base;
+    let mut coverage: BTreeMap<&'static str, u64> = BTreeMap::new();
+    for _ in 0..universes {
+        let seed = splitmix64(&mut state);
+        for (key, count) in run_one_swarm(package, test_file, seed, &f) {
+            *coverage.entry(key).or_insert(0) += count;
+        }
+    }
+    eprintln!("charpente-sim [{test_file}]: coverage over {universes} universes:");
+    for (key, count) in &coverage {
+        eprintln!("  {key}: {count}");
+    }
+    let missing: Vec<&str> = require
+        .iter()
+        .filter(|key| coverage.get(*key).copied().unwrap_or(0) == 0)
+        .copied()
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "sim coverage requirement failed in {test_file}: {missing:?} never occurred over \
+         {universes} universes — raise the universe count, adjust the workload, or drop the \
+         requirement (a required state that never occurs is an untested claim)"
+    );
+}
+
+/// One universe: derive its `FaultConfig` from the seed (frozen derivation:
+/// `splitmix64` once more past the seed itself), run under `catch_unwind` so
+/// a panicking workload still gets a seed+config+repro report (the harness
+/// gap this runner closes — hard rule 5), and return its coverage marks.
+fn run_one_swarm(
+    package: &str,
+    test_file: &str,
+    seed: u64,
+    f: &impl Fn(&mut Sim) -> Result<(), String>,
+) -> BTreeMap<&'static str, u64> {
+    let mut s = seed;
+    let cfg_seed = splitmix64(&mut s);
+    let cfg = FaultConfig::swarm(&mut Rng::new(cfg_seed));
+    let mut sim = Sim::with_faults(seed, cfg.clone());
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut sim))) {
+        Ok(Ok(())) => sim.coverage(),
+        Ok(Err(msg)) => panic!(
+            "{}",
+            swarm_failure_report(package, test_file, seed, &cfg, &msg)
+        ),
+        Err(payload) => panic!(
+            "{}",
+            swarm_failure_report(package, test_file, seed, &cfg, &panic_message(&*payload))
+        ),
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+fn swarm_failure_report(
+    package: &str,
+    test_file: &str,
+    seed: u64,
+    cfg: &FaultConfig,
+    msg: &str,
+) -> String {
+    format!(
+        "\nsim failure in {test_file}: {msg}\n  seed:   {seed:#018x}\n  config: {cfg:?}\n  repro:  CHARPENTE_SEED={seed:#x} cargo test -p {package} --test {test_file} -- --nocapture\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -883,5 +1080,126 @@ mod tests {
             "typed_tables"
         );
         assert_eq!(test_name("wal.rs"), "wal");
+    }
+
+    // ---------------------------------------------------------- swarm
+
+    #[test]
+    fn swarm_same_seed_same_config() {
+        let a = FaultConfig::swarm(&mut Rng::new(0x5EED));
+        let b = FaultConfig::swarm(&mut Rng::new(0x5EED));
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+    }
+
+    #[test]
+    fn swarm_configs_vary() {
+        let mut rng = Rng::new(0xC0FFEE);
+        let mut debug_strings = std::collections::BTreeSet::new();
+        let mut saw_write_error_zero = false;
+        let mut saw_write_error_nonzero = false;
+        for _ in 0..64 {
+            let cfg = FaultConfig::swarm(&mut rng);
+            cfg.validate();
+            assert!(cfg.crash_apply + cfg.crash_torn <= 1.0);
+            assert!(cfg.disk_latency.0 <= cfg.disk_latency.1);
+            assert!(cfg.net_latency.0 <= cfg.net_latency.1);
+            if cfg.write_error == 0.0 {
+                saw_write_error_zero = true;
+            } else {
+                saw_write_error_nonzero = true;
+            }
+            debug_strings.insert(format!("{cfg:?}"));
+        }
+        assert!(debug_strings.len() >= 2, "swarm configs never varied");
+        assert!(saw_write_error_zero, "never sampled write_error == 0.0");
+        assert!(saw_write_error_nonzero, "never sampled write_error > 0.0");
+    }
+
+    #[test]
+    fn cover_counts_marks() {
+        let sim = Sim::new(1);
+        sim.cover("x");
+        sim.cover("x");
+        assert_eq!(sim.coverage()["x"], 2);
+    }
+
+    #[test]
+    fn auto_coverage_fires() {
+        let sim = Sim::with_faults(
+            2,
+            FaultConfig {
+                write_error: 1.0,
+                ..FaultConfig::none()
+            },
+        );
+        let file = sim.disk().open("f").unwrap();
+        let err = file.write_at(0, b"x").unwrap_err();
+        assert!(err.to_string().contains("injected fault"), "{err}");
+        assert!(sim.coverage()["fault:write_error"] >= 1);
+
+        let sim = Sim::with_faults(3, FaultConfig::none());
+        let file = sim.disk().open("f").unwrap();
+        file.write_at(0, b"unsynced").unwrap();
+        sim.restart();
+        assert_eq!(sim.coverage()["restart"], 1);
+        assert!(
+            sim.coverage().keys().any(|k| k.starts_with("crash:")),
+            "{:?}",
+            sim.coverage()
+        );
+    }
+
+    #[test]
+    fn swarm_runner_reports_seed_on_panic() {
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_universes_swarm_in(
+                "charpente-sim",
+                "swarm_meta.rs",
+                1,
+                &[],
+                |_sim: &mut Sim| -> Result<(), String> { panic!("boom") },
+            );
+        }))
+        .expect_err("the runner must panic when the workload panics");
+        let msg = panic_message(&*payload);
+        assert!(msg.contains("seed:"), "{msg}");
+        assert!(msg.contains("config:"), "{msg}");
+        assert!(msg.contains("CHARPENTE_SEED="), "{msg}");
+    }
+
+    #[test]
+    fn swarm_runner_requirement_failure_names_the_key() {
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_universes_swarm_in(
+                "charpente-sim",
+                "swarm_meta.rs",
+                4,
+                &["never:happens"],
+                |_sim: &mut Sim| Ok(()),
+            );
+        }))
+        .expect_err("a never-covered required key must fail the batch");
+        let msg = panic_message(&*payload);
+        assert!(msg.contains("never:happens"), "{msg}");
+        assert!(msg.contains("raise the universe count"), "{msg}");
+    }
+
+    #[test]
+    fn swarm_universe_replays_identically() {
+        let run = |seed: u64| {
+            let mut s = seed;
+            let cfg_seed = splitmix64(&mut s);
+            let cfg = FaultConfig::swarm(&mut Rng::new(cfg_seed));
+            let sim = Sim::with_faults(seed, cfg);
+            let disk = sim.disk();
+            let file = disk.open("f").unwrap();
+            let mut payload = [0u8; 64];
+            sim.entropy().fill(&mut payload);
+            let _ = file.write_at(0, &payload);
+            let _ = file.sync();
+            sim.restart();
+            (sim.durable_fingerprint(), sim.now())
+        };
+        assert_eq!(run(0x51E4), run(0x51E4));
     }
 }
