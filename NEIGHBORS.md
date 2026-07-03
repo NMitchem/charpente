@@ -9,7 +9,7 @@ was still empty as of mid-2026. Also: the technique lineage an implementer must 
 | Neighbor | What it proves | Why it isn't charpente |
 |---|---|---|
 | **Convex** (convex.dev; backend OSS'd 2024, FSL) | Closest *in spirit*: typed transactional functions + reactive subscriptions in one platform; developers love the model | TypeScript (runtime checks, not a compile-time oracle); hosted-first; no determinism/DST story; separate components, not one binary |
-| **SpacetimeDB** (Clockwork Labs) | Closest *in shape*: database and server fused into one process, "reducers" run in-DB, realtime subscriptions built in | Reducers are WASM modules (serialization boundary re-enters, host langs vary); no deterministic-simulation testing story; game-centric design pressure (BitCraft); consistency model tuned for that niche. Study it seriously — it validates demand for the fused shape |
+| **SpacetimeDB** (Clockwork Labs) | Closest *in shape*: database and server fused into one process, "reducers" run in-DB, realtime subscriptions built in | Reducers are WASM modules (serialization boundary re-enters, host langs vary); no deterministic-simulation testing story — still true of 2.0 (2026-03), their explicit push into general web dev; the game-centric era is over, the DST gap is not. Study it seriously — it validates demand for the fused shape |
 | **PocketBase** (Go) | Massive appetite for "backend in one file" (auth+DB+realtime+files on SQLite) | Untyped-dynamic surface, Go, no transactional queue, no sim, explicitly hobby/small-scale positioning |
 | **Supabase / Firebase** | The bundle is the right product (auth+DB+realtime+storage+jobs) | The anti-shape: N separate services composed behind a dashboard — every boundary charpente deletes, they operate |
 | **Cloudflare Durable Objects (+ SQLite-in-DO, 2024)** | Data-next-to-compute with zero-latency storage is real and shipping at scale; per-object single-threading tames concurrency | Proprietary runtime, JS/WASM, per-object sharding model, no self-host, no sim |
@@ -40,6 +40,18 @@ on why); for charpente to add their features is milestone work.
   replacement used by RisingWave in production CI. Study both APIs before designing the
   `Net`/`Clock` traits; madsim's tokio-API-compatibility trick is the likeliest shape for
   keeping the ecosystem usable at the edges.
+- TigerBeetle's **Vörtex** (2025) — the black-box complement to the VOPR: stock release
+  binaries, TCP-proxy network faults, real process kill/pause. The model for testing
+  charpente's hyper edge, which the in-process sim cannot reach (PLAN M1).
+- **Jepsen's TigerBeetle analysis** (2025) — the sharpest independent critique of DST:
+  corruption *granularity* is its own fault axis (whole-sector injection missed a
+  single-byte bug), and heavy fuzzing still leaves pattern gaps. Read before expanding
+  the fault matrix.
+- Polar Signals' "theater of state machines" and S2.dev's DST writeup (2025) — the Rust
+  practitioner convergence on bus-owned scheduling and total entropy control (their
+  gotchas — ambient HashMap seeds, wall-clock timestamps in log lines — are this
+  deny-list's reason to exist); S2's mad-turmoil fuses turmoil's net-sim with madsim's
+  libc-level determinism.
 - sled's simulation writeup (Tyler Neely) + FoundationDB's `flow` docs — failure modes of
   half-deterministic designs.
 
@@ -53,6 +65,10 @@ on why); for charpente to add their features is milestone work.
 **Storage**
 - redb (pure-Rust B-tree; has a `StorageBackend` trait — mount it behind the `Disk`
   boundary); compare sled postmortems. LSM background: RocksDB wiki, LevelDB paper.
+  Health check 2026-07: actively maintained (v4.1.0, 2026-04); its 2026 changelogs credit
+  AI coding agents with finding real corruption-class bugs — a thesis data point, and a
+  reminder the engine under our tables has had fresh corruption bugs: the fault matrix
+  runs through it for a reason.
 - Litestream's WAL-shipping design doc — the M1 replication/backup blueprint.
 
 **Deployment/scale stance**
@@ -65,10 +81,20 @@ on why); for charpente to add their features is milestone work.
 
 ## Standing intel questions
 
-Track quarterly; each would change positioning if it flips:
-1. Does Convex ship any determinism/replay story?
-2. Does SpacetimeDB generalize beyond games (and add a testing story)?
+Track quarterly; each would change positioning if it flips. Last checked 2026-07-02
+(two-agent primary-source sweep):
+1. Does Convex ship any determinism/replay story? — **No.** 2022-era property tests and a
+   JS mock backend only; their agent push (an "Agent" component) targets agents as app
+   *users*, not agent-developers.
+2. Does SpacetimeDB generalize beyond games (and add a testing story)? — **Generalized,
+   yes** (2.0, 2026-03, explicit web-dev push; row updated above). **Testing story:
+   still none.** Still WASM reducers; no new funding since the 2022 Series A.
 3. Does anyone else publish an "agent-native framework" explicitly targeting feedback-loop
-   quality? (As of 2026-07: no.)
+   quality? — **Still no.** But agent *tooling* is now table stakes everywhere (Encore
+   "for Humans and Agents", Supabase's $500M agents-build-databases raise, Cloudflare
+   Project Think). The moat is specifically determinism + the compile-time oracle;
+   "agent-friendly" alone no longer differentiates.
 4. Do Rust compile times improve enough (parallel frontend, cranelift backend) to void the
-   compile-latency risk in PLAN.md?
+   compile-latency risk in PLAN.md? — **Not yet.** Parallel frontend still nightly-only
+   (target walked back to 20–25% at 8 threads); cranelift ≈5% total clean-build win, no
+   debug info. The risk stands.

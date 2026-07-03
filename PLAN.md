@@ -44,6 +44,9 @@ required zero framework patches.
 - **Migrations:** schema versions as log records; compile-time incompatibility detection.
 - **Error/introspection polish:** `charpente describe`, structured sim-failure reports —
   the agent-interface quality bar (DESIGN §7) gets its own test suite.
+- **Edge harness:** Vörtex-style black-box rig for the hyper edge — stock binary,
+  TCP-proxy fault injection, process kill/pause. The sim proves the kernel; this covers
+  the wire (`serve`).
 
 **Exit criteria:** a follower promoted mid-write-load loses nothing and serves reads
 throughout; a reconnecting realtime client provably misses no events.

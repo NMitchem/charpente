@@ -79,12 +79,21 @@ crash-time write-buffer collapse in which every unsynced write independently sur
 tears (an arbitrary strict subset of its sectors), or vanishes. Subset tears matter: they
 produce the file-extends-past-garbage layouts that defeat length-prefix-only recovery,
 which prefix-only tearing never catches (found while building the first meta-test).
+Tracked extensions to the matrix (the Jepsen/TigerBeetle lessons — corruption *granularity*
+is its own fault axis; whole-sector injection provably misses single-byte bugs): bit-level
+corruption of durable bytes, misdirected writes, and latent read errors. They land with
+WAL segment management, paired with the recovery-horizon rule in §2.
 
 **Consequence for the concurrency model.** The core state machine is single-threaded —
 concurrency lives at the edges (HTTP handling, queue workers, replication) and is itself
-scheduled through the deterministic executor in sim mode. Throughput comes from the absence
-of network hops and lock contention, not from parallel mutation. This mirrors TigerBeetle
-and Redis: a single thread applying a log is astonishingly fast when it never waits.
+scheduled through the deterministic executor. The executor's load-bearing rule (the
+FoundationDB half-measures lesson): the kernel loop's choice of *which ready event source
+to service next* is an explicit decision made by the same code in production and in
+simulation — only the entropy behind the decision differs. A production loop that
+multiplexes by racing a real channel while the sim draws from a different structure is
+not testing the scheduler production runs. Throughput comes from the absence of network
+hops and lock contention, not from parallel mutation. This mirrors TigerBeetle and Redis:
+a single thread applying a log is astonishingly fast when it never waits.
 
 The HTTP kernel (`charpente::http`) lives inside the boundary — the sim drives
 `App::handle` directly; hyper only translates wire↔struct at the edge
@@ -127,6 +136,17 @@ seq-correct), and deletes later segments. Any IO failure poisons the log — fsy
 cannot honestly be retried (fsyncgate); the only exit from poison is restart-and-recover,
 and recovery is idempotent. The apply loop (`Engine`) holds the standing invariant:
 machine state ≡ fold(apply, durable records) — submit is append → sync → apply → ack.
+
+**Two durability fences, tracked.** (1) Recovery cannot yet tell a torn tail from mid-log
+corruption of committed frames: any invalid frame is the cut, so bitrot below the store's
+durable horizon would silently discard acknowledged records — or trip `Db::open`'s
+ahead-of-the-log assert with a misdiagnosis. The rule when read faults land: an invalid
+frame at or below the horizon (the store's `applied_seq` at open) is a hard corruption
+error naming restore-from-replica/backup, never a cut. (2) `File::sync` does not persist
+a file's *directory entry*: a freshly rotated-in segment's name can vanish on power loss,
+taking acknowledged records with it — prod `Disk` needs a directory barrier and the sim
+must model entry loss. Both land with WAL segment management; M1 replication is what
+makes repair possible.
 
 **Record payload (v0, implemented).** A committed transaction's effects:
 `[n: u32]` then n tagged effects — put `0x00 [table][row]`, delete
