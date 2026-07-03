@@ -10,7 +10,7 @@ use charpente::{Db, DbConfig, Event, Job, Schema, TxError, View, table};
 use charpente_core::io::Entropy;
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::table::{Codec, Id, Snapshot, Store};
-use charpente_sim::{FaultConfig, Sim, run_universes};
+use charpente_sim::{FaultConfig, Sim, run_universes_swarm};
 
 #[table]
 struct Org {
@@ -566,7 +566,19 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
 
 #[test]
 fn transactions_survive_the_fault_matrix() {
-    run_universes!(256, tx_workload);
+    run_universes_swarm!(
+        256,
+        tx_workload,
+        require: [
+            "fault:write_error",
+            "fault:sync_error",
+            "fault:crash",
+            "crash:applied",
+            "crash:torn",
+            "crash:dropped",
+            "restart",
+        ]
+    );
 }
 
 #[test]
