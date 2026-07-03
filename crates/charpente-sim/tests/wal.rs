@@ -10,7 +10,7 @@ use std::io;
 use charpente_core::engine::{Engine, StateMachine};
 use charpente_core::io::{Disk, Entropy};
 use charpente_core::log::{Wal, WalConfig};
-use charpente_sim::{FaultConfig, Sim, run_universes};
+use charpente_sim::{FaultConfig, Sim, run_universes, run_universes_swarm};
 
 fn small_segments() -> WalConfig {
     WalConfig {
@@ -140,9 +140,19 @@ fn wal_workload(sim: &mut Sim, payload_len: impl Fn(&dyn Entropy) -> usize) -> R
 
 #[test]
 fn wal_survives_the_fault_matrix() {
-    run_universes!(512, |sim: &mut Sim| {
-        wal_workload(sim, |entropy| 100 + (entropy.next_u64() % 1400) as usize)
-    });
+    run_universes_swarm!(
+        512,
+        |sim: &mut Sim| { wal_workload(sim, |entropy| 100 + (entropy.next_u64() % 1400) as usize) },
+        require: [
+            "fault:write_error",
+            "fault:sync_error",
+            "fault:crash",
+            "crash:applied",
+            "crash:torn",
+            "crash:dropped",
+            "restart",
+        ]
+    );
 }
 
 /// Same property with every payload exactly 512 bytes, so every regenerated
