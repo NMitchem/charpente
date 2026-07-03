@@ -5,6 +5,7 @@
 //! `#[table]` references `::charpente_core` paths; `#[route]` references
 //! `::charpente` paths — the using crate must depend on the respective crate.
 
+mod job;
 mod route;
 mod table;
 
@@ -33,6 +34,16 @@ pub fn route(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as route::RouteArgs);
     let func = parse_macro_input!(input as ItemFn);
     match route::expand(args, func) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+#[proc_macro_attribute]
+pub fn job(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as job::JobArgs);
+    let input = parse_macro_input!(input as DeriveInput);
+    match job::expand(args, input) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }

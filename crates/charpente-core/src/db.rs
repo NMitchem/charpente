@@ -45,10 +45,11 @@ impl Default for DbConfig {
 // ---------------------------------------------------------------- traits
 
 /// A queued unit of work (DESIGN.md §6). `tx.enqueue` records it atomically
-/// with the transaction's state changes; dispatch arrives with M0 step 6.
-/// v0: implemented by hand; `#[job]` will derive it.
+/// with the transaction's state changes; dispatch lives in
+/// `charpente::kernel`. v0: implemented by hand; `#[job]` derives it.
 pub trait Job: Codec {
     const NAME: &'static str;
+    const RETRY: crate::job::RetryPolicy = crate::job::RetryPolicy::DEFAULT;
 }
 
 /// A realtime event (DESIGN.md §6). Emits live in the log record itself —

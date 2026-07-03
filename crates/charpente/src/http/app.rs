@@ -12,6 +12,7 @@ use charpente_macros::table;
 
 use crate::http::router::{RouteMatch, Router};
 use crate::http::{ApiError, Request, Response, Route, hex};
+use crate::kernel::JobDef;
 
 // ---------------------------------------------------------------- session
 
@@ -91,6 +92,7 @@ pub struct App {
     entropy: Box<dyn Entropy>,
     config: AppConfig,
     router: Router,
+    job_defs: Vec<JobDef>,
 }
 
 impl App {
@@ -108,11 +110,26 @@ impl App {
             entropy,
             config,
             router: Router::new(),
+            job_defs: Vec::new(),
         })
     }
 
     pub fn mount(mut self, routes: Vec<Route>) -> App {
         self.router.mount(routes);
+        self
+    }
+
+    /// Registers `#[job]` descriptors (mount-time duplicate-name panic — each
+    /// job type is mounted once, like routes).
+    pub fn mount_jobs(mut self, defs: Vec<JobDef>) -> App {
+        for def in defs {
+            assert!(
+                !self.job_defs.iter().any(|d| d.name == def.name),
+                "job \"{}\" registered twice — each #[job] type is mounted once",
+                def.name
+            );
+            self.job_defs.push(def);
+        }
         self
     }
 
@@ -124,6 +141,30 @@ impl App {
 
     pub fn config(&self) -> &AppConfig {
         &self.config
+    }
+
+    // The kernel loop (event loop task) is the first caller of these three —
+    // it does not exist yet, so they are unused until then.
+    #[allow(dead_code)]
+    pub(crate) fn db_mut(&mut self) -> &mut Db {
+        &mut self.db
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn entropy(&self) -> &dyn Entropy {
+        &*self.entropy
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn take_job_defs(&mut self) -> Vec<JobDef> {
+        std::mem::take(&mut self.job_defs)
+    }
+
+    /// Test-only equivalent of `db_mut` — integration tests cannot see
+    /// `pub(crate)`; the kernel itself uses `db_mut`.
+    #[doc(hidden)]
+    pub fn db_for_tests(&mut self) -> &mut Db {
+        &mut self.db
     }
 
     pub fn handle(&mut self, request: Request) -> Response {
