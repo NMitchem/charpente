@@ -273,7 +273,7 @@ use charpente::{Db, Job};
 use charpente_core::io::Entropy;
 use charpente_core::log::WalConfig;
 use charpente_core::table::{Codec, View};
-use charpente_sim::run_universes;
+use charpente_sim::run_universes_swarm;
 
 #[table]
 struct Item {
@@ -466,7 +466,19 @@ fn http_workload(sim: &mut Sim) -> Result<(), String> {
 
 #[test]
 fn http_requests_survive_the_fault_matrix() {
-    run_universes!(256, http_workload);
+    run_universes_swarm!(
+        256,
+        http_workload,
+        require: [
+            "fault:write_error",
+            "fault:sync_error",
+            "fault:crash",
+            "crash:applied",
+            "crash:torn",
+            "crash:dropped",
+            "restart",
+        ]
+    );
 }
 
 #[test]
