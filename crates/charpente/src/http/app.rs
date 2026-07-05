@@ -4,8 +4,9 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::io;
+use std::time::Duration;
 
-use charpente_core::db::{Db, DbConfig, Schema, Tx, TxError};
+use charpente_core::db::{Db, DbConfig, Job, Schema, Tx, TxError};
 use charpente_core::io::{Disk, Entropy};
 use charpente_core::table::Id;
 use charpente_macros::table;
@@ -13,6 +14,7 @@ use charpente_macros::table;
 use crate::http::router::{RouteMatch, Router};
 use crate::http::{ApiError, Request, Response, Route, hex};
 use crate::kernel::JobDef;
+use crate::kernel::cron::{CronEntry, CronRow};
 
 // ---------------------------------------------------------------- session
 
@@ -93,24 +95,31 @@ pub struct App {
     config: AppConfig,
     router: Router,
     job_defs: Vec<JobDef>,
+    cron_entries: Vec<CronEntry>,
 }
 
 impl App {
-    /// Opens the Db with the app's schema plus the platform's `Session`
-    /// table — registered here so recovery can always replay logins.
+    /// Opens the Db with the app's schema plus the platform's `Session` and
+    /// `CronRow` tables — registered here so recovery can always replay
+    /// logins and schedules.
     pub fn open(
         disk: Box<dyn Disk>,
         schema: Schema,
         entropy: Box<dyn Entropy>,
         config: AppConfig,
     ) -> io::Result<App> {
-        let db = Db::open(disk, config.db.clone(), schema.table::<Session>())?;
+        let db = Db::open(
+            disk,
+            config.db.clone(),
+            schema.table::<Session>().table::<CronRow>(),
+        )?;
         Ok(App {
             db,
             entropy,
             config,
             router: Router::new(),
             job_defs: Vec::new(),
+            cron_entries: Vec::new(),
         })
     }
 
@@ -130,6 +139,26 @@ impl App {
             );
             self.job_defs.push(def);
         }
+        self
+    }
+
+    /// Registers a cron schedule (mount-time duplicate-name panic — each
+    /// name is scheduled once). `make` builds the job enqueued on each tick.
+    pub fn schedule<J: Job + 'static>(
+        mut self,
+        name: &'static str,
+        every: Duration,
+        make: impl Fn() -> J + Send + 'static,
+    ) -> App {
+        assert!(
+            !self.cron_entries.iter().any(|e| e.name == name),
+            "cron schedule \"{name}\" scheduled twice — schedule each name once"
+        );
+        self.cron_entries.push(CronEntry {
+            name,
+            interval: every,
+            enqueue: Box::new(move |tx| tx.enqueue(make())),
+        });
         self
     }
 
@@ -165,6 +194,18 @@ impl App {
     #[doc(hidden)]
     pub fn take_job_defs_for_tests(&mut self) -> Vec<JobDef> {
         self.take_job_defs()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn take_cron_entries(&mut self) -> Vec<CronEntry> {
+        std::mem::take(&mut self.cron_entries)
+    }
+
+    /// Test-only equivalent of `take_cron_entries` — integration tests cannot
+    /// see `pub(crate)`; the kernel itself uses `take_cron_entries`.
+    #[doc(hidden)]
+    pub fn take_cron_entries_for_tests(&mut self) -> Vec<CronEntry> {
+        self.take_cron_entries()
     }
 
     /// Test-only equivalent of `db_mut` — integration tests cannot see

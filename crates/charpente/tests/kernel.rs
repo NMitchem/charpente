@@ -247,6 +247,106 @@ fn unregistered_job_name_fails_with_the_fix() {
     );
 }
 
+use charpente::kernel::CronScheduler;
+use std::time::Duration;
+
+const HOUR: u64 = 3_600_000_000_000;
+
+fn cron_app(seed: u64) -> (Sim, App) {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![CountUp])
+    .schedule("hourly-count", Duration::from_secs(3600), || CountUp {
+        slot: 0,
+    });
+    (sim, app)
+}
+
+#[test]
+fn cron_upsert_ticks_and_catches_up_once() {
+    let (_sim, mut app) = cron_app(0x630);
+    let mut cron = CronScheduler::new(app.take_cron_entries_for_tests());
+    let db = app.db_for_tests();
+
+    cron.upsert(db, 0).unwrap();
+    assert_eq!(cron.next_deadline(), Some(HOUR));
+    assert!(!cron.has_due(HOUR - 1) && cron.has_due(HOUR));
+
+    // A tick advances the schedule and enqueues through the normal path.
+    let (name, catchup) = cron.tick(db, HOUR).unwrap();
+    assert_eq!((name, catchup), ("hourly-count", false));
+    assert_eq!(db.drain_enqueued().len(), 1);
+    assert_eq!(cron.next_deadline(), Some(2 * HOUR));
+
+    // Downtime: three intervals pass unserved. Catch-up fires ONCE and the
+    // schedule jumps past now — no backfill.
+    let much_later = 5 * HOUR + 7;
+    assert!(cron.has_due(much_later));
+    let (_, catchup) = cron.tick(db, much_later).unwrap();
+    assert!(
+        catchup,
+        "a tick past a whole missed interval reports catch-up"
+    );
+    assert_eq!(db.drain_enqueued().len(), 1, "one catch-up tick, not three");
+    assert_eq!(cron.next_deadline(), Some(much_later + HOUR));
+    assert!(!cron.has_due(much_later));
+}
+
+#[test]
+fn cron_schedule_survives_reopen_without_resetting_phase() {
+    let sim = Sim::with_faults(0x631, FaultConfig::none());
+    let open = |sim: &Sim| {
+        App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Counter>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(jobs![CountUp])
+        .schedule("hourly-count", Duration::from_secs(3600), || CountUp {
+            slot: 0,
+        })
+    };
+    let mut app = open(&sim);
+    let mut cron = CronScheduler::new(app.take_cron_entries_for_tests());
+    cron.upsert(app.db_for_tests(), 0).unwrap();
+
+    sim.restart();
+    drop(app);
+    let mut app = open(&sim);
+    let mut cron = CronScheduler::new(app.take_cron_entries_for_tests());
+    // Re-upsert at a later now: the existing row keeps its phase.
+    cron.upsert(app.db_for_tests(), 30 * 60 * 1_000_000_000)
+        .unwrap();
+    assert_eq!(
+        cron.next_deadline(),
+        Some(HOUR),
+        "an existing schedule keeps next_due across restarts"
+    );
+}
+
+#[test]
+#[should_panic(expected = "scheduled twice")]
+fn duplicate_cron_names_panic_at_mount() {
+    let sim = Sim::with_faults(0x632, FaultConfig::none());
+    let _ = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .schedule("n", Duration::from_secs(1), || CountUp { slot: 0 })
+    .schedule("n", Duration::from_secs(2), || CountUp { slot: 1 });
+}
+
 #[test]
 fn rebuild_restores_pending_jobs_after_reopen() {
     let sim = Sim::with_faults(0x624, FaultConfig::none());

@@ -2,6 +2,8 @@
 //! the event loop multiplexing HTTP requests, due jobs, and cron ticks — all
 //! inside the simulation boundary. The loop lands with the executor task.
 
+pub(crate) mod cron;
 mod dispatch;
 
+pub use cron::{CronRow, CronScheduler};
 pub use dispatch::{Dispatcher, JobDef, JobEntry, JobError, JobOutcome};
