@@ -39,7 +39,7 @@ impl CronScheduler {
 
     pub fn upsert(&mut self, db: &mut Db, now: u64) -> io::Result<()> {
         for (entry, cached) in &mut self.entries {
-            let interval = nanos(entry.interval);
+            let interval = nanos(entry.interval, entry.name);
             let existing = {
                 let snap = db.snapshot()?;
                 CronRow::by_name(&snap, &entry.name.to_string())?.pop()
@@ -60,12 +60,15 @@ impl CronScheduler {
                     }
                 }
             };
-            *cached = row.next_due;
+            // Cache updates only after the commit succeeds (matching `tick`):
+            // a failed write must not leave the cache pointing at a row that
+            // was never durably written.
             db.transact(|tx| {
                 tx.put(&row);
                 Ok::<(), io::Error>(())
             })
             .map_err(flatten)?;
+            *cached = row.next_due;
         }
         Ok(())
     }
@@ -85,7 +88,7 @@ impl CronScheduler {
             .filter(|(_, due)| *due <= now)
             .min_by_key(|(_, due)| *due)
             .expect("tick called with nothing due");
-        let interval = nanos(entry.interval);
+        let interval = nanos(entry.interval, entry.name);
         let catchup = now >= (*cached).saturating_add(interval); // a whole interval missed
         let next = now + interval; // catch-up fires once: jump past now
         let name = entry.name;
@@ -105,8 +108,13 @@ impl CronScheduler {
     }
 }
 
-fn nanos(d: Duration) -> u64 {
-    u64::try_from(d.as_nanos()).expect("cron interval exceeds u64 nanos")
+fn nanos(d: Duration, name: &'static str) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or_else(|_| {
+        panic!(
+            "cron schedule \"{name}\": interval {d:?} exceeds u64 nanos (~584 years) — \
+             pick a smaller interval"
+        )
+    })
 }
 
 fn flatten(e: TxError<io::Error>) -> io::Error {
