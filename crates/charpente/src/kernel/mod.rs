@@ -4,4 +4,4 @@
 
 mod dispatch;
 
-pub use dispatch::{JobDef, JobEntry, JobError};
+pub use dispatch::{Dispatcher, JobDef, JobEntry, JobError, JobOutcome};

@@ -160,6 +160,13 @@ impl App {
         std::mem::take(&mut self.job_defs)
     }
 
+    /// Test-only equivalent of `take_job_defs` — integration tests cannot see
+    /// `pub(crate)`; the kernel itself uses `take_job_defs`.
+    #[doc(hidden)]
+    pub fn take_job_defs_for_tests(&mut self) -> Vec<JobDef> {
+        self.take_job_defs()
+    }
+
     /// Test-only equivalent of `db_mut` — integration tests cannot see
     /// `pub(crate)`; the kernel itself uses `db_mut`.
     #[doc(hidden)]
