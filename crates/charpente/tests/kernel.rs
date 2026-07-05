@@ -381,3 +381,106 @@ fn rebuild_restores_pending_jobs_after_reopen() {
     let outcome = dispatcher.run_due(app.db_for_tests(), 0).unwrap();
     assert!(matches!(outcome, JobOutcome::Done { .. }));
 }
+
+// ------------------------------------------------------------------- loop
+
+use charpente::http::ApiError;
+use charpente::http::{Method, Request};
+use charpente::kernel::{Kernel, SimSource};
+use charpente::route;
+use charpente::routes;
+use serde::{Deserialize, Serialize};
+
+const SEC: u64 = 1_000_000_000;
+
+#[derive(Serialize, Deserialize)]
+struct Hit {
+    slot: u64,
+}
+
+#[route(POST "/hit")]
+fn hit(tx: &mut Tx, body: Hit) -> Result<u64, ApiError> {
+    tx.enqueue(CountUp { slot: body.slot });
+    Ok(body.slot)
+}
+
+fn loop_app(sim: &Sim) -> App {
+    App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![hit])
+    .mount_jobs(jobs![CountUp])
+    .schedule("hourly-count", Duration::from_secs(3600), || CountUp {
+        slot: 777,
+    })
+}
+
+#[test]
+fn loop_serves_requests_runs_jobs_and_ticks_cron() {
+    let sim = Sim::with_faults(0x640, FaultConfig::none());
+    let mut source = SimSource::new(Box::new(sim.clock()), 2 * HOUR + SEC);
+    for i in 0..3u64 {
+        source.push_at(
+            i * SEC,
+            Request::new(Method::Post, "/hit").json(&Hit { slot: i }),
+        );
+    }
+    let responses = source.responses();
+
+    let mut kernel = Kernel::new(loop_app(&sim), Box::new(sim.clock())).unwrap();
+    kernel.run(&mut source).unwrap(); // returns at the horizon (Shutdown)
+
+    let stats = kernel.stats();
+    assert_eq!(stats.requests, 3);
+    assert_eq!(stats.cron_ticks, 2, "two hours inside the horizon");
+    assert_eq!(stats.jobs_done, 5, "3 request jobs + 2 cron jobs");
+    assert_eq!((stats.jobs_retried, stats.jobs_dead), (0, 0));
+
+    let recorded = responses.lock().unwrap();
+    assert_eq!(recorded.len(), 3);
+    assert!(recorded.iter().all(|(status, _)| *status == 200));
+
+    let mut app = kernel.into_app();
+    let snap = app.db_for_tests().snapshot().unwrap();
+    let counters = snap.scan::<Counter>().unwrap();
+    // slots 0,1,2 hit once each; cron slot 777 hit twice.
+    assert_eq!(counters.len(), 4);
+    assert_eq!(
+        counters
+            .iter()
+            .map(|c| (c.id.raw(), c.hits))
+            .collect::<Vec<_>>(),
+        vec![(0, 1), (1, 1), (2, 1), (777, 2)]
+    );
+    let jobs = snap.scan::<JobRow>().unwrap();
+    assert!(jobs.iter().all(|j| j.status == JobStatus::Done));
+}
+
+#[test]
+fn loop_replays_identically_for_the_same_seed() {
+    let trace = |seed: u64| {
+        let sim = Sim::new(seed); // default faults, including latency
+        let mut source = SimSource::new(Box::new(sim.clock()), HOUR);
+        for i in 0..5u64 {
+            source.push_at(
+                i * SEC,
+                Request::new(Method::Post, "/hit").json(&Hit { slot: i }),
+            );
+        }
+        let responses = source.responses();
+        let run = (|| -> Result<(), std::io::Error> {
+            let mut kernel = Kernel::new(loop_app(&sim), Box::new(sim.clock()))?;
+            kernel.run(&mut source)
+        })();
+        let outcome = format!("{run:?}");
+        let recorded = responses.lock().unwrap().clone();
+        (outcome, recorded, sim.durable_fingerprint(), sim.now())
+    };
+    for seed in [0x7, 0xB0B, 0xC0FFEE] {
+        assert_eq!(trace(seed), trace(seed), "seed {seed:#x}");
+    }
+}

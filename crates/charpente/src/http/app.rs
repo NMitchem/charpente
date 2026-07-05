@@ -172,19 +172,14 @@ impl App {
         &self.config
     }
 
-    // The kernel loop (event loop task) is the first caller of these three —
-    // it does not exist yet, so they are unused until then.
-    #[allow(dead_code)]
     pub(crate) fn db_mut(&mut self) -> &mut Db {
         &mut self.db
     }
 
-    #[allow(dead_code)]
     pub(crate) fn entropy(&self) -> &dyn Entropy {
         &*self.entropy
     }
 
-    #[allow(dead_code)]
     pub(crate) fn take_job_defs(&mut self) -> Vec<JobDef> {
         std::mem::take(&mut self.job_defs)
     }
@@ -196,7 +191,6 @@ impl App {
         self.take_job_defs()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn take_cron_entries(&mut self) -> Vec<CronEntry> {
         std::mem::take(&mut self.cron_entries)
     }
