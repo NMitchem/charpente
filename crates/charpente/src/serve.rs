@@ -13,7 +13,10 @@ use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 
+use charpente_core::io::Instant;
+
 use crate::http::{App, Method, Request, Response};
+use crate::kernel;
 
 /// A running server. v0 has no graceful shutdown — the process owns it; the
 /// threads end when the process does.
@@ -29,15 +32,28 @@ impl Server {
 
 pub fn serve(addr: &str, app: App) -> io::Result<Server> {
     let body_cap = app.config().body_cap;
-    let (kernel_tx, kernel_rx) =
-        mpsc::channel::<(Request, tokio::sync::oneshot::Sender<Response>)>();
+    let (kernel_tx, kernel_rx) = mpsc::channel::<(Request, kernel::Reply)>();
 
-    // The kernel: one thread owning the App — requests serialize here. M0
-    // step 6 adds more event sources (due jobs, cron ticks) to this loop.
+    // The kernel: one thread owning the App — requests, due jobs, and cron
+    // ticks all serialize through Kernel::run's event loop (DESIGN §1).
     std::thread::spawn(move || {
-        let mut app = app;
-        while let Ok((request, reply)) = kernel_rx.recv() {
-            let _ = reply.send(app.handle(request));
+        let clock = crate::prod::ProdClock::new();
+        let mut kernel = match kernel::Kernel::new(app, Box::new(crate::prod::ProdClock::new())) {
+            Ok(kernel) => kernel,
+            Err(e) => {
+                eprintln!("charpente kernel failed to start — fix the store/log and restart: {e}");
+                return;
+            }
+        };
+        let mut source = ProdSource {
+            rx: kernel_rx,
+            stash: None,
+            clock,
+        };
+        if let Err(e) = kernel.run(&mut source) {
+            eprintln!(
+                "charpente kernel stopped on a platform IO failure — restart to recover: {e}"
+            );
         }
     });
 
@@ -65,7 +81,10 @@ pub fn serve(addr: &str, app: App) -> io::Result<Server> {
                             let response = match to_kernel_request(req, body_cap).await {
                                 Ok(request) => {
                                     let (tx, rx) = tokio::sync::oneshot::channel();
-                                    if kernel.send((request, tx)).is_err() {
+                                    let reply: kernel::Reply = Box::new(move |response| {
+                                        let _ = tx.send(response);
+                                    });
+                                    if kernel.send((request, reply)).is_err() {
                                         Response::error(500, "the kernel thread is gone")
                                     } else {
                                         rx.await.unwrap_or_else(|_| {
@@ -87,6 +106,48 @@ pub fn serve(addr: &str, app: App) -> io::Result<Server> {
     });
 
     Ok(Server { addr: local })
+}
+
+/// Feeds `Kernel::run` from hyper's channel — the production `RequestSource`
+/// (DESIGN §1 same-shape rule: `SimSource` is the sim's counterpart).
+struct ProdSource {
+    rx: mpsc::Receiver<(Request, kernel::Reply)>,
+    stash: Option<(Request, kernel::Reply)>,
+    clock: crate::prod::ProdClock,
+}
+
+impl kernel::RequestSource for ProdSource {
+    fn poll(&mut self) -> Option<(Request, kernel::Reply)> {
+        self.stash.take().or_else(|| self.rx.try_recv().ok())
+    }
+
+    fn wait_until(&mut self, deadline: Option<Instant>) -> kernel::Wake {
+        use charpente_core::io::Clock;
+        use kernel::Wake;
+        match deadline {
+            Some(deadline) => {
+                let now = self.clock.now();
+                if deadline <= now {
+                    return Wake::Deadline;
+                }
+                match self.rx.recv_timeout(deadline.duration_since(now)) {
+                    Ok(item) => {
+                        self.stash = Some(item);
+                        Wake::Ready
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => Wake::Deadline,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => Wake::Shutdown,
+                }
+            }
+            None => match self.rx.recv() {
+                Ok(item) => {
+                    self.stash = Some(item);
+                    Wake::Ready
+                }
+                Err(_) => Wake::Shutdown,
+            },
+        }
+    }
 }
 
 async fn to_kernel_request(
