@@ -376,6 +376,10 @@ fn http_state_matches(db: &Db, n: u64) -> Result<(), String> {
     Ok(())
 }
 
+// Two families suffice here (vs kernel.rs's three): this workload breaks and
+// restarts on the FIRST Io error, so no second op ever reaches a poisoned WAL
+// or redb's latched handle — their wordings cannot surface. The reopen-time
+// state checks remain the oracle either way.
 fn is_injected(text: &str) -> bool {
     text.contains("simulated") || text.contains("injected")
 }

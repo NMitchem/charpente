@@ -218,8 +218,10 @@ exactly** — never one more (no double-apply), never one less (no lost ack). Pl
   commits handler effects and the Done-mark in *separate* transactions must fail the
   flagship property under crash injection — proving the harness would catch the
   dual-write bug this design deletes.
-- Coverage `require:` keys on the batch: `job:done`, `job:retried`, `job:dead`,
-  `cron:tick`, `cron:catchup`, plus the standard `fault:*`/`crash:*` set.
+- Coverage `require:` keys on the batch: `job:done`, `job:retried`, `cron:tick`, plus
+  the standard `fault:*`/`crash:*` set. (`job:dead` and `cron:catchup` are covered
+  opportunistically plus pinned by deterministic tests — requiring them per batch
+  would trade flakiness for nothing; amended at landing, final review concurring.)
 
 ## Error surface (hard rule 5)
 

@@ -22,7 +22,7 @@ Scope, in dependency order:
    log record; serializable by construction.
 5. **HTTP layer.** `#[route]` macro over a hyper-based server; typed params/body/response;
    sessions (minimal auth).
-6. **Queue + cron.** Transactional enqueue, post-commit lease/dispatch, idempotency keys,
+6. **Queue + cron.** Transactional enqueue, post-commit dispatch, idempotency keys,
    typed retry policy; cron ticks as transactions.
 7. **`charpente test --sim`** CLI: seeded parallel universes, fault schedules, failure =
    seed + minimal repro command.
