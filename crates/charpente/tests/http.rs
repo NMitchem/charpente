@@ -382,10 +382,13 @@ fn is_injected(text: &str) -> bool {
 
 /// One universe: recover → verify → requests through App::handle (an acked
 /// 200 must survive anything) → crash. A 500 whose body is not an injected
-/// fault is a real bug and fails the universe.
-fn http_workload(sim: &mut Sim) -> Result<(), String> {
+/// fault is a real bug and fails the universe. Returns every (status, body)
+/// observed, in order, so the determinism test can compare the full response
+/// trace across replays of the same seed, not just the durable fingerprint.
+fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
     let entropy = sim.entropy();
     let mut acked = 0u64;
+    let mut responses = Vec::new();
 
     for _round in 0..3 {
         sim.crash_disk_after(64 + entropy.next_u64() % 512);
@@ -413,6 +416,7 @@ fn http_workload(sim: &mut Sim) -> Result<(), String> {
             if entropy.next_u64().is_multiple_of(5) {
                 let before = app.db().last_applied();
                 let resp = app.handle(Request::new(Method::Get, "/items"));
+                responses.push((resp.status, resp.body.clone()));
                 if resp.status != 404 && resp.status != 405 {
                     return Err(format!(
                         "GET /items must be unroutable, got {}",
@@ -424,6 +428,7 @@ fn http_workload(sim: &mut Sim) -> Result<(), String> {
                 }
             }
             let resp = app.handle(Request::new(Method::Post, "/items").json(&PutItem { i: acked }));
+            responses.push((resp.status, resp.body.clone()));
             match resp.status {
                 200 => acked += 1,
                 500 => {
@@ -463,9 +468,14 @@ fn http_workload(sim: &mut Sim) -> Result<(), String> {
                 "durability violated: {acked} acked over HTTP, {recovered} recovered"
             ));
         }
-        return http_state_matches(app.db(), recovered);
+        http_state_matches(app.db(), recovered)?;
+        return Ok(responses);
     }
-    Ok(()) // every attempt died to injected faults; earlier rounds verified every reachable prefix
+    Ok(responses) // every attempt died to injected faults; earlier rounds verified every reachable prefix
+}
+
+fn http_workload(sim: &mut Sim) -> Result<(), String> {
+    http_workload_traced(sim).map(|_| ())
 }
 
 #[test]
@@ -489,9 +499,9 @@ fn http_requests_survive_the_fault_matrix() {
 fn http_replays_identically_for_the_same_seed() {
     let trace = |seed: u64| {
         let mut sim = Sim::new(seed);
-        let result = http_workload(&mut sim);
-        assert_eq!(result, Ok(()), "seed {seed:#x}");
-        (sim.durable_fingerprint(), sim.now())
+        let result = http_workload_traced(&mut sim);
+        let responses = result.unwrap_or_else(|e| panic!("seed {seed:#x}: {e}"));
+        (responses, sim.durable_fingerprint(), sim.now())
     };
     for seed in [0x51, 0xFACE_0FF5, 0x1DEA_C0DE_1DEA_C0DE] {
         assert_eq!(trace(seed), trace(seed));

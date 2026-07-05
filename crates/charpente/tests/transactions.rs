@@ -489,6 +489,10 @@ fn db_matches_model(snap: &Snapshot, n: u64) -> Result<(), String> {
     Ok(())
 }
 
+fn is_injected(text: &str) -> bool {
+    text.contains("simulated") || text.contains("injected")
+}
+
 /// One universe: recover → verify against the oracle → mixed commits and
 /// aborts → random checkpoint → crash, everything seeded.
 fn tx_workload(sim: &mut Sim) -> Result<(), String> {
@@ -551,7 +555,12 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
                 Err(TxError::App(_)) => break,
                 Err(TxError::Io(_)) => break, // died mid-commit; durable or not
             }
-            if entropy.next_u64().is_multiple_of(4) && db.checkpoint().is_err() {
+            if entropy.next_u64().is_multiple_of(4)
+                && let Err(e) = db.checkpoint()
+            {
+                if !is_injected(&e.to_string()) {
+                    return Err(format!("non-injected checkpoint failure: {e}"));
+                }
                 break;
             }
         }
@@ -569,8 +578,7 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
         let db = match Db::open(Box::new(sim.disk()), cfg.clone(), property_schema()) {
             Ok(db) => db,
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("simulated") || msg.contains("injected") {
+                if is_injected(&e.to_string()) {
                     sim.restart();
                     continue;
                 }
