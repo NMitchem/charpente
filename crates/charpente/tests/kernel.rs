@@ -615,7 +615,21 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
                 continue;
             }
         };
-        exactly_once_holds(&mut app)?;
+        // The checker's own reads (snapshot/scan) are disk ops too: an armed
+        // crash countdown can trip right here, so this call needs the same
+        // classify-and-reopen treatment as every other fallible step below —
+        // otherwise an injected fault mid-check reads as a real violation
+        // (found by seed 0x348270b38f166529).
+        match exactly_once_holds(&mut app) {
+            Ok(()) => {}
+            Err(msg) => {
+                if !is_injected(&msg) {
+                    return Err(msg);
+                }
+                sim.restart();
+                continue;
+            }
+        }
 
         let horizon = sim.now().as_nanos() + 400 * SEC;
         let mut source = SimSource::new(Box::new(sim.clock()), horizon);
@@ -688,7 +702,17 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
     // faults relent, then check the invariant one last time.
     for _attempt in 0..8 {
         match kernel_crash_app(sim) {
-            Ok(mut app) => return exactly_once_holds(&mut app),
+            // Same classify-and-reopen treatment as the round loop above: the
+            // checker's own reads can hit an armed crash too.
+            Ok(mut app) => match exactly_once_holds(&mut app) {
+                Ok(()) => return Ok(()),
+                Err(msg) => {
+                    if !is_injected(&msg) {
+                        return Err(msg);
+                    }
+                    sim.restart();
+                }
+            },
             Err(e) if is_injected(&e.to_string()) => sim.restart(),
             Err(e) => return Err(format!("final open failed non-injected: {e}")),
         }
