@@ -85,6 +85,12 @@ impl Kernel {
         let now = clock.now().as_nanos();
         cron.upsert(app.db_mut(), now)?;
         dispatcher.rebuild(&app.db_mut().snapshot()?)?;
+        // The rebuild scan above is the authoritative snapshot of everything
+        // enqueued before construction; ids still sitting in the drain buffer
+        // from pre-construction transacts are already in the heap — draining
+        // them later would resurrect already-serviced jobs as duplicate heap
+        // entries (found by the 120-ticks test, seed 0x650).
+        let _ = app.db_mut().drain_enqueued();
         Ok(Kernel {
             app,
             dispatcher,
