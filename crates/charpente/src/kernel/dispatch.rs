@@ -195,18 +195,23 @@ impl Dispatcher {
                 Err(e)
             }
             Err(TxError::App(JobError::App(err))) => {
-                let retry = self
-                    .defs
-                    .get(
-                        db.snapshot()?
-                            .get(Id::<JobRow>::from_raw(id))?
-                            .expect("row existed a moment ago")
-                            .name
-                            .as_str(),
-                    )
-                    .map_or(RetryPolicy::DEFAULT, |d| d.retry);
-                let outcome = db
-                    .transact(|tx| {
+                // Every fallible step below (the policy re-read, the
+                // failure-record transact) is run through this closure so
+                // that ANY Err exit — not just the sibling Io arm's — still
+                // restores the heap entry: run_due's contract is that a
+                // Pending job is always in the heap on return.
+                let mut record = || -> io::Result<JobOutcome> {
+                    let retry = self
+                        .defs
+                        .get(
+                            db.snapshot()?
+                                .get(Id::<JobRow>::from_raw(id))?
+                                .expect("row existed a moment ago")
+                                .name
+                                .as_str(),
+                        )
+                        .map_or(RetryPolicy::DEFAULT, |d| d.retry);
+                    db.transact(|tx| {
                         let mut row = tx
                             .get(Id::<JobRow>::from_raw(id))?
                             .expect("row existed a moment ago");
@@ -231,11 +236,20 @@ impl Dispatcher {
                     })
                     .map_err(|e| match e {
                         TxError::Io(e) | TxError::App(e) => e,
-                    })?;
-                if let JobOutcome::Retried { due_at, .. } = outcome {
-                    self.due.insert((due_at, id));
+                    })
+                };
+                match record() {
+                    Ok(outcome) => {
+                        if let JobOutcome::Retried { due_at, .. } = outcome {
+                            self.due.insert((due_at, id));
+                        }
+                        Ok(outcome)
+                    }
+                    Err(e) => {
+                        self.due.insert((due_at, id));
+                        Err(e)
+                    }
                 }
-                Ok(outcome)
             }
         }
     }
