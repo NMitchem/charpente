@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::io;
 
 use charpente::{Db, DbConfig, Event, Job, Schema, TxError, View, table};
-use charpente_core::io::Entropy;
+use charpente_core::io::{Disk, Entropy};
 use charpente_core::job::JobRow;
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::table::{Codec, Id, Snapshot, Store};
@@ -768,4 +768,60 @@ fn regression_store_bricked_by_creation_crash() {
         Ok(()),
         "seed 0x1f733f8d9eebf822 no longer recovers a store bricked at creation"
     );
+}
+
+/// Builds a committed, gracefully-closed store, then durably resizes its file
+/// to `resize(old_len)` — the crash-collapse states where the store file's
+/// length disagrees with its durable header's layout (an unsynced `set_len`
+/// drops while the header god-page write survives, or a torn tail write
+/// extends the file past the layout). redb 4.1.0 panics at open on both
+/// (page_manager.rs:231 / :257) instead of returning Err; Store::open must
+/// convert that into an open failure so Db::open discards and rebuilds from
+/// the WAL. Found by the kernel flagship swarm, seed 0x64622c74f8660a09.
+fn mangled_store_len_recovers(resize: impl Fn(u64) -> u64) {
+    let (sim, mut db) = quiet_db(0x0DD5_12E5);
+    db.transact(|tx| {
+        tx.put(&Org {
+            id: Id::from_raw(1),
+            name: "acme".into(),
+        });
+        tx.put(&invoice(10, 1, 5000));
+        Ok::<_, io::Error>(())
+    })
+    .unwrap();
+    // Graceful close: redb durably flushes, so header layout == file length.
+    drop(db);
+
+    let file = sim.disk().open("tables.redb").unwrap();
+    let len = file.len().unwrap();
+    file.set_len(resize(len)).unwrap();
+    file.sync().unwrap();
+    drop(file);
+
+    let db = Db::open(Box::new(sim.disk()), DbConfig::default(), app_schema()).unwrap();
+    let snap = db.snapshot().unwrap();
+    assert_eq!(
+        ids(&snap.scan::<Invoice>().unwrap()),
+        vec![10],
+        "rebuilt store must replay the full WAL"
+    );
+    assert_eq!(
+        snap.scan::<Org>().unwrap().len(),
+        1,
+        "rebuilt store must replay the full WAL"
+    );
+}
+
+/// File shorter than the header's layout: redb 4.1.0 asserts at
+/// page_manager.rs:231 before its own repair path can run.
+#[test]
+fn store_shorter_than_header_layout_is_discarded_and_rebuilt() {
+    mangled_store_len_recovers(|len| len - 4096);
+}
+
+/// File longer than the header's layout but not page-aligned: redb 4.1.0
+/// recalculates the layout, then asserts exact equality at page_manager.rs:257.
+#[test]
+fn store_longer_than_header_layout_is_discarded_and_rebuilt() {
+    mangled_store_len_recovers(|len| len + 100);
 }

@@ -149,10 +149,14 @@ the sim-capable IO layer comes first because it cannot be retrofitted.
 - **Open cleanup**: `Kernel` and `ProdSource` anchor two independent `ProdClock`s in
   `serve.rs` — precision-only skew, no correctness impact, converge on one shared
   `Arc<dyn Clock>` later.
-- **Priority follow-up**: the pre-existing redb `page_manager.rs` panic (first seen
-  pre-step-6) now hits roughly 10–25% of 256-universe flagship batches — frequency is
-  higher than first estimated and it gates a headline suite; seeds recorded in
-  `.superpowers/sdd/progress.md`.
+- **Resolved (2026-07-05): the redb `page_manager.rs` panic.** Root-caused via seed
+  0x64622c74f8660a09: a crash drops an unsynced store `set_len` while the header
+  god-page write survives, leaving file length ≠ header layout; redb 4.1.0 *asserts* at
+  open (:231/:257) instead of returning Err, bypassing `Db::open`'s discard-and-rebuild.
+  Fix: `Store::open` converts open-time panics into open failures (fence scoped to open;
+  DESIGN §4); deterministic RNG-free regressions for both assert sites in
+  tests/transactions.rs. Verified: 8/8 fresh 256-universe flagship batches green (was
+  10–25% red per batch) + 3 full-workspace runs. Upstream report drafted, not yet filed.
 - Next: M0 step 7 per PLAN.md — the `charpente test --sim` CLI (seeded parallel
   universes, fault schedules, failure = seed + minimal repro command). Step 8 (the
   agent-built demo app) is behind it.

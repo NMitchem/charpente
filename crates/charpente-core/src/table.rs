@@ -263,9 +263,29 @@ fn redb_err(e: impl fmt::Display) -> io::Error {
 impl Store {
     pub fn open(disk: &dyn Disk, path: &str) -> io::Result<Store> {
         let file = disk.open(path)?;
-        let db = Builder::new()
-            .create_with_backend(DiskBackend { file })
-            .map_err(redb_err)?;
+        // redb 4.1.0 panics (asserts) instead of returning Err on some
+        // crash-mangled files — page_manager.rs:231/:257 fire when the
+        // durable header's layout length disagrees with the file length,
+        // a state an unsynced `set_len` dropped at crash produces while the
+        // header god-page write survives. Convert an open-time panic into an
+        // open failure so Db::open's discard-and-rebuild path engages; scoped
+        // to open only — a redb panic during operation still propagates.
+        // Reported upstream; drop the fence when redb returns Err here.
+        let db = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Builder::new().create_with_backend(DiskBackend { file })
+        }))
+        .map_err(|panic| {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .map(str::to_owned)
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            io::Error::other(format!(
+                "table store (redb) panicked at open — treating the store as unopenable: {msg}"
+            ))
+        })?
+        .map_err(redb_err)?;
         Ok(Store { db })
     }
 

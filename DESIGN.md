@@ -233,7 +233,14 @@ status (Pending/Done/Dead), attempts, due_at, and last_error — the queue dispa
 substrate (§6). Done and Dead rows are retained (GC is a later question, filed with WAL
 segment GC). A store that cannot open at all — e.g. a
 crash tore its creation — is discarded at `Db::open` and rebuilt by replaying the WAL
-from scratch; the log is the only source of truth. That rebuild is safe only while the
+from scratch; the log is the only source of truth. "Cannot open" includes redb panicking
+at open: redb 4.1.0 asserts (page_manager.rs:231/:257) instead of erroring when a crash
+leaves the store file's length disagreeing with its durable header's layout — an unsynced
+`set_len` drops at crash while the header god-page write survives (sim-found; the crash
+model is exactly ALICE's unordered-writeback). `Store::open` converts an open-time panic
+into an open failure so the discard path covers it; the fence is scoped to open — a redb
+panic during operation still propagates. Reported upstream; drop the fence when redb
+returns `Err` for this state. That rebuild is safe only while the
 WAL is never compacted (it retains seq 0); WAL segment GC must revisit it.
 
 **Snapshots & reads.** MVCC snapshots at log positions; read-only queries (and follower
