@@ -490,6 +490,12 @@ fn db_matches_model(snap: &Snapshot, n: u64) -> Result<(), String> {
 }
 
 fn is_injected(text: &str) -> bool {
+    // Only the sim's own fault wordings — this workload never sees the
+    // WAL/engine's "poisoned" guard (checkpoint doesn't touch it) or redb's
+    // "close and re-open the database" latch (any Io error here breaks and
+    // restarts the universe immediately, before a second op could ever reach
+    // an already-latched handle — unlike kernel.rs's SUT, which absorbs
+    // request Io into 500s and keeps running).
     text.contains("simulated") || text.contains("injected")
 }
 
