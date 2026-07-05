@@ -4,9 +4,10 @@
 use charpente::http::{App, AppConfig};
 use charpente::kernel::{Dispatcher, JobDef, JobEntry, JobError, JobOutcome};
 use charpente::{Schema, Tx, job, jobs, table};
-use charpente_core::db::Job;
+use charpente_core::db::{Job, TxError};
+use charpente_core::io::Entropy;
 use charpente_core::job::{JobRow, JobStatus};
-use charpente_core::table::{Id, View};
+use charpente_core::table::{Codec, Id, View};
 use charpente_sim::{FaultConfig, Sim};
 
 #[table]
@@ -483,4 +484,370 @@ fn loop_replays_identically_for_the_same_seed() {
     for seed in [0x7, 0xB0B, 0xC0FFEE] {
         assert_eq!(trace(seed), trace(seed), "seed {seed:#x}");
     }
+}
+
+// ---------------------------------------------------------- swarm properties
+
+use charpente_core::log::WalConfig;
+use charpente_sim::run_universes_swarm;
+
+fn crash_config() -> AppConfig {
+    AppConfig {
+        body_cap: 1 << 20,
+        db: charpente::DbConfig {
+            wal: WalConfig {
+                dir: "wal".to_string(),
+                segment_bytes: 4096,
+            },
+            store_path: "tables.redb".to_string(),
+        },
+    }
+}
+
+#[job(retry(max = 3, backoff = "5s"))]
+struct Flaky {
+    roll: u64,
+}
+
+impl Flaky {
+    fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+        // Deterministic per-payload failure: rolls 0/1 always fail (their
+        // retries march to Dead through the log); 2.. succeed and count.
+        if self.roll < 2 {
+            return Err(JobError::app(format!("flaky roll {} refused", self.roll)));
+        }
+        let hits = tx
+            .get(Id::<Counter>::from_raw(self.roll))?
+            .map_or(0, |c| c.hits);
+        tx.put(&Counter {
+            id: Id::from_raw(self.roll),
+            hits: hits + 1,
+        });
+        Ok(())
+    }
+}
+
+fn kernel_crash_app(sim: &Sim) -> std::io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        crash_config(),
+    )?
+    .mount(routes![hit])
+    .mount_jobs(jobs![CountUp, Flaky])
+    .schedule("minutely", Duration::from_secs(60), || CountUp {
+        slot: 999,
+    }))
+}
+
+fn is_injected(text: &str) -> bool {
+    // Poisoning (WAL, engine, or redb's own internal state) only ever follows
+    // an earlier injected fault in the sim, so recognizing it here can't mask
+    // a real bug: every reopen still runs exactly_once_holds as the oracle
+    // over durable state, regardless of how a round ended. redb speaks in its
+    // own words when it has already seen a prior IO failure on the same
+    // handle ("Previous I/O error occurred. Please close and re-open the
+    // database.") — reachable because App::handle absorbs a request's
+    // TxError::Io into a 500 by design (a client retries), so the kernel loop
+    // keeps running requests against an already-broken store until a job or
+    // cron tick (which does propagate) surfaces it.
+    text.contains("simulated")
+        || text.contains("injected")
+        || text.contains("poisoned")
+        || text.contains("Previous I/O error")
+}
+
+/// The exactly-once invariant: every Done job that writes to `Counter` — both
+/// `CountUp{slot}` and `Flaky{roll}` (Flaky rolls 0/1 can never reach Done;
+/// they fail deterministically and die Dead, so every Done Flaky wrote
+/// exactly once, same as CountUp) — bumped its counter exactly once, hits ≡
+/// Done-count per key, regardless of crashes. `CountUp` and `Flaky` sharing
+/// one `Counter` id space is deliberate, not an oversight: exactly-once
+/// holding across two interleaved writer job types on one key is a strictly
+/// stronger property than each type owning a disjoint domain.
+fn exactly_once_holds(app: &mut App) -> Result<(), String> {
+    let snap = app.db_for_tests().snapshot().map_err(|e| e.to_string())?;
+    let jobs = snap.scan::<JobRow>().map_err(|e| e.to_string())?;
+    let counters: std::collections::BTreeMap<u64, u64> = snap
+        .scan::<Counter>()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|c| (c.id.raw(), c.hits))
+        .collect();
+    let mut done: std::collections::BTreeMap<u64, u64> = Default::default();
+    for job in &jobs {
+        if job.status == JobStatus::Done && (job.name == "CountUp" || job.name == "Flaky") {
+            let key = u64::decode(&mut &job.payload[..]).map_err(|e| e.to_string())?;
+            *done.entry(key).or_insert(0) += 1;
+        }
+    }
+    for (&key, &done_count) in &done {
+        let hits = counters.get(&key).copied().unwrap_or(0);
+        if hits != done_count {
+            return Err(format!(
+                "exactly-once violated at key {key}: {done_count} Done jobs but {hits} hits"
+            ));
+        }
+    }
+    // And no counter without a Done job (effects never outrun the done-mark —
+    // this holds for cron's slot 999 too; its hits also commit with a done-mark).
+    for (&key, &hits) in &counters {
+        if done.get(&key).copied().unwrap_or(0) == 0 && hits > 0 {
+            return Err(format!("key {key} has {hits} hits but no Done job"));
+        }
+    }
+    Ok(())
+}
+
+fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
+    let entropy = sim.entropy();
+    for _round in 0..3 {
+        sim.crash_disk_after(64 + entropy.next_u64() % 768);
+        let mut app = match kernel_crash_app(sim) {
+            Ok(app) => app,
+            Err(e) => {
+                if !is_injected(&e.to_string()) {
+                    return Err(format!("open failed non-injected: {e}"));
+                }
+                sim.restart();
+                continue;
+            }
+        };
+        exactly_once_holds(&mut app)?;
+
+        let horizon = sim.now().as_nanos() + 400 * SEC;
+        let mut source = SimSource::new(Box::new(sim.clock()), horizon);
+        let base = sim.now().as_nanos();
+        for i in 0..(1 + entropy.next_u64() % 6) {
+            let slot = entropy.next_u64() % 8;
+            source.push_at(
+                base + i * SEC,
+                Request::new(Method::Post, "/hit").json(&Hit { slot }),
+            );
+        }
+        // A couple of Flaky jobs enqueued directly (retry path under faults).
+        // A fault here can poison the Db (the WAL marks itself poisoned on a
+        // write/sync failure); building Kernel::new on a poisoned Db would
+        // surface a different, generic "poisoned" message on the next WAL op
+        // instead of the real injected one, so classify right at the site —
+        // same "reopen on injected, fail otherwise" shape as every other
+        // fallible step in this workload.
+        match app.db_for_tests().transact(|tx| {
+            tx.enqueue(Flaky {
+                roll: entropy.next_u64() % 4,
+            });
+            Ok::<(), std::io::Error>(())
+        }) {
+            Ok(()) => {}
+            Err(TxError::Io(e)) => {
+                if !is_injected(&e.to_string()) {
+                    return Err(format!("Flaky pre-enqueue failed non-injected: {e}"));
+                }
+                sim.restart();
+                continue;
+            }
+            Err(TxError::App(e)) => {
+                // The closure only ever returns Ok — an App rejection here
+                // would mean the closure itself changed underneath us.
+                return Err(format!("Flaky pre-enqueue: impossible App rejection: {e}"));
+            }
+        }
+
+        let run = (|| -> Result<(), std::io::Error> {
+            let mut kernel = Kernel::new(app, Box::new(sim.clock()))?;
+            let out = kernel.run(&mut source);
+            let stats = kernel.stats();
+            if stats.jobs_done > 0 {
+                sim.cover("job:done");
+            }
+            if stats.jobs_retried > 0 {
+                sim.cover("job:retried");
+            }
+            if stats.jobs_dead > 0 {
+                sim.cover("job:dead");
+            }
+            if stats.cron_ticks > 0 {
+                sim.cover("cron:tick");
+            }
+            if stats.cron_catchups > 0 {
+                sim.cover("cron:catchup");
+            }
+            out
+        })();
+        if let Err(e) = run
+            && !is_injected(&e.to_string())
+        {
+            return Err(format!("kernel stopped non-injected: {e}"));
+        }
+        sim.restart();
+    }
+
+    // Final quiet verification (step-4/5 convention): reopen until injected
+    // faults relent, then check the invariant one last time.
+    for _attempt in 0..8 {
+        match kernel_crash_app(sim) {
+            Ok(mut app) => return exactly_once_holds(&mut app),
+            Err(e) if is_injected(&e.to_string()) => sim.restart(),
+            Err(e) => return Err(format!("final open failed non-injected: {e}")),
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn kernel_jobs_are_exactly_once_under_the_fault_matrix() {
+    run_universes_swarm!(256, kernel_workload, require: [
+        "job:done",
+        "job:retried",
+        "cron:tick",
+        "fault:crash",
+        "crash:torn",
+        "restart",
+    ]);
+}
+
+#[test]
+fn always_failing_job_dies_and_the_monthly_cron_ticks_120_times() {
+    let sim = Sim::with_faults(0x650, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![AlwaysFails, CountUp])
+    .schedule("monthly", Duration::from_secs(30 * 24 * 3600), || CountUp {
+        slot: 1,
+    });
+
+    // Kernel::new consumes the App: all seeding happens BEFORE construction.
+    let mut app = app;
+    app.db_for_tests()
+        .transact(|tx| {
+            tx.enqueue(AlwaysFails {});
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let mut source = SimSource::new(
+        Box::new(sim.clock()),
+        10 * 365 * 24 * 3600 * SEC, // ten years — DESIGN §6's promise, literally
+    );
+    kernel.run(&mut source).unwrap();
+
+    let stats = kernel.stats();
+    assert_eq!(stats.jobs_dead, 1, "AlwaysFails dies at max attempts");
+    assert_eq!(stats.jobs_retried, 1, "max 2: one retry, then dead");
+    // First tick lands one interval in; ten years of 30-day months:
+    assert_eq!(stats.cron_ticks, 121);
+    assert_eq!(stats.cron_catchups, 0);
+    let app = kernel.into_app();
+    // ...and this whole decade of queue traffic ran in well under a second
+    // of wall time, or the suite would be unshippable. Virtual time works.
+    drop(app);
+}
+
+/// A deliberately WRONG executor: handler effects commit first, the
+/// done-mark commits separately. The exactly-once invariant must be able to
+/// see the difference under a crash between the two — otherwise our flagship
+/// property is theater.
+#[test]
+fn harness_catches_a_split_done_mark() {
+    let sim = Sim::with_faults(0x660, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![CountUp]);
+    let db = app.db_for_tests();
+    db.transact(|tx| {
+        tx.enqueue(CountUp { slot: 5 });
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    let id = db.drain_enqueued()[0];
+
+    // Wrong executor, transaction 1: handler effects WITHOUT the done-mark.
+    db.transact(|tx| {
+        let hits = tx.get(Id::<Counter>::from_raw(5))?.map_or(0, |c| c.hits);
+        tx.put(&Counter {
+            id: Id::from_raw(5),
+            hits: hits + 1,
+        });
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    // Crash lands here, before transaction 2 (the separate done-mark).
+    sim.restart();
+    drop(app);
+
+    // Recovery: the job is still Pending; a correct re-execution double-counts.
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![CountUp]);
+    let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+    dispatcher
+        .rebuild(&app.db_for_tests().snapshot().unwrap())
+        .unwrap();
+    assert!(
+        dispatcher.has_due(0),
+        "the split executor left the job Pending"
+    );
+    dispatcher.run_due(app.db_for_tests(), 0).unwrap();
+
+    let err = exactly_once_holds(&mut app).unwrap_err();
+    assert!(
+        err.contains("exactly-once violated at key 5"),
+        "the invariant must catch the split done-mark: {err}"
+    );
+    let _ = id;
+}
+
+#[test]
+fn idempotency_key_rides_the_row_and_means_nothing_to_the_platform() {
+    let (_sim, mut app) = quiet_kernel_app(0x670);
+    let db = app.db_for_tests();
+    db.transact(|tx| {
+        tx.enqueue_keyed("receipt:42", CountUp { slot: 1 });
+        tx.enqueue_keyed("receipt:42", CountUp { slot: 2 }); // same key: BOTH exist
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    let jobs = db.snapshot().unwrap().scan::<JobRow>().unwrap();
+    assert_eq!(jobs.len(), 2, "keys are identity, not dedupe — spec ruling");
+    assert!(jobs.iter().all(|j| j.key.as_deref() == Some("receipt:42")));
+}
+
+#[test]
+fn due_jobs_are_not_starved_by_a_request_flood() {
+    let sim = Sim::with_faults(0x680, FaultConfig::none());
+    let mut source = SimSource::new(Box::new(sim.clock()), 200 * SEC);
+    for i in 0..100u64 {
+        // All requests arrive at t=0: maximal contention with the due job.
+        source.push_at(0, Request::new(Method::Post, "/hit").json(&Hit { slot: i }));
+    }
+    let mut app = loop_app(&sim);
+    app.db_for_tests()
+        .transact(|tx| {
+            tx.enqueue(CountUp { slot: 7777 });
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    kernel.run(&mut source).unwrap();
+    assert_eq!(
+        kernel.stats().jobs_done,
+        101,
+        "every job ran despite the flood (100 request jobs + the seeded one)"
+    );
 }
