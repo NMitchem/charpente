@@ -542,20 +542,21 @@ fn kernel_crash_app(sim: &Sim) -> std::io::Result<App> {
 }
 
 fn is_injected(text: &str) -> bool {
-    // Poisoning (WAL, engine, or redb's own internal state) only ever follows
-    // an earlier injected fault in the sim, so recognizing it here can't mask
-    // a real bug: every reopen still runs exactly_once_holds as the oracle
-    // over durable state, regardless of how a round ended. redb speaks in its
-    // own words when it has already seen a prior IO failure on the same
-    // handle ("Previous I/O error occurred. Please close and re-open the
-    // database.") — reachable because App::handle absorbs a request's
-    // TxError::Io into a 500 by design (a client retries), so the kernel loop
-    // keeps running requests against an already-broken store until a job or
-    // cron tick (which does propagate) surfaces it.
+    // Three recognized fault-fallout families — anything else must fail the
+    // universe for adjudication; the exactly-once check on reopen remains the
+    // oracle either way, so recognizing these can't mask a real bug:
+    //   1. injected/simulated wordings — the sim's own fault-injection sites.
+    //   2. our own poison wordings — the WAL/engine's poisoned-after-a-prior-
+    //      failure guard.
+    //   3. redb's latch — its own internal "already saw an IO error on this
+    //      handle" signal, reachable because App::handle absorbs a request's
+    //      TxError::Io into a 500 by design (a client retries), so the kernel
+    //      loop keeps running requests against an already-broken store until
+    //      a job or cron tick (which does propagate) surfaces it.
     text.contains("simulated")
         || text.contains("injected")
         || text.contains("poisoned")
-        || text.contains("Previous I/O error")
+        || text.contains("close and re-open the database")
 }
 
 /// The exactly-once invariant: every Done job that writes to `Counter` — both
