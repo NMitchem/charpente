@@ -119,8 +119,40 @@ the sim-capable IO layer comes first because it cannot be retrofitted.
   latent read errors), and two log durability fences (recovery-horizon rule for mid-log
   corruption; directory-entry durability at rotation) — all land with WAL segment
   management. NEIGHBORS carries the 2026-07 quarterly intel (quadrant still empty).
-- Next: M0 step 6 per PLAN.md — queue + cron: post-commit lease/dispatch off the
-  `charpente.jobs` table, idempotency keys, typed retry policy, cron ticks as
-  transactions; this is where the deterministic edge executor (DECISIONS §10) lands —
-  the kernel loop gains its second and third event sources. Its spec must carry the
-  executor same-shape rule (DESIGN §1).
+- **M0 step 6 done**: queue + cron + the deterministic edge executor (spec
+  docs/superpowers/specs/2026-07-02-queue-cron-design.md). `JobRow` moved into
+  `charpente-core` (meta-counter ids from `next_job_id`, bumped at apply; the raw
+  `(seq, idx)` substrate is gone); `#[job]` + `jobs![]` registration + typed `RetryPolicy`
+  (doubling backoff, Dead at max). Handlers are pure state transitions run inline as one
+  transaction — effects and the Done-mark commit atomically, exactly-once state effects
+  structurally; on `Err` a second transaction commits the failure record (attempts,
+  due_at, last_error), with `JobError::{App, Io}` keeping platform faults from consuming
+  retry budget (not an attempt: heap restored, row untouched); handler panics are absorbed
+  into the same retry path. Cron rows tick as transactions (recurring enqueuer, fire-once
+  catch-up, no backfill). The kernel loop (`charpente::kernel::Kernel::run`) is the
+  same-shape rule's home: one ready set over requests/jobs/cron, one entropy draw only
+  when contended; `serve.rs`'s blocking `recv` loop is gone, replaced by `ProdSource`.
+  Enqueue keys are external identity, unread by the platform in v0 (M1's external-IO
+  surface consumes them). Property suite (2×256 fresh-seed swarm batches, flagship green
+  repeatedly): exactly-once effects under the full fault matrix, dead-letter content, 121
+  ticks over ~10 virtual years plus exactly one catch-up tick after downtime,
+  no-starvation, key round-trip, a split-done-mark meta-test proving the harness would
+  catch the dual-write bug this design deletes, and (folding followup #24) response-trace
+  determinism with checkpoint `is_injected` routing in all three property test files. The
+  suite found and fixed 3 real bugs plus 1 checker gap while landing: `Kernel::new`
+  resurrecting serviced jobs via stale drain ids (regression seeds pinned in the
+  120-ticks/starvation tests), a swallowed injected fault misclassified as unrelated
+  poison, a cross-writer checker gap, and imprecise redb latch-wording matching.
+- **Open design item**: the request arm swallows request-path `Io` into a 500 and keeps
+  serving off a dead/poisoned disk until a job or cron tick stops the loop — needs a spec
+  decision (asymmetric with the job/cron arms, which do stop).
+- **Open cleanup**: `Kernel` and `ProdSource` anchor two independent `ProdClock`s in
+  `serve.rs` — precision-only skew, no correctness impact, converge on one shared
+  `Arc<dyn Clock>` later.
+- **Priority follow-up**: the pre-existing redb `page_manager.rs` panic (first seen
+  pre-step-6) now hits roughly 10–25% of 256-universe flagship batches — frequency is
+  higher than first estimated and it gates a headline suite; seeds recorded in
+  `.superpowers/sdd/progress.md`.
+- Next: M0 step 7 per PLAN.md — the `charpente test --sim` CLI (seeded parallel
+  universes, fault schedules, failure = seed + minimal repro command). Step 8 (the
+  agent-built demo app) is behind it.

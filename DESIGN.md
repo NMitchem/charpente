@@ -93,7 +93,10 @@ simulation — only the entropy behind the decision differs. A production loop t
 multiplexes by racing a real channel while the sim draws from a different structure is
 not testing the scheduler production runs. Throughput comes from the absence of network
 hops and lock contention, not from parallel mutation. This mirrors TigerBeetle and Redis:
-a single thread applying a log is astonishingly fast when it never waits.
+a single thread applying a log is astonishingly fast when it never waits. The rule is
+implemented (M0 step 6): `charpente::kernel`'s `Kernel::run` builds the ready set over
+requests (`RequestSource`), due jobs, and due cron ticks and draws one entropy pick only
+when more than one is ready — idle iterations spend no entropy.
 
 The HTTP kernel (`charpente::http`) lives inside the boundary — the sim drives
 `App::handle` directly; hyper only translates wire↔struct at the edge
@@ -150,12 +153,14 @@ makes repair possible.
 
 **Record payload (v0, implemented).** A committed transaction's effects:
 `[n: u32]` then n tagged effects — put `0x00 [table][row]`, delete
-`0x01 [table][id]`, enqueue `0x02 [job][payload]`, emit `0x03 [event][payload]`,
-strings and byte fields length-prefixed per the row codec. Table effects are
-the transaction's collapsed write set in (table, id) order — intermediate
-overwrites inside a transaction are observable by no one and are not logged;
-enqueues and emits keep call order. Replay resolves table names through the
-`Schema` registry passed to `Db::open`.
+`0x01 [table][id]`, enqueue `0x02 [job][payload][key: Option<String>]`, emit
+`0x03 [event][payload]`, strings and byte fields length-prefixed per the row
+codec. Table effects are the transaction's collapsed write set in (table, id)
+order — intermediate overwrites inside a transaction are observable by no one
+and are not logged; enqueues and emits keep call order. Replay resolves table
+names through the `Schema` registry passed to `Db::open`. The enqueue key is
+the job's stable external identity — carried, never interpreted inside the
+deterministic boundary in v0; M1's external-IO surface is what consumes it.
 
 **Isolation.** Serializable, trivially: transactions apply one at a time to the
 single-threaded core. Read-only queries run against consistent snapshots (see §4) and never
@@ -220,9 +225,13 @@ deterministic under identical op sequences (raw-fingerprint replay holds), and
 crash is only a crash if the process dies with the database open, which is exactly what
 the sim models. Index entries are `[key len: u32][key bytes][id: u64 be]` (length prefix
 prevents prefix-collision ambiguity); exact-match lookups only until a real query
-pattern demands order-preserving key encoding. A built-in `charpente.jobs` table (key
-`(seq, idx)`, value `[name][payload]`) materializes transactional enqueues in the same
-apply — the queue dispatcher's substrate (§6). A store that cannot open at all — e.g. a
+pattern demands order-preserving key encoding. A built-in `charpente.jobs` table
+materializes transactional enqueues in the same apply as a `JobRow` per enqueue effect —
+id from the monotonic `next_job_id` meta counter (bumped atomically with `applied_seq` in
+the same store transaction, deterministic across replay), plus name, payload, key,
+status (Pending/Done/Dead), attempts, due_at, and last_error — the queue dispatcher's
+substrate (§6). Done and Dead rows are retained (GC is a later question, filed with WAL
+segment GC). A store that cannot open at all — e.g. a
 crash tore its creation — is discarded at `Db::open` and rebuilt by replaying the WAL
 from scratch; the log is the only source of truth. That rebuild is safe only while the
 WAL is never compacted (it retains seq 0); WAL segment GC must revisit it.
@@ -244,13 +253,20 @@ the metadata, direct streaming for the bytes).
 
 ## 6. Queue, cron, realtime — all faces of the log
 
-- **Queue.** `tx.enqueue(job)` writes the job into the committing log record. Post-commit,
-  the dispatcher (outside the deterministic core, but sim-schedulable) leases jobs to
-  workers. At-least-once delivery; exactly-once *observability* via idempotency keys stored
-  transactionally with the job's own resulting transaction. Retries, backoff, and dead-letter
-  are typed policy on the `#[job]` item.
-- **Cron.** Schedules are rows; ticks are transactions. In simulation, virtual time makes
-  "run this monthly job 120 times" a subsecond test.
+- **Queue.** `tx.enqueue(job)`/`enqueue_keyed(key, job)` writes the job into the committing
+  log record; apply materializes a `JobRow` (§4). Post-commit, the kernel dispatcher runs
+  due jobs inline on the kernel thread: a `#[job]` handler is `fn run(self, tx: &mut Tx) ->
+  Result<(), JobError>` — itself a transaction. `Ok` commits its effects and the job's
+  Done-mark atomically in one record: exactly-once state effects, structurally. `Err`
+  aborts that transaction and a second commits the failure record — attempts, doubling
+  backoff, Dead at the policy's `max`, last_error carried (typed `RetryPolicy` on the
+  `#[job]` item; handler panics are absorbed into the same path). At-least-once execution
+  plus idempotency-key observability is the framing M1's external-effect handlers need; v0
+  handlers are pure state and don't need it yet.
+- **Cron.** Schedules are rows; a due tick is one transaction that advances `next_due` and
+  enqueues through the normal path — a recurring enqueuer, inheriting retry and
+  observability for free. Catch-up fires once per wake, never backfills. In simulation,
+  virtual time makes "run this monthly job 120 times" a subsecond test.
 - **Realtime.** `tx.emit(event)` puts events in the log; SSE/WebSocket subscribers tail the
   log with a cursor. Resume-from-cursor is exact (it is a log position), so reconnects have
   no silent gap — the failure mode that plagues every bolted-on pub/sub.
