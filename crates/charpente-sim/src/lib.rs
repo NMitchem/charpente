@@ -10,6 +10,7 @@
 //! (`File`'s supertrait). Every container with order-dependent iteration is a
 //! BTree — replaying a seed must be byte-identical, forever.
 
+pub mod checks;
 mod disk;
 mod net;
 pub mod rng;
