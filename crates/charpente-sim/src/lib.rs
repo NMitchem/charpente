@@ -932,29 +932,36 @@ pub fn run_universes_swarm_in(
     );
 }
 
-/// One universe: derive its `FaultConfig` from the seed (frozen derivation:
-/// `splitmix64` once more past the seed itself), run under `catch_unwind` so
-/// a panicking workload still gets a seed+config+repro report (the harness
-/// gap this runner closes — hard rule 5), and return its coverage marks.
+/// One universe, shared by the frozen swarm macro and the CLI harness
+/// (harness.rs). The seed→behavior mapping here is the frozen replay
+/// contract: config derives from `splitmix64(seed)`, the workload runs
+/// under catch_unwind, Ok returns coverage. Do not reorder anything.
+pub(crate) fn run_universe(
+    seed: u64,
+    f: &dyn Fn(&mut Sim) -> Result<(), String>,
+) -> Result<BTreeMap<&'static str, u64>, (FaultConfig, String)> {
+    let mut s = seed;
+    let cfg_seed = splitmix64(&mut s);
+    let cfg = FaultConfig::swarm(&mut Rng::new(cfg_seed));
+    let mut sim = Sim::with_faults(seed, cfg.clone());
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut sim))) {
+        Ok(Ok(())) => Ok(sim.coverage()),
+        Ok(Err(msg)) => Err((cfg, msg)),
+        Err(payload) => Err((cfg, panic_message(&*payload))),
+    }
+}
+
 fn run_one_swarm(
     package: &str,
     test_file: &str,
     seed: u64,
     f: &impl Fn(&mut Sim) -> Result<(), String>,
 ) -> BTreeMap<&'static str, u64> {
-    let mut s = seed;
-    let cfg_seed = splitmix64(&mut s);
-    let cfg = FaultConfig::swarm(&mut Rng::new(cfg_seed));
-    let mut sim = Sim::with_faults(seed, cfg.clone());
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut sim))) {
-        Ok(Ok(())) => sim.coverage(),
-        Ok(Err(msg)) => panic!(
+    match run_universe(seed, f) {
+        Ok(coverage) => coverage,
+        Err((cfg, msg)) => panic!(
             "{}",
             swarm_failure_report(package, test_file, seed, &cfg, &msg)
-        ),
-        Err(payload) => panic!(
-            "{}",
-            swarm_failure_report(package, test_file, seed, &cfg, &panic_message(&*payload))
         ),
     }
 }
