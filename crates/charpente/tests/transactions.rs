@@ -665,7 +665,10 @@ fn poisoned_reports_wal_poison_after_io_failure() {
             Ok::<_, io::Error>(())
         })
         .unwrap_err();
-    assert!(matches!(err, TxError::Io(_)), "a crashed disk must fail the commit");
+    assert!(
+        matches!(err, TxError::Io(_)),
+        "a crashed disk must fail the commit"
+    );
     assert!(
         db.poisoned(),
         "an Io commit failure must leave the db observably poisoned"
