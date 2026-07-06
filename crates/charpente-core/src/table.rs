@@ -322,9 +322,33 @@ impl Store {
         let mut txn = self.db.begin_write().map_err(redb_err)?;
         txn.set_durability(Durability::None).map_err(redb_err)?;
         let out = {
-            let mut writer = Writer { txn: &txn };
+            let next_job_id_before = {
+                let meta = txn.open_table(META).map_err(redb_err)?;
+                meta.get("next_job_id")
+                    .map_err(redb_err)?
+                    .map_or(0, |g| g.value())
+            };
+            let mut writer = Writer {
+                txn: &txn,
+                jobs_materialized: 0,
+            };
             let out = f(&mut writer)?;
             let mut meta = txn.open_table(META).map_err(redb_err)?;
+            // Negative-space: next_job_id is a monotonic counter bumped only
+            // by materialize_job. It must never move except by exactly one
+            // per job materialized in this apply — never backwards, never
+            // skipping, never double-counting a single effect.
+            let next_job_id_after = meta
+                .get("next_job_id")
+                .map_err(redb_err)?
+                .map_or(0, |g| g.value());
+            assert_eq!(
+                next_job_id_after,
+                next_job_id_before + writer.jobs_materialized,
+                "next_job_id moved from {next_job_id_before} to {next_job_id_after} in apply({seq}), \
+                 which materialized {} job(s) — the counter must advance by exactly one per job",
+                writer.jobs_materialized
+            );
             meta.insert("applied_seq", seq).map_err(redb_err)?;
             out
         };
@@ -361,6 +385,9 @@ impl Store {
 /// every put and delete.
 pub struct Writer<'txn> {
     txn: &'txn redb::WriteTransaction,
+    /// Count of `materialize_job` calls so far this apply — `Store::apply`
+    /// checks this against `next_job_id`'s actual movement.
+    jobs_materialized: u64,
 }
 
 impl Writer<'_> {
@@ -425,6 +452,7 @@ impl Writer<'_> {
             .map_or(0, |g| g.value());
         meta.insert("next_job_id", id + 1).map_err(redb_err)?;
         drop(meta);
+        self.jobs_materialized += 1;
         self.put(&crate::job::JobRow {
             id: crate::table::Id::from_raw(id),
             name: name.to_string(),
