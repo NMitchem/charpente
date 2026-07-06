@@ -989,6 +989,35 @@ fn swarm_failure_report(
     )
 }
 
+// ------------------------------------------------------------ App harness
+
+/// Generates the app's `tests/sim.rs` main (spec §App-side convention):
+/// explicit registration, `routes![]`/`jobs![]` idiom. Requires
+/// `harness = false` on the test target.
+#[macro_export]
+macro_rules! sim_tests {
+    ($($name:ident $(require [$($key:expr),* $(,)?])?),+ $(,)?) => {
+        fn main() {
+            let tests: &[$crate::harness::SimTest] = &[$(
+                $crate::harness::SimTest {
+                    name: stringify!($name),
+                    run: $name,
+                    require: &[$($($key),*)?],
+                },
+            )+];
+            let args = match $crate::harness::HarnessArgs::parse(std::env::args().skip(1)) {
+                Ok(args) => args,
+                Err(usage) => {
+                    eprintln!("{usage}");
+                    std::process::exit(2);
+                }
+            };
+            let code = $crate::harness::run(tests, &args, &mut std::io::stdout().lock());
+            std::process::exit(code);
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

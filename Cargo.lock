@@ -260,6 +260,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sim-fixture"
+version = "0.0.0"
+dependencies = [
+ "charpente",
+ "charpente-core",
+ "charpente-sim",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

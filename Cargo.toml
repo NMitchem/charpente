@@ -6,6 +6,7 @@ members = [
     "crates/charpente-macros",
     "crates/charpente-sim",
     "crates/charpente-cli",
+    "crates/sim-fixture",
 ]
 
 [workspace.package]

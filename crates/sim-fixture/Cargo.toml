@@ -1,0 +1,20 @@
+[package]
+name = "sim-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+charpente.workspace = true
+charpente-core.workspace = true
+
+[dev-dependencies]
+charpente-sim = { path = "../charpente-sim" }
+
+[[test]]
+name = "sim"
+harness = false
