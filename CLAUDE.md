@@ -143,9 +143,9 @@ the sim-capable IO layer comes first because it cannot be retrofitted.
   resurrecting serviced jobs via stale drain ids (regression seeds pinned in the
   120-ticks/starvation tests), a swallowed injected fault misclassified as unrelated
   poison, a cross-writer checker gap, and imprecise redb latch-wording matching.
-- **Open design item**: the request arm swallows request-path `Io` into a 500 and keeps
-  serving off a dead/poisoned disk until a job or cron tick stops the loop — needs a spec
-  decision (asymmetric with the job/cron arms, which do stop).
+  Ruling (2026-07-05, step-7 spec): the request arm now stops the loop when
+  `Db::poisoned()` is true after a request's 500 — it no longer keeps serving off a
+  dead engine, closing the prior asymmetry with the job/cron arms.
 - **Open cleanup**: `Kernel` and `ProdSource` anchor two independent `ProdClock`s in
   `serve.rs` — precision-only skew, no correctness impact, converge on one shared
   `Arc<dyn Clock>` later.

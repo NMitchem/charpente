@@ -96,7 +96,9 @@ hops and lock contention, not from parallel mutation. This mirrors TigerBeetle a
 a single thread applying a log is astonishingly fast when it never waits. The rule is
 implemented (M0 step 6): `charpente::kernel`'s `Kernel::run` builds the ready set over
 requests (`RequestSource`), due jobs, and due cron ticks and draws one entropy pick only
-when more than one is ready — idle iterations spend no entropy.
+when more than one is ready — idle iterations spend no entropy. The request arm stops the
+loop when the engine is poisoned (ruling 2026-07-05, spec `2026-07-05-sim-cli-design.md`):
+a 500 goes to the client first, then `Db::poisoned()` gates continuing.
 
 The HTTP kernel (`charpente::http`) lives inside the boundary — the sim drives
 `App::handle` directly; hyper only translates wire↔struct at the edge

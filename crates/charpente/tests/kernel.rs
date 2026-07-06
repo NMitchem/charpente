@@ -386,11 +386,14 @@ fn rebuild_restores_pending_jobs_after_reopen() {
 // ------------------------------------------------------------------- loop
 
 use charpente::http::ApiError;
-use charpente::http::{Method, Request};
-use charpente::kernel::{Kernel, SimSource};
+use charpente::http::{Method, Request, Response};
+use charpente::kernel::{Kernel, Reply, RequestSource, SimSource, Wake};
 use charpente::route;
 use charpente::routes;
+use charpente_core::io::Instant;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 const SEC: u64 = 1_000_000_000;
 
@@ -418,6 +421,79 @@ fn loop_app(sim: &Sim) -> App {
     .schedule("hourly-count", Duration::from_secs(3600), || CountUp {
         slot: 777,
     })
+}
+
+/// Scripted request source for tests that need the reply itself (`SimSource`
+/// above only records `(status, body)`): drains a fixed list of requests in
+/// order, then reports `Shutdown`.
+struct ScriptedSource {
+    requests: VecDeque<Request>,
+    replies: Arc<Mutex<Vec<Response>>>,
+}
+
+fn scripted_source(requests: Vec<Request>) -> (ScriptedSource, Arc<Mutex<Vec<Response>>>) {
+    let replies = Arc::new(Mutex::new(Vec::new()));
+    (
+        ScriptedSource {
+            requests: requests.into(),
+            replies: replies.clone(),
+        },
+        replies,
+    )
+}
+
+impl RequestSource for ScriptedSource {
+    fn poll(&mut self) -> Option<(Request, Reply)> {
+        let request = self.requests.pop_front()?;
+        let sink = self.replies.clone();
+        let reply: Reply = Box::new(move |response: Response| {
+            sink.lock()
+                .expect("replies lock poisoned by an earlier panic")
+                .push(response);
+        });
+        Some((request, reply))
+    }
+
+    fn wait_until(&mut self, _deadline: Option<Instant>) -> Wake {
+        if self.requests.is_empty() {
+            Wake::Shutdown
+        } else {
+            Wake::Ready
+        }
+    }
+}
+
+/// Spec ruling (2026-07-05): after a request-path Io becomes a 500, the
+/// kernel checks Db::poisoned() and stops — it must not keep serving
+/// guaranteed-500s off a dead engine. Non-poisoning failures keep step 5's
+/// 500-and-continue contract.
+#[test]
+fn kernel_stops_after_a_request_poisons_the_engine() {
+    // Fault-free open, then kill the disk: a lifetime sync_error would fail
+    // Db::open itself before any request runs (Task 1 hit this; its test
+    // validates the crash_disk_now -> Io -> poisoned mechanism used here).
+    let sim = Sim::with_faults(0x0DED_0001, FaultConfig::none());
+    let app = kernel_crash_app(&sim).unwrap();
+    let hit = |n: u64| Request::new(Method::Post, "/hit").json(&Hit { slot: n });
+    // Two requests scripted: the first 500s AND poisons; the loop must stop
+    // with Err before the second is ever serviced.
+    let (mut source, replies) = scripted_source(vec![hit(1), hit(2)]);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    sim.crash_disk_now(); // every disk op from here fails: request 1's commit Io-fails and poisons
+    let err = kernel
+        .run(&mut source)
+        .expect_err("poisoned engine must stop the loop");
+    assert!(
+        err.to_string().contains("poisoned"),
+        "stop error must name the poison contract: {err}"
+    );
+    let replies = replies.lock().unwrap();
+    assert_eq!(
+        replies.len(),
+        1,
+        "the poisoning request got its 500; the next was never served"
+    );
+    assert_eq!(replies[0].status, 500);
 }
 
 #[test]
@@ -549,10 +625,15 @@ fn is_injected(text: &str) -> bool {
     //   2. our own poison wordings — the WAL/engine's poisoned-after-a-prior-
     //      failure guard.
     //   3. redb's latch — its own internal "already saw an IO error on this
-    //      handle" signal, reachable because App::handle absorbs a request's
-    //      TxError::Io into a 500 by design (a client retries), so the kernel
-    //      loop keeps running requests against an already-broken store until
-    //      a job or cron tick (which does propagate) surfaces it.
+    //      handle" signal. Before the 2026-07-05 ruling, App::handle absorbed
+    //      a request's TxError::Io into a 500 and the kernel kept serving, so
+    //      a second request against the same already-broken handle could
+    //      surface this text. The request arm now stops the loop the moment
+    //      a request poisons the engine (Db::poisoned()), so within one
+    //      kernel run that path is closed; the text remains reachable from
+    //      this workload's own sequential reads (`exactly_once_holds`'s
+    //      snapshot/scan calls can still hit a freshly armed crash
+    //      mid-check) and stays recognized here for defense in depth.
     text.contains("simulated")
         || text.contains("injected")
         || text.contains("poisoned")

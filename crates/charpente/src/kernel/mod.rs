@@ -146,6 +146,17 @@ impl Kernel {
                     let response = self.app.handle(request);
                     reply(response);
                     self.stats.requests += 1;
+                    // Spec 2026-07-05 (request-arm ruling): a request-path Io
+                    // is absorbed into a 500 for the client, but a poisoned
+                    // engine serves no one — stop; restart-and-recover is the
+                    // only exit from poison. Non-poisoning faults continue.
+                    if self.app.db_mut().poisoned() {
+                        return Err(io::Error::other(
+                            "kernel stopped: the engine is poisoned (a request-path IO failure \
+                             made durability unknowable) — the request received its 500; \
+                             restart the process to recover from the WAL",
+                        ));
+                    }
                 }
                 Ready::Job => match self.dispatcher.run_due(self.app.db_mut(), now)? {
                     JobOutcome::Done { .. } => self.stats.jobs_done += 1,
