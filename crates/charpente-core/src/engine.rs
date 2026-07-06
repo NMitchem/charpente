@@ -98,4 +98,11 @@ impl<S: StateMachine> Engine<S> {
     pub fn last_applied(&self) -> Option<u64> {
         self.last_applied
     }
+
+    /// True if a post-sync apply failure poisoned the engine, or any IO
+    /// failure poisoned its WAL. A poisoned engine serves no further
+    /// transactions; restart-and-recover is the only exit.
+    pub fn poisoned(&self) -> bool {
+        self.poisoned || self.wal.poisoned()
+    }
 }

@@ -166,6 +166,13 @@ impl Wal {
         self.next_seq
     }
 
+    /// True after any IO failure on this log (fsyncgate: durability of
+    /// everything since the last good sync is unknown). The only exit is
+    /// restart-and-recover.
+    pub fn poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     fn rotate(&mut self) -> io::Result<()> {
         self.guard(self.tail.sync())?; // sync-before-rotate keeps `sync` a whole-log barrier
         let name = segment_name(&self.cfg.dir, self.next_seq);

@@ -641,6 +641,37 @@ fn transactions_replay_identically_for_the_same_seed() {
     }
 }
 
+/// Step 7 (spec §Ruled 3): the kernel needs to ask "is this engine dead?"
+/// after a request-path Io 500. Poison is already tracked (fsyncgate);
+/// this pins the read-only surface that exposes it.
+///
+/// Deviation from the task brief: the brief's literal test set
+/// `sync_error: 1.0` on the `Sim` up front, but `FaultConfig` is fixed for a
+/// `Sim`'s whole lifetime, and redb's store creation inside `Db::open`
+/// itself syncs — so that config fails `Db::open` before the test ever
+/// reaches `transact`. `crash_disk_now` (used elsewhere in this file, e.g.
+/// `broken_ordering_workload`) lets the open succeed and then guarantees
+/// the very next disk op fails, which is what actually exercises the
+/// poison path.
+#[test]
+fn poisoned_reports_wal_poison_after_io_failure() {
+    let sim = Sim::with_faults(0x9015_0DED, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), app_schema()).unwrap();
+    assert!(!db.poisoned(), "a fresh db must not be poisoned");
+    sim.crash_disk_now();
+    let err = db
+        .transact(|tx| {
+            tx.put(&invoice(1, 1, 1));
+            Ok::<_, io::Error>(())
+        })
+        .unwrap_err();
+    assert!(matches!(err, TxError::Io(_)), "a crashed disk must fail the commit");
+    assert!(
+        db.poisoned(),
+        "an Io commit failure must leave the db observably poisoned"
+    );
+}
+
 // ---------------------------------------------------- negative space
 
 /// The classic dual-write bug, reconstructed on purpose: apply to the store

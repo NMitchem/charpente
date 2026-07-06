@@ -540,6 +540,12 @@ impl Db {
     pub fn last_applied(&self) -> Option<u64> {
         self.engine.last_applied()
     }
+
+    /// True once the engine or its WAL is poisoned — every further transact
+    /// fails. Callers (the kernel loop) stop and restart to recover.
+    pub fn poisoned(&self) -> bool {
+        self.engine.poisoned()
+    }
 }
 
 #[cfg(test)]
