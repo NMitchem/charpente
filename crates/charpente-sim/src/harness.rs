@@ -3,8 +3,9 @@
 //! (`SimTest`), parses runner flags (`HarnessArgs`), and runs them as a
 //! sequential batch reusing the frozen single-universe executor
 //! (`crate::run_universe`) — the same seed→behavior mapping the internal
-//! swarm macro uses. Parallelism and JSON output (`Report::to_json`) land on
-//! top of this module later without changing these types.
+//! swarm macro uses. Runs a batch in parallel over a `--jobs`-sized thread
+//! pool and can render the report as JSON (`Report::to_json`) for downstream
+//! tooling.
 //!
 //! Batch model: one splitmix64 chain, seeded from the master seed, consumed
 //! in registry order — each selected test draws `args.universes` seeds in
@@ -15,8 +16,24 @@
 //! `--seed 0x…` bypasses the chain entirely: each selected test runs once on
 //! that literal seed, and coverage requirements are skipped (a single
 //! universe can't be expected to hit everything a batch would).
+//!
+//! Parallelism: all seeds for a batch are pre-derived on the main thread, in
+//! the exact registry order above, before any work is distributed — a pool
+//! of `args.jobs` workers then race over an index counter, so `--jobs 1` and
+//! `--jobs 8` consume the identical seed sequence and produce byte-identical
+//! `Report`s (worker scheduling is unobservable; only universe index orders
+//! the output).
+
+// The one sanctioned thread-spawning site in the workspace besides prod
+// impls: the harness orchestrates universes from OUTSIDE the deterministic
+// boundary — each universe inside a worker is a sealed, single-threaded,
+// seed-determined world, and reports are ordered by universe index so the
+// pool's scheduling is unobservable.
+#![allow(clippy::disallowed_methods)]
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::rng::splitmix64;
 use crate::{FaultConfig, Sim, ambient_base_seed, run_universe};
@@ -82,6 +99,21 @@ impl HarnessArgs {
                     ));
                 }
             }
+        }
+
+        if universes == 0 {
+            return Err(
+                "--universes must be at least 1 (0 universes is not a trustworthy signal — a \
+                 green run of zero universes proves nothing)"
+                    .to_string(),
+            );
+        }
+        if seed.is_some() && master_seed.is_some() {
+            return Err(
+                "--seed and --master-seed cannot be combined — --seed replays exactly one \
+                 literal universe, --master-seed only picks where a batch's seed chain starts"
+                    .to_string(),
+            );
         }
 
         Ok(HarnessArgs {
@@ -183,10 +215,16 @@ pub fn run(tests: &[SimTest], args: &HarnessArgs, out: &mut dyn std::io::Write) 
             &selected,
             args.master_seed.unwrap_or_else(ambient_base_seed),
             args.universes,
+            args.jobs,
         ),
     };
 
-    write_human(&report, out);
+    match args.format {
+        Format::Human => write_human(&report, out),
+        Format::Json => {
+            let _ = writeln!(out, "{}", report.to_json());
+        }
+    }
     if report.failures.is_empty() && report.missing_coverage.is_empty() {
         0
     } else {
@@ -216,7 +254,12 @@ fn run_single_seed(tests: &[&SimTest], seed: u64) -> Report {
     report
 }
 
-fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64) -> Report {
+/// One (test, universe) unit of work: the seed is pre-derived on the main
+/// thread before any worker starts, so `jobs` only changes scheduling, never
+/// the seed each universe runs with.
+type UniverseOutcome = Result<BTreeMap<&'static str, u64>, (FaultConfig, String)>;
+
+fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) -> Report {
     let mut report = Report {
         master_seed,
         universes,
@@ -224,12 +267,49 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64) -> Report {
         coverage: BTreeMap::new(),
         missing_coverage: Vec::new(),
     };
+
+    // Pre-derive every universe's seed on the main thread, in registry
+    // order, before any work is distributed — this is the entire reason
+    // `--jobs 1` and `--jobs 8` produce byte-identical reports.
     let mut state = master_seed;
+    let mut work: Vec<(usize, u64)> = Vec::with_capacity(tests.len() * universes as usize);
+    for test_index in 0..tests.len() {
+        for _ in 0..universes {
+            work.push((test_index, splitmix64(&mut state)));
+        }
+    }
+
+    let next = AtomicUsize::new(0);
+    let slots: Mutex<Vec<Option<UniverseOutcome>>> =
+        Mutex::new((0..work.len()).map(|_| None).collect());
+    let jobs = jobs.max(1);
+
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= work.len() {
+                        return;
+                    }
+                    let (test_index, seed) = work[index];
+                    let outcome = run_universe(seed, &tests[test_index].run);
+                    slots.lock().unwrap()[index] = Some(outcome);
+                }
+            });
+        }
+    });
+    let mut slots = slots.into_inner().unwrap();
+
+    let mut index = 0;
     for test in tests {
         let mut covered: BTreeMap<&'static str, u64> = BTreeMap::new();
         for _ in 0..universes {
-            let seed = splitmix64(&mut state);
-            match run_universe(seed, &test.run) {
+            let (_, seed) = work[index];
+            let outcome = slots[index]
+                .take()
+                .expect("every work item is filled before the pool returns");
+            match outcome {
                 Ok(cov) => merge(&mut covered, &cov),
                 Err((config, message)) => report.failures.push(Failure {
                     test: test.name,
@@ -238,6 +318,7 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64) -> Report {
                     message,
                 }),
             }
+            index += 1;
         }
         merge(&mut report.coverage, &covered);
         for key in test.require {
@@ -254,6 +335,115 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64) -> Report {
 fn merge(into: &mut BTreeMap<&'static str, u64>, from: &BTreeMap<&'static str, u64>) {
     for (key, count) in from {
         *into.entry(key).or_insert(0) += count;
+    }
+}
+
+impl Report {
+    /// Hand-assembled JSON (no dependency): field order is a pinned contract
+    /// downstream tooling parses. Seeds are always hex strings, never JSON
+    /// numbers — a `u64` seed routinely exceeds 2^53, the largest integer a
+    /// JSON-consuming float type can represent exactly. `summary` is always
+    /// the trailing field.
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        out.push('{');
+
+        out.push_str("\"master_seed\":\"");
+        out.push_str(&format!("{:#x}", self.master_seed));
+        out.push_str("\",\"universes\":");
+        out.push_str(&self.universes.to_string());
+
+        out.push_str(",\"failures\":[");
+        for (i, f) in self.failures.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"test\":\"");
+            json_escape(f.test, &mut out);
+            out.push_str("\",\"seed\":\"");
+            out.push_str(&format!("{:#x}", f.seed));
+            out.push_str("\",\"config\":");
+            config_json(&f.config, &mut out);
+            out.push_str(",\"message\":\"");
+            json_escape(&f.message, &mut out);
+            out.push_str("\",\"repro\":\"");
+            json_escape(
+                &format!(
+                    "charpente test --sim --filter {} --seed {:#x}",
+                    f.test, f.seed
+                ),
+                &mut out,
+            );
+            out.push_str("\"}");
+        }
+        out.push(']');
+
+        out.push_str(",\"coverage\":{");
+        for (i, (key, count)) in self.coverage.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push('"');
+            json_escape(key, &mut out);
+            out.push_str("\":");
+            out.push_str(&count.to_string());
+        }
+        out.push('}');
+
+        out.push_str(",\"missing_coverage\":[");
+        for (i, (test, key)) in self.missing_coverage.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"test\":\"");
+            json_escape(test, &mut out);
+            out.push_str("\",\"key\":\"");
+            json_escape(key, &mut out);
+            out.push_str("\"}");
+        }
+        out.push(']');
+
+        let passed = self.failures.is_empty() && self.missing_coverage.is_empty();
+        out.push_str(&format!(
+            ",\"summary\":{{\"failures\":{},\"missing_coverage\":{},\"passed\":{passed}}}",
+            self.failures.len(),
+            self.missing_coverage.len(),
+        ));
+
+        out.push('}');
+        out
+    }
+}
+
+fn config_json(cfg: &FaultConfig, out: &mut String) {
+    out.push_str(&format!(
+        "{{\"write_error\":{},\"sync_error\":{},\"crash_apply\":{},\"crash_torn\":{},\
+         \"disk_latency\":{{\"lo_ns\":{},\"hi_ns\":{}}},\"net_latency\":{{\"lo_ns\":{},\"hi_ns\":{}}}}}",
+        cfg.write_error,
+        cfg.sync_error,
+        cfg.crash_apply,
+        cfg.crash_torn,
+        cfg.disk_latency.0.as_nanos(),
+        cfg.disk_latency.1.as_nanos(),
+        cfg.net_latency.0.as_nanos(),
+        cfg.net_latency.1.as_nanos(),
+    ));
+}
+
+/// Escapes `"`, `\`, and control characters for a JSON string body (the
+/// caller supplies the surrounding quotes) — no `serde_json` dependency for
+/// output this small.
+fn json_escape(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
     }
 }
 
@@ -553,5 +743,195 @@ mod tests {
         let mut out = Vec::new();
         let code = run(&tests, &args, &mut out);
         assert_eq!(code, 0, "the failing test must be excluded by the filter");
+    }
+
+    // --------------------------------------------------- parse hardening
+
+    #[test]
+    fn universes_zero_is_a_usage_error() {
+        let err = parse(&["--universes", "0"]).unwrap_err();
+        assert!(err.contains("--universes"), "{err}");
+        assert!(err.contains('0'), "{err}");
+    }
+
+    #[test]
+    fn seed_and_master_seed_together_is_a_usage_error_naming_both_flags() {
+        let err = parse(&["--seed", "0x1", "--master-seed", "0x2"]).unwrap_err();
+        assert!(err.contains("--seed"), "{err}");
+        assert!(err.contains("--master-seed"), "{err}");
+    }
+
+    #[test]
+    fn non_hex_seed_value_reports_the_expected_message() {
+        let err = parse(&["--seed", "zzz"]).unwrap_err();
+        assert_eq!(
+            err,
+            "--seed expects a hex value like 0xdeadbeef, got \"zzz\""
+        );
+    }
+
+    // --------------------------------------------- parallel == sequential
+
+    fn sometimes_fails_from_entropy(sim: &mut Sim) -> Result<(), String> {
+        use charpente_core::io::Entropy;
+        let mut b = [0u8; 1];
+        sim.entropy().fill(&mut b);
+        if b[0] % 5 == 0 {
+            Err(format!("flaky: entropy byte {} was divisible by 5", b[0]))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn parallel_and_sequential_batches_produce_identical_reports() {
+        let test = SimTest {
+            name: "flaky",
+            run: sometimes_fails_from_entropy,
+            require: &[],
+        };
+        let master_seed = 0xf00d_beef_u64;
+
+        let sequential = run_batch(&[&test], master_seed, 64, 1);
+        let parallel = run_batch(&[&test], master_seed, 64, 8);
+
+        assert!(
+            !sequential.failures.is_empty(),
+            "the flaky workload must trigger at least one failure over 64 universes for this \
+             test to exercise failure ordering"
+        );
+        assert_eq!(sequential.master_seed, parallel.master_seed);
+        assert_eq!(sequential.universes, parallel.universes);
+        assert_eq!(sequential.coverage, parallel.coverage);
+        assert_eq!(sequential.missing_coverage, parallel.missing_coverage);
+        assert_eq!(
+            sequential.failures.len(),
+            parallel.failures.len(),
+            "sequential: {:?}\nparallel: {:?}",
+            sequential.failures,
+            parallel.failures
+        );
+        for (a, b) in sequential.failures.iter().zip(parallel.failures.iter()) {
+            assert_eq!(a.test, b.test);
+            assert_eq!(
+                a.seed, b.seed,
+                "failures must be ordered by universe index, not completion order"
+            );
+            assert_eq!(a.message, b.message);
+            assert_eq!(format!("{:?}", a.config), format!("{:?}", b.config));
+        }
+    }
+
+    // ------------------------------------------------- coverage (parallel)
+
+    #[test]
+    fn missing_coverage_pairs_test_name_with_key_exactly_under_a_parallel_run() {
+        fn covers_something_else(sim: &mut Sim) -> Result<(), String> {
+            sim.cover("sometimes:happens");
+            Ok(())
+        }
+        let test = SimTest {
+            name: "that_test",
+            run: covers_something_else,
+            require: &["never:happens"],
+        };
+        let report = run_batch(&[&test], 0x1234, 8, 4);
+        assert_eq!(
+            report.missing_coverage,
+            vec![("that_test".to_string(), "never:happens".to_string())]
+        );
+    }
+
+    #[test]
+    fn coverage_requirement_guidance_text_survives_a_parallel_run() {
+        fn covers_something_else(sim: &mut Sim) -> Result<(), String> {
+            sim.cover("sometimes:happens");
+            Ok(())
+        }
+        let tests = [SimTest {
+            name: "that_test",
+            run: covers_something_else,
+            require: &["never:happens"],
+        }];
+        let args = parse(&["--universes", "8", "--jobs", "4"]).unwrap();
+        let mut out = Vec::new();
+        let code = run(&tests, &args, &mut out);
+        assert_eq!(code, 1);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("that_test"), "{text}");
+        assert!(text.contains("never:happens"), "{text}");
+        assert!(
+            text.contains("raise the universe count, adjust the workload, or drop the requirement"),
+            "{text}"
+        );
+    }
+
+    // -------------------------------------------------------------- JSON
+
+    #[test]
+    fn json_master_seed_and_failure_seed_are_hex_strings_not_numbers() {
+        let tests = [SimTest {
+            name: "always_fails",
+            run: always_fails,
+            require: &[],
+        }];
+        let args = parse(&[
+            "--universes",
+            "1",
+            "--master-seed",
+            "0xabc123",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        let mut out = Vec::new();
+        let code = run(&tests, &args, &mut out);
+        assert_eq!(code, 1);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"master_seed\":\"0x"), "{text}");
+        assert!(
+            text.contains("\"test\":\"always_fails\",\"seed\":\"0x"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn json_failure_object_has_config_message_and_repro_fields() {
+        let tests = [SimTest {
+            name: "always_fails",
+            run: always_fails,
+            require: &[],
+        }];
+        let args = parse(&["--universes", "1", "--format", "json"]).unwrap();
+        let mut out = Vec::new();
+        let code = run(&tests, &args, &mut out);
+        assert_eq!(code, 1);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("\"config\":{"), "{text}");
+        assert!(text.contains("\"message\":\"toy failure\""), "{text}");
+        assert!(
+            text.contains("\"repro\":\"charpente test --sim --filter always_fails --seed 0x"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn json_output_has_a_trailing_summary_object() {
+        let tests = [SimTest {
+            name: "always_ok",
+            run: always_ok,
+            require: &[],
+        }];
+        let args = parse(&["--universes", "1", "--format", "json"]).unwrap();
+        let mut out = Vec::new();
+        let code = run(&tests, &args, &mut out);
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).unwrap();
+        let trimmed = text.trim_end();
+        assert!(trimmed.contains("\"summary\":{"), "{trimmed}");
+        assert!(
+            trimmed.ends_with("}}"),
+            "the summary object must be the trailing field: {trimmed}"
+        );
     }
 }
