@@ -340,10 +340,14 @@ fn merge(into: &mut BTreeMap<&'static str, u64>, from: &BTreeMap<&'static str, u
 
 impl Report {
     /// Hand-assembled JSON (no dependency): field order is a pinned contract
-    /// downstream tooling parses. Seeds are always hex strings, never JSON
-    /// numbers — a `u64` seed routinely exceeds 2^53, the largest integer a
-    /// JSON-consuming float type can represent exactly. `summary` is always
-    /// the trailing field.
+    /// downstream tooling parses (spec: docs/superpowers/specs/
+    /// 2026-07-05-sim-cli-design.md, "Failure output"). Seeds are always hex
+    /// strings, never JSON numbers — a `u64` seed routinely exceeds 2^53,
+    /// the largest integer a JSON-consuming float type can represent
+    /// exactly. Each failure record carries its own `master_seed` (the spec
+    /// requires a record to be self-contained once extracted from the
+    /// document); `summary` is the trailing field, exactly `{master_seed,
+    /// universes, failures, coverage}` per spec.
     pub fn to_json(&self) -> String {
         let mut out = String::new();
         out.push('{');
@@ -362,6 +366,8 @@ impl Report {
             json_escape(f.test, &mut out);
             out.push_str("\",\"seed\":\"");
             out.push_str(&format!("{:#x}", f.seed));
+            out.push_str("\",\"master_seed\":\"");
+            out.push_str(&format!("{:#x}", self.master_seed));
             out.push_str("\",\"config\":");
             config_json(&f.config, &mut out);
             out.push_str(",\"message\":\"");
@@ -378,17 +384,8 @@ impl Report {
         }
         out.push(']');
 
-        out.push_str(",\"coverage\":{");
-        for (i, (key, count)) in self.coverage.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push('"');
-            json_escape(key, &mut out);
-            out.push_str("\":");
-            out.push_str(&count.to_string());
-        }
-        out.push('}');
+        out.push_str(",\"coverage\":");
+        coverage_json(&self.coverage, &mut out);
 
         out.push_str(",\"missing_coverage\":[");
         for (i, (test, key)) in self.missing_coverage.iter().enumerate() {
@@ -403,16 +400,32 @@ impl Report {
         }
         out.push(']');
 
-        let passed = self.failures.is_empty() && self.missing_coverage.is_empty();
         out.push_str(&format!(
-            ",\"summary\":{{\"failures\":{},\"missing_coverage\":{},\"passed\":{passed}}}",
+            ",\"summary\":{{\"master_seed\":\"{:#x}\",\"universes\":{},\"failures\":{},\"coverage\":",
+            self.master_seed,
+            self.universes,
             self.failures.len(),
-            self.missing_coverage.len(),
         ));
+        coverage_json(&self.coverage, &mut out);
+        out.push('}');
 
         out.push('}');
         out
     }
+}
+
+fn coverage_json(coverage: &BTreeMap<&'static str, u64>, out: &mut String) {
+    out.push('{');
+    for (i, (key, count)) in coverage.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        json_escape(key, out);
+        out.push_str("\":");
+        out.push_str(&count.to_string());
+    }
+    out.push('}');
 }
 
 fn config_json(cfg: &FaultConfig, out: &mut String) {
@@ -893,6 +906,32 @@ mod tests {
             text.contains("\"test\":\"always_fails\",\"seed\":\"0x"),
             "{text}"
         );
+        // Every failure record is self-contained: it carries its own
+        // master_seed (spec field order test, seed, master_seed, config), on
+        // top of the document's top-level and summary master_seed fields —
+        // three occurrences total for this one-failure batch.
+        let occurrences = text.matches("\"master_seed\":\"0xabc123\"").count();
+        assert_eq!(
+            occurrences, 3,
+            "expected the top-level, per-failure, and summary master_seed: {text}"
+        );
+        let obj_start = text.find("\"test\":\"always_fails\"").unwrap();
+        let seed_pos = text[obj_start..]
+            .find("\"seed\":\"0x")
+            .map(|p| p + obj_start)
+            .unwrap();
+        let master_seed_pos = text[seed_pos..]
+            .find("\"master_seed\":\"0xabc123\"")
+            .map(|p| p + seed_pos)
+            .unwrap();
+        let config_pos = text[master_seed_pos..]
+            .find("\"config\":{")
+            .map(|p| p + master_seed_pos)
+            .unwrap();
+        assert!(
+            obj_start < seed_pos && seed_pos < master_seed_pos && master_seed_pos < config_pos,
+            "failure record field order must be test, seed, master_seed, config: {text}"
+        );
     }
 
     #[test]
@@ -916,22 +955,34 @@ mod tests {
     }
 
     #[test]
-    fn json_output_has_a_trailing_summary_object() {
+    fn json_summary_matches_the_spec_shape() {
         let tests = [SimTest {
-            name: "always_ok",
-            run: always_ok,
+            name: "always_fails",
+            run: always_fails,
             require: &[],
         }];
-        let args = parse(&["--universes", "1", "--format", "json"]).unwrap();
+        let args = parse(&[
+            "--universes",
+            "1",
+            "--master-seed",
+            "0xabc123",
+            "--format",
+            "json",
+        ])
+        .unwrap();
         let mut out = Vec::new();
         let code = run(&tests, &args, &mut out);
-        assert_eq!(code, 0);
+        assert_eq!(code, 1);
         let text = String::from_utf8(out).unwrap();
         let trimmed = text.trim_end();
-        assert!(trimmed.contains("\"summary\":{"), "{trimmed}");
+        // The spec pins the trailing summary object's field set exactly:
+        // {master_seed, universes, failures, coverage} (docs/superpowers/
+        // specs/2026-07-05-sim-cli-design.md, "Failure output").
         assert!(
-            trimmed.ends_with("}}"),
-            "the summary object must be the trailing field: {trimmed}"
+            trimmed.ends_with(
+                "\"summary\":{\"master_seed\":\"0xabc123\",\"universes\":1,\"failures\":1,\"coverage\":{}}}"
+            ),
+            "{trimmed}"
         );
     }
 }
