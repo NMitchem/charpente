@@ -12,6 +12,7 @@
 
 pub mod checks;
 mod disk;
+pub mod harness;
 mod net;
 pub mod rng;
 
