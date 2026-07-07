@@ -97,7 +97,7 @@ structurally is demonstrated, caught, and reverted at
 | [MANIFESTO.md](MANIFESTO.md) | Why this exists — the agent-era argument |
 | [DESIGN.md](DESIGN.md) | Architecture: the deterministic core, write model, typed surface, simulation |
 | [PLAN.md](PLAN.md) | Milestones (M0–M2), risks, non-goals |
-| [docs/GUIDE.md](docs/GUIDE.md) | How to build an app — agent-first, every code block compile-gated |
+| [docs/GUIDE.md](docs/GUIDE.md) | How to build an app — agent-first, every runnable example compile-gated |
 | [examples/invoicing](examples/invoicing) | The M0 demo: agent-built against the docs alone; DEMO.md + FINDINGS.md |
 
 ## Non-goals
