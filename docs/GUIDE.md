@@ -4,8 +4,10 @@
 and built by `crates/guide-examples` — `cargo build -p guide-examples` fails
 if a block stops compiling. Sections 1–4 cover the persistence layer:
 project setup, tables, the database, and transactions. Sections 5–7 cover
-the deterministic kernel: HTTP, jobs, and cron. Sections 8–9 — sim testing
-and an error index — land in later commits.)*
+the deterministic kernel: HTTP, jobs, and cron. Section 8 covers sim
+testing — writing `tests/sim.rs`, running `charpente test --sim`, and
+replaying a failure's seed. Section 9 is an error index: look up the
+message you're staring at.)*
 
 ## 1. Project setup
 
@@ -1189,3 +1191,512 @@ A pure background worker — jobs and cron, no routes of its own — mounts
 zero routes and still calls `serve`: v0's only entry point binds an HTTP
 listener alongside the job/cron loop (unrouted requests just 404). There
 is no separate headless-worker entry point yet.
+
+## 8. Sim testing
+
+Everything in §1–§7 routes ambient IO through `Disk`, `Entropy`, and
+`Clock` instead of touching the OS directly — that is the whole reason
+`charpente-sim` can exist. `charpente_sim::Sim` implements all three traits
+against one seed: a `u64` that determines virtual time, every entropy draw,
+and a fault matrix (write errors, sync errors, crashes between any two disk
+operations, torn writes). `App::handle` (§5) is what the simulator drives —
+your handlers, jobs, and cron ticks run completely unmodified; nothing
+about your app becomes "testable" specially, because it was already built
+on the traits. The product's core promise: the same seed always produces
+the same universe, so a failure a workload returns is not just a bug
+report — it is a one-command reproduction, forever.
+
+### `tests/sim.rs`
+
+§1 already set up the pieces: `charpente-sim` as a `dev-dependency`, and a
+`[[test]] name = "sim", harness = false` target. `harness = false` matters
+here — it tells Cargo not to link the default libtest harness into that
+binary, so `charpente_sim::sim_tests! { ... }` can supply its own `main`
+instead, one that knows how to run many seeded universes and report on
+them, rather than running a fixed list of `#[test]` functions once each.
+
+A workload is a plain function, `fn(&mut Sim) -> Result<(), String>`: `Ok(())`
+means the universe passed; `Err(message)` means it didn't, and so does a
+panic (both turn into the same kind of failure record). `sim_tests!` lists
+the workloads to run by name, each optionally followed by `require [...]` —
+sometimes-coverage keys (`Sim::cover`, plus the sim's own auto-covered
+`fault:*`/`crash:*`/`restart` keys) that must be hit at least once across
+that test's universes in a batch run, or the batch fails even if every
+universe individually passed. A `require`d key that never fires is telling
+you something real: either the workload never drives the system into that
+state, or the universe count is too low to make it likely.
+
+```rust
+use charpente::core::io::Disk;
+use charpente::{Db, DbConfig, Id, Schema, View, table};
+use charpente_sim::Sim;
+use charpente_sim::checks::{is_fault_fallout, replays_identically};
+
+#[table]
+struct Counter {
+    id: Id<Counter>,
+    hits: u64,
+}
+
+// This is the shape of `tests/sim.rs`'s top level — the macro generates the
+// binary's `fn main`, wiring these two workloads (and their `require` keys,
+// if any) into the harness's arg parsing and reporting.
+charpente_sim::sim_tests! {
+    counter_roundtrip require ["restart"],
+    counter_replays,
+}
+
+/// `sim_tests!` workloads return `Result<(), String>` — this one delegates
+/// to a helper that returns the interesting value instead, so the
+/// determinism checker below can reuse the exact same logic.
+fn counter_roundtrip(sim: &mut Sim) -> Result<(), String> {
+    counter_roundtrip_result(sim).map(|_| ())
+}
+
+/// `replays_identically` is the determinism oracle: it runs `workload` twice
+/// on two fresh `Sim`s seeded identically and demands both the return value
+/// and the durable end-state match byte-for-byte.
+fn counter_replays(sim: &mut Sim) -> Result<(), String> {
+    replays_identically(sim.seed(), counter_roundtrip_result)
+}
+
+/// Puts a row, restarts the simulated disk (crashes and reopens), and reads
+/// it back. Returns `None` — not a failure — when there is nothing to
+/// assert: the write was never acked, or either `Db::open` hit fault
+/// fallout (the harness's own fault paths, not this workload's contract,
+/// are under test elsewhere). `is_fault_fallout` recognizes the sim's own
+/// injected-fault wording, the WAL/engine poison wording, and redb's
+/// "close and re-open the database" latch — anything else is treated as a
+/// real bug and fails the universe.
+fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
+    let schema = || Schema::new().table::<Counter>();
+    let mut db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema()) {
+        Ok(db) => db,
+        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let acked = db
+        .transact(|tx| {
+            tx.put(&Counter {
+                id: Id::from_raw(1),
+                hits: 1,
+            });
+            Ok::<_, std::io::Error>(())
+        })
+        .is_ok();
+
+    sim.restart(); // power-cycles the simulated disk: unsynced writes tear or vanish
+    drop(db); // the old handle is dead after restart — reopen, per its own contract
+
+    let db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema()) {
+        Ok(db) => db,
+        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !acked {
+        return Ok(None);
+    }
+    let snap = db.snapshot().map_err(|e| e.to_string())?;
+    match snap.get::<Counter>(Id::from_raw(1)).map_err(|e| e.to_string())? {
+        Some(row) => Ok(Some(row.hits)),
+        None => Err("acked Counter row lost across a crash".to_string()),
+    }
+}
+```
+
+### The three checkers
+
+`charpente_sim::checks` ships three reusable oracles — reach for these
+before hand-rolling the same logic a fourth time:
+
+- `is_fault_fallout(text: &str) -> bool` — classifies an error's *text*:
+  is this the harness's own injected fault (or its consequences) rather
+  than a bug your workload should fail on? It recognizes the sim's
+  injected-fault wording, the WAL/engine poison wording, and redb's
+  "close and re-open the database" latch. Used inside a workload to turn
+  "the disk broke, as instructed" into "no answer this round" rather than
+  a hard failure — never to swallow anything else.
+- `replays_identically(seed: u64, workload: impl Fn(&mut Sim) -> Result<T, String>) -> Result<(), String>`
+  — the determinism oracle. Runs `workload` twice, each on its own fresh
+  `Sim::new(seed)`, and fails if the returned value or the durable
+  end-state (`Sim::durable_fingerprint`) diverge. It always constructs
+  plain `Sim::new` worlds (never a swarm `FaultConfig`), so replaying an
+  exact swarm universe's fault schedule needs its own `Sim` reconstructed
+  the same way `run_universe` builds one.
+- `acked_implies_durable(seed: u64, rounds: u32, drive: impl FnMut(&mut Sim) -> Result<Vec<String>, String>, verify: impl FnMut(&mut Sim, &[String]) -> Result<(), String>) -> Result<(), String>`
+  — the ack-durability property, generically: `rounds` times, `drive` does
+  one round of work and returns the ids it promised are durable (classifying
+  its own faults with `is_fault_fallout`, same as above), the sim restarts,
+  and `verify` checks every id acked *so far* survived. A failure names the
+  round it broke on.
+
+```rust,ignore
+pub fn is_fault_fallout(text: &str) -> bool
+
+pub fn replays_identically<T: PartialEq + std::fmt::Debug>(
+    seed: u64,
+    workload: impl Fn(&mut Sim) -> Result<T, String>,
+) -> Result<(), String>
+
+pub fn acked_implies_durable(
+    seed: u64,
+    rounds: u32,
+    drive: impl FnMut(&mut Sim) -> Result<Vec<String>, String>,
+    verify: impl FnMut(&mut Sim, &[String]) -> Result<(), String>,
+) -> Result<(), String>
+```
+
+A worked `acked_implies_durable` example — a toy that writes one byte per
+round and only claims the ack once its `sync` returns `Ok`:
+
+```rust
+use charpente::core::io::Disk;
+use charpente_sim::Sim;
+use charpente_sim::checks::{acked_implies_durable, is_fault_fallout};
+
+/// Returns a fresh `drive` closure: each call performs one round, writing
+/// the next byte and syncing before claiming its ack — never before.
+fn drive() -> impl FnMut(&mut Sim) -> Result<Vec<String>, String> {
+    let mut round: u64 = 0;
+    move |sim: &mut Sim| {
+        let file = match sim.disk().open("bytes") {
+            Ok(f) => f,
+            Err(e) if is_fault_fallout(&e.to_string()) => return Ok(vec![]),
+            Err(e) => return Err(e.to_string()),
+        };
+        if let Err(e) = file.write_at(round, &[0xAA]) {
+            let msg = e.to_string();
+            return if is_fault_fallout(&msg) { Ok(vec![]) } else { Err(msg) };
+        }
+        if let Err(e) = file.sync() {
+            let msg = e.to_string();
+            return if is_fault_fallout(&msg) { Ok(vec![]) } else { Err(msg) };
+        }
+        let id = format!("byte-{round}");
+        round += 1;
+        Ok(vec![id])
+    }
+}
+
+fn verify(sim: &mut Sim, acked: &[String]) -> Result<(), String> {
+    let file = sim.disk().open("bytes").map_err(|e| e.to_string())?;
+    let len = file.len().map_err(|e| e.to_string())?;
+    for id in acked {
+        let offset: u64 = id
+            .strip_prefix("byte-")
+            .expect("ack ids are \"byte-N\"")
+            .parse()
+            .expect("ack ids carry a numeric offset");
+        if offset >= len {
+            return Err(format!("{id} missing after restart (file len {len})"));
+        }
+    }
+    Ok(())
+}
+
+fn bytes_survive_restarts(sim: &mut Sim) -> Result<(), String> {
+    acked_implies_durable(sim.seed(), 5, drive(), verify)
+}
+```
+
+### `charpente test --sim`
+
+Run it from the app crate's own directory (or pass `--dir`):
+
+```bash
+charpente test --sim [--universes N] [--seed 0x…] [--master-seed 0x…] \
+    [--filter S] [--jobs N] [--format human|json] [--dir PATH]
+```
+
+- `--universes N` — how many fresh seeds to run **per selected test**
+  (default 256; must be at least 1 — a green run of zero universes proves
+  nothing).
+- `--seed 0x…` — bypass the batch entirely and run every selected test
+  once, on this exact literal seed. Coverage `require`ments are skipped (one
+  universe can't be expected to hit everything a batch would). This is the
+  replay flag: it is exactly what a failure's own `repro:` line uses.
+- `--master-seed 0x…` — pick where the batch's seed chain starts, instead
+  of fresh OS entropy, for a byte-identical repeat of an entire batch
+  (every test's every universe). Cannot be combined with `--seed`.
+- `--filter S` — run only tests whose name contains `S`. Filtering happens
+  **before** any seed is drawn, so a filtered run consumes a different (but
+  still fully reproducible) prefix of the seed chain than an unfiltered one
+  — this is why every individual failure's repro line carries its own
+  universe seed rather than relying on the batch's master seed.
+- `--jobs N` — how many universes to run in parallel (default: the host's
+  available parallelism). Every universe's seed is pre-derived on the main
+  thread, in registry order, before any work is handed out, so `--jobs 1`
+  and `--jobs 8` run the identical seed sequence and produce byte-identical
+  reports — worker scheduling is unobservable.
+- `--format human|json` — human is the default; `json` emits one object
+  with `master_seed`, `universes`, `failures` (each carrying its own `test`,
+  `seed`, `master_seed`, `config`, `message`, and copy-pasteable `repro`
+  command), `coverage`, `missing_coverage` (`{test, key}` pairs), and a
+  trailing `summary`, for downstream tooling.
+- `--dir PATH` — the app crate directory to build and run sim tests from
+  (default: `.`). This flag is consumed by the CLI itself; every other flag
+  passes straight through to the sim binary the CLI builds and execs.
+
+Exit codes: **0** every universe of every selected test passed and every
+`require`d coverage key was hit; **1** at least one universe failed, or a
+coverage requirement went unmet — the run itself completed, but something
+in it was red; **2** the run never got that far — a build failure, no
+`tests/sim.rs` target found, an unrecognized flag, a filter matching no
+tests, or the sim binary failing to launch or exiting by signal. Exit code
+2 means "rerun once this is fixed," not "here is a reproducible bug."
+
+### Reading a failure, replaying its seed
+
+A human-format failure looks like this (the exact shape a pinned test in
+`charpente-sim`'s harness checks byte-for-byte):
+
+```text
+sim failure in receipts_exactly_once: exactly-once violated: hits 2, done 1 for key 3
+  seed:   0x8bee1752811ae873
+  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms) }
+  repro:  charpente test --sim --filter receipts_exactly_once --seed 0x8bee1752811ae873
+```
+
+Four lines, each load-bearing:
+
+- The first line is the workload's own `Err` message (or an absorbed panic
+  payload) — the actual claim that failed.
+- `seed` is the one `u64` that determined this entire universe: virtual
+  time, every entropy draw, and the fault matrix's decisions.
+- `config` is that universe's sampled `FaultConfig` — the fault rates and
+  latency ranges actually in effect (swarm testing draws a different matrix
+  per universe rather than one fixed set for every run; §7 mentions the
+  swarm sampler's other consumer, virtual-time cron testing). Reading it
+  tells you what kind of trouble was injected — e.g. `crash_torn: 0.664668`
+  here means torn writes were common in this universe.
+- `repro` is not advice, it **is** the reproduction: paste that exact line
+  and the same universe runs again, because `--seed` (above) replays a
+  literal seed byte-identically. There is no separate "figure out how to
+  reproduce this" step — the failure message already did that work.
+
+The same discipline extends outward: `run_universes!`/`run_universes_swarm!`
+(the frozen internal-suite macros the platform's own tests use) and
+`charpente test --sim` share the same seed→behavior mapping, so
+`CHARPENTE_SEED=0x… cargo test -p <pkg> --test <file>` and `charpente test
+--sim --seed 0x…` are the same idea at two different layers: a failure's
+seed is always enough, on its own, to see the exact same universe again.
+
+## 9. Error index
+
+A lookup, not a tutorial: find the message you're staring at (or its
+stable prefix — noted where the real text carries a runtime value), read
+what it means, and what to do. Every message below names its own fix
+already (hard rule 5) — this index adds which subsystem produced it, since
+that's what a bare string on a terminal doesn't tell you.
+
+### `#[table]` shape violations (`charpente-macros/src/table.rs`, compile time)
+
+Six ways `#[table]` rejects a struct — §2 walks through all of them on a
+`Ping` example:
+
+```text
+missing `id: Id<Ping>` field — every #[table] row needs a typed primary key (add `id: Id<Ping>`)
+the `id` field of a #[table] must be `Id<Ping>` — a typed id, never a bare integer
+`id` is the primary key — it is already the fastest lookup; remove #[index]
+#[table] needs named fields — `Ping` must be a braced struct with an `id: Id<Ping>` field
+#[table] applies to structs — enums and unions cannot be rows
+#[table] structs cannot be generic — a table is one concrete row shape; make `Ping` non-generic
+```
+
+In order: no `id` field at all — add one. `id` present but not `Id<Self>` —
+type it. `#[index]` on `id` itself — remove it, `id` is already the primary
+key. Not a braced struct with named fields (tuple/unit structs) — rewrite
+as one. An enum or union — `#[table]` only applies to structs. A generic
+struct — a table is one concrete row shape; monomorphize it yourself before
+attaching `#[table]`.
+
+One more, at runtime rather than macro-expansion time — corrupted or
+schema-drifted bytes on disk fail to decode into a row:
+
+```text
+row decode: 3 trailing bytes after a Ping row — schema drift or corruption
+```
+
+Meaning: the byte layout on disk doesn't match the struct's current fields
+— usually a field was added, removed, or reordered without a migration
+(§2: fields encode in declaration order). Fix: don't reorder or remove
+fields on a table with durable data; add new fields, or write a v1 schema
+(nothing exists for that yet — v0 is one fixed layout per table type).
+
+### `#[route]` argument-convention violations (`charpente-macros/src/route.rs`, compile time)
+
+```text
+a #[route] handler's first argument must be `tx: &mut Tx` — `ping` is missing it
+`get_note` takes 0 argument(s) after `tx` (excluding `ctx`) but the path "/notes/:id" has 1 :param(s) — write one argument per :param (same name, path order) plus at most one JSON body argument
+this argument must be named `id` to match :id in "/notes/:id" — got `key`
+route path must start with '/' — got "notes"
+unknown method PUSH — one of GET, POST, PUT, PATCH, DELETE
+the route path must be a string literal — e.g. #[route(GET "/notes/:id")]
+the only route flag is `auth` — write `#[route(GET "/path", auth)]`
+#[route] handlers are free functions — no `self`
+empty :param name in "/notes/:"
+write `#[route(METHOD "/path")]` — e.g. #[route(GET "/notes/:id")]
+```
+
+§5's "What `#[route]` rejects" walks through the first three with full
+examples. The rest, in order: the path literal doesn't start with `/`; the
+method name isn't one of `GET`/`POST`/`PUT`/`PATCH`/`DELETE`; the path
+isn't a string literal at all (e.g. a `const`); the trailing flag after the
+path isn't `auth`; the handler takes `self` (route handlers are free
+functions); a `:` segment has nothing after it; and the macro's own
+argument list didn't parse as `METHOD "/path"` to begin with. Every one of
+these is a compile error at the `#[route]` call site — fix the signature or
+the pattern and it's gone.
+
+### `#[job]` retry-syntax and shape violations (`charpente-macros/src/job.rs`, compile time)
+
+```text
+write `#[job]` or `#[job(retry(max = <int>, backoff = "<n><unit>"))]` (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff = "10s"))]`
+backoff "10" has no unit — write `#[job]` or `#[job(retry(max = <int>, backoff = "<n><unit>"))]` (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff = "10s"))]`
+unknown retry field `jitter` — write `#[job]` or `#[job(retry(max = <int>, backoff = "<n><unit>"))]` (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff = "10s"))]`
+`max` given twice — write it once
+`backoff` given twice — write it once
+backoff "12xs": "12x" is not a whole number — write `#[job]` or `#[job(retry(max = <int>, backoff = "<n><unit>"))]` (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff = "10s"))]`
+backoff "99999999999999h" overflows u64 milliseconds — write `#[job]` or `#[job(retry(max = <int>, backoff = "<n><unit>"))]` (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff = "10s"))]`
+#[job] applies to structs — enums and unions cannot be job payloads
+#[job] structs cannot be generic — a job is one concrete payload shape; make `Baz` non-generic
+#[job] needs named fields — `Baz` must be a braced struct
+```
+
+Anything other than bare `#[job]` or `#[job(retry(max = <int>, backoff =
+"<n><unit>"))]` (unit one of `ms`, `s`, `m`, `h`) hits the first message —
+it names the two accepted forms directly, so the fix is always "match one
+of those two shapes." The rest are that same message with more specific
+context prepended: a backoff string missing its unit, an unrecognized field
+name inside `retry(...)`, `max`/`backoff` written twice, a backoff whose
+number doesn't parse, or one so large it overflows `u64` milliseconds once
+converted to it. The last three are the same struct-shape checks `#[table]`
+makes (§2): only structs, only non-generic, only named fields.
+
+Three more, at job-dispatch time rather than macro-expansion time
+(`charpente/src/kernel/dispatch.rs` — covered behaviorally in §6's "Retry,
+dead-letter, and exactly-once effects"):
+
+```text
+job decode for SendReceipt: <the underlying decode error> — schema drift or corruption
+handler panicked: <the panic payload>
+job "SendReceipt" is not registered — add it to the jobs![…] list passed to App::mount_jobs (or this log outlived a renamed job type)
+```
+
+The first: a `JobRow`'s stored payload no longer decodes as its named job
+type — same schema-drift story as a table row, but for a job's fields.
+Fix, same rule: don't reorder or remove a job payload's fields once jobs of
+that type may exist Pending in the store. The second: your `run` method (or
+something it called) panicked; charpente absorbs it as an ordinary handler
+rejection (an attempt, counted against retry budget) rather than crashing
+the kernel thread — fix the panic like any other bug in `run`. The third: a
+`JobRow` in the store names a job type that isn't in the `jobs![...]` list
+passed to `App::mount_jobs` — usually a job type was renamed or removed
+without a matching change to old enqueued rows; add it back to the list, or
+accept that those rows are now permanently unreachable.
+
+One more from the same file, `JobError::Io`'s own `Display` — not a
+rejection at all, the opposite: proof nothing was attempted, folded into
+the poisoned-engine story below:
+
+```text
+platform IO failure during the handler (not an attempt): <e>
+```
+
+### Router mount conflict (`charpente/src/http/router.rs`, `App::mount` time)
+
+```text
+route conflict: GET /notes/:key (fn by_key) collides with GET /notes/:id (fn by_id) — two routes with the same method and shape can both match one path; change one pattern
+```
+
+Two mounted routes share a method and a shape — the same sequence of
+literal-vs-`:param` segments, so both could match one real incoming path
+(§5: a literal segment beats a `:param` at the same position instead of
+conflicting, so `/notes/all` and `/notes/:id` are fine together; two
+different `:param` names at the same position are not). This panics at
+`.mount(...)` time, before the app ever serves a request — fix by changing
+one of the two patterns so their shapes differ.
+
+### Duplicate registration (`charpente/src/http/app.rs`, `charpente-core/src/db.rs`, mount time)
+
+```text
+job "CountUp" registered twice — each #[job] type is mounted once
+cron schedule "nightly" scheduled twice — schedule each name once
+Ctx::create_session called twice in one request — one session per request
+Schema: table "Counter" registered twice — register each #[table] type once
+```
+
+The first three are all the same shape as the router conflict above, just
+for a different registry: `App::mount_jobs([...])` (§6), `App::schedule(...)`
+(§7), and `Ctx::create_session` (§5's Sessions section — called at most once
+per request, since the token is drawn before the transaction starts) each
+panic the moment a name is reused. The fourth (§3) is `Schema::table::<R>()`
+— called twice for the same `#[table]` type when building the `Schema`
+passed to `Db::open`, including registering `Session` or `charpente.jobs`
+yourself (`App::open`/`Db::open` already register those). Fix in every
+case: register that name/type exactly once.
+
+### Record and body size limits (`charpente-core/src/db.rs`, `charpente-core/src/log.rs`, `charpente/src/http/app.rs`)
+
+```text
+transaction effects are 20000000 bytes but one log record holds at most 16777216 — split the work into smaller transactions
+contract: WAL records are 1..=16777216 bytes — got 0
+request body is 65 bytes but the cap is 64 — raise AppConfig.body_cap or send less
+```
+
+The first (§4) is `Db::transact`'s own assert: everything one transaction
+buffers — every `put`/`delete`/`enqueue`/`emit` — must fit in one 16 MiB
+(`1 << 24` byte) log record, checked right before the record is appended.
+Fix: split the transaction into smaller ones. The second is the WAL's own
+mirrored contract on `Wal::append` (`charpente-core::log::MAX_RECORD_BYTES`)
+— the same ceiling, one layer lower; `Db::transact`'s assert fires first in
+practice, since it checks the same limit before ever calling `append`. The
+third (§5) is `AppConfig::body_cap` (default 1 MiB) rejecting an oversized
+request body — this is what fences the first assert from ever seeing raw
+network input; production also enforces the cap at the wire, before routing,
+with its own near-identical 413 text (`"request body exceeds the N-byte cap
+— raise AppConfig.body_cap or send less"`) — code exercised only through
+`App::handle` (sim tests included) only ever sees the kernel-layer message
+quoted above, since the wire check is a `charpente::serve`-only path.
+
+### Schema / replay mismatches (`charpente-core/src/db.rs`)
+
+```text
+log record references table "widgets" but the Schema does not include it — register it in the Schema passed to Db::open, or migrate the log
+```
+
+The WAL holds a record naming a table that isn't in the `Schema` handed to
+this `Db::open` call — almost always a `#[table]` type was removed from
+your app (or its registration dropped) while old durable data still
+references it by name. Fix: register the table again, at least until that
+data is migrated away; §3 covers registration.
+
+### Poisoned-engine errors (restart-and-recover)
+
+```text
+WAL poisoned by an earlier IO failure — durability is unknown and fsync cannot honestly be retried; restart and recover
+engine poisoned: a durable record failed to apply, so machine state no longer matches the log — restart and recover
+internal storage failure — the request may or may not have committed; retry after the server recovers: <e>
+```
+
+All three describe the same family: an IO failure landed somewhere the
+platform cannot honestly shrug off. The first (`charpente-core/src/log.rs`)
+is the WAL itself — any failed append or sync leaves the durability of
+everything since the last good sync genuinely unknown ("fsyncgate"), so the
+log refuses every further operation rather than guess. The second
+(`charpente-core/src/engine.rs`) is the apply loop: a record synced
+successfully (so it **is** durable) but the state machine then failed to
+apply it, meaning in-memory state has diverged from the log — the only
+honest response is to stop, not to keep applying against a machine that no
+longer matches its own history. The third (`charpente/src/http/app.rs`,
+§5's "Ack-after-durable") is how a poisoned engine surfaces to an HTTP
+caller: `TxError::Io` after the handler's own logic already returned `Ok`,
+so whether the write landed is genuinely unknown from the caller's side too
+— the 500 says so instead of guessing. In every case the fix is the same:
+restart the process. Recovery (`Db::open`/`Engine::recover`, §3) replays the
+WAL from the last checkpoint and is itself idempotent, so restart-and-retry
+is always the correct response to any of these three, never a retry loop
+against the same live, poisoned handle. `Db::poisoned()` lets the kernel
+loop check this directly — per the step-7 ruling, the request arm now stops
+serving once a request's own 500 leaves the engine poisoned, rather than
+keep accepting traffic against a dead engine.
