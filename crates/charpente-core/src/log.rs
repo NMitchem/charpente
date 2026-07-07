@@ -198,7 +198,8 @@ impl Wal {
     /// barrier runs after each removal, so a crash can resurrect at most
     /// the most-recently-removed segment — always adjacent to the retained
     /// set, never a gap (a resurrected segment below a durable checkpoint
-    /// replays as no-ops through the store's skip_through gate).
+    /// replays as no-ops through the store's skip_through gate, once
+    /// `Db::open` seeds recovery from `base_seq` — T3).
     pub fn gc(&mut self, keep_from: u64, retain_segments: usize) -> io::Result<()> {
         self.check_poison()?;
         let prefix = format!("{}/", self.cfg.dir);

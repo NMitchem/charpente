@@ -603,10 +603,14 @@ fn gc_crash_workload(sim: &mut Sim) -> Result<(), String> {
         let keep_from = entropy.next_u64() % (submitted.len() as u64 + 1);
         // gc itself can hit an injected fault mid-loop (poisoning the wal,
         // fsyncgate-style) — that is expected and exactly what this property
-        // must survive, not an error to propagate.
+        // must survive, not an error to propagate. Note the in-memory
+        // base_seq is NOT a bound on the post-crash floor: a remove can
+        // succeed while its following barrier fails (base_seq unadvanced),
+        // and the crash coin can still make that removal stick — the floor
+        // then legitimately lands above base_seq. Gap-freedom is the
+        // property, and the reopen's "a segment is missing" check owns it.
         let _ = wal.gc(keep_from, 2);
     }
-    let base = wal.base_seq();
 
     sim.crash_disk_now();
     sim.restart();
@@ -649,12 +653,6 @@ fn gc_crash_workload(sim: &mut Sim) -> Result<(), String> {
         }
     }
     if acked > 0 {
-        let recovered_first = records.first().map_or(0, |(s, _)| *s);
-        if recovered_first > base {
-            return Err(format!(
-                "gc left a gap: base was {base} but recovery's floor is {recovered_first}"
-            ));
-        }
         let last_acked_seq = acked as u64 - 1;
         let recovered_last = records.last().map(|(s, _)| *s);
         if recovered_last.is_none_or(|s| s < last_acked_seq) {
