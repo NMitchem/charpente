@@ -1,8 +1,8 @@
 # M0 step 5 — HTTP layer: design
 
-Status: awaiting Noah's review. The boundary decision marked **[FLAGGED]** was made on
-the recommended option after the question went unanswered (Noah away); everything else
-follows README/DESIGN/PLAN/DECISIONS directly.
+Status: signed off by Noah 2026-07-06. The boundary decision marked **[FLAGGED]** was
+made on the recommended option while Noah was away and has since been explicitly
+approved; everything else follows README/DESIGN/PLAN/DECISIONS directly.
 
 ## Goal
 
