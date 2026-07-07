@@ -227,8 +227,15 @@ pub fn list_invoices(tx: &mut Tx) -> Result<Vec<InvoiceView>, ApiError> {
     Ok(out)
 }
 
+// WRONG (deliberately, for the M0 step-8 dual-write demo — see
+// examples/invoicing/DEMO.md): the send-receipt enqueue is split out of the
+// finalize transaction into a SECOND, separately-committed one
+// (`Ctx::enqueue_in_a_second_transaction`). Transaction A marks the invoice
+// Final and emits `InvoiceFinalized`; transaction B enqueues `SendReceipt`.
+// A crash between the two acks the finalize but never durably records that
+// a receipt is owed — no error, no log, just a gap.
 #[route(POST "/invoices/:id/finalize", auth)]
-pub fn finalize_invoice(tx: &mut Tx, id: Id<Invoice>) -> Result<InvoiceView, ApiError> {
+pub fn finalize_invoice(tx: &mut Tx, id: Id<Invoice>, ctx: &Ctx) -> Result<InvoiceView, ApiError> {
     let mut inv = tx.get(id)?.ok_or(ApiError::NotFound)?;
     if inv.state != InvoiceState::Draft {
         return Err(ApiError::BadRequest(format!(
@@ -239,8 +246,8 @@ pub fn finalize_invoice(tx: &mut Tx, id: Id<Invoice>) -> Result<InvoiceView, Api
     }
     inv.state = InvoiceState::Final;
     tx.put(&inv);
-    tx.enqueue(SendReceipt { invoice: id.raw() });
     tx.emit(InvoiceFinalized { invoice: id.raw() });
+    ctx.enqueue_in_a_second_transaction(SendReceipt { invoice: id.raw() });
     Ok(invoice_view(tx, &inv)?)
 }
 

@@ -287,7 +287,7 @@ impl Tx {
     pub fn enqueue<J: Job>(&mut self, job: J) {
         let mut payload = Vec::new();
         job.encode(&mut payload);
-        self.effects.enqueues.push((J::NAME, payload, None));
+        self.enqueue_raw(J::NAME, payload, None);
     }
 
     /// Enqueues with an idempotency key: the job's stable identity to the world
@@ -302,7 +302,17 @@ impl Tx {
         );
         let mut payload = Vec::new();
         job.encode(&mut payload);
-        self.effects.enqueues.push((J::NAME, payload, Some(key)));
+        self.enqueue_raw(J::NAME, payload, Some(key));
+    }
+
+    /// Enqueues by job name and a pre-encoded payload, bypassing `Job`'s type
+    /// safety — the shared primitive behind `enqueue`/`enqueue_keyed`'s typed
+    /// wrappers above. Also used (deliberately, for the M0 step-8 dual-write
+    /// demo — see examples/invoicing/DEMO.md) by `Ctx`'s second-transaction
+    /// escape hatch in crates/charpente/src/http/app.rs. App code should
+    /// reach for `enqueue`/`enqueue_keyed` instead.
+    pub fn enqueue_raw(&mut self, name: &'static str, payload: Vec<u8>, key: Option<String>) {
+        self.effects.enqueues.push((name, payload, key));
     }
 
     pub fn emit<Ev: Event>(&mut self, event: Ev) {
