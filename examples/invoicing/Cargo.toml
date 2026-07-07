@@ -1,0 +1,21 @@
+[package]
+name = "invoicing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+charpente.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+charpente-sim = { path = "../../crates/charpente-sim" }
+
+[[test]]
+name = "sim"
+harness = false
