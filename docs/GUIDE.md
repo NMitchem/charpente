@@ -394,8 +394,9 @@ guarantee.
 is the whole surface — the sim drives `handle` directly, and
 `charpente::serve` is what feeds it from real hyper traffic in production.
 Every request that reaches a matched route runs inside exactly one
-transaction: routing, the session lookup, and your handler all happen
-inside the same `db.transact` call covered in §4.
+transaction: routing runs first (an unmatched request never opens one),
+then the session lookup and your handler run inside the same `db.transact`
+call covered in §4.
 
 ### The `#[route]` argument convention
 
@@ -410,8 +411,9 @@ and dispatches to it:
   exactly like its param (`:id` needs an argument named `id`). Its type
   must implement `FromParam` — `u64`, `String`, and `Id<T>` (any `T`) are
   provided; a bad path segment fails as a named 400, not a panic.
-- Then at most one JSON body argument, of any type implementing
-  `serde::Deserialize`.
+- Then at most one JSON body argument, of any owned deserializable type
+  (`serde::de::DeserializeOwned` — the glue's actual bound); a type
+  borrowing from the input won't compile.
 - Then, optionally, a trailing argument named exactly `ctx`, typed `&Ctx`
   (session access — see Sessions below).
 
@@ -1068,9 +1070,13 @@ fn build_app(data_dir: &str) -> std::io::Result<App> {
 ```
 
 An interval that overflows u64 nanoseconds (~584 years — not a realistic
-schedule, but checked) panics the same way, at mount time: `"cron schedule
-\"<name>\": interval <duration> exceeds u64 nanos (~584 years) — pick a
-smaller interval"`.
+schedule, but checked) panics too, with `"cron schedule \"<name>\":
+interval <duration> exceeds u64 nanos (~584 years) — pick a smaller
+interval"` — but unlike the duplicate-name panic, not synchronously at the
+`.schedule(...)` call: `App::schedule` stores the `Duration` unconverted,
+and the conversion only happens at kernel startup. For a `serve()`-based
+app that startup runs on the spawned kernel thread, so `serve` has already
+returned `Ok` when the panic takes the kernel down.
 
 ### Ticks are transactions
 
@@ -1079,7 +1085,8 @@ Nothing about a tick is special: `CronRow` (`id`, `#[index] name`,
 and a due tick opens a transaction that reads that row, advances
 `next_due` by one interval, and calls your `make()` job's `tx.enqueue` —
 all committed together. A schedule's phase survives process restarts: its
-row is upserted (not reset) at every `App::open`.
+row is upserted (not reset) at startup — `App::open` only registers the
+table; the upsert itself happens when the kernel starts.
 
 ### Catch-up fires once, never backfills
 
