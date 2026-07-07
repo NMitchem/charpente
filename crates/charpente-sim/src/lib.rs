@@ -1005,15 +1005,15 @@ macro_rules! sim_tests {
                     require: &[$($($key),*)?],
                 },
             )+];
-            let args = match $crate::harness::HarnessArgs::parse(std::env::args().skip(1)) {
+            let args = match $crate::harness::HarnessArgs::parse(::std::env::args().skip(1)) {
                 Ok(args) => args,
                 Err(usage) => {
-                    eprintln!("{usage}");
-                    std::process::exit(2);
+                    ::std::eprintln!("{usage}");
+                    ::std::process::exit(2);
                 }
             };
-            let code = $crate::harness::run(tests, &args, &mut std::io::stdout().lock());
-            std::process::exit(code);
+            let code = $crate::harness::run(tests, &args, &mut ::std::io::stdout().lock());
+            ::std::process::exit(code);
         }
     };
 }

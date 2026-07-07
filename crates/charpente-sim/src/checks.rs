@@ -128,6 +128,14 @@ mod tests {
     }
 
     #[test]
+    fn replays_identically_wraps_a_first_run_error() {
+        let err = replays_identically(7, |_: &mut Sim| Err::<u8, String>("boom".to_string()))
+            .unwrap_err();
+        assert!(err.contains("first run failed under seed"), "{err}");
+        assert!(err.contains("boom"), "{err}");
+    }
+
+    #[test]
     fn replays_identically_passes_an_honest_workload() {
         replays_identically(42, |sim: &mut Sim| {
             let mut byte = [0u8; 1];
@@ -193,6 +201,19 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn acked_implies_durable_wraps_a_drive_error() {
+        let err = acked_implies_durable(
+            9,
+            3,
+            |_sim: &mut Sim| Err::<Vec<String>, String>("boom".to_string()),
+            toy_verify,
+        )
+        .unwrap_err();
+        assert!(err.contains("drive failed in round 1"), "{err}");
+        assert!(err.contains("boom"), "{err}");
     }
 
     #[test]

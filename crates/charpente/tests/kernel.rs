@@ -483,9 +483,14 @@ fn kernel_stops_after_a_request_poisons_the_engine() {
     let err = kernel
         .run(&mut source)
         .expect_err("poisoned engine must stop the loop");
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("poisoned"),
-        "stop error must name the poison contract: {err}"
+        msg.contains("poisoned"),
+        "stop error must name the poison contract: {msg}"
+    );
+    assert!(
+        msg.contains("durability unknowable") && msg.contains("restart the process"),
+        "stop error must also name the site and the fix (hard rule 5): {msg}"
     );
     let replies = replies.lock().unwrap();
     assert_eq!(

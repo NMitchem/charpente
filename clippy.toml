@@ -13,6 +13,8 @@ disallowed-methods = [
     { path = "std::time::Instant::now", reason = "ambient monotonic clock — use the Clock trait (DESIGN.md §1)" },
     { path = "std::thread::sleep", reason = "ambient time — use Clock::sleep (DESIGN.md §1)" },
     { path = "std::thread::spawn", reason = "ambient task spawning — scheduling goes through the deterministic executor (DESIGN.md §1)" },
+    { path = "std::thread::scope", reason = "ambient task spawning — scheduling goes through the deterministic executor (DESIGN.md §1)" },
+    { path = "std::thread::Scope::spawn", reason = "ambient task spawning — scheduling goes through the deterministic executor (DESIGN.md §1)" },
     { path = "std::fs::read", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },
     { path = "std::fs::read_to_string", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },
     { path = "std::fs::write", reason = "ambient filesystem — use the Disk trait (DESIGN.md §1)" },

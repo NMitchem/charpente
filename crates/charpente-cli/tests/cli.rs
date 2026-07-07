@@ -58,6 +58,14 @@ fn sim_failures_exit_one_with_seed_and_repro_line() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("seed:   0x"), "failure block:\n{stdout}");
     assert!(stdout.contains("repro:  charpente test --sim --filter sometimes_fails --seed 0x"));
+    // The gap this closes: a failing run must still reveal its master seed
+    // (previously only an all-green run printed it, in the stdout summary
+    // line) — the startup line goes to stderr, before any universe runs.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("master seed") && stderr.contains("0x0000000000005eed"),
+        "startup line must announce the master seed even on a failing run:\n{stderr}"
+    );
 }
 
 #[test]

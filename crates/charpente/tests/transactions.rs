@@ -675,6 +675,54 @@ fn poisoned_reports_wal_poison_after_io_failure() {
     );
 }
 
+/// T1 followup: the WAL-poison test above never reaches the engine's OWN
+/// poison bit (engine.rs's "a durable record failed to apply" guard) — a
+/// crashed disk fails the WAL's own append/sync first. This test opens with
+/// Invoice missing from the schema on purpose: the WAL append and sync for
+/// an Invoice put both succeed (no disk fault at all), but
+/// `TableMachine::apply`'s schema lookup fails afterward — a post-sync
+/// apply failure, which is the engine's own bit, not the WAL's.
+#[test]
+fn poisoned_reports_the_engines_own_bit_after_a_post_sync_apply_failure() {
+    let sim = Sim::with_faults(0x9015_0DEE, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Org>(), // Invoice missing on purpose
+    )
+    .unwrap();
+    assert!(!db.poisoned());
+
+    let err = db
+        .transact(|tx| {
+            tx.put(&invoice(1, 1, 1));
+            Ok::<_, io::Error>(())
+        })
+        .unwrap_err();
+    assert!(matches!(err, TxError::Io(_)));
+    assert!(
+        db.poisoned(),
+        "a post-sync apply failure must poison the db"
+    );
+
+    // A second transaction never touches disk: `Engine::submit`'s own
+    // poisoned-flag check fires first. Its distinct wording proves this run
+    // hit the engine's OWN bit, not the WAL's fsyncgate poison.
+    let err = db
+        .transact(|tx| {
+            tx.put(&Org {
+                id: Id::from_raw(2),
+                name: "x".into(),
+            });
+            Ok::<_, io::Error>(())
+        })
+        .unwrap_err();
+    assert!(
+        matches!(&err, TxError::Io(e) if e.to_string().contains("a durable record failed to apply")),
+        "{err:?}"
+    );
+}
+
 // ---------------------------------------------------- negative space
 
 /// The classic dual-write bug, reconstructed on purpose: apply to the store

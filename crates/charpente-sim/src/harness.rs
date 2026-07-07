@@ -24,13 +24,6 @@
 //! `Report`s (worker scheduling is unobservable; only universe index orders
 //! the output).
 
-// The one sanctioned thread-spawning site in the workspace besides prod
-// impls: the harness orchestrates universes from OUTSIDE the deterministic
-// boundary — each universe inside a worker is a sealed, single-threaded,
-// seed-determined world, and reports are ordered by universe index so the
-// pool's scheduling is unobservable.
-#![allow(clippy::disallowed_methods)]
-
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -260,6 +253,11 @@ fn run_single_seed(tests: &[&SimTest], seed: u64) -> Report {
 type UniverseOutcome = Result<BTreeMap<&'static str, u64>, (FaultConfig, String)>;
 
 fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) -> Report {
+    // DESIGN §7: the master seed is printed at startup, before any universe
+    // runs — a failing run from OS entropy must still reveal the seed that
+    // would replay it. stderr, so `--format json`'s stdout stays pure JSON.
+    eprintln!("sim: {universes} universe(s) per test from master seed {master_seed:#018x}");
+
     let mut report = Report {
         master_seed,
         universes,
@@ -284,6 +282,12 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) 
         Mutex::new((0..work.len()).map(|_| None).collect());
     let jobs = jobs.max(1);
 
+    // The one sanctioned thread-spawning site in the workspace besides prod
+    // impls: the harness orchestrates universes from OUTSIDE the deterministic
+    // boundary — each universe inside a worker is a sealed, single-threaded,
+    // seed-determined world, and reports are ordered by universe index so the
+    // pool's scheduling is unobservable.
+    #[allow(clippy::disallowed_methods)]
     std::thread::scope(|scope| {
         for _ in 0..jobs {
             scope.spawn(|| {
