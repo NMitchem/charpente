@@ -195,6 +195,31 @@ the sim-capable IO layer comes first because it cannot be retrofitted.
   alone. `extern crate self as charpente;` in charpente's lib.rs makes all three macros
   usable in charpente's own src. `sim-fixture` is single-dep: any expansion regression
   to `::charpente_core::` breaks the workspace build.
-- Next: M0 step 8 per PLAN.md — the agent-built demo app (invoicing or todo-SaaS),
-  written against the docs alone. Exit criteria: 10k seeded sim universes with fault
-  injection green, `kill -9` survival.
+- **M0 step 8 done — M0 COMPLETE (2026-07-07, spec docs/superpowers/specs/
+  2026-07-06-demo-app-design.md).** Phase 1: `docs/GUIDE.md` (9 sections, agent-first,
+  compile-gated: `crates/guide-examples` extracts and builds every `rust` block; all ~40
+  error-index strings review-verified byte-exact; the whole-guide review's sufficiency
+  walk caught the one blocking gap — the app-level sim driver (`Request` builder/
+  `SimSource`/`Kernel`) was undocumented — fixed in 60cbd10 before the experiment).
+  Phase 2: `examples/invoicing` built by a fresh docs-only sonnet agent (context:
+  BRIEF+README+GUIDE only) — **run 1 succeeded: zero restarts, zero framework patches,
+  transcript audit clean** (no forbidden reads). Exit criteria, with evidence: 10k
+  seeded universes with fault injection green (master seed 0x483e230baed4922b);
+  crash-at-any-point never loses an acked write (in-sim acked-durability property under
+  the full fault matrix, part of the 10k run; the wire-level kill -9 rig stays M1 per
+  spec); zero framework patches (demo commits a513cae..ac5e95a touch only examples/ +
+  the members line). The recorded dual-write demo (examples/invoicing/DEMO.md): the
+  split-transaction outbox bug is *inexpressible from app code* (routes only see
+  `&mut Tx`) — writing it required a temporary framework escape hatch (WRONG c0dbcea);
+  the sim caught it in the first 1024-universe batch (24 failed, seed
+  0xc9e68010250237f4, repro replayed byte-identical); revert is byte-exact (RIGHT
+  bfecd64). Demo-agent friction (examples/invoicing/FINDINGS.md, guide follow-ups):
+  no transactional time source documented (agent built a cron-ticked day-counter),
+  no id-generation primitive for app rows (built an IdCounter singleton row),
+  `Id<T>` Serialize story unclear, `#[index]` on enum fields unshown. The trybuild
+  error-message suite (tracked follow-up) should prioritize the macro errors the demo
+  agent actually hit.
+- Next: M1 per PLAN.md — replication (async log shipping, follower reads, failover),
+  realtime SSE/WS with exact resume, auth properly (OIDC, hashed session tokens),
+  migrations as log records, error/introspection polish (`charpente describe`), and the
+  Vörtex-style black-box edge harness for the hyper layer.
