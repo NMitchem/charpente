@@ -1,7 +1,7 @@
 //! The app kernel: sessions inside the commit point (DESIGN §8), and `App` —
 //! the owner of the `Db` that turns each request into one transaction.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::io;
 use std::time::Duration;
@@ -36,15 +36,7 @@ pub struct Ctx {
     session: Option<Session>,
     fresh_token: String,
     created: Cell<bool>,
-    /// M0 step-8 dual-write demo (examples/invoicing/DEMO.md): jobs buffered
-    /// here commit in a SECOND transaction, separate from this request's own
-    /// — see `enqueue_in_a_second_transaction`.
-    deferred: RefCell<DeferredEnqueues>,
 }
-
-/// `(job name, encoded payload, idempotency key)` — named so `Ctx::deferred`
-/// and `App::handle`'s local don't trip clippy's type-complexity lint.
-type DeferredEnqueues = Vec<(&'static str, Vec<u8>, Option<String>)>;
 
 impl Ctx {
     pub fn session(&self) -> Option<&Session> {
@@ -73,19 +65,6 @@ impl Ctx {
         if let Some(session) = &self.session {
             tx.delete::<Session>(session.id);
         }
-    }
-
-    /// DELIBERATELY DANGEROUS (M0 step-8 dual-write demo, see
-    /// examples/invoicing/DEMO.md): buffers `job` to be enqueued in a SECOND
-    /// transaction, committed only after this request's own transaction is
-    /// already durable and acked. A crash between the two is a silent,
-    /// permanent gap — exactly the class of bug charpente's one-commit-point
-    /// design exists to delete. Production handlers must use
-    /// `Tx::enqueue`/`Tx::enqueue_keyed` in the SAME transaction instead.
-    pub fn enqueue_in_a_second_transaction<J: Job>(&self, job: J) {
-        let mut payload = Vec::new();
-        job.encode(&mut payload);
-        self.deferred.borrow_mut().push((J::NAME, payload, None));
     }
 }
 
@@ -255,7 +234,6 @@ impl App {
         let token = bearer_or_cookie(&request.headers);
         let (auth_required, glue) = (route.auth, route.glue);
 
-        let mut deferred: DeferredEnqueues = Vec::new();
         let result = self.db.transact(|tx| {
             let session = match &token {
                 Some(token) => Session::by_token(tx, token)?.into_iter().next(),
@@ -268,30 +246,11 @@ impl App {
                 session,
                 fresh_token,
                 created: Cell::new(false),
-                deferred: RefCell::new(Vec::new()),
             };
-            let out = glue(tx, &ctx, &captures, &request.body);
-            deferred = ctx.deferred.into_inner();
-            out
+            glue(tx, &ctx, &captures, &request.body)
         });
         match result {
-            Ok(response) => {
-                if !deferred.is_empty() {
-                    // M0 step-8 dual-write demo: a SECOND, independently
-                    // committed transaction — deliberately NOT atomic with
-                    // the request's own commit above. Best-effort, no retry:
-                    // this is exactly the missing half of the outbox pattern
-                    // that makes the naive version buggy (see
-                    // examples/invoicing/DEMO.md).
-                    let _ = self.db.transact(|tx| {
-                        for (name, payload, key) in deferred {
-                            tx.enqueue_raw(name, payload, key);
-                        }
-                        Ok::<(), std::convert::Infallible>(())
-                    });
-                }
-                response
-            }
+            Ok(response) => response,
             Err(TxError::App(e)) => e.response(),
             Err(TxError::Io(e)) => Response::error(
                 500,
