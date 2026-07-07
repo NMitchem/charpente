@@ -157,3 +157,6 @@ not indexed. Worth documenting the actual bound `#[index]` fields need.
   jobs), with every `require`d coverage key (`restart`, `kernel:served`,
   `reminder:sent`) hit in every batch; `cargo clippy --workspace
   --all-targets` and `cargo fmt --check` both clean.
+
+---
+Evidence (2026-07-07): `charpente test --sim --dir examples/invoicing --universes 10000 --jobs 8` — all green, master seed 0x483e230baed4922b.
