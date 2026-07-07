@@ -2,8 +2,8 @@
 //! row; `#[route]` turns a function into a typed HTTP handler. Macro errors
 //! are product surface (hard rule 5): each one names the contract and the fix.
 //!
-//! `#[table]` references `::charpente_core` paths; `#[route]` references
-//! `::charpente` paths — the using crate must depend on the respective crate.
+//! All three macros reference `::charpente` paths (`charpente::core` for the
+//! deterministic core) — the using crate depends on `charpente` alone.
 
 mod job;
 mod route;

@@ -103,8 +103,9 @@ the sim-capable IO layer comes first because it cannot be retrofitted.
   thread); tokio's ambient APIs deny-listed. Sim suite includes the request-level crash
   property (a 200 survives kill-at-any-point; jobs ≡ acked requests) and a determinism
   check; loopback smoke test drives real HTTP/1.1 bytes. `#[route]` emits
-  `::charpente` paths, so it works in dependent crates (and integration tests), not in
-  charpente's own src. `Disk` and `Entropy` gained a `Send` supertrait (the kernel
+  `::charpente` paths (all three macros do, since 2026-07-06's macro-path unification,
+  which also made them usable in charpente's own src via `extern crate self`).
+  `Disk` and `Entropy` gained a `Send` supertrait (the kernel
   thread owns the App), mirroring `File`'s earlier `Send + Sync`.
 - **Pre-step-6 harness upgrade done** (from the 2026-07-02 DST research pass): swarm-
   sampled `FaultConfig` per universe (`run_universes_swarm!`; sampling order is frozen
@@ -187,11 +188,13 @@ the sim-capable IO layer comes first because it cannot be retrofitted.
   the pinned crash-recovery regression seed (0x8bee1752811ae873) green, clippy/fmt clean,
   and the CLI eating its own dogfood against `crates/sim-fixture` — 1024 universes, all
   green, master seed 0xf04ab23a1645c496, ~3.5s wall time over 8 jobs.
-- **Open note for step 8**: apps using `#[table]` currently need BOTH `charpente` and
-  `charpente-core` as dependencies — the macro expands to `::charpente_core::` paths from
-  app `src` — while `#[route]` emits `::charpente::` paths and needs only the one dep
-  (surfaced building `crates/sim-fixture`, step-7 T6). Decide a re-export or macro-path
-  unification before the demo app bakes the two-dep shape into public docs.
+- **Macro-path unification done (2026-07-06, spec docs/superpowers/specs/
+  2026-07-06-macro-path-unification-design.md)**: `#[table]`/`#[job]` now emit
+  `::charpente::core::` paths (through the public `charpente::core` re-export, which is
+  officially load-bearing), matching `#[route]` — app crates depend on `charpente`
+  alone. `extern crate self as charpente;` in charpente's lib.rs makes all three macros
+  usable in charpente's own src. `sim-fixture` is single-dep: any expansion regression
+  to `::charpente_core::` breaks the workspace build.
 - Next: M0 step 8 per PLAN.md — the agent-built demo app (invoicing or todo-SaaS),
   written against the docs alone. Exit criteria: 10k seeded sim universes with fault
   injection green, `kill -9` survival.

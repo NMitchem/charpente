@@ -10,7 +10,6 @@ workspace = true
 
 [dependencies]
 charpente.workspace = true
-charpente-core.workspace = true
 
 [dev-dependencies]
 charpente-sim = { path = "../charpente-sim" }

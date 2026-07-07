@@ -102,27 +102,27 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
             #(#emitted_fields,)*
         }
 
-        impl ::charpente_core::table::Row for #name {
+        impl ::charpente::core::table::Row for #name {
             const TABLE: &'static str = #name_str;
-            const INDEXES: &'static [::charpente_core::table::IndexDef<Self>] = &[
-                #(::charpente_core::table::IndexDef {
+            const INDEXES: &'static [::charpente::core::table::IndexDef<Self>] = &[
+                #(::charpente::core::table::IndexDef {
                     name: #index_names,
                     key: Self::#index_fn_idents,
                 },)*
             ];
 
-            fn id(&self) -> ::charpente_core::table::Id<Self> {
+            fn id(&self) -> ::charpente::core::table::Id<Self> {
                 self.id
             }
 
             fn encode_row(&self, out: &mut ::std::vec::Vec<u8>) {
-                #(::charpente_core::table::Codec::encode(&self.#field_idents, out);)*
+                #(::charpente::core::table::Codec::encode(&self.#field_idents, out);)*
             }
 
             fn decode_row(bytes: &[u8]) -> ::std::io::Result<Self> {
                 let input = &mut &bytes[..];
                 #(let #field_idents =
-                    <#field_types as ::charpente_core::table::Codec>::decode(input)?;)*
+                    <#field_types as ::charpente::core::table::Codec>::decode(input)?;)*
                 if !input.is_empty() {
                     return Err(::std::io::Error::new(
                         ::std::io::ErrorKind::InvalidData,
@@ -140,14 +140,14 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
             #(
                 #[doc(hidden)]
                 fn #index_fn_idents(row: &Self, out: &mut ::std::vec::Vec<u8>) {
-                    ::charpente_core::table::Codec::encode(&row.#index_field_idents, out);
+                    ::charpente::core::table::Codec::encode(&row.#index_field_idents, out);
                 }
 
                 /// Exact-match lookup on the `#[index]` field, in id order.
                 /// Works on any `View`: a `Snapshot` outside transactions or
                 /// a `Tx` inside one.
                 #vis fn #by_fn_idents(
-                    view: &impl ::charpente_core::table::View,
+                    view: &impl ::charpente::core::table::View,
                     key: &#index_field_types,
                 ) -> ::std::io::Result<::std::vec::Vec<Self>> {
                     view.scan_by::<Self>(#index_names, key)

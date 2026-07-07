@@ -171,7 +171,10 @@ by definition, so "one at a time" costs microseconds, not milliseconds.
 
 ## 3. The typed surface
 
-Every contract in the system is a Rust item; every contract violation is a compile error.
+Every contract in the system is a Rust item; every contract violation is a compile
+error. App crates depend on `charpente` alone: all three derive macros resolve through
+`::charpente::` paths (`charpente::core` re-exports the deterministic core), so the
+platform is one dependency, not two.
 
 - **Tables.** `#[table]` on a struct derives the row codec, key type (`Id<T>`, typed, never
   a bare u64), and secondary index declarations. Schema *is* the Rust definition.

@@ -173,21 +173,21 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
     Ok(quote! {
         #input
 
-        impl ::charpente_core::table::Codec for #name {
+        impl ::charpente::core::table::Codec for #name {
             fn encode(&self, out: &mut ::std::vec::Vec<u8>) {
-                #(::charpente_core::table::Codec::encode(&self.#field_idents, out);)*
+                #(::charpente::core::table::Codec::encode(&self.#field_idents, out);)*
             }
 
             fn decode(input: &mut &[u8]) -> ::std::io::Result<Self> {
                 #(let #field_idents =
-                    <#field_types as ::charpente_core::table::Codec>::decode(input)?;)*
+                    <#field_types as ::charpente::core::table::Codec>::decode(input)?;)*
                 ::std::result::Result::Ok(Self { #(#field_idents,)* })
             }
         }
 
-        impl ::charpente_core::db::Job for #name {
+        impl ::charpente::core::db::Job for #name {
             const NAME: &'static str = #name_str;
-            const RETRY: ::charpente_core::job::RetryPolicy = ::charpente_core::job::RetryPolicy {
+            const RETRY: ::charpente::core::job::RetryPolicy = ::charpente::core::job::RetryPolicy {
                 max: #max,
                 backoff: ::std::time::Duration::from_millis(#backoff_millis),
             };
@@ -200,7 +200,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                     payload: &[u8],
                 ) -> ::std::result::Result<(), ::charpente::kernel::JobError> {
                     let input = &mut &payload[..];
-                    let job = <#name as ::charpente_core::table::Codec>::decode(input)
+                    let job = <#name as ::charpente::core::table::Codec>::decode(input)
                         .map_err(|e| ::charpente::kernel::JobError::App(::std::format!(
                             "job decode for {}: {e} — schema drift or corruption", #name_str
                         )))?;
@@ -215,8 +215,8 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                     job.run(tx)
                 }
                 ::charpente::kernel::JobDef {
-                    name: <#name as ::charpente_core::db::Job>::NAME,
-                    retry: <#name as ::charpente_core::db::Job>::RETRY,
+                    name: <#name as ::charpente::core::db::Job>::NAME,
+                    retry: <#name as ::charpente::core::db::Job>::RETRY,
                     glue: __charpente_job_glue,
                 }
             }

@@ -2,8 +2,8 @@
 //! convention). Also the meta-test's target: `sometimes_fails` is gated
 //! behind CHARPENTE_FIXTURE_FAIL so the workspace suite stays green.
 
+use charpente::core::io::Entropy;
 use charpente::{Db, DbConfig, Id, Schema, View};
-use charpente_core::io::Entropy;
 use charpente_sim::Sim;
 use sim_fixture::FixtureCounter;
 
