@@ -133,6 +133,18 @@ impl Disk for ProdDisk {
         names.sort(); // callers must never see filesystem enumeration order
         Ok(names)
     }
+
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        // Prefixes are flat names ("wal/", or "" for the root); fsync the
+        // directory that holds those entries. Same fsync-vs-F_FULLFSYNC
+        // caveat as ProdFile::sync — revisit both together.
+        let dir = match prefix.rfind('/') {
+            Some(i) => self.root.join(&prefix[..i]),
+            None => self.root.clone(),
+        };
+        std::fs::create_dir_all(&dir)?;
+        std::fs::File::open(&dir)?.sync_all()
+    }
 }
 
 struct ProdFile {

@@ -10,7 +10,9 @@ use std::io;
 use charpente_core::engine::{Engine, StateMachine};
 use charpente_core::io::{Disk, Entropy};
 use charpente_core::log::{Wal, WalConfig};
-use charpente_sim::{FaultConfig, Sim, run_universes, run_universes_swarm};
+use charpente_sim::{
+    FaultConfig, Sim, run_universes, run_universes_swarm, run_universes_swarm_with,
+};
 
 fn small_segments() -> WalConfig {
     WalConfig {
@@ -152,6 +154,23 @@ fn wal_survives_the_fault_matrix() {
             "crash:dropped",
             "restart",
         ]
+    );
+}
+
+/// The fault matrix with dir-entry loss forced hot: every universe's
+/// FaultConfig gets dir_entry_loss = 0.5 stamped on top of the swarm draw.
+/// Acked records must still always recover — this is the meta-evidence that
+/// the rotate/recovery dir barriers (log.rs) are load-bearing: commenting out
+/// the rotate barrier turns this red (records vanish with the unsynced
+/// segment name).
+#[test]
+fn wal_survives_dir_entry_loss() {
+    run_universes_swarm_with!(
+        0x01D_D1E5,
+        256,
+        |cfg: &mut FaultConfig| { cfg.dir_entry_loss = 0.5; },
+        |sim| wal_workload(sim, |entropy| 100 + (entropy.next_u64() % 1400) as usize),
+        require: ["fault:dir-entry", "restart"]
     );
 }
 
@@ -382,6 +401,79 @@ fn apply_failure_poisons_the_engine_until_recovery() {
     assert_eq!(
         engine.machine().ledger.records,
         vec![b"zero".to_vec(), b"one".to_vec()]
+    );
+}
+
+// ------------------------------------------------------- dir-entry barrier
+
+#[test]
+fn unsynced_segment_name_vanishes_at_crash_without_a_dir_barrier() {
+    // Raw-disk test: create a file, sync its BYTES but not its NAME, crash
+    // with dir_entry_loss = 1.0 — the file must be gone.
+    let cfg = FaultConfig {
+        dir_entry_loss: 1.0,
+        crash_apply: 1.0,
+        ..FaultConfig::none()
+    };
+    let sim = Sim::with_faults(0xD1E_0001, cfg);
+    let disk = sim.disk();
+    let f = disk.open("wal/00000000000000000000.log").unwrap();
+    f.write_at(0, b"acked").unwrap();
+    f.sync().unwrap();
+    sim.crash_disk_now();
+    sim.restart();
+    assert!(
+        disk.list("wal/").unwrap().is_empty(),
+        "unsynced dirent must be lost"
+    );
+
+    // Same again, but with the barrier — the file must survive.
+    let sim = Sim::with_faults(
+        0xD1E_0002,
+        FaultConfig {
+            dir_entry_loss: 1.0,
+            crash_apply: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let disk = sim.disk();
+    let f = disk.open("wal/00000000000000000000.log").unwrap();
+    f.write_at(0, b"acked").unwrap();
+    f.sync().unwrap();
+    disk.sync_dir("wal/").unwrap();
+    sim.crash_disk_now();
+    sim.restart();
+    assert_eq!(
+        disk.list("wal/").unwrap().len(),
+        1,
+        "barriered dirent must survive"
+    );
+}
+
+#[test]
+fn unsynced_removal_resurrects_at_crash_without_a_dir_barrier() {
+    let cfg = FaultConfig {
+        dir_entry_loss: 1.0,
+        crash_apply: 1.0,
+        ..FaultConfig::none()
+    };
+    let sim = Sim::with_faults(0xD1E_0003, cfg);
+    let disk = sim.disk();
+    let f = disk.open("wal/00000000000000000000.log").unwrap();
+    f.write_at(0, b"stale").unwrap();
+    f.sync().unwrap();
+    disk.sync_dir("wal/").unwrap();
+    disk.remove("wal/00000000000000000000.log").unwrap();
+    sim.crash_disk_now();
+    sim.restart();
+    let names = disk.list("wal/").unwrap();
+    assert_eq!(names.len(), 1, "unsynced removal must resurrect the file");
+    let f = disk.open(&names[0]).unwrap();
+    let mut out = [0u8; 5];
+    f.read_at(0, &mut out).unwrap();
+    assert_eq!(
+        &out, b"stale",
+        "resurrection restores the last durable content"
     );
 }
 

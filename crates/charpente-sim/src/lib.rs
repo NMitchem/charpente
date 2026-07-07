@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use charpente_core::io::{Clock, Conn, Disk, Entropy, File, Instant, Listener, Net};
 
-use crate::disk::{DiskWorld, PendingOp};
+use crate::disk::{DiskWorld, FileState, PendingOp};
 use crate::net::{ConnState, NetWorld, host_of, normalize};
 use crate::rng::{Rng, splitmix64};
 
@@ -39,6 +39,9 @@ pub struct FaultConfig {
     pub crash_apply: f64,
     /// P(an unsynced write survives a crash torn); the rest are lost entirely.
     pub crash_torn: f64,
+    /// P(an unsynced directory entry is lost (create) or resurrected
+    /// (remove) at crash).
+    pub dir_entry_loss: f64,
     pub disk_latency: (Duration, Duration),
     pub net_latency: (Duration, Duration),
 }
@@ -50,6 +53,7 @@ impl Default for FaultConfig {
             sync_error: 0.02,
             crash_apply: 0.4,
             crash_torn: 0.3,
+            dir_entry_loss: 0.0,
             disk_latency: (Duration::from_micros(20), Duration::from_millis(2)),
             net_latency: (Duration::from_micros(100), Duration::from_millis(20)),
         }
@@ -63,6 +67,7 @@ impl FaultConfig {
             sync_error: 0.0,
             crash_apply: 0.0,
             crash_torn: 0.0,
+            dir_entry_loss: 0.0,
             disk_latency: (Duration::ZERO, Duration::ZERO),
             net_latency: (Duration::ZERO, Duration::ZERO),
         }
@@ -116,6 +121,11 @@ impl FaultConfig {
             sync_error,
             crash_apply,
             crash_torn,
+            // Not yet swarm-sampled: this axis draws from a field-keyed
+            // sub-stream once it lands (segment-mgmt design §4), so it
+            // cannot perturb the sequential draws above — a future field
+            // composes order-independently. Zero here takes no draw.
+            dir_entry_loss: 0.0,
             disk_latency: (Duration::ZERO, disk_hi),
             net_latency: (Duration::ZERO, net_hi),
         };
@@ -129,6 +139,7 @@ impl FaultConfig {
             ("sync_error", self.sync_error),
             ("crash_apply", self.crash_apply),
             ("crash_torn", self.crash_torn),
+            ("dir_entry_loss", self.dir_entry_loss),
         ] {
             assert!(
                 (0.0..=1.0).contains(&p),
@@ -335,6 +346,17 @@ impl Sim {
         for file in disk.files.values_mut() {
             crate::disk::collapse(file, faults, &self.world.cfg, coverage);
         }
+        // Zero-draw fast path: off by default, so every seed that predates
+        // this fault axis replays with the exact same rng sequence (the
+        // frozen replay contract).
+        if self.world.cfg.dir_entry_loss > 0.0 {
+            crate::disk::collapse_dir_entries(
+                disk,
+                faults,
+                self.world.cfg.dir_entry_loss,
+                coverage,
+            );
+        }
         disk.epoch += 1;
         disk.crashed = false;
         disk.crash_countdown = None;
@@ -406,7 +428,17 @@ impl Disk for SimDisk {
     fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
         let mut guard = self.world.lock();
         guard.disk_op(&self.world.cfg)?;
-        guard.disk.files.entry(path.to_string()).or_default();
+        if !guard.disk.files.contains_key(path) {
+            // A fresh name (including a reopen of one still in
+            // pending_removes — that entry is left alone, so its stashed
+            // durable bytes can still resurrect): its directory entry is not
+            // durable until sync_dir.
+            guard
+                .disk
+                .files
+                .insert(path.to_string(), FileState::default());
+            guard.disk.pending_creates.insert(path.to_string());
+        }
         let epoch = guard.disk.epoch;
         Ok(Box::new(SimFile {
             world: self.world.clone(),
@@ -418,12 +450,23 @@ impl Disk for SimDisk {
     fn remove(&self, path: &str) -> io::Result<()> {
         let mut guard = self.world.lock();
         guard.disk_op(&self.world.cfg)?;
-        if guard.disk.files.remove(path).is_none() {
+        let Some(file) = guard.disk.files.remove(path) else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("remove(\"{path}\"): no such simulated file"),
             ));
+        };
+        if !guard.disk.pending_creates.remove(path) {
+            // The create was already durable (or predates this fault axis
+            // mattering); the removal itself is what's now pending — a
+            // crash before sync_dir can resurrect these durable bytes.
+            guard
+                .disk
+                .pending_removes
+                .insert(path.to_string(), file.durable);
         }
+        // else: never durable, so dropping both entries loses nothing a
+        // crash could resurrect.
         Ok(())
     }
 
@@ -437,6 +480,29 @@ impl Disk for SimDisk {
             .filter(|k| k.starts_with(prefix))
             .cloned()
             .collect())
+    }
+
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        let mut guard = self.world.lock();
+        guard.disk_op(&self.world.cfg)?;
+        if guard.faults.chance(self.world.cfg.sync_error) {
+            guard.cover("fault:sync_error");
+            // Same contract as File::sync: a failed barrier leaves the
+            // durability of every entry it would have covered unknown.
+            return Err(io::Error::other(
+                "simulated fsync failure on a directory barrier — durability of the directory \
+                 entries it covers is unknown",
+            ));
+        }
+        guard
+            .disk
+            .pending_creates
+            .retain(|name| !name.starts_with(prefix));
+        guard
+            .disk
+            .pending_removes
+            .retain(|name, _| !name.starts_with(prefix));
+        Ok(())
     }
 }
 
@@ -895,16 +961,77 @@ pub fn run_universes_swarm_in(
     require: &[&str],
     f: impl Fn(&mut Sim) -> Result<(), String>,
 ) {
+    // Ambient base, no config override — delegates to the `_with` runner
+    // added alongside `run_universes_swarm_with!`; a no-op adjust makes this
+    // byte-for-byte the same seed→behavior mapping as before that macro
+    // existed (`run_universe`, below, is untouched and still the shared
+    // contract with the CLI harness).
+    run_universes_swarm_with_in(
+        package,
+        file,
+        ambient_base_seed(),
+        universes,
+        require,
+        |_cfg: &mut FaultConfig| {},
+        f,
+    );
+}
+
+/// `run_universes_swarm!` with a per-universe `FaultConfig` override: after
+/// the swarm samples a universe's config, `adjust` runs on it before the
+/// universe executes — for tests that want the swarm's per-universe variety
+/// with one axis forced hot (e.g. `dir_entry_loss`, not yet swarm-sampled).
+/// Unlike `run_universes_swarm!`, the base seed is explicit — this is for
+/// permanent, always-in-the-suite properties that must not flake batch to
+/// batch. A NEW macro: `run_universe`'s frozen replay contract is untouched
+/// (`run_universe_with_adjust`, below, is a separate function). Call as
+/// `run_universes_swarm_with!(base, N, adjust, f)` or with `require: [...]`.
+#[macro_export]
+macro_rules! run_universes_swarm_with {
+    ($base:expr, $universes:expr, $adjust:expr, $f:expr) => {
+        $crate::run_universes_swarm_with_in(
+            env!("CARGO_PKG_NAME"),
+            file!(),
+            $base,
+            $universes,
+            &[],
+            $adjust,
+            $f,
+        )
+    };
+    ($base:expr, $universes:expr, $adjust:expr, $f:expr, require: [$($key:expr),* $(,)?]) => {
+        $crate::run_universes_swarm_with_in(
+            env!("CARGO_PKG_NAME"),
+            file!(),
+            $base,
+            $universes,
+            &[$($key),*],
+            $adjust,
+            $f,
+        )
+    };
+}
+
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn run_universes_swarm_with_in(
+    package: &str,
+    file: &str,
+    base: u64,
+    universes: u64,
+    require: &[&str],
+    adjust: impl Fn(&mut FaultConfig),
+    f: impl Fn(&mut Sim) -> Result<(), String>,
+) {
     let test_file = test_name(file);
     if let Ok(seed_var) = std::env::var("CHARPENTE_SEED") {
         let seed = parse_seed(&seed_var);
         eprintln!(
             "charpente-sim [{test_file}]: replaying seed {seed:#018x} — coverage requirements skipped under CHARPENTE_SEED"
         );
-        run_one_swarm(package, test_file, seed, &f);
+        run_one_swarm_with(package, test_file, seed, &adjust, &f);
         return;
     }
-    let base = ambient_base_seed();
     eprintln!(
         "charpente-sim [{test_file}]: {universes} swarm universes from base seed {base:#018x}"
     );
@@ -912,7 +1039,7 @@ pub fn run_universes_swarm_in(
     let mut coverage: BTreeMap<&'static str, u64> = BTreeMap::new();
     for _ in 0..universes {
         let seed = splitmix64(&mut state);
-        for (key, count) in run_one_swarm(package, test_file, seed, &f) {
+        for (key, count) in run_one_swarm_with(package, test_file, seed, &adjust, &f) {
             *coverage.entry(key).or_insert(0) += count;
         }
     }
@@ -937,6 +1064,10 @@ pub fn run_universes_swarm_in(
 /// (harness.rs). The seed→behavior mapping here is the frozen replay
 /// contract: config derives from `splitmix64(seed)`, the workload runs
 /// under catch_unwind, Ok returns coverage. Do not reorder anything.
+// `FaultConfig` crossed clippy's large-Err threshold the moment
+// `dir_entry_loss` landed; boxing the Err would touch this frozen function's
+// signature (and every caller) for a lint, not a behavior change.
+#[allow(clippy::result_large_err)]
 pub(crate) fn run_universe(
     seed: u64,
     f: &dyn Fn(&mut Sim) -> Result<(), String>,
@@ -952,13 +1083,35 @@ pub(crate) fn run_universe(
     }
 }
 
-fn run_one_swarm(
+/// Like `run_universe`, but applies `adjust` to the sampled config first — a
+/// separate function so `run_universe`'s frozen contract is never touched.
+#[allow(clippy::result_large_err)] // see run_universe
+fn run_universe_with_adjust(
+    seed: u64,
+    adjust: &dyn Fn(&mut FaultConfig),
+    f: &dyn Fn(&mut Sim) -> Result<(), String>,
+) -> Result<BTreeMap<&'static str, u64>, (FaultConfig, String)> {
+    let mut s = seed;
+    let cfg_seed = splitmix64(&mut s);
+    let mut cfg = FaultConfig::swarm(&mut Rng::new(cfg_seed));
+    adjust(&mut cfg);
+    cfg.validate(); // an adjust closure that produces an invalid config is a workload bug
+    let mut sim = Sim::with_faults(seed, cfg.clone());
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut sim))) {
+        Ok(Ok(())) => Ok(sim.coverage()),
+        Ok(Err(msg)) => Err((cfg, msg)),
+        Err(payload) => Err((cfg, panic_message(&*payload))),
+    }
+}
+
+fn run_one_swarm_with(
     package: &str,
     test_file: &str,
     seed: u64,
+    adjust: &impl Fn(&mut FaultConfig),
     f: &impl Fn(&mut Sim) -> Result<(), String>,
 ) -> BTreeMap<&'static str, u64> {
-    match run_universe(seed, f) {
+    match run_universe_with_adjust(seed, adjust, f) {
         Ok(coverage) => coverage,
         Err((cfg, msg)) => panic!(
             "{}",

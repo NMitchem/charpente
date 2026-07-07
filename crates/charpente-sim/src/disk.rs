@@ -5,11 +5,14 @@
 //! full, torn (an arbitrary strict subset of its sectors), or not at all;
 //! because decisions are independent across ops and across sectors, later
 //! data can survive earlier data's loss — unordered page-cache flushes, the
-//! ALICE/TigerBeetle crash-consistency model. Not yet modeled: directory-
-//! entry durability (created files survive crashes without a directory sync)
-//! and read faults — both revisit with WAL segment management.
+//! ALICE/TigerBeetle crash-consistency model. Directory-entry durability is
+//! modeled too (`pending_creates`/`pending_removes`, collapsed by
+//! `collapse_dir_entries`): a created or removed name is not durable until
+//! `Disk::sync_dir`. Not yet modeled: read faults — revisit with the
+//! fault-matrix extensions (bit-level corruption, misdirected writes,
+//! latent read errors).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::FaultConfig;
 use crate::rng::Rng;
@@ -25,6 +28,11 @@ pub(crate) struct DiskWorld {
     pub crashed: bool,
     /// Ops until the next injected crash; the op that hits zero fails.
     pub crash_countdown: Option<u64>,
+    /// Created names whose directory entry is not yet durable.
+    pub pending_creates: BTreeSet<String>,
+    /// Removed names whose removal is not yet durable, keyed to the durable
+    /// content a crash would resurrect.
+    pub pending_removes: BTreeMap<String, Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -103,6 +111,52 @@ pub(crate) fn collapse(
         }
     }
     file.durable = apply(std::mem::take(&mut file.durable), &survivors);
+}
+
+/// Crash-collapses pending directory entries. Only called when
+/// `dir_entry_loss > 0.0` — the zero-draw fast path that keeps every pinned
+/// seed's rng sequence untouched while this fault axis is off (the frozen
+/// replay contract). An affected pending create vanishes: its file is
+/// dropped even if its bytes are durable, because losing the *name* is the
+/// whole point of the fence. An affected pending remove resurrects: the file
+/// returns with its last durable content. For a name pending both a remove
+/// and a re-create (the rebuild path — remove, then reopen before
+/// `sync_dir`), the remove is rolled first: a resurrection discards whatever
+/// state the new create left behind; only if the remove sticks does the
+/// create get its own roll. Every affected entry marks `"fault:dir-entry"`.
+pub(crate) fn collapse_dir_entries(
+    disk: &mut DiskWorld,
+    rng: &mut Rng,
+    p: f64,
+    coverage: &mut BTreeMap<&'static str, u64>,
+) {
+    let mut mark = |key: &'static str| *coverage.entry(key).or_insert(0) += 1;
+    let names: BTreeSet<String> = disk
+        .pending_creates
+        .iter()
+        .cloned()
+        .chain(disk.pending_removes.keys().cloned())
+        .collect();
+    for name in names {
+        let had_create = disk.pending_creates.remove(&name);
+        if let Some(durable) = disk.pending_removes.remove(&name)
+            && rng.chance(p)
+        {
+            mark("fault:dir-entry");
+            disk.files.insert(
+                name,
+                FileState {
+                    durable,
+                    pending: Vec::new(),
+                },
+            );
+            continue; // resurrection discards any pending re-create
+        }
+        if had_create && rng.chance(p) {
+            mark("fault:dir-entry");
+            disk.files.remove(&name);
+        }
+    }
 }
 
 /// A torn write. Sectors flush unordered, so an arbitrary strict subset of a

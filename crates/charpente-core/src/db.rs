@@ -457,6 +457,10 @@ impl Db {
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e),
                 }
+                // Barrier the removal before rebuilding: an unsynced removal
+                // that a later crash resurrects must not shadow the rebuilt
+                // store with the bricked one it was discarded for.
+                disk.sync_dir(&cfg.store_path)?;
                 Store::open(&*disk, &cfg.store_path)?
             }
         };

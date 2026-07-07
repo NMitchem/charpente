@@ -263,6 +263,11 @@ fn redb_err(e: impl fmt::Display) -> io::Error {
 impl Store {
     pub fn open(disk: &dyn Disk, path: &str) -> io::Result<Store> {
         let file = disk.open(path)?;
+        // The store file's name must be durable too — File::sync (below,
+        // inside redb's writes) does not persist a directory entry, so a
+        // crash right after first creation could lose the file itself
+        // (DESIGN §2).
+        disk.sync_dir(path)?;
         // redb 4.1.0 panics (asserts) instead of returning Err on some
         // crash-mangled files — page_manager.rs:231/:257 fire when the
         // durable header's layout length disagrees with the file length,

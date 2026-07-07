@@ -94,6 +94,11 @@ pub trait Disk: Send {
     /// All file names starting with `prefix`, sorted — callers must never
     /// depend on filesystem enumeration order.
     fn list(&self, prefix: &str) -> io::Result<Vec<String>>;
+
+    /// Directory barrier: on `Ok`, every prior create/remove of a name
+    /// starting with `prefix` survives any crash. `File::sync` does not
+    /// persist a file's directory entry; this does (DESIGN §2).
+    fn sync_dir(&self, prefix: &str) -> io::Result<()>;
 }
 
 /// An open file. Writes are volatile until `sync` returns `Ok`: after a crash,

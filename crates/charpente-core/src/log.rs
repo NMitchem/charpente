@@ -4,7 +4,11 @@
 //! Frame: `[seq: u64 le][len: u32 le][crc: u32 le][payload]`, crc over
 //! seq‖len‖payload. Segments are named `<dir>/<base_seq:020>.log`; rotation
 //! syncs the old segment before the new one takes writes, so a `sync` on the
-//! tail is always a durability barrier for the whole log.
+//! tail is always a durability barrier for the whole log. Rotation also
+//! barriers the new segment's *name* with `Disk::sync_dir` before returning —
+//! `File::sync` durably persists a file's bytes but not its directory entry,
+//! so an unbarriered rotation could lose a synced segment's name at crash
+//! (DESIGN §2).
 //!
 //! Recovery scans frames in order and stops at the first invalid one: the
 //! rest of that segment is truncated and later segments are deleted — they
@@ -12,7 +16,10 @@
 //! the log accepts appends; this is load-bearing. Without it, a discarded
 //! frame of the same length as its replacement can survive beyond the new
 //! frame, checksum-valid and seq-correct, and a later recovery would
-//! resurrect a record this recovery chose to discard.
+//! resurrect a record this recovery chose to discard. The deletions are
+//! themselves barriered with `sync_dir` — a later-segment name resurrected by
+//! an unsynced removal would reintroduce the exact stale data the cut just
+//! discarded.
 //!
 //! Any IO failure poisons the log: after a failed fsync the durability of
 //! prior writes is unknown and retrying cannot honestly clear that (the
@@ -70,6 +77,7 @@ impl Wal {
 
         if names.is_empty() {
             let tail = disk.open(&segment_name(&cfg.dir, 0))?;
+            disk.sync_dir(&prefix)?;
             return Ok(Wal {
                 disk,
                 cfg,
@@ -114,6 +122,7 @@ impl Wal {
                     for later in &names[index + 1..] {
                         disk.remove(later)?;
                     }
+                    disk.sync_dir(&prefix)?; // recovery leaves a durably-clean directory
                     tail = Some((file, cut));
                     break;
                 }
@@ -177,6 +186,9 @@ impl Wal {
         self.guard(self.tail.sync())?; // sync-before-rotate keeps `sync` a whole-log barrier
         let name = segment_name(&self.cfg.dir, self.next_seq);
         self.tail = self.guard(self.disk.open(&name))?;
+        // The new segment's name must be durable before frames land in it —
+        // the sync-before-rotate rule extended to the directory entry.
+        self.guard(self.disk.sync_dir(&format!("{}/", self.cfg.dir)))?;
         self.tail_offset = 0;
         Ok(())
     }

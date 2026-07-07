@@ -60,7 +60,8 @@ trait Clock   { fn now(&self) -> Instant; fn sleep(&self, d: Duration); }
 trait Entropy { fn fill(&self, buf: &mut [u8]); }
 trait Disk    { fn open(&self, path: &str) -> Result<Box<dyn File>>;
                 fn remove(&self, path: &str) -> Result<()>;
-                fn list(&self, prefix: &str) -> Result<Vec<String>>; }   // always sorted
+                fn list(&self, prefix: &str) -> Result<Vec<String>>;   // always sorted
+                fn sync_dir(&self, prefix: &str) -> Result<()>; }  // the directory barrier (§2)
 trait File    { fn len(&self) -> Result<u64>;
                 fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<()>;
                 fn write_at(&self, offset: u64, data: &[u8]) -> Result<()>;
@@ -142,16 +143,26 @@ cannot honestly be retried (fsyncgate); the only exit from poison is restart-and
 and recovery is idempotent. The apply loop (`Engine`) holds the standing invariant:
 machine state ≡ fold(apply, durable records) — submit is append → sync → apply → ack.
 
-**Two durability fences, tracked.** (1) Recovery cannot yet tell a torn tail from mid-log
-corruption of committed frames: any invalid frame is the cut, so bitrot below the store's
-durable horizon would silently discard acknowledged records — or trip `Db::open`'s
-ahead-of-the-log assert with a misdiagnosis. The rule when read faults land: an invalid
-frame at or below the horizon (the store's `applied_seq` at open) is a hard corruption
-error naming restore-from-replica/backup, never a cut. (2) `File::sync` does not persist
-a file's *directory entry*: a freshly rotated-in segment's name can vanish on power loss,
-taking acknowledged records with it — prod `Disk` needs a directory barrier and the sim
-must model entry loss. Both land with WAL segment management; M1 replication is what
-makes repair possible.
+**Two durability fences.** (1) *Tracked.* Recovery cannot yet tell a torn tail from
+mid-log corruption of committed frames: any invalid frame is the cut, so bitrot below the
+store's durable horizon would silently discard acknowledged records — or trip
+`Db::open`'s ahead-of-the-log assert with a misdiagnosis. The rule when read faults land:
+an invalid frame at or below the horizon (the store's `applied_seq` at open) is a hard
+corruption error naming restore-from-replica/backup, never a cut. Lands with WAL segment
+management (recovery-horizon rule); M1 replication is what makes repair possible.
+(2) *Held.* `File::sync` does not persist a file's *directory entry*, so a freshly
+rotated-in segment's name (or a store file's, at creation) could vanish on power loss,
+taking acknowledged records with it, or a removed name could resurrect one a recovery
+already discarded. `Disk::sync_dir(prefix)` is the barrier: on `Ok`, every prior
+create/remove of a name starting with `prefix` is durable — same flat-namespace prefix
+contract as `list`. The prod impl fsyncs the holding directory; the sim tracks pending
+creates/removes and, only when `FaultConfig.dir_entry_loss > 0.0`, independently rolls
+each pending entry at crash (an affected create vanishes even if its bytes synced; an
+affected remove resurrects the file with its last durable content) — zero rng draws when
+the field is 0.0 (its default), so every pre-existing pinned seed replays unchanged. The
+log barriers rotation (before the new segment takes writes) and post-cut recovery cleanup
+(a durably-clean directory after truncation); the store barriers creation and the
+rebuild-discard-then-reopen path. Coverage key `fault:dir-entry`.
 
 **Record payload (v0, implemented).** A committed transaction's effects:
 `[n: u32]` then n tagged effects — put `0x00 [table][row]`, delete

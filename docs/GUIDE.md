@@ -1929,7 +1929,7 @@ A human-format failure looks like this (the exact shape a pinned test in
 ```text
 sim failure in receipts_exactly_once: exactly-once violated: hits 2, done 1 for key 3
   seed:   0x8bee1752811ae873
-  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms) }
+  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms) }
   repro:  charpente test --sim --filter receipts_exactly_once --seed 0x8bee1752811ae873
 ```
 
