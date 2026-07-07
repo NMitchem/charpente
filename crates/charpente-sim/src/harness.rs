@@ -476,7 +476,7 @@ fn write_human(report: &Report, out: &mut dyn std::io::Write) {
     if report.failures.is_empty() && report.missing_coverage.is_empty() {
         let _ = writeln!(
             out,
-            "sim: {} universe(s) per test, all green (master seed {:#018x})",
+            "sim: {} universe(s) per test, all green (master seed: {:#018x})",
             report.universes, report.master_seed
         );
     }
