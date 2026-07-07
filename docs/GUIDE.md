@@ -49,8 +49,9 @@ default libtest harness, so the sim runner supplies its own `main` instead.
 `charpente::prod::ProdDisk` is the production mount for the `Disk` trait —
 the sanctioned place ambient filesystem calls happen. Every table's backing
 file and the write-ahead log's segments live under one root directory, as
-flat relative names (`wal/000001.log`, `tables.redb`); subdirectories are
-created on demand.
+flat relative names (`tables.redb`; WAL segments are named by their
+zero-padded 20-digit base sequence, so the first is
+`wal/00000000000000000000.log`); subdirectories are created on demand.
 
 ```rust
 use charpente::prod::ProdDisk;
@@ -79,7 +80,8 @@ plus one lookup function per `#[index]` field.
 - It must have an `id` field of type `Id<Self>` — a typed primary key.
   `Id<Invoice>` is not `Id<Org>`, and neither is a bare `u64`. By
   convention (every example here follows it) `id` is declared first, but
-  the macro only checks that the field exists, not its position.
+  the macro only checks that the field exists and that its type is
+  `Id<Self>` (the rejection list below), never its position.
 - Every other field's type must implement `Codec` — charpente's own
   deterministic, versionless (v0) encoding, not serde. `Codec` is
   implemented for `u8`/`u16`/`u32`/`u64`/`i8`/`i16`/`i32`/`i64`, `bool`,
@@ -348,10 +350,19 @@ transactions".
 
 ### `TxError::App` vs `TxError::Io`
 
-```rust,ignore
-pub enum TxError<E> {
-    App(E),
-    Io(std::io::Error),
+`TxError<E>` has exactly two variants, and this block matches the real
+type — a variant rename or addition breaks the guide's compile gate:
+
+```rust
+use charpente::TxError;
+
+/// The two arms differ in what they promise: `App` means nothing was
+/// written; `Io` means the outcome is unknown (details below).
+fn describe<E: std::fmt::Display>(err: &TxError<E>) -> String {
+    match err {
+        TxError::App(e) => format!("rejected by the app — nothing was written: {e}"),
+        TxError::Io(e) => format!("platform IO failure — outcome unknown: {e}"),
+    }
 }
 ```
 
@@ -1104,8 +1115,9 @@ Because the simulator's clock is virtual, a schedule's real-world interval
 costs nothing extra to exercise exhaustively: driving a monthly cron
 schedule through ten simulated years (121 ticks) runs in well under a
 second of wall-clock time. Nothing about cron's tick behavior depends on
-wall-clock speed — the sim harness that drives this (`charpente test
---sim`) is covered in a later section.
+wall-clock speed — §8 shows the machinery (a scripted kernel under virtual
+time, in "Driving the whole app in a sim") and `charpente test --sim`, the
+runner.
 
 ### Putting it together
 
@@ -1199,12 +1211,14 @@ Everything in §1–§7 routes ambient IO through `Disk`, `Entropy`, and
 `charpente-sim` can exist. `charpente_sim::Sim` implements all three traits
 against one seed: a `u64` that determines virtual time, every entropy draw,
 and a fault matrix (write errors, sync errors, crashes between any two disk
-operations, torn writes). `App::handle` (§5) is what the simulator drives —
-your handlers, jobs, and cron ticks run completely unmodified; nothing
-about your app becomes "testable" specially, because it was already built
-on the traits. The product's core promise: the same seed always produces
-the same universe, so a failure a workload returns is not just a bug
-report — it is a one-command reproduction, forever.
+operations, torn writes). The whole app is what the simulator drives:
+requests through the same `App::handle` (§5), jobs and cron through the
+same kernel loop (§6–§7) production runs — see "Driving the whole app in a
+sim" below. Your handlers run completely unmodified; nothing about your app
+becomes "testable" specially, because it was already built on the traits.
+The product's core promise: the same seed always produces the same
+universe, so a failure a workload returns is not just a bug report — it is
+a one-command reproduction, forever.
 
 ### `tests/sim.rs`
 
@@ -1227,7 +1241,6 @@ you something real: either the workload never drives the system into that
 state, or the universe count is too low to make it likely.
 
 ```rust
-use charpente::core::io::Disk;
 use charpente::{Db, DbConfig, Id, Schema, View, table};
 use charpente_sim::Sim;
 use charpente_sim::checks::{is_fault_fallout, replays_identically};
@@ -1320,9 +1333,12 @@ before hand-rolling the same logic a fourth time:
   — the determinism oracle. Runs `workload` twice, each on its own fresh
   `Sim::new(seed)`, and fails if the returned value or the durable
   end-state (`Sim::durable_fingerprint`) diverge. It always constructs
-  plain `Sim::new` worlds (never a swarm `FaultConfig`), so replaying an
-  exact swarm universe's fault schedule needs its own `Sim` reconstructed
-  the same way `run_universe` builds one.
+  plain `Sim::new` worlds — never a *swarm* `FaultConfig` (swarm testing:
+  the harness samples each universe's fault rates and latency ranges from
+  its own seed, so a batch explores many fault mixes instead of every
+  universe sharing one fixed matrix) — so it re-runs the workload's logic
+  under default fault rates rather than replaying the exact fault schedule
+  of the swarm universe that called it.
 - `acked_implies_durable(seed: u64, rounds: u32, drive: impl FnMut(&mut Sim) -> Result<Vec<String>, String>, verify: impl FnMut(&mut Sim, &[String]) -> Result<(), String>) -> Result<(), String>`
   — the ack-durability property, generically: `rounds` times, `drive` does
   one round of work and returns the ids it promised are durable (classifying
@@ -1399,6 +1415,216 @@ fn bytes_survive_restarts(sim: &mut Sim) -> Result<(), String> {
 }
 ```
 
+### Driving the whole app in a sim
+
+The workloads above drive `Db` directly. The full app — routes, jobs, and
+cron multiplexed on one loop — is just as drivable, because the loop itself
+(`charpente::kernel::Kernel`) sits inside the deterministic boundary:
+`charpente::serve` (§5) runs it against hyper's channel in production; a
+sim test runs the identical loop code against a scripted timeline. Three
+pieces:
+
+- **Requests** are built with the public builder: `Request::new(Method::Post,
+  "/hit")`, then `.header(key, value)` (keys are lowercased for you) and
+  `.json(&value)` for a JSON body. An authenticated request carries its
+  session token (§5) the same way production traffic does:
+  `.header("authorization", format!("Bearer {token}"))`.
+- **`SimSource`** is the scripted request source.
+  `SimSource::new(Box::new(sim.clock()), horizon_nanos)` bounds the
+  universe at a virtual-time horizon; `push_at(at_nanos, request)`
+  schedules arrivals (in arrival order — pushing out of order is an
+  assert); `responses()` hands back a shared handle to the recorded
+  `(status, body)` pairs, filled in as the kernel replies.
+- **`Kernel::new(app, Box::new(sim.clock()))`** consumes the mounted `App`
+  (upserting cron rows and rebuilding the job due-heap — §6, §7);
+  `kernel.run(&mut source)` then serves scripted requests at their virtual
+  arrival times, runs due jobs, and ticks cron, exactly as in production —
+  and since sleeping through an empty stretch just advances the virtual
+  clock, a two-hour universe finishes in milliseconds. `run` returns
+  `Ok(())` once nothing is left inside the horizon, `Err` if the engine
+  poisoned mid-run (§9). Afterwards, `kernel.stats()` snapshots the loop's
+  counters (`requests`, `jobs_done`, `jobs_retried`, `jobs_dead`,
+  `cron_ticks`, `cron_catchups`) and `kernel.into_app()` hands the `App`
+  back — `app.db().snapshot()` reads the durable end-state.
+
+One mindset note before the example: under `charpente test --sim`, every
+universe gets its own swarm-sampled fault matrix, so exact-trace assertions
+("exactly 3 requests, exactly 5 jobs done") will fail whenever a fault
+fires. Assert *invariants* — claims that hold under any fault schedule —
+and classify operational failures with `is_fault_fallout`, exactly like the
+`Db`-level workload above. (For an exact-trace test, build your own
+fault-free world inside the workload: `Sim::with_faults(seed,
+FaultConfig::none())`.)
+
+```rust
+use charpente::core::job::{JobRow, JobStatus};
+use charpente::core::table::{Codec, Id};
+use charpente::http::{ApiError, App, AppConfig, Method, Request};
+use charpente::kernel::{JobError, Kernel, SimSource};
+use charpente::{Schema, Tx, View, job, jobs, route, routes, table};
+use charpente_sim::Sim;
+use charpente_sim::checks::is_fault_fallout;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+const SEC: u64 = 1_000_000_000; // SimSource timestamps are virtual nanoseconds
+
+#[table]
+struct Counter {
+    id: Id<Counter>,
+    hits: u64,
+}
+
+#[job]
+struct CountUp {
+    slot: u64,
+}
+
+impl CountUp {
+    fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+        let hits = tx.get(Id::<Counter>::from_raw(self.slot))?.map_or(0, |c| c.hits);
+        tx.put(&Counter {
+            id: Id::from_raw(self.slot),
+            hits: hits + 1,
+        });
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct HitBody {
+    slot: u64,
+}
+
+#[route(POST "/hit")]
+fn hit(tx: &mut Tx, body: HitBody) -> Result<u64, ApiError> {
+    tx.enqueue(CountUp { slot: body.slot });
+    Ok(body.slot)
+}
+
+fn build_app(sim: &Sim) -> std::io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?
+    .mount(routes![hit])
+    .mount_jobs(jobs![CountUp])
+    .schedule("hourly-count", Duration::from_secs(3600), || CountUp {
+        slot: 777,
+    }))
+}
+
+/// The end-state oracle, run after the universe. Two invariants that hold
+/// under ANY fault schedule:
+///
+/// - Ack-after-durable, app-level: every 200 from `/hit` committed its
+///   enqueue in the same log record, so at least `acked` request-slot
+///   CountUp rows exist. `>=`, not `==`: a request that got a 500 for a
+///   platform Io failure is ambiguous (§4) — its record may have landed
+///   anyway.
+/// - Exactly-once (§6), checked from the outside: per slot, counter hits
+///   ≡ Done job rows — a handler's effects and its Done-mark commit as one
+///   record, so no fault schedule can split them.
+fn check_invariants(app: &App, acked: u64) -> Result<(), String> {
+    let snap = app.db().snapshot().map_err(|e| e.to_string())?;
+    let mut request_jobs = 0u64;
+    let mut done: BTreeMap<u64, u64> = BTreeMap::new();
+    for job in snap.scan::<JobRow>().map_err(|e| e.to_string())? {
+        if job.name != "CountUp" {
+            continue;
+        }
+        let slot = u64::decode(&mut &job.payload[..]).map_err(|e| e.to_string())?;
+        if slot < 3 {
+            request_jobs += 1; // enqueued by a request, not by cron's slot 777
+        }
+        if job.status == JobStatus::Done {
+            *done.entry(slot).or_insert(0) += 1;
+        }
+    }
+    if request_jobs < acked {
+        return Err(format!(
+            "ack-durability violated: {acked} 200s acked but only {request_jobs} request jobs durable"
+        ));
+    }
+    for counter in snap.scan::<Counter>().map_err(|e| e.to_string())? {
+        let done_count = done.get(&counter.id.raw()).copied().unwrap_or(0);
+        if counter.hits != done_count {
+            return Err(format!(
+                "exactly-once violated at slot {}: {} hits vs {done_count} Done jobs",
+                counter.id.raw(),
+                counter.hits
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One whole-app universe: three requests arrive over three virtual
+/// seconds, each enqueueing a job; an hourly cron schedule ticks twice
+/// before the two-hour horizon; then the durable end-state is checked.
+fn whole_app(sim: &mut Sim) -> Result<(), String> {
+    let app = match build_app(sim) {
+        Ok(app) => app,
+        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+
+    let mut source = SimSource::new(Box::new(sim.clock()), 2 * 3600 * SEC + SEC);
+    for slot in 0..3u64 {
+        source.push_at(
+            slot * SEC,
+            Request::new(Method::Post, "/hit").json(&HitBody { slot }),
+        );
+    }
+    let responses = source.responses();
+
+    let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
+        Ok(kernel) => kernel,
+        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    // The same event loop `serve` runs in production. An `Err` here means
+    // the engine poisoned mid-run — under an injected fault schedule that
+    // is fallout, not a bug.
+    if let Err(e) = kernel.run(&mut source)
+        && !is_fault_fallout(&e.to_string())
+    {
+        return Err(e.to_string());
+    }
+
+    let stats = kernel.stats();
+    if stats.requests > 0 {
+        sim.cover("kernel:served"); // pair with `require ["kernel:served"]`
+    }
+    let acked = responses
+        .lock()
+        .map_err(|_| "responses lock poisoned".to_string())?
+        .iter()
+        .filter(|(status, _)| *status == 200)
+        .count() as u64;
+
+    let app = kernel.into_app();
+    match check_invariants(&app, acked) {
+        Ok(()) => Ok(()),
+        // The oracle's own reads go through the same faulted disk (e.g. the
+        // store can latch after an earlier injected write error): fallout
+        // ends the universe with nothing to assert; anything else is real.
+        Err(msg) if is_fault_fallout(&msg) => Ok(()),
+        Err(msg) => Err(msg),
+    }
+}
+```
+
+Register it like any workload — add `whole_app require ["kernel:served"]`
+to the `sim_tests! { ... }` list. Nothing limits a universe to one script,
+either: `run` returns when its source is exhausted, and the same kernel can
+be `run` again against a second `SimSource` — script a login phase, read
+the token out of its recorded responses, then script the authenticated
+phase with `.header("authorization", format!("Bearer {token}"))`.
+
 ### `charpente test --sim`
 
 Run it from the app crate's own directory (or pass `--dir`):
@@ -1464,11 +1690,10 @@ Four lines, each load-bearing:
 - `seed` is the one `u64` that determined this entire universe: virtual
   time, every entropy draw, and the fault matrix's decisions.
 - `config` is that universe's sampled `FaultConfig` — the fault rates and
-  latency ranges actually in effect (swarm testing draws a different matrix
-  per universe rather than one fixed set for every run; §7 mentions the
-  swarm sampler's other consumer, virtual-time cron testing). Reading it
-  tells you what kind of trouble was injected — e.g. `crash_torn: 0.664668`
-  here means torn writes were common in this universe.
+  latency ranges actually in effect (per-universe swarm sampling, glossed
+  under the checkers above). Reading it tells you what kind of trouble was
+  injected — e.g. `crash_torn: 0.664668` here means torn writes were
+  common in this universe.
 - `repro` is not advice, it **is** the reproduction: paste that exact line
   and the same universe runs again, because `--seed` (above) replays a
   literal seed byte-identically. There is no separate "figure out how to
@@ -1635,6 +1860,26 @@ panic the moment a name is reused. The fourth (§3) is `Schema::table::<R>()`
 passed to `Db::open`, including registering `Session` or `charpente.jobs`
 yourself (`App::open`/`Db::open` already register those). Fix in every
 case: register that name/type exactly once.
+
+### Call-site contract panics (`charpente-core/src/db.rs`, `charpente/src/prod.rs`, `charpente/src/kernel/cron.rs`)
+
+```text
+contract: an idempotency key names the job's external identity — it cannot be empty
+Disk paths are relative flat names like "wal/000001.log" — got "<path>"
+cron schedule "<name>": interval <duration> exceeds u64 nanos (~584 years) — pick a smaller interval
+```
+
+The first (§4, §6) is `tx.enqueue_keyed(key, job)` handed an empty `key` —
+the key is the job's stable identity to the world outside the log, so an
+empty one names nothing; pass a real identity (e.g. `format!("receipt:{id}")`)
+or use plain `tx.enqueue` if the job has no external identity to protect.
+The second (§1) is any `Disk` operation handed a path that is absolute,
+empty, or contains a `.`/`..` segment — usually a hand-built `DbConfig`
+`store_path`/`wal.dir`; fix: plain relative flat names only. The third
+(§7) is a cron interval that overflows `u64` nanoseconds; note §7's timing
+caveat — it fires at kernel startup, not at the `.schedule(...)` call, so
+under `serve()` it takes the kernel thread down after `serve` has already
+returned `Ok`.
 
 ### Record and body size limits (`charpente-core/src/db.rs`, `charpente-core/src/log.rs`, `charpente/src/http/app.rs`)
 
