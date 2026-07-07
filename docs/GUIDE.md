@@ -3,9 +3,9 @@
 *(This file is compile-gated: every `rust` code block below is extracted
 and built by `crates/guide-examples` — `cargo build -p guide-examples` fails
 if a block stops compiling. Sections 1–4 cover the persistence layer:
-project setup, tables, the database, and transactions. Sections 5–9 — HTTP
-routes, jobs, cron, sim testing, and an error index — land in later
-commits.)*
+project setup, tables, the database, and transactions. Sections 5–7 cover
+the deterministic kernel: HTTP, jobs, and cron. Sections 8–9 — sim testing
+and an error index — land in later commits.)*
 
 ## 1. Project setup
 
@@ -387,3 +387,798 @@ inside `f` — charpente's own crates ban these mechanically with a clippy
 `disallowed-methods`/`disallowed-types` deny-list (`clippy.toml`) enforced
 in CI, not by review; adopt the same deny-list in your own app for the same
 guarantee.
+
+## 5. HTTP
+
+`App` owns the `Db` plus a router; `App::handle(request: Request) -> Response`
+is the whole surface — the sim drives `handle` directly, and
+`charpente::serve` is what feeds it from real hyper traffic in production.
+Every request that reaches a matched route runs inside exactly one
+transaction: routing, the session lookup, and your handler all happen
+inside the same `db.transact` call covered in §4.
+
+### The `#[route]` argument convention
+
+`#[route(METHOD "/path/:param", ...)]` goes on a free function (`METHOD` is
+one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`; the trailing `, auth` flag is
+optional and covered under Sessions below). The macro checks the function's
+argument list against the path and emits the glue that extracts, decodes,
+and dispatches to it:
+
+- The first argument must be named exactly `tx`, typed `&mut Tx`.
+- Then one argument per `:param` in the path, **in path order**, each named
+  exactly like its param (`:id` needs an argument named `id`). Its type
+  must implement `FromParam` — `u64`, `String`, and `Id<T>` (any `T`) are
+  provided; a bad path segment fails as a named 400, not a panic.
+- Then at most one JSON body argument, of any type implementing
+  `serde::Deserialize`.
+- Then, optionally, a trailing argument named exactly `ctx`, typed `&Ctx`
+  (session access — see Sessions below).
+
+The handler returns `Result<T, ApiError>` where `T: serde::Serialize`; on
+`Ok`, the glue emits `Response::json(200, &value)`.
+
+```rust
+use charpente::core::table::Id;
+use charpente::http::{ApiError, App, AppConfig, Ctx};
+use charpente::prod::{ProdDisk, ProdEntropy};
+use charpente::{Schema, Tx, View, route, routes, table};
+use serde::Deserialize;
+
+#[table]
+struct Note {
+    id: Id<Note>,
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct NoteBody {
+    text: String,
+}
+
+// tx, then :id (named `id`, path order), then the JSON body, then `ctx`.
+#[route(POST "/notes/:id")]
+fn create_note(tx: &mut Tx, id: u64, body: NoteBody, ctx: &Ctx) -> Result<u64, ApiError> {
+    let _ = ctx; // available; this route just doesn't need a session
+    tx.put(&Note {
+        id: Id::from_raw(id),
+        text: body.text,
+    });
+    Ok(id)
+}
+
+#[route(GET "/notes/:id")]
+fn get_note(tx: &mut Tx, id: Id<Note>) -> Result<String, ApiError> {
+    Ok(tx.get(id)?.ok_or(ApiError::NotFound)?.text)
+}
+
+fn build_app(data_dir: &str) -> std::io::Result<App> {
+    Ok(App::open(
+        Box::new(ProdDisk::new(data_dir)?),
+        Schema::new().table::<Note>(),
+        Box::new(ProdEntropy::new()?),
+        AppConfig::default(),
+    )?
+    .mount(routes![create_note, get_note]))
+}
+```
+
+`Request`'s shape (what a handler ultimately runs against, one layer down):
+`method: Method`, `path: String`, `headers: BTreeMap<String, String>` (keys
+lowercased), `body: Vec<u8>`. The query string is stripped at the edge and
+ignored in v0 — routes cannot see it.
+
+### Mounting routes, and the conflict panic
+
+`App::open(...)` returns the platform-registered `App`; `.mount(routes![...])`
+adds a batch of routes, checking every new route against every route already
+mounted. Two routes with the **same method and the same shape** — the same
+sequence of literal-vs-`:param` segments, so both could match one real path
+— panic at mount time, not at request time:
+
+```rust
+use charpente::http::{ApiError, App};
+use charpente::{Tx, route, routes};
+
+#[route(GET "/notes/:id")]
+fn by_id(tx: &mut Tx, id: u64) -> Result<u64, ApiError> {
+    let _ = tx;
+    Ok(id)
+}
+
+#[route(GET "/notes/:key")]
+fn by_key(tx: &mut Tx, key: String) -> Result<String, ApiError> {
+    let _ = tx;
+    Ok(key)
+}
+
+// `/notes/:id` and `/notes/:key` are the same shape under the same method —
+// both could match `GET /notes/42` — so mounting both panics with:
+// "route conflict: GET /notes/:key (fn by_key) collides with GET
+//  /notes/:id (fn by_id) — two routes with the same method and shape can
+//  both match one path; change one pattern"
+fn mount_conflicting(app: App) -> App {
+    app.mount(routes![by_id, by_key])
+}
+```
+
+A literal segment beats a `:param` at the same position instead of
+conflicting — `/notes/all` and `/notes/:id` can coexist, and a request for
+`/notes/all` always prefers the literal route.
+
+### Sessions: the platform `Session` table and `Ctx`
+
+`App::open` registers one table of its own alongside yours: `Session` (`id:
+Id<Session>`, `#[index] token: String`, `subject: String`) — raw tokens in
+v0; M1 adds hashing and expiry. Every request gets a `Ctx`, built inside the
+same transaction as your handler, carrying:
+
+- `ctx.session() -> Option<&Session>` — the session matched by the
+  request's credentials, if any.
+- `ctx.create_session(tx, subject) -> String` — inserts a `Session` row and
+  returns its token (a login). The token is 32 entropy bytes, hex-encoded
+  (64 characters), drawn once *before* the transaction starts — calling
+  `create_session` twice in one request panics: "Ctx::create_session called
+  twice in one request — one session per request".
+- `ctx.revoke(tx)` — deletes the current session (a no-op without one).
+
+The request's credential is read from `Authorization: Bearer <token>` if
+present, else a `charpente_session=<token>` pair in the `Cookie` header.
+`#[route(METHOD "/path", auth)]` rejects the request before your handler
+runs if no session matched: 401, with the fixed message "no valid session —
+send `Authorization: Bearer <token>` or a `charpente_session` cookie".
+Without `auth`, the route always runs — `ctx.session()` is just `None`.
+
+```rust
+use charpente::http::{ApiError, App, AppConfig, Ctx};
+use charpente::prod::{ProdDisk, ProdEntropy};
+use charpente::{Schema, Tx, route, routes};
+
+#[route(POST "/login")]
+fn login(tx: &mut Tx, subject: String, ctx: &Ctx) -> Result<String, ApiError> {
+    Ok(ctx.create_session(tx, subject))
+}
+
+#[route(GET "/me", auth)]
+fn whoami(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
+    let _ = tx;
+    Ok(ctx
+        .session()
+        .expect("auth routes always have a session")
+        .subject
+        .clone())
+}
+
+#[route(POST "/logout", auth)]
+fn logout(tx: &mut Tx, ctx: &Ctx) -> Result<&'static str, ApiError> {
+    ctx.revoke(tx);
+    Ok("bye")
+}
+
+fn build_app(data_dir: &str) -> std::io::Result<App> {
+    Ok(App::open(
+        Box::new(ProdDisk::new(data_dir)?),
+        Schema::new(), // Session is registered by App::open itself
+        Box::new(ProdEntropy::new()?),
+        AppConfig::default(),
+    )?
+    .mount(routes![login, whoami, logout]))
+}
+```
+
+### `ApiError` and status mapping
+
+A handler rejects with `ApiError`; `From<io::Error> for ApiError` converts
+to `Internal`, so `?` works on `tx` reads exactly like it does inside a
+plain transaction (§4). Every response body is a JSON envelope
+`{"error": "<message>"}` except a 200, which is the handler's own returned
+value:
+
+- `BadRequest(String)` → 400. What `FromParam`/JSON-body decoding produce
+  (below), or your own rejection.
+- `Unauthorized` → 401. Fixed message (quoted above) — produced by `auth`
+  routes only, before your handler runs.
+- `NotFound` → 404. Fixed message `"not found"` — the same text an
+  unmatched path gets from the router directly.
+- `Internal(String)` → 500. Carries `e.to_string()` when it arrived via
+  `?`, or your own message.
+
+Two more statuses never go through `ApiError` at all: an unmatched path is
+404 ("not found") and a matched path with the wrong method is 405 ("method
+not allowed for this path") — both produced by the router before a
+transaction ever opens, so nothing was attempted, let alone written.
+
+A path param that doesn't parse is a named 400 — e.g. a non-numeric `:id`
+against a `u64` argument: `"path parameter :id must be an unsigned integer
+— got \"abc\""`. A missing or malformed JSON body is a named 400 too, e.g.
+`"this route requires a JSON body of type NoteBody"` (empty body) or
+`"invalid JSON body for NoteBody: <serde_json's own message>"`.
+
+### The 1 MiB body cap
+
+`AppConfig::body_cap` (default `1 << 20` — 1,048,576 bytes, 1 MiB) fences
+the request body — and, transitively, `Db::transact`'s 16 MiB record-size
+assert (§4) from ever seeing raw network input. It is enforced in two
+places:
+
+- In production, `charpente::serve` enforces it at the wire — a
+  length-limited body read rejects an oversized body *before* the request
+  is even routed, so it applies uniformly to every path, matched or not.
+  With a 64-byte cap and a 65-byte body, the wire's 413 reads exactly:
+  `"request body exceeds the 64-byte cap — raise AppConfig.body_cap or
+  send less"`.
+- Inside the kernel (`App::handle` — what the sim drives directly, and
+  what `serve` calls after decoding), the same cap is checked again, but
+  only **after** routing succeeds: an oversized body sent to an unmatched
+  path 404s, not 413, since the router runs first. With the same 64/65
+  numbers, this 413 reads: `"request body is 65 bytes but the cap is 64 —
+  raise AppConfig.body_cap or send less"`.
+
+Apps exercised only through `App::handle` (sim tests, and anything built
+directly against the kernel) only ever see the second message — the wire
+check is production-only edge behavior.
+
+```rust
+use charpente::http::AppConfig;
+
+fn small_cap_config() -> AppConfig {
+    AppConfig {
+        body_cap: 4096,
+        ..AppConfig::default()
+    }
+}
+```
+
+### Ack-after-durable
+
+A 200 is emitted only once the handler's transaction has returned `Ok` —
+which, per §4, only happens after that transaction's one log record has
+synced to disk. There is no path that returns a 200 before durability.
+
+The other statuses fall out of §4's `TxError` split precisely:
+`ApiError`-mapped statuses (400/401/404, and a handler-level 500 from
+`Internal`/`?`) are `TxError::App(e)` — the transaction aborted, **nothing
+was written**, so there is nothing ambiguous about them. The remaining
+case, `TxError::Io` — a platform failure appending or syncing the record
+itself, outside the handler's own logic — is genuinely unknown: the record
+may already be durable. It surfaces as its own 500, with a message that
+says so instead of guessing: `"internal storage failure — the request may
+or may not have committed; retry after the server recovers: {e}"`.
+
+### Starting the server
+
+`charpente::serve::serve(addr: &str, app: App) -> io::Result<Server>` spawns
+the kernel (requests, due jobs, and cron ticks — §6 and §7 ride the same
+loop) on one thread and the hyper listener on another, then returns as soon
+as both are up — it does not block. v0 has no graceful shutdown: the
+process owns the server for as long as it runs.
+
+```rust
+use charpente::core::table::Id;
+use charpente::http::{ApiError, App, AppConfig};
+use charpente::prod::{ProdDisk, ProdEntropy};
+use charpente::{Schema, Tx, View, route, routes, table};
+use serde::Deserialize;
+
+#[table]
+struct Note {
+    id: Id<Note>,
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct NoteBody {
+    text: String,
+}
+
+#[route(POST "/notes/:id")]
+fn create_note(tx: &mut Tx, id: u64, body: NoteBody) -> Result<u64, ApiError> {
+    tx.put(&Note {
+        id: Id::from_raw(id),
+        text: body.text,
+    });
+    Ok(id)
+}
+
+#[route(GET "/notes/:id")]
+fn get_note(tx: &mut Tx, id: Id<Note>) -> Result<String, ApiError> {
+    Ok(tx.get(id)?.ok_or(ApiError::NotFound)?.text)
+}
+
+fn main() -> std::io::Result<()> {
+    let app = App::open(
+        Box::new(ProdDisk::new("./data")?),
+        Schema::new().table::<Note>(),
+        Box::new(ProdEntropy::new()?),
+        AppConfig::default(),
+    )?
+    .mount(routes![create_note, get_note]);
+
+    charpente::serve::serve("0.0.0.0:8080", app)?;
+
+    // `serve` already returned a running server; park the main thread to
+    // keep the process alive for it (no graceful shutdown in v0).
+    loop {
+        std::thread::park();
+    }
+}
+```
+
+### What `#[route]` rejects
+
+Every rejection is a compile error naming the contract and the fix:
+
+```rust,ignore
+// first argument isn't named `tx`
+#[route(GET "/ping")]
+fn ping(ctx: &Ctx) -> Result<&'static str, ApiError> {
+    Ok("pong")
+}
+// "a #[route] handler's first argument must be `tx: &mut Tx` — `ping` is
+//  missing it"
+
+// argument count doesn't match the :param count
+#[route(GET "/notes/:id")]
+fn get_note(tx: &mut Tx) -> Result<String, ApiError> {
+    Ok(String::new())
+}
+// "`get_note` takes 0 argument(s) after `tx` (excluding `ctx`) but the path
+//  \"/notes/:id\" has 1 :param(s) — write one argument per :param (same
+//  name, path order) plus at most one JSON body argument"
+
+// argument name doesn't match the :param name
+#[route(GET "/notes/:id")]
+fn get_note(tx: &mut Tx, key: u64) -> Result<String, ApiError> {
+    Ok(String::new())
+}
+// "this argument must be named `id` to match :id in \"/notes/:id\" — got
+//  `key`"
+
+// route path isn't a string literal, or doesn't start with '/', or names
+// an unknown method — each fails at the same macro-argument-parsing step
+// with its own named message (e.g. "route path must start with '/' — got
+// \"notes\"", "unknown method PUSH — one of GET, POST, PUT, PATCH, DELETE").
+```
+
+## 6. Jobs
+
+Jobs ride the same kernel loop as HTTP requests (§5's `charpente::serve`
+starts it): mounting a job or a schedule needs no separate worker process
+or entry point.
+
+### `#[job]` and its retry policy
+
+`#[job]` derives a job payload's `Codec`, its `NAME`, and the `JobEntry`
+glue `jobs![...]` collects — the same shape `#[table]` derives for rows
+(§2), minus the primary key. Bare `#[job]` takes `RetryPolicy::DEFAULT` (5
+attempts, 30s base backoff); `#[job(retry(max = <int>, backoff =
+"<n><unit>"))]` overrides either or both — `backoff` is a bare number plus
+a unit, one of `ms`, `s`, `m`, `h`.
+
+```rust
+use charpente::core::job::RetryPolicy;
+use charpente::kernel::JobError;
+use charpente::{Job, Tx, job};
+
+#[job]
+struct Basic {}
+
+impl Basic {
+    fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+        Ok(())
+    }
+}
+
+#[job(retry(max = 3, backoff = "10s"))]
+struct Custom {}
+
+impl Custom {
+    fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+        Ok(())
+    }
+}
+
+fn retry_policies() -> (RetryPolicy, RetryPolicy) {
+    (Basic::RETRY, Custom::RETRY) // (5, 30s), (3, 10s)
+}
+```
+
+### The handler signature
+
+`#[job]` does not derive a handler — you write one yourself, an inherent
+method with exactly this shape: `fn run(self, tx: &mut Tx) -> Result<(),
+JobError>`. It runs as its own transaction, so it reads and writes through
+`tx` exactly like a route handler or the closure in §4's `db.transact`.
+`JobError: From<io::Error>` (mapping to `JobError::Io`), so `?` works on
+`tx` reads the same way it does with `ApiError`:
+
+```rust
+use charpente::core::table::Id;
+use charpente::kernel::JobError;
+use charpente::{Tx, View, job, table};
+
+#[table]
+struct Counter {
+    id: Id<Counter>,
+    hits: u64,
+}
+
+#[job]
+struct CountUp {
+    slot: u64,
+}
+
+impl CountUp {
+    fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+        let hits = tx.get(Id::<Counter>::from_raw(self.slot))?.map_or(0, |c| c.hits);
+        tx.put(&Counter {
+            id: Id::from_raw(self.slot),
+            hits: hits + 1,
+        });
+        Ok(())
+    }
+}
+```
+
+### Registering jobs: `jobs![...]` and `mount_jobs`
+
+Like `routes![...]`, `jobs![...]` collects descriptors explicitly — a job
+type only dispatches once it's in this list, passed to
+`App::mount_jobs(...)`:
+
+```rust
+use charpente::core::table::Id;
+use charpente::http::{App, AppConfig};
+use charpente::kernel::JobError;
+use charpente::prod::{ProdDisk, ProdEntropy};
+use charpente::{Schema, Tx, View, job, jobs, table};
+
+#[table]
+struct Counter {
+    id: Id<Counter>,
+    hits: u64,
+}
+
+#[job(retry(max = 3, backoff = "10s"))]
+struct CountUp {
+    slot: u64,
+}
+
+impl CountUp {
+    fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+        let hits = tx.get(Id::<Counter>::from_raw(self.slot))?.map_or(0, |c| c.hits);
+        tx.put(&Counter {
+            id: Id::from_raw(self.slot),
+            hits: hits + 1,
+        });
+        Ok(())
+    }
+}
+
+fn build_app(data_dir: &str) -> std::io::Result<App> {
+    Ok(App::open(
+        Box::new(ProdDisk::new(data_dir)?),
+        Schema::new().table::<Counter>(),
+        Box::new(ProdEntropy::new()?),
+        AppConfig::default(),
+    )?
+    .mount_jobs(jobs![CountUp]))
+}
+```
+
+Mounting the same job type twice — in one `mount_jobs` call, or across
+several — panics at mount time: `"job \"CountUp\" registered twice — each
+#[job] type is mounted once"`.
+
+### Enqueueing: `enqueue` vs `enqueue_keyed`
+
+From inside any transaction — a route handler, a job handler, a cron tick
+— `tx.enqueue(job)` writes the job into that same committing log record;
+`Db::transact`'s apply step materializes it as a row in the platform's
+`charpente.jobs` table. `tx.enqueue_keyed(key, job)` does the same, plus
+carries a key: the job's stable identity to the world **outside** the log
+(the idempotency key an at-least-once external effect needs downstream —
+M1's external-IO surface consumes it). Inside the deterministic boundary
+the key means nothing in v0 — it is carried, never indexed or deduped on,
+because exactly-once state effects here are structural (below), not
+key-based. An empty key is a contract panic: `"contract: an idempotency
+key names the job's external identity — it cannot be empty"`.
+
+```rust
+use charpente::core::table::Id;
+use charpente::http::ApiError;
+use charpente::kernel::JobError;
+use charpente::{Tx, View, job, route, table};
+
+#[table]
+struct Invoice {
+    id: Id<Invoice>,
+    finalized: bool,
+}
+
+#[job]
+struct SendReminder {
+    invoice: u64,
+}
+
+impl SendReminder {
+    fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+        Ok(())
+    }
+}
+
+#[route(POST "/invoices/:id/remind")]
+fn remind(tx: &mut Tx, id: u64) -> Result<(), ApiError> {
+    let mut inv = tx
+        .get(Id::<Invoice>::from_raw(id))?
+        .ok_or(ApiError::NotFound)?;
+    inv.finalized = true;
+    tx.put(&inv);
+    tx.enqueue_keyed(format!("reminder:{id}"), SendReminder { invoice: id });
+    Ok(())
+}
+```
+
+### Retry, dead-letter, and exactly-once effects
+
+The dispatcher runs the earliest-due job inline, on the kernel thread, as
+its own transaction. On `Ok`, the handler's own effects (puts, deletes,
+enqueues, emits) and the row's Done-mark commit **as one record** — there
+is no window where the effects are durable but the Done-mark isn't, or
+vice versa: exactly-once state effects, structurally.
+
+On `Err(JobError::App(msg))` — your handler's own rejection, a panic inside
+it (absorbed as `"handler panicked: <payload>"`), or a corrupt payload
+(schema drift: `"job decode for <Name>: <e> — schema drift or corruption"`)
+— that attempt's own effects never committed, and a *second* transaction
+records the failure: `attempts` increments, `last_error` gets the message,
+and:
+
+- if `attempts < retry.max`: stays Pending, `due_at` moves to
+  `now + backoff * 2^(attempts - 1)` (nanoseconds; doubles every attempt,
+  saturating rather than overflowing at absurd attempt counts) — the
+  policy's configured base `backoff` is attempt 1's wait.
+- if `attempts >= retry.max`: status becomes Dead. Dead rows are retained,
+  with `last_error` as the record of what killed them.
+
+On `Err(JobError::Io(e))` — a platform fault the handler's own reads
+surfaced, or one from the transaction machinery itself — none of this
+happens: it is **not an attempt**. The row stays Pending, untouched, and
+the error bubbles up (restart-and-recover, same as a request-path `Io`
+failure in §5) instead of silently burning retry budget on a healthy job
+that just hit a bad disk. `JobError::Io`'s own `Display` names this:
+`"platform IO failure during the handler (not an attempt): <e>"`.
+
+One more failure mode: if a `JobRow`'s `name` isn't in the `jobs![...]` list
+`App::mount_jobs` was given — a job enqueued by a since-removed or renamed
+type — it fails the same way as a handler rejection, with: `"job
+\"<name>\" is not registered — add it to the jobs![…] list passed to
+App::mount_jobs (or this log outlived a renamed job type)"`.
+
+### What `#[job]` rejects
+
+```rust,ignore
+// unrecognized retry syntax
+#[job(bogus)]
+struct Foo {}
+// "write `#[job]` or `#[job(retry(max = <int>, backoff = \"<n><unit>\"))]`
+//  (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff =
+//  \"10s\"))]`"
+
+// backoff with no unit suffix
+#[job(retry(max = 3, backoff = "10"))]
+struct Bar {}
+// "backoff \"10\" has no unit — write `#[job]` or `#[job(retry(max =
+//  <int>, backoff = \"<n><unit>\"))]` (unit is one of ms, s, m, h) — e.g.
+//  `#[job(retry(max = 3, backoff = \"10s\"))]`"
+
+// enums and unions cannot be job payloads
+#[job]
+enum Baz {
+    A,
+}
+// "#[job] applies to structs — enums and unions cannot be job payloads"
+```
+
+## 7. Cron
+
+Cron rides the same kernel loop as HTTP requests and jobs (§5, §6) — a
+schedule is a row, and a due tick is one transaction that advances the
+schedule and enqueues a job through the exact same path `tx.enqueue` uses:
+a recurring enqueuer, inheriting retry and observability for free.
+
+### Registering a schedule: `App::schedule`
+
+`App::schedule(name: &'static str, every: Duration, make: impl Fn() -> J +
+Send + 'static) -> App` registers one schedule; `make` builds the job
+enqueued on each tick.
+
+```rust
+use charpente::core::table::Id;
+use charpente::http::{App, AppConfig};
+use charpente::kernel::JobError;
+use charpente::prod::{ProdDisk, ProdEntropy};
+use charpente::{Schema, Tx, View, job, jobs, table};
+use std::time::Duration;
+
+#[table]
+struct DigestState {
+    id: Id<DigestState>,
+    sent: u64,
+}
+
+#[job]
+struct SendDigest {}
+
+impl SendDigest {
+    fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+        let sent = tx.get(Id::<DigestState>::from_raw(0))?.map_or(0, |s| s.sent);
+        tx.put(&DigestState {
+            id: Id::from_raw(0),
+            sent: sent + 1,
+        });
+        Ok(())
+    }
+}
+
+fn build_app(data_dir: &str) -> std::io::Result<App> {
+    Ok(App::open(
+        Box::new(ProdDisk::new(data_dir)?),
+        Schema::new().table::<DigestState>(),
+        Box::new(ProdEntropy::new()?),
+        AppConfig::default(),
+    )?
+    .mount_jobs(jobs![SendDigest])
+    .schedule("monthly-digest", Duration::from_secs(30 * 24 * 3600), || {
+        SendDigest {}
+    }))
+}
+```
+
+Scheduling the same name twice panics at mount time, same shape as routes
+and jobs:
+
+```rust
+use charpente::http::{App, AppConfig};
+use charpente::kernel::JobError;
+use charpente::prod::{ProdDisk, ProdEntropy};
+use charpente::{Schema, Tx, job};
+use std::time::Duration;
+
+#[job]
+struct Tick {}
+
+impl Tick {
+    fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+        Ok(())
+    }
+}
+
+// "cron schedule \"nightly\" scheduled twice — schedule each name once"
+fn build_app(data_dir: &str) -> std::io::Result<App> {
+    Ok(App::open(
+        Box::new(ProdDisk::new(data_dir)?),
+        Schema::new(),
+        Box::new(ProdEntropy::new()?),
+        AppConfig::default(),
+    )?
+    .schedule("nightly", Duration::from_secs(3600), || Tick {})
+    .schedule("nightly", Duration::from_secs(7200), || Tick {}))
+}
+```
+
+An interval that overflows u64 nanoseconds (~584 years — not a realistic
+schedule, but checked) panics the same way, at mount time: `"cron schedule
+\"<name>\": interval <duration> exceeds u64 nanos (~584 years) — pick a
+smaller interval"`.
+
+### Ticks are transactions
+
+Nothing about a tick is special: `CronRow` (`id`, `#[index] name`,
+`interval_nanos`, `next_due`) is a platform-registered row like `Session`,
+and a due tick opens a transaction that reads that row, advances
+`next_due` by one interval, and calls your `make()` job's `tx.enqueue` —
+all committed together. A schedule's phase survives process restarts: its
+row is upserted (not reset) at every `App::open`.
+
+### Catch-up fires once, never backfills
+
+If the process is down across more than one whole interval — say an
+hourly schedule misses five hours of ticks — the next tick still only
+enqueues **one** job, and `next_due` jumps to `now + interval`: a single
+step past the present, not five queued catch-up runs for the five missed
+hours. Backfill is a deliberate non-goal.
+
+### Virtual time in tests
+
+Because the simulator's clock is virtual, a schedule's real-world interval
+costs nothing extra to exercise exhaustively: driving a monthly cron
+schedule through ten simulated years (121 ticks) runs in well under a
+second of wall-clock time. Nothing about cron's tick behavior depends on
+wall-clock speed — the sim harness that drives this (`charpente test
+--sim`) is covered in a later section.
+
+### Putting it together
+
+Routes, sessions, jobs, and a cron schedule all mount onto the same `App`;
+one call to `charpente::serve::serve` starts all of it:
+
+```rust
+use charpente::core::table::Id;
+use charpente::http::{ApiError, App, AppConfig, Ctx};
+use charpente::kernel::JobError;
+use charpente::prod::{ProdDisk, ProdEntropy};
+use charpente::{Schema, Tx, View, job, jobs, route, routes, table};
+use serde::Deserialize;
+use std::time::Duration;
+
+#[table]
+struct Note {
+    id: Id<Note>,
+    text: String,
+}
+
+#[table]
+struct DigestState {
+    id: Id<DigestState>,
+    sent: u64,
+}
+
+#[derive(Deserialize)]
+struct NoteBody {
+    text: String,
+}
+
+#[job]
+struct SendDigest {}
+
+impl SendDigest {
+    fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+        let sent = tx.get(Id::<DigestState>::from_raw(0))?.map_or(0, |s| s.sent);
+        tx.put(&DigestState {
+            id: Id::from_raw(0),
+            sent: sent + 1,
+        });
+        Ok(())
+    }
+}
+
+#[route(POST "/notes/:id")]
+fn create_note(tx: &mut Tx, id: u64, body: NoteBody, ctx: &Ctx) -> Result<u64, ApiError> {
+    let _ = ctx;
+    tx.put(&Note {
+        id: Id::from_raw(id),
+        text: body.text,
+    });
+    Ok(id)
+}
+
+#[route(GET "/notes/:id")]
+fn get_note(tx: &mut Tx, id: Id<Note>) -> Result<String, ApiError> {
+    Ok(tx.get(id)?.ok_or(ApiError::NotFound)?.text)
+}
+
+fn main() -> std::io::Result<()> {
+    let app = App::open(
+        Box::new(ProdDisk::new("./data")?),
+        Schema::new().table::<Note>().table::<DigestState>(),
+        Box::new(ProdEntropy::new()?),
+        AppConfig::default(),
+    )?
+    .mount(routes![create_note, get_note])
+    .mount_jobs(jobs![SendDigest])
+    .schedule("monthly-digest", Duration::from_secs(30 * 24 * 3600), || {
+        SendDigest {}
+    });
+
+    charpente::serve::serve("0.0.0.0:8080", app)?;
+    loop {
+        std::thread::park();
+    }
+}
+```
+
+A pure background worker — jobs and cron, no routes of its own — mounts
+zero routes and still calls `serve`: v0's only entry point binds an HTTP
+listener alongside the job/cron loop (unrouted requests just 404). There
+is no separate headless-worker entry point yet.
