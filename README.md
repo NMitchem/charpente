@@ -80,13 +80,25 @@ otherwise is how platforms die building a worse Spanner instead of a better SQLi
 
 ## Status
 
-**Design phase.** Nothing runs yet. The documents are the project:
+**M0 shipped (2026-07-07).** The sim-first core is built: a segmented
+checksummed WAL, typed tables on redb, transactions with one commit point
+across state/queue/events, the HTTP kernel, queue + cron, and `charpente
+test --sim` — the deterministic simulator with seeded fault injection this
+whole platform is staked on. A docs-only agent then built
+[`examples/invoicing`](examples/invoicing) from these documents alone, with
+zero framework patches, and it runs green over 10,000 seeded
+fault-injection universes (master seed `0x483e230baed4922b`). The
+dual-write bug class the second guarantee above claims to delete
+structurally is demonstrated, caught, and reverted at
+[examples/invoicing/DEMO.md](examples/invoicing/DEMO.md).
 
 | Doc | What it is |
 |---|---|
 | [MANIFESTO.md](MANIFESTO.md) | Why this exists — the agent-era argument |
 | [DESIGN.md](DESIGN.md) | Architecture: the deterministic core, write model, typed surface, simulation |
 | [PLAN.md](PLAN.md) | Milestones (M0–M2), risks, non-goals |
+| [docs/GUIDE.md](docs/GUIDE.md) | How to build an app — agent-first, every code block compile-gated |
+| [examples/invoicing](examples/invoicing) | The M0 demo: agent-built against the docs alone; DEMO.md + FINDINGS.md |
 
 ## Non-goals
 
