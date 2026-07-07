@@ -1,0 +1,15 @@
+[package]
+name = "guide-examples"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+charpente.workspace = true
+charpente-sim = { path = "../charpente-sim" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
