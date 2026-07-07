@@ -24,6 +24,13 @@
 //! Any IO failure poisons the log: after a failed fsync the durability of
 //! prior writes is unknown and retrying cannot honestly clear that (the
 //! fsyncgate lesson). The only recovery from poison is a restart.
+//!
+//! `Wal::gc` deletes whole segments once a checkpoint no longer needs them:
+//! it removes segments ascending from `base_seq`, barriering after each
+//! removal, so a crash mid-gc can resurrect at most the most-recently-removed
+//! segment — never a gap between what's retained and what recovery expects.
+//! `Wal::open` starts recovery's expected seq at the first remaining
+//! segment's base instead of 0.
 
 use std::io;
 
@@ -56,6 +63,9 @@ pub struct Wal {
     tail: Box<dyn File>,
     tail_offset: u64,
     next_seq: u64,
+    /// Lowest seq the log still retains; recovery starts here instead of 0
+    /// once `gc` has run.
+    base_seq: u64,
     poisoned: bool,
 }
 
@@ -84,11 +94,13 @@ impl Wal {
                 tail,
                 tail_offset: 0,
                 next_seq: 0,
+                base_seq: 0,
                 poisoned: false,
             });
         }
 
-        let mut expected_seq = 0u64;
+        let mut expected_seq = parse_segment_name(&cfg.dir, &names[0])?;
+        let base_seq = expected_seq;
         let mut tail: Option<(Box<dyn File>, u64)> = None;
         for (index, name) in names.iter().enumerate() {
             let base = parse_segment_name(&cfg.dir, name)?;
@@ -136,6 +148,7 @@ impl Wal {
             tail,
             tail_offset,
             next_seq: expected_seq,
+            base_seq,
             poisoned: false,
         })
     }
@@ -173,6 +186,38 @@ impl Wal {
 
     pub fn next_seq(&self) -> u64 {
         self.next_seq
+    }
+
+    /// Lowest seq the log still retains; recovery starts here.
+    pub fn base_seq(&self) -> u64 {
+        self.base_seq
+    }
+
+    /// Deletes whole segments every frame of which is below `keep_from`,
+    /// always keeping at least `retain_segments` segments. The directory
+    /// barrier runs after each removal, so a crash can resurrect at most
+    /// the most-recently-removed segment — always adjacent to the retained
+    /// set, never a gap (a resurrected segment below a durable checkpoint
+    /// replays as no-ops through the store's skip_through gate).
+    pub fn gc(&mut self, keep_from: u64, retain_segments: usize) -> io::Result<()> {
+        self.check_poison()?;
+        let prefix = format!("{}/", self.cfg.dir);
+        let names = self.guard(self.disk.list(&prefix))?;
+        let mut bases = Vec::with_capacity(names.len());
+        for name in &names {
+            bases.push(parse_segment_name(&self.cfg.dir, name)?);
+        }
+        let deletable = names.len().saturating_sub(retain_segments.max(1));
+        for i in 0..deletable {
+            // names[i]'s frames end where names[i + 1] begins.
+            if bases[i + 1] > keep_from {
+                break;
+            }
+            self.guard(self.disk.remove(&names[i]))?;
+            self.guard(self.disk.sync_dir(&prefix))?;
+            self.base_seq = bases[i + 1];
+        }
+        Ok(())
     }
 
     /// True after any IO failure on this log (fsyncgate: durability of

@@ -317,20 +317,24 @@ fn foreign_file_in_the_log_directory_is_refused_by_name() {
 
 #[test]
 fn segment_gap_is_refused_with_the_expected_seq() {
+    // Removing the FIRST segment is no longer a gap: since `gc`, recovery
+    // starts at whichever segment is oldest, so that looks like a legitimate
+    // gc'd floor (covered by the gc tests below). A genuine gap is a MIDDLE
+    // segment going missing — the contiguity check still catches that.
     let sim = quiet_sim();
     let records: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 300]).collect();
     let refs: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
     build_log(&sim, &refs);
     let segments = sim.disk().list("wal/").unwrap();
-    assert!(segments.len() >= 2);
-    sim.disk().remove(&segments[0]).unwrap();
+    assert!(segments.len() >= 3, "need a middle segment to remove");
+    sim.disk().remove(&segments[1]).unwrap();
 
     let Err(err) = Engine::recover(Box::new(sim.disk()), small_segments(), Ledger::default())
     else {
         panic!("recovery must refuse a log with a missing segment");
     };
     let msg = err.to_string();
-    assert!(msg.contains("seq 0 was expected"), "{msg}");
+    assert!(msg.contains("seq 12 was expected"), "{msg}");
 }
 
 #[test]
@@ -474,6 +478,204 @@ fn unsynced_removal_resurrects_at_crash_without_a_dir_barrier() {
     assert_eq!(
         &out, b"stale",
         "resurrection restores the last durable content"
+    );
+}
+
+// ------------------------------------------------------------------- gc
+
+fn tiny_segments() -> WalConfig {
+    WalConfig {
+        dir: "wal".to_string(),
+        segment_bytes: 64,
+    }
+}
+
+fn base_of(name: &str) -> u64 {
+    name.strip_prefix("wal/")
+        .and_then(|s| s.strip_suffix(".log"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("not a segment name: {name}"))
+}
+
+#[test]
+fn gc_deletes_only_whole_segments_below_keep_from() {
+    // 64-byte segments, 8-byte payloads -> 24-byte frames, 2 per segment;
+    // rotation happens every ~2 records.
+    let sim = quiet_sim();
+    let mut wal = Wal::open(Box::new(sim.disk()), tiny_segments(), |_, _| Ok(())).unwrap();
+    let records: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 8]).collect();
+    for record in &records {
+        wal.append(record).unwrap();
+    }
+    wal.sync().unwrap();
+
+    wal.gc(20, 1).unwrap();
+
+    let names = sim.disk().list("wal/").unwrap();
+    assert!(!names.is_empty());
+    let first_base = base_of(&names[0]);
+    assert!(
+        first_base <= 20,
+        "the retained floor must start at or below keep_from"
+    );
+    assert_eq!(wal.base_seq(), first_base);
+
+    let mut recovered: Vec<(u64, Vec<u8>)> = Vec::new();
+    Wal::open(Box::new(sim.disk()), tiny_segments(), |seq, payload| {
+        recovered.push((seq, payload.to_vec()));
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(recovered.len(), 40 - first_base as usize);
+    assert_eq!(recovered.first().unwrap().0, first_base);
+    assert_eq!(recovered.last().unwrap().0, 39);
+    for (seq, payload) in &recovered {
+        assert_eq!(
+            *payload, records[*seq as usize],
+            "seq {seq} content mismatch"
+        );
+    }
+}
+
+#[test]
+fn gc_respects_the_retain_floor() {
+    let sim = quiet_sim();
+    let mut wal = Wal::open(Box::new(sim.disk()), tiny_segments(), |_, _| Ok(())).unwrap();
+    let records: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 8]).collect();
+    for record in &records {
+        wal.append(record).unwrap();
+    }
+    wal.sync().unwrap();
+
+    wal.gc(u64::MAX, 3).unwrap();
+
+    assert!(
+        sim.disk().list("wal/").unwrap().len() >= 3,
+        "floor holds even when keep_from allows more"
+    );
+}
+
+/// One universe: fill a tiny-segment log, gc at a random floor, crash right
+/// after, reopen. The barrier-after-each-removal design means a crash can
+/// resurrect at most the most-recently-removed segment — always adjacent to
+/// the retained set, never a gap. `dir_entry_loss` is forced hot so
+/// resurrection is common, not rare.
+fn gc_crash_workload(sim: &mut Sim) -> Result<(), String> {
+    let entropy = sim.entropy();
+
+    // Even opening a fresh (empty-dir) log barriers a directory entry, so
+    // this can transiently fail under injected sync errors — unrelated to
+    // gc, and handled the same way as any other transient recovery failure
+    // elsewhere in this file: restart and retry.
+    let mut opened = None;
+    for _ in 0..8 {
+        match Wal::open(Box::new(sim.disk()), tiny_segments(), |_, _| Ok(())) {
+            Ok(wal) => {
+                opened = Some(wal);
+                break;
+            }
+            Err(_) => sim.restart(),
+        }
+    }
+    let mut wal = opened.ok_or("initial open failed 8 times in a row — not transient faults")?;
+
+    let n = 20 + entropy.next_u64() % 40;
+    let mut submitted: Vec<Vec<u8>> = Vec::new();
+    let mut acked = 0usize;
+    for i in 0..n {
+        let payload = vec![(i % 251) as u8; 8];
+        if wal.append(&payload).is_err() {
+            break; // never written at all
+        }
+        // Pushed before the sync outcome is known: once the bytes are
+        // written, a crash can still make them durable (crash_apply doesn't
+        // care whether the app's own `sync` call happened to fail) — only a
+        // failed `append` means the bytes truly never existed.
+        submitted.push(payload);
+        if wal.sync().is_err() {
+            break; // durability of this record (and anything later) is unknown
+        }
+        acked += 1;
+    }
+
+    if !wal.poisoned() {
+        let keep_from = entropy.next_u64() % (submitted.len() as u64 + 1);
+        // gc itself can hit an injected fault mid-loop (poisoning the wal,
+        // fsyncgate-style) — that is expected and exactly what this property
+        // must survive, not an error to propagate.
+        let _ = wal.gc(keep_from, 2);
+    }
+    let base = wal.base_seq();
+
+    sim.crash_disk_now();
+    sim.restart();
+
+    let mut recovered: Option<Vec<(u64, Vec<u8>)>> = None;
+    for _attempt in 0..8 {
+        let mut records: Vec<(u64, Vec<u8>)> = Vec::new();
+        match Wal::open(Box::new(sim.disk()), tiny_segments(), |seq, payload| {
+            records.push((seq, payload.to_vec()));
+            Ok(())
+        }) {
+            Ok(_) => {
+                recovered = Some(records);
+                break;
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("a segment is missing") {
+                    return Err(format!("gc left a gap after crash: {msg}"));
+                }
+                sim.restart(); // transient fault on recovery itself — retry
+            }
+        }
+    }
+    let records =
+        recovered.ok_or("final recovery failed 8 times in a row — not transient faults")?;
+
+    for (i, (seq, payload)) in records.iter().enumerate() {
+        if i > 0 && *seq != records[i - 1].0 + 1 {
+            return Err(format!(
+                "recovered seqs not contiguous: {seq} follows {}",
+                records[i - 1].0
+            ));
+        }
+        let want = submitted
+            .get(*seq as usize)
+            .ok_or_else(|| format!("recovered seq {seq} was never submitted"))?;
+        if payload != want {
+            return Err(format!("record {seq} corrupt after recovery"));
+        }
+    }
+    if acked > 0 {
+        let recovered_first = records.first().map_or(0, |(s, _)| *s);
+        if recovered_first > base {
+            return Err(format!(
+                "gc left a gap: base was {base} but recovery's floor is {recovered_first}"
+            ));
+        }
+        let last_acked_seq = acked as u64 - 1;
+        let recovered_last = records.last().map(|(s, _)| *s);
+        if recovered_last.is_none_or(|s| s < last_acked_seq) {
+            return Err(format!(
+                "durability violated: last acked seq {last_acked_seq} not recovered (got {recovered_last:?})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn gc_interrupted_by_crash_never_leaves_a_gap() {
+    run_universes_swarm_with!(
+        0x6C_0001,
+        256,
+        |cfg: &mut FaultConfig| {
+            cfg.dir_entry_loss = 0.5;
+        },
+        gc_crash_workload,
+        require: ["restart"]
     );
 }
 
