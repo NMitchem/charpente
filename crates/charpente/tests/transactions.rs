@@ -490,12 +490,13 @@ fn db_matches_model(snap: &Snapshot, n: u64) -> Result<(), String> {
 }
 
 fn is_injected(text: &str) -> bool {
-    // Only the sim's own fault wordings — this workload never sees the
-    // WAL/engine's "poisoned" guard (checkpoint doesn't touch it) or redb's
-    // "close and re-open the database" latch (any Io error here breaks and
-    // restarts the universe immediately, before a second op could ever reach
-    // an already-latched handle — unlike kernel.rs's SUT, which absorbs
-    // request Io into 500s and keeps running).
+    // Only the sim's own fault wordings — any Io error (from transact's
+    // commit, or from checkpoint's own gc, which can now poison the WAL too)
+    // breaks and restarts the universe immediately, before a second op could
+    // ever reach an already-poisoned/latched handle, so this workload never
+    // sees the WAL/engine's "poisoned" guard text or redb's "close and
+    // re-open the database" latch — unlike kernel.rs's SUT, which absorbs
+    // request Io into 500s and keeps running.
     text.contains("simulated") || text.contains("injected")
 }
 
@@ -509,6 +510,7 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
             segment_bytes: 4096,
         },
         store_path: "tables.redb".to_string(),
+        ..DbConfig::default()
     };
     let mut committed = 0u64; // acknowledged transactions
 
@@ -906,4 +908,245 @@ fn store_shorter_than_header_layout_is_discarded_and_rebuilt() {
 #[test]
 fn store_longer_than_header_layout_is_discarded_and_rebuilt() {
     mangled_store_len_recovers(|len| len + 100);
+}
+
+// ---------------------------------------------------- segment-mgmt T3: GC
+
+/// Segment names are `<dir>/<base_seq:020>.log` (log.rs module docs); parsed
+/// here rather than via the crate's private `parse_segment_name` (which
+/// integration tests cannot see) to check GC's effect from the outside.
+fn segment_base(name: &str) -> u64 {
+    name.strip_prefix("wal/")
+        .and_then(|s| s.strip_suffix(".log"))
+        .expect("segment name shape")
+        .parse()
+        .expect("segment base is numeric")
+}
+
+fn tiny_segments_cfg() -> DbConfig {
+    DbConfig {
+        wal: WalConfig {
+            dir: "wal".to_string(),
+            segment_bytes: 64,
+        },
+        ..DbConfig::default()
+    }
+}
+
+#[test]
+fn checkpoint_gcs_segments_and_recovery_still_replays_the_tail() {
+    let cfg = tiny_segments_cfg();
+    let sim = Sim::with_faults(0xC0FF_EE01, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+    db.transact(|tx| {
+        tx.put(&Org {
+            id: Id::from_raw(1),
+            name: "acme".into(),
+        });
+        Ok::<_, io::Error>(())
+    })
+    .unwrap();
+    for i in 0..50u64 {
+        db.transact(|tx| {
+            tx.put(&invoice(i, 1, i as i64));
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+    }
+
+    let before = sim.disk().list("wal/").unwrap().len();
+    assert!(
+        before > 2,
+        "tiny segments should have rotated many times by now: {before}"
+    );
+
+    db.checkpoint().unwrap();
+
+    let names = sim.disk().list("wal/").unwrap();
+    assert!(
+        names.len() < before,
+        "checkpoint should have GC'd finished segments: {before} -> {}",
+        names.len()
+    );
+    let earliest_base = names.iter().map(|n| segment_base(n)).min().unwrap();
+    assert!(
+        earliest_base > 0,
+        "checkpoint should have advanced the log floor past 0"
+    );
+
+    drop(db);
+    let db = Db::open(Box::new(sim.disk()), cfg, app_schema()).unwrap();
+    let snap = db.snapshot().unwrap();
+    assert_eq!(snap.scan::<Org>().unwrap().len(), 1);
+    assert_eq!(snap.scan::<Invoice>().unwrap().len(), 50);
+    for i in 0..50u64 {
+        assert!(
+            snap.get::<Invoice>(Id::from_raw(i)).unwrap().is_some(),
+            "invoice {i} must survive the retained tail + checkpointed store"
+        );
+    }
+}
+
+#[test]
+fn retention_pin_holds_segments_gc_would_otherwise_delete() {
+    let cfg = tiny_segments_cfg();
+    let sim = Sim::with_faults(0xC0FF_EE02, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), cfg, app_schema()).unwrap();
+    for i in 0..50u64 {
+        db.transact(|tx| {
+            tx.put(&invoice(i, 1, i as i64));
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+    }
+    let before = sim.disk().list("wal/").unwrap().len();
+
+    db.pin_retention(Box::new(|| 0));
+    db.checkpoint().unwrap();
+
+    let after = sim.disk().list("wal/").unwrap().len();
+    assert_eq!(
+        after, before,
+        "a pin at seq 0 must block every deletion: {before} -> {after}"
+    );
+}
+
+#[test]
+fn auto_checkpoint_fires_on_the_record_cadence() {
+    let cfg = DbConfig {
+        checkpoint_every: 8,
+        ..tiny_segments_cfg()
+    };
+    let sim = Sim::with_faults(0xC0FF_EE03, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), cfg, app_schema()).unwrap();
+    for i in 0..9u64 {
+        db.transact(|tx| {
+            tx.put(&invoice(i, 1, i as i64));
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+    }
+
+    let names = sim.disk().list("wal/").unwrap();
+    let earliest_base = names.iter().map(|n| segment_base(n)).min().unwrap();
+    assert!(
+        earliest_base > 0,
+        "the cadence should have auto-checkpointed by the 9th commit, GC'ing early segments"
+    );
+}
+
+#[test]
+fn unopenable_store_with_compacted_wal_is_a_named_hard_error() {
+    let cfg = tiny_segments_cfg();
+    let sim = Sim::with_faults(0x0DD5_C0DE, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+    db.transact(|tx| {
+        tx.put(&Org {
+            id: Id::from_raw(1),
+            name: "acme".into(),
+        });
+        tx.put(&invoice(10, 1, 5000));
+        Ok::<_, io::Error>(())
+    })
+    .unwrap();
+    for i in 0..20u64 {
+        db.transact(|tx| {
+            tx.put(&invoice(100 + i, 1, i as i64));
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+    }
+    db.checkpoint().unwrap();
+    assert!(
+        sim.disk()
+            .list("wal/")
+            .unwrap()
+            .iter()
+            .map(|n| segment_base(n))
+            .min()
+            .unwrap()
+            > 0,
+        "setup must actually compact the log before mangling the store"
+    );
+    // Graceful close: redb durably flushes, so header layout == file length.
+    drop(db);
+
+    let file = sim.disk().open("tables.redb").unwrap();
+    let len = file.len().unwrap();
+    file.set_len(len - 4096).unwrap();
+    file.sync().unwrap();
+    drop(file);
+
+    let err = Db::open(Box::new(sim.disk()), cfg, app_schema()).unwrap_err();
+    let msg = err.to_string();
+    for needle in ["cannot open", "compacted", "restore", "retain_segments"] {
+        assert!(
+            msg.contains(needle),
+            "error must name the state and the fix: {msg}"
+        );
+    }
+}
+
+#[test]
+fn unopenable_store_with_full_wal_still_rebuilds() {
+    // Same mangling as `mangled_store_len_recovers`, but with no checkpoint
+    // or GC ever run (DbConfig::default()'s huge segment_bytes means only
+    // one segment ever exists, so base_seq stays 0): the pre-T3
+    // discard-and-rebuild path must still work unchanged.
+    mangled_store_len_recovers(|len| len - 4096);
+}
+
+/// Companion to `regression_store_bricked_by_creation_crash` below: that
+/// test's pinned seed exercises the scenario through `tx_workload`'s much
+/// larger fuzz surface (3 rounds of commits/checkpoints/crashes) and was
+/// never itself re-verified to still land on a genuinely bricked store —
+/// T1's extra `sync_dir` barriers and this task's own extra `disk.list` in
+/// the rebuild-rule check both shift exactly the crash-timing that seed
+/// depends on. This test instead constructs the scenario directly and
+/// self-verifies it at each step: an independent `Store::open` on the
+/// post-crash disk confirms the store really is bricked *before* asking
+/// `Db::open` to prove it discards and rebuilds — so this test cannot
+/// silently stop testing what it claims to, the way a bare pinned seed can.
+#[test]
+fn fresh_store_creation_crash_is_discarded_and_rebuilt() {
+    let mut state = 0xB81C_2026_0003u64; // scan seed, not the regression's own
+    let mut found = None;
+    'scan: for _ in 0..500 {
+        let seed = charpente_sim::rng::splitmix64(&mut state);
+        for ops in 0..32u64 {
+            let sim = Sim::new(seed);
+            sim.crash_disk_after(ops);
+            let cfg = DbConfig::default();
+            let opened = Db::open(Box::new(sim.disk()), cfg.clone(), Schema::new());
+            sim.restart();
+            if opened.is_err() && Store::open(&sim.disk(), &cfg.store_path).is_err() {
+                found = Some((seed, ops));
+                break 'scan;
+            }
+        }
+    }
+    let (seed, ops) = found.expect(
+        "no (seed, crash-op) pair in a 500x32 scan bricked a fresh store at creation — \
+         the crash model regressed",
+    );
+    eprintln!("bricked-at-creation scan: seed {seed:#018x}, crash after {ops} disk ops");
+
+    // The (seed, ops) pair IS the reproduction: replay it fresh.
+    let sim = Sim::new(seed);
+    sim.crash_disk_after(ops);
+    let cfg = DbConfig::default();
+    assert!(Db::open(Box::new(sim.disk()), cfg.clone(), Schema::new()).is_err());
+    sim.restart();
+    assert!(
+        Store::open(&sim.disk(), &cfg.store_path).is_err(),
+        "setup must independently confirm the store is bricked before Db::open is asked to fix it"
+    );
+
+    let db = Db::open(Box::new(sim.disk()), cfg, Schema::new())
+        .expect("Db::open must discard and rebuild a store bricked at creation");
+    assert_eq!(
+        db.last_applied(),
+        None,
+        "nothing was ever durably committed to this fresh db"
+    );
 }

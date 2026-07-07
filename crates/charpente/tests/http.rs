@@ -325,6 +325,7 @@ fn crash_app_config() -> AppConfig {
                 segment_bytes: 4096,
             },
             store_path: "tables.redb".to_string(),
+            ..charpente::DbConfig::default()
         },
     }
 }
@@ -445,7 +446,7 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
                 other => return Err(format!("unexpected status {other}")),
             }
             if entropy.next_u64().is_multiple_of(4)
-                && let Err(e) = app.db().checkpoint()
+                && let Err(e) = app.db_for_tests().checkpoint()
             {
                 if !is_injected(&e.to_string()) {
                     return Err(format!("non-injected checkpoint failure: {e}"));

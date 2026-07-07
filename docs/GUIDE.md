@@ -330,20 +330,31 @@ fn config() -> DbConfig {
             segment_bytes: 64 << 20, // 64 MiB
         },
         store_path: "tables.redb".to_string(),
+        retain_segments: 2,
+        checkpoint_every: 4096,
     }
 }
 ```
 
 `DbConfig::default()` already sets exactly these values — most apps never
-construct one by hand.
+construct one by hand. `retain_segments` and `checkpoint_every` govern
+`Db::checkpoint`'s log GC, covered next.
 
 ### Recovery, behaviorally
 
 `Db::open` opens the table store first; if the store itself can't open (a
 crash mid-creation can leave bytes redb refuses to read), it's discarded and
 rebuilt — the store is a materialization of the log, never a second source
-of truth. `Db::open` then recovers the write-ahead log and replays every
-durable record after the store's last checkpoint back into it, so a
+of truth. That rebuild only works while the log still holds everything back
+to seq 0, though: `Db::checkpoint(&mut self)` durably persists the store,
+then deletes WAL segments below the checkpoint (`DbConfig::retain_segments`
+floors how much it keeps; `checkpoint_every` auto-fires the cadence every N
+committed records, `0` to disable it and checkpoint only by hand). Once the
+log has been compacted this way, a store that can't open is unrecoverable
+locally — `Db::open` returns a named error instead of a silent (wrong)
+rebuild, naming the fix: restore from a replica/backup, or widen
+`retain_segments`. `Db::open` then recovers the write-ahead log and replays
+every durable record after the store's last checkpoint back into it, so a
 reopened `Db` reflects every transaction that ever committed, even one the
 store hadn't caught up to when the process died. Recovery can itself fail
 under an IO fault; `Db::open` is idempotent, so the caller's answer to a

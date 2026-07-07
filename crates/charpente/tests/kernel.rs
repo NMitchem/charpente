@@ -581,6 +581,7 @@ fn crash_config() -> AppConfig {
                 segment_bytes: 4096,
             },
             store_path: "tables.redb".to_string(),
+            ..charpente::DbConfig::default()
         },
     }
 }

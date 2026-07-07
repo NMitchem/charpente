@@ -305,7 +305,7 @@ fn segment_name(dir: &str, base_seq: u64) -> String {
     format!("{dir}/{base_seq:020}.log")
 }
 
-fn parse_segment_name(dir: &str, name: &str) -> io::Result<u64> {
+pub(crate) fn parse_segment_name(dir: &str, name: &str) -> io::Result<u64> {
     let bad = || {
         corrupt(format!(
             "unexpected file \"{name}\" in the log directory — segments are named \

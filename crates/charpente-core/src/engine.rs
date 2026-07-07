@@ -40,18 +40,34 @@ impl<S: StateMachine> Engine<S> {
     /// Recovers the log and replays every durable record into `machine`.
     /// Replay can fail (the machine's own IO, or the log's); recovery is
     /// idempotent — restart and retry.
+    ///
+    /// Replay's expected-first-seq re-anchors to wherever the log actually
+    /// starts (`0` for a never-compacted log, `Wal::base_seq()` once
+    /// `Db::checkpoint` has GC'd earlier segments — segment-mgmt T3): the
+    /// closure trusts its own first invocation as that anchor, and asserts
+    /// gapless continuation for every call after it, same as before. If GC
+    /// left nothing to replay at all (the retained tail has zero frames),
+    /// the closure never runs and `last_applied` is seeded straight from
+    /// `wal.base_seq()` once the log is open — recovery must resume there,
+    /// not at 0, or the very next `submit` diverges from the log's own
+    /// bookkeeping and panics.
     pub fn recover(disk: Box<dyn Disk>, cfg: WalConfig, mut machine: S) -> io::Result<Engine<S>> {
-        let mut last_applied = None;
+        let mut last_applied: Option<u64> = None;
         let wal = Wal::open(disk, cfg, |seq, payload| {
-            assert_eq!(
-                seq,
-                last_applied.map_or(0, |l: u64| l + 1),
-                "replay skipped a seq — the log handed records out of order"
-            );
+            if let Some(prev) = last_applied {
+                assert_eq!(
+                    seq,
+                    prev + 1,
+                    "replay skipped a seq — the log handed records out of order"
+                );
+            }
             machine.apply(seq, payload)?;
             last_applied = Some(seq);
             Ok(())
         })?;
+        if last_applied.is_none() && wal.base_seq() > 0 {
+            last_applied = Some(wal.base_seq() - 1);
+        }
         Ok(Engine {
             wal,
             machine,
@@ -93,6 +109,10 @@ impl<S: StateMachine> Engine<S> {
 
     pub fn machine_mut(&mut self) -> &mut S {
         &mut self.machine
+    }
+
+    pub fn wal_mut(&mut self) -> &mut Wal {
+        &mut self.wal
     }
 
     pub fn last_applied(&self) -> Option<u64> {

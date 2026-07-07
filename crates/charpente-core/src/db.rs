@@ -16,12 +16,13 @@
 //! the log — carried, never interpreted inside the deterministic boundary.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io;
 
 use crate::engine::{Engine, StateMachine};
 use crate::io::Disk;
 use crate::job::JobRow;
-use crate::log::{MAX_RECORD_BYTES, WalConfig};
+use crate::log::{MAX_RECORD_BYTES, WalConfig, parse_segment_name};
 use crate::table::{Codec, Id, Row, Snapshot, Store, View, Writer};
 
 // ---------------------------------------------------------------- config
@@ -31,6 +32,12 @@ pub struct DbConfig {
     pub wal: WalConfig,
     /// The store's file name inside the `Disk` namespace.
     pub store_path: String,
+    /// Segments `Db::checkpoint` always retains past the checkpoint floor,
+    /// even when GC would otherwise delete more.
+    pub retain_segments: usize,
+    /// Auto-`checkpoint` after this many committed records; `0` disables the
+    /// cadence (manual `Db::checkpoint` only).
+    pub checkpoint_every: u64,
 }
 
 impl Default for DbConfig {
@@ -38,6 +45,8 @@ impl Default for DbConfig {
         DbConfig {
             wal: WalConfig::default(),
             store_path: "tables.redb".to_string(),
+            retain_segments: 2,
+            checkpoint_every: 4096,
         }
     }
 }
@@ -425,11 +434,25 @@ impl StateMachine for TableMachine {
 /// The composed deterministic core: WAL + store + schema. One `Db` is the
 /// single writer; `transact` takes `&mut self`, so transactions are
 /// serializable because two cannot exist at once.
-// `Debug` (not in the brief's listing, but required: `Db::open(..).unwrap_err()`
-// bounds the `Ok` type on `Debug`) delegates to `Engine`'s own restricted impl.
-#[derive(Debug)]
+// `Debug` is hand-written, not derived: `retention_pin` is a `Box<dyn Fn>`,
+// which has no `Debug` impl, and the derive would require one. `Db::open(..)
+// .unwrap_err()` needs SOME `Debug` bound on the `Ok` type, so `engine` and
+// `cfg` are shown and `retention_pin` is simply omitted.
 pub struct Db {
     engine: Engine<TableMachine>,
+    cfg: DbConfig,
+    retention_pin: Option<Box<dyn Fn() -> u64 + Send>>,
+    records_since_checkpoint: u64,
+}
+
+impl fmt::Debug for Db {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Db")
+            .field("engine", &self.engine)
+            .field("cfg", &self.cfg)
+            .field("records_since_checkpoint", &self.records_since_checkpoint)
+            .finish()
+    }
 }
 
 impl Db {
@@ -437,21 +460,42 @@ impl Db {
     /// record past the store's checkpoint into it. Recovery can fail under
     /// IO faults; it is idempotent — restart and retry. A store that cannot
     /// open at all is discarded and rebuilt from the WAL — the store is a
-    /// materialization of the log, never a second source of truth (DESIGN §4).
+    /// materialization of the log, never a second source of truth (DESIGN
+    /// §4) — but only while the log still holds everything back to seq 0.
+    /// Once `Db::checkpoint` has GC'd segments below its floor
+    /// (`DbConfig::retain_segments`/`checkpoint_every`), the records the
+    /// store would need no longer exist locally: rebuild is impossible and
+    /// this is a named hard error instead of a silent (wrong) rebuild.
     pub fn open(disk: Box<dyn Disk>, cfg: DbConfig, schema: Schema) -> io::Result<Db> {
         // The jobs table is platform-owned; an app registering it itself
         // hits the existing duplicate-registration assert.
         let schema = schema.table::<JobRow>();
         let store = match Store::open(&*disk, &cfg.store_path) {
             Ok(store) => store,
-            Err(_) => {
+            Err(e) => {
+                // Peek the log's floor before touching the store: if it has
+                // been compacted past seq 0, the records below the store's
+                // last checkpoint are gone for good and rebuilding would
+                // silently lose them — refuse instead (DESIGN §4).
+                let prefix = format!("{}/", cfg.wal.dir);
+                let names = disk.list(&prefix)?;
+                if let Some(first) = names.first() {
+                    let base = parse_segment_name(&cfg.wal.dir, first)?;
+                    if base > 0 {
+                        return Err(io::Error::other(format!(
+                            "table store cannot open ({e}) and the log is compacted to seq \
+                             {base} — the records below the store's last checkpoint no longer \
+                             exist locally, so the store cannot be rebuilt from the log alone; \
+                             restore this node from a replica or backup, or widen \
+                             DbConfig::retain_segments (DESIGN §4)"
+                        )));
+                    }
+                }
                 // A store that cannot open is discarded and rebuilt from the
                 // WAL — it is a materialization of the log, never a second
                 // source of truth (DESIGN §4). E.g. a crash can tear the
                 // store's creation, leaving durable bytes redb rejects on
                 // every later open (found by seed 0x1f733f8d9eebf822).
-                // Safe only because the WAL is never compacted and retains
-                // seq 0; WAL segment GC must revisit this rebuild.
                 match disk.remove(&cfg.store_path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -471,7 +515,7 @@ impl Db {
             skip_through,
             enqueued: Vec::new(),
         };
-        let mut engine = Engine::recover(disk, cfg.wal, machine)?;
+        let mut engine = Engine::recover(disk, cfg.wal.clone(), machine)?;
         // Recovery replay must not leak into the kernel's incremental feed —
         // the dispatcher rebuilds its due-heap from a Pending scan at open.
         engine.machine_mut().enqueued.clear();
@@ -483,7 +527,12 @@ impl Db {
                  the store outran durable truth, which append→sync→apply forbids"
             );
         }
-        Ok(Db { engine })
+        Ok(Db {
+            engine,
+            cfg,
+            retention_pin: None,
+            records_since_checkpoint: 0,
+        })
     }
 
     /// Runs one transaction: `f` reads through `tx` and buffers effects; on
@@ -516,6 +565,14 @@ impl Db {
             record.len()
         );
         self.engine.submit(&record).map_err(TxError::Io)?;
+        self.records_since_checkpoint += 1;
+        if self.cfg.checkpoint_every > 0
+            && self.records_since_checkpoint >= self.cfg.checkpoint_every
+        {
+            // An fsync failure here poisons like any other (fsyncgate) — it
+            // surfaces through the same TxError::Io as a commit failure.
+            self.checkpoint().map_err(TxError::Io)?;
+        }
         Ok(out)
     }
 
@@ -536,9 +593,27 @@ impl Db {
             .collect()
     }
 
-    /// Durably persists the store, bounding recovery replay at this seq.
-    pub fn checkpoint(&self) -> io::Result<()> {
-        self.engine.machine().store.checkpoint()
+    /// Durably persists the store, bounding recovery replay at this seq,
+    /// then deletes WAL segments below the checkpoint (respecting the
+    /// retention pin and `DbConfig::retain_segments`).
+    pub fn checkpoint(&mut self) -> io::Result<()> {
+        self.engine.machine().store.checkpoint()?;
+        let applied = self.engine.machine().store.applied_seq()?;
+        let mut keep_from = applied.map_or(0, |s| s + 1);
+        if let Some(pin) = &self.retention_pin {
+            keep_from = keep_from.min(pin());
+        }
+        self.records_since_checkpoint = 0;
+        self.engine
+            .wal_mut()
+            .gc(keep_from, self.cfg.retain_segments)
+    }
+
+    /// Registers a floor `checkpoint`'s GC will never delete past — e.g. a
+    /// replication cursor that still needs older records than the store's
+    /// own checkpoint does. Overrides any previously registered pin.
+    pub fn pin_retention(&mut self, pin: Box<dyn Fn() -> u64 + Send>) {
+        self.retention_pin = Some(pin);
     }
 
     pub fn last_applied(&self) -> Option<u64> {

@@ -256,8 +256,15 @@ leaves the store file's length disagreeing with its durable header's layout — 
 model is exactly ALICE's unordered-writeback). `Store::open` converts an open-time panic
 into an open failure so the discard path covers it; the fence is scoped to open — a redb
 panic during operation still propagates. Reported upstream; drop the fence when redb
-returns `Err` for this state. That rebuild is safe only while the
-WAL is never compacted (it retains seq 0); WAL segment GC must revisit it.
+returns `Err` for this state. That rebuild holds only while the log still retains seq 0:
+`Db::checkpoint` durably persists the store, then deletes WAL segments below the
+checkpoint (`Wal::gc`, floored at `DbConfig::retain_segments`, default 2; a caller-supplied
+retention pin can hold more), auto-firing every `DbConfig::checkpoint_every` committed
+records (default 4096; `0` disables the cadence — manual `checkpoint` only). Once the log
+is compacted past seq 0, an unopenable store is no longer rebuildable from the log alone —
+`Db::open` checks the log's base before discarding the store and returns a named hard
+error instead (naming the compaction, and the fix: restore from a replica/backup, or widen
+`retain_segments`) rather than silently losing the records below the old checkpoint.
 
 **Snapshots & reads.** MVCC snapshots at log positions; read-only queries (and follower
 reads) run against snapshots without touching the write path. Blob columns over a
