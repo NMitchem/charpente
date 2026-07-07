@@ -37,6 +37,8 @@ disallowed-methods = [
     { path = "tokio::time::sleep", reason = "ambient time — use Clock::sleep (DESIGN.md §1)" },
     { path = "tokio::net::TcpListener::bind", reason = "ambient network — use the Net trait (DESIGN.md §1)" },
     { path = "tokio::net::TcpStream::connect", reason = "ambient network — use the Net trait (DESIGN.md §1)" },
+    { path = "std::process::Command::new", reason = "ambient process spawning — edge tooling only (charpente-cli); nothing inside the deterministic boundary spawns processes (DESIGN.md §1)" },
+    { path = "std::process::Command::spawn", reason = "ambient process spawning — edge tooling only (charpente-cli); nothing inside the deterministic boundary spawns processes (DESIGN.md §1)" },
 ]
 
 disallowed-types = [

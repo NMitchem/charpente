@@ -1,5 +1,9 @@
 use std::process::Command;
 
+// Process spawning is edge tooling here, outside the deterministic core
+// (DESIGN.md §1) — this test drives the built `charpente` binary as a real
+// subprocess, exactly as a user would.
+#[allow(clippy::disallowed_methods)]
 fn charpente() -> Command {
     Command::new(env!("CARGO_BIN_EXE_charpente"))
 }

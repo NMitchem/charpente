@@ -4,9 +4,13 @@
 //! `charpente-sim::harness` and runs inside that binary. This module only
 //! knows how to find it and how to strip `--dir` out of the passthrough
 //! flags (spec: docs/superpowers/specs/2026-07-05-sim-cli-design.md).
+//!
+//! Exit codes: 0 green, 1 sim failures (the sim binary's own code, passed
+//! through unchanged), 2 build, usage, or infrastructure errors (this
+//! layer's own failures — see `exit_code_for`).
 
 use std::io::Write as _;
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 
 /// Flags this CLI itself recognizes: the harness's runner flags (passed
 /// through unchanged) plus `--dir`, which this layer consumes. All of them
@@ -39,11 +43,42 @@ pub fn run(args: &[String]) -> i32 {
         Err(code) => return code,
     };
 
-    match Command::new(executable).args(&passthrough).status() {
-        Ok(status) => status.code().unwrap_or(1),
+    // Process spawning is edge tooling here, outside the deterministic core
+    // (DESIGN.md §1) — this execs the built sim binary directly; nothing
+    // inside the core spawns processes.
+    #[allow(clippy::disallowed_methods)]
+    let result = Command::new(executable).args(&passthrough).status();
+    exit_code_for(result)
+}
+
+/// Maps the sim binary's completed `Command` result to `test --sim`'s own
+/// exit code. The child's own code passes through unchanged (0 green, 1 sim
+/// failures, occasionally 2 for the sim binary's own usage errors) — that
+/// code is the sim binary's contract, not this layer's to reinterpret. A
+/// child that produced *no* code at all is this layer's problem instead:
+/// killed by a signal (`status.code()` is `None`), or never launched at all
+/// (the binary vanished between build and exec, permissions changed, …).
+/// Both are infrastructure failures, not sim results, so both map to 2 —
+/// collapsing either into 1 would misreport an infrastructure fault as a
+/// reproducible sim failure.
+fn exit_code_for(result: Result<ExitStatus, std::io::Error>) -> i32 {
+    match result {
+        Ok(status) => match status.code() {
+            Some(code) => code,
+            None => {
+                eprintln!(
+                    "error: the sim binary did not exit normally ({status}) — rerun \
+                     charpente test --sim"
+                );
+                2
+            }
+        },
         Err(e) => {
-            eprintln!("error: failed to run the sim binary: {e}");
-            1
+            eprintln!(
+                "error: failed to run the sim binary: {e} — rebuild (it may have vanished \
+                 between build and exec)"
+            );
+            2
         }
     }
 }
@@ -85,6 +120,10 @@ fn split_dir(args: &[String]) -> Result<(String, Vec<String>), i32> {
 /// then scan its stdout for the `sim` test target's executable path. Build
 /// errors are the compiler's oracle — forwarded verbatim, never wrapped.
 fn build_and_locate(dir: &str) -> Result<String, i32> {
+    // Process spawning is edge tooling here, outside the deterministic core
+    // (DESIGN.md §1) — this shells out to cargo to build the sim target;
+    // nothing inside the core spawns processes.
+    #[allow(clippy::disallowed_methods)]
     let output = Command::new("cargo")
         .args(["test", "--test", "sim", "--no-run", "--message-format=json"])
         .current_dir(dir)
@@ -119,12 +158,17 @@ fn build_and_locate(dir: &str) -> Result<String, i32> {
 
 /// Scans `cargo`'s `--message-format=json` stdout (one JSON object per line)
 /// for the compiler-artifact record whose target is named "sim" with a
-/// non-null `executable`. Plain string search, no JSON dependency: cargo's
-/// message schema is stable enough for this, and pulling in a parser for one
-/// field isn't worth it (CLAUDE.md style: smallest code that does the job).
+/// non-null `executable`. Requires both `"reason":"compiler-artifact"` and
+/// `"name":"sim"` on the same line — cheap insurance against a
+/// `compiler-message` line that happens to mention a dependency named
+/// "sim" (e.g. in a diagnostic) matching by accident. Plain string search,
+/// no JSON dependency: cargo's message schema is stable enough for this,
+/// and pulling in a parser for two fields isn't worth it (CLAUDE.md style:
+/// smallest code that does the job).
 fn find_sim_executable(stdout: &str) -> Option<String> {
     for line in stdout.lines() {
-        if line.contains(r#""name":"sim""#)
+        if line.contains(r#""reason":"compiler-artifact""#)
+            && line.contains(r#""name":"sim""#)
             && let Some(path) = extract_executable(line)
         {
             return Some(path);
@@ -200,11 +244,82 @@ mod tests {
     }
 
     #[test]
+    fn extract_executable_unescapes_doubled_backslashes() {
+        // A JSON-encoded Windows-style path: each single backslash is
+        // doubled in the JSON text. Guards the chars.next()-consuming loop
+        // against a refactor that stops treating `\\` as one literal `\`.
+        let line = r#"{"reason":"compiler-artifact","target":{"name":"sim"},"executable":"C:\\Users\\proj\\sim.exe"}"#;
+        assert_eq!(
+            extract_executable(line),
+            Some(r"C:\Users\proj\sim.exe".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_executable_unescapes_an_escaped_quote() {
+        // A path containing a literal `"` is encoded as `\"` in JSON; the
+        // loop must consume the escaped quote as data, not as the closing
+        // delimiter.
+        let line = r#"{"reason":"compiler-artifact","target":{"name":"sim"},"executable":"/tmp/some \"quoted\" path/sim"}"#;
+        assert_eq!(
+            extract_executable(line),
+            Some("/tmp/some \"quoted\" path/sim".to_string())
+        );
+    }
+
+    #[test]
     fn find_sim_executable_skips_non_sim_targets() {
         let stdout = concat!(
             "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"sim_fixture\"},\"executable\":null}\n",
             "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"sim\"},\"executable\":\"/x/sim-bin\"}\n",
         );
         assert_eq!(find_sim_executable(stdout), Some("/x/sim-bin".to_string()));
+    }
+
+    #[test]
+    fn find_sim_executable_ignores_non_artifact_lines_naming_sim() {
+        // A compiler-message line can mention a dependency literally named
+        // "sim" in its diagnostic text; only a compiler-artifact record
+        // counts.
+        let stdout = concat!(
+            "{\"reason\":\"compiler-message\",\"message\":\"warning in crate sim\",\"name\":\"sim\"}\n",
+            "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"sim\"},\"executable\":\"/x/sim-bin\"}\n",
+        );
+        assert_eq!(find_sim_executable(stdout), Some("/x/sim-bin".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_code_for_passes_through_the_child_exit_code() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(exit_code_for(Ok(ExitStatus::from_raw(0))), 0);
+        assert_eq!(exit_code_for(Ok(ExitStatus::from_raw(1 << 8))), 1);
+        assert_eq!(exit_code_for(Ok(ExitStatus::from_raw(2 << 8))), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_code_for_maps_a_signal_killed_child_to_two() {
+        use std::os::unix::process::ExitStatusExt;
+        // Raw status 9 with no WIFEXITED bit set: killed by SIGKILL, not a
+        // normal exit — `.code()` is `None` on this platform.
+        let status = ExitStatus::from_raw(9);
+        assert_eq!(
+            status.code(),
+            None,
+            "test fixture: expected a signal-killed status"
+        );
+        assert_eq!(exit_code_for(Ok(status)), 2);
+    }
+
+    #[test]
+    fn exit_code_for_maps_a_launch_failure_to_two() {
+        #[allow(clippy::disallowed_methods)]
+        let result = Command::new("/definitely/not/a/real/charpente-sim-binary-xyz").status();
+        assert!(
+            result.is_err(),
+            "test fixture: expected the exec to fail — got {result:?}"
+        );
+        assert_eq!(exit_code_for(result), 2);
     }
 }
