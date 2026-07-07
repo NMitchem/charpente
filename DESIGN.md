@@ -290,9 +290,28 @@ Charpente treats the coding agent as the primary developer persona:
 - **Errors are prompts.** Compile-time and sim-failure output is structured for machine
   consumption: the exact contract violated, the file/line, the seed and fault schedule for
   sim failures, and the minimal repro command. Error quality is a feature with a test suite.
-- **`charpente test --sim`** is the agent's inner loop: seeded, parallel, deterministic.
-  A failure message *is* a reproduction (`--seed 0x9f3a...`), so the agent's fix-verify
-  cycle needs no flaky-test triage.
+- **`charpente test --sim` (v0, implemented).** The agent's inner loop: seeded, parallel,
+  deterministic. App crates write property workloads in `tests/sim.rs` (`harness = false`)
+  registered via `charpente_sim::sim_tests! { name require ["fault:crash", …], … }` —
+  workloads share the internal suite's signature, `fn(&mut Sim) -> Result<(), String>`;
+  `Err` and panics both fail a universe. `charpente test --sim [--universes N] [--seed
+  0x…] [--master-seed 0x…] [--filter S] [--jobs N] [--format human|json] [--dir PATH]`
+  builds the app's `sim` target via `cargo test --no-run` and execs it directly — build
+  errors surface verbatim, the compiler is already the oracle. Batch model: one master
+  seed (OS entropy, printed at startup, or pinned via `--master-seed` for byte-identical
+  replay) derives per-universe seeds in registry order; `--jobs`-many workers race over an
+  index counter, so scheduling changes nothing about the seed sequence or report order.
+  `--seed 0x…` replays exactly one universe and skips `require` coverage checks (one
+  universe can't be expected to hit everything a batch would). A failure message *is* a
+  reproduction (`--seed 0x9f3a...`), so the agent's fix-verify cycle needs no flaky-test
+  triage. `--format json` is the machine-readable surface: per-failure `{test, seed,
+  master_seed, config, message, repro}`, `coverage`, `missing_coverage` (`{test, key}`
+  pairs for `require`d keys never hit), and a trailing `summary`. Ships with a three-item
+  checker library (`charpente_sim::checks`): `is_fault_fallout` (the injected/poisoned/
+  redb-latch fallout classifier, productized out of four hand-rolled internal copies),
+  `replays_identically` (determinism oracle), and `acked_implies_durable` (the
+  request-level ack-durability property, generalized for app workloads). Exit codes: 0
+  green, 1 sim failures or unmet coverage, 2 build/usage/infrastructure error.
 - **Skill/docs layout.** Documentation ships as both human prose and a machine-readable
   pack designed to be loaded into an agent's context (the framework's conventions are only
   worth having if the agent applying them has them in scope).

@@ -157,6 +157,41 @@ the sim-capable IO layer comes first because it cannot be retrofitted.
   DESIGN §4); deterministic RNG-free regressions for both assert sites in
   tests/transactions.rs. Verified: 8/8 fresh 256-universe flagship batches green (was
   10–25% red per batch) + 3 full-workspace runs. Upstream report drafted, not yet filed.
-- Next: M0 step 7 per PLAN.md — the `charpente test --sim` CLI (seeded parallel
-  universes, fault schedules, failure = seed + minimal repro command). Step 8 (the
-  agent-built demo app) is behind it.
+- **M0 step 7 done**: `charpente test --sim` (spec docs/superpowers/specs/
+  2026-07-05-sim-cli-design.md). Ships the harness (`charpente-sim::harness`: `SimTest`
+  registry, `HarnessArgs`, sequential/parallel batch runner reusing the frozen
+  `run_universe` executor, human + JSON `Report`), the app-side convention
+  (`charpente_sim::sim_tests!{}` generates `tests/sim.rs`'s `main`, `harness = false`;
+  workloads are `fn(&mut Sim) -> Result<(), String>`, `Err`/panic both fail a universe),
+  the CLI (`charpente-cli`: `charpente test --sim` builds the app's `sim` target via
+  `cargo test --no-run --message-format=json` and execs it directly, passing through
+  --universes/--seed/--master-seed/--filter/--jobs/--format, exit 0/1/2), and the
+  three-item checker library (`charpente-sim::checks`: `is_fault_fallout`,
+  `replays_identically`, `acked_implies_durable`). Also closes the step-6 open item: the
+  request arm now stops the kernel loop when `Db::poisoned()` after a request's 500
+  (`Wal`/`Engine`/`Db::poisoned()` exposed in T1, ruling landed in T2). Batch model: one
+  master seed (OS entropy, or `--master-seed` for byte-identical replay) derives
+  per-universe seeds in registry order; `--jobs`-many workers race over an index counter,
+  so scheduling never touches the seed sequence or report order. JSON is DESIGN §7's
+  machine-readable surface: per-failure `{test, seed, master_seed, config, message,
+  repro}`, `coverage`, `missing_coverage` (`{test, key}`, present when a `require`d key
+  went unmet), and a trailing `summary` — shape pinned by tests. The headline meta-test
+  (T8) proves the product promise end-to-end: parse a failure report, extract its repro
+  line, execute it, get the identical failure byte-for-byte; master-seed batch replay is
+  separately proven byte-identical. Two review fix waves landed mid-plan: T5 (JSON shape
+  had drifted from the spec — per-failure `master_seed` and the summary shape were
+  under-enumerated in the brief; spec governs, fixed in a662240) and T7 (escape-path
+  tests, signal/launch failures mapped to exit 2 not 1, `std::process::Command`
+  deny-listed at the edge with site-local allows in `charpente-cli`, fixed in 0a05567).
+  Evidence: 2x fresh `cargo test --workspace` runs green, kernel flagship green once more,
+  the pinned crash-recovery regression seed (0x8bee1752811ae873) green, clippy/fmt clean,
+  and the CLI eating its own dogfood against `crates/sim-fixture` — 1024 universes, all
+  green, master seed 0xf04ab23a1645c496, ~3.5s wall time over 8 jobs.
+- **Open note for step 8**: apps using `#[table]` currently need BOTH `charpente` and
+  `charpente-core` as dependencies — the macro expands to `::charpente_core::` paths from
+  app `src` — while `#[route]` emits `::charpente::` paths and needs only the one dep
+  (surfaced building `crates/sim-fixture`, step-7 T6). Decide a re-export or macro-path
+  unification before the demo app bakes the two-dep shape into public docs.
+- Next: M0 step 8 per PLAN.md — the agent-built demo app (invoicing or todo-SaaS),
+  written against the docs alone. Exit criteria: 10k seeded sim universes with fault
+  injection green, `kill -9` survival.

@@ -84,8 +84,10 @@ sim failure in invoices_survive_crashes
 ```
 
 JSON (`--format json`): one record per failure `{test, seed, master_seed, config,
-message, repro}` plus a batch summary `{master_seed, universes, failures, coverage}` —
-the DESIGN §7 machine-readable surface. The JSON shape is pinned by tests from day one.
+message, repro}`, a top-level `missing_coverage` array of `{test, key}` pairs (present
+when a `require`d coverage key went unmet across the batch — empty otherwise), plus a
+batch summary `{master_seed, universes, failures, coverage}` — the DESIGN §7
+machine-readable surface. The JSON shape is pinned by tests from day one.
 
 Exit codes: 0 green, 1 sim failures (or unmet coverage requirements), 2 build/usage
 error. Coverage failures name the key and the test that required it.

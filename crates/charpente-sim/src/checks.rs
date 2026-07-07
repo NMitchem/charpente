@@ -205,7 +205,9 @@ mod tests {
         // Pinned: under this seed the round-1 write's crash-collapse draw
         // lands on "dropped" rather than "applied" (a 1-byte write's only
         // outcomes are those two — see disk::tear), so the missing-sync bug
-        // is caught on round 1, deterministically, forever.
+        // is caught on round 1, deterministically — given the current
+        // disk::collapse/tear code and FaultConfig::default()'s crash rates.
+        // Re-pin if either changes.
         let seed = 0x5eed_ca11;
         let err = acked_implies_durable(seed, 5, toy_drive(false), toy_verify).unwrap_err();
         assert!(
