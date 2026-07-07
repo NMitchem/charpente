@@ -37,6 +37,14 @@ API; nothing is ever deletable above the last durable checkpoint. Deterministic 
 sim by construction (GC is a pure function of checkpoint seq + segment layout +
 config).
 
+**Checkpoint cadence (plan-time addition).** Planning surfaced that `checkpoint()` has
+no production call site — only tests call it — so checkpoint-anchored GC would ship
+dark. `Db` therefore owns a deterministic auto-checkpoint cadence:
+`DbConfig::checkpoint_every` (applied records, default 4096, `0` = manual only); after
+an apply that crosses the threshold, the commit path runs `checkpoint()` (which runs
+GC). Core-only, deterministic in sim (a pure function of applied-record count), no
+kernel changes. Explicit `Db::checkpoint()` remains available and also runs GC.
+
 **base_seq.** The WAL learns its lowest retained seq. Recovery scans from the base
 segment as it does today from seq 0; `Wal` exposes the base for the horizon rule and
 for `Db::open`'s rebuild decision. Segment file names already carry `base_seq:020`,
