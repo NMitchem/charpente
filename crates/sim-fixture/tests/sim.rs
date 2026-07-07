@@ -9,20 +9,38 @@ use sim_fixture::FixtureCounter;
 
 charpente_sim::sim_tests! {
     counter_roundtrip require ["restart"],
+    fixture_replays,
     sometimes_fails,
 }
 
 fn counter_roundtrip(sim: &mut Sim) -> Result<(), String> {
-    // Put a row, crash, reopen: an acked commit must survive. Faults are
-    // expected in swarm universes — classified fallout is a pass for THIS
-    // fixture (the harness, not the app, is under test here).
+    counter_roundtrip_result(sim).map(|_| ())
+}
+
+/// Wires `replays_identically` to a real app roundtrip: two fresh worlds on
+/// the same seed must retrace `counter_roundtrip_result` byte-for-byte. Uses
+/// `sim.seed()` only — the restarts happen inside the two inner `Sim`s the
+/// checker constructs, not on this test's own outer `sim`, so this test
+/// carries no `require` (nothing here marks the outer sim's coverage).
+fn fixture_replays(sim: &mut Sim) -> Result<(), String> {
+    charpente_sim::checks::replays_identically(sim.seed(), counter_roundtrip_result)
+}
+
+/// Puts a row, crashes, reopens: an acked commit must survive. Returns the
+/// row's `hits` value read back after restart, or `None` when there's
+/// nothing to assert (write not acked, or either open hit fault fallout —
+/// the harness's own fault paths, not the app's contract, are under test
+/// here). `counter_roundtrip` collapses this to pass/fail;
+/// `fixture_replays` additionally demands the `Option<u64>` itself replay
+/// identically across two independent worlds on the same seed.
+fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     use charpente_sim::checks::is_fault_fallout;
-    let fallout_ok = |e: String| if is_fault_fallout(&e) { Ok(()) } else { Err(e) };
 
     let schema = || Schema::new().table::<FixtureCounter>();
     let mut db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema()) {
         Ok(db) => db,
-        Err(e) => return fallout_ok(e.to_string()),
+        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(None),
+        Err(e) => return Err(e.to_string()),
     };
     let acked = db
         .transact(|tx| {
@@ -37,18 +55,20 @@ fn counter_roundtrip(sim: &mut Sim) -> Result<(), String> {
     drop(db);
     let db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema()) {
         Ok(db) => db,
-        Err(e) => return fallout_ok(e.to_string()),
+        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(None),
+        Err(e) => return Err(e.to_string()),
     };
-    if acked {
-        let snap = db.snapshot().map_err(|e| e.to_string())?;
-        let row = snap
-            .get::<FixtureCounter>(Id::from_raw(7))
-            .map_err(|e| e.to_string())?;
-        if row.is_none() {
-            return Err("acked FixtureCounter row lost across a crash".into());
-        }
+    if !acked {
+        return Ok(None);
     }
-    Ok(())
+    let snap = db.snapshot().map_err(|e| e.to_string())?;
+    let row = snap
+        .get::<FixtureCounter>(Id::from_raw(7))
+        .map_err(|e| e.to_string())?;
+    match row {
+        Some(row) => Ok(Some(row.hits)),
+        None => Err("acked FixtureCounter row lost across a crash".into()),
+    }
 }
 
 fn sometimes_fails(sim: &mut Sim) -> Result<(), String> {
