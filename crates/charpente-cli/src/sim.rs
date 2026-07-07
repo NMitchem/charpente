@@ -280,9 +280,12 @@ mod tests {
     fn find_sim_executable_ignores_non_artifact_lines_naming_sim() {
         // A compiler-message line can mention a dependency literally named
         // "sim" in its diagnostic text; only a compiler-artifact record
-        // counts.
+        // counts. The distractor carries its own (bogus) "executable" field
+        // so this test actually discriminates on the reason-gate: without
+        // it, name-only matching would return the distractor's path instead
+        // of the real artifact's.
         let stdout = concat!(
-            "{\"reason\":\"compiler-message\",\"message\":\"warning in crate sim\",\"name\":\"sim\"}\n",
+            "{\"reason\":\"compiler-message\",\"name\":\"sim\",\"executable\":\"/bogus/path\"}\n",
             "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"sim\"},\"executable\":\"/x/sim-bin\"}\n",
         );
         assert_eq!(find_sim_executable(stdout), Some("/x/sim-bin".to_string()));
