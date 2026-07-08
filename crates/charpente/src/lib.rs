@@ -14,4 +14,5 @@ pub use charpente_macros::{job, route, table};
 pub mod http;
 pub mod kernel;
 pub mod prod;
+pub mod repl;
 pub mod serve;
