@@ -80,10 +80,18 @@ crash-time write-buffer collapse in which every unsynced write independently sur
 tears (an arbitrary strict subset of its sectors), or vanishes. Subset tears matter: they
 produce the file-extends-past-garbage layouts that defeat length-prefix-only recovery,
 which prefix-only tearing never catches (found while building the first meta-test).
-Tracked extensions to the matrix (the Jepsen/TigerBeetle lessons — corruption *granularity*
-is its own fault axis; whole-sector injection provably misses single-byte bugs): bit-level
-corruption of durable bytes, misdirected writes, and latent read errors. They land with
-WAL segment management, paired with the recovery-horizon rule in §2.
+Three more axes (the Jepsen/TigerBeetle lessons — corruption *granularity* is its own fault
+axis; whole-sector injection provably misses single-byte bugs), landed with WAL segment
+management and paired with the recovery-horizon rule in §2: `FaultConfig.bit_flip` corrupts
+one random bit of one random byte in one random file's durable content at `Sim::restart`,
+before crash collapse; `FaultConfig.misdirected_write` lands a `write_at`'s payload past the
+requested offset while the call still returns `Ok` (the requested offset stays stale);
+`FaultConfig.read_error` is a transient `read_at` failure (the next read may succeed). All
+three (plus `dir_entry_loss`, §2) draw from per-field sub-streams keyed by (universe seed,
+FNV-1a of the field name) rather than `FaultConfig::swarm`'s legacy sequential draw — each
+field's stream is independent, so adding one perturbs no existing universe's legacy draws
+and no other extended field's draws (`sample_extended_fields`, charpente-sim, applied right
+after `FaultConfig::swarm` in every swarm-sampled universe).
 
 **Consequence for the concurrency model.** The core state machine is single-threaded —
 concurrency lives at the edges (HTTP handling, queue workers, replication) and is itself

@@ -4,12 +4,18 @@
 
 use crate::Sim;
 
-/// The three recognized fault-fallout families (extracted from the internal
+/// The recognized fault-fallout families (extracted from the internal
 /// suite, which had hand-rolled this four times):
-///  1. the sim's own injected-fault wordings,
+///  1. the sim's own injected-fault wordings — including the `read_error`
+///     and `misdirected_write` axes (segment-mgmt T5), both of which are
+///     "injected"/"simulated" too,
 ///  2. our WAL/engine poison wording,
 ///  3. redb's latch ("close and re-open the database") — its internal
-///     already-saw-an-IO-error signal.
+///     already-saw-an-IO-error signal,
+///  4. the WAL's durable-horizon hard error (segment-mgmt T4's recovery-
+///     horizon rule): `bit_flip`/`misdirected_write` corrupting an
+///     already-acknowledged frame is a legitimate consequence of the fault
+///     matrix, surfaced loudly by design — not a bug.
 ///
 /// Anything else is NOT fallout and must fail the universe for adjudication.
 /// Recognizing these cannot mask a real bug so long as the workload's
@@ -19,6 +25,7 @@ pub fn is_fault_fallout(text: &str) -> bool {
         || text.contains("injected")
         || text.contains("poisoned")
         || text.contains("close and re-open the database")
+        || text.contains("durable horizon")
 }
 
 /// Determinism oracle: runs `workload` twice, each on its own fresh
@@ -94,13 +101,17 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
-    fn recognizes_all_three_families_and_nothing_else() {
+    fn recognizes_all_recognized_families_and_nothing_else() {
         for fallout in [
             "simulated disk write error (injected fault)",
             "simulated fsync failure — durability of writes since the last successful sync is unknown",
             "WAL poisoned by an earlier IO failure",
             "engine poisoned: a durable record failed to apply",
             "Storage error: close and re-open the database",
+            "injected read error",
+            "log frame 3 is invalid but at-or-below the store's durable horizon 7 — this is \
+             corruption of acknowledged records, not a torn tail, and truncating it would \
+             silently lose data; restore this node from a replica or backup (DESIGN §2)",
         ] {
             assert!(is_fault_fallout(fallout), "must classify: {fallout}");
         }

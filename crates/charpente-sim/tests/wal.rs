@@ -8,8 +8,9 @@
 use std::io;
 
 use charpente_core::engine::{Engine, StateMachine};
-use charpente_core::io::{Disk, Entropy};
+use charpente_core::io::{Disk, Entropy, File};
 use charpente_core::log::{Wal, WalConfig};
+use charpente_sim::checks::is_fault_fallout;
 use charpente_sim::{
     FaultConfig, Sim, run_universes, run_universes_swarm, run_universes_swarm_with,
 };
@@ -73,7 +74,14 @@ fn check_prefix(recovered: &[Vec<u8>], submitted: &[Vec<u8>], acked: usize) -> R
 }
 
 /// One universe: recover → check → submit-until-death → power-cycle, with
-/// every choice seeded. `payload_len` picks the size distribution.
+/// every choice seeded. `payload_len` picks the size distribution. Threads
+/// the durable horizon (`acked - 1`, mirroring `Db::open`'s use of the
+/// store's `applied_seq` — segment-mgmt T4/T5) into every recovery: once
+/// `bit_flip`/`misdirected_write` can corrupt already-durable bytes, a
+/// horizon-less recovery could silently accept fewer than `acked` records
+/// (an ordinary cut, since nothing tells it those bytes were ever
+/// acknowledged) — exactly the bug the horizon rule exists to convert into
+/// a named, loud error instead.
 fn wal_workload(sim: &mut Sim, payload_len: impl Fn(&dyn Entropy) -> usize) -> Result<(), String> {
     let entropy = sim.entropy();
     let mut submitted: Vec<Vec<u8>> = Vec::new();
@@ -81,14 +89,28 @@ fn wal_workload(sim: &mut Sim, payload_len: impl Fn(&dyn Entropy) -> usize) -> R
 
     for _round in 0..4 {
         sim.crash_disk_after(entropy.next_u64() % 96);
+        let horizon = acked.checked_sub(1).map(|s| s as u64);
         let mut engine = match Engine::recover(
             Box::new(sim.disk()),
             small_segments(),
             Ledger::default(),
-            None,
+            horizon,
         ) {
             Ok(engine) => engine,
-            Err(_) => {
+            Err(e) => {
+                let msg = e.to_string();
+                if !is_fault_fallout(&msg) {
+                    return Err(format!("recovery failed with a non-fallout error: {msg}"));
+                }
+                // The horizon hard error is permanent — the corrupted bytes
+                // don't un-corrupt on retry, and DESIGN §2's own remedy
+                // (restore from a replica or backup) is out of scope for
+                // this workload — so the universe ends here, successfully:
+                // the fence held, and every acked record has already
+                // cleared `check_prefix` in an earlier round.
+                if msg.contains("durable horizon") {
+                    return Ok(());
+                }
                 sim.restart();
                 continue;
             }
@@ -117,24 +139,41 @@ fn wal_workload(sim: &mut Sim, payload_len: impl Fn(&dyn Entropy) -> usize) -> R
 
     // Recovery itself can hit injected write/fsync errors (it truncates and
     // syncs the cut) — seed 0x5cafb3ac016dccf9 found that. It is idempotent,
-    // so the real-world response is restart-and-retry.
+    // so the real-world response is restart-and-retry — except the horizon
+    // hard error, which is permanent (see above) and ends the universe here.
+    // `read_error` is transient but independently re-rolled per read, so a
+    // long run of injected read errors across a big log's full scan can
+    // outlast a small attempt budget without ever indicating a real bug —
+    // same as `transactions.rs`'s final-recovery convention, a budget
+    // exhausted entirely by recognized fault-fallout ends the universe here
+    // too (every acked record has already cleared `check_prefix` up to the
+    // last successful round).
     let mut recovered = None;
-    for _attempt in 0..8 {
+    for _attempt in 0..32 {
+        let horizon = acked.checked_sub(1).map(|s| s as u64);
         match Engine::recover(
             Box::new(sim.disk()),
             small_segments(),
             Ledger::default(),
-            None,
+            horizon,
         ) {
             Ok(engine) => {
                 recovered = Some(engine);
                 break;
             }
-            Err(_) => sim.restart(),
+            Err(e) => {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!(
+                        "final recovery failed with a non-fallout error: {e}"
+                    ));
+                }
+                sim.restart();
+            }
         }
     }
-    let engine =
-        recovered.ok_or("final recovery failed 8 times in a row — not transient faults")?;
+    let Some(engine) = recovered else {
+        return Ok(()); // every attempt died to recognized faults (incl. the horizon fence)
+    };
     check_prefix(&engine.machine().records, &submitted, acked)?;
 
     // The hash must equal a from-scratch fold of the recovered records —
@@ -203,6 +242,408 @@ fn wal_replays_identically_for_the_same_seed() {
     for seed in [0x11, 0xFEED_FACE, 0x0123_4567_89AB_CDEF] {
         assert_eq!(trace(seed), trace(seed));
     }
+}
+
+// ------------------------------------------- fault-matrix extensions (T5)
+//
+// Three axes new to this task — bit-level corruption of durable bytes,
+// misdirected writes, and latent read errors (DESIGN §1) — each gets two
+// properties: a meta-test proving the harness catches a deliberately naive
+// victim (the safety equipment itself, checked), and an always-hot property
+// proving the REAL `Wal` + recovery-horizon rule survives the axis (the
+// system under test).
+
+/// Like `wal_workload`, but a single round and an explicit horizon: build a
+/// log, ack it fully, restart (the forced axis may fire), then recover with
+/// horizon = the last acked seq — mirroring `Db::open`'s production use of
+/// the store's `applied_seq` as the horizon threaded into `Engine::recover`.
+/// Never silent loss: either every acked record comes back, or recovery
+/// fails with a recognized fault-fallout error (the horizon hard error and
+/// the injected read error both count — `checks::is_fault_fallout`
+/// classifies both).
+fn wal_survives_hot_axis(sim: &mut Sim) -> Result<(), String> {
+    let entropy = sim.entropy();
+    let mut engine = match Engine::recover(
+        Box::new(sim.disk()),
+        small_segments(),
+        Ledger::default(),
+        None,
+    ) {
+        Ok(engine) => engine,
+        Err(e) => {
+            let msg = e.to_string();
+            return if is_fault_fallout(&msg) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "initial open failed with a non-fallout error: {msg}"
+                ))
+            };
+        }
+    };
+
+    let n = 4 + entropy.next_u64() % 20;
+    let mut submitted: Vec<Vec<u8>> = Vec::new();
+    let mut acked = 0usize;
+    for _ in 0..n {
+        let mut payload = vec![0u8; 100 + (entropy.next_u64() % 900) as usize];
+        entropy.fill(&mut payload);
+        submitted.push(payload.clone());
+        match engine.submit(&payload) {
+            Ok(seq) => {
+                if seq != acked as u64 {
+                    return Err(format!("submit returned seq {seq}, expected {acked}"));
+                }
+                acked += 1;
+            }
+            Err(e) => {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("submit failed with a non-fallout error: {e}"));
+                }
+                break;
+            }
+        }
+    }
+    drop(engine);
+    sim.restart(); // the forced axis (and any swarm-sampled ones) may fire here
+
+    let horizon = acked.checked_sub(1).map(|s| s as u64);
+    match Engine::recover(
+        Box::new(sim.disk()),
+        small_segments(),
+        Ledger::default(),
+        horizon,
+    ) {
+        Ok(engine) => check_prefix(&engine.machine().records, &submitted, acked),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_fault_fallout(&msg) {
+                Ok(()) // the fence held (or an ordinary transient fault) — not silent loss
+            } else {
+                Err(format!(
+                    "recovery failed with a non-fault-fallout error: {msg}"
+                ))
+            }
+        }
+    }
+}
+
+#[test]
+fn wal_survives_bit_flip() {
+    run_universes_swarm_with!(
+        0xB17_F11D_0100,
+        256,
+        |cfg: &mut FaultConfig| {
+            cfg.bit_flip = 0.1;
+        },
+        wal_survives_hot_axis,
+        require: ["fault:bit_flip"]
+    );
+}
+
+#[test]
+fn wal_survives_misdirected_write() {
+    run_universes_swarm_with!(
+        0x1DEC_7ED0_0200,
+        256,
+        |cfg: &mut FaultConfig| {
+            cfg.misdirected_write = 0.1;
+        },
+        wal_survives_hot_axis,
+        require: ["fault:misdirected_write"]
+    );
+}
+
+#[test]
+fn wal_survives_read_error() {
+    run_universes_swarm_with!(
+        0x2EAD_0300,
+        256,
+        |cfg: &mut FaultConfig| {
+            cfg.read_error = 0.1;
+        },
+        wal_survives_hot_axis,
+        require: ["fault:read_error"]
+    );
+}
+
+// ---------------------------------------------- meta-tests: naive victims
+//
+// Each victim reuses a small, self-contained toy log format (independent of
+// the real `Wal`'s frame layout) — the point is to prove the HARNESS (the
+// fault injection + the property-test scanning idiom) reliably exposes each
+// class of bug, not to re-implement the real `Wal`. Each forces exactly one
+// axis hot and zeroes every other axis (`*cfg = FaultConfig::none()` first)
+// so a catch is unambiguously attributable to the axis under test.
+
+fn toy_crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Frame: [payload len: u32 le][crc32(payload): u32 le][payload] — same
+/// shape as `crash_recovery.rs`'s toy log, reused here against a different
+/// fault axis.
+fn toy_append(file: &dyn File, end: u64, payload: &[u8]) -> io::Result<u64> {
+    let mut frame = Vec::with_capacity(8 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&toy_crc32(payload).to_le_bytes());
+    frame.extend_from_slice(payload);
+    file.write_at(end, &frame)?;
+    file.sync()?;
+    Ok(end + frame.len() as u64)
+}
+
+/// The victim for the bit_flip meta-test: trusts the length prefix, never
+/// re-checks the checksum — crash_recovery.rs's naive recovery (`checked =
+/// false`), reused here to demonstrate the same class of bug against
+/// bit-level durable corruption instead of torn writes.
+fn toy_recover_naive(disk: &dyn Disk, path: &str) -> io::Result<Vec<Vec<u8>>> {
+    let file = disk.open(path)?;
+    let len = file.len()?;
+    let mut records = Vec::new();
+    let mut pos = 0u64;
+    loop {
+        if pos + 8 > len {
+            break;
+        }
+        let mut header = [0u8; 8];
+        file.read_at(pos, &mut header)?;
+        let payload_len = u64::from(u32::from_le_bytes(header[0..4].try_into().unwrap()));
+        if payload_len == 0 || pos + 8 + payload_len > len {
+            break;
+        }
+        let mut payload = vec![0u8; payload_len as usize];
+        file.read_at(pos + 8, &mut payload)?;
+        records.push(payload);
+        pos += 8 + payload_len;
+    }
+    Ok(records)
+}
+
+/// Append a small toy log (all synced), restart (bit_flip may fire), then
+/// recover with the naive length-trusting reader. A flipped payload byte
+/// keeps the frame's length intact — the naive reader accepts it and
+/// silently returns the wrong bytes.
+fn bit_flip_naive_recovery_victim(sim: &mut Sim) -> Result<(), String> {
+    let disk = sim.disk();
+    let entropy = sim.entropy();
+    let file = disk.open("toy/naive.log").map_err(|e| e.to_string())?;
+    let mut end = 0u64;
+    let mut submitted = Vec::new();
+    for _ in 0..8 {
+        let mut payload = vec![0u8; 200 + (entropy.next_u64() % 800) as usize];
+        entropy.fill(&mut payload);
+        end = toy_append(&*file, end, &payload).map_err(|e| e.to_string())?;
+        submitted.push(payload);
+    }
+    drop(file);
+    sim.restart(); // bit_flip forced hot: may corrupt one durable byte
+
+    let recovered = toy_recover_naive(&disk, "toy/naive.log").map_err(|e| e.to_string())?;
+    if recovered.len() != submitted.len() {
+        return Err(format!(
+            "naive recovery lost records: {} recovered, {} appended",
+            recovered.len(),
+            submitted.len()
+        ));
+    }
+    for (i, (got, want)) in recovered.iter().zip(&submitted).enumerate() {
+        if got != want {
+            return Err(format!(
+                "record {i} corrupt: naive length-trusting recovery accepted a bit-flipped payload"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn harness_catches_recovery_that_trusts_lengths_without_crc() {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_universes_swarm_with!(
+            0xB17_F11D_0001,
+            64,
+            |cfg: &mut FaultConfig| {
+                *cfg = FaultConfig::none();
+                cfg.bit_flip = 0.25;
+            },
+            bit_flip_naive_recovery_victim
+        );
+    }))
+    .expect_err(
+        "the harness no longer catches naive length-only recovery under bit-flip corruption \
+         within 64 seeds — the bit_flip fault injection itself has regressed",
+    );
+    let msg = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+    eprintln!("caught naive length-only recovery: {msg}");
+    assert!(msg.contains("seed:"), "{msg}");
+    assert!(
+        msg.contains("naive length-trusting recovery accepted a bit-flipped payload")
+            || msg.contains("naive recovery lost records"),
+        "{msg}"
+    );
+}
+
+/// Victim for the misdirected-write meta-test: writes then simply trusts
+/// the call's `Ok` — no read-back verification, which is exactly what
+/// `misdirected_write`'s treachery defeats: the call still returns `Ok`
+/// even though the payload landed elsewhere and the intended offset stays
+/// stale.
+fn never_reads_back_victim(sim: &mut Sim) -> Result<(), String> {
+    let disk = sim.disk();
+    let entropy = sim.entropy();
+    let file = disk.open("toy/store.bin").map_err(|e| e.to_string())?;
+    let mut expected = Vec::new();
+    for i in 0..16u64 {
+        let offset = i * 64;
+        let mut record = vec![0u8; 32];
+        entropy.fill(&mut record);
+        file.write_at(offset, &record).map_err(|e| e.to_string())?; // still Ok — the treachery
+        expected.push((offset, record));
+    }
+    file.sync().map_err(|e| e.to_string())?;
+
+    // The audit: read back what a "trust the write" store never checks.
+    for (offset, want) in &expected {
+        let mut got = vec![0u8; want.len()];
+        file.read_at(*offset, &mut got).map_err(|e| e.to_string())?;
+        if &got != want {
+            return Err(format!(
+                "misdirected write: offset {offset} landed wrong — a store that never reads \
+                 back would have believed this write succeeded"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn harness_catches_a_store_that_never_reads_back() {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_universes_swarm_with!(
+            0x1DEC_7ED0_0002,
+            64,
+            |cfg: &mut FaultConfig| {
+                *cfg = FaultConfig::none();
+                cfg.misdirected_write = 0.25;
+            },
+            never_reads_back_victim
+        );
+    }))
+    .expect_err(
+        "the harness no longer catches a never-reads-back store under misdirected writes \
+         within 64 seeds — the misdirected_write fault injection itself has regressed",
+    );
+    let msg = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+    eprintln!("caught never-reads-back store: {msg}");
+    assert!(msg.contains("seed:"), "{msg}");
+    assert!(msg.contains("landed wrong"), "{msg}");
+}
+
+/// The victim for the read_error meta-test: recovery that treats ANY
+/// `read_at` error (including a transient injected one) as a clean end of
+/// the log — with `read_error` forced hot it silently drops acked records
+/// instead of surfacing the error and retrying.
+fn toy_recover_swallows_read_errors(disk: &dyn Disk, path: &str) -> io::Result<Vec<Vec<u8>>> {
+    let file = disk.open(path)?;
+    let len = file.len()?;
+    let mut records = Vec::new();
+    let mut pos = 0u64;
+    loop {
+        if pos + 8 > len {
+            break;
+        }
+        let mut header = [0u8; 8];
+        if file.read_at(pos, &mut header).is_err() {
+            break; // the bug: any read error reads as "nothing more to recover"
+        }
+        let payload_len = u64::from(u32::from_le_bytes(header[0..4].try_into().unwrap()));
+        let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        if payload_len == 0 || pos + 8 + payload_len > len {
+            break;
+        }
+        let mut payload = vec![0u8; payload_len as usize];
+        if file.read_at(pos + 8, &mut payload).is_err() {
+            break;
+        }
+        if toy_crc32(&payload) != crc {
+            break;
+        }
+        records.push(payload);
+        pos += 8 + payload_len;
+    }
+    Ok(records)
+}
+
+fn read_error_naive_recovery_victim(sim: &mut Sim) -> Result<(), String> {
+    let disk = sim.disk();
+    let entropy = sim.entropy();
+    let file = disk.open("toy/checked.log").map_err(|e| e.to_string())?;
+    let mut end = 0u64;
+    let mut submitted = Vec::new();
+    for _ in 0..8 {
+        let mut payload = vec![0u8; 200 + (entropy.next_u64() % 800) as usize];
+        entropy.fill(&mut payload);
+        end = toy_append(&*file, end, &payload).map_err(|e| e.to_string())?;
+        submitted.push(payload);
+    }
+    drop(file);
+
+    let recovered =
+        toy_recover_swallows_read_errors(&disk, "toy/checked.log").map_err(|e| e.to_string())?;
+    if recovered.len() < submitted.len() {
+        return Err(format!(
+            "naive recovery silently dropped {} acked record(s) after treating an injected \
+             read error as clean end",
+            submitted.len() - recovered.len()
+        ));
+    }
+    for (i, (got, want)) in recovered.iter().zip(&submitted).enumerate() {
+        if got != want {
+            return Err(format!("record {i} diverged after recovery"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn harness_catches_recovery_that_reads_through_errors_as_eof() {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_universes_swarm_with!(
+            0x2EAD_0003,
+            64,
+            |cfg: &mut FaultConfig| {
+                *cfg = FaultConfig::none();
+                cfg.read_error = 0.25;
+            },
+            read_error_naive_recovery_victim
+        );
+    }))
+    .expect_err(
+        "the harness no longer catches read-error-as-EOF recovery within 64 seeds — the \
+         read_error fault injection itself has regressed",
+    );
+    let msg = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+    eprintln!("caught read-error-as-EOF recovery: {msg}");
+    assert!(msg.contains("seed:"), "{msg}");
+    assert!(msg.contains("silently dropped"), "{msg}");
 }
 
 // ------------------------------------------------------------- unit tests
@@ -752,13 +1193,23 @@ fn gc_crash_workload(sim: &mut Sim) -> Result<(), String> {
     sim.crash_disk_now();
     sim.restart();
 
+    // Threads the durable horizon (`acked - 1`), same reasoning as
+    // `wal_workload`: once bit_flip/misdirected_write can corrupt an
+    // already-durable frame, a horizon-less reopen could silently accept
+    // fewer than `acked` records instead of surfacing the named hard error.
+    let horizon = acked.checked_sub(1).map(|s| s as u64);
     let mut recovered: Option<Vec<(u64, Vec<u8>)>> = None;
-    for _attempt in 0..8 {
+    for _attempt in 0..32 {
         let mut records: Vec<(u64, Vec<u8>)> = Vec::new();
-        match Wal::open(Box::new(sim.disk()), tiny_segments(), |seq, payload| {
-            records.push((seq, payload.to_vec()));
-            Ok(())
-        }) {
+        match Wal::open_with_horizon(
+            Box::new(sim.disk()),
+            tiny_segments(),
+            horizon,
+            |seq, payload| {
+                records.push((seq, payload.to_vec()));
+                Ok(())
+            },
+        ) {
             Ok(_) => {
                 recovered = Some(records);
                 break;
@@ -768,12 +1219,18 @@ fn gc_crash_workload(sim: &mut Sim) -> Result<(), String> {
                 if msg.contains("a segment is missing") {
                     return Err(format!("gc left a gap after crash: {msg}"));
                 }
-                sim.restart(); // transient fault on recovery itself — retry
+                if !is_fault_fallout(&msg) {
+                    return Err(format!(
+                        "final reopen failed with a non-fallout error: {msg}"
+                    ));
+                }
+                sim.restart(); // transient fault (or the horizon fence) — retry
             }
         }
     }
-    let records =
-        recovered.ok_or("final recovery failed 8 times in a row — not transient faults")?;
+    let Some(records) = recovered else {
+        return Ok(()); // every attempt died to recognized faults (incl. the horizon fence)
+    };
 
     for (i, (seq, payload)) in records.iter().enumerate() {
         if i > 0 && *seq != records[i - 1].0 + 1 {

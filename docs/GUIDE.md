@@ -1586,7 +1586,10 @@ before hand-rolling the same logic a fourth time:
 - `is_fault_fallout(text: &str) -> bool` — classifies an error's *text*:
   is this the harness's own injected fault (or its consequences) rather
   than a bug your workload should fail on? It recognizes the sim's
-  injected-fault wording, the WAL/engine poison wording, and redb's
+  injected-fault wording (including the `read_error` and
+  `misdirected_write` axes), the WAL/engine poison wording, the WAL's
+  durable-horizon hard error (bit-level corruption of an already-
+  acknowledged frame — a fault-matrix consequence, not a bug), and redb's
   "close and re-open the database" latch. Used inside a workload to turn
   "the disk broke, as instructed" into "no answer this round" rather than
   a hard failure — never to swallow anything else.

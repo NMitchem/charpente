@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use charpente_core::io::{Clock, Conn, Disk, Entropy, File, Instant, Listener, Net};
 
-use crate::disk::{DiskWorld, FileState, PendingOp};
+use crate::disk::{DiskWorld, FileState, PendingOp, SECTOR};
 use crate::net::{ConnState, NetWorld, host_of, normalize};
 use crate::rng::{Rng, splitmix64};
 
@@ -42,6 +42,18 @@ pub struct FaultConfig {
     /// P(an unsynced directory entry is lost (create) or resurrected
     /// (remove) at crash).
     pub dir_entry_loss: f64,
+    /// P(`Sim::restart` flips one random bit of one random byte in one
+    /// random file's already-durable content, before per-file crash
+    /// collapse runs) — bit-level corruption at rest (the bitrot model).
+    pub bit_flip: f64,
+    /// P(a `write_at`'s payload lands at `offset + 512*(1 + below(4))`
+    /// instead of the requested `offset` — the intended target stays
+    /// stale, and the call still returns `Ok`: a disk that silently wrote
+    /// the right bytes in the wrong place).
+    pub misdirected_write: f64,
+    /// P(a `read_at` returns a transient injected IO error — the next read
+    /// of the same bytes may succeed).
+    pub read_error: f64,
     pub disk_latency: (Duration, Duration),
     pub net_latency: (Duration, Duration),
 }
@@ -54,6 +66,9 @@ impl Default for FaultConfig {
             crash_apply: 0.4,
             crash_torn: 0.3,
             dir_entry_loss: 0.0,
+            bit_flip: 0.0,
+            misdirected_write: 0.0,
+            read_error: 0.0,
             disk_latency: (Duration::from_micros(20), Duration::from_millis(2)),
             net_latency: (Duration::from_micros(100), Duration::from_millis(20)),
         }
@@ -68,6 +83,9 @@ impl FaultConfig {
             crash_apply: 0.0,
             crash_torn: 0.0,
             dir_entry_loss: 0.0,
+            bit_flip: 0.0,
+            misdirected_write: 0.0,
+            read_error: 0.0,
             disk_latency: (Duration::ZERO, Duration::ZERO),
             net_latency: (Duration::ZERO, Duration::ZERO),
         }
@@ -121,11 +139,19 @@ impl FaultConfig {
             sync_error,
             crash_apply,
             crash_torn,
-            // Not yet swarm-sampled: this axis draws from a field-keyed
-            // sub-stream once it lands (segment-mgmt design §4), so it
-            // cannot perturb the sequential draws above — a future field
-            // composes order-independently. Zero here takes no draw.
+            // These four axes draw from field-keyed sub-streams
+            // (`sample_extended_fields`, applied in `run_universe`/
+            // `run_universe_with_adjust` right after this function returns)
+            // rather than this sequential stream, so they cannot perturb the
+            // draws above — each composes order-independently and adding
+            // one changes no other field's draws. Zero here takes no draw;
+            // a caller that constructs `FaultConfig::swarm` directly (e.g.
+            // this module's own unit tests) without also calling
+            // `sample_extended_fields` gets these off, deterministically.
             dir_entry_loss: 0.0,
+            bit_flip: 0.0,
+            misdirected_write: 0.0,
+            read_error: 0.0,
             disk_latency: (Duration::ZERO, disk_hi),
             net_latency: (Duration::ZERO, net_hi),
         };
@@ -140,6 +166,9 @@ impl FaultConfig {
             ("crash_apply", self.crash_apply),
             ("crash_torn", self.crash_torn),
             ("dir_entry_loss", self.dir_entry_loss),
+            ("bit_flip", self.bit_flip),
+            ("misdirected_write", self.misdirected_write),
+            ("read_error", self.read_error),
         ] {
             assert!(
                 (0.0..=1.0).contains(&p),
@@ -159,6 +188,52 @@ impl FaultConfig {
             "net_latency range inverted"
         );
     }
+}
+
+/// Extended fault fields draw from per-field sub-streams keyed by (universe
+/// seed, field name) — never from `FaultConfig::swarm`'s legacy sequential
+/// stream above (this file's frozen replay contract). Adding a field here
+/// changes no existing universe's legacy draws and no other extended
+/// field's draws: each stream is independent of the seed's position in any
+/// other stream. Called from `run_universe`/`run_universe_with_adjust`
+/// immediately after `FaultConfig::swarm`, so every swarm-sampled universe
+/// (the production CLI harness and every workspace swarm test alike) also
+/// gets these axes sampled — this is also how Task 1's `dir_entry_loss`
+/// becomes swarm-sampled, since it draws here too.
+pub fn sample_extended_fields(seed: u64, cfg: &mut FaultConfig) {
+    fn stream(seed: u64, name: &str) -> Rng {
+        let mut h = 0xcbf2_9ce4_8422_2325u64; // FNV-1a, matching crc.rs's style
+        for b in name.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let mut s = seed ^ h;
+        Rng::new(splitmix64(&mut s))
+    }
+    let mut r = stream(seed, "bit_flip");
+    cfg.bit_flip = if r.chance(0.25) {
+        r.below(20) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = stream(seed, "misdirected_write");
+    cfg.misdirected_write = if r.chance(0.25) {
+        r.below(10) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = stream(seed, "read_error");
+    cfg.read_error = if r.chance(0.25) {
+        r.below(50) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = stream(seed, "dir_entry_loss");
+    cfg.dir_entry_loss = if r.chance(0.25) {
+        r.below(500) as f64 / 1000.0
+    } else {
+        0.0
+    };
 }
 
 struct State {
@@ -343,6 +418,32 @@ impl Sim {
             coverage,
             ..
         } = &mut *guard;
+        // Bit-level corruption of already-durable bytes (the bitrot model),
+        // before per-file crash collapse: one restart-time roll picks at
+        // most one file (by rng index over sorted names — BTreeMap iterates
+        // sorted already) with non-empty durable content and flips one
+        // random bit of one random byte. Zero-draw fast path: off by
+        // default, so every seed that predates this fault axis replays with
+        // the exact same rng sequence (the frozen replay contract).
+        if self.world.cfg.bit_flip > 0.0 && faults.chance(self.world.cfg.bit_flip) {
+            let names: Vec<String> = disk
+                .files
+                .iter()
+                .filter(|(_, f)| !f.durable.is_empty())
+                .map(|(name, _)| name.clone())
+                .collect();
+            if !names.is_empty() {
+                let name = &names[faults.below(names.len() as u64) as usize];
+                let file = disk
+                    .files
+                    .get_mut(name)
+                    .expect("name was just read from disk.files");
+                let byte_idx = faults.below(file.durable.len() as u64) as usize;
+                let bit = faults.below(8) as u32;
+                file.durable[byte_idx] ^= 1 << bit;
+                *coverage.entry("fault:bit_flip").or_insert(0) += 1;
+            }
+        }
         for file in disk.files.values_mut() {
             crate::disk::collapse(file, faults, &self.world.cfg, coverage);
         }
@@ -544,7 +645,14 @@ impl File for SimFile {
     }
 
     fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
-        self.op(|state, _, path| {
+        self.op(|state, cfg, path| {
+            if cfg.read_error > 0.0 && state.faults.chance(cfg.read_error) {
+                state.cover("fault:read_error");
+                // Transient: the disk itself is fine, so a later read of the
+                // same bytes may succeed — unlike a write/sync fault, this
+                // never touches the file's content or pending queue.
+                return Err(io::Error::other("injected read error"));
+            }
             let view = file_state(state, path).view();
             let end = offset.checked_add(out.len() as u64).expect("read_at range overflowed u64");
             if end > view.len() as u64 {
@@ -572,8 +680,17 @@ impl File for SimFile {
                     "simulated disk write error (injected fault)",
                 ));
             }
+            // Misdirected write: the payload lands past the requested
+            // offset instead of at it — the intended target stays stale,
+            // and the call still returns `Ok`. That's the whole treachery:
+            // nothing here or at the caller can tell the write went wrong.
+            let mut target_offset = offset;
+            if cfg.misdirected_write > 0.0 && state.faults.chance(cfg.misdirected_write) {
+                state.cover("fault:misdirected_write");
+                target_offset = offset + SECTOR * (1 + state.faults.below(4));
+            }
             file_state(state, path).pending.push(PendingOp::Write {
-                offset,
+                offset: target_offset,
                 data: data.to_vec(),
             });
             Ok(())
@@ -1064,6 +1181,10 @@ pub fn run_universes_swarm_with_in(
 /// (harness.rs). The seed→behavior mapping here is the frozen replay
 /// contract: config derives from `splitmix64(seed)`, the workload runs
 /// under catch_unwind, Ok returns coverage. Do not reorder anything.
+/// `sample_extended_fields` runs right after `FaultConfig::swarm` — its own
+/// sub-streams (keyed off `seed`, not `cfg_seed`) never touch the legacy
+/// draw above, so this addition changes no existing universe's replay
+/// (segment-mgmt T5's pin test proves it).
 // `FaultConfig` crossed clippy's large-Err threshold the moment
 // `dir_entry_loss` landed; boxing the Err would touch this frozen function's
 // signature (and every caller) for a lint, not a behavior change.
@@ -1074,7 +1195,8 @@ pub(crate) fn run_universe(
 ) -> Result<BTreeMap<&'static str, u64>, (FaultConfig, String)> {
     let mut s = seed;
     let cfg_seed = splitmix64(&mut s);
-    let cfg = FaultConfig::swarm(&mut Rng::new(cfg_seed));
+    let mut cfg = FaultConfig::swarm(&mut Rng::new(cfg_seed));
+    sample_extended_fields(seed, &mut cfg);
     let mut sim = Sim::with_faults(seed, cfg.clone());
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut sim))) {
         Ok(Ok(())) => Ok(sim.coverage()),
@@ -1085,6 +1207,9 @@ pub(crate) fn run_universe(
 
 /// Like `run_universe`, but applies `adjust` to the sampled config first — a
 /// separate function so `run_universe`'s frozen contract is never touched.
+/// `sample_extended_fields` runs before `adjust`, same placement as
+/// `run_universe`, so a test forcing one axis hot (`adjust`) always wins
+/// over whatever that axis's sub-stream happened to sample.
 #[allow(clippy::result_large_err)] // see run_universe
 fn run_universe_with_adjust(
     seed: u64,
@@ -1094,6 +1219,7 @@ fn run_universe_with_adjust(
     let mut s = seed;
     let cfg_seed = splitmix64(&mut s);
     let mut cfg = FaultConfig::swarm(&mut Rng::new(cfg_seed));
+    sample_extended_fields(seed, &mut cfg);
     adjust(&mut cfg);
     cfg.validate(); // an adjust closure that produces an invalid config is a workload bug
     let mut sim = Sim::with_faults(seed, cfg.clone());
@@ -1322,6 +1448,133 @@ mod tests {
         assert!(debug_strings.len() >= 2, "swarm configs never varied");
         assert!(saw_write_error_zero, "never sampled write_error == 0.0");
         assert!(saw_write_error_nonzero, "never sampled write_error > 0.0");
+    }
+
+    #[test]
+    fn extended_field_sampling_never_touches_the_legacy_stream() {
+        // The frozen contract's discriminating test: for a fixed seed, the
+        // legacy fields must be IDENTICAL with and without extended sampling.
+        let mut s = 0x5EED_F00D_u64;
+        let cfg_seed = splitmix64(&mut s);
+        let legacy = FaultConfig::swarm(&mut Rng::new(cfg_seed));
+        let mut extended = legacy.clone();
+        sample_extended_fields(0x5EED_F00D, &mut extended);
+        assert_eq!(legacy.write_error, extended.write_error);
+        assert_eq!(legacy.sync_error, extended.sync_error);
+        assert_eq!(legacy.crash_apply, extended.crash_apply);
+        assert_eq!(legacy.crash_torn, extended.crash_torn);
+        // And the extended fields are deterministic per (seed, field name):
+        let mut again = legacy.clone();
+        sample_extended_fields(0x5EED_F00D, &mut again);
+        assert_eq!(extended.bit_flip, again.bit_flip);
+        assert_eq!(extended.misdirected_write, again.misdirected_write);
+        assert_eq!(extended.read_error, again.read_error);
+        assert_eq!(extended.dir_entry_loss, again.dir_entry_loss);
+    }
+
+    // ---------------------------------------------- fault-matrix extensions
+
+    #[test]
+    fn read_error_fires_transiently_and_is_covered() {
+        let sim = Sim::with_faults(
+            0x2EAD_0001,
+            FaultConfig {
+                read_error: 1.0,
+                ..FaultConfig::none()
+            },
+        );
+        let file = sim.disk().open("f").unwrap();
+        file.write_at(0, b"hello").unwrap();
+        file.sync().unwrap();
+        let mut out = [0u8; 5];
+        let err = file.read_at(0, &mut out).unwrap_err();
+        assert!(err.to_string().contains("injected read error"), "{err}");
+        assert_eq!(sim.coverage()["fault:read_error"], 1);
+
+        // Off by default: no draw, no error.
+        let sim = Sim::with_faults(0x2EAD_0002, FaultConfig::none());
+        let file = sim.disk().open("f").unwrap();
+        file.write_at(0, b"hello").unwrap();
+        file.sync().unwrap();
+        let mut out = [0u8; 5];
+        file.read_at(0, &mut out).unwrap();
+        assert_eq!(&out, b"hello");
+    }
+
+    #[test]
+    fn misdirected_write_leaves_the_intended_offset_stale_but_returns_ok() {
+        let sim = Sim::with_faults(
+            0x0FF_0001,
+            FaultConfig {
+                misdirected_write: 1.0,
+                ..FaultConfig::none()
+            },
+        );
+        let file = sim.disk().open("f").unwrap();
+        file.write_at(0, b"payload!").unwrap(); // still Ok — the treachery
+        file.sync().unwrap();
+        let mut out = [0u8; 8];
+        file.read_at(0, &mut out).unwrap();
+        assert_ne!(
+            &out, b"payload!",
+            "the intended offset must stay stale — the bytes landed elsewhere"
+        );
+        assert!(
+            file.len().unwrap() > 8,
+            "the misdirected payload must land beyond the intended offset"
+        );
+        assert_eq!(sim.coverage()["fault:misdirected_write"], 1);
+    }
+
+    #[test]
+    fn bit_flip_corrupts_exactly_one_bit_of_one_file_at_restart() {
+        let sim = Sim::with_faults(
+            0xB17_0001,
+            FaultConfig {
+                bit_flip: 1.0,
+                ..FaultConfig::none()
+            },
+        );
+        let file = sim.disk().open("f").unwrap();
+        let original = vec![0xAAu8; 64];
+        file.write_at(0, &original).unwrap();
+        file.sync().unwrap();
+
+        sim.restart();
+
+        let file = sim.disk().open("f").unwrap();
+        let mut after = vec![0u8; 64];
+        file.read_at(0, &mut after).unwrap();
+        let mut diff_bytes = 0;
+        let mut total_flipped_bits = 0u32;
+        for (a, b) in original.iter().zip(&after) {
+            if a != b {
+                diff_bytes += 1;
+                total_flipped_bits += (a ^ b).count_ones();
+            }
+        }
+        assert_eq!(diff_bytes, 1, "exactly one byte must differ: {after:?}");
+        assert_eq!(
+            total_flipped_bits, 1,
+            "exactly one bit must differ: {after:?}"
+        );
+        assert_eq!(sim.coverage()["fault:bit_flip"], 1);
+    }
+
+    #[test]
+    fn bit_flip_is_a_no_op_with_no_non_empty_durable_file() {
+        // No file has ever been synced: bit_flip has nothing to corrupt, and
+        // must not panic reaching for one.
+        let sim = Sim::with_faults(
+            0xB17_0002,
+            FaultConfig {
+                bit_flip: 1.0,
+                ..FaultConfig::none()
+            },
+        );
+        let _file = sim.disk().open("f").unwrap(); // never written or synced
+        sim.restart();
+        assert_eq!(sim.coverage().get("fault:bit_flip"), None);
     }
 
     #[test]
