@@ -143,13 +143,20 @@ cannot honestly be retried (fsyncgate); the only exit from poison is restart-and
 and recovery is idempotent. The apply loop (`Engine`) holds the standing invariant:
 machine state ≡ fold(apply, durable records) — submit is append → sync → apply → ack.
 
-**Two durability fences.** (1) *Tracked.* Recovery cannot yet tell a torn tail from
-mid-log corruption of committed frames: any invalid frame is the cut, so bitrot below the
-store's durable horizon would silently discard acknowledged records — or trip
-`Db::open`'s ahead-of-the-log assert with a misdiagnosis. The rule when read faults land:
-an invalid frame at or below the horizon (the store's `applied_seq` at open) is a hard
-corruption error naming restore-from-replica/backup, never a cut. Lands with WAL segment
-management (recovery-horizon rule); M1 replication is what makes repair possible.
+**Two durability fences.** (1) *Held (recovery-horizon rule).* A cut can only ever
+discard unacknowledged data, so recovery must tell a torn tail from mid-log corruption
+of committed frames. `Db::open` reads the store's `applied_seq` before recovery — the
+durable horizon — and threads it through `Engine::recover` into
+`Wal::open_with_horizon`: an invalid frame at or below the horizon is a hard corruption
+error naming the frame, the horizon, and restore-from-replica/backup, never a cut (and
+the error path mutates nothing — no truncation, no segment deletion); above the horizon
+it is a torn tail and cuts exactly as before. The rule's other half guards the state no
+invalid frame can reveal: if the log's `base_seq` exceeds the horizon + 1, whole
+acknowledged records exist in neither the store nor the log (never a state checkpoint
+GC can produce — its floor is bounded by its own checkpoint's `applied_seq + 1`), and
+`Db::open` refuses with the same restore-naming error before recovery runs. Standalone
+`Wal::open` (no store in sight) keeps cut-at-first-invalid. M1 replication is what
+makes repair possible.
 (2) *Held.* `File::sync` does not persist a file's *directory entry*, so a freshly
 rotated-in segment's name (or a store file's, at creation) could vanish on power loss,
 taking acknowledged records with it, or a removed name could resurrect one a recovery

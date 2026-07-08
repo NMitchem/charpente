@@ -466,6 +466,16 @@ impl Db {
     /// (`DbConfig::retain_segments`/`checkpoint_every`), the records the
     /// store would need no longer exist locally: rebuild is impossible and
     /// this is a named hard error instead of a silent (wrong) rebuild.
+    ///
+    /// The recovery-horizon rule (DESIGN §2, segment-mgmt T4): the store's
+    /// `applied_seq` is the durable horizon threaded into `Engine::recover`,
+    /// so a corrupt frame at-or-below it is a named hard error rather than a
+    /// cut. The other half of the same rule lives here, before recovery
+    /// runs at all — if the log's base_seq is already past the horizon
+    /// (`applied_seq + 1`), an entire prefix of acknowledged records has
+    /// vanished from both the store and the log; that is never a shape
+    /// `checkpoint`'s own gc produces, so it is refused rather than silently
+    /// replayed from wherever the log happens to start.
     pub fn open(disk: Box<dyn Disk>, cfg: DbConfig, schema: Schema) -> io::Result<Db> {
         // The jobs table is platform-owned; an app registering it itself
         // hits the existing duplicate-registration assert.
@@ -509,13 +519,38 @@ impl Db {
             }
         };
         let skip_through = store.applied_seq()?;
+        // Recovery-horizon rule, vanished-prefix half (segment-mgmt T4; T2/T3
+        // review adjudication). Checkpoint-driven gc can only ever leave the
+        // log's floor at or below its own checkpoint's applied_seq + 1 (T2's
+        // safety proof) — never above it. So base_seq > that boundary is not
+        // a shape gc produces: it means the records between the horizon and
+        // the base are gone from the log AND never reached the store —
+        // corruption or entry loss, not something rebuild-from-WAL can
+        // recover from. Peeked here, before Engine::recover runs, so the
+        // hard error mutates nothing (same peek style as the unopenable-store
+        // branch above; `None` reads as horizon `0`, so a fresh store paired
+        // with any compacted log is rejected the same way).
+        let horizon = skip_through.map_or(0, |applied| applied + 1);
+        let prefix = format!("{}/", cfg.wal.dir);
+        if let Some(first) = disk.list(&prefix)?.first() {
+            let base = parse_segment_name(&cfg.wal.dir, first)?;
+            if base > horizon {
+                return Err(io::Error::other(format!(
+                    "log base_seq is {base} but the store's durable horizon is only {horizon} \
+                     — acknowledged records between the horizon and the base exist in neither \
+                     the store nor the log; this is corruption or entry loss, never a state \
+                     Db::checkpoint's own gc can produce; restore this node from a replica or \
+                     backup (DESIGN §2)"
+                )));
+            }
+        }
         let machine = TableMachine {
             store,
             schema,
             skip_through,
             enqueued: Vec::new(),
         };
-        let mut engine = Engine::recover(disk, cfg.wal.clone(), machine)?;
+        let mut engine = Engine::recover(disk, cfg.wal.clone(), machine, skip_through)?;
         // Recovery replay must not leak into the kernel's incremental feed —
         // the dispatcher rebuilds its due-heap from a Pending scan at open.
         engine.machine_mut().enqueued.clear();

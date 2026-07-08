@@ -1087,6 +1087,87 @@ fn unopenable_store_with_compacted_wal_is_a_named_hard_error() {
     }
 }
 
+// -------------------------------------------------- segment-mgmt T4: horizon
+
+#[test]
+fn db_open_routes_the_store_horizon_into_recovery() {
+    let sim = Sim::with_faults(0xC0FF_EE06, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), app_schema()).unwrap();
+    for i in 0..10u64 {
+        db.transact(|tx| {
+            tx.put(&invoice(i, 1, i as i64));
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+    }
+    db.checkpoint().unwrap(); // durable horizon (store applied_seq) is now 9
+    drop(db);
+
+    // Corrupt the CRC byte of the very first frame's header (offset 12) —
+    // guaranteed to sit inside an early frame regardless of the record's own
+    // payload encoding, and definitely at-or-below the horizon of 9.
+    let segments = sim.disk().list("wal/").unwrap();
+    let file = sim.disk().open(&segments[0]).unwrap();
+    let mut byte = [0u8; 1];
+    file.read_at(12, &mut byte).unwrap();
+    file.write_at(12, &[byte[0] ^ 0xFF]).unwrap();
+    file.sync().unwrap();
+
+    let err = Db::open(Box::new(sim.disk()), DbConfig::default(), app_schema()).unwrap_err();
+    let msg = err.to_string();
+    for needle in ["invalid", "durable horizon", "acknowledged", "restore"] {
+        assert!(
+            msg.contains(needle),
+            "Db::open must route the store's horizon into recovery, not open with fewer rows: {msg}"
+        );
+    }
+}
+
+/// The other half of the recovery-horizon rule (T2/T3 review adjudication):
+/// `base_seq > applied_seq + 1` means records between them are gone from
+/// BOTH the store and the log — corruption or entry loss, never a shape
+/// `Db::checkpoint`'s own gc can produce (gc always keeps the log's floor at
+/// or below its checkpoint's `applied_seq + 1`). Constructed directly at the
+/// raw `Store`/`Wal` layer — the store's durable `applied_seq` is pinned to
+/// 5 by hand, then the log is gc'd past seq 6 with no store involved at all
+/// — because reaching this state through `Db`'s own API would mean fighting
+/// (or duplicating) the very invariant this test proves `Db::open` enforces.
+#[test]
+fn db_open_refuses_a_vanished_prefix() {
+    let cfg = tiny_segments_cfg();
+    let sim = Sim::with_faults(0xC0FF_EE07, FaultConfig::none());
+
+    let store = Store::open(&sim.disk(), &cfg.store_path).unwrap();
+    for seq in 0..=5u64 {
+        store.apply(seq, |_w| Ok::<(), io::Error>(())).unwrap();
+    }
+    store.checkpoint().unwrap(); // durably pins applied_seq at 5
+    drop(store);
+
+    let mut wal = Wal::open(Box::new(sim.disk()), cfg.wal.clone(), |_, _| Ok(())).unwrap();
+    let records: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 8]).collect();
+    for record in &records {
+        wal.append(record).unwrap();
+    }
+    wal.sync().unwrap();
+    wal.gc(20, 1).unwrap();
+    assert!(
+        wal.base_seq() > 6,
+        "setup must push the log's base past the store's horizon (5 + 1 = 6): {}",
+        wal.base_seq()
+    );
+    drop(wal);
+
+    let err = Db::open(Box::new(sim.disk()), cfg, app_schema()).unwrap_err();
+    let msg = err.to_string();
+    for needle in ["base", "horizon", "neither", "restore"] {
+        assert!(
+            msg.contains(needle),
+            "vanished-prefix error must name the base, the horizon, and the fix: {msg}"
+        );
+    }
+}
+
 #[test]
 fn unopenable_store_with_full_wal_still_rebuilds() {
     // Same mangling as `mangled_store_len_recovers`, but with no checkpoint

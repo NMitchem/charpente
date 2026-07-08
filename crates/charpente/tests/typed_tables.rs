@@ -325,7 +325,12 @@ fn tables_workload(sim: &mut Sim) -> Result<(), String> {
         sim.crash_disk_after(64 + entropy.next_u64() % 512);
 
         let (engine, store) = match (|| {
-            let engine = Engine::recover(Box::new(sim.disk()), wal_cfg.clone(), OpLog::default())?;
+            let engine = Engine::recover(
+                Box::new(sim.disk()),
+                wal_cfg.clone(),
+                OpLog::default(),
+                None,
+            )?;
             let store = Store::open(&sim.disk(), "tables.redb")?;
             io::Result::Ok((engine, store))
         })() {

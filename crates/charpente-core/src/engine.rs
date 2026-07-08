@@ -51,9 +51,19 @@ impl<S: StateMachine> Engine<S> {
     /// `wal.base_seq()` once the log is open — recovery must resume there,
     /// not at 0, or the very next `submit` diverges from the log's own
     /// bookkeeping and panics.
-    pub fn recover(disk: Box<dyn Disk>, cfg: WalConfig, mut machine: S) -> io::Result<Engine<S>> {
+    ///
+    /// `horizon` is the recovery-horizon rule (DESIGN §2, segment-mgmt T4):
+    /// the store's `applied_seq` at open, threaded into `Wal` so a corrupt
+    /// frame at-or-below it is a named hard error, never a cut. Callers with
+    /// no store in the picture (standalone WAL tests) pass `None`.
+    pub fn recover(
+        disk: Box<dyn Disk>,
+        cfg: WalConfig,
+        mut machine: S,
+        horizon: Option<u64>,
+    ) -> io::Result<Engine<S>> {
         let mut last_applied: Option<u64> = None;
-        let wal = Wal::open(disk, cfg, |seq, payload| {
+        let wal = Wal::open_with_horizon(disk, cfg, horizon, |seq, payload| {
             if let Some(prev) = last_applied {
                 assert_eq!(
                     seq,
@@ -65,6 +75,21 @@ impl<S: StateMachine> Engine<S> {
             last_applied = Some(seq);
             Ok(())
         })?;
+        if let Some(h) = horizon {
+            // Negative space: a vanished prefix (the log's floor past the
+            // horizon by more than one) is a distinct hard error `Db::open`
+            // must catch BEFORE calling `recover` (segment-mgmt T4) — this
+            // is the state Wal::open_with_horizon's own frame-level check
+            // cannot see (no invalid frame is involved; whole segments are
+            // just gone). If this ever fires, the caller skipped that check.
+            assert!(
+                wal.base_seq() <= h + 1,
+                "Engine::recover: log base_seq {} is past the durable horizon {h} + 1 — the \
+                 caller must reject a vanished prefix before calling recover, not rely on this \
+                 assert",
+                wal.base_seq()
+            );
+        }
         if last_applied.is_none() && wal.base_seq() > 0 {
             last_applied = Some(wal.base_seq() - 1);
         }

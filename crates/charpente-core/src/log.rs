@@ -31,7 +31,16 @@
 //! segment — never a gap between what's retained and what recovery expects.
 //! `Wal::open` starts recovery's expected seq at the first remaining
 //! segment's base instead of 0.
+//!
+//! `Wal::open_with_horizon` (DESIGN §2's recovery-horizon rule): plain
+//! `open` cannot tell a torn tail from corruption of an already-durable,
+//! already-applied record — both are just "the first invalid frame". A
+//! caller that knows the durable horizon (`Db::open`, from the store's
+//! `applied_seq`) can pass it in: an invalid frame at-or-below the horizon
+//! is a hard corruption error instead of a cut, because truncating it would
+//! silently discard acknowledged data no cut is ever entitled to lose.
 
+use std::fmt;
 use std::io;
 
 use crate::crc::Crc32;
@@ -69,13 +78,50 @@ pub struct Wal {
     poisoned: bool,
 }
 
+// `disk`/`tail` are `Box<dyn Disk>`/`Box<dyn File>`, neither `Debug`-bound —
+// same reasoning as `Engine`'s hand-written impl (engine.rs), and needed for
+// the same reason: `Result::unwrap_err` on a `Wal`-returning call needs some
+// `Debug` bound on the `Ok` side (used by tests).
+impl fmt::Debug for Wal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Wal")
+            .field("cfg", &self.cfg)
+            .field("tail_offset", &self.tail_offset)
+            .field("next_seq", &self.next_seq)
+            .field("base_seq", &self.base_seq)
+            .field("poisoned", &self.poisoned)
+            .finish()
+    }
+}
+
 impl Wal {
     /// Opens the log, replaying every recovered record into `on_record` in
     /// seq order, and leaves the log ready to append after the last one. An
-    /// `on_record` error aborts recovery.
+    /// `on_record` error aborts recovery. Standalone behavior: no durable
+    /// horizon, so a corrupt frame is always a cut — see
+    /// `open_with_horizon`.
     pub fn open(
         disk: Box<dyn Disk>,
         cfg: WalConfig,
+        on_record: impl FnMut(u64, &[u8]) -> io::Result<()>,
+    ) -> io::Result<Wal> {
+        Wal::open_with_horizon(disk, cfg, None, on_record)
+    }
+
+    /// Like `open`, but `horizon` (the store's `applied_seq` at `Db::open` —
+    /// DESIGN §2's recovery-horizon rule) distinguishes two kinds of invalid
+    /// frame: at-or-below the horizon, corruption has hit an already-durable,
+    /// already-applied record, and recovery refuses to silently drop it (a
+    /// hard error, naming the frame, the horizon, and the restore path);
+    /// above it, the frame is an ordinary torn tail and recovery cuts there
+    /// exactly as `open` (horizon `None`) always has. The hard-error path
+    /// mutates nothing — it returns before any truncation or deletion runs,
+    /// so a caller that retries with a wider (or no) horizon still sees
+    /// today's cut behavior, untouched.
+    pub fn open_with_horizon(
+        disk: Box<dyn Disk>,
+        cfg: WalConfig,
+        horizon: Option<u64>,
         mut on_record: impl FnMut(u64, &[u8]) -> io::Result<()>,
     ) -> io::Result<Wal> {
         assert!(
@@ -120,7 +166,18 @@ impl Wal {
                         expected_seq += 1;
                         offset += HEADER_BYTES + payload.len() as u64;
                     }
-                    Frame::Invalid => break Some(offset),
+                    Frame::Invalid => {
+                        if horizon.is_some_and(|h| expected_seq <= h) {
+                            return Err(corrupt(format!(
+                                "log frame {expected_seq} is invalid but at-or-below the store's \
+                                 durable horizon {h} — this is corruption of acknowledged records, \
+                                 not a torn tail, and truncating it would silently lose data; \
+                                 restore this node from a replica or backup (DESIGN §2)",
+                                h = horizon.expect("checked by is_some_and"),
+                            )));
+                        }
+                        break Some(offset);
+                    }
                     Frame::CleanEnd => break None,
                 }
             };

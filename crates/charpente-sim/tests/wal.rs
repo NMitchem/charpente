@@ -81,14 +81,18 @@ fn wal_workload(sim: &mut Sim, payload_len: impl Fn(&dyn Entropy) -> usize) -> R
 
     for _round in 0..4 {
         sim.crash_disk_after(entropy.next_u64() % 96);
-        let mut engine =
-            match Engine::recover(Box::new(sim.disk()), small_segments(), Ledger::default()) {
-                Ok(engine) => engine,
-                Err(_) => {
-                    sim.restart();
-                    continue;
-                }
-            };
+        let mut engine = match Engine::recover(
+            Box::new(sim.disk()),
+            small_segments(),
+            Ledger::default(),
+            None,
+        ) {
+            Ok(engine) => engine,
+            Err(_) => {
+                sim.restart();
+                continue;
+            }
+        };
         check_prefix(&engine.machine().records, &submitted, acked)?;
 
         submitted = engine.machine().records.clone();
@@ -116,7 +120,12 @@ fn wal_workload(sim: &mut Sim, payload_len: impl Fn(&dyn Entropy) -> usize) -> R
     // so the real-world response is restart-and-retry.
     let mut recovered = None;
     for _attempt in 0..8 {
-        match Engine::recover(Box::new(sim.disk()), small_segments(), Ledger::default()) {
+        match Engine::recover(
+            Box::new(sim.disk()),
+            small_segments(),
+            Ledger::default(),
+            None,
+        ) {
             Ok(engine) => {
                 recovered = Some(engine);
                 break;
@@ -204,8 +213,13 @@ fn quiet_sim() -> Sim {
 }
 
 fn build_log(sim: &Sim, records: &[&[u8]]) {
-    let mut engine =
-        Engine::recover(Box::new(sim.disk()), small_segments(), Ledger::default()).unwrap();
+    let mut engine = Engine::recover(
+        Box::new(sim.disk()),
+        small_segments(),
+        Ledger::default(),
+        None,
+    )
+    .unwrap();
     for record in records {
         engine.submit(record).unwrap();
     }
@@ -224,8 +238,13 @@ fn rotation_spreads_records_across_segments_and_recovers() {
         "4 KiB segments must have rotated: {segments:?}"
     );
 
-    let engine =
-        Engine::recover(Box::new(sim.disk()), small_segments(), Ledger::default()).unwrap();
+    let engine = Engine::recover(
+        Box::new(sim.disk()),
+        small_segments(),
+        Ledger::default(),
+        None,
+    )
+    .unwrap();
     assert_eq!(engine.machine().records, records);
     assert_eq!(engine.last_applied(), Some(39));
 }
@@ -247,8 +266,13 @@ fn bit_flip_cuts_the_log_there_and_deletes_later_segments() {
     segment.write_at(offset, &[byte[0] ^ 0xFF]).unwrap();
     segment.sync().unwrap();
 
-    let engine =
-        Engine::recover(Box::new(sim.disk()), small_segments(), Ledger::default()).unwrap();
+    let engine = Engine::recover(
+        Box::new(sim.disk()),
+        small_segments(),
+        Ledger::default(),
+        None,
+    )
+    .unwrap();
     assert_eq!(
         engine.machine().records,
         records[..3],
@@ -270,6 +294,94 @@ fn bit_flip_cuts_the_log_there_and_deletes_later_segments() {
 }
 
 #[test]
+fn corruption_below_the_horizon_is_a_hard_error_not_a_cut() {
+    let sim = quiet_sim();
+    // Same construction as bit_flip_cuts_the_log_there_and_deletes_later_segments.
+    let records: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 300]).collect();
+    let refs: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
+    build_log(&sim, &refs);
+    let before = sim.disk().list("wal/").unwrap();
+
+    // Flip one payload byte of record 3 (segment 0, frame 3).
+    let segment = sim.disk().open(&before[0]).unwrap();
+    let offset = 3 * 316 + 16 + 100;
+    let mut byte = [0u8; 1];
+    segment.read_at(offset, &mut byte).unwrap();
+    segment.write_at(offset, &[byte[0] ^ 0xFF]).unwrap();
+    segment.sync().unwrap();
+
+    // Horizon 7 sits above the flipped frame (seq 3): the corruption is below
+    // the store's durable horizon, so it must be a named hard error, never a cut.
+    let err = Wal::open_with_horizon(Box::new(sim.disk()), small_segments(), Some(7), |_, _| {
+        Ok(())
+    })
+    .unwrap_err();
+    let msg = err.to_string();
+    for needle in ["invalid", "durable horizon", "acknowledged", "restore"] {
+        assert!(
+            msg.contains(needle),
+            "horizon error must name the contract: {msg}"
+        );
+    }
+
+    // The hard-error attempt mutated nothing: reopening with horizon None
+    // still cuts at frame 3 exactly as before.
+    let engine = Engine::recover(
+        Box::new(sim.disk()),
+        small_segments(),
+        Ledger::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        engine.machine().records,
+        records[..3],
+        "the cut still lands on the flipped frame — the hard-error attempt mutated nothing"
+    );
+    let after = sim.disk().list("wal/").unwrap();
+    assert_eq!(
+        after,
+        vec![before[0].clone()],
+        "the real recovery still deletes later segments after the cut"
+    );
+}
+
+#[test]
+fn corruption_above_the_horizon_still_cuts() {
+    let sim = quiet_sim();
+    let records: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 300]).collect();
+    let refs: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
+    build_log(&sim, &refs);
+    let before = sim.disk().list("wal/").unwrap();
+
+    let segment = sim.disk().open(&before[0]).unwrap();
+    let offset = 3 * 316 + 16 + 100;
+    let mut byte = [0u8; 1];
+    segment.read_at(offset, &mut byte).unwrap();
+    segment.write_at(offset, &[byte[0] ^ 0xFF]).unwrap();
+    segment.sync().unwrap();
+
+    // Horizon 2 sits below the flipped frame (seq 3): recovery cuts there
+    // exactly as Wal::open (horizon None) does today, recovering seqs 0..=2.
+    let mut recovered: Vec<(u64, Vec<u8>)> = Vec::new();
+    Wal::open_with_horizon(
+        Box::new(sim.disk()),
+        small_segments(),
+        Some(2),
+        |seq, payload| {
+            recovered.push((seq, payload.to_vec()));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        recovered.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "recovery cuts at the flipped frame and recovers only seqs 0..=2"
+    );
+}
+
+#[test]
 fn recovered_log_accepts_appends_after_a_cut() {
     let sim = quiet_sim();
     build_log(&sim, &[b"one", b"two", b"three"]);
@@ -281,8 +393,13 @@ fn recovered_log_accepts_appends_after_a_cut() {
     file.write_at(last_frame + 12, &[0xFF]).unwrap();
     file.sync().unwrap();
 
-    let mut engine =
-        Engine::recover(Box::new(sim.disk()), small_segments(), Ledger::default()).unwrap();
+    let mut engine = Engine::recover(
+        Box::new(sim.disk()),
+        small_segments(),
+        Ledger::default(),
+        None,
+    )
+    .unwrap();
     assert_eq!(
         engine.machine().records,
         vec![b"one".to_vec(), b"two".to_vec()]
@@ -293,8 +410,13 @@ fn recovered_log_accepts_appends_after_a_cut() {
         "seq continues from the cut"
     );
 
-    let engine =
-        Engine::recover(Box::new(sim.disk()), small_segments(), Ledger::default()).unwrap();
+    let engine = Engine::recover(
+        Box::new(sim.disk()),
+        small_segments(),
+        Ledger::default(),
+        None,
+    )
+    .unwrap();
     assert_eq!(engine.machine().records[2], b"three-again");
 }
 
@@ -304,8 +426,12 @@ fn foreign_file_in_the_log_directory_is_refused_by_name() {
     build_log(&sim, &[b"x"]);
     sim.disk().open("wal/notes.txt").unwrap();
 
-    let Err(err) = Engine::recover(Box::new(sim.disk()), small_segments(), Ledger::default())
-    else {
+    let Err(err) = Engine::recover(
+        Box::new(sim.disk()),
+        small_segments(),
+        Ledger::default(),
+        None,
+    ) else {
         panic!("recovery must refuse a log directory holding foreign files");
     };
     let msg = err.to_string();
@@ -329,8 +455,12 @@ fn segment_gap_is_refused_with_the_expected_seq() {
     assert!(segments.len() >= 3, "need a middle segment to remove");
     sim.disk().remove(&segments[1]).unwrap();
 
-    let Err(err) = Engine::recover(Box::new(sim.disk()), small_segments(), Ledger::default())
-    else {
+    let Err(err) = Engine::recover(
+        Box::new(sim.disk()),
+        small_segments(),
+        Ledger::default(),
+        None,
+    ) else {
         panic!("recovery must refuse a log with a missing segment");
     };
     let msg = err.to_string();
@@ -340,8 +470,13 @@ fn segment_gap_is_refused_with_the_expected_seq() {
 #[test]
 fn empty_directory_starts_at_seq_zero() {
     let sim = quiet_sim();
-    let mut engine =
-        Engine::recover(Box::new(sim.disk()), small_segments(), Ledger::default()).unwrap();
+    let mut engine = Engine::recover(
+        Box::new(sim.disk()),
+        small_segments(),
+        Ledger::default(),
+        None,
+    )
+    .unwrap();
     assert_eq!(engine.last_applied(), None);
     assert_eq!(engine.submit(b"first").unwrap(), 0);
 }
@@ -380,6 +515,7 @@ fn apply_failure_poisons_the_engine_until_recovery() {
             ledger: Ledger::default(),
             refuse_seq: Some(1),
         },
+        None,
     )
     .unwrap();
     engine.submit(b"zero").unwrap();
@@ -400,6 +536,7 @@ fn apply_failure_poisons_the_engine_until_recovery() {
             ledger: Ledger::default(),
             refuse_seq: None,
         },
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -688,6 +825,7 @@ fn recovery_propagates_apply_failure() {
             ledger: Ledger::default(),
             refuse_seq: Some(0),
         },
+        None,
     )
     .unwrap_err();
     assert_eq!(err.to_string(), "injected apply failure");

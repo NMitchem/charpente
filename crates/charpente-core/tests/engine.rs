@@ -60,7 +60,8 @@ fn recover_reanchors_replay_at_a_gc_compacted_log_base() {
     drop(wal);
 
     // Recovery must replay starting at `base`, not panic expecting seq 0.
-    let mut engine = Engine::recover(Box::new(sim.disk()), wal_cfg(), Counter::default()).unwrap();
+    let mut engine =
+        Engine::recover(Box::new(sim.disk()), wal_cfg(), Counter::default(), None).unwrap();
     let applied = &engine.machine().applied;
     assert_eq!(
         applied.first().map(|(s, _)| *s),
@@ -105,7 +106,8 @@ fn recover_seeds_last_applied_even_when_the_retained_segment_is_empty() {
     file.set_len(0).unwrap();
     file.sync().unwrap();
 
-    let engine = Engine::recover(Box::new(sim.disk()), wal_cfg(), Counter::default()).unwrap();
+    let engine =
+        Engine::recover(Box::new(sim.disk()), wal_cfg(), Counter::default(), None).unwrap();
     assert!(
         engine.machine().applied.is_empty(),
         "no frames were replayed"
