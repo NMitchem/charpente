@@ -104,6 +104,26 @@ the answer), so acked-durability workloads route their shortfall through
 `checks::durable_corruption_fired` — loss is excused only in universes where a
 durable-corruption fault actually fired.
 
+**Per-host worlds** (landed with M1 replication's first task): `Sim::host(name)` gives a
+named simulated host its own disk (`DiskWorld`, unchanged — the same crash/countdown/epoch
+model, just one instance per host) and its own fault + entropy streams, keyed sub-streams
+off (universe seed, host name) via the same construction as the extended fault fields
+(`keyed_stream`, formerly `sample_extended_fields`'s private `stream` helper) — a host's
+rolls never depend on other hosts' op interleaving, and creating or using a host draws from
+none of the frozen global streams (`Sim::disk()`, `Sim::entropy()`, `Sim::restart()`,
+`Sim::durable_fingerprint()` are byte-identical to before this task; every pre-existing
+pinned seed replays unchanged). Virtual time and disk latency stay universe-global — time
+is one dimension, not a per-host one. `SimHost::crash_now`/`crash_after`/`restart` mirror
+the global equivalents scoped to that host's disk (crash coverage is the new `"crash:host"`
+key, distinct from the global `"fault:crash"`), and additionally tear down the host's
+network presence (`NetWorld::teardown_host`): every connection with that host on one side
+closes that side and drops the in-flight queue addressed to it (a dead host will never read
+those bytes), and every listener it owns is removed so a restart's `listen` on the same
+address succeeds. Listener tokens (bumped by a `next_listener` counter) stop a handle held
+across a crash from accepting on, or clobbering, a later re-`listen` at the same address.
+This is the sim-side prerequisite for the multi-node replication universes in M1's second
+sub-project — nothing above the sim is testable without host-scoped crash/restart.
+
 **Consequence for the concurrency model.** The core state machine is single-threaded —
 concurrency lives at the edges (HTTP handling, queue workers, replication) and is itself
 scheduled through the deterministic executor. The executor's load-bearing rule (the

@@ -24,7 +24,7 @@ use std::time::Duration;
 use charpente_core::io::{Clock, Conn, Disk, Entropy, File, Instant, Listener, Net};
 
 use crate::disk::{DiskWorld, FileState, PendingOp, SECTOR};
-use crate::net::{ConnState, NetWorld, host_of, normalize};
+use crate::net::{ConnState, ListenerState, NetWorld, host_of, normalize};
 use crate::rng::{Rng, splitmix64};
 
 /// Fault-injection probabilities and latency ranges. The defaults are the
@@ -220,39 +220,69 @@ impl FaultConfig {
 /// gets these axes sampled — this is also how Task 1's `dir_entry_loss`
 /// becomes swarm-sampled, since it draws here too.
 pub fn sample_extended_fields(seed: u64, cfg: &mut FaultConfig) {
-    fn stream(seed: u64, name: &str) -> Rng {
-        let mut h = 0xcbf2_9ce4_8422_2325u64; // FNV-1a, matching crc.rs's style
-        for b in name.bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        let mut s = seed ^ h;
-        Rng::new(splitmix64(&mut s))
-    }
-    let mut r = stream(seed, "bit_flip");
+    let mut r = keyed_stream(seed, "bit_flip");
     cfg.bit_flip = if r.chance(0.25) {
         r.below(20) as f64 / 1000.0
     } else {
         0.0
     };
-    let mut r = stream(seed, "misdirected_write");
+    let mut r = keyed_stream(seed, "misdirected_write");
     cfg.misdirected_write = if r.chance(0.25) {
         r.below(10) as f64 / 1000.0
     } else {
         0.0
     };
-    let mut r = stream(seed, "read_error");
+    let mut r = keyed_stream(seed, "read_error");
     cfg.read_error = if r.chance(0.25) {
         r.below(50) as f64 / 1000.0
     } else {
         0.0
     };
-    let mut r = stream(seed, "dir_entry_loss");
+    let mut r = keyed_stream(seed, "dir_entry_loss");
     cfg.dir_entry_loss = if r.chance(0.25) {
         r.below(500) as f64 / 1000.0
     } else {
         0.0
     };
+}
+
+/// A stream independent of both the legacy sequential draw and every other
+/// keyed stream: `seed` XORed with an FNV-1a hash of `name`, expanded through
+/// splitmix64 into a fresh xoshiro256++ state. Used for `sample_extended_fields`'s
+/// per-field fault axes and for a host's `faults`/`entropy` streams
+/// (`HostWorld::new`) — same construction, so a host's rolls never depend on
+/// other hosts' op interleaving or on the frozen global streams.
+fn keyed_stream(seed: u64, name: &str) -> Rng {
+    let mut h = 0xcbf2_9ce4_8422_2325u64; // FNV-1a, matching crc.rs's style
+    for b in name.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut s = seed ^ h;
+    Rng::new(splitmix64(&mut s))
+}
+
+/// One simulated host's disk + fault/entropy streams. Reuses `DiskWorld`
+/// unchanged (`crashed`/`crash_countdown`/`epoch` already carry a single
+/// host's crash model); `faults`/`entropy` are keyed sub-streams
+/// (`keyed_stream`), so a host's rolls never depend on other hosts' op
+/// interleaving, and no host perturbs the frozen global `State.faults`/
+/// `State.entropy` streams. Latency is NOT per-host: virtual time is one
+/// dimension shared by the whole universe (`State.latency`/`State.now`).
+struct HostWorld {
+    disk: DiskWorld,
+    faults: Rng,
+    entropy: Rng,
+}
+
+impl HostWorld {
+    fn new(seed: u64, host: &str) -> HostWorld {
+        HostWorld {
+            disk: DiskWorld::default(),
+            faults: keyed_stream(seed, &format!("host-faults:{host}")),
+            entropy: keyed_stream(seed, &format!("host-entropy:{host}")),
+        }
+    }
 }
 
 struct State {
@@ -268,11 +298,46 @@ struct State {
     /// Sometimes-coverage: named-event counts across the universe (Antithesis
     /// "sometimes assertions", adapted) — see `Sim::cover`.
     coverage: BTreeMap<&'static str, u64>,
+    /// Per-host worlds, created lazily by `Sim::host`. NEW state: no existing
+    /// single-node universe ever populates this map, so the frozen global
+    /// world above is untouched by this task (the replay contract).
+    hosts: BTreeMap<String, HostWorld>,
 }
 
 impl State {
     fn cover(&mut self, key: &'static str) {
         *self.coverage.entry(key).or_insert(0) += 1;
+    }
+
+    /// Panics if `name` was never created via `Sim::host` — a `SimHost`
+    /// handle can only be produced by `Sim::host`, which creates the entry
+    /// first, so reaching this with a missing name is a framework bug, not a
+    /// caller error.
+    fn host_mut(&mut self, name: &str) -> &mut HostWorld {
+        self.hosts.get_mut(name).unwrap_or_else(|| {
+            panic!("simulated host \"{name}\" used before Sim::host(\"{name}\") created it")
+        })
+    }
+
+    fn world_of(&mut self, host: &Option<String>) -> &mut DiskWorld {
+        match host {
+            None => &mut self.disk,
+            Some(name) => &mut self.host_mut(name).disk,
+        }
+    }
+
+    fn faults_of(&mut self, host: &Option<String>) -> &mut Rng {
+        match host {
+            None => &mut self.faults,
+            Some(name) => &mut self.host_mut(name).faults,
+        }
+    }
+
+    fn entropy_of(&mut self, host: &Option<String>) -> &mut Rng {
+        match host {
+            None => &mut self.entropy,
+            Some(name) => &mut self.host_mut(name).entropy,
+        }
     }
 
     fn advance(&mut self, (lo, hi): (Duration, Duration)) {
@@ -293,18 +358,34 @@ impl State {
     }
 
     /// Charged by every disk operation: the injected-crash countdown ticks
-    /// here, so a crash can land between any two operations.
-    fn disk_op(&mut self, cfg: &FaultConfig) -> io::Result<()> {
-        if self.disk.crashed {
+    /// here, so a crash can land between any two operations. `host` selects
+    /// the global world (`None`) or a per-host world (`Some`, `crash:host`
+    /// coverage instead of `fault:crash` — a host crash is a new axis, not
+    /// the global disk crash) — either way the transition also tears down
+    /// that host's network presence (`NetWorld::teardown_host`).
+    fn disk_op(&mut self, cfg: &FaultConfig, host: &Option<String>) -> io::Result<()> {
+        let world = self.world_of(host);
+        if world.crashed {
             return Err(crashed_error());
         }
-        if let Some(countdown) = self.disk.crash_countdown {
+        let mut newly_crashed = false;
+        if let Some(countdown) = world.crash_countdown {
             if countdown == 0 {
-                self.disk.crashed = true;
-                self.cover("fault:crash"); // count the transition only
-                return Err(crashed_error());
+                world.crashed = true;
+                newly_crashed = true;
+            } else {
+                world.crash_countdown = Some(countdown - 1);
             }
-            self.disk.crash_countdown = Some(countdown - 1);
+        }
+        if newly_crashed {
+            match host {
+                Some(name) => {
+                    self.cover("crash:host"); // count the transition only
+                    self.net.teardown_host(name);
+                }
+                None => self.cover("fault:crash"), // count the transition only
+            }
+            return Err(crashed_error());
         }
         self.advance(cfg.disk_latency);
         Ok(())
@@ -328,6 +409,24 @@ impl World {
 
 fn crashed_error() -> io::Error {
     io::Error::other("simulated crash: the disk is gone until Sim::restart()")
+}
+
+/// FNV-1a over a disk world's durable file contents — shared by
+/// `Sim::durable_fingerprint` and `SimHost::durable_fingerprint`, so both
+/// produce the exact same bytes over the file map each is given.
+fn fingerprint_files(files: &BTreeMap<String, FileState>) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for &b in bytes {
+            hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for (name, file) in files {
+        eat(name.as_bytes());
+        eat(&(file.durable.len() as u64).to_le_bytes());
+        eat(&file.durable);
+    }
+    hash
 }
 
 pub struct Sim {
@@ -357,6 +456,7 @@ impl Sim {
                     disk: DiskWorld::default(),
                     net: NetWorld::default(),
                     coverage: BTreeMap::new(),
+                    hosts: BTreeMap::new(),
                 }),
             }),
         }
@@ -391,12 +491,14 @@ impl Sim {
     pub fn entropy(&self) -> SimEntropy {
         SimEntropy {
             world: self.world.clone(),
+            host: None,
         }
     }
 
     pub fn disk(&self) -> SimDisk {
         SimDisk {
             world: self.world.clone(),
+            host: None,
         }
     }
 
@@ -405,6 +507,23 @@ impl Sim {
         SimNet {
             world: self.world.clone(),
             host: host.to_string(),
+        }
+    }
+
+    /// A named simulated host: its own disk, its own keyed fault/entropy
+    /// streams, and (via `SimHost::net`) the shared `NetWorld` under its
+    /// name. Created lazily on first call and reused by name thereafter —
+    /// `sim.host("a")` twice returns handles onto the same host world.
+    pub fn host(&self, name: &str) -> SimHost {
+        let mut guard = self.world.lock();
+        let seed = self.world.seed;
+        guard
+            .hosts
+            .entry(name.to_string())
+            .or_insert_with(|| HostWorld::new(seed, name));
+        SimHost {
+            world: self.world.clone(),
+            name: name.to_string(),
         }
     }
 
@@ -496,19 +615,130 @@ impl Sim {
     /// FNV-1a over all durable file contents — for determinism assertions:
     /// the same seed must produce the same fingerprint, forever.
     pub fn durable_fingerprint(&self) -> u64 {
-        let guard = self.world.lock();
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut eat = |bytes: &[u8]| {
-            for &b in bytes {
-                hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        };
-        for (name, file) in &guard.disk.files {
-            eat(name.as_bytes());
-            eat(&(file.durable.len() as u64).to_le_bytes());
-            eat(&file.durable);
+        fingerprint_files(&self.world.lock().disk.files)
+    }
+}
+
+/// A named simulated host: its own disk world, its own keyed fault/entropy
+/// streams, and the shared `NetWorld` under its name. Obtained from
+/// `Sim::host` (which creates the underlying world on first call); `Clone`
+/// just duplicates the handle onto that same world.
+#[derive(Clone)]
+pub struct SimHost {
+    world: Arc<World>,
+    name: String,
+}
+
+impl SimHost {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn disk(&self) -> SimDisk {
+        SimDisk {
+            world: self.world.clone(),
+            host: Some(self.name.clone()),
         }
-        hash
+    }
+
+    pub fn entropy(&self) -> SimEntropy {
+        SimEntropy {
+            world: self.world.clone(),
+            host: Some(self.name.clone()),
+        }
+    }
+
+    /// Same as `sim.net(host.name())` — `NetWorld` is not split per host
+    /// (listeners/conns are already keyed by address/id), only the disk and
+    /// fault/entropy streams are.
+    pub fn net(&self) -> SimNet {
+        SimNet {
+            world: self.world.clone(),
+            host: self.name.clone(),
+        }
+    }
+
+    /// Crashes this host now: its disk starts erroring until `restart()`,
+    /// and (on the transition into crashed) its network presence tears down
+    /// (`NetWorld::teardown_host`) — mirrors `Sim::crash_disk_now`, scoped to
+    /// this host.
+    pub fn crash_now(&self) {
+        let mut guard = self.world.lock();
+        let host = guard.host_mut(&self.name);
+        let was_crashed = host.disk.crashed;
+        host.disk.crashed = true;
+        if !was_crashed {
+            guard.cover("crash:host");
+            guard.net.teardown_host(&self.name);
+        }
+    }
+
+    /// Injects a crash on the `ops`-th subsequent disk operation *on this
+    /// host* — mirrors `Sim::crash_disk_after`.
+    pub fn crash_after(&self, ops: u64) {
+        self.world.lock().host_mut(&self.name).disk.crash_countdown = Some(ops);
+    }
+
+    /// Power-cycles this host: same crash-collapse model as `Sim::restart`
+    /// (bit-level corruption roll, then per-file collapse, then dir-entry
+    /// collapse), scoped to this host's disk and fault stream, then this
+    /// host's network presence tears down — a clean power cycle drops
+    /// connections too, and this also makes a crashed host's re-`listen`
+    /// possible even if `crash_now` was never called (teardown is
+    /// idempotent).
+    pub fn restart(&self) {
+        let mut guard = self.world.lock();
+        let cfg = self.world.cfg.clone();
+        guard.host_mut(&self.name); // asserts the invariant; borrow ends immediately
+        {
+            let State {
+                hosts, coverage, ..
+            } = &mut *guard;
+            let host = hosts.get_mut(&self.name).expect("checked above");
+            let HostWorld { disk, faults, .. } = host;
+            // Bit-level corruption of already-durable bytes, before per-file
+            // crash collapse — see `Sim::restart`'s doc for the full model;
+            // this is that same roll, scoped to this host's files and faults
+            // stream.
+            if cfg.bit_flip > 0.0 && faults.chance(cfg.bit_flip) {
+                let names: Vec<String> = disk
+                    .files
+                    .iter()
+                    .filter(|(name, f)| {
+                        name.starts_with(&cfg.corruption_scope) && !f.durable.is_empty()
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                if !names.is_empty() {
+                    let name = &names[faults.below(names.len() as u64) as usize];
+                    let file = disk
+                        .files
+                        .get_mut(name)
+                        .expect("name was just read from disk.files");
+                    let byte_idx = faults.below(file.durable.len() as u64) as usize;
+                    let bit = faults.below(8) as u32;
+                    file.durable[byte_idx] ^= 1 << bit;
+                    *coverage.entry("fault:bit_flip").or_insert(0) += 1;
+                }
+            }
+            for file in disk.files.values_mut() {
+                crate::disk::collapse(file, faults, &cfg, coverage);
+            }
+            if cfg.dir_entry_loss > 0.0 {
+                crate::disk::collapse_dir_entries(disk, faults, cfg.dir_entry_loss, coverage);
+            }
+            disk.epoch += 1;
+            disk.crashed = false;
+            disk.crash_countdown = None;
+        }
+        guard.net.teardown_host(&self.name);
+    }
+
+    /// FNV-1a over this host's durable file contents — see
+    /// `Sim::durable_fingerprint`.
+    pub fn durable_fingerprint(&self) -> u64 {
+        let mut guard = self.world.lock();
+        fingerprint_files(&guard.host_mut(&self.name).disk.files)
     }
 }
 
@@ -533,38 +763,50 @@ impl Clock for SimClock {
 
 pub struct SimEntropy {
     world: Arc<World>,
+    host: Option<String>,
 }
 
 impl Entropy for SimEntropy {
     fn fill(&self, buf: &mut [u8]) {
-        self.world.lock().entropy.fill(buf);
+        self.world.lock().entropy_of(&self.host).fill(buf);
     }
 }
+
+// `next_u64` (used by the host-entropy test below, and by every workload
+// that wants a raw draw) is `Entropy`'s own default method, built on `fill`
+// — no inherent method needed here, and adding a shadowing one would only
+// make every other call site's `Entropy` import look unused to clippy.
 
 // ---------------------------------------------------------------- Disk
 
 pub struct SimDisk {
     world: Arc<World>,
+    /// `None` = the frozen global world; `Some(host)` = that host's world.
+    host: Option<String>,
 }
 
 impl Disk for SimDisk {
     fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
         let mut guard = self.world.lock();
-        guard.disk_op(&self.world.cfg)?;
-        if !guard.disk.files.contains_key(path) {
+        guard.disk_op(&self.world.cfg, &self.host)?;
+        if !guard.world_of(&self.host).files.contains_key(path) {
             // A fresh name (including a reopen of one still in
             // pending_removes — that entry is left alone, so its stashed
             // durable bytes can still resurrect): its directory entry is not
             // durable until sync_dir.
             guard
-                .disk
+                .world_of(&self.host)
                 .files
                 .insert(path.to_string(), FileState::default());
-            guard.disk.pending_creates.insert(path.to_string());
+            guard
+                .world_of(&self.host)
+                .pending_creates
+                .insert(path.to_string());
         }
-        let epoch = guard.disk.epoch;
+        let epoch = guard.world_of(&self.host).epoch;
         Ok(Box::new(SimFile {
             world: self.world.clone(),
+            host: self.host.clone(),
             path: path.to_string(),
             epoch,
         }))
@@ -572,19 +814,19 @@ impl Disk for SimDisk {
 
     fn remove(&self, path: &str) -> io::Result<()> {
         let mut guard = self.world.lock();
-        guard.disk_op(&self.world.cfg)?;
-        let Some(file) = guard.disk.files.remove(path) else {
+        guard.disk_op(&self.world.cfg, &self.host)?;
+        let Some(file) = guard.world_of(&self.host).files.remove(path) else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("remove(\"{path}\"): no such simulated file"),
             ));
         };
-        if !guard.disk.pending_creates.remove(path) {
+        if !guard.world_of(&self.host).pending_creates.remove(path) {
             // The create was already durable (or predates this fault axis
             // mattering); the removal itself is what's now pending — a
             // crash before sync_dir can resurrect these durable bytes.
             guard
-                .disk
+                .world_of(&self.host)
                 .pending_removes
                 .insert(path.to_string(), file.durable);
         }
@@ -595,9 +837,9 @@ impl Disk for SimDisk {
 
     fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
         let mut guard = self.world.lock();
-        guard.disk_op(&self.world.cfg)?;
+        guard.disk_op(&self.world.cfg, &self.host)?;
         Ok(guard
-            .disk
+            .world_of(&self.host)
             .files
             .keys()
             .filter(|k| k.starts_with(prefix))
@@ -607,8 +849,11 @@ impl Disk for SimDisk {
 
     fn sync_dir(&self, prefix: &str) -> io::Result<()> {
         let mut guard = self.world.lock();
-        guard.disk_op(&self.world.cfg)?;
-        if guard.faults.chance(self.world.cfg.sync_error) {
+        guard.disk_op(&self.world.cfg, &self.host)?;
+        if guard
+            .faults_of(&self.host)
+            .chance(self.world.cfg.sync_error)
+        {
             guard.cover("fault:sync_error");
             // Same contract as File::sync: a failed barrier leaves the
             // durability of every entry it would have covered unknown.
@@ -618,11 +863,11 @@ impl Disk for SimDisk {
             ));
         }
         guard
-            .disk
+            .world_of(&self.host)
             .pending_creates
             .retain(|name| !name.starts_with(prefix));
         guard
-            .disk
+            .world_of(&self.host)
             .pending_removes
             .retain(|name, _| !name.starts_with(prefix));
         Ok(())
@@ -631,6 +876,7 @@ impl Disk for SimDisk {
 
 pub struct SimFile {
     world: Arc<World>,
+    host: Option<String>,
     path: String,
     epoch: u64,
 }
@@ -642,20 +888,24 @@ impl SimFile {
         f: impl FnOnce(&mut State, &FaultConfig, &str) -> io::Result<T>,
     ) -> io::Result<T> {
         let mut guard = self.world.lock();
-        if guard.disk.epoch != self.epoch {
+        if guard.world_of(&self.host).epoch != self.epoch {
             return Err(io::Error::other(format!(
                 "file handle for \"{}\" predates a simulated crash — contract: reopen files after Sim::restart()",
                 self.path
             )));
         }
-        guard.disk_op(&self.world.cfg)?;
+        guard.disk_op(&self.world.cfg, &self.host)?;
         f(&mut guard, &self.world.cfg, &self.path)
     }
 }
 
-fn file_state<'a>(state: &'a mut State, path: &str) -> &'a mut disk::FileState {
+fn file_state<'a>(
+    state: &'a mut State,
+    host: &Option<String>,
+    path: &str,
+) -> &'a mut disk::FileState {
     state
-        .disk
+        .world_of(host)
         .files
         .get_mut(path)
         .unwrap_or_else(|| panic!("simulated file \"{path}\" removed while a handle was open"))
@@ -663,19 +913,19 @@ fn file_state<'a>(state: &'a mut State, path: &str) -> &'a mut disk::FileState {
 
 impl File for SimFile {
     fn len(&self) -> io::Result<u64> {
-        self.op(|state, _, path| Ok(file_state(state, path).view().len() as u64))
+        self.op(|state, _, path| Ok(file_state(state, &self.host, path).view().len() as u64))
     }
 
     fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
         self.op(|state, cfg, path| {
-            if cfg.read_error > 0.0 && state.faults.chance(cfg.read_error) {
+            if cfg.read_error > 0.0 && state.faults_of(&self.host).chance(cfg.read_error) {
                 state.cover("fault:read_error");
                 // Transient: the disk itself is fine, so a later read of the
                 // same bytes may succeed — unlike a write/sync fault, this
                 // never touches the file's content or pending queue.
                 return Err(io::Error::other("injected read error"));
             }
-            let view = file_state(state, path).view();
+            let view = file_state(state, &self.host, path).view();
             let end = offset.checked_add(out.len() as u64).expect("read_at range overflowed u64");
             if end > view.len() as u64 {
                 return Err(io::Error::new(
@@ -696,7 +946,7 @@ impl File for SimFile {
             if data.is_empty() {
                 return Ok(());
             }
-            if state.faults.chance(cfg.write_error) {
+            if state.faults_of(&self.host).chance(cfg.write_error) {
                 state.cover("fault:write_error");
                 return Err(io::Error::other(
                     "simulated disk write error (injected fault)",
@@ -712,22 +962,24 @@ impl File for SimFile {
             let mut target_offset = offset;
             if cfg.misdirected_write > 0.0
                 && path.starts_with(&cfg.corruption_scope)
-                && state.faults.chance(cfg.misdirected_write)
+                && state.faults_of(&self.host).chance(cfg.misdirected_write)
             {
                 state.cover("fault:misdirected_write");
-                target_offset = offset + SECTOR * (1 + state.faults.below(4));
+                target_offset = offset + SECTOR * (1 + state.faults_of(&self.host).below(4));
             }
-            file_state(state, path).pending.push(PendingOp::Write {
-                offset: target_offset,
-                data: data.to_vec(),
-            });
+            file_state(state, &self.host, path)
+                .pending
+                .push(PendingOp::Write {
+                    offset: target_offset,
+                    data: data.to_vec(),
+                });
             Ok(())
         })
     }
 
     fn set_len(&self, len: u64) -> io::Result<()> {
         self.op(|state, _, path| {
-            file_state(state, path)
+            file_state(state, &self.host, path)
                 .pending
                 .push(PendingOp::SetLen { len });
             Ok(())
@@ -736,7 +988,7 @@ impl File for SimFile {
 
     fn sync(&self) -> io::Result<()> {
         self.op(|state, cfg, path| {
-            if state.faults.chance(cfg.sync_error) {
+            if state.faults_of(&self.host).chance(cfg.sync_error) {
                 state.cover("fault:sync_error");
                 // Real fsync failure semantics: nothing can be assumed. The
                 // buffer stays volatile; a later crash collapses it as usual.
@@ -744,7 +996,7 @@ impl File for SimFile {
                     "simulated fsync failure — durability of writes since the last successful sync is unknown",
                 ));
             }
-            let file = file_state(state, path);
+            let file = file_state(state, &self.host, path);
             file.durable = file.view();
             file.pending.clear();
             Ok(())
@@ -773,13 +1025,19 @@ impl Net for SimNet {
                 format!("\"{addr}\" already has a simulated listener"),
             ));
         }
-        guard
-            .net
-            .listeners
-            .insert(addr.to_string(), Default::default());
+        let token = guard.net.next_listener;
+        guard.net.next_listener += 1;
+        guard.net.listeners.insert(
+            addr.to_string(),
+            ListenerState {
+                backlog: Default::default(),
+                token,
+            },
+        );
         Ok(Box::new(SimListener {
             world: self.world.clone(),
             addr: addr.to_string(),
+            token,
         }))
     }
 
@@ -820,6 +1078,7 @@ impl Net for SimNet {
             .listeners
             .get_mut(addr)
             .expect("checked above")
+            .backlog
             .push_back(id);
         Ok(Box::new(SimConn {
             world: self.world.clone(),
@@ -832,17 +1091,28 @@ impl Net for SimNet {
 pub struct SimListener {
     world: Arc<World>,
     addr: String,
+    /// This listen generation's identity — a crashed host's re-`listen` on
+    /// the same address gets a fresh token, so a stale handle from before
+    /// the crash can't accept on (or, in `Drop`, clobber) the new one.
+    token: u64,
 }
 
 impl Listener for SimListener {
     fn accept(&self) -> io::Result<Option<Box<dyn Conn>>> {
         let mut guard = self.world.lock();
-        let backlog = guard
-            .net
-            .listeners
-            .get_mut(&self.addr)
-            .expect("listener state removed while the handle was open");
-        match backlog.pop_front() {
+        let listener = match guard.net.listeners.get_mut(&self.addr) {
+            Some(l) if l.token == self.token => l,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    format!(
+                        "listener \"{}\" is dead — its host crashed or it was already closed",
+                        self.addr
+                    ),
+                ));
+            }
+        };
+        match listener.backlog.pop_front() {
             Some(id) => Ok(Some(Box::new(SimConn {
                 world: self.world.clone(),
                 id,
@@ -859,7 +1129,10 @@ impl Listener for SimListener {
 
 impl Drop for SimListener {
     fn drop(&mut self) {
-        self.world.lock().net.listeners.remove(&self.addr);
+        let mut guard = self.world.lock();
+        if guard.net.listeners.get(&self.addr).map(|l| l.token) == Some(self.token) {
+            guard.net.listeners.remove(&self.addr);
+        }
     }
 }
 
@@ -899,7 +1172,12 @@ impl Conn for SimConn {
         } else {
             (state.open_b, state.open_a)
         };
-        assert!(my_open, "send on a connection this side already closed");
+        if !my_open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "send on a connection whose host crashed or closed it — reconnect after restart",
+            ));
+        }
         if !peer_open {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -928,11 +1206,17 @@ impl Conn for SimConn {
             .conns
             .get_mut(&self.id)
             .expect("connection state removed");
-        let (queue, peer_open) = if self.is_a {
-            (&mut state.to_a, state.open_b)
+        let (queue, my_open, peer_open) = if self.is_a {
+            (&mut state.to_a, state.open_a, state.open_b)
         } else {
-            (&mut state.to_b, state.open_a)
+            (&mut state.to_b, state.open_b, state.open_a)
         };
+        if !my_open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "recv on a connection whose host crashed or closed it — reconnect after restart",
+            ));
+        }
         match queue.front() {
             Some((deliver_at, data)) if *deliver_at <= now => {
                 assert!(
@@ -1720,6 +2004,136 @@ mod tests {
         let msg = panic_message(&*payload);
         assert!(msg.contains("never:happens"), "{msg}");
         assert!(msg.contains("raise the universe count"), "{msg}");
+    }
+
+    // ------------------------------------------------------------ hosts
+
+    #[test]
+    fn host_worlds_are_isolated_disks() {
+        let sim = Sim::with_faults(0x805_0001, FaultConfig::none());
+        let a = sim.host("a");
+        let b = sim.host("b");
+        let fa = a.disk().open("wal/x").unwrap();
+        fa.write_at(0, b"aaa").unwrap();
+        fa.sync().unwrap();
+        assert!(
+            b.disk().list("wal/").unwrap().is_empty(),
+            "b must not see a's files"
+        );
+        assert!(
+            sim.disk().list("wal/").unwrap().is_empty(),
+            "the global world must not see host files"
+        );
+        assert_ne!(a.durable_fingerprint(), b.durable_fingerprint());
+    }
+
+    #[test]
+    fn host_crash_is_scoped_to_that_host() {
+        let sim = Sim::with_faults(0x805_0002, FaultConfig::none());
+        let a = sim.host("a");
+        let b = sim.host("b");
+        let fa = a.disk().open("f").unwrap();
+        fa.write_at(0, b"unsynced").unwrap();
+        let fb = b.disk().open("f").unwrap();
+        fb.write_at(0, b"unsynced").unwrap();
+        a.crash_now();
+        assert!(fa.len().is_err(), "a's handles die at a's crash");
+        assert_eq!(fb.len().unwrap(), 8, "b is untouched");
+        a.restart();
+        let fa = a.disk().open("f").unwrap();
+        assert_eq!(fa.len().unwrap(), 0, "none() drops a's unsynced writes");
+        assert_eq!(fb.len().unwrap(), 8, "b's page cache survives a's restart");
+        assert_eq!(sim.coverage()["crash:host"], 1);
+    }
+
+    #[test]
+    fn host_entropy_streams_are_independent_of_interleaving() {
+        // Draw from a twice then b once vs b once then a twice: a's draws and
+        // b's draws must be identical either way (field-keyed sub-streams).
+        let draws = |order_ab: bool| {
+            let sim = Sim::with_faults(0x805_0003, FaultConfig::none());
+            let (a, b) = (sim.host("a"), sim.host("b"));
+            let mut out = Vec::new();
+            if order_ab {
+                out.push(("a", a.entropy().next_u64()));
+                out.push(("a", a.entropy().next_u64()));
+                out.push(("b", b.entropy().next_u64()));
+            } else {
+                out.push(("b", b.entropy().next_u64()));
+                out.push(("a", a.entropy().next_u64()));
+                out.push(("a", a.entropy().next_u64()));
+            }
+            out.sort();
+            out
+        };
+        assert_eq!(draws(true), draws(false));
+    }
+
+    #[test]
+    fn host_crash_closes_conns_and_listeners() {
+        let sim = Sim::with_faults(0x805_0004, FaultConfig::none());
+        let a = sim.host("a");
+        let b = sim.host("b");
+        let listener = b.net().listen("b:7000").unwrap();
+        let conn_a = a.net().connect("b:7000").unwrap();
+        let conn_b = poll_accept(&sim, &*listener);
+        conn_a.send(b"hi").unwrap();
+        sim.clock().sleep(Duration::from_secs(1));
+        let mut buf = [0u8; 16];
+        assert_eq!(conn_b.recv(&mut buf).unwrap(), Some(2));
+
+        b.crash_now();
+        b.restart();
+        // The surviving side observes the close; the crashed side's old handles error.
+        assert_eq!(conn_a.recv(&mut buf).unwrap(), Some(0), "peer closed");
+        assert!(
+            conn_b.send(b"x").is_err(),
+            "a crashed host's old conn handle is dead"
+        );
+        // The listener slot is free again after restart.
+        let _relisten = b
+            .net()
+            .listen("b:7000")
+            .expect("crash freed the listener name");
+    }
+
+    /// Clock-stepping accept loop: retries `accept` until a connection lands
+    /// in the backlog, advancing virtual time between polls so a nonzero
+    /// `net_latency` config still resolves.
+    fn poll_accept(sim: &Sim, listener: &dyn Listener) -> Box<dyn Conn> {
+        for _ in 0..1000 {
+            if let Some(conn) = listener.accept().unwrap() {
+                return conn;
+            }
+            sim.clock().sleep(Duration::from_millis(1));
+        }
+        panic!("poll_accept: no connection arrived after 1000 polls");
+    }
+
+    #[test]
+    fn creating_hosts_never_perturbs_the_global_world() {
+        let run = |with_hosts: bool| {
+            let sim = Sim::new(0x805_0005); // default faults — draws happen
+            if with_hosts {
+                let h = sim.host("bystander");
+                let f = h.disk().open("noise").unwrap();
+                let _ = f.write_at(0, b"noise");
+                let _ = f.sync();
+            }
+            let disk = sim.disk();
+            let f = disk.open("f").unwrap();
+            let mut payload = [0u8; 256];
+            sim.entropy().fill(&mut payload);
+            let _ = f.write_at(0, &payload);
+            let _ = f.sync();
+            sim.restart();
+            sim.durable_fingerprint()
+        };
+        assert_eq!(
+            run(false),
+            run(true),
+            "host activity must not shift global draws"
+        );
     }
 
     #[test]
