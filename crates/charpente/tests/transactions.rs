@@ -1530,12 +1530,25 @@ fn seed_rebuilds_a_byte_identical_store() {
     );
 
     // A fresh commit on B (allow_writes is the default) appends at applied + 1.
+    // It also enqueues, proving next_job_id continuity: the new job's id must
+    // pick up exactly where the export's counter left off, never colliding
+    // with one of the seeded jobs' own ids.
     db_b.transact(|tx| {
         tx.put(&invoice(999, 0, 1));
+        tx.enqueue(SendReceipt { invoice: 999 });
         Ok::<_, io::Error>(())
     })
     .unwrap();
     assert_eq!(db_b.last_applied(), Some(applied + 1));
+    let new_job = db_b
+        .drain_enqueued()
+        .pop()
+        .expect("the fresh commit enqueued exactly one job");
+    assert_eq!(
+        new_job.raw(),
+        next_job_id,
+        "job ids must continue from the exported counter, not collide with a seeded job's"
+    );
 
     // B's WAL base == applied + 1 — exactly the horizon + 1 boundary Db::open accepts.
     let names = host_b.disk().list("wal/").unwrap();
