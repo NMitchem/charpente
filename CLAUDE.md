@@ -219,7 +219,31 @@ the sim-capable IO layer comes first because it cannot be retrofitted.
   `Id<T>` Serialize story unclear, `#[index]` on enum fields unshown. The trybuild
   error-message suite (tracked follow-up) should prioritize the macro errors the demo
   agent actually hit.
-- Next: M1 per PLAN.md — replication (async log shipping, follower reads, failover),
-  realtime SSE/WS with exact resume, auth properly (OIDC, hashed session tokens),
+- **M1 sub-project 1 done — WAL segment management (2026-07-08, spec docs/superpowers/
+  specs/2026-07-07-wal-segment-management-design.md).** M1 runs as six sub-projects
+  (spec records the decomposition). Shipped: `Disk::sync_dir` directory barrier (fence
+  2 held — rotation, recovery cleanup, store creation/rebuild all barriered; sim models
+  entry loss/resurrection, `dir_entry_loss`); `Wal::{base_seq, gc}` + checkpoint-driven
+  GC (`DbConfig::{retain_segments: 2, checkpoint_every: 4096}`, retention pin for the
+  M1 shipper, cadence at the transact funnel); the compacted-log rebuild rule and the
+  recovery-horizon rule (fence 1 held: corruption ≤ horizon = named hard error, never a
+  cut; vanished prefix base > horizon+1 rejected at `Db::open`; `Engine::recover`
+  re-anchored, gaplessness triple-guarded); fault-matrix extensions `bit_flip`/
+  `misdirected_write`/`read_error` via field-keyed sub-streams (frozen legacy sampling
+  untouched, pinned by test) with meta-tests catching three naive victims. Two Noah
+  rulings (spec §4): durable-corruption axes scoped to `"wal/"` (store bitrot is
+  v0 truth — redb + M1 restore; M2 engine owns page checksums; the redb COW-fallback-
+  defeat finding joins the upstream report), and the above-horizon truth (acked-but-
+  uncheckpointed records lost only to media corruption, window = checkpoint_every,
+  closed by M1 replication) handled by the fourth public checker
+  `checks::durable_corruption_fired` — excuses fire-time-marked corruption universes
+  only, consistency oracles never excused. Sim found 2 real findings while landing
+  (both rulings above); evidence: every task opus-reviewed (0 unresolved findings), 2x
+  fresh `cargo test --workspace` green, pinned seed 0x8bee1752811ae873 green, fresh
+  1024-universe invoicing batch green (master seed 0x3e7dfacb98b685bb), clippy/fmt/
+  guide gate clean.
+- Next: M1 sub-project 2 per the segment-mgmt spec — replication (async log shipping
+  into the retention pin, follower reads, manual promotion, backup, multi-node sim);
+  then realtime SSE/WS with exact resume, auth properly (OIDC, hashed session tokens),
   migrations as log records, error/introspection polish (`charpente describe`), and the
   Vörtex-style black-box edge harness for the hyper layer.
