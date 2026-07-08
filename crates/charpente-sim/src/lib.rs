@@ -66,6 +66,17 @@ pub struct FaultConfig {
     /// errors, never silent wrongness. Not swarm-sampled (constant
     /// default; not a drawn field).
     pub corruption_scope: String,
+    /// P(a `send` kills the connection: the wire dies mid-conversation —
+    /// the sender gets `ConnectionReset`, the peer reads EOF, and every
+    /// in-flight message in both directions is dropped). Rolls on the
+    /// global fault stream: a connection spans two hosts, and the wire
+    /// belongs to neither.
+    pub conn_drop: f64,
+    /// P(a `send`'s drawn latency is ×64 — a latency spike; the message
+    /// is delayed, never lost). The replication spec's `ship_latency`,
+    /// landed as a superset over every connection: the sim cannot and
+    /// should not know which conns are "replication".
+    pub net_spike: f64,
     pub disk_latency: (Duration, Duration),
     pub net_latency: (Duration, Duration),
 }
@@ -84,6 +95,8 @@ impl Default for FaultConfig {
             misdirected_write: 0.0,
             read_error: 0.0,
             corruption_scope: CORRUPTION_SCOPE_DEFAULT.to_string(),
+            conn_drop: 0.0,
+            net_spike: 0.0,
             disk_latency: (Duration::from_micros(20), Duration::from_millis(2)),
             net_latency: (Duration::from_micros(100), Duration::from_millis(20)),
         }
@@ -102,6 +115,8 @@ impl FaultConfig {
             misdirected_write: 0.0,
             read_error: 0.0,
             corruption_scope: CORRUPTION_SCOPE_DEFAULT.to_string(),
+            conn_drop: 0.0,
+            net_spike: 0.0,
             disk_latency: (Duration::ZERO, Duration::ZERO),
             net_latency: (Duration::ZERO, Duration::ZERO),
         }
@@ -155,7 +170,7 @@ impl FaultConfig {
             sync_error,
             crash_apply,
             crash_torn,
-            // These four axes draw from field-keyed sub-streams
+            // These six axes draw from field-keyed sub-streams
             // (`sample_extended_fields`, applied in `run_universe`/
             // `run_universe_with_adjust` right after this function returns)
             // rather than this sequential stream, so they cannot perturb the
@@ -168,6 +183,8 @@ impl FaultConfig {
             bit_flip: 0.0,
             misdirected_write: 0.0,
             read_error: 0.0,
+            conn_drop: 0.0,
+            net_spike: 0.0,
             // Constant, never drawn: the scope is a property of what the
             // corruption axes are FOR (the WAL fences), not a fault rate.
             corruption_scope: CORRUPTION_SCOPE_DEFAULT.to_string(),
@@ -188,6 +205,8 @@ impl FaultConfig {
             ("bit_flip", self.bit_flip),
             ("misdirected_write", self.misdirected_write),
             ("read_error", self.read_error),
+            ("conn_drop", self.conn_drop),
+            ("net_spike", self.net_spike),
         ] {
             assert!(
                 (0.0..=1.0).contains(&p),
@@ -241,6 +260,18 @@ pub fn sample_extended_fields(seed: u64, cfg: &mut FaultConfig) {
     let mut r = keyed_stream(seed, "dir_entry_loss");
     cfg.dir_entry_loss = if r.chance(0.25) {
         r.below(500) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "conn_drop");
+    cfg.conn_drop = if r.chance(0.25) {
+        r.below(30) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "net_spike");
+    cfg.net_spike = if r.chance(0.25) {
+        r.below(200) as f64 / 1000.0
     } else {
         0.0
     };
@@ -1145,15 +1176,49 @@ pub struct SimConn {
 impl Conn for SimConn {
     fn send(&self, data: &[u8]) -> io::Result<()> {
         let mut guard = self.world.lock();
+        // Wire death, rolled before the latency draw. Both net axes roll on
+        // the GLOBAL fault stream: a connection spans two hosts, and the
+        // wire belongs to neither. Zero-draw when off — every seed that
+        // predates these axes replays with the exact same rng sequence (the
+        // frozen replay contract). The sender's side closes (this call gets
+        // the reset; a retry gets NotConnected) and both in-flight queues
+        // drop; the peer's side stays nominally open so it observes the
+        // death the way a socket shows it — EOF on recv, BrokenPipe on send.
+        if self.world.cfg.conn_drop > 0.0 && guard.faults.chance(self.world.cfg.conn_drop) {
+            guard.cover("fault:conn_drop");
+            let state = guard
+                .net
+                .conns
+                .get_mut(&self.id)
+                .expect("connection state removed");
+            if self.is_a {
+                state.open_a = false;
+            } else {
+                state.open_b = false;
+            }
+            state.to_a.clear();
+            state.to_b.clear();
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "injected connection drop — the wire died mid-conversation; reconnect",
+            ));
+        }
         let deliver_at = {
             let (lo, hi) = self.world.cfg.net_latency;
             let lo = u64::try_from(lo.as_nanos()).expect("latency exceeds u64 nanos");
             let hi = u64::try_from(hi.as_nanos()).expect("latency exceeds u64 nanos");
-            let latency = if hi == 0 {
+            let mut latency = if hi == 0 {
                 0
             } else {
                 guard.latency.between(lo, hi)
             };
+            // Latency spike: this message's drawn latency ×64 — delayed,
+            // never lost. `.max(1)` keeps a spike observable even under a
+            // zero-latency config.
+            if self.world.cfg.net_spike > 0.0 && guard.faults.chance(self.world.cfg.net_spike) {
+                guard.cover("fault:net_spike");
+                latency = latency.saturating_mul(64).max(1);
+            }
             guard.now + latency
         };
         let state = guard
@@ -1782,6 +1847,44 @@ mod tests {
         assert_eq!(extended.misdirected_write, again.misdirected_write);
         assert_eq!(extended.read_error, again.read_error);
         assert_eq!(extended.dir_entry_loss, again.dir_entry_loss);
+        assert_eq!(extended.conn_drop, again.conn_drop);
+        assert_eq!(extended.net_spike, again.net_spike);
+    }
+
+    #[test]
+    fn extended_sampling_of_net_axes_is_order_independent() {
+        // Same contract as the pin test above, extended to the net axes: the
+        // legacy sequential draws are byte-identical with and without extended
+        // sampling, and each net axis depends only on (seed, field name) —
+        // recomputing it from its own keyed stream alone, with no other field
+        // sampled, yields exactly what `sample_extended_fields` produced.
+        let seed = 0x0D20_5EED_u64;
+        let mut s = seed;
+        let cfg_seed = splitmix64(&mut s);
+        let legacy = FaultConfig::swarm(&mut Rng::new(cfg_seed));
+        let mut extended = legacy.clone();
+        sample_extended_fields(seed, &mut extended);
+        assert_eq!(legacy.write_error, extended.write_error);
+        assert_eq!(legacy.sync_error, extended.sync_error);
+        assert_eq!(legacy.crash_apply, extended.crash_apply);
+        assert_eq!(legacy.crash_torn, extended.crash_torn);
+        assert_eq!(legacy.disk_latency, extended.disk_latency);
+        assert_eq!(legacy.net_latency, extended.net_latency);
+
+        let mut r = keyed_stream(seed, "conn_drop");
+        let conn_drop = if r.chance(0.25) {
+            r.below(30) as f64 / 1000.0
+        } else {
+            0.0
+        };
+        assert_eq!(extended.conn_drop, conn_drop);
+        let mut r = keyed_stream(seed, "net_spike");
+        let net_spike = if r.chance(0.25) {
+            r.below(200) as f64 / 1000.0
+        } else {
+            0.0
+        };
+        assert_eq!(extended.net_spike, net_spike);
     }
 
     // ---------------------------------------------- fault-matrix extensions
@@ -1935,6 +2038,60 @@ mod tests {
         let _file = sim.disk().open("wal/f").unwrap(); // never written or synced
         sim.restart();
         assert_eq!(sim.coverage().get("fault:bit_flip"), None);
+    }
+
+    #[test]
+    fn conn_drop_kills_the_connection_and_is_covered() {
+        let sim = Sim::with_faults(
+            0xD20_0001,
+            FaultConfig {
+                conn_drop: 1.0,
+                ..FaultConfig::none()
+            },
+        );
+        let a = sim.host("a");
+        let b = sim.host("b");
+        let listener = b.net().listen("b:1").unwrap();
+        let conn = a.net().connect("b:1").unwrap();
+        let server = poll_accept(&sim, &*listener);
+        let err = conn.send(b"doomed").unwrap_err();
+        assert!(err.to_string().contains("injected"), "{err}");
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            server.recv(&mut buf).unwrap(),
+            Some(0),
+            "the other side sees close"
+        );
+        assert_eq!(sim.coverage()["fault:conn_drop"], 1);
+    }
+
+    #[test]
+    fn net_spike_delays_but_delivers() {
+        let mut cfg = FaultConfig::none();
+        cfg.net_latency = (Duration::from_millis(1), Duration::from_millis(1));
+        cfg.net_spike = 1.0;
+        let sim = Sim::with_faults(0xD20_0002, cfg);
+        let a = sim.host("a");
+        let b = sim.host("b");
+        let listener = b.net().listen("b:1").unwrap();
+        let conn = a.net().connect("b:1").unwrap();
+        let server = poll_accept(&sim, &*listener);
+        conn.send(b"spiked").unwrap();
+        let mut buf = [0u8; 8];
+        sim.clock().sleep(Duration::from_millis(1));
+        assert_eq!(
+            server.recv(&mut buf).unwrap(),
+            None,
+            "not delivered at the un-spiked latency"
+        );
+        sim.clock().sleep(Duration::from_millis(63));
+        assert_eq!(
+            server.recv(&mut buf).unwrap(),
+            Some(6),
+            "delivered after the ×64 spike"
+        );
+        assert_eq!(&buf[..6], b"spiked");
+        assert_eq!(sim.coverage()["fault:net_spike"], 1);
     }
 
     #[test]

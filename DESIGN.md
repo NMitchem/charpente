@@ -102,7 +102,12 @@ above `applied_seq` is indistinguishable from a torn tail and is legitimately cu
 standard WAL convention; un-checkpointed data has one local copy, and M1 replication is
 the answer), so acked-durability workloads route their shortfall through
 `checks::durable_corruption_fired` — loss is excused only in universes where a
-durable-corruption fault actually fired.
+durable-corruption fault actually fired. Two wire-scoped axes landed with M1
+replication's second sub-project, sampled from the same field-keyed sub-streams and
+rolled at `Conn::send` on the global fault stream (a connection spans two hosts; the wire
+belongs to neither): `FaultConfig.conn_drop` kills the live connection — the sender gets
+`ConnectionReset`, the peer reads EOF, in-flight messages in both directions drop — and
+`FaultConfig.net_spike` multiplies one message's drawn latency ×64 (delayed, never lost).
 
 **Per-host worlds** (landed with M1 replication's first task): `Sim::host(name)` gives a
 named simulated host its own disk (`DiskWorld`, unchanged — the same crash/countdown/epoch
