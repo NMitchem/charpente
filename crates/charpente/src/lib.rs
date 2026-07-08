@@ -7,7 +7,7 @@
 extern crate self as charpente;
 
 pub use charpente_core as core;
-pub use charpente_core::db::{Db, DbConfig, Event, Job, Schema, Tx, TxError};
+pub use charpente_core::db::{Db, DbConfig, Event, Job, Schema, Seeder, Tx, TxError};
 pub use charpente_core::table::{Id, Snapshot, View};
 pub use charpente_macros::{job, route, table};
 

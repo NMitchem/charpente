@@ -185,6 +185,14 @@ impl<S: StateMachine> Engine<S> {
         &mut self.wal
     }
 
+    /// Reclaims the engine's WAL and state machine, discarding the poison
+    /// bit — the seed path (`Db::into_seeder`, db.rs): the whole timeline is
+    /// about to be replaced, so nothing about the engine's own state needs
+    /// preserving beyond the raw parts.
+    pub fn into_parts(self) -> (Wal, S) {
+        (self.wal, self.machine)
+    }
+
     pub fn last_applied(&self) -> Option<u64> {
         self.last_applied
     }

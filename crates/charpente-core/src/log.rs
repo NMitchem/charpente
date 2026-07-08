@@ -361,6 +361,13 @@ impl Wal {
         self.poisoned
     }
 
+    /// Reclaims the underlying `Disk` handle, discarding all log state — the
+    /// seed path (`Db::into_seeder`, db.rs): the whole timeline is about to
+    /// be replaced, so nothing here needs preserving beyond the raw disk.
+    pub(crate) fn into_disk(self) -> Box<dyn Disk> {
+        self.disk
+    }
+
     fn rotate(&mut self) -> io::Result<()> {
         self.guard(self.tail.sync())?; // sync-before-rotate keeps `sync` a whole-log barrier
         let name = segment_name(&self.cfg.dir, self.next_seq);
@@ -437,7 +444,7 @@ pub fn frame_crc(seq: u64, payload: &[u8]) -> u32 {
     crc.finish()
 }
 
-fn segment_name(dir: &str, base_seq: u64) -> String {
+pub(crate) fn segment_name(dir: &str, base_seq: u64) -> String {
     format!("{dir}/{base_seq:020}.log")
 }
 

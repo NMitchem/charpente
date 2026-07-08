@@ -22,7 +22,7 @@ use std::io;
 use crate::engine::{Engine, StateMachine};
 use crate::io::Disk;
 use crate::job::JobRow;
-use crate::log::{MAX_RECORD_BYTES, WalConfig, parse_segment_name};
+use crate::log::{MAX_RECORD_BYTES, WalConfig, parse_segment_name, segment_name};
 use crate::table::{Codec, Id, Row, Snapshot, Store, View, Writer};
 
 // ---------------------------------------------------------------- config
@@ -88,6 +88,7 @@ pub enum TxError<E> {
 
 // ---------------------------------------------------------------- schema
 
+#[derive(Clone)]
 struct TableOps {
     apply_put: fn(&mut Writer<'_>, &[u8]) -> io::Result<()>,
     apply_delete: fn(&mut Writer<'_>, u64) -> io::Result<()>,
@@ -104,7 +105,7 @@ fn apply_delete<R: Row>(w: &mut Writer<'_>, id: u64) -> io::Result<()> {
 /// The set of tables a `Db` can replay log records into. Every `#[table]`
 /// type the application writes must be registered — replay works on raw
 /// record bytes and needs the typed codecs to maintain indexes.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Schema {
     tables: BTreeMap<&'static str, TableOps>,
 }
@@ -128,6 +129,22 @@ impl Schema {
             R::TABLE
         );
         self
+    }
+
+    /// Every registered table name, sorted (`BTreeMap` order) — the export
+    /// path's walk order: a caller builds the same `Schema` on both sides
+    /// and iterates this to know which tables to `Snapshot::scan_raw`.
+    pub fn table_names(&self) -> Vec<&'static str> {
+        self.tables.keys().copied().collect()
+    }
+
+    /// Drops one table's ops. Used only by `Db::into_seeder` to strip the
+    /// platform-owned `JobRow` registration (`Db::open` always adds it)
+    /// before handing the schema to a fresh `Seeder`, which re-adds it
+    /// itself — without this, that would hit `table`'s own
+    /// duplicate-registration assert.
+    pub(crate) fn remove(&mut self, table: &'static str) {
+        self.tables.remove(table);
     }
 
     fn ops(&self, table: &str) -> io::Result<&TableOps> {
@@ -724,6 +741,105 @@ impl Db {
     /// fails. Callers (the kernel loop) stop and restart to recover.
     pub fn poisoned(&self) -> bool {
         self.engine.poisoned()
+    }
+
+    /// Deconstructs a live `Db` into a `Seeder` over the same disk — the seed
+    /// path's producer side (DESIGN §5): an app rebuilding a follower's state
+    /// in-process from its own primary's snapshot. The recovered schema
+    /// already carries `JobRow` (`Db::open` adds it on the way in);
+    /// `Schema::remove` strips it back off so `Seeder::new` doesn't
+    /// double-register it.
+    pub fn into_seeder(self) -> io::Result<Seeder> {
+        let (wal, machine) = self.engine.into_parts();
+        let disk = wal.into_disk();
+        let TableMachine {
+            store, mut schema, ..
+        } = machine;
+        drop(store); // Seeder::new discards the store file itself; nothing to save
+        schema.remove(JobRow::TABLE);
+        Seeder::new(disk, self.cfg, schema)
+    }
+}
+
+// ---------------------------------------------------------------- seed
+
+/// Builds a node's state from a primary's logical snapshot stream: rows in,
+/// then `finish` pins the metadata, checkpoints, and lays an empty WAL
+/// segment at `applied_seq + 1` — exactly the base = horizon + 1 boundary
+/// `Db::open` accepts (DESIGN §5). Everything previously in this data dir
+/// is discarded at construction: seeding replaces the timeline.
+pub struct Seeder {
+    disk: Box<dyn Disk>,
+    cfg: DbConfig,
+    schema: Schema,        // the caller's schema, passed to Db::open at finish
+    import_schema: Schema, // schema + JobRow, used to decode/import rows
+    store: Store,
+}
+
+impl Seeder {
+    /// `schema` must NOT include `JobRow` — `Seeder` registers it itself
+    /// (mirroring `Db::open`), so a schema already carrying it (e.g. one
+    /// recovered from a live `Db` via `into_seeder`) would double-register.
+    /// Discards any store file and `wal/` segments already at `disk`,
+    /// dir-barriered — seeding always replaces a timeline, never merges
+    /// into one.
+    pub fn new(disk: Box<dyn Disk>, cfg: DbConfig, schema: Schema) -> io::Result<Seeder> {
+        match disk.remove(&cfg.store_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        disk.sync_dir(&cfg.store_path)?;
+        let wal_prefix = format!("{}/", cfg.wal.dir);
+        for name in disk.list(&wal_prefix)? {
+            disk.remove(&name)?;
+        }
+        disk.sync_dir(&wal_prefix)?;
+        let store = Store::open(&*disk, &cfg.store_path)?;
+        let import_schema = schema.clone().table::<JobRow>();
+        Ok(Seeder {
+            disk,
+            cfg,
+            schema,
+            import_schema,
+            store,
+        })
+    }
+
+    /// One table's worth of exported rows, applied through the schema's
+    /// typed ops — indexes rebuilt exactly as the live apply path maintains
+    /// them. The id inside each row's own encoded bytes is what `put`
+    /// re-derives the key from; the tuple's `u64` travels for
+    /// debuggability and future delta use, not because `apply_put` needs it.
+    pub fn rows(&mut self, table: &str, rows: &[(u64, Vec<u8>)]) -> io::Result<()> {
+        self.store.import(|w| {
+            for (id, bytes) in rows {
+                let _ = id;
+                (self.import_schema.ops(table)?.apply_put)(w, bytes)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Pins the metadata, checkpoints, and lays the empty seed segment at
+    /// `applied_seq + 1`, then hands the result through the normal
+    /// `Db::open` — the same path every other startup goes through, so
+    /// nothing about a seeded node's open is special.
+    pub fn finish(self, applied_seq: u64, next_job_id: u64) -> io::Result<Db> {
+        let Seeder {
+            disk,
+            cfg,
+            schema,
+            store,
+            ..
+        } = self;
+        store.set_import_meta(applied_seq, next_job_id)?;
+        store.checkpoint()?;
+        drop(store); // graceful close before Db::open reopens the same file
+        let name = segment_name(&cfg.wal.dir, applied_seq + 1);
+        disk.open(&name)?;
+        disk.sync_dir(&format!("{}/", cfg.wal.dir))?;
+        Db::open(disk, cfg, schema)
     }
 }
 

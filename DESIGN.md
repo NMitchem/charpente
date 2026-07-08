@@ -334,6 +334,17 @@ reads) run against snapshots without touching the write path. Blob columns over 
 configurable size spill to a content-addressed blob store (same log-commit discipline for
 the metadata, direct streaming for the bytes).
 
+**Logical export (v1, implemented).** A `Snapshot` also exposes the seed path's read
+surface (M1 replication T4): `applied_seq`/`next_job_id` read META off the snapshot's own
+transaction — consistent with the rows it is about to hand out, unlike `Store::applied_seq`,
+which opens a fresh one and so could observe a later write — and `scan_raw` hands back a
+table's raw `(id, bytes)` pairs, undecoded, in id order (empty, not an error, for a table
+that was never created). `Store::import`/`set_import_meta` are the write-side counterpart:
+`import` commits typed rows through the same `Writer` (and so the same index maintenance)
+as ordinary `apply`, but with no seq or `next_job_id` bookkeeping of its own — a logical
+snapshot has no log position — and `set_import_meta` sets both meta keys explicitly, once,
+after every table has landed.
+
 ## 5. Replication & deployment [reversible in mechanism, fixed in stance]
 
 - **Mechanism (v1):** asynchronous log shipping to N followers; a follower is promoted on
@@ -343,6 +354,24 @@ the metadata, direct streaming for the bytes).
 - **Deploy:** one binary + one data directory. Upgrades: new binary replays/attaches to the
   same log (schema versions in-log make this well-defined). Backup: log segments + periodic
   snapshot to object storage, Litestream-style, built in — not an add-on.
+
+**Seeding (v1, implemented).** `Db::into_seeder`/`Seeder` builds a follower's (or a fresh
+backup's) entire state from a primary's logical snapshot stream, no log replay involved
+(M1 replication T4). `Seeder::new` first discards any store file and `wal/` segments
+already at the target disk, dir-barriered — seeding always replaces a timeline, never
+merges into one; `rows` applies one table's exported `(id, bytes)` pairs through the
+schema's typed ops exactly as the live apply path does, indexes rebuilt as a side effect;
+`finish` pins `applied_seq`/`next_job_id`, checkpoints, and lays a single empty WAL segment
+at `applied_seq + 1` before handing the result through the ordinary `Db::open` — precisely
+the base = horizon + 1 boundary the recovery-horizon rule (§2) already accepts, so open
+sees a clean, un-compacted follower with nothing to replay. `Schema` is `Clone` and gains
+`table_names` (the export walk order both sides agree on) and a crate-private `remove`:
+`Db::open` always adds `JobRow` to the schema it's given, so `Db::into_seeder` — the
+producer side, deconstructing a live `Db` into a `Seeder` over the same disk — strips it
+back off before handing the schema to a fresh `Seeder`, which re-adds it itself; without
+that, seeding a live `Db`'s own state would double-register the platform's own table. The
+network-facing seed session (shipping rows to a remote follower) is a later M1 task; this
+is the substrate it sends over the wire.
 
 ## 6. Queue, cron, realtime — all faces of the log
 

@@ -382,6 +382,39 @@ impl Store {
             txn: self.db.begin_read().map_err(redb_err)?,
         })
     }
+
+    /// Applies raw exported rows with NO seq or `next_job_id` bookkeeping —
+    /// the seed path's writer (`Seeder::rows`, db.rs). A logical snapshot has
+    /// no log position of its own to record; `set_import_meta` sets both meta
+    /// keys explicitly once every table has landed.
+    pub fn import(&self, f: impl FnOnce(&mut Writer<'_>) -> io::Result<()>) -> io::Result<()> {
+        let mut txn = self.db.begin_write().map_err(redb_err)?;
+        txn.set_durability(Durability::None).map_err(redb_err)?;
+        {
+            let mut writer = Writer {
+                txn: &txn,
+                jobs_materialized: 0,
+            };
+            f(&mut writer)?;
+        }
+        txn.commit().map_err(redb_err)?;
+        Ok(())
+    }
+
+    /// Sets both META keys directly — the seed path's counterpart to the
+    /// bookkeeping `Store::apply` derives from replay. A logical import has
+    /// no records to replay, only the exporter's already-final counts.
+    pub fn set_import_meta(&self, applied_seq: u64, next_job_id: u64) -> io::Result<()> {
+        let mut txn = self.db.begin_write().map_err(redb_err)?;
+        txn.set_durability(Durability::None).map_err(redb_err)?;
+        {
+            let mut meta = txn.open_table(META).map_err(redb_err)?;
+            meta.insert("applied_seq", applied_seq).map_err(redb_err)?;
+            meta.insert("next_job_id", next_job_id).map_err(redb_err)?;
+        }
+        txn.commit().map_err(redb_err)?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------- Writer
@@ -554,6 +587,54 @@ impl View for Snapshot {
                 )
             });
             out.push(row);
+        }
+        Ok(out)
+    }
+}
+
+impl Snapshot {
+    /// The log position this snapshot's rows correspond to — read off THIS
+    /// snapshot's own transaction, unlike `Store::applied_seq` (which opens a
+    /// fresh one): consistent with the rows a caller is about to export
+    /// (`scan_raw`), even as the store keeps taking new writes underneath.
+    pub fn applied_seq(&self) -> io::Result<Option<u64>> {
+        match self.txn.open_table(META) {
+            Ok(meta) => Ok(meta
+                .get("applied_seq")
+                .map_err(redb_err)?
+                .map(|g| g.value())),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+            Err(e) => Err(redb_err(e)),
+        }
+    }
+
+    /// The job id counter as of this snapshot — same own-transaction
+    /// consistency reasoning as `applied_seq`.
+    pub fn next_job_id(&self) -> io::Result<u64> {
+        match self.txn.open_table(META) {
+            Ok(meta) => Ok(meta
+                .get("next_job_id")
+                .map_err(redb_err)?
+                .map_or(0, |g| g.value())),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
+            Err(e) => Err(redb_err(e)),
+        }
+    }
+
+    /// Every row's id and raw encoded bytes, in id order — the logical
+    /// export primitive (`Seeder::rows` re-applies them through the typed
+    /// ops on the import side). Empty, not an error, when the table has
+    /// never been created.
+    pub fn scan_raw(&self, table: &str) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        let rows = match self.txn.open_table(rows_def(table)) {
+            Ok(rows) => rows,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(redb_err(e)),
+        };
+        let mut out = Vec::new();
+        for entry in rows.range(0u64..=u64::MAX).map_err(redb_err)? {
+            let (key, value) = entry.map_err(redb_err)?;
+            out.push((key.value(), value.value().to_vec()));
         }
         Ok(out)
     }

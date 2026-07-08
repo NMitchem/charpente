@@ -6,11 +6,11 @@
 use std::collections::BTreeMap;
 use std::io;
 
-use charpente::{Db, DbConfig, Event, Job, Schema, TxError, View, table};
+use charpente::{Db, DbConfig, Event, Job, Schema, Seeder, TxError, View, table};
 use charpente_core::io::{Disk, Entropy};
 use charpente_core::job::JobRow;
 use charpente_core::log::{Wal, WalConfig};
-use charpente_core::table::{Codec, Id, Snapshot, Store};
+use charpente_core::table::{Codec, Id, Row, Snapshot, Store};
 use charpente_sim::{FaultConfig, Sim, run_universes_swarm};
 
 #[table]
@@ -81,6 +81,13 @@ fn ids(rows: &[Invoice]) -> Vec<u64> {
 
 fn app_schema() -> Schema {
     Schema::new().table::<Org>().table::<Invoice>()
+}
+
+/// Mirrors what `Db::open` registers internally (it always adds `JobRow`
+/// itself) — the export side needs its own independent `Schema` instance to
+/// walk `table_names()` over, since a live `Db` never hands its schema back.
+fn export_schema() -> Schema {
+    app_schema().table::<JobRow>()
 }
 
 fn quiet_db(seed: u64) -> (Sim, Db) {
@@ -1452,4 +1459,183 @@ fn apply_shipped_still_works_while_writes_are_forbidden() {
     assert_eq!(db_b.last_applied(), Some(0));
     let snap = db_b.snapshot().unwrap();
     assert_eq!(snap.scan::<Invoice>().unwrap()[0].amount_cents, 500);
+}
+
+// ------------------------------------------------------------- repl T4
+
+/// `(id, name, payload)` per job, id order — the content comparison
+/// `table_contents` doesn't cover (jobs aren't one of its two tables).
+fn job_contents(snap: &Snapshot) -> Vec<(u64, String, Vec<u8>)> {
+    snap.scan::<JobRow>()
+        .unwrap()
+        .into_iter()
+        .map(|j| (j.id.raw(), j.name, j.payload))
+        .collect()
+}
+
+/// The full round trip: a primary's logical snapshot (every registered
+/// table's raw rows, plus the meta the exporter reads off ONE snapshot
+/// transaction) rebuilds a byte-for-byte-equivalent follower through
+/// `Seeder` — `finish` lands the follower exactly at the horizon + 1
+/// boundary `Db::open` accepts, so it opens with nothing left to replay.
+#[test]
+fn seed_rebuilds_a_byte_identical_store() {
+    let sim = Sim::with_faults(0x5EED_0001, FaultConfig::none());
+    let host_a = sim.host("a");
+    let host_b = sim.host("b");
+    let cfg = DbConfig::default();
+    let mut db_a = Db::open(Box::new(host_a.disk()), cfg.clone(), app_schema()).unwrap();
+
+    for i in 0..30u64 {
+        db_a.transact(|tx| {
+            if i < 3 {
+                tx.put(&Org {
+                    id: Id::from_raw(i),
+                    name: format!("org-{i}"),
+                });
+            }
+            tx.put(&invoice(i, i % 3, (i as i64 + 1) * 10));
+            if i.is_multiple_of(5) {
+                tx.enqueue(SendReceipt { invoice: i });
+            }
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+    }
+    db_a.checkpoint().unwrap();
+
+    // Export: one MVCC snapshot, so meta and rows are mutually consistent.
+    let snap = db_a.snapshot().unwrap();
+    let applied = snap.applied_seq().unwrap().expect("30 committed txns");
+    let next_job_id = snap.next_job_id().unwrap();
+    assert!(next_job_id > 0, "setup must have enqueued at least one job");
+
+    let mut seeder = Seeder::new(Box::new(host_b.disk()), cfg.clone(), app_schema()).unwrap();
+    for table in export_schema().table_names() {
+        let rows = snap.scan_raw(table).unwrap();
+        seeder.rows(table, &rows).unwrap();
+    }
+    let mut db_b = seeder.finish(applied, next_job_id).unwrap();
+
+    assert_eq!(db_b.last_applied(), Some(applied));
+    assert_eq!(
+        table_contents(&db_a.snapshot().unwrap()),
+        table_contents(&db_b.snapshot().unwrap()),
+        "seeded state must match the export through the typed surface"
+    );
+    assert_eq!(
+        job_contents(&db_a.snapshot().unwrap()),
+        job_contents(&db_b.snapshot().unwrap()),
+        "seeded jobs must match the export too — a platform table, not an app one"
+    );
+
+    // A fresh commit on B (allow_writes is the default) appends at applied + 1.
+    db_b.transact(|tx| {
+        tx.put(&invoice(999, 0, 1));
+        Ok::<_, io::Error>(())
+    })
+    .unwrap();
+    assert_eq!(db_b.last_applied(), Some(applied + 1));
+
+    // B's WAL base == applied + 1 — exactly the horizon + 1 boundary Db::open accepts.
+    let names = host_b.disk().list("wal/").unwrap();
+    let base = names.iter().map(|n| segment_base(n)).min().unwrap();
+    assert_eq!(
+        base,
+        applied + 1,
+        "the seed segment must sit at applied_seq + 1"
+    );
+
+    // Reopen B: recovery replays nothing, state intact.
+    let before = table_contents(&db_b.snapshot().unwrap());
+    let before_applied = db_b.last_applied();
+    drop(db_b);
+    let db_b2 = Db::open(Box::new(host_b.disk()), cfg, app_schema()).unwrap();
+    assert_eq!(db_b2.last_applied(), before_applied);
+    assert_eq!(table_contents(&db_b2.snapshot().unwrap()), before);
+}
+
+/// `into_seeder` discards whatever timeline was already at the disk —
+/// seeding replaces state, it never merges with it.
+#[test]
+fn into_seeder_discards_the_old_timeline() {
+    let (sim, mut db) = quiet_db(0x5EED_0002);
+    for i in 0..10u64 {
+        db.transact(|tx| {
+            tx.put(&invoice(i, 0, i as i64));
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+    }
+    assert_eq!(db.last_applied(), Some(9));
+
+    let mut rows = Vec::new();
+    for i in 0..5u64 {
+        let mut bytes = Vec::new();
+        invoice(i, 0, i as i64).encode_row(&mut bytes);
+        rows.push((i, bytes));
+    }
+
+    let mut seeder = db.into_seeder().unwrap();
+    seeder.rows(Invoice::TABLE, &rows).unwrap();
+    let db2 = seeder.finish(4, 0).unwrap();
+
+    let names = sim.disk().list("wal/").unwrap();
+    assert_eq!(
+        names.len(),
+        1,
+        "into_seeder must discard every prior segment: {names:?}"
+    );
+    assert_eq!(
+        segment_base(&names[0]),
+        5,
+        "the seeded segment must sit at applied_seq + 1"
+    );
+    let file = sim.disk().open(&names[0]).unwrap();
+    assert_eq!(
+        file.len().unwrap(),
+        0,
+        "the seeded segment must be empty — recovery replays nothing"
+    );
+
+    assert_eq!(db2.last_applied(), Some(4));
+    let snap = db2.snapshot().unwrap();
+    assert_eq!(ids(&snap.scan::<Invoice>().unwrap()), vec![0, 1, 2, 3, 4]);
+}
+
+/// Proof the import path maintains secondary indexes, not just row bytes.
+#[test]
+fn seeded_indexes_answer_queries() {
+    let (_sim_a, mut db_a) = quiet_db(0x5EED_0003);
+    for i in 0..6u64 {
+        db_a.transact(|tx| {
+            tx.put(&invoice(i, i % 2, (i as i64 + 1) * 10));
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+    }
+    db_a.checkpoint().unwrap();
+
+    let snap = db_a.snapshot().unwrap();
+    let applied = snap.applied_seq().unwrap().unwrap();
+    let next_job_id = snap.next_job_id().unwrap();
+    let rows = snap.scan_raw(Invoice::TABLE).unwrap();
+
+    let sim_b = Sim::with_faults(0x5EED_0004, FaultConfig::none());
+    let mut seeder =
+        Seeder::new(Box::new(sim_b.disk()), DbConfig::default(), app_schema()).unwrap();
+    seeder.rows(Invoice::TABLE, &rows).unwrap();
+    let db_b = seeder.finish(applied, next_job_id).unwrap();
+
+    let acme = Id::<Org>::from_raw(0);
+    let expected = ids(&Invoice::by_org(&snap, &acme).unwrap());
+    let got = ids(&Invoice::by_org(&db_b.snapshot().unwrap(), &acme).unwrap());
+    assert!(
+        !expected.is_empty(),
+        "setup must actually populate the index bucket under test"
+    );
+    assert_eq!(
+        got, expected,
+        "a seeded index must answer the same query as the source"
+    );
 }
