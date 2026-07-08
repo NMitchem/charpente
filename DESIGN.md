@@ -91,7 +91,18 @@ three (plus `dir_entry_loss`, §2) draw from per-field sub-streams keyed by (uni
 FNV-1a of the field name) rather than `FaultConfig::swarm`'s legacy sequential draw — each
 field's stream is independent, so adding one perturbs no existing universe's legacy draws
 and no other extended field's draws (`sample_extended_fields`, charpente-sim, applied right
-after `FaultConfig::swarm` in every swarm-sampled universe).
+after `FaultConfig::swarm` in every swarm-sampled universe). The two durable-corruption
+axes (`bit_flip`, `misdirected_write`) are scoped to `FaultConfig.corruption_scope`
+(default `"wal/"`): they exist to prove the WAL fences (frame CRC + the recovery-horizon
+rule), and store-file bitrot is beneath those fences — v0's answer to it is redb plus M1's
+restore-from-replica, and M2's own storage engine owns page checksums; `read_error` and
+`dir_entry_loss` stay global (they produce errors, never silent wrongness). Even inside
+the scope, the horizon fence only defends checkpointed data: corruption of an acked frame
+above `applied_seq` is indistinguishable from a torn tail and is legitimately cut (the
+standard WAL convention; un-checkpointed data has one local copy, and M1 replication is
+the answer), so acked-durability workloads route their shortfall through
+`checks::durable_corruption_fired` — loss is excused only in universes where a
+durable-corruption fault actually fired.
 
 **Consequence for the concurrency model.** The core state machine is single-threaded —
 concurrency lives at the edges (HTTP handling, queue workers, replication) and is itself
@@ -280,6 +291,12 @@ is compacted past seq 0, an unopenable store is no longer rebuildable from the l
 `Db::open` checks the log's base before discarding the store and returns a named hard
 error instead (naming the compaction, and the fix: restore from a replica/backup, or widen
 `retain_segments`) rather than silently losing the records below the old checkpoint.
+A second sim-established redb finding (upstream-report material): direct corruption of the
+store file's durable bytes — bit flips, misdirected writes — can defeat redb's
+copy-on-write crash consistency entirely, either panicking internally or silently falling
+back to an older, still self-consistent root that under-reports `applied_seq`; v0 does not
+defend store-file bitrot (the corruption fault axes are scoped to `wal/`, §1), redb + M1
+restore is the answer, and M2's own engine owns page checksums.
 
 **Snapshots & reads.** MVCC snapshots at log positions; read-only queries (and follower
 reads) run against snapshots without touching the write path. Blob columns over a

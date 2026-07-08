@@ -11,7 +11,7 @@ use charpente_core::io::{Disk, Entropy};
 use charpente_core::job::JobRow;
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::table::{Codec, Id, Snapshot, Store};
-use charpente_sim::{FaultConfig, Sim, run_universes_swarm_with};
+use charpente_sim::{FaultConfig, Sim, run_universes_swarm};
 
 #[table]
 struct Org {
@@ -496,8 +496,13 @@ fn is_injected(text: &str) -> bool {
     // ever reach an already-poisoned/latched handle, so this workload never
     // sees the WAL/engine's "poisoned" guard text or redb's "close and
     // re-open the database" latch — unlike kernel.rs's SUT, which absorbs
-    // request Io into 500s and keeps running.
-    text.contains("simulated") || text.contains("injected")
+    // request Io into 500s and keeps running. The WAL's durable-horizon hard
+    // error (segment-mgmt T4/T5) is recognized too: bit_flip/
+    // misdirected_write corrupting an already-acknowledged frame below the
+    // checkpoint horizon is a legitimate fault-matrix consequence surfaced
+    // loudly by design, not a bug (and it is permanent — a universe that
+    // hits it on recovery retries into the every-attempt-died fallthrough).
+    text.contains("simulated") || text.contains("injected") || text.contains("durable horizon")
 }
 
 /// One universe: recover → verify against the oracle → mixed commits and
@@ -526,6 +531,16 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
 
         let recovered = db.last_applied().map_or(0, |s| s + 1);
         if recovered < committed {
+            // Excused ONLY when the harness actually injected durable
+            // corruption in this universe: bit_flip/misdirected_write on a
+            // WAL file above the checkpoint horizon is silently cut at
+            // recovery, by the WAL convention (see
+            // `checks::durable_corruption_fired`); ending the universe here
+            // keeps the strong oracle standing everywhere corruption did
+            // not fire.
+            if charpente_sim::checks::durable_corruption_fired(sim) {
+                return Ok(());
+            }
             return Err(format!(
                 "durability violated: {committed} txns acknowledged, {recovered} recovered"
             ));
@@ -610,6 +625,10 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
         };
         let recovered = db.last_applied().map_or(0, |s| s + 1);
         if recovered < committed {
+            // Same excuse-only-if-injected routing as the round loop above.
+            if charpente_sim::checks::durable_corruption_fired(sim) {
+                return Ok(());
+            }
             return Err(format!(
                 "durability violated: {committed} txns acknowledged, {recovered} recovered"
             ));
@@ -633,27 +652,10 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
     Ok(()) // every attempt died to injected faults; earlier rounds verified every reachable prefix
 }
 
-// `bit_flip`/`misdirected_write` are stamped off for this property
-// (segment-mgmt T5 finding, not a WAL/Engine/Db bug — see the identical,
-// longer note in typed_tables.rs's `tables_and_log_survive_the_fault_matrix`):
-// both axes can corrupt the redb store file's own durable bytes directly,
-// and redb's crash consistency can be defeated by that corruption
-// independent of anything this codebase does — either an internal redb
-// panic (page_manager.rs assertions) or a silent fallback to an older, still
-// self-consistent root that under-reports `Store::applied_seq`, the value
-// `Db::open`'s recovery horizon trusts as durable truth. Out of scope for
-// this task; the WAL-layer horizon rule itself is fully exercised, unscoped,
-// by `wal.rs`'s own bit_flip/misdirected_write property tests. `dir_entry_loss`
-// and `read_error` stay swarm-sampled — neither can corrupt redb's bytes.
 #[test]
 fn transactions_survive_the_fault_matrix() {
-    run_universes_swarm_with!(
-        0x7A_0001,
+    run_universes_swarm!(
         256,
-        |cfg: &mut FaultConfig| {
-            cfg.bit_flip = 0.0;
-            cfg.misdirected_write = 0.0;
-        },
         tx_workload,
         require: [
             "fault:write_error",

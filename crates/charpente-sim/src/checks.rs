@@ -1,6 +1,7 @@
 //! Reusable oracles for sim workloads (step-7 spec §Platform-checker
-//! library). v0 ships exactly three; more earn their way in when the demo
-//! app demands them.
+//! library). v0 shipped exactly three; `durable_corruption_fired` earned
+//! its way in when the durable-corruption fault axes landed (segment-mgmt
+//! T5) — more earn their way in the same way.
 
 use crate::Sim;
 
@@ -26,6 +27,28 @@ pub fn is_fault_fallout(text: &str) -> bool {
         || text.contains("poisoned")
         || text.contains("close and re-open the database")
         || text.contains("durable horizon")
+}
+
+/// True when a durable-corruption fault (`bit_flip` or `misdirected_write`)
+/// actually fired in this universe. The oracle companion to those two axes:
+/// an acked record they corrupted ABOVE the store's checkpoint horizon is
+/// silently cut at recovery — the standard WAL convention (an invalid frame
+/// is a torn tail unless provably below the horizon), and bitrot of the
+/// only local copy is unrecoverable by design; v0's answer is M1
+/// replication. So an acked-durability check routes its shortfall through
+/// this: loss is excused ONLY in universes where corruption was actually
+/// injected, and the strong oracle stands in every other universe. Never
+/// use it to excuse wrong DATA (corruption must surface as loss or a named
+/// error, not as different bytes) or consistency violations (e.g.
+/// exactly-once) — a cut reverts state to a prefix, which stays consistent.
+pub fn durable_corruption_fired(sim: &Sim) -> bool {
+    let coverage = sim.coverage();
+    coverage.get("fault:bit_flip").copied().unwrap_or(0) > 0
+        || coverage
+            .get("fault:misdirected_write")
+            .copied()
+            .unwrap_or(0)
+            > 0
 }
 
 /// Determinism oracle: runs `workload` twice, each on its own fresh
@@ -122,6 +145,59 @@ mod tests {
         ] {
             assert!(!is_fault_fallout(real_bug), "must NOT classify: {real_bug}");
         }
+    }
+
+    // ------------------------------------------- durable_corruption_fired
+
+    #[test]
+    fn durable_corruption_fired_tracks_the_two_corruption_axes_only() {
+        use crate::FaultConfig;
+
+        // Quiet world: nothing fired.
+        let sim = Sim::with_faults(0xD0C_0001, FaultConfig::none());
+        assert!(!durable_corruption_fired(&sim));
+
+        // A read error is NOT durable corruption (it produces errors, never
+        // silent wrongness).
+        let sim = Sim::with_faults(
+            0xD0C_0002,
+            FaultConfig {
+                read_error: 1.0,
+                ..FaultConfig::none()
+            },
+        );
+        let file = sim.disk().open("wal/f").unwrap();
+        file.write_at(0, b"x").unwrap();
+        file.sync().unwrap();
+        let mut out = [0u8; 1];
+        let _ = file.read_at(0, &mut out);
+        assert!(!durable_corruption_fired(&sim));
+
+        // A misdirected write in scope IS.
+        let sim = Sim::with_faults(
+            0xD0C_0003,
+            FaultConfig {
+                misdirected_write: 1.0,
+                ..FaultConfig::none()
+            },
+        );
+        let file = sim.disk().open("wal/f").unwrap();
+        file.write_at(0, b"x").unwrap();
+        assert!(durable_corruption_fired(&sim));
+
+        // A bit flip at restart IS.
+        let sim = Sim::with_faults(
+            0xD0C_0004,
+            FaultConfig {
+                bit_flip: 1.0,
+                ..FaultConfig::none()
+            },
+        );
+        let file = sim.disk().open("wal/f").unwrap();
+        file.write_at(0, b"x").unwrap();
+        file.sync().unwrap();
+        sim.restart();
+        assert!(durable_corruption_fired(&sim));
     }
 
     // ---------------------------------------------------- replays_identically

@@ -274,7 +274,7 @@ use charpente_core::io::Entropy;
 use charpente_core::job::JobRow;
 use charpente_core::log::WalConfig;
 use charpente_core::table::{Codec, View};
-use charpente_sim::run_universes_swarm_with;
+use charpente_sim::run_universes_swarm;
 
 #[table]
 struct Item {
@@ -411,6 +411,15 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
         };
         let recovered = app.db().last_applied().map_or(0, |s| s + 1);
         if recovered < acked {
+            // Excused ONLY when the harness actually injected durable
+            // corruption in this universe: bit_flip/misdirected_write on a
+            // WAL file above the checkpoint horizon is silently cut at
+            // recovery, by the WAL convention (see
+            // `checks::durable_corruption_fired`); the strong oracle stands
+            // in every universe where corruption did not fire.
+            if charpente_sim::checks::durable_corruption_fired(sim) {
+                return Ok(responses);
+            }
             return Err(format!(
                 "durability violated: {acked} acked over HTTP, {recovered} recovered"
             ));
@@ -487,6 +496,10 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
         };
         let recovered = app.db().last_applied().map_or(0, |s| s + 1);
         if recovered < acked {
+            // Same excuse-only-if-injected routing as the round loop above.
+            if charpente_sim::checks::durable_corruption_fired(sim) {
+                return Ok(responses);
+            }
             return Err(format!(
                 "durability violated: {acked} acked over HTTP, {recovered} recovered"
             ));
@@ -507,24 +520,10 @@ fn http_workload(sim: &mut Sim) -> Result<(), String> {
     http_workload_traced(sim).map(|_| ())
 }
 
-// `bit_flip`/`misdirected_write` are stamped off for this property
-// (segment-mgmt T5 finding, not a WAL/Engine/Db bug — see the identical,
-// longer note in typed_tables.rs's `tables_and_log_survive_the_fault_matrix`):
-// both axes can corrupt the redb store file's own durable bytes directly,
-// and redb's crash consistency can be defeated by that corruption
-// independent of anything this codebase does. Out of scope for this task;
-// the WAL-layer horizon rule itself is fully exercised, unscoped, by
-// `wal.rs`'s own property tests. `dir_entry_loss` and `read_error` stay
-// swarm-sampled — neither can corrupt redb's bytes.
 #[test]
 fn http_requests_survive_the_fault_matrix() {
-    run_universes_swarm_with!(
-        0x4771_0001,
+    run_universes_swarm!(
         256,
-        |cfg: &mut FaultConfig| {
-            cfg.bit_flip = 0.0;
-            cfg.misdirected_write = 0.0;
-        },
         http_workload,
         require: [
             "fault:write_error",

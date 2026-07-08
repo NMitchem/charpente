@@ -28,25 +28,11 @@ fn fixture_replays(sim: &mut Sim) -> Result<(), String> {
 
 /// Puts a row, crashes, reopens: an acked commit must survive. Returns the
 /// row's `hits` value read back after restart, or `None` when there's
-/// nothing to assert (write not acked, either open hit fault fallout, or a
-/// read on the reopened snapshot did — the harness's own fault paths, not
-/// the app's contract, are under test here). `counter_roundtrip` collapses
-/// this to pass/fail; `fixture_replays` additionally demands the
-/// `Option<u64>` itself replay identically across two independent worlds on
-/// the same seed.
-///
-/// `None` is also the outcome when the row is acked but missing on reopen
-/// with no error at all (`db.snapshot()`/`.get()` both `Ok`) — a known,
-/// separately-tracked limitation, not this fixture's contract: `bit_flip`/
-/// `misdirected_write` (segment-mgmt T5) can corrupt the redb store file's
-/// own durable bytes directly, and redb's crash consistency — like any
-/// copy-on-write store keeping a small number of valid roots — can be
-/// defeated by that corruption independent of anything this codebase does,
-/// by silently falling back to an older, still self-consistent root. This
-/// is a real, reproducible, out-of-scope-for-Task-5 gap in redb's own
-/// corruption handling, not something the WAL-layer horizon rule (fully
-/// exercised, unscoped, by `charpente-sim`'s own `wal.rs` property tests)
-/// can reach — the corruption is beneath it, inside the store redb owns.
+/// nothing to assert (write not acked, or an open/read hit fault fallout —
+/// the harness's own fault paths, not the app's contract, are under test
+/// here). `counter_roundtrip` collapses this to pass/fail;
+/// `fixture_replays` additionally demands the `Option<u64>` itself replay
+/// identically across two independent worlds on the same seed.
 fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     use charpente_sim::checks::is_fault_fallout;
 
@@ -85,7 +71,17 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
         Err(e) if is_fault_fallout(&e.to_string()) => return Ok(None),
         Err(e) => return Err(e.to_string()),
     };
-    Ok(row.map(|row| row.hits))
+    match row {
+        Some(row) => Ok(Some(row.hits)),
+        // Acked-but-lost is excused ONLY when the harness actually injected
+        // durable corruption in this universe (bit_flip/misdirected_write on
+        // a WAL file): corruption of an acked record above the checkpoint
+        // horizon is silently cut at recovery, by the WAL convention — see
+        // `durable_corruption_fired`'s docs. In every universe where no
+        // corruption fired, this stays the hard check it always was.
+        None if charpente_sim::checks::durable_corruption_fired(sim) => Ok(None),
+        None => Err("acked FixtureCounter row lost across a crash".into()),
+    }
 }
 
 fn sometimes_fails(sim: &mut Sim) -> Result<(), String> {

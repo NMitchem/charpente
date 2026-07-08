@@ -375,6 +375,12 @@ fn wal_survives_read_error() {
 // class of bug, not to re-implement the real `Wal`. Each forces exactly one
 // axis hot and zeroes every other axis (`*cfg = FaultConfig::none()` first)
 // so a catch is unambiguously attributable to the axis under test.
+//
+// Path convention: the bit_flip/misdirected_write victims live under "wal/"
+// because those two axes are scoped to `FaultConfig::corruption_scope`
+// (default "wal/" — Noah's ruling, 2026-07-07); the read_error victim
+// deliberately lives under "toy/" because read errors are global, and its
+// staying caught there is itself evidence of that.
 
 fn toy_crc32(data: &[u8]) -> u32 {
     let mut crc = !0u32;
@@ -435,7 +441,7 @@ fn toy_recover_naive(disk: &dyn Disk, path: &str) -> io::Result<Vec<Vec<u8>>> {
 fn bit_flip_naive_recovery_victim(sim: &mut Sim) -> Result<(), String> {
     let disk = sim.disk();
     let entropy = sim.entropy();
-    let file = disk.open("toy/naive.log").map_err(|e| e.to_string())?;
+    let file = disk.open("wal/naive.log").map_err(|e| e.to_string())?;
     let mut end = 0u64;
     let mut submitted = Vec::new();
     for _ in 0..8 {
@@ -447,7 +453,7 @@ fn bit_flip_naive_recovery_victim(sim: &mut Sim) -> Result<(), String> {
     drop(file);
     sim.restart(); // bit_flip forced hot: may corrupt one durable byte
 
-    let recovered = toy_recover_naive(&disk, "toy/naive.log").map_err(|e| e.to_string())?;
+    let recovered = toy_recover_naive(&disk, "wal/naive.log").map_err(|e| e.to_string())?;
     if recovered.len() != submitted.len() {
         return Err(format!(
             "naive recovery lost records: {} recovered, {} appended",
@@ -503,7 +509,7 @@ fn harness_catches_recovery_that_trusts_lengths_without_crc() {
 fn never_reads_back_victim(sim: &mut Sim) -> Result<(), String> {
     let disk = sim.disk();
     let entropy = sim.entropy();
-    let file = disk.open("toy/store.bin").map_err(|e| e.to_string())?;
+    let file = disk.open("wal/store.bin").map_err(|e| e.to_string())?;
     let mut expected = Vec::new();
     for i in 0..16u64 {
         let offset = i * 64;

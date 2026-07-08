@@ -1578,9 +1578,9 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
 }
 ```
 
-### The three checkers
+### The checkers
 
-`charpente_sim::checks` ships three reusable oracles — reach for these
+`charpente_sim::checks` ships four reusable oracles — reach for these
 before hand-rolling the same logic a fourth time:
 
 - `is_fault_fallout(text: &str) -> bool` — classifies an error's *text*:
@@ -1609,9 +1609,22 @@ before hand-rolling the same logic a fourth time:
   its own faults with `is_fault_fallout`, same as above), the sim restarts,
   and `verify` checks every id acked *so far* survived. A failure names the
   round it broke on.
+- `durable_corruption_fired(sim: &Sim) -> bool` — true when a
+  durable-corruption fault (`bit_flip` or `misdirected_write`) actually
+  fired in this universe. Those axes can corrupt an acked WAL record above
+  the store's checkpoint horizon, and recovery then legitimately cuts it
+  (an invalid frame is a torn tail unless provably below the horizon — the
+  standard WAL convention; the un-checkpointed data had one local copy).
+  Route an acked-durability check's *shortfall* through this so the loss is
+  excused only in universes where corruption was actually injected — the
+  strong oracle stands everywhere else. Never use it to excuse wrong data
+  or a consistency violation (a cut reverts state to a prefix, which stays
+  consistent).
 
 ```rust,ignore
 pub fn is_fault_fallout(text: &str) -> bool
+
+pub fn durable_corruption_fired(sim: &Sim) -> bool
 
 pub fn replays_identically<T: PartialEq + std::fmt::Debug>(
     seed: u64,

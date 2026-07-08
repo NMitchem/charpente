@@ -127,6 +127,35 @@ the horizon must fail; misdirected writes: a store layer that never re-reads wha
 wrote must fail; latent reads: a recovery that treats read errors as clean EOF must
 fail).
 
+**Ruling (Noah, 2026-07-07): the durable-corruption axes are scoped to WAL files.**
+T5's landing found that `bit_flip`/`misdirected_write` reaching the table store's own
+file defeats redb's crash consistency independently of anything this codebase does
+(internal redb panics, or a silent fallback to an older still-consistent root that
+under-reports `applied_seq`). The two axes were built to prove the WAL-layer fences
+(frame CRC + the recovery-horizon rule) — that is the domain v0 can honestly defend —
+so they are scoped by `FaultConfig.corruption_scope` (default `"wal/"`, a constant,
+never swarm-drawn). Store bitrot is recorded as an architectural truth: redb + M1
+restore-from-replica is the v0 answer; M2's own storage engine owns page checksums.
+`read_error` and `dir_entry_loss` stay global — they produce errors, never silent
+wrongness.
+
+**Fix-wave finding (same date, evidence from the scoped re-run): the horizon fence
+only defends checkpointed data.** With the axes scoped to `wal/`, a second, distinct
+silent-loss mode remained: corruption of an acked frame ABOVE the store's checkpoint
+horizon (`applied_seq`; `checkpoint_every` defaults to 4096, so small apps have
+near-zero horizon coverage) is indistinguishable from a torn tail and is legitimately
+cut — the standard WAL convention (Postgres treats a mid-WAL CRC mismatch as
+end-of-log the same way). No v0 single-node fence can close it: bitrot of the only
+local copy of un-checkpointed data is unrecoverable by design; replication (M1) is
+the answer. Consequence for oracles: acked-durability checks route their shortfall
+through `checks::durable_corruption_fired(sim)` — loss is excused ONLY in universes
+where a durable-corruption fault actually fired, and the strong oracle stands
+everywhere else (consistency oracles like exactly-once are never excused; a cut
+reverts to a prefix, which stays consistent). Evidence: instrumented seed
+0x8ccda9b5911555fa (http; misdirected WAL append at intended offset 355 landing at
+2403 → cut above horizon → 3 acked records gone), invoicing seed 0xcb60fa34ef1ab44c
+(bit_flip 0.019, wal-scoped, "acked finalize but invoice 1 is Draft").
+
 ## 5. What changes where
 
 - `charpente-core::log` — base_seq, GC (`Wal::gc(to_seq)` called by the store

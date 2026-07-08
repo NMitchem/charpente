@@ -54,9 +54,23 @@ pub struct FaultConfig {
     /// P(a `read_at` returns a transient injected IO error — the next read
     /// of the same bytes may succeed).
     pub read_error: f64,
+    /// Path prefix scoping the durable-corruption axes: `bit_flip` and
+    /// `misdirected_write` only affect files whose path starts with this
+    /// prefix. These two axes exist to prove the WAL-layer fences (frame
+    /// CRC + the recovery-horizon rule) — the domain v0 can honestly
+    /// defend; corruption of the table store's own bytes is beneath those
+    /// fences and defeats redb's crash consistency independently of
+    /// anything this codebase does (Noah's ruling, 2026-07-07: redb + M1
+    /// restore is the v0 answer, M2's own checksummed engine is the fix).
+    /// `read_error` and `dir_entry_loss` stay global — they produce
+    /// errors, never silent wrongness. Not swarm-sampled (constant
+    /// default; not a drawn field).
+    pub corruption_scope: String,
     pub disk_latency: (Duration, Duration),
     pub net_latency: (Duration, Duration),
 }
+
+const CORRUPTION_SCOPE_DEFAULT: &str = "wal/";
 
 impl Default for FaultConfig {
     fn default() -> FaultConfig {
@@ -69,6 +83,7 @@ impl Default for FaultConfig {
             bit_flip: 0.0,
             misdirected_write: 0.0,
             read_error: 0.0,
+            corruption_scope: CORRUPTION_SCOPE_DEFAULT.to_string(),
             disk_latency: (Duration::from_micros(20), Duration::from_millis(2)),
             net_latency: (Duration::from_micros(100), Duration::from_millis(20)),
         }
@@ -86,6 +101,7 @@ impl FaultConfig {
             bit_flip: 0.0,
             misdirected_write: 0.0,
             read_error: 0.0,
+            corruption_scope: CORRUPTION_SCOPE_DEFAULT.to_string(),
             disk_latency: (Duration::ZERO, Duration::ZERO),
             net_latency: (Duration::ZERO, Duration::ZERO),
         }
@@ -152,6 +168,9 @@ impl FaultConfig {
             bit_flip: 0.0,
             misdirected_write: 0.0,
             read_error: 0.0,
+            // Constant, never drawn: the scope is a property of what the
+            // corruption axes are FOR (the WAL fences), not a fault rate.
+            corruption_scope: CORRUPTION_SCOPE_DEFAULT.to_string(),
             disk_latency: (Duration::ZERO, disk_hi),
             net_latency: (Duration::ZERO, net_hi),
         };
@@ -421,15 +440,18 @@ impl Sim {
         // Bit-level corruption of already-durable bytes (the bitrot model),
         // before per-file crash collapse: one restart-time roll picks at
         // most one file (by rng index over sorted names — BTreeMap iterates
-        // sorted already) with non-empty durable content and flips one
-        // random bit of one random byte. Zero-draw fast path: off by
-        // default, so every seed that predates this fault axis replays with
-        // the exact same rng sequence (the frozen replay contract).
+        // sorted already) with non-empty durable content inside
+        // `corruption_scope` and flips one random bit of one random byte.
+        // Zero-draw fast path: off by default, so every seed that predates
+        // this fault axis replays with the exact same rng sequence (the
+        // frozen replay contract).
         if self.world.cfg.bit_flip > 0.0 && faults.chance(self.world.cfg.bit_flip) {
             let names: Vec<String> = disk
                 .files
                 .iter()
-                .filter(|(_, f)| !f.durable.is_empty())
+                .filter(|(name, f)| {
+                    name.starts_with(&self.world.cfg.corruption_scope) && !f.durable.is_empty()
+                })
                 .map(|(name, _)| name.clone())
                 .collect();
             if !names.is_empty() {
@@ -684,8 +706,14 @@ impl File for SimFile {
             // offset instead of at it — the intended target stays stale,
             // and the call still returns `Ok`. That's the whole treachery:
             // nothing here or at the caller can tell the write went wrong.
+            // Scoped to `corruption_scope` (see its field docs); the scope
+            // check precedes the roll, so out-of-scope writes consume no
+            // draws — a zero-draw fast path in both dimensions.
             let mut target_offset = offset;
-            if cfg.misdirected_write > 0.0 && state.faults.chance(cfg.misdirected_write) {
+            if cfg.misdirected_write > 0.0
+                && path.starts_with(&cfg.corruption_scope)
+                && state.faults.chance(cfg.misdirected_write)
+            {
                 state.cover("fault:misdirected_write");
                 target_offset = offset + SECTOR * (1 + state.faults.below(4));
             }
@@ -1510,7 +1538,7 @@ mod tests {
                 ..FaultConfig::none()
             },
         );
-        let file = sim.disk().open("f").unwrap();
+        let file = sim.disk().open("wal/f").unwrap();
         file.write_at(0, b"payload!").unwrap(); // still Ok — the treachery
         file.sync().unwrap();
         let mut out = [0u8; 8];
@@ -1527,6 +1555,29 @@ mod tests {
     }
 
     #[test]
+    fn misdirected_write_never_touches_files_outside_the_corruption_scope() {
+        // Even at probability 1.0, a write outside `corruption_scope`
+        // (default "wal/") lands exactly where it was aimed — the axis
+        // exists to prove the WAL fences, not to model store-file bitrot
+        // (Noah's ruling, 2026-07-07).
+        let sim = Sim::with_faults(
+            0x0FF_0002,
+            FaultConfig {
+                misdirected_write: 1.0,
+                ..FaultConfig::none()
+            },
+        );
+        let file = sim.disk().open("tables.redb").unwrap();
+        file.write_at(0, b"payload!").unwrap();
+        file.sync().unwrap();
+        let mut out = [0u8; 8];
+        file.read_at(0, &mut out).unwrap();
+        assert_eq!(&out, b"payload!", "out-of-scope writes land where aimed");
+        assert_eq!(file.len().unwrap(), 8);
+        assert_eq!(sim.coverage().get("fault:misdirected_write"), None);
+    }
+
+    #[test]
     fn bit_flip_corrupts_exactly_one_bit_of_one_file_at_restart() {
         let sim = Sim::with_faults(
             0xB17_0001,
@@ -1535,14 +1586,14 @@ mod tests {
                 ..FaultConfig::none()
             },
         );
-        let file = sim.disk().open("f").unwrap();
+        let file = sim.disk().open("wal/f").unwrap();
         let original = vec![0xAAu8; 64];
         file.write_at(0, &original).unwrap();
         file.sync().unwrap();
 
         sim.restart();
 
-        let file = sim.disk().open("f").unwrap();
+        let file = sim.disk().open("wal/f").unwrap();
         let mut after = vec![0u8; 64];
         file.read_at(0, &mut after).unwrap();
         let mut diff_bytes = 0;
@@ -1562,6 +1613,31 @@ mod tests {
     }
 
     #[test]
+    fn bit_flip_never_picks_a_file_outside_the_corruption_scope() {
+        // A durable out-of-scope file next to an empty scope: nothing to
+        // corrupt, even at probability 1.0 (Noah's ruling, 2026-07-07).
+        let sim = Sim::with_faults(
+            0xB17_0003,
+            FaultConfig {
+                bit_flip: 1.0,
+                ..FaultConfig::none()
+            },
+        );
+        let file = sim.disk().open("tables.redb").unwrap();
+        let original = vec![0x55u8; 64];
+        file.write_at(0, &original).unwrap();
+        file.sync().unwrap();
+
+        sim.restart();
+
+        let file = sim.disk().open("tables.redb").unwrap();
+        let mut after = vec![0u8; 64];
+        file.read_at(0, &mut after).unwrap();
+        assert_eq!(after, original, "out-of-scope durable bytes stay intact");
+        assert_eq!(sim.coverage().get("fault:bit_flip"), None);
+    }
+
+    #[test]
     fn bit_flip_is_a_no_op_with_no_non_empty_durable_file() {
         // No file has ever been synced: bit_flip has nothing to corrupt, and
         // must not panic reaching for one.
@@ -1572,7 +1648,7 @@ mod tests {
                 ..FaultConfig::none()
             },
         );
-        let _file = sim.disk().open("f").unwrap(); // never written or synced
+        let _file = sim.disk().open("wal/f").unwrap(); // never written or synced
         sim.restart();
         assert_eq!(sim.coverage().get("fault:bit_flip"), None);
     }
