@@ -758,6 +758,12 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
                 // would mean the closure itself changed underneath us.
                 return Err(format!("Flaky pre-enqueue: impossible App rejection: {e}"));
             }
+            Err(TxError::NotPrimary { primary }) => {
+                // This workload never calls forbid_writes.
+                return Err(format!(
+                    "Flaky pre-enqueue: impossible NotPrimary rejection (primary {primary})"
+                ));
+            }
         }
 
         let run = (|| -> Result<(), std::io::Error> {

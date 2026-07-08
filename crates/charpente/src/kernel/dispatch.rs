@@ -194,6 +194,16 @@ impl Dispatcher {
                 self.due.insert((due_at, id)); // still Pending in the store
                 Err(e)
             }
+            Err(TxError::NotPrimary { .. }) => {
+                // The T8 kernel gate makes this unreachable — job dispatch
+                // never runs on a follower. If it ever fires, that gate
+                // broke: fail loudly, don't silently retry.
+                self.due.insert((due_at, id));
+                Err(io::Error::other(
+                    "BUG: a job/cron transaction hit NotPrimary — the kernel must not run \
+                     dispatch or cron on a follower (DESIGN §5)",
+                ))
+            }
             Err(TxError::App(JobError::App(err))) => {
                 // Every fallible step below (the policy re-read, the
                 // failure-record transact) is run through this closure so
@@ -236,6 +246,10 @@ impl Dispatcher {
                     })
                     .map_err(|e| match e {
                         TxError::Io(e) | TxError::App(e) => e,
+                        TxError::NotPrimary { .. } => io::Error::other(
+                            "BUG: a job/cron transaction hit NotPrimary — the kernel must not \
+                             run dispatch or cron on a follower (DESIGN §5)",
+                        ),
                     })
                 };
                 match record() {

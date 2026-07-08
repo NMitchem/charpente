@@ -1293,3 +1293,111 @@ fn recovery_propagates_apply_failure() {
     .unwrap_err();
     assert_eq!(err.to_string(), "injected apply failure");
 }
+
+// ------------------------------------------------------- read_from (repl T3)
+//
+// The primary-side shipper's read surface: a verified read-back of
+// already-appended frames, never trusting anything it hasn't re-checksummed.
+
+#[test]
+fn read_from_returns_verified_frames_across_segments() {
+    // 64-byte segments, 8-byte payloads -> 24-byte frames, 2 per segment —
+    // 40 records forces many rotations (same shape as the gc tests above).
+    let sim = quiet_sim();
+    let mut wal = Wal::open(Box::new(sim.disk()), tiny_segments(), |_, _| Ok(())).unwrap();
+    let records: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 8]).collect();
+    for (i, record) in records.iter().enumerate() {
+        wal.append(record).unwrap();
+        if i % 4 == 3 {
+            wal.sync().unwrap();
+        }
+    }
+    wal.sync().unwrap();
+
+    let segments = sim.disk().list("wal/").unwrap();
+    assert!(
+        segments.len() > 1,
+        "64-byte segments must have rotated: {segments:?}"
+    );
+
+    let got = wal.read_from(13, 27, usize::MAX).unwrap();
+    assert_eq!(
+        got.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        (13..=27).collect::<Vec<_>>(),
+        "exactly seqs 13..=27"
+    );
+    for (seq, payload) in &got {
+        assert_eq!(
+            *payload, records[*seq as usize],
+            "seq {seq} content mismatch"
+        );
+    }
+
+    let capped = wal.read_from(0, 39, 64).unwrap();
+    assert!(!capped.is_empty(), "must return at least one frame");
+    assert_eq!(capped[0].0, 0, "starts at from_seq");
+    let total: usize = capped.iter().map(|(_, p)| p.len()).sum();
+    assert!(
+        total >= 64,
+        "stops only once max_bytes worth of payload has accumulated: {total}"
+    );
+    assert!(
+        capped.len() < 40,
+        "the 64-byte cap must have stopped it well short of the whole log"
+    );
+    for (seq, payload) in &capped {
+        assert_eq!(
+            *payload, records[*seq as usize],
+            "seq {seq} content mismatch"
+        );
+    }
+}
+
+#[test]
+fn read_from_refuses_a_corrupt_frame_below_up_to() {
+    let sim = quiet_sim();
+    let mut wal = Wal::open(Box::new(sim.disk()), small_segments(), |_, _| Ok(())).unwrap();
+    let records: Vec<Vec<u8>> = (0..10u8).map(|i| vec![i; 8]).collect();
+    for record in &records {
+        wal.append(record).unwrap();
+    }
+    wal.sync().unwrap();
+
+    // Flip one durable payload byte of frame 4 (24-byte frames: 16-byte
+    // header + 8-byte payload; all 10 fit in one 4 KiB segment).
+    let segments = sim.disk().list("wal/").unwrap();
+    let segment = sim.disk().open(&segments[0]).unwrap();
+    let offset = 4 * 24 + 16;
+    let mut byte = [0u8; 1];
+    segment.read_at(offset, &mut byte).unwrap();
+    segment.write_at(offset, &[byte[0] ^ 0xFF]).unwrap();
+    segment.sync().unwrap();
+
+    let err = wal.read_from(0, 9, usize::MAX).unwrap_err();
+    let msg = err.to_string();
+    for needle in ["frame 4", "shipped", "restore"] {
+        assert!(msg.contains(needle), "{msg}");
+    }
+}
+
+#[test]
+fn read_from_below_base_is_a_named_error() {
+    let sim = quiet_sim();
+    let mut wal = Wal::open(Box::new(sim.disk()), tiny_segments(), |_, _| Ok(())).unwrap();
+    let records: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 8]).collect();
+    for record in &records {
+        wal.append(record).unwrap();
+    }
+    wal.sync().unwrap();
+    wal.gc(20, 1).unwrap();
+    let base = wal.base_seq();
+    assert!(base > 0, "gc must have advanced the floor");
+
+    let err = wal.read_from(base - 1, base, usize::MAX).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains(&base.to_string()), "must name the base: {msg}");
+    assert!(
+        msg.contains("snapshot"),
+        "must name the snapshot path: {msg}"
+    );
+}

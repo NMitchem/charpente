@@ -250,6 +250,82 @@ impl Wal {
         self.base_seq
     }
 
+    /// Reads back already-appended frames `[from_seq, up_to]`, re-verifying
+    /// every CRC (the shipper's read surface — a frame corrupted on disk
+    /// after append must never travel). Stops early once `max_bytes` of
+    /// payload have accumulated, but always returns at least one frame when
+    /// any is available. `up_to` must not exceed the durable end — callers
+    /// pass the engine's `last_applied`.
+    pub fn read_from(
+        &self,
+        from_seq: u64,
+        up_to: u64,
+        max_bytes: usize,
+    ) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        if from_seq < self.base_seq {
+            return Err(corrupt(format!(
+                "read_from({from_seq}) but the log's base is {} — those frames are GC'd; \
+                 ship a snapshot instead (DESIGN §5)",
+                self.base_seq
+            )));
+        }
+        assert!(
+            up_to < self.next_seq,
+            "read_from up_to {up_to} is past the log end {}",
+            self.next_seq
+        );
+        let prefix = format!("{}/", self.cfg.dir);
+        let names = self.disk.list(&prefix)?;
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        for (index, name) in names.iter().enumerate() {
+            let base = parse_segment_name(&self.cfg.dir, name)?;
+            // A segment's end is the next segment's base (the tail segment
+            // ends at next_seq); skip whole segments that end at or before
+            // from_seq without even opening them.
+            let seg_end = match names.get(index + 1) {
+                Some(next) => parse_segment_name(&self.cfg.dir, next)?,
+                None => self.next_seq,
+            };
+            if seg_end <= from_seq {
+                continue;
+            }
+            let file = self.disk.open(name)?;
+            let len = file.len()?;
+            let mut offset = 0u64;
+            let mut seq = base;
+            while seq <= up_to {
+                match read_frame(&*file, len, offset, seq)? {
+                    Frame::Valid { payload } => {
+                        let flen = payload.len();
+                        if seq >= from_seq {
+                            bytes += flen;
+                            out.push((seq, payload));
+                            if bytes >= max_bytes {
+                                return Ok(out);
+                            }
+                        }
+                        seq += 1;
+                        offset += HEADER_BYTES + flen as u64;
+                    }
+                    Frame::CleanEnd => break,
+                    Frame::Invalid => {
+                        return Err(corrupt(format!(
+                            "log frame {seq} failed verification while being read back for \
+                             shipping — a corrupted frame must never be shipped; durable bytes \
+                             below the acknowledged end are corrupt; restore this node from a \
+                             replica or backup (DESIGN §2)"
+                        )));
+                    }
+                }
+            }
+            if seq > up_to {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Deletes whole segments every frame of which is below `keep_from`,
     /// always keeping at least `retain_segments` segments. The directory
     /// barrier runs after each removal, so a crash can resurrect at most
@@ -350,7 +426,10 @@ fn read_frame(file: &dyn File, len: u64, offset: u64, expected_seq: u64) -> io::
     Ok(Frame::Valid { payload })
 }
 
-fn frame_crc(seq: u64, payload: &[u8]) -> u32 {
+/// The frame checksum: both replication sides recompute it independently —
+/// the shipper before it leaves the primary, the follower's own `Wal::append`
+/// after it lands — the `Hello` handshake's integrity anchor (DESIGN §5).
+pub fn frame_crc(seq: u64, payload: &[u8]) -> u32 {
     let mut crc = Crc32::new();
     crc.update(&seq.to_le_bytes())
         .update(&(payload.len() as u32).to_le_bytes())

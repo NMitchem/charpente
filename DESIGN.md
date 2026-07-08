@@ -186,6 +186,9 @@ seq-correct), and deletes later segments. Any IO failure poisons the log — fsy
 cannot honestly be retried (fsyncgate); the only exit from poison is restart-and-recover,
 and recovery is idempotent. The apply loop (`Engine`) holds the standing invariant:
 machine state ≡ fold(apply, durable records) — submit is append → sync → apply → ack.
+The log gains a verified read surface for the shipper (`Wal::read_from`/`Db::read_log`,
+M1 replication T3): re-checksums every frame it hands back and refuses, by name, to hand
+back one that fails — a frame corrupted on disk after append must never travel.
 
 **Two durability fences.** (1) *Held (recovery-horizon rule).* A cut can only ever
 discard unacknowledged data, so recovery must tell a torn tail from mid-log corruption
@@ -264,7 +267,10 @@ aggregation arrive as typed combinators once real usage shows which ones matter.
 read-only Postgres-wire endpoint (for BI/analytics tools) is a later, separate surface and
 never the primary API. Read accessors are generated against the `View` trait —
 implemented by both `Snapshot` (outside transactions) and `Tx` (inside one, where reads
-also see the transaction's own writes).
+also see the transaction's own writes). Follower reads need zero app-code changes:
+effect-free transactions run unchanged on any node, while an effectful one on a node
+marked a read-only follower (`Db::forbid_writes`) is rejected with `TxError::NotPrimary`
+before it ever reaches the log (§5).
 
 ## 4. Storage engine [reversible — staged]
 

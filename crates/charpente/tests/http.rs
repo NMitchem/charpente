@@ -176,6 +176,34 @@ fn body_cap_is_a_413_before_decoding() {
     );
 }
 
+/// repl T3: `TxError::NotPrimary` maps to 421, naming the primary; reads are
+/// unaffected by the gate.
+#[test]
+fn writes_on_a_follower_get_421_naming_the_primary() {
+    let (_sim, mut app) = quiet_app(0x9012_0005);
+    let created = app.handle(Request::new(Method::Post, "/notes").json(&CreateNote {
+        id: 1,
+        text: "hi".into(),
+    }));
+    assert_eq!(created.status, 200, "{}", body_text(&created));
+
+    app.db_for_tests().forbid_writes("primary-1:9000".into());
+
+    let resp = app.handle(Request::new(Method::Post, "/notes").json(&CreateNote {
+        id: 2,
+        text: "bye".into(),
+    }));
+    assert_eq!(resp.status, 421, "{}", body_text(&resp));
+    let body = body_text(&resp);
+    assert!(body.contains("primary-1:9000"), "{body}");
+    assert!(body.contains("follower"), "{body}");
+
+    // A read route still answers 200 — the write gate never touches reads.
+    let get = app.handle(Request::new(Method::Get, "/notes/1"));
+    assert_eq!(get.status, 200);
+    assert_eq!(body_text(&get), "\"hi\"");
+}
+
 #[test]
 fn sessions_login_auth_logout() {
     let (_sim, mut app) = quiet_app(0x47C);

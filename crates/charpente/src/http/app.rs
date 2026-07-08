@@ -259,6 +259,13 @@ impl App {
                      committed; retry after the server recovers: {e}"
                 ),
             ),
+            Err(TxError::NotPrimary { primary }) => Response::error(
+                421,
+                &format!(
+                    "this node is a read-only follower — writes go to the primary at \
+                     {primary}; retry there (the request was not committed)"
+                ),
+            ),
         }
     }
 }

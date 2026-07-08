@@ -128,12 +128,57 @@ impl<S: StateMachine> Engine<S> {
         Ok(seq)
     }
 
+    /// The follower's apply path: append every frame, one sync, then apply
+    /// each — the same append→sync→apply discipline as `submit`, minus the
+    /// client ack, amortizing the sync over a shipped batch. Shipped seqs
+    /// cross a trust boundary, so a gap is a named error, not an assert.
+    pub fn submit_batch(&mut self, frames: &[(u64, Vec<u8>)]) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other(
+                "engine poisoned: a durable record failed to apply, so machine state no \
+                 longer matches the log — restart and recover",
+            ));
+        }
+        for (seq, payload) in frames {
+            if *seq != self.wal.next_seq() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "shipped frame carries seq {seq} but this log expects seq {} — the ship \
+                         stream is out of order or from a different timeline; reconnect and \
+                         re-Hello",
+                        self.wal.next_seq()
+                    ),
+                ));
+            }
+            self.wal.append(payload)?;
+        }
+        self.wal.sync()?;
+        for (seq, payload) in frames {
+            assert_eq!(
+                *seq,
+                self.last_applied.map_or(0, |l| l + 1),
+                "apply loop skipped a seq — append and apply have diverged"
+            );
+            if let Err(e) = self.machine.apply(*seq, payload) {
+                self.poisoned = true;
+                return Err(e);
+            }
+            self.last_applied = Some(*seq);
+        }
+        Ok(())
+    }
+
     pub fn machine(&self) -> &S {
         &self.machine
     }
 
     pub fn machine_mut(&mut self) -> &mut S {
         &mut self.machine
+    }
+
+    pub fn wal(&self) -> &Wal {
+        &self.wal
     }
 
     pub fn wal_mut(&mut self) -> &mut Wal {

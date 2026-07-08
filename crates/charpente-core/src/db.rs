@@ -76,6 +76,14 @@ pub trait Event: Codec {
 pub enum TxError<E> {
     App(E),
     Io(io::Error),
+    /// The follower rejection (DESIGN §5): this node has been marked a
+    /// read-only follower (`Db::forbid_writes`) and the transaction had at
+    /// least one effect to write — nothing was attempted. `primary` names
+    /// where to send it instead. Reads and effect-free transactions never
+    /// see this; the gate only looks at `f`'s buffered effects.
+    NotPrimary {
+        primary: String,
+    },
 }
 
 // ---------------------------------------------------------------- schema
@@ -443,6 +451,10 @@ pub struct Db {
     cfg: DbConfig,
     retention_pin: Option<Box<dyn Fn() -> u64 + Send>>,
     records_since_checkpoint: u64,
+    /// `Some(primary)` once `forbid_writes` has marked this node a read-only
+    /// follower; `None` (the default) allows commits. Gates `transact` only
+    /// — `apply_shipped` is the follower's own write path and bypasses it.
+    not_primary: Option<String>,
 }
 
 impl fmt::Debug for Db {
@@ -451,6 +463,7 @@ impl fmt::Debug for Db {
             .field("engine", &self.engine)
             .field("cfg", &self.cfg)
             .field("records_since_checkpoint", &self.records_since_checkpoint)
+            .field("not_primary", &self.not_primary)
             .finish()
     }
 }
@@ -567,6 +580,7 @@ impl Db {
             cfg,
             retention_pin: None,
             records_since_checkpoint: 0,
+            not_primary: None,
         })
     }
 
@@ -591,6 +605,11 @@ impl Db {
         let out = f(&mut tx).map_err(TxError::App)?;
         if tx.effects.is_empty() {
             return Ok(out);
+        }
+        if let Some(primary) = &self.not_primary {
+            return Err(TxError::NotPrimary {
+                primary: primary.clone(),
+            });
         }
         let record = encode_record(&tx.effects);
         assert!(
@@ -649,6 +668,52 @@ impl Db {
     /// own checkpoint does. Overrides any previously registered pin.
     pub fn pin_retention(&mut self, pin: Box<dyn Fn() -> u64 + Send>) {
         self.retention_pin = Some(pin);
+    }
+
+    /// Marks this node a read-only follower: every further effectful
+    /// `transact` returns `TxError::NotPrimary { primary }` naming where
+    /// writes go instead (DESIGN §5). Reads and effect-free transactions are
+    /// unaffected; `apply_shipped` is a separate path this never gates.
+    pub fn forbid_writes(&mut self, primary: String) {
+        self.not_primary = Some(primary);
+    }
+
+    /// Restores commits — the primary role, or a promoted follower's first act.
+    pub fn allow_writes(&mut self) {
+        self.not_primary = None;
+    }
+
+    pub fn writes_allowed(&self) -> bool {
+        self.not_primary.is_none()
+    }
+
+    /// Applies frames shipped from the primary: the follower's only write
+    /// path (DESIGN §5). Runs the checkpoint cadence like transact — a
+    /// follower checkpoints and GCs its own log on the same schedule.
+    pub fn apply_shipped(&mut self, frames: &[(u64, Vec<u8>)]) -> io::Result<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        self.engine.submit_batch(frames)?;
+        self.records_since_checkpoint += frames.len() as u64;
+        if self.cfg.checkpoint_every > 0
+            && self.records_since_checkpoint >= self.cfg.checkpoint_every
+        {
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    /// Verified read-back of committed records for the shipper; `up_to` is
+    /// capped at `last_applied`, so the unsynced tail never travels.
+    pub fn read_log(&self, from_seq: u64, max_bytes: usize) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        let Some(last) = self.engine.last_applied() else {
+            return Ok(Vec::new());
+        };
+        if from_seq > last {
+            return Ok(Vec::new());
+        }
+        self.engine.wal().read_from(from_seq, last, max_bytes)
     }
 
     pub fn last_applied(&self) -> Option<u64> {

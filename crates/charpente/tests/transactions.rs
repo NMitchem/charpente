@@ -578,6 +578,9 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
                 }) {
                     Err(TxError::App(_)) => {}
                     Err(TxError::Io(_)) => break, // snapshot failed: died here
+                    Err(TxError::NotPrimary { .. }) => {
+                        unreachable!("this workload never calls forbid_writes")
+                    }
                     Ok(()) => unreachable!("the closure always aborts"),
                 }
                 if db.last_applied() != before {
@@ -590,6 +593,9 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
                 // (found by seed 0x5e713efe41f78d1a)
                 Err(TxError::App(_)) => break,
                 Err(TxError::Io(_)) => break, // died mid-commit; durable or not
+                Err(TxError::NotPrimary { .. }) => {
+                    unreachable!("this workload never calls forbid_writes")
+                }
             }
             if entropy.next_u64().is_multiple_of(4)
                 && let Err(e) = db.checkpoint()
@@ -1269,4 +1275,181 @@ fn fresh_store_creation_crash_is_discarded_and_rebuilt() {
         None,
         "nothing was ever durably committed to this fresh db"
     );
+}
+
+// ------------------------------------------------------------- repl T3
+
+/// `forbid_writes` gates only effectful `transact`; reads (and effect-free
+/// transactions) are untouched, and `allow_writes` restores commits.
+#[test]
+fn forbidden_writes_fail_with_not_primary_and_reads_still_work() {
+    let (_sim, mut db) = quiet_db(0x9012_0001);
+    db.transact(|tx| {
+        tx.put(&invoice(1, 1, 100));
+        Ok::<_, io::Error>(())
+    })
+    .unwrap();
+    assert!(db.writes_allowed());
+
+    db.forbid_writes("primary-1:7000".to_string());
+    assert!(!db.writes_allowed());
+
+    // A read-only transaction (no effects) still works.
+    let amount = db
+        .transact(|tx| {
+            Ok::<_, io::Error>(tx.get::<Invoice>(Id::from_raw(1))?.map(|i| i.amount_cents))
+        })
+        .unwrap();
+    assert_eq!(amount, Some(100));
+
+    // An effectful transaction is rejected, naming the primary — and writes
+    // nothing (last_applied is unchanged).
+    let err = db
+        .transact(|tx| {
+            tx.put(&invoice(2, 1, 200));
+            Ok::<_, io::Error>(())
+        })
+        .unwrap_err();
+    match err {
+        TxError::NotPrimary { primary } => assert_eq!(primary, "primary-1:7000"),
+        other => panic!("expected NotPrimary, got {other:?}"),
+    }
+    assert_eq!(
+        db.last_applied(),
+        Some(0),
+        "the rejected transaction wrote nothing"
+    );
+
+    db.allow_writes();
+    assert!(db.writes_allowed());
+    db.transact(|tx| {
+        tx.put(&invoice(2, 1, 200));
+        Ok::<_, io::Error>(())
+    })
+    .unwrap();
+    assert_eq!(db.last_applied(), Some(1), "allow_writes restores commits");
+}
+
+/// A row-content snapshot of both tables, keyed by id — the equality check
+/// two independently-built `Db`s' scans get compared against.
+type TableContents = (BTreeMap<u64, String>, BTreeMap<u64, (u64, i64, bool)>);
+
+fn table_contents(snap: &Snapshot) -> TableContents {
+    let orgs = snap
+        .scan::<Org>()
+        .unwrap()
+        .into_iter()
+        .map(|o| (o.id.raw(), o.name))
+        .collect();
+    let invoices = snap
+        .scan::<Invoice>()
+        .unwrap()
+        .into_iter()
+        .map(|i| (i.id.raw(), (i.org.raw(), i.amount_cents, i.paid)))
+        .collect();
+    (orgs, invoices)
+}
+
+/// The convergence oracle in miniature: a follower fed the primary's own
+/// `read_log` output via `apply_shipped`, in batches, ends up with
+/// byte-identical durable state.
+#[test]
+fn apply_shipped_replays_records_byte_identically() {
+    let sim = Sim::with_faults(0x9012_0002, FaultConfig::none());
+    let host_a = sim.host("a");
+    let host_b = sim.host("b");
+    let mut db_a = Db::open(Box::new(host_a.disk()), DbConfig::default(), app_schema()).unwrap();
+    let mut db_b = Db::open(Box::new(host_b.disk()), DbConfig::default(), app_schema()).unwrap();
+
+    for i in 0..20u64 {
+        db_a.transact(|tx| {
+            if i < 3 {
+                tx.put(&Org {
+                    id: Id::from_raw(i),
+                    name: format!("org-{i}"),
+                });
+            }
+            tx.put(&invoice(i, i % 3, (i as i64 + 1) * 100));
+            if i >= 5 {
+                tx.delete::<Invoice>(Id::from_raw(i - 5));
+            }
+            if i % 4 == 0 {
+                tx.enqueue(SendReceipt { invoice: i });
+            }
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+    }
+    assert_eq!(db_a.last_applied(), Some(19), "20 transactions, 20 records");
+
+    let frames = db_a.read_log(0, usize::MAX).unwrap();
+    assert_eq!(frames.len(), 20);
+    let mid = frames.len() / 2;
+    db_b.apply_shipped(&frames[..mid]).unwrap();
+    db_b.apply_shipped(&frames[mid..]).unwrap();
+
+    assert_eq!(db_b.last_applied(), db_a.last_applied());
+    assert_eq!(
+        table_contents(&db_a.snapshot().unwrap()),
+        table_contents(&db_b.snapshot().unwrap()),
+        "every row must match after replay"
+    );
+
+    db_a.checkpoint().unwrap();
+    db_b.checkpoint().unwrap();
+    drop(db_a);
+    drop(db_b);
+
+    let db_a = Db::open(Box::new(host_a.disk()), DbConfig::default(), app_schema()).unwrap();
+    let db_b = Db::open(Box::new(host_b.disk()), DbConfig::default(), app_schema()).unwrap();
+    assert_eq!(db_a.last_applied(), db_b.last_applied());
+    assert_eq!(
+        host_a.durable_fingerprint(),
+        host_b.durable_fingerprint(),
+        "the convergence oracle: byte-identical durable state at equal seq"
+    );
+}
+
+#[test]
+fn apply_shipped_refuses_a_seq_gap_by_name() {
+    let sim = Sim::with_faults(0x9012_0003, FaultConfig::none());
+    let host_a = sim.host("a");
+    let host_b = sim.host("b");
+    let mut db_a = Db::open(Box::new(host_a.disk()), DbConfig::default(), app_schema()).unwrap();
+    for i in 0..10u64 {
+        db_a.transact(|tx| {
+            tx.put(&invoice(i, 0, i as i64));
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+    }
+    let frames = db_a.read_log(0, usize::MAX).unwrap();
+    assert_eq!(frames.len(), 10);
+
+    let mut db_b = Db::open(Box::new(host_b.disk()), DbConfig::default(), app_schema()).unwrap();
+    let err = db_b.apply_shipped(&frames[5..]).unwrap_err();
+    assert!(err.to_string().contains("expects seq"), "{err}");
+}
+
+/// `apply_shipped` is the follower's own write path — `forbid_writes` never
+/// gates it (only `transact` is gated).
+#[test]
+fn apply_shipped_still_works_while_writes_are_forbidden() {
+    let sim = Sim::with_faults(0x9012_0004, FaultConfig::none());
+    let host_a = sim.host("a");
+    let host_b = sim.host("b");
+    let mut db_a = Db::open(Box::new(host_a.disk()), DbConfig::default(), app_schema()).unwrap();
+    db_a.transact(|tx| {
+        tx.put(&invoice(1, 0, 500));
+        Ok::<_, io::Error>(())
+    })
+    .unwrap();
+    let frames = db_a.read_log(0, usize::MAX).unwrap();
+
+    let mut db_b = Db::open(Box::new(host_b.disk()), DbConfig::default(), app_schema()).unwrap();
+    db_b.forbid_writes("primary-1:7000".to_string());
+    db_b.apply_shipped(&frames).unwrap();
+    assert_eq!(db_b.last_applied(), Some(0));
+    let snap = db_b.snapshot().unwrap();
+    assert_eq!(snap.scan::<Invoice>().unwrap()[0].amount_cents, 500);
 }

@@ -120,5 +120,9 @@ fn nanos(d: Duration, name: &'static str) -> u64 {
 fn flatten(e: TxError<io::Error>) -> io::Error {
     match e {
         TxError::App(e) | TxError::Io(e) => e,
+        TxError::NotPrimary { .. } => io::Error::other(
+            "BUG: a job/cron transaction hit NotPrimary — the kernel must not run dispatch or \
+             cron on a follower (DESIGN §5)",
+        ),
     }
 }

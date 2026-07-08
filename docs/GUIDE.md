@@ -471,20 +471,24 @@ a transaction that doesn't panics with "transaction effects are N bytes but
 one log record holds at most 16777216 — split the work into smaller
 transactions".
 
-### `TxError::App` vs `TxError::Io`
+### `TxError`'s three variants
 
-`TxError<E>` has exactly two variants, and this block matches the real
-type — a variant rename or addition breaks the guide's compile gate:
+`TxError<E>` has three variants, and this block matches the real type — a
+variant rename or addition breaks the guide's compile gate:
 
 ```rust
 use charpente::TxError;
 
-/// The two arms differ in what they promise: `App` means nothing was
-/// written; `Io` means the outcome is unknown (details below).
+/// The three arms differ in what they promise: `App` means nothing was
+/// written; `Io` means the outcome is unknown (details below); `NotPrimary`
+/// means this node is a read-only follower and nothing was even attempted.
 fn describe<E: std::fmt::Display>(err: &TxError<E>) -> String {
     match err {
         TxError::App(e) => format!("rejected by the app — nothing was written: {e}"),
         TxError::Io(e) => format!("platform IO failure — outcome unknown: {e}"),
+        TxError::NotPrimary { primary } => {
+            format!("read-only follower — writes go to {primary} instead")
+        }
     }
 }
 ```
@@ -498,6 +502,10 @@ committed record's log entry after `f` returned `Ok`. That second case is
 genuinely ambiguous — the record may already be durable and will reappear
 after the next recovery even though the caller was told the commit failed —
 so treat `TxError::Io` as "unknown," never as "definitely didn't happen."
+`NotPrimary { primary }` fires only when `f` had at least one effect to
+write and this node has been marked a read-only follower
+(`Db::forbid_writes`, DESIGN §5) — reads and effect-free transactions never
+see it; the HTTP layer maps it to 421, naming `primary`.
 
 ### What a transaction cannot do
 
