@@ -139,8 +139,9 @@ restore-from-replica is the v0 answer; M2's own storage engine owns page checksu
 `read_error` and `dir_entry_loss` stay global — they produce errors, never silent
 wrongness.
 
-**Fix-wave finding (same date, evidence from the scoped re-run): the horizon fence
-only defends checkpointed data.** With the axes scoped to `wal/`, a second, distinct
+**Fix-wave finding (same date, evidence from the scoped re-run; signed off by Noah
+2026-07-07 — the recorded truth, the checker mechanism, and the invoicing test edit
+all approved): the horizon fence only defends checkpointed data.** With the axes scoped to `wal/`, a second, distinct
 silent-loss mode remained: corruption of an acked frame ABOVE the store's checkpoint
 horizon (`applied_seq`; `checkpoint_every` defaults to 4096, so small apps have
 near-zero horizon coverage) is indistinguishable from a torn tail and is legitimately
