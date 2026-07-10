@@ -56,6 +56,29 @@ pub enum Msg {
     HandOffDone,
 }
 
+impl Msg {
+    /// The variant's wire name, for error surfaces that must name what
+    /// arrived ("unexpected Frames on a fresh replication connection").
+    pub fn name(&self) -> &'static str {
+        match self {
+            Msg::Hello { .. } => "Hello",
+            Msg::Frames { .. } => "Frames",
+            Msg::Heartbeat { .. } => "Heartbeat",
+            Msg::Ack { .. } => "Ack",
+            Msg::SnapshotStart { .. } => "SnapshotStart",
+            Msg::SnapshotRows { .. } => "SnapshotRows",
+            Msg::SnapshotEnd => "SnapshotEnd",
+            Msg::Refuse { .. } => "Refuse",
+            Msg::CtrlPromote => "CtrlPromote",
+            Msg::CtrlSwitchover { .. } => "CtrlSwitchover",
+            Msg::CtrlOk { .. } => "CtrlOk",
+            Msg::CtrlErr { .. } => "CtrlErr",
+            Msg::HandOff { .. } => "HandOff",
+            Msg::HandOffDone => "HandOffDone",
+        }
+    }
+}
+
 fn encode_pairs(pairs: &[(u64, Vec<u8>)], out: &mut Vec<u8>) {
     (u32::try_from(pairs.len()).expect("frame batch exceeds u32 length")).encode(out);
     for (seq, payload) in pairs {
@@ -66,7 +89,15 @@ fn encode_pairs(pairs: &[(u64, Vec<u8>)], out: &mut Vec<u8>) {
 
 fn decode_pairs(input: &mut &[u8]) -> io::Result<Vec<(u64, Vec<u8>)>> {
     let n = u32::decode(input)?;
-    let mut pairs = Vec::with_capacity(n as usize);
+    // The declared count is untrusted: a corrupt or hostile message can name
+    // billions of pairs in a handful of bytes. The smallest possible pair is
+    // 12 bytes (a u64 seq + a Vec<u8>'s 4-byte length prefix with no payload),
+    // so no honest message can hold more than `input.len() / 12` pairs — cap
+    // the preallocation there. An over-declared `n` still errors by name when
+    // the loop runs out of bytes (the `u64`/`Vec<u8>` decodes below), just
+    // without allocating gigabytes first.
+    let cap = (n as usize).min(input.len() / 12);
+    let mut pairs = Vec::with_capacity(cap);
     for _ in 0..n {
         let seq = u64::decode(input)?;
         let payload = Vec::<u8>::decode(input)?;
@@ -361,6 +392,21 @@ mod tests {
         let err = decode(&bytes).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("trailing bytes"), "{msg}");
+    }
+
+    #[test]
+    fn decode_refuses_a_huge_declared_pair_count_without_over_allocating() {
+        // A `Frames` message (tag 1) whose length prefix claims u32::MAX pairs
+        // but carries only a few bytes: the preallocation is capped by the
+        // remaining input, and the decode still fails by name when the first
+        // pair runs out of bytes — never an allocation abort.
+        let mut bytes = vec![1u8]; // tag: Frames
+        u32::MAX.encode(&mut bytes); // n = 4_294_967_295 pairs declared
+        bytes.extend_from_slice(&[0u8; 3]); // far too few bytes for even one pair
+        let err = decode(&bytes).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("row decode"), "{msg}");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

@@ -203,7 +203,14 @@ acknowledged records exist in neither the store nor the log (never a state check
 GC can produce — its floor is bounded by its own checkpoint's `applied_seq + 1`), and
 `Db::open` refuses with the same restore-naming error before recovery runs. Standalone
 `Wal::open` (no store in sight) keeps cut-at-first-invalid. M1 replication is what
-makes repair possible.
+makes repair possible. One shape is exempted because it provably loses nothing: a
+checkpointed store beside an *entirely empty* log directory. Segment names are
+dir-barriered before any frame lands in them (fence 2, below), so every route to a
+checkpointed store leaves at least one name-durable segment — except a crash inside
+`Seeder::finish`, between the store checkpoint and laying the seed segment. `Db::open`
+recognizes the shape and lays the segment `finish` would have (base = horizon + 1,
+nothing to replay) instead of starting a fresh log at 0 (found by replication T6, seed
+0xcaef83b2feb5edf5).
 (2) *Held.* `File::sync` does not persist a file's *directory entry*, so a freshly
 rotated-in segment's name (or a store file's, at creation) could vanish on power loss,
 taking acknowledged records with it, or a removed name could resurrect one a recovery
@@ -372,6 +379,44 @@ back off before handing the schema to a fresh `Seeder`, which re-adds it itself;
 that, seeding a live `Db`'s own state would double-register the platform's own table. The
 network-facing seed session (shipping rows to a remote follower) is a later M1 task; this
 is the substrate it sends over the wire.
+
+**The data plane (v1, implemented).** `charpente::repl::Repl` is the session engine
+(M1 replication T6): the primary opens a replication listener and runs one `Session` per
+inbound conn; a follower/backup runs one outbound `Follower` client against its primary.
+Both are driven kernel-shaped — `pump_io` moves bytes without touching the `Db` (accept,
+drain readable messages into per-conn queues, note reconnect timers), then `step` does one
+unit of work against the `Db` per call (handle one message, push one `Frames`/snapshot
+batch to one session round-robin, heartbeat, or reconnect). A session opens on its first
+message: a `Hello` (proto version, the follower's own listen address, and its position —
+last durable seq + that frame's CRC via `frame_crc`) runs the decision ladder pinned by
+tests: version mismatch → `Refuse` naming both versions; a non-primary role → `Refuse`
+naming the real primary (no cascading); follower at-or-ahead of the primary with unknown
+bytes, or a CRC mismatch on a retained frame → `Refuse` naming both seqs, both CRCs, and
+the re-seed fix (diverged timelines are refused, never merged); position below the GC'd
+base (or an empty follower against a compacted log) → snapshot-seed; otherwise `Frames`
+resume from position + 1. Shipping reads exclusively through `Db::read_log` — CRC
+re-verified at read-back, capped at `last_applied`, so a frame corrupted on the primary's
+disk is refused by name rather than shipped, and the unsynced tail never travels. The
+follower appends via `Db::apply_shipped` (append → sync → apply, recovery's own
+discipline) and sends `Ack { durable_seq }` only after that sync, never on receipt; a
+shipped seq gap means a different timeline — drop the conn and re-`Hello`. The retention
+pin is wired at `Repl::open`: `Db::pin_retention` reads a shared floor recomputed on every
+ack and session change — the min over live sessions of acked + 1 (a not-yet-acked
+session pins at its cursor; a seeding session at its snapshot's `applied_seq + 1`) — so a
+live lagging session holds GC exactly as long as it lives and releases it when reaped.
+Seeding streams `SnapshotStart`/`SnapshotRows`/`SnapshotEnd` out of ONE MVCC snapshot
+(batches near `SNAPSHOT_BATCH_BYTES`, one message per step); the follower buffers the
+stream and, at `SnapshotEnd`, latches `db_needs_reseed` — `Repl::step` cannot replace a
+`Db` it only borrows, so the CALLER (the kernel arm, T8) runs `Repl::run_seed(db, clock)`,
+which consumes the `Db` through `into_seeder`, replays the buffer, `finish`es at the
+horizon + 1 boundary, re-gates writes, and returns the new `Db`; a conn death mid-stream
+never latches, and the next `Hello` restarts the seed from scratch (idempotent —
+`Seeder::new` discards). The durable role file (§2's role semantics, T5) carries its own
+CRC line: a torn role write is a named integrity error, never a parse of whatever bytes
+survived — a torn "follower:p:1" that still parses as a role naming a ghost primary is
+exactly what the T6 harness caught (seed 0x51dacce702b667c8). Control verbs
+(promote/switchover/hand-off) land in T7; until then the session answers them `CtrlErr`
+by name.
 
 ## 6. Queue, cron, realtime — all faces of the log
 

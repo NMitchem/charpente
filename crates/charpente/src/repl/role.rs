@@ -7,9 +7,22 @@
 //! switchover (`Primary` → `HandingOff` → `Follower`) crash-safe: a node
 //! restarting mid-flip resolves against whatever it actually wrote, never
 //! a config default.
+//!
+//! The file carries its own CRC (`<role line>\n<crc32 hex>`): a role write
+//! whose sync failed can be TORN by a later crash, and a torn role line can
+//! still parse — "follower:p:1" torn to "follower:p:\0" is a valid form
+//! naming a ghost primary (found by the replication T6 harness, seed
+//! 0x51dacce702b667c8; the unparseable-tear sibling is seed
+//! 0x23b5e7e7f2132438). Integrity failure is a named hard error, never a
+//! parse of whatever bytes survived — and never a silent fall back to
+//! config: a corrupt file is indistinguishable from a real role flip, and
+//! the durable role must win over config (spec §2), so only the operator
+//! can safely decide (delete the file to re-init from config on a node
+//! that never finished first boot; restore the node otherwise).
 
 use std::io;
 
+use charpente_core::crc::Crc32;
 use charpente_core::io::Disk;
 
 const ROLE_FILE: &str = "role";
@@ -87,18 +100,43 @@ fn mismatch_notice(durable: &Role, config: &Role) -> String {
     notice
 }
 
-/// Writes the durable role file: `write_at` + `set_len` + `sync` +
-/// `sync_dir` — a role flip must survive any crash before it takes effect
-/// (spec §2's three-state switchover safety).
+fn line_crc(line: &str) -> u32 {
+    let mut crc = Crc32::new();
+    crc.update(line.as_bytes());
+    crc.finish()
+}
+
+/// Writes the durable role file — `<role line>\n<crc32 hex>` — with
+/// `write_at` + `set_len` + `sync` + `sync_dir`: a role flip must survive
+/// any crash before it takes effect (spec §2's three-state switchover
+/// safety), and a flip a crash TORE must fail `load_role`'s integrity check
+/// by name rather than parse as some other role (the module doc's torn-write
+/// finding).
 pub fn store_role(disk: &dyn Disk, role: &Role) -> io::Result<()> {
     let line = role_to_line(role);
-    let bytes = line.as_bytes();
+    let content = format!("{line}\n{:08x}", line_crc(&line));
+    let bytes = content.as_bytes();
     let file = disk.open(ROLE_FILE)?;
     file.write_at(0, bytes)?;
     file.set_len(bytes.len() as u64)?;
     file.sync()?;
     disk.sync_dir(ROLE_FILE)?;
     Ok(())
+}
+
+/// The corrupt-role-file hard error: names the failure and both exits. Not
+/// classified as fault fallout — an operator (or a first-boot caller that
+/// KNOWS no flip ever happened) must decide, never an automatic fallback.
+fn corrupt_role_error(reason: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "role file failed its integrity check ({reason}) — a torn write or corruption; if \
+             this node never finished first boot, delete the \"role\" file to re-initialize it \
+             from config; otherwise restore this node from a replica or backup (expected \
+             contents: one of {EXPECTED_FORMS}, then its crc32 on a second line)"
+        ),
+    )
 }
 
 /// Reads the role file; absent → writes `initial` and returns it (first
@@ -114,13 +152,14 @@ pub fn load_role(disk: &dyn Disk, initial: &Role) -> io::Result<(Role, Option<St
     let len = file.len()?;
     let mut buf = vec![0u8; len as usize];
     file.read_at(0, &mut buf)?;
-    let text = String::from_utf8(buf).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("role file: not valid UTF-8 ({e}) — expected one of: {EXPECTED_FORMS}"),
-        )
-    })?;
-    let durable = parse_role(text.trim_end_matches('\n'))?;
+    let text = String::from_utf8(buf).map_err(|_| corrupt_role_error("not valid UTF-8"))?;
+    let (line, stored_crc) = text
+        .split_once('\n')
+        .ok_or_else(|| corrupt_role_error("missing the crc line"))?;
+    if format!("{:08x}", line_crc(line)) != stored_crc.trim_end_matches('\n') {
+        return Err(corrupt_role_error("crc mismatch"));
+    }
+    let durable = parse_role(line)?;
     if durable == *initial {
         return Ok((durable, None));
     }
@@ -235,5 +274,56 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("role file"), "{msg}");
         assert!(msg.contains(EXPECTED_FORMS), "{msg}");
+    }
+
+    /// The torn-write finding (module doc; replication T6 harness, seed
+    /// 0x51dacce702b667c8): a torn role line can still PARSE —
+    /// "follower:p:1" torn to "follower:p:\0" names a ghost primary — so
+    /// integrity must fail by name, never yield a parsed role. Constructed
+    /// deterministically: durable bytes emulate exactly what the sim's
+    /// crash collapse produced (a prefix of the write, zero-extended to the
+    /// set_len length).
+    #[test]
+    fn a_torn_but_parseable_role_line_fails_integrity_by_name() {
+        let disk = disk();
+        store_role(
+            &disk,
+            &Role::Follower {
+                primary: "p:1".to_string(),
+            },
+        )
+        .unwrap();
+        let file = disk.open(ROLE_FILE).unwrap();
+        // Tear the tail: the last byte of the line and the whole crc line
+        // survive as zeros.
+        let torn = b"follower:p:\0";
+        file.write_at(0, torn).unwrap();
+        file.set_len(torn.len() as u64).unwrap();
+        file.sync().unwrap();
+
+        let err = load_role(
+            &disk,
+            &Role::Follower {
+                primary: "p:1".to_string(),
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("integrity check"), "{msg}");
+        assert!(msg.contains("delete the \"role\" file"), "{msg}");
+    }
+
+    #[test]
+    fn a_crc_mismatch_fails_integrity_by_name() {
+        let disk = disk();
+        store_role(&disk, &Role::Primary).unwrap();
+        let file = disk.open(ROLE_FILE).unwrap();
+        // Flip one byte of the role line; the stored crc no longer matches.
+        file.write_at(0, b"Primary").unwrap();
+        file.sync().unwrap();
+
+        let err = load_role(&disk, &Role::Primary).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("integrity check (crc mismatch)"), "{msg}");
     }
 }

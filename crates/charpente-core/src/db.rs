@@ -562,17 +562,37 @@ impl Db {
         // with any compacted log is rejected the same way).
         let horizon = skip_through.map_or(0, |applied| applied + 1);
         let prefix = format!("{}/", cfg.wal.dir);
-        if let Some(first) = disk.list(&prefix)?.first() {
-            let base = parse_segment_name(&cfg.wal.dir, first)?;
-            if base > horizon {
-                return Err(io::Error::other(format!(
-                    "log base_seq is {base} but the store's durable horizon is only {horizon} \
-                     — acknowledged records between the horizon and the base exist in neither \
-                     the store nor the log; this is corruption or entry loss, never a state \
-                     Db::checkpoint's own gc can produce; restore this node from a replica or \
-                     backup (DESIGN §2)"
-                )));
+        match disk.list(&prefix)?.first() {
+            Some(first) => {
+                let base = parse_segment_name(&cfg.wal.dir, first)?;
+                if base > horizon {
+                    return Err(io::Error::other(format!(
+                        "log base_seq is {base} but the store's durable horizon is only \
+                         {horizon} — acknowledged records between the horizon and the base \
+                         exist in neither the store nor the log; this is corruption or entry \
+                         loss, never a state Db::checkpoint's own gc can produce; restore this \
+                         node from a replica or backup (DESIGN §2)"
+                    )));
+                }
             }
+            // A checkpointed store beside an EMPTY log directory: the
+            // mid-seed-finish crash shape (found by replication T6, seed
+            // 0xcaef83b2feb5edf5). `Seeder::finish` checkpoints the store at
+            // N and only then lays the seed segment and barriers its name —
+            // a crash between the two leaves exactly this state. It proves
+            // nothing was lost: every other route to a checkpointed store
+            // leaves at least one name-barriered segment (a segment's
+            // directory entry is barriered before any frame lands in it —
+            // DESIGN §2's fence 2), so no record above the horizon can have
+            // been acknowledged. Lay the segment `finish` would have — base
+            // = horizon + 1, nothing to replay — instead of letting
+            // `Wal::open` start a fresh log at 0 and trip the
+            // outran-durable-truth assert below.
+            None if skip_through.is_some() => {
+                disk.open(&segment_name(&cfg.wal.dir, horizon))?;
+                disk.sync_dir(&prefix)?;
+            }
+            None => {}
         }
         let machine = TableMachine {
             store,
@@ -735,6 +755,24 @@ impl Db {
 
     pub fn last_applied(&self) -> Option<u64> {
         self.engine.last_applied()
+    }
+
+    /// The lowest seq the local WAL still retains (`0` until `checkpoint`'s GC
+    /// has advanced it). The primary-side session engine (`charpente::repl`)
+    /// uses it to decide a `Hello`'s position: a follower whose next needed
+    /// seq is below this base has fallen off the retained log and must be
+    /// re-seeded from a snapshot rather than resumed with frames (DESIGN §5).
+    pub fn log_base(&self) -> u64 {
+        self.engine.wal().base_seq()
+    }
+
+    /// The registered table names, in schema-registry (sorted) order —
+    /// including the platform-owned `JobRow`. The seed producer
+    /// (`charpente::repl`) walks these to stream every table's rows to a
+    /// fresh follower (DESIGN §5); a live `Db` never hands its `Schema` back,
+    /// so this is the only reach to that walk order.
+    pub fn table_names(&self) -> Vec<&'static str> {
+        self.engine.machine().schema.table_names()
     }
 
     /// True once the engine or its WAL is poisoned — every further transact

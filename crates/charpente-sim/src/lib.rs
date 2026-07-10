@@ -648,6 +648,29 @@ impl Sim {
     pub fn durable_fingerprint(&self) -> u64 {
         fingerprint_files(&self.world.lock().disk.files)
     }
+
+    /// The earliest virtual time at which a currently in-flight network
+    /// message becomes deliverable (over every connection), or `None` when no
+    /// message is in flight. A multi-node test scheduler jumps here when no
+    /// node has immediate work — the deterministic analogue of blocking on a
+    /// socket. Read-only: draws no randomness and mutates nothing, so it
+    /// never perturbs a seed's replay.
+    pub fn next_wakeup(&self) -> Option<u64> {
+        let guard = self.world.lock();
+        let now = guard.now;
+        let mut next: Option<u64> = None;
+        for conn in guard.net.conns.values() {
+            // A conn delivers its queues in FIFO order, so only the front of
+            // each matters; a front already due (<= now) was drained by
+            // pump_io, and one for a dead conn no live node reads is ignored.
+            for (deliver_at, _) in [conn.to_a.front(), conn.to_b.front()].into_iter().flatten() {
+                if *deliver_at > now {
+                    next = Some(next.map_or(*deliver_at, |n| n.min(*deliver_at)));
+                }
+            }
+        }
+        next
+    }
 }
 
 /// A named simulated host: its own disk world, its own keyed fault/entropy
