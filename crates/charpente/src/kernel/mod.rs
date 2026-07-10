@@ -30,6 +30,16 @@ pub enum Wake {
     Shutdown,
 }
 
+/// The result of one `Kernel::step`. `Worked` serviced exactly one ready
+/// source; `Idle` found nothing ready and reports the earliest deadline to
+/// park on — `step` itself never blocks, so a driver (`run`, or a custom loop)
+/// parks on `Idle`. Extracting the loop body this way lets replication drive
+/// the same decision code without owning the park (T8).
+pub enum Step {
+    Worked,
+    Idle { deadline: Option<Instant> },
+}
+
 /// Where the kernel's requests come from: hyper's channel in production, a
 /// scripted timeline in the sim. `RequestSource` is the one seam DESIGN §1's
 /// same-shape rule allows — `Kernel::run` is otherwise identical code.
@@ -104,78 +114,92 @@ impl Kernel {
     /// The event loop (DESIGN §1 same-shape rule): identical code under
     /// `serve()` and under the sim; only the `RequestSource` impl differs.
     /// Returns `Ok(())` on source `Shutdown`; `Err` on platform IO failure
-    /// (poisoned engine — restart to recover).
+    /// (poisoned engine — restart to recover). Thin wrapper over `step`: it
+    /// owns the park, `step` owns the decision.
     pub fn run(&mut self, source: &mut dyn RequestSource) -> io::Result<()> {
         loop {
-            if self.pending.is_none() {
-                self.pending = source.poll();
-            }
-            let now = self.clock.now().as_nanos();
-            let mut ready = Vec::with_capacity(3);
-            if self.pending.is_some() {
-                ready.push(Ready::Request);
-            }
-            if self.dispatcher.has_due(now) {
-                ready.push(Ready::Job);
-            }
-            if self.cron.has_due(now) {
-                ready.push(Ready::Cron);
-            }
-            if ready.is_empty() {
-                let deadline = [self.dispatcher.next_deadline(), self.cron.next_deadline()]
-                    .into_iter()
-                    .flatten()
-                    .min()
-                    .map(Instant::from_nanos);
-                match source.wait_until(deadline) {
-                    Wake::Shutdown => return Ok(()),
-                    Wake::Ready | Wake::Deadline => continue,
-                }
-            }
-            // The same-shape decision site (DESIGN §1): one entropy draw
-            // picks among ready sources, only when contended — an idle
-            // iteration (exactly one ready source) must not consume entropy.
-            let choice = if ready.len() == 1 {
-                ready[0]
-            } else {
-                ready[(self.app.entropy().next_u64() % ready.len() as u64) as usize]
-            };
-            match choice {
-                Ready::Request => {
-                    let (request, reply) = self.pending.take().expect("checked above");
-                    let response = self.app.handle(request);
-                    reply(response);
-                    self.stats.requests += 1;
-                    // Spec 2026-07-05 (request-arm ruling): a request-path Io
-                    // is absorbed into a 500 for the client, but a poisoned
-                    // engine serves no one — stop; restart-and-recover is the
-                    // only exit from poison. Non-poisoning faults continue.
-                    if self.app.db_mut().poisoned() {
-                        return Err(io::Error::other(
-                            "kernel stopped: the engine is poisoned (a request-path IO failure \
-                             made durability unknowable) — the request received its 500; \
-                             restart the process to recover from the WAL",
-                        ));
-                    }
-                }
-                Ready::Job => match self.dispatcher.run_due(self.app.db_mut(), now)? {
-                    JobOutcome::Done { .. } => self.stats.jobs_done += 1,
-                    JobOutcome::Retried { .. } => self.stats.jobs_retried += 1,
-                    JobOutcome::Dead { .. } => self.stats.jobs_dead += 1,
-                },
-                Ready::Cron => {
-                    let (_, catchup) = self.cron.tick(self.app.db_mut(), now)?;
-                    self.stats.cron_ticks += 1;
-                    if catchup {
-                        self.stats.cron_catchups += 1;
+            match self.step(source)? {
+                Step::Worked => {}
+                Step::Idle { deadline } => {
+                    if let Wake::Shutdown = source.wait_until(deadline) {
+                        return Ok(());
                     }
                 }
             }
-            // Any serviced source may have enqueued (handlers can enqueue
-            // too), so this runs after every branch above, not just Job.
-            self.dispatcher
-                .note_enqueued(self.app.db_mut().drain_enqueued());
         }
+    }
+
+    /// One iteration of the loop: build the ready set, service exactly one
+    /// ready source (the same-shape decision, DESIGN §1), and return `Worked`;
+    /// or, when nothing is ready, return `Idle { deadline }` without parking.
+    /// The replication kernel arm and the park tick land here in T8.
+    pub fn step(&mut self, source: &mut dyn RequestSource) -> io::Result<Step> {
+        if self.pending.is_none() {
+            self.pending = source.poll();
+        }
+        let now = self.clock.now().as_nanos();
+        let mut ready = Vec::with_capacity(3);
+        if self.pending.is_some() {
+            ready.push(Ready::Request);
+        }
+        if self.dispatcher.has_due(now) {
+            ready.push(Ready::Job);
+        }
+        if self.cron.has_due(now) {
+            ready.push(Ready::Cron);
+        }
+        if ready.is_empty() {
+            let deadline = [self.dispatcher.next_deadline(), self.cron.next_deadline()]
+                .into_iter()
+                .flatten()
+                .min()
+                .map(Instant::from_nanos);
+            return Ok(Step::Idle { deadline });
+        }
+        // The same-shape decision site (DESIGN §1): one entropy draw
+        // picks among ready sources, only when contended — an idle
+        // iteration (exactly one ready source) must not consume entropy.
+        let choice = if ready.len() == 1 {
+            ready[0]
+        } else {
+            ready[(self.app.entropy().next_u64() % ready.len() as u64) as usize]
+        };
+        match choice {
+            Ready::Request => {
+                let (request, reply) = self.pending.take().expect("checked above");
+                let response = self.app.handle(request);
+                reply(response);
+                self.stats.requests += 1;
+                // Spec 2026-07-05 (request-arm ruling): a request-path Io
+                // is absorbed into a 500 for the client, but a poisoned
+                // engine serves no one — stop; restart-and-recover is the
+                // only exit from poison. Non-poisoning faults continue.
+                if self.app.db_mut().poisoned() {
+                    return Err(io::Error::other(
+                        "kernel stopped: the engine is poisoned (a request-path IO failure \
+                         made durability unknowable) — the request received its 500; \
+                         restart the process to recover from the WAL",
+                    ));
+                }
+            }
+            Ready::Job => match self.dispatcher.run_due(self.app.db_mut(), now)? {
+                JobOutcome::Done { .. } => self.stats.jobs_done += 1,
+                JobOutcome::Retried { .. } => self.stats.jobs_retried += 1,
+                JobOutcome::Dead { .. } => self.stats.jobs_dead += 1,
+            },
+            Ready::Cron => {
+                let (_, catchup) = self.cron.tick(self.app.db_mut(), now)?;
+                self.stats.cron_ticks += 1;
+                if catchup {
+                    self.stats.cron_catchups += 1;
+                }
+            }
+        }
+        // Any serviced source may have enqueued (handlers can enqueue
+        // too), so this runs after every branch above, not just Job.
+        self.dispatcher
+            .note_enqueued(self.app.db_mut().drain_enqueued());
+        Ok(Step::Worked)
     }
 
     pub fn stats(&self) -> KernelStats {
