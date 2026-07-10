@@ -44,6 +44,19 @@ pub(crate) struct Follower {
     /// The seed in progress: `Some` once `SnapshotStart` opens one. Cleared and
     /// re-opened by a fresh `SnapshotStart` (a mid-seed reconnect restarts it).
     seed: Option<SeedInProgress>,
+    /// A `HandOff { at_seq }` received from the primary during a switchover:
+    /// `Repl` consumes it in `step` (verifies position, flips this node to
+    /// primary, sends `HandOffDone`). Task 7.
+    handoff: Option<u64>,
+    /// Startup resolution of a durable `HandingOff { to }` role (Task 7, spec
+    /// §2): this client probes `to`; a ship response confirms `to` is primary
+    /// (this node demotes to its follower), a `not-a-primary` refusal means
+    /// `to` has not been promoted yet (retry), any other refusal is a diverged
+    /// timeline (the operator's re-seed signal, surfaced as the step error).
+    resolving: bool,
+    /// Set when a probe confirmed `to` is primary; `Repl` reads it to perform
+    /// the durable demote, then clears both flags via `took_resolution`.
+    resolved: bool,
 }
 
 struct SeedInProgress {
@@ -64,12 +77,61 @@ impl Follower {
             inbox: VecDeque::new(),
             reconnect_at: None,
             seed: None,
+            handoff: None,
+            resolving: false,
+            resolved: false,
         }
+    }
+
+    /// A client that probes `to` to resolve a durable `HandingOff { to }` role
+    /// at startup (spec §2). Otherwise identical to `new`.
+    pub(crate) fn new_resolving(to: String, my_listen: Option<String>) -> Follower {
+        let mut f = Follower::new(to, my_listen);
+        f.resolving = true;
+        f
     }
 
     /// True once `SnapshotEnd` has landed: the caller must run `run_seed`.
     pub(crate) fn needs_reseed(&self) -> bool {
         self.seed.as_ref().is_some_and(|s| s.complete)
+    }
+
+    /// A received `HandOff` awaiting `Repl` (which owns the durable role flip).
+    pub(crate) fn handoff_pending(&self) -> bool {
+        self.handoff.is_some()
+    }
+
+    /// Takes the received `HandOff`'s `at_seq` for `Repl` to promote against.
+    pub(crate) fn take_handoff(&mut self) -> Option<u64> {
+        self.handoff.take()
+    }
+
+    /// True once a `HandingOff` probe confirmed `to` is primary; consumes the
+    /// signal and leaves this a plain follower client of `to`.
+    pub(crate) fn took_resolution(&mut self) -> bool {
+        if self.resolved {
+            self.resolved = false;
+            self.resolving = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Best-effort `Refuse` on the current conn (a named protocol rejection the
+    /// primary logs verbatim); the conn is torn down by the caller afterward.
+    pub(crate) fn refuse(&self, message: String) {
+        if let Some(c) = &self.conn {
+            let _ = c.send(&encode(&Msg::Refuse { message }));
+        }
+    }
+
+    /// Best-effort `HandOffDone` on the current conn — the promoted follower's
+    /// last word to the draining primary before the conn is dropped.
+    pub(crate) fn send_handoff_done(&self) {
+        if let Some(c) = &self.conn {
+            let _ = c.send(&encode(&Msg::HandOffDone));
+        }
     }
 
     /// Non-destructive IO movement (pump_io): drain readable messages into the
@@ -100,13 +162,22 @@ impl Follower {
     }
 
     pub(crate) fn has_work(&self, now: u64) -> bool {
+        if self.handoff.is_some() {
+            return true; // Repl must accept the hand-off
+        }
         if self.needs_reseed() {
             return false; // run_seed handles it
+        }
+        // Buffered messages are processed before any reconnect (a HandOff or
+        // trailing frames received right before the conn dropped must not be
+        // stranded).
+        if !self.inbox.is_empty() {
+            return true;
         }
         if self.conn.is_none() {
             return self.reconnect_at.is_none_or(|t| now >= t);
         }
-        !self.inbox.is_empty()
+        false
     }
 
     pub(crate) fn next_deadline(&self, _now: u64) -> Option<u64> {
@@ -117,20 +188,39 @@ impl Follower {
         }
     }
 
-    /// One unit of work: connect + `Hello` when disconnected and due, or
-    /// handle one inbox message.
+    /// One unit of work: handle one buffered message, else connect + `Hello`
+    /// when disconnected and due. Buffered messages come first so a `HandOff`
+    /// (or trailing frames) received in the same drain as the conn's EOF is
+    /// processed rather than lost to the reconnect (the conn only drops once
+    /// the inbox is empty, so a re-Hello never races stale buffered frames).
     pub(crate) fn step(&mut self, net: &dyn Net, db: &mut Db, now: u64) -> io::Result<()> {
-        if self.conn.is_none() {
-            if self.reconnect_at.is_some_and(|t| now < t) {
-                return Ok(()); // backoff not yet due — has_work gates this,
-                // but a caller stepping unconditionally must not spin connects
-            }
-            return self.connect_and_hello(net, db, now);
-        }
         let Some(raw) = self.inbox.pop_front() else {
-            return Ok(());
+            if self.conn.is_none() && self.reconnect_at.is_none_or(|t| now >= t) {
+                return self.connect_and_hello(net, db, now);
+            }
+            return Ok(()); // backoff not yet due, or connected and idle
         };
-        match decode(&raw)? {
+        let msg = decode(&raw)?;
+        // Startup HandingOff resolution (spec §2): the first response from the
+        // probed `to` decides whether this node demotes.
+        if self.resolving {
+            match &msg {
+                // `to` isn't primary yet — nothing to resolve against; back off
+                // and retry (never a hard error, never a silent resume).
+                Msg::Refuse { message } if message.contains("not a primary") => {
+                    self.disconnect(now);
+                    return Ok(());
+                }
+                // A diverged/other refusal is the operator's re-seed signal.
+                Msg::Refuse { message } => return Err(io::Error::other(message.clone())),
+                // Any ship message proves `to` is a primary: Repl demotes this
+                // node to Follower(to) after this step (the message applies
+                // normally below — apply_shipped is idempotent under crash, so
+                // applying before the durable flip is safe).
+                _ => self.resolved = true,
+            }
+        }
+        match msg {
             Msg::Frames { frames } => self.apply_and_ack(db, &frames, now),
             Msg::SnapshotStart {
                 applied_seq,
@@ -174,6 +264,12 @@ impl Follower {
                 Ok(())
             }
             Msg::Heartbeat { .. } => Ok(()), // liveness only in v1
+            // Switchover hand-off: the drain reached `at_seq`. Latch it for
+            // Repl, which owns the durable Primary flip and the HandOffDone.
+            Msg::HandOff { at_seq } => {
+                self.handoff = Some(at_seq);
+                Ok(())
+            }
             Msg::Refuse { message } => Err(io::Error::other(message)),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,

@@ -37,9 +37,22 @@ pub(crate) enum Phase {
     Shipping,
 }
 
+/// A control verb parked on a fresh connection, decoded but not yet acted on:
+/// role changes are `Repl`-level (they flip the durable role, re-gate the `Db`,
+/// re-wire the retention pin), so the session only records the verb and `Repl`
+/// executes it in `step` (Task 7).
+pub(crate) enum PendingCtrl {
+    Promote,
+    Switchover(String),
+}
+
 /// One primary-side replication session.
 pub(crate) struct Session {
     conn: Box<dyn Conn>,
+    /// Stable id assigned at accept: `Repl` addresses the control connection to
+    /// reply on (across reaps that reorder the Vec) and the ship session it
+    /// last sent a `HandOff` to by this id.
+    pub id: u64,
     /// The follower's own replication address, learned from its `Hello`
     /// (switchover targets sessions by it — Task 7).
     pub listen: Option<String>,
@@ -48,6 +61,12 @@ pub(crate) struct Session {
     /// The highest seq the follower has acknowledged durable, if any.
     pub acked: Option<u64>,
     phase: Phase,
+    /// A control connection: its first message was a control verb, not a
+    /// `Hello`. It ships nothing, heartbeats nothing, and pins no retention;
+    /// `Repl` drives the verb and replies on it.
+    pub control: bool,
+    /// A decoded-but-unexecuted control verb (`Repl` consumes it in `step`).
+    pub pending_ctrl: Option<PendingCtrl>,
     /// Lazily allocated once, reused: sized to the largest message the wire
     /// can carry (spec §1's "one buffer per conn").
     recv_buf: Option<Vec<u8>>,
@@ -60,13 +79,16 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    pub(crate) fn new(conn: Box<dyn Conn>) -> Session {
+    pub(crate) fn new(conn: Box<dyn Conn>, id: u64) -> Session {
         Session {
             conn,
+            id,
             listen: None,
             cursor: 0,
             acked: None,
             phase: Phase::AwaitHello,
+            control: false,
+            pending_ctrl: None,
             recv_buf: None,
             inbox: VecDeque::new(),
             last_sent: 0,
@@ -79,6 +101,10 @@ impl Session {
     /// position + 1 while seeding; the resume point while shipping). mod.rs
     /// mins this over live sessions (spec §1's retention pin).
     pub(crate) fn pin_floor(&self) -> u64 {
+        // A control connection ships nothing and must never hold GC.
+        if self.control {
+            return u64::MAX;
+        }
         self.acked.map_or(self.cursor, |a| a + 1)
     }
 
@@ -107,6 +133,11 @@ impl Session {
 
     /// True when this session has a unit of work to do now.
     pub(crate) fn has_work(&self, db: &Db, now: u64) -> bool {
+        // A control connection's only work is a decoded verb waiting for `Repl`
+        // to execute it; it never ships or heartbeats.
+        if self.control {
+            return self.pending_ctrl.is_some();
+        }
         if !self.inbox.is_empty() {
             return true;
         }
@@ -131,6 +162,11 @@ impl Session {
     /// snapshot/frames/heartbeat message. `role` decides `Hello` handling — a
     /// primary serves the ladder, a follower/backup refuses (no cascading).
     pub(crate) fn service(&mut self, db: &Db, now: u64, role: &Role) -> io::Result<()> {
+        // A control connection is driven by `Repl` (which owns the durable role
+        // and pin); the round-robin never ships on it.
+        if self.control {
+            return Ok(());
+        }
         if let Some(raw) = self.inbox.pop_front() {
             let msg = match decode(&raw) {
                 Ok(msg) => msg,
@@ -205,17 +241,33 @@ impl Session {
                 self.acked = Some(durable_seq);
                 Ok(())
             }
-            Msg::CtrlPromote
-            | Msg::CtrlSwitchover { .. }
-            | Msg::HandOff { .. }
-            | Msg::HandOffDone => {
-                // The control plane is Task 7; refuse politely by name until
-                // then (no todo!/unimplemented! — house rule).
+            // A control verb opens a control connection: record it and let
+            // `Repl` execute it (the role flip, `Db` re-gate, and pin re-wire
+            // are all `Repl`-level). No reply here — `Repl` answers on this
+            // conn once the verb resolves.
+            Msg::CtrlPromote => {
+                self.control = true;
+                self.pending_ctrl = Some(PendingCtrl::Promote);
+                Ok(())
+            }
+            Msg::CtrlSwitchover { to } => {
+                self.control = true;
+                self.pending_ctrl = Some(PendingCtrl::Switchover(to));
+                Ok(())
+            }
+            // Hand-off frames travel over an established ship session or the
+            // follower client, never a fresh conn — one arriving here is a
+            // protocol error (a `HandOffDone` on the live drain session is
+            // drained by `Repl` before the round-robin, see
+            // `drain_switchover_inbox`).
+            other @ (Msg::HandOff { .. } | Msg::HandOffDone) => {
                 self.send(
-                    &Msg::CtrlErr {
-                        message: "replication control verbs (promote/switchover/hand-off) are \
-                                  not implemented until replication task 7"
-                            .to_string(),
+                    &Msg::Refuse {
+                        message: format!(
+                            "unexpected {} on a fresh replication connection — hand-off frames \
+                             belong to an established switchover, not a new conn",
+                            other.name()
+                        ),
                     },
                     now,
                 );
@@ -306,6 +358,32 @@ impl Session {
         } else {
             self.last_sent = now;
         }
+    }
+
+    /// Sends one message on this session's conn (a control reply, or the drain's
+    /// `HandOff`); marks the session dead on wire failure so `Repl` can react.
+    pub(crate) fn reply(&mut self, msg: &Msg, now: u64) {
+        self.send(msg, now);
+    }
+
+    /// During an active switchover, `Repl` drains the target ship session's
+    /// inbox here — instead of the round-robin's `service` — so a `HandOffDone`
+    /// buffered alongside the peer's EOF is read before the dead-session reap
+    /// discards it. Folds `Ack`s into `acked` (drain-completion rides them);
+    /// returns whether a `HandOffDone` was seen. A malformed frame on the
+    /// reliable sim wire is ignored (the drain has its deadline backstop).
+    pub(crate) fn drain_switchover_inbox(&mut self) -> bool {
+        let mut done = false;
+        while let Some(raw) = self.inbox.pop_front() {
+            if let Ok(msg) = decode(&raw) {
+                match msg {
+                    Msg::Ack { durable_seq } => self.acked = Some(durable_seq),
+                    Msg::HandOffDone => done = true,
+                    _ => {}
+                }
+            }
+        }
+        done
     }
 }
 

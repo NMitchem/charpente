@@ -20,8 +20,9 @@ use charpente_core::io::{Clock, Disk, Listener, Net};
 
 use crate::Db;
 use crate::repl::follower::Follower;
-use crate::repl::role::{Role, load_role};
-use crate::repl::session::Session;
+use crate::repl::protocol::Msg;
+use crate::repl::role::{Role, load_role, store_role};
+use crate::repl::session::{PendingCtrl, Session};
 
 mod follower;
 pub mod protocol;
@@ -81,20 +82,50 @@ pub struct ReplStats {
     pub seeds: u64,
 }
 
+/// Which half of the switchover a draining primary is in (spec §2). `Draining`
+/// is abortable (deadline → back to `Primary`); `HandedOff` — the `HandOff` is
+/// sent — is the point of no return (deadline → stay write-stopped).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwitchoverPhase {
+    Draining,
+    HandedOff,
+}
+
+/// A live switchover in progress on the primary side (spec §2).
+struct Switchover {
+    /// The target follower's listen address (the switchover target).
+    to: String,
+    /// The control connection (a `Session` by id) awaiting `CtrlOk`/`CtrlErr`.
+    ctrl_id: u64,
+    phase: SwitchoverPhase,
+    /// Virtual-time nanos at which the drain (or the HandedOff wait) gives up.
+    deadline: u64,
+    /// The ship session id we last sent a `HandOff` to — so a reconnect (a new
+    /// session id for the same follower) gets a fresh `HandOff` (loss liveness).
+    handoff_sent_id: Option<u64>,
+}
+
 /// The replication engine for one node: the durable role, the listener (when
 /// configured), the live primary-side sessions, the follower-side client (on
 /// a follower/backup), and the retention pin wired into the `Db`.
 pub struct Repl {
     role: Role,
     net: Box<dyn Net>,
-    // Held for task 7's durable role flips (switchover/promote write here);
-    // unused in the data plane.
-    #[allow(dead_code)]
+    /// The durable role file's disk — every role flip (switchover/promote/
+    /// demote) writes here before it takes effect.
     role_disk: Box<dyn Disk>,
+    /// This node's own replication listen address (from config), stamped into a
+    /// follower client's `Hello` so a later switchover can target this node.
+    my_listen: Option<String>,
     listener: Option<Box<dyn Listener>>,
     sessions: Vec<Session>,
     rr_cursor: usize,
+    /// Monotonic id source for accepted sessions (control-conn addressing).
+    next_session_id: u64,
     follower: Option<Follower>,
+    /// A switchover this node initiated as primary (`None` otherwise).
+    switchover: Option<Switchover>,
     /// The retention floor `Db::checkpoint`'s GC never deletes past — the min
     /// over live sessions of each session's pin (spec §1). `u64::MAX` (no
     /// pin) when there are no sessions.
@@ -139,7 +170,13 @@ impl Repl {
             Role::Follower { primary } | Role::Backup { primary } => {
                 Some(Follower::new(primary.clone(), cfg.listen.clone()))
             }
-            _ => None,
+            // A durable `HandingOff` at open means this node restarted mid-
+            // switchover (spec §2): it stays write-stopped and probes `to` to
+            // resolve (demote to its follower once `to` is confirmed primary).
+            Role::HandingOff { to } => {
+                Some(Follower::new_resolving(to.clone(), cfg.listen.clone()))
+            }
+            Role::Primary => None,
         };
 
         Ok((
@@ -147,10 +184,13 @@ impl Repl {
                 role,
                 net,
                 role_disk,
+                my_listen: cfg.listen.clone(),
                 listener,
                 sessions: Vec::new(),
                 rr_cursor: 0,
+                next_session_id: 0,
                 follower,
+                switchover: None,
                 pin_floor,
                 stats: ReplStats::default(),
             },
@@ -171,6 +211,13 @@ impl Repl {
         self.stats
     }
 
+    /// The switchover half this node is in, if it is draining one (test hook —
+    /// the crash-between-handoff-and-demote property drives to `HandedOff`).
+    #[doc(hidden)]
+    pub fn switchover_phase(&self) -> Option<SwitchoverPhase> {
+        self.switchover.as_ref().map(|s| s.phase)
+    }
+
     /// Non-destructive IO movement, called unconditionally each iteration like
     /// `source.poll()`: accept pending conns, drain readable messages into
     /// internal queues, note reconnect timers. No `Db` access.
@@ -179,7 +226,9 @@ impl Repl {
             // Accept until there is no pending conn, or the listener is dead
             // (host crashed — recovery reopens it). `while let` stops on both.
             while let Ok(Some(conn)) = listener.accept() {
-                self.sessions.push(Session::new(conn));
+                let id = self.next_session_id;
+                self.next_session_id += 1;
+                self.sessions.push(Session::new(conn, id));
             }
             self.recompute_pin(); // fresh AwaitHello sessions floor the pin at 0
         }
@@ -196,6 +245,18 @@ impl Repl {
     pub fn has_work(&self, db: &Db, now_nanos: u64) -> bool {
         if self.db_needs_reseed() {
             return true; // the caller must run_seed; step() no-ops until it does
+        }
+        // A received hand-off (follower side) or a switchover deadline reached
+        // (primary side) both demand a step even with no session traffic.
+        if self.follower.as_ref().is_some_and(|f| f.handoff_pending()) {
+            return true;
+        }
+        if self
+            .switchover
+            .as_ref()
+            .is_some_and(|sw| now_nanos >= sw.deadline)
+        {
+            return true;
         }
         if self.sessions.iter().any(|s| s.dead) {
             return true;
@@ -225,6 +286,11 @@ impl Repl {
         {
             fold(d);
         }
+        // The switchover drain/HandedOff deadline: the scheduler must advance
+        // virtual time to it so the abort/stall fires when nothing else runs.
+        if let Some(sw) = &self.switchover {
+            fold(sw.deadline);
+        }
         best
     }
 
@@ -238,11 +304,37 @@ impl Repl {
         }
         let now = clock.now().as_nanos();
 
+        // Follower side: a switchover HandOff arrived — become primary.
+        if self.follower.as_ref().is_some_and(|f| f.handoff_pending()) {
+            let at_seq = self
+                .follower
+                .as_mut()
+                .and_then(Follower::take_handoff)
+                .expect("handoff_pending was true");
+            return self.accept_handoff(db, at_seq, now);
+        }
+
+        // Primary side: drive an active switchover. A terminal transition
+        // (HandOff sent, completed, aborted, stalled) consumes the step;
+        // otherwise fall through so the round-robin ships and catches the
+        // target up.
+        if self.switchover.is_some() && self.drive_switchover(db, now)? {
+            return Ok(());
+        }
+
         let before = self.sessions.len();
         self.sessions.retain(|s| !s.dead);
         if self.sessions.len() != before {
             self.rr_cursor = 0;
             self.recompute_pin();
+        }
+
+        // A control verb parked on a fresh conn: execute it (promote, or begin
+        // a switchover). Handled before the round-robin, which skips it.
+        for idx in 0..self.sessions.len() {
+            if self.sessions[idx].pending_ctrl.is_some() {
+                return self.begin_control(db, idx, now);
+            }
         }
 
         let n = self.sessions.len();
@@ -257,10 +349,424 @@ impl Repl {
             }
         }
 
-        if let Some(f) = &mut self.follower {
-            return f.step(&*self.net, db, now);
+        // Follower client (also the HandingOff resolver). A confirmed probe
+        // demotes this node to a plain follower of `to`.
+        let resolved = if let Some(f) = &mut self.follower {
+            f.step(&*self.net, db, now)?;
+            f.took_resolution()
+        } else {
+            false
+        };
+        if resolved {
+            let to = match &self.role {
+                Role::HandingOff { to } => to.clone(),
+                // took_resolution only fires on a HandingOff resolver.
+                _ => return Ok(()),
+            };
+            self.resolve_to_follower(db, &to)?;
         }
         Ok(())
+    }
+
+    // ------------------------------------------------------ control plane
+
+    /// Drives an active switchover one step (spec §2). Returns `true` when a
+    /// terminal transition consumed this step; `false` to fall through to the
+    /// round-robin so the drain keeps shipping to the target.
+    fn drive_switchover(&mut self, db: &mut Db, now: u64) -> io::Result<bool> {
+        let (to, phase, deadline, ctrl_id, handoff_sent_id) = {
+            let sw = self.switchover.as_ref().expect("active switchover");
+            (
+                sw.to.clone(),
+                sw.phase,
+                sw.deadline,
+                sw.ctrl_id,
+                sw.handoff_sent_id,
+            )
+        };
+        let last = db.last_applied();
+
+        // Read the target's acks + any HandOffDone from EVERY session
+        // advertising `to` (a reconnect may have left a stale/dead one still in
+        // the Vec before the reap; a HandOffDone can also arrive buffered with
+        // the peer's EOF). Take the highest acked seen, and prefer a live
+        // session to send the HandOff on.
+        let mut got_done = false;
+        let mut best_acked: Option<u64> = None;
+        let mut live_target: Option<usize> = None;
+        for (i, s) in self.sessions.iter_mut().enumerate() {
+            if !s.control && s.listen.as_deref() == Some(to.as_str()) {
+                got_done |= s.drain_switchover_inbox();
+                best_acked = best_acked.max(s.acked);
+                if !s.dead {
+                    live_target = Some(i);
+                }
+            }
+        }
+        let caught_up = best_acked == last && last.is_some();
+
+        match phase {
+            SwitchoverPhase::Draining => {
+                if now >= deadline {
+                    self.abort_switchover(db, ctrl_id, &to, last, best_acked, now);
+                    return Ok(true);
+                }
+                // Send the HandOff only when caught up AND a live session
+                // exists. A dead target at catch-up means the follower just
+                // disconnected — stay Draining and wait for its reconnect.
+                if caught_up && let Some(i) = live_target {
+                    let at = last.expect("caught_up implies a durable position");
+                    self.sessions[i].reply(&Msg::HandOff { at_seq: at }, now);
+                    // A failed send (conn drop) leaves us Draining — the
+                    // follower reconnects and the drain resumes. A success is
+                    // the point of no return.
+                    if !self.sessions[i].dead {
+                        let sid = self.sessions[i].id;
+                        let sw = self.switchover.as_mut().expect("active switchover");
+                        sw.phase = SwitchoverPhase::HandedOff;
+                        sw.handoff_sent_id = Some(sid);
+                    }
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            SwitchoverPhase::HandedOff => {
+                if got_done {
+                    self.complete_switchover(db, ctrl_id, &to, now)?;
+                    return Ok(true);
+                }
+                if now >= deadline {
+                    self.stall_switchover(ctrl_id, &to, now);
+                    return Ok(true);
+                }
+                // The HandOff was lost and the follower reconnected (a fresh
+                // session id, caught up again): resend once. If the follower
+                // already promoted it will not reconnect, so this never
+                // double-promotes.
+                if caught_up && let Some(i) = live_target {
+                    let sid = self.sessions[i].id;
+                    if handoff_sent_id != Some(sid) {
+                        let at = last.expect("caught_up implies a durable position");
+                        self.sessions[i].reply(&Msg::HandOff { at_seq: at }, now);
+                        if !self.sessions[i].dead {
+                            let sw = self.switchover.as_mut().expect("active switchover");
+                            sw.handoff_sent_id = Some(sid);
+                        }
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    /// Executes a control verb parked on session `idx`.
+    fn begin_control(&mut self, db: &mut Db, idx: usize, now: u64) -> io::Result<()> {
+        let verb = self.sessions[idx]
+            .pending_ctrl
+            .take()
+            .expect("begin_control on a session with a pending verb");
+        let ctrl_id = self.sessions[idx].id;
+        match verb {
+            PendingCtrl::Promote => self.do_promote(db, ctrl_id, now),
+            PendingCtrl::Switchover(to) => self.begin_switchover(db, ctrl_id, to, now),
+        }
+    }
+
+    /// `promote` — failover, bounded loss (spec §2). A follower/backup flips
+    /// durably to primary, drops its upstream client, and starts serving.
+    fn do_promote(&mut self, db: &mut Db, ctrl_id: u64, now: u64) -> io::Result<()> {
+        match self.role.clone() {
+            Role::Primary => {
+                self.reply_ctrl(
+                    ctrl_id,
+                    &Msg::CtrlErr {
+                        message: "cannot promote: this node is already the primary".to_string(),
+                    },
+                    now,
+                );
+                return Ok(());
+            }
+            Role::HandingOff { to } => {
+                self.reply_ctrl(
+                    ctrl_id,
+                    &Msg::CtrlErr {
+                        message: format!(
+                            "cannot promote: this node is handing off to {to} — let the \
+                             switchover finish or restart to resolve, then promote if needed"
+                        ),
+                    },
+                    now,
+                );
+                return Ok(());
+            }
+            Role::Follower { .. } | Role::Backup { .. } => {}
+        }
+        if self.my_listen.is_none() {
+            self.reply_ctrl(
+                ctrl_id,
+                &Msg::CtrlErr {
+                    message: "cannot promote: this node has no replication listen address and \
+                              so cannot serve as a primary — restart it with one configured"
+                        .to_string(),
+                },
+                now,
+            );
+            return Ok(());
+        }
+        store_role(&*self.role_disk, &Role::Primary)?;
+        self.role = Role::Primary;
+        db.allow_writes();
+        self.follower = None; // no upstream — this is the authoritative timeline now
+        let last = db.last_applied();
+        self.reply_ctrl(
+            ctrl_id,
+            &Msg::CtrlOk {
+                message: format!(
+                    "promoted to primary at last_applied {last:?} — records the previous primary \
+                     acked but had not yet shipped are lost (the DECISIONS §6 failover window); \
+                     this timeline is now authoritative"
+                ),
+            },
+            now,
+        );
+        self.recompute_pin();
+        Ok(())
+    }
+
+    /// `switchover` — begin the zero-loss drain (spec §2). Requires a live
+    /// session from a follower advertising `to`; flips durably to
+    /// `HandingOff(to)`, write-stops, and starts draining. The control conn is
+    /// held open (by id) for the eventual `CtrlOk`/`CtrlErr`.
+    fn begin_switchover(
+        &mut self,
+        db: &mut Db,
+        ctrl_id: u64,
+        to: String,
+        now: u64,
+    ) -> io::Result<()> {
+        match self.role.clone() {
+            Role::Follower { primary } | Role::Backup { primary } => {
+                self.reply_ctrl(
+                    ctrl_id,
+                    &Msg::CtrlErr {
+                        message: format!(
+                            "cannot switch over: this node is not the primary (it follows \
+                             {primary}) — issue the switchover to the primary"
+                        ),
+                    },
+                    now,
+                );
+                return Ok(());
+            }
+            Role::HandingOff { to: cur } => {
+                self.reply_ctrl(
+                    ctrl_id,
+                    &Msg::CtrlErr {
+                        message: format!("cannot switch over: already handing off to {cur}"),
+                    },
+                    now,
+                );
+                return Ok(());
+            }
+            Role::Primary => {}
+        }
+        let found = self
+            .sessions
+            .iter()
+            .any(|s| !s.control && s.listen.as_deref() == Some(to.as_str()));
+        if !found {
+            let known: Vec<String> = self
+                .sessions
+                .iter()
+                .filter(|s| !s.control)
+                .filter_map(|s| s.listen.clone())
+                .collect();
+            self.reply_ctrl(
+                ctrl_id,
+                &Msg::CtrlErr {
+                    message: format!(
+                        "cannot switch over to {to}: no replication session from a follower \
+                         listening at {to} — known followers: {known:?} (the target must be a \
+                         connected follower advertising {to} as its listen address)"
+                    ),
+                },
+                now,
+            );
+            return Ok(());
+        }
+        // Point of departure: durable role flips BEFORE we act on it.
+        store_role(&*self.role_disk, &Role::HandingOff { to: to.clone() })?;
+        self.role = Role::HandingOff { to: to.clone() };
+        db.forbid_writes(to.clone());
+        self.switchover = Some(Switchover {
+            to,
+            ctrl_id,
+            phase: SwitchoverPhase::Draining,
+            deadline: now + SWITCHOVER_DEADLINE_NANOS,
+            handoff_sent_id: None,
+        });
+        Ok(())
+    }
+
+    /// A `HandOff` landed on the follower client: verify the position, flip
+    /// durably to primary, ack with `HandOffDone`, and start serving Hellos.
+    fn accept_handoff(&mut self, db: &mut Db, at_seq: u64, _now: u64) -> io::Result<()> {
+        if db.last_applied() != Some(at_seq) {
+            // The drain waits for acked == last, so this should be impossible;
+            // a named protocol error rather than a silent wrong promotion.
+            let msg = format!(
+                "hand-off protocol error: the primary handed off at seq {at_seq} but this \
+                 follower's last_applied is {:?} — the drain did not reach equality",
+                db.last_applied()
+            );
+            if let Some(f) = &self.follower {
+                f.refuse(msg.clone());
+            }
+            return Err(io::Error::other(msg));
+        }
+        if self.my_listen.is_none() {
+            let msg = "hand-off refused: this follower has no replication listen address and \
+                       cannot become a primary"
+                .to_string();
+            if let Some(f) = &self.follower {
+                f.refuse(msg.clone());
+            }
+            return Err(io::Error::other(msg));
+        }
+        store_role(&*self.role_disk, &Role::Primary)?;
+        self.role = Role::Primary;
+        db.allow_writes();
+        if let Some(f) = &self.follower {
+            f.send_handoff_done(); // on the old client conn, before it is dropped
+        }
+        self.follower = None; // drops the upstream conn — this node is primary
+        self.recompute_pin();
+        Ok(())
+    }
+
+    /// The drain caught up and the follower confirmed `HandOffDone`: flip
+    /// durably to `Follower(to)`, drop the old ship sessions, and start a
+    /// follower client toward the new primary. No divergence is possible — the
+    /// drain reached byte-for-byte equality.
+    fn complete_switchover(
+        &mut self,
+        db: &mut Db,
+        ctrl_id: u64,
+        to: &str,
+        now: u64,
+    ) -> io::Result<()> {
+        store_role(
+            &*self.role_disk,
+            &Role::Follower {
+                primary: to.to_string(),
+            },
+        )?;
+        self.role = Role::Follower {
+            primary: to.to_string(),
+        };
+        db.forbid_writes(to.to_string());
+        // Reply on the control conn while it is still in the Vec.
+        self.reply_ctrl(
+            ctrl_id,
+            &Msg::CtrlOk {
+                message: format!(
+                    "switchover to {to} complete — this node is now a follower of {to}"
+                ),
+            },
+            now,
+        );
+        self.sessions.clear(); // drop every ship session (and the control conn)
+        self.switchover = None;
+        self.follower = Some(Follower::new(to.to_string(), self.my_listen.clone()));
+        self.recompute_pin();
+        Ok(())
+    }
+
+    /// The drain could not catch the follower up before the deadline (still
+    /// Draining): abort back to `Primary`, resume writes, and name the lag.
+    fn abort_switchover(
+        &mut self,
+        db: &mut Db,
+        ctrl_id: u64,
+        to: &str,
+        last: Option<u64>,
+        acked: Option<u64>,
+        now: u64,
+    ) {
+        // The abort is not durable-critical, but the role must return to
+        // Primary before writes resume; a failed write is fault fallout.
+        let _ = store_role(&*self.role_disk, &Role::Primary);
+        self.role = Role::Primary;
+        db.allow_writes();
+        let lag = match (last, acked) {
+            (Some(l), Some(a)) => l.saturating_sub(a),
+            (Some(l), None) => l + 1,
+            _ => 0,
+        };
+        self.reply_ctrl(
+            ctrl_id,
+            &Msg::CtrlErr {
+                message: format!(
+                    "switchover to {to} aborted: the follower lag is {lag} record(s) (it acked \
+                     {acked:?}, this primary is at {last:?}) and the drain did not complete \
+                     before the {SWITCHOVER_DEADLINE_NANOS}ns deadline — this node is primary \
+                     again and accepting writes"
+                ),
+            },
+            now,
+        );
+        self.switchover = None;
+        self.recompute_pin();
+    }
+
+    /// The `HandOff` was sent (point of no return) but no `HandOffDone` came
+    /// back before the deadline: stay write-stopped, name the situation. The
+    /// durable role stays `HandingOff` — a restart resolves against `to`.
+    fn stall_switchover(&mut self, ctrl_id: u64, to: &str, now: u64) {
+        self.reply_ctrl(
+            ctrl_id,
+            &Msg::CtrlErr {
+                message: format!(
+                    "switchover to {to}: the hand-off was sent but no confirmation returned \
+                     before the deadline — this node stays write-stopped; verify {to} has been \
+                     promoted (its role file says primary), then restart this node to resolve \
+                     against {to}"
+                ),
+            },
+            now,
+        );
+        // Stop actively driving; the node remains HandingOff (write-stopped)
+        // until an operator restarts it (it never silently resumes Primary).
+        self.switchover = None;
+    }
+
+    /// A durable demote from `HandingOff` (startup resolution): flip to
+    /// `Follower(to)`, drop any ship sessions accepted while draining, and
+    /// reset the pin. The resolver follower client keeps running as a plain
+    /// follower of `to`.
+    fn resolve_to_follower(&mut self, db: &mut Db, to: &str) -> io::Result<()> {
+        store_role(
+            &*self.role_disk,
+            &Role::Follower {
+                primary: to.to_string(),
+            },
+        )?;
+        self.role = Role::Follower {
+            primary: to.to_string(),
+        };
+        db.forbid_writes(to.to_string());
+        self.sessions.clear();
+        self.recompute_pin();
+        Ok(())
+    }
+
+    /// Replies on the control conn addressed by `ctrl_id`; a no-op when it has
+    /// died (the durable role change stands regardless — the operator re-checks).
+    fn reply_ctrl(&mut self, ctrl_id: u64, msg: &Msg, now: u64) {
+        if let Some(s) = self.sessions.iter_mut().find(|s| s.id == ctrl_id) {
+            s.reply(msg, now);
+        }
     }
 
     /// True once the follower has buffered a complete snapshot stream

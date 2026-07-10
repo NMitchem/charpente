@@ -17,9 +17,9 @@ use charpente::repl::protocol::{Msg, decode, encode};
 use charpente::repl::role::Role;
 use charpente::repl::{MAX_MESSAGE_BYTES, ReplConfig};
 use charpente::{Db, DbConfig, Id, Job, Schema, TxError, table};
-use charpente_core::io::{Clock, Disk, Net};
+use charpente_core::io::{Clock, Conn, Disk, Net};
 use charpente_core::log::{Wal, WalConfig};
-use charpente_core::table::Codec;
+use charpente_core::table::{Codec, Row};
 use charpente_sim::checks::is_fault_fallout;
 use charpente_sim::{FaultConfig, Sim, SimClock, SimHost, run_universes_swarm_with};
 
@@ -80,6 +80,18 @@ struct Node {
     /// Seeds completed by `Repl` instances retired at recovery (a reopen builds
     /// a fresh `Repl` whose counter starts at 0); added to the live counter.
     carried_seeds: u64,
+    /// True once a control verb targeting this universe COULD have flipped this
+    /// node's durable role (T7). Gates `open_node`'s torn-role re-init: before
+    /// any possible flip, a torn role file is a first-boot tear and deleting it
+    /// re-inits from config (T6's sanctioned exit); after one, config no longer
+    /// names the truth — re-initializing could resurrect a demoted primary as
+    /// writable (sim-found, seed 0x668365a4e50671ba: p's `Follower` role write
+    /// failed its sync during switchover completion, the crash tore it, and the
+    /// re-init handler brought p back as a second writable primary). The
+    /// product path was never wrong — the torn file is a named hard error whose
+    /// fix text says restore, not re-init; the universe goes inconclusive
+    /// exactly like the bricked-store case.
+    flipped: bool,
 }
 
 /// Total snapshot seeds this node has completed, across recoveries.
@@ -92,7 +104,7 @@ fn spawn_node(sim: &Sim, host: &str, cfg: ReplConfig, db_cfg: DbConfig) -> Resul
     // Open can hit injected faults (a failed sync during store/WAL creation);
     // restart the fresh host and retry, exactly as recovery does.
     for _ in 0..RECOVER_ATTEMPTS {
-        match open_node(&h, &cfg, &db_cfg) {
+        match open_node(&h, &cfg, &db_cfg, false) {
             Ok((db, repl)) => {
                 return Ok(Node {
                     host: h,
@@ -104,6 +116,7 @@ fn spawn_node(sim: &Sim, host: &str, cfg: ReplConfig, db_cfg: DbConfig) -> Resul
                     db_cfg,
                     recoveries: 0,
                     carried_seeds: 0,
+                    flipped: false,
                 });
             }
             Err(e) if is_fault_fallout(&e) => {
@@ -135,7 +148,12 @@ fn finish_universe(sim: &Sim, r: Result<(), String>) -> Result<(), String> {
     }
 }
 
-fn open_node(h: &SimHost, cfg: &ReplConfig, db_cfg: &DbConfig) -> Result<(Db, Repl), String> {
+fn open_node(
+    h: &SimHost,
+    cfg: &ReplConfig,
+    db_cfg: &DbConfig,
+    flipped: bool,
+) -> Result<(Db, Repl), String> {
     let mut db = Db::open(Box::new(h.disk()), db_cfg.clone(), make_schema())
         .map_err(|e| format!("Db::open: {e}"))?;
     match Repl::open(Box::new(h.net()), Box::new(h.disk()), cfg.clone(), &mut db) {
@@ -145,10 +163,22 @@ fn open_node(h: &SimHost, cfg: &ReplConfig, db_cfg: &DbConfig) -> Result<(Db, Re
         // first-boot role write. Fixed in role.rs by the CRC integrity line —
         // corruption is now this named hard error instead of a silent
         // wrong-role parse. The error's own fix text applies verbatim here:
-        // these nodes never finish first boot before the tear (T6 never flips
-        // a role), so deleting the file to re-initialize from config is the
-        // sanctioned exit, and load_role rewrites the initial on the retry.
+        // BEFORE any role flip these nodes never finished first boot, so
+        // deleting the file to re-initialize from config is the sanctioned
+        // exit, and load_role rewrites the initial on the retry. AFTER a
+        // possible flip (T7's control verbs) the same move is the error text's
+        // OTHER branch — "otherwise restore this node from a replica or
+        // backup" — because config may resurrect a demoted primary as writable
+        // (sim-found, seed 0x668365a4e50671ba, pinned below): the harness has
+        // no restore rig yet, so the universe is honestly inconclusive.
         Err(e) if e.to_string().contains("integrity check") => {
+            if flipped {
+                return Err(format!(
+                    "{INCONCLUSIVE}: {} torn role file after a role flip — the operator \
+                     restore path (not config re-init) is the fix: {e}",
+                    h.name()
+                ));
+            }
             let _ = h.disk().remove("role");
             let _ = h.disk().sync_dir("role");
             let (repl, _notice) =
@@ -201,7 +231,7 @@ fn recover_node(sim: &Sim, node: &mut Node) -> Result<(), String> {
 }
 
 fn reopen(node: &mut Node) -> Result<(), String> {
-    let (db, repl) = open_node(&node.host, &node.repl_cfg, &node.db_cfg)?;
+    let (db, repl) = open_node(&node.host, &node.repl_cfg, &node.db_cfg, node.flipped)?;
     node.repl = repl;
     node.db = Some(db);
     Ok(())
@@ -1146,4 +1176,675 @@ fn harness_catches_a_shipper_that_skips_crc_reverification() {
     let mut correct = Sim::with_faults(seed, cfg);
     skip_crc_workload(&mut correct, false)
         .expect("the CRC-verified shipper must survive the victim's universe");
+}
+
+// ============================================================ control plane
+//
+// Task 7: switchover (zero-loss), promote (bounded-loss failover), and the
+// three-state hand-off state machine. A CLI/test drives the verbs over the
+// replication port exactly as the shipped `charpente` CLI will (same-shape
+// rule): connect to a node's listener, send a `CtrlSwitchover`/`CtrlPromote`,
+// read the `CtrlOk`/`CtrlErr` back on the same conn.
+
+/// The outcome of one offered write — the switchover oracle sorts writes into
+/// the acked set (must survive) vs the routed set (the write-stop landed).
+enum WriteOutcome {
+    Acked,
+    NotPrimary,
+    Fallout,
+}
+
+/// Offer one widget write at `node`; classify the result. A platform fault
+/// recovers the node (fallout, not a bug); a `NotPrimary` rejection is the
+/// role gate working. Only a real bug returns `Err`.
+fn write_once(sim: &Sim, node: &mut Node, i: u64) -> Result<WriteOutcome, String> {
+    let Some(db) = node.db.as_mut() else {
+        return Ok(WriteOutcome::Fallout);
+    };
+    let r = db.transact(|tx| {
+        tx.put(&Widget {
+            id: Id::from_raw(i),
+            kind: i % 3,
+            weight: i as i64,
+        });
+        Ok::<(), io::Error>(())
+    });
+    match r {
+        Ok(()) => Ok(WriteOutcome::Acked),
+        Err(TxError::NotPrimary { .. }) => Ok(WriteOutcome::NotPrimary),
+        Err(TxError::Io(e)) if is_fault_fallout(&e.to_string()) => {
+            recover_node(sim, node)?;
+            Ok(WriteOutcome::Fallout)
+        }
+        Err(TxError::Io(e)) => Err(format!("commit io: {e}")),
+        Err(TxError::App(e)) => Err(format!("commit app: {e}")),
+    }
+}
+
+/// A control connection from the out-of-band "cli" host: the conn plus its
+/// one recv buffer (allocated once — recv needs a buffer sized to the largest
+/// possible message, and allocating it per poll would dominate the universe).
+struct CtrlConn {
+    conn: Box<dyn Conn>,
+    buf: Vec<u8>,
+}
+
+impl CtrlConn {
+    /// Connect and send the verb. A connect/send failure (the target crashed,
+    /// an injected conn drop) is the operator's retry, not a bug: inconclusive.
+    fn open(sim: &Sim, addr: &str, verb: &Msg) -> Result<CtrlConn, String> {
+        let conn = sim
+            .host("cli")
+            .net()
+            .connect(addr)
+            .map_err(|e| format!("{INCONCLUSIVE}: ctrl connect {addr}: {e}"))?;
+        conn.send(&encode(verb))
+            .map_err(|e| format!("{INCONCLUSIVE}: ctrl send: {e}"))?;
+        Ok(CtrlConn {
+            conn,
+            buf: vec![0u8; MAX_MESSAGE_BYTES],
+        })
+    }
+
+    /// Poll for the node's reply. `Ok(None)` — keep driving.
+    fn poll(&mut self) -> Result<Option<Msg>, String> {
+        match self.conn.recv(&mut self.buf) {
+            Ok(Some(0)) => Err("control conn closed before a reply".to_string()),
+            Ok(Some(n)) => decode(&self.buf[..n]).map(Some).map_err(|e| e.to_string()),
+            Ok(None) => Ok(None),
+            Err(e) => Err(format!("ctrl recv: {e}")),
+        }
+    }
+}
+
+/// Drive the given nodes' scheduler until the control conn answers. A lost conn
+/// or a quiescent-without-reply state is inconclusive (the peer crashed / the
+/// operator path takes over), never a bug.
+fn drive_ctrl(
+    sim: &Sim,
+    nodes: &mut [&mut Node],
+    cli: &mut CtrlConn,
+    budget: u32,
+) -> Result<Msg, String> {
+    for _ in 0..budget {
+        let advanced = scheduler_round(sim, nodes)?;
+        match cli.poll() {
+            Ok(Some(m)) => return Ok(m),
+            Ok(None) => {}
+            Err(e) => return Err(format!("{INCONCLUSIVE}: {e}")),
+        }
+        if !advanced {
+            return Err(format!("{INCONCLUSIVE}: quiescent before a control reply"));
+        }
+    }
+    Err(format!("{INCONCLUSIVE}: no control reply within budget"))
+}
+
+/// At most one node accepts writes — the switchover/failover safety invariant.
+fn assert_one_writable(p: &Node, f: &Node) -> Result<(), String> {
+    let pw = p.db.as_ref().is_some_and(|d| d.writes_allowed());
+    let fw = f.db.as_ref().is_some_and(|d| d.writes_allowed());
+    if pw && fw {
+        return Err(format!(
+            "two writable primaries at once — control-plane safety violated (p role {:?} \
+             recoveries {}, f role {:?} recoveries {})",
+            p.repl.role(),
+            p.recoveries,
+            f.repl.role(),
+            f.recoveries
+        ));
+    }
+    Ok(())
+}
+
+/// Every acked widget id is present in `node`'s store — the zero-loss oracle
+/// (switchover) and the drain meta-test's inverting victim both run this.
+fn assert_all_present(node: &Node, ids: &[u64], who: &str) -> Result<(), String> {
+    let db = node.db.as_ref().ok_or_else(|| format!("{who} has no db"))?;
+    retry_fallout(|| {
+        let snap = db.snapshot().map_err(|e| e.to_string())?;
+        let rows = snap.scan_raw(Widget::TABLE).map_err(|e| e.to_string())?;
+        for id in ids {
+            if !rows.iter().any(|(rid, _)| rid == id) {
+                return Err(format!(
+                    "acked widget {id} is missing on {who} — the zero-loss oracle caught a lost \
+                     record"
+                ));
+            }
+        }
+        Ok(())
+    })
+}
+
+// ------------------------------------------- property: zero-loss switchover
+
+#[test]
+fn switchover_mid_write_load_loses_nothing_and_serves_reads_throughout() {
+    run_universes_swarm_with!(
+        0x2EB1_0009,
+        256,
+        no_media_corruption,
+        |sim: &mut Sim| {
+            let r = switchover_universe(sim);
+            finish_universe(sim, r)
+        },
+        require: ["fault:conn_drop"]
+    );
+}
+
+/// The result of one switchover attempt's drain.
+enum DrainResult {
+    Reply(Msg),
+    /// The target follower was momentarily disconnected (conn_drop mid-
+    /// reconnect) when the verb was processed — retry.
+    NoSession,
+    /// The control conn was lost or the primary recovered — inconclusive.
+    Lost,
+}
+
+/// Drive one switchover attempt to its reply under continued write load at p.
+/// A follower read must succeed throughout the drain (only an injected fault
+/// may fail it).
+fn run_switchover_drain(
+    sim: &Sim,
+    p: &mut Node,
+    f: &mut Node,
+    cli: &mut CtrlConn,
+    acked: &mut Vec<u64>,
+    next: &mut u64,
+    base_p_recoveries: u32,
+) -> Result<DrainResult, String> {
+    // Write load continues until the write-stop is observed (the property's
+    // point: acked-during-drain writes survive; a NotPrimary is the stop
+    // landing). Offering unboundedly would balloon the log in universes where
+    // the follower recovers repeatedly (the verb can spend many rounds in
+    // flight because rounds with runnable work don't advance virtual time), so
+    // the load is also capped — the stop lands within a handful of rounds in
+    // any universe that will answer at all.
+    let mut stopped = false;
+    let mut offered = 0u32;
+    for _ in 0..CONVERGE_BUDGET {
+        if !stopped && offered < 256 {
+            offered += 1;
+            match write_once(sim, p, *next)? {
+                WriteOutcome::Acked => acked.push(*next),
+                WriteOutcome::NotPrimary => stopped = true,
+                WriteOutcome::Fallout => {}
+            }
+            *next += 1;
+        }
+        if let Some(fdb) = f.db.as_ref()
+            && let Err(e) = fdb.snapshot()
+            && !is_fault_fallout(&e.to_string())
+        {
+            return Err(format!("follower read rejected during the drain: {e}"));
+        }
+        let advanced = scheduler_round(sim, &mut [p, f])?;
+        match cli.poll() {
+            Ok(Some(Msg::CtrlErr { message })) if message.contains("no replication session") => {
+                return Ok(DrainResult::NoSession);
+            }
+            Ok(Some(m)) => return Ok(DrainResult::Reply(m)),
+            Ok(None) => {}
+            Err(_) => return Ok(DrainResult::Lost),
+        }
+        if !advanced {
+            return Ok(DrainResult::Lost); // quiescent, no reply coming
+        }
+        // A primary crash mid-drain loses the switchover state and the control
+        // conn — inconclusive. A follower recovering just re-Hellos and the
+        // drain continues, so it is not.
+        if p.recoveries > base_p_recoveries {
+            return Ok(DrainResult::Lost);
+        }
+    }
+    Ok(DrainResult::Lost)
+}
+
+fn switchover_universe(sim: &mut Sim) -> Result<(), String> {
+    let mut p = spawn_node(sim, "p", primary_cfg("p:1"), DbConfig::default())?;
+    let mut f = spawn_node(sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default())?;
+
+    let mut acked: Vec<u64> = Vec::new();
+    let mut next = 0u64;
+    for _ in 0..12u64 {
+        if matches!(write_once(sim, &mut p, next)?, WriteOutcome::Acked) {
+            acked.push(next);
+        }
+        next += 1;
+        drive_rounds(sim, &mut [&mut p, &mut f], 3)?;
+    }
+    let base_p_recoveries = p.recoveries;
+    // From the first verb on, either node's durable role may flip.
+    p.flipped = true;
+    f.flipped = true;
+
+    // Issue the switchover, retrying with a fresh control conn if the target
+    // follower is momentarily reconnecting (conn_drop). Each attempt re-drives
+    // convergence so f is connected and caught up before the verb lands.
+    let mut reply: Option<Msg> = None;
+    for _ in 0..8u32 {
+        run_until(sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET)?;
+        if p.recoveries > base_p_recoveries {
+            break; // p recovered during warm-up — inconclusive below
+        }
+        let mut cli = match CtrlConn::open(
+            sim,
+            "p:1",
+            &Msg::CtrlSwitchover {
+                to: "f:1".to_string(),
+            },
+        ) {
+            Ok(cli) => cli,
+            Err(_) => {
+                // The CLI's own conn faulted — retry the verb (the operator's
+                // move) after letting the world settle.
+                drive_rounds(sim, &mut [&mut p, &mut f], 20)?;
+                continue;
+            }
+        };
+        match run_switchover_drain(
+            sim,
+            &mut p,
+            &mut f,
+            &mut cli,
+            &mut acked,
+            &mut next,
+            base_p_recoveries,
+        )? {
+            DrainResult::Reply(m) => {
+                reply = Some(m);
+                break;
+            }
+            DrainResult::NoSession => {
+                drive_rounds(sim, &mut [&mut p, &mut f], 20)?;
+                continue;
+            }
+            DrainResult::Lost => break,
+        }
+    }
+
+    // A primary crash mid-drain (or a target that never reconnected) hands the
+    // switchover to operator resolution (spec §2); the automated zero-loss
+    // oracle only adjudicates a clean run.
+    let Some(reply) = reply else {
+        sim.cover("repl:switchover-inconclusive");
+        return assert_one_writable(&p, &f);
+    };
+
+    match reply {
+        Msg::CtrlOk { .. } => {
+            assert_one_writable(&p, &f)?;
+            if !f.db.as_ref().is_some_and(|d| d.writes_allowed()) {
+                return Err("f is not writable after the switchover completed".to_string());
+            }
+            if !matches!(f.repl.role(), Role::Primary) {
+                return Err(format!(
+                    "f's role is not Primary after switchover: {:?}",
+                    f.repl.role()
+                ));
+            }
+            if p.db.as_ref().is_some_and(|d| d.writes_allowed()) {
+                return Err("p is still writable after handing off".to_string());
+            }
+            if !matches!(p.repl.role(), Role::Follower { .. }) {
+                return Err(format!(
+                    "p's role is not Follower after switchover: {:?}",
+                    p.repl.role()
+                ));
+            }
+            assert_all_present(&f, &acked, "f")?;
+            // Keep writing on the new primary; the old primary (now a follower)
+            // converges with no divergence.
+            for _ in 0..12u64 {
+                let _ = write_once(sim, &mut f, next)?;
+                next += 1;
+                drive_rounds(sim, &mut [&mut p, &mut f], 3)?;
+            }
+            run_until(sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET)?;
+            assert_converged(&p, &f)?;
+            Ok(())
+        }
+        Msg::CtrlErr { message } => {
+            // The rare HandOffDone-loss window (spec §2): the hand-off was sent
+            // and f promoted, but the confirmation was lost, so p stays
+            // write-stopped. Safety holds; this is not the happy-path oracle.
+            sim.cover("repl:switchover-stalled");
+            if !message.contains("switchover") {
+                return Err(format!("unexpected CtrlErr from a switchover: {message}"));
+            }
+            assert_one_writable(&p, &f)
+        }
+        other => Err(format!("unexpected switchover reply: {other:?}")),
+    }
+}
+
+// ---------------------------------------------- property: bounded failover
+
+/// No checkpoint/GC: the whole log stays retained from the start, so the
+/// prefix oracle can read p's every durable frame back after the crash.
+fn no_gc_cfg() -> DbConfig {
+    DbConfig {
+        wal: WalConfig {
+            dir: "wal".to_string(),
+            segment_bytes: 256,
+        },
+        store_path: "tables.redb".to_string(),
+        retain_segments: 1024,
+        checkpoint_every: 0,
+    }
+}
+
+#[test]
+fn failover_preserves_everything_the_follower_acked() {
+    run_universes_swarm_with!(0x2EB1_000A, 128, no_media_corruption, |sim: &mut Sim| {
+        let r = failover_universe(sim);
+        finish_universe(sim, r)
+    });
+}
+
+fn failover_universe(sim: &mut Sim) -> Result<(), String> {
+    let cfg = no_gc_cfg();
+    let mut p = spawn_node(sim, "p", primary_cfg("p:1"), cfg.clone())?;
+    let mut f = spawn_node(sim, "f", follower_cfg("f:1", "p:1"), cfg.clone())?;
+
+    for next in 0..30u64 {
+        let _ = write_once(sim, &mut p, next)?;
+        drive_rounds(sim, &mut [&mut p, &mut f], 2)?;
+    }
+    // Let f follow further — it may still lag (the DECISIONS §6 window).
+    drive_rounds(sim, &mut [&mut p, &mut f], 40)?;
+
+    // Stage the crash: p must still be a live primary, f must hold a position.
+    if p.db.is_none() || !matches!(p.repl.role(), Role::Primary) || f.recoveries > 0 {
+        sim.cover("repl:failover-inconclusive");
+        return Ok(());
+    }
+    let Some(f_last) = f.db.as_ref().and_then(|d| d.last_applied()) else {
+        sim.cover("repl:failover-inconclusive");
+        return Ok(());
+    };
+
+    // Host crash on p — no drain (a real failover).
+    p.host.crash_now();
+
+    // Promote f (drive f alone; p is down).
+    f.flipped = true;
+    let reply = match CtrlConn::open(sim, "f:1", &Msg::CtrlPromote)
+        .and_then(|mut cli| drive_ctrl(sim, &mut [&mut f], &mut cli, CONVERGE_BUDGET))
+    {
+        Ok(m) => m,
+        Err(e) if e.contains(INCONCLUSIVE) => {
+            sim.cover("repl:failover-inconclusive");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    match reply {
+        Msg::CtrlOk { message } => {
+            if !message.contains("last_applied") {
+                return Err(format!("promote CtrlOk must name last_applied: {message}"));
+            }
+        }
+        Msg::CtrlErr { message } => return Err(format!("promote refused unexpectedly: {message}")),
+        other => return Err(format!("unexpected promote reply: {other:?}")),
+    }
+    if f.recoveries > 0 || !f.db.as_ref().is_some_and(|d| d.writes_allowed()) {
+        sim.cover("repl:failover-inconclusive");
+        return Ok(());
+    }
+
+    // f's WAL frames up to f_last must be a byte-exact prefix of p's durable
+    // log — f applied exactly p's records, a consistent prefix (property 3 in
+    // the spec matrix). Its store therefore holds every acked id whose seq is
+    // ≤ f_last; ids beyond are the honest failover window.
+    let f_frames = {
+        let fdb = f.db.as_ref().expect("f live");
+        retry_fallout(|| {
+            fdb.read_log(fdb.log_base(), usize::MAX)
+                .map_err(|e| e.to_string())
+        })?
+    };
+    let p_frames = reopen_p_frames(&mut p, &cfg)?;
+    for (seq, bytes) in &f_frames {
+        if *seq > f_last {
+            continue;
+        }
+        match p_frames.iter().find(|(s, _)| s == seq) {
+            Some((_, pb)) if pb == bytes => {}
+            Some(_) => {
+                return Err(format!(
+                    "f's frame at seq {seq} diverges from p's — not a prefix of p's timeline"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "f holds a frame at seq {seq} that p never had — a forked timeline"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reopen p's crashed disk and read its full durable log — the prefix oracle's
+/// reference. Retried under open-time faults; inconclusive if it can't recover.
+fn reopen_p_frames(node: &mut Node, cfg: &DbConfig) -> Result<Vec<(u64, Vec<u8>)>, String> {
+    for _ in 0..RECOVER_ATTEMPTS {
+        node.host.restart();
+        match Db::open(Box::new(node.host.disk()), cfg.clone(), make_schema()) {
+            Ok(db) => match db.read_log(db.log_base(), usize::MAX) {
+                Ok(frames) => return Ok(frames),
+                Err(e) if is_fault_fallout(&e.to_string()) => continue,
+                Err(e) => return Err(format!("reopen p read_log: {e}")),
+            },
+            Err(e) if is_fault_fallout(&e.to_string()) => continue,
+            Err(e) => return Err(format!("reopen p: {e}")),
+        }
+    }
+    Err(format!(
+        "{INCONCLUSIVE}: reopening p exhausted {RECOVER_ATTEMPTS} attempts"
+    ))
+}
+
+// -------------------------- property: no two writable primaries on a crash
+
+#[test]
+fn crash_between_handoff_and_demote_never_yields_two_writable_primaries() {
+    use charpente::repl::SwitchoverPhase;
+
+    let sim = Sim::with_faults(0x2EB1_000B, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    for i in 0..10u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert_one_writable(&p, &f).unwrap();
+
+    // Begin the switchover and drive to the HandedOff instant (HandOff sent,
+    // HandOffDone not yet processed).
+    p.flipped = true;
+    f.flipped = true;
+    let _cli = CtrlConn::open(
+        &sim,
+        "p:1",
+        &Msg::CtrlSwitchover {
+            to: "f:1".to_string(),
+        },
+    )
+    .unwrap();
+    run_until(
+        &sim,
+        &mut [&mut p, &mut f],
+        |ns| ns[0].repl.switchover_phase() == Some(SwitchoverPhase::HandedOff),
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    assert_eq!(p.repl.switchover_phase(), Some(SwitchoverPhase::HandedOff));
+    assert_one_writable(&p, &f).unwrap();
+
+    // Crash p's host before it processes HandOffDone.
+    p.host.crash_now();
+    assert_one_writable(&p, &f).unwrap();
+
+    // f promotes via the in-flight HandOff (or already has).
+    run_until(
+        &sim,
+        &mut [&mut f],
+        |ns| ns[0].db.as_ref().is_some_and(|d| d.writes_allowed()),
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    assert!(matches!(f.repl.role(), Role::Primary), "f must be primary");
+    assert_one_writable(&p, &f).unwrap();
+
+    // Restart p with its durable HandingOff role: it must come up write-stopped
+    // and resolve against f (now primary), demoting to Follower{f}.
+    recover_node(&sim, &mut p).unwrap();
+    assert!(
+        matches!(p.repl.role(), Role::HandingOff { .. }),
+        "p must reopen write-stopped in HandingOff, got {:?}",
+        p.repl.role()
+    );
+    assert_one_writable(&p, &f).unwrap();
+
+    // Drive both; check the safety invariant after every round until p demotes.
+    let mut demoted = false;
+    for _ in 0..CONVERGE_BUDGET {
+        if matches!(p.repl.role(), Role::Follower { .. }) {
+            demoted = true;
+            break;
+        }
+        scheduler_round(&sim, &mut [&mut p, &mut f]).unwrap();
+        assert_one_writable(&p, &f).unwrap();
+    }
+    assert!(demoted, "p must resolve to a follower of f");
+    assert_one_writable(&p, &f).unwrap();
+
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert_converged(&p, &f).unwrap();
+}
+
+// ------------------------------ property: switchover aborts on a laggard
+
+#[test]
+fn switchover_aborts_on_a_lagging_follower_by_name() {
+    let sim = Sim::with_faults(0x2EB1_000C, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    for i in 0..10u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+
+    // Partition p↔f so the drain can never complete; advance p past f.
+    sim.partition("p", "f");
+    for i in 10..20u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+        drive_rounds(&sim, &mut [&mut p, &mut f], 2).unwrap();
+    }
+    let p_last = p.db.as_ref().unwrap().last_applied();
+    let f_last = f.db.as_ref().unwrap().last_applied();
+    assert!(p_last > f_last, "p must be ahead of the partitioned f");
+
+    p.flipped = true;
+    f.flipped = true;
+    let mut cli = CtrlConn::open(
+        &sim,
+        "p:1",
+        &Msg::CtrlSwitchover {
+            to: "f:1".to_string(),
+        },
+    )
+    .unwrap();
+    let reply = drive_ctrl(&sim, &mut [&mut p, &mut f], &mut cli, CONVERGE_BUDGET).unwrap();
+    match reply {
+        Msg::CtrlErr { message } => {
+            for needle in ["lag", "deadline", "aborted"] {
+                assert!(
+                    message.contains(needle),
+                    "abort message missing {needle:?}: {message}"
+                );
+            }
+        }
+        other => panic!("a lagging switchover must abort with CtrlErr, got {other:?}"),
+    }
+
+    // p is primary again and writes flow.
+    assert!(
+        matches!(p.repl.role(), Role::Primary),
+        "p must be primary again"
+    );
+    assert!(
+        p.db.as_ref().unwrap().writes_allowed(),
+        "p must accept writes"
+    );
+    commit_widget(&sim, &mut p, 100).expect("writes flow after an aborted switchover");
+}
+
+// ----------------------------------- meta-test: the drain oracle inverts
+
+/// The victim move the drain exists to prevent: promoting a measurably-behind
+/// follower (no drain). The SAME zero-loss oracle switchover uses must catch
+/// the lost records — proving the oracle is what keeps switchover honest.
+fn promote_without_drain_workload(sim: &mut Sim) -> Result<(), String> {
+    let cfg = DbConfig::default();
+    let mut p = spawn_node(sim, "p", primary_cfg("p:1"), cfg.clone())?;
+    let mut f = spawn_node(sim, "f", follower_cfg("f:1", "p:1"), cfg.clone())?;
+
+    let mut acked: Vec<u64> = Vec::new();
+    let mut next = 0u64;
+    for _ in 0..12u64 {
+        if matches!(write_once(sim, &mut p, next)?, WriteOutcome::Acked) {
+            acked.push(next);
+        }
+        next += 1;
+        drive_rounds(sim, &mut [&mut p, &mut f], 3)?;
+    }
+    run_until(sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET)?;
+
+    // Partition so f falls measurably behind, then keep acking on p.
+    sim.partition("p", "f");
+    for _ in 0..12u64 {
+        if matches!(write_once(sim, &mut p, next)?, WriteOutcome::Acked) {
+            acked.push(next);
+        }
+        next += 1;
+        drive_rounds(sim, &mut [&mut p], 2)?;
+    }
+
+    // Promote f WITHOUT a drain.
+    f.flipped = true;
+    let mut cli = CtrlConn::open(sim, "f:1", &Msg::CtrlPromote)?;
+    match drive_ctrl(sim, &mut [&mut f], &mut cli, CONVERGE_BUDGET)? {
+        Msg::CtrlOk { .. } => {}
+        other => return Err(format!("promote failed in the meta-test: {other:?}")),
+    }
+
+    // The oracle must catch the skipped drain.
+    assert_all_present(&f, &acked, "f")
+}
+
+#[test]
+fn the_zero_loss_oracle_catches_a_promote_without_drain() {
+    let mut state = 0x2EB1_000D_u64;
+    let mut caught: Option<(u64, String)> = None;
+    for _ in 0..64 {
+        let seed = charpente_sim::rng::splitmix64(&mut state);
+        let mut sim = Sim::with_faults(seed, FaultConfig::none());
+        if let Err(msg) = promote_without_drain_workload(&mut sim) {
+            caught = Some((seed, msg));
+            break;
+        }
+    }
+    let (seed, msg) = caught.expect(
+        "the zero-loss oracle no longer catches a promote-without-drain — the drain is not being \
+         exercised by the switchover path",
+    );
+    eprintln!("caught promote-without-drain: seed {seed:#018x}: {msg}");
+    assert!(
+        msg.contains("zero-loss oracle"),
+        "the failure must be the oracle catching the loss: {msg}"
+    );
 }

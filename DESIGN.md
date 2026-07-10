@@ -417,9 +417,42 @@ follower buffers it until `SnapshotEnd`. Right at M1 scale; incremental streamin
 tracked fix before large-store seeding. The durable role file (§2's role semantics, T5) carries its own
 CRC line: a torn role write is a named integrity error, never a parse of whatever bytes
 survived — a torn "follower:p:1" that still parses as a role naming a ghost primary is
-exactly what the T6 harness caught (seed 0x51dacce702b667c8). Control verbs
-(promote/switchover/hand-off) land in T7; until then the session answers them `CtrlErr`
-by name.
+exactly what the T6 harness caught (seed 0x51dacce702b667c8).
+
+**The control plane (v1, implemented).** Admin verbs travel over the replication port as
+control messages in the same protocol (M1 replication T7) — the sim drives them through
+exactly the code path the CLI uses (same-shape rule). A connection is a *control* conn
+when its first message is a verb (`CtrlPromote`/`CtrlSwitchover{to}`) rather than a
+`Hello`; a control conn ships nothing, pins no retention, and `Repl` (not the ship
+round-robin) executes the verb and answers `CtrlOk`/`CtrlErr` on it — because every
+transition flips the durable role file, re-gates the `Db`, and re-wires the pin, all
+`Repl`-level. **Switchover** (`Primary → HandingOff(to) → Follower(to)`) is zero-loss and
+crash-safe on the three-state role file: `store_role(HandingOff{to})` write-stops the
+primary (`db.forbid_writes(to)` — reads and effect-free transactions still run, effectful
+ones get `TxError::NotPrimary`), then it *drains* — the target session's `Ack`s are read
+each step and, when its acked seq reaches `db.last_applied()`, the primary sends
+`HandOff{at_seq}` and enters HandedOff, **the point of no return**. Draining is abortable:
+the `SWITCHOVER_DEADLINE_NANOS` deadline while still Draining returns durably to `Primary`,
+resumes writes, and the `CtrlErr` names the follower's remaining lag. HandedOff never
+aborts: on `HandOffDone` the primary flips durably to `Follower(to)`, drops its ship
+sessions, and starts a follower client toward the new primary (drained to byte equality,
+no divergence possible); on the deadline it stays write-stopped and the `CtrlErr` says the
+hand-off was sent — verify `to` and restart to resolve. The follower side of `HandOff`
+verifies `last_applied == at_seq` (else a named `Refuse` protocol error), requires a
+configured listen address (an unpromotable follower is never a switchover target — its
+`Hello` carries no listen, so it never matches), flips durably to `Primary`, allows
+writes, replies `HandOffDone` on the old conn, and begins accepting Hellos. A `HandOff`
+buffered in the same drain as the primary's crash-EOF is not stranded: the follower client
+drains its inbox before any reconnect, and the primary drains the target session's inbox
+before the dead-session reap. **Promote** (`charpente promote`) is the bounded-loss
+failover: a follower/backup drops its upstream client, flips durably to `Primary`, allows
+writes, and the `CtrlOk` names `last_applied` — records the dead primary acked but had not
+shipped are the DECISIONS §6 window, lost honestly and named. A node that restarts in a
+durable `HandingOff(to)` stays write-stopped and resolves against `to`: a probe `Hello`
+answered as a primary demotes it to `Follower(to)` (a diverged refusal is the operator's
+re-seed signal, surfaced as the step error); `to` unreachable or not-yet-primary keeps it
+`HandingOff` on a reconnect cadence — it never silently resumes `Primary`, so no
+interleaving yields two writable primaries.
 
 ## 6. Queue, cron, realtime — all faces of the log
 
