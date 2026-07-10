@@ -411,7 +411,10 @@ stream and, at `SnapshotEnd`, latches `db_needs_reseed` — `Repl::step` cannot 
 which consumes the `Db` through `into_seeder`, replays the buffer, `finish`es at the
 horizon + 1 boundary, re-gates writes, and returns the new `Db`; a conn death mid-stream
 never latches, and the next `Hello` restarts the seed from scratch (idempotent —
-`Seeder::new` discards). The durable role file (§2's role semantics, T5) carries its own
+`Seeder::new` discards). Stated plainly: v1 seeding holds the full logical snapshot in
+memory on BOTH sides — the primary queues the whole stream when seeding begins, the
+follower buffers it until `SnapshotEnd`. Right at M1 scale; incremental streaming is the
+tracked fix before large-store seeding. The durable role file (§2's role semantics, T5) carries its own
 CRC line: a torn role write is a named integrity error, never a parse of whatever bytes
 survived — a torn "follower:p:1" that still parses as a role naming a ghost primary is
 exactly what the T6 harness caught (seed 0x51dacce702b667c8). Control verbs

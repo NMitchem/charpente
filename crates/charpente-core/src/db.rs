@@ -585,7 +585,9 @@ impl Db {
             // directory entry is barriered before any frame lands in it —
             // DESIGN §2's fence 2), so no record above the horizon can have
             // been acknowledged. Lay the segment `finish` would have — base
-            // = horizon + 1, nothing to replay — instead of letting
+            // = applied_seq + 1 (this fn's `horizon` local; §2 calls
+            // applied_seq itself the horizon, so in §2's words base =
+            // horizon + 1), nothing to replay — instead of letting
             // `Wal::open` start a fresh log at 0 and trip the
             // outran-durable-truth assert below.
             None if skip_through.is_some() => {
