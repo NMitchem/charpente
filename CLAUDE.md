@@ -7,9 +7,48 @@ art — DST, storage, replication).
 
 ## What this is
 
-An agent-native, single-binary Rust backend platform. Design phase → M0. The milestones
-and exit criteria in PLAN.md are the roadmap; do not reorder M0's dependency sequence —
-the sim-capable IO layer comes first because it cannot be retrofitted.
+An agent-native, single-binary Rust backend platform. M0 is complete; M1 is in progress
+(see "Current state" below). The milestones and exit criteria in PLAN.md are the roadmap;
+do not reorder a milestone's dependency sequence.
+
+## Commands
+
+- Full check, same three commands as CI (.github/workflows/ci.yml):
+  `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`
+  (carries the nondeterminism deny-list), `cargo test --workspace`.
+- One test file: `cargo test -p charpente --test kernel` — property suites live in each
+  crate's `tests/` (charpente: http/kernel/replication/transactions/typed_tables;
+  charpente-sim: crash_recovery/determinism/net_partition/wal; charpente-core:
+  engine/materialize).
+- Replay one universe: `CHARPENTE_SEED=0x… cargo test -p <crate> --test <file> --
+  --nocapture`. Every sim failure prints this exact repro line — paste it verbatim.
+  Coverage `require:` keys are skipped under `CHARPENTE_SEED`.
+- App-level sim batch: `cargo run -p charpente-cli -- test --sim [--universes N]
+  [--seed 0x…] [--master-seed 0x…] [--filter S] [--jobs N] [--format human|json]
+  [--dir PATH]` — dogfood target `--dir crates/sim-fixture`. Exit 0 green, 1 failures,
+  2 usage/launch error. `--master-seed` replays a whole batch byte-identically.
+- Editing docs/GUIDE.md can break the build: `crates/guide-examples`'s build.rs extracts
+  and compiles every ```rust block. `cargo build -p guide-examples` checks it alone.
+
+## Workspace map
+
+- `crates/charpente-core` — the deterministic core: `io` traits, `log` (WAL), `engine`,
+  `table`, `db`, jobs. No ambient IO anywhere inside.
+- `crates/charpente` — the platform crate apps depend on (re-exports `core`, officially
+  load-bearing): `http` kernel, `kernel` loop, `serve` (the hyper/tokio wire edge),
+  `prod` (the one deny-list-allowed IO module). `extern crate self as charpente` makes
+  the macros usable in its own src.
+- `crates/charpente-macros` — `#[table]`/`#[route]`/`#[job]`; all emit `::charpente::`
+  paths, so app crates depend on `charpente` alone.
+- `crates/charpente-sim` — simulator (seeded xoshiro, virtual time, fault matrix), the
+  frozen `run_universes!` runner + swarm runner, `harness` (the `charpente test --sim`
+  runtime), `checks` (the public checker library).
+- `crates/charpente-cli` — the `charpente` binary; edge tooling, may spawn processes.
+- `crates/sim-fixture` — minimal app the CLI dogfoods against; single-dep on `charpente`,
+  so it also pins macro-path expansion.
+- `crates/guide-examples` — compile gate for docs/GUIDE.md.
+- `examples/invoicing` — the M0 demo app, agent-built from docs alone (DEMO.md,
+  FINDINGS.md).
 
 ## Hard rules (the guarantees are the product)
 
