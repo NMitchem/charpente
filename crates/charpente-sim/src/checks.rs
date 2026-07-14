@@ -37,10 +37,15 @@ pub fn is_fault_fallout(text: &str) -> bool {
 /// only local copy is unrecoverable by design; v0's answer is M1
 /// replication. So an acked-durability check routes its shortfall through
 /// this: loss is excused ONLY in universes where corruption was actually
-/// injected, and the strong oracle stands in every other universe. Never
-/// use it to excuse wrong DATA (corruption must surface as loss or a named
-/// error, not as different bytes) or consistency violations (e.g.
-/// exactly-once) — a cut reverts state to a prefix, which stays consistent.
+/// injected, and the strong oracle stands in every other universe. This is
+/// the SINGLE-NODE excuse: a workload with a converged follower keeps none
+/// of it — a record the primary lost to media corruption still lives on the
+/// follower, so such a workload asserts the stronger oracle (every acked id
+/// survives on the follower) instead of excusing the loss (spec §4 property
+/// 8, the promise M1 replication makes good). Never use it to excuse wrong
+/// DATA (corruption must surface as loss or a named error, not as different
+/// bytes) or consistency violations (e.g. exactly-once) — a cut reverts
+/// state to a prefix, which stays consistent.
 pub fn durable_corruption_fired(sim: &Sim) -> bool {
     let coverage = sim.coverage();
     coverage.get("fault:bit_flip").copied().unwrap_or(0) > 0

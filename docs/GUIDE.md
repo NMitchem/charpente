@@ -2230,3 +2230,108 @@ against the same live, poisoned handle. `Db::poisoned()` lets the kernel
 loop check this directly — per the step-7 ruling, the request arm now stops
 serving once a request's own 500 leaves the engine poisoned, rather than
 keep accepting traffic against a dead engine.
+
+## 10. Replication
+
+One primary accepts writes; followers replay its log and arrive at
+byte-identical state (DESIGN §5 — replication is log-position arithmetic, not a
+merge). It is asynchronous: a follower acks a record only after it has synced
+it locally, and the primary's own ack to a client can be ahead of any
+follower, so a failover can lose the records the primary acked but had not yet
+shipped (the bounded-loss window, named in the `promote` reply). There is no
+sharding and no multi-master — that stance is fixed.
+
+### Configuring a node
+
+A node's *effective* role lives in a durable role file on its data disk; the
+`initial_role` in `ReplConfig` only seeds it on first boot, and a mismatch
+between the two is surfaced on stderr (the file wins — config never silently
+re-roles a node). `listen` is the node's replication address, a port distinct
+from its HTTP port; a node without one cannot be promoted remotely.
+
+`serve::serve_replicated` is `serve` plus replication: same HTTP edge, but the
+kernel also runs the replication engine. A `serve::backup` node runs the engine
+with no HTTP edge at all — it only follows and keeps a promotable copy.
+
+```rust
+use charpente::http::App;
+use charpente::prod::ProdDisk;
+use charpente::repl::role::Role;
+use charpente::repl::ReplConfig;
+use charpente::serve;
+
+fn run_primary(app: App) -> std::io::Result<()> {
+    let cfg = ReplConfig {
+        listen: Some("0.0.0.0:9090".to_string()),
+        initial_role: Role::Primary,
+    };
+    // HTTP on 8080, replication on 9090. Returns once both are up.
+    serve::serve_replicated("0.0.0.0:8080", app, Box::new(ProdDisk::new("./data")?), cfg)?;
+    Ok(())
+}
+
+fn run_follower(app: App) -> std::io::Result<()> {
+    let cfg = ReplConfig {
+        listen: Some("0.0.0.0:9091".to_string()),
+        initial_role: Role::Follower {
+            primary: "primary-host:9090".to_string(),
+        },
+    };
+    serve::serve_replicated("0.0.0.0:8080", app, Box::new(ProdDisk::new("./data")?), cfg)?;
+    Ok(())
+}
+
+fn run_backup(app: App) -> std::io::Result<()> {
+    let cfg = ReplConfig {
+        listen: Some("0.0.0.0:9092".to_string()),
+        initial_role: Role::Backup {
+            primary: "primary-host:9090".to_string(),
+        },
+    };
+    // A backup blocks on the current thread — no HTTP edge, no requests.
+    serve::backup(app, Box::new(ProdDisk::new("./backup-data")?), cfg)
+}
+```
+
+### What a follower does
+
+A follower's kernel serves reads and ships its log, but never runs jobs or cron
+(those are the primary's — the same store rows, jobs table and all, replicate to
+the follower, so its `charpente.jobs` mirrors the primary's Done marks without
+re-running anything). An effectful transaction on a follower — any route that
+`put`s, `delete`s, `enqueue`s, or `emit`s — is refused with `TxError::NotPrimary`,
+which the HTTP layer maps to **421** naming the primary to retry against:
+
+```text
+HTTP/1.1 421 Misdirected Request
+this node is a read-only follower — writes go to the primary at
+primary-host:9090; retry there (the request was not committed)
+```
+
+A read-only transaction (no effects) commits on a follower unchanged, so GET
+routes work everywhere.
+
+### Promotion and switchover
+
+Two operator moves change which node is primary, both crash-safe on the durable
+role file:
+
+- **`promote`** is the bounded-loss failover: a follower or backup flips to
+  primary and starts accepting writes immediately. Records the dead primary
+  acked but had not shipped are lost — the reply names the `last_applied` it
+  promoted at so the window is explicit.
+- **`switchover`** is the zero-loss, planned handoff: the current primary
+  write-stops and *drains* to the target follower, and only once the follower
+  has acked every record does it hand off — no acked record is lost. If the
+  target cannot catch up before the deadline, the switchover aborts and the
+  primary resumes.
+
+Both travel as control messages over the replication port (the CLI that issues
+them is a later milestone; the wire protocol and the state machine behind them
+are in place). When a follower's own local copy is unrecoverable — media
+corruption below its checkpoint horizon, or a log directory a crash left gapped
+— the fix is not a local repair but a restore: promote a healthy replica and
+re-seed the damaged node from it as a fresh follower (its snapshot rebuilds the
+whole state, no log replay). This is the promise a single node cannot make and
+a replicated deployment can: a record one node loses to media corruption
+survives on another.

@@ -90,7 +90,11 @@ impl Default for AppConfig {
 /// `&mut self`, so requests are serializable by construction. The sim drives
 /// `handle` directly; `crate::serve` feeds it from hyper in production.
 pub struct App {
-    db: Db,
+    /// `Option` only so the replication reseed swap can `take` the `Db`, hand
+    /// it to `Repl::run_seed` (which consumes and returns a rebuilt one), and
+    /// `put` it back — the slot is `Some` at every other observable moment
+    /// (`db()`/`db_mut()` expect it).
+    db: Option<Db>,
     entropy: Box<dyn Entropy>,
     config: AppConfig,
     router: Router,
@@ -114,7 +118,7 @@ impl App {
             schema.table::<Session>().table::<CronRow>(),
         )?;
         Ok(App {
-            db,
+            db: Some(db),
             entropy,
             config,
             router: Router::new(),
@@ -165,7 +169,9 @@ impl App {
     /// Snapshot/checkpoint access for the kernel loop and tests — handlers
     /// never see it.
     pub fn db(&self) -> &Db {
-        &self.db
+        self.db
+            .as_ref()
+            .expect("db taken for reseed — a kernel bug left it out")
     }
 
     pub fn config(&self) -> &AppConfig {
@@ -173,7 +179,23 @@ impl App {
     }
 
     pub(crate) fn db_mut(&mut self) -> &mut Db {
-        &mut self.db
+        self.db
+            .as_mut()
+            .expect("db taken for reseed — a kernel bug left it out")
+    }
+
+    /// Lifts the `Db` out for the replication reseed swap (the kernel's
+    /// `Ready::Repl` arm): `Repl::run_seed` consumes it and returns a rebuilt
+    /// one that `put_db` restores. Between the two calls `db()`/`db_mut()`
+    /// would panic — the arm holds them adjacent, so no other code runs.
+    pub(crate) fn take_db(&mut self) -> Db {
+        self.db
+            .take()
+            .expect("db taken twice — the reseed swap is not re-entrant")
+    }
+
+    pub(crate) fn put_db(&mut self, db: Db) {
+        self.db = Some(db);
     }
 
     pub(crate) fn entropy(&self) -> &dyn Entropy {
@@ -206,7 +228,19 @@ impl App {
     /// `pub(crate)`; the kernel itself uses `db_mut`.
     #[doc(hidden)]
     pub fn db_for_tests(&mut self) -> &mut Db {
-        &mut self.db
+        self.db_mut()
+    }
+
+    /// Test-only equivalents of `take_db`/`put_db` — integration tests cannot
+    /// see `pub(crate)`; the kernel itself uses the unsuffixed pair.
+    #[doc(hidden)]
+    pub fn take_db_for_tests(&mut self) -> Db {
+        self.take_db()
+    }
+
+    #[doc(hidden)]
+    pub fn put_db_for_tests(&mut self, db: Db) {
+        self.put_db(db);
     }
 
     pub fn handle(&mut self, request: Request) -> Response {
@@ -234,7 +268,7 @@ impl App {
         let token = bearer_or_cookie(&request.headers);
         let (auth_required, glue) = (route.auth, route.glue);
 
-        let result = self.db.transact(|tx| {
+        let result = self.db_mut().transact(|tx| {
             let session = match &token {
                 Some(token) => Session::by_token(tx, token)?.into_iter().next(),
                 None => None,

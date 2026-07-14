@@ -143,7 +143,17 @@ implemented (M0 step 6): `charpente::kernel`'s `Kernel::run` builds the ready se
 requests (`RequestSource`), due jobs, and due cron ticks and draws one entropy pick only
 when more than one is ready — idle iterations spend no entropy. The request arm stops the
 loop when the engine is poisoned (ruling 2026-07-05, spec `2026-07-05-sim-cli-design.md`):
-a 500 goes to the client first, then `Db::poisoned()` gates continuing.
+a 500 goes to the client first, then `Db::poisoned()` gates continuing. The loop body is
+one `Kernel::step` (M1 replication T8): it services one ready source and returns, or
+reports the deadline to park on — `run` is the thin wrapper that owns the park, so a
+replicated driver can own it differently without forking the decision code. Replication
+(M1) adds a fourth ready source, the `Repl` engine, whose role gates the set: a follower
+(or a draining primary — `is_primary` is false while handing off) serves reads and ships
+its log but never runs jobs or cron (those would hit `TxError::NotPrimary`), and a
+follower→primary flip inside `Repl::step` rebuilds the due-heap and cron from the
+replicated store on the next iteration. A repl-configured node also caps every idle wait at
+a 5ms park tick, so in-flight replication IO — sim messages or prod TCP — is polled
+promptly regardless of the next job/cron deadline.
 
 The HTTP kernel (`charpente::http`) lives inside the boundary — the sim drives
 `App::handle` directly; hyper only translates wire↔struct at the edge
@@ -453,6 +463,20 @@ answered as a primary demotes it to `Follower(to)` (a diverged refusal is the op
 re-seed signal, surfaced as the step error); `to` unreachable or not-yet-primary keeps it
 `HandingOff` on a reconnect cadence — it never silently resumes `Primary`, so no
 interleaving yields two writable primaries.
+
+**Surfaces (v1, implemented).** The kernel wires the data + control plane in (M1
+replication T8): `Kernel::with_replication(app, clock, repl)` runs the `Repl` engine as the
+fourth ready source (§1), and `run`/`step` split so the park is the driver's. Three edges
+in `charpente::serve` expose it: `serve_replicated(addr, app, repl_disk, repl_cfg)` mirrors
+`serve` but the kernel thread opens `Repl` (durable role on `repl_disk`, wire on `ProdNet`)
+and runs `with_replication` — a follower answers writes with 421 and reads from its
+replicated copy, a primary ships; a startup role/config mismatch prints to stderr, config
+never overriding the durable role. `backup(app, repl_disk, repl_cfg)` runs the same kernel
+on the current thread against an `EmptySource` (no HTTP edge, no requests) — a node that
+only follows and keeps a promotable copy. The reseed swap that `Repl::run_seed` needs lands
+in `App`: the `Db` sits behind an `Option` so the `Ready::Repl` arm can `take` it, hand it
+to `run_seed`, and `put` the rebuilt one back, adjacent so no other code observes the empty
+slot.
 
 ## 6. Queue, cron, realtime — all faces of the log
 

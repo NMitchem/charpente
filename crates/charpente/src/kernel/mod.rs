@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use charpente_core::io::{Clock, Instant};
 
 use crate::http::{App, Request, Response};
+use crate::repl::{REPL_TICK_NANOS, Repl};
 
 /// Delivers a `Response` back to whoever is waiting on a request — a channel
 /// reply in production, a recorded `(status, body)` in the sim.
@@ -72,6 +73,7 @@ enum Ready {
     Request,
     Job,
     Cron,
+    Repl,
 }
 
 /// The deterministic kernel: one `App`, one due-heap, one cron schedule, one
@@ -84,16 +86,44 @@ pub struct Kernel {
     clock: Box<dyn Clock>,
     pending: Option<(Request, Reply)>,
     stats: KernelStats,
+    /// The replication engine when this kernel runs replicated (`None` for a
+    /// plain single node — the ready set then never gates and never ticks).
+    repl: Option<Repl>,
+    /// Whether the last iteration saw this node as a live primary. A
+    /// follower→primary flip (promote or a switchover hand-off, both inside
+    /// `Repl::step`) rebuilds the due-heap and cron from the replicated store
+    /// — the only truth for a promoted node.
+    was_primary: bool,
 }
 
 impl Kernel {
     /// Consumes the mounted App: upserts cron rows, rebuilds the due-heap
-    /// from Pending rows. `now` for the cron phase comes from `clock`.
-    pub fn new(mut app: App, clock: Box<dyn Clock>) -> io::Result<Kernel> {
+    /// from Pending rows. `now` for the cron phase comes from `clock`. The
+    /// single-node constructor — no replication.
+    pub fn new(app: App, clock: Box<dyn Clock>) -> io::Result<Kernel> {
+        Kernel::build(app, clock, None)
+    }
+
+    /// The replicated constructor: same setup, plus a `Repl` whose role gates
+    /// the ready set (a follower serves reads and ships, never runs jobs/cron)
+    /// and whose park tick (`REPL_TICK_NANOS`) bounds every idle wait so
+    /// in-flight replication IO is polled promptly.
+    pub fn with_replication(app: App, clock: Box<dyn Clock>, repl: Repl) -> io::Result<Kernel> {
+        Kernel::build(app, clock, Some(repl))
+    }
+
+    fn build(mut app: App, clock: Box<dyn Clock>, repl: Option<Repl>) -> io::Result<Kernel> {
         let mut dispatcher = Dispatcher::new(app.take_job_defs());
         let mut cron = CronScheduler::new(app.take_cron_entries());
         let now = clock.now().as_nanos();
-        cron.upsert(app.db_mut(), now)?;
+        let was_primary = repl.as_ref().is_none_or(Repl::is_primary);
+        // `cron.upsert` writes the schedule rows — skip it on a follower (its
+        // `Db` is write-stopped, and the rows arrive by replication anyway); a
+        // promotion re-runs it in `after_repl_step`. `dispatcher.rebuild` is a
+        // read, always safe.
+        if was_primary {
+            cron.upsert(app.db_mut(), now)?;
+        }
         dispatcher.rebuild(&app.db_mut().snapshot()?)?;
         // The rebuild scan above is the authoritative snapshot of everything
         // enqueued before construction; ids still sitting in the drain buffer
@@ -108,6 +138,8 @@ impl Kernel {
             clock,
             pending: None,
             stats: KernelStats::default(),
+            repl,
+            was_primary,
         })
     }
 
@@ -138,22 +170,52 @@ impl Kernel {
             self.pending = source.poll();
         }
         let now = self.clock.now().as_nanos();
-        let mut ready = Vec::with_capacity(3);
+        // Non-destructive IO movement, the peer of `source.poll()` (DESIGN §1):
+        // accept conns, drain readable messages, note timers — no `Db` access.
+        if let Some(repl) = &mut self.repl {
+            repl.pump_io(now);
+        }
+        // A follower (or a draining primary — `is_primary` is false while
+        // handing off) serves reads and ships, but never runs jobs or cron:
+        // those transactions would hit `TxError::NotPrimary` (DESIGN §5).
+        let primary = self.repl.as_ref().is_none_or(Repl::is_primary);
+        let mut ready = Vec::with_capacity(4);
         if self.pending.is_some() {
             ready.push(Ready::Request);
         }
-        if self.dispatcher.has_due(now) {
+        if primary && self.dispatcher.has_due(now) {
             ready.push(Ready::Job);
         }
-        if self.cron.has_due(now) {
+        if primary && self.cron.has_due(now) {
             ready.push(Ready::Cron);
         }
+        if self
+            .repl
+            .as_ref()
+            .is_some_and(|r| r.has_work(self.app.db(), now))
+        {
+            ready.push(Ready::Repl);
+        }
         if ready.is_empty() {
-            let deadline = [self.dispatcher.next_deadline(), self.cron.next_deadline()]
-                .into_iter()
-                .flatten()
-                .min()
-                .map(Instant::from_nanos);
+            // Gate the job/cron deadlines on `primary` too: a follower with a
+            // due-but-gated job must not busy-spin on a deadline already in the
+            // past — the park tick (below) is what wakes it to re-check.
+            let mut deadline = [
+                primary.then(|| self.dispatcher.next_deadline()).flatten(),
+                primary.then(|| self.cron.next_deadline()).flatten(),
+                self.repl.as_ref().and_then(|r| r.next_deadline(now)),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .map(Instant::from_nanos);
+            // The replication park tick (spec §3's accepted wart): a
+            // repl-configured node never parks past one tick, so in-flight sim
+            // messages and prod TCP are both polled within `REPL_TICK_NANOS`.
+            if self.repl.is_some() {
+                let tick = Instant::from_nanos(now + REPL_TICK_NANOS);
+                deadline = Some(deadline.map_or(tick, |d| d.min(tick)));
+            }
             return Ok(Step::Idle { deadline });
         }
         // The same-shape decision site (DESIGN §1): one entropy draw
@@ -194,16 +256,66 @@ impl Kernel {
                     self.stats.cron_catchups += 1;
                 }
             }
+            Ready::Repl => {
+                let repl = self.repl.as_mut().expect("Repl arm only pushed when Some");
+                // A `Refuse`-diverged or fault error bubbles like the job arm's
+                // — restart-and-recover is the only exit (DESIGN §5).
+                repl.step(self.app.db_mut(), &*self.clock)?;
+                if repl.db_needs_reseed() {
+                    // `run_seed` consumes and returns the `Db` (it cannot
+                    // replace one it only borrows); the swap is adjacent so
+                    // `db()`/`db_mut()` never observe the empty slot.
+                    let db = self.app.take_db();
+                    let db = repl.run_seed(db, &*self.clock)?;
+                    self.app.put_db(db);
+                }
+                self.after_repl_step()?;
+            }
         }
-        // Any serviced source may have enqueued (handlers can enqueue
-        // too), so this runs after every branch above, not just Job.
-        self.dispatcher
-            .note_enqueued(self.app.db_mut().drain_enqueued());
+        // Any serviced source may have enqueued (handlers can enqueue too), so
+        // this runs after every branch above. A follower's shipped applies also
+        // fill the buffer, but a follower never runs jobs — drain it either way
+        // to keep it bounded and feed the heap only while primary (a promotion
+        // rebuilds the heap from the store in `after_repl_step`).
+        let enqueued = self.app.db_mut().drain_enqueued();
+        if primary {
+            self.dispatcher.note_enqueued(enqueued);
+        }
         Ok(Step::Worked)
+    }
+
+    /// After a `Repl::step`, catch a follower→primary flip (promote, or a
+    /// switchover hand-off): rebuild the due-heap and cron from the replicated
+    /// store — the store's Pending rows are the only truth, and `rebuild` only
+    /// enqueues Pending ones, so a job the old primary already marked Done is
+    /// never resurrected onto the heap.
+    fn after_repl_step(&mut self) -> io::Result<()> {
+        let primary = self.repl.as_ref().is_none_or(Repl::is_primary);
+        if primary && !self.was_primary {
+            let now = self.clock.now().as_nanos();
+            self.cron.upsert(self.app.db_mut(), now)?;
+            let snap = self.app.db_mut().snapshot()?;
+            self.dispatcher.rebuild(&snap)?;
+        }
+        self.was_primary = primary;
+        Ok(())
     }
 
     pub fn stats(&self) -> KernelStats {
         self.stats
+    }
+
+    /// Borrows the mounted App — tests read `db().last_applied()`/snapshots
+    /// without consuming the kernel (`into_app` is the consuming form).
+    #[doc(hidden)]
+    pub fn app(&self) -> &App {
+        &self.app
+    }
+
+    /// True for a live primary — `false` on a follower or a draining primary.
+    /// Mirrors `Repl::is_primary`; a non-replicated kernel is always primary.
+    pub fn is_primary(&self) -> bool {
+        self.repl.as_ref().is_none_or(Repl::is_primary)
     }
 
     /// Hands the mounted App back for post-run inspection in tests.

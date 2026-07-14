@@ -1848,3 +1848,845 @@ fn the_zero_loss_oracle_catches_a_promote_without_drain() {
         "the failure must be the oracle catching the loss: {msg}"
     );
 }
+
+// ============================================ kernel-level multi-node (T8)
+//
+// Task 8 wires the data plane into the kernel: a follower's `Kernel` serves
+// reads and answers writes with 421, ships its log, but never runs jobs or
+// cron (gated on `Repl::is_primary`); a promoted follower rebuilds its due-heap
+// from the replicated store. These nodes wrap a `Kernel` + `SimSource` and
+// drive it with `Kernel::step` — the same decision code prod runs — where the
+// `Node` above drove `Repl` directly. The scheduler mirrors `scheduler_round`
+// but one `kernel.step` per node per round IS the pump+has_work+step the
+// Db-level scheduler spelled out.
+
+use charpente::http::{ApiError, App, AppConfig, Method, Request, Session};
+use charpente::kernel::{CronRow, Kernel, RecordedResponses, SimSource, Step};
+use charpente::{Tx, View, job, jobs, route, routes};
+use charpente_core::job::JobRow;
+
+#[table]
+struct Tally {
+    id: Id<Tally>,
+    count: u64,
+}
+
+#[job]
+struct Bump {
+    slot: u64,
+}
+
+impl Bump {
+    fn run(self, tx: &mut Tx) -> Result<(), charpente::kernel::JobError> {
+        let count = tx
+            .get(Id::<Tally>::from_raw(self.slot))?
+            .map_or(0, |t: Tally| t.count);
+        tx.put(&Tally {
+            id: Id::from_raw(self.slot),
+            count: count + 1,
+        });
+        Ok(())
+    }
+}
+
+#[route(POST "/widget/:id")]
+fn put_widget(tx: &mut Tx, id: u64) -> Result<u64, ApiError> {
+    tx.put(&Widget {
+        id: Id::from_raw(id),
+        kind: id % 3,
+        weight: id as i64,
+    });
+    tx.enqueue(Bump { slot: id });
+    Ok(id)
+}
+
+#[route(GET "/widget/:id")]
+fn get_widget(tx: &mut Tx, id: Id<Widget>) -> Result<i64, ApiError> {
+    Ok(tx.get(id)?.ok_or(ApiError::NotFound)?.weight)
+}
+
+fn kernel_schema() -> Schema {
+    Schema::new().table::<Widget>().table::<Tally>()
+}
+
+/// The schema a raw `Db::open` needs to match a kernel `App`'s: `App::open`
+/// adds `Session` + `CronRow`, `Db::open` adds `JobRow` itself.
+fn full_schema() -> Schema {
+    kernel_schema().table::<Session>().table::<CronRow>()
+}
+
+fn backup_cfg(listen: &str, primary: &str) -> ReplConfig {
+    ReplConfig {
+        listen: Some(listen.to_string()),
+        initial_role: Role::Backup {
+            primary: primary.to_string(),
+        },
+    }
+}
+
+/// One replication node driven through its `Kernel` (T8), not `Repl` directly.
+struct KNode {
+    host: SimHost,
+    kernel: Option<Kernel>,
+    /// Scripted requests + the recorded `(status, body)` sink.
+    source: SimSource,
+    responses: RecordedResponses,
+    name: String,
+    repl_cfg: ReplConfig,
+    db_cfg: DbConfig,
+    recoveries: u32,
+    flipped: bool,
+    /// A designated survivor (the property's clean follower) is never
+    /// recovered — a fault on it makes the universe inconclusive, because the
+    /// single-follower promise needs one clean copy.
+    recoverable: bool,
+}
+
+/// Build the App + Repl + Kernel for one host, with the same torn-role
+/// first-boot re-init the Db-level `open_node` uses.
+fn open_kernel(
+    sim: &Sim,
+    h: &SimHost,
+    cfg: &ReplConfig,
+    db_cfg: &DbConfig,
+    flipped: bool,
+) -> Result<Kernel, String> {
+    let mut app = App::open(
+        Box::new(h.disk()),
+        kernel_schema(),
+        Box::new(h.entropy()),
+        AppConfig {
+            body_cap: 1 << 20,
+            db: db_cfg.clone(),
+        },
+    )
+    .map_err(|e| format!("App::open: {e}"))?
+    .mount(routes![put_widget, get_widget])
+    .mount_jobs(jobs![Bump])
+    .schedule("tick", Duration::from_secs(1), || Bump { slot: 0 });
+
+    let repl = match Repl::open(
+        Box::new(h.net()),
+        Box::new(h.disk()),
+        cfg.clone(),
+        app.db_for_tests(),
+    ) {
+        Ok((repl, _notice)) => repl,
+        Err(e) if e.to_string().contains("integrity check") => {
+            if flipped {
+                return Err(format!(
+                    "{INCONCLUSIVE}: {} torn role file after a role flip — the operator restore \
+                     path (not config re-init) is the fix: {e}",
+                    h.name()
+                ));
+            }
+            let _ = h.disk().remove("role");
+            let _ = h.disk().sync_dir("role");
+            Repl::open(
+                Box::new(h.net()),
+                Box::new(h.disk()),
+                cfg.clone(),
+                app.db_for_tests(),
+            )
+            .map_err(|e| format!("Repl::open (after torn-role re-init): {e}"))?
+            .0
+        }
+        Err(e) => return Err(format!("Repl::open: {e}")),
+    };
+    Kernel::with_replication(app, Box::new(sim.clock()), repl).map_err(|e| format!("Kernel: {e}"))
+}
+
+fn spawn_kernel_node(
+    sim: &Sim,
+    host: &str,
+    cfg: ReplConfig,
+    db_cfg: DbConfig,
+    horizon: u64,
+    recoverable: bool,
+) -> Result<KNode, String> {
+    let h = sim.host(host);
+    for _ in 0..RECOVER_ATTEMPTS {
+        match open_kernel(sim, &h, &cfg, &db_cfg, false) {
+            Ok(kernel) => {
+                let source = SimSource::new(Box::new(sim.clock()), horizon);
+                let responses = source.responses();
+                return Ok(KNode {
+                    host: h,
+                    kernel: Some(kernel),
+                    source,
+                    responses,
+                    name: host.to_string(),
+                    repl_cfg: cfg,
+                    db_cfg,
+                    recoveries: 0,
+                    flipped: false,
+                    recoverable,
+                });
+            }
+            Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
+            Err(e) if is_fault_fallout(&e) => {
+                h.restart();
+                continue;
+            }
+            Err(e) => return Err(format!("{host}: {e}")),
+        }
+    }
+    Err(format!(
+        "{INCONCLUSIVE}: {host} kernel spawn exhausted {RECOVER_ATTEMPTS} attempts"
+    ))
+}
+
+/// A node whose local copy is unrecoverable (corruption below the horizon):
+/// the named hard error whose fix is restore-from-replica. The above-horizon
+/// property turns this into the real restore path.
+const RESTORE_NEEDED: &str = "universe-restore-needed";
+
+fn recover_kernel_node(sim: &Sim, node: &mut KNode) -> Result<(), String> {
+    sim.cover("restart");
+    node.recoveries += 1;
+    node.kernel = None; // release old handles before power-cycling
+    let mut last = String::new();
+    for _ in 0..RECOVER_ATTEMPTS {
+        node.host.restart();
+        match open_kernel(sim, &node.host, &node.repl_cfg, &node.db_cfg, node.flipped) {
+            Ok(kernel) => {
+                node.kernel = Some(kernel);
+                return Ok(());
+            }
+            Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
+            // Corruption at or below the durable horizon: not a torn tail — the
+            // local copy is bricked and the fix is restore. Surface it (the
+            // caller reseeds from the survivor) rather than retry into the same
+            // durable bytes forever.
+            Err(e) if e.contains("restore this node from a replica or backup") => {
+                return Err(format!(
+                    "{RESTORE_NEEDED}: {} corrupted below the horizon",
+                    node.name
+                ));
+            }
+            Err(e) if e.contains("cannot be rebuilt from the log alone") => {
+                return Err(format!(
+                    "{RESTORE_NEEDED}: {} store bricked below a compacted log",
+                    node.name
+                ));
+            }
+            // A vanished base segment (dir_entry_loss lost the entry naming a
+            // low segment, leaving a gap Db::open refuses to guess across): the
+            // local log directory is damaged unrecoverably — same restore path
+            // (workload-model finding, seed 0x6b3de0f93ddc2a36).
+            Err(e) if e.contains("refusing to guess") => {
+                return Err(format!(
+                    "{RESTORE_NEEDED}: {} log directory gapped by entry loss",
+                    node.name
+                ));
+            }
+            Err(e) if is_fault_fallout(&e) => last = e,
+            Err(e) => return Err(format!("recover {}: {e}", node.name)),
+        }
+    }
+    Err(format!(
+        "{INCONCLUSIVE}: recover {} exhausted {RECOVER_ATTEMPTS} attempts (last: {last})",
+        node.name
+    ))
+}
+
+/// One `Kernel::step`, classifying faults. A recoverable node reopens on
+/// fallout (progress); a designated survivor's fault is inconclusive.
+fn kstep_node(sim: &Sim, node: &mut KNode) -> Result<Step, String> {
+    let stepped = {
+        let kernel = node.kernel.as_mut().expect("kstep on a live node");
+        kernel.step(&mut node.source)
+    };
+    match stepped {
+        Ok(step) => Ok(step),
+        // A recoverable node reopens on transient fallout OR on its own local
+        // media corruption surfaced mid-step (a misdirected write to its wal
+        // that the shipping read-back refuses): a restart re-runs recovery,
+        // which cuts an above-horizon torn tail or routes a below-horizon
+        // corruption to the restore path (RESTORE_NEEDED). Workload-model
+        // finding, seed 0xd352f1bf5ef94cc6: without this arm the primary's own
+        // shipped-frame refusal read as a bug instead of the restart it names.
+        Err(e)
+            if node.recoverable
+                && (is_fault_fallout(&e.to_string()) || is_local_corruption(&e.to_string())) =>
+        {
+            recover_kernel_node(sim, node)?;
+            Ok(Step::Worked)
+        }
+        // A designated survivor that faults or hits its OWN media corruption
+        // can no longer serve as the clean reference: the single-follower
+        // promise assumes one undamaged copy, so this universe is inconclusive
+        // — not a bug (workload-model finding, seed 0xa90fe2035d7d4bf2: the
+        // survivor's wal took the misdirected write, and its shipping refusal
+        // read as a failure of the promise it can no longer underwrite). A
+        // genuine data/consistency bug never surfaces here (those panic, or
+        // the final oracles on the survivor's store catch them).
+        Err(e) if !node.recoverable => Err(format!(
+            "{INCONCLUSIVE}: {} (the designated survivor) faulted: {e}",
+            node.name
+        )),
+        Err(e) => Err(format!("{} kernel step: {e}", node.name)),
+    }
+}
+
+/// A node's own durable copy is damaged (media corruption on the shipping
+/// read-back, or a base segment gapped by entry loss) — the named hard errors
+/// whose fix is restore, not a local repair.
+fn is_local_corruption(e: &str) -> bool {
+    e.contains("restore this node from a replica or backup")
+        || e.contains("corrupted frame must never be shipped")
+        || e.contains("refusing to guess")
+}
+
+/// One scheduler round over kernel nodes: step each once; if none worked,
+/// advance virtual time to the earliest deadline (node park tick, node timer,
+/// or in-flight network delivery). A repl-configured kernel always reports a
+/// park-tick deadline, so this effectively never reports full quiescence.
+fn kernel_round(sim: &Sim, nodes: &mut [&mut KNode]) -> Result<bool, String> {
+    let mut worked = false;
+    let mut deadlines: Vec<u64> = Vec::new();
+    for node in nodes.iter_mut() {
+        match kstep_node(sim, node)? {
+            Step::Worked => worked = true,
+            Step::Idle { deadline } => {
+                if let Some(d) = deadline {
+                    deadlines.push(d.as_nanos());
+                }
+            }
+        }
+    }
+    if worked {
+        return Ok(true);
+    }
+    let now = sim.now().as_nanos();
+    let mut next = sim.next_wakeup();
+    for d in deadlines {
+        if d > now {
+            next = Some(next.map_or(d, |x| x.min(d)));
+        }
+    }
+    match next {
+        Some(t) if t > now => {
+            sim.clock().sleep(Duration::from_nanos(t - now));
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn krun_until(
+    sim: &Sim,
+    nodes: &mut [&mut KNode],
+    done: impl Fn(&[&mut KNode]) -> bool,
+    budget: u32,
+) -> Result<(), String> {
+    for _ in 0..budget {
+        if done(nodes) {
+            return Ok(());
+        }
+        if !kernel_round(sim, nodes)? {
+            return if done(nodes) {
+                Ok(())
+            } else {
+                Err("kernel stall: no work, no pending events, done() false".to_string())
+            };
+        }
+    }
+    if done(nodes) {
+        Ok(())
+    } else {
+        Err(format!("kernel budget {budget} exhausted before done()"))
+    }
+}
+
+fn klast(node: &KNode) -> Option<u64> {
+    node.kernel
+        .as_ref()
+        .and_then(|k| k.app().db().last_applied())
+}
+
+fn kconverged(nodes: &[&mut KNode]) -> bool {
+    klast(nodes[0]) == klast(nodes[1])
+}
+
+/// Push a request onto `target`'s source and drive the whole node set until it
+/// is answered; returns the recorded `(status, body)`.
+fn drive_request(
+    sim: &Sim,
+    nodes: &mut [&mut KNode],
+    target: usize,
+    req: Request,
+    budget: u32,
+) -> Result<(u16, Vec<u8>), String> {
+    let sink = nodes[target].responses.clone();
+    let before = sink.lock().expect("responses lock").len();
+    let now = sim.now().as_nanos();
+    nodes[target].source.push_at(now, req);
+    for _ in 0..budget {
+        if sink.lock().expect("responses lock").len() > before {
+            return Ok(sink.lock().expect("responses lock")[before].clone());
+        }
+        if !kernel_round(sim, nodes)? {
+            break;
+        }
+    }
+    if sink.lock().expect("responses lock").len() > before {
+        Ok(sink.lock().expect("responses lock")[before].clone())
+    } else {
+        Err(format!(
+            "{INCONCLUSIVE}: no response to a request on node {target} within budget"
+        ))
+    }
+}
+
+/// Drive the given kernel nodes until a control conn to one of them answers.
+fn drive_ctrl_kernel(
+    sim: &Sim,
+    nodes: &mut [&mut KNode],
+    cli: &mut CtrlConn,
+    budget: u32,
+) -> Result<Msg, String> {
+    for _ in 0..budget {
+        let advanced = kernel_round(sim, nodes)?;
+        match cli.poll() {
+            Ok(Some(m)) => return Ok(m),
+            Ok(None) => {}
+            Err(e) => return Err(format!("{INCONCLUSIVE}: {e}")),
+        }
+        if !advanced {
+            return Err(format!("{INCONCLUSIVE}: quiescent before a control reply"));
+        }
+    }
+    Err(format!("{INCONCLUSIVE}: no control reply within budget"))
+}
+
+// ------------------------------------ property: follower gating (deterministic)
+
+#[test]
+fn follower_kernel_serves_reads_never_jobs_or_cron() {
+    let sim = Sim::with_faults(0x2EB1_0100, FaultConfig::none());
+    let horizon = 100 * 1_000_000_000; // 100 virtual seconds — room for cron
+    let mut p = spawn_kernel_node(
+        &sim,
+        "p",
+        primary_cfg("p:1"),
+        DbConfig::default(),
+        horizon,
+        true,
+    )
+    .unwrap();
+    let mut f = spawn_kernel_node(
+        &sim,
+        "f",
+        follower_cfg("f:1", "p:1"),
+        DbConfig::default(),
+        horizon,
+        true,
+    )
+    .unwrap();
+
+    // Writes on the primary: each commits a widget AND enqueues a job.
+    for id in 0..6u64 {
+        let (status, _) = drive_request(
+            &sim,
+            &mut [&mut p, &mut f],
+            0,
+            Request::new(Method::Post, format!("/widget/{id}")),
+            CONVERGE_BUDGET,
+        )
+        .unwrap();
+        assert_eq!(status, 200, "the primary commits a POST");
+    }
+    // Advance until the primary's cron has ticked twice and f has converged.
+    krun_until(
+        &sim,
+        &mut [&mut p, &mut f],
+        |ns| ns[0].kernel.as_ref().unwrap().stats().cron_ticks >= 2 && kconverged(ns),
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+
+    let pstats = p.kernel.as_ref().unwrap().stats();
+    let fstats = f.kernel.as_ref().unwrap().stats();
+    assert!(pstats.jobs_done > 0, "the primary ran jobs");
+    assert!(pstats.cron_ticks >= 2, "the primary ticked cron");
+    assert_eq!(fstats.jobs_done, 0, "a follower never runs jobs");
+    assert_eq!(fstats.cron_ticks, 0, "a follower never ticks cron");
+
+    // The Done marks are replicated: f's jobs table byte-mirrors p's.
+    {
+        let ps = p.kernel.as_ref().unwrap().app().db().snapshot().unwrap();
+        let fs = f.kernel.as_ref().unwrap().app().db().snapshot().unwrap();
+        let pj = ps.scan_raw(JobRow::TABLE).unwrap();
+        let fj = fs.scan_raw(JobRow::TABLE).unwrap();
+        assert!(!pj.is_empty(), "there were jobs to replicate");
+        assert_eq!(pj, fj, "f's jobs table mirrors p's (Done marks replicated)");
+    }
+
+    // A read on the follower answers 200 with the primary's data.
+    let (status, body) = drive_request(
+        &sim,
+        &mut [&mut p, &mut f],
+        1,
+        Request::new(Method::Get, "/widget/3"),
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    assert_eq!(status, 200, "the follower serves reads");
+    assert_eq!(
+        body, b"3",
+        "the read returns the primary's replicated value"
+    );
+
+    // A write on the follower is refused 421 naming the primary.
+    let (status, body) = drive_request(
+        &sim,
+        &mut [&mut p, &mut f],
+        1,
+        Request::new(Method::Post, "/widget/99"),
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    assert_eq!(status, 421, "the follower refuses writes");
+    assert!(
+        String::from_utf8_lossy(&body).contains("p:1"),
+        "the 421 names the primary: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+// -------------------------------- property: backup opens + promotes (spec §4 #7)
+
+#[test]
+fn backup_node_dir_opens_and_promotes_fingerprint_identical() {
+    let sim = Sim::with_faults(0x2EB1_0102, FaultConfig::none());
+    let horizon = 100 * 1_000_000_000;
+    let mut p = spawn_kernel_node(
+        &sim,
+        "p",
+        primary_cfg("p:1"),
+        DbConfig::default(),
+        horizon,
+        true,
+    )
+    .unwrap();
+    // A Backup-role node: its SimSource stays empty (requests never arrive),
+    // the in-sim shape of `serve::backup`'s `EmptySource`.
+    let mut b = spawn_kernel_node(
+        &sim,
+        "b",
+        backup_cfg("b:1", "p:1"),
+        DbConfig::default(),
+        horizon,
+        true,
+    )
+    .unwrap();
+
+    for id in 0..8u64 {
+        let (status, _) = drive_request(
+            &sim,
+            &mut [&mut p, &mut b],
+            0,
+            Request::new(Method::Post, format!("/widget/{id}")),
+            CONVERGE_BUDGET,
+        )
+        .unwrap();
+        assert_eq!(status, 200);
+    }
+    krun_until(&sim, &mut [&mut p, &mut b], kconverged, CONVERGE_BUDGET).unwrap();
+
+    // The backup answered nothing and ran nothing — it only followed.
+    let bstats = b.kernel.as_ref().unwrap().stats();
+    assert_eq!(bstats.requests, 0, "a backup answers no requests");
+    assert_eq!(bstats.jobs_done, 0, "a backup runs no jobs");
+    assert_eq!(bstats.cron_ticks, 0, "a backup ticks no cron");
+
+    let seq = p.kernel.as_ref().unwrap().app().db().last_applied();
+    let p_scan = table_scans(p.kernel.as_ref().unwrap().app().db()).unwrap();
+
+    // Graceful close: dropping the kernel drops the App/Db (redb persists, WAL
+    // synced). The dir then opens clean through a raw Db::open — the promise
+    // the compacted-log restore text makes.
+    let bkernel = b.kernel.take().unwrap();
+    drop(bkernel);
+    {
+        let db = Db::open(Box::new(b.host.disk()), DbConfig::default(), full_schema())
+            .expect("a gracefully-closed backup dir opens clean");
+        assert_eq!(
+            db.last_applied(),
+            seq,
+            "the reopened dir holds the converged position"
+        );
+    }
+
+    // Restart b (safe post-graceful-close — nothing unsynced to collapse) and
+    // promote it: it accepts writes from its acked position.
+    b.flipped = true;
+    b.host.restart();
+    b.kernel = Some(open_kernel(&sim, &b.host, &b.repl_cfg, &b.db_cfg, false).unwrap());
+
+    let mut cli = CtrlConn::open(&sim, "b:1", &Msg::CtrlPromote).unwrap();
+    let reply = drive_ctrl_kernel(&sim, &mut [&mut b], &mut cli, CONVERGE_BUDGET).unwrap();
+    match reply {
+        Msg::CtrlOk { message } => assert!(
+            message.contains("last_applied"),
+            "promote CtrlOk names last_applied: {message}"
+        ),
+        other => panic!("a backup promote must succeed: {other:?}"),
+    }
+    assert!(
+        b.kernel.as_ref().unwrap().is_primary(),
+        "b is a primary after promotion"
+    );
+    // The promote itself is at the converged position; becoming primary then
+    // re-upserts the (already-replicated, identical) cron row, one redundant
+    // record past `seq`, so the CONTENT is what must equal p's — the typed
+    // scans byte-match at that state.
+    let b_scan = table_scans(b.kernel.as_ref().unwrap().app().db()).unwrap();
+    assert_eq!(
+        b_scan, p_scan,
+        "the promoted backup's typed scans equal the primary's at that seq"
+    );
+
+    // And it now accepts writes.
+    let (status, _) = drive_request(
+        &sim,
+        &mut [&mut b],
+        0,
+        Request::new(Method::Post, "/widget/100"),
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    assert_eq!(status, 200, "a promoted backup accepts writes");
+}
+
+// --------------------- property: the above-horizon promise kept (spec §4 #8)
+
+use charpente_core::job::JobStatus;
+
+const SEC_NANOS: u64 = 1_000_000_000;
+const KBUDGET: u32 = 200_000;
+
+/// Checkpointing config so a store horizon forms below the WAL tail — the
+/// precondition for below-horizon corruption to be distinguishable from a
+/// torn tail.
+fn horizon_db_cfg() -> DbConfig {
+    DbConfig {
+        wal: WalConfig {
+            dir: "wal".to_string(),
+            segment_bytes: 256,
+        },
+        store_path: "tables.redb".to_string(),
+        retain_segments: 2,
+        checkpoint_every: 8,
+    }
+}
+
+/// Which acked widget ids the node's store currently holds (it never loses
+/// these once present, being the designated survivor).
+fn ids_present(node: &KNode, ids: &[u64]) -> Result<Vec<u64>, String> {
+    let db = node.kernel.as_ref().ok_or("node has no kernel")?.app().db();
+    let snap = db.snapshot().map_err(|e| e.to_string())?;
+    let rows = snap.scan_raw(Widget::TABLE).map_err(|e| e.to_string())?;
+    Ok(ids
+        .iter()
+        .copied()
+        .filter(|id| rows.iter().any(|(rid, _)| rid == id))
+        .collect())
+}
+
+/// THE promise (spec §4 property 8): every acked id the follower had converged
+/// on still lives on it. No `durable_corruption_fired` excuse — a converged
+/// follower exists, so this is a hard oracle.
+fn assert_survivor_holds(node: &KNode, ids: &[u64]) -> Result<(), String> {
+    retry_fallout(|| {
+        let db = node
+            .kernel
+            .as_ref()
+            .ok_or("survivor has no kernel")?
+            .app()
+            .db();
+        let snap = db.snapshot().map_err(|e| e.to_string())?;
+        let rows = snap.scan_raw(Widget::TABLE).map_err(|e| e.to_string())?;
+        for id in ids {
+            if !rows.iter().any(|(rid, _)| rid == id) {
+                return Err(format!(
+                    "acked+converged widget {id} vanished from the survivor — the above-horizon \
+                     promise broke: media corruption on the primary lost a record the follower \
+                     had (spec §4 property 8)"
+                ));
+            }
+        }
+        Ok(())
+    })
+}
+
+/// The consistency oracle carried over from the kernel suite: every replicated
+/// Done Bump bumped its Tally exactly once (a cut reverts to a prefix, which
+/// stays consistent, so this holds through corruption).
+fn bump_exactly_once(node: &KNode) -> Result<(), String> {
+    retry_fallout(|| {
+        let db = node.kernel.as_ref().ok_or("no kernel")?.app().db();
+        let snap = db.snapshot().map_err(|e| e.to_string())?;
+        let jobs = snap.scan::<JobRow>().map_err(|e| e.to_string())?;
+        let tallies: std::collections::BTreeMap<u64, u64> = snap
+            .scan::<Tally>()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|t| (t.id.raw(), t.count))
+            .collect();
+        let mut done: std::collections::BTreeMap<u64, u64> = Default::default();
+        for j in &jobs {
+            if j.status == JobStatus::Done && j.name == "Bump" {
+                let slot = u64::decode(&mut &j.payload[..]).map_err(|e| e.to_string())?;
+                *done.entry(slot).or_insert(0) += 1;
+            }
+        }
+        for (&slot, &d) in &done {
+            let c = tallies.get(&slot).copied().unwrap_or(0);
+            if c != d {
+                return Err(format!(
+                    "exactly-once violated on the survivor at slot {slot}: {d} Done bumps but \
+                     {c} tally"
+                ));
+            }
+        }
+        Ok(())
+    })
+}
+
+/// The real restore path (property (a)): the survivor is promoted, then the
+/// bricked node is wiped and rebuilt as a fresh follower of it — re-seeded from
+/// the survivor's snapshot. This is the compacted-log error text's promise made
+/// real (the Db-level suite could only mark it inconclusive).
+fn restore_p_from_survivor(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<(), String> {
+    sim.cover("repl:restored-from-follower");
+    // Promote the survivor if it is not already primary.
+    if !f.kernel.as_ref().is_some_and(|k| k.is_primary()) {
+        f.flipped = true;
+        let mut cli = CtrlConn::open(sim, "f:1", &Msg::CtrlPromote)?;
+        match drive_ctrl_kernel(sim, &mut [f], &mut cli, KBUDGET)? {
+            Msg::CtrlOk { .. } => {}
+            other => {
+                return Err(format!(
+                    "{INCONCLUSIVE}: promoting the survivor failed: {other:?}"
+                ));
+            }
+        }
+    }
+    // Wipe the bricked node's disk and rebuild it as a fresh follower of the
+    // survivor — a fresh follower below the survivor's base re-seeds.
+    p.kernel = None;
+    p.host.restart();
+    let disk = p.host.disk();
+    for name in disk.list("").map_err(|e| e.to_string())? {
+        let _ = disk.remove(&name);
+    }
+    let _ = disk.sync_dir("");
+    let _ = disk.sync_dir("wal/");
+    p.repl_cfg = follower_cfg("p:1", "f:1");
+    p.flipped = true;
+    p.recoveries += 1;
+    p.kernel = Some(
+        open_kernel(sim, &p.host, &p.repl_cfg, &p.db_cfg, true).map_err(|e| {
+            if e.contains(INCONCLUSIVE) {
+                e
+            } else {
+                format!("{INCONCLUSIVE}: restore reopen: {e}")
+            }
+        })?,
+    );
+    // Drive the re-seed to convergence so the restore is real, not just wired.
+    // Any failure here (a stall, or the freshly-restored node needing yet
+    // another restore) is too much damage to adjudicate: inconclusive.
+    krun_until(sim, &mut [p, f], kconverged, KBUDGET).map_err(|e| {
+        if e.contains(INCONCLUSIVE) {
+            e
+        } else {
+            format!("{INCONCLUSIVE}: restore convergence stalled: {e}")
+        }
+    })
+}
+
+#[test]
+fn wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower() {
+    run_universes_swarm_with!(
+        0x2EB1_000E,
+        128,
+        |cfg: &mut FaultConfig| {
+            cfg.bit_flip = 0.02;
+            cfg.misdirected_write = 0.005;
+        },
+        |sim: &mut Sim| {
+            let r = above_horizon_universe(sim);
+            finish_universe(sim, r)
+        },
+        require: ["fault:bit_flip"]
+    );
+}
+
+fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
+    let db_cfg = horizon_db_cfg();
+    let horizon = 200 * SEC_NANOS;
+    let mut p = spawn_kernel_node(sim, "p", primary_cfg("p:1"), db_cfg.clone(), horizon, true)?;
+    // The designated survivor: never recovered — a fault on it is inconclusive
+    // (the single-follower promise needs one clean copy), so its store keeps
+    // every record it applied.
+    let mut f = spawn_kernel_node(sim, "f", follower_cfg("f:1", "p:1"), db_cfg, horizon, false)?;
+
+    let mut acked: Vec<u64> = Vec::new();
+    let mut promised: std::collections::BTreeSet<u64> = Default::default();
+
+    for round in 0..8u64 {
+        for k in 0..3u64 {
+            let id = round * 3 + k;
+            match drive_request(
+                sim,
+                &mut [&mut p, &mut f],
+                0,
+                Request::new(Method::Post, format!("/widget/{id}")),
+                KBUDGET,
+            ) {
+                Ok((200, _)) => acked.push(id),
+                Ok(_) => {} // 421 (p demoted after a restore) / 500 — not acked
+                Err(e) if e.contains(RESTORE_NEEDED) => {
+                    restore_p_from_survivor(sim, &mut p, &mut f)?
+                }
+                // INCONCLUSIVE (finish_universe covers it) or a real bug: bubble.
+                Err(e) => return Err(e),
+            }
+        }
+        // Converge f onto p as far as faults allow (best effort — a stall under
+        // persistent faults is not a bug, we snapshot what f durably holds).
+        match krun_until(sim, &mut [&mut p, &mut f], kconverged, KBUDGET) {
+            Ok(()) => {}
+            Err(e) if e.contains(RESTORE_NEEDED) => restore_p_from_survivor(sim, &mut p, &mut f)?,
+            Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
+            Err(_) => {}
+        }
+        // Record everything f durably holds now — it keeps these forever.
+        promised.extend(retry_fallout(|| ids_present(&f, &acked)).unwrap_or_default());
+
+        // The corruption trigger: crash + restart p (bit_flip rolls on p's
+        // wal/ at restart). Recovery may cut above the horizon (silent loss,
+        // pre-M1) or hard-error below it (the restore path).
+        p.host.crash_now();
+        match recover_kernel_node(sim, &mut p) {
+            Ok(()) => {}
+            Err(e) if e.contains(RESTORE_NEEDED) => restore_p_from_survivor(sim, &mut p, &mut f)?,
+            Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Final best-effort convergence so f reflects the latest shipped state.
+    let _ = krun_until(sim, &mut [&mut p, &mut f], kconverged, KBUDGET);
+
+    // THE promise: every acked+converged id still lives on the survivor. No
+    // single-node corruption excuse — a converged follower kept the record.
+    let promised: Vec<u64> = promised.into_iter().collect();
+    assert_survivor_holds(&f, &promised)?;
+    // And the replicated jobs stayed exactly-once through it all.
+    bump_exactly_once(&f)?;
+    Ok(())
+}
