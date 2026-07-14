@@ -2326,12 +2326,31 @@ role file:
   target cannot catch up before the deadline, the switchover aborts and the
   primary resumes.
 
-Both travel as control messages over the replication port (the CLI that issues
-them is a later milestone; the wire protocol and the state machine behind them
-are in place). When a follower's own local copy is unrecoverable — media
-corruption below its checkpoint horizon, or a log directory a crash left gapped
-— the fix is not a local repair but a restore: promote a healthy replica and
-re-seed the damaged node from it as a fresh follower (its snapshot rebuilds the
-whole state, no log replay). This is the promise a single node cannot make and
-a replicated deployment can: a record one node loses to media corruption
-survives on another.
+Both travel as control messages over the replication port, issued with the
+`charpente` CLI:
+
+```bash
+charpente promote --node <addr>
+charpente switchover --primary <addr> --to <addr>
+```
+
+`<addr>` is a node's *replication* address (`ReplConfig.listen`), never its
+HTTP port. Both verbs connect, send the control message, and poll for a reply
+up to the same 30s deadline the primary's own switchover drain is bound by
+(`SWITCHOVER_DEADLINE_NANOS`); the node's own words are the product surface,
+forwarded verbatim:
+
+- exit 0 — `CtrlOk`, printed to stdout (e.g. `promoted to primary at
+  last_applied Some(41) — …`).
+- exit 1 — `CtrlErr` or `Refuse`, printed to stderr (a refusal: already
+  primary, no matching follower session, switchover deadline exceeded, …).
+- exit 2 — usage, connect, or timeout failure (bad flags, the node
+  unreachable, no reply before the deadline) — never a node-level decision.
+
+When a follower's own local copy is unrecoverable — media corruption below its
+checkpoint horizon, or a log directory a crash left gapped — the fix is not a
+local repair but a restore: promote a healthy replica and re-seed the damaged
+node from it as a fresh follower (its snapshot rebuilds the whole state, no
+log replay). This is the promise a single node cannot make and a replicated
+deployment can: a record one node loses to media corruption survives on
+another.

@@ -1,6 +1,8 @@
 //! `charpente` — the CLI: `test --sim` (seeded parallel universes),
-//! `describe` (the machine-readable contract), `serve` (DESIGN.md §7).
+//! `promote`/`switchover` (replication control verbs), `describe` (the
+//! machine-readable contract), `serve` (DESIGN.md §7).
 
+mod ctl;
 mod sim;
 
 fn main() {
@@ -10,8 +12,10 @@ fn main() {
         args.get(1).map(String::as_str),
     ) {
         (Some("test"), Some("--sim")) => sim::run(&args[2..]),
+        (Some("promote"), _) => ctl::run(&args),
+        (Some("switchover"), _) => ctl::run(&args),
         _ => {
-            eprintln!("{}", sim::USAGE);
+            eprintln!("{}\n{}", sim::USAGE, ctl::USAGE);
             2
         }
     };
