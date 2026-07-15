@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use charpente_core::db::{Db, DbConfig, Job, Schema, Tx, TxError};
 use charpente_core::io::{Disk, Entropy};
-use charpente_core::table::Id;
+use charpente_core::table::{Id, View};
 use charpente_macros::table;
 
-use crate::auth::{ApiKey, hash_token};
+use crate::auth::{ApiKey, AuthReject, OidcVerifier, Principal, Via, hash_token, resolve};
 use crate::http::router::{RouteGlue, RouteMatch, Router};
 use crate::http::{ApiError, Cursor, Request, Response, Route, Subscription, hex};
 use crate::kernel::JobDef;
@@ -38,11 +38,16 @@ pub struct Session {
 
 // ---------------------------------------------------------------- ctx
 
-/// Per-request context handed to handlers: the authenticated session (if
-/// any) and one fresh entropy-derived token for session creation. `now` and
-/// `session_ttl` are the clock reading `handle_or_subscribe` took for this
-/// request and the app's configured TTL — both needed to mint `expires_at`.
+/// Per-request context handed to handlers: the authenticated principal (if
+/// any) and one fresh entropy-derived token for session/key creation. `now`
+/// and `session_ttl` are the clock reading `handle_or_subscribe` took for
+/// this request and the app's configured TTL — both needed to mint
+/// `expires_at`.
 pub struct Ctx {
+    principal: Option<Principal>,
+    /// Compat cache for `session()`: the `Session` row, re-looked-up during
+    /// `build_ctx`, only when `principal.via == Via::Session(_)` — `None`
+    /// for an `ApiKey`/`Oidc` principal or no principal at all.
     session: Option<Session>,
     fresh_token: String,
     now: u64,
@@ -51,6 +56,15 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    /// The resolution ladder's output (auth T4) — `None` on a route without
+    /// `auth` and no credential presented.
+    pub fn principal(&self) -> Option<&Principal> {
+        self.principal.as_ref()
+    }
+
+    /// Compatibility accessor: the `Session` row, only when the principal
+    /// was authenticated `via` a session (bearer or cookie) — `None` for an
+    /// `ApiKey`/`Oidc` principal.
     pub fn session(&self) -> Option<&Session> {
         self.session.as_ref()
     }
@@ -364,14 +378,30 @@ impl App {
         match glue {
             RouteGlue::Http(glue) => {
                 let result = self.db_mut().transact(|tx| {
-                    let ctx = build_ctx(tx, &token, auth_required, fresh_token, now, session_ttl)?;
+                    let ctx = build_ctx(
+                        tx,
+                        &token,
+                        auth_required,
+                        fresh_token,
+                        now,
+                        session_ttl,
+                        None,
+                    )?;
                     glue(tx, &ctx, &captures, &request.body)
                 });
                 Handled::Response(result.unwrap_or_else(tx_error_response))
             }
             RouteGlue::Sse(glue) => {
                 let result = self.db_mut().transact(|tx| {
-                    let ctx = build_ctx(tx, &token, auth_required, fresh_token, now, session_ttl)?;
+                    let ctx = build_ctx(
+                        tx,
+                        &token,
+                        auth_required,
+                        fresh_token,
+                        now,
+                        session_ttl,
+                        None,
+                    )?;
                     glue(tx, &ctx, &captures, cursor)
                 });
                 match result {
@@ -392,11 +422,12 @@ pub enum Handled {
     Subscribe(Subscription),
 }
 
-/// Shared session-lookup-then-auth-gate, used by both route flavors: reads
-/// the session for the bearer/cookie token's hash (if any), treats a row
-/// past `expires_at` as absent — but remembers the distinction so an
-/// auth-required route sees `SessionExpired` rather than the generic
-/// `Unauthorized` — and builds the `Ctx` the handler sees.
+/// Runs the resolution ladder (`auth::resolve`, spec §2) on the bearer/
+/// cookie token, maps a rejected credential to its named 401, gates
+/// `auth`-required routes on a missing principal (the no-credential 401 —
+/// `resolve` itself never produces this: it returns `Ok(None)` for "nothing
+/// presented"), and builds the `Ctx` the handler sees. `oidc` is T5's hook
+/// (spec §3) — always `None` until `App::with_oidc` exists.
 fn build_ctx(
     tx: &mut Tx,
     token: &Option<String>,
@@ -404,29 +435,25 @@ fn build_ctx(
     fresh_token: String,
     now: u64,
     session_ttl: u64,
+    oidc: Option<&OidcVerifier>,
 ) -> Result<Ctx, ApiError> {
-    let mut expired = false;
-    let session = match token {
-        Some(token) => match Session::by_token_hash(tx, &hash_token(token))?
-            .into_iter()
-            .next()
-        {
-            Some(s) if s.expires_at <= now => {
-                expired = true;
-                None
-            }
-            other => other,
-        },
-        None => None,
-    };
-    if auth_required && session.is_none() {
-        return Err(if expired {
-            ApiError::SessionExpired
-        } else {
-            ApiError::Unauthorized
-        });
+    let principal = resolve(tx, token.as_deref(), oidc, now).map_err(|reject| match reject {
+        AuthReject::Unrecognized => ApiError::UnrecognizedCredential,
+        AuthReject::Expired => ApiError::SessionExpired,
+        AuthReject::Io(e) => ApiError::from(e),
+    })?;
+    if auth_required && principal.is_none() {
+        return Err(ApiError::Unauthorized);
     }
+    let session = match &principal {
+        Some(Principal {
+            via: Via::Session(id),
+            ..
+        }) => tx.get(*id)?,
+        _ => None,
+    };
     Ok(Ctx {
+        principal,
         session,
         fresh_token,
         now,

@@ -252,10 +252,16 @@ fn ev_json<Ev: Event + serde::Serialize>(bytes: &[u8]) -> io::Result<String> {
 #[derive(Debug)]
 pub enum ApiError {
     BadRequest(String),
+    /// No credential presented at all on an `auth` route.
     Unauthorized,
+    /// A bearer/cookie token hashed to no live `ApiKey`/`Session` row:
+    /// garbage, revoked (row deleted), or a two-dot bearer with no OIDC
+    /// configured — distinct from `Unauthorized` (nothing presented) and
+    /// from `SessionExpired` (a real row, just past its TTL).
+    UnrecognizedCredential,
     /// A bearer/cookie token matched a session row past its `expires_at` —
-    /// distinct from `Unauthorized` (no match at all): the client had a real
-    /// session, it just aged out.
+    /// distinct from `UnrecognizedCredential` (no match at all): the client
+    /// had a real session, it just aged out.
     SessionExpired,
     NotFound,
     Internal(String),
@@ -273,13 +279,14 @@ impl ApiError {
             ApiError::BadRequest(msg) => Response::error(400, msg),
             ApiError::Unauthorized => Response::error(
                 401,
-                "no valid session — send `Authorization: Bearer <token>` or a \
-                 `charpente_session` cookie",
+                "authentication required — send \"Authorization: Bearer <token>\" or the \
+                 charpente_session cookie",
             ),
-            ApiError::SessionExpired => Response::error(
+            ApiError::UnrecognizedCredential => Response::error(
                 401,
-                "session expired — the token matched a session past its TTL; log in again",
+                "unrecognized credential — it may have been revoked; obtain a new one",
             ),
+            ApiError::SessionExpired => Response::error(401, "session expired — log in again"),
             ApiError::NotFound => Response::error(404, "not found"),
             ApiError::Internal(msg) => Response::error(500, msg),
         }

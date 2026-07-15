@@ -54,7 +54,9 @@ fn login(tx: &mut Tx, subject: String, ctx: &Ctx) -> Result<String, ApiError> {
 #[route(GET "/me", auth)]
 fn whoami(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
     let _ = tx;
-    Ok(ctx.session().expect("auth route").subject.clone())
+    // ctx.principal() (not ctx.session()) so this route answers for any
+    // ladder rung — session, API key, or (T5) OIDC.
+    Ok(ctx.principal().expect("auth route").subject.clone())
 }
 
 #[route(POST "/logout", auth)]
@@ -122,6 +124,17 @@ fn quiet_app(seed: u64) -> (Sim, App) {
 
 fn body_text(response: &Response) -> String {
     String::from_utf8(response.body.clone()).unwrap()
+}
+
+/// The `{"error": "<message>"}` envelope's message, decoded — used to pin
+/// the 401 family byte-exact (auth T4) without hand-escaping JSON quotes.
+fn error_text(response: &Response) -> String {
+    #[derive(Deserialize)]
+    struct ErrBody {
+        error: String,
+    }
+    let body: ErrBody = serde_json::from_slice(&response.body).unwrap();
+    body.error
 }
 
 #[test]
@@ -255,10 +268,10 @@ fn sessions_login_auth_logout() {
     // No session: auth routes are 401 with instructions.
     let denied = app.handle(Request::new(Method::Get, "/me"));
     assert_eq!(denied.status, 401);
-    assert!(
-        body_text(&denied).contains("Authorization: Bearer"),
-        "{}",
-        body_text(&denied)
+    assert_eq!(
+        error_text(&denied),
+        "authentication required — send \"Authorization: Bearer <token>\" or the \
+         charpente_session cookie"
     );
 
     // Login mints a token.
@@ -367,11 +380,7 @@ fn session_token_is_hashed_at_rest_and_expires() {
         2_000,
     );
     assert_eq!(expired.status, 401, "{}", body_text(&expired));
-    assert!(
-        body_text(&expired).contains("session expired"),
-        "{}",
-        body_text(&expired)
-    );
+    assert_eq!(error_text(&expired), "session expired — log in again");
 }
 
 #[test]
@@ -405,8 +414,9 @@ fn api_key_mints_prefixed_hashes_at_rest_and_revokes() {
     assert_eq!(rows[0].subject, "alice");
     let key_id = rows[0].id;
 
-    // 3. Bearer resolution against the ladder is Task 4's job — here we only
-    //    land the row + mint (per the brief's sequencing note).
+    // 3. Bearer resolution against the ladder is covered end to end by
+    //    resolution_ladder_matrix (auth T4) — this test only proves the
+    //    row + mint shape.
 
     // 4. Revoke: DELETE removes it from the table (revoke-as-delete).
     let revoked = app.handle(
@@ -416,6 +426,120 @@ fn api_key_mints_prefixed_hashes_at_rest_and_revokes() {
     assert_eq!(revoked.status, 200, "{}", body_text(&revoked));
     let after = ApiKey::by_key_hash(&app.db().snapshot().unwrap(), &hash).unwrap();
     assert!(after.is_empty(), "revoked key must not remain in the table");
+}
+
+/// The resolution ladder (auth T4, spec §2), end to end over one app: every
+/// row of the matrix, exact status + exact 401 text where rejected. `now`
+/// advances monotonically across rows so the 1µs session TTL's expiry
+/// boundary (row 3) never leaks into a later row's "valid" assertions.
+#[test]
+fn resolution_ladder_matrix() {
+    let sim = Sim::with_faults(0x4444_0001, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig {
+            session_ttl: 1_000,
+            ..AppConfig::default()
+        },
+    )
+    .unwrap()
+    .mount(key_routes());
+
+    const NO_CREDENTIAL: &str = "authentication required — send \"Authorization: Bearer \
+                                  <token>\" or the charpente_session cookie";
+    const UNRECOGNIZED: &str = "unrecognized credential — it may have been revoked; obtain a \
+                                 new one";
+    const EXPIRED: &str = "session expired — log in again";
+
+    // 1. No header at all.
+    let denied = app.handle_at(Request::new(Method::Get, "/me"), 0);
+    assert_eq!(denied.status, 401, "{}", body_text(&denied));
+    assert_eq!(error_text(&denied), NO_CREDENTIAL);
+
+    // 2. Bearer, valid session.
+    let login_alice = app.handle_at(Request::new(Method::Post, "/login").json(&"alice"), 0);
+    let token_alice: String = serde_json::from_slice(&login_alice.body).unwrap();
+    let ok = app.handle_at(
+        Request::new(Method::Get, "/me").header("Authorization", format!("Bearer {token_alice}")),
+        500,
+    );
+    assert_eq!(ok.status, 200, "{}", body_text(&ok));
+    assert_eq!(body_text(&ok), "\"alice\"");
+
+    // 3. Bearer, expired session (now past the 1_000ns TTL).
+    let expired = app.handle_at(
+        Request::new(Method::Get, "/me").header("Authorization", format!("Bearer {token_alice}")),
+        2_000,
+    );
+    assert_eq!(expired.status, 401, "{}", body_text(&expired));
+    assert_eq!(error_text(&expired), EXPIRED);
+
+    // 4. Bearer, valid API key.
+    let login_bob = app.handle_at(Request::new(Method::Post, "/login").json(&"bob"), 2_000);
+    let token_bob: String = serde_json::from_slice(&login_bob.body).unwrap();
+    let minted = app.handle_at(
+        Request::new(Method::Post, "/keys").header("Authorization", format!("Bearer {token_bob}")),
+        2_000,
+    );
+    assert_eq!(minted.status, 200, "{}", body_text(&minted));
+    let raw_key_bob: String = serde_json::from_slice(&minted.body).unwrap();
+    let key_ok = app.handle_at(
+        Request::new(Method::Get, "/me").header("Authorization", format!("Bearer {raw_key_bob}")),
+        2_500,
+    );
+    assert_eq!(key_ok.status, 200, "{}", body_text(&key_ok));
+    assert_eq!(body_text(&key_ok), "\"bob\"");
+
+    // 5. Bearer, revoked API key.
+    let key_hash = hash_token(&raw_key_bob);
+    let key_id = ApiKey::by_key_hash(&app.db().snapshot().unwrap(), &key_hash)
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("api key row exists")
+        .id;
+    let revoked = app.handle_at(
+        Request::new(Method::Delete, format!("/keys/{}", key_id.raw()))
+            .header("Authorization", format!("Bearer {token_bob}")),
+        2_500,
+    );
+    assert_eq!(revoked.status, 200, "{}", body_text(&revoked));
+    let after_revoke = app.handle_at(
+        Request::new(Method::Get, "/me").header("Authorization", format!("Bearer {raw_key_bob}")),
+        2_600,
+    );
+    assert_eq!(after_revoke.status, 401, "{}", body_text(&after_revoke));
+    assert_eq!(error_text(&after_revoke), UNRECOGNIZED);
+
+    // 6. Bearer, garbage.
+    let garbage = app.handle_at(
+        Request::new(Method::Get, "/me").header("Authorization", "Bearer nope"),
+        2_600,
+    );
+    assert_eq!(garbage.status, 401, "{}", body_text(&garbage));
+    assert_eq!(error_text(&garbage), UNRECOGNIZED);
+
+    // 7. Cookie, valid session.
+    let login_carol = app.handle_at(Request::new(Method::Post, "/login").json(&"carol"), 2_600);
+    let token_carol: String = serde_json::from_slice(&login_carol.body).unwrap();
+    let cookie_ok = app.handle_at(
+        Request::new(Method::Get, "/me")
+            .header("Cookie", format!("charpente_session={token_carol}")),
+        2_700,
+    );
+    assert_eq!(cookie_ok.status, 200, "{}", body_text(&cookie_ok));
+    assert_eq!(body_text(&cookie_ok), "\"carol\"");
+
+    // 8. Bearer, two dots (JWT-shaped), no OIDC configured — judged as a
+    //    JWT, never falls through to hash lookup.
+    let jwt_shaped = app.handle_at(
+        Request::new(Method::Get, "/me").header("Authorization", "Bearer a.b.c"),
+        2_700,
+    );
+    assert_eq!(jwt_shaped.status, 401, "{}", body_text(&jwt_shaped));
+    assert_eq!(error_text(&jwt_shaped), UNRECOGNIZED);
 }
 
 #[test]
