@@ -15,6 +15,7 @@ pub use charpente_macros::{event, job, route, table};
 // `charpente` (macro-path unification, DESIGN.md §3).
 pub use serde;
 
+pub mod auth;
 pub mod http;
 pub mod kernel;
 pub mod prod;
