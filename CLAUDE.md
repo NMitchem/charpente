@@ -281,8 +281,45 @@ do not reorder a milestone's dependency sequence.
   fresh `cargo test --workspace` green, pinned seed 0x8bee1752811ae873 green, fresh
   1024-universe invoicing batch green (master seed 0x3e7dfacb98b685bb), clippy/fmt/
   guide gate clean.
-- Next: M1 sub-project 2 per the segment-mgmt spec — replication (async log shipping
-  into the retention pin, follower reads, manual promotion, backup, multi-node sim);
-  then realtime SSE/WS with exact resume, auth properly (OIDC, hashed session tokens),
-  migrations as log records, error/introspection polish (`charpente describe`), and the
-  Vörtex-style black-box edge harness for the hyper layer.
+- **M1 sub-project 2 done — replication (2026-07-14, spec docs/superpowers/specs/
+  2026-07-08-replication-design.md, 10-task plan + final review + fix wave, commits
+  f83d786..de17569).** Shipped: per-host sim worlds (host-scoped disks, crash/restart,
+  net teardown; global world frozen) + `conn_drop`/`net_spike` fault axes via
+  field-keyed sub-streams; verified WAL read-back/batch apply/`NotPrimary` write gate;
+  logical snapshot seeder (follower store + WAL base at horizon+1, `next_job_id`
+  continuity proven); 14-variant wire codec + durable role file (file wins over
+  config, always); the ship/ack/seed/diverge data plane; three-state switchover
+  (`Draining` abortable → `HandedOff` point of no return — structurally enforced: the
+  abort arm exists only in `Draining`; every role flip durably writes the role file
+  before acting) + `promote`; kernel integration (`Kernel::step` extraction — the
+  single-node path byte-identical, pinned seeds intact; `Ready::Repl` arm; follower
+  gating of jobs/cron; `REPL_TICK_NANOS` park cap; promote rebuilds due-heap/cron
+  same-step) + `serve::serve_replicated`/`serve::backup`; `charpente promote`/
+  `switchover` CLI verbs (exit 0/1/2, node's words forwarded verbatim). All 8 spec §4
+  properties live with real oracles; all five error surfaces pinned by text
+  (NotPrimary→421+primary, Diverged both-seqs-both-CRCs, switchover abort, role/config
+  mismatch demote-requires-re-seed, version mismatch). The above-horizon IOU from
+  sub-project 1 is closed: with a converged follower, WAL corruption on the primary no
+  longer loses acked records (property 8, cover-pinned headline path, promised-nonempty
+  require). Final opus whole-branch review: READY, 0 Critical; its 2 Importants fixed
+  same-day in de17569 (empty-`Frames` peer message panicked a fresh follower — guarded,
+  seed 0x2EB1_000F; silent `AwaitHello` conn pinned GC at 0 forever —
+  `HELLO_DEADLINE_NANOS` reap, seed 0x2EB1_0010; fix-found hazard recorded: stale
+  deadlines folded into `next_deadline` must be self-clearing, control conns excluded
+  via `pin_floor`'s `u64::MAX` short-circuit). Evidence: 12/12-stage sweep green
+  (replication swarm ×2, four core suites ×2, charpente-sim ×2, pinned
+  0x8bee1752811ae873 + kernel 0x348270b38f166529 replays, invoicing 1024 universes
+  master seed 0xb278a843d377e615, full workspace + clippy + fmt); demo-of-record: two
+  loopback `serve_replicated` invoicing nodes, 50/50 acked curl writes survive
+  `kill -9` + `charpente promote` (0 missing on the promoted follower, which then
+  accepts writes), promote reply names the DECISIONS §6 bounded-loss window, restarted
+  old primary prints the pinned demote/re-seed refusal — transcript in the ledger.
+  Follow-up backlog (ledgered in the sub-project close-out entry): typed error kinds at
+  the trust-boundary seams (re-Hello/not-a-primary/RESTORE_NEEDED substrings), seed
+  0x94a70e2360154b09 explicitly triaged unpinned, swarm inconclusive-rate/runtime
+  tuning (~27 min suite), ctl connect-refusal/malformed-reply tests, spec §4 stale
+  `fault:conn-drop` token.
+- Next: M1 sub-project 3 — realtime SSE/WS with exact resume; then auth properly
+  (OIDC, hashed session tokens), migrations as log records, error/introspection polish
+  (`charpente describe`), and the Vörtex-style black-box edge harness for the hyper
+  layer.
