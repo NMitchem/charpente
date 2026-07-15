@@ -17,7 +17,8 @@ use crate::Db;
 use crate::repl::protocol::{Msg, decode, encode};
 use crate::repl::role::Role;
 use crate::repl::{
-    FRAMES_BATCH_BYTES, HEARTBEAT_NANOS, MAX_MESSAGE_BYTES, PROTO_VERSION, SNAPSHOT_BATCH_BYTES,
+    FRAMES_BATCH_BYTES, HEARTBEAT_NANOS, HELLO_DEADLINE_NANOS, MAX_MESSAGE_BYTES, PROTO_VERSION,
+    SNAPSHOT_BATCH_BYTES,
 };
 
 /// Where a session is in its lifecycle. `AwaitHello` is the just-accepted
@@ -73,13 +74,16 @@ pub(crate) struct Session {
     inbox: VecDeque<Vec<u8>>,
     /// Virtual-time nanos of the last send — the heartbeat cadence clock.
     last_sent: u64,
+    /// Virtual-time nanos this session was accepted — the `AwaitHello`
+    /// arrival-deadline clock, mirroring `last_sent`'s heartbeat clock.
+    created_at: u64,
     /// The peer's wire died (send/recv error or EOF): reaped by mod.rs, which
     /// then recomputes the pin.
     pub dead: bool,
 }
 
 impl Session {
-    pub(crate) fn new(conn: Box<dyn Conn>, id: u64) -> Session {
+    pub(crate) fn new(conn: Box<dyn Conn>, id: u64, now: u64) -> Session {
         Session {
             conn,
             id,
@@ -92,6 +96,7 @@ impl Session {
             recv_buf: None,
             inbox: VecDeque::new(),
             last_sent: 0,
+            created_at: now,
             dead: false,
         }
     }
@@ -99,7 +104,9 @@ impl Session {
     /// The retention floor this session pins: `acked + 1` once acking, else
     /// its `cursor` (0 while awaiting a Hello — conservative; the snapshot
     /// position + 1 while seeding; the resume point while shipping). mod.rs
-    /// mins this over live sessions (spec §1's retention pin).
+    /// mins this over live sessions (spec §1's retention pin). A silent
+    /// `AwaitHello` session only pins at 0 until `hello_deadline` reaps it —
+    /// otherwise it would hold GC at 0 forever.
     pub(crate) fn pin_floor(&self) -> u64 {
         // A control connection ships nothing and must never hold GC.
         if self.control {
@@ -147,7 +154,10 @@ impl Session {
                 let backlog = db.last_applied().is_some_and(|last| self.cursor <= last);
                 backlog || now >= self.last_sent + HEARTBEAT_NANOS
             }
-            Phase::AwaitHello => false,
+            // Due once the arrival deadline passes: `service` reaps it (a
+            // peer that opened the wire and never sent Hello or a control
+            // verb must not pin retention at 0 forever).
+            Phase::AwaitHello => now >= self.created_at + HELLO_DEADLINE_NANOS,
         }
     }
 
@@ -156,6 +166,19 @@ impl Session {
     /// to the earliest such deadline when nothing else is runnable).
     pub(crate) fn heartbeat_deadline(&self) -> Option<u64> {
         matches!(self.phase, Phase::Shipping).then(|| self.last_sent + HEARTBEAT_NANOS)
+    }
+
+    /// The deadline by which a fresh connection must send its first message,
+    /// if it is still `AwaitHello` — mirrors `heartbeat_deadline`'s shape so
+    /// the scheduler wakes for it the same way. A control conn is excluded:
+    /// it DID send its first message (the verb flips `control`, not `phase`),
+    /// pins nothing, and is never serviced by the round-robin — a deadline
+    /// here would go permanently stale once passed, poisoning the node's
+    /// earliest-timer min forever (found by the switchover-abort test: the
+    /// stale min hid the real 30s drain deadline behind a `d > now` filter).
+    pub(crate) fn hello_deadline(&self) -> Option<u64> {
+        (!self.control && matches!(self.phase, Phase::AwaitHello))
+            .then(|| self.created_at + HELLO_DEADLINE_NANOS)
     }
 
     /// One unit of work: handle one inbox message, or push one
@@ -211,7 +234,15 @@ impl Session {
                     Ok(())
                 }
             }
-            Phase::AwaitHello => Ok(()),
+            // Silent past its arrival deadline: reap it (mod.rs's step()
+            // retains non-dead sessions and recomputes the pin next round —
+            // the same path a dropped wire already takes).
+            Phase::AwaitHello => {
+                if now >= self.created_at + HELLO_DEADLINE_NANOS {
+                    self.dead = true;
+                }
+                Ok(())
+            }
         }
     }
 

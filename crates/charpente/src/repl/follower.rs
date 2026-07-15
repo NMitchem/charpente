@@ -317,12 +317,22 @@ impl Follower {
         frames: &[(u64, Vec<u8>)],
         now: u64,
     ) -> io::Result<()> {
+        // apply_shipped is a documented no-op on an empty batch — it never
+        // advances last_applied, so there is nothing to ack. The real shipper
+        // (Session::ship_frames) never sends an empty Frames (it only sends
+        // when read_log returns something), but nothing on the wire enforces
+        // that; a fresh follower with last_applied == None must not treat one
+        // as advancing the log (that unwrap-shaped assumption is exactly what
+        // used to panic the kernel thread here).
+        if frames.is_empty() {
+            return Ok(());
+        }
         match db.apply_shipped(frames) {
             Ok(()) => {
                 let ack = Msg::Ack {
                     durable_seq: db
                         .last_applied()
-                        .expect("apply_shipped just advanced the log"),
+                        .expect("apply_shipped just advanced the log on a non-empty batch"),
                 };
                 self.send_or_drop(&ack, now);
                 Ok(())

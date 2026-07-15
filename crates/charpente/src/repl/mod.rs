@@ -49,6 +49,14 @@ pub const SNAPSHOT_BATCH_BYTES: usize = 256 << 10;
 /// Idle-session heartbeat interval (spec Global Constraints): 1s.
 pub const HEARTBEAT_NANOS: u64 = 1_000_000_000;
 
+/// A fresh connection that never sends its first message (`Hello` or a
+/// control verb) is reaped after this long (final-review finding): with no
+/// deadline, a peer that opens the replication port and goes silent parks in
+/// `AwaitHello` forever, whose `pin_floor()` is 0 — pinning GC at the base
+/// indefinitely. Sized generously above `HEARTBEAT_NANOS` so it never races a
+/// slow-but-honest peer's first message.
+pub const HELLO_DEADLINE_NANOS: u64 = 10 * HEARTBEAT_NANOS;
+
 /// Follower reconnect backoff after a dropped session (spec Global
 /// Constraints): 500ms.
 pub const RECONNECT_NANOS: u64 = 500_000_000;
@@ -228,7 +236,7 @@ impl Repl {
             while let Ok(Some(conn)) = listener.accept() {
                 let id = self.next_session_id;
                 self.next_session_id += 1;
-                self.sessions.push(Session::new(conn, id));
+                self.sessions.push(Session::new(conn, id, now_nanos));
             }
             self.recompute_pin(); // fresh AwaitHello sessions floor the pin at 0
         }
@@ -276,6 +284,9 @@ impl Repl {
         let mut fold = |d: u64| best = Some(best.map_or(d, |b: u64| b.min(d)));
         for s in &self.sessions {
             if let Some(d) = s.heartbeat_deadline() {
+                fold(d);
+            }
+            if let Some(d) = s.hello_deadline() {
                 fold(d);
             }
         }

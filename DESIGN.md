@@ -409,11 +409,19 @@ re-verified at read-back, capped at `last_applied`, so a frame corrupted on the 
 disk is refused by name rather than shipped, and the unsynced tail never travels. The
 follower appends via `Db::apply_shipped` (append → sync → apply, recovery's own
 discipline) and sends `Ack { durable_seq }` only after that sync, never on receipt; a
-shipped seq gap means a different timeline — drop the conn and re-`Hello`. The retention
+shipped seq gap means a different timeline — drop the conn and re-`Hello`. An empty
+`Frames` batch — never sent by the real shipper (it only ships when it has something to
+ship), but not enforced by the wire — is a no-op on the follower side: `apply_shipped`
+doesn't advance `last_applied` on an empty batch, so there is nothing to ack. The retention
 pin is wired at `Repl::open`: `Db::pin_retention` reads a shared floor recomputed on every
 ack and session change — the min over live sessions of acked + 1 (a not-yet-acked
 session pins at its cursor; a seeding session at its snapshot's `applied_seq + 1`) — so a
-live lagging session holds GC exactly as long as it lives and releases it when reaped.
+live lagging session holds GC exactly as long as it lives and releases it when reaped. A
+session still `AwaitHello` (accepted but silent) pins at 0 like any not-yet-acked session;
+`HELLO_DEADLINE_NANOS` (10× the heartbeat interval, checked and reaped the same shape as
+the heartbeat deadline) fires for one that never sends its first message — `Hello` or a
+control verb — so a peer that opens the replication port and never speaks cannot hold GC
+at the base forever.
 Seeding streams `SnapshotStart`/`SnapshotRows`/`SnapshotEnd` out of ONE MVCC snapshot
 (batches near `SNAPSHOT_BATCH_BYTES`, one message per step); the follower buffers the
 stream and, at `SnapshotEnd`, latches `db_needs_reseed` — `Repl::step` cannot replace a

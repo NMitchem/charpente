@@ -791,6 +791,71 @@ fn live_lagging_session_pins_gc() {
     assert_converged(&p, &f).unwrap();
 }
 
+/// Regression (final replication review, finding 2): a peer that opens a conn
+/// to the replication port and never sends `Hello` (or a control verb) used
+/// to park in `AwaitHello` forever — `pin_floor()` is 0 in that phase, and
+/// nothing reaped the session, so it pinned GC at the base indefinitely.
+/// Mirrors `live_lagging_session_pins_gc`'s pin/GC assertions, but the peer
+/// here never speaks at all.
+#[test]
+fn a_silent_await_hello_session_stops_pinning_gc_after_its_deadline() {
+    let sim = Sim::with_faults(0x2EB1_0010, FaultConfig::none());
+    let db_cfg = DbConfig {
+        wal: WalConfig {
+            dir: "wal".to_string(),
+            segment_bytes: 128,
+        },
+        store_path: "tables.redb".to_string(),
+        retain_segments: 1,
+        checkpoint_every: 4,
+    };
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), db_cfg).unwrap();
+
+    // A peer that connects and never sends anything — no Hello, no control
+    // verb. Kept alive for the whole test: dropping it would close the wire
+    // and let the ordinary dead-session path (drain() sees EOF) reap it,
+    // which is not what this test is proving.
+    let _silent = sim.host("silent").net().connect("p:1").unwrap();
+
+    // Accept the conn via pump_io directly rather than drive_rounds/
+    // scheduler_round: with nothing else scheduled on this quiet primary, the
+    // scheduler's "nothing runnable, jump to the next event" fallback would
+    // otherwise fast-forward virtual time straight to the arrival deadline on
+    // its very first idle round (the deadline is the only pending event),
+    // reaping the session before this test can observe the pin holding.
+    // pump_io's own accept-loop recomputes the pin (0) without risking that.
+    p.repl.pump_io(sim.now().as_nanos());
+
+    // Commit past several checkpoint boundaries — GC is purely a function of
+    // commits-since-checkpoint, not of stepping the scheduler, so no further
+    // driving is needed to prove the pin holds. Mirrors
+    // live_lagging_session_pins_gc's pin/GC assertion.
+    for i in 0..16u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    assert_eq!(
+        p.db.as_ref().unwrap().log_base(),
+        0,
+        "a fresh AwaitHello session must pin GC at 0 before its arrival deadline"
+    );
+
+    // Advance virtual time past the deadline and drive the primary: now the
+    // session itself is due, so the scheduler reaps it instead of idling.
+    sim.clock()
+        .sleep(Duration::from_nanos(charpente::repl::HELLO_DEADLINE_NANOS));
+    drive_rounds(&sim, &mut [&mut p], 4).unwrap();
+
+    // Keep committing so the checkpoint cadence actually runs GC again.
+    for i in 16..32u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    assert!(
+        p.db.as_ref().unwrap().log_base() > 0,
+        "the silent AwaitHello session's deadline must have released the pin (base stuck at {})",
+        p.db.as_ref().unwrap().log_base()
+    );
+}
+
 // -------------------------------------------------- property: divergence
 
 #[test]
@@ -935,6 +1000,72 @@ fn hello_to_a_follower_is_refused_naming_the_not_a_primary_state() {
             );
         }
         other => panic!("expected Refuse, got {other:?}"),
+    }
+}
+
+// --------------------------------------------- error-surface pin: empty ship
+
+/// Regression (final replication review, finding 1): the real shipper
+/// (`Session::ship_frames`) never sends an empty `Frames` batch (it only
+/// sends when `read_log` returns something), but nothing on the wire enforces
+/// that — a hostile or buggy peer could. `apply_shipped` is a documented
+/// no-op on an empty batch (charpente-core db.rs: it never advances
+/// `last_applied`), so the follower's ack path used to `.expect()` a
+/// just-advanced position that never came, panicking the kernel thread on a
+/// fresh follower (`last_applied() == None`). Driven by hand, not
+/// `spawn_node`'s primary: a raw listener stands in for the primary so the
+/// test can hand back a `Frames { frames: vec![] }` the real shipper never
+/// would.
+#[test]
+fn empty_frames_delivered_to_a_fresh_follower_neither_panics_nor_acks() {
+    let sim = Sim::with_faults(0x2EB1_000F, FaultConfig::none());
+    let ph = sim.host("p");
+    let listener = ph.net().listen("p:1").expect("listen");
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+
+    // Drive the follower once: a fresh client (no conn, no backoff) has work
+    // immediately, and its one step is connect_and_hello.
+    let now = sim.now().as_nanos();
+    f.repl.pump_io(now);
+    assert!(
+        f.db.as_ref().is_some_and(|db| f.repl.has_work(db, now)),
+        "a fresh follower client must have work immediately (nothing to wait on)"
+    );
+    step_node(&sim, &mut f).unwrap();
+
+    let conn = listener
+        .accept()
+        .unwrap()
+        .expect("the follower's connect_and_hello must have dialed p:1");
+    let mut buf = vec![0u8; MAX_MESSAGE_BYTES];
+    let n = conn
+        .recv(&mut buf)
+        .unwrap()
+        .expect("the follower's Hello must have arrived (zero simulated net latency)");
+    assert!(
+        matches!(decode(&buf[..n]).unwrap(), Msg::Hello { .. }),
+        "the follower's first message on a fresh conn must be a Hello"
+    );
+
+    conn.send(&encode(&Msg::Frames { frames: vec![] })).unwrap();
+
+    // Drive the follower to process the empty batch: must not panic (the
+    // regression), must not fabricate a durable position, and must not ack.
+    for _ in 0..8 {
+        let now = sim.now().as_nanos();
+        f.repl.pump_io(now);
+        if f.db.as_ref().is_some_and(|db| f.repl.has_work(db, now)) {
+            step_node(&sim, &mut f).unwrap();
+        }
+    }
+    assert_eq!(
+        f.db.as_ref().unwrap().last_applied(),
+        None,
+        "an empty Frames batch must not fabricate a durable position on a fresh follower"
+    );
+    match conn.recv(&mut buf) {
+        Ok(None) => {}
+        other => panic!("the follower acked (or replied to) an empty Frames batch: {other:?}"),
     }
 }
 
@@ -2621,7 +2752,7 @@ fn wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower()
             let r = above_horizon_universe(sim);
             finish_universe(sim, r)
         },
-        require: ["fault:bit_flip"]
+        require: ["fault:bit_flip", "repl:above-horizon-cut", "repl:promised-nonempty"]
     );
 }
 
@@ -2670,9 +2801,21 @@ fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
         // The corruption trigger: crash + restart p (bit_flip rolls on p's
         // wal/ at restart). Recovery may cut above the horizon (silent loss,
         // pre-M1) or hard-error below it (the restore path).
+        let last_before_crash = p.kernel.as_ref().and_then(|k| k.app().db().last_applied());
         p.host.crash_now();
         match recover_kernel_node(sim, &mut p) {
-            Ok(()) => {}
+            Ok(()) => {
+                // The headline path this property is named for: recovery
+                // succeeded (no RESTORE_NEEDED, the hard-error/restore path)
+                // but truncated a tail that had already been applied — a
+                // silent above-horizon cut, not a hard error. `require`d
+                // below so the batch fails by name if it never actually
+                // fires over the whole run.
+                let last_after = p.kernel.as_ref().and_then(|k| k.app().db().last_applied());
+                if last_after < last_before_crash {
+                    sim.cover("repl:above-horizon-cut");
+                }
+            }
             Err(e) if e.contains(RESTORE_NEEDED) => restore_p_from_survivor(sim, &mut p, &mut f)?,
             Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
             Err(e) => return Err(e),
@@ -2685,6 +2828,13 @@ fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
     // THE promise: every acked+converged id still lives on the survivor. No
     // single-node corruption excuse — a converged follower kept the record.
     let promised: Vec<u64> = promised.into_iter().collect();
+    // A non-empty `promised` is the other half of a non-vacuous run: an empty
+    // set (the primary faulted before ever shipping anything a round
+    // converged on) would pass `assert_survivor_holds` trivially. `require`d
+    // below so the batch fails by name if that's all 128 universes ever did.
+    if !promised.is_empty() {
+        sim.cover("repl:promised-nonempty");
+    }
     assert_survivor_holds(&f, &promised)?;
     // And the replicated jobs stayed exactly-once through it all.
     bump_exactly_once(&f)?;
