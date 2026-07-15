@@ -3,7 +3,7 @@
 //! exit criterion — "a reconnecting realtime client provably misses no
 //! events"), its off-by-one meta-test, and the determinism check.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 
 use charpente::event;
@@ -234,15 +234,16 @@ struct Client {
     /// Delivered frames not yet checked against the ledger: `(id, name,
     /// json)`, oldest first.
     pending: VecDeque<(u64, &'static str, String)>,
-    /// One past the highest id ever popped from `pending` (content-
-    /// verified) — ids below this are accounted for, not merely forfeited.
-    /// Sound because delivery is gap-free by construction within one
-    /// continuous tail (`deliver_unit`'s loop advances `next_id` past EVERY
-    /// row it reads, matching or not, so nothing matching is ever silently
-    /// skipped inside one session) and a resume starts exactly at
-    /// `cursor.id + 1` when correct — the off-by-one meta-test is what
-    /// proves the harness catches a resume that violates that.
-    verified_through: u64,
+    /// Every id ever content-verified (matched against the ledger) via
+    /// `drain` — the membership bound `settled()` checks against, not a
+    /// high-water mark. A high-water mark (max verified id + 1) is UNSOUND:
+    /// if a later id gets verified before an earlier one was ever delivered
+    /// at all (a reconnect that verifies 0-5, then jumps straight to 7
+    /// without ever receiving 6), the mark advances past the gap and
+    /// permanently excuses it — the interior-skip meta-test proves
+    /// membership catches what the mark could not (T6 review). `floor`
+    /// stays a separate, permanent forfeit trim; this set only ever grows.
+    verified: BTreeSet<u64>,
     cursor: Option<Cursor>,
     need_subscribe: bool,
     current_handle: Option<SimSinkHandle>,
@@ -260,7 +261,7 @@ impl Client {
             next_scan_id: 0,
             floor: 0,
             pending: VecDeque::new(),
-            verified_through: 0,
+            verified: BTreeSet::new(),
             cursor: None,
             need_subscribe: true,
             current_handle: None,
@@ -282,12 +283,45 @@ impl Client {
     /// or past `next_scan_id` simply hasn't been looked at yet and is
     /// irrelevant here (a still-open tail would still be delivering it).
     fn settled(&self) -> bool {
-        let lo = self.floor.max(self.verified_through).min(self.next_scan_id);
-        self.pending.is_empty()
-            && self
-                .ledger
-                .range(lo..self.next_scan_id)
-                .all(|(_, (name, key, _))| !self.matches(name, key))
+        self.pending.is_empty() && self.first_unaccounted().is_none()
+    }
+
+    /// The first matching (subscribed-filter-passing) ledger id in `[floor,
+    /// next_scan_id)` that has not been content-verified — `None` at
+    /// quiescence. `settled()`'s worker, factored out so a diagnostic can
+    /// name the exact missing id (`unsettled_report`, the skip meta-test's
+    /// discriminator) instead of only reporting counts. The `.min` clamp on
+    /// `lo` is the same floor-trim safety the old bound used — `floor` can
+    /// run ahead of `next_scan_id` transiently (a bare reconnect's boundary
+    /// observed before this client's own ledger scan has caught up to it),
+    /// and `BTreeMap::range` panics on an inverted bound.
+    fn first_unaccounted(&self) -> Option<u64> {
+        let lo = self.floor.min(self.next_scan_id);
+        for (id, (name, key, _)) in self.ledger.range(lo..self.next_scan_id) {
+            if self.matches(name, key) && !self.verified.contains(id) {
+                return Some(*id);
+            }
+        }
+        None
+    }
+
+    /// The diagnostic `realtime_workload` returns when the settle phase
+    /// exhausts its attempts still unsettled — factored onto `Client` so the
+    /// skip meta-test can byte-pin the missing id the same way the
+    /// off-by-one meta-test byte-pins `duplicate`.
+    fn unsettled_report(&self) -> String {
+        format!(
+            "client never caught up: ledger has {} entries scanned through id {}, floor {}, \
+             {} frames still unverified, first unaccounted matching id {:?}, cursor={:?} \
+             need_subscribe={}",
+            self.ledger.len(),
+            self.next_scan_id,
+            self.floor,
+            self.pending.len(),
+            self.first_unaccounted(),
+            self.cursor,
+            self.need_subscribe
+        )
     }
 
     /// Reads every event committed since the last scan and records it,
@@ -330,7 +364,30 @@ impl Client {
     /// scanned yet.
     fn try_match(&self, id: u64, name: &str, json: &str) -> MatchOutcome {
         match self.ledger.get(&id) {
-            Some((exp_name, _, exp_json)) if *exp_name == name && exp_json == json => {
+            Some((exp_name, key, exp_json)) if *exp_name == name && exp_json == json => {
+                // Content matches the ledger row at this id exactly — but a
+                // delivered frame is only legitimate if that row ALSO
+                // satisfies this subscription's own filter. Over-delivery
+                // (a leaked wrong-name or wrong-key row) carries genuine
+                // content at its own id, so content equality alone would
+                // silently Match it; this closes that direction.
+                if !self.matches(exp_name, key) {
+                    let violation = if !self.mode_names.contains(exp_name) {
+                        format!(
+                            "name {exp_name:?} is not in the subscribed set {:?}",
+                            self.mode_names
+                        )
+                    } else {
+                        format!(
+                            "key {key:?} does not match the subscribed key {:?}",
+                            self.mode_key
+                        )
+                    };
+                    return MatchOutcome::Mismatch(format!(
+                        "over-delivery at event id {id}: delivered frame name {name:?} \
+                         violates this subscription's filter — {violation}"
+                    ));
+                }
                 MatchOutcome::Matched
             }
             Some((exp_name, _, exp_json)) => MatchOutcome::Mismatch(format!(
@@ -350,7 +407,7 @@ impl Client {
             match self.try_match(id, name, &json) {
                 MatchOutcome::Matched => {
                     self.pending.pop_front();
-                    self.verified_through = self.verified_through.max(id + 1);
+                    self.verified.insert(id);
                 }
                 MatchOutcome::Pending => break,
                 MatchOutcome::Mismatch(e) => return Err(e),
@@ -667,16 +724,7 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
     }
 
     if !client.settled() {
-        return Err(format!(
-            "client never caught up: ledger has {} entries scanned through id {}, floor {}, \
-             {} frames still unverified, cursor={:?} need_subscribe={}",
-            client.ledger.len(),
-            client.next_scan_id,
-            client.floor,
-            client.pending.len(),
-            client.cursor,
-            client.need_subscribe
-        ));
+        return Err(client.unsettled_report());
     }
 
     Ok(client.trace)
@@ -755,4 +803,76 @@ fn the_harness_catches_a_resume_that_replays_the_cursor_event() {
         .expect("the harness must catch a resume that redelivers the cursor event");
     assert!(err.contains("duplicate"), "{err}");
     assert!(err.contains(&cursor.id.to_string()), "{err}");
+}
+
+/// The skip-direction naive victim: a resume that reads from `cursor.id + 2`
+/// instead of `cursor.id + 1` — skipping the successor event (id
+/// `cursor.id + 1`) outright rather than redelivering the cursor's own event
+/// (the off-by-one test's victim, above). `assert_strictly_increasing` does
+/// NOT catch this — ids still strictly ascend across the skip, which is
+/// legal on its own. Only a membership-based `settled()` can: it finds the
+/// skipped id sitting matched-in-the-ledger-but-never-verified at
+/// quiescence. RED evidence (T6 review): against the OLD high-water
+/// `verified_through` bound, this exact scenario passed `settled()` — the
+/// later ids' verification retroactively excused the skipped one. The fixed
+/// `first_unaccounted`/`verified` membership check is what turns that into a
+/// named failure below.
+#[test]
+fn the_harness_catches_a_resume_that_skips_the_successor_event() {
+    let sim = Sim::with_faults(0x2EB2_51C1, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap();
+    for n in 0..6u64 {
+        app.db_for_tests()
+            .transact(|tx| {
+                tx.emit(Ping { n });
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+    }
+    let snap = app.db_for_tests().snapshot().unwrap();
+    let events: Vec<EventRow> = snap.scan_from(0, 64).unwrap();
+    assert_eq!(events.len(), 6);
+
+    let mut client = Client::new(PING_ONLY, None);
+    client.sync_ledger(app.db_for_tests()).unwrap();
+
+    for e in &events[..2] {
+        let json = serde_json::to_string(&Ping::decode(&mut &e.payload[..]).unwrap())
+            .expect("Ping serializes");
+        client.pending.push_back((e.id.raw(), "ping", json));
+    }
+    client.drain().unwrap();
+    let cursor_id = events[1].id.raw();
+
+    // THE BUG: resume at cursor.id + 2 instead of cursor.id + 1 — the
+    // successor event (id = cursor.id + 1) is never requested and never
+    // delivered.
+    for e in events.iter().filter(|e| e.id.raw() >= cursor_id + 2) {
+        let json = serde_json::to_string(&Ping::decode(&mut &e.payload[..]).unwrap())
+            .expect("Ping serializes");
+        client.pending.push_back((e.id.raw(), "ping", json));
+    }
+    client.drain().unwrap();
+
+    let missing = cursor_id + 1;
+    assert!(
+        !client.settled(),
+        "the harness must catch a resume that skips event id {missing}"
+    );
+    assert_eq!(
+        client.first_unaccounted(),
+        Some(missing),
+        "settled() must name the skipped id precisely, not just detect *a* gap"
+    );
+    let report = client.unsettled_report();
+    assert!(
+        report.contains(&missing.to_string()),
+        "the failure report must name the missing id: {report}"
+    );
 }
