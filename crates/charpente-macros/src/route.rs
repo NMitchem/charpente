@@ -9,7 +9,10 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
-use syn::{Error, FnArg, Ident, ItemFn, LitStr, Pat, PatType, Token};
+use syn::{
+    Error, FnArg, GenericArgument, Ident, ItemFn, LitStr, Pat, PatType, PathArguments, ReturnType,
+    Token, Type,
+};
 
 pub(crate) struct RouteArgs {
     method: Ident,
@@ -58,6 +61,13 @@ fn arg_name(pat: &PatType) -> Option<String> {
 }
 
 pub(crate) fn expand(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
+    if args.method == "SSE" {
+        return expand_sse(args, func);
+    }
+    expand_http(args, func)
+}
+
+fn expand_http(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
     let method_variant = match args.method.to_string().as_str() {
         "GET" => quote!(Get),
         "POST" => quote!(Post),
@@ -67,7 +77,7 @@ pub(crate) fn expand(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> 
         other => {
             return Err(Error::new(
                 args.method.span(),
-                format!("unknown method {other} — one of GET, POST, PUT, PATCH, DELETE"),
+                format!("unknown method {other} — one of GET, POST, PUT, PATCH, DELETE, SSE"),
             ));
         }
     };
@@ -223,9 +233,213 @@ pub(crate) fn expand(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> 
                     pattern: #pattern_lit,
                     auth: #auth,
                     name: #name_str,
-                    glue: #glue_name,
+                    glue: ::charpente::http::RouteGlue::Http(#glue_name),
                 }
             }
         }
     })
+}
+
+/// `#[route(SSE "/path")]`: registers `Method::Get` plus a subscribe-
+/// flavored wrapper. The handler contract (spec docs/superpowers/specs/
+/// 2026-07-14-realtime-design.md §2): `fn(tx: &mut Tx, [captures,]
+/// ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError>` —
+/// unlike a plain route, `ctx` and `cursor` are both mandatory (no optional
+/// trailing `ctx`, no body argument).
+fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
+    let pattern = args.path.value();
+    if !pattern.starts_with('/') {
+        return Err(Error::new(
+            args.path.span(),
+            format!("route path must start with '/' — got \"{pattern}\""),
+        ));
+    }
+    let params: Vec<String> = pattern[1..]
+        .split('/')
+        .filter_map(|s| s.strip_prefix(':').map(str::to_string))
+        .collect();
+    if params.iter().any(String::is_empty) {
+        return Err(Error::new(
+            args.path.span(),
+            format!("empty :param name in \"{pattern}\""),
+        ));
+    }
+
+    let name = &func.sig.ident;
+    let name_str = name.to_string();
+    let vis = &func.vis;
+
+    let mut inputs = func.sig.inputs.iter();
+    let tx_ok = matches!(
+        inputs.next(),
+        Some(FnArg::Typed(pat)) if arg_name(pat).as_deref() == Some("tx")
+    );
+    if !tx_ok {
+        return Err(Error::new(
+            func.sig.span(),
+            format!(
+                "a #[route] handler's first argument must be `tx: &mut Tx` — `{name_str}` is missing it"
+            ),
+        ));
+    }
+    let rest: Vec<&PatType> = inputs
+        .map(|arg| match arg {
+            FnArg::Typed(pat) => Ok(pat),
+            FnArg::Receiver(r) => Err(Error::new(
+                r.span(),
+                "#[route] handlers are free functions — no `self`",
+            )),
+        })
+        .collect::<syn::Result<_>>()?;
+
+    if rest.len() != params.len() + 2 {
+        return Err(Error::new(
+            func.sig.span(),
+            format!(
+                "an SSE route handler is `fn {name_str}(tx: &mut Tx, {}ctx: &Ctx, \
+                 cursor: Option<Cursor>) -> Result<Subscription, ApiError>` — one argument \
+                 per :param in \"{pattern}\" (path order), then `ctx`, then `cursor`",
+                params
+                    .iter()
+                    .map(|p| format!("{p}: _, "))
+                    .collect::<String>()
+            ),
+        ));
+    }
+    for (i, param) in params.iter().enumerate() {
+        let got = arg_name(rest[i]);
+        if got.as_deref() != Some(param.as_str()) {
+            return Err(Error::new(
+                rest[i].span(),
+                format!(
+                    "this argument must be named `{param}` to match :{param} in \"{pattern}\" — \
+                     got `{}`",
+                    got.unwrap_or_else(|| "<pattern>".to_string())
+                ),
+            ));
+        }
+    }
+    let ctx_arg = rest[params.len()];
+    if arg_name(ctx_arg).as_deref() != Some("ctx") {
+        return Err(Error::new(
+            ctx_arg.span(),
+            format!(
+                "an SSE route handler's next-to-last argument must be named `ctx: &Ctx` — got `{}`",
+                arg_name(ctx_arg).unwrap_or_else(|| "<pattern>".to_string())
+            ),
+        ));
+    }
+    let cursor_arg = rest[params.len() + 1];
+    if arg_name(cursor_arg).as_deref() != Some("cursor") {
+        return Err(Error::new(
+            cursor_arg.span(),
+            format!(
+                "an SSE route handler's last argument must be named `cursor: Option<Cursor>` — \
+                 got `{}`",
+                arg_name(cursor_arg).unwrap_or_else(|| "<pattern>".to_string())
+            ),
+        ));
+    }
+
+    let ReturnType::Type(_, ret_ty) = &func.sig.output else {
+        return Err(Error::new(
+            func.sig.span(),
+            "an SSE route returns Result<Subscription, ApiError> — write \
+             `-> Result<Subscription, ApiError>`",
+        ));
+    };
+    if !is_subscription_result(ret_ty) {
+        return Err(Error::new(
+            ret_ty.span(),
+            "an SSE route returns Result<Subscription, ApiError> — got a different return type",
+        ));
+    }
+
+    let glue_name = format_ident!("__charpente_route_{name}");
+    let param_lets: Vec<TokenStream> = params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let ident = format_ident!("{p}");
+            let ty = &rest[i].ty;
+            quote! {
+                let #ident = <#ty as ::charpente::http::FromParam>::from_param(#p, &captures[#i])?;
+            }
+        })
+        .collect();
+    let mut call_args: Vec<TokenStream> = vec![quote!(tx)];
+    for p in &params {
+        let ident = format_ident!("{p}");
+        call_args.push(quote!(#ident));
+    }
+    call_args.push(quote!(ctx));
+    call_args.push(quote!(cursor));
+
+    let auth = args.auth;
+    let pattern_lit = &args.path;
+
+    Ok(quote! {
+        #func
+
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        fn #glue_name(
+            tx: &mut ::charpente::Tx,
+            ctx: &::charpente::http::Ctx,
+            captures: &[::std::string::String],
+            cursor: ::std::option::Option<::charpente::http::Cursor>,
+        ) -> ::std::result::Result<::charpente::http::Subscription, ::charpente::http::ApiError> {
+            let _ = captures; // SSE routes without :params use none of them
+            #(#param_lets)*
+            #name(#(#call_args),*)
+        }
+
+        /// Route marker for `routes![…]` — `#[route]` emitted it.
+        #[allow(non_camel_case_types)]
+        #vis struct #name {}
+
+        impl ::charpente::http::RouteDef for #name {
+            fn route() -> ::charpente::http::Route {
+                ::charpente::http::Route {
+                    method: ::charpente::http::Method::Get,
+                    pattern: #pattern_lit,
+                    auth: #auth,
+                    name: #name_str,
+                    glue: ::charpente::http::RouteGlue::Sse(#glue_name),
+                }
+            }
+        }
+    })
+}
+
+/// Checks the syntactic shape `Result<Subscription, ApiError>` (a macro
+/// can't do full type-checking — a mismatch that slips past this still
+/// fails to compile against `SubGlue`'s signature, just with rustc's own
+/// message instead of this one).
+fn is_subscription_result(ty: &Type) -> bool {
+    let Type::Path(path) = ty else { return false };
+    let Some(seg) = path.path.segments.last() else {
+        return false;
+    };
+    if seg.ident != "Result" {
+        return false;
+    }
+    let PathArguments::AngleBracketed(generics) = &seg.arguments else {
+        return false;
+    };
+    let types: Vec<&Type> = generics
+        .args
+        .iter()
+        .filter_map(|a| match a {
+            GenericArgument::Type(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    types.len() == 2
+        && last_segment_is(types[0], "Subscription")
+        && last_segment_is(types[1], "ApiError")
+}
+
+fn last_segment_is(ty: &Type, ident: &str) -> bool {
+    matches!(ty, Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == ident))
 }

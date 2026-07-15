@@ -8,12 +8,13 @@
 mod app;
 mod router;
 
-pub use app::{App, AppConfig, Ctx, Session};
-pub use router::{Glue, Route, RouteDef, RouteMatch, Router};
+pub use app::{App, AppConfig, Ctx, Handled, Session};
+pub use router::{Glue, Route, RouteDef, RouteGlue, RouteMatch, Router, SubGlue};
 
 use std::collections::BTreeMap;
 use std::io;
 
+use charpente_core::db::Event;
 use charpente_core::table::Id;
 
 // ---------------------------------------------------------------- method
@@ -53,20 +54,32 @@ impl Method {
 // ---------------------------------------------------------------- request
 
 /// A request as the kernel sees it: the edge (or the sim) has already dealt
-/// with the wire. Header keys are lowercase; the query string is stripped at
-/// the edge and ignored in v0.
+/// with the wire. Header keys are lowercase. `path` never carries a query
+/// string — `Request::new` splits it into `query` at construction, the only
+/// v0 consumer being the SSE `cursor` query parameter (`?cursor=<id>.<seq>`).
 pub struct Request {
     pub method: Method,
     pub path: String,
+    pub query: BTreeMap<String, String>,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
 }
 
 impl Request {
+    /// `path` may carry a `?query` suffix (e.g. `"/feed?cursor=5.9"`) — it is
+    /// split off into `query` here, never left in `path` (the router matches
+    /// path segments only). No percent-decoding: v0's one query consumer
+    /// (`cursor`) is plain digits and a dot.
     pub fn new(method: Method, path: impl Into<String>) -> Request {
+        let raw = path.into();
+        let (path, query) = match raw.split_once('?') {
+            Some((path, query)) => (path.to_string(), parse_query(query)),
+            None => (raw, BTreeMap::new()),
+        };
         Request {
             method,
-            path: path.into(),
+            path,
+            query,
             headers: BTreeMap::new(),
             body: Vec::new(),
         }
@@ -81,6 +94,14 @@ impl Request {
         self.body = serde_json::to_vec(value).expect("request fixture serializes");
         self
     }
+}
+
+fn parse_query(raw: &str) -> BTreeMap<String, String> {
+    raw.split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 // ---------------------------------------------------------------- response
@@ -112,6 +133,101 @@ impl Response {
         }
         Response::json(status, &Body { error: message })
     }
+}
+
+// ---------------------------------------------------------------- realtime
+
+/// The realtime resume cursor (DESIGN §6): an event id plus its committing
+/// record's seq. The seq half exists for failover honesty — two diverged
+/// timelines (an old primary's unshipped tail vs. a promoted follower's new
+/// writes) can mint the same event id for different events; a bare id
+/// cannot detect that. Resume validation (T5) requires the retained row at
+/// `id` to carry `seq`, else the divergence error, never silent
+/// misattribution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cursor {
+    pub id: u64,
+    pub seq: u64,
+}
+
+impl Cursor {
+    /// Wire form "<id>.<seq>". `None` for an unparseable string — the caller
+    /// maps that to the 400 below, never a silent from-now.
+    pub fn parse(s: &str) -> Option<Cursor> {
+        let (id, seq) = s.split_once('.')?;
+        Some(Cursor {
+            id: id.parse().ok()?,
+            seq: seq.parse().ok()?,
+        })
+    }
+
+    pub fn wire(&self) -> String {
+        format!("{}.{}", self.id, self.seq)
+    }
+}
+
+/// One subscribed event type's delivery entry: its wire name and its
+/// monomorphized decode-then-JSON-encode function, captured statically at
+/// the `Subscription::of::<Ev>()` call site. There is no runtime event
+/// registry (spec §4) — the delivery path already holds the encoder for
+/// every name it can match.
+pub struct SubEntry {
+    pub name: &'static str,
+    pub encode_json: fn(&[u8]) -> io::Result<String>,
+}
+
+/// What an SSE route handler returns: which event types to tail (compile-
+/// checked — names never appear as strings in app code), an optional
+/// exact-match scoping key, and the resume cursor (the handler passes
+/// through, or clamps, what the platform extracted from the request).
+pub struct Subscription {
+    pub entries: Vec<SubEntry>,
+    pub key: Option<String>,
+    pub cursor: Option<Cursor>,
+}
+
+impl Subscription {
+    pub fn of<Ev: Event + serde::Serialize>() -> Subscription {
+        Subscription {
+            entries: vec![SubEntry {
+                name: Ev::NAME,
+                encode_json: ev_json::<Ev>,
+            }],
+            key: None,
+            cursor: None,
+        }
+    }
+
+    pub fn and<Ev: Event + serde::Serialize>(mut self) -> Subscription {
+        self.entries.push(SubEntry {
+            name: Ev::NAME,
+            encode_json: ev_json::<Ev>,
+        });
+        self
+    }
+
+    /// An exact-match scoping filter (e.g. an org id) — the handler owns
+    /// access control; the platform never parses the key.
+    pub fn key(mut self, key: impl Into<String>) -> Subscription {
+        self.key = Some(key.into());
+        self
+    }
+
+    pub fn cursor(mut self, cursor: Option<Cursor>) -> Subscription {
+        self.cursor = cursor;
+        self
+    }
+}
+
+fn ev_json<Ev: Event + serde::Serialize>(bytes: &[u8]) -> io::Result<String> {
+    let mut input = bytes;
+    let ev = Ev::decode(&mut input)?;
+    serde_json::to_string(&ev).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("event {} failed JSON encoding: {e}", Ev::NAME),
+        )
+    })
 }
 
 // ---------------------------------------------------------------- errors

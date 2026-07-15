@@ -179,9 +179,7 @@ fn http_edge(
                             let response = match to_kernel_request(req, body_cap).await {
                                 Ok(request) => {
                                     let (tx, rx) = tokio::sync::oneshot::channel();
-                                    let reply: kernel::Reply = Box::new(move |response| {
-                                        let _ = tx.send(response);
-                                    });
+                                    let reply: kernel::Reply = Box::new(HttpReply { tx });
                                     if kernel.send((request, reply)).is_err() {
                                         Response::error(500, "the kernel thread is gone")
                                     } else {
@@ -204,6 +202,54 @@ fn http_edge(
     });
 
     Ok(Server { addr: local })
+}
+
+/// Frames buffered per SSE connection before the kernel's drop-on-full
+/// policy (T5) costs a slow consumer its tail. Fixed, no entropy.
+const EVENT_SINK_BUFFER: usize = 256;
+
+/// The prod `Respond`: `send` completes the request over the existing
+/// oneshot back to the hyper service future — unchanged from before this
+/// became a trait. `stream` is the SSE upgrade's other half: it delivers the
+/// same opening response over that oneshot, then hands back a bounded-
+/// channel sink. Nothing drains the channel's receiver yet — the writer task
+/// that turns frames into wire bytes is T7's job — so today a tail attached
+/// to a real connection dies on its first send (`Closed`, once the receiver
+/// drops at the end of this function): honest, not a lie, since that IS
+/// what "no writer exists yet" means.
+struct HttpReply {
+    tx: tokio::sync::oneshot::Sender<Response>,
+}
+
+impl kernel::Respond for HttpReply {
+    fn send(self: Box<Self>, response: Response) {
+        let _ = self.tx.send(response);
+    }
+
+    fn stream(self: Box<Self>, response: Response) -> Box<dyn kernel::EventSink> {
+        let (frame_tx, _frame_rx) =
+            std::sync::mpsc::sync_channel::<kernel::EventFrame>(EVENT_SINK_BUFFER);
+        let _ = self.tx.send(response);
+        Box::new(BoundedSink { tx: frame_tx })
+    }
+}
+
+/// The bounded-channel sink T7's writer task will drain. `try_send` maps
+/// directly onto `SinkStatus` — full or disconnected both cost the tail its
+/// connection (kernel policy, T5): a slow or dead consumer never blocks
+/// kernel progress.
+struct BoundedSink {
+    tx: std::sync::mpsc::SyncSender<kernel::EventFrame>,
+}
+
+impl kernel::EventSink for BoundedSink {
+    fn send(&mut self, frame: &kernel::EventFrame) -> kernel::SinkStatus {
+        match self.tx.try_send(frame.clone()) {
+            Ok(()) => kernel::SinkStatus::Ok,
+            Err(std::sync::mpsc::TrySendError::Full(_)) => kernel::SinkStatus::Full,
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => kernel::SinkStatus::Closed,
+        }
+    }
 }
 
 /// The `RequestSource` for a backup node: no requests ever arrive, so `poll`
@@ -287,20 +333,26 @@ async fn to_kernel_request(
             "unsupported method — one of GET, POST, PUT, PATCH, DELETE",
         ));
     };
-    let path = req.uri().path().to_string(); // query string stripped: v0 ignores it
-    let mut headers = std::collections::BTreeMap::new();
+    // `path_and_query` keeps the `?cursor=…` suffix; `Request::new` is the
+    // one place that splits it into `path`/`query` (the SSE cursor param's
+    // only v0 consumer).
+    let raw_path = match req.uri().path_and_query() {
+        Some(pq) => pq.as_str().to_string(),
+        None => req.uri().path().to_string(),
+    };
+    let mut request = Request::new(method, raw_path);
     for (name, value) in req.headers() {
         if let Ok(v) = value.to_str() {
-            headers.insert(name.as_str().to_ascii_lowercase(), v.to_string());
+            request
+                .headers
+                .insert(name.as_str().to_ascii_lowercase(), v.to_string());
         }
     }
     match Limited::new(req.into_body(), body_cap).collect().await {
-        Ok(collected) => Ok(Request {
-            method,
-            path,
-            headers,
-            body: collected.to_bytes().to_vec(),
-        }),
+        Ok(collected) => {
+            request.body = collected.to_bytes().to_vec();
+            Ok(request)
+        }
         Err(e)
             if e.downcast_ref::<http_body_util::LengthLimitError>()
                 .is_some() =>
@@ -331,7 +383,7 @@ mod tests {
     use std::io::{Read, Write};
 
     use super::*;
-    use crate::http::{ApiError, AppConfig, Ctx, Route, Session};
+    use crate::http::{ApiError, AppConfig, Ctx, Route, RouteGlue, Session};
     use crate::prod::{ProdDisk, ProdEntropy};
     use crate::repl::role::Role;
     use charpente_core::db::{Schema, Tx};
@@ -369,7 +421,7 @@ mod tests {
             pattern: "/hello",
             auth: false,
             name: "hello",
-            glue: hello_glue,
+            glue: RouteGlue::Http(hello_glue),
         }]);
 
         let server = serve("127.0.0.1:0", app).unwrap();
@@ -437,14 +489,14 @@ mod tests {
                 pattern: "/rows/:id",
                 auth: false,
                 name: "put_row",
-                glue: put_row_glue,
+                glue: RouteGlue::Http(put_row_glue),
             },
             Route {
                 method: Method::Get,
                 pattern: "/rows/:id",
                 auth: false,
                 name: "get_row",
-                glue: get_row_glue,
+                glue: RouteGlue::Http(get_row_glue),
             },
         ]
     }
@@ -577,7 +629,7 @@ mod tests {
             pattern: "/hello",
             auth: false,
             name: "hello",
-            glue: hello_glue,
+            glue: RouteGlue::Http(hello_glue),
         }]);
 
         let server = serve("127.0.0.1:0", app).unwrap();

@@ -5,18 +5,35 @@
 use charpente_core::db::Tx;
 
 use crate::http::app::Ctx;
-use crate::http::{ApiError, Method, Response};
+use crate::http::{ApiError, Cursor, Method, Response, Subscription};
 
-/// The glue signature `#[route]` generates: parse captures and body, call
-/// the handler, encode the response. Runs inside the request's transaction.
+/// The glue signature a plain `#[route(METHOD …)]` generates: parse captures
+/// and body, call the handler, encode the response. Runs inside the
+/// request's transaction.
 pub type Glue = fn(&mut Tx, &Ctx, &[String], &[u8]) -> Result<Response, ApiError>;
+
+/// The glue signature `#[route(SSE …)]` generates: parse captures and the
+/// platform-extracted cursor, call the handler, return the typed
+/// subscription. Never a `Response` — an SSE route only makes sense
+/// dispatched through the kernel (`App::handle_or_subscribe`'s
+/// `Handled::Subscribe`), which has a sink to hand the tail.
+pub type SubGlue = fn(&mut Tx, &Ctx, &[String], Option<Cursor>) -> Result<Subscription, ApiError>;
+
+/// A route's flavor-specific glue. The two flavors are dispatched
+/// differently by `App::handle_or_subscribe` — that's the only reason this
+/// wraps `Glue`/`SubGlue` instead of `Route` holding a bare `Glue`.
+#[derive(Clone, Copy)]
+pub enum RouteGlue {
+    Http(Glue),
+    Sse(SubGlue),
+}
 
 pub struct Route {
     pub method: Method,
     pub pattern: &'static str,
     pub auth: bool,
     pub name: &'static str,
-    pub glue: Glue,
+    pub glue: RouteGlue,
 }
 
 /// Implemented by the marker struct `#[route]` emits next to each handler,
@@ -184,7 +201,7 @@ mod tests {
             pattern,
             auth: false,
             name,
-            glue: ok,
+            glue: RouteGlue::Http(ok),
         }
     }
 

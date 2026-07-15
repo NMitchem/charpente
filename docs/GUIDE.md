@@ -614,9 +614,11 @@ fn build_app(data_dir: &str) -> std::io::Result<App> {
 ```
 
 `Request`'s shape (what a handler ultimately runs against, one layer down):
-`method: Method`, `path: String`, `headers: BTreeMap<String, String>` (keys
-lowercased), `body: Vec<u8>`. The query string is stripped at the edge and
-ignored in v0 — routes cannot see it.
+`method: Method`, `path: String`, `query: BTreeMap<String, String>`,
+`headers: BTreeMap<String, String>` (keys lowercased), `body: Vec<u8>`.
+`query` is parsed from the URL's `?...` suffix at construction; a plain
+`#[route]` handler still has no argument-convention access to it (only
+`#[route(SSE ...)]`'s platform-extracted resume cursor reads it today).
 
 ### Returning rows from a route: `Id<T>` isn't serializable
 

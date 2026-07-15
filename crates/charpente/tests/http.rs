@@ -2,8 +2,10 @@
 //! sessions, error mapping — unit tests here; the macro end-to-end tests and
 //! the request-level crash property are appended by later plan tasks.
 
-use charpente::http::{ApiError, App, AppConfig, Ctx, Method, Request, Response, Route};
-use charpente::{Schema, Tx, route, routes, table};
+use charpente::http::{
+    ApiError, App, AppConfig, Ctx, Cursor, Handled, Method, Request, Response, Route, Subscription,
+};
+use charpente::{Schema, Tx, event, route, routes, table};
 use charpente_core::table::Id;
 use charpente_sim::{FaultConfig, Sim};
 use serde::{Deserialize, Serialize};
@@ -291,6 +293,73 @@ fn routes_macro_collects_descriptors() {
     assert_eq!(all.len(), 5);
     assert!(all.iter().any(|r| r.pattern == "/me" && r.auth));
     assert!(all.iter().any(|r| r.pattern == "/notes/:id" && !r.auth));
+}
+
+// ---------------------------------------------------- realtime (T4)
+
+#[event]
+struct NoteAdded {
+    note: u64,
+}
+
+#[route(SSE "/feed")]
+fn feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<NoteAdded>().cursor(cursor))
+}
+
+fn sse_app(seed: u64) -> (Sim, App) {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![feed]);
+    (sim, app)
+}
+
+#[test]
+fn cursor_parses_wire_form_and_rejects_garbage() {
+    assert_eq!(Cursor::parse("12.34"), Some(Cursor { id: 12, seq: 34 }));
+    assert_eq!(Cursor::parse(""), None);
+    assert_eq!(Cursor::parse("12"), None);
+    assert_eq!(Cursor::parse("12.x"), None);
+}
+
+#[test]
+fn sse_route_reaches_handler_with_extracted_cursor() {
+    let (_sim, mut app) = sse_app(0x9012_0006);
+
+    // The `Last-Event-ID` header wins.
+    let handled =
+        app.handle_or_subscribe(Request::new(Method::Get, "/feed").header("last-event-id", "5.9"));
+    let Handled::Subscribe(sub) = handled else {
+        panic!("expected Subscribe from an SSE route")
+    };
+    assert_eq!(sub.cursor, Some(Cursor { id: 5, seq: 9 }));
+
+    // Same result from the `cursor` query parameter with no header.
+    let handled = app.handle_or_subscribe(Request::new(Method::Get, "/feed?cursor=5.9"));
+    let Handled::Subscribe(sub) = handled else {
+        panic!("expected Subscribe from an SSE route")
+    };
+    assert_eq!(sub.cursor, Some(Cursor { id: 5, seq: 9 }));
+
+    // An unparseable cursor is a 400 naming the contract — the handler never runs.
+    let handled = app
+        .handle_or_subscribe(Request::new(Method::Get, "/feed").header("last-event-id", "garbage"));
+    let Handled::Response(resp) = handled else {
+        panic!("expected Response for an unparseable cursor")
+    };
+    assert_eq!(resp.status, 400);
+    assert!(
+        body_text(&resp).contains("cursor must be"),
+        "{}",
+        body_text(&resp)
+    );
 }
 
 // ---------------------------------------------------- crash property

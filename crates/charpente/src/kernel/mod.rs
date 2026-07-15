@@ -4,9 +4,11 @@
 
 pub(crate) mod cron;
 mod dispatch;
+mod tail;
 
 pub use cron::{CronRow, CronScheduler};
 pub use dispatch::{Dispatcher, JobDef, JobEntry, JobError, JobOutcome};
+pub use tail::{EventFrame, EventSink, SinkStatus};
 
 use std::collections::VecDeque;
 use std::io;
@@ -17,9 +19,21 @@ use charpente_core::io::{Clock, Instant};
 use crate::http::{App, Request, Response};
 use crate::repl::{REPL_TICK_NANOS, Repl};
 
-/// Delivers a `Response` back to whoever is waiting on a request — a channel
-/// reply in production, a recorded `(status, body)` in the sim.
-pub type Reply = Box<dyn FnOnce(Response) + Send>;
+/// Delivers a response back to whoever is waiting on a request — a channel
+/// reply in production, a recorded `(status, body)` in the sim. `stream` is
+/// the SSE upgrade: instead of ending the exchange, it hands back a sink the
+/// kernel pushes frames into for the rest of the connection (T5's Tail arm
+/// is the first caller; today nothing calls it — `App::handle`'s plain path
+/// never produces a subscription, only `handle_or_subscribe` does).
+pub trait Respond: Send {
+    /// One-shot: this response ends the exchange.
+    fn send(self: Box<Self>, response: Response);
+    /// The SSE upgrade: deliver the stream-opening response, return the sink
+    /// the kernel pushes frames into for the rest of the connection.
+    fn stream(self: Box<Self>, response: Response) -> Box<dyn EventSink>;
+}
+
+pub type Reply = Box<dyn Respond>;
 
 /// What woke `Kernel::run` out of a park.
 pub enum Wake {
@@ -230,7 +244,7 @@ impl Kernel {
             Ready::Request => {
                 let (request, reply) = self.pending.take().expect("checked above");
                 let response = self.app.handle(request);
-                reply(response);
+                reply.send(response);
                 self.stats.requests += 1;
                 // Spec 2026-07-05 (request-arm ruling): a request-path Io
                 // is absorbed into a 500 for the client, but a poisoned
@@ -366,11 +380,8 @@ impl RequestSource for SimSource {
         let now = self.clock.now().as_nanos();
         if self.script.front().is_some_and(|&(at, _)| at <= now) {
             let (_, request) = self.script.pop_front().expect("checked");
-            let sink = self.responses.clone();
-            let reply: Reply = Box::new(move |response: Response| {
-                sink.lock()
-                    .expect("responses lock poisoned by an earlier panic")
-                    .push((response.status, response.body));
+            let reply: Reply = Box::new(SimReply {
+                sink: self.responses.clone(),
             });
             return Some((request, reply));
         }
@@ -397,5 +408,48 @@ impl RequestSource for SimSource {
             }
             _ => Wake::Shutdown, // nothing left inside this universe's horizon
         }
+    }
+}
+
+/// `SimSource`'s `Respond`: `send` is the existing recorded-response
+/// behavior; `stream` records the SSE upgrade's opening response the same
+/// way, then hands back a no-op recording sink — a `Vec<EventFrame>` behind
+/// `Arc<Mutex>`, always `Ok` (T5 replaces every use with `SimSink`, which a
+/// workload can stall or close).
+struct SimReply {
+    sink: RecordedResponses,
+}
+
+impl Respond for SimReply {
+    fn send(self: Box<Self>, response: Response) {
+        self.sink
+            .lock()
+            .expect("responses lock poisoned by an earlier panic")
+            .push((response.status, response.body));
+    }
+
+    fn stream(self: Box<Self>, response: Response) -> Box<dyn EventSink> {
+        self.sink
+            .lock()
+            .expect("responses lock poisoned by an earlier panic")
+            .push((response.status, response.body));
+        Box::new(RecordingSink::default())
+    }
+}
+
+/// The T4 placeholder sink: records every frame, always answers `Ok`. T5
+/// replaces every construction site with `SimSink` (stallable, closeable);
+/// this exists only so `Respond::stream` has a real implementation instead
+/// of an `unimplemented!()` on what will become a reachable path.
+#[derive(Default)]
+struct RecordingSink(Arc<Mutex<Vec<EventFrame>>>);
+
+impl EventSink for RecordingSink {
+    fn send(&mut self, frame: &EventFrame) -> SinkStatus {
+        self.0
+            .lock()
+            .expect("recording sink lock poisoned by an earlier panic")
+            .push(frame.clone());
+        SinkStatus::Ok
     }
 }

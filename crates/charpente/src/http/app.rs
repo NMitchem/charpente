@@ -11,8 +11,8 @@ use charpente_core::io::{Disk, Entropy};
 use charpente_core::table::Id;
 use charpente_macros::table;
 
-use crate::http::router::{RouteMatch, Router};
-use crate::http::{ApiError, Request, Response, Route, hex};
+use crate::http::router::{RouteGlue, RouteMatch, Router};
+use crate::http::{ApiError, Cursor, Request, Response, Route, Subscription, hex};
 use crate::kernel::JobDef;
 use crate::kernel::cron::{CronEntry, CronRow};
 
@@ -243,16 +243,39 @@ impl App {
         self.put_db(db);
     }
 
+    /// The plain surface: routes to a `Response` (`handle_or_subscribe`'s
+    /// `Response` outcome), and turns a `Subscribe` outcome into a 500 — an
+    /// SSE route matched, but a bare caller has no sink to hand the tail.
+    /// Only the kernel (`Kernel::step`, T5) has one, so only it should ever
+    /// see a `Handled::Subscribe`.
     pub fn handle(&mut self, request: Request) -> Response {
+        match self.handle_or_subscribe(request) {
+            Handled::Response(response) => response,
+            Handled::Subscribe(_) => Response::error(
+                500,
+                "an SSE route matched App::handle, which has no sink to hand the tail — \
+                 subscribe requests must go through Kernel::run",
+            ),
+        }
+    }
+
+    /// Routes, then dispatches by the matched route's flavor: a plain
+    /// `#[route]` runs its handler and returns `Response`; a
+    /// `#[route(SSE …)]` extracts the resume cursor (before the handler
+    /// runs — an unparseable one is a 400, never a silent from-now), runs
+    /// its handler, and returns the validated `Subscription`.
+    pub fn handle_or_subscribe(&mut self, request: Request) -> Handled {
         let (route, captures) = match self.router.find(request.method, &request.path) {
             RouteMatch::Found(route, captures) => (route, captures),
-            RouteMatch::PathNotFound => return Response::error(404, "not found"),
+            RouteMatch::PathNotFound => {
+                return Handled::Response(Response::error(404, "not found"));
+            }
             RouteMatch::MethodNotAllowed => {
-                return Response::error(405, "method not allowed for this path");
+                return Handled::Response(Response::error(405, "method not allowed for this path"));
             }
         };
         if request.body.len() > self.config.body_cap {
-            return Response::error(
+            return Handled::Response(Response::error(
                 413,
                 &format!(
                     "request body is {} bytes but the cap is {} — raise AppConfig.body_cap \
@@ -260,48 +283,118 @@ impl App {
                     request.body.len(),
                     self.config.body_cap
                 ),
-            );
+            ));
         }
+        let auth_required = route.auth;
+        let glue = route.glue;
+        let cursor = match glue {
+            RouteGlue::Sse(_) => match extract_cursor(&request) {
+                Ok(cursor) => cursor,
+                Err(response) => return Handled::Response(response),
+            },
+            RouteGlue::Http(_) => None,
+        };
+
         let mut fresh = [0u8; 32];
         self.entropy.fill(&mut fresh);
         let fresh_token = hex(&fresh);
         let token = bearer_or_cookie(&request.headers);
-        let (auth_required, glue) = (route.auth, route.glue);
 
-        let result = self.db_mut().transact(|tx| {
-            let session = match &token {
-                Some(token) => Session::by_token(tx, token)?.into_iter().next(),
-                None => None,
-            };
-            if auth_required && session.is_none() {
-                return Err(ApiError::Unauthorized);
+        match glue {
+            RouteGlue::Http(glue) => {
+                let result = self.db_mut().transact(|tx| {
+                    let ctx = build_ctx(tx, &token, auth_required, fresh_token)?;
+                    glue(tx, &ctx, &captures, &request.body)
+                });
+                Handled::Response(result.unwrap_or_else(tx_error_response))
             }
-            let ctx = Ctx {
-                session,
-                fresh_token,
-                created: Cell::new(false),
-            };
-            glue(tx, &ctx, &captures, &request.body)
-        });
-        match result {
-            Ok(response) => response,
-            Err(TxError::App(e)) => e.response(),
-            Err(TxError::Io(e)) => Response::error(
-                500,
-                &format!(
-                    "internal storage failure — the request may or may not have \
-                     committed; retry after the server recovers: {e}"
-                ),
-            ),
-            Err(TxError::NotPrimary { primary }) => Response::error(
-                421,
-                &format!(
-                    "this node is a read-only follower — writes go to the primary at \
-                     {primary}; retry there (the request was not committed)"
-                ),
-            ),
+            RouteGlue::Sse(glue) => {
+                let result = self.db_mut().transact(|tx| {
+                    let ctx = build_ctx(tx, &token, auth_required, fresh_token)?;
+                    glue(tx, &ctx, &captures, cursor)
+                });
+                match result {
+                    Ok(subscription) => Handled::Subscribe(subscription),
+                    Err(e) => Handled::Response(tx_error_response(e)),
+                }
+            }
         }
     }
+}
+
+/// What matching a route and running its handler produced. `Response` ends
+/// the exchange; `Subscribe` is an SSE route's validated subscription —
+/// meaningful only to a caller with a sink to hand the tail (the kernel),
+/// which is why `App::handle` maps it to a 500 instead of returning it.
+pub enum Handled {
+    Response(Response),
+    Subscribe(Subscription),
+}
+
+/// Shared session-lookup-then-auth-gate, used by both route flavors: reads
+/// the session for the bearer/cookie token (if any), rejects an auth-
+/// required route with no session, and builds the `Ctx` the handler sees.
+fn build_ctx(
+    tx: &mut Tx,
+    token: &Option<String>,
+    auth_required: bool,
+    fresh_token: String,
+) -> Result<Ctx, ApiError> {
+    let session = match token {
+        Some(token) => Session::by_token(tx, token)?.into_iter().next(),
+        None => None,
+    };
+    if auth_required && session.is_none() {
+        return Err(ApiError::Unauthorized);
+    }
+    Ok(Ctx {
+        session,
+        fresh_token,
+        created: Cell::new(false),
+    })
+}
+
+/// `TxError<ApiError>` -> `Response`, shared by both route flavors: `App`
+/// names the handler's own rejection; `Io`/`NotPrimary` name the platform
+/// failure and the fix (hard rule 5).
+fn tx_error_response(err: TxError<ApiError>) -> Response {
+    match err {
+        TxError::App(e) => e.response(),
+        TxError::Io(e) => Response::error(
+            500,
+            &format!(
+                "internal storage failure — the request may or may not have \
+                 committed; retry after the server recovers: {e}"
+            ),
+        ),
+        TxError::NotPrimary { primary } => Response::error(
+            421,
+            &format!(
+                "this node is a read-only follower — writes go to the primary at \
+                 {primary}; retry there (the request was not committed)"
+            ),
+        ),
+    }
+}
+
+/// The client cursor, extracted before the handler runs (spec §2):
+/// `Last-Event-ID` wins (browser-native SSE resume), else the `cursor`
+/// query parameter, else `None` ("from now"). A present-but-unparseable
+/// value is the named 400 — never a silent from-now.
+fn extract_cursor(request: &Request) -> Result<Option<Cursor>, Response> {
+    let raw = request
+        .headers
+        .get("last-event-id")
+        .or_else(|| request.query.get("cursor"));
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    Cursor::parse(raw).map(Some).ok_or_else(|| {
+        Response::error(
+            400,
+            &format!("cursor must be \"<id>.<seq>\" — got \"{raw}\"; omit it to tail from now"),
+        )
+    })
 }
 
 /// `Authorization: Bearer <t>` wins; else the `charpente_session` cookie.

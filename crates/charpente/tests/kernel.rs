@@ -387,7 +387,9 @@ fn rebuild_restores_pending_jobs_after_reopen() {
 
 use charpente::http::ApiError;
 use charpente::http::{Method, Request, Response};
-use charpente::kernel::{Kernel, Reply, RequestSource, SimSource, Wake};
+use charpente::kernel::{
+    EventFrame, EventSink, Kernel, Reply, RequestSource, Respond, SimSource, SinkStatus, Wake,
+};
 use charpente::route;
 use charpente::routes;
 use charpente_core::io::Instant;
@@ -442,14 +444,44 @@ fn scripted_source(requests: Vec<Request>) -> (ScriptedSource, Arc<Mutex<Vec<Res
     )
 }
 
+/// `ScriptedSource`'s `Respond`: `send` records the plain response;
+/// `stream` (unreached by this file's tests — none subscribe) records the
+/// opening response the same way and hands back a no-op sink so the trait
+/// has a real implementation either way.
+struct ScriptedReply {
+    sink: Arc<Mutex<Vec<Response>>>,
+}
+
+impl Respond for ScriptedReply {
+    fn send(self: Box<Self>, response: Response) {
+        self.sink
+            .lock()
+            .expect("replies lock poisoned by an earlier panic")
+            .push(response);
+    }
+
+    fn stream(self: Box<Self>, response: Response) -> Box<dyn EventSink> {
+        self.sink
+            .lock()
+            .expect("replies lock poisoned by an earlier panic")
+            .push(response);
+        Box::new(NoopSink)
+    }
+}
+
+struct NoopSink;
+
+impl EventSink for NoopSink {
+    fn send(&mut self, _frame: &EventFrame) -> SinkStatus {
+        SinkStatus::Ok
+    }
+}
+
 impl RequestSource for ScriptedSource {
     fn poll(&mut self) -> Option<(Request, Reply)> {
         let request = self.requests.pop_front()?;
-        let sink = self.replies.clone();
-        let reply: Reply = Box::new(move |response: Response| {
-            sink.lock()
-                .expect("replies lock poisoned by an earlier panic")
-                .push(response);
+        let reply: Reply = Box::new(ScriptedReply {
+            sink: self.replies.clone(),
         });
         Some((request, reply))
     }
