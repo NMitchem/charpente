@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use charpente::event;
@@ -19,7 +20,7 @@ use charpente_core::event::EventRow;
 use charpente_core::io::{Clock, Conn, Disk, Entropy, Net};
 use charpente_core::log::WalConfig;
 use charpente_core::table::{Codec, View};
-use charpente_sim::checks::is_fault_fallout;
+use charpente_sim::checks::{durable_corruption_fired, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim, SimEntropy, SimHost, run_universes_swarm_with};
 use serde::{Deserialize, Serialize};
 
@@ -481,6 +482,33 @@ impl Client {
                     self.cursor = None;
                     self.need_subscribe = true;
                 }
+                409 if text.contains("diverged from this node's timeline")
+                    && durable_corruption_fired(sim) =>
+                {
+                    // T6 interlude investigation (t6-realtime-interlude-
+                    // investigation.md): a synced-and-delivered event can
+                    // still be lost to the sanctioned single-node
+                    // media-corruption window (M1 sub-project 1's ruling —
+                    // `bit_flip`/`misdirected_write`, "wal/"-scoped,
+                    // above-horizon, window `checkpoint_every`). That's a
+                    // real loss, not a bug, but it rewinds the store
+                    // BACKWARD — unlike the retention-floor arm above, which
+                    // only ever advances `floor` forward. Mirroring that
+                    // arm's plain `cursor=None; need_subscribe=true` would
+                    // leave forfeited-but-remembered ids sitting in
+                    // `ledger`/`pending` at or past the store's new (lower)
+                    // head, which `first_unaccounted` would then block on
+                    // forever with no future emit ever able to satisfy them.
+                    // So prune down to the store's current head instead of
+                    // just resetting the cursor.
+                    let head = db.next_event_id().map_err(|e| e.to_string())?;
+                    self.ledger.retain(|&id, _| id < head);
+                    self.pending.retain(|&(id, ..)| id < head);
+                    self.next_scan_id = self.next_scan_id.min(head);
+                    sim.cover("realtime:gap");
+                    self.cursor = None;
+                    self.need_subscribe = true;
+                }
                 _ if is_fault_fallout(&text) => {
                     // Not acked; need_subscribe stays true, retried next
                     // round with the same cursor.
@@ -880,6 +908,38 @@ fn the_harness_catches_a_resume_that_skips_the_successor_event() {
         report.contains(&missing.to_string()),
         "the failure report must name the missing id: {report}"
     );
+}
+
+/// The discriminating twin for the durable-corruption divergence arm (T6
+/// interlude investigation): the exact same 409 shape, but in a
+/// corruption-free universe the gate must stay OFF — `Client::absorb` still
+/// hard-fails, proving the excuse can never mask a real (non-corruption)
+/// loss. `FaultConfig::none()` never touches `bit_flip`/`misdirected_write`,
+/// so `durable_corruption_fired` reads `false` and the new arm's guard
+/// doesn't match — the response falls through to the same catch-all `Err`
+/// every unrecognized subscribe status hits.
+#[test]
+fn the_harness_refuses_a_diverged_409_without_durable_corruption() {
+    let sim = Sim::with_faults(0x2EB2_C0DE, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap();
+    assert!(
+        !durable_corruption_fired(&sim),
+        "a fresh, fault-free sim must not report durable corruption"
+    );
+
+    let mut client = Client::new(PING_ONLY, None);
+    let body = br#"{"error":"cursor 0.2 diverged from this node's timeline (next event id is 0) -- re-sync current state through reads, then reconnect without a cursor"}"#.to_vec();
+    let sinks: SinkHandles = Arc::new(Mutex::new(Vec::new()));
+    let err = client
+        .absorb(&sim, app.db(), &[(409, body)], Some((true, 0)), &sinks)
+        .expect_err("the corruption-gated excuse must not fire without durable corruption");
+    assert!(err.contains("diverged"), "{err}");
 }
 
 // ==================================== multi-node: follower tails + failover
