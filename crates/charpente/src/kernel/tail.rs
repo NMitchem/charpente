@@ -1,11 +1,26 @@
 //! The event-sink seam (realtime T4; DESIGN §6, spec docs/superpowers/specs/
-//! 2026-07-14-realtime-design.md §3). `EventSink` is what a driver — prod's
-//! bounded channel (`crate::serve`), sim's recording buffer — implements so
-//! the kernel can push frames to a subscriber without knowing who, or what,
-//! is on the other end. The Tail registry itself (registration, floor/
-//! divergence validation, the bounded delivery unit, `SimSink`) lands in T5;
-//! this file exists now only so `Respond` (kernel/mod.rs) compiles against
-//! its exact shapes.
+//! 2026-07-14-realtime-design.md §3) plus the Tail registry itself
+//! (realtime T5): registration's delivery half — the bounded unit that
+//! reads new events off the store and pushes matching frames into a
+//! subscriber's sink, floor-checked first so a tail that fell behind
+//! retention gets one terminal frame instead of silently replaying gone
+//! history. `Kernel` (kernel/mod.rs) owns registration (validation, the
+//! ready-set gate, round-robin scheduling); this file owns what happens
+//! once a tail is scheduled.
+
+use std::io;
+use std::sync::{Arc, Mutex};
+
+use charpente_core::db::Db;
+use charpente_core::event::EventRow;
+use charpente_core::table::View;
+
+use crate::http::Subscription;
+
+/// Rows read (and filtered) per `deliver_unit` call — the bound that keeps
+/// one Tail service a unit of work the kernel's same-shape rule can account
+/// for, the same role `TAIL_BATCH_EVENTS`'s peers (job/cron ticks) play.
+pub const TAIL_BATCH_EVENTS: usize = 64;
 
 /// What a sink reports back from one `send` attempt.
 pub enum SinkStatus {
@@ -39,4 +54,142 @@ pub struct EventFrame {
 /// to push into; the brief's exact shape governs over the earlier sketch.
 pub trait EventSink: Send {
     fn send(&mut self, frame: &EventFrame) -> SinkStatus;
+}
+
+/// One live subscription: what it wants (`sub`), where its frames go
+/// (`sink`), and how far it has been delivered (`next_id` — the next event
+/// id it has not yet seen; the Ready::Tail gate is `next_id <
+/// next_event_id`).
+pub struct Tail {
+    pub sub: Subscription,
+    pub sink: Box<dyn EventSink>,
+    pub next_id: u64,
+}
+
+/// One bounded unit: read up to `TAIL_BATCH_EVENTS` rows from `next_id`,
+/// filter, push. Returns whether the tail survives. The floor check runs
+/// FIRST: a tail that fell behind retention gets the terminal gap frame and
+/// dies — deterministic, part of the unit, independent of whatever the sink
+/// reports for that final send (the tail is dying either way, so the send's
+/// own `SinkStatus` is not acted on).
+pub fn deliver_unit(tail: &mut Tail, db: &Db) -> io::Result<bool> {
+    let floor = db.event_floor()?;
+    if tail.next_id < floor {
+        let gap = EventFrame {
+            id: tail.next_id,
+            seq: 0,
+            name: "charpente.gap",
+            json: format!(
+                "{{\"floor\":{floor},\"tail\":{},\"fix\":\"re-sync current state through reads, then reconnect without a cursor\"}}",
+                tail.next_id
+            ),
+        };
+        let _ = tail.sink.send(&gap);
+        return Ok(false);
+    }
+    let rows: Vec<EventRow> = db.snapshot()?.scan_from(tail.next_id, TAIL_BATCH_EVENTS)?;
+    for row in rows {
+        tail.next_id = row.id.raw() + 1;
+        if tail.sub.key.is_some() && tail.sub.key.as_deref() != row.key.as_deref() {
+            continue;
+        }
+        let Some(entry) = tail.sub.entries.iter().find(|e| e.name == row.name) else {
+            continue;
+        };
+        let frame = EventFrame {
+            id: row.id.raw(),
+            seq: row.seq,
+            name: entry.name,
+            json: (entry.encode_json)(&row.payload)?,
+        };
+        match tail.sink.send(&frame) {
+            SinkStatus::Ok => {}
+            SinkStatus::Full | SinkStatus::Closed => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// The sim's real `EventSink`: buffers accepted frames, driven by a
+/// workload-supplied `stall` closure that decides whether each `send`
+/// succeeds or reports `Full` — the sim's stand-in for a slow or bounded
+/// real consumer. `Arc<Mutex>` inside is the sim world's honest-uncontended
+/// pattern (`SimSinkHandle` is the read side a workload keeps after the
+/// sink itself is boxed into a `Tail`).
+pub struct SimSink {
+    frames: Arc<Mutex<Vec<EventFrame>>>,
+    closed: Arc<Mutex<bool>>,
+    stall: Box<dyn FnMut() -> bool + Send>,
+}
+
+/// The workload's read side of a `SimSink`: every frame the sink accepted,
+/// in delivery order, and whether the sink has been dropped — which happens
+/// exactly when the kernel drops a dead tail (drop-on-full or the terminal
+/// gap), since the `Tail` (and the `Box<dyn EventSink>` inside it) goes with
+/// it. `closed` is therefore a lifecycle signal, not a per-send status: a
+/// send that itself reported `Full` is not recorded here (it was refused),
+/// but the sink is not "closed" until the kernel actually drops the tail.
+#[derive(Clone)]
+pub struct SimSinkHandle {
+    frames: Arc<Mutex<Vec<EventFrame>>>,
+    closed: Arc<Mutex<bool>>,
+}
+
+impl SimSink {
+    pub fn new(stall: Box<dyn FnMut() -> bool + Send>) -> (SimSink, SimSinkHandle) {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let closed = Arc::new(Mutex::new(false));
+        (
+            SimSink {
+                frames: frames.clone(),
+                closed: closed.clone(),
+                stall,
+            },
+            SimSinkHandle { frames, closed },
+        )
+    }
+}
+
+impl EventSink for SimSink {
+    fn send(&mut self, frame: &EventFrame) -> SinkStatus {
+        if (self.stall)() {
+            return SinkStatus::Full;
+        }
+        self.frames
+            .lock()
+            .expect("sim sink lock poisoned by an earlier panic")
+            .push(frame.clone());
+        SinkStatus::Ok
+    }
+}
+
+impl Drop for SimSink {
+    /// The tail's connection ends exactly when the `Tail` (and this boxed
+    /// sink) is dropped — the kernel never calls a separate "close"; there
+    /// is none on `EventSink`. Marking `closed` here, rather than from a
+    /// `SinkStatus`, is what makes `SimSinkHandle::closed()` mean "this
+    /// tail is gone" regardless of whether its last send happened to
+    /// succeed (the terminal gap frame's send is not acted on either way).
+    fn drop(&mut self) {
+        *self
+            .closed
+            .lock()
+            .expect("sim sink lock poisoned by an earlier panic") = true;
+    }
+}
+
+impl SimSinkHandle {
+    pub fn frames(&self) -> Vec<EventFrame> {
+        self.frames
+            .lock()
+            .expect("sim sink lock poisoned by an earlier panic")
+            .clone()
+    }
+
+    pub fn closed(&self) -> bool {
+        *self
+            .closed
+            .lock()
+            .expect("sim sink lock poisoned by an earlier panic")
+    }
 }

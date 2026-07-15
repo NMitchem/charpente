@@ -8,15 +8,19 @@ mod tail;
 
 pub use cron::{CronRow, CronScheduler};
 pub use dispatch::{Dispatcher, JobDef, JobEntry, JobError, JobOutcome};
-pub use tail::{EventFrame, EventSink, SinkStatus};
+pub use tail::{EventFrame, EventSink, SimSink, SimSinkHandle, SinkStatus, TAIL_BATCH_EVENTS};
 
 use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
 
+use charpente_core::db::Db;
+use charpente_core::event::EventRow;
 use charpente_core::io::{Clock, Instant};
+use charpente_core::table::View;
 
-use crate::http::{App, Request, Response};
+use crate::http::{App, Cursor, Handled, Request, Response};
+use crate::kernel::tail::Tail;
 use crate::repl::{REPL_TICK_NANOS, Repl};
 
 /// Delivers a response back to whoever is waiting on a request — a channel
@@ -88,6 +92,7 @@ enum Ready {
     Job,
     Cron,
     Repl,
+    Tail,
 }
 
 /// The deterministic kernel: one `App`, one due-heap, one cron schedule, one
@@ -108,6 +113,14 @@ pub struct Kernel {
     /// `Repl::step`) rebuilds the due-heap and cron from the replicated store
     /// — the only truth for a promoted node.
     was_primary: bool,
+    /// Live SSE subscriptions (realtime T5). A tail joins the ready set only
+    /// while it is behind (`next_id < next_event_id`); dead tails (below
+    /// retention, or a sink that reported `Full`/`Closed`) are removed right
+    /// after the arm services them.
+    tails: Vec<Tail>,
+    /// Round-robin start index into `tails` for the next `Ready::Tail`
+    /// service — bounds one slow tail from starving the others.
+    tail_cursor: usize,
 }
 
 impl Kernel {
@@ -154,6 +167,8 @@ impl Kernel {
             stats: KernelStats::default(),
             repl,
             was_primary,
+            tails: Vec::new(),
+            tail_cursor: 0,
         })
     }
 
@@ -210,6 +225,18 @@ impl Kernel {
         {
             ready.push(Ready::Repl);
         }
+        // The Tail source only ever joins via data state, never a timer: a
+        // tail becomes eligible the instant some commit moves
+        // `next_event_id` past it, and the guard here skips the read
+        // entirely when there are no tails at all, so a kernel that never
+        // sees a subscribe does zero extra IO and existing pinned seeds
+        // replay unchanged (kernel.rs's `loop_replays_identically_...`).
+        if !self.tails.is_empty() {
+            let next_event_id = self.app.db().next_event_id()?;
+            if self.tails.iter().any(|t| t.next_id < next_event_id) {
+                ready.push(Ready::Tail);
+            }
+        }
         if ready.is_empty() {
             // Gate the job/cron deadlines on `primary` too: a follower with a
             // due-but-gated job must not busy-spin on a deadline already in the
@@ -243,8 +270,18 @@ impl Kernel {
         match choice {
             Ready::Request => {
                 let (request, reply) = self.pending.take().expect("checked above");
-                let response = self.app.handle(request);
-                reply.send(response);
+                match self.app.handle_or_subscribe(request) {
+                    Handled::Response(response) => reply.send(response),
+                    Handled::Subscribe(sub) => {
+                        match validate_subscribe(self.app.db(), sub.cursor) {
+                            Ok(next_id) => {
+                                let sink = reply.stream(Response::sse_headers());
+                                self.tails.push(Tail { sub, sink, next_id });
+                            }
+                            Err(response) => reply.send(response),
+                        }
+                    }
+                }
                 self.stats.requests += 1;
                 // Spec 2026-07-05 (request-arm ruling): a request-path Io
                 // is absorbed into a 500 for the client, but a poisoned
@@ -284,6 +321,19 @@ impl Kernel {
                     self.app.put_db(db);
                 }
                 self.after_repl_step()?;
+            }
+            Ready::Tail => {
+                let next_event_id = self.app.db().next_event_id()?;
+                let n = self.tails.len();
+                let idx = (0..n)
+                    .map(|i| (self.tail_cursor + i) % n)
+                    .find(|&i| self.tails[i].next_id < next_event_id)
+                    .expect("Ready::Tail only pushed when some tail is behind");
+                let survives = tail::deliver_unit(&mut self.tails[idx], self.app.db())?;
+                self.tail_cursor = (idx + 1) % n;
+                if !survives {
+                    self.tails.swap_remove(idx);
+                }
             }
         }
         // Any serviced source may have enqueued (handlers can enqueue too), so
@@ -338,9 +388,83 @@ impl Kernel {
     }
 }
 
+/// Registration-time validation for an SSE subscribe (T5, DESIGN §6), reading
+/// off the `Db` snapshot: a present cursor must sit at or above this node's
+/// retention floor (checked first — a cursor that old is simply gone, no
+/// finer diagnosis is possible), and if it clears that bar, the retained row
+/// at its id must carry its exact seq (checked second — a cursor ahead of
+/// everything this node has ever minted, and a cursor whose id landed on a
+/// different event than the one the client saw, are both a diverged
+/// timeline, distinguished only by the message's `{detail}`). No cursor at
+/// all always succeeds, positioned to tail from now. Returns the tail's
+/// starting `next_id` on success.
+fn validate_subscribe(db: &Db, cursor: Option<Cursor>) -> Result<u64, Response> {
+    let next_event_id = db.next_event_id().map_err(io_500)?;
+    let Some(cursor) = cursor else {
+        return Ok(next_event_id);
+    };
+    let floor = db.event_floor().map_err(io_500)?;
+    if cursor.id < floor {
+        return Err(Response::error(
+            409,
+            &format!(
+                "cursor {} is below this node's retention floor {floor} — events that old are \
+                 gone; re-sync current state through reads, then reconnect without a cursor",
+                cursor.wire()
+            ),
+        ));
+    }
+    let snap = db.snapshot().map_err(io_500)?;
+    let rows: Vec<EventRow> = snap.scan_from(cursor.id, 1).map_err(io_500)?;
+    match rows.first() {
+        Some(row) if row.id.raw() == cursor.id => {
+            if row.seq != cursor.seq {
+                return Err(Response::error(
+                    409,
+                    &format!(
+                        "cursor {} diverged from this node's timeline (event {} here has seq \
+                         {}, not {}) — your history came from another primary; re-sync current \
+                         state through reads, then reconnect without a cursor",
+                        cursor.wire(),
+                        cursor.id,
+                        row.seq,
+                        cursor.seq
+                    ),
+                ));
+            }
+            Ok(cursor.id + 1)
+        }
+        _ => Err(Response::error(
+            409,
+            &format!(
+                "cursor {} diverged from this node's timeline (next event id is {next_event_id}) \
+                 — your history came from another primary; re-sync current state through reads, \
+                 then reconnect without a cursor",
+                cursor.wire()
+            ),
+        )),
+    }
+}
+
+fn io_500(e: io::Error) -> Response {
+    Response::error(
+        500,
+        &format!("internal storage failure validating the subscribe cursor — retry: {e}"),
+    )
+}
+
 /// `(status, body)` pairs `SimSource` records — named so its `Arc<Mutex<_>>`
 /// doesn't trip clippy's type-complexity lint at every use site.
 pub type RecordedResponses = Arc<Mutex<Vec<(u16, Vec<u8>)>>>;
+
+/// `SimSinkHandle`s `SimSource` hands back, one per SSE upgrade it has
+/// produced, in upgrade order — the realtime counterpart to
+/// `RecordedResponses`.
+pub type SinkHandles = Arc<Mutex<Vec<SimSinkHandle>>>;
+
+/// One workload-supplied `SimSink` stall closure, queued for the next SSE
+/// upgrade `SimSource` produces.
+type StallQueue = Arc<Mutex<VecDeque<Box<dyn FnMut() -> bool + Send>>>>;
 
 /// Deterministic scripted source for sim tests: requests arrive at virtual
 /// times; replies record `(status, body)`; the horizon bounds the universe.
@@ -349,6 +473,8 @@ pub struct SimSource {
     script: VecDeque<(u64, Request)>,
     responses: RecordedResponses,
     horizon: u64,
+    stalls: StallQueue,
+    sinks: SinkHandles,
 }
 
 impl SimSource {
@@ -358,6 +484,8 @@ impl SimSource {
             script: VecDeque::new(),
             responses: Arc::new(Mutex::new(Vec::new())),
             horizon: horizon_nanos,
+            stalls: Arc::new(Mutex::new(VecDeque::new())),
+            sinks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -373,6 +501,27 @@ impl SimSource {
     pub fn responses(&self) -> RecordedResponses {
         self.responses.clone()
     }
+
+    /// Queues a `SimSink` stall behavior for this source's next SSE upgrade
+    /// (FIFO — one entry per `Respond::stream` call, in the order those
+    /// upgrades happen; a request that never reaches an SSE route leaves the
+    /// queue untouched). An upgrade with nothing queued gets a sink that
+    /// never stalls. This is the seam onto a subscribe's delivery: a
+    /// workload queues a stall, scripts the SSE request that will consume
+    /// it, then reads the matching `SimSinkHandle` back from `sinks()` once
+    /// the kernel has run.
+    pub fn push_stall(&mut self, stall: Box<dyn FnMut() -> bool + Send>) {
+        self.stalls
+            .lock()
+            .expect("stall queue lock poisoned by an earlier panic")
+            .push_back(stall);
+    }
+
+    /// `SimSinkHandle`s for every SSE upgrade this source has produced so
+    /// far, in upgrade order.
+    pub fn sinks(&self) -> SinkHandles {
+        self.sinks.clone()
+    }
 }
 
 impl RequestSource for SimSource {
@@ -382,6 +531,8 @@ impl RequestSource for SimSource {
             let (_, request) = self.script.pop_front().expect("checked");
             let reply: Reply = Box::new(SimReply {
                 sink: self.responses.clone(),
+                stalls: self.stalls.clone(),
+                sinks: self.sinks.clone(),
             });
             return Some((request, reply));
         }
@@ -413,11 +564,13 @@ impl RequestSource for SimSource {
 
 /// `SimSource`'s `Respond`: `send` is the existing recorded-response
 /// behavior; `stream` records the SSE upgrade's opening response the same
-/// way, then hands back a no-op recording sink — a `Vec<EventFrame>` behind
-/// `Arc<Mutex>`, always `Ok` (T5 replaces every use with `SimSink`, which a
-/// workload can stall or close).
+/// way, then hands back a real `SimSink` — stallable per a workload-queued
+/// closure (`SimSource::push_stall`), defaulting to one that never stalls —
+/// and stashes the matching `SimSinkHandle` for `SimSource::sinks()`.
 struct SimReply {
     sink: RecordedResponses,
+    stalls: StallQueue,
+    sinks: SinkHandles,
 }
 
 impl Respond for SimReply {
@@ -433,23 +586,17 @@ impl Respond for SimReply {
             .lock()
             .expect("responses lock poisoned by an earlier panic")
             .push((response.status, response.body));
-        Box::new(RecordingSink::default())
-    }
-}
-
-/// The T4 placeholder sink: records every frame, always answers `Ok`. T5
-/// replaces every construction site with `SimSink` (stallable, closeable);
-/// this exists only so `Respond::stream` has a real implementation instead
-/// of an `unimplemented!()` on what will become a reachable path.
-#[derive(Default)]
-struct RecordingSink(Arc<Mutex<Vec<EventFrame>>>);
-
-impl EventSink for RecordingSink {
-    fn send(&mut self, frame: &EventFrame) -> SinkStatus {
-        self.0
+        let stall = self
+            .stalls
             .lock()
-            .expect("recording sink lock poisoned by an earlier panic")
-            .push(frame.clone());
-        SinkStatus::Ok
+            .expect("stall queue lock poisoned by an earlier panic")
+            .pop_front()
+            .unwrap_or_else(|| Box::new(|| false) as Box<dyn FnMut() -> bool + Send>);
+        let (sink, handle) = SimSink::new(stall);
+        self.sinks
+            .lock()
+            .expect("sink handle list lock poisoned by an earlier panic")
+            .push(handle);
+        Box::new(sink)
     }
 }

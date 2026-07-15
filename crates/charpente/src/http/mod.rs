@@ -133,6 +133,21 @@ impl Response {
         }
         Response::json(status, &Body { error: message })
     }
+
+    /// The 200 that opens an SSE connection (T5): `content-type:
+    /// text/event-stream`, `cache-control: no-cache`, empty body — frames
+    /// follow over the sink the kernel pushes into for the rest of the
+    /// connection (`Respond::stream`, `Kernel`'s Tail registration).
+    pub fn sse_headers() -> Response {
+        let mut headers = BTreeMap::new();
+        headers.insert("content-type".to_string(), "text/event-stream".to_string());
+        headers.insert("cache-control".to_string(), "no-cache".to_string());
+        Response {
+            status: 200,
+            headers,
+            body: Vec::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------- realtime

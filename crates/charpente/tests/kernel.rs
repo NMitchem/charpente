@@ -1005,3 +1005,300 @@ fn due_jobs_are_not_starved_by_a_request_flood() {
         "every job ran despite the flood (100 request jobs + the seeded one)"
     );
 }
+
+// ------------------------------------------------------------------- tail
+
+use charpente::event;
+use charpente::http::{Ctx, Cursor, Subscription};
+
+#[event]
+struct Bumped {
+    n: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct EmitBody {
+    n: u64,
+}
+
+#[route(POST "/emit")]
+fn emit_one(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
+    tx.emit(Bumped { n: body.n });
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct FloodBody {
+    count: u64,
+}
+
+/// Emits `count` events in ONE transaction — the atomic multi-event commit
+/// the retention tests need: `Db::checkpoint`'s GC only ever runs at the
+/// cadence-driven checkpoint (never mid-transaction), so a single commit
+/// that both mints many events AND crosses the checkpoint threshold is the
+/// only way to move the retention floor without ever giving a live tail a
+/// chance to interleave a delivery attempt in between.
+#[route(POST "/flood")]
+fn flood(tx: &mut Tx, body: FloodBody) -> Result<(), ApiError> {
+    for i in 0..body.count {
+        tx.emit(Bumped { n: i });
+    }
+    Ok(())
+}
+
+#[route(SSE "/feed")]
+fn tail_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<Bumped>().cursor(cursor))
+}
+
+fn tail_app(sim: &Sim, db: charpente::DbConfig) -> App {
+    App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig {
+            db,
+            ..AppConfig::default()
+        },
+    )
+    .unwrap()
+    .mount(routes![tail_feed, emit_one, flood])
+}
+
+/// A `SimSink` stall closure: the first `n` calls succeed, every call after
+/// that reports `Full`.
+fn full_after(n: usize) -> Box<dyn FnMut() -> bool + Send> {
+    let mut calls = 0usize;
+    Box::new(move || {
+        let full = calls >= n;
+        calls += 1;
+        full
+    })
+}
+
+#[test]
+fn a_tail_receives_matching_events_exactly_and_in_order() {
+    let sim = Sim::with_faults(0x6A0, FaultConfig::none());
+    let app = tail_app(&sim, charpente::DbConfig::default());
+    let mut source = SimSource::new(Box::new(sim.clock()), 10 * SEC);
+    source.push_at(0, Request::new(Method::Get, "/feed"));
+    for (i, n) in [10u64, 20, 30].into_iter().enumerate() {
+        source.push_at(
+            (i as u64 + 1) * SEC,
+            Request::new(Method::Post, "/emit").json(&EmitBody { n }),
+        );
+    }
+    let sinks = source.sinks();
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    kernel.run(&mut source).unwrap();
+
+    let handles = sinks.lock().unwrap();
+    assert_eq!(handles.len(), 1, "one SSE upgrade");
+    let frames = handles[0].frames();
+    assert_eq!(frames.len(), 3);
+    let mut prev: Option<u64> = None;
+    for (frame, n) in frames.iter().zip([10u64, 20, 30]) {
+        assert_eq!(frame.name, "bumped");
+        assert_eq!(frame.json, serde_json::to_string(&Bumped { n }).unwrap());
+        if let Some(p) = prev {
+            assert!(frame.id > p, "ids must strictly ascend");
+        }
+        prev = Some(frame.id);
+    }
+    // The subscribe wrote nothing (no seq consumed); each emit is its own commit.
+    assert_eq!(
+        frames.iter().map(|f| f.seq).collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "frames carry the committing record's seq"
+    );
+}
+
+#[test]
+fn resume_from_cursor_delivers_the_successor_onward_no_dup_no_gap() {
+    let sim = Sim::with_faults(0x6A1, FaultConfig::none());
+    let app = tail_app(&sim, charpente::DbConfig::default());
+    let mut source = SimSource::new(Box::new(sim.clock()), 20 * SEC);
+    source.push_at(0, Request::new(Method::Get, "/feed"));
+    for n in 0..5u64 {
+        source.push_at(
+            (n + 1) * SEC,
+            Request::new(Method::Post, "/emit").json(&EmitBody { n }),
+        );
+    }
+    let sinks = source.sinks();
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    kernel.run(&mut source).unwrap();
+
+    // The wire cursor for "event 2" comes straight from what the first tail
+    // actually received — no peeking at the raw event table.
+    let cursor_wire = {
+        let handles = sinks.lock().unwrap();
+        let frames = handles[0].frames();
+        assert_eq!(frames.len(), 5);
+        Cursor {
+            id: frames[2].id,
+            seq: frames[2].seq,
+        }
+        .wire()
+    };
+
+    source.push_at(
+        6 * SEC,
+        Request::new(Method::Get, format!("/feed?cursor={cursor_wire}")),
+    );
+    source.push_at(
+        7 * SEC,
+        Request::new(Method::Post, "/emit").json(&EmitBody { n: 5 }),
+    );
+    kernel.run(&mut source).unwrap();
+
+    let handles = sinks.lock().unwrap();
+    assert_eq!(handles.len(), 2, "two SSE upgrades");
+    let resumed_ids: Vec<u64> = handles[1].frames().iter().map(|f| f.id).collect();
+    assert_eq!(
+        resumed_ids,
+        vec![3, 4, 5],
+        "no dup, no gap, then the live one"
+    );
+}
+
+#[test]
+fn cursor_below_floor_and_diverged_cursor_are_named_409s() {
+    let sim = Sim::with_faults(0x6A2, FaultConfig::none());
+    let db_cfg = charpente::DbConfig {
+        event_retention: 2,
+        checkpoint_every: 1,
+        ..charpente::DbConfig::default()
+    };
+    let app = tail_app(&sim, db_cfg);
+    let mut source = SimSource::new(Box::new(sim.clock()), 10 * SEC);
+    // One commit, ten events, checkpoint_every=1 fires right after: floor
+    // lands at 10 - 2 = 8 before any subscribe is ever evaluated.
+    source.push_at(
+        0,
+        Request::new(Method::Post, "/flood").json(&FloodBody { count: 10 }),
+    );
+    source.push_at(SEC, Request::new(Method::Get, "/feed?cursor=1.0"));
+    source.push_at(2 * SEC, Request::new(Method::Get, "/feed?cursor=999.1"));
+    source.push_at(
+        3 * SEC,
+        Request::new(Method::Get, format!("/feed?cursor=8.{}", u64::MAX)),
+    );
+    let responses = source.responses();
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    kernel.run(&mut source).unwrap();
+
+    let responses = responses.lock().unwrap();
+    assert_eq!(responses.len(), 4);
+    assert_eq!(responses[0].0, 200, "the flood commits");
+    let body = |i: usize| String::from_utf8(responses[i].1.clone()).unwrap();
+    assert_eq!(responses[1].0, 409, "{}", body(1));
+    assert!(body(1).contains("retention floor"), "{}", body(1));
+    assert_eq!(responses[2].0, 409, "{}", body(2));
+    assert!(
+        body(2).contains("diverged") && body(2).contains("next event id"),
+        "{}",
+        body(2)
+    );
+    assert_eq!(responses[3].0, 409, "{}", body(3));
+    assert!(body(3).contains("not"), "{}", body(3));
+}
+
+#[test]
+fn a_tail_behind_retention_gets_the_gap_frame_then_closes() {
+    let sim = Sim::with_faults(0x6A3, FaultConfig::none());
+    let db_cfg = charpente::DbConfig {
+        event_retention: 2,
+        checkpoint_every: 1,
+        ..charpente::DbConfig::default()
+    };
+    let app = tail_app(&sim, db_cfg);
+    let mut source = SimSource::new(Box::new(sim.clock()), 10 * SEC);
+    source.push_at(0, Request::new(Method::Get, "/feed")); // from now: next_id = 0
+    source.push_at(
+        SEC,
+        Request::new(Method::Post, "/emit").json(&EmitBody { n: 99 }),
+    );
+    // One atomic commit of 5 more events + its checkpoint jumps the floor to
+    // 6 - 2 = 4, past the tail's stalled position (1) — no interleaved
+    // delivery attempt is possible in between (see `flood`'s doc comment).
+    source.push_at(
+        2 * SEC,
+        Request::new(Method::Post, "/flood").json(&FloodBody { count: 5 }),
+    );
+    let sinks = source.sinks();
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    kernel.run(&mut source).unwrap();
+
+    let handles = sinks.lock().unwrap();
+    assert_eq!(handles.len(), 1);
+    let frames = handles[0].frames();
+    assert_eq!(frames.len(), 2, "one real frame, then the terminal gap");
+    assert_eq!(frames[0].id, 0);
+    let last = &frames[1];
+    assert_eq!(last.name, "charpente.gap");
+    assert!(last.json.contains("\"floor\":4"), "{}", last.json);
+    assert!(last.json.contains("\"tail\":1"), "{}", last.json);
+    assert!(
+        last.json.contains("reconnect without a cursor"),
+        "{}",
+        last.json
+    );
+    assert!(handles[0].closed());
+}
+
+#[test]
+fn a_full_sink_drops_the_tail_and_resume_recovers() {
+    let sim = Sim::with_faults(0x6A4, FaultConfig::none());
+    let app = tail_app(&sim, charpente::DbConfig::default());
+    let mut source = SimSource::new(Box::new(sim.clock()), 20 * SEC);
+    source.push_stall(full_after(2)); // the 3rd send (index 2) reports Full
+    source.push_at(0, Request::new(Method::Get, "/feed"));
+    for n in 0..3u64 {
+        source.push_at(
+            (n + 1) * SEC,
+            Request::new(Method::Post, "/emit").json(&EmitBody { n }),
+        );
+    }
+    let sinks = source.sinks();
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    kernel.run(&mut source).unwrap();
+
+    let resume_cursor = {
+        let handles = sinks.lock().unwrap();
+        assert_eq!(handles.len(), 1);
+        let frames = handles[0].frames();
+        assert_eq!(frames.len(), 2, "the 3rd send was Full — the tail dropped");
+        assert!(handles[0].closed());
+        Cursor {
+            id: frames[1].id,
+            seq: frames[1].seq,
+        }
+        .wire()
+    };
+
+    // Two more events land (ids 3, 4) while the tail is dead.
+    source.push_at(
+        4 * SEC,
+        Request::new(Method::Post, "/emit").json(&EmitBody { n: 3 }),
+    );
+    source.push_at(
+        5 * SEC,
+        Request::new(Method::Post, "/emit").json(&EmitBody { n: 4 }),
+    );
+    source.push_at(
+        6 * SEC,
+        Request::new(Method::Get, format!("/feed?cursor={resume_cursor}")),
+    );
+    kernel.run(&mut source).unwrap();
+
+    let handles = sinks.lock().unwrap();
+    assert_eq!(handles.len(), 2);
+    let resumed_ids: Vec<u64> = handles[1].frames().iter().map(|f| f.id).collect();
+    assert_eq!(
+        resumed_ids,
+        vec![2, 3, 4],
+        "resume recovers events 3,4,5 (ids 2,3,4)"
+    );
+}
