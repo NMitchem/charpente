@@ -41,6 +41,19 @@ disallowed-methods = [
     { path = "tokio::net::TcpStream::connect", reason = "ambient network — use the Net trait (DESIGN.md §1)" },
     { path = "std::process::Command::new", reason = "ambient process spawning — edge tooling only (charpente-cli); nothing inside the deterministic boundary spawns processes (DESIGN.md §1)" },
     { path = "std::process::Command::spawn", reason = "ambient process spawning — edge tooling only (charpente-cli); nothing inside the deterministic boundary spawns processes (DESIGN.md §1)" },
+    # rsa (auth T5, OIDC RS256 verification) pulls rand/rand_core/getrandom
+    # transitively and unconditionally via num-bigint-dig's mandatory "prime"
+    # feature — no combination of rsa's own feature flags disables it. The
+    # shipped production paths (OidcVerifier::from_config, ::verify) only
+    # construct RsaPublicKey and call .verify(), both RNG-free; test JWT
+    # minting uses RsaPrivateKey::from_p_q (fixed primes) + the no-RNG .sign()
+    # path. These entries fence rsa's nameable RNG-consuming surface so the
+    # boundary is mechanical rather than a claim in a review doc.
+    { path = "rsa::RsaPrivateKey::new", reason = "RSA keygen draws OS entropy directly — use the Entropy trait (DESIGN.md §1); production paths only construct RsaPublicKey from provisioned JWKS material" },
+    { path = "rsa::RsaPrivateKey::new_with_exp", reason = "RSA keygen draws OS entropy directly — use the Entropy trait (DESIGN.md §1); production paths only construct RsaPublicKey from provisioned JWKS material" },
+    { path = "rsa::RsaPrivateKey::sign_with_rng", reason = "RSA blinded signing draws OS entropy — use the Entropy trait (DESIGN.md §1); the deterministic core only verifies signatures, it never signs" },
+    { path = "rsa::RsaPrivateKey::decrypt_blinded", reason = "RSA blinded decryption draws OS entropy — use the Entropy trait (DESIGN.md §1); the deterministic core has no RSA decryption path" },
+    { path = "rsa::RsaPublicKey::encrypt", reason = "RSA encryption draws OS entropy for padding — use the Entropy trait (DESIGN.md §1); the deterministic core only verifies signatures, it never encrypts" },
 ]
 
 disallowed-types = [
@@ -56,4 +69,10 @@ disallowed-types = [
     { path = "tokio::net::TcpListener", reason = "ambient network — Net trait, or edge modules only (DESIGN.md §1)" },
     { path = "tokio::net::TcpStream", reason = "ambient network — Net trait, or edge modules only (DESIGN.md §1)" },
     { path = "tokio::time::Instant", reason = "ambient monotonic clock — use the Clock trait (DESIGN.md §1)" },
+    # Recorded as fence-of-intent (auth T5 review fix): rand_core is only
+    # transitively reachable via rsa (see the disallowed-methods comment
+    # above) — no direct dependency names this path today, so this entry is
+    # currently inert, but it's here so the fence fires the moment any code
+    # ever writes `rand_core::OsRng`.
+    { path = "rand_core::OsRng", reason = "ambient OS entropy source — use the Entropy trait (DESIGN.md §1)" },
 ]
