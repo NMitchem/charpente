@@ -319,7 +319,50 @@ do not reorder a milestone's dependency sequence.
   0x94a70e2360154b09 explicitly triaged unpinned, swarm inconclusive-rate/runtime
   tuning (~27 min suite), ctl connect-refusal/malformed-reply tests, spec §4 stale
   `fault:conn-drop` token.
-- Next: M1 sub-project 3 — realtime SSE/WS with exact resume; then auth properly
-  (OIDC, hashed session tokens), migrations as log records, error/introspection polish
+- **M1 sub-project 3 done — realtime SSE with exact resume (2026-07-15, spec
+  docs/superpowers/specs/2026-07-14-realtime-design.md, 10-task plan + final review,
+  commits 14a3684..57a0c94).** Shipped: keyed emits (`tx.emit_keyed`; emit format gained
+  `key: Option<String>`, breaking pre-release) materialized at apply into the built-in
+  `charpente.events` table (`next_event_id` meta counter, the `next_job_id` pattern —
+  ids byte-identical on followers); count-based retention
+  (`DbConfig::event_retention: 65_536`) GC'd at checkpoint + `Db::event_floor`;
+  `#[event]` (NAME snake_case, Codec + Serialize via `::charpente::serde` with the
+  `#[serde(crate)]` redirect); `#[route(SSE …)]` handlers returning typed
+  `Subscription` (compile-checked event types, exact-match key filter, session auth via
+  Ctx); the `<id>.<seq>` cursor (seq exists for failover honesty — cross-timeline id
+  reuse is a named diverged-409, mirroring replication's Diverged); the kernel Tail
+  ready-source (ONE delivery path: bounded 64-row table reads whenever behind, no
+  live/catch-up modes; drop-on-full — cursor resume IS the backpressure recovery); the
+  `Respond` seam (drivers hand the kernel an `EventSink`; SimSink in sim, bounded
+  channel + spawn_blocking pump + hand-rolled SseBody at the hyper edge); browser-native
+  `Last-Event-ID` resume. Error surface all pinned by text: below-floor 409, both
+  diverged 409s, `charpente.gap` terminal frame, cursor-400. WS + TS codegen +
+  `events![]` deliberately deferred (spec non-goals). Properties: the flagship
+  reconnecting-client oracle (BTreeSet-membership settled() — the T6 review caught the
+  original high-water bound silently excusing interior skips; fixed with a skip
+  meta-test proven RED against the old oracle), off-by-one + skip discriminating twins,
+  full-trace determinism, follower tails + failover resume/divergence multi-node
+  property (bounded loss by construction, foreign cursor refused by name). Mid-plan
+  interlude (Noah-ruled): T2's GC perturbation exposed a pre-existing replication hole —
+  a freshly-seeded follower Hello'd `position: None` and a lossy post-cut primary
+  silently re-seeded the SURVIVOR (seed 0xd4d9c59769a6738c); fixed in 0ef5fef
+  (SnapshotStart carries the seed frontier CRC, durable meta fallback, diverged-ahead
+  refusal holds; adversarially reviewed). Also found (Noah-ruled follow-up, NOT yet
+  investigated): debug/release universe replay divergence, seed 0xff159ed76d2806e4 —
+  the seed promise is per-build-mode today. Evidence: 14-stage sweep green (realtime ×2,
+  replication ×2, core4 ×2, sim ×2, pinned 0x8bee1752811ae873 + 0x348270b38f166529
+  replays, invoicing 1024u master 0xae4aec23d8d3707f, full workspace + clippy + fmt);
+  live demo-of-record: curl -N tail against the invoicing binary, kill mid-stream,
+  `Last-Event-ID` resume delivers exactly the missed frames, garbage/cross-timeline
+  cursors print the pinned 400/409 byte-exact (transcript in the ledger). Final review:
+  READY, 0 Critical; headline follow-ups ledgered: encode-error delivery is
+  whole-node-fatal (documented contract; needs its pinning meta-test + a decision on a
+  gentler per-tail-drop shape), T7 pump-linger under silent-disconnect churn, gap-frame
+  `id:` line defeats EventSource auto-self-heal (fails loud, never wrong),
+  double-buffered sink (~512 effective), the corrupt-frame double-fault window
+  (0x820d5e907fbb8b55, fail-stop direction).
+- Next: the debug/release replay-divergence investigation (seed 0xff159ed76d2806e4,
+  Noah-ruled follow-up), then M1 sub-project 4 — auth properly (OIDC, hashed session
+  tokens); then migrations as log records, error/introspection polish
   (`charpente describe`), and the Vörtex-style black-box edge harness for the hyper
   layer.
