@@ -12,12 +12,14 @@ use charpente_core::io::{Disk, Entropy};
 use charpente_core::table::{Id, View};
 use charpente_macros::table;
 
+use crate::auth::sweep::{self, SessionSweep};
 use crate::auth::{
     ApiKey, AuthReject, OidcConfig, OidcVerifier, Presented, Principal, Via, hash_token, resolve,
 };
 use crate::http::router::{RouteGlue, RouteMatch, Router};
 use crate::http::{ApiError, Cursor, Request, Response, Route, Subscription, hex};
 use crate::kernel::JobDef;
+use crate::kernel::JobEntry;
 use crate::kernel::cron::{CronEntry, CronRow};
 
 // ---------------------------------------------------------------- session
@@ -172,7 +174,11 @@ pub struct App {
 impl App {
     /// Opens the Db with the app's schema plus the platform's `Session`,
     /// `ApiKey`, and `CronRow` tables — registered here so recovery can
-    /// always replay logins, minted keys, and schedules.
+    /// always replay logins, minted keys, and schedules. The built-in daily
+    /// session-expiry sweep (auth T6) is seeded the same unconditional way:
+    /// its `#[job]` def and cron entry land in `job_defs`/`cron_entries`
+    /// before any app-level `mount_jobs`/`schedule` call, so every app gets
+    /// it with no opt-in.
     pub fn open(
         disk: Box<dyn Disk>,
         schema: Schema,
@@ -192,8 +198,8 @@ impl App {
             entropy,
             config,
             router: Router::new(),
-            job_defs: Vec::new(),
-            cron_entries: Vec::new(),
+            job_defs: vec![<SessionSweep as JobEntry>::def()],
+            cron_entries: vec![sweep::platform_cron_entry()],
             oidc: None,
         })
     }
@@ -243,7 +249,9 @@ impl App {
         self.cron_entries.push(CronEntry {
             name,
             interval: every,
-            enqueue: Box::new(move |tx| tx.enqueue(make())),
+            // `now` rides the widened seam (T6) but plain user schedules
+            // don't need it — `make` stays the simple `() -> J` shape.
+            enqueue: Box::new(move |tx, _now| tx.enqueue(make())),
         });
         self
     }

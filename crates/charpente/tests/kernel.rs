@@ -1,7 +1,7 @@
 //! Kernel-layer tests (PLAN M0 step 6): #[job] surface, dispatcher, cron,
 //! the event loop, and the step-6 swarm properties.
 
-use charpente::http::{App, AppConfig};
+use charpente::http::{App, AppConfig, Session};
 use charpente::kernel::{Dispatcher, JobDef, JobEntry, JobError, JobOutcome};
 use charpente::{Schema, Tx, job, jobs, table};
 use charpente_core::db::{Job, TxError};
@@ -252,6 +252,7 @@ use charpente::kernel::CronScheduler;
 use std::time::Duration;
 
 const HOUR: u64 = 3_600_000_000_000;
+const DAY: u64 = 24 * HOUR;
 
 fn cron_app(seed: u64) -> (Sim, App) {
     let sim = Sim::with_faults(seed, FaultConfig::none());
@@ -895,10 +896,31 @@ fn always_failing_job_dies_and_the_monthly_cron_ticks_120_times() {
     let stats = kernel.stats();
     assert_eq!(stats.jobs_dead, 1, "AlwaysFails dies at max attempts");
     assert_eq!(stats.jobs_retried, 1, "max 2: one retry, then dead");
-    // First tick lands one interval in; ten years of 30-day months:
-    assert_eq!(stats.cron_ticks, 121);
-    assert_eq!(stats.cron_catchups, 0);
+    assert_eq!(
+        stats.cron_catchups, 0,
+        "neither schedule — monthly or the platform's built-in daily sweep \
+         (auth T6) — ever needs catch-up in this quiet decade-long run"
+    );
     let app = kernel.into_app();
+    // stats.cron_ticks now aggregates BOTH schedules: "monthly" and the
+    // platform's built-in daily session-expiry sweep, which every App gets
+    // with no opt-in (auth T6) — over ten years that's ~3650 extra ticks,
+    // so a raw total is no longer a precise stand-in for "did the monthly
+    // schedule fire 121 times". Scope the check to the monthly schedule's
+    // own effect instead: it enqueues CountUp{slot: 1} every tick, so
+    // Counter{id: 1}.hits IS its tick count, immune to how many other
+    // schedules also ticked in the same run.
+    let monthly_hits = app
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan::<Counter>()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id.raw() == 1)
+        .map_or(0, |c| c.hits);
+    // First tick lands one interval in; ten years of 30-day months:
+    assert_eq!(monthly_hits, 121, "the monthly schedule's own tick count");
     // ...and this whole decade of queue traffic ran in well under a second
     // of wall time, or the suite would be unshippable. Virtual time works.
     drop(app);
@@ -1007,6 +1029,97 @@ fn due_jobs_are_not_starved_by_a_request_flood() {
     );
 }
 
+// ------------------------------------------------------------------- sweep
+
+/// Mints a session the same way `http.rs`'s `login` does — the sweep test
+/// only needs its own routes to avoid cross-file coupling between the two
+/// integration test binaries.
+#[route(POST "/sweep-login")]
+fn sweep_login(tx: &mut Tx, subject: String, ctx: &Ctx) -> Result<String, ApiError> {
+    Ok(ctx.create_session(tx, subject))
+}
+
+#[route(GET "/sweep-whoami", auth)]
+fn sweep_whoami(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
+    let _ = tx;
+    Ok(ctx.principal().expect("auth route").subject.clone())
+}
+
+/// Auth T6: the platform's built-in daily session-expiry sweep. Every `App`
+/// gets it with no opt-in (like `Session`/`ApiKey`/`CronRow` themselves).
+/// `session_ttl: 0` lets each login's own `now` argument set `expires_at`
+/// directly, so the two sessions land squarely on either side of the
+/// platform's real `Duration::from_secs(86_400)` cadence (`DAY`, in nanos)
+/// without needing a test-only knob on the interval.
+#[test]
+fn session_sweep_deletes_expired_rows_on_tick() {
+    let sim = Sim::with_faults(0x6B0, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig {
+            session_ttl: 0,
+            ..AppConfig::default()
+        },
+    )
+    .unwrap()
+    .mount(routes![sweep_login, sweep_whoami]);
+
+    let login_a = app.handle_at(
+        Request::new(Method::Post, "/sweep-login").json(&"alice"),
+        100,
+    ); // expires_at = 100 — long before the first tick at DAY
+    assert_eq!(login_a.status, 200);
+    let token_a: String = serde_json::from_slice(&login_a.body).unwrap();
+
+    let login_b = app.handle_at(
+        Request::new(Method::Post, "/sweep-login").json(&"bob"),
+        2 * DAY,
+    ); // expires_at = 2*DAY — long after the first tick
+    assert_eq!(login_b.status, 200);
+
+    assert_eq!(
+        app.db()
+            .snapshot()
+            .unwrap()
+            .scan::<Session>()
+            .unwrap()
+            .len(),
+        2,
+        "the sweep hasn't run yet — both rows are still on disk"
+    );
+
+    // Lazy resolution (T2) already refuses the expired token on its own,
+    // with zero help from the sweep — the sweep is storage hygiene, not the
+    // correctness mechanism.
+    let denied = app.handle_at(
+        Request::new(Method::Get, "/sweep-whoami")
+            .header("Authorization", format!("Bearer {token_a}")),
+        DAY / 2,
+    );
+    assert_eq!(
+        denied.status, 401,
+        "lazy expiry must already hide alice's row"
+    );
+
+    // Run the kernel forward past the platform's first daily tick: now=DAY
+    // sits strictly between the two expiries (100 <= DAY < 2*DAY), so the
+    // sweep's enqueued `before` deletes exactly alice's row.
+    let mut source = SimSource::new(Box::new(sim.clock()), DAY + SEC);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    kernel.run(&mut source).unwrap();
+
+    let app = kernel.into_app();
+    let sessions = app.db().snapshot().unwrap().scan::<Session>().unwrap();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "the expired row is swept; the live one survives"
+    );
+    assert_eq!(sessions[0].subject, "bob");
+}
+
 // ------------------------------------------------------------------- tail
 
 use charpente::event;
@@ -1107,10 +1220,14 @@ fn a_tail_receives_matching_events_exactly_and_in_order() {
         }
         prev = Some(frame.id);
     }
-    // The subscribe wrote nothing (no seq consumed); each emit is its own commit.
+    // The subscribe wrote nothing (no seq consumed); each emit is its own
+    // commit. Seq starts at 1, not 0: the platform's built-in daily
+    // session-sweep cron (auth T6, every App gets one with no opt-in)
+    // upserts its CronRow at kernel construction, consuming seq 0 before any
+    // user transaction runs.
     assert_eq!(
         frames.iter().map(|f| f.seq).collect::<Vec<_>>(),
-        vec![0, 1, 2],
+        vec![1, 2, 3],
         "frames carry the committing record's seq"
     );
 }

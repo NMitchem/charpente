@@ -18,10 +18,19 @@ pub struct CronRow {
     pub next_due: u64,
 }
 
+/// Named (like `kernel::RecordedResponses`/`SinkHandles`) so the closure type
+/// doesn't trip clippy's type-complexity lint at every use site. Widened
+/// (auth T6) to carry the tick's own `now`: the platform's built-in
+/// session-expiry sweep enqueues a `#[job]` that needs a clock reading, and a
+/// job handler runs as a transaction with no clock of its own (DESIGN §1) —
+/// the cron tick is the only place `now` is available, so it rides along
+/// into the enqueue closure instead.
+pub type CronEnqueue = Box<dyn Fn(&mut Tx, u64) + Send>;
+
 pub struct CronEntry {
     pub name: &'static str,
     pub interval: Duration,
-    pub enqueue: Box<dyn Fn(&mut Tx) + Send>,
+    pub enqueue: CronEnqueue,
 }
 
 pub struct CronScheduler {
@@ -99,7 +108,7 @@ impl CronScheduler {
                 .unwrap_or_else(|| panic!("cron invariant: schedule \"{name}\" has no row"));
             row.next_due = next;
             tx.put(&row);
-            enqueue(tx);
+            enqueue(tx, now);
             Ok::<(), io::Error>(())
         })
         .map_err(flatten)?;
