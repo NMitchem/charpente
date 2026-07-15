@@ -5,18 +5,22 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
+use std::time::Duration;
 
 use charpente::event;
 use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, Method, Request, Subscription};
-use charpente::kernel::{Kernel, SimSinkHandle, SimSource, SinkHandles};
-use charpente::{Schema, Tx, route, routes};
+use charpente::kernel::{Kernel, RecordedResponses, SimSinkHandle, SimSource, SinkHandles, Step};
+use charpente::repl::protocol::{Msg, decode, encode};
+use charpente::repl::role::Role;
+use charpente::repl::{MAX_MESSAGE_BYTES, Repl, ReplConfig};
+use charpente::{DbConfig, Schema, Tx, route, routes};
 use charpente_core::db::Db;
 use charpente_core::event::EventRow;
-use charpente_core::io::Entropy;
+use charpente_core::io::{Clock, Conn, Disk, Entropy, Net};
 use charpente_core::log::WalConfig;
 use charpente_core::table::{Codec, View};
 use charpente_sim::checks::is_fault_fallout;
-use charpente_sim::{FaultConfig, Sim, SimEntropy, run_universes_swarm_with};
+use charpente_sim::{FaultConfig, Sim, SimEntropy, SimHost, run_universes_swarm_with};
 use serde::{Deserialize, Serialize};
 
 const SEC: u64 = 1_000_000_000;
@@ -874,5 +878,671 @@ fn the_harness_catches_a_resume_that_skips_the_successor_event() {
     assert!(
         report.contains(&missing.to_string()),
         "the failure report must name the missing id: {report}"
+    );
+}
+
+// ==================================== multi-node: follower tails + failover
+//
+// Task 8: two REPLICATED kernels (the rig shape from replication.rs's T8
+// section — `KNode`/`spawn_kernel_node`/`kernel_round`/`drive_request`/
+// `CtrlConn`, reproduced here since integration-test binaries share no code)
+// wired to T6's OWN client model above, reused verbatim (never forked): a
+// client tails the FOLLOWER's kernel while emits land on the primary
+// (`realtime:follower-tail`); the primary is killed and the follower
+// promoted, and the SAME client reconnects with its cursor, proving the
+// failover kept exactly what the follower had durably shipped
+// (`realtime:failover-resume` — DECISIONS §6's bounded-loss window is
+// implicit here: the client's ledger is synced from whichever node it is
+// CONNECTED to, so an event never shipped to the follower simply never
+// enters the ledger `settled()` waits on, mirroring how
+// `failover_preserves_everything_the_follower_acked` checks a PREFIX of the
+// primary's timeline rather than "everything ever acked"); and a second,
+// deliberately foreign cursor — built by partitioning the follower, driving
+// the primary past the follower's shipped position, and recording one
+// unshipped event's id.seq before killing the primary — proves the promoted
+// follower refuses it by name by name (kernel/mod.rs's `validate_subscribe`
+// 409 family) rather than ever serving the wrong content
+// (`realtime:failover-diverged`).
+
+/// Marker prefix meaning "this universe's faults were too persistent for the
+/// multi-node dance to complete" — a covered skip. This file's own copy of
+/// replication.rs's `INCONCLUSIVE` idiom (two separate test binaries share no
+/// platform code, only the pattern).
+const INCONCLUSIVE: &str = "universe-inconclusive";
+
+const RT_RECOVER_ATTEMPTS: u32 = 200;
+const RT_STEP_BUDGET: u32 = 20_000;
+const RT_SETTLE_ATTEMPTS: u32 = 40;
+const RT_HORIZON: u64 = 300 * SEC;
+
+/// Disables the durable-media-corruption axes (mirrors replication.rs's own
+/// `no_media_corruption`): a primary that bitrots its own WAL and silently
+/// loses an acked-but-unconverged record is the above-horizon promise's
+/// property (M1 replication task 8's `wal_corruption_on_the_primary_...`),
+/// not this one — this property's failover loss window is the DELIBERATE,
+/// honest one (partition + unshipped tail), never an incidental one from
+/// bitrot noise.
+fn no_media_corruption(cfg: &mut FaultConfig) {
+    cfg.bit_flip = 0.0;
+    cfg.misdirected_write = 0.0;
+}
+
+fn rt_primary_cfg(addr: &str) -> ReplConfig {
+    ReplConfig {
+        listen: Some(addr.to_string()),
+        initial_role: Role::Primary,
+    }
+}
+
+fn rt_follower_cfg(listen: &str, primary: &str) -> ReplConfig {
+    ReplConfig {
+        listen: Some(listen.to_string()),
+        initial_role: Role::Follower {
+            primary: primary.to_string(),
+        },
+    }
+}
+
+fn multi_node_db_cfg() -> DbConfig {
+    DbConfig {
+        wal: WalConfig {
+            dir: "wal".to_string(),
+            segment_bytes: 4096,
+        },
+        store_path: "tables.redb".to_string(),
+        event_retention: 64,
+        checkpoint_every: 8,
+        ..DbConfig::default()
+    }
+}
+
+/// One replication node driven through its `Kernel` — this file's own copy
+/// of replication.rs's `KNode`, scoped to what this property needs (no
+/// jobs/cron: this workload only ever mounts the emit/subscribe routes).
+struct RNode {
+    host: SimHost,
+    kernel: Option<Kernel>,
+    source: SimSource,
+    responses: RecordedResponses,
+    sinks: SinkHandles,
+    name: String,
+    repl_cfg: ReplConfig,
+    db_cfg: DbConfig,
+    recoveries: u32,
+    flipped: bool,
+}
+
+/// Build the App + Repl + Kernel for one host, with the same torn-role
+/// first-boot re-init idiom `open_kernel` uses in replication.rs.
+fn open_rt_kernel(
+    sim: &Sim,
+    h: &SimHost,
+    cfg: &ReplConfig,
+    db_cfg: &DbConfig,
+    flipped: bool,
+) -> Result<Kernel, String> {
+    let mut app = App::open(
+        Box::new(h.disk()),
+        Schema::new(),
+        Box::new(h.entropy()),
+        AppConfig {
+            body_cap: 1 << 20,
+            db: db_cfg.clone(),
+        },
+    )
+    .map_err(|e| format!("App::open: {e}"))?
+    .mount(routes![
+        emit_ping, emit_pong, feed_both, feed_ping, feed_keyed
+    ]);
+
+    let repl = match Repl::open(
+        Box::new(h.net()),
+        Box::new(h.disk()),
+        cfg.clone(),
+        app.db_for_tests(),
+    ) {
+        Ok((repl, _notice)) => repl,
+        Err(e) if e.to_string().contains("integrity check") => {
+            if flipped {
+                return Err(format!(
+                    "{INCONCLUSIVE}: {} torn role file after a role flip — restore, not \
+                     re-init, is the fix: {e}",
+                    h.name()
+                ));
+            }
+            let _ = h.disk().remove("role");
+            let _ = h.disk().sync_dir("role");
+            Repl::open(
+                Box::new(h.net()),
+                Box::new(h.disk()),
+                cfg.clone(),
+                app.db_for_tests(),
+            )
+            .map_err(|e| format!("Repl::open (after torn-role re-init): {e}"))?
+            .0
+        }
+        Err(e) => return Err(format!("Repl::open: {e}")),
+    };
+    Kernel::with_replication(app, Box::new(sim.clock()), repl).map_err(|e| format!("Kernel: {e}"))
+}
+
+fn spawn_rt_node(
+    sim: &Sim,
+    host: &str,
+    cfg: ReplConfig,
+    db_cfg: DbConfig,
+    horizon: u64,
+) -> Result<RNode, String> {
+    let h = sim.host(host);
+    for _ in 0..RT_RECOVER_ATTEMPTS {
+        match open_rt_kernel(sim, &h, &cfg, &db_cfg, false) {
+            Ok(kernel) => {
+                let source = SimSource::new(Box::new(sim.clock()), horizon);
+                let responses = source.responses();
+                let sinks = source.sinks();
+                return Ok(RNode {
+                    host: h,
+                    kernel: Some(kernel),
+                    source,
+                    responses,
+                    sinks,
+                    name: host.to_string(),
+                    repl_cfg: cfg,
+                    db_cfg,
+                    recoveries: 0,
+                    flipped: false,
+                });
+            }
+            Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
+            Err(e) if is_fault_fallout(&e) => {
+                h.restart();
+                continue;
+            }
+            Err(e) => return Err(format!("{host}: {e}")),
+        }
+    }
+    Err(format!(
+        "{INCONCLUSIVE}: {host} kernel spawn exhausted {RT_RECOVER_ATTEMPTS} attempts"
+    ))
+}
+
+/// Restart-and-recover a node in place. Local-corruption-shaped hard errors
+/// (no restore rig in this property — it isn't what this task proves) are
+/// folded into the same inconclusive skip the Db-level `recover_node` uses in
+/// replication.rs, rather than attempting the kernel-level restore dance.
+fn recover_rt_node(sim: &Sim, node: &mut RNode) -> Result<(), String> {
+    sim.cover("restart");
+    node.recoveries += 1;
+    node.kernel = None;
+    let mut last = String::new();
+    for _ in 0..RT_RECOVER_ATTEMPTS {
+        node.host.restart();
+        match open_rt_kernel(sim, &node.host, &node.repl_cfg, &node.db_cfg, node.flipped) {
+            Ok(kernel) => {
+                node.kernel = Some(kernel);
+                return Ok(());
+            }
+            Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
+            Err(e)
+                if e.contains("restore this node from a replica or backup")
+                    || e.contains("cannot be rebuilt from the log alone")
+                    || e.contains("refusing to guess") =>
+            {
+                return Err(format!(
+                    "{INCONCLUSIVE}: {} local copy unrestorable (no restore rig in this \
+                     property): {e}",
+                    node.name
+                ));
+            }
+            Err(e) if is_fault_fallout(&e) => last = e,
+            Err(e) => return Err(format!("recover {}: {e}", node.name)),
+        }
+    }
+    Err(format!(
+        "{INCONCLUSIVE}: recover {} exhausted {RT_RECOVER_ATTEMPTS} attempts (last: {last})",
+        node.name
+    ))
+}
+
+/// One `Kernel::step`, classifying faults exactly like replication.rs's
+/// `kstep_node`.
+fn kstep_rt_node(sim: &Sim, node: &mut RNode) -> Result<Step, String> {
+    let stepped = {
+        let kernel = node.kernel.as_mut().expect("kstep on a live node");
+        kernel.step(&mut node.source)
+    };
+    match stepped {
+        Ok(step) => Ok(step),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            recover_rt_node(sim, node)?;
+            Ok(Step::Worked)
+        }
+        Err(e) => Err(format!("{} kernel step: {e}", node.name)),
+    }
+}
+
+/// One scheduler round over kernel nodes — mirrors replication.rs's
+/// `kernel_round`.
+fn rt_kernel_round(sim: &Sim, nodes: &mut [&mut RNode]) -> Result<bool, String> {
+    let mut worked = false;
+    let mut deadlines: Vec<u64> = Vec::new();
+    for node in nodes.iter_mut() {
+        match kstep_rt_node(sim, node)? {
+            Step::Worked => worked = true,
+            Step::Idle { deadline } => {
+                if let Some(d) = deadline {
+                    deadlines.push(d.as_nanos());
+                }
+            }
+        }
+    }
+    if worked {
+        return Ok(true);
+    }
+    let now = sim.now().as_nanos();
+    let mut next = sim.next_wakeup();
+    for d in deadlines {
+        if d > now {
+            next = Some(next.map_or(d, |x| x.min(d)));
+        }
+    }
+    match next {
+        Some(t) if t > now => {
+            sim.clock().sleep(Duration::from_nanos(t - now));
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Push a request onto `target`'s source and drive the whole node set until
+/// it is answered — mirrors replication.rs's `drive_request`.
+fn rt_drive_request(
+    sim: &Sim,
+    nodes: &mut [&mut RNode],
+    target: usize,
+    req: Request,
+    budget: u32,
+) -> Result<(u16, Vec<u8>), String> {
+    let sink = nodes[target].responses.clone();
+    let before = sink.lock().expect("responses lock poisoned").len();
+    let now = sim.now().as_nanos();
+    nodes[target].source.push_at(now, req);
+    for _ in 0..budget {
+        {
+            let guard = sink.lock().expect("responses lock poisoned");
+            if guard.len() > before {
+                return Ok(guard[before].clone());
+            }
+        }
+        if !rt_kernel_round(sim, nodes)? {
+            break;
+        }
+    }
+    let guard = sink.lock().expect("responses lock poisoned");
+    if guard.len() > before {
+        Ok(guard[before].clone())
+    } else {
+        Err(format!(
+            "{INCONCLUSIVE}: no response to a request on node {target} within budget"
+        ))
+    }
+}
+
+/// A control connection to a node's replication listener — mirrors
+/// replication.rs's `CtrlConn`.
+struct CtrlConn {
+    conn: Box<dyn Conn>,
+    buf: Vec<u8>,
+}
+
+impl CtrlConn {
+    fn open(sim: &Sim, addr: &str, verb: &Msg) -> Result<CtrlConn, String> {
+        let conn = sim
+            .host("cli")
+            .net()
+            .connect(addr)
+            .map_err(|e| format!("{INCONCLUSIVE}: ctrl connect {addr}: {e}"))?;
+        conn.send(&encode(verb))
+            .map_err(|e| format!("{INCONCLUSIVE}: ctrl send: {e}"))?;
+        Ok(CtrlConn {
+            conn,
+            buf: vec![0u8; MAX_MESSAGE_BYTES],
+        })
+    }
+
+    fn poll(&mut self) -> Result<Option<Msg>, String> {
+        match self.conn.recv(&mut self.buf) {
+            Ok(Some(0)) => Err("control conn closed before a reply".to_string()),
+            Ok(Some(n)) => decode(&self.buf[..n]).map(Some).map_err(|e| e.to_string()),
+            Ok(None) => Ok(None),
+            Err(e) => Err(format!("ctrl recv: {e}")),
+        }
+    }
+}
+
+fn drive_ctrl_kernel(
+    sim: &Sim,
+    nodes: &mut [&mut RNode],
+    cli: &mut CtrlConn,
+    budget: u32,
+) -> Result<Msg, String> {
+    for _ in 0..budget {
+        let advanced = rt_kernel_round(sim, nodes)?;
+        match cli.poll() {
+            Ok(Some(m)) => return Ok(m),
+            Ok(None) => {}
+            Err(e) => return Err(format!("{INCONCLUSIVE}: {e}")),
+        }
+        if !advanced {
+            return Err(format!("{INCONCLUSIVE}: quiescent before a control reply"));
+        }
+    }
+    Err(format!("{INCONCLUSIVE}: no control reply within budget"))
+}
+
+/// Drives `client` against `nodes[target]` until it holds a live, settled
+/// tail: (re)subscribes whenever it lacks one via `push_subscribe` — T6's own
+/// helper, already fully generic over any `Kernel`/`SimSource` pair, reused
+/// unmodified — and otherwise drives a bounded burst and drains through
+/// `Client::absorb`/`sync_and_drain`, T6's SAME oracle, unmodified. A
+/// recovery on the target node (fresh `Kernel`, so any existing sink handle
+/// is orphaned — the tail never explicitly closes it, so `absorb` alone would
+/// wait forever) forces a resubscribe, mirroring how the single-node flagship
+/// resets `need_subscribe`/`current_handle` at every epoch/restart boundary.
+fn drive_client_to_settled(
+    sim: &Sim,
+    nodes: &mut [&mut RNode],
+    target: usize,
+    client: &mut Client,
+    path: &'static str,
+) -> Result<(), String> {
+    for _ in 0..RT_SETTLE_ATTEMPTS {
+        let recoveries_before = nodes[target].recoveries;
+        if client.need_subscribe {
+            let before = nodes[target]
+                .responses
+                .lock()
+                .expect("responses lock poisoned")
+                .len();
+            let now = sim.now().as_nanos();
+            let subscribe_info = {
+                let node = &mut *nodes[target];
+                let kernel = node
+                    .kernel
+                    .as_ref()
+                    .ok_or_else(|| format!("{INCONCLUSIVE}: target has no kernel"))?;
+                push_subscribe(sim, kernel, &mut node.source, path, client.cursor, now)?
+            };
+            let mut got = None;
+            for _ in 0..RT_STEP_BUDGET {
+                {
+                    let guard = nodes[target]
+                        .responses
+                        .lock()
+                        .expect("responses lock poisoned");
+                    if guard.len() > before {
+                        got = Some(guard[before].clone());
+                    }
+                }
+                if got.is_some() {
+                    break;
+                }
+                if !rt_kernel_round(sim, nodes)? {
+                    break;
+                }
+            }
+            let Some(resp) = got else {
+                return Err(format!("{INCONCLUSIVE}: no subscribe reply within budget"));
+            };
+            let node = &mut *nodes[target];
+            let kernel = node
+                .kernel
+                .as_ref()
+                .ok_or_else(|| format!("{INCONCLUSIVE}: target has no kernel"))?;
+            client.absorb(
+                sim,
+                kernel.app().db(),
+                &[resp],
+                Some(subscribe_info),
+                &node.sinks,
+            )?;
+        } else {
+            for _ in 0..64 {
+                if !rt_kernel_round(sim, nodes)? {
+                    break;
+                }
+            }
+            let node = &mut *nodes[target];
+            let kernel = node
+                .kernel
+                .as_ref()
+                .ok_or_else(|| format!("{INCONCLUSIVE}: target has no kernel"))?;
+            client.absorb(sim, kernel.app().db(), &[], None, &node.sinks)?;
+        }
+        if nodes[target].recoveries > recoveries_before {
+            client.need_subscribe = true;
+            client.current_handle = None;
+        }
+        if client.settled() && !client.need_subscribe {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// The three-phase property. Setup: a primary `p` (emits+writes) and a
+/// follower `f` (the client's tail). Phase 1: subscribe on `f`, emit on `p`,
+/// prove live delivery through the shipped log — `realtime:follower-tail`.
+/// Setup for phases 2/3: partition `f` from `p`, drive `p` past what `f` ever
+/// shipped, record one such event's id.seq (an honestly-constructed foreign
+/// cursor — never one `f` could have minted), then kill `p` for good and
+/// promote `f`. Phase 2: the SAME client reconnects with its (valid, `f`-
+/// shipped) cursor and must settle exactly — `realtime:failover-resume`.
+/// Phase 3: a fresh subscribe using the deliberately foreign cursor must be
+/// refused by name (never served) — `realtime:failover-diverged`.
+fn multi_node_realtime_universe(sim: &mut Sim) -> Result<(), String> {
+    let db_cfg = multi_node_db_cfg();
+    let mut p = spawn_rt_node(sim, "p", rt_primary_cfg("p:1"), db_cfg.clone(), RT_HORIZON)?;
+    let mut f = spawn_rt_node(sim, "f", rt_follower_cfg("f:1", "p:1"), db_cfg, RT_HORIZON)?;
+
+    let (path, mode_names, mode_key) = mode_for(sim.seed());
+    let mut client = Client::new(mode_names, mode_key);
+
+    // ---------------------------------------------------- Phase 1: follower-tail
+    drive_client_to_settled(sim, &mut [&mut p, &mut f], 1, &mut client, path)?;
+    for _ in 0..6u32 {
+        let (route, body) = pick_emit(sim);
+        let (status, resp_body) = rt_drive_request(
+            sim,
+            &mut [&mut p, &mut f],
+            0,
+            Request::new(Method::Post, route).json(&body),
+            RT_STEP_BUDGET,
+        )?;
+        if status != 200 && !is_fault_fallout(&String::from_utf8_lossy(&resp_body)) {
+            return Err(format!(
+                "unexpected emit status {status} on p: {resp_body:?}"
+            ));
+        }
+        drive_client_to_settled(sim, &mut [&mut p, &mut f], 1, &mut client, path)?;
+    }
+    if !client.settled() {
+        return Err(client.unsettled_report());
+    }
+    if !client.trace.is_empty() {
+        sim.cover("realtime:follower-tail");
+    }
+
+    // ------------------------------------------- Phase 2/3 setup: divergence
+    sim.partition("p", "f");
+    let mut divergent: Option<Cursor> = None;
+    for _ in 0..8u32 {
+        if divergent.is_some() || p.kernel.is_none() {
+            break;
+        }
+        let boundary = p
+            .kernel
+            .as_ref()
+            .expect("checked above")
+            .app()
+            .db()
+            .next_event_id()
+            .map_err(|e| e.to_string())?;
+        let (route, body) = pick_emit(sim);
+        let (status, resp_body) = match rt_drive_request(
+            sim,
+            &mut [&mut p],
+            0,
+            Request::new(Method::Post, route).json(&body),
+            RT_STEP_BUDGET,
+        ) {
+            Ok(v) => v,
+            Err(e) if e.contains(INCONCLUSIVE) => continue,
+            Err(e) => return Err(e),
+        };
+        if status == 200 {
+            if let Some(k) = p.kernel.as_ref() {
+                let snap = k.app().db().snapshot().map_err(|e| e.to_string())?;
+                let rows: Vec<EventRow> = snap.scan_from(boundary, 1).map_err(|e| e.to_string())?;
+                if let Some(row) = rows.first() {
+                    divergent = Some(Cursor {
+                        id: row.id.raw(),
+                        seq: row.seq,
+                    });
+                }
+            }
+        } else if !is_fault_fallout(&String::from_utf8_lossy(&resp_body)) {
+            return Err(format!(
+                "unexpected emit status {status} on p during the partition window: {resp_body:?}"
+            ));
+        }
+    }
+    let Some(divergent) = divergent else {
+        return Err(format!(
+            "{INCONCLUSIVE}: could not construct a p-only divergent cursor within the retry \
+             budget"
+        ));
+    };
+
+    // Kill p for good — the partitioned tail above never ships.
+    p.host.crash_now();
+
+    // Promote f.
+    f.flipped = true;
+    let reply = CtrlConn::open(sim, "f:1", &Msg::CtrlPromote)
+        .and_then(|mut cli| drive_ctrl_kernel(sim, &mut [&mut f], &mut cli, RT_STEP_BUDGET))?;
+    match reply {
+        Msg::CtrlOk { message } => {
+            if !message.contains("last_applied") {
+                return Err(format!("promote CtrlOk must name last_applied: {message}"));
+            }
+        }
+        Msg::CtrlErr { message } => {
+            return Err(format!("promote refused unexpectedly: {message}"));
+        }
+        other => return Err(format!("unexpected promote reply: {other:?}")),
+    }
+    if !f.kernel.as_ref().is_some_and(|k| k.is_primary()) {
+        return Err(
+            "f must report is_primary() immediately after a successful CtrlPromote reply"
+                .to_string(),
+        );
+    }
+
+    // ---------------------------------------------------- Phase 2: failover-resume
+    client.need_subscribe = true;
+    client.current_handle = None;
+    drive_client_to_settled(sim, &mut [&mut f], 0, &mut client, path)?;
+    if !client.settled() {
+        return Err(client.unsettled_report());
+    }
+    sim.cover("realtime:failover-resume");
+
+    // ------------------------------------------------- Phase 3: failover-diverged
+    let mut got_family = false;
+    for _ in 0..8u32 {
+        if f.kernel.is_none() {
+            break;
+        }
+        let before = f.responses.lock().expect("responses lock poisoned").len();
+        let now = sim.now().as_nanos();
+        f.source.push_at(
+            now,
+            Request::new(Method::Get, format!("{path}?cursor={}", divergent.wire())),
+        );
+        let mut resp = None;
+        for _ in 0..RT_STEP_BUDGET {
+            {
+                let guard = f.responses.lock().expect("responses lock poisoned");
+                if guard.len() > before {
+                    resp = Some(guard[before].clone());
+                }
+            }
+            if resp.is_some() {
+                break;
+            }
+            if !rt_kernel_round(sim, &mut [&mut f])? {
+                break;
+            }
+        }
+        let Some((status, body)) = resp else {
+            return Err(format!(
+                "{INCONCLUSIVE}: no reply to the deliberately foreign-cursor subscribe"
+            ));
+        };
+        let text = String::from_utf8_lossy(&body).to_string();
+        if status == 409
+            && (text.contains("diverged from this node's timeline")
+                || text.contains("retention floor"))
+        {
+            got_family = true;
+            break;
+        }
+        if is_fault_fallout(&text) {
+            continue;
+        }
+        return Err(format!(
+            "a cursor referencing an event minted only on p's lost (partitioned, unshipped) \
+             tail must be refused by name — diverged or below-floor, never served: got {status} \
+             {text}"
+        ));
+    }
+    if !got_family {
+        return Err(format!(
+            "{INCONCLUSIVE}: never got a clean diverged/below-floor reply for the foreign \
+             cursor within the retry budget"
+        ));
+    }
+    sim.cover("realtime:failover-diverged");
+
+    Ok(())
+}
+
+fn finish_rt_universe(sim: &Sim, r: Result<(), String>) -> Result<(), String> {
+    match r {
+        Err(e) if e.contains(INCONCLUSIVE) => {
+            sim.cover("realtime:multi-node-inconclusive");
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+#[test]
+fn follower_tails_and_the_failover_resume_divergence_property() {
+    run_universes_swarm_with!(
+        0x2EB2_0002,
+        128,
+        no_media_corruption,
+        |sim: &mut Sim| {
+            let r = multi_node_realtime_universe(sim);
+            finish_rt_universe(sim, r)
+        },
+        require: [
+            "realtime:follower-tail",
+            "realtime:failover-resume",
+            "realtime:failover-diverged"
+        ]
     );
 }
