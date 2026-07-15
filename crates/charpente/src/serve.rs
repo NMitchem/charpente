@@ -577,8 +577,9 @@ mod tests {
         let id: u64 = captures[0].parse().expect("smoke test sends numeric ids");
         tx.put(&Session {
             id: Id::from_raw(id),
-            token: format!("smoke-{id}"),
+            token_hash: format!("smoke-{id}"),
             subject: "replicated".to_string(),
+            expires_at: u64::MAX,
         });
         Ok(Response::json(200, &id))
     }

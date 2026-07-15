@@ -2390,6 +2390,7 @@ fn open_kernel(
         AppConfig {
             body_cap: 1 << 20,
             db: db_cfg.clone(),
+            ..AppConfig::default()
         },
     )
     .map_err(|e| format!("App::open: {e}"))?

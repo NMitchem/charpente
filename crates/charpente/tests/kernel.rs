@@ -615,6 +615,7 @@ fn crash_config() -> AppConfig {
             store_path: "tables.redb".to_string(),
             ..charpente::DbConfig::default()
         },
+        ..AppConfig::default()
     }
 }
 

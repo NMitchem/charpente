@@ -2,8 +2,10 @@
 //! sessions, error mapping — unit tests here; the macro end-to-end tests and
 //! the request-level crash property are appended by later plan tasks.
 
+use charpente::auth::hash_token;
 use charpente::http::{
-    ApiError, App, AppConfig, Ctx, Cursor, Handled, Method, Request, Response, Route, Subscription,
+    ApiError, App, AppConfig, Ctx, Cursor, Handled, Method, Request, Response, Route, Session,
+    Subscription,
 };
 use charpente::{Schema, Tx, event, route, routes, table};
 use charpente_core::table::Id;
@@ -281,6 +283,58 @@ fn sessions_survive_recovery() {
 }
 
 #[test]
+fn session_token_is_hashed_at_rest_and_expires() {
+    let sim = Sim::with_faults(0x005E_5510, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Note>(),
+        Box::new(sim.entropy()),
+        AppConfig {
+            session_ttl: 1_000,
+            ..AppConfig::default()
+        },
+    )
+    .unwrap()
+    .mount(note_routes());
+
+    // 1. Login at now=0 mints a raw token.
+    let login = app.handle_at(Request::new(Method::Post, "/login").json(&"alice"), 0);
+    assert_eq!(login.status, 200, "{}", body_text(&login));
+    let token: String = serde_json::from_slice(&login.body).unwrap();
+
+    // 2. The stored row carries the hash, never the raw token.
+    let snap = app.db().snapshot().unwrap();
+    let hash = hash_token(&token);
+    let rows = Session::by_token_hash(&snap, &hash).unwrap();
+    assert_eq!(rows.len(), 1, "exactly one session row");
+    assert_eq!(rows[0].token_hash, hash);
+    assert_ne!(
+        rows[0].token_hash, token,
+        "the raw token must never be stored"
+    );
+
+    // 3. Still valid well inside the 1µs TTL.
+    let me = app.handle_at(
+        Request::new(Method::Get, "/me").header("Authorization", format!("Bearer {token}")),
+        500,
+    );
+    assert_eq!(me.status, 200, "{}", body_text(&me));
+    assert_eq!(body_text(&me), "\"alice\"");
+
+    // 4. Past expiry: a distinct 401, not the generic unrecognized-credential one.
+    let expired = app.handle_at(
+        Request::new(Method::Get, "/me").header("Authorization", format!("Bearer {token}")),
+        2_000,
+    );
+    assert_eq!(expired.status, 401, "{}", body_text(&expired));
+    assert!(
+        body_text(&expired).contains("session expired"),
+        "{}",
+        body_text(&expired)
+    );
+}
+
+#[test]
 fn handler_api_errors_map_to_statuses() {
     let (_sim, mut app) = quiet_app(0x47E);
     let resp = app.handle(Request::new(Method::Get, "/notes/12345"));
@@ -334,23 +388,27 @@ fn sse_route_reaches_handler_with_extracted_cursor() {
     let (_sim, mut app) = sse_app(0x9012_0006);
 
     // The `Last-Event-ID` header wins.
-    let handled =
-        app.handle_or_subscribe(Request::new(Method::Get, "/feed").header("last-event-id", "5.9"));
+    let handled = app.handle_or_subscribe(
+        Request::new(Method::Get, "/feed").header("last-event-id", "5.9"),
+        0,
+    );
     let Handled::Subscribe(sub) = handled else {
         panic!("expected Subscribe from an SSE route")
     };
     assert_eq!(sub.cursor, Some(Cursor { id: 5, seq: 9 }));
 
     // Same result from the `cursor` query parameter with no header.
-    let handled = app.handle_or_subscribe(Request::new(Method::Get, "/feed?cursor=5.9"));
+    let handled = app.handle_or_subscribe(Request::new(Method::Get, "/feed?cursor=5.9"), 0);
     let Handled::Subscribe(sub) = handled else {
         panic!("expected Subscribe from an SSE route")
     };
     assert_eq!(sub.cursor, Some(Cursor { id: 5, seq: 9 }));
 
     // An unparseable cursor is a 400 naming the contract — the handler never runs.
-    let handled = app
-        .handle_or_subscribe(Request::new(Method::Get, "/feed").header("last-event-id", "garbage"));
+    let handled = app.handle_or_subscribe(
+        Request::new(Method::Get, "/feed").header("last-event-id", "garbage"),
+        0,
+    );
     let Handled::Response(resp) = handled else {
         panic!("expected Response for an unparseable cursor")
     };
@@ -424,6 +482,7 @@ fn crash_app_config() -> AppConfig {
             store_path: "tables.redb".to_string(),
             ..charpente::DbConfig::default()
         },
+        ..AppConfig::default()
     }
 }
 

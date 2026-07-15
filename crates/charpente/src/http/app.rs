@@ -11,6 +11,7 @@ use charpente_core::io::{Disk, Entropy};
 use charpente_core::table::Id;
 use charpente_macros::table;
 
+use crate::auth::hash_token;
 use crate::http::router::{RouteGlue, RouteMatch, Router};
 use crate::http::{ApiError, Cursor, Request, Response, Route, Subscription, hex};
 use crate::kernel::JobDef;
@@ -18,23 +19,34 @@ use crate::kernel::cron::{CronEntry, CronRow};
 
 // ---------------------------------------------------------------- session
 
-/// Minimal auth: a session row inside the commit point. Tokens are stored
-/// raw in M0 — M1 ("auth, properly") hashes them and adds expiry.
+/// Default session lifetime: 30 days, in nanoseconds — the clock's unit
+/// throughout the kernel (`Clock::now().as_nanos()`).
+pub const SESSION_TTL: u64 = 30 * 24 * 60 * 60 * 1_000_000_000;
+
+/// A session row inside the commit point (DESIGN §8). The token is stored
+/// hashed (M1 "auth, properly") — only `token_hash` ever reaches disk; the
+/// raw token lives only in the response that mints it. `expires_at` is a
+/// clock reading (nanos); a row past it is treated as absent, never valid.
 #[table]
 pub struct Session {
     pub id: Id<Session>,
     #[index]
-    pub token: String,
+    pub token_hash: String,
     pub subject: String,
+    pub expires_at: u64,
 }
 
 // ---------------------------------------------------------------- ctx
 
 /// Per-request context handed to handlers: the authenticated session (if
-/// any) and one fresh entropy-derived token for session creation.
+/// any) and one fresh entropy-derived token for session creation. `now` and
+/// `session_ttl` are the clock reading `handle_or_subscribe` took for this
+/// request and the app's configured TTL — both needed to mint `expires_at`.
 pub struct Ctx {
     session: Option<Session>,
     fresh_token: String,
+    now: u64,
+    session_ttl: u64,
     created: Cell<bool>,
 }
 
@@ -45,7 +57,8 @@ impl Ctx {
 
     /// Creates a session for `subject` and returns its token (login). One
     /// per request — the fresh token is drawn before the transaction, so a
-    /// second call could only reuse it.
+    /// second call could only reuse it. Stores the hash, never the raw
+    /// token; `expires_at` is this request's `now` plus the app's TTL.
     pub fn create_session(&self, tx: &mut Tx, subject: impl Into<String>) -> String {
         assert!(
             !self.created.replace(true),
@@ -54,8 +67,9 @@ impl Ctx {
         let id = u64::from_str_radix(&self.fresh_token[..16], 16).expect("token is hex");
         tx.put(&Session {
             id: Id::from_raw(id),
-            token: self.fresh_token.clone(),
+            token_hash: hash_token(&self.fresh_token),
             subject: subject.into(),
+            expires_at: self.now + self.session_ttl,
         });
         self.fresh_token.clone()
     }
@@ -75,6 +89,9 @@ pub struct AppConfig {
     /// `Db::transact`'s MAX_RECORD_BYTES assert from network input.
     pub body_cap: usize,
     pub db: DbConfig,
+    /// How long a minted session stays valid, in nanoseconds — added to the
+    /// minting request's `now` to set `Session::expires_at`.
+    pub session_ttl: u64,
 }
 
 impl Default for AppConfig {
@@ -82,6 +99,7 @@ impl Default for AppConfig {
         AppConfig {
             body_cap: 1 << 20,
             db: DbConfig::default(),
+            session_ttl: SESSION_TTL,
         }
     }
 }
@@ -247,9 +265,19 @@ impl App {
     /// `Response` outcome), and turns a `Subscribe` outcome into a 500 — an
     /// SSE route matched, but a bare caller has no sink to hand the tail.
     /// Only the kernel (`Kernel::step`, T5) has one, so only it should ever
-    /// see a `Handled::Subscribe`.
+    /// see a `Handled::Subscribe`. Defaults `now` to 0 — every current
+    /// caller relies on this implicitly for sessions that outlive a single
+    /// scenario; a test that must observe the expiry boundary calls
+    /// `handle_at` directly instead.
     pub fn handle(&mut self, request: Request) -> Response {
-        match self.handle_or_subscribe(request) {
+        self.handle_at(request, 0)
+    }
+
+    /// `handle`, with the clock reading `handle_or_subscribe` needs made
+    /// explicit — the seam a caller that tracks its own `now` (tests driving
+    /// session expiry) uses instead of the 0-default.
+    pub fn handle_at(&mut self, request: Request, now: u64) -> Response {
+        match self.handle_or_subscribe(request, now) {
             Handled::Response(response) => response,
             Handled::Subscribe(_) => Response::error(
                 500,
@@ -263,8 +291,10 @@ impl App {
     /// `#[route]` runs its handler and returns `Response`; a
     /// `#[route(SSE …)]` extracts the resume cursor (before the handler
     /// runs — an unparseable one is a 400, never a silent from-now), runs
-    /// its handler, and returns the validated `Subscription`.
-    pub fn handle_or_subscribe(&mut self, request: Request) -> Handled {
+    /// its handler, and returns the validated `Subscription`. `now` is the
+    /// caller's clock reading (the kernel's own `Clock`, in production) —
+    /// threaded into `Ctx` for session expiry and minting.
+    pub fn handle_or_subscribe(&mut self, request: Request, now: u64) -> Handled {
         let (route, captures) = match self.router.find(request.method, &request.path) {
             RouteMatch::Found(route, captures) => (route, captures),
             RouteMatch::PathNotFound => {
@@ -299,18 +329,19 @@ impl App {
         self.entropy.fill(&mut fresh);
         let fresh_token = hex(&fresh);
         let token = bearer_or_cookie(&request.headers);
+        let session_ttl = self.config.session_ttl;
 
         match glue {
             RouteGlue::Http(glue) => {
                 let result = self.db_mut().transact(|tx| {
-                    let ctx = build_ctx(tx, &token, auth_required, fresh_token)?;
+                    let ctx = build_ctx(tx, &token, auth_required, fresh_token, now, session_ttl)?;
                     glue(tx, &ctx, &captures, &request.body)
                 });
                 Handled::Response(result.unwrap_or_else(tx_error_response))
             }
             RouteGlue::Sse(glue) => {
                 let result = self.db_mut().transact(|tx| {
-                    let ctx = build_ctx(tx, &token, auth_required, fresh_token)?;
+                    let ctx = build_ctx(tx, &token, auth_required, fresh_token, now, session_ttl)?;
                     glue(tx, &ctx, &captures, cursor)
                 });
                 match result {
@@ -332,24 +363,44 @@ pub enum Handled {
 }
 
 /// Shared session-lookup-then-auth-gate, used by both route flavors: reads
-/// the session for the bearer/cookie token (if any), rejects an auth-
-/// required route with no session, and builds the `Ctx` the handler sees.
+/// the session for the bearer/cookie token's hash (if any), treats a row
+/// past `expires_at` as absent — but remembers the distinction so an
+/// auth-required route sees `SessionExpired` rather than the generic
+/// `Unauthorized` — and builds the `Ctx` the handler sees.
 fn build_ctx(
     tx: &mut Tx,
     token: &Option<String>,
     auth_required: bool,
     fresh_token: String,
+    now: u64,
+    session_ttl: u64,
 ) -> Result<Ctx, ApiError> {
+    let mut expired = false;
     let session = match token {
-        Some(token) => Session::by_token(tx, token)?.into_iter().next(),
+        Some(token) => match Session::by_token_hash(tx, &hash_token(token))?
+            .into_iter()
+            .next()
+        {
+            Some(s) if s.expires_at <= now => {
+                expired = true;
+                None
+            }
+            other => other,
+        },
         None => None,
     };
     if auth_required && session.is_none() {
-        return Err(ApiError::Unauthorized);
+        return Err(if expired {
+            ApiError::SessionExpired
+        } else {
+            ApiError::Unauthorized
+        });
     }
     Ok(Ctx {
         session,
         fresh_token,
+        now,
+        session_ttl,
         created: Cell::new(false),
     })
 }

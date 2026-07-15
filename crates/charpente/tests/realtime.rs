@@ -107,6 +107,7 @@ fn realtime_app(sim: &Sim) -> io::Result<App> {
                 checkpoint_every: 2,
                 ..charpente::DbConfig::default()
             },
+            ..AppConfig::default()
         },
     )?
     .mount(routes![
@@ -988,6 +989,7 @@ fn open_rt_kernel(
         AppConfig {
             body_cap: 1 << 20,
             db: db_cfg.clone(),
+            ..AppConfig::default()
         },
     )
     .map_err(|e| format!("App::open: {e}"))?

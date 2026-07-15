@@ -270,7 +270,7 @@ impl Kernel {
         match choice {
             Ready::Request => {
                 let (request, reply) = self.pending.take().expect("checked above");
-                match self.app.handle_or_subscribe(request) {
+                match self.app.handle_or_subscribe(request, now) {
                     Handled::Response(response) => reply.send(response),
                     Handled::Subscribe(sub) => {
                         match validate_subscribe(self.app.db(), sub.cursor) {

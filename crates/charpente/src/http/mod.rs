@@ -253,6 +253,10 @@ fn ev_json<Ev: Event + serde::Serialize>(bytes: &[u8]) -> io::Result<String> {
 pub enum ApiError {
     BadRequest(String),
     Unauthorized,
+    /// A bearer/cookie token matched a session row past its `expires_at` —
+    /// distinct from `Unauthorized` (no match at all): the client had a real
+    /// session, it just aged out.
+    SessionExpired,
     NotFound,
     Internal(String),
 }
@@ -271,6 +275,10 @@ impl ApiError {
                 401,
                 "no valid session — send `Authorization: Bearer <token>` or a \
                  `charpente_session` cookie",
+            ),
+            ApiError::SessionExpired => Response::error(
+                401,
+                "session expired — the token matched a session past its TTL; log in again",
             ),
             ApiError::NotFound => Response::error(404, "not found"),
             ApiError::Internal(msg) => Response::error(500, msg),
