@@ -5,7 +5,7 @@
 use charpente::core::io::Entropy;
 use charpente::{Db, DbConfig, Id, Schema, View};
 use charpente_sim::Sim;
-use sim_fixture::FixtureCounter;
+use sim_fixture::{FixtureCounter, NoteAdded};
 
 charpente_sim::sim_tests! {
     counter_roundtrip require ["restart"],
@@ -44,10 +44,9 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     };
     let acked = db
         .transact(|tx| {
-            tx.put(&FixtureCounter {
-                id: Id::from_raw(7),
-                hits: 1,
-            });
+            let id = Id::<FixtureCounter>::from_raw(7);
+            tx.put(&FixtureCounter { id, hits: 1 });
+            tx.emit(NoteAdded { note: id.raw() });
             Ok::<_, std::io::Error>(())
         })
         .is_ok();
