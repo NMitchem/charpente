@@ -586,6 +586,7 @@ fn seeding_db_cfg() -> DbConfig {
         store_path: "tables.redb".to_string(),
         retain_segments: 1,
         checkpoint_every: 8,
+        event_retention: 65_536,
     }
 }
 
@@ -720,6 +721,7 @@ fn live_lagging_session_pins_gc() {
         store_path: "tables.redb".to_string(),
         retain_segments: 1,
         checkpoint_every: 4,
+        event_retention: 65_536,
     };
     let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), db_cfg.clone()).unwrap();
     let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), db_cfg.clone()).unwrap();
@@ -808,6 +810,7 @@ fn a_silent_await_hello_session_stops_pinning_gc_after_its_deadline() {
         store_path: "tables.redb".to_string(),
         retain_segments: 1,
         checkpoint_every: 4,
+        event_retention: 65_536,
     };
     let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), db_cfg).unwrap();
 
@@ -1203,6 +1206,7 @@ fn skip_crc_workload(sim: &mut Sim, bug: bool) -> Result<(), String> {
         store_path: "tables.redb".to_string(),
         retain_segments: 64, // no GC pressure — every frame stays retained
         checkpoint_every: 0, // no checkpoint — the horizon stays at 0
+        event_retention: 65_536,
     };
     let mut p =
         Db::open(Box::new(ph.disk()), cfg.clone(), make_schema()).map_err(|e| e.to_string())?;
@@ -1663,6 +1667,7 @@ fn no_gc_cfg() -> DbConfig {
         store_path: "tables.redb".to_string(),
         retain_segments: 1024,
         checkpoint_every: 0,
+        event_retention: 65_536,
     }
 }
 
@@ -2610,6 +2615,7 @@ fn horizon_db_cfg() -> DbConfig {
         store_path: "tables.redb".to_string(),
         retain_segments: 2,
         checkpoint_every: 8,
+        event_retention: 65_536,
     }
 }
 

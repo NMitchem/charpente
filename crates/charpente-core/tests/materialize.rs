@@ -109,6 +109,55 @@ fn emits_materialize_event_rows_in_call_order_with_monotonic_ids() {
 }
 
 #[test]
+fn checkpoint_gc_retains_exactly_event_retention_events() {
+    let sim = Sim::with_faults(0x603, FaultConfig::none());
+    let cfg = DbConfig {
+        event_retention: 4,
+        checkpoint_every: 0,
+        ..DbConfig::default()
+    };
+    let mut db = Db::open(Box::new(sim.disk()), cfg, Schema::new()).unwrap();
+    for i in 0..10u32 {
+        db.transact(|tx: &mut Tx| {
+            tx.emit(TestEvent { n: i });
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    }
+    db.checkpoint().unwrap();
+    let snap = db.snapshot().unwrap();
+    let rows: Vec<EventRow> = snap.scan_from(0, 64).unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0].id.raw(), 6); // ids 6..=9 survive
+    assert_eq!(db.event_floor().unwrap(), 6);
+}
+
+#[test]
+fn event_floor_is_next_event_id_when_empty() {
+    let sim = Sim::with_faults(0x604, FaultConfig::none());
+    let cfg = DbConfig {
+        event_retention: 0,
+        checkpoint_every: 0,
+        ..DbConfig::default()
+    };
+    let mut db = Db::open(Box::new(sim.disk()), cfg, Schema::new()).unwrap();
+    // Fresh Db, no emits:
+    assert_eq!(db.event_floor().unwrap(), 0);
+
+    // After 3 emits and a checkpoint with event_retention: 0, GC deletes
+    // everything up to the tail — the floor falls back to next_event_id.
+    for i in 0..3u32 {
+        db.transact(|tx: &mut Tx| {
+            tx.emit(TestEvent { n: i });
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    }
+    db.checkpoint().unwrap();
+    assert_eq!(db.event_floor().unwrap(), db.next_event_id().unwrap());
+}
+
+#[test]
 fn scan_from_honors_from_id_and_limit() {
     let sim = Sim::with_faults(0x602, FaultConfig::none());
     let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();

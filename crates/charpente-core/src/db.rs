@@ -40,6 +40,10 @@ pub struct DbConfig {
     /// Auto-`checkpoint` after this many committed records; `0` disables the
     /// cadence (manual `Db::checkpoint` only).
     pub checkpoint_every: u64,
+    /// How many of the most recent `EventRow`s `checkpoint`'s GC retains;
+    /// `0` retains nothing beyond the current tail. Count-based rather than
+    /// time-based: v0 has no transactional wall-time source (DESIGN §6).
+    pub event_retention: u64,
 }
 
 impl Default for DbConfig {
@@ -49,6 +53,7 @@ impl Default for DbConfig {
             store_path: "tables.redb".to_string(),
             retain_segments: 2,
             checkpoint_every: 4096,
+            event_retention: 65_536,
         }
     }
 }
@@ -743,16 +748,70 @@ impl Db {
     /// then deletes WAL segments below the checkpoint (respecting the
     /// retention pin and `DbConfig::retain_segments`).
     pub fn checkpoint(&mut self) -> io::Result<()> {
-        self.engine.machine().store.checkpoint()?;
-        let applied = self.engine.machine().store.applied_seq()?;
+        let store = &self.engine.machine().store;
+        store.checkpoint()?;
+        let applied = store.applied_seq()?;
         let mut keep_from = applied.map_or(0, |s| s + 1);
         if let Some(pin) = &self.retention_pin {
             keep_from = keep_from.min(pin());
+        }
+        // Event retention GC runs ONLY here, at the cadence-driven
+        // checkpoint — never inside `transact`/`Store::apply`, because GC is
+        // not a log record. That is the determinism argument: a primary and
+        // every follower replay the identical log and checkpoint on the
+        // identical applied-records cadence (`DbConfig::checkpoint_every`),
+        // so they compute the identical floor and delete the identical
+        // EventRows at identical seq boundaries — fingerprint-at-equal-seq
+        // equality holds (proven by `charpente/tests/replication.rs`'s
+        // fingerprint oracle, which walks every registered table including
+        // `charpente.events`). The has-work gate below is part of the same
+        // argument (identical rows ⇒ identical gate on every node) — and it
+        // keeps a checkpoint with nothing to delete from committing a write
+        // transaction at all, so event-free databases checkpoint exactly as
+        // they did before events existed.
+        let snap = store.snapshot()?;
+        let floor = snap
+            .next_event_id()?
+            .saturating_sub(self.cfg.event_retention);
+        let has_work = floor > 0
+            && snap
+                .scan_from::<EventRow>(0, 1)?
+                .first()
+                .is_some_and(|row| row.id.raw() < floor);
+        drop(snap);
+        if has_work {
+            store.gc_events(floor)?;
         }
         self.records_since_checkpoint = 0;
         self.engine
             .wal_mut()
             .gc(keep_from, self.cfg.retain_segments)
+    }
+
+    /// The smallest retained `EventRow` id — `next_event_id` when the table
+    /// holds nothing (either no emit has ever happened, or `checkpoint`'s GC
+    /// has deleted every row up to the tail). Never exceeds `next_event_id`:
+    /// GC only ever deletes ids strictly below it. Subscribers compare their
+    /// cursor against this to detect they have fallen off retention.
+    pub fn event_floor(&self) -> io::Result<u64> {
+        let snap = self.snapshot()?;
+        let rows: Vec<EventRow> = snap.scan_from(0, 1)?;
+        match rows.first() {
+            Some(row) => {
+                // Negative space: every stored event id was minted below the
+                // counter, and GC never touches the counter — so the floor
+                // can never reach, let alone exceed, next_event_id.
+                let next = snap.next_event_id()?;
+                assert!(
+                    row.id.raw() < next,
+                    "event_floor: smallest retained event id {} is not below next_event_id \
+                     {next} — an event exists that the counter never minted",
+                    row.id.raw()
+                );
+                Ok(row.id.raw())
+            }
+            None => snap.next_event_id(),
+        }
     }
 
     /// Registers a floor `checkpoint`'s GC will never delete past — e.g. a

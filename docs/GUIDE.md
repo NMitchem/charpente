@@ -332,13 +332,17 @@ fn config() -> DbConfig {
         store_path: "tables.redb".to_string(),
         retain_segments: 2,
         checkpoint_every: 4096,
+        event_retention: 65_536,
     }
 }
 ```
 
 `DbConfig::default()` already sets exactly these values — most apps never
 construct one by hand. `retain_segments` and `checkpoint_every` govern
-`Db::checkpoint`'s log GC, covered next.
+`Db::checkpoint`'s log GC, covered next. `event_retention` bounds the
+built-in `charpente.events` table the same way: each checkpoint deletes all
+but the newest `event_retention` event rows (`Db::event_floor()` reports the
+smallest id still retained).
 
 ### Recovery, behaviorally
 

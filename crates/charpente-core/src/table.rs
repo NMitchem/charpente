@@ -428,6 +428,44 @@ impl Store {
         Ok(())
     }
 
+    /// Deletes `EventRow`s with `id < floor` in one direct store write — the
+    /// retention GC's helper (`Db::checkpoint`, db.rs), never `Store::apply`:
+    /// GC is not a log record, so it must not touch `applied_seq` or the
+    /// `next_event_id`/`next_job_id` counters. `Durability::None`, the same
+    /// pattern as `set_import_meta`/`import`: a crash before the next
+    /// durable commit just loses the deletion (rows resurface, briefly
+    /// over-retained — never lost data, never an under-retention bug), and
+    /// the next checkpoint recomputes the same floor from `next_event_id`
+    /// and deletes them again.
+    pub fn gc_events(&self, floor: u64) -> io::Result<()> {
+        let mut txn = self.db.begin_write().map_err(redb_err)?;
+        txn.set_durability(Durability::None).map_err(redb_err)?;
+        {
+            let ids: Vec<u64> = match txn.open_table(rows_def(crate::event::EventRow::TABLE)) {
+                Ok(rows) => {
+                    let mut ids = Vec::new();
+                    for entry in rows.range(0u64..floor).map_err(redb_err)? {
+                        let (key, _) = entry.map_err(redb_err)?;
+                        ids.push(key.value());
+                    }
+                    ids
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => Vec::new(),
+                Err(e) => return Err(redb_err(e)),
+            };
+            let mut writer = Writer {
+                txn: &txn,
+                jobs_materialized: 0,
+                events_materialized: 0,
+            };
+            for id in ids {
+                writer.delete::<crate::event::EventRow>(Id::from_raw(id))?;
+            }
+        }
+        txn.commit().map_err(redb_err)?;
+        Ok(())
+    }
+
     /// Sets all META keys directly — the seed path's counterpart to the
     /// bookkeeping `Store::apply` derives from replay. A logical import has
     /// no records to replay, only the exporter's already-final counts.
