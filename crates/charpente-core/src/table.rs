@@ -226,6 +226,11 @@ pub trait View {
     /// Exact-match secondary index lookup, in id order. Called through the
     /// typed accessors `#[table]` generates (`Invoice::by_org(...)`).
     fn scan_by<R: Row>(&self, index_name: &str, key: &impl Codec) -> io::Result<Vec<R>>;
+
+    /// Rows with `id >= from_id`, in id order, at most `limit` — the
+    /// realtime cursor read (`charpente.events`, but usable on any table). A
+    /// `Vec` for now; see `scan`'s note.
+    fn scan_from<R: Row>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>>;
 }
 
 // ---------------------------------------------------------------- Store
@@ -327,15 +332,21 @@ impl Store {
         let mut txn = self.db.begin_write().map_err(redb_err)?;
         txn.set_durability(Durability::None).map_err(redb_err)?;
         let out = {
-            let next_job_id_before = {
+            let (next_job_id_before, next_event_id_before) = {
                 let meta = txn.open_table(META).map_err(redb_err)?;
-                meta.get("next_job_id")
-                    .map_err(redb_err)?
-                    .map_or(0, |g| g.value())
+                (
+                    meta.get("next_job_id")
+                        .map_err(redb_err)?
+                        .map_or(0, |g| g.value()),
+                    meta.get("next_event_id")
+                        .map_err(redb_err)?
+                        .map_or(0, |g| g.value()),
+                )
             };
             let mut writer = Writer {
                 txn: &txn,
                 jobs_materialized: 0,
+                events_materialized: 0,
             };
             let out = f(&mut writer)?;
             let mut meta = txn.open_table(META).map_err(redb_err)?;
@@ -353,6 +364,20 @@ impl Store {
                 "next_job_id moved from {next_job_id_before} to {next_job_id_after} in apply({seq}), \
                  which materialized {} job(s) — the counter must advance by exactly one per job",
                 writer.jobs_materialized
+            );
+            // Negative-space: same rule as next_job_id, for next_event_id and
+            // materialize_event.
+            let next_event_id_after = meta
+                .get("next_event_id")
+                .map_err(redb_err)?
+                .map_or(0, |g| g.value());
+            assert_eq!(
+                next_event_id_after,
+                next_event_id_before + writer.events_materialized,
+                "next_event_id moved from {next_event_id_before} to {next_event_id_after} in \
+                 apply({seq}), which materialized {} event(s) — the counter must advance by \
+                 exactly one per event",
+                writer.events_materialized
             );
             meta.insert("applied_seq", seq).map_err(redb_err)?;
             out
@@ -383,10 +408,11 @@ impl Store {
         })
     }
 
-    /// Applies raw exported rows with NO seq or `next_job_id` bookkeeping —
-    /// the seed path's writer (`Seeder::rows`, db.rs). A logical snapshot has
-    /// no log position of its own to record; `set_import_meta` sets both meta
-    /// keys explicitly once every table has landed.
+    /// Applies raw exported rows with NO seq or `next_job_id`/`next_event_id`
+    /// bookkeeping — the seed path's writer (`Seeder::rows`, db.rs). A
+    /// logical snapshot has no log position of its own to record;
+    /// `set_import_meta` sets all meta keys explicitly once every table has
+    /// landed.
     pub fn import(&self, f: impl FnOnce(&mut Writer<'_>) -> io::Result<()>) -> io::Result<()> {
         let mut txn = self.db.begin_write().map_err(redb_err)?;
         txn.set_durability(Durability::None).map_err(redb_err)?;
@@ -394,6 +420,7 @@ impl Store {
             let mut writer = Writer {
                 txn: &txn,
                 jobs_materialized: 0,
+                events_materialized: 0,
             };
             f(&mut writer)?;
         }
@@ -401,16 +428,23 @@ impl Store {
         Ok(())
     }
 
-    /// Sets both META keys directly — the seed path's counterpart to the
+    /// Sets all META keys directly — the seed path's counterpart to the
     /// bookkeeping `Store::apply` derives from replay. A logical import has
     /// no records to replay, only the exporter's already-final counts.
-    pub fn set_import_meta(&self, applied_seq: u64, next_job_id: u64) -> io::Result<()> {
+    pub fn set_import_meta(
+        &self,
+        applied_seq: u64,
+        next_job_id: u64,
+        next_event_id: u64,
+    ) -> io::Result<()> {
         let mut txn = self.db.begin_write().map_err(redb_err)?;
         txn.set_durability(Durability::None).map_err(redb_err)?;
         {
             let mut meta = txn.open_table(META).map_err(redb_err)?;
             meta.insert("applied_seq", applied_seq).map_err(redb_err)?;
             meta.insert("next_job_id", next_job_id).map_err(redb_err)?;
+            meta.insert("next_event_id", next_event_id)
+                .map_err(redb_err)?;
         }
         txn.commit().map_err(redb_err)?;
         Ok(())
@@ -426,6 +460,9 @@ pub struct Writer<'txn> {
     /// Count of `materialize_job` calls so far this apply — `Store::apply`
     /// checks this against `next_job_id`'s actual movement.
     jobs_materialized: u64,
+    /// Count of `materialize_event` calls so far this apply — `Store::apply`
+    /// checks this against `next_event_id`'s actual movement.
+    events_materialized: u64,
 }
 
 impl Writer<'_> {
@@ -500,6 +537,34 @@ impl Writer<'_> {
             attempts: 0,
             due_at: 0,
             last_error: None,
+        })?;
+        Ok(id)
+    }
+
+    /// Materializes one emit effect as an `EventRow`, id from the monotonic
+    /// `next_event_id` meta counter — bumped in this same store transaction,
+    /// so ids are deterministic across replay. Platform apply-path surface.
+    pub fn materialize_event(
+        &mut self,
+        seq: u64,
+        name: &str,
+        payload: &[u8],
+        key: Option<&str>,
+    ) -> io::Result<u64> {
+        let mut meta = self.txn.open_table(META).map_err(redb_err)?;
+        let id = meta
+            .get("next_event_id")
+            .map_err(redb_err)?
+            .map_or(0, |g| g.value());
+        meta.insert("next_event_id", id + 1).map_err(redb_err)?;
+        drop(meta);
+        self.events_materialized += 1;
+        self.put(&crate::event::EventRow {
+            id: crate::table::Id::from_raw(id),
+            seq,
+            name: name.to_string(),
+            key: key.map(str::to_string),
+            payload: payload.to_vec(),
         })?;
         Ok(id)
     }
@@ -590,6 +655,20 @@ impl View for Snapshot {
         }
         Ok(out)
     }
+
+    fn scan_from<R: Row>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>> {
+        let rows = match self.txn.open_table(rows_def(R::TABLE)) {
+            Ok(rows) => rows,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(redb_err(e)),
+        };
+        let mut out = Vec::new();
+        for entry in rows.range(from_id..).map_err(redb_err)?.take(limit) {
+            let (_, value) = entry.map_err(redb_err)?;
+            out.push(R::decode_row(value.value())?);
+        }
+        Ok(out)
+    }
 }
 
 impl Snapshot {
@@ -614,6 +693,19 @@ impl Snapshot {
         match self.txn.open_table(META) {
             Ok(meta) => Ok(meta
                 .get("next_job_id")
+                .map_err(redb_err)?
+                .map_or(0, |g| g.value())),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
+            Err(e) => Err(redb_err(e)),
+        }
+    }
+
+    /// The event id counter as of this snapshot — same own-transaction
+    /// consistency reasoning as `applied_seq`.
+    pub fn next_event_id(&self) -> io::Result<u64> {
+        match self.txn.open_table(META) {
+            Ok(meta) => Ok(meta
+                .get("next_event_id")
                 .map_err(redb_err)?
                 .map_or(0, |g| g.value())),
             Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),

@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::io;
 
 use charpente::{Db, DbConfig, Event, Job, Schema, Seeder, TxError, View, table};
+use charpente_core::event::EventRow;
 use charpente_core::io::{Disk, Entropy};
 use charpente_core::job::JobRow;
 use charpente_core::log::{Wal, WalConfig};
@@ -84,10 +85,11 @@ fn app_schema() -> Schema {
 }
 
 /// Mirrors what `Db::open` registers internally (it always adds `JobRow`
-/// itself) — the export side needs its own independent `Schema` instance to
-/// walk `table_names()` over, since a live `Db` never hands its schema back.
+/// and `EventRow` itself) — the export side needs its own independent
+/// `Schema` instance to walk `table_names()` over, since a live `Db` never
+/// hands its schema back.
 fn export_schema() -> Schema {
-    app_schema().table::<JobRow>()
+    app_schema().table::<JobRow>().table::<EventRow>()
 }
 
 fn quiet_db(seed: u64) -> (Sim, Db) {
@@ -1508,6 +1510,7 @@ fn seed_rebuilds_a_byte_identical_store() {
     let snap = db_a.snapshot().unwrap();
     let applied = snap.applied_seq().unwrap().expect("30 committed txns");
     let next_job_id = snap.next_job_id().unwrap();
+    let next_event_id = snap.next_event_id().unwrap();
     assert!(next_job_id > 0, "setup must have enqueued at least one job");
 
     let mut seeder = Seeder::new(Box::new(host_b.disk()), cfg.clone(), app_schema()).unwrap();
@@ -1515,7 +1518,7 @@ fn seed_rebuilds_a_byte_identical_store() {
         let rows = snap.scan_raw(table).unwrap();
         seeder.rows(table, &rows).unwrap();
     }
-    let mut db_b = seeder.finish(applied, next_job_id).unwrap();
+    let mut db_b = seeder.finish(applied, next_job_id, next_event_id).unwrap();
 
     assert_eq!(db_b.last_applied(), Some(applied));
     assert_eq!(
@@ -1591,7 +1594,7 @@ fn into_seeder_discards_the_old_timeline() {
 
     let mut seeder = db.into_seeder().unwrap();
     seeder.rows(Invoice::TABLE, &rows).unwrap();
-    let db2 = seeder.finish(4, 0).unwrap();
+    let db2 = seeder.finish(4, 0, 0).unwrap();
 
     let names = sim.disk().list("wal/").unwrap();
     assert_eq!(
@@ -1632,13 +1635,14 @@ fn seeded_indexes_answer_queries() {
     let snap = db_a.snapshot().unwrap();
     let applied = snap.applied_seq().unwrap().unwrap();
     let next_job_id = snap.next_job_id().unwrap();
+    let next_event_id = snap.next_event_id().unwrap();
     let rows = snap.scan_raw(Invoice::TABLE).unwrap();
 
     let sim_b = Sim::with_faults(0x5EED_0004, FaultConfig::none());
     let mut seeder =
         Seeder::new(Box::new(sim_b.disk()), DbConfig::default(), app_schema()).unwrap();
     seeder.rows(Invoice::TABLE, &rows).unwrap();
-    let db_b = seeder.finish(applied, next_job_id).unwrap();
+    let db_b = seeder.finish(applied, next_job_id, next_event_id).unwrap();
 
     let acme = Id::<Org>::from_raw(0);
     let expected = ids(&Invoice::by_org(&snap, &acme).unwrap());

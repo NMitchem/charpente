@@ -817,7 +817,8 @@ impl Repl {
         // though this call returns an error and the node recovers into it, so
         // the seed must count here, not after a `finish` that may fault-late.
         self.stats.seeds += 1;
-        let mut new_db = seeder.finish(start.applied_seq, start.next_job_id)?;
+        let mut new_db =
+            seeder.finish(start.applied_seq, start.next_job_id, start.next_event_id)?;
         if let Role::Follower { primary } | Role::Backup { primary } = &role {
             new_db.forbid_writes(primary.clone());
         }

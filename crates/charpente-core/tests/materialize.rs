@@ -14,7 +14,8 @@
 
 use std::io;
 
-use charpente_core::db::{Db, DbConfig, Job, Schema, Tx};
+use charpente_core::db::{Db, DbConfig, Event, Job, Schema, Tx};
+use charpente_core::event::EventRow;
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::table::{Codec, View};
 use charpente_sim::{FaultConfig, Sim};
@@ -28,6 +29,23 @@ impl Codec for Ping {
 }
 impl Job for Ping {
     const NAME: &'static str = "ping";
+}
+
+struct TestEvent {
+    n: u32,
+}
+impl Codec for TestEvent {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.n.encode(out);
+    }
+    fn decode(input: &mut &[u8]) -> io::Result<TestEvent> {
+        Ok(TestEvent {
+            n: u32::decode(input)?,
+        })
+    }
+}
+impl Event for TestEvent {
+    const NAME: &'static str = "test_event";
 }
 
 #[test]
@@ -64,4 +82,45 @@ fn enqueues_materialize_job_rows_with_counter_ids() {
     })
     .unwrap();
     assert_eq!(db.drain_enqueued()[0].raw(), 2);
+}
+
+#[test]
+fn emits_materialize_event_rows_in_call_order_with_monotonic_ids() {
+    let sim = Sim::with_faults(0x601, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    db.transact(|tx: &mut Tx| {
+        tx.emit(TestEvent { n: 1 });
+        tx.emit_keyed("org-7", TestEvent { n: 2 });
+        tx.emit(TestEvent { n: 3 });
+        Ok::<_, ()>(())
+    })
+    .unwrap();
+    let snap = db.snapshot().unwrap();
+    let rows: Vec<EventRow> = snap.scan_from(0, 16).unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].id.raw(), 0);
+    assert_eq!(rows[1].id.raw(), 1);
+    assert_eq!(rows[2].id.raw(), 2);
+    assert_eq!(rows[1].key.as_deref(), Some("org-7"));
+    assert!(rows.iter().all(|r| r.name == "test_event"));
+    assert_eq!(db.next_event_id().unwrap(), 3);
+    // seq stamps the committing record: all three share it.
+    assert_eq!(rows[0].seq, rows[2].seq);
+}
+
+#[test]
+fn scan_from_honors_from_id_and_limit() {
+    let sim = Sim::with_faults(0x602, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    db.transact(|tx: &mut Tx| {
+        tx.emit(TestEvent { n: 1 });
+        tx.emit_keyed("org-7", TestEvent { n: 2 });
+        tx.emit(TestEvent { n: 3 });
+        Ok::<_, ()>(())
+    })
+    .unwrap();
+    let snap = db.snapshot().unwrap();
+    let rows: Vec<EventRow> = snap.scan_from(1, 1).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id.raw(), 1);
 }

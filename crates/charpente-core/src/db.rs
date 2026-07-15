@@ -7,8 +7,9 @@
 //!
 //! Record payload v0: `[n: u32 le]` then n tagged effects —
 //! `0x00 [table][row]` put, `0x01 [table][id: u64 le]` delete,
-//! `0x02 [job][payload][key: Option<String>]` enqueue, `0x03 [event][payload]`
-//! emit — strings and byte fields length-prefixed per the `Codec` layout.
+//! `0x02 [job][payload][key: Option<String>]` enqueue,
+//! `0x03 [event][payload][key: Option<String>]` emit — strings and byte
+//! fields length-prefixed per the `Codec` layout.
 //! Table effects are the transaction's collapsed overlay in (table, id)
 //! order: intermediate overwrites inside a transaction are invisible to
 //! every observer and are not logged. Enqueues and emits keep call order.
@@ -20,6 +21,7 @@ use std::fmt;
 use std::io;
 
 use crate::engine::{Engine, StateMachine};
+use crate::event::EventRow;
 use crate::io::Disk;
 use crate::job::JobRow;
 use crate::log::{MAX_RECORD_BYTES, WalConfig, parse_segment_name, segment_name};
@@ -61,8 +63,9 @@ pub trait Job: Codec {
     const RETRY: crate::job::RetryPolicy = crate::job::RetryPolicy::DEFAULT;
 }
 
-/// A realtime event (DESIGN.md §6). Emits live in the log record itself —
-/// subscribers tail the log; nothing is materialized in the store.
+/// A realtime event (DESIGN.md §6). Emits materialize into `charpente.events`
+/// at apply, the same way enqueues materialize `JobRow` — subscribers read
+/// through the ranged scan (`View::scan_from`), not the log directly.
 /// v0: implemented by hand; `#[event]` will derive it.
 pub trait Event: Codec {
     const NAME: &'static str;
@@ -180,6 +183,7 @@ enum Effect {
     Emit {
         event: String,
         payload: Vec<u8>,
+        key: Option<String>,
     },
 }
 
@@ -189,7 +193,7 @@ enum Effect {
 struct TxEffects {
     overlay: BTreeMap<&'static str, BTreeMap<u64, Option<Vec<u8>>>>,
     enqueues: Vec<(&'static str, Vec<u8>, Option<String>)>,
-    emits: Vec<(&'static str, Vec<u8>)>,
+    emits: Vec<(&'static str, Vec<u8>, Option<String>)>,
 }
 
 impl TxEffects {
@@ -233,10 +237,11 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
         encode_bytes(payload, &mut out);
         key.encode(&mut out);
     }
-    for (event, payload) in &effects.emits {
+    for (event, payload, key) in &effects.emits {
         out.push(3);
         encode_bytes(event.as_bytes(), &mut out);
         encode_bytes(payload, &mut out);
+        key.encode(&mut out);
     }
     out
 }
@@ -264,6 +269,7 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
             3 => Effect::Emit {
                 event: String::decode(input)?,
                 payload: Vec::<u8>::decode(input)?,
+                key: Option::<String>::decode(input)?,
             },
             other => {
                 return Err(io::Error::new(
@@ -342,7 +348,17 @@ impl Tx {
     pub fn emit<Ev: Event>(&mut self, event: Ev) {
         let mut payload = Vec::new();
         event.encode(&mut payload);
-        self.effects.emits.push((Ev::NAME, payload));
+        self.effects.emits.push((Ev::NAME, payload, None));
+    }
+
+    /// Emits with an opaque scoping key (e.g. an org id) — the exact-match
+    /// filter `Subscription::key` matches against. Mirrors `enqueue_keyed`.
+    pub fn emit_keyed<Ev: Event>(&mut self, key: impl Into<String>, event: Ev) {
+        let mut payload = Vec::new();
+        event.encode(&mut payload);
+        self.effects
+            .emits
+            .push((Ev::NAME, payload, Some(key.into())));
     }
 }
 
@@ -409,6 +425,31 @@ impl View for Tx {
         }
         Ok(merged.into_values().collect())
     }
+
+    fn scan_from<R: Row>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>> {
+        let mut merged: BTreeMap<u64, R> = BTreeMap::new();
+        for row in self.snapshot.scan::<R>()? {
+            if row.id().raw() >= from_id {
+                merged.insert(row.id().raw(), row);
+            }
+        }
+        if let Some(overlay) = self.effects.overlay.get(R::TABLE) {
+            for (&id, entry) in overlay {
+                if id < from_id {
+                    continue;
+                }
+                match entry {
+                    Some(bytes) => {
+                        merged.insert(id, R::decode_row(bytes)?);
+                    }
+                    None => {
+                        merged.remove(&id);
+                    }
+                }
+            }
+        }
+        Ok(merged.into_values().take(limit).collect())
+    }
 }
 
 // ---------------------------------------------------------------- machine
@@ -444,7 +485,13 @@ impl StateMachine for TableMachine {
                     Effect::Enqueue { job, payload, key } => {
                         ids.push(w.materialize_job(job, payload, key.as_deref())?);
                     }
-                    Effect::Emit { .. } => {} // the log itself is the event feed
+                    Effect::Emit {
+                        event,
+                        payload,
+                        key,
+                    } => {
+                        w.materialize_event(seq, event, payload, key.as_deref())?;
+                    }
                 }
             }
             Ok(ids)
@@ -507,9 +554,9 @@ impl Db {
     /// `checkpoint`'s own gc produces, so it is refused rather than silently
     /// replayed from wherever the log happens to start.
     pub fn open(disk: Box<dyn Disk>, cfg: DbConfig, schema: Schema) -> io::Result<Db> {
-        // The jobs table is platform-owned; an app registering it itself
-        // hits the existing duplicate-registration assert.
-        let schema = schema.table::<JobRow>();
+        // The jobs and events tables are platform-owned; an app registering
+        // either itself hits the existing duplicate-registration assert.
+        let schema = schema.table::<JobRow>().table::<EventRow>();
         let store = match Store::open(&*disk, &cfg.store_path) {
             Ok(store) => store,
             Err(e) => {
@@ -674,6 +721,12 @@ impl Db {
         self.engine.machine().store.snapshot()
     }
 
+    /// The event id counter (meta counter; `0` when unset) — same access
+    /// shape as `Snapshot::next_job_id`.
+    pub fn next_event_id(&self) -> io::Result<u64> {
+        self.snapshot()?.next_event_id()
+    }
+
     /// Ids of jobs materialized by transactions since the last drain — the
     /// kernel's incremental feed for its due-heap. Recovery replay does not
     /// appear here; the dispatcher rebuilds from a Pending scan at open.
@@ -786,9 +839,9 @@ impl Db {
     /// Deconstructs a live `Db` into a `Seeder` over the same disk — the seed
     /// path's producer side (DESIGN §5): an app rebuilding a follower's state
     /// in-process from its own primary's snapshot. The recovered schema
-    /// already carries `JobRow` (`Db::open` adds it on the way in);
-    /// `Schema::remove` strips it back off so `Seeder::new` doesn't
-    /// double-register it.
+    /// already carries `JobRow`/`EventRow` (`Db::open` adds both on the way
+    /// in); `Schema::remove` strips them back off so `Seeder::new` doesn't
+    /// double-register either.
     pub fn into_seeder(self) -> io::Result<Seeder> {
         let (wal, machine) = self.engine.into_parts();
         let disk = wal.into_disk();
@@ -797,6 +850,7 @@ impl Db {
         } = machine;
         drop(store); // Seeder::new discards the store file itself; nothing to save
         schema.remove(JobRow::TABLE);
+        schema.remove(EventRow::TABLE);
         Seeder::new(disk, self.cfg, schema)
     }
 }
@@ -812,17 +866,17 @@ pub struct Seeder {
     disk: Box<dyn Disk>,
     cfg: DbConfig,
     schema: Schema,        // the caller's schema, passed to Db::open at finish
-    import_schema: Schema, // schema + JobRow, used to decode/import rows
+    import_schema: Schema, // schema + JobRow + EventRow, used to decode/import rows
     store: Store,
 }
 
 impl Seeder {
-    /// `schema` must NOT include `JobRow` — `Seeder` registers it itself
-    /// (mirroring `Db::open`), so a schema already carrying it (e.g. one
-    /// recovered from a live `Db` via `into_seeder`) would double-register.
-    /// Discards any store file and `wal/` segments already at `disk`,
-    /// dir-barriered — seeding always replaces a timeline, never merges
-    /// into one.
+    /// `schema` must NOT include `JobRow`/`EventRow` — `Seeder` registers
+    /// both itself (mirroring `Db::open`), so a schema already carrying
+    /// either (e.g. one recovered from a live `Db` via `into_seeder`) would
+    /// double-register. Discards any store file and `wal/` segments already
+    /// at `disk`, dir-barriered — seeding always replaces a timeline, never
+    /// merges into one.
     pub fn new(disk: Box<dyn Disk>, cfg: DbConfig, schema: Schema) -> io::Result<Seeder> {
         match disk.remove(&cfg.store_path) {
             Ok(()) => {}
@@ -836,7 +890,7 @@ impl Seeder {
         }
         disk.sync_dir(&wal_prefix)?;
         let store = Store::open(&*disk, &cfg.store_path)?;
-        let import_schema = schema.clone().table::<JobRow>();
+        let import_schema = schema.clone().table::<JobRow>().table::<EventRow>();
         Ok(Seeder {
             disk,
             cfg,
@@ -865,7 +919,7 @@ impl Seeder {
     /// `applied_seq + 1`, then hands the result through the normal
     /// `Db::open` — the same path every other startup goes through, so
     /// nothing about a seeded node's open is special.
-    pub fn finish(self, applied_seq: u64, next_job_id: u64) -> io::Result<Db> {
+    pub fn finish(self, applied_seq: u64, next_job_id: u64, next_event_id: u64) -> io::Result<Db> {
         let Seeder {
             disk,
             cfg,
@@ -873,7 +927,7 @@ impl Seeder {
             store,
             ..
         } = self;
-        store.set_import_meta(applied_seq, next_job_id)?;
+        store.set_import_meta(applied_seq, next_job_id, next_event_id)?;
         store.checkpoint()?;
         drop(store); // graceful close before Db::open reopens the same file
         let name = segment_name(&cfg.wal.dir, applied_seq + 1);
@@ -898,7 +952,7 @@ mod tests {
             .or_default()
             .insert(1, Some(vec![9]));
         effects.enqueues.push(("send_receipt", vec![10, 0], None));
-        effects.emits.push(("invoice_finalized", vec![7]));
+        effects.emits.push(("invoice_finalized", vec![7], None));
         effects
     }
 
@@ -927,7 +981,33 @@ mod tests {
                 },
                 Effect::Emit {
                     event: "invoice_finalized".into(),
-                    payload: vec![7]
+                    payload: vec![7],
+                    key: None
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn keyed_emit_roundtrips() {
+        let mut effects = TxEffects::default();
+        effects
+            .emits
+            .push(("invoice_finalized", vec![1], Some("org-7".to_string())));
+        effects.emits.push(("ping", vec![2], None));
+        let decoded = decode_record(&encode_record(&effects)).unwrap();
+        assert_eq!(
+            decoded,
+            vec![
+                Effect::Emit {
+                    event: "invoice_finalized".into(),
+                    payload: vec![1],
+                    key: Some("org-7".into())
+                },
+                Effect::Emit {
+                    event: "ping".into(),
+                    payload: vec![2],
+                    key: None
                 },
             ]
         );

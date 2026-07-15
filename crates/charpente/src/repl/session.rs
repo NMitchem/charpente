@@ -332,10 +332,12 @@ impl Session {
             .applied_seq()?
             .expect("a primary chosen for snapshot seeding has applied records");
         let next_job_id = snap.next_job_id()?;
+        let next_event_id = snap.next_event_id()?;
         let mut pending = VecDeque::new();
         pending.push_back(Msg::SnapshotStart {
             applied_seq,
             next_job_id,
+            next_event_id,
         });
         for table in db.table_names() {
             let rows = snap.scan_raw(table)?;

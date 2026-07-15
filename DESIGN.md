@@ -238,8 +238,9 @@ rebuild-discard-then-reopen path. Coverage key `fault:dir-entry`.
 **Record payload (v0, implemented).** A committed transaction's effects:
 `[n: u32]` then n tagged effects — put `0x00 [table][row]`, delete
 `0x01 [table][id]`, enqueue `0x02 [job][payload][key: Option<String>]`, emit
-`0x03 [event][payload]`, strings and byte fields length-prefixed per the row
-codec. Table effects are the transaction's collapsed write set in (table, id)
+`0x03 [event][payload][key: Option<String>]`, strings and byte fields
+length-prefixed per the row codec. Table effects are the transaction's
+collapsed write set in (table, id)
 order — intermediate overwrites inside a transaction are observable by no one
 and are not logged; enqueues and emits keep call order. Replay resolves table
 names through the `Schema` registry passed to `Db::open`. The enqueue key is

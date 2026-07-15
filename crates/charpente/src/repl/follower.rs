@@ -23,6 +23,7 @@ use crate::repl::{MAX_MESSAGE_BYTES, PROTO_VERSION, RECONNECT_NANOS};
 pub(crate) struct SeedStart {
     pub applied_seq: u64,
     pub next_job_id: u64,
+    pub next_event_id: u64,
 }
 
 /// The buffered snapshot stream: one `(table, rows)` entry per
@@ -225,6 +226,7 @@ impl Follower {
             Msg::SnapshotStart {
                 applied_seq,
                 next_job_id,
+                next_event_id,
             } => {
                 // Opens (or restarts, after a mid-seed reconnect) a seed. We
                 // buffer the stream rather than blocking so the single-writer
@@ -233,6 +235,7 @@ impl Follower {
                     start: SeedStart {
                         applied_seq,
                         next_job_id,
+                        next_event_id,
                     },
                     rows: Vec::new(),
                     complete: false,
