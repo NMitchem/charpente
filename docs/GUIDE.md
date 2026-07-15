@@ -7,7 +7,8 @@ project setup, tables, the database, and transactions. Sections 5–7 cover
 the deterministic kernel: HTTP, jobs, and cron. Section 8 covers sim
 testing — writing `tests/sim.rs`, running `charpente test --sim`, and
 replaying a failure's seed. Section 9 is an error index: look up the
-message you're staring at.)*
+message you're staring at. Section 10 covers replication; section 11
+covers realtime SSE subscriptions.)*
 
 ## 1. Project setup
 
@@ -389,7 +390,7 @@ written.
 
 ```rust
 use charpente::core::table::Codec;
-use charpente::{Db, Event, Id, Job, Tx, TxError, View, table};
+use charpente::{Db, Id, Job, Tx, TxError, View, event, table};
 use std::io;
 
 #[table]
@@ -420,23 +421,9 @@ impl Job for SendReceipt {
     // are covered in a later section.
 }
 
+#[event]
 struct InvoiceFinalized {
     invoice: u64,
-}
-
-impl Codec for InvoiceFinalized {
-    fn encode(&self, out: &mut Vec<u8>) {
-        self.invoice.encode(out);
-    }
-    fn decode(input: &mut &[u8]) -> io::Result<InvoiceFinalized> {
-        Ok(InvoiceFinalized {
-            invoice: u64::decode(input)?,
-        })
-    }
-}
-
-impl Event for InvoiceFinalized {
-    const NAME: &'static str = "invoice_finalized";
 }
 
 /// The row update, the receipt job, and the realtime event all commit in
@@ -458,13 +445,16 @@ fn finalize(db: &mut Db, id: u64) -> Result<(), TxError<io::Error>> {
 }
 ```
 
-Every `Job` needs `Codec` + a `NAME`; every `Event` needs `Codec` + a
-`NAME`. Both are implemented by hand today (v0); `#[job]` derives the rest
-of a job's registration for you (a later section). `tx.put` and `tx.delete`
-cannot fail — they only buffer a write into the transaction's overlay;
-`tx.get`/`scan`/`scan_by` return `io::Result` because they read through the
-snapshot. A transaction that never calls `put`/`delete`/`enqueue`/`emit`
-writes nothing and consumes no log position — read-only queries are free.
+`Job` needs `Codec` + a `NAME`, implemented by hand today (v0); `#[job]`
+derives the rest of a job's registration for you (a later section).
+`#[event]` derives everything an event needs in one step: `Codec` (the log
+format), `Event` (`NAME` is the snake_case of the type name — §11 has the
+exact splitting rule), and `Serialize` (the wire format `#[route(SSE …)]`
+subscribers receive, §11). `tx.put` and `tx.delete` cannot fail — they only
+buffer a write into the transaction's overlay; `tx.get`/`scan`/`scan_by`
+return `io::Result` because they read through the snapshot. A transaction
+that never calls `put`/`delete`/`enqueue`/`emit` writes nothing and consumes
+no log position — read-only queries are free.
 
 Enqueuing also takes an idempotency key, for effects the outside world must
 observe at most once: `tx.enqueue_keyed(key, job)`. An empty key is a
@@ -2360,3 +2350,350 @@ node from it as a fresh follower (its snapshot rebuilds the whole state, no
 log replay). This is the promise a single node cannot make and a replicated
 deployment can: a record one node loses to media corruption survives on
 another.
+
+## 11. Realtime
+
+SSE subscribers tail the log through a materialized `charpente.events` table with
+exact resume: a client that reconnects with its last-received id provably misses
+nothing (DESIGN §6, PLAN M1's exit criterion). Nothing here needs a message broker
+— `tx.emit`/`tx.emit_keyed` write into the same committing log record as everything
+else in the transaction, and delivery reads that table the same way the job
+dispatcher reads `charpente.jobs`.
+
+### `#[event]`
+
+```rust
+use charpente::{Event, event};
+
+#[event]
+struct HTTPEvent {
+    code: u16,
+}
+
+#[event]
+struct InvoicePDFSent {
+    invoice: u64,
+}
+
+fn names() -> (&'static str, &'static str) {
+    (HTTPEvent::NAME, InvoicePDFSent::NAME) // ("http_event", "invoice_pdf_sent")
+}
+```
+
+`#[event]` derives three things a plain struct doesn't have: `Codec` (the log/table
+format — the same machinery `#[table]`/`#[job]` use), `impl Event` (`NAME`, the wire
+and delivery-filter name), and `serde::Serialize` (the JSON a subscriber receives).
+`NAME` is the snake_case of the type name, computed at compile time — not a name you
+choose, so it can never drift from the type. The splitting rule inserts `_` before an
+uppercase letter that follows a lowercase letter or digit, and before the *last*
+letter of a run of capitals when that letter is immediately followed by a lowercase
+one — so a whole acronym run stays one word except right at its boundary with the
+next word: `NoteAdded` → `note_added`; `HTTPEvent` → `http_event` (the run `HTTP`
+stays together, splitting only where the trailing `E` turns out to start `Event`);
+`InvoicePDFSent` → `invoice_pdf_sent` (`PDF` stays together, `S` starts `Sent`).
+
+### Emitting: `tx.emit` and `tx.emit_keyed`
+
+```rust,ignore
+pub fn emit<Ev: Event>(&mut self, event: Ev)
+pub fn emit_keyed<Ev: Event>(&mut self, key: impl Into<String>, event: Ev)
+```
+
+Both buffer into the transaction's effects exactly like `enqueue`/`enqueue_keyed` —
+nothing is visible to a subscriber until the transaction's one log record commits.
+`emit_keyed`'s key is an opaque scoping filter (an org id, a tenant id, a room name —
+whatever a `Subscription` should be allowed to narrow on); the platform never parses
+it, only exact-matches it at delivery (`Subscription::key`, below). `tx.emit` is
+`emit_keyed` with no key: every subscription of that event type sees it, key filter
+or not.
+
+### The SSE route and `Subscription`
+
+`#[route(SSE "/path")]` is a route flavor, not a different mounting mechanism —
+`routes![...]` and `App::mount` treat it exactly like `#[route(GET ...)]`. Its
+handler signature is fixed, and unlike a plain route neither trailing argument is
+optional:
+
+```rust,ignore
+fn handler(tx: &mut Tx, [captures,] ctx: &Ctx, cursor: Option<Cursor>)
+    -> Result<Subscription, ApiError>
+```
+
+```rust
+use charpente::event;
+use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, Method, Request, Subscription};
+use charpente::kernel::{Kernel, SimSource};
+use charpente::{Schema, Tx, route, routes};
+use charpente_sim::Sim;
+use serde::{Deserialize, Serialize};
+
+#[event]
+struct Ping {
+    n: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PingBody {
+    n: u64,
+}
+
+#[route(POST "/ping")]
+fn send_ping(tx: &mut Tx, body: PingBody) -> Result<(), ApiError> {
+    tx.emit(Ping { n: body.n });
+    Ok(())
+}
+
+/// A real handler would narrow `.key(...)` to the caller's own org, read off
+/// `ctx.session()` exactly like any other route's access control — the
+/// platform enforces nothing about the key beyond the exact-match filter.
+#[route(SSE "/feed")]
+fn feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<Ping>().cursor(cursor))
+}
+
+fn build_app(sim: &Sim) -> std::io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?
+    .mount(routes![feed, send_ping]))
+}
+```
+
+```rust,ignore
+impl Subscription {
+    pub fn of<Ev: Event + serde::Serialize>() -> Subscription;
+    pub fn and<Ev: Event + serde::Serialize>(self) -> Subscription;
+    pub fn key(self, key: impl Into<String>) -> Subscription;
+    pub fn cursor(self, cursor: Option<Cursor>) -> Subscription;
+}
+```
+
+`Subscription::of::<Ping>()` names the event type as a Rust type, not a string — a
+typo is a compile error, never a silently-empty subscription. `.and::<Ev2>()` adds a
+second type to the same tail; `.key(...)` narrows delivery to one exact-match value;
+`.cursor(...)` takes the resume point the platform already extracted (next) — the
+handler can pass it straight through, as `feed` does above, or clamp it to some
+app-level boundary.
+
+### Cursor semantics
+
+The platform extracts the client's resume cursor *before* the handler runs, so an
+unparseable one never reaches app code:
+
+1. The `Last-Event-ID` header, if present — this is what makes a browser's native
+   `EventSource` reconnection resume automatically, no client code required.
+2. Else the `cursor` query parameter (`?cursor=<id>.<seq>`) — for a first connect
+   from a non-browser client, or a manual reconnect.
+3. Else `None` — "from now": only events committed after this moment.
+
+A present-but-unparseable cursor is a 400, and the handler never runs:
+
+```text
+cursor must be "<id>.<seq>" — got "not-a-cursor"; omit it to tail from now
+```
+
+The wire form is always `<id>.<seq>`: an event id and its committing record's log
+seq, joined by a dot (`Cursor::wire`). The seq half is not decorative — two diverged
+timelines (an old primary's unshipped tail vs. a promoted follower's new writes, §10)
+can mint the same event id for two *different* events, and a bare id can't tell them
+apart. Resume validation at subscribe time checks both, in order:
+
+- **Below the retention floor** — the cursor's id predates everything this node
+  still retains:
+
+  ```text
+  cursor 1.0 is below this node's retention floor 8 — events that old are
+  gone; re-sync current state through reads, then reconnect without a cursor
+  ```
+
+- **Diverged** — either the cursor's id is ahead of anything this node has ever
+  minted:
+
+  ```text
+  cursor 999.1 diverged from this node's timeline (next event id is 10) —
+  your history came from another primary; re-sync current state through
+  reads, then reconnect without a cursor
+  ```
+
+  or the retained row at that id carries a different seq than the client
+  remembers (the cross-timeline case — the id was reused by a different
+  history):
+
+  ```text
+  cursor 8.42 diverged from this node's timeline (event 8 here has seq 3,
+  not 42) — your history came from another primary; re-sync current state
+  through reads, then reconnect without a cursor
+  ```
+
+Every one of these three named errors ends with the identical fix: re-sync current
+state through ordinary reads, then reconnect with no cursor at all — a fresh
+"from now" subscribe never revalidates against history it doesn't have.
+
+### Delivery: one bounded path, no live/catch-up modes
+
+A validated subscribe joins the kernel's ready set as a `Tail` — data-gated, never a
+timer (DESIGN §1): it becomes eligible the instant some commit advances
+`charpente.events` past its position. One unit of delivery reads up to
+`TAIL_BATCH_EVENTS` (64) rows, filters by the subscription's names and key,
+JSON-encodes matches, and pushes frames to the connection's sink. There is no
+separate "catch up" mode and no separate "live push" path — a freshly-resumed
+subscription with thousands of events queued and a brand-new one sitting at "now"
+are served by the exact same code, just starting at different positions.
+
+A tail that falls behind retention *while already subscribed* (a slow consumer a
+burst of writes outpaces) gets one terminal SSE frame instead of silently replaying
+gone history, then its connection closes — the same three facts as the 409s, shaped
+as a frame instead of a rejected request:
+
+```text
+id: 1.0
+event: charpente.gap
+data: {"floor":4,"tail":1,"fix":"re-sync current state through reads, then reconnect without a cursor"}
+
+```
+
+A sink that reports itself full or closed — a slow browser tab, a dead TCP
+connection — costs its own tail immediately; it never blocks the kernel loop for
+anyone else. Nothing is sent in that case (there is no one left to tell); the
+client's own reconnect-with-`Last-Event-ID` behavior is the entire recovery story,
+which is why every case above ends the same way: re-sync, then reconnect.
+
+### The wire
+
+```text
+id: 0.0
+event: ping
+data: {"n":1}
+
+id: 1.1
+event: ping
+data: {"n":2}
+
+```
+
+Each emit above is its own request, hence its own commit — a different `seq` each
+time; two events emitted by the *same* transaction share one `seq` (§4's "call
+order" note applies to delivery order too). Each frame is `id: <id>.<seq>`,
+`event: <name>`, `data: <json>`, then a blank line.
+`id` matches `Cursor::wire` exactly, which is what makes a browser's native
+`Last-Event-ID` resume work with zero client code. An idle connection gets a `:hb`
+comment frame every 15 seconds — pure keepalive, no semantics, never interpreted as
+an event.
+
+### Testing a tail in sim
+
+The whole-app sim driver from §8 covers SSE routes with no extra machinery — a
+subscribe is just a `GET` request whose kernel response is an upgrade instead of a
+one-shot reply, recorded as a `SimSinkHandle`:
+
+```rust
+use charpente::event;
+use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, Method, Request, Subscription};
+use charpente::kernel::{Kernel, SimSource};
+use charpente::{Schema, Tx, route, routes};
+use charpente_sim::Sim;
+use serde::{Deserialize, Serialize};
+
+const SEC: u64 = 1_000_000_000;
+
+#[event]
+struct Ping {
+    n: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PingBody {
+    n: u64,
+}
+
+#[route(POST "/ping")]
+fn send_ping(tx: &mut Tx, body: PingBody) -> Result<(), ApiError> {
+    tx.emit(Ping { n: body.n });
+    Ok(())
+}
+
+#[route(SSE "/feed")]
+fn feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<Ping>().cursor(cursor))
+}
+
+fn build_app(sim: &Sim) -> std::io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?
+    .mount(routes![feed, send_ping]))
+}
+
+/// A client that always resumes with its last-received id.seq sees no gap and
+/// no duplicate across a disconnect+reconnect — the property this whole
+/// design exists to prove (DESIGN §6, PLAN M1's exit criterion).
+fn tail_resumes_after_reconnect(sim: &mut Sim) -> Result<(), String> {
+    let app = build_app(sim).map_err(|e| e.to_string())?;
+    let mut source = SimSource::new(Box::new(sim.clock()), 10 * SEC);
+    source.push_at(0, Request::new(Method::Get, "/feed"));
+    for n in 0..3u64 {
+        source.push_at(
+            (n + 1) * SEC,
+            Request::new(Method::Post, "/ping").json(&PingBody { n }),
+        );
+    }
+    let sinks = source.sinks();
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).map_err(|e| e.to_string())?;
+    kernel.run(&mut source).map_err(|e| e.to_string())?;
+
+    // Resume from the second frame the connection actually saw — never from
+    // a hand-computed id; the client only ever knows what it received.
+    let resume_cursor = {
+        let handles = sinks.lock().map_err(|_| "sinks lock poisoned".to_string())?;
+        let frames = handles[0].frames();
+        Cursor {
+            id: frames[1].id,
+            seq: frames[1].seq,
+        }
+        .wire()
+    };
+    source.push_at(
+        4 * SEC,
+        Request::new(Method::Get, format!("/feed?cursor={resume_cursor}")),
+    );
+    source.push_at(
+        5 * SEC,
+        Request::new(Method::Post, "/ping").json(&PingBody { n: 3 }),
+    );
+    kernel.run(&mut source).map_err(|e| e.to_string())?;
+
+    let handles = sinks.lock().map_err(|_| "sinks lock poisoned".to_string())?;
+    let resumed: Vec<u64> = handles[1].frames().iter().map(|f| f.id).collect();
+    if resumed != vec![2, 3] {
+        return Err(format!("expected [2, 3], got {resumed:?} — gap or duplicate"));
+    }
+    Ok(())
+}
+```
+
+`source.sinks()` hands back every SSE upgrade's handle, in upgrade order;
+`handle.frames()` is everything that connection received so far, in delivery order;
+`handle.closed()` is true once the kernel has dropped the tail (drop-on-full, or the
+terminal gap frame). A stalled consumer is scripted with `source.push_stall(closure)`
+(queued FIFO, one entry per upgrade) — a closure returning `true` makes that send
+report `Full`, which is how the drop-on-full path above gets exercised without a real
+slow client. Register a workload like `tail_resumes_after_reconnect` in `sim_tests!
+{ ... }` exactly like any other (§8).
+
+### Follower tails and failover
+
+A follower serves subscribes unchanged — `charpente.events` replicates like any
+other table, so its rows are byte-identical to the primary's the instant they're
+applied (§10). A failover honors the same bounded-loss window for events that it
+does for everything else: `promote` can lose events the old primary acked but
+hadn't shipped, named honestly in its reply; a client whose cursor referenced one of
+those lost events gets the diverged 409 on reconnect, never wrong events silently
+delivered in their place.

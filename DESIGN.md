@@ -153,7 +153,14 @@ its log but never runs jobs or cron (those would hit `TxError::NotPrimary`), and
 follower→primary flip inside `Repl::step` rebuilds the due-heap and cron from the
 replicated store on the next iteration. A repl-configured node also caps every idle wait at
 a 5ms park tick, so in-flight replication IO — sim messages or prod TCP — is polled
-promptly regardless of the next job/cron deadline.
+promptly regardless of the next job/cron deadline. Realtime (M1 sub-project 3) adds a fifth
+ready source, `Tail`: unlike the other four it is never timer-gated — a subscription
+becomes eligible the instant some commit advances `next_event_id` past its `next_id`, and
+the per-step read that checks this is skipped entirely whenever no tail is registered, so a
+kernel that never sees an SSE subscribe does zero extra IO and every pre-existing pinned
+seed replays unchanged. One unit of `Ready::Tail` work is a bounded table read
+(`TAIL_BATCH_EVENTS` rows), serviced round-robin across live tails so one deep resume never
+starves the rest of the ready set (§6).
 
 The HTTP kernel (`charpente::http`) lives inside the boundary — the sim drives
 `App::handle` directly; hyper only translates wire↔struct at the edge
@@ -515,9 +522,59 @@ slot.
   enqueues through the normal path — a recurring enqueuer, inheriting retry and
   observability for free. Catch-up fires once per wake, never backfills. In simulation,
   virtual time makes "run this monthly job 120 times" a subsecond test.
-- **Realtime.** `tx.emit(event)` puts events in the log; SSE/WebSocket subscribers tail the
-  log with a cursor. Resume-from-cursor is exact (it is a log position), so reconnects have
-  no silent gap — the failure mode that plagues every bolted-on pub/sub.
+- **Realtime.** `tx.emit(event)`/`tx.emit_keyed(key, event)` writes a typed event into the
+  committing log record alongside the transaction's other effects — `key` is an opaque
+  scoping filter (an org id, typically), carried but never interpreted inside the
+  deterministic boundary. Apply materializes each into the built-in `charpente.events`
+  table (`EventRow { id, seq, name, key, payload }`); `id` comes from a `next_event_id`
+  meta-counter bumped in call order — the `next_job_id` pattern exactly, so ids are
+  strictly monotonic, order-isomorphic to log position, and byte-identical on followers.
+  Retention is count-based: `DbConfig::event_retention` (default 65,536) bounds the table,
+  garbage-collected at the existing checkpoint cadence; `Db::event_floor()` reports the
+  smallest id still retained.
+- **The cursor is the event id, wire-encoded with its committing record's seq: `<id>.<seq>`.**
+  Resume from cursor `(c, s)` delivers every matching event with `id > c` — exact by
+  construction, since ids are minted at apply in log order. The seq half exists for one
+  reason: failover honesty. Two diverged timelines — an old primary's unshipped tail and a
+  promoted follower's new writes — can mint the same event id for two different events; a
+  bare id cannot detect that. Resume validation reads the retained row at `id == c` and
+  requires its `seq == s`; a mismatch is a named divergence, never a silent
+  misattribution — the same shape as replication's diverged-`Hello` refusal (§5).
+- **The subscription surface.** `#[route(SSE "/path")]` is a route flavor whose handler is
+  an ordinary transaction (session auth via `Ctx` like any route) returning a typed
+  `Subscription`: `Subscription::of::<Ev>().and::<Ev2>()` names event types compile-checked
+  (never as strings in app code), `.key(...)` is an optional exact-match filter, and
+  `.cursor(cursor)` takes the platform-extracted resume point (the handler passes it
+  through, or clamps it — access control is the handler's own session/row logic, not the
+  platform's). The platform extracts the client's cursor before the handler runs:
+  `Last-Event-ID` header wins (browser-native SSE resume), else a `cursor` query
+  parameter, else `None` ("from now" — only future events); an unparseable cursor is a 400
+  and the handler never runs.
+- **Kernel delivery is one path, no modes.** A validated subscribe registers a `Tail`
+  (`{ subscription, sink, next_id }`) on the fifth ready source (§1) — eligible the instant
+  a commit advances `next_event_id` past it, never a timer. One unit of work reads up to
+  `TAIL_BATCH_EVENTS` rows from `next_id`, filters by name and key, JSON-encodes matches
+  through the encoder each `Subscription::of::<Ev>()` captured statically at the subscribe
+  site (there is no runtime event registry — "unregistered event at delivery" is
+  inexpressible, not an error case), and pushes frames to a driver-supplied sink: a bounded
+  channel drained by the hyper SSE writer in production, an in-memory buffer in sim. There
+  is no separate push-on-commit path and no live/catch-up distinction — a commit simply
+  advances `next_event_id`, which makes tails ready; "live" is just "zero behind." A sink
+  that reports `Full` or `Closed` costs the tail its connection, deterministically and
+  immediately: a slow or dead consumer never costs kernel progress, and the client's cursor
+  resume is the recovery mechanism, not a server-side retry queue.
+- **Honesty at the edges.** A cursor below the retention floor, or one naming an event id
+  this node never minted (or minted with a different seq — the cross-timeline case), is
+  refused at subscribe with a 409 naming the floor or the divergence detail and the fix:
+  re-sync current state through reads, then reconnect without a cursor. A tail that falls
+  behind retention mid-stream gets the same fact set as a terminal SSE frame —
+  `event: charpente.gap` — then its sink closes. Sink overflow itself sends nothing (there
+  is no one left to tell); the client that reconnects with `Last-Event-ID` resumes exactly,
+  which is the point. Follower tails read the same materialized table replication keeps
+  byte-identical (§5), so a subscribe on a follower works with zero app-code changes; a
+  failover honors the DECISIONS §6 bounded-loss window for events exactly as it does for
+  state, and a cursor that crossed timelines gets the divergence refusal, never wrong
+  events.
 
 ## 7. The agent interface
 
