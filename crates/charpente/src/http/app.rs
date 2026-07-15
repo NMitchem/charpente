@@ -11,7 +11,7 @@ use charpente_core::io::{Disk, Entropy};
 use charpente_core::table::Id;
 use charpente_macros::table;
 
-use crate::auth::hash_token;
+use crate::auth::{ApiKey, hash_token};
 use crate::http::router::{RouteGlue, RouteMatch, Router};
 use crate::http::{ApiError, Cursor, Request, Response, Route, Subscription, hex};
 use crate::kernel::JobDef;
@@ -60,10 +60,7 @@ impl Ctx {
     /// second call could only reuse it. Stores the hash, never the raw
     /// token; `expires_at` is this request's `now` plus the app's TTL.
     pub fn create_session(&self, tx: &mut Tx, subject: impl Into<String>) -> String {
-        assert!(
-            !self.created.replace(true),
-            "Ctx::create_session called twice in one request — one session per request"
-        );
+        self.mint_credential();
         let id = u64::from_str_radix(&self.fresh_token[..16], 16).expect("token is hex");
         tx.put(&Session {
             id: Id::from_raw(id),
@@ -74,11 +71,41 @@ impl Ctx {
         self.fresh_token.clone()
     }
 
+    /// Mints an API key for `subject` and returns the raw key (`"ck_"` plus
+    /// 64 hex chars — the same pre-transaction entropy draw `create_session`
+    /// uses, per request). One per request, sharing `create_session`'s mint
+    /// budget. Stores `hash_token` of the full raw key (prefix included),
+    /// never the raw key itself.
+    pub fn create_api_key(&self, tx: &mut Tx, subject: impl Into<String>) -> String {
+        self.mint_credential();
+        let id = u64::from_str_radix(&self.fresh_token[..16], 16).expect("token is hex");
+        let raw = format!("ck_{}", self.fresh_token);
+        tx.put(&ApiKey {
+            id: Id::from_raw(id),
+            key_hash: hash_token(&raw),
+            subject: subject.into(),
+            created_at: self.now,
+        });
+        raw
+    }
+
     /// Deletes the current session (logout). A no-op without one.
     pub fn revoke(&self, tx: &mut Tx) {
         if let Some(session) = &self.session {
             tx.delete::<Session>(session.id);
         }
+    }
+
+    /// The shared one-mint-per-request gate: `create_session` and
+    /// `create_api_key` both draw from the single pre-transaction
+    /// `fresh_token` entropy draw, so a request minting a second credential
+    /// (of either kind) would silently reuse it — refused instead.
+    fn mint_credential(&self) {
+        assert!(
+            !self.created.replace(true),
+            "Ctx::create_session/create_api_key called twice in one request — one credential \
+             mint per request"
+        );
     }
 }
 
@@ -121,9 +148,9 @@ pub struct App {
 }
 
 impl App {
-    /// Opens the Db with the app's schema plus the platform's `Session` and
-    /// `CronRow` tables — registered here so recovery can always replay
-    /// logins and schedules.
+    /// Opens the Db with the app's schema plus the platform's `Session`,
+    /// `ApiKey`, and `CronRow` tables — registered here so recovery can
+    /// always replay logins, minted keys, and schedules.
     pub fn open(
         disk: Box<dyn Disk>,
         schema: Schema,
@@ -133,7 +160,10 @@ impl App {
         let db = Db::open(
             disk,
             config.db.clone(),
-            schema.table::<Session>().table::<CronRow>(),
+            schema
+                .table::<Session>()
+                .table::<ApiKey>()
+                .table::<CronRow>(),
         )?;
         Ok(App {
             db: Some(db),

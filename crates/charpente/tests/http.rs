@@ -2,7 +2,7 @@
 //! sessions, error mapping — unit tests here; the macro end-to-end tests and
 //! the request-level crash property are appended by later plan tasks.
 
-use charpente::auth::hash_token;
+use charpente::auth::{ApiKey, hash_token};
 use charpente::http::{
     ApiError, App, AppConfig, Ctx, Cursor, Handled, Method, Request, Response, Route, Session,
     Subscription,
@@ -65,6 +65,46 @@ fn logout(tx: &mut Tx, ctx: &Ctx) -> Result<&'static str, ApiError> {
 
 fn note_routes() -> Vec<Route> {
     routes![create_note, get_note, login, whoami, logout]
+}
+
+// ---------------------------------------------------- api keys (auth T3)
+
+#[route(POST "/keys", auth)]
+fn create_key(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
+    let subject = ctx.session().expect("auth route").subject.clone();
+    Ok(ctx.create_api_key(tx, subject))
+}
+
+#[route(DELETE "/keys/:id", auth)]
+fn revoke_key(tx: &mut Tx, id: Id<ApiKey>, ctx: &Ctx) -> Result<&'static str, ApiError> {
+    let _ = ctx;
+    tx.delete::<ApiKey>(id);
+    Ok("revoked")
+}
+
+/// Test-only route driving the one-mint-per-request assert: a handler that
+/// calls both mints in the same request.
+#[route(POST "/double-mint")]
+fn double_mint(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
+    let _ = ctx.create_session(tx, "x");
+    Ok(ctx.create_api_key(tx, "x"))
+}
+
+fn key_routes() -> Vec<Route> {
+    routes![login, whoami, create_key, revoke_key, double_mint]
+}
+
+fn key_app(seed: u64) -> (Sim, App) {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Note>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(key_routes());
+    (sim, app)
 }
 
 fn quiet_app(seed: u64) -> (Sim, App) {
@@ -331,6 +371,71 @@ fn session_token_is_hashed_at_rest_and_expires() {
         body_text(&expired).contains("session expired"),
         "{}",
         body_text(&expired)
+    );
+}
+
+#[test]
+fn api_key_mints_prefixed_hashes_at_rest_and_revokes() {
+    let (_sim, mut app) = key_app(0x47E);
+
+    // Login as alice.
+    let login = app.handle(Request::new(Method::Post, "/login").json(&"alice"));
+    assert_eq!(login.status, 200, "{}", body_text(&login));
+    let token: String = serde_json::from_slice(&login.body).unwrap();
+
+    // 1. Mint an API key; the raw key is "ck_" + 64 hex chars.
+    let minted = app.handle(
+        Request::new(Method::Post, "/keys").header("Authorization", format!("Bearer {token}")),
+    );
+    assert_eq!(minted.status, 200, "{}", body_text(&minted));
+    let raw_key: String = serde_json::from_slice(&minted.body).unwrap();
+    assert!(raw_key.starts_with("ck_"), "{raw_key}");
+    assert_eq!(raw_key.len(), "ck_".len() + 64);
+
+    // 2. The stored row carries hash_token(raw_key), never the raw key.
+    let snap = app.db().snapshot().unwrap();
+    let hash = hash_token(&raw_key);
+    let rows = ApiKey::by_key_hash(&snap, &hash).unwrap();
+    assert_eq!(rows.len(), 1, "exactly one api key row");
+    assert_eq!(rows[0].key_hash, hash);
+    assert_ne!(
+        rows[0].key_hash, raw_key,
+        "the raw key must never be stored"
+    );
+    assert_eq!(rows[0].subject, "alice");
+    let key_id = rows[0].id;
+
+    // 3. Bearer resolution against the ladder is Task 4's job — here we only
+    //    land the row + mint (per the brief's sequencing note).
+
+    // 4. Revoke: DELETE removes it from the table (revoke-as-delete).
+    let revoked = app.handle(
+        Request::new(Method::Delete, format!("/keys/{}", key_id.raw()))
+            .header("Authorization", format!("Bearer {token}")),
+    );
+    assert_eq!(revoked.status, 200, "{}", body_text(&revoked));
+    let after = ApiKey::by_key_hash(&app.db().snapshot().unwrap(), &hash).unwrap();
+    assert!(after.is_empty(), "revoked key must not remain in the table");
+}
+
+#[test]
+fn one_credential_mint_per_request() {
+    let (_sim, mut app) = key_app(0x47F);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        app.handle(Request::new(Method::Post, "/double-mint"))
+    }));
+    let payload = match result {
+        Ok(_) => panic!("minting two credentials in one request must panic"),
+        Err(payload) => payload,
+    };
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .expect("panic payload should carry the message string");
+    assert!(
+        message.contains("one credential mint per request"),
+        "{message}"
     );
 }
 
