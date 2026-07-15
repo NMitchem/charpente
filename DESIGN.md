@@ -154,7 +154,8 @@ follower→primary flip inside `Repl::step` rebuilds the due-heap and cron from 
 replicated store on the next iteration. A repl-configured node also caps every idle wait at
 a 5ms park tick, so in-flight replication IO — sim messages or prod TCP — is polled
 promptly regardless of the next job/cron deadline. Realtime (M1 sub-project 3) adds a fifth
-ready source, `Tail`: unlike the other four it is never timer-gated — a subscription
+ready source, `Tail`: unlike the deadline-carrying sources (jobs, cron, repl) it is never
+timer-gated — like a request, it is gated purely by something happening: a subscription
 becomes eligible the instant some commit advances `next_event_id` past its `next_id`, and
 the per-step read that checks this is skipped entirely whenever no tail is registered, so a
 kernel that never sees an SSE subscribe does zero extra IO and every pre-existing pinned
@@ -562,7 +563,10 @@ slot.
   advances `next_event_id`, which makes tails ready; "live" is just "zero behind." A sink
   that reports `Full` or `Closed` costs the tail its connection, deterministically and
   immediately: a slow or dead consumer never costs kernel progress, and the client's cursor
-  resume is the recovery mechanism, not a server-side retry queue.
+  resume is the recovery mechanism, not a server-side retry queue. Event payloads must be
+  JSON-serializable — a serde_json rejection (NaN floats, non-string map keys) is a
+  contract violation, and delivering the offending durable event is kernel-fatal (the
+  encode error stops the loop; a restart re-encounters it).
 - **Honesty at the edges.** A cursor below the retention floor, or one naming an event id
   this node never minted (or minted with a different seq — the cross-timeline case), is
   refused at subscribe with a 409 naming the floor or the divergence detail and the fix:

@@ -2403,9 +2403,24 @@ Both buffer into the transaction's effects exactly like `enqueue`/`enqueue_keyed
 nothing is visible to a subscriber until the transaction's one log record commits.
 `emit_keyed`'s key is an opaque scoping filter (an org id, a tenant id, a room name —
 whatever a `Subscription` should be allowed to narrow on); the platform never parses
-it, only exact-matches it at delivery (`Subscription::key`, below). `tx.emit` is
-`emit_keyed` with no key: every subscription of that event type sees it, key filter
-or not.
+it, only exact-matches it at delivery (`Subscription::key`, below). The match rule is
+exact on both sides, and it is the load-bearing multi-tenant scoping rule, so
+precisely: an *unkeyed* subscription (no `.key(...)`) receives every event of its
+types, keyed or not; a *keyed* subscription receives only events whose key is an
+exact match — which means a keyed subscription does **not** receive `tx.emit`
+(unkeyed) events, since no key equals the absence of one. Scope a tenant feed by
+emitting *everything* that tenant should see with `emit_keyed` and its key; reserve
+bare `tx.emit` for events only an unkeyed (global) subscription should tail.
+
+One contract rides along with the `Serialize` derive: every `#[event]` payload must
+be JSON-serializable. A value serde_json rejects — a `NaN` or infinite float, a map
+with non-string keys — is a contract violation, and it is not caught at emit time
+(the log/table store `Codec` bytes; JSON encoding happens at delivery). Delivery of
+an unserializable event is kernel-fatal: the encode error (`"event <name> failed
+JSON encoding: <serde_json's message>"`) propagates out of the delivery arm as a
+platform `io::Error` and stops the kernel loop, and since the event row is durable, a
+restart re-encounters it the moment a matching subscription catches up to it. Keep
+event payloads to plainly-JSON shapes.
 
 ### The SSE route and `Subscription`
 
