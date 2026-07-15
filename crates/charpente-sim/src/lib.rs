@@ -77,6 +77,16 @@ pub struct FaultConfig {
     /// landed as a superset over every connection: the sim cannot and
     /// should not know which conns are "replication".
     pub net_spike: f64,
+    /// The realtime tail's slow/bounded-consumer rate. Unlike every other
+    /// axis above, nothing inside this crate reads it — `SimSink`'s stall
+    /// closure lives in the `charpente` crate (T5) and takes no `Sim`
+    /// reference at all, so there is no internal consumption site to wire.
+    /// This field exists purely so a workload can read it back
+    /// (`Sim::subscriber_stall`) to drive its own closure at a per-universe
+    /// rate, the same way every other extended field varies per universe —
+    /// the roll itself, and the `fault:subscriber_stall` coverage mark, are
+    /// the workload's own responsibility (realtime T6).
+    pub subscriber_stall: f64,
     pub disk_latency: (Duration, Duration),
     pub net_latency: (Duration, Duration),
 }
@@ -97,6 +107,7 @@ impl Default for FaultConfig {
             corruption_scope: CORRUPTION_SCOPE_DEFAULT.to_string(),
             conn_drop: 0.0,
             net_spike: 0.0,
+            subscriber_stall: 0.0,
             disk_latency: (Duration::from_micros(20), Duration::from_millis(2)),
             net_latency: (Duration::from_micros(100), Duration::from_millis(20)),
         }
@@ -117,6 +128,7 @@ impl FaultConfig {
             corruption_scope: CORRUPTION_SCOPE_DEFAULT.to_string(),
             conn_drop: 0.0,
             net_spike: 0.0,
+            subscriber_stall: 0.0,
             disk_latency: (Duration::ZERO, Duration::ZERO),
             net_latency: (Duration::ZERO, Duration::ZERO),
         }
@@ -170,7 +182,7 @@ impl FaultConfig {
             sync_error,
             crash_apply,
             crash_torn,
-            // These six axes draw from field-keyed sub-streams
+            // These seven axes draw from field-keyed sub-streams
             // (`sample_extended_fields`, applied in `run_universe`/
             // `run_universe_with_adjust` right after this function returns)
             // rather than this sequential stream, so they cannot perturb the
@@ -185,6 +197,7 @@ impl FaultConfig {
             read_error: 0.0,
             conn_drop: 0.0,
             net_spike: 0.0,
+            subscriber_stall: 0.0,
             // Constant, never drawn: the scope is a property of what the
             // corruption axes are FOR (the WAL fences), not a fault rate.
             corruption_scope: CORRUPTION_SCOPE_DEFAULT.to_string(),
@@ -207,6 +220,7 @@ impl FaultConfig {
             ("read_error", self.read_error),
             ("conn_drop", self.conn_drop),
             ("net_spike", self.net_spike),
+            ("subscriber_stall", self.subscriber_stall),
         ] {
             assert!(
                 (0.0..=1.0).contains(&p),
@@ -272,6 +286,12 @@ pub fn sample_extended_fields(seed: u64, cfg: &mut FaultConfig) {
     let mut r = keyed_stream(seed, "net_spike");
     cfg.net_spike = if r.chance(0.25) {
         r.below(200) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "subscriber_stall");
+    cfg.subscriber_stall = if r.chance(0.25) {
+        r.below(250) as f64 / 1000.0
     } else {
         0.0
     };
@@ -495,6 +515,16 @@ impl Sim {
 
     pub fn seed(&self) -> u64 {
         self.world.seed
+    }
+
+    /// This universe's sampled `subscriber_stall` rate — the one extended
+    /// field with no internal consumption site (see the field's doc). A
+    /// workload reads this to drive its own `SimSink` stall closure (`charpente`'s
+    /// `SimSink` lives outside this crate and has no `Sim` reference of its
+    /// own) at this universe's rate, and marks `fault:subscriber_stall`
+    /// coverage itself when the roll actually fires.
+    pub fn subscriber_stall(&self) -> f64 {
+        self.world.cfg.subscriber_stall
     }
 
     /// Marks a named event for sometimes-coverage accounting. Workload-side
@@ -1872,6 +1902,7 @@ mod tests {
         assert_eq!(extended.dir_entry_loss, again.dir_entry_loss);
         assert_eq!(extended.conn_drop, again.conn_drop);
         assert_eq!(extended.net_spike, again.net_spike);
+        assert_eq!(extended.subscriber_stall, again.subscriber_stall);
     }
 
     #[test]
@@ -2115,6 +2146,24 @@ mod tests {
         );
         assert_eq!(&buf[..6], b"spiked");
         assert_eq!(sim.coverage()["fault:net_spike"], 1);
+    }
+
+    #[test]
+    fn subscriber_stall_defaults_off_and_reads_back_through_the_accessor() {
+        // Unlike every other extended field, `subscriber_stall` has no
+        // internal consumption site in this crate (see the field's doc) —
+        // `Sim::subscriber_stall` is the whole surface, so this pins that
+        // read-back rather than an internal fault-firing effect.
+        let sim = Sim::with_faults(0x2EB2_0000, FaultConfig::none());
+        assert_eq!(sim.subscriber_stall(), 0.0);
+        let sim = Sim::with_faults(
+            0x2EB2_0001,
+            FaultConfig {
+                subscriber_stall: 0.42,
+                ..FaultConfig::none()
+            },
+        );
+        assert_eq!(sim.subscriber_stall(), 0.42);
     }
 
     #[test]
