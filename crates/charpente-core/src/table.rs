@@ -469,11 +469,21 @@ impl Store {
     /// Sets all META keys directly — the seed path's counterpart to the
     /// bookkeeping `Store::apply` derives from replay. A logical import has
     /// no records to replay, only the exporter's already-final counts.
+    /// `seed_frontier_crc` is the primary's `frame_crc` of the record at
+    /// `applied_seq`: a follower seeded here holds none of that record's WAL
+    /// bytes (its own log starts empty at `applied_seq + 1`), so this is the
+    /// only proof of its frontier's identity until real frames ship —
+    /// `hello_position` (charpente::repl) reads it back to Hello with a full
+    /// position instead of a `None` that forces a re-seed. The seq it vouches
+    /// is stored beside it (`seed_frontier_seq` = this `applied_seq`): the
+    /// CRC is only ever valid for that one seq, and `applied_seq` itself
+    /// advances with later applies.
     pub fn set_import_meta(
         &self,
         applied_seq: u64,
         next_job_id: u64,
         next_event_id: u64,
+        seed_frontier_crc: u32,
     ) -> io::Result<()> {
         let mut txn = self.db.begin_write().map_err(redb_err)?;
         txn.set_durability(Durability::None).map_err(redb_err)?;
@@ -482,6 +492,10 @@ impl Store {
             meta.insert("applied_seq", applied_seq).map_err(redb_err)?;
             meta.insert("next_job_id", next_job_id).map_err(redb_err)?;
             meta.insert("next_event_id", next_event_id)
+                .map_err(redb_err)?;
+            meta.insert("seed_frontier_seq", applied_seq)
+                .map_err(redb_err)?;
+            meta.insert("seed_frontier_crc", u64::from(seed_frontier_crc))
                 .map_err(redb_err)?;
         }
         txn.commit().map_err(redb_err)?;
@@ -747,6 +761,33 @@ impl Snapshot {
                 .map_err(redb_err)?
                 .map_or(0, |g| g.value())),
             Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
+            Err(e) => Err(redb_err(e)),
+        }
+    }
+
+    /// The seed frontier `(seq, crc)` (`set_import_meta`), if this store was
+    /// built by the seed path — `None` for a store opened from an ordinary
+    /// log (the keys are written only by an import). A stored `0` is a real
+    /// CRC, not "unset", so this is an `Option`, never `map_or(0, …)`.
+    pub fn seed_frontier(&self) -> io::Result<Option<(u64, u32)>> {
+        match self.txn.open_table(META) {
+            Ok(meta) => {
+                let seq = meta.get("seed_frontier_seq").map_err(redb_err)?;
+                let crc = meta.get("seed_frontier_crc").map_err(redb_err)?;
+                match (seq, crc) {
+                    (Some(seq), Some(crc)) => Ok(Some((seq.value(), crc.value() as u32))),
+                    (None, None) => Ok(None),
+                    // Negative space: set_import_meta writes both keys in one
+                    // transaction — one without the other never happens.
+                    (seq, crc) => panic!(
+                        "seed frontier meta is torn: seq {:?}, crc {:?} — set_import_meta writes \
+                         both keys atomically",
+                        seq.map(|g| g.value()),
+                        crc.map(|g| g.value())
+                    ),
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
             Err(e) => Err(redb_err(e)),
         }
     }

@@ -732,6 +732,17 @@ impl Db {
         self.snapshot()?.next_event_id()
     }
 
+    /// The seed frontier `(seq, frontier_crc)` this store was built at, if it
+    /// was seeded (`Seeder::finish`) — `None` for a store opened from an
+    /// ordinary log. The seq is pinned at seed time and never advances (the
+    /// CRC is only valid for that one seq); callers compare it against
+    /// `last_applied` before trusting the CRC. Used by `charpente::repl` to
+    /// prove a freshly-seeded node's position (`hello_position`) and to chain
+    /// the frontier through a seeded-then-promoted primary (`begin_seeding`).
+    pub fn seed_frontier(&self) -> io::Result<Option<(u64, u32)>> {
+        self.snapshot()?.seed_frontier()
+    }
+
     /// Ids of jobs materialized by transactions since the last drain — the
     /// kernel's incremental feed for its due-heap. Recovery replay does not
     /// appear here; the dispatcher rebuilds from a Pending scan at open.
@@ -977,8 +988,17 @@ impl Seeder {
     /// Pins the metadata, checkpoints, and lays the empty seed segment at
     /// `applied_seq + 1`, then hands the result through the normal
     /// `Db::open` — the same path every other startup goes through, so
-    /// nothing about a seeded node's open is special.
-    pub fn finish(self, applied_seq: u64, next_job_id: u64, next_event_id: u64) -> io::Result<Db> {
+    /// nothing about a seeded node's open is special. `frontier_crc` is the
+    /// primary's CRC of the record at `applied_seq` (`Msg::SnapshotStart`):
+    /// persisted so a follower that reboots before shipping any frame can
+    /// still prove its frontier (`Db::seed_frontier`).
+    pub fn finish(
+        self,
+        applied_seq: u64,
+        next_job_id: u64,
+        next_event_id: u64,
+        frontier_crc: u32,
+    ) -> io::Result<Db> {
         let Seeder {
             disk,
             cfg,
@@ -986,7 +1006,7 @@ impl Seeder {
             store,
             ..
         } = self;
-        store.set_import_meta(applied_seq, next_job_id, next_event_id)?;
+        store.set_import_meta(applied_seq, next_job_id, next_event_id, frontier_crc)?;
         store.checkpoint()?;
         drop(store); // graceful close before Db::open reopens the same file
         let name = segment_name(&cfg.wal.dir, applied_seq + 1);

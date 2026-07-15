@@ -432,7 +432,19 @@ horizon + 1 boundary, re-gates writes, and returns the new `Db`; a conn death mi
 never latches, and the next `Hello` restarts the seed from scratch (idempotent —
 `Seeder::new` discards). Stated plainly: v1 seeding holds the full logical snapshot in
 memory on BOTH sides — the primary queues the whole stream when seeding begins, the
-follower buffers it until `SnapshotEnd`. Right at M1 scale; incremental streaming is the
+follower buffers it until `SnapshotEnd`. `SnapshotStart` also carries the seed frontier's
+CRC — the primary's `frame_crc` of the record at `applied_seq`, which the follower persists
+(`seed_frontier_seq`/`seed_frontier_crc` meta): a freshly-seeded follower holds none of that
+record's WAL bytes (its own log starts empty at `applied_seq + 1`), so without it `Hello`
+could only send `None`, and a primary that had since lost its own tail above the horizon
+would answer that empty position with a re-seed — silently wiping a converged survivor from
+the now-lossy primary. With the CRC the follower Hellos `(applied_seq, crc)`, so the ladder
+runs its diverged-ahead / resume checks instead; the fallback holds across a restart before
+any frame ships, and fires only while `last_applied` still equals the seed's seq — the CRC
+vouches for that one record alone, and a node whose log vanished after applying past the
+seed honestly sends `None` and re-seeds (finding-1 fix). A seeded-then-promoted primary that
+has to seed others before its first commit chains the same stored frontier into its own
+`SnapshotStart`. Right at M1 scale; incremental streaming is the
 tracked fix before large-store seeding. The durable role file (§2's role semantics, T5) carries its own
 CRC line: a torn role write is a named integrity error, never a parse of whatever bytes
 survived — a torn "follower:p:1" that still parses as a role naming a ghost primary is

@@ -24,6 +24,7 @@ pub(crate) struct SeedStart {
     pub applied_seq: u64,
     pub next_job_id: u64,
     pub next_event_id: u64,
+    pub frontier_crc: u32,
 }
 
 /// The buffered snapshot stream: one `(table, rows)` entry per
@@ -227,6 +228,7 @@ impl Follower {
                 applied_seq,
                 next_job_id,
                 next_event_id,
+                frontier_crc,
             } => {
                 // Opens (or restarts, after a mid-seed reconnect) a seed. We
                 // buffer the stream rather than blocking so the single-writer
@@ -236,6 +238,7 @@ impl Follower {
                         applied_seq,
                         next_job_id,
                         next_event_id,
+                        frontier_crc,
                     },
                     rows: Vec::new(),
                     complete: false,
@@ -396,18 +399,64 @@ impl Follower {
 }
 
 /// The `Hello` position: `(last durable seq, that frame's CRC)`, or `None`
-/// when the follower is empty OR its last frame is below its own retained base
-/// (freshly seeded, nothing shipped yet — an empty position forces a re-seed,
-/// idempotent because `Seeder::new` discards).
+/// when this node cannot prove one.
+///
+/// The ladder (spec §5, finding-1 fix): (a) our retained log holds the frame
+/// at `last_applied` — the ordinary path, CRC recomputed from the frame; (b)
+/// that frame is below our own base because we were freshly seeded and no
+/// frame has shipped yet (the seed lays an empty segment at `applied_seq +
+/// 1`, so `last_applied` predates our WAL) — fall back to the seed frontier
+/// CRC the primary handed us (`Db::seed_frontier`), proving the position so
+/// the ladder can run its diverged/resume checks instead of a `None` that
+/// silently re-seeds us from a possibly-lossy primary; (c) `None` — either a
+/// genuinely empty store, or a node that truly cannot prove its position:
+/// its log vanished/was cut back to a durable horizon past any stored seed
+/// frontier, or `read_log` refused a corrupt frame below the acked end
+/// (sim-found while landing the fix, frozen-batch seed 0x820d5e907fbb8b55:
+/// bitrot below `last_applied` on a follower). For a follower, the re-seed
+/// an empty position draws IS that corruption error's named fix — restore
+/// this node from a replica. Once a real frame lands, path (a) resumes.
 fn hello_position(db: &Db) -> io::Result<Option<(u64, u32)>> {
     let Some(last) = db.last_applied() else {
-        return Ok(None);
+        return Ok(None); // genuinely empty — nothing applied, nothing seeded
     };
     match db.read_log(last, 1) {
-        Ok(frames) => Ok(frames.first().map(|(s, p)| (*s, frame_crc(*s, p)))),
-        // read_from's below-base refusal is the InvalidData kind; a transient
-        // read fault is io::Error::other — propagate that to retry the Hello.
-        Err(e) if e.kind() == io::ErrorKind::InvalidData => Ok(None),
+        // (a) the frame is retained: recompute its CRC as always.
+        Ok(frames) => {
+            let (s, p) = frames.first().expect(
+                "read_log at last_applied returns that frame whenever last_applied is Some",
+            );
+            Ok(Some((*s, frame_crc(*s, p))))
+        }
+        // read_log's refusals are the InvalidData kind; a transient read
+        // fault is io::Error::other — propagate that to retry the Hello.
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+            if last < db.log_base() {
+                // The below-base refusal: our whole log sits above `last`, so
+                // the refusal is positional, never a corrupt read. Negative
+                // space: gc keeps `base <= applied + 1` and `Db::open`
+                // rejects any vanished prefix beyond horizon + 1, so below-
+                // base can only mean base == last + 1 exactly.
+                assert_eq!(
+                    db.log_base(),
+                    last + 1,
+                    "log base {} is above last_applied {last} + 1 — a vanished prefix \
+                     Db::open must have refused",
+                    db.log_base()
+                );
+                // (b) the seed frontier, only when it vouches for `last`
+                // itself: the stored CRC belongs to the seed's seq alone; if
+                // applies advanced past the seed before the log went missing,
+                // the frontier proves nothing about `last` (an empty position
+                // and its re-seed are the honest answer).
+                if let Some((seed_seq, crc)) = db.seed_frontier()?
+                    && seed_seq == last
+                {
+                    return Ok(Some((last, crc)));
+                }
+            }
+            Ok(None) // (c) cannot prove a position — the primary re-seeds us
+        }
         Err(e) => Err(e),
     }
 }

@@ -333,11 +333,42 @@ impl Session {
             .expect("a primary chosen for snapshot seeding has applied records");
         let next_job_id = snap.next_job_id()?;
         let next_event_id = snap.next_event_id()?;
+        // The frontier CRC the follower will Hello with before any frame
+        // ships: our own `frame_crc` of the record at `applied_seq`. Seeding
+        // pins retention (a fresh session pins GC at its cursor 0 until this
+        // very call sets it to `applied_seq + 1`), so on an ordinary primary
+        // the record is retained and read_log returns it. A primary that was
+        // itself seeded and promoted before any commit holds no frame at
+        // `applied_seq` at all (its log starts empty above it) — read_log
+        // refuses below-base and the frontier chains through this node's own
+        // stored seed frontier instead (the CRC the original primary vouched).
+        // Any other refusal (a corrupt frame below the acked end) propagates
+        // by name — the same surface decide_hello's resume check already has.
+        let frontier_crc = match db.read_log(applied_seq, 1) {
+            Ok(frames) => frames
+                .first()
+                .map(|(s, p)| frame_crc(*s, p))
+                .expect("read_log(applied_seq, 1) returns that frame when it does not refuse"),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData && applied_seq < db.log_base() => {
+                match db.seed_frontier()? {
+                    Some((seed_seq, crc)) if seed_seq == applied_seq => crc,
+                    // Negative space: below-base means base == applied_seq + 1
+                    // (gc keeps base <= applied + 1; Db::open refuses vanished
+                    // prefixes), and the only route to that shape with no
+                    // matching seed frontier is a log that vanished beneath a
+                    // durable horizon — a node that cannot vouch a frontier
+                    // must not seed followers; surface the refusal.
+                    _ => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        };
         let mut pending = VecDeque::new();
         pending.push_back(Msg::SnapshotStart {
             applied_seq,
             next_job_id,
             next_event_id,
+            frontier_crc,
         });
         for table in db.table_names() {
             let rows = snap.scan_raw(table)?;

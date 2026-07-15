@@ -30,10 +30,14 @@ pub enum Msg {
     /// tag 3 — follower ack: durable through `durable_seq`.
     Ack { durable_seq: u64 },
     /// tag 4 — logical snapshot begins; the follower's fresh meta.
+    /// `frontier_crc` is the primary's `frame_crc` of the record at
+    /// `applied_seq`: the follower persists it so it can Hello with a full
+    /// position (not a re-seed-forcing `None`) before any frame ships.
     SnapshotStart {
         applied_seq: u64,
         next_job_id: u64,
         next_event_id: u64,
+        frontier_crc: u32,
     },
     /// tag 5 — one table's worth of snapshot rows, each `(id, row bytes)`.
     SnapshotRows {
@@ -162,11 +166,13 @@ pub fn encode(msg: &Msg) -> Vec<u8> {
             applied_seq,
             next_job_id,
             next_event_id,
+            frontier_crc,
         } => {
             out.push(4);
             applied_seq.encode(&mut out);
             next_job_id.encode(&mut out);
             next_event_id.encode(&mut out);
+            frontier_crc.encode(&mut out);
         }
         Msg::SnapshotRows { table, rows } => {
             out.push(5);
@@ -224,6 +230,7 @@ pub fn decode(bytes: &[u8]) -> io::Result<Msg> {
             applied_seq: u64::decode(input)?,
             next_job_id: u64::decode(input)?,
             next_event_id: u64::decode(input)?,
+            frontier_crc: u32::decode(input)?,
         },
         5 => Msg::SnapshotRows {
             table: String::decode(input)?,
@@ -323,6 +330,7 @@ mod tests {
             applied_seq: 100,
             next_job_id: 5,
             next_event_id: 2,
+            frontier_crc: 0xfeed_face,
         });
     }
 

@@ -911,6 +911,302 @@ fn diverged_follower_is_refused_by_name() {
     );
 }
 
+// -------------------------------------------- property: seeded-follower frontier
+
+/// Durably flips one byte of the highest-seq WAL frame's stored CRC on a host,
+/// so recovery reads that frame as torn and cuts the log just below it — a
+/// deterministic stand-in for the `bit_flip` fault the swarm `wal_corruption`
+/// property hits at random. When the store's durable checkpoint sits below the
+/// cut, this is an above-horizon cut (recovery succeeds, silently losing the
+/// tail), not a below-horizon hard error. Frame layout (log.rs): a 16-byte
+/// header `seq(8) plen(4) crc(4)` then `plen` payload bytes.
+fn corrupt_last_wal_frame(host: &SimHost) -> Result<(), String> {
+    let disk = host.disk();
+    let mut names = disk.list("wal/").map_err(|e| e.to_string())?;
+    names.sort();
+    let seg = names.last().ok_or("no wal segment to corrupt")?;
+    let file = disk.open(seg).map_err(|e| e.to_string())?;
+    let len = file.len().map_err(|e| e.to_string())?;
+    let mut offset = 0u64;
+    let mut last_frame: Option<u64> = None;
+    while offset + 16 <= len {
+        let mut header = [0u8; 16];
+        file.read_at(offset, &mut header)
+            .map_err(|e| e.to_string())?;
+        let plen = u64::from(u32::from_le_bytes(
+            header[8..12].try_into().expect("4 bytes"),
+        ));
+        if plen == 0 || offset + 16 + plen > len {
+            break;
+        }
+        last_frame = Some(offset);
+        offset += 16 + plen;
+    }
+    let frame = last_frame.ok_or("wal segment holds no complete frame")?;
+    // Flip a bit in the stored CRC (header bytes 12..16): frame_crc(seq,
+    // payload) will no longer match, so read_frame reads this frame as torn.
+    let crc_off = frame + 12;
+    let mut b = [0u8; 1];
+    file.read_at(crc_off, &mut b).map_err(|e| e.to_string())?;
+    b[0] ^= 0xff;
+    file.write_at(crc_off, &b).map_err(|e| e.to_string())?;
+    file.sync().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Finding-1 regression (T2 report "Finding 1", seed 0xd4d9c59769a6738c): a
+/// follower seeded at frontier F, with ZERO frames shipped since, reconnecting
+/// to a primary that lost its tail below F (a legal above-horizon cut) must be
+/// REFUSED by name — never silently re-seeded from the lossy primary, which
+/// would wipe the converged survivor's data. Before the fix the follower
+/// Hello'd `position: None` (its frontier predates its own WAL, so `read_log`
+/// refused below-base), and the compacted-log primary answered `Snapshot`,
+/// wiping the survivor. The frontier-CRC fallback lets it Hello `(F, crc)`, so
+/// the `pos_seq > last` diverged-ahead arm fires. Deterministic: the cut is
+/// forced by corrupting the primary's tail frame and crashing (its store
+/// reverts to the checkpoint, recovery cuts the torn tail above the horizon).
+#[test]
+fn a_seeded_follower_with_zero_frames_refuses_a_lossy_primary() {
+    let sim = Sim::with_faults(0x2EB1_0011, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), seeding_db_cfg()).unwrap();
+    // Commit past several checkpoint boundaries (checkpoint_every 8): the log
+    // compacts (base > 0) and a durable store horizon forms below the tail.
+    for i in 0..30u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    let f_frontier =
+        p.db.as_ref()
+            .unwrap()
+            .last_applied()
+            .expect("the primary has records");
+    assert!(
+        p.db.as_ref().unwrap().log_base() > 0,
+        "the primary's log must be compacted (the seed-below-base precondition)"
+    );
+
+    // Seed a fresh follower; stop the instant the seed lands, before any frame
+    // ships (the primary holds nothing above the frontier, so none would).
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), seeding_db_cfg()).unwrap();
+    run_until(
+        &sim,
+        &mut [&mut p, &mut f],
+        |ns| ns[1].repl.stats().seeds >= 1,
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    {
+        let fdb = f.db.as_ref().unwrap();
+        assert_eq!(
+            fdb.last_applied(),
+            Some(f_frontier),
+            "the follower seeded at the primary's frontier"
+        );
+        assert_eq!(
+            fdb.log_base(),
+            f_frontier + 1,
+            "the seed lays the WAL base above the frontier — exactly the below-base fallback case"
+        );
+    }
+    let fp_before = data_fingerprint(&f.host).unwrap();
+
+    // Partition so nothing ships while the primary is bricked, then force an
+    // above-horizon cut: corrupt the tail frame, crash (unsynced store applies
+    // collapse back to the checkpoint), recover (recovery cuts the torn tail).
+    sim.partition("p", "f");
+    corrupt_last_wal_frame(&p.host).unwrap();
+    p.host.crash_now(); // crashed disk: the Db drop below cannot gracefully persist
+    p.db = None;
+    p.host.restart(); // collapse unsynced (store reverts to the checkpoint), reboot
+    reopen(&mut p).expect("an above-horizon cut recovers cleanly, not RESTORE_NEEDED");
+    let p_last_after =
+        p.db.as_ref()
+            .unwrap()
+            .last_applied()
+            .expect("the primary recovered with records");
+    assert!(
+        p_last_after < f_frontier,
+        "the cut must leave the primary below the follower's frontier (p={p_last_after}, f={f_frontier})"
+    );
+    assert!(
+        p.db.as_ref().unwrap().log_base() > 0,
+        "the primary's log stays compacted after the cut (so the buggy path would re-seed)"
+    );
+
+    // Reconnect: the follower must be refused by name (diverged ahead), never
+    // re-seeded. Its step() surfaces the refusal as an io::Error.
+    sim.repair("p", "f");
+    let err = run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET)
+        .expect_err("a seeded follower ahead of a lossy primary must be refused, never re-seeded");
+    for needle in ["diverged", "seq", "crc", "re-seed", "fresh data dir"] {
+        assert!(err.contains(needle), "refusal missing {needle:?}: {err}");
+    }
+    // The refusal names BOTH positions: the follower's frontier and the primary's last.
+    assert!(
+        err.contains(&f_frontier.to_string()),
+        "refusal must name the follower's frontier {f_frontier}: {err}"
+    );
+    assert!(
+        err.contains(&p_last_after.to_string()),
+        "refusal must name the primary's last {p_last_after}: {err}"
+    );
+    // No wipe: the follower still holds exactly what it seeded.
+    assert_eq!(
+        total_seeds(&f),
+        1,
+        "the follower must not have re-seeded (seeds={})",
+        total_seeds(&f)
+    );
+    assert_eq!(
+        data_fingerprint(&f.host).unwrap(),
+        fp_before,
+        "the follower's data must be untouched — no silent re-seed from the lossy primary"
+    );
+}
+
+/// The healthy path this fix is most at risk of regressing: a seeded follower
+/// that RESTARTS before shipping any frame must still resume against its
+/// (intact) primary — the persisted frontier CRC survives the restart (piece
+/// 2) and its `(F, crc)` Hello matches the primary's retained frame, so the
+/// ladder resumes with `Frames`, never a spurious refuse or re-seed. Then real
+/// frames ship and it converges.
+#[test]
+fn a_restarted_seeded_follower_resumes_without_re_seeding() {
+    let sim = Sim::with_faults(0x2EB1_0012, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), seeding_db_cfg()).unwrap();
+    for i in 0..30u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    assert!(
+        p.db.as_ref().unwrap().log_base() > 0,
+        "the primary's log must be compacted"
+    );
+
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), seeding_db_cfg()).unwrap();
+    run_until(
+        &sim,
+        &mut [&mut p, &mut f],
+        |ns| ns[1].repl.stats().seeds >= 1,
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    let frontier = f.db.as_ref().unwrap().last_applied().expect("f seeded");
+
+    // Restart the follower before any frame ships: it reopens at the frontier,
+    // its persisted seed_frontier_crc intact — this is the across-restart
+    // durability the fallback depends on.
+    recover_node(&sim, &mut f).unwrap();
+    let seeds_after_restart = total_seeds(&f);
+    assert_eq!(
+        seeds_after_restart, 1,
+        "the restart itself must not re-seed"
+    );
+    assert_eq!(
+        f.db.as_ref().unwrap().last_applied(),
+        Some(frontier),
+        "the follower reopened at its frontier"
+    );
+    assert_eq!(
+        f.db.as_ref()
+            .unwrap()
+            .seed_frontier()
+            .unwrap()
+            .map(|(s, _)| s),
+        Some(frontier),
+        "the seed frontier must survive the restart"
+    );
+
+    // One more commit on the primary (kept below the checkpoint cadence so the
+    // frontier frame stays retained — a further checkpoint's GC would evict it
+    // and re-seeding below the base would be the *correct* answer, not the
+    // resume this test pins). The follower reconnects with its (frontier, crc)
+    // fallback, the primary resumes it (CRC matches its retained frame), and
+    // the new frame ships — converging one past the frontier.
+    commit_widget(&sim, &mut p, 30).unwrap();
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert_converged(&p, &f).unwrap();
+    assert!(
+        f.db.as_ref().unwrap().last_applied() > Some(frontier),
+        "frames must have shipped past the frontier after the resume"
+    );
+    assert_eq!(
+        total_seeds(&f),
+        1,
+        "the follower resumed — it must NOT have taken a spurious second seed (seeds={})",
+        total_seeds(&f)
+    );
+}
+
+/// The seed frontier CRC vouches for exactly ONE seq — the seed's. A seeded
+/// follower that shipped frames PAST its seed and then lost its whole log
+/// (checkpointed store beside an empty log dir — `Db::open` re-lays the seed
+/// segment at horizon + 1) must NOT pair the stale seed CRC with its advanced
+/// `last_applied`: that Hello would be refused as diverged-crc by a healthy
+/// primary (a false refusal — the brief's named regression risk). The honest
+/// answer is an empty position → re-seed, which converges.
+#[test]
+fn a_seeded_follower_that_advanced_then_lost_its_log_reseeds_not_refused() {
+    let sim = Sim::with_faults(0x2EB1_0013, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), seeding_db_cfg()).unwrap();
+    for i in 0..30u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    assert!(p.db.as_ref().unwrap().log_base() > 0, "compacted");
+
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), seeding_db_cfg()).unwrap();
+    run_until(
+        &sim,
+        &mut [&mut p, &mut f],
+        |ns| ns[1].repl.stats().seeds >= 1,
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    let seed_seq = f.db.as_ref().unwrap().last_applied().expect("f seeded");
+
+    // Ship real frames past the seed, then checkpoint f so its store horizon
+    // durably advances beyond the seed frontier.
+    commit_widget(&sim, &mut p, 30).unwrap();
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    let advanced = f.db.as_ref().unwrap().last_applied().unwrap();
+    assert!(
+        advanced > seed_seq,
+        "a frame must have shipped past the seed"
+    );
+    f.db.as_mut().unwrap().checkpoint().unwrap();
+
+    // Lose f's entire log: graceful close, delete every segment (dir-synced),
+    // power-cycle (frees the listener; everything above is durable, so the
+    // fault-free collapse drops nothing), reopen — Db::open lays an empty
+    // segment at horizon + 1, so f's stale seed frontier (seed_seq) no longer
+    // matches its last_applied (advanced).
+    f.db = None;
+    let disk = f.host.disk();
+    for name in disk.list("wal/").unwrap() {
+        disk.remove(&name).unwrap();
+    }
+    disk.sync_dir("wal/").unwrap();
+    f.host.restart();
+    reopen(&mut f).unwrap();
+    assert_eq!(f.db.as_ref().unwrap().last_applied(), Some(advanced));
+    assert_eq!(
+        f.db.as_ref().unwrap().log_base(),
+        advanced + 1,
+        "open lays the segment at horizon + 1 over the vanished log"
+    );
+
+    // Reconnect (drive explicitly — last_applied already matches, so a
+    // converged-predicate wait would return before the Hello even travels):
+    // the rejoin must never surface a refusal (the stale CRC paired with the
+    // advanced seq would draw diverged-crc from this healthy primary); the
+    // honest empty position re-seeds instead.
+    drive_rounds(&sim, &mut [&mut p, &mut f], 256).expect("a healthy rejoin must never be refused");
+    assert_eq!(
+        f.repl.stats().seeds,
+        1,
+        "the log-less follower re-seeds (cannot prove its advanced position)"
+    );
+    assert_converged(&p, &f).unwrap();
+}
+
 // --------------------------------------------- error-surface pin: version
 
 /// Drive a single node against a raw client conn until the client gets a reply.

@@ -1518,7 +1518,12 @@ fn seed_rebuilds_a_byte_identical_store() {
         let rows = snap.scan_raw(table).unwrap();
         seeder.rows(table, &rows).unwrap();
     }
-    let mut db_b = seeder.finish(applied, next_job_id, next_event_id).unwrap();
+    // Db-level seed test: no wire, no `hello_position` — the frontier CRC is
+    // never read back, so `0` stands in for it (the wire path is exercised by
+    // charpente/tests/replication.rs).
+    let mut db_b = seeder
+        .finish(applied, next_job_id, next_event_id, 0)
+        .unwrap();
 
     assert_eq!(db_b.last_applied(), Some(applied));
     assert_eq!(
@@ -1594,7 +1599,7 @@ fn into_seeder_discards_the_old_timeline() {
 
     let mut seeder = db.into_seeder().unwrap();
     seeder.rows(Invoice::TABLE, &rows).unwrap();
-    let db2 = seeder.finish(4, 0, 0).unwrap();
+    let db2 = seeder.finish(4, 0, 0, 0).unwrap();
 
     let names = sim.disk().list("wal/").unwrap();
     assert_eq!(
@@ -1642,7 +1647,9 @@ fn seeded_indexes_answer_queries() {
     let mut seeder =
         Seeder::new(Box::new(sim_b.disk()), DbConfig::default(), app_schema()).unwrap();
     seeder.rows(Invoice::TABLE, &rows).unwrap();
-    let db_b = seeder.finish(applied, next_job_id, next_event_id).unwrap();
+    let db_b = seeder
+        .finish(applied, next_job_id, next_event_id, 0)
+        .unwrap();
 
     let acme = Id::<Org>::from_raw(0);
     let expected = ids(&Invoice::by_org(&snap, &acme).unwrap());
