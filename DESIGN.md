@@ -49,7 +49,12 @@ the deterministic boundary and cannot perform ambient IO.
 simulation testing only works if the system is designed for it from the first line. One
 `SystemTime::now()`, one stray `tokio::spawn`, one direct file write inside the core, and
 replay determinism is gone — and with it the entire verification story that justifies the
-platform. Retrofitting determinism onto a nondeterministic codebase is a rewrite.
+platform. Retrofitting determinism onto a nondeterministic codebase is a rewrite. The
+promise holds across build modes too: redb-4.1.0's open path issues an extra,
+`debug_assertions`-gated page walk that used to draw sim IO rolls in debug only and skew
+release onto a different universe from the same seed (found via seed `0xff159ed76d2806e4`),
+held now by forcing redb's debug-assertions on in release (`Cargo.toml`'s
+`[profile.release.package.redb]`) so both modes consume one identical draw stream.
 
 **Shape.** Synchronous and poll-shaped, not async futures (DECISIONS §10). `Instant` is
 charpente's own nanosecond type — std's is opaque and cannot be fabricated from virtual
