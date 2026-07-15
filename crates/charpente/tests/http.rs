@@ -2,7 +2,8 @@
 //! sessions, error mapping — unit tests here; the macro end-to-end tests and
 //! the request-level crash property are appended by later plan tasks.
 
-use charpente::auth::{ApiKey, hash_token};
+use base64ct::{Base64UrlUnpadded, Encoding};
+use charpente::auth::{ApiKey, OidcConfig, OidcConfigError, hash_token};
 use charpente::http::{
     ApiError, App, AppConfig, Ctx, Cursor, Handled, Method, Request, Response, Route, Session,
     Subscription,
@@ -10,7 +11,10 @@ use charpente::http::{
 use charpente::{Schema, Tx, event, route, routes, table};
 use charpente_core::table::Id;
 use charpente_sim::{FaultConfig, Sim};
+use rsa::traits::PublicKeyParts;
+use rsa::{BigUint, Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[table]
 struct Note {
@@ -540,6 +544,353 @@ fn resolution_ladder_matrix() {
     );
     assert_eq!(jwt_shaped.status, 401, "{}", body_text(&jwt_shaped));
     assert_eq!(error_text(&jwt_shaped), UNRECOGNIZED);
+
+    // 9. A garbage bearer presented to a route that does NOT require auth
+    //    (`/login` has no `auth` attribute) is still resolved — and
+    //    rejected — because `build_ctx` runs the ladder unconditionally
+    //    before checking `auth_required` (review-flagged coverage gap:
+    //    pins the presented-but-invalid-on-open-route posture T4 landed).
+    let garbage_open_route = app.handle_at(
+        Request::new(Method::Post, "/login")
+            .header("Authorization", "Bearer garbage-not-two-dots")
+            .json(&"eve"),
+        2_700,
+    );
+    assert_eq!(
+        garbage_open_route.status,
+        401,
+        "{}",
+        body_text(&garbage_open_route)
+    );
+    assert_eq!(error_text(&garbage_open_route), UNRECOGNIZED);
+}
+
+// ---------------------------------------------------- OIDC (auth T5)
+
+/// A fixed RSA-2048 test keypair, generated ONCE with `openssl genrsa` and
+/// checked in as its two 1024-bit primes — never generated at test runtime
+/// (the deny-list forbids ambient OS entropy; `RsaPrivateKey::from_p_q`
+/// rebuilds `n`/`d` deterministically from these, and `.sign(...)` below
+/// uses RustCrypto's no-RNG PKCS1v15 path, so every minted token is
+/// byte-reproducible).
+const TEST_RSA_P: &[u8] = &[
+    0xee, 0x28, 0xc5, 0xb6, 0x51, 0xe4, 0x61, 0xc6, 0x53, 0xd5, 0x9a, 0xe4, 0x22, 0x85, 0xa9, 0x52,
+    0x2a, 0x43, 0xf7, 0xac, 0x85, 0x04, 0xfd, 0xb5, 0x1c, 0xa7, 0x30, 0x98, 0xc8, 0xf2, 0x5d, 0x71,
+    0x58, 0xa5, 0x3f, 0x3a, 0xf8, 0x1f, 0xb1, 0xec, 0x68, 0xc7, 0xd4, 0x72, 0x6e, 0xc6, 0xad, 0xe1,
+    0xf1, 0xc1, 0xe3, 0x70, 0xd0, 0x94, 0xca, 0x01, 0x7a, 0x2d, 0x0e, 0xc0, 0x0f, 0xa8, 0x61, 0xe8,
+    0xc4, 0x06, 0x87, 0x9a, 0xaa, 0xf9, 0x78, 0xc5, 0x88, 0xd2, 0xba, 0x4d, 0x96, 0x3f, 0x05, 0x56,
+    0x18, 0x64, 0xf8, 0x95, 0x42, 0x8d, 0x9c, 0xed, 0x6c, 0xbb, 0x0a, 0xb3, 0x95, 0xc3, 0x6e, 0x33,
+    0xe9, 0xd5, 0x4c, 0x3a, 0x6b, 0x05, 0x6d, 0x8d, 0x15, 0x8d, 0xe1, 0x0e, 0x11, 0x21, 0x2f, 0x0e,
+    0x16, 0x5a, 0x5f, 0xdc, 0xed, 0x2c, 0xa8, 0x2c, 0x37, 0x88, 0x5f, 0xea, 0xdd, 0x71, 0x73, 0x35,
+];
+const TEST_RSA_Q: &[u8] = &[
+    0xc0, 0xab, 0x74, 0x12, 0x0a, 0x2d, 0xb5, 0xb0, 0x20, 0x84, 0x33, 0x8f, 0xf2, 0x85, 0xef, 0xac,
+    0x2e, 0xeb, 0x07, 0x7b, 0x01, 0xcb, 0x66, 0x97, 0x63, 0x87, 0x1c, 0x3e, 0x0d, 0x41, 0xd5, 0xde,
+    0x66, 0x63, 0x95, 0xe6, 0x9a, 0xd5, 0x4f, 0xc0, 0xd3, 0x0c, 0x8e, 0x27, 0xfd, 0x19, 0x5f, 0xc4,
+    0x5a, 0xb6, 0x41, 0xd5, 0xdc, 0xee, 0x9c, 0xcb, 0x7c, 0x73, 0x80, 0x2f, 0x0f, 0xf6, 0xfe, 0x50,
+    0x67, 0xe9, 0x7d, 0x33, 0x2b, 0x26, 0x42, 0x63, 0x64, 0xb3, 0xdd, 0xa8, 0x71, 0xcc, 0xdf, 0xce,
+    0xac, 0xac, 0x75, 0x56, 0xf4, 0xc2, 0xc5, 0x6e, 0x22, 0x09, 0x14, 0x9f, 0x24, 0x28, 0x9f, 0xb4,
+    0x04, 0x85, 0x98, 0xab, 0xdb, 0x3d, 0x6f, 0xd4, 0x8e, 0x64, 0x32, 0x7c, 0x5f, 0x93, 0x5f, 0x8b,
+    0xa0, 0x93, 0xb9, 0xd8, 0xe5, 0x6f, 0x77, 0xdb, 0x86, 0x07, 0xc0, 0xbf, 0x79, 0xbf, 0x97, 0xf3,
+];
+const TEST_KID: &str = "test-key-1";
+const OIDC_ISSUER: &str = "https://idp.test";
+const OIDC_AUDIENCE: &str = "charpente";
+/// An arbitrary fixed instant (nanos) used as `now` throughout — far enough
+/// from zero that `exp`/`nbf` offsets in both directions never underflow.
+const OIDC_NOW: u64 = 1_700_000_000_000_000_000;
+
+fn test_rsa_keypair() -> (RsaPrivateKey, RsaPublicKey) {
+    let p = BigUint::from_bytes_be(TEST_RSA_P);
+    let q = BigUint::from_bytes_be(TEST_RSA_Q);
+    let e = BigUint::from(65537u32);
+    let private = RsaPrivateKey::from_p_q(p, q, e).expect("fixed test primes are valid");
+    let public = RsaPublicKey::from(&private);
+    (private, public)
+}
+
+fn test_jwks_json(public: &RsaPublicKey) -> String {
+    let n = Base64UrlUnpadded::encode_string(&public.n().to_bytes_be());
+    let e = Base64UrlUnpadded::encode_string(&public.e().to_bytes_be());
+    serde_json::json!({"keys": [{"kty": "RSA", "kid": TEST_KID, "n": n, "e": e}]}).to_string()
+}
+
+/// Signs `header_json`.`payload_json` with the fixed test private key —
+/// RustCrypto's no-RNG PKCS1v15 `sign` path (never `sign_with_rng`), so
+/// minting is deterministic and reproducible byte-for-byte.
+fn mint_jwt(
+    private: &RsaPrivateKey,
+    header_json: &serde_json::Value,
+    payload: &serde_json::Value,
+) -> String {
+    let header_b64 = Base64UrlUnpadded::encode_string(header_json.to_string().as_bytes());
+    let payload_b64 = Base64UrlUnpadded::encode_string(payload.to_string().as_bytes());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let digest = Sha256::digest(signing_input.as_bytes());
+    let sig = private
+        .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
+        .expect("no-rng PKCS1v15 sign");
+    let sig_b64 = Base64UrlUnpadded::encode_string(&sig);
+    format!("{header_b64}.{payload_b64}.{sig_b64}")
+}
+
+fn rs256_header() -> serde_json::Value {
+    serde_json::json!({"alg": "RS256", "typ": "JWT", "kid": TEST_KID})
+}
+
+fn valid_claims() -> serde_json::Value {
+    let now_secs = OIDC_NOW / 1_000_000_000;
+    serde_json::json!({
+        "iss": OIDC_ISSUER,
+        "aud": OIDC_AUDIENCE,
+        "sub": "bob",
+        "exp": now_secs + 3600,
+        "nbf": now_secs - 60,
+    })
+}
+
+fn oidc_app(seed: u64, public: &RsaPublicKey) -> (Sim, App) {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(note_routes())
+    .with_oidc(OidcConfig {
+        issuer: OIDC_ISSUER.into(),
+        audience: OIDC_AUDIENCE.into(),
+        jwks_json: test_jwks_json(public),
+    });
+    (sim, app)
+}
+
+/// The OIDC claim matrix (spec §3), each check violated in isolation → its
+/// named 401, byte-exact; the valid token accepted end to end.
+#[test]
+fn oidc_claim_matrix() {
+    const BAD_SIGNATURE: &str = "OIDC token signature does not verify against any configured \
+                                  JWKS key — the token was not issued by a trusted key; obtain \
+                                  a new one";
+    const EXPIRED: &str = "OIDC token expired — its \"exp\" claim is in the past; obtain a new \
+                            one";
+    const NOT_YET_VALID: &str = "OIDC token is not yet valid — its \"nbf\" claim is in the \
+                                  future; wait or mint a fresh token";
+
+    let (private, public) = test_rsa_keypair();
+
+    // 1. Valid token: iss/aud/exp/nbf all ok, sub "bob".
+    let valid_jwt = mint_jwt(&private, &rs256_header(), &valid_claims());
+    let verifier = charpente::auth::OidcVerifier::from_config(OidcConfig {
+        issuer: OIDC_ISSUER.into(),
+        audience: OIDC_AUDIENCE.into(),
+        jwks_json: test_jwks_json(&public),
+    })
+    .unwrap();
+    assert_eq!(verifier.verify(&valid_jwt, OIDC_NOW).unwrap(), "bob");
+
+    // 2. Bad signature: flip the first byte of the decoded signature.
+    let mut segments = valid_jwt.split('.');
+    let (h, p, s) = (
+        segments.next().unwrap(),
+        segments.next().unwrap(),
+        segments.next().unwrap(),
+    );
+    let mut sig_bytes = Base64UrlUnpadded::decode_vec(s).unwrap();
+    sig_bytes[0] ^= 0xff;
+    let tampered_jwt = format!("{h}.{p}.{}", Base64UrlUnpadded::encode_string(&sig_bytes));
+    assert_eq!(
+        verifier
+            .verify(&tampered_jwt, OIDC_NOW)
+            .unwrap_err()
+            .to_string(),
+        BAD_SIGNATURE
+    );
+
+    // 3. exp in the past.
+    let now_secs = OIDC_NOW / 1_000_000_000;
+    let mut expired_claims = valid_claims();
+    expired_claims["exp"] = serde_json::json!(now_secs - 3600);
+    let expired_jwt = mint_jwt(&private, &rs256_header(), &expired_claims);
+    assert_eq!(
+        verifier
+            .verify(&expired_jwt, OIDC_NOW)
+            .unwrap_err()
+            .to_string(),
+        EXPIRED
+    );
+
+    // 4. nbf in the future.
+    let mut not_yet_claims = valid_claims();
+    not_yet_claims["exp"] = serde_json::json!(now_secs + 7200);
+    not_yet_claims["nbf"] = serde_json::json!(now_secs + 3600);
+    let not_yet_jwt = mint_jwt(&private, &rs256_header(), &not_yet_claims);
+    assert_eq!(
+        verifier
+            .verify(&not_yet_jwt, OIDC_NOW)
+            .unwrap_err()
+            .to_string(),
+        NOT_YET_VALID
+    );
+
+    // 5. Wrong issuer — names got vs configured.
+    let mut wrong_iss_claims = valid_claims();
+    wrong_iss_claims["iss"] = serde_json::json!("https://wrong.example");
+    let wrong_iss_jwt = mint_jwt(&private, &rs256_header(), &wrong_iss_claims);
+    assert_eq!(
+        verifier
+            .verify(&wrong_iss_jwt, OIDC_NOW)
+            .unwrap_err()
+            .to_string(),
+        format!(
+            "OIDC token has issuer \"https://wrong.example\" but this server is configured \
+             for issuer \"{OIDC_ISSUER}\" — mint the token against the configured issuer or \
+             fix OidcConfig::issuer"
+        )
+    );
+
+    // 6. Wrong audience — names got vs configured.
+    let mut wrong_aud_claims = valid_claims();
+    wrong_aud_claims["aud"] = serde_json::json!("someone-else");
+    let wrong_aud_jwt = mint_jwt(&private, &rs256_header(), &wrong_aud_claims);
+    assert_eq!(
+        verifier
+            .verify(&wrong_aud_jwt, OIDC_NOW)
+            .unwrap_err()
+            .to_string(),
+        format!(
+            "OIDC token has audience \"someone-else\" but this server is configured for \
+             audience \"{OIDC_AUDIENCE}\" — mint the token for the configured audience or fix \
+             OidcConfig::audience"
+        )
+    );
+
+    // 7. alg "HS256" in the header — unsupported-alg, never reaches the
+    //    (bogus) signature check.
+    let hs256_header = serde_json::json!({"alg": "HS256", "typ": "JWT", "kid": TEST_KID});
+    let hs256_jwt = mint_jwt(&private, &hs256_header, &valid_claims());
+    assert_eq!(
+        verifier
+            .verify(&hs256_jwt, OIDC_NOW)
+            .unwrap_err()
+            .to_string(),
+        "unsupported OIDC token alg \"HS256\" — only \"RS256\" is verified; mint the token \
+         with an RS256-signed key"
+    );
+
+    // 8. Not three segments.
+    assert_eq!(
+        verifier
+            .verify("not.enough", OIDC_NOW)
+            .unwrap_err()
+            .to_string(),
+        "malformed OIDC token — expected \"header.payload.signature\" (three dot-separated \
+         segments); got 2 segment(s)"
+    );
+
+    // 9. End to end: GET /me with the valid JWT bearer on an
+    //    App::with_oidc app → 200 "bob".
+    let (_sim, mut app) = oidc_app(0x0D1C_0001, &public);
+    let ok = app.handle_at(
+        Request::new(Method::Get, "/me").header("Authorization", format!("Bearer {valid_jwt}")),
+        OIDC_NOW,
+    );
+    assert_eq!(ok.status, 200, "{}", body_text(&ok));
+    assert_eq!(body_text(&ok), "\"bob\"");
+
+    // 10. The OIDC rung is scoped to the Authorization bearer header ONLY
+    //     (spec §2 rung 1): a cookie value with two dots, even with a
+    //     verifier mounted, always goes down the hash path — never
+    //     OIDC-verified — so it lands on the unrecognized-credential 401.
+    let cookie_two_dots = app.handle_at(
+        Request::new(Method::Get, "/me").header("Cookie", "charpente_session=a.b.c"),
+        OIDC_NOW,
+    );
+    assert_eq!(
+        cookie_two_dots.status,
+        401,
+        "{}",
+        body_text(&cookie_two_dots)
+    );
+    assert_eq!(
+        error_text(&cookie_two_dots),
+        "unrecognized credential — it may have been revoked; obtain a new one"
+    );
+}
+
+#[test]
+fn oidc_config_errors_are_named_at_mount() {
+    let bad_json = OidcConfig {
+        issuer: OIDC_ISSUER.into(),
+        audience: OIDC_AUDIENCE.into(),
+        jwks_json: "not json".into(),
+    };
+    let err = charpente::auth::OidcVerifier::from_config(bad_json).unwrap_err();
+    let OidcConfigError::MalformedJwks(_) = &err else {
+        panic!("expected MalformedJwks, got {err:?}");
+    };
+    assert!(
+        err.to_string()
+            .starts_with("OidcConfig::jwks_json is not valid JSON: "),
+        "{err}"
+    );
+
+    let no_keys = OidcConfig {
+        issuer: OIDC_ISSUER.into(),
+        audience: OIDC_AUDIENCE.into(),
+        jwks_json: serde_json::json!({"keys": []}).to_string(),
+    };
+    let err = charpente::auth::OidcVerifier::from_config(no_keys).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "OidcConfig::jwks_json has no keys — the \"keys\" array is empty; add at least one \
+         RSA key"
+    );
+
+    let non_rsa = OidcConfig {
+        issuer: OIDC_ISSUER.into(),
+        audience: OIDC_AUDIENCE.into(),
+        jwks_json: serde_json::json!({"keys": [{"kty": "EC", "kid": "k1", "n": "x", "e": "y"}]})
+            .to_string(),
+    };
+    let err = charpente::auth::OidcVerifier::from_config(non_rsa).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "OIDC JWKS key k1 has kty \"EC\" — only \"RSA\" is supported in v1; remove non-RSA \
+         keys from the JWKS"
+    );
+
+    let bad_alg = OidcConfig {
+        issuer: OIDC_ISSUER.into(),
+        audience: OIDC_AUDIENCE.into(),
+        jwks_json: serde_json::json!({
+            "keys": [{"kty": "RSA", "kid": "k1", "alg": "RS384", "n": "x", "e": "y"}]
+        })
+        .to_string(),
+    };
+    let err = charpente::auth::OidcVerifier::from_config(bad_alg).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "OIDC JWKS key k1 has alg \"RS384\" — only \"RS256\" is supported; fix or remove the \
+         key's \"alg\" field"
+    );
+
+    let bad_n = OidcConfig {
+        issuer: OIDC_ISSUER.into(),
+        audience: OIDC_AUDIENCE.into(),
+        jwks_json: serde_json::json!({
+            "keys": [{"kty": "RSA", "kid": "k1", "n": "not-base64url!!", "e": "AQAB"}]
+        })
+        .to_string(),
+    };
+    let err = charpente::auth::OidcVerifier::from_config(bad_n).unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("OIDC JWKS key k1 is invalid: modulus \"n\" is not valid base64url: "),
+        "{err}"
+    );
 }
 
 #[test]

@@ -14,8 +14,9 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 tokio = { version = "1", features = ["rt", "net", "sync"] }
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["oid"] }
 base64ct = { version = "1", features = ["alloc"] }
+rsa = "0.9"
 
 [lints]
 workspace = true

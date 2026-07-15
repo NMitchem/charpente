@@ -4,6 +4,7 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use charpente_core::db::{Db, DbConfig, Job, Schema, Tx, TxError};
@@ -11,7 +12,9 @@ use charpente_core::io::{Disk, Entropy};
 use charpente_core::table::{Id, View};
 use charpente_macros::table;
 
-use crate::auth::{ApiKey, AuthReject, OidcVerifier, Principal, Via, hash_token, resolve};
+use crate::auth::{
+    ApiKey, AuthReject, OidcConfig, OidcVerifier, Presented, Principal, Via, hash_token, resolve,
+};
 use crate::http::router::{RouteGlue, RouteMatch, Router};
 use crate::http::{ApiError, Cursor, Request, Response, Route, Subscription, hex};
 use crate::kernel::JobDef;
@@ -159,6 +162,11 @@ pub struct App {
     router: Router,
     job_defs: Vec<JobDef>,
     cron_entries: Vec<CronEntry>,
+    /// `Arc` (not a bare reference) so `handle_or_subscribe` can clone an
+    /// owned handle before `db_mut()` takes `&mut self` — cloning an `Arc` is
+    /// an atomic refcount bump, not a JWKS re-parse. `None` until
+    /// `App::with_oidc` mounts a verifier.
+    oidc: Option<Arc<OidcVerifier>>,
 }
 
 impl App {
@@ -186,11 +194,23 @@ impl App {
             router: Router::new(),
             job_defs: Vec::new(),
             cron_entries: Vec::new(),
+            oidc: None,
         })
     }
 
     pub fn mount(mut self, routes: Vec<Route>) -> App {
         self.router.mount(routes);
+        self
+    }
+
+    /// Mounts the OIDC static-JWKS verifier (spec §3): `config.jwks_json` is
+    /// parsed once, here, at mount time — a bad key, unsupported `alg`, or
+    /// malformed document panics with the named `OidcConfigError` text
+    /// (never a request-time error), mirroring `mount`/`mount_jobs`/
+    /// `schedule`'s mount-time conflict panics elsewhere in this file.
+    pub fn with_oidc(mut self, config: OidcConfig) -> App {
+        let verifier = OidcVerifier::from_config(config).unwrap_or_else(|e| panic!("{e}"));
+        self.oidc = Some(Arc::new(verifier));
         self
     }
 
@@ -372,20 +392,24 @@ impl App {
         let mut fresh = [0u8; 32];
         self.entropy.fill(&mut fresh);
         let fresh_token = hex(&fresh);
-        let token = bearer_or_cookie(&request.headers);
+        let presented = bearer_or_cookie(&request.headers);
         let session_ttl = self.config.session_ttl;
+        // Cloning the `Arc` (an atomic refcount bump, not a JWKS re-parse)
+        // lets this outlive the `&mut self` `db_mut()` takes below — see the
+        // field doc on `App::oidc`.
+        let oidc = self.oidc.clone();
 
         match glue {
             RouteGlue::Http(glue) => {
                 let result = self.db_mut().transact(|tx| {
                     let ctx = build_ctx(
                         tx,
-                        &token,
+                        &presented,
                         auth_required,
                         fresh_token,
                         now,
                         session_ttl,
-                        None,
+                        oidc.as_deref(),
                     )?;
                     glue(tx, &ctx, &captures, &request.body)
                 });
@@ -395,12 +419,12 @@ impl App {
                 let result = self.db_mut().transact(|tx| {
                     let ctx = build_ctx(
                         tx,
-                        &token,
+                        &presented,
                         auth_required,
                         fresh_token,
                         now,
                         session_ttl,
-                        None,
+                        oidc.as_deref(),
                     )?;
                     glue(tx, &ctx, &captures, cursor)
                 });
@@ -426,20 +450,21 @@ pub enum Handled {
 /// cookie token, maps a rejected credential to its named 401, gates
 /// `auth`-required routes on a missing principal (the no-credential 401 —
 /// `resolve` itself never produces this: it returns `Ok(None)` for "nothing
-/// presented"), and builds the `Ctx` the handler sees. `oidc` is T5's hook
-/// (spec §3) — always `None` until `App::with_oidc` exists.
+/// presented"), and builds the `Ctx` the handler sees. `oidc` is the mounted
+/// verifier (spec §3) — `None` until `App::with_oidc` runs.
 fn build_ctx(
     tx: &mut Tx,
-    token: &Option<String>,
+    presented: &Presented,
     auth_required: bool,
     fresh_token: String,
     now: u64,
     session_ttl: u64,
     oidc: Option<&OidcVerifier>,
 ) -> Result<Ctx, ApiError> {
-    let principal = resolve(tx, token.as_deref(), oidc, now).map_err(|reject| match reject {
+    let principal = resolve(tx, presented, oidc, now).map_err(|reject| match reject {
         AuthReject::Unrecognized => ApiError::UnrecognizedCredential,
         AuthReject::Expired => ApiError::SessionExpired,
+        AuthReject::Oidc(reject) => ApiError::Oidc(reject),
         AuthReject::Io(e) => ApiError::from(e),
     })?;
     if auth_required && principal.is_none() {
@@ -506,18 +531,24 @@ fn extract_cursor(request: &Request) -> Result<Option<Cursor>, Response> {
 }
 
 /// `Authorization: Bearer <t>` wins; else the `charpente_session` cookie.
-fn bearer_or_cookie(headers: &BTreeMap<String, String>) -> Option<String> {
+/// Tagged with its source (`Presented`) so the ladder's two-dot JWT-shape
+/// check (spec §2 rung 1) applies to a bearer only — a cookie value always
+/// goes down the hash path, dots or not.
+fn bearer_or_cookie(headers: &BTreeMap<String, String>) -> Presented {
     if let Some(auth) = headers.get("authorization")
         && let Some(token) = auth.strip_prefix("Bearer ")
     {
-        return Some(token.trim().to_string());
+        return Presented::Bearer(token.trim().to_string());
     }
-    for pair in headers.get("cookie")?.split(';') {
+    let Some(cookie_header) = headers.get("cookie") else {
+        return Presented::None;
+    };
+    for pair in cookie_header.split(';') {
         if let Some((name, value)) = pair.trim().split_once('=')
             && name == "charpente_session"
         {
-            return Some(value.to_string());
+            return Presented::Cookie(value.to_string());
         }
     }
-    None
+    Presented::None
 }

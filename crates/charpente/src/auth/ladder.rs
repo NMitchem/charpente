@@ -1,19 +1,21 @@
 //! The resolution ladder (auth T4, spec §2): one entry point that turns a
 //! presented bearer/cookie token into a `Principal`, replacing the old
 //! direct-session-only lookup `build_ctx` used to do inline. Order: a
-//! two-dot bearer is judged as a JWT (OIDC verify if configured, never a
-//! fall-through to hash lookup); any other token hashes once and checks
-//! `ApiKey` before `Session` (expiry-checked); nothing presented is
-//! `Ok(None)` — the caller's `auth` gate, not this function, answers the
-//! no-credential 401. Pure over `(tx, token, now)`: zero entropy draws, zero
-//! clock reads (`now` is the caller's single reading) — the frozen replay
-//! contract holds by construction.
+//! two-dot BEARER (never a cookie — spec §2 rung 1 is scoped to the
+//! Authorization header) is judged as a JWT (OIDC verify if configured,
+//! never a fall-through to hash lookup); any other presented token hashes
+//! once and checks `ApiKey` before `Session` (expiry-checked); nothing
+//! presented is `Ok(None)` — the caller's `auth` gate, not this function,
+//! answers the no-credential 401. Pure over `(tx, presented, now)`: zero
+//! entropy draws, zero clock reads (`now` is the caller's single reading) —
+//! the frozen replay contract holds by construction.
 
 use std::io;
 
 use charpente_core::db::Tx;
 use charpente_core::table::Id;
 
+use crate::auth::oidc::{OidcReject, OidcVerifier};
 use crate::auth::{ApiKey, hash_token};
 use crate::http::Session;
 
@@ -50,6 +52,10 @@ pub enum AuthReject {
     Unrecognized,
     /// Matched a `Session` row past its `expires_at`.
     Expired,
+    /// A two-dot bearer, judged as a JWT, failed OIDC verification — the
+    /// per-check 401 taxonomy lives in `OidcReject` (spec §6); this is the
+    /// one mapping seam (T5's ruling), not a reshape of the other variants.
+    Oidc(OidcReject),
     Io(io::Error),
 }
 
@@ -59,46 +65,48 @@ impl From<io::Error> for AuthReject {
     }
 }
 
-/// Placeholder for the static-JWKS RS256 verifier auth T5 builds (spec §3).
-/// Nothing in this task constructs one — there is no `OidcConfig`/
-/// `App::with_oidc` yet — so every caller here passes `None`, and a
-/// two-dot bearer is always the unrecognized-credential reject (`resolve`'s
-/// `None` arm below). T5 replaces this type (likely relocating it into its
-/// own `auth::oidc` module, with real fields: parsed JWKS, issuer,
-/// audience) and `verify`'s body (RS256 signature check, then `iss`/`aud`/
-/// `exp`/`nbf` claims). The method's signature — pure over `(token, now)`,
-/// returning an ephemeral `Principal { via: Via::Oidc }` on success or an
-/// `AuthReject` naming which check failed — is the hook this task fixes;
-/// T5 fills it in without reshaping `resolve` (T5 may still enrich
-/// `AuthReject` with per-check variants — that's additive, not a reshape).
-pub struct OidcVerifier;
-
-impl OidcVerifier {
-    pub fn verify(&self, token: &str, now: u64) -> Result<Principal, AuthReject> {
-        let _ = (token, now);
-        unimplemented!("auth T5: static-JWKS RS256 verification (spec §3)")
-    }
+/// Where a resolved credential came from — the source that scopes the OIDC
+/// rung (spec §2 rung 1: the Authorization bearer header ONLY). A
+/// `charpente_session` cookie always goes down the hash path (`ApiKey` then
+/// `Session`) even if its value happens to contain two dots; only a
+/// `Bearer` token is ever judged as a JWT.
+pub enum Presented {
+    Bearer(String),
+    Cookie(String),
+    None,
 }
 
-/// The resolution ladder. `token` is whatever the caller already resolved
-/// from `Authorization: Bearer <t>` or the `charpente_session` cookie
-/// (mirroring `bearer_or_cookie`'s merge today) — both sources run the same
-/// ladder here, JWT-shape rung included.
+/// The resolution ladder. `presented` is whatever the caller already
+/// resolved from `Authorization: Bearer <t>` or the `charpente_session`
+/// cookie (`bearer_or_cookie`), tagged with its source so the two-dot
+/// JWT-shape check applies to a bearer only.
 pub fn resolve(
     tx: &mut Tx,
-    token: Option<&str>,
+    presented: &Presented,
     oidc: Option<&OidcVerifier>,
     now: u64,
 ) -> Result<Option<Principal>, AuthReject> {
-    let Some(token) = token else {
-        return Ok(None);
+    let token = match presented {
+        Presented::None => return Ok(None),
+        Presented::Bearer(token) => {
+            if token.matches('.').count() == 2 {
+                return match oidc {
+                    Some(verifier) => verifier
+                        .verify(token, now)
+                        .map(|subject| {
+                            Some(Principal {
+                                subject,
+                                via: Via::Oidc,
+                            })
+                        })
+                        .map_err(AuthReject::Oidc),
+                    None => Err(AuthReject::Unrecognized),
+                };
+            }
+            token.as_str()
+        }
+        Presented::Cookie(token) => token.as_str(),
     };
-    if token.matches('.').count() == 2 {
-        return match oidc {
-            Some(verifier) => verifier.verify(token, now).map(Some),
-            None => Err(AuthReject::Unrecognized),
-        };
-    }
     let hash = hash_token(token);
     if let Some(key) = ApiKey::by_key_hash(tx, &hash)?.into_iter().next() {
         return Ok(Some(Principal {

@@ -17,6 +17,8 @@ use std::io;
 use charpente_core::db::Event;
 use charpente_core::table::Id;
 
+use crate::auth::OidcReject;
+
 // ---------------------------------------------------------------- method
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -263,6 +265,10 @@ pub enum ApiError {
     /// distinct from `UnrecognizedCredential` (no match at all): the client
     /// had a real session, it just aged out.
     SessionExpired,
+    /// A two-dot bearer, judged as a JWT, failed OIDC verification — the
+    /// per-check 401 text lives on `OidcReject` itself (spec §6); this
+    /// variant is the one mapping seam from `AuthReject::Oidc`.
+    Oidc(OidcReject),
     NotFound,
     Internal(String),
 }
@@ -287,6 +293,7 @@ impl ApiError {
                 "unrecognized credential — it may have been revoked; obtain a new one",
             ),
             ApiError::SessionExpired => Response::error(401, "session expired — log in again"),
+            ApiError::Oidc(reject) => Response::error(401, &reject.to_string()),
             ApiError::NotFound => Response::error(404, "not found"),
             ApiError::Internal(msg) => Response::error(500, msg),
         }
