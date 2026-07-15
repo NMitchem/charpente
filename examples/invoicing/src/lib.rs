@@ -11,8 +11,8 @@ use charpente::http::{App, AppConfig};
 use charpente::{Schema, jobs as jobs_macro, routes as routes_macro};
 use jobs::{AdvanceDay, SendOverdueReminder, SendReceipt};
 use routes::{
-    create_customer, create_invoice, finalize_invoice, get_customer, get_invoice, list_customers,
-    list_invoices, login, record_payment,
+    create_customer, create_invoice, events_feed, finalize_invoice, get_customer, get_invoice,
+    list_customers, list_invoices, login, record_payment,
 };
 use std::time::Duration;
 
@@ -43,6 +43,7 @@ pub fn build_app(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> std::io::Res
             list_invoices,
             finalize_invoice,
             record_payment,
+            events_feed,
         ])
         .mount_jobs(jobs_macro![SendReceipt, SendOverdueReminder, AdvanceDay])
         .schedule("daily-overdue-check", DAILY_TICK, || AdvanceDay {}))

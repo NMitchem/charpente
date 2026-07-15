@@ -1,7 +1,7 @@
 use charpente::View;
 use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::{Codec, Id};
-use charpente::http::{App, Method, Request};
+use charpente::http::{App, Cursor, Method, Request};
 use charpente::kernel::{Kernel, SimSource};
 use charpente_sim::checks::{is_fault_fallout, replays_identically};
 use charpente_sim::{FaultConfig, Sim};
@@ -18,6 +18,7 @@ charpente_sim::sim_tests! {
     receipts_exactly_once require ["kernel:served"],
     overdue_reminders_over_months require ["reminder:sent"],
     illegal_transitions_are_rejected,
+    events_feed_resumes_across_restart,
 }
 
 fn build(sim: &Sim) -> std::io::Result<App> {
@@ -558,6 +559,151 @@ fn illegal_transitions_are_rejected(sim: &mut Sim) -> Result<(), String> {
         return Err(format!(
             "expected total_cents=100, got {}",
             paid_view["total_cents"]
+        ));
+    }
+    Ok(())
+}
+
+// ---- 6. an org's SSE feed resumes exactly across a crash/restart ----------
+
+/// GUIDE §11's exact-resume property, at the app level: a subscriber to
+/// `/events/feed` that reconnects with its last-received cursor after a
+/// crash sees every event its org emitted, no gap and no duplicate — even
+/// though the whole process (and the live SSE connection with it) died in
+/// between. Deterministic like `illegal_transitions_are_rejected`: this is
+/// about the resume guarantee itself, not fault-tolerance under injection,
+/// so it drives its own fault-free `Sim` from this universe's seed.
+fn events_feed_resumes_across_restart(sim: &mut Sim) -> Result<(), String> {
+    let seed = sim.seed();
+    let mut fresh = Sim::with_faults(seed, FaultConfig::none());
+
+    let app = invoicing::build_app(Box::new(fresh.disk()), Box::new(fresh.entropy()))
+        .map_err(|e| e.to_string())?;
+    let mut kernel = Kernel::new(app, Box::new(fresh.clock())).map_err(|e| e.to_string())?;
+    let token = login(&mut kernel, &mut fresh)?
+        .ok_or_else(|| "login did not ack under FaultConfig::none()".to_string())?;
+    let auth = format!("Bearer {token}");
+
+    let mut source = SimSource::new(Box::new(fresh.clock()), 10 * SEC);
+    source.push_at(
+        0,
+        Request::new(Method::Get, "/events/feed").header("authorization", &auth),
+    );
+    source.push_at(
+        SEC,
+        Request::new(Method::Post, "/customers/1")
+            .header("authorization", &auth)
+            .json(&CreateCustomerBody {
+                name: "Acme".into(),
+                email: "acme@example.com".into(),
+            }),
+    );
+    source.push_at(
+        2 * SEC,
+        Request::new(Method::Post, "/invoices/1")
+            .header("authorization", &auth)
+            .json(&CreateInvoiceBody {
+                customer: 1,
+                due_day: 30,
+                line_items: vec![LineItemInput {
+                    description: "Widget".into(),
+                    unit_amount_cents: 500,
+                    quantity: 2,
+                }],
+            }),
+    );
+    source.push_at(
+        3 * SEC,
+        Request::new(Method::Post, "/invoices/1/finalize").header("authorization", &auth),
+    );
+    let sinks = source.sinks();
+    kernel.run(&mut source).map_err(|e| e.to_string())?;
+
+    // `finalize` emits `InvoiceFinalized` directly; its enqueued `SendReceipt`
+    // job runs inline on the same kernel loop and emits `ReceiptSent` — both
+    // land inside this one `kernel.run` call (no extra virtual time needed).
+    let received_before = {
+        let handles = sinks
+            .lock()
+            .map_err(|_| "sink handles lock poisoned".to_string())?;
+        if handles.is_empty() {
+            return Err("the subscribe never upgraded to SSE".to_string());
+        }
+        handles[0].frames()
+    };
+    let names_before: Vec<&str> = received_before.iter().map(|f| f.name).collect();
+    if names_before != ["invoice_finalized", "receipt_sent"] {
+        return Err(format!(
+            "expected [invoice_finalized, receipt_sent] before the restart, got {names_before:?}"
+        ));
+    }
+    let resume_cursor = {
+        let last = received_before.last().expect("checked above: len 2");
+        Cursor {
+            id: last.id,
+            seq: last.seq,
+        }
+        .wire()
+    };
+    let before_ids: BTreeSet<u64> = received_before.iter().map(|f| f.id).collect();
+
+    fresh.restart(); // power-cycles the simulated disk: the live connection dies with the process
+    drop(kernel);
+
+    let app = invoicing::build_app(Box::new(fresh.disk()), Box::new(fresh.entropy()))
+        .map_err(|e| e.to_string())?;
+    let mut kernel = Kernel::new(app, Box::new(fresh.clock())).map_err(|e| e.to_string())?;
+
+    let mut source = SimSource::new(Box::new(fresh.clock()), 10 * SEC);
+    // The bearer token is durable (login acked before anything else ran), so
+    // the reconnect needs no fresh login — exactly what a real client gets:
+    // its session outlives the crash, and so does its resume cursor.
+    source.push_at(
+        0,
+        Request::new(Method::Get, format!("/events/feed?cursor={resume_cursor}"))
+            .header("authorization", &auth),
+    );
+    source.push_at(
+        SEC,
+        Request::new(Method::Post, "/invoices/2")
+            .header("authorization", &auth)
+            .json(&CreateInvoiceBody {
+                customer: 1,
+                due_day: 30,
+                line_items: vec![LineItemInput {
+                    description: "Gadget".into(),
+                    unit_amount_cents: 1000,
+                    quantity: 1,
+                }],
+            }),
+    );
+    source.push_at(
+        2 * SEC,
+        Request::new(Method::Post, "/invoices/2/finalize").header("authorization", &auth),
+    );
+    let sinks = source.sinks();
+    kernel.run(&mut source).map_err(|e| e.to_string())?;
+
+    let received_after = {
+        let handles = sinks
+            .lock()
+            .map_err(|_| "sink handles lock poisoned".to_string())?;
+        if handles.is_empty() {
+            return Err("the resumed subscribe never upgraded to SSE".to_string());
+        }
+        handles[0].frames()
+    };
+    let names_after: Vec<&str> = received_after.iter().map(|f| f.name).collect();
+    if names_after != ["invoice_finalized", "receipt_sent"] {
+        return Err(format!(
+            "expected [invoice_finalized, receipt_sent] after the resume, got {names_after:?} \
+             — a gap or a duplicate in the resumed tail"
+        ));
+    }
+    if let Some(dup) = received_after.iter().find(|f| before_ids.contains(&f.id)) {
+        return Err(format!(
+            "resumed tail re-delivered event {} — already seen before the restart",
+            dup.id
         ));
     }
     Ok(())

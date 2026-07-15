@@ -6,17 +6,19 @@ use crate::model::{
     APP_CLOCK_ID, AppClock, Invoice, InvoiceState, LineItem, REMINDER_SEQ, Receipt, Reminder,
     next_id,
 };
-use charpente::core::table::Codec;
 use charpente::kernel::JobError;
-use charpente::{Event, Id, Tx, View, job};
-use std::io;
+use charpente::{Id, Tx, View, event, job};
 
 /// Enqueued once, in the same transaction as `finalize_invoice` (routes.rs).
 /// "Sending" a receipt means writing a `Receipt` row and emitting an event —
-/// there is no external IO in this app (brief).
+/// there is no external IO in this app (brief). `org` rides along because a
+/// job has no `Ctx`/session of its own (GUIDE §6) — `finalize_invoice`
+/// carries the caller's org key through so `ReceiptSent` can be emitted
+/// keyed to the same org `InvoiceFinalized` was.
 #[job]
 pub struct SendReceipt {
     pub invoice: u64,
+    pub org: String,
 }
 
 impl SendReceipt {
@@ -40,35 +42,21 @@ impl SendReceipt {
             amount_cents,
             issued_day: day,
         });
-        tx.emit(ReceiptSent {
-            invoice: self.invoice,
-            amount_cents,
-        });
+        tx.emit_keyed(
+            self.org,
+            ReceiptSent {
+                invoice: self.invoice,
+                amount_cents,
+            },
+        );
         Ok(())
     }
 }
 
+#[event]
 pub struct ReceiptSent {
     pub invoice: u64,
     pub amount_cents: i64,
-}
-
-impl Codec for ReceiptSent {
-    fn encode(&self, out: &mut Vec<u8>) {
-        self.invoice.encode(out);
-        self.amount_cents.encode(out);
-    }
-
-    fn decode(input: &mut &[u8]) -> io::Result<Self> {
-        Ok(ReceiptSent {
-            invoice: u64::decode(input)?,
-            amount_cents: i64::decode(input)?,
-        })
-    }
-}
-
-impl Event for ReceiptSent {
-    const NAME: &'static str = "receipt_sent";
 }
 
 /// One per overdue Final invoice, enqueued from `AdvanceDay`'s own

@@ -4,32 +4,18 @@
 //! or `String`, see FINDINGS.md), so this sidesteps the open question of
 //! whether `Id<T>` itself implements `serde::Serialize`.
 
-use crate::jobs::SendReceipt;
+use crate::jobs::{ReceiptSent, SendReceipt};
 use crate::model::{
     APP_CLOCK_ID, AppClock, Customer, Invoice, InvoiceState, LINE_ITEM_SEQ, LineItem, next_id,
 };
 use charpente::core::table::Id;
-use charpente::http::{ApiError, Ctx};
-use charpente::{Tx, View, route};
+use charpente::http::{ApiError, Ctx, Cursor, Subscription};
+use charpente::{Tx, View, event, route};
 use serde::{Deserialize, Serialize};
 
+#[event]
 pub struct InvoiceFinalized {
     pub invoice: u64,
-}
-
-impl charpente::core::table::Codec for InvoiceFinalized {
-    fn encode(&self, out: &mut Vec<u8>) {
-        self.invoice.encode(out);
-    }
-    fn decode(input: &mut &[u8]) -> std::io::Result<Self> {
-        Ok(InvoiceFinalized {
-            invoice: u64::decode(input)?,
-        })
-    }
-}
-
-impl charpente::Event for InvoiceFinalized {
-    const NAME: &'static str = "invoice_finalized";
 }
 
 // ---- Customers ----------------------------------------------------------
@@ -228,7 +214,7 @@ pub fn list_invoices(tx: &mut Tx) -> Result<Vec<InvoiceView>, ApiError> {
 }
 
 #[route(POST "/invoices/:id/finalize", auth)]
-pub fn finalize_invoice(tx: &mut Tx, id: Id<Invoice>) -> Result<InvoiceView, ApiError> {
+pub fn finalize_invoice(tx: &mut Tx, id: Id<Invoice>, ctx: &Ctx) -> Result<InvoiceView, ApiError> {
     let mut inv = tx.get(id)?.ok_or(ApiError::NotFound)?;
     if inv.state != InvoiceState::Draft {
         return Err(ApiError::BadRequest(format!(
@@ -239,8 +225,21 @@ pub fn finalize_invoice(tx: &mut Tx, id: Id<Invoice>) -> Result<InvoiceView, Api
     }
     inv.state = InvoiceState::Final;
     tx.put(&inv);
-    tx.enqueue(SendReceipt { invoice: id.raw() });
-    tx.emit(InvoiceFinalized { invoice: id.raw() });
+    // The org key scoping `/events/feed` (below): this app has no separate
+    // org table, so the logged-in session's own subject stands in for the
+    // tenant identity — every event an org's data produces is emitted keyed
+    // to it, and `SendReceipt` carries it through to the job that emits
+    // `ReceiptSent` later (jobs have no `Ctx` of their own).
+    let org = ctx
+        .session()
+        .expect("auth routes always have a session")
+        .subject
+        .clone();
+    tx.enqueue(SendReceipt {
+        invoice: id.raw(),
+        org: org.clone(),
+    });
+    tx.emit_keyed(org, InvoiceFinalized { invoice: id.raw() });
     Ok(invoice_view(tx, &inv)?)
 }
 
@@ -265,4 +264,28 @@ pub fn current_day(tx: &mut Tx) -> std::io::Result<u64> {
     Ok(tx
         .get(Id::<AppClock>::from_raw(APP_CLOCK_ID))?
         .map_or(0, |c| c.day))
+}
+
+// ---- Realtime -------------------------------------------------------------
+
+/// One org-scoped feed of both realtime events this app emits — GUIDE §11.
+/// `auth` is what makes an org key available at all: the caller's own
+/// session subject *is* the org key `finalize_invoice` emitted with, so a
+/// caller only ever tails its own org's events, never anyone else's.
+#[route(SSE "/events/feed", auth)]
+pub fn events_feed(
+    tx: &mut Tx,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let _ = tx;
+    let org = ctx
+        .session()
+        .expect("auth routes always have a session")
+        .subject
+        .clone();
+    Ok(Subscription::of::<InvoiceFinalized>()
+        .and::<ReceiptSent>()
+        .key(org)
+        .cursor(cursor))
 }
