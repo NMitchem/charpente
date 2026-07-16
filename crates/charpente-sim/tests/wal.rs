@@ -1277,6 +1277,138 @@ fn gc_interrupted_by_crash_never_leaves_a_gap() {
     );
 }
 
+// -------------------------------------- recovery-cut atomicity (interlude)
+//
+// Regression for the recovery-cut atomicity bug found via replication seed
+// 0x4177819b4a2ba984: a non-tail cut used to truncate the cut segment BEFORE
+// removing orphaned later segments. Truncation and removal are two separate
+// durability events, and a crash that stranded the (now durable) truncation
+// before the removals left a durable gap [shortened segment, surviving
+// orphan] — which the gaplessness check then refuses to recover across,
+// bricking the node on above-horizon data it was entitled to discard. The
+// fix removes orphans first (highest base first, each barriered), truncating
+// last, so every crash-intermediate is a contiguous prefix.
+//
+// This constructs the exact vulnerable state (a non-tail, above-horizon
+// corrupt frame → a cut with orphaned later segments) and injects a crash at
+// EVERY op index of recovery — including each durability point of the cut
+// path — asserting recovery always completes idempotently to the pre-cut
+// prefix and NEVER produces the gap refusal. `crash_apply = 1.0` is the
+// investigation's mechanism precisely: an unsynced op fully persists on the
+// power cycle (bytes reached the platter, fsync just never confirmed), so a
+// truncation that outran its removals STAYS a durable gap — the property is
+// RED against truncate-then-remove and green only once the order is fixed.
+
+/// Builds a 10-segment log (tiny 64 B segments, 8 B payloads = 24 B frames, 2
+/// per segment: seqs {0,1},{2,3},{4,5},…,{18,19}), then corrupts seq 5 (the
+/// 2nd frame of segment base 4, a non-tail segment). Recovery with a horizon
+/// below seq 5 then makes an above-horizon, non-tail cut at offset 24 of
+/// segment base 4, with orphaned segments base 6..=18 to remove — the shape
+/// the fix protects.
+fn build_corrupted_multi_segment_log(dir_entry_loss: f64) -> Sim {
+    let sim = Sim::with_faults(
+        0x4C07_A701,
+        FaultConfig {
+            crash_apply: 1.0,
+            dir_entry_loss,
+            ..FaultConfig::none()
+        },
+    );
+    {
+        let mut wal = Wal::open(Box::new(sim.disk()), tiny_segments(), |_, _| Ok(())).unwrap();
+        for i in 0..20u64 {
+            wal.append(&[(i % 251) as u8; 8]).unwrap();
+            wal.sync().unwrap();
+        }
+    }
+    // Flip a durable, synced payload byte of seq 5 (segment base 4, 2nd frame
+    // at offset 24; 16 B header, so the payload starts at 40). An
+    // above-horizon non-tail cut, deterministically.
+    let seg = sim.disk().open("wal/00000000000000000004.log").unwrap();
+    let mut byte = [0u8; 1];
+    seg.read_at(24 + 16, &mut byte).unwrap();
+    seg.write_at(24 + 16, &[byte[0] ^ 0xFF]).unwrap();
+    seg.sync().unwrap();
+    sim
+}
+
+/// Recovers with horizon 4 (seq 5 sits above it, so the corruption is a cut,
+/// not the below-horizon hard error), retrying restart-and-recover through
+/// injected faults. Returns the recovered seqs. Asserts the negative space —
+/// recovery must NEVER report the gap refusal (that would mean the cut left a
+/// durable gap), and any other failure must be recognized fault fallout.
+fn recover_prefix_or_gap(sim: &Sim, at: u64) -> Vec<u64> {
+    for _ in 0..8 {
+        let mut got = Vec::new();
+        match Wal::open_with_horizon(Box::new(sim.disk()), tiny_segments(), Some(4), |seq, _| {
+            got.push(seq);
+            Ok(())
+        }) {
+            Ok(_) => return got,
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !(msg.contains("a segment is missing") || msg.contains("refusing to guess")),
+                    "crash@{at}: recovery cut left a durable gap — orphaned segment survived a \
+                     truncation: {msg}"
+                );
+                assert!(
+                    is_fault_fallout(&msg),
+                    "crash@{at}: unexpected non-fallout recovery error: {msg}"
+                );
+                sim.restart();
+            }
+        }
+    }
+    panic!("crash@{at}: recovery never completed in 8 restart attempts");
+}
+
+fn scan_recovery_cut_crash_points(dir_entry_loss: f64) {
+    // Baseline (no crash): the cut recovers exactly seqs 0..=4 and removes the
+    // seven orphaned segments, leaving bases 0, 2, 4 — the state every crashed
+    // run must converge to.
+    let sim = build_corrupted_multi_segment_log(dir_entry_loss);
+    assert_eq!(recover_prefix_or_gap(&sim, u64::MAX), vec![0, 1, 2, 3, 4]);
+    assert_eq!(
+        sim.disk().list("wal/").unwrap().len(),
+        3,
+        "the cut removes every orphaned later segment (bases 0, 2, 4 remain)"
+    );
+
+    // Crash at every op index of recovery, spanning the whole cut path
+    // (orphan removals, each barrier, the truncation, its sync). Each run must
+    // finish idempotently at the same prefix and never gap.
+    for at in 0..48u64 {
+        let sim = build_corrupted_multi_segment_log(dir_entry_loss);
+        sim.crash_disk_after(at);
+        assert_eq!(
+            recover_prefix_or_gap(&sim, at),
+            vec![0, 1, 2, 3, 4],
+            "crash@{at}: recovery must be idempotent to the pre-cut prefix"
+        );
+        // A second, clean recovery must see the same durable prefix — the
+        // recovered directory is stable, not merely reachable once.
+        assert_eq!(recover_prefix_or_gap(&sim, at), vec![0, 1, 2, 3, 4]);
+    }
+}
+
+#[test]
+fn recovery_cut_never_leaves_a_gap_at_any_crash_point() {
+    // Un-barriered removes stick (dir_entry_loss = 0.0): the exact
+    // investigation mechanism. Truncate-then-remove leaves the gap here.
+    scan_recovery_cut_crash_points(0.0);
+}
+
+#[test]
+fn recovery_cut_survives_orphan_resurrection() {
+    // dir_entry_loss forced hot: a crash mid-removal resurrects the
+    // most-recently-removed (un-barriered) orphan. Removing highest base first
+    // and barriering each keeps the resurrected orphan adjacent to the
+    // retained prefix — never a gap — and recovery re-removes it. The same
+    // exposure `gc` already accepts (module docs), now proven for the cut path.
+    scan_recovery_cut_crash_points(1.0);
+}
+
 #[test]
 fn recovery_propagates_apply_failure() {
     let sim = quiet_sim();

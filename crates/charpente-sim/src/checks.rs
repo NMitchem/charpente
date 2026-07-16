@@ -56,6 +56,20 @@ pub fn durable_corruption_fired(sim: &Sim) -> bool {
             > 0
 }
 
+/// True when the `dir_entry_loss` axis actually fired in this universe — a
+/// pending directory create vanished, or a pending removal resurrected
+/// (`FaultConfig.dir_entry_loss`, coverage key `fault:dir-entry`). The
+/// fire-time-marked companion to that axis, the same discipline as
+/// `durable_corruption_fired`: a workload that routes a recovery gap
+/// (`Db::open`'s "a segment is missing … refusing to guess") to a restore
+/// path must do so ONLY when entry loss could have gapped the directory. With
+/// the recovery-cut ordering fixed (log.rs), the platform never itself leaves
+/// a durable gap, so a gap without this axis firing is a genuine platform
+/// regression that must fail loud — not be masked as a routine restore.
+pub fn dir_entry_loss_fired(sim: &Sim) -> bool {
+    sim.coverage().get("fault:dir-entry").copied().unwrap_or(0) > 0
+}
+
 /// Determinism oracle: runs `workload` twice, each on its own fresh
 /// `Sim::new(seed)` world, and asserts both the returned value and the
 /// durable end-state (`Sim::durable_fingerprint`) match. Always constructs
@@ -203,6 +217,45 @@ mod tests {
         file.sync().unwrap();
         sim.restart();
         assert!(durable_corruption_fired(&sim));
+    }
+
+    // ------------------------------------------------ dir_entry_loss_fired
+
+    #[test]
+    fn dir_entry_loss_fired_tracks_the_dir_entry_axis() {
+        use crate::FaultConfig;
+
+        // Quiet world: nothing fired.
+        let sim = Sim::with_faults(0xD1E_0001, FaultConfig::none());
+        assert!(!dir_entry_loss_fired(&sim));
+
+        // A crash with the axis off, even with a pending removal, never fires
+        // it (zero-draw fast path — the frozen replay contract).
+        let sim = Sim::with_faults(0xD1E_0002, FaultConfig::none());
+        let file = sim.disk().open("wal/f").unwrap();
+        file.write_at(0, b"x").unwrap();
+        file.sync().unwrap();
+        sim.disk().sync_dir("wal/").unwrap();
+        sim.disk().remove("wal/f").unwrap();
+        sim.restart();
+        assert!(!dir_entry_loss_fired(&sim));
+
+        // The axis forced hot: an un-barriered removal resurrects at the
+        // crash and marks the coverage key.
+        let sim = Sim::with_faults(
+            0xD1E_0003,
+            FaultConfig {
+                dir_entry_loss: 1.0,
+                ..FaultConfig::none()
+            },
+        );
+        let file = sim.disk().open("wal/f").unwrap();
+        file.write_at(0, b"x").unwrap();
+        file.sync().unwrap();
+        sim.disk().sync_dir("wal/").unwrap();
+        sim.disk().remove("wal/f").unwrap();
+        sim.restart();
+        assert!(dir_entry_loss_fired(&sim));
     }
 
     // ---------------------------------------------------- replays_identically

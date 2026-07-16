@@ -202,10 +202,13 @@ capability is in scope inside a transaction).
 **Log format (v0, implemented).** Frames of `[seq u64][len u32][crc32 u32][payload]`
 (crc over all three) in segments named `wal/<base_seq:020>.log`; rotation syncs the old
 segment before the new one takes writes, so a tail `sync` is a whole-log durability
-barrier. Recovery scans in order, cuts at the first invalid frame, truncates there and
-syncs the truncation before accepting appends (load-bearing: without it, a same-length
-discarded frame beyond the cut can be resurrected by a later recovery, checksum-valid and
-seq-correct), and deletes later segments. Any IO failure poisons the log — fsync results
+barrier. Recovery scans in order and cuts at the first invalid frame: it deletes the
+orphaned later segments first (highest base first, each `sync_dir`-barriered) and only
+then truncates the cut segment, syncing the truncation before accepting appends. The
+truncation-sync is load-bearing (without it, a same-length discarded frame beyond the cut
+can be resurrected by a later recovery, checksum-valid and seq-correct); the
+delete-before-truncate order is a fence in its own right (fence 3, below). Any IO failure
+poisons the log — fsync results
 cannot honestly be retried (fsyncgate); the only exit from poison is restart-and-recover,
 and recovery is idempotent. The apply loop (`Engine`) holds the standing invariant:
 machine state ≡ fold(apply, durable records) — submit is append → sync → apply → ack.
@@ -213,7 +216,7 @@ The log gains a verified read surface for the shipper (`Wal::read_from`/`Db::rea
 M1 replication T3): re-checksums every frame it hands back and refuses, by name, to hand
 back one that fails — a frame corrupted on disk after append must never travel.
 
-**Two durability fences.** (1) *Held (recovery-horizon rule).* A cut can only ever
+**Three durability fences.** (1) *Held (recovery-horizon rule).* A cut can only ever
 discard unacknowledged data, so recovery must tell a torn tail from mid-log corruption
 of committed frames. `Db::open` reads the store's `applied_seq` before recovery — the
 durable horizon — and threads it through `Engine::recover` into
@@ -247,6 +250,17 @@ the field is 0.0 (its default), so every pre-existing pinned seed replays unchan
 log barriers rotation (before the new segment takes writes) and post-cut recovery cleanup
 (a durably-clean directory after truncation); the store barriers creation and the
 rebuild-discard-then-reopen path. Coverage key `fault:dir-entry`.
+(3) *Held (recovery-cut ordering).* A non-tail cut truncates one segment and removes the
+orphaned later ones — two separate durability events. Truncating first strands a durable
+gap whenever a crash keeps the truncation but drops the removals: a shortened segment
+beside a surviving orphan, which the gaplessness check (fence 1's `refusing to guess`)
+then refuses to recover across, bricking the node on data it was entitled to discard.
+Recovery removes the orphans first — highest base first, each `sync_dir`-barriered,
+exactly as `gc` removes ascending — and truncates last, so every crash-intermediate is a
+contiguous prefix, recovery re-finds the same cut, and it is idempotent at every crash
+point (found by replication seed 0x4177819b4a2ba984; the test-side restore path that had
+masked it now gates on `checks::dir_entry_loss_fired`, so a platform-created gap fails
+loud again).
 
 **Record payload (v0, implemented).** A committed transaction's effects:
 `[n: u32]` then n tagged effects — put `0x00 [table][row]`, delete

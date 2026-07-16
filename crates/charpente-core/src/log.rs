@@ -10,16 +10,27 @@
 //! so an unbarriered rotation could lose a synced segment's name at crash
 //! (DESIGN §2).
 //!
-//! Recovery scans frames in order and stops at the first invalid one: the
-//! rest of that segment is truncated and later segments are deleted — they
-//! hold only unacknowledged or stale data. The truncation is synced before
-//! the log accepts appends; this is load-bearing. Without it, a discarded
-//! frame of the same length as its replacement can survive beyond the new
-//! frame, checksum-valid and seq-correct, and a later recovery would
-//! resurrect a record this recovery chose to discard. The deletions are
-//! themselves barriered with `sync_dir` — a later-segment name resurrected by
-//! an unsynced removal would reintroduce the exact stale data the cut just
-//! discarded.
+//! Recovery scans frames in order and stops at the first invalid one: later
+//! segments hold only unacknowledged or stale data and are deleted, and the
+//! cut segment is truncated at the invalid frame. Two orderings are
+//! load-bearing. (1) The later segments are removed FIRST — highest base
+//! first, each barriered with `sync_dir` before the next (`gc`'s discipline)
+//! — and only then is the cut segment truncated. Shortening the cut segment
+//! while a later segment still exists on disk risks a durable gap: truncation
+//! and removal are separate durability events, so a crash between them that
+//! keeps the truncation but drops the removals strands a shortened segment
+//! beside a surviving orphan — a gap the gaplessness check then refuses to
+//! recover across, bricking the node on data it was entitled to discard.
+//! Remove-then-truncate makes every crash-intermediate a contiguous prefix
+//! instead, so recovery re-finds this exact cut and is idempotent at every
+//! crash point (found via replication seed 0x4177819b4a2ba984). (2) The
+//! truncation is synced before the log accepts appends. Without it, a
+//! discarded frame of the same length as its replacement can survive beyond
+//! the new frame, checksum-valid and seq-correct, and a later recovery would
+//! resurrect a record this recovery chose to discard. Each removal is
+//! barriered with `sync_dir` for the reason `gc` is — a later-segment name
+//! resurrected by an unsynced removal would reintroduce the exact stale data
+//! the cut just discarded (and, now, reopen the gap the ordering closes).
 //!
 //! Any IO failure poisons the log: after a failed fsync the durability of
 //! prior writes is unknown and retrying cannot honestly clear that (the
@@ -183,13 +194,50 @@ impl Wal {
             };
             match cut {
                 Some(cut) => {
+                    // Orphaned later segments hold only post-cut data and go
+                    // FIRST — highest base first, each barriered with `sync_dir`
+                    // before the next, exactly as `gc` removes ascending and
+                    // barriers each. Only once every later segment is durably
+                    // gone is the cut segment truncated: the order is the
+                    // invariant. Truncating first would make the truncation and
+                    // the removals two separate durability events in the wrong
+                    // order — a crash that keeps the truncation but drops the
+                    // removals leaves a shortened segment beside a surviving
+                    // orphan, a durable gap the gaplessness check then refuses
+                    // to recover across (seed 0x4177819b4a2ba984). Removing
+                    // highest-first keeps every crash-intermediate a contiguous
+                    // prefix, so recovery re-finds this exact cut and is
+                    // idempotent at every crash point (module docs).
+                    let later = &names[index + 1..];
+                    for name in later.iter().rev() {
+                        disk.remove(name)?;
+                        disk.sync_dir(&prefix)?;
+                    }
+                    if !later.is_empty() {
+                        // Negative space, checked against the disk itself: no
+                        // segment past the cut point may still exist before the
+                        // truncation runs. A `list` fault here is ordinary
+                        // recovery fallout (`?`); a surviving later segment is
+                        // a broken invariant (a `remove` returned Ok yet left
+                        // the name), never recovered around.
+                        let remaining = disk.list(&prefix)?;
+                        assert!(
+                            remaining
+                                .iter()
+                                .all(|n| match parse_segment_name(&cfg.dir, n) {
+                                    Ok(other) => other <= base,
+                                    Err(_) => true, // foreign files are refused elsewhere
+                                }),
+                            "recovery is about to shorten segment {base} while a later segment \
+                             still exists — orphaned segments must be removed before the cut \
+                             segment is truncated (gaplessness, seed 0x4177819b4a2ba984): \
+                             {remaining:?}"
+                        );
+                    }
                     if cut < len {
                         // Load-bearing truncation; see the module docs.
                         file.set_len(cut)?;
                         file.sync()?;
-                    }
-                    for later in &names[index + 1..] {
-                        disk.remove(later)?;
                     }
                     disk.sync_dir(&prefix)?; // recovery leaves a durably-clean directory
                     tail = Some((file, cut));

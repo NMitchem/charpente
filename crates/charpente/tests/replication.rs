@@ -20,7 +20,7 @@ use charpente::{Db, DbConfig, Id, Job, Schema, TxError, table};
 use charpente_core::io::{Clock, Conn, Disk, Net};
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::table::{Codec, Row};
-use charpente_sim::checks::is_fault_fallout;
+use charpente_sim::checks::{dir_entry_loss_fired, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim, SimClock, SimHost, run_universes_swarm_with};
 
 // ------------------------------------------------------------- fixtures
@@ -2506,8 +2506,15 @@ fn recover_kernel_node(sim: &Sim, node: &mut KNode) -> Result<(), String> {
             // A vanished base segment (dir_entry_loss lost the entry naming a
             // low segment, leaving a gap Db::open refuses to guess across): the
             // local log directory is damaged unrecoverably — same restore path
-            // (workload-model finding, seed 0x6b3de0f93ddc2a36).
-            Err(e) if e.contains("refusing to guess") => {
+            // (workload-model finding, seed 0x6b3de0f93ddc2a36). Gated on the
+            // axis having ACTUALLY fired (fire-time-marked, `durable_corruption_
+            // fired`'s discipline): with the recovery-cut ordering fixed
+            // (log.rs, seed 0x4177819b4a2ba984) the platform never itself
+            // leaves a durable gap, so this restore excuse is legitimate only
+            // when entry loss could have caused the gap. A gap in a universe
+            // where the axis never fired is a platform regression — it falls
+            // through to the loud bug arm below, not this mask.
+            Err(e) if e.contains("refusing to guess") && dir_entry_loss_fired(sim) => {
                 return Err(format!(
                     "{RESTORE_NEEDED}: {} log directory gapped by entry loss",
                     node.name
@@ -3103,19 +3110,68 @@ fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
 
         // The corruption trigger: crash + restart p (bit_flip rolls on p's
         // wal/ at restart). Recovery may cut above the horizon (silent loss,
-        // pre-M1) or hard-error below it (the restore path).
+        // pre-M1) or hard-error below it (the restore path). Random bit_flip
+        // alone drives the above-horizon cut only when its byte lands in p's
+        // narrow applied-but-uncheckpointed window (`checkpoint_every` 8), so
+        // it fires by luck of the fault schedule — fragile, and a stream shift
+        // (e.g. the recovery-cut ordering fix) can zero it out. To drive the
+        // above-horizon cut with honest margin we append, when p is the
+        // primary, one *sacrificial* request to p ALONE — stepping only p, so
+        // f is neither shipped it nor pulls it (and p's crash below drops any
+        // in-flight ship) — then deterministically corrupt p's new tail (that
+        // frame) with the rig's own `corrupt_last_wal_frame` (the sanctioned
+        // bit_flip stand-in from
+        // `a_seeded_follower_with_zero_frames_refuses_a_lossy_primary`). The
+        // sacrificial frame is applied (acked) and above the checkpoint, so
+        // recovery cuts it above the horizon (fired as the cover below via the
+        // `forced_cut` observable). Two things keep this from weakening the
+        // property: (1) f never
+        // held the sacrificial, so p re-appending at the cut seq next round is
+        // conflict-free — never a primary-diverges-behind-a-longer-follower
+        // (that scenario, which corrupting p's *converged* tail would
+        // manufacture, is the promote/failover path this property does not
+        // model and tests elsewhere); (2) the sacrificial id is untracked, so
+        // no oracle asserts it survives — an unshipped acked record legitimately
+        // dies in an above-horizon cut (DECISIONS §6's bounded-loss window).
+        // Gated on p actually being primary (after a restore f is primary and p
+        // a follower that would just 421); best-effort otherwise (an injected
+        // fault on the sacrificial means no forced cut that round — bit_flip
+        // still rolls and below-horizon rounds still restore).
+        let forced_cut = p.kernel.as_ref().is_some_and(|k| k.is_primary())
+            && matches!(
+                drive_request(
+                    sim,
+                    &mut [&mut p],
+                    0,
+                    Request::new(Method::Post, format!("/widget/{}", 10_000 + round)),
+                    KBUDGET,
+                ),
+                Ok((200, _))
+            );
         let last_before_crash = p.kernel.as_ref().and_then(|k| k.app().db().last_applied());
+        if forced_cut {
+            let _ = corrupt_last_wal_frame(&p.host);
+        }
         p.host.crash_now();
         match recover_kernel_node(sim, &mut p) {
             Ok(()) => {
                 // The headline path this property is named for: recovery
-                // succeeded (no RESTORE_NEEDED, the hard-error/restore path)
-                // but truncated a tail that had already been applied — a
-                // silent above-horizon cut, not a hard error. `require`d
-                // below so the batch fails by name if it never actually
-                // fires over the whole run.
+                // succeeded (no RESTORE_NEEDED / hard-error / restore path) yet
+                // discarded a durable, above-the-checkpoint frame — a silent
+                // above-horizon cut. Two observables of that one event, either
+                // fires the `require`d cover: (1) `forced_cut` — we corrupted
+                // an applied above-checkpoint tail above and recovery still
+                // returned Ok, which IS an above-horizon cut by construction (a
+                // below-horizon corruption would have returned RESTORE_NEEDED);
+                // (2) `last_after < last_before` — a natural bit_flip cut that
+                // also shrank the applied set. The first is the reliable driver
+                // (the second is a fragile proxy: recovery re-applies durable
+                // frames the pre-crash in-memory point hadn't yet, so a real
+                // cut can leave last_applied unchanged or higher — which is why
+                // it silently stopped firing after the recovery-cut stream
+                // shift, and why the forced observable exists).
                 let last_after = p.kernel.as_ref().and_then(|k| k.app().db().last_applied());
-                if last_after < last_before_crash {
+                if forced_cut || last_after < last_before_crash {
                     sim.cover("repl:above-horizon-cut");
                 }
             }
