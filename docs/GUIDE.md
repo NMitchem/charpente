@@ -2244,6 +2244,15 @@ A node's *effective* role lives in a durable role file on its data disk; the
 between the two is surfaced on stderr (the file wins — config never silently
 re-roles a node). `listen` is the node's replication address, a port distinct
 from its HTTP port; a node without one cannot be promoted remotely.
+`peer_secret` authenticates connections to this port: when `Some`, every
+inbound `Hello`/control verb must present the same secret (hashed and
+compared constant-time) or it is refused and the connection closed before any
+state changes; `None` accepts anything inbound. A node with `peer_secret` set
+always attaches it outbound, so a half-configured pair works in exactly one
+direction — configure the followers first, then the primary. The replication
+wire is plaintext TCP: `peer_secret` authenticates peers, it does not encrypt
+the link (a private network is the deployment assumption; transport
+encryption is a later milestone).
 
 `serve::serve_replicated` is `serve` plus replication: same HTTP edge, but the
 kernel also runs the replication engine. A `serve::backup` node runs the engine
@@ -2260,6 +2269,7 @@ fn run_primary(app: App) -> std::io::Result<()> {
     let cfg = ReplConfig {
         listen: Some("0.0.0.0:9090".to_string()),
         initial_role: Role::Primary,
+        peer_secret: Some("shared-with-every-follower".to_string()),
     };
     // HTTP on 8080, replication on 9090. Returns once both are up.
     serve::serve_replicated("0.0.0.0:8080", app, Box::new(ProdDisk::new("./data")?), cfg)?;
@@ -2272,6 +2282,7 @@ fn run_follower(app: App) -> std::io::Result<()> {
         initial_role: Role::Follower {
             primary: "primary-host:9090".to_string(),
         },
+        peer_secret: Some("shared-with-every-follower".to_string()),
     };
     serve::serve_replicated("0.0.0.0:8080", app, Box::new(ProdDisk::new("./data")?), cfg)?;
     Ok(())
@@ -2283,6 +2294,7 @@ fn run_backup(app: App) -> std::io::Result<()> {
         initial_role: Role::Backup {
             primary: "primary-host:9090".to_string(),
         },
+        peer_secret: Some("shared-with-every-follower".to_string()),
     };
     // A backup blocks on the current thread — no HTTP edge, no requests.
     serve::backup(app, Box::new(ProdDisk::new("./backup-data")?), cfg)
@@ -2326,20 +2338,24 @@ Both travel as control messages over the replication port, issued with the
 `charpente` CLI:
 
 ```bash
-charpente promote --node <addr>
-charpente switchover --primary <addr> --to <addr>
+charpente promote --node <addr> [--secret <s>]
+charpente switchover --primary <addr> --to <addr> [--secret <s>]
 ```
 
 `<addr>` is a node's *replication* address (`ReplConfig.listen`), never its
-HTTP port. Both verbs connect, send the control message, and poll for a reply
-up to the same 30s deadline the primary's own switchover drain is bound by
+HTTP port. `--secret` is the target node's `peer_secret` proof — required
+whenever that node is configured with one; absent, `None` is sent, which a
+`peer_secret: None` node accepts and a configured one refuses. Both verbs
+connect, send the control message, and poll for a reply up to the same 30s
+deadline the primary's own switchover drain is bound by
 (`SWITCHOVER_DEADLINE_NANOS`); the node's own words are the product surface,
 forwarded verbatim:
 
 - exit 0 — `CtrlOk`, printed to stdout (e.g. `promoted to primary at
   last_applied Some(41) — …`).
 - exit 1 — `CtrlErr` or `Refuse`, printed to stderr (a refusal: already
-  primary, no matching follower session, switchover deadline exceeded, …).
+  primary, no matching follower session, switchover deadline exceeded, a
+  missing/mismatched `--secret`, …).
 - exit 2 — usage, connect, or timeout failure (bad flags, the node
   unreachable, no reply before the deadline) — never a node-level decision.
 

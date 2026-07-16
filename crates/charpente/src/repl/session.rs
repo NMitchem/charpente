@@ -14,6 +14,7 @@ use charpente_core::io::Conn;
 use charpente_core::log::frame_crc;
 
 use crate::Db;
+use crate::auth::{ct_eq_hex, hash_token};
 use crate::repl::protocol::{Msg, decode, encode};
 use crate::repl::role::Role;
 use crate::repl::{
@@ -184,7 +185,15 @@ impl Session {
     /// One unit of work: handle one inbox message, or push one
     /// snapshot/frames/heartbeat message. `role` decides `Hello` handling — a
     /// primary serves the ladder, a follower/backup refuses (no cascading).
-    pub(crate) fn service(&mut self, db: &Db, now: u64, role: &Role) -> io::Result<()> {
+    /// `peer_secret` (spec §5, auth T7) gates every inbound Hello/Ctrl on a
+    /// matching proof when configured (`Some`); `None` accepts all.
+    pub(crate) fn service(
+        &mut self,
+        db: &Db,
+        now: u64,
+        role: &Role,
+        peer_secret: &Option<String>,
+    ) -> io::Result<()> {
         // A control connection is driven by `Repl` (which owns the durable role
         // and pin); the round-robin never ships on it.
         if self.control {
@@ -206,7 +215,7 @@ impl Session {
                     return Ok(());
                 }
             };
-            return self.handle(msg, db, now, role);
+            return self.handle(msg, db, now, role, peer_secret);
         }
         match &mut self.phase {
             Phase::Seeding { pending } => {
@@ -246,25 +255,36 @@ impl Session {
         }
     }
 
-    fn handle(&mut self, msg: Msg, db: &Db, now: u64, role: &Role) -> io::Result<()> {
+    fn handle(
+        &mut self,
+        msg: Msg,
+        db: &Db,
+        now: u64,
+        role: &Role,
+        peer_secret: &Option<String>,
+    ) -> io::Result<()> {
         match msg {
             Msg::Hello {
                 proto,
                 listen,
                 position,
+                secret,
             } => {
-                self.listen = listen;
-                match decide_hello(role, db, proto, position)? {
+                match decide_hello(role, db, proto, position, peer_secret, &secret)? {
                     Decision::Refuse(message) => {
                         self.send(&Msg::Refuse { message }, now);
                         self.dead = true;
                     }
                     Decision::Frames { from } => {
+                        self.listen = listen;
                         self.cursor = from;
                         self.last_sent = now;
                         self.phase = Phase::Shipping;
                     }
-                    Decision::Snapshot => self.begin_seeding(db, now)?,
+                    Decision::Snapshot => {
+                        self.listen = listen;
+                        self.begin_seeding(db, now)?;
+                    }
                 }
                 Ok(())
             }
@@ -275,13 +295,35 @@ impl Session {
             // A control verb opens a control connection: record it and let
             // `Repl` execute it (the role flip, `Db` re-gate, and pin re-wire
             // are all `Repl`-level). No reply here — `Repl` answers on this
-            // conn once the verb resolves.
-            Msg::CtrlPromote => {
+            // conn once the verb resolves. The secret check comes first (spec
+            // §5): a mismatch refuses and closes before `control`/
+            // `pending_ctrl` are ever touched — no ladder entry.
+            Msg::CtrlPromote { secret } => {
+                if !secret_matches(peer_secret, &secret) {
+                    self.send(
+                        &Msg::Refuse {
+                            message: PEER_SECRET_REFUSAL.to_string(),
+                        },
+                        now,
+                    );
+                    self.dead = true;
+                    return Ok(());
+                }
                 self.control = true;
                 self.pending_ctrl = Some(PendingCtrl::Promote);
                 Ok(())
             }
-            Msg::CtrlSwitchover { to } => {
+            Msg::CtrlSwitchover { to, secret } => {
+                if !secret_matches(peer_secret, &secret) {
+                    self.send(
+                        &Msg::Refuse {
+                            message: PEER_SECRET_REFUSAL.to_string(),
+                        },
+                        now,
+                    );
+                    self.dead = true;
+                    return Ok(());
+                }
                 self.control = true;
                 self.pending_ctrl = Some(PendingCtrl::Switchover(to));
                 Ok(())
@@ -457,7 +499,28 @@ enum Decision {
     Snapshot,
 }
 
+/// The peer-secret refusal (spec §5/§6, auth T7): pinned verbatim by tests.
+pub(crate) const PEER_SECRET_REFUSAL: &str = "peer secret missing or mismatched — set \
+     ReplConfig.peer_secret to match this node (or run the CLI verb with --secret)";
+
+/// True when `presented` proves `peer_secret` (spec §5): `peer_secret: None`
+/// accepts everything (and a presented proof it did not ask for is ignored,
+/// not an error); `Some` requires `ct_eq_hex(hash_token(presented),
+/// hash_token(configured))` — constant-time over the SHA-256 digests, never a
+/// raw-string compare. A missing `presented` is treated as an empty string,
+/// which fails the compare against any real configured secret.
+fn secret_matches(peer_secret: &Option<String>, presented: &Option<String>) -> bool {
+    match peer_secret {
+        None => true,
+        Some(configured) => {
+            let presented = presented.as_deref().unwrap_or("");
+            ct_eq_hex(&hash_token(presented), &hash_token(configured))
+        }
+    }
+}
+
 /// The `Hello` decision ladder (spec §1), pinned by the error-surface tests:
+/// peer secret mismatch → refuse, before any other check (spec §5, auth T7);
 /// version mismatch → refuse (both versions); not-a-primary → refuse; follower
 /// ahead → refuse (diverged); position below the retained base → snapshot;
 /// position retained → verify the frame CRC (mismatch → diverged, match →
@@ -468,7 +531,12 @@ fn decide_hello(
     db: &Db,
     proto: u8,
     position: Option<(u64, u32)>,
+    peer_secret: &Option<String>,
+    presented_secret: &Option<String>,
 ) -> io::Result<Decision> {
+    if !secret_matches(peer_secret, presented_secret) {
+        return Ok(Decision::Refuse(PEER_SECRET_REFUSAL.to_string()));
+    }
     if proto != PROTO_VERSION {
         return Ok(Decision::Refuse(format!(
             "replication protocol version mismatch: this node speaks protocol version \

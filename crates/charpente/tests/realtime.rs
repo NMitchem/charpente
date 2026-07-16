@@ -992,6 +992,7 @@ fn rt_primary_cfg(addr: &str) -> ReplConfig {
     ReplConfig {
         listen: Some(addr.to_string()),
         initial_role: Role::Primary,
+        peer_secret: None,
     }
 }
 
@@ -1001,6 +1002,7 @@ fn rt_follower_cfg(listen: &str, primary: &str) -> ReplConfig {
         initial_role: Role::Follower {
             primary: primary.to_string(),
         },
+        peer_secret: None,
     }
 }
 
@@ -1492,7 +1494,7 @@ fn multi_node_realtime_universe(sim: &mut Sim) -> Result<(), String> {
 
     // Promote f.
     f.flipped = true;
-    let reply = CtrlConn::open(sim, "f:1", &Msg::CtrlPromote)
+    let reply = CtrlConn::open(sim, "f:1", &Msg::CtrlPromote { secret: None })
         .and_then(|mut cli| drive_ctrl_kernel(sim, &mut [&mut f], &mut cli, RT_STEP_BUDGET))?;
     match reply {
         Msg::CtrlOk { message } => {

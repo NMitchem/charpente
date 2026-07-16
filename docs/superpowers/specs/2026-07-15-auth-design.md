@@ -124,7 +124,8 @@ invisible from the moment `now` passes `expires_at`, restart or not.
   Outbound, a configured node always attaches its proof. So a half-configured
   pair works in exactly one direction — the configured node's inbound is guarded,
   the unconfigured node's is open — which is visible, debuggable, and the
-  rollout-friendly middle state (configure the primary first, then followers).
+  rollout-friendly middle state (configure the followers first, then the
+  primary).
 - The CLI verbs gain `--secret <s>` (absent = send `None`); the existing exit-code
   contract stands (a `Refuse` maps to exit 1 with the forwarded text).
 - **Threat model, stated honestly (GUIDE + DESIGN):** the replication wire is

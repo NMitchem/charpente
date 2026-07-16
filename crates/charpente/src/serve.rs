@@ -671,6 +671,7 @@ mod tests {
             repl::ReplConfig {
                 listen: Some(repl_p.clone()),
                 initial_role: Role::Primary,
+                peer_secret: None,
             },
         )
         .unwrap();
@@ -683,6 +684,7 @@ mod tests {
                 initial_role: Role::Follower {
                     primary: repl_p.clone(),
                 },
+                peer_secret: None,
             },
         )
         .unwrap();

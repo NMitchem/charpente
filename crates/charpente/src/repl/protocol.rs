@@ -17,10 +17,15 @@ pub enum Msg {
     /// tag 0 — session open. `listen` is the follower's own replication
     /// address when it has one (switchover targets sessions by it);
     /// `position` is (last durable seq, that frame's crc) or None when empty.
+    /// `secret` is this peer's proof of `ReplConfig.peer_secret`, always
+    /// attached when the sender is configured with one (spec §5); `None`
+    /// otherwise. Appended after the pre-existing fields (pre-release, no
+    /// `PROTO_VERSION` bump).
     Hello {
         proto: u8,
         listen: Option<String>,
         position: Option<(u64, u32)>,
+        secret: Option<String>,
     },
     /// tag 1 — a batch of durable WAL frames, each `(seq, frame bytes)`.
     Frames { frames: Vec<(u64, Vec<u8>)> },
@@ -50,10 +55,12 @@ pub enum Msg {
     /// (diverged / version mismatch / not-a-primary), built by the refusing
     /// side so both ends log the same words.
     Refuse { message: String },
-    /// tag 8 — admin verb: promote this follower to primary.
-    CtrlPromote,
-    /// tag 9 — admin verb: switch the primary role over to `to`.
-    CtrlSwitchover { to: String },
+    /// tag 8 — admin verb: promote this follower to primary. `secret` is the
+    /// CLI's `--secret` proof (spec §5), `None` when not given.
+    CtrlPromote { secret: Option<String> },
+    /// tag 9 — admin verb: switch the primary role over to `to`. `secret` is
+    /// the CLI's `--secret` proof (spec §5), `None` when not given.
+    CtrlSwitchover { to: String, secret: Option<String> },
     /// tag 10 — a control verb succeeded.
     CtrlOk { message: String },
     /// tag 11 — a control verb failed.
@@ -77,7 +84,7 @@ impl Msg {
             Msg::SnapshotRows { .. } => "SnapshotRows",
             Msg::SnapshotEnd => "SnapshotEnd",
             Msg::Refuse { .. } => "Refuse",
-            Msg::CtrlPromote => "CtrlPromote",
+            Msg::CtrlPromote { .. } => "CtrlPromote",
             Msg::CtrlSwitchover { .. } => "CtrlSwitchover",
             Msg::CtrlOk { .. } => "CtrlOk",
             Msg::CtrlErr { .. } => "CtrlErr",
@@ -144,11 +151,13 @@ pub fn encode(msg: &Msg) -> Vec<u8> {
             proto,
             listen,
             position,
+            secret,
         } => {
             out.push(0);
             proto.encode(&mut out);
             listen.encode(&mut out);
             encode_position(position, &mut out);
+            secret.encode(&mut out);
         }
         Msg::Frames { frames } => {
             out.push(1);
@@ -184,10 +193,14 @@ pub fn encode(msg: &Msg) -> Vec<u8> {
             out.push(7);
             message.encode(&mut out);
         }
-        Msg::CtrlPromote => out.push(8),
-        Msg::CtrlSwitchover { to } => {
+        Msg::CtrlPromote { secret } => {
+            out.push(8);
+            secret.encode(&mut out);
+        }
+        Msg::CtrlSwitchover { to, secret } => {
             out.push(9);
             to.encode(&mut out);
+            secret.encode(&mut out);
         }
         Msg::CtrlOk { message } => {
             out.push(10);
@@ -216,6 +229,7 @@ pub fn decode(bytes: &[u8]) -> io::Result<Msg> {
             proto: u8::decode(input)?,
             listen: Option::<String>::decode(input)?,
             position: decode_position(input)?,
+            secret: Option::<String>::decode(input)?,
         },
         1 => Msg::Frames {
             frames: decode_pairs(input)?,
@@ -240,9 +254,12 @@ pub fn decode(bytes: &[u8]) -> io::Result<Msg> {
         7 => Msg::Refuse {
             message: String::decode(input)?,
         },
-        8 => Msg::CtrlPromote,
+        8 => Msg::CtrlPromote {
+            secret: Option::<String>::decode(input)?,
+        },
         9 => Msg::CtrlSwitchover {
             to: String::decode(input)?,
+            secret: Option::<String>::decode(input)?,
         },
         10 => Msg::CtrlOk {
             message: String::decode(input)?,
@@ -294,11 +311,13 @@ mod tests {
             proto: PROTO_VERSION,
             listen: None,
             position: None,
+            secret: None,
         });
         roundtrips(Msg::Hello {
             proto: PROTO_VERSION,
             listen: Some("follower:9000".to_string()),
             position: Some((42, 0xdead_beef)),
+            secret: Some("s3cret".to_string()),
         });
     }
 
@@ -360,13 +379,21 @@ mod tests {
 
     #[test]
     fn ctrl_promote_roundtrips() {
-        roundtrips(Msg::CtrlPromote);
+        roundtrips(Msg::CtrlPromote { secret: None });
+        roundtrips(Msg::CtrlPromote {
+            secret: Some("s3cret".to_string()),
+        });
     }
 
     #[test]
     fn ctrl_switchover_roundtrips() {
         roundtrips(Msg::CtrlSwitchover {
             to: "follower:9001".to_string(),
+            secret: None,
+        });
+        roundtrips(Msg::CtrlSwitchover {
+            to: "follower:9001".to_string(),
+            secret: Some("s3cret".to_string()),
         });
     }
 

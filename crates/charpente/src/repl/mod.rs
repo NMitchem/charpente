@@ -80,6 +80,14 @@ pub struct ReplConfig {
     /// a follower without one cannot be promoted remotely (no control conn).
     pub listen: Option<String>,
     pub initial_role: Role,
+    /// Peer-auth secret (spec §5, auth T7). `Some` refuses any inbound
+    /// Hello/Ctrl whose proof doesn't match (`Msg::Refuse`, no state touched);
+    /// `None` accepts everything inbound and ignores an unrequired proof.
+    /// Outbound, a configured node always attaches its proof — so a
+    /// half-configured pair works in exactly one direction (the configured
+    /// side's inbound is guarded, the other's is open). The wire is plaintext
+    /// TCP: this authenticates peers, it does not encrypt the link.
+    pub peer_secret: Option<String>,
 }
 
 /// Sim-agnostic counters a workload can assert on without reaching into the
@@ -126,6 +134,11 @@ pub struct Repl {
     /// This node's own replication listen address (from config), stamped into a
     /// follower client's `Hello` so a later switchover can target this node.
     my_listen: Option<String>,
+    /// This node's configured peer secret (spec §5, auth T7): `Some` gates
+    /// every inbound Hello/Ctrl on a matching proof; `None` accepts all and
+    /// attaches nothing outbound. Threaded to `Session::service` (inbound
+    /// enforcement) and to every `Follower` this node builds (outbound proof).
+    peer_secret: Option<String>,
     listener: Option<Box<dyn Listener>>,
     sessions: Vec<Session>,
     rr_cursor: usize,
@@ -175,15 +188,19 @@ impl Repl {
         };
 
         let follower = match &role {
-            Role::Follower { primary } | Role::Backup { primary } => {
-                Some(Follower::new(primary.clone(), cfg.listen.clone()))
-            }
+            Role::Follower { primary } | Role::Backup { primary } => Some(Follower::new(
+                primary.clone(),
+                cfg.listen.clone(),
+                cfg.peer_secret.clone(),
+            )),
             // A durable `HandingOff` at open means this node restarted mid-
             // switchover (spec §2): it stays write-stopped and probes `to` to
             // resolve (demote to its follower once `to` is confirmed primary).
-            Role::HandingOff { to } => {
-                Some(Follower::new_resolving(to.clone(), cfg.listen.clone()))
-            }
+            Role::HandingOff { to } => Some(Follower::new_resolving(
+                to.clone(),
+                cfg.listen.clone(),
+                cfg.peer_secret.clone(),
+            )),
             Role::Primary => None,
         };
 
@@ -193,6 +210,7 @@ impl Repl {
                 net,
                 role_disk,
                 my_listen: cfg.listen.clone(),
+                peer_secret: cfg.peer_secret.clone(),
                 listener,
                 sessions: Vec::new(),
                 rr_cursor: 0,
@@ -354,7 +372,7 @@ impl Repl {
             if self.sessions[idx].has_work(db, now) {
                 self.rr_cursor = (idx + 1) % n;
                 let role = self.role.clone();
-                self.sessions[idx].service(db, now, &role)?;
+                self.sessions[idx].service(db, now, &role, &self.peer_secret)?;
                 self.recompute_pin();
                 return Ok(());
             }
@@ -689,7 +707,11 @@ impl Repl {
         );
         self.sessions.clear(); // drop every ship session (and the control conn)
         self.switchover = None;
-        self.follower = Some(Follower::new(to.to_string(), self.my_listen.clone()));
+        self.follower = Some(Follower::new(
+            to.to_string(),
+            self.my_listen.clone(),
+            self.peer_secret.clone(),
+        ));
         self.recompute_pin();
         Ok(())
     }

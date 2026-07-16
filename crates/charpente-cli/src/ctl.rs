@@ -17,8 +17,8 @@ use charpente::prod::{ProdClock, ProdNet};
 use charpente::repl::protocol::{Msg, decode, encode};
 use charpente::repl::{MAX_MESSAGE_BYTES, SWITCHOVER_DEADLINE_NANOS};
 
-pub const USAGE: &str = "usage: charpente promote --node <addr>\n\
-       charpente switchover --primary <addr> --to <addr>";
+pub const USAGE: &str = "usage: charpente promote --node <addr> [--secret <s>]\n\
+       charpente switchover --primary <addr> --to <addr> [--secret <s>]";
 
 /// Poll cadence while waiting for a control reply — every tick goes through
 /// `Clock::sleep` (`ProdClock` in production), never an ambient sleep.
@@ -26,8 +26,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, PartialEq)]
 enum Cmd {
-    Promote { node: String },
-    Switchover { primary: String, to: String },
+    Promote {
+        node: String,
+        secret: Option<String>,
+    },
+    Switchover {
+        primary: String,
+        to: String,
+        secret: Option<String>,
+    },
 }
 
 impl Cmd {
@@ -35,15 +42,20 @@ impl Cmd {
     /// primary being asked to switch over.
     fn addr(&self) -> &str {
         match self {
-            Cmd::Promote { node } => node,
+            Cmd::Promote { node, .. } => node,
             Cmd::Switchover { primary, .. } => primary,
         }
     }
 
     fn msg(&self) -> Msg {
         match self {
-            Cmd::Promote { .. } => Msg::CtrlPromote,
-            Cmd::Switchover { to, .. } => Msg::CtrlSwitchover { to: to.clone() },
+            Cmd::Promote { secret, .. } => Msg::CtrlPromote {
+                secret: secret.clone(),
+            },
+            Cmd::Switchover { to, secret, .. } => Msg::CtrlSwitchover {
+                to: to.clone(),
+                secret: secret.clone(),
+            },
         }
     }
 }
@@ -51,16 +63,24 @@ impl Cmd {
 /// Parses `args` starting at the verb name ("promote" or "switchover"). Any
 /// failure — an unrecognized verb, or a required flag missing or valueless —
 /// returns the full usage string naming both verbs, so an operator sees the
-/// whole contract rather than guessing at a single flag's spelling.
+/// whole contract rather than guessing at a single flag's spelling. `--secret`
+/// is optional on both verbs (absent sends `None`, matching an unconfigured
+/// node's `ReplConfig.peer_secret`, spec §5).
 fn parse(args: &[String]) -> Result<Cmd, String> {
     match args.first().map(String::as_str) {
         Some("promote") => Ok(Cmd::Promote {
             node: require_flag(&args[1..], "--node")?,
+            secret: optional_flag(&args[1..], "--secret")?,
         }),
         Some("switchover") => {
             let primary = require_flag(&args[1..], "--primary")?;
             let to = require_flag(&args[1..], "--to")?;
-            Ok(Cmd::Switchover { primary, to })
+            let secret = optional_flag(&args[1..], "--secret")?;
+            Ok(Cmd::Switchover {
+                primary,
+                to,
+                secret,
+            })
         }
         _ => Err(USAGE.to_string()),
     }
@@ -80,6 +100,23 @@ fn require_flag(args: &[String], name: &str) -> Result<String, String> {
         }
     }
     Err(format!("error: missing required flag {name}\n\n{USAGE}"))
+}
+
+/// Scans `args` for `name`, returning its value when present. Absent
+/// entirely is `Ok(None)` (the flag is optional); present with no following
+/// value is still a usage error, the same as `require_flag`.
+fn optional_flag(args: &[String], name: &str) -> Result<Option<String>, String> {
+    let mut iter = args.iter();
+    while let Some(flag) = iter.next() {
+        if flag == name {
+            return iter
+                .next()
+                .cloned()
+                .map(Some)
+                .ok_or_else(|| format!("error: {name} requires a value\n\n{USAGE}"));
+        }
+    }
+    Ok(None)
 }
 
 /// Blocks (via `Clock::sleep`-paced polling, not real blocking IO) until
@@ -209,7 +246,8 @@ mod tests {
         assert_eq!(
             cmd,
             Cmd::Promote {
-                node: "127.0.0.1:9000".to_string()
+                node: "127.0.0.1:9000".to_string(),
+                secret: None,
             }
         );
     }
@@ -229,8 +267,57 @@ mod tests {
             Cmd::Switchover {
                 primary: "127.0.0.1:9000".to_string(),
                 to: "127.0.0.1:9001".to_string(),
+                secret: None,
             }
         );
+    }
+
+    #[test]
+    fn parse_promote_reads_the_secret_flag() {
+        let cmd = parse(&args(&[
+            "promote",
+            "--node",
+            "127.0.0.1:9000",
+            "--secret",
+            "s3cret",
+        ]))
+        .unwrap();
+        assert_eq!(
+            cmd,
+            Cmd::Promote {
+                node: "127.0.0.1:9000".to_string(),
+                secret: Some("s3cret".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_switchover_reads_the_secret_flag() {
+        let cmd = parse(&args(&[
+            "switchover",
+            "--primary",
+            "127.0.0.1:9000",
+            "--to",
+            "127.0.0.1:9001",
+            "--secret",
+            "s3cret",
+        ]))
+        .unwrap();
+        assert_eq!(
+            cmd,
+            Cmd::Switchover {
+                primary: "127.0.0.1:9000".to_string(),
+                to: "127.0.0.1:9001".to_string(),
+                secret: Some("s3cret".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_promote_secret_with_no_value_names_both_verbs_in_the_usage_string() {
+        let err = parse(&args(&["promote", "--node", "127.0.0.1:9000", "--secret"])).unwrap_err();
+        assert!(err.contains("charpente promote"), "{err}");
+        assert!(err.contains("charpente switchover"), "{err}");
     }
 
     #[test]

@@ -38,6 +38,9 @@ pub(crate) struct Follower {
     /// This node's own listen address, sent in `Hello` so a later switchover
     /// can target this follower by name (carried, unused until Task 7).
     my_listen: Option<String>,
+    /// This node's configured peer secret (spec §5, auth T7), attached to
+    /// every outbound `Hello` as this side's proof; `None` when unconfigured.
+    peer_secret: Option<String>,
     conn: Option<Box<dyn Conn>>,
     recv_buf: Option<Vec<u8>>,
     inbox: VecDeque<Vec<u8>>,
@@ -70,10 +73,15 @@ struct SeedInProgress {
 }
 
 impl Follower {
-    pub(crate) fn new(primary: String, my_listen: Option<String>) -> Follower {
+    pub(crate) fn new(
+        primary: String,
+        my_listen: Option<String>,
+        peer_secret: Option<String>,
+    ) -> Follower {
         Follower {
             primary,
             my_listen,
+            peer_secret,
             conn: None,
             recv_buf: None,
             inbox: VecDeque::new(),
@@ -87,8 +95,12 @@ impl Follower {
 
     /// A client that probes `to` to resolve a durable `HandingOff { to }` role
     /// at startup (spec §2). Otherwise identical to `new`.
-    pub(crate) fn new_resolving(to: String, my_listen: Option<String>) -> Follower {
-        let mut f = Follower::new(to, my_listen);
+    pub(crate) fn new_resolving(
+        to: String,
+        my_listen: Option<String>,
+        peer_secret: Option<String>,
+    ) -> Follower {
+        let mut f = Follower::new(to, my_listen, peer_secret);
         f.resolving = true;
         f
     }
@@ -303,6 +315,7 @@ impl Follower {
             proto: PROTO_VERSION,
             listen: self.my_listen.clone(),
             position,
+            secret: self.peer_secret.clone(),
         };
         if conn.send(&encode(&hello)).is_err() {
             self.reconnect_at = Some(now + RECONNECT_NANOS);

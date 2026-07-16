@@ -84,8 +84,8 @@ fn promote_prints_the_ctrl_ok_message_and_exits_zero() {
         },
         |msg| {
             assert!(
-                matches!(msg, Msg::CtrlPromote),
-                "expected CtrlPromote, got {msg:?}"
+                matches!(msg, Msg::CtrlPromote { secret: None }),
+                "expected CtrlPromote with no secret, got {msg:?}"
             )
         },
     );
@@ -99,6 +99,53 @@ fn promote_prints_the_ctrl_ok_message_and_exits_zero() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("promoted at seq 41"), "{stdout}");
+}
+
+/// The `--secret` flag round-trips onto the wire message (auth T7, spec §5),
+/// and a `Refuse` reply — the node's answer to a missing/mismatched peer
+/// secret — maps to exit 1 with its text forwarded verbatim, the same as any
+/// other control-verb refusal.
+#[test]
+fn promote_with_secret_flag_attaches_it_and_a_refuse_reply_exits_one() {
+    let out = drive(
+        |addr| {
+            vec![
+                "promote".to_string(),
+                "--node".to_string(),
+                addr.to_string(),
+                "--secret".to_string(),
+                "wrong".to_string(),
+            ]
+        },
+        Msg::Refuse {
+            message: "peer secret missing or mismatched — set ReplConfig.peer_secret to match \
+                      this node (or run the CLI verb with --secret)"
+                .to_string(),
+        },
+        |msg| match msg {
+            Msg::CtrlPromote { secret } => {
+                assert_eq!(
+                    secret.as_deref(),
+                    Some("wrong"),
+                    "expected the --secret value"
+                )
+            }
+            other => panic!("expected CtrlPromote, got {other:?}"),
+        },
+    );
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("peer secret missing or mismatched"),
+        "{stderr}"
+    );
 }
 
 #[test]

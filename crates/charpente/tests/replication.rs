@@ -523,6 +523,7 @@ fn primary_cfg(addr: &str) -> ReplConfig {
     ReplConfig {
         listen: Some(addr.to_string()),
         initial_role: Role::Primary,
+        peer_secret: None,
     }
 }
 
@@ -532,6 +533,7 @@ fn follower_cfg(listen: &str, primary: &str) -> ReplConfig {
         initial_role: Role::Follower {
             primary: primary.to_string(),
         },
+        peer_secret: None,
     }
 }
 
@@ -1255,6 +1257,7 @@ fn hello_with_a_future_protocol_version_is_refused_naming_both_versions() {
             proto: charpente::repl::PROTO_VERSION + 1,
             listen: None,
             position: None,
+            secret: None,
         },
     )
     .unwrap();
@@ -1284,6 +1287,7 @@ fn hello_to_a_follower_is_refused_naming_the_not_a_primary_state() {
             proto: charpente::repl::PROTO_VERSION,
             listen: Some("x:1".to_string()),
             position: None,
+            secret: None,
         },
     )
     .unwrap();
@@ -1300,6 +1304,131 @@ fn hello_to_a_follower_is_refused_naming_the_not_a_primary_state() {
         }
         other => panic!("expected Refuse, got {other:?}"),
     }
+}
+
+// ------------------------------------------------- property: peer secret
+
+/// Spec §5 (auth T7): a node configured with `peer_secret: Some` refuses any
+/// inbound Hello/Ctrl whose proof does not match — named `Refuse`, before any
+/// state is touched (no ladder entry, no pin, no seed, no role flip).
+fn assert_peer_secret_refusal(reply: &Msg) {
+    match reply {
+        Msg::Refuse { message } => {
+            assert_eq!(
+                message,
+                "peer secret missing or mismatched — set ReplConfig.peer_secret to match this \
+                 node (or run the CLI verb with --secret)"
+            );
+        }
+        other => panic!("expected the peer-secret Refuse, got {other:?}"),
+    }
+}
+
+#[test]
+fn peer_secret_refuses_mismatch_and_admits_match() {
+    let sim = Sim::with_faults(0x2EB1_0011, FaultConfig::none());
+    let db_cfg = seeding_db_cfg(); // small segments/checkpoint cadence: GC is observable
+    let p_cfg = ReplConfig {
+        peer_secret: Some("s3cret".to_string()),
+        ..primary_cfg("p:1")
+    };
+    let mut p = spawn_node(&sim, "p", p_cfg, db_cfg.clone()).unwrap();
+
+    // No secret at all: refused by name.
+    let reply = exchange_hello(
+        &sim,
+        &mut p,
+        "p:1",
+        Msg::Hello {
+            proto: charpente::repl::PROTO_VERSION,
+            listen: Some("f:1".to_string()),
+            position: None,
+            secret: None,
+        },
+    )
+    .unwrap();
+    assert_peer_secret_refusal(&reply);
+    drive_rounds(&sim, &mut [&mut p], 4).unwrap(); // reap the refused session
+
+    // The wrong secret: same refusal.
+    let reply = exchange_hello(
+        &sim,
+        &mut p,
+        "p:1",
+        Msg::Hello {
+            proto: charpente::repl::PROTO_VERSION,
+            listen: Some("f:1".to_string()),
+            position: None,
+            secret: Some("wrong".to_string()),
+        },
+    )
+    .unwrap();
+    assert_peer_secret_refusal(&reply);
+    drive_rounds(&sim, &mut [&mut p], 4).unwrap(); // reap the refused session
+
+    // Neither refusal opened a seed or pinned retention: drive enough commits
+    // for GC to compact past the base — it must, since no live session (the
+    // refused ones died on the spot, and were reaped above) holds it back.
+    for i in 0..60u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    assert!(
+        p.db.as_ref().unwrap().log_base() > 0,
+        "GC must have advanced — a refused Hello must never pin retention"
+    );
+    assert_eq!(
+        p.repl.stats().seeds,
+        0,
+        "a refused Hello must never begin a snapshot seed"
+    );
+
+    // The right secret: admitted, and a real follower converges end-to-end
+    // (Follower attaches its configured secret automatically, outbound).
+    let f_cfg = ReplConfig {
+        peer_secret: Some("s3cret".to_string()),
+        ..follower_cfg("f:1", "p:1")
+    };
+    let mut f = spawn_node(&sim, "f", f_cfg, db_cfg).unwrap();
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert_converged(&p, &f).unwrap();
+
+    // A CtrlPromote without the secret at a secret-configured node → Refuse,
+    // and the role never flips (no state touched on refusal). Reuses the
+    // converged follower `f`, which has a listen address (promotable).
+    let mut cli = CtrlConn::open(&sim, "f:1", &Msg::CtrlPromote { secret: None }).unwrap();
+    let reply = drive_ctrl(&sim, &mut [&mut f], &mut cli, CONVERGE_BUDGET).unwrap();
+    assert_peer_secret_refusal(&reply);
+    assert!(
+        matches!(f.repl.role(), Role::Follower { .. }),
+        "a refused promote must leave the durable role untouched: {:?}",
+        f.repl.role()
+    );
+    assert!(
+        !f.db.as_ref().unwrap().writes_allowed(),
+        "a refused promote must never flip the node to a writable primary"
+    );
+}
+
+/// The half-configured "open" direction (spec §5): an unconfigured primary
+/// accepts a follower's proof it never asked for, gracefully — no error, no
+/// refusal — and the pair converges exactly as an all-`None` pair would. The
+/// guarded direction (a configured primary refusing an unconfigured follower)
+/// is already exercised above (the "no secret at all" case).
+#[test]
+fn peer_secret_unconfigured_node_accepts_a_followers_unrequired_proof() {
+    let sim = Sim::with_faults(0x2EB1_0012, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let f_cfg = ReplConfig {
+        peer_secret: Some("s3cret".to_string()),
+        ..follower_cfg("f:1", "p:1")
+    };
+    let mut f = spawn_node(&sim, "f", f_cfg, DbConfig::default()).unwrap();
+
+    for i in 0..20u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert_converged(&p, &f).unwrap();
 }
 
 // --------------------------------------------- error-surface pin: empty ship
@@ -1864,6 +1993,7 @@ fn switchover_universe(sim: &mut Sim) -> Result<(), String> {
             "p:1",
             &Msg::CtrlSwitchover {
                 to: "f:1".to_string(),
+                secret: None,
             },
         ) {
             Ok(cli) => cli,
@@ -2002,7 +2132,7 @@ fn failover_universe(sim: &mut Sim) -> Result<(), String> {
 
     // Promote f (drive f alone; p is down).
     f.flipped = true;
-    let reply = match CtrlConn::open(sim, "f:1", &Msg::CtrlPromote)
+    let reply = match CtrlConn::open(sim, "f:1", &Msg::CtrlPromote { secret: None })
         .and_then(|mut cli| drive_ctrl(sim, &mut [&mut f], &mut cli, CONVERGE_BUDGET))
     {
         Ok(m) => m,
@@ -2103,6 +2233,7 @@ fn crash_between_handoff_and_demote_never_yields_two_writable_primaries() {
         "p:1",
         &Msg::CtrlSwitchover {
             to: "f:1".to_string(),
+            secret: None,
         },
     )
     .unwrap();
@@ -2187,6 +2318,7 @@ fn switchover_aborts_on_a_lagging_follower_by_name() {
         "p:1",
         &Msg::CtrlSwitchover {
             to: "f:1".to_string(),
+            secret: None,
         },
     )
     .unwrap();
@@ -2248,7 +2380,7 @@ fn promote_without_drain_workload(sim: &mut Sim) -> Result<(), String> {
 
     // Promote f WITHOUT a drain.
     f.flipped = true;
-    let mut cli = CtrlConn::open(sim, "f:1", &Msg::CtrlPromote)?;
+    let mut cli = CtrlConn::open(sim, "f:1", &Msg::CtrlPromote { secret: None })?;
     match drive_ctrl(sim, &mut [&mut f], &mut cli, CONVERGE_BUDGET)? {
         Msg::CtrlOk { .. } => {}
         other => return Err(format!("promote failed in the meta-test: {other:?}")),
@@ -2353,6 +2485,7 @@ fn backup_cfg(listen: &str, primary: &str) -> ReplConfig {
         initial_role: Role::Backup {
             primary: primary.to_string(),
         },
+        peer_secret: None,
     }
 }
 
@@ -2865,7 +2998,7 @@ fn backup_node_dir_opens_and_promotes_fingerprint_identical() {
     b.host.restart();
     b.kernel = Some(open_kernel(&sim, &b.host, &b.repl_cfg, &b.db_cfg, false).unwrap());
 
-    let mut cli = CtrlConn::open(&sim, "b:1", &Msg::CtrlPromote).unwrap();
+    let mut cli = CtrlConn::open(&sim, "b:1", &Msg::CtrlPromote { secret: None }).unwrap();
     let reply = drive_ctrl_kernel(&sim, &mut [&mut b], &mut cli, CONVERGE_BUDGET).unwrap();
     match reply {
         Msg::CtrlOk { message } => assert!(
@@ -3005,7 +3138,7 @@ fn restore_p_from_survivor(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<()
     // Promote the survivor if it is not already primary.
     if !f.kernel.as_ref().is_some_and(|k| k.is_primary()) {
         f.flipped = true;
-        let mut cli = CtrlConn::open(sim, "f:1", &Msg::CtrlPromote)?;
+        let mut cli = CtrlConn::open(sim, "f:1", &Msg::CtrlPromote { secret: None })?;
         match drive_ctrl_kernel(sim, &mut [f], &mut cli, KBUDGET)? {
             Msg::CtrlOk { .. } => {}
             other => {
