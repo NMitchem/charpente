@@ -635,12 +635,111 @@ Charpente treats the coding agent as the primary developer persona:
   pack designed to be loaded into an agent's context (the framework's conventions are only
   worth having if the agent applying them has them in scope).
 
-## 8. Auth & multi-tenancy [M1, reversible]
+## 8. Auth & multi-tenancy [M1]
 
-Sessions, API keys, and OIDC as built-in typed tables and route guards; org/tenant scoping
-as a first-class key prefix so "every query is tenant-scoped" is a type-level property
-rather than a code-review checklist item. Deliberately boring; the value is that it is
-*inside* the commit point like everything else.
+Sessions and API keys are built-in typed tables inside the commit point; a pre-transaction
+resolution ladder turns a presented credential into one `Principal`, and `#[route(…, auth)]`
+gates on it. Deliberately boring — the value is that credential state is a transaction like
+everything else (durable, replicated, recovered on restart), not a bolted-on side store.
+Everything here is pure computation plus the kernel's one `Clock` reading per request, so it
+replays byte-identically in sim; the crypto is RustCrypto (`sha2`, `rsa`, `base64ct`), never
+hand-rolled, and lives in `charpente`, never inside the deterministic `charpente-core`.
+
+- **Hashed at rest.** `Session { id, token_hash #[index], subject, expires_at }` and
+  `ApiKey { id, key_hash #[index], subject, created_at }` register platform-side in
+  `App::open` (alongside `CronRow`), so recovery replays logins and minted keys with no app
+  code. The stored `*_hash` is lowercase-hex SHA-256 of the raw credential; **the raw
+  token/key exists only in the mint response and never reaches disk.** Hashing happens
+  before the effects record is built, so the WAL carries the hash too — the flagship
+  negative-space sim property (scan every durable file in the universe under the full fault
+  matrix, assert no raw credential byte-string appears in any store, WAL segment, or role
+  file) is what mechanically forbids a regression; its naive-victim meta-test (a resolver
+  that stores the raw token) fails that oracle by name. `create_session(tx, subject)` sets
+  `expires_at = now + session_ttl` (`AppConfig`, default 30 days in `Clock` nanos);
+  `create_api_key(tx, subject)` returns `"ck_"` + 64 hex (the prefix makes a leaked key
+  grep-able for secret scanners); revocation is `tx.delete::<ApiKey>(id)` — an ordinary
+  write, durable and replicated like any other.
+- **One entropy draw, one mint per request.** Both credential kinds are fed by the single
+  existing pre-transaction `fresh_token` draw — zero new draws, so every pinned seed's
+  entropy interleaving is structurally untouched (the frozen replay contract holds by
+  construction, not re-verification). The consequence, enforced by a shared once-assert: one
+  credential mint per request, session OR key, never both — a second mint panics
+  (`Ctx::create_session/create_api_key called twice in one request — one credential mint per
+  request`). Handlers cannot draw entropy (`Tx` has no `Entropy` by design), so this is the
+  honest shape, not a limitation to route around.
+- **The resolution ladder (pre-transaction, pure).** One entry point replaces the old
+  session-only lookup, producing `Option<Principal { subject, via }>` with
+  `enum Via { Session(id), ApiKey(id), Oidc }`: (1) an `Authorization: Bearer <t>` whose
+  token contains exactly two `.` is judged as a JWT — OIDC-verified if a verifier is mounted,
+  else a named unrecognized-credential 401; never a fall-through, a JWT-shaped credential is
+  judged as a JWT. (2) Any other bearer is SHA-256'd and exact-matched against the `ApiKey`
+  index, then the `Session` index (expiry-checked against `now`). (3) A `charpente_session`
+  cookie takes the same hash path — and *only* the hash path: the two-dot JWT rung is scoped
+  to the Authorization header, so a cookie value that happens to contain two dots is never
+  OIDC-verified (a ruling, pinned by test). (4) Nothing presented is `principal = None`.
+  `#[route(…, auth)]` answers the no-credential 401 when the principal is absent;
+  `Ctx::principal()` is the surface, and `Ctx::session()` survives as a compat accessor
+  returning the row only for a `Session` principal. The ladder runs unconditionally before
+  the `auth` gate, so a garbage credential on a no-auth route is still rejected. Lookups are
+  hash-then-index-equality on SHA-256 outputs — an attacker controls no stored preimage and
+  learns nothing exploitable from index-lookup timing; the one equality on secret-derived
+  data both sides control is the repl secret compare below, which is constant-time.
+- **OIDC, static-JWKS only.** `App::with_oidc(OidcConfig { issuer, audience, jwks_json })`
+  parses the JWKS once at mount — a bad key, unsupported `kty`/`alg`, or malformed document
+  is a named mount-time panic (which key, what is wrong, the fix), never a request-time
+  error. `verify` is pure over `(jwt, now)`: split the compact JWT (exactly three segments,
+  else malformed), base64url-decode header/payload/signature, require header `alg == "RS256"`
+  (v1 is RS256-only; `kid` selects the JWK when present, else all configured keys are tried),
+  check RSA-PKCS1-v1.5-SHA256 over the `header.payload` signing input, then `iss`
+  string-equals issuer, `aud` (string or array) contains audience, `exp > now - skew`,
+  `nbf <= now + skew` (`JWT_CLOCK_SKEW_NANOS` = 60s; JWT `exp`/`nbf` seconds converted to the
+  clock's nanos). Success yields an ephemeral `Principal { subject: sub, via: Oidc }` — no
+  row, nothing to revoke but a short `exp`. Each failed check is its own named 401 (below).
+  Verification is ~100µs of pure computation on the kernel thread; the test suite checks in a
+  fixed RSA keypair and mints tokens in-test with the same crate, so the claim matrix replays
+  byte-identically — proof the crypto path added no nondeterminism. Dynamic JWKS fetch (any
+  outbound IO) waits for the external-IO surface; ES256 joins when someone needs it.
+- **Expiry: lazy resolution is correctness, the sweep is hygiene.** A `Session` row with
+  `expires_at <= now` is treated as absent at resolution — invisible the instant `now` passes
+  it, restart or not (the same restart-stable `Clock` shape cron's catch-up already relies
+  on). A built-in daily cron (`charpente.session_sweep`, registered platform-side with no
+  opt-in, running through the ordinary cron/job machinery — retry and observability for free)
+  deletes expired rows in one transaction per tick so the table doesn't grow unbounded.
+  Because lazy resolution is authoritative, the sweep's cadence is not load-bearing; the tick
+  threads its `now` into an enqueued `SessionSweep { before }` job (the cron enqueue closure
+  was widened to see the scheduler's `now`), which deletes rows with `expires_at <= before`.
+- **Replication peer secret.** `ReplConfig.peer_secret: Option<String>` closes the
+  anyone-can-connect hole on the replication port (the AwaitHello-pins-GC / empty-`Frames`
+  class, already hardened, now access-controlled). When `Some`, every inbound `Hello` and
+  single-message control conn (`CtrlPromote`/`CtrlSwitchover`) must present a matching secret,
+  checked *first* — before any position/pin/seed logic — and a mismatch is `Msg::Refuse` with
+  the named text and close, zero state touched. The compare is constant-time over SHA-256
+  digests of both sides (`ct_eq_hex(hash_token(a), hash_token(b))`), never a raw `==`. `None`
+  preserves today's open behavior: a node enforces only its own config — a `Some` node refuses
+  unproven inbound, a `None` node accepts everything and gracefully ignores a proof it never
+  required (not an error). So a half-configured pair works in exactly one direction, which
+  fixes the rollout order at **followers first, then the primary** (a ruling — configuring the
+  primary first would lock every not-yet-configured follower out). The CLI verbs gain
+  `--secret`; a `Refuse` maps to the existing exit-1-with-forwarded-text path.
+- **Threat model, stated not implied.** The replication wire is plaintext TCP. `peer_secret`
+  *authenticates* peers — it does not encrypt the link, so an eavesdropper on the path reads
+  both the frames and the secret. The deployment assumption is a private network; transport
+  encryption is an M2 conversation. This is documented in DESIGN and GUIDE, never left to
+  inference.
+- **The named 401 family (product surface, all pinned by tests against text).** No credential
+  on an `auth` route, unrecognized bearer/cookie, expired session, the seven OIDC per-check
+  rejections (bad signature, `exp`, `nbf`, wrong issuer, wrong audience, unsupported `alg`,
+  malformed), the mount-time OIDC config errors, and the repl refusal each name the specific
+  failure and its fix — precision over vagueness, since the leak profile is already acceptable
+  (possession of an expired token proves past authorization; JWT claims are attacker-visible
+  by construction). The exact strings live in the code and are pinned by the ladder/OIDC/repl
+  test matrices; GUIDE §5 quotes the set byte-for-byte in its error-index voice.
+- **Multi-tenancy (deferred to its own design).** Org/tenant scoping as a first-class key
+  prefix — "every query is tenant-scoped" as a type-level property rather than a review
+  checklist item — is a table-layer type-system feature, deferred to a design of its own; the
+  session-subject pattern (and `emit_keyed`'s scoping key for realtime, §6) covers scoping
+  until then, as the realtime demo shows. API-key scopes/permissions are subject-only in v1 —
+  a permissions story earns its own design too.
 
 ## 9. Open questions (tracked, not blocking)
 

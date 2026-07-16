@@ -711,33 +711,87 @@ A literal segment beats a `:param` at the same position instead of
 conflicting — `/notes/all` and `/notes/:id` can coexist, and a request for
 `/notes/all` always prefers the literal route.
 
-### Sessions: the platform `Session` table and `Ctx`
+### Auth: sessions, API keys, and the resolution ladder
 
-`App::open` registers one table of its own alongside yours: `Session` (`id:
-Id<Session>`, `#[index] token: String`, `subject: String`) — raw tokens in
-v0; M1 adds hashing and expiry. Every request gets a `Ctx`, built inside the
-same transaction as your handler, carrying:
+`App::open` registers two platform tables of its own alongside yours —
+`Session` (`id: Id<Session>`, `#[index] token_hash: String`, `subject:
+String`, `expires_at: u64`) and `ApiKey` (`id: Id<ApiKey>`, `#[index]
+key_hash: String`, `subject: String`, `created_at: u64`) — both inside the
+commit point, so a login or a minted key is a durable, replicated
+transaction like any other. **Only the hash is ever stored:**
+`token_hash`/`key_hash` are lowercase-hex SHA-256 of the raw credential; the
+raw string exists only in the response that mints it and never reaches disk
+(a sim property scans every durable file in the universe and proves it).
 
-- `ctx.session() -> Option<&Session>` — the session matched by the
-  request's credentials, if any.
+Every request gets a `Ctx`, built inside the same transaction as your
+handler, carrying:
+
+- `ctx.principal() -> Option<&Principal>` — the authenticated identity, if
+  any: `Principal { subject: String, via: Via }`, where `via` names which
+  rung authenticated it (`Via::Session(id)`, `Via::ApiKey(id)`, or
+  `Via::Oidc`). This is the surface to read `subject` from on any `auth`
+  route, whatever the credential kind.
+- `ctx.session() -> Option<&Session>` — a compatibility accessor: the
+  `Session` row, but only when the principal authenticated `via` a session
+  (bearer or cookie); `None` for an API-key or OIDC principal.
 - `ctx.create_session(tx, subject) -> String` — inserts a `Session` row and
-  returns its token (a login). The token is 32 entropy bytes, hex-encoded
-  (64 characters), drawn once *before* the transaction starts — calling
-  `create_session` twice in one request panics: "Ctx::create_session called
-  twice in one request — one session per request".
-- `ctx.revoke(tx)` — deletes the current session (a no-op without one).
+  returns its raw token (a login). `expires_at` is this request's `now` plus
+  `AppConfig::session_ttl` (default 30 days).
+- `ctx.create_api_key(tx, subject) -> String` — inserts an `ApiKey` row and
+  returns the raw key: `"ck_"` + 64 hex chars (the prefix makes a leaked key
+  grep-able for scanners). Revoke a key by deleting its row —
+  `tx.delete::<ApiKey>(id)`, an ordinary write.
+- `ctx.revoke(tx)` — deletes the current session (logout); a no-op without
+  one.
 
-The request's credential is read from `Authorization: Bearer <token>` if
-present, else a `charpente_session=<token>` pair in the `Cookie` header.
-`#[route(METHOD "/path", auth)]` rejects the request before your handler
-runs if no session matched: 401, with the fixed message "no valid session —
-send `Authorization: Bearer <token>` or a `charpente_session` cookie".
-Without `auth`, the route always runs — `ctx.session()` is just `None`.
+One credential mint per request, of either kind. The raw token/key is 32
+entropy bytes drawn once *before* the transaction starts, so
+`create_session` and `create_api_key` share a single mint budget — calling
+either a second time in one request panics: "Ctx::create_session/create_api_key
+called twice in one request — one credential mint per request".
+
+**The resolution ladder.** Before your handler runs, the platform turns the
+request's credential into a `Principal`, in this order:
+
+1. `Authorization: Bearer <t>` where `<t>` contains exactly two `.` — judged
+   as a JWT and OIDC-verified (below). With no verifier mounted, a JWT-shaped
+   bearer is an unrecognized credential, never a fall-through to the hash
+   path.
+2. Any other bearer — SHA-256'd and matched against the `ApiKey` index, then
+   the `Session` index (a session past its `expires_at` is treated as
+   absent).
+3. A `charpente_session=<t>` cookie — the same hash path as 2. Only a
+   `Bearer` header is ever OIDC-verified; a cookie value that happens to
+   contain two dots still goes down the hash path.
+4. Nothing presented — `principal` is `None`.
+
+`#[route(METHOD "/path", auth)]` rejects the request before your handler runs
+when the principal is `None`. Without `auth`, the route always runs and
+`ctx.principal()` is whatever the ladder resolved (possibly `None`) — but a
+*presented* credential is still resolved and rejected even on a no-auth
+route, so a garbage bearer never reaches a handler.
+
+The 401s are named and fixed — copy these verbatim if you assert against
+them:
+
+```text
+authentication required — send "Authorization: Bearer <token>" or the charpente_session cookie
+unrecognized credential — it may have been revoked; obtain a new one
+session expired — log in again
+```
+
+The first fires when an `auth` route saw no credential; the second for a
+bearer/cookie that matched no live row (garbage, revoked, or a JWT-shaped
+bearer with no OIDC configured); the third for a session past its TTL. Expiry
+is *lazy*: a row is invisible the moment `now` passes `expires_at`, restart
+or not — a built-in daily cron sweeps the dead rows for hygiene, but
+resolution never waits on it.
 
 ```rust
+use charpente::auth::ApiKey;
 use charpente::http::{ApiError, App, AppConfig, Ctx};
 use charpente::prod::{ProdDisk, ProdEntropy};
-use charpente::{Schema, Tx, route, routes};
+use charpente::{Id, Schema, Tx, route, routes};
 
 #[route(POST "/login")]
 fn login(tx: &mut Tx, subject: String, ctx: &Ctx) -> Result<String, ApiError> {
@@ -748,8 +802,8 @@ fn login(tx: &mut Tx, subject: String, ctx: &Ctx) -> Result<String, ApiError> {
 fn whoami(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
     let _ = tx;
     Ok(ctx
-        .session()
-        .expect("auth routes always have a session")
+        .principal()
+        .expect("auth routes always have a principal")
         .subject
         .clone())
 }
@@ -760,16 +814,82 @@ fn logout(tx: &mut Tx, ctx: &Ctx) -> Result<&'static str, ApiError> {
     Ok("bye")
 }
 
+// Mint an API key for the caller's own subject; revoke by deleting the row.
+#[route(POST "/keys", auth)]
+fn mint_key(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
+    let subject = ctx.principal().expect("auth route").subject.clone();
+    Ok(ctx.create_api_key(tx, subject))
+}
+
+#[route(DELETE "/keys/:id", auth)]
+fn revoke_key(tx: &mut Tx, id: Id<ApiKey>, ctx: &Ctx) -> Result<&'static str, ApiError> {
+    let _ = ctx;
+    tx.delete::<ApiKey>(id);
+    Ok("revoked")
+}
+
 fn build_app(data_dir: &str) -> std::io::Result<App> {
     Ok(App::open(
         Box::new(ProdDisk::new(data_dir)?),
-        Schema::new(), // Session is registered by App::open itself
+        Schema::new(), // Session and ApiKey are registered by App::open itself
         Box::new(ProdEntropy::new()?),
         AppConfig::default(),
     )?
-    .mount(routes![login, whoami, logout]))
+    .mount(routes![login, whoami, logout, mint_key, revoke_key]))
 }
 ```
+
+### OIDC (static JWKS)
+
+`App::with_oidc` mounts a verifier for RS256-signed JWTs against a static
+JWKS — pure signature-and-claims checking on the kernel thread, no network
+fetch (dynamic JWKS is a later milestone). Configure it with the IdP's
+issuer, your audience, and the JWKS document verbatim:
+
+```rust
+use charpente::auth::OidcConfig;
+use charpente::http::App;
+
+fn mount_oidc(app: App) -> App {
+    app.with_oidc(OidcConfig {
+        issuer: "https://idp.example.com".to_string(),
+        audience: "my-charpente-api".to_string(),
+        // The IdP's JWKS document, verbatim — one or more RSA keys.
+        jwks_json: r#"{"keys":[{"kty":"RSA","kid":"k1","n":"0vx7...","e":"AQAB"}]}"#.to_string(),
+    })
+}
+```
+
+The JWKS is parsed once, at mount — a malformed document or an unusable key
+panics *then*, naming the offending key and the fix, never at request time
+(`<kid>` is the key's `kid`, or its position when absent):
+
+```text
+OidcConfig::jwks_json is not valid JSON: <detail> — pass the IdP's JWKS document verbatim (a {"keys": [...]} object)
+OidcConfig::jwks_json has no keys — the "keys" array is empty; add at least one RSA key
+OIDC JWKS key <kid> has kty "EC" — only "RSA" is supported in v1; remove non-RSA keys from the JWKS
+OIDC JWKS key <kid> has alg "RS384" — only "RS256" is supported; fix or remove the key's "alg" field
+OIDC JWKS key <kid> is invalid: modulus "n" is not valid base64url: <detail>
+```
+
+A verified token yields a `Principal` with `via: Via::Oidc` and `subject` =
+the token's `sub` claim — ephemeral, no row, nothing to revoke but a short
+`exp`. `exp`/`nbf` are checked against the request clock with a 60-second skew
+tolerance. Each failed check is its own named 401 (the `iss`/`aud` ones name
+presented-vs-configured; `<presented>`/`<configured>` are the actual values):
+
+```text
+malformed OIDC token — expected "header.payload.signature" (three dot-separated segments); got 2 segment(s)
+unsupported OIDC token alg "HS256" — only "RS256" is verified; mint the token with an RS256-signed key
+OIDC token signature does not verify against any configured JWKS key — the token was not issued by a trusted key; obtain a new one
+OIDC token expired — its "exp" claim is in the past; obtain a new one
+OIDC token is not yet valid — its "nbf" claim is in the future; wait or mint a fresh token
+OIDC token has issuer "<presented>" but this server is configured for issuer "<configured>" — mint the token against the configured issuer or fix OidcConfig::issuer
+OIDC token has audience "<presented>" but this server is configured for audience "<configured>" — mint the token for the configured audience or fix OidcConfig::audience
+```
+
+The replication port has its own peer-authentication secret, unrelated to
+this request-side auth — see §10.
 
 ### `ApiError` and status mapping
 
@@ -781,8 +901,11 @@ value:
 
 - `BadRequest(String)` → 400. What `FromParam`/JSON-body decoding produce
   (below), or your own rejection.
-- `Unauthorized` → 401. Fixed message (quoted above) — produced by `auth`
-  routes only, before your handler runs.
+- The 401 family → 401. Auth rejections, produced before your handler runs
+  (the resolution ladder, above): `Unauthorized` (no credential),
+  `UnrecognizedCredential`, `SessionExpired`, and `Oidc(..)` (one per failed
+  OIDC check). Their exact, named texts are in the auth section above — you
+  rarely construct these yourself; the `auth` gate and the ladder emit them.
 - `NotFound` → 404. Fixed message `"not found"` — the same text an
   unmatched path gets from the router directly.
 - `Internal(String)` → 500. Carries `e.to_string()` when it arrived via
@@ -2128,19 +2251,21 @@ one of the two patterns so their shapes differ.
 ```text
 job "CountUp" registered twice — each #[job] type is mounted once
 cron schedule "nightly" scheduled twice — schedule each name once
-Ctx::create_session called twice in one request — one session per request
+Ctx::create_session/create_api_key called twice in one request — one credential mint per request
 Schema: table "Counter" registered twice — register each #[table] type once
 ```
 
-The first three are all the same shape as the router conflict above, just
-for a different registry: `App::mount_jobs([...])` (§6), `App::schedule(...)`
-(§7), and `Ctx::create_session` (§5's Sessions section — called at most once
-per request, since the token is drawn before the transaction starts) each
-panic the moment a name is reused. The fourth (§3) is `Schema::table::<R>()`
-— called twice for the same `#[table]` type when building the `Schema`
-passed to `Db::open`, including registering `Session` or `charpente.jobs`
-yourself (`App::open`/`Db::open` already register those). Fix in every
-case: register that name/type exactly once.
+The first two are the same shape as the router conflict above, just for a
+different registry: `App::mount_jobs([...])` (§6) and `App::schedule(...)`
+(§7) panic the moment a name is reused. The third is the once-per-request
+mint budget (§5's auth section): `create_session` and `create_api_key` share
+one pre-transaction entropy draw, so a request that mints a second credential
+of either kind panics. The fourth (§3) is `Schema::table::<R>()` — called
+twice for the same `#[table]` type when building the `Schema` passed to
+`Db::open`, including registering `Session`, `ApiKey`, or `charpente.jobs`
+yourself (`App::open`/`Db::open` already register those). Fix in every case:
+register that name/type exactly once, and mint at most one credential per
+request.
 
 ### Call-site contract panics (`charpente-core/src/db.rs`, `charpente/src/prod.rs`, `charpente/src/kernel/cron.rs`)
 
@@ -2249,10 +2374,18 @@ inbound `Hello`/control verb must present the same secret (hashed and
 compared constant-time) or it is refused and the connection closed before any
 state changes; `None` accepts anything inbound. A node with `peer_secret` set
 always attaches it outbound, so a half-configured pair works in exactly one
-direction — configure the followers first, then the primary. The replication
-wire is plaintext TCP: `peer_secret` authenticates peers, it does not encrypt
-the link (a private network is the deployment assumption; transport
-encryption is a later milestone).
+direction — configure the followers first, then the primary (the reverse
+would lock the not-yet-configured followers out). A refused inbound gets one
+named message, before any state moves:
+
+```text
+peer secret missing or mismatched — set ReplConfig.peer_secret to match this node (or run the CLI verb with --secret)
+```
+
+The replication wire is plaintext TCP: `peer_secret` authenticates peers, it
+does not encrypt the link (a private network is the deployment assumption;
+transport encryption is a later milestone). An eavesdropper on the path can
+read both the frames and the secret.
 
 `serve::serve_replicated` is `serve` plus replication: same HTTP edge, but the
 kernel also runs the replication engine. A `serve::backup` node runs the engine
