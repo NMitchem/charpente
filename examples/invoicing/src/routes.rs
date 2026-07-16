@@ -8,6 +8,7 @@ use crate::jobs::{ReceiptSent, SendReceipt};
 use crate::model::{
     APP_CLOCK_ID, AppClock, Customer, Invoice, InvoiceState, LINE_ITEM_SEQ, LineItem, next_id,
 };
+use charpente::auth::ApiKey;
 use charpente::core::table::Id;
 use charpente::http::{ApiError, Ctx, Cursor, Subscription};
 use charpente::{Tx, View, event, route};
@@ -288,4 +289,30 @@ pub fn events_feed(
         .and::<ReceiptSent>()
         .key(org)
         .cursor(cursor))
+}
+
+// ---- API keys (auth T9 demo) -----------------------------------------------
+
+/// Mints an API key for the caller's own subject. Returns the raw
+/// `"ck_"`-prefixed key once; only its hash is ever stored (auth T3) — the
+/// same shape as `crates/charpente/tests/http.rs`'s `create_key`.
+#[route(POST "/keys", auth)]
+pub fn create_key(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
+    let subject = ctx
+        .session()
+        .expect("auth routes always have a session")
+        .subject
+        .clone();
+    Ok(ctx.create_api_key(tx, subject))
+}
+
+/// Revokes an API key by id — revoke-as-delete (auth T3): no separate
+/// revoked flag, the row is simply gone, so the next request bearing that
+/// key falls through the resolution ladder to the unrecognized-credential
+/// 401.
+#[route(DELETE "/keys/:id", auth)]
+pub fn revoke_key(tx: &mut Tx, id: Id<ApiKey>, ctx: &Ctx) -> Result<&'static str, ApiError> {
+    let _ = ctx;
+    tx.delete::<ApiKey>(id);
+    Ok("revoked")
 }

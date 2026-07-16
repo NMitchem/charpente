@@ -1,4 +1,5 @@
 use charpente::View;
+use charpente::auth::{ApiKey, hash_token};
 use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::{Codec, Id};
 use charpente::http::{App, Cursor, Method, Request};
@@ -19,6 +20,7 @@ charpente_sim::sim_tests! {
     overdue_reminders_over_months require ["reminder:sent"],
     illegal_transitions_are_rejected,
     events_feed_resumes_across_restart,
+    api_key_authorizes_then_revoked_is_rejected,
 }
 
 fn build(sim: &Sim) -> std::io::Result<App> {
@@ -707,4 +709,153 @@ fn events_feed_resumes_across_restart(sim: &mut Sim) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+// ---- 7. a minted API key authorizes; once revoked, it is rejected ---------
+
+/// `#[job]`-independent: this workload never touches `SendReceipt` or the
+/// day-advance cron, just `/keys` mint/revoke against an authed route
+/// (`/customers`). Runs under `sim`'s own fault config (not a fresh
+/// fault-free `Sim`, unlike `illegal_transitions_are_rejected` /
+/// `events_feed_resumes_across_restart`), so every step follows the other
+/// fault-injected workloads' discipline: an unclean ack is fault fallout,
+/// not a failure, EXCEPT the final read — once the revoke itself acked 200
+/// (durably committed, per the platform's ack-after-durable rule), a 200 on
+/// the next read with the same key is a real bug, not fallout.
+fn api_key_authorizes_then_revoked_is_rejected(sim: &mut Sim) -> Result<(), String> {
+    let app = match build(sim) {
+        Ok(app) => app,
+        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
+        Ok(k) => k,
+        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let token = login(&mut kernel, sim)?.unwrap_or_default();
+    let auth = format!("Bearer {token}");
+
+    // Mint an API key.
+    let mut source = SimSource::new(Box::new(sim.clock()), SEC);
+    source.push_at(
+        0,
+        Request::new(Method::Post, "/keys").header("authorization", &auth),
+    );
+    if let Err(e) = kernel.run(&mut source)
+        && !is_fault_fallout(&e.to_string())
+    {
+        return Err(e.to_string());
+    }
+    let Some(200) = statuses_of(&source)?.first().copied() else {
+        return Ok(()); // mint didn't cleanly ack — fault fallout
+    };
+    let raw_key: String = {
+        let responses = source.responses();
+        let responses = responses
+            .lock()
+            .map_err(|_| "responses lock poisoned".to_string())?;
+        serde_json::from_slice(&responses[0].1).map_err(|e| e.to_string())?
+    };
+    let key_auth = format!("Bearer {raw_key}");
+
+    // The freshly minted key authorizes an authed route.
+    let mut source = SimSource::new(Box::new(sim.clock()), SEC);
+    source.push_at(
+        0,
+        Request::new(Method::Get, "/customers").header("authorization", &key_auth),
+    );
+    if let Err(e) = kernel.run(&mut source)
+        && !is_fault_fallout(&e.to_string())
+    {
+        return Err(e.to_string());
+    }
+    let Some(200) = statuses_of(&source)?.first().copied() else {
+        return Ok(()); // the authorizing read didn't cleanly ack — fault fallout
+    };
+    sim.cover("auth:key-authorizes");
+
+    // Look up the minted key's row to get its id for the revoke route —
+    // mirrors crates/charpente/tests/http.rs's resolution_ladder_matrix.
+    let key_hash = hash_token(&raw_key);
+    let snap = match kernel.app().db().snapshot() {
+        Ok(s) => s,
+        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let key_id = match ApiKey::by_key_hash(&snap, &key_hash) {
+        Ok(rows) => match rows.into_iter().next() {
+            Some(row) => row.id,
+            None => return Ok(()), // row not durable yet — fault fallout
+        },
+        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    drop(snap);
+
+    // Revoke it.
+    let mut source = SimSource::new(Box::new(sim.clock()), SEC);
+    source.push_at(
+        0,
+        Request::new(Method::Delete, format!("/keys/{}", key_id.raw()))
+            .header("authorization", &auth),
+    );
+    if let Err(e) = kernel.run(&mut source)
+        && !is_fault_fallout(&e.to_string())
+    {
+        return Err(e.to_string());
+    }
+    let Some(200) = statuses_of(&source)?.first().copied() else {
+        return Ok(()); // revoke didn't cleanly ack — fault fallout
+    };
+
+    // The revoked key is now rejected — the named 401, byte-exact (copied
+    // from crates/charpente/tests/http.rs:456-457's UNRECOGNIZED constant).
+    let mut source = SimSource::new(Box::new(sim.clock()), SEC);
+    source.push_at(
+        0,
+        Request::new(Method::Get, "/customers").header("authorization", &key_auth),
+    );
+    if let Err(e) = kernel.run(&mut source)
+        && !is_fault_fallout(&e.to_string())
+    {
+        return Err(e.to_string());
+    }
+    let responses = source.responses();
+    let (status, body) = {
+        let responses = responses
+            .lock()
+            .map_err(|_| "responses lock poisoned".to_string())?;
+        match responses.first() {
+            Some((status, body)) => (*status, body.clone()),
+            None => return Ok(()), // no response recorded — fault fallout
+        }
+    };
+    const UNRECOGNIZED: &str =
+        "unrecognized credential — it may have been revoked; obtain a new one";
+    match status {
+        200 => Err(
+            "revoked API key still authorized a request — revoke did not take effect \
+                     even though the revoke request itself acked 200"
+                .to_string(),
+        ),
+        401 => {
+            #[derive(serde::Deserialize)]
+            struct ErrBody {
+                error: String,
+            }
+            let err: ErrBody = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+            if err.error != UNRECOGNIZED {
+                return Err(format!(
+                    "expected {UNRECOGNIZED:?} for a revoked key, got {:?}",
+                    err.error
+                ));
+            }
+            Ok(())
+        }
+        // Any other status (e.g. 500 from a fault mid-ladder-resolution) is
+        // fault fallout, not a bug: the revoke's own 200 ack already proved
+        // the delete committed.
+        _ => Ok(()),
+    }
 }
