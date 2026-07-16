@@ -361,8 +361,50 @@ do not reorder a milestone's dependency sequence.
   `id:` line defeats EventSource auto-self-heal (fails loud, never wrong),
   double-buffered sink (~512 effective), the corrupt-frame double-fault window
   (0x820d5e907fbb8b55, fail-stop direction).
-- Next: the debug/release replay-divergence investigation (seed 0xff159ed76d2806e4,
-  Noah-ruled follow-up), then M1 sub-project 4 — auth properly (OIDC, hashed session
-  tokens); then migrations as log records, error/introspection polish
+- **Mode-skew resolved (2026-07-15, bbeae2e)**: the debug/release replay divergence
+  (seed 0xff159ed76d2806e4) was redb's `debug-assertions`-conditional layout, not
+  charpente nondeterminism; fixed with a profile override so both build modes share
+  one layout, plus a CI tripwire that replays the divergence seed and the crash-recovery
+  pin in `--release` on every push. The seed promise is build-mode-independent again.
+- **M1 sub-project 4 done — auth (2026-07-16, spec docs/superpowers/specs/
+  2026-07-15-auth-design.md, 9-task plan + 2 Noah-ruled interludes, commits
+  6ab45ba..3080e83).** Shipped: SHA-256 `hash_token` + branch-free `ct_eq_hex` (T1);
+  hashed-at-rest session tokens + lazy expiry as the correctness path (T2); API keys
+  (`ck_` + 64 hex, id from the token's first 16 hex chars, revoke-as-delete) (T3); the
+  4-rung resolution ladder — ApiKey before Session, JWT-shape never falls through,
+  `Principal`/`Via`, the named 401 family pinned byte-exact (T4, two rulings: cookies
+  never OIDC-verify; presented-but-invalid 401s everywhere); OIDC static-JWKS RS256
+  with per-check named 401s + mount-time config errors (T5, rsa's RNG surface
+  deny-listed); the daily session-expiry sweep cron — hygiene, not correctness (T6);
+  the replication peer secret — Hello/Ctrl proof checked first, refuse-before-any-
+  state-change, constant-time over hash digests, appended to the wire without a proto
+  bump, `--secret` on both CLI verbs (T7; review caught the GUIDE/spec rollout-order
+  inversion — it's followers-first-then-primary, since the receiver checks and the
+  follower dials; refused Hellos never pin GC). Interludes: T6's platform cron shifted
+  the fault stream and exposed (a) a latent realtime oracle gap (afba8cc) and (b) a
+  pre-existing WAL recovery-cut atomicity bug — orphaned segments now removed before
+  truncation, durability fence 3 (9d11540, seed 0x4177819b4a2ba984). Flagship
+  negative-space property (T8, tests/auth.rs): raw credentials never touch the durable
+  store — two-host rig, 128 universes at base 0x2EB3_0001, media corruption ON, every
+  acked token/key + the peer-secret literal scanned against every durable file on both
+  hosts; naive-victim meta-test RED-proven against the shared oracle; determinism at
+  0x2EB3_5EED via per-host fingerprints. DESIGN §8 sketch→mechanism + GUIDE auth/OIDC
+  sections, every quoted error string sourced from its pinning test (3080e83); invoicing
+  gained /keys mint+revoke + the authorizes-then-revoked sim (7dd5a2f). Threat model
+  stated honestly everywhere: the replication wire is plaintext TCP — the secret
+  authenticates peers, it does not encrypt. Evidence: 7-stage close-out sweep green
+  (fmt/clippy; full workspace; all seven charpente suites ×2; charpente-sim ×2; pinned
+  debug replays 0x8bee1752811ae873 + 0x348270b38f166529; release replays
+  0x8bee1752811ae873 + 0xff159ed76d2806e4 per the mode-skew guard; invoicing 1024u
+  master 0x4c91fc3370a7d730); live demo-of-record (transcript in the ledger): mint →
+  key authorizes → revoke → the named 401 byte-exact, 2s-TTL login expires to its named
+  401, wrong/missing `--secret` promote prints the pinned refusal and exits 1, correct
+  secret admitted through to role logic. Follow-ups ledgered: the diverged-BEHIND
+  re-seed hole (seed 0x752166a16e0d2c99, Important/borderline-Critical, decide_hello's
+  below-base Snapshot arm — fix before or at sub-project 5's start), CtrlSwitchover
+  secret arm untested end-to-end, `Some("")` behaves as `None`, refused sessions now
+  excluded from switchover candidacy (beneficial, noted).
+- Next: the diverged-BEHIND re-seed fix (seed 0x752166a16e0d2c99), then M1
+  sub-project 5 — migrations as log records; then error/introspection polish
   (`charpente describe`), and the Vörtex-style black-box edge harness for the hyper
   layer.
