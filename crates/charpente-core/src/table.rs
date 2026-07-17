@@ -671,6 +671,29 @@ impl Writer<'_> {
         Ok(())
     }
 
+    /// Decode-free overwrite: the `MigratePut` apply (spec §3). The bytes
+    /// are already encoded under the table's target version; the old value
+    /// is never interpreted (it is one version older — decoding it under
+    /// the compiled type is exactly the bug this path exists to avoid),
+    /// and indexes are deliberately untouched: they are rebuilt wholesale
+    /// by the close-out trigger.
+    pub fn put_raw(&mut self, table: &str, id: u64, row: &[u8]) -> io::Result<()> {
+        let mut rows = self.txn.open_table(rows_def(table)).map_err(redb_err)?;
+        rows.insert(id, row).map_err(redb_err)?;
+        Ok(())
+    }
+
+    /// Raw read of one row's stored bytes (apply-side helper for the
+    /// close-out trigger's old-row peek).
+    pub fn get_raw(&mut self, table: &str, id: u64) -> io::Result<Option<Vec<u8>>> {
+        let rows = match self.txn.open_table(rows_def(table)) {
+            Ok(rows) => rows,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(redb_err(e)),
+        };
+        Ok(rows.get(id).map_err(redb_err)?.map(|g| g.value().to_vec()))
+    }
+
     fn replace_row<R: Row>(&mut self, row: &R, id: u64) -> io::Result<Option<R>> {
         let mut rows = self.txn.open_table(rows_def(R::TABLE)).map_err(redb_err)?;
         let old = match rows.get(id).map_err(redb_err)? {
@@ -856,6 +879,32 @@ impl Snapshot {
         for entry in rows.range(0u64..=u64::MAX).map_err(redb_err)? {
             let (key, value) = entry.map_err(redb_err)?;
             out.push((key.value(), value.value().to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// Raw rows with `id > after_id` (all rows when `None`), ascending, at
+    /// most `limit` — the migration executor's bounded batch read (spec
+    /// §3: batching must bound memory, not just record size).
+    pub fn scan_raw_from(
+        &self,
+        table: &str,
+        after_id: Option<u64>,
+        limit: usize,
+    ) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        let rows = match self.txn.open_table(rows_def(table)) {
+            Ok(rows) => rows,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(redb_err(e)),
+        };
+        let from = after_id.map_or(0, |a| a.saturating_add(1));
+        let mut out = Vec::new();
+        for item in rows.range(from..).map_err(redb_err)? {
+            if out.len() == limit {
+                break;
+            }
+            let (k, v) = item.map_err(redb_err)?;
+            out.push((k.value(), v.value().to_vec()));
         }
         Ok(out)
     }

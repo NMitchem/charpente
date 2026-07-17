@@ -104,9 +104,8 @@ pub enum TxError<E> {
 struct TableOps {
     apply_put: fn(&mut Writer<'_>, &[u8]) -> io::Result<()>,
     apply_delete: fn(&mut Writer<'_>, u64) -> io::Result<()>,
-    // Consumed by the migration executor's close-out apply (T4/T6); no
-    // reader yet in this task, which only plumbs the field into place.
-    #[allow(dead_code)]
+    // Rebuilds every one of the table's secondary indexes from its rows;
+    // invoked by the migration close-out trigger in `TableMachine::apply`.
     rebuild_indexes: fn(&mut Writer<'_>) -> io::Result<()>,
     version: u32,
     fingerprint: Option<u64>,
@@ -243,6 +242,11 @@ enum Effect {
         payload: Vec<u8>,
         key: Option<String>,
     },
+    MigratePut {
+        table: String,
+        id: u64,
+        row: Vec<u8>,
+    },
 }
 
 /// A transaction's buffered effects: the collapsed per-table overlay
@@ -252,6 +256,7 @@ struct TxEffects {
     overlay: BTreeMap<&'static str, BTreeMap<u64, Option<Vec<u8>>>>,
     enqueues: Vec<(&'static str, Vec<u8>, Option<String>)>,
     emits: Vec<(&'static str, Vec<u8>, Option<String>)>,
+    migrate_puts: Vec<(&'static str, u64, Vec<u8>)>,
 }
 
 impl TxEffects {
@@ -259,6 +264,7 @@ impl TxEffects {
         self.overlay.values().all(BTreeMap::is_empty)
             && self.enqueues.is_empty()
             && self.emits.is_empty()
+            && self.migrate_puts.is_empty()
     }
 }
 
@@ -270,7 +276,8 @@ fn encode_bytes(bytes: &[u8], out: &mut Vec<u8>) {
 fn encode_record(effects: &TxEffects) -> Vec<u8> {
     let n = effects.overlay.values().map(BTreeMap::len).sum::<usize>()
         + effects.enqueues.len()
-        + effects.emits.len();
+        + effects.emits.len()
+        + effects.migrate_puts.len();
     let mut out = Vec::new();
     (u32::try_from(n).expect("transaction exceeds u32 effects")).encode(&mut out);
     for (table, entries) in &effects.overlay {
@@ -301,6 +308,12 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
         encode_bytes(payload, &mut out);
         key.encode(&mut out);
     }
+    for (table, id, row) in &effects.migrate_puts {
+        out.push(4);
+        encode_bytes(table.as_bytes(), &mut out);
+        id.encode(&mut out);
+        encode_bytes(row, &mut out);
+    }
     out
 }
 
@@ -328,6 +341,11 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 event: String::decode(input)?,
                 payload: Vec::<u8>::decode(input)?,
                 key: Option::<String>::decode(input)?,
+            },
+            4 => Effect::MigratePut {
+                table: String::decode(input)?,
+                id: u64::decode(input)?,
+                row: Vec::<u8>::decode(input)?,
             },
             other => {
                 return Err(io::Error::new(
@@ -380,6 +398,17 @@ impl Tx {
             .entry(R::TABLE)
             .or_default()
             .insert(id.raw(), None);
+    }
+
+    /// Buffers one decode-free migration write (spec §3). `row` must
+    /// already be encoded under the table's TARGET version. Used only by
+    /// `Db::migrate_schema`'s executor — deliberately not `pub`.
+    // No caller until T6 wires the executor; the wire path (encode/decode/
+    // apply) and its close-out trigger are exercised now (record roundtrip +
+    // tests/migrate_apply.rs). The allow comes off when T6 calls this.
+    #[allow(dead_code)]
+    pub(crate) fn migrate_put(&mut self, table: &'static str, id: u64, row: Vec<u8>) {
+        self.effects.migrate_puts.push((table, id, row));
     }
 
     pub fn enqueue<J: Job>(&mut self, job: J) {
@@ -538,7 +567,35 @@ impl StateMachine for TableMachine {
             let mut ids = Vec::new();
             for effect in &effects {
                 match effect {
-                    Effect::Put { table, row } => (schema.ops(table)?.apply_put)(w, row)?,
+                    Effect::Put { table, row } => {
+                        if table == crate::migration::SchemaVersion::TABLE {
+                            // Close-out detection (spec §3): a version
+                            // transition with the in-flight marker
+                            // clearing rebuilds the migrated table's
+                            // indexes — at apply, so primary, replay, and
+                            // followers rebuild at the same log position.
+                            let new = crate::migration::SchemaVersion::decode_row(row)?;
+                            let old = w
+                                .get_raw(table, new.id.raw())?
+                                .map(|b| crate::migration::SchemaVersion::decode_row(&b))
+                                .transpose()?;
+                            (schema.ops(table)?.apply_put)(w, row)?;
+                            let closed_out = old.as_ref().is_some_and(|o| {
+                                o.migrating_to.is_some()
+                                    && new.migrating_to.is_none()
+                                    && new.version > o.version
+                            });
+                            if closed_out {
+                                (schema.ops(&new.table)?.rebuild_indexes)(w)?;
+                            }
+                        } else {
+                            (schema.ops(table)?.apply_put)(w, row)?;
+                        }
+                    }
+                    Effect::MigratePut { table, id, row } => {
+                        schema.ops(table)?; // registered-table check, same error surface
+                        w.put_raw(table, *id, row)?;
+                    }
                     Effect::Delete { table, id } => (schema.ops(table)?.apply_delete)(w, *id)?,
                     Effect::Enqueue { job, payload, key } => {
                         ids.push(w.materialize_job(job, payload, key.as_deref())?);
@@ -996,7 +1053,7 @@ pub struct Seeder {
     disk: Box<dyn Disk>,
     cfg: DbConfig,
     schema: Schema,        // the caller's schema, passed to Db::open at finish
-    import_schema: Schema, // schema + JobRow + EventRow, used to decode/import rows
+    import_schema: Schema, // schema + JobRow + EventRow + SchemaVersion, used to decode/import rows
     store: Store,
 }
 
@@ -1179,6 +1236,21 @@ mod tests {
                     key: None
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn migrate_put_roundtrips_through_the_record_format() {
+        let mut effects = TxEffects::default();
+        effects.migrate_puts.push(("Widget", 7, vec![1, 2, 3]));
+        let decoded = decode_record(&encode_record(&effects)).unwrap();
+        assert_eq!(
+            decoded,
+            vec![Effect::MigratePut {
+                table: "Widget".to_string(),
+                id: 7,
+                row: vec![1, 2, 3],
+            }]
         );
     }
 
