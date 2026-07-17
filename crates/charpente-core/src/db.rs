@@ -25,7 +25,7 @@ use crate::event::EventRow;
 use crate::io::Disk;
 use crate::job::JobRow;
 use crate::log::{MAX_RECORD_BYTES, WalConfig, parse_segment_name, segment_name};
-use crate::table::{Codec, Id, Row, Snapshot, Store, View, Writer};
+use crate::table::{Codec, Id, Row, RowShape, Snapshot, Store, View, Writer};
 
 // ---------------------------------------------------------------- config
 
@@ -44,6 +44,9 @@ pub struct DbConfig {
     /// `0` retains nothing beyond the current tail. Count-based rather than
     /// time-based: v0 has no transactional wall-time source (DESIGN §6).
     pub event_retention: u64,
+    /// Rows per transaction while a table migrates (spec §3) — bounds one
+    /// migration commit's WAL record size.
+    pub migration_batch_size: u64,
 }
 
 impl Default for DbConfig {
@@ -54,6 +57,7 @@ impl Default for DbConfig {
             retain_segments: 2,
             checkpoint_every: 4096,
             event_retention: 65_536,
+            migration_batch_size: 1000,
         }
     }
 }
@@ -100,6 +104,12 @@ pub enum TxError<E> {
 struct TableOps {
     apply_put: fn(&mut Writer<'_>, &[u8]) -> io::Result<()>,
     apply_delete: fn(&mut Writer<'_>, u64) -> io::Result<()>,
+    // Consumed by the migration executor's close-out apply (T4/T6); no
+    // reader yet in this task, which only plumbs the field into place.
+    #[allow(dead_code)]
+    rebuild_indexes: fn(&mut Writer<'_>) -> io::Result<()>,
+    version: u32,
+    fingerprint: Option<u64>,
 }
 
 fn apply_put<R: Row>(w: &mut Writer<'_>, row: &[u8]) -> io::Result<()> {
@@ -110,12 +120,17 @@ fn apply_delete<R: Row>(w: &mut Writer<'_>, id: u64) -> io::Result<()> {
     w.delete::<R>(Id::from_raw(id))
 }
 
+fn rebuild_indexes<R: Row>(w: &mut Writer<'_>) -> io::Result<()> {
+    w.rebuild_indexes_for::<R>()
+}
+
 /// The set of tables a `Db` can replay log records into. Every `#[table]`
 /// type the application writes must be registered — replay works on raw
 /// record bytes and needs the typed codecs to maintain indexes.
 #[derive(Default, Clone)]
 pub struct Schema {
     tables: BTreeMap<&'static str, TableOps>,
+    migrations: BTreeMap<&'static str, Vec<crate::migration::MigrationStep>>,
 }
 
 impl Schema {
@@ -129,6 +144,9 @@ impl Schema {
             TableOps {
                 apply_put: apply_put::<R>,
                 apply_delete: apply_delete::<R>,
+                rebuild_indexes: rebuild_indexes::<R>,
+                version: R::VERSION,
+                fingerprint: R::FINGERPRINT,
             },
         );
         assert!(
@@ -146,11 +164,46 @@ impl Schema {
         self.tables.keys().copied().collect()
     }
 
+    /// Registers one migration step for `table` (which must already be
+    /// `.table::<R>()`-registered under the same name). Steps may be
+    /// registered in any order; the executor looks them up by
+    /// `from_version`.
+    pub fn migration<Step: crate::migration::TableMigration>(
+        mut self,
+        table: &'static str,
+    ) -> Schema {
+        assert!(
+            self.tables.contains_key(table),
+            "Schema: migration() registered for table \"{table}\" but it was never .table()'d \
+             — call .table::<R>() for \"{table}\" before registering its migrations"
+        );
+        self.migrations
+            .entry(table)
+            .or_default()
+            .push(crate::migration::MigrationStep {
+                from_version: Step::Prev::VERSION,
+                to_version: Step::VERSION,
+                apply: crate::migration::migration_step_fn::<Step>,
+            });
+        self
+    }
+
+    pub fn migrations_for(&self, table: &str) -> &[crate::migration::MigrationStep] {
+        self.migrations.get(table).map_or(&[], Vec::as_slice)
+    }
+
+    /// A registered table's `(version, fingerprint)`.
+    pub fn table_meta(&self, table: &str) -> Option<(u32, Option<u64>)> {
+        self.tables
+            .get(table)
+            .map(|ops| (ops.version, ops.fingerprint))
+    }
+
     /// Drops one table's ops. Used only by `Db::into_seeder` to strip the
-    /// platform-owned `JobRow` registration (`Db::open` always adds it)
-    /// before handing the schema to a fresh `Seeder`, which re-adds it
-    /// itself — without this, that would hit `table`'s own
-    /// duplicate-registration assert.
+    /// platform-owned registrations — `JobRow`, `EventRow`, `SchemaVersion`
+    /// (`Db::open` always adds all three) — before handing the schema to a
+    /// fresh `Seeder`, which re-adds them itself; without this, that would
+    /// hit `table`'s own duplicate-registration assert.
     pub(crate) fn remove(&mut self, table: &'static str) {
         self.tables.remove(table);
     }
@@ -559,9 +612,13 @@ impl Db {
     /// `checkpoint`'s own gc produces, so it is refused rather than silently
     /// replayed from wherever the log happens to start.
     pub fn open(disk: Box<dyn Disk>, cfg: DbConfig, schema: Schema) -> io::Result<Db> {
-        // The jobs and events tables are platform-owned; an app registering
-        // either itself hits the existing duplicate-registration assert.
-        let schema = schema.table::<JobRow>().table::<EventRow>();
+        // The jobs, events, and schema-versions tables are platform-owned; an
+        // app registering any itself hits the existing duplicate-registration
+        // assert.
+        let schema = schema
+            .table::<JobRow>()
+            .table::<EventRow>()
+            .table::<crate::migration::SchemaVersion>();
         let store = match Store::open(&*disk, &cfg.store_path) {
             Ok(store) => store,
             Err(e) => {
@@ -911,9 +968,9 @@ impl Db {
     /// Deconstructs a live `Db` into a `Seeder` over the same disk — the seed
     /// path's producer side (DESIGN §5): an app rebuilding a follower's state
     /// in-process from its own primary's snapshot. The recovered schema
-    /// already carries `JobRow`/`EventRow` (`Db::open` adds both on the way
-    /// in); `Schema::remove` strips them back off so `Seeder::new` doesn't
-    /// double-register either.
+    /// already carries `JobRow`/`EventRow`/`SchemaVersion` (`Db::open` adds
+    /// all three on the way in); `Schema::remove` strips them back off so
+    /// `Seeder::new` doesn't double-register any.
     pub fn into_seeder(self) -> io::Result<Seeder> {
         let (wal, machine) = self.engine.into_parts();
         let disk = wal.into_disk();
@@ -923,6 +980,7 @@ impl Db {
         drop(store); // Seeder::new discards the store file itself; nothing to save
         schema.remove(JobRow::TABLE);
         schema.remove(EventRow::TABLE);
+        schema.remove(crate::migration::SchemaVersion::TABLE);
         Seeder::new(disk, self.cfg, schema)
     }
 }
@@ -943,10 +1001,11 @@ pub struct Seeder {
 }
 
 impl Seeder {
-    /// `schema` must NOT include `JobRow`/`EventRow` — `Seeder` registers
-    /// both itself (mirroring `Db::open`), so a schema already carrying
-    /// either (e.g. one recovered from a live `Db` via `into_seeder`) would
-    /// double-register. Discards any store file and `wal/` segments already
+    /// `schema` must NOT include `JobRow`/`EventRow`/`SchemaVersion` —
+    /// `Seeder` registers all three itself (mirroring `Db::open`), so a
+    /// schema already carrying any (e.g. one recovered from a live `Db` via
+    /// `into_seeder`) would double-register. Discards any store file and
+    /// `wal/` segments already
     /// at `disk`, dir-barriered — seeding always replaces a timeline, never
     /// merges into one.
     pub fn new(disk: Box<dyn Disk>, cfg: DbConfig, schema: Schema) -> io::Result<Seeder> {
@@ -962,7 +1021,11 @@ impl Seeder {
         }
         disk.sync_dir(&wal_prefix)?;
         let store = Store::open(&*disk, &cfg.store_path)?;
-        let import_schema = schema.clone().table::<JobRow>().table::<EventRow>();
+        let import_schema = schema
+            .clone()
+            .table::<JobRow>()
+            .table::<EventRow>()
+            .table::<crate::migration::SchemaVersion>();
         Ok(Seeder {
             disk,
             cfg,
@@ -1140,5 +1203,100 @@ mod tests {
     fn empty_effects_know_they_are_empty() {
         assert!(TxEffects::default().is_empty());
         assert!(!effects_fixture().is_empty());
+    }
+
+    mod schema_migrations {
+        use super::super::*;
+        use crate::migration::{MigrationError, TableMigration};
+        use crate::table::{Codec, IndexDef, RowShape};
+
+        struct WidgetV1 {
+            count: u32,
+        }
+        impl RowShape for WidgetV1 {
+            const VERSION: u32 = 1;
+            fn encode_row(&self, out: &mut Vec<u8>) {
+                self.count.encode(out);
+            }
+            fn decode_row(bytes: &[u8]) -> io::Result<WidgetV1> {
+                let input = &mut &bytes[..];
+                Ok(WidgetV1 {
+                    count: u32::decode(input)?,
+                })
+            }
+        }
+        struct Widget {
+            id: Id<Widget>,
+            count: u32,
+        }
+        impl RowShape for Widget {
+            const VERSION: u32 = 2;
+            fn encode_row(&self, out: &mut Vec<u8>) {
+                self.id.encode(out);
+                self.count.encode(out);
+            }
+            fn decode_row(bytes: &[u8]) -> io::Result<Widget> {
+                let input = &mut &bytes[..];
+                Ok(Widget {
+                    id: Id::decode(input)?,
+                    count: u32::decode(input)?,
+                })
+            }
+        }
+        impl Row for Widget {
+            const TABLE: &'static str = "Widget";
+            const INDEXES: &'static [IndexDef<Widget>] = &[];
+            const VERSION: u32 = 2;
+            const FINGERPRINT: Option<u64> = Some(0xabc);
+            fn id(&self) -> Id<Widget> {
+                self.id
+            }
+            fn encode_row(&self, out: &mut Vec<u8>) {
+                self.id.encode(out);
+                self.count.encode(out);
+            }
+            fn decode_row(bytes: &[u8]) -> io::Result<Widget> {
+                let input = &mut &bytes[..];
+                Ok(Widget {
+                    id: Id::decode(input)?,
+                    count: u32::decode(input)?,
+                })
+            }
+        }
+        impl TableMigration for Widget {
+            type Prev = WidgetV1;
+            fn migrate(prev: WidgetV1) -> Result<Widget, MigrationError> {
+                Ok(Widget {
+                    id: Id::from_raw(0),
+                    count: prev.count,
+                })
+            }
+        }
+
+        #[test]
+        #[should_panic(expected = "never .table()'d")]
+        fn migration_for_an_unregistered_table_panics_by_name() {
+            let _ = Schema::new().migration::<Widget>("Widget");
+        }
+
+        #[test]
+        fn registered_step_survives_schema_storage_and_applies() {
+            let schema = Schema::new()
+                .table::<Widget>()
+                .migration::<Widget>("Widget");
+            let steps = schema.migrations_for("Widget");
+            assert_eq!((steps[0].from_version, steps[0].to_version), (1, 2));
+            let mut old = Vec::new();
+            WidgetV1 { count: 3 }.encode_row(&mut old);
+            let new = (steps[0].apply)(&old).unwrap();
+            assert_eq!(<Widget as Row>::decode_row(&new).unwrap().count, 3);
+        }
+
+        #[test]
+        fn table_meta_reads_version_and_fingerprint() {
+            let schema = Schema::new().table::<Widget>();
+            assert_eq!(schema.table_meta("Widget"), Some((2, Some(0xabc))));
+            assert_eq!(schema.table_meta("Nope"), None);
+        }
     }
 }

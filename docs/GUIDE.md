@@ -334,6 +334,7 @@ fn config() -> DbConfig {
         retain_segments: 2,
         checkpoint_every: 4096,
         event_retention: 65_536,
+        migration_batch_size: 1000,
     }
 }
 ```
@@ -343,7 +344,9 @@ construct one by hand. `retain_segments` and `checkpoint_every` govern
 `Db::checkpoint`'s log GC, covered next. `event_retention` bounds the
 built-in `charpente.events` table the same way: each checkpoint deletes all
 but the newest `event_retention` event rows (`Db::event_floor()` reports the
-smallest id still retained).
+smallest id still retained). `migration_batch_size` caps how many rows one
+schema-migration transaction rewrites at a time, bounding a single migration
+commit's WAL record size.
 
 ### Recovery, behaviorally
 

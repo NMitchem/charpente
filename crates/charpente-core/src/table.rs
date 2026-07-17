@@ -640,6 +640,37 @@ impl Writer<'_> {
         Ok(id)
     }
 
+    /// Drops and rebuilds every one of `R`'s secondary index tables from
+    /// the rows table. Index entries are derived, store-local data —
+    /// never logged, deterministic, idempotent — so this is safe to redo
+    /// after a crash at any point (spec §3: triggered by applying a
+    /// migration close-out record). Memory is bounded by index keys, not
+    /// rows: each pass streams the rows table once per index.
+    pub fn rebuild_indexes_for<R: Row>(&mut self) -> io::Result<()> {
+        for index in R::INDEXES {
+            let name = index_table_name(index);
+            self.txn
+                .delete_table(index_def(&name))
+                .map_err(|e| io::Error::other(format!("rebuild_indexes: dropping {name}: {e}")))?;
+            let mut entries: Vec<Vec<u8>> = Vec::new();
+            {
+                let rows = self.txn.open_table(rows_def(R::TABLE)).map_err(redb_err)?;
+                for item in rows.iter().map_err(redb_err)? {
+                    let (k, v) = item.map_err(redb_err)?;
+                    let row = R::decode_row(v.value())?;
+                    let mut key = Vec::new();
+                    (index.key)(&row, &mut key);
+                    entries.push(index_entry(key, k.value()));
+                }
+            }
+            let mut table = self.txn.open_table(index_def(&name)).map_err(redb_err)?;
+            for entry in &entries {
+                table.insert(entry.as_slice(), ()).map_err(redb_err)?;
+            }
+        }
+        Ok(())
+    }
+
     fn replace_row<R: Row>(&mut self, row: &R, id: u64) -> io::Result<Option<R>> {
         let mut rows = self.txn.open_table(rows_def(R::TABLE)).map_err(redb_err)?;
         let old = match rows.get(id).map_err(redb_err)? {
