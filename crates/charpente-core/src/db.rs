@@ -884,9 +884,11 @@ impl Db {
 
     /// The lowest seq the local WAL still retains (`0` until `checkpoint`'s GC
     /// has advanced it). The primary-side session engine (`charpente::repl`)
-    /// uses it to decide a `Hello`'s position: a follower whose next needed
-    /// seq is below this base has fallen off the retained log and must be
-    /// re-seeded from a snapshot rather than resumed with frames (DESIGN §5).
+    /// uses it to decide a `Hello`'s position: an empty (None-position)
+    /// follower whose next needed seq is below this base is snapshot-seeded,
+    /// while a POSITIONED follower below it is refused (diverged behind — the
+    /// primary GC'd the frame at that seq and cannot prove a prefix; DESIGN §5,
+    /// Design B).
     pub fn log_base(&self) -> u64 {
         self.engine.wal().base_seq()
     }

@@ -430,9 +430,14 @@ last durable seq + that frame's CRC via `frame_crc`) runs the decision ladder pi
 tests: version mismatch → `Refuse` naming both versions; a non-primary role → `Refuse`
 naming the real primary (no cascading); follower at-or-ahead of the primary with unknown
 bytes, or a CRC mismatch on a retained frame → `Refuse` naming both seqs, both CRCs, and
-the re-seed fix (diverged timelines are refused, never merged); position below the GC'd
-base (or an empty follower against a compacted log) → snapshot-seed; otherwise `Frames`
-resume from position + 1. Shipping reads exclusively through `Db::read_log` — CRC
+the re-seed fix (diverged timelines are refused, never merged); a POSITIONED follower
+below the GC'd base → `Refuse` (diverged behind — the primary GC'd the frame at that seq
+and cannot prove the follower's records are a prefix of its timeline, so a re-seed could
+silently wipe a follower the primary forked below; the refusal names both remedies,
+re-seed a true laggard or promote the follower — Design B,
+`.superpowers/sdd/diverged-behind-investigation.md`); an empty (None-position) follower
+against a compacted log → snapshot-seed; otherwise `Frames` resume from position + 1.
+Shipping reads exclusively through `Db::read_log` — CRC
 re-verified at read-back, capped at `last_applied`, so a frame corrupted on the primary's
 disk is refused by name rather than shipped, and the unsynced tail never travels. The
 follower appends via `Db::apply_shipped` (append → sync → apply, recovery's own

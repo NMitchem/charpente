@@ -783,14 +783,26 @@ fn live_lagging_session_pins_gc() {
         f_pinned + 1,
     );
 
-    // Repair and restart the follower: below the base now, it must re-seed.
+    // Repair, then bring the follower back from a FRESH data dir: it fell below
+    // the released base, and Design B refuses a POSITIONED below-base rejoin
+    // (pinned by a_same_timeline_laggard_below_the_base_is_refused_not_reseeded)
+    // — the operator's remedy is exactly this, a wiped data dir that Hellos with
+    // an empty position and snapshot-seeds. It must re-seed and converge.
     sim.repair("p", "f");
     f.host.restart();
+    {
+        let disk = f.host.disk();
+        for name in disk.list("").unwrap() {
+            let _ = disk.remove(&name);
+        }
+        let _ = disk.sync_dir("");
+        let _ = disk.sync_dir("wal/");
+    }
     f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), db_cfg).unwrap();
     run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
     assert!(
         f.repl.stats().seeds >= 1,
-        "a follower below the base must re-seed on rejoin"
+        "a fresh-data-dir follower below the base must re-seed on rejoin"
     );
     assert_converged(&p, &f).unwrap();
 }
@@ -1207,6 +1219,193 @@ fn a_seeded_follower_that_advanced_then_lost_its_log_reseeds_not_refused() {
         "the log-less follower re-seeds (cannot prove its advanced position)"
     );
     assert_converged(&p, &f).unwrap();
+}
+
+// ------------------------------------------- property: diverged BEHIND (Design B)
+
+/// The diverged-BEHIND re-seed hole (dossier
+/// `.superpowers/sdd/diverged-behind-investigation.md`, Noah-ruled Design B,
+/// 2026-07-16): a converged follower holding a PROVEN record at seq N
+/// reconnects to a primary that forked BELOW N. The primary recovered past an
+/// above-horizon corruption cut (dropping its own frame at N), stayed Primary,
+/// re-appended PAST N on a new timeline, and GC'd past N. The follower's
+/// `Hello (N, crc_f(N))` now has `pos_seq <= last` (the diverged-AHEAD guard is
+/// bypassed) and `N < base` (the CRC-compare arm is skipped) — the single
+/// unguarded arm. Before Design B the primary answered `Snapshot`, silently
+/// WIPING the follower's converged acked record at N (it lives on the follower,
+/// gone from the forked primary). Design B refuses by name instead. The
+/// follower's data must be untouched and no new seed may begin. Deterministic,
+/// `FaultConfig::none()`.
+#[test]
+fn a_converged_follower_below_a_forked_primarys_base_is_refused_not_rewound() {
+    let sim = Sim::with_faults(0x2EB1_0014, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), seeding_db_cfg()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), seeding_db_cfg()).unwrap();
+
+    // Converge f via real frames: it holds frame N in its own retained log
+    // (path (a) of hello_position — a genuine acked record, not a seed
+    // frontier), so its Hello is (N, crc_f(N)).
+    for i in 0..30u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    let n = f.db.as_ref().unwrap().last_applied().expect("f converged");
+    assert!(
+        p.db.as_ref().unwrap().log_base() > 0,
+        "the primary's log must be compacted (a store horizon below the tail)"
+    );
+
+    // Partition, then fork the primary BELOW N: corrupt its tail frame (seq N),
+    // crash, recover — an above-horizon cut drops frame N, leaving p.last = N-1.
+    sim.partition("p", "f");
+    corrupt_last_wal_frame(&p.host).unwrap();
+    p.host.crash_now();
+    p.db = None;
+    p.host.restart();
+    reopen(&mut p).expect("an above-horizon cut recovers cleanly, not RESTORE_NEEDED");
+    let p_after_cut = p.db.as_ref().unwrap().last_applied().expect("p recovered");
+    assert!(
+        p_after_cut < n,
+        "the cut must drop the primary below the follower's frontier (p={p_after_cut}, f={n})"
+    );
+
+    // Re-advance the primary PAST N on the forked timeline (distinct ids 100..
+    // so the re-appended frame at seq N is genuinely different bytes than f's),
+    // then checkpoint+GC so base > N. p's restart cleared every session, so GC
+    // is unpinned and the base moves freely — the exact shape that reaches the
+    // below-base arm with pos_seq <= last (never the diverged-AHEAD guard).
+    for i in 100..150u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    p.db.as_mut().unwrap().checkpoint().unwrap();
+    let p_last = p.db.as_ref().unwrap().last_applied().unwrap();
+    let p_base = p.db.as_ref().unwrap().log_base();
+    assert!(
+        p_last > n,
+        "the primary must have re-advanced past the follower's frontier (last={p_last}, f={n})"
+    );
+    assert!(
+        p_base > n,
+        "the primary must have GC'd past the follower's frontier (base={p_base}, f={n}) — the \
+         below-base precondition that reaches the diverged-behind arm"
+    );
+
+    let fp_before = data_fingerprint(&f.host).unwrap();
+    let seeds_before = total_seeds(&f);
+
+    // Reconnect: the follower must be refused by name, never silently re-seeded
+    // (which would wipe its converged records). Its step() surfaces the refusal
+    // as an io::Error.
+    sim.repair("p", "f");
+    let err = run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).expect_err(
+        "a converged follower below a forked primary's base must be refused, never re-seeded",
+    );
+    for needle in ["diverged", "seq", "re-seed", "fresh data dir", "promote"] {
+        assert!(err.contains(needle), "refusal missing {needle:?}: {err}");
+    }
+    // The refusal names BOTH concrete positions: the follower's seq and the base.
+    assert!(
+        err.contains(&n.to_string()),
+        "refusal must name the follower's position {n}: {err}"
+    );
+    assert!(
+        err.contains(&p_base.to_string()),
+        "refusal must name the primary's retained base {p_base}: {err}"
+    );
+    // No wipe: the follower took no seed and its bytes are unchanged.
+    assert_eq!(
+        total_seeds(&f),
+        seeds_before,
+        "the follower must not have re-seeded (seeds went {seeds_before} -> {})",
+        total_seeds(&f)
+    );
+    assert_eq!(
+        data_fingerprint(&f.host).unwrap(),
+        fp_before,
+        "the follower's data must be untouched — no silent re-seed from the forked primary"
+    );
+}
+
+/// Design B's deliberate cost, pinned so it is a choice and not an accident: a
+/// POSITIONED follower that merely lagged past the primary's retained window —
+/// SAME timeline, its records a true prefix of the primary's — is ALSO refused.
+/// The primary GC'd the frame at the follower's position and cannot prove the
+/// prefix relation from what it retains, and it cannot distinguish this benign
+/// case from the data-losing forked-behind one above, so it refuses both. Pre-
+/// Design-B this re-seeded (harmless here); now the operator's remedy text
+/// covers it (re-seed a true laggard from a fresh data dir). The None-position
+/// fresh-follower seed path is untouched — pinned by
+/// `late_follower_seeds_below_the_gcd_base_and_converges`. Deterministic,
+/// `FaultConfig::none()`.
+#[test]
+fn a_same_timeline_laggard_below_the_base_is_refused_not_reseeded() {
+    let sim = Sim::with_faults(0x2EB1_0015, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), seeding_db_cfg()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), seeding_db_cfg()).unwrap();
+
+    // Converge f to K on the shared timeline (holds frame K, a proven position).
+    for i in 0..20u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    let k = f.db.as_ref().unwrap().last_applied().expect("f converged");
+
+    // Crash-restart the follower: this tears its wire so the primary reaps the
+    // session and releases the retention pin, and the follower reopens at K,
+    // disconnected until it is next stepped.
+    recover_node(&sim, &mut f).unwrap();
+    // Drive the primary ALONE so it reaps the follower's dead session (pin ->
+    // u64::MAX); the follower is not stepped here, so it stays disconnected.
+    drive_rounds(&sim, &mut [&mut p], 16).unwrap();
+
+    // Advance the primary FAR past K on the SAME timeline and GC past K (no
+    // fork, no corruption — the benign laggard shape). With the pin released the
+    // base moves comfortably past K.
+    for i in 20..80u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    p.db.as_mut().unwrap().checkpoint().unwrap();
+    let p_last = p.db.as_ref().unwrap().last_applied().unwrap();
+    let p_base = p.db.as_ref().unwrap().log_base();
+    assert!(
+        p_last > k,
+        "the primary re-advanced past the laggard (last={p_last}, k={k})"
+    );
+    assert!(
+        p_base > k,
+        "the primary GC'd past the laggard's position (base={p_base}, k={k})"
+    );
+
+    let seeds_before = total_seeds(&f);
+
+    // Reconnect: the follower re-Hellos with its proven (K, crc). It must be
+    // refused by name, not re-seeded, even though its records are a clean prefix.
+    let err = run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET)
+        .expect_err("a positioned laggard below the base must be refused, never re-seeded");
+    for needle in ["diverged", "seq", "re-seed", "fresh data dir", "promote"] {
+        assert!(err.contains(needle), "refusal missing {needle:?}: {err}");
+    }
+    assert!(
+        err.contains(&k.to_string()),
+        "refusal must name the follower's position {k}: {err}"
+    );
+    assert!(
+        err.contains(&p_base.to_string()),
+        "refusal must name the primary's retained base {p_base}: {err}"
+    );
+    // Refused, not re-seeded: no new seed, and f still sits at K (never rewound
+    // onto the far-ahead primary).
+    assert_eq!(
+        total_seeds(&f),
+        seeds_before,
+        "the laggard must not re-seed (seeds went {seeds_before} -> {})",
+        total_seeds(&f)
+    );
+    assert_eq!(
+        f.db.as_ref().unwrap().last_applied(),
+        Some(k),
+        "the refused laggard stays at its own position, never rewound onto the primary"
+    );
 }
 
 // --------------------------------------------- error-surface pin: version

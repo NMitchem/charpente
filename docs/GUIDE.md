@@ -2500,6 +2500,15 @@ log replay). This is the promise a single node cannot make and a replicated
 deployment can: a record one node loses to media corruption survives on
 another.
 
+The same deliberate re-seed applies to a follower that comes back holding data
+after being offline past the primary's retention window (`retain_segments`):
+the primary has GC'd the frames that would prove the follower's records are a
+prefix of its timeline, so it refuses to re-seed it automatically — naming
+both positions and both remedies — rather than risk silently overwriting a
+follower that is actually *ahead* of a primary that forked behind it. If the
+follower truly just lagged, stop it, clear its data directory, and restart it;
+it re-seeds from a snapshot and converges.
+
 ## 11. Realtime
 
 SSE subscribers tail the log through a materialized `charpente.events` table with

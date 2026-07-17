@@ -404,7 +404,30 @@ do not reorder a milestone's dependency sequence.
   below-base Snapshot arm — fix before or at sub-project 5's start), CtrlSwitchover
   secret arm untested end-to-end, `Some("")` behaves as `None`, refused sessions now
   excluded from switchover candidacy (beneficial, noted).
-- Next: the diverged-BEHIND re-seed fix (seed 0x752166a16e0d2c99), then M1
-  sub-project 5 — migrations as log records; then error/introspection polish
+- **Diverged-BEHIND re-seed hole closed (2026-07-16, follow-on interlude; this
+  commit).** `decide_hello`'s positioned below-base arm now refuses by name
+  (`diverged_behind`, both seqs + both remedies: fresh-data-dir re-seed for a true
+  laggard, promote-the-follower if the primary forked) instead of answering Snapshot —
+  a primary that recovered behind a converged follower, kept serving, and GC'd its only
+  witness can no longer silently rewind the last surviving copy of acked records.
+  Noah-ruled Design B: refuse not demote (the primary can't know it's the loser),
+  wire-free; Design C (durable timeline epoch at fork points, restores positioned
+  auto-heal) ledgered as follow-up. None-position fresh followers still auto-seed
+  (late-follower test unchanged). RED-first per hard rule 3: 0x2EB1_0014 (forked-behind
+  — refusal + fingerprint + seed-count unchanged) and 0x2EB1_0015 (the benign
+  same-timeline laggard, deliberately refused — the previously-uncovered positioned
+  case), both proven red on unfixed code and via guard-reverted meta-check.
+  `live_lagging_session_pins_gc`'s coda adapted to the fresh-data-dir operator remedy
+  (its GC pin/release purpose untouched; adversarially adjudicated as legitimate, not
+  weakening). Dossier: .superpowers/sdd/diverged-behind-investigation.md (seed
+  0x752166a16e0d2c99 is historical provenance from an abandoned wal-interlude workload
+  variant; it replays green — the deterministic tests are the reproduction). GUIDE §10
+  gained the operator paragraph for followers offline past the retention window.
+  Evidence: replication 27/27 green (~24.5 min under external CPU contention), realtime
+  6/6, fmt + clippy -D warnings + guide gate clean; adversarial opus review READY,
+  0 Critical/Important (ledgered polish notes: the shared "diverged:" label slightly
+  over-claims for the benign laggard; the diverged-family refusals are fragment-pinned,
+  not raw-client byte-exact — pre-existing class-wide).
+- Next: M1 sub-project 5 — migrations as log records; then error/introspection polish
   (`charpente describe`), and the Vörtex-style black-box edge harness for the hyper
   layer.

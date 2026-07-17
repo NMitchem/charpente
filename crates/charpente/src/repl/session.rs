@@ -522,7 +522,8 @@ fn secret_matches(peer_secret: &Option<String>, presented: &Option<String>) -> b
 /// The `Hello` decision ladder (spec §1), pinned by the error-surface tests:
 /// peer secret mismatch → refuse, before any other check (spec §5, auth T7);
 /// version mismatch → refuse (both versions); not-a-primary → refuse; follower
-/// ahead → refuse (diverged); position below the retained base → snapshot;
+/// ahead → refuse (diverged); a positioned follower below the retained base →
+/// refuse (diverged behind — the primary GC'd its witness, Design B);
 /// position retained → verify the frame CRC (mismatch → diverged, match →
 /// resume); empty position → snapshot when the log has been compacted, else
 /// frames from 0.
@@ -570,8 +571,18 @@ fn decide_hello(
             Some(last),
         ))),
         Some(last) => {
-            if pos_seq < db.log_base() {
-                return Ok(Decision::Snapshot);
+            let base = db.log_base();
+            if pos_seq < base {
+                // Refuse, never re-seed (Design B, dossier
+                // .superpowers/sdd/diverged-behind-investigation.md): the
+                // primary GC'd the frame at pos_seq, so it cannot prove the
+                // follower's records are a prefix of its timeline. If the
+                // primary forked BELOW the follower (recovered past an
+                // above-horizon cut and kept serving), a re-seed here would
+                // silently wipe the follower's converged acked records. A
+                // None-position (fresh/log-less) follower still auto-seeds —
+                // the arm above this match.
+                return Ok(Decision::Refuse(diverged_behind(pos_seq, base)));
             }
             let ours = db
                 .read_log(pos_seq, 1)?
@@ -607,5 +618,25 @@ fn diverged_crc(pos_seq: u64, pos_crc: u32, last: u64, ours: u32) -> String {
          the logs share a seq but not its bytes, a forked timeline that can never be merged; \
          re-seed the follower from a fresh data dir (stop it, delete its data dir, restart to \
          snapshot-seed from this primary)"
+    )
+}
+
+/// A positioned follower whose proven seq sits below the primary's retained
+/// base (Design B, dossier .superpowers/sdd/diverged-behind-investigation.md):
+/// the primary GC'd that frame, so it cannot prove the follower's records are a
+/// prefix of its timeline — a re-seed would silently overwrite the follower,
+/// which is data-loss when the primary forked below it. Names both remedies:
+/// re-seed a true laggard, or promote the follower if the primary forked behind.
+fn diverged_behind(pos_seq: u64, base: u64) -> String {
+    format!(
+        "diverged: the follower holds a proven record at seq {pos_seq}, but this primary has \
+         GC'd every record below its retained base {base} — with no frame at or below seq \
+         {pos_seq} to compare, this primary cannot prove the follower's records are a prefix of \
+         its own timeline, and re-seeding here would silently overwrite whatever the follower \
+         holds; if the follower merely lagged past the retained window, re-seed it deliberately \
+         from a fresh data dir (stop it, delete its data dir, restart to snapshot-seed from this \
+         primary); if instead this primary forked below the follower (recovered past an \
+         above-horizon corruption cut and kept serving), promote the follower and re-seed this \
+         node from it"
     )
 }
