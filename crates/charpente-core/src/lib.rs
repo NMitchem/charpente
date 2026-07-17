@@ -10,4 +10,5 @@ pub mod event;
 pub mod io;
 pub mod job;
 pub mod log;
+pub mod migration;
 pub mod table;

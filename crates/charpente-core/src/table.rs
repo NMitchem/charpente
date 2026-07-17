@@ -201,10 +201,29 @@ pub struct IndexDef<R> {
     pub key: fn(&R, &mut Vec<u8>),
 }
 
+/// A row's codec only — no table identity, no indexes. Implemented by
+/// `#[table]` (alongside `Row`) and by `#[row_shape]` (a superseded
+/// version kept in code purely so the migration chain can decode it —
+/// DESIGN §3). `Row: RowShape` is deliberately NOT a supertrait bound:
+/// `Row`'s codec methods predate this trait; macro-generated types
+/// implement both, delegating one to the other.
+pub trait RowShape: Sized {
+    const VERSION: u32;
+    fn encode_row(&self, out: &mut Vec<u8>);
+    fn decode_row(bytes: &[u8]) -> io::Result<Self>;
+}
+
 /// A table row. Implemented by `#[table]`, not by hand.
 pub trait Row: Sized + 'static {
     const TABLE: &'static str;
     const INDEXES: &'static [IndexDef<Self>];
+    /// The row's schema version (`#[table(version = N)]`; `1` if omitted).
+    const VERSION: u32 = 1;
+    /// Structural fingerprint of the field shape, `Some` only for
+    /// macro-generated (`#[table]`) types. `None` (the default) opts the
+    /// table out of the versioning gate and the replication digest —
+    /// hand-written platform impls are unaffected by this sub-project.
+    const FINGERPRINT: Option<u64> = None;
     fn id(&self) -> Id<Self>;
     fn encode_row(&self, out: &mut Vec<u8>);
     fn decode_row(bytes: &[u8]) -> io::Result<Self>;
