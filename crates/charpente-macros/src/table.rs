@@ -1,7 +1,7 @@
 use quote::{format_ident, quote};
 use syn::{Data, DeriveInput, Error, Fields, spanned::Spanned};
 
-pub(crate) fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+pub(crate) fn expand(input: DeriveInput, version: u32) -> syn::Result<proc_macro2::TokenStream> {
     let name = &input.ident;
     let name_str = name.to_string();
 
@@ -81,6 +81,23 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
         ));
     }
 
+    let fingerprint = crate::fingerprint::compute(&field_idents, &field_types);
+    // Spec §1's compile error: a version bump without the TableMigration
+    // impl must not compile. A const-evaluated call whose bound is the
+    // whole point — E0277 names the missing impl at the struct.
+    let migration_assert = if version >= 2 {
+        quote! {
+            const _: () = {
+                const fn __charpente_assert_migration<
+                    T: ::charpente::core::migration::TableMigration,
+                >() {}
+                __charpente_assert_migration::<#name>();
+            };
+        }
+    } else {
+        quote! {}
+    };
+
     let attrs = &input.attrs;
     let vis = &input.vis;
 
@@ -104,6 +121,9 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
 
         impl ::charpente::core::table::Row for #name {
             const TABLE: &'static str = #name_str;
+            const VERSION: u32 = #version;
+            const FINGERPRINT: ::std::option::Option<u64> =
+                ::std::option::Option::Some(#fingerprint);
             const INDEXES: &'static [::charpente::core::table::IndexDef<Self>] = &[
                 #(::charpente::core::table::IndexDef {
                     name: #index_names,
@@ -135,6 +155,17 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
                 Ok(Self { #(#field_idents,)* })
             }
         }
+
+        impl ::charpente::core::table::RowShape for #name {
+            const VERSION: u32 = #version;
+            fn encode_row(&self, out: &mut ::std::vec::Vec<u8>) {
+                <Self as ::charpente::core::table::Row>::encode_row(self, out)
+            }
+            fn decode_row(bytes: &[u8]) -> ::std::io::Result<Self> {
+                <Self as ::charpente::core::table::Row>::decode_row(bytes)
+            }
+        }
+        #migration_assert
 
         impl #name {
             #(

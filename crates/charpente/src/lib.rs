@@ -9,7 +9,7 @@ extern crate self as charpente;
 pub use charpente_core as core;
 pub use charpente_core::db::{Db, DbConfig, Event, Job, Schema, Seeder, Tx, TxError};
 pub use charpente_core::table::{Id, Snapshot, View};
-pub use charpente_macros::{event, job, route, table};
+pub use charpente_macros::{event, job, route, row_shape, table};
 // Re-exported so `#[event]`'s emitted `Serialize` derive resolves through
 // `::charpente::serde` — app crates emitting events stay single-dep on
 // `charpente` (macro-path unification, DESIGN.md §3).

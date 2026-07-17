@@ -534,3 +534,52 @@ fn jobs_materialize_with_counter_ids_in_order() {
         ]
     );
 }
+
+// -------------------------------------------------------- version + fingerprint
+
+#[charpente::row_shape(version = 1)]
+struct GizmoV1 {
+    id: u64,
+    count: u32,
+}
+
+#[charpente::table(version = 2)]
+struct Gizmo {
+    id: charpente::core::table::Id<Gizmo>,
+    count: u32,
+    label: String,
+}
+
+impl charpente::core::migration::TableMigration for Gizmo {
+    type Prev = GizmoV1;
+    fn migrate(prev: GizmoV1) -> Result<Gizmo, charpente::core::migration::MigrationError> {
+        Ok(Gizmo {
+            id: charpente::core::table::Id::from_raw(prev.id),
+            count: prev.count,
+            label: String::new(),
+        })
+    }
+}
+
+#[test]
+fn versioned_table_carries_version_and_fingerprint() {
+    use charpente::core::table::Row;
+    assert_eq!(Gizmo::VERSION, 2);
+    assert!(Gizmo::FINGERPRINT.is_some());
+}
+
+#[test]
+fn bare_table_stays_version_one_and_now_fingerprinted() {
+    use charpente::core::table::Row;
+    assert_eq!(Org::VERSION, 1);
+    assert!(Org::FINGERPRINT.is_some());
+}
+
+#[test]
+fn row_shape_roundtrips_under_its_own_codec() {
+    use charpente::core::table::RowShape;
+    let mut bytes = Vec::new();
+    GizmoV1 { id: 4, count: 9 }.encode_row(&mut bytes);
+    let back = GizmoV1::decode_row(&bytes).unwrap();
+    assert_eq!((back.id, back.count), (4, 9));
+}
