@@ -316,6 +316,7 @@ impl Follower {
             listen: self.my_listen.clone(),
             position,
             secret: self.peer_secret.clone(),
+            schema_digest: db.schema_digest(),
         };
         if conn.send(&encode(&hello)).is_err() {
             self.reconnect_at = Some(now + RECONNECT_NANOS);

@@ -269,8 +269,17 @@ impl Session {
                 listen,
                 position,
                 secret,
+                schema_digest,
             } => {
-                match decide_hello(role, db, proto, position, peer_secret, &secret)? {
+                match decide_hello(
+                    role,
+                    db,
+                    proto,
+                    position,
+                    peer_secret,
+                    &secret,
+                    schema_digest,
+                )? {
                     Decision::Refuse(message) => {
                         self.send(&Msg::Refuse { message }, now);
                         self.dead = true;
@@ -503,6 +512,12 @@ enum Decision {
 pub(crate) const PEER_SECRET_REFUSAL: &str = "peer secret missing or mismatched — set \
      ReplConfig.peer_secret to match this node (or run the CLI verb with --secret)";
 
+/// The schema-digest refusal (migrations spec §5): pinned verbatim by tests.
+const SCHEMA_DIGEST_MISMATCH: &str = "replication schema mismatch: this node's #[table] schema digest does not match the \
+     peer's — one side is running a binary compiled against a different table shape; rebuild \
+     both nodes from the same source and restart them (stop both, upgrade both, start the \
+     primary first)";
+
 /// True when `presented` proves `peer_secret` (spec §5): `peer_secret: None`
 /// accepts everything (and a presented proof it did not ask for is ignored,
 /// not an error); `Some` requires `ct_eq_hex(hash_token(presented),
@@ -521,7 +536,9 @@ fn secret_matches(peer_secret: &Option<String>, presented: &Option<String>) -> b
 
 /// The `Hello` decision ladder (spec §1), pinned by the error-surface tests:
 /// peer secret mismatch → refuse, before any other check (spec §5, auth T7);
-/// version mismatch → refuse (both versions); not-a-primary → refuse; follower
+/// version mismatch → refuse (both versions); schema digest mismatch →
+/// refuse (migrations spec §5, before any role logic — a schema-mismatched
+/// peer must never seed or ship frames); not-a-primary → refuse; follower
 /// ahead → refuse (diverged); a positioned follower below the retained base →
 /// refuse (diverged behind — the primary GC'd its witness, Design B);
 /// position retained → verify the frame CRC (mismatch → diverged, match →
@@ -534,6 +551,7 @@ fn decide_hello(
     position: Option<(u64, u32)>,
     peer_secret: &Option<String>,
     presented_secret: &Option<String>,
+    schema_digest: u64,
 ) -> io::Result<Decision> {
     if !secret_matches(peer_secret, presented_secret) {
         return Ok(Decision::Refuse(PEER_SECRET_REFUSAL.to_string()));
@@ -544,6 +562,9 @@ fn decide_hello(
              {PROTO_VERSION}, but the peer's Hello declared version {proto} — upgrade the older \
              binary so both speak the expected version {PROTO_VERSION}"
         )));
+    }
+    if schema_digest != db.schema_digest() {
+        return Ok(Decision::Refuse(SCHEMA_DIGEST_MISMATCH.to_string()));
     }
     match role {
         Role::Primary | Role::HandingOff { .. } => {}

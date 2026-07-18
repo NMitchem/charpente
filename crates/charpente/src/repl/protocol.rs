@@ -19,13 +19,16 @@ pub enum Msg {
     /// `position` is (last durable seq, that frame's crc) or None when empty.
     /// `secret` is this peer's proof of `ReplConfig.peer_secret`, always
     /// attached when the sender is configured with one (spec §5); `None`
-    /// otherwise. Appended after the pre-existing fields (pre-release, no
-    /// `PROTO_VERSION` bump).
+    /// otherwise. `schema_digest` is the sender's `Db::schema_digest()`
+    /// (migrations spec §5) — a mismatch is refused by name before any
+    /// role logic runs. Both appended after the pre-existing fields
+    /// (pre-release, no `PROTO_VERSION` bump).
     Hello {
         proto: u8,
         listen: Option<String>,
         position: Option<(u64, u32)>,
         secret: Option<String>,
+        schema_digest: u64,
     },
     /// tag 1 — a batch of durable WAL frames, each `(seq, frame bytes)`.
     Frames { frames: Vec<(u64, Vec<u8>)> },
@@ -152,12 +155,14 @@ pub fn encode(msg: &Msg) -> Vec<u8> {
             listen,
             position,
             secret,
+            schema_digest,
         } => {
             out.push(0);
             proto.encode(&mut out);
             listen.encode(&mut out);
             encode_position(position, &mut out);
             secret.encode(&mut out);
+            schema_digest.encode(&mut out);
         }
         Msg::Frames { frames } => {
             out.push(1);
@@ -230,6 +235,7 @@ pub fn decode(bytes: &[u8]) -> io::Result<Msg> {
             listen: Option::<String>::decode(input)?,
             position: decode_position(input)?,
             secret: Option::<String>::decode(input)?,
+            schema_digest: u64::decode(input)?,
         },
         1 => Msg::Frames {
             frames: decode_pairs(input)?,
@@ -312,12 +318,14 @@ mod tests {
             listen: None,
             position: None,
             secret: None,
+            schema_digest: 0,
         });
         roundtrips(Msg::Hello {
             proto: PROTO_VERSION,
             listen: Some("follower:9000".to_string()),
             position: Some((42, 0xdead_beef)),
             secret: Some("s3cret".to_string()),
+            schema_digest: 0x1234_5678_9abc_def0,
         });
     }
 

@@ -235,6 +235,27 @@ impl Schema {
     }
 }
 
+/// The pure fold behind `Db::schema_digest` (kept free so unit tests can
+/// build a `Schema` directly without a `Db`/`Disk`): one aggregate over
+/// every versioned table's `(name, version, fingerprint)`, sorted by name
+/// (BTreeMap order). `FINGERPRINT: None` tables are excluded — platform
+/// tables are covered by PROTO_VERSION, and a hand-written app `Row` impl
+/// opts out of the digest exactly as it opts out of the gate (spec §4
+/// scope note).
+pub(crate) fn schema_digest_of(schema: &Schema) -> u64 {
+    let mut buf = Vec::new();
+    for table in schema.table_names() {
+        let Some((version, Some(fingerprint))) = schema.table_meta(table) else {
+            continue;
+        };
+        buf.extend_from_slice(table.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&version.to_le_bytes());
+        buf.extend_from_slice(&fingerprint.to_le_bytes());
+    }
+    crate::migration::fnv1a_hash(&buf)
+}
+
 // ---------------------------------------------------------------- record
 
 #[derive(Debug, PartialEq)]
@@ -1325,6 +1346,15 @@ impl Db {
         self.engine.machine().schema.table_names()
     }
 
+    /// One aggregate over every versioned table's `(name, version,
+    /// fingerprint)`, sorted by name (BTreeMap order). `FINGERPRINT: None`
+    /// tables are excluded — platform tables are covered by PROTO_VERSION,
+    /// and a hand-written app `Row` impl opts out of the digest exactly as
+    /// it opts out of the gate (spec §4 scope note).
+    pub fn schema_digest(&self) -> u64 {
+        schema_digest_of(&self.engine.machine().schema)
+    }
+
     /// True once the engine or its WAL is poisoned — every further transact
     /// fails. Callers (the kernel loop) stop and restart to recover.
     pub fn poisoned(&self) -> bool {
@@ -1846,6 +1876,58 @@ mod tests {
             let schema = Schema::new().table::<Widget>();
             assert_eq!(schema.table_meta("Widget"), Some((2, Some(0xabc))));
             assert_eq!(schema.table_meta("Nope"), None);
+        }
+
+        #[test]
+        fn schema_digest_of_is_equal_for_equal_schemas() {
+            let a = Schema::new().table::<Widget>();
+            let b = Schema::new().table::<Widget>();
+            assert_eq!(schema_digest_of(&a), schema_digest_of(&b));
+        }
+
+        #[test]
+        fn schema_digest_of_differs_when_a_fingerprint_drifts() {
+            struct WidgetV2Drifted {
+                id: Id<WidgetV2Drifted>,
+                count: u32,
+            }
+            impl RowShape for WidgetV2Drifted {
+                const VERSION: u32 = 2;
+                fn encode_row(&self, out: &mut Vec<u8>) {
+                    self.id.encode(out);
+                    self.count.encode(out);
+                }
+                fn decode_row(bytes: &[u8]) -> io::Result<WidgetV2Drifted> {
+                    let input = &mut &bytes[..];
+                    Ok(WidgetV2Drifted {
+                        id: Id::decode(input)?,
+                        count: u32::decode(input)?,
+                    })
+                }
+            }
+            impl Row for WidgetV2Drifted {
+                const TABLE: &'static str = "Widget";
+                const INDEXES: &'static [IndexDef<WidgetV2Drifted>] = &[];
+                const VERSION: u32 = 2;
+                const FINGERPRINT: Option<u64> = Some(0xdef);
+                fn id(&self) -> Id<WidgetV2Drifted> {
+                    self.id
+                }
+                fn encode_row(&self, out: &mut Vec<u8>) {
+                    self.id.encode(out);
+                    self.count.encode(out);
+                }
+                fn decode_row(bytes: &[u8]) -> io::Result<WidgetV2Drifted> {
+                    let input = &mut &bytes[..];
+                    Ok(WidgetV2Drifted {
+                        id: Id::decode(input)?,
+                        count: u32::decode(input)?,
+                    })
+                }
+            }
+            let compiled = Schema::new().table::<Widget>();
+            let drifted = Schema::new().table::<WidgetV2Drifted>();
+            assert_ne!(schema_digest_of(&compiled), schema_digest_of(&drifted));
         }
     }
 }

@@ -1523,6 +1523,7 @@ fn hello_with_a_future_protocol_version_is_refused_naming_both_versions() {
             listen: None,
             position: None,
             secret: None,
+            schema_digest: 0,
         },
     )
     .unwrap();
@@ -1544,6 +1545,7 @@ fn hello_to_a_follower_is_refused_naming_the_not_a_primary_state() {
     let sim = Sim::with_faults(0x2EB1_0007, FaultConfig::none());
     // A follower of an (absent) primary — it still listens for control conns.
     let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    let digest = f.db.as_ref().unwrap().schema_digest();
     let reply = exchange_hello(
         &sim,
         &mut f,
@@ -1553,6 +1555,7 @@ fn hello_to_a_follower_is_refused_naming_the_not_a_primary_state() {
             listen: Some("x:1".to_string()),
             position: None,
             secret: None,
+            schema_digest: digest,
         },
     )
     .unwrap();
@@ -1609,6 +1612,7 @@ fn peer_secret_refuses_mismatch_and_admits_match() {
             listen: Some("f:1".to_string()),
             position: None,
             secret: None,
+            schema_digest: 0,
         },
     )
     .unwrap();
@@ -1625,6 +1629,7 @@ fn peer_secret_refuses_mismatch_and_admits_match() {
             listen: Some("f:1".to_string()),
             position: None,
             secret: Some("wrong".to_string()),
+            schema_digest: 0,
         },
     )
     .unwrap();
@@ -1672,6 +1677,54 @@ fn peer_secret_refuses_mismatch_and_admits_match() {
         !f.db.as_ref().unwrap().writes_allowed(),
         "a refused promote must never flip the node to a writable primary"
     );
+}
+
+/// Migrations spec §5: a Hello whose `schema_digest` does not match this
+/// node's compiled schema is refused by name, before any state is touched
+/// (no seed begins); a real follower's auto-attached digest matches and
+/// convergence is unaffected.
+#[test]
+fn hello_schema_digest_mismatch_refuses_zero_state_touched_and_match_converges() {
+    let sim = Sim::with_faults(0x2EB8_0001, FaultConfig::none());
+    let db_cfg = seeding_db_cfg();
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), db_cfg.clone()).unwrap();
+    let real = p.db.as_ref().unwrap().schema_digest();
+
+    let reply = exchange_hello(
+        &sim,
+        &mut p,
+        "p:1",
+        Msg::Hello {
+            proto: charpente::repl::PROTO_VERSION,
+            listen: Some("f:1".to_string()),
+            position: None,
+            secret: None,
+            schema_digest: real.wrapping_add(1),
+        },
+    )
+    .unwrap();
+    match &reply {
+        Msg::Refuse { message } => assert_eq!(
+            message.as_str(),
+            "replication schema mismatch: this node's #[table] schema digest does not match \
+             the peer's — one side is running a binary compiled against a different table \
+             shape; rebuild both nodes from the same source and restart them (stop both, \
+             upgrade both, start the primary first)"
+        ),
+        other => panic!("expected the schema-digest Refuse, got {other:?}"),
+    }
+    drive_rounds(&sim, &mut [&mut p], 4).unwrap();
+    assert_eq!(
+        p.repl.stats().seeds,
+        0,
+        "a digest-refused Hello must never begin a seed"
+    );
+
+    // Happy path: a real follower's auto-attached digest matches and
+    // convergence is unaffected.
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), db_cfg).unwrap();
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert_converged(&sim, &mut p, &mut f).unwrap();
 }
 
 /// The half-configured "open" direction (spec §5): an unconfigured primary
