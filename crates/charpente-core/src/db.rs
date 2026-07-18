@@ -98,6 +98,21 @@ pub enum TxError<E> {
     },
 }
 
+/// Collapses a `TxError` from a platform-internal transaction (the schema
+/// migration executor) into a plain `io::Error`: those transactions have no
+/// application error type worth preserving, and `NotPrimary` is unreachable
+/// (`migrate_schema` asserts writes are allowed before running).
+fn tx_err_to_io<E: fmt::Debug>(e: TxError<E>) -> io::Error {
+    match e {
+        TxError::Io(e) => e,
+        TxError::App(e) => io::Error::other(format!("schema migration transact rejected: {e:?}")),
+        TxError::NotPrimary { primary } => io::Error::other(format!(
+            "schema migration ran on a non-primary node (primary: {primary}) — unreachable: \
+             migrate_schema asserts writes are allowed before running"
+        )),
+    }
+}
+
 // ---------------------------------------------------------------- schema
 
 #[derive(Clone)]
@@ -403,10 +418,6 @@ impl Tx {
     /// Buffers one decode-free migration write (spec §3). `row` must
     /// already be encoded under the table's TARGET version. Used only by
     /// `Db::migrate_schema`'s executor — deliberately not `pub`.
-    // No caller until T6 wires the executor; the wire path (encode/decode/
-    // apply) and its close-out trigger are exercised now (record roundtrip +
-    // tests/migrate_apply.rs). The allow comes off when T6 calls this.
-    #[allow(dead_code)]
     pub(crate) fn migrate_put(&mut self, table: &'static str, id: u64, row: Vec<u8>) {
         self.effects.migrate_puts.push((table, id, row));
     }
@@ -1350,6 +1361,142 @@ impl Db {
         let rows: Vec<crate::migration::SchemaVersion> = self.snapshot()?.scan()?;
         self.adopted = rows.into_iter().map(|r| r.table).collect();
         Ok(())
+    }
+
+    /// The writable-node half of the schema gate (spec §2/§3): verifies
+    /// each behind table's chain, then runs the batched, resumable,
+    /// decode-free rewrite. Call sites: the kernel's startup (single-node
+    /// and primary — `Kernel::run`) and `do_promote` (a promoted follower
+    /// resumes any in-flight watermark). Followers never call this — they
+    /// receive migration through log shipping (spec §4).
+    pub fn migrate_schema(&mut self) -> io::Result<()> {
+        assert!(
+            self.writes_allowed(),
+            "migrate_schema on a write-forbidden node — the gate is role-aware (spec §2): \
+             call it only on single-node/primary at startup, or at promote"
+        );
+        self.reload_adopted()?;
+        let tables: Vec<&'static str> = self.engine.machine().schema.table_names();
+        for table in tables {
+            let Some((compiled_version, Some(compiled_fingerprint))) =
+                self.engine.machine().schema.table_meta(table)
+            else {
+                continue;
+            };
+            let vid = crate::migration::schema_version_id(table);
+            let snap = self.snapshot()?;
+            let persisted: Option<crate::migration::SchemaVersion> = snap.get(vid)?;
+            let rows_exist = !snap.scan_raw_from(table, None, 1)?.is_empty();
+            drop(snap);
+            let from = match gate_status(
+                table,
+                (compiled_version, compiled_fingerprint),
+                persisted.as_ref(),
+                rows_exist,
+            ) {
+                GateStatus::Current | GateStatus::Adopt => continue,
+                GateStatus::Refuse(msg) => return Err(io::Error::other(msg)),
+                GateStatus::Migrate { from } => from,
+            };
+            // Chain existence, before touching anything.
+            let steps: Vec<crate::migration::MigrationStep> =
+                self.engine.machine().schema.migrations_for(table).to_vec();
+            let mut cursor = from;
+            while cursor != compiled_version {
+                let Some(step) = steps.iter().find(|s| s.from_version == cursor) else {
+                    return Err(io::Error::other(format!(
+                        "table \"{table}\" has no registered migration from version {cursor} — \
+                         persisted version is {from}, compiled version is {compiled_version}; \
+                         register Schema::migration::<Step>(\"{table}\") for the \
+                         version-{cursor} step, or this data cannot be opened by this binary"
+                    )));
+                };
+                cursor = step.to_version;
+            }
+            self.migrate_table(table, from, compiled_version, compiled_fingerprint, &steps)?;
+        }
+        Ok(())
+    }
+
+    /// Spec §3's loop. Every batch commits its `MigratePut`s AND the
+    /// watermark advance in ONE transaction — a crash between them is
+    /// impossible; resumption is re-entry. The close-out transaction is the
+    /// version bump whose apply rebuilds the table's indexes (T4).
+    ///
+    /// LOAD-BEARING ordering (T4 review): the close-out is its OWN
+    /// transaction, strictly after every rewrite batch. It must never share
+    /// a record with a `MigratePut`: the close-out's apply rebuilds the
+    /// table's indexes in pass 1, presuming every migrated row is already
+    /// durably applied — a `MigratePut` in the same record only lands in
+    /// pass 2, so the rebuild would run over pre-migration bytes and corrupt
+    /// the indexes. The empty-batch branch below preserves this (the
+    /// close-out fires only once `scan_raw_from` past the watermark is
+    /// empty), and `TableMachine::apply` debug-asserts it at the rebuild.
+    fn migrate_table(
+        &mut self,
+        table: &'static str,
+        from: u32,
+        to: u32,
+        fingerprint: u64,
+        steps: &[crate::migration::MigrationStep],
+    ) -> io::Result<()> {
+        let vid = crate::migration::schema_version_id(table);
+        let batch_size = self.cfg.migration_batch_size as usize;
+        loop {
+            let snap = self.snapshot()?;
+            let watermark: Option<u64> = snap
+                .get::<crate::migration::SchemaVersion>(vid)?
+                .and_then(|v| v.migrating_through);
+            let batch = snap.scan_raw_from(table, watermark, batch_size)?;
+            drop(snap);
+            if batch.is_empty() {
+                self.transact(|tx| -> Result<(), io::Error> {
+                    tx.put(&crate::migration::SchemaVersion {
+                        id: vid,
+                        table: table.to_string(),
+                        version: to,
+                        fingerprint,
+                        migrating_through: None,
+                        migrating_to: None,
+                    });
+                    Ok(())
+                })
+                .map_err(tx_err_to_io)?;
+                return Ok(());
+            }
+            let new_watermark = batch.last().map(|(id, _)| *id);
+            let mut migrated: Vec<(u64, Vec<u8>)> = Vec::with_capacity(batch.len());
+            for (id, bytes) in batch {
+                let mut version = from;
+                let mut bytes = bytes;
+                while version != to {
+                    let step = steps
+                        .iter()
+                        .find(|s| s.from_version == version)
+                        .expect("chain verified by migrate_schema");
+                    bytes = (step.apply)(&bytes).map_err(|e| {
+                        io::Error::other(format!("migrating table \"{table}\" row {id}: {e}"))
+                    })?;
+                    version = step.to_version;
+                }
+                migrated.push((id, bytes));
+            }
+            self.transact(|tx| -> Result<(), io::Error> {
+                for (id, bytes) in migrated {
+                    tx.migrate_put(table, id, bytes);
+                }
+                tx.put(&crate::migration::SchemaVersion {
+                    id: vid,
+                    table: table.to_string(),
+                    version: from, // not done until the close-out above
+                    fingerprint,
+                    migrating_through: new_watermark,
+                    migrating_to: Some(to),
+                });
+                Ok(())
+            })
+            .map_err(tx_err_to_io)?;
+        }
     }
 
     /// Deconstructs a live `Db` into a `Seeder` over the same disk — the seed
