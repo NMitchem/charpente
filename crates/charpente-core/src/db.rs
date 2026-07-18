@@ -16,7 +16,7 @@
 //! The enqueue key is the job's idempotency identity to the world outside
 //! the log — carried, never interpreted inside the deterministic boundary.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 
@@ -551,6 +551,13 @@ struct TableMachine {
     /// Ids of jobs materialized since the last `Db::drain_enqueued` — the
     /// kernel's incremental feed for its due-heap.
     enqueued: Vec<u64>,
+    /// Per-table persisted schema state as of replay progress: seeded
+    /// from the checkpointed store at open, updated whenever a
+    /// `charpente.schema_versions` put applies. Consulted before any row
+    /// byte decodes (spec §2 — the upgrade barrier, enforced at the exact
+    /// dangerous point). Keyed by table name; value is
+    /// `(version, fingerprint)`.
+    versions: BTreeMap<String, (u32, u64)>,
 }
 
 impl StateMachine for TableMachine {
@@ -560,43 +567,84 @@ impl StateMachine for TableMachine {
         }
         let effects = decode_record(payload)?;
         let schema = &self.schema;
+        // The dynamic version map is mutated in pass 1 (adoption/watermark
+        // rows declare their table's version) and read in pass 2 (the gate);
+        // a disjoint-field borrow alongside `schema`, both distinct from the
+        // `self.store` the `apply` call borrows.
+        let versions = &mut self.versions;
         // `w.materialize_job` returns the new id; collected locally because
         // the closure can't also hold `&mut self.enqueued` while `schema`
         // (borrowed from `self`) is captured — extend after the store commits.
         let new_ids = self.store.apply(seq, |w| {
             let mut ids = Vec::new();
+            // Pass 1: schema-table effects first, so a record that both
+            // adopts a table and writes its first rows has declared the
+            // table's version by the time pass 2 checks it.
+            for effect in &effects {
+                if let Effect::Put { table, row } = effect
+                    && table == crate::migration::SchemaVersion::TABLE
+                {
+                    // Close-out detection (spec §3): a version transition
+                    // with the in-flight marker clearing rebuilds the
+                    // migrated table's indexes — at apply, so primary,
+                    // replay, and followers rebuild at the same log
+                    // position.
+                    let new = crate::migration::SchemaVersion::decode_row(row)?;
+                    let old = w
+                        .get_raw(table, new.id.raw())?
+                        .map(|b| crate::migration::SchemaVersion::decode_row(&b))
+                        .transpose()?;
+                    (schema.ops(table)?.apply_put)(w, row)?;
+                    let closed_out = old.as_ref().is_some_and(|o| {
+                        o.migrating_to.is_some()
+                            && new.migrating_to.is_none()
+                            && new.version > o.version
+                    });
+                    if closed_out {
+                        // LOAD-BEARING (T4 review): the rebuild presumes every
+                        // migrated row is already durably applied. A MigratePut
+                        // in this same record only lands in pass 2 (below), so a
+                        // close-out sharing a record with one would rebuild over
+                        // pre-migration bytes. `migrate_table` guarantees the
+                        // close-out is its own transaction, strictly after every
+                        // rewrite batch.
+                        debug_assert!(
+                            !effects
+                                .iter()
+                                .any(|e| matches!(e, Effect::MigratePut { .. })),
+                            "close-out version bump for \"{}\" shares a record with a \
+                             MigratePut — the index rebuild would run before pass 2 applies \
+                             the rewritten rows",
+                            new.table
+                        );
+                        (schema.ops(&new.table)?.rebuild_indexes)(w)?;
+                    }
+                    versions.insert(new.table.clone(), (new.version, new.fingerprint));
+                }
+            }
+            // Pass 2: everything else, version-checked before any row byte
+            // decodes.
             for effect in &effects {
                 match effect {
                     Effect::Put { table, row } => {
                         if table == crate::migration::SchemaVersion::TABLE {
-                            // Close-out detection (spec §3): a version
-                            // transition with the in-flight marker
-                            // clearing rebuilds the migrated table's
-                            // indexes — at apply, so primary, replay, and
-                            // followers rebuild at the same log position.
-                            let new = crate::migration::SchemaVersion::decode_row(row)?;
-                            let old = w
-                                .get_raw(table, new.id.raw())?
-                                .map(|b| crate::migration::SchemaVersion::decode_row(&b))
-                                .transpose()?;
-                            (schema.ops(table)?.apply_put)(w, row)?;
-                            let closed_out = old.as_ref().is_some_and(|o| {
-                                o.migrating_to.is_some()
-                                    && new.migrating_to.is_none()
-                                    && new.version > o.version
-                            });
-                            if closed_out {
-                                (schema.ops(&new.table)?.rebuild_indexes)(w)?;
-                            }
-                        } else {
-                            (schema.ops(table)?.apply_put)(w, row)?;
+                            continue; // pass 1 applied it
                         }
+                        check_replay_version(schema, versions, table)?;
+                        (schema.ops(table)?.apply_put)(w, row)?;
+                    }
+                    Effect::Delete { table, id } => {
+                        check_replay_version(schema, versions, table)?;
+                        (schema.ops(table)?.apply_delete)(w, *id)?;
                     }
                     Effect::MigratePut { table, id, row } => {
-                        schema.ops(table)?; // registered-table check, same error surface
+                        // The rewrite itself: exempt from the version
+                        // equality check (its whole point is bytes at the
+                        // target version over rows at the old one), still
+                        // registered-table-checked, still decode-free.
+                        schema.ops(table)?;
                         w.put_raw(table, *id, row)?;
                     }
-                    Effect::Delete { table, id } => (schema.ops(table)?.apply_delete)(w, *id)?,
                     Effect::Enqueue { job, payload, key } => {
                         ids.push(w.materialize_job(job, payload, key.as_deref())?);
                     }
@@ -614,6 +662,142 @@ impl StateMachine for TableMachine {
         self.enqueued.extend(new_ids);
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------- gate
+
+/// One table's gate verdict (spec §2), computed from the compiled schema
+/// and the persisted `charpente.schema_versions` row. Pure — T9's
+/// naive-gate meta-test runs a check-skipping variant side by side with
+/// this real one against the same real store.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GateStatus {
+    /// Persisted matches compiled — nothing to do.
+    Current,
+    /// No persisted row: baseline (rows predate versioning) or a fresh
+    /// table. Adoption happens at first write, not at open.
+    Adopt,
+    /// Persisted version is behind the compiled one; the executor runs
+    /// (on a writable node) from `from`.
+    Migrate { from: u32 },
+    /// A named refusal — the message is the product surface (hard rule 5).
+    Refuse(String),
+}
+
+pub fn gate_status(
+    table: &str,
+    compiled: (u32, u64),
+    persisted: Option<&crate::migration::SchemaVersion>,
+    rows_exist: bool,
+) -> GateStatus {
+    let (compiled_version, compiled_fingerprint) = compiled;
+    let Some(row) = persisted else {
+        if rows_exist && compiled_version > 1 {
+            // Pre-versioning data (baseline 1) under a bumped binary:
+            // migrate from 1. Post-versioning tables always have a row by
+            // first-write adoption, so baseline-1 is unambiguous (spec §1).
+            return GateStatus::Migrate { from: 1 };
+        }
+        return GateStatus::Adopt;
+    };
+    if let (Some(through), Some(to)) = (row.migrating_through, row.migrating_to)
+        && to != compiled_version
+    {
+        return GateStatus::Refuse(format!(
+            "table \"{table}\" has an interrupted migration to version {to} in flight \
+             (resumable watermark at row id {through}) but this binary is compiled for \
+             version {compiled_version} — rows on either side of the watermark are at \
+             different versions and no single chain start covers both; finish the \
+             interrupted migration with the binary that started it, or restore"
+        ));
+    }
+    if row.version == compiled_version {
+        if !crate::migration::fingerprint_matches(Some(row.fingerprint), compiled_fingerprint) {
+            return GateStatus::Refuse(drift_msg(
+                table,
+                row.fingerprint,
+                compiled_fingerprint,
+                compiled_version,
+            ));
+        }
+        return GateStatus::Current;
+    }
+    if row.version > compiled_version {
+        return GateStatus::Refuse(downgrade_msg(table, row.version, compiled_version));
+    }
+    GateStatus::Migrate { from: row.version }
+}
+
+fn upgrade_barrier_msg(table: &str, persisted: u32, compiled: u32) -> String {
+    format!(
+        "table \"{table}\" has unrecovered writes from the previous binary (persisted version \
+         {persisted}, this binary is compiled for version {compiled}) — run the previous \
+         binary once to a clean shutdown, then upgrade (spec §2's upgrade barrier)"
+    )
+}
+
+fn drift_msg(table: &str, persisted_fp: u64, compiled_fp: u64, version: u32) -> String {
+    format!(
+        "table \"{table}\"'s shape changed but its #[table(version = ...)] did not — \
+         persisted fingerprint {persisted_fp:#x} != compiled fingerprint {compiled_fp:#x} at \
+         version {version}; bump the version and add a TableMigration, or revert the struct \
+         change"
+    )
+}
+
+fn downgrade_msg(table: &str, persisted: u32, compiled: u32) -> String {
+    format!(
+        "table \"{table}\" is at persisted version {persisted} but this binary is compiled for \
+         version {compiled} — the binary is older than the data; run a binary built for at \
+         least version {persisted}"
+    )
+}
+
+/// Refuses, by name, replaying an ordinary record for a table whose
+/// declared version/fingerprint does not match the compiled one (spec
+/// §2): the barrier (version behind), the downgrade (version ahead), and
+/// drift (same version, different shape) — all BEFORE decoding row bytes.
+/// A fingerprinted table with NO declared version cannot occur for
+/// records written by an adoption-aware binary (first-write adoption);
+/// seeing one is corruption-or-foreign-data and refuses by name.
+fn check_replay_version(
+    schema: &Schema,
+    versions: &BTreeMap<String, (u32, u64)>,
+    table: &str,
+) -> io::Result<()> {
+    let Some((compiled_version, Some(compiled_fp))) = schema.table_meta(table) else {
+        return Ok(()); // FINGERPRINT: None — not a versioned table.
+    };
+    let Some(&(persisted_version, persisted_fp)) = versions.get(table) else {
+        return Err(io::Error::other(format!(
+            "replaying a record for versioned table \"{table}\" with no adoption row on \
+             record — this log was not written by an adoption-aware binary, or is corrupt; \
+             restore from a replica or backup"
+        )));
+    };
+    if persisted_version < compiled_version {
+        return Err(io::Error::other(upgrade_barrier_msg(
+            table,
+            persisted_version,
+            compiled_version,
+        )));
+    }
+    if persisted_version > compiled_version {
+        return Err(io::Error::other(downgrade_msg(
+            table,
+            persisted_version,
+            compiled_version,
+        )));
+    }
+    if persisted_fp != compiled_fp {
+        return Err(io::Error::other(drift_msg(
+            table,
+            persisted_fp,
+            compiled_fp,
+            compiled_version,
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- db
@@ -634,6 +818,10 @@ pub struct Db {
     /// follower; `None` (the default) allows commits. Gates `transact` only
     /// — `apply_shipped` is the follower's own write path and bypasses it.
     not_primary: Option<String>,
+    /// Tables that already carry a `charpente.schema_versions` row (T6's
+    /// first-write adoption): rebuilt from the store at open and by
+    /// `migrate_schema`. Omitted from `Debug` like `retention_pin`.
+    adopted: BTreeSet<String>,
 }
 
 impl fmt::Debug for Db {
@@ -762,11 +950,29 @@ impl Db {
             }
             None => {}
         }
+        // Seed the replay-time version map (the two-pass gate) from the
+        // CHECKPOINTED store; tail records update it live as their
+        // adoption/watermark rows apply.
+        let mut versions: BTreeMap<String, (u32, u64)> = BTreeMap::new();
+        {
+            let snap = store.snapshot()?;
+            for table in schema.table_names() {
+                if !matches!(schema.table_meta(table), Some((_, Some(_)))) {
+                    continue; // FINGERPRINT: None — not a versioned table.
+                }
+                if let Some(row) = snap.get::<crate::migration::SchemaVersion>(
+                    crate::migration::schema_version_id(table),
+                )? {
+                    versions.insert(row.table.clone(), (row.version, row.fingerprint));
+                }
+            }
+        }
         let machine = TableMachine {
             store,
             schema,
             skip_through,
             enqueued: Vec::new(),
+            versions,
         };
         let mut engine = Engine::recover(disk, cfg.wal.clone(), machine, skip_through)?;
         // Recovery replay must not leak into the kernel's incremental feed —
@@ -780,13 +986,31 @@ impl Db {
                  the store outran durable truth, which append→sync→apply forbids"
             );
         }
-        Ok(Db {
+        let replayed = engine.last_applied() != skip_through;
+        let mut db = Db {
             engine,
             cfg,
             retention_pin: None,
             records_since_checkpoint: 0,
             not_primary: None,
-        })
+            adopted: BTreeSet::new(),
+        };
+        // Post-replay: the authoritative pure checks against the now-current
+        // store (a drifted/downgraded table with a CLEAN tail still refuses;
+        // a bump with a clean tail is fine here — the executor runs later, on
+        // a writable node, via migrate_schema).
+        db.check_schema_gate()?;
+        db.reload_adopted()?;
+        // Persist-store-at-open-after-replay (spec §2): makes "boot the
+        // previous binary once" the complete barrier remedy. Conditional on
+        // having replayed so no-op opens add zero disk ops (the pinned-seed
+        // rule, same rationale as adoption-at-first-write). Deliberately a
+        // store persist only, NOT a full `Db::checkpoint` — see
+        // `persist_store_at_open`.
+        if replayed {
+            db.persist_store_at_open()?;
+        }
+        Ok(db)
     }
 
     /// Runs one transaction: `f` reads through `tx` and buffers effects; on
@@ -816,6 +1040,62 @@ impl Db {
                 primary: primary.clone(),
             });
         }
+        // First-write adoption (spec §1): the first write to a versioned
+        // table carries that table's `charpente.schema_versions` row, so the
+        // record declares its own version before the replay gate ever checks
+        // it. Only versioned (Some-fingerprint) tables, only the first time
+        // (`self.adopted`), and never a table this very transaction already
+        // writes a schema row for (the executor's watermark/close-out puts).
+        let adoption_tables: Vec<&'static str> = tx
+            .effects
+            .overlay
+            .keys()
+            .copied()
+            .filter(|t| {
+                *t != crate::migration::SchemaVersion::TABLE
+                    && !self.adopted.contains(*t)
+                    && self
+                        .engine
+                        .machine()
+                        .schema
+                        .table_meta(t)
+                        .is_some_and(|(_, fp)| fp.is_some())
+            })
+            .collect();
+        for table in &adoption_tables {
+            let (version, fingerprint) = self
+                .engine
+                .machine()
+                .schema
+                .table_meta(table)
+                .expect("filtered on table_meta above");
+            let vid = crate::migration::schema_version_id(table);
+            // Skip if this very transaction already writes the table's
+            // schema row (the executor's watermark/close-out puts).
+            let already = tx
+                .effects
+                .overlay
+                .get(crate::migration::SchemaVersion::TABLE)
+                .is_some_and(|m| m.contains_key(&vid.raw()));
+            if already {
+                continue;
+            }
+            let row = crate::migration::SchemaVersion {
+                id: vid,
+                table: (*table).to_string(),
+                version,
+                fingerprint: fingerprint.expect("filtered on Some above"),
+                migrating_through: None,
+                migrating_to: None,
+            };
+            let mut bytes = Vec::new();
+            row.encode_row(&mut bytes);
+            tx.effects
+                .overlay
+                .entry(crate::migration::SchemaVersion::TABLE)
+                .or_default()
+                .insert(vid.raw(), Some(bytes));
+        }
         let record = encode_record(&tx.effects);
         assert!(
             record.len() <= MAX_RECORD_BYTES,
@@ -824,6 +1104,9 @@ impl Db {
             record.len()
         );
         self.engine.submit(&record).map_err(TxError::Io)?;
+        for table in adoption_tables {
+            self.adopted.insert(table.to_string());
+        }
         self.records_since_checkpoint += 1;
         if self.cfg.checkpoint_every > 0
             && self.records_since_checkpoint >= self.cfg.checkpoint_every
@@ -911,6 +1194,21 @@ impl Db {
         self.engine
             .wal_mut()
             .gc(keep_from, self.cfg.retain_segments)
+    }
+
+    /// The spec §2 "the store checkpoints at open" step (persist-store-at-
+    /// open-after-replay), deliberately NARROWER than `Db::checkpoint`: it
+    /// advances the store's durable `applied_seq` and nothing else — no
+    /// event-retention GC, no WAL segment GC, `records_since_checkpoint`
+    /// untouched. Retention/segment GC must stay EXCLUSIVELY on the cadence-
+    /// driven (`checkpoint_every`) schedule the realtime tail oracle is
+    /// validated against; running GC at this extra, open-triggered site
+    /// perturbs the deterministic GC schedule (a full checkpoint here deleted
+    /// events out from under an in-flight subscriber — realtime seed
+    /// 0xa2f2fa03568749d4 — and diverged primary/follower event floors at
+    /// equal seq).
+    fn persist_store_at_open(&self) -> io::Result<()> {
+        self.engine.machine().store.checkpoint()
     }
 
     /// The smallest retained `EventRow` id — `next_event_id` when the table
@@ -1020,6 +1318,38 @@ impl Db {
     /// fails. Callers (the kernel loop) stop and restart to recover.
     pub fn poisoned(&self) -> bool {
         self.engine.poisoned()
+    }
+
+    /// The pure post-replay gate walk: returns the first named refusal.
+    fn check_schema_gate(&self) -> io::Result<()> {
+        let snap = self.snapshot()?;
+        let schema = &self.engine.machine().schema;
+        for table in schema.table_names() {
+            let Some((version, Some(fingerprint))) = schema.table_meta(table) else {
+                continue;
+            };
+            let persisted: Option<crate::migration::SchemaVersion> =
+                snap.get(crate::migration::schema_version_id(table))?;
+            let rows_exist = !snap.scan_raw_from(table, None, 1)?.is_empty();
+            if let GateStatus::Refuse(msg) = gate_status(
+                table,
+                (version, fingerprint),
+                persisted.as_ref(),
+                rows_exist,
+            ) {
+                return Err(io::Error::other(msg));
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuilds the adopted-set (T6's first-write adoption) from the store.
+    /// Called at open and again by migrate_schema (a promoted follower's
+    /// rows arrived by shipping after its open).
+    fn reload_adopted(&mut self) -> io::Result<()> {
+        let rows: Vec<crate::migration::SchemaVersion> = self.snapshot()?.scan()?;
+        self.adopted = rows.into_iter().map(|r| r.table).collect();
+        Ok(())
     }
 
     /// Deconstructs a live `Db` into a `Seeder` over the same disk — the seed

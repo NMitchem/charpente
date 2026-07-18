@@ -187,6 +187,12 @@ keeping no-op opens free of new disk ops, for the same pinned-seed reason as
 adoption-at-first-write). "Boot the previous binary once" is therefore the whole
 remedy — it replays its own tail, checkpoints, and leaves nothing foreign behind.
 
+This open-time persist advances `applied_seq` only — it must not run event-retention
+GC or WAL segment GC. Those stay on the cadence-driven (`checkpoint_every`) schedule
+the realtime tail oracle is validated against; running them at this extra, open-
+triggered site perturbs the deterministic GC schedule (realtime seed
+0xa2f2fa03568749d4).
+
 Once a table is fully migrated to `N` in production, the `TableMigration`/
 `#[row_shape]` code below `N` can be deleted from source; deleting it *before* every
 deployed copy of the data has reached `N` is exactly what the missing-chain-link

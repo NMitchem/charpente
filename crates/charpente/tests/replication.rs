@@ -394,37 +394,65 @@ fn commit_widget(sim: &Sim, node: &mut Node, i: u64) -> Result<(), String> {
 /// (a) equal `last_applied`, (b) byte-equal `scan_raw` over every table plus
 /// the meta counter — the layout-independent content oracle that holds across
 /// a seed and across crash-recovery, retried under transient read faults.
-fn assert_converged(p: &Node, f: &Node) -> Result<(), String> {
+fn assert_converged(sim: &Sim, p: &mut Node, f: &mut Node) -> Result<(), String> {
+    // The two-node analogue of `retry_read_reopen`: the convergence scan reads
+    // BOTH nodes' live redb handles, so a latched poison ("close and re-open
+    // the database") can be on either; the `p:`/`f:` prefix `converged_read`
+    // tags its redb reads with says which, so only that node is reopened.
+    for _ in 0..64 {
+        // `last_applied` reads in-memory engine state (no redb snapshot), so it
+        // cannot latch the redb poison — check it each attempt, un-prefixed.
+        let (pla, fla) = {
+            let pdb = p.db.as_ref().ok_or("p has no db")?;
+            let fdb = f.db.as_ref().ok_or("f has no db")?;
+            (pdb.last_applied(), fdb.last_applied())
+        };
+        if pla != fla {
+            return Err(format!("last_applied mismatch: p={pla:?} f={fla:?}"));
+        }
+        match converged_read(p, f) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.contains("close and re-open the database") => {
+                // Latched redb poison — recover_node-style drop+reopen clears
+                // it (fresh handle; WAL replay restores the converged applied
+                // state). Only the poisoned node, by its `p:`/`f:` tag.
+                if e.starts_with("p:") {
+                    recover_node(sim, p)?;
+                } else {
+                    recover_node(sim, f)?;
+                }
+            }
+            Err(e) if is_fault_fallout(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err("retry_fallout: 64 attempts all faulted".to_string())
+}
+
+/// One convergence-scan attempt. redb reads are tagged `p:`/`f:` so the caller
+/// can reopen the poisoned node; logical divergences carry their own message.
+fn converged_read(p: &Node, f: &Node) -> Result<(), String> {
     let pdb = p.db.as_ref().ok_or("p has no db")?;
     let fdb = f.db.as_ref().ok_or("f has no db")?;
-    if pdb.last_applied() != fdb.last_applied() {
-        return Err(format!(
-            "last_applied mismatch: p={:?} f={:?}",
-            pdb.last_applied(),
-            fdb.last_applied()
-        ));
+    let ps = pdb.snapshot().map_err(|e| format!("p: {e}"))?;
+    let fs = fdb.snapshot().map_err(|e| format!("f: {e}"))?;
+    for table in pdb.table_names() {
+        let pr = ps.scan_raw(table).map_err(|e| format!("p: {e}"))?;
+        let fr = fs.scan_raw(table).map_err(|e| format!("f: {e}"))?;
+        if pr != fr {
+            return Err(format!(
+                "table {table} diverged: p has {} rows, f has {}",
+                pr.len(),
+                fr.len()
+            ));
+        }
     }
-    retry_fallout(|| {
-        let ps = pdb.snapshot().map_err(|e| e.to_string())?;
-        let fs = fdb.snapshot().map_err(|e| e.to_string())?;
-        for table in pdb.table_names() {
-            let pr = ps.scan_raw(table).map_err(|e| e.to_string())?;
-            let fr = fs.scan_raw(table).map_err(|e| e.to_string())?;
-            if pr != fr {
-                return Err(format!(
-                    "table {table} diverged: p has {} rows, f has {}",
-                    pr.len(),
-                    fr.len()
-                ));
-            }
-        }
-        if ps.next_job_id().map_err(|e| e.to_string())?
-            != fs.next_job_id().map_err(|e| e.to_string())?
-        {
-            return Err("next_job_id diverged".to_string());
-        }
-        Ok(())
-    })
+    if ps.next_job_id().map_err(|e| format!("p: {e}"))?
+        != fs.next_job_id().map_err(|e| format!("f: {e}"))?
+    {
+        return Err("next_job_id diverged".to_string());
+    }
+    Ok(())
 }
 
 /// (c) The determinism gift: after checkpoint + graceful close on both nodes,
@@ -513,6 +541,41 @@ fn retry_fallout<T>(mut f: impl FnMut() -> Result<T, String>) -> Result<T, Strin
     Err("retry_fallout: 64 attempts all faulted".to_string())
 }
 
+/// `retry_fallout` for a read that goes through a live redb handle. A single
+/// transient injected read error LATCHES redb's handle poison ("Previous I/O
+/// error ... close and re-open the database"): every later snapshot off the
+/// SAME handle keeps returning it, so plain `retry_fallout` spins its whole
+/// budget making no progress. On that specific tell we drop and reopen the
+/// node's handle (recover_node-style — a fresh redb handle clears the latch),
+/// then retry the read. Any OTHER fault fallout (e.g. a raw transient WAL read
+/// at its own site) keeps retrying in place, exactly as `retry_fallout` always
+/// did. Same bounded 64-attempt budget; `finish_universe`'s classification is
+/// untouched — `recover`'s own INCONCLUSIVE/hard errors propagate as-is.
+///
+/// Pinned RED→GREEN seed 0xdce31ea4094053cb: first-write adoption (migrations
+/// sub-project 5) shifted this universe's 0.02 read-fault draw onto
+/// `assert_converged`'s oracle read, latching the poison there — RED on the
+/// unfixed harness (`retry_fallout` spins 64× on the poisoned handle), GREEN
+/// once the read reopens. Both nodes had FULLY converged; the latched-redb-
+/// poison class is pre-existing — same family as the recovery-retry fsyncgate
+/// seed 0x5cafb3ac016dccf9 — surfaced, not caused, by the adoption byte-shift.
+fn retry_read_reopen<N, T>(
+    sim: &Sim,
+    node: &mut N,
+    recover: impl Fn(&Sim, &mut N) -> Result<(), String>,
+    read: impl Fn(&N) -> Result<T, String>,
+) -> Result<T, String> {
+    for _ in 0..64 {
+        match read(node) {
+            Ok(v) => return Ok(v),
+            Err(e) if e.contains("close and re-open the database") => recover(sim, node)?,
+            Err(e) if is_fault_fallout(&e) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err("retry_fallout: 64 attempts all faulted".to_string())
+}
+
 fn converged(nodes: &[&mut Node]) -> bool {
     let a = nodes[0].db.as_ref().and_then(|d| d.last_applied());
     let b = nodes[1].db.as_ref().and_then(|d| d.last_applied());
@@ -573,7 +636,7 @@ fn convergence_universe(sim: &mut Sim) -> Result<(), String> {
     }
     run_until(sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET)?;
 
-    assert_converged(&p, &f)?;
+    assert_converged(sim, &mut p, &mut f)?;
     assert_bytes_identical(sim, p, f)
 }
 
@@ -627,7 +690,7 @@ fn seeding_universe(sim: &mut Sim) -> Result<(), String> {
     if f.db.as_ref().map_or(0, |d| d.log_base()) == 0 {
         return Err("a seeded follower's WAL base must be above 0".to_string());
     }
-    assert_converged(&p, &f)
+    assert_converged(sim, &mut p, &mut f)
 }
 
 /// Sim-found bug, seed 0xcaef83b2feb5edf5 (this file's seeding property):
@@ -806,7 +869,7 @@ fn live_lagging_session_pins_gc() {
         f.repl.stats().seeds >= 1,
         "a fresh-data-dir follower below the base must re-seed on rejoin"
     );
-    assert_converged(&p, &f).unwrap();
+    assert_converged(&sim, &mut p, &mut f).unwrap();
 }
 
 /// Regression (final replication review, finding 2): a peer that opens a conn
@@ -1140,7 +1203,7 @@ fn a_restarted_seeded_follower_resumes_without_re_seeding() {
     // the new frame ships — converging one past the frontier.
     commit_widget(&sim, &mut p, 30).unwrap();
     run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
-    assert_converged(&p, &f).unwrap();
+    assert_converged(&sim, &mut p, &mut f).unwrap();
     assert!(
         f.db.as_ref().unwrap().last_applied() > Some(frontier),
         "frames must have shipped past the frontier after the resume"
@@ -1221,7 +1284,7 @@ fn a_seeded_follower_that_advanced_then_lost_its_log_reseeds_not_refused() {
         1,
         "the log-less follower re-seeds (cannot prove its advanced position)"
     );
-    assert_converged(&p, &f).unwrap();
+    assert_converged(&sim, &mut p, &mut f).unwrap();
 }
 
 // ------------------------------------------- property: diverged BEHIND (Design B)
@@ -1592,7 +1655,7 @@ fn peer_secret_refuses_mismatch_and_admits_match() {
     };
     let mut f = spawn_node(&sim, "f", f_cfg, db_cfg).unwrap();
     run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
-    assert_converged(&p, &f).unwrap();
+    assert_converged(&sim, &mut p, &mut f).unwrap();
 
     // A CtrlPromote without the secret at a secret-configured node → Refuse,
     // and the role never flips (no state touched on refusal). Reuses the
@@ -1630,7 +1693,7 @@ fn peer_secret_unconfigured_node_accepts_a_followers_unrequired_proof() {
         commit_widget(&sim, &mut p, i).unwrap();
     }
     run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
-    assert_converged(&p, &f).unwrap();
+    assert_converged(&sim, &mut p, &mut f).unwrap();
 }
 
 // --------------------------------------------- error-surface pin: empty ship
@@ -2062,9 +2125,9 @@ fn assert_one_writable(p: &Node, f: &Node) -> Result<(), String> {
 
 /// Every acked widget id is present in `node`'s store — the zero-loss oracle
 /// (switchover) and the drain meta-test's inverting victim both run this.
-fn assert_all_present(node: &Node, ids: &[u64], who: &str) -> Result<(), String> {
-    let db = node.db.as_ref().ok_or_else(|| format!("{who} has no db"))?;
-    retry_fallout(|| {
+fn assert_all_present(sim: &Sim, node: &mut Node, ids: &[u64], who: &str) -> Result<(), String> {
+    retry_read_reopen(sim, node, recover_node, |node| {
+        let db = node.db.as_ref().ok_or_else(|| format!("{who} has no db"))?;
         let snap = db.snapshot().map_err(|e| e.to_string())?;
         let rows = snap.scan_raw(Widget::TABLE).map_err(|e| e.to_string())?;
         for id in ids {
@@ -2257,7 +2320,7 @@ fn switchover_universe(sim: &mut Sim) -> Result<(), String> {
                     p.repl.role()
                 ));
             }
-            assert_all_present(&f, &acked, "f")?;
+            assert_all_present(sim, &mut f, &acked, "f")?;
             // Keep writing on the new primary; the old primary (now a follower)
             // converges with no divergence.
             for _ in 0..12u64 {
@@ -2266,7 +2329,7 @@ fn switchover_universe(sim: &mut Sim) -> Result<(), String> {
                 drive_rounds(sim, &mut [&mut p, &mut f], 3)?;
             }
             run_until(sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET)?;
-            assert_converged(&p, &f)?;
+            assert_converged(sim, &mut p, &mut f)?;
             Ok(())
         }
         Msg::CtrlErr { message } => {
@@ -2490,7 +2553,7 @@ fn crash_between_handoff_and_demote_never_yields_two_writable_primaries() {
     assert_one_writable(&p, &f).unwrap();
 
     run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
-    assert_converged(&p, &f).unwrap();
+    assert_converged(&sim, &mut p, &mut f).unwrap();
 }
 
 // ------------------------------ property: switchover aborts on a laggard
@@ -2591,7 +2654,7 @@ fn promote_without_drain_workload(sim: &mut Sim) -> Result<(), String> {
     }
 
     // The oracle must catch the skipped drain.
-    assert_all_present(&f, &acked, "f")
+    assert_all_present(sim, &mut f, &acked, "f")
 }
 
 #[test]
@@ -3277,8 +3340,8 @@ fn ids_present(node: &KNode, ids: &[u64]) -> Result<Vec<u64>, String> {
 /// THE promise (spec §4 property 8): every acked id the follower had converged
 /// on still lives on it. No `durable_corruption_fired` excuse — a converged
 /// follower exists, so this is a hard oracle.
-fn assert_survivor_holds(node: &KNode, ids: &[u64]) -> Result<(), String> {
-    retry_fallout(|| {
+fn assert_survivor_holds(sim: &Sim, node: &mut KNode, ids: &[u64]) -> Result<(), String> {
+    retry_read_reopen(sim, node, recover_kernel_node, |node| {
         let db = node
             .kernel
             .as_ref()
@@ -3303,8 +3366,8 @@ fn assert_survivor_holds(node: &KNode, ids: &[u64]) -> Result<(), String> {
 /// The consistency oracle carried over from the kernel suite: every replicated
 /// Done Bump bumped its Tally exactly once (a cut reverts to a prefix, which
 /// stays consistent, so this holds through corruption).
-fn bump_exactly_once(node: &KNode) -> Result<(), String> {
-    retry_fallout(|| {
+fn bump_exactly_once(sim: &Sim, node: &mut KNode) -> Result<(), String> {
+    retry_read_reopen(sim, node, recover_kernel_node, |node| {
         let db = node.kernel.as_ref().ok_or("no kernel")?.app().db();
         let snap = db.snapshot().map_err(|e| e.to_string())?;
         let jobs = snap.scan::<JobRow>().map_err(|e| e.to_string())?;
@@ -3444,7 +3507,10 @@ fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
             Err(_) => {}
         }
         // Record everything f durably holds now — it keeps these forever.
-        promised.extend(retry_fallout(|| ids_present(&f, &acked)).unwrap_or_default());
+        promised.extend(
+            retry_read_reopen(sim, &mut f, recover_kernel_node, |f| ids_present(f, &acked))
+                .unwrap_or_default(),
+        );
 
         // The corruption trigger: crash + restart p (bit_flip rolls on p's
         // wal/ at restart). Recovery may cut above the horizon (silent loss,
@@ -3532,8 +3598,8 @@ fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
     if !promised.is_empty() {
         sim.cover("repl:promised-nonempty");
     }
-    assert_survivor_holds(&f, &promised)?;
+    assert_survivor_holds(sim, &mut f, &promised)?;
     // And the replicated jobs stayed exactly-once through it all.
-    bump_exactly_once(&f)?;
+    bump_exactly_once(sim, &mut f)?;
     Ok(())
 }
