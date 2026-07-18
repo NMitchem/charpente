@@ -3,11 +3,12 @@
 
 use charpente::http::{App, AppConfig, Session};
 use charpente::kernel::{Dispatcher, JobDef, JobEntry, JobError, JobOutcome};
-use charpente::{Schema, Tx, job, jobs, table};
+use charpente::{Db, DbConfig, Schema, Tx, job, jobs, table};
 use charpente_core::db::{Job, TxError};
 use charpente_core::io::Entropy;
 use charpente_core::job::{JobRow, JobStatus};
-use charpente_core::table::{Codec, Id, View};
+use charpente_core::migration::{MigrationError, TableMigration};
+use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, View};
 use charpente_sim::{FaultConfig, Sim};
 
 #[table]
@@ -1419,4 +1420,113 @@ fn a_full_sink_drops_the_tail_and_resume_recovers() {
         vec![2, 3, 4],
         "resume recovers events 3,4,5 (ids 2,3,4)"
     );
+}
+
+// -------------------------------------------------------- T7: migration gate
+
+/// A hand-rolled v1 shape sharing table name "Gadget" with the
+/// `#[table(version = 2)]` `Gadget` below — migration_gate.rs's dual-impl
+/// pattern: the `#[table]` macro always ties `TABLE` to the Rust struct
+/// identifier, so a from-scratch v1 fixture under a different Rust name
+/// needs a hand-written `Row`+`RowShape` pair to land on the same table.
+struct GadgetV1 {
+    id: Id<GadgetV1>,
+    count: u32,
+}
+impl Row for GadgetV1 {
+    const TABLE: &'static str = "Gadget";
+    const INDEXES: &'static [IndexDef<GadgetV1>] = &[];
+    const VERSION: u32 = 1;
+    const FINGERPRINT: Option<u64> = Some(0x5EED_0001);
+    fn id(&self) -> Id<GadgetV1> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.count.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> std::io::Result<GadgetV1> {
+        let input = &mut &bytes[..];
+        Ok(GadgetV1 {
+            id: Id::decode(input)?,
+            count: u32::decode(input)?,
+        })
+    }
+}
+impl RowShape for GadgetV1 {
+    const VERSION: u32 = 1;
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        Row::encode_row(self, out)
+    }
+    fn decode_row(bytes: &[u8]) -> std::io::Result<GadgetV1> {
+        <GadgetV1 as Row>::decode_row(bytes)
+    }
+}
+
+#[table(version = 2)]
+struct Gadget {
+    id: Id<Gadget>,
+    count: u32,
+    label: String,
+}
+impl TableMigration for Gadget {
+    type Prev = GadgetV1;
+    fn migrate(prev: GadgetV1) -> Result<Gadget, MigrationError> {
+        Ok(Gadget {
+            id: Id::from_raw(prev.id.raw()),
+            count: prev.count,
+            label: "migrated".to_string(),
+        })
+    }
+}
+
+#[test]
+fn kernel_migrates_the_schema_before_the_first_request_is_served() {
+    let sim = Sim::with_faults(0x2EB7_0007, FaultConfig::none());
+    // Seed a v1 store via a bare Db, clean-shutdown checkpointed — the
+    // fixture the kernel below must migrate before it serves anything.
+    let mut seed_db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<GadgetV1>(),
+    )
+    .unwrap();
+    seed_db
+        .transact(|tx| -> Result<(), ()> {
+            for i in 0..3u64 {
+                tx.put(&GadgetV1 {
+                    id: Id::from_raw(i),
+                    count: i as u32,
+                });
+            }
+            Ok(())
+        })
+        .unwrap();
+    seed_db.checkpoint().unwrap(); // clean shutdown: the tail is drained
+    drop(seed_db);
+
+    // Build the app/kernel against the v2 schema + migration, then run:
+    // Kernel::run's startup gate must migrate every row before the first
+    // (only) scripted request is served.
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new()
+            .table::<Gadget>()
+            .migration::<Gadget>("Gadget"),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap();
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let mut source = SimSource::new(Box::new(sim.clock()), SEC);
+    kernel.run(&mut source).unwrap();
+
+    let mut app = kernel.into_app();
+    let mut rows: Vec<Gadget> = app.db_for_tests().snapshot().unwrap().scan().unwrap();
+    rows.sort_by_key(|r| r.id.raw());
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        assert_eq!(row.label, "migrated");
+        assert_eq!(row.count, row.id.raw() as u32);
+    }
 }

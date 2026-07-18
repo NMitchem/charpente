@@ -546,6 +546,10 @@ impl Repl {
         store_role(&*self.role_disk, &Role::Primary)?;
         self.role = Role::Primary;
         db.allow_writes();
+        // A promoted follower is now the writable node: run the schema
+        // gate before acking — it resumes any in-flight watermark the dead
+        // primary left mid-migration (spec §4).
+        db.migrate_schema()?;
         self.follower = None; // no upstream — this is the authoritative timeline now
         let last = db.last_applied();
         self.reply_ctrl(

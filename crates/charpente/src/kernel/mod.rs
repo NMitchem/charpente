@@ -178,11 +178,25 @@ impl Kernel {
     /// (poisoned engine — restart to recover). Thin wrapper over `step`: it
     /// owns the park, `step` owns the decision.
     pub fn run(&mut self, source: &mut dyn RequestSource) -> io::Result<()> {
+        // The role-aware schema gate (spec §2): single-node and primary
+        // kernels migrate before serving anything; followers skip (their
+        // migration arrives by shipping) and run it at promote instead.
+        if self.app.db_mut().writes_allowed() {
+            self.app.db_mut().migrate_schema()?;
+        }
         loop {
             match self.step(source)? {
                 Step::Worked => {}
                 Step::Idle { deadline } => {
                     if let Wake::Shutdown = source.wait_until(deadline) {
+                        // Clean shutdown (spec §2's other half): checkpoint
+                        // so the next open finds a compacted store rather
+                        // than replaying the WAL tail — skipped when
+                        // poisoned, since checkpointing a poisoned engine
+                        // would mask the poison.
+                        if !self.app.db_mut().poisoned() {
+                            self.app.db_mut().checkpoint()?;
+                        }
                         return Ok(());
                     }
                 }
