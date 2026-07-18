@@ -590,6 +590,15 @@ struct TableMachine {
     /// dangerous point). Keyed by table name; value is
     /// `(version, fingerprint)`.
     versions: BTreeMap<String, (u32, u64)>,
+    /// Tables for which a below-compiled-version ordinary record was replayed
+    /// decode-free during this recovery (spec §2 — a full rebuild-from-WAL of a
+    /// store whose history crosses a version bump). Post-replay, a table in
+    /// this set whose FINAL declared version reached compiled is admitted (its
+    /// own history migrated forward in the WAL — a rebuilt store reopens after
+    /// its migration); one still below compiled is a genuine unrecovered tail
+    /// and the barrier fires (fail-closed preserved) unless it is a resumable
+    /// in-flight migration to the compiled target.
+    saw_below: BTreeSet<String>,
 }
 
 impl StateMachine for TableMachine {
@@ -604,6 +613,7 @@ impl StateMachine for TableMachine {
         // a disjoint-field borrow alongside `schema`, both distinct from the
         // `self.store` the `apply` call borrows.
         let versions = &mut self.versions;
+        let saw_below = &mut self.saw_below;
         // `w.materialize_job` returns the new id; collected locally because
         // the closure can't also hold `&mut self.enqueued` while `schema`
         // (borrowed from `self`) is captured — extend after the store commits.
@@ -662,12 +672,34 @@ impl StateMachine for TableMachine {
                         if table == crate::migration::SchemaVersion::TABLE {
                             continue; // pass 1 applied it
                         }
-                        check_replay_version(schema, versions, table)?;
-                        (schema.ops(table)?.apply_put)(w, row)?;
+                        // A below-compiled-version ordinary record (a full
+                        // rebuild-from-WAL replaying history that predates a
+                        // version bump) is applied DECODE-FREE: its bytes are at
+                        // the old version, and decoding them under the compiled
+                        // type is the very misdecode the upgrade barrier exists
+                        // to prevent (spec §2's organizing rule). The id is a
+                        // version-independent prefix — every row encodes its id
+                        // first, u64 LE — so put_raw needs no decode. A later
+                        // MigratePut overwrites the row and the close-out
+                        // rebuilds indexes; if the table never reaches compiled
+                        // the post-replay barrier fires (saw_below).
+                        if is_below_compiled(schema, versions, table) {
+                            let id = row_id_prefix(row)?;
+                            saw_below.insert(table.clone());
+                            w.put_raw(table, id, row)?;
+                        } else {
+                            check_replay_version(schema, versions, table)?;
+                            (schema.ops(table)?.apply_put)(w, row)?;
+                        }
                     }
                     Effect::Delete { table, id } => {
-                        check_replay_version(schema, versions, table)?;
-                        (schema.ops(table)?.apply_delete)(w, *id)?;
+                        if is_below_compiled(schema, versions, table) {
+                            saw_below.insert(table.clone());
+                            w.delete_raw(table, *id)?;
+                        } else {
+                            check_replay_version(schema, versions, table)?;
+                            (schema.ops(table)?.apply_delete)(w, *id)?;
+                        }
                     }
                     Effect::MigratePut { table, id, row } => {
                         // The rewrite itself: exempt from the version
@@ -743,6 +775,29 @@ pub fn gate_status(
              interrupted migration with the binary that started it, or restore"
         ));
     }
+    // In-flight-target FINGERPRINT refusal (spec §2/§5): a migration TO the
+    // compiled version, but begun by a binary whose TARGET shape differs from
+    // this one's. The persisted `fingerprint` field already holds the original
+    // target's fingerprint (the executor writes it from the first watermark
+    // on), so no extra field is needed. Resuming under a different shape would
+    // leave rows below the watermark at the original target's bytes and rows
+    // above at this binary's — a silently mixed-shape table, the very drift the
+    // fingerprint mechanism exists to prevent. The version-equality drift arm
+    // below never runs mid-resume (row.version stays at `from` until
+    // close-out), so the check must live here.
+    if let (Some(through), Some(to)) = (row.migrating_through, row.migrating_to)
+        && to == compiled_version
+        && !crate::migration::fingerprint_matches(Some(row.fingerprint), compiled_fingerprint)
+    {
+        return GateStatus::Refuse(format!(
+            "table \"{table}\" has an interrupted migration to version {to} in flight \
+             (resumable watermark at row id {through}) begun by a binary whose target shape \
+             (fingerprint {:#x}) differs from this binary's (fingerprint {compiled_fingerprint:#x}) \
+             — resuming would mix two shapes in one table; finish the interrupted migration \
+             with the binary that started it, or restore",
+            row.fingerprint
+        ));
+    }
     if row.version == compiled_version {
         if !crate::migration::fingerprint_matches(Some(row.fingerprint), compiled_fingerprint) {
             return GateStatus::Refuse(drift_msg(
@@ -792,6 +847,38 @@ fn downgrade_msg(table: &str, persisted: u32, compiled: u32) -> String {
 /// A fingerprinted table with NO declared version cannot occur for
 /// records written by an adoption-aware binary (first-write adoption);
 /// seeing one is corruption-or-foreign-data and refuses by name.
+/// True if `table` is a versioned table whose CURRENT declared version (in the
+/// replay-time `versions` map) is strictly below the compiled version — i.e.
+/// the record about to apply is at an older shape and must be handled
+/// decode-free (spec §2).
+fn is_below_compiled(
+    schema: &Schema,
+    versions: &BTreeMap<String, (u32, u64)>,
+    table: &str,
+) -> bool {
+    let Some((compiled_version, Some(_))) = schema.table_meta(table) else {
+        return false; // FINGERPRINT: None — not a versioned table.
+    };
+    versions
+        .get(table)
+        .is_some_and(|&(v, _)| v < compiled_version)
+}
+
+/// The row id is a version-independent prefix: every `#[table]`/`#[row_shape]`
+/// struct encodes `self.id` first, as a u64 LE. So the primary key is
+/// recoverable from raw bytes without decoding under any version.
+fn row_id_prefix(row: &[u8]) -> io::Result<u64> {
+    if row.len() < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "row too short to carry an 8-byte id prefix",
+        ));
+    }
+    Ok(u64::from_le_bytes(
+        row[..8].try_into().expect("len checked"),
+    ))
+}
+
 fn check_replay_version(
     schema: &Schema,
     versions: &BTreeMap<String, (u32, u64)>,
@@ -1005,6 +1092,7 @@ impl Db {
             skip_through,
             enqueued: Vec::new(),
             versions,
+            saw_below: BTreeSet::new(),
         };
         let mut engine = Engine::recover(disk, cfg.wal.clone(), machine, skip_through)?;
         // Recovery replay must not leak into the kernel's incremental feed —
@@ -1365,6 +1453,7 @@ impl Db {
     fn check_schema_gate(&self) -> io::Result<()> {
         let snap = self.snapshot()?;
         let schema = &self.engine.machine().schema;
+        let saw_below = &self.engine.machine().saw_below;
         for table in schema.table_names() {
             let Some((version, Some(fingerprint))) = schema.table_meta(table) else {
                 continue;
@@ -1372,13 +1461,40 @@ impl Db {
             let persisted: Option<crate::migration::SchemaVersion> =
                 snap.get(crate::migration::schema_version_id(table))?;
             let rows_exist = !snap.scan_raw_from(table, None, 1)?.is_empty();
-            if let GateStatus::Refuse(msg) = gate_status(
+            match gate_status(
                 table,
                 (version, fingerprint),
                 persisted.as_ref(),
                 rows_exist,
             ) {
-                return Err(io::Error::other(msg));
+                GateStatus::Refuse(msg) => return Err(io::Error::other(msg)),
+                // The upgrade barrier fires POST-replay for a full rebuild,
+                // discriminated by saw_below (spec §2). A table that needs
+                // migration (Migrate) AND replayed below-version records during
+                // this recovery is a genuine unrecovered foreign tail → barrier
+                // (fail-closed, preserving migration_gate.rs's barrier test) —
+                // UNLESS it is a resumable in-flight migration TO the compiled
+                // target (its below-watermark rows were decode-free-replayed to
+                // their new bytes; migrate_schema finishes the rest) → admit. A
+                // table that needs migration but replayed NO below-version
+                // records is the clean upgrade path (checkpointed store) →
+                // migrate_schema handles it. Finding-1's completed case reached
+                // compiled and never lands here (it is Current, not Migrate).
+                GateStatus::Migrate { .. } if saw_below.contains(table) => {
+                    let in_flight_to_compiled = persisted
+                        .as_ref()
+                        .and_then(|r| r.migrating_to)
+                        .is_some_and(|to| to == version);
+                    if !in_flight_to_compiled {
+                        let persisted_version = persisted.as_ref().map_or(1, |r| r.version);
+                        return Err(io::Error::other(upgrade_barrier_msg(
+                            table,
+                            persisted_version,
+                            version,
+                        )));
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())

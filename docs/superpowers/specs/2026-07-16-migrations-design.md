@@ -295,7 +295,12 @@ fragment pins are not acceptance)
 - Version downgrade (table name, persisted version, compiled version).
 - **Upgrade barrier** (table name, persisted/compiled versions, the remedy: run the
   previous binary once to a clean shutdown, then upgrade) — including its
-  in-flight-target variant (interrupted migration to X, compiled targets Y).
+  in-flight-target variant (interrupted migration to X, compiled targets Y), and its
+  in-flight-target-**fingerprint** variant: an interrupted migration to the compiled
+  version but begun by a binary whose target shape differs (both fingerprints named;
+  resuming would mix two shapes in one table). The original target fingerprint is read
+  from the persisted `schema_versions` row — the executor writes the target's fingerprint
+  from the first watermark on, so no extra field is needed (migrations T9 interlude).
 - Replication schema-digest mismatch at `Hello` (refused by name, mirroring the
   `proto` mismatch text).
 

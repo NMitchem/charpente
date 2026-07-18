@@ -683,6 +683,17 @@ impl Writer<'_> {
         Ok(())
     }
 
+    /// Decode-free primary-row removal, the delete counterpart to `put_raw`
+    /// (spec §2's decode-free rebuild replay): a below-version row was written
+    /// via `put_raw` and carries no index entries, so removing the primary row
+    /// is sufficient — the old value is never decoded (decoding it under the
+    /// compiled type is exactly the misdecode this path exists to avoid).
+    pub fn delete_raw(&mut self, table: &str, id: u64) -> io::Result<()> {
+        let mut rows = self.txn.open_table(rows_def(table)).map_err(redb_err)?;
+        rows.remove(id).map_err(redb_err)?;
+        Ok(())
+    }
+
     /// Raw read of one row's stored bytes (apply-side helper for the
     /// close-out trigger's old-row peek).
     pub fn get_raw(&mut self, table: &str, id: u64) -> io::Result<Option<Vec<u8>>> {

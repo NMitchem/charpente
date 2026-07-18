@@ -4,6 +4,7 @@
 use std::io;
 
 use charpente_core::db::{Db, DbConfig, Schema};
+use charpente_core::io::Disk;
 use charpente_core::migration::{MigrationError, SchemaVersion, TableMigration, schema_version_id};
 use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, View};
 use charpente_sim::{FaultConfig, Sim};
@@ -423,5 +424,250 @@ fn missing_chain_link_refuses_by_name() {
         "table \"Widget\" has no registered migration from version 1 — persisted version is \
          1, compiled version is 2; register Schema::migration::<Step>(\"Widget\") for the \
          version-1 step, or this data cannot be opened by this binary"
+    );
+}
+
+// ------------------------------------------------------------------------
+// Migrations T9 interlude regressions (spec §2, §5). All three were RED at
+// HEAD 238823d and are the deterministic reproductions of the two findings the
+// T9 property suite surfaced (dossier: .superpowers/sdd/migrations-t9-interlude.md).
+
+/// FINDING 1 (RED at 238823d). A store discarded and rebuilt from the WAL after
+/// a COMPLETED migration used to trip the upgrade barrier — the WAL still holds
+/// the pre-bump v1 records, and replay-from-zero decoded them under the v2
+/// binary. Deleting the store file lands in the exact state `Db::open`'s
+/// discard-and-rebuild produces (empty store, applied_seq=None, full replay).
+/// The fix decode-free-replays the below-version records and admits because the
+/// WAL's own later records migrate the table to the compiled version.
+#[test]
+fn finding1_completed_migration_reopens_after_a_store_rebuild() {
+    let sim = Sim::with_faults(0x2EB7_0020, FaultConfig::none());
+    seed_v1(&sim, 5);
+    let v2 = || {
+        Schema::new()
+            .table::<Widget2>()
+            .migration::<Widget2>("Widget")
+    };
+    {
+        let mut db = Db::open(Box::new(sim.disk()), cfg(), v2()).unwrap();
+        db.migrate_schema().unwrap();
+        db.checkpoint().unwrap();
+    }
+    // Discard the store file: the discard-and-rebuild end state.
+    sim.disk().remove("t.redb").unwrap();
+    // Reopen v2 — the rebuilt store must come back at v2 with the migrated rows,
+    // not refuse. (At 238823d this returned the upgrade-barrier error, and the
+    // "run the previous binary" remedy was a dead end: the v1 binary then
+    // refused with the downgrade error — a single-node brick.)
+    let db = Db::open(Box::new(sim.disk()), cfg(), v2()).unwrap();
+    let mut rows: Vec<Widget2> = db.snapshot().unwrap().scan().unwrap();
+    rows.sort_by_key(|r| r.id.raw());
+    assert_eq!(rows.len(), 5);
+    for (i, r) in rows.iter().enumerate() {
+        assert_eq!(
+            (r.id.raw(), r.count, r.label.as_str()),
+            (i as u64, i as u32, "migrated")
+        );
+    }
+    let sv: SchemaVersion = db
+        .snapshot()
+        .unwrap()
+        .get(schema_version_id("Widget"))
+        .unwrap()
+        .unwrap();
+    assert_eq!((sv.version, sv.migrating_to), (2, None));
+}
+
+/// FINDING 1, case (b): a store discarded BEFORE any migration ran. The WAL
+/// holds a clean, complete v1 history but no migration records, so the rebuild
+/// cannot tell it from an unrecovered foreign v1 tail (the barrier test above's
+/// cousin) — and correctly BARRIERS (fail-closed retained, Noah ruling 1). The
+/// barrier's remedy works here (unlike the completed-migration case): one
+/// old-binary open recovers+checkpoints the v1 store, then the v2 binary
+/// migrates clean.
+#[test]
+fn caseb_rebuild_before_migration_barriers_then_the_remedy_clears_it() {
+    let sim = Sim::with_faults(0x2EB7_0021, FaultConfig::none());
+    seed_v1(&sim, 5);
+    let v2 = || {
+        Schema::new()
+            .table::<Widget2>()
+            .migration::<Widget2>("Widget")
+    };
+    // Discard the store BEFORE migrating.
+    sim.disk().remove("t.redb").unwrap();
+    // Open v2 → the barrier fires (indistinguishable from a foreign tail).
+    let err = Db::open(Box::new(sim.disk()), cfg(), v2()).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "table \"Widget\" has unrecovered writes from the previous binary (persisted version \
+         1, this binary is compiled for version 2) — run the previous binary once to a clean \
+         shutdown, then upgrade (spec §2's upgrade barrier)"
+    );
+    // The remedy: one old-binary open recovers+checkpoints from the WAL...
+    drop(
+        Db::open(
+            Box::new(sim.disk()),
+            cfg(),
+            Schema::new().table::<WidgetV1>(),
+        )
+        .unwrap(),
+    );
+    // ...then the v2 binary opens and migrates clean.
+    let mut db = Db::open(Box::new(sim.disk()), cfg(), v2()).unwrap();
+    db.migrate_schema().unwrap();
+    let rows: Vec<Widget2> = db.snapshot().unwrap().scan().unwrap();
+    assert_eq!(rows.len(), 5);
+    assert!(rows.iter().all(|r| r.label == "migrated"));
+}
+
+/// FINDING 2 (RED at 238823d). Resuming an interrupted migration under a v2
+/// schema of the SAME version but a DIFFERENT fingerprint used to be admitted,
+/// silently completing with the foreign transform and leaving a mixed-shape
+/// table (rows below the watermark at the original target's bytes, rows above
+/// at the resuming binary's). The persisted `fingerprint` field already holds
+/// the original target's fingerprint mid-flight, so the gate can and now does
+/// refuse by name.
+#[test]
+fn finding2_cross_fingerprint_resume_refuses_by_name() {
+    // Two v2 shapes, same version, different fingerprint AND layout. `Widget2A`
+    // begins the migration (rejecting row count 2 so batch 1 commits and the
+    // watermark lands at row id 1); `Widget2B` tries to resume it.
+    struct Widget2A {
+        id: Id<Widget2A>,
+        count: u32,
+        label: String,
+    }
+    impl Row for Widget2A {
+        const TABLE: &'static str = "Widget";
+        const INDEXES: &'static [IndexDef<Widget2A>] = &[];
+        const VERSION: u32 = 2;
+        const FINGERPRINT: Option<u64> = Some(0x2A2A);
+        fn id(&self) -> Id<Widget2A> {
+            self.id
+        }
+        fn encode_row(&self, out: &mut Vec<u8>) {
+            self.id.encode(out);
+            self.count.encode(out);
+            self.label.encode(out);
+        }
+        fn decode_row(bytes: &[u8]) -> io::Result<Widget2A> {
+            let input = &mut &bytes[..];
+            Ok(Widget2A {
+                id: Id::decode(input)?,
+                count: u32::decode(input)?,
+                label: String::decode(input)?,
+            })
+        }
+    }
+    impl RowShape for Widget2A {
+        const VERSION: u32 = 2;
+        fn encode_row(&self, out: &mut Vec<u8>) {
+            Row::encode_row(self, out)
+        }
+        fn decode_row(bytes: &[u8]) -> io::Result<Widget2A> {
+            <Widget2A as Row>::decode_row(bytes)
+        }
+    }
+    impl TableMigration for Widget2A {
+        type Prev = WidgetV1;
+        fn migrate(prev: WidgetV1) -> Result<Widget2A, MigrationError> {
+            if prev.count == 2 {
+                return Err(MigrationError::Reject("A refuses count 2".to_string()));
+            }
+            Ok(Widget2A {
+                id: Id::from_raw(prev.id.raw()),
+                count: prev.count,
+                label: "shapeA".to_string(),
+            })
+        }
+    }
+
+    struct Widget2B {
+        id: Id<Widget2B>,
+        count: u32,
+        flag: bool,
+        note: String,
+    }
+    impl Row for Widget2B {
+        const TABLE: &'static str = "Widget";
+        const INDEXES: &'static [IndexDef<Widget2B>] = &[];
+        const VERSION: u32 = 2;
+        const FINGERPRINT: Option<u64> = Some(0x2B2B);
+        fn id(&self) -> Id<Widget2B> {
+            self.id
+        }
+        fn encode_row(&self, out: &mut Vec<u8>) {
+            self.id.encode(out);
+            self.count.encode(out);
+            self.flag.encode(out);
+            self.note.encode(out);
+        }
+        fn decode_row(bytes: &[u8]) -> io::Result<Widget2B> {
+            let input = &mut &bytes[..];
+            Ok(Widget2B {
+                id: Id::decode(input)?,
+                count: u32::decode(input)?,
+                flag: bool::decode(input)?,
+                note: String::decode(input)?,
+            })
+        }
+    }
+    impl RowShape for Widget2B {
+        const VERSION: u32 = 2;
+        fn encode_row(&self, out: &mut Vec<u8>) {
+            Row::encode_row(self, out)
+        }
+        fn decode_row(bytes: &[u8]) -> io::Result<Widget2B> {
+            <Widget2B as Row>::decode_row(bytes)
+        }
+    }
+    impl TableMigration for Widget2B {
+        type Prev = WidgetV1;
+        fn migrate(prev: WidgetV1) -> Result<Widget2B, MigrationError> {
+            Ok(Widget2B {
+                id: Id::from_raw(prev.id.raw()),
+                count: prev.count,
+                flag: true,
+                note: "shapeB".to_string(),
+            })
+        }
+    }
+
+    let sim = Sim::with_faults(0x2EB7_0022, FaultConfig::none());
+    seed_v1(&sim, 4); // ids 0..4, counts 0..4 — row 2 has count 2
+    let batched = DbConfig {
+        migration_batch_size: 2,
+        ..cfg()
+    };
+    // Begin under A: batch 1 (rows 0,1) commits, batch 2 (row 2) rejects →
+    // durable in-flight watermark at row id 1, migrating_to=Some(2).
+    {
+        let mut db = Db::open(
+            Box::new(sim.disk()),
+            batched.clone(),
+            Schema::new()
+                .table::<Widget2A>()
+                .migration::<Widget2A>("Widget"),
+        )
+        .unwrap();
+        db.migrate_schema().unwrap_err();
+    }
+    // Resume under B (same version 2, fingerprint 0x2b2b ≠ 0x2a2a): refused by
+    // name — no mixed-shape table.
+    let err = Db::open(
+        Box::new(sim.disk()),
+        batched,
+        Schema::new()
+            .table::<Widget2B>()
+            .migration::<Widget2B>("Widget"),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "table \"Widget\" has an interrupted migration to version 2 in flight (resumable \
+         watermark at row id 1) begun by a binary whose target shape (fingerprint 0x2a2a) \
+         differs from this binary's (fingerprint 0x2b2b) — resuming would mix two shapes in \
+         one table; finish the interrupted migration with the binary that started it, or restore"
     );
 }
