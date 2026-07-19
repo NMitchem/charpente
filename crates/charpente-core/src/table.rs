@@ -903,6 +903,13 @@ impl Snapshot {
         after_id: Option<u64>,
         limit: usize,
     ) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        // A watermark at u64::MAX is past every possible id: `saturating_add(1)`
+        // below would otherwise stay at u64::MAX forever, so `from..` never
+        // advances and the row at u64::MAX re-enters every batch (permanent
+        // brick for a table with a row at that id).
+        if after_id == Some(u64::MAX) {
+            return Ok(Vec::new());
+        }
         let rows = match self.txn.open_table(rows_def(table)) {
             Ok(rows) => rows,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),

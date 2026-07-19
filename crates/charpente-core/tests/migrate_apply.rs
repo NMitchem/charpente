@@ -170,3 +170,38 @@ fn migrate_put_overwrites_without_indexing_then_close_out_rebuilds() {
         "the stale 'old' index entry is gone after the rebuild"
     );
 }
+
+// T11 final-review fix (Finding 3): `after_id == Some(u64::MAX)` must not
+// re-include the row at u64::MAX forever. `saturating_add(1)` on u64::MAX
+// stays at u64::MAX, so `from..` never advances past it — the batching
+// executor would re-read and re-decode that row under the target codec
+// every batch, never reaching close-out (a permanent brick for any table
+// with a row at that id). The fix short-circuits: a watermark at u64::MAX
+// is past every possible id, so the next batch is empty by construction.
+#[test]
+fn scan_raw_from_at_u64_max_watermark_returns_empty() {
+    let sim = Sim::with_faults(0x2EB7_00F5, FaultConfig::none());
+    let schema = Schema::new().table::<Widget>();
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), schema).unwrap();
+
+    db.transact(|tx: &mut Tx| {
+        tx.put(&Widget {
+            id: Id::from_raw(u64::MAX),
+            key: "last".to_string(),
+        });
+        Ok::<(), ()>(())
+    })
+    .unwrap();
+
+    let snap = db.snapshot().unwrap();
+    // Sanity: the row is really there and a `None` watermark sees it.
+    assert_eq!(snap.scan_raw_from("Widget", None, 10).unwrap().len(), 1);
+    // The watermark past every id must not re-include it.
+    assert!(
+        snap.scan_raw_from("Widget", Some(u64::MAX), 10)
+            .unwrap()
+            .is_empty(),
+        "a watermark at u64::MAX must see no further rows — otherwise the row at \
+         u64::MAX would re-enter every subsequent migration batch forever"
+    );
+}

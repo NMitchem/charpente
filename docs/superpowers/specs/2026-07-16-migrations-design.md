@@ -180,6 +180,25 @@ kind tags — schema-independent framing; row bytes are never touched):
   between persisted `V` and compiled `N` → refuse, named error identifying the
   `Vk -> Vk+1` gap), and run or resume the migration (§3).
 
+**Amendment (2026-07-18, T9 interlude, commit f1b711e) — shipped ordering.** The
+"checks run strictly before WAL replay" framing above describes the *original*
+design; what shipped reorders it. Below-compiled-version ordinary records replay
+**decode-free during recovery** (`TableMachine::apply`, keyed on `is_below_compiled`:
+`put_raw`/`delete_raw` overwrite raw bytes, skip index upkeep, and mark the table in a
+per-recovery `saw_below` set) instead of being blocked outright. Same-version-drift/
+downgrade refusals can still fire per-record, inline, during replay
+(`check_replay_version`, before that record's `apply_put` decode) — but the
+**authoritative** admit/refuse decision, re-derived against the final post-replay
+store for every table, is `check_schema_gate`, called once, strictly **after**
+`Engine::recover` returns. That is what the upgrade-barrier bullet's "tail contains
+any ordinary records" test is realized as: `saw_below.contains(table)` — absent →
+clean upgrade path, admit (`migrate_schema` handles it); present and the table did not
+reach the compiled version within this same replay → barrier fires, unless it is a
+resumable in-flight migration to the compiled target. The motivating hazard is
+unchanged (row bytes must never be decoded under the wrong version); only the
+enforcement point moved, from "one check before replay starts" to "replay tolerates
+old shapes decode-free, an authoritative gate decides after."
+
 Two checkpoints make the barrier a crash-then-upgrade-only event, with no new
 operator verbs: the store checkpoints **on clean shutdown** and **at open after a
 recovery that replayed records** (an open that replayed nothing checkpoints nothing —

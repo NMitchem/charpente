@@ -13,7 +13,7 @@
 - Commit directly to `main`, no Co-Authored-By trailers. One commit per task unless a task says otherwise. `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` clean before every commit.
 - **Frozen replay contracts:** adoption-at-first-write and the replayed-only checkpoint-at-open are *designed* to add zero disk ops to non-migrating universes, but "zero entropy" does not imply "unmoved interleavings" — T11's evidence sweep must **re-verify** (not merely replay) the pinned seeds listed there. A pinned seed that replays green but no longer reproduces its historical bug is a silent coverage loss; treat any that shifted as needing re-derivation and say so in the close-out entry.
 - The `Hello` wire change (T8) is pre-release: `schema_digest: u64` appended after `secret`, no `PROTO_VERSION` bump (auth T7's peer-secret precedent). It breaks four hand-built `Msg::Hello` literals in `crates/charpente/tests/replication.rs` (lines ~1455, ~1485, ~1541, ~1557) — T8 fixes all four; the not-a-primary test (~1485) needs a *matching* digest pre-computed into a local before the `exchange_hello` call (an `f.db` borrow inside the call site conflicts with the `&mut f` argument).
-- Error messages are product surface (hard rule 5): the **six** named errors from spec §5 are pinned **verbatim** — full-string equality on the formatted message (minus dynamic values asserted separately), not 1–2 substring fragments.
+- Error messages are product surface (hard rule 5): the **seven** named errors from spec §5 are pinned **verbatim** — full-string equality on the formatted message (minus dynamic values asserted separately), not 1–2 substring fragments.
 - Sim-first (hard rule 3): every retry-until-open loop in tests uses the established idiom — `sim.restart()` between attempts, `charpente_sim::checks::is_fault_fallout` (or the local `is_injected` pattern, `crates/charpente/tests/transactions.rs:531-577`) to classify errors, bounded rounds. Never an unclassified unbounded `loop { match Db::open { Err(_) => continue } }`.
 - Seed bases for new tests: `0x2EB7_xxxx` (core migration tests), `0x2EB8_xxxx` (replication-side migration tests). Before first use run `grep -rn "0x2EB7_\|0x2EB8_" crates/` — expected: no hits.
 - `Row::FINGERPRINT: Option<u64>` defaults to `None`; only `#[table]`-generated types get `Some`. Hand-written platform `Row` impls (`JobRow` job.rs:81, `EventRow` event.rs:24, and T1's `SchemaVersion`) need zero changes and are skipped by the gate and excluded from the digest.
@@ -1913,7 +1913,7 @@ fn a_rejecting_migration_names_the_row_and_leaves_the_store_untouched() {
 }
 ```
 
-  And the missing-chain-link verbatim pin (every one of spec §5's six named errors must have a byte-exact pin somewhere in T5/T6/T8/T9; this is the one the others don't cover):
+  And the missing-chain-link verbatim pin (every one of spec §5's seven named errors must have a byte-exact pin somewhere in T5/T6/T8/T9; this is the one the others don't cover):
 
 ```rust
 #[test]

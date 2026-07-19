@@ -650,7 +650,7 @@ impl StateMachine for TableMachine {
                         // pre-migration bytes. `migrate_table` guarantees the
                         // close-out is its own transaction, strictly after every
                         // rewrite batch.
-                        debug_assert!(
+                        assert!(
                             !effects
                                 .iter()
                                 .any(|e| matches!(e, Effect::MigratePut { .. })),
