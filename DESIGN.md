@@ -288,9 +288,11 @@ platform is one dependency, not two.
 
 - **Tables.** `#[table]` on a struct derives the row codec, key type (`Id<T>`, typed, never
   a bare u64), and secondary index declarations. Schema *is* the Rust definition.
-- **Migrations.** A schema change generates a migration as a log record (schema versions
-  live in the log like everything else). Incompatible changes — dropping a field a query
-  still uses — fail at compile time because the query is code referencing the field.
+- **Migrations.** `#[table(version = N)]` versions a row's shape; a bump without a
+  registered `TableMigration` is a compile error. Ordinary Rust already catches a query
+  referencing a field that no longer exists — the mechanism below is for what Rust
+  cannot see: a same-length field swap or retype that recompiles clean and misdecodes on
+  disk.
 - **Routes (v0 implemented).** `#[route(METHOD "/path/:param"[, auth])]` — handler args:
   `tx: &mut Tx`, one per `:param` (same name, path order), at most one JSON body arg,
   optional trailing `ctx: &Ctx` (session access); return `Result<T: Serialize, ApiError>`.
@@ -305,6 +307,77 @@ platform is one dependency, not two.
   change-time checks: deleting a metric a dashboard depends on, or renaming a label, is a
   detectable breaking change against a lockfile of the observability contract, the same way
   Cargo.lock pins dependencies. Instrumentation that cannot silently rot.
+
+**Migrations (v1, implemented; spec `docs/superpowers/specs/2026-07-16-migrations-design.md`).**
+The organizing rule: no code path ever decodes row bytes under any version other than the
+one they were encoded at; where that cannot be guaranteed, the node refuses by name instead
+of guessing. `#[table(version = N)]` defaults `N` to 1 — every table until now is version 1
+with no code change required. Bumping to `N >= 2` requires keeping the prior version's
+struct in code under an explicit name (`#[row_shape(version = N-1)]`, codec-only — no table
+identity, no indexes, no redb registration) and `impl TableMigration for CurrentStruct {
+type Prev = PriorStruct; fn migrate(prev) -> Result<Self, MigrationError>; }`; the macro
+emits a const assert requiring the impl, so a bump without one is a missing-trait-impl error
+at the struct, not a runtime surprise. Every version also carries a structural fingerprint —
+a hand-rolled, fixed 64-bit FNV-1a over its `(field_name, type_name)` sequence, computed at
+macro-expansion time and exposed as `Row::FINGERPRINT: Option<u64>` — that catches the hole
+compile-time checking cannot: a same-shape struct edited without bumping `version`.
+`Row::FINGERPRINT` defaults to `None`; a hand-written `Row` impl (the platform's own
+`JobRow`/`EventRow`/`SchemaVersion`) stays `None` and is invisible to the gate — silently
+opting a table out of drift protection is the cost of not using `#[table]`.
+
+**The gate, the barrier, and the seven refusals.** A built-in table,
+`charpente.schema_versions`, records each versioned table's last-known `(version,
+fingerprint, migrating_through, migrating_to)`; its row is written lazily, piggybacked on
+the table's first data write in the same effects record (adoption-at-first-write —
+`Db::open` writes nothing unless it actually migrates, so pinned seeds' fault schedules are
+undisturbed). The read-only check runs at every `Db::open`, on every node — including an
+ordinary follower's, where it is a no-op admit for a converged, same-binary node. The
+rewrite itself is a separate step, `migrate_schema()`: the kernel runs it at startup,
+before serving anything, on a node that is writable (single node or primary); a follower
+runs it only at promote (resuming any in-flight watermark the dead primary left). An
+ordinary follower never runs it — it receives the rewrite only through shipped
+`MigratePut` records (below). Ordinary WAL-tail records for a
+table below its compiled version replay decode-free (a row's id is a version-independent
+leading prefix, so no foreign-version decode is needed); the authoritative decision runs
+once replay completes, admitting a table whose history reached the compiled version or is a
+resumable in-flight migration, and refusing everything else by name. Seven named refusals
+cover the space: fingerprint drift under an unchanged version; version downgrade; the
+upgrade barrier itself (a foreign, unrecovered WAL tail from an older binary); its
+in-flight-target variant (an interrupted migration aimed at a version other than the
+compiled one); its in-flight-target-fingerprint variant (an interrupted migration to the
+compiled version, but begun by a binary whose target shape differs — the persisted
+`fingerprint` field already carries the original target's shape, so resuming under a
+different one is caught without a new field); a missing migration chain link; and a
+migration-transform failure (a rejecting `TableMigration::migrate`). Two checkpoints — on
+clean shutdown, and at open after a replay — make the barrier's remedy exactly "run the
+previous binary once to a clean shutdown, then upgrade": no new operator verb.
+
+**Execution: `MigratePut`.** The rewrite is an ordinary sequence of `Db::transact` calls
+using one new effect kind, `MigratePut(table, id, bytes)`, applied everywhere (live commit,
+crash-replay, follower apply) by overwriting the row's stored bytes without decoding the old
+value and leaving indexes untouched — the second decode-under-the-wrong-version path
+(`Writer::replace_row`'s index-upkeep decode) never sees a mid-migration row. The executor
+batches `DbConfig::migration_batch_size` rows (default 1000) per transaction over a bounded
+range read, committing each batch's rewrites and its watermark advance
+(`migrating_through`) together so a crash between them is impossible by construction; the
+closing transaction clears the watermark and bumps `(version, fingerprint)` to the target —
+the single moment a table is considered migrated, and the moment its apply trigger rebuilds
+that table's secondary indexes wholesale (deterministic, idempotent, so primary and
+followers rebuild at the same log position with no separate mechanism).
+
+**Migrations: replication.** Followers never migrate locally: the primary's migration is
+ordinary log records, received through the existing shipping path unchanged, applying
+`MigratePut` decode-free and rebuilding indexes at the close-out apply like any other record
+— a fresh follower is snapshot-seeded with the primary's `schema_versions` rows already in
+it, a converged follower is simply behind, and a follower promoted mid-migration resumes the
+remaining batches itself at promote. `Hello` gains `schema_digest: u64` — an FNV-1a fold
+over every fingerprinted table's `(name, version, fingerprint)`, checked after the
+peer-secret and protocol-version checks and refused by name on mismatch, mirroring the
+`proto` refusal — so a schema-mismatched peer never seeds or ships a single frame. While a
+table's migration is in flight to a follower its copy is mixed-version and must not be read
+under the compiled type; v0 followers serve no typed app-table reads today (jobs/cron are
+already follower-gated, realtime tails read `charpente.events`, untouched by table
+migration), so this is a documented invariant rather than an enforced one.
 
 **Query API [reversible — start simple].** V0 is get/put/scan over typed keys plus typed
 secondary indexes — deliberately KV-shaped, not relational. Rich predicates, joins, and

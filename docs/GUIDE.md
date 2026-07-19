@@ -8,7 +8,8 @@ the deterministic kernel: HTTP, jobs, and cron. Section 8 covers sim
 testing — writing `tests/sim.rs`, running `charpente test --sim`, and
 replaying a failure's seed. Section 9 is an error index: look up the
 message you're staring at. Section 10 covers replication; section 11
-covers realtime SSE subscriptions.)*
+covers realtime SSE subscriptions; section 12 covers migrations —
+evolving a `#[table]` row's shape safely.)*
 
 ## 1. Project setup
 
@@ -2873,3 +2874,143 @@ does for everything else: `promote` can lose events the old primary acked but
 hadn't shipped, named honestly in its reply; a client whose cursor referenced one of
 those lost events gets the diverged 409 on reconnect, never wrong events silently
 delivered in their place.
+
+## 12. Migrations
+
+A `#[table]` row's shape can change safely — add a field with a default, drop one, or
+retype one via an explicit conversion — without a hand-written backfill script and
+without risking a silent misdecode of rows already on disk. The mechanism (DESIGN §3;
+spec `docs/superpowers/specs/2026-07-16-migrations-design.md`) runs once, eagerly,
+before a node serves any traffic; app code never sees a mixed-version table.
+
+### Versioning a table: `#[table(version = N)]`
+
+Every `#[table]` struct has an implicit version, `1`, until you write
+`#[table(version = N)]`. Bumping `N` to `2` or higher and recompiling **does not
+compile** unless you also keep the old shape in code — under a different name, marked
+`#[row_shape(version = N-1)]` (codec only: no table identity, no `#[index]`, never
+registered as a table itself) — and `impl TableMigration` describing how to get from
+the old shape to the new one. The macro also computes a structural fingerprint of each
+version's field names and types; if the fields change shape without a version bump,
+the fingerprint catches it at the next startup — a compile-time check plus a runtime
+backstop for the one hole compile-time checking cannot close (nothing forces you to
+remember to bump `version`).
+
+### Worked example: adding a field
+
+Start from an ordinary version-1 table:
+
+```rust
+use charpente::{Id, table};
+
+#[table]
+struct Widget {
+    id: Id<Widget>,
+    count: u32,
+}
+```
+
+To add a `label: String` field: rename the old struct (`WidgetV1`, marked
+`#[row_shape]` at its old version), define the new `Widget` at the bumped version, and
+write the conversion:
+
+```rust
+use charpente::core::migration::{MigrationError, TableMigration};
+use charpente::{Db, DbConfig, Id, Schema, prod::ProdDisk, row_shape, table};
+
+/// The superseded shape — kept only so `TableMigration::migrate` can decode
+/// bytes an older binary wrote. No `#[index]`, no redb registration.
+#[row_shape(version = 1)]
+struct WidgetV1 {
+    id: Id<WidgetV1>,
+    count: u32,
+}
+
+/// The current shape. Bumping to `version = 2` without the `TableMigration`
+/// impl below is a compile error — the macro emits an assert-impl const.
+#[table(version = 2)]
+struct Widget {
+    id: Id<Widget>,
+    count: u32,
+    label: String,
+}
+
+impl TableMigration for Widget {
+    type Prev = WidgetV1;
+    fn migrate(prev: WidgetV1) -> Result<Widget, MigrationError> {
+        Ok(Widget {
+            id: Id::from_raw(prev.id.raw()),
+            count: prev.count,
+            label: String::new(), // the field's required default
+        })
+    }
+}
+
+fn open(data_dir: &str) -> std::io::Result<Db> {
+    let disk = ProdDisk::new(data_dir)?;
+    let schema = Schema::new()
+        .table::<Widget>()
+        .migration::<Widget>("Widget"); // registers the 1 -> 2 step
+    Db::open(Box::new(disk), DbConfig::default(), schema)
+}
+```
+
+`Schema::migration::<Step>(table)` registers one step of the chain — the table name
+string (`"Widget"`, `Widget::TABLE`) must already be `.table()`-registered under the
+same name. A multi-version bump (1 → 2 → 3) registers one step per version pair;
+`migrate_schema` walks the chain and refuses by name if a link is missing.
+
+### What happens at next startup
+
+Nothing here is app code — the kernel runs it automatically, before serving any
+request, job, or cron tick. `Db::open` itself only runs the read-only gate check: it
+reads `charpente.schema_versions`, finds `Widget` at its persisted version 1 with a
+registered chain to the compiled version 2, and admits (every open runs this check, on
+every node — refusing by name instead is the barrier, below). The rewrite is a separate
+step, `migrate_schema`, which the kernel calls right after open, before it serves
+anything, on a single node or a primary: it reads existing rows in batches
+(`DbConfig::migration_batch_size`, default 1000), applies `migrate` to each, and commits
+the rewritten batch plus a resumable watermark in one transaction. A crash mid-migration
+is exactly resumption — the next start picks up from the watermark and finishes; no row
+is transformed twice, none skipped. Once every row has moved, one
+closing transaction bumps `Widget` to `(2, fingerprint(2))` and rebuilds its secondary
+indexes. Existing rows come back with `label` populated by whatever `migrate` computed
+— here, `""` — with no manual backfill and no window where old- and new-shape rows are
+both visible to the app. A table with no rows yet has nothing to migrate: its first
+write simply adopts the compiled version directly.
+
+### The upgrade procedure
+
+For a replicated deployment (§10): stop both nodes — mixed-version serving is out of
+scope, and `Hello`'s schema digest refuses it anyway — install the new binary on both,
+then start the **primary first**. It runs the gate and migrates before it serves
+anything. Start the followers after: they never migrate locally, they receive the
+primary's `MigratePut` records through ordinary log shipping and rebuild indexes at the
+same log position the primary did. No re-seed is ever required by a migration — the
+only re-seed rule is the pre-existing retention-window one (§10, "Promotion and
+switchover").
+
+### The upgrade barrier
+
+A crash *before* a clean shutdown leaves an old binary's writes sitting in the WAL
+tail, uncheckpointed. Starting a version-bumped binary against that tail refuses
+rather than guess at decoding bytes it cannot prove are its own shape:
+
+```text
+table "Widget" has unrecovered writes from the previous binary (persisted version 1,
+this binary is compiled for version 2) — run the previous binary once to a clean
+shutdown, then upgrade (spec §2's upgrade barrier)
+```
+
+The remedy is exactly what the message says, and nothing more: start the **previous**
+binary once, let it recover and shut down cleanly (a clean exit always checkpoints),
+then start the new one — it now opens and migrates without complaint. An interrupted
+migration is a different case, and self-heals on its own: restarting the *same* binary
+just resumes from its watermark, no barrier involved; the barrier fires only for a
+tail a differently-versioned binary cannot prove is safe to decode.
+
+### Hand-written `Row` opts out
+
+`Row::FINGERPRINT` defaults to `None`, and a table whose row type is `None`-fingerprinted
+is invisible to the gate — writing `Row` by hand instead of using `#[table]` silently
+opts that table out of drift protection. Use `#[table]`.
