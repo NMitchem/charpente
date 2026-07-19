@@ -118,6 +118,35 @@ impl TableMigration for Widget2 {
     }
 }
 
+/// `FINGERPRINT: None` (the `Row` trait default) — an ordinary, never-
+/// versioned "Widget" table. `Db::transact`'s first-write adoption only
+/// fires for `fp.is_some()` tables, so writes through this shape NEVER
+/// carry a `charpente.schema_versions` adoption row: a WAL tail written by
+/// this binary is indistinguishable, to a later versioned binary, from
+/// corruption or a foreign log.
+struct WidgetUnversioned {
+    id: Id<WidgetUnversioned>,
+    count: u32,
+}
+impl Row for WidgetUnversioned {
+    const TABLE: &'static str = "Widget";
+    const INDEXES: &'static [IndexDef<WidgetUnversioned>] = &[];
+    fn id(&self) -> Id<WidgetUnversioned> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.count.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<WidgetUnversioned> {
+        let input = &mut &bytes[..];
+        Ok(WidgetUnversioned {
+            id: Id::decode(input)?,
+            count: u32::decode(input)?,
+        })
+    }
+}
+
 fn cfg() -> DbConfig {
     DbConfig {
         store_path: "t.redb".into(),
@@ -424,6 +453,53 @@ fn missing_chain_link_refuses_by_name() {
         "table \"Widget\" has no registered migration from version 1 — persisted version is \
          1, compiled version is 2; register Schema::migration::<Step>(\"Widget\") for the \
          version-1 step, or this data cannot be opened by this binary"
+    );
+}
+
+#[test]
+fn no_adoption_row_refuses_a_foreign_tail_from_an_unversioned_binary() {
+    let sim = Sim::with_faults(0x2EB7_0009, FaultConfig::none());
+    {
+        // Seed WITHOUT a checkpoint, then crash-restart: the store's unsynced
+        // apply reverts to nothing while the fsync'd WAL record survives, so
+        // the record lives ONLY in the WAL tail and a reopen must replay it
+        // through TableMachine::apply (same crash idiom as the upgrade-
+        // barrier test above). WidgetUnversioned's FINGERPRINT is None, so
+        // this write never wrote a `charpente.schema_versions` row either.
+        let mut db = Db::open(
+            Box::new(sim.disk()),
+            cfg(),
+            Schema::new().table::<WidgetUnversioned>(),
+        )
+        .unwrap();
+        db.transact(|tx| -> Result<(), ()> {
+            tx.put(&WidgetUnversioned {
+                id: Id::from_raw(1),
+                count: 5,
+            });
+            Ok(())
+        })
+        .unwrap();
+        sim.restart(); // store reverts to nothing; the WAL record survives
+        drop(db);
+    }
+    // Reopen under a schema where "Widget" IS versioned: check_replay_version
+    // finds no persisted `charpente.schema_versions` row for it (none was
+    // ever written, in the store or the WAL tail) — the no-adoption-row
+    // refusal fires before the persisted-version comparisons even run, so
+    // this is provably NOT the upgrade barrier (which requires a persisted
+    // row that is merely at a lower version).
+    let err = Db::open(
+        Box::new(sim.disk()),
+        cfg(),
+        Schema::new().table::<WidgetV1>(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "replaying a record for versioned table \"Widget\" with no adoption row on record — \
+         this log was not written by an adoption-aware binary, or is corrupt; restore from a \
+         replica or backup"
     );
 }
 
