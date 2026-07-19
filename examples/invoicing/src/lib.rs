@@ -20,6 +20,7 @@ pub fn schema() -> Schema {
     Schema::new()
         .table::<model::Customer>()
         .table::<model::Invoice>()
+        .migration::<model::Invoice>("Invoice")
         .table::<model::LineItem>()
         .table::<model::Receipt>()
         .table::<model::Reminder>()

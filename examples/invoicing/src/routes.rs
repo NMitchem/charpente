@@ -167,6 +167,7 @@ pub fn create_invoice(
         customer: customer_id,
         state: InvoiceState::Draft,
         due_day: body.due_day,
+        notes: String::new(),
     };
     tx.put(&inv);
 

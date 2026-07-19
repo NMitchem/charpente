@@ -11,8 +11,9 @@
 //! catch-up tick still only advances the day counter by one, exactly the
 //! "missed days are not backfilled" behavior the brief asks for.
 
+use charpente::core::migration::{MigrationError, TableMigration};
 use charpente::core::table::Codec;
-use charpente::{Id, Tx, View, table};
+use charpente::{Id, Tx, View, row_shape, table};
 use std::io;
 
 #[table]
@@ -51,7 +52,19 @@ impl Codec for InvoiceState {
     }
 }
 
-#[table]
+/// The superseded shape — kept only so `TableMigration::migrate` can decode
+/// bytes an older binary wrote. No `#[index]`, no redb registration.
+#[row_shape(version = 1)]
+pub struct InvoiceV1 {
+    pub id: Id<InvoiceV1>,
+    pub customer: Id<Customer>,
+    pub state: InvoiceState,
+    pub due_day: u64,
+}
+
+/// Bumping to `version = 2` without the `TableMigration` impl below is a
+/// compile error — the macro emits an assert-impl const.
+#[table(version = 2)]
 pub struct Invoice {
     pub id: Id<Invoice>,
     #[index]
@@ -60,6 +73,22 @@ pub struct Invoice {
     /// App-relative day this invoice is due, in `AppClock` units — not a
     /// wall-clock timestamp (see module doc).
     pub due_day: u64,
+    /// Free-text notes on the invoice; added via the migration mechanism
+    /// (GUIDE §12) — existing rows come back with `""`.
+    pub notes: String,
+}
+
+impl TableMigration for Invoice {
+    type Prev = InvoiceV1;
+    fn migrate(prev: InvoiceV1) -> Result<Invoice, MigrationError> {
+        Ok(Invoice {
+            id: Id::from_raw(prev.id.raw()),
+            customer: prev.customer,
+            state: prev.state,
+            due_day: prev.due_day,
+            notes: String::new(), // the field's required default
+        })
+    }
 }
 
 #[table]
