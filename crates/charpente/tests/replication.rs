@@ -19,7 +19,8 @@ use charpente::repl::{MAX_MESSAGE_BYTES, ReplConfig};
 use charpente::{Db, DbConfig, Id, Job, Schema, TxError, table};
 use charpente_core::io::{Clock, Conn, Disk, Net};
 use charpente_core::log::{Wal, WalConfig};
-use charpente_core::table::{Codec, Row};
+use charpente_core::migration::{MigrationError, SchemaVersion, TableMigration, schema_version_id};
+use charpente_core::table::{Codec, IndexDef, Row, RowShape, View};
 use charpente_sim::checks::{dir_entry_loss_fired, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim, SimClock, SimHost, run_universes_swarm_with};
 
@@ -63,6 +64,89 @@ fn make_schema() -> Schema {
     Schema::new().table::<Widget>().table::<Gadget>()
 }
 
+// ------------------------------------------------ migrations T10 fixtures
+
+/// A hand-rolled v1 shape sharing the "WidgetV2" table with the
+/// `#[table(version = 2)]` `WidgetV2` below (mirrors kernel.rs's
+/// `GadgetV1`/`Gadget` pattern: the macro always ties `TABLE` to the struct
+/// identifier, so a from-scratch v1 fixture needs a hand-written Row+
+/// RowShape pair to land on the compiled v2 struct's table).
+struct WidgetV1 {
+    id: Id<WidgetV1>,
+    count: u32,
+}
+impl Row for WidgetV1 {
+    const TABLE: &'static str = "WidgetV2";
+    const INDEXES: &'static [IndexDef<WidgetV1>] = &[];
+    const VERSION: u32 = 1;
+    const FINGERPRINT: Option<u64> = Some(0x2EB8_0001);
+    fn id(&self) -> Id<WidgetV1> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.count.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<WidgetV1> {
+        let input = &mut &bytes[..];
+        Ok(WidgetV1 {
+            id: Id::decode(input)?,
+            count: u32::decode(input)?,
+        })
+    }
+}
+impl RowShape for WidgetV1 {
+    const VERSION: u32 = 1;
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        Row::encode_row(self, out)
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<WidgetV1> {
+        <WidgetV1 as Row>::decode_row(bytes)
+    }
+}
+
+/// The compiled target: adds an index (so the close-out's index rebuild has
+/// something concrete to prove converged) plus the `note` field the
+/// migration fills.
+#[table(version = 2)]
+struct WidgetV2 {
+    id: Id<WidgetV2>,
+    #[index]
+    count: u32,
+    note: String,
+}
+impl TableMigration for WidgetV2 {
+    type Prev = WidgetV1;
+    fn migrate(prev: WidgetV1) -> Result<WidgetV2, MigrationError> {
+        Ok(WidgetV2 {
+            id: Id::from_raw(prev.id.raw()),
+            count: prev.count,
+            note: "v2".to_string(),
+        })
+    }
+}
+
+fn make_schema_v1() -> Schema {
+    Schema::new().table::<WidgetV1>()
+}
+
+fn make_schema_v2() -> Schema {
+    Schema::new()
+        .table::<WidgetV2>()
+        .migration::<WidgetV2>("WidgetV2")
+}
+
+/// The `by_count` index, content-compared (id, count, note) so the caller
+/// never needs a `PartialEq`/`Debug` derive on `WidgetV2` — matches the
+/// migrations.rs precedent (`by_count`/`WidgetIndexedV2`).
+fn count_index_snapshot(db: &Db, k: u32) -> Vec<(u64, u32, String)> {
+    let mut rows = WidgetV2::by_count(&db.snapshot().unwrap(), &k).unwrap();
+    rows.sort_by_key(|r| r.id.raw());
+    rows.into_iter()
+        .map(|r| (r.id.raw(), r.count, r.note))
+        .collect()
+}
+
 // ------------------------------------------------------------- the node
 
 /// One replication node driven at the `Db` level (no kernel until task 8).
@@ -74,6 +158,11 @@ struct Node {
     name: String,
     repl_cfg: ReplConfig,
     db_cfg: DbConfig,
+    /// The schema this node opens/reopens under (migrations T10: a schema
+    /// override threaded through `spawn_node_with_schema`, so `reopen`/
+    /// `recover_node` reopen the SAME (possibly versioned) schema rather
+    /// than the file's base `make_schema()`).
+    schema: Schema,
     /// Node recoveries so far (poison/crash → reopen) — a clean universe has
     /// zero; the fingerprint oracle skips its byte check when this is nonzero.
     recoveries: u32,
@@ -100,11 +189,25 @@ fn total_seeds(node: &Node) -> u64 {
 }
 
 fn spawn_node(sim: &Sim, host: &str, cfg: ReplConfig, db_cfg: DbConfig) -> Result<Node, String> {
+    spawn_node_with_schema(sim, host, cfg, db_cfg, make_schema())
+}
+
+/// `spawn_node`, parameterized on the schema (migrations T10: a v1/v2/
+/// migration-bearing schema needs a node built against it, not the file's
+/// base `Widget`/`Gadget` fixtures) — smallest-diff plumbing, no call-site
+/// churn on the many existing `spawn_node` callers.
+fn spawn_node_with_schema(
+    sim: &Sim,
+    host: &str,
+    cfg: ReplConfig,
+    db_cfg: DbConfig,
+    schema: Schema,
+) -> Result<Node, String> {
     let h = sim.host(host);
     // Open can hit injected faults (a failed sync during store/WAL creation);
     // restart the fresh host and retry, exactly as recovery does.
     for _ in 0..RECOVER_ATTEMPTS {
-        match open_node(&h, &cfg, &db_cfg, false) {
+        match open_node(&h, &cfg, &db_cfg, false, &schema) {
             Ok((db, repl)) => {
                 return Ok(Node {
                     host: h,
@@ -114,6 +217,7 @@ fn spawn_node(sim: &Sim, host: &str, cfg: ReplConfig, db_cfg: DbConfig) -> Resul
                     name: host.to_string(),
                     repl_cfg: cfg,
                     db_cfg,
+                    schema,
                     recoveries: 0,
                     carried_seeds: 0,
                     flipped: false,
@@ -153,8 +257,9 @@ fn open_node(
     cfg: &ReplConfig,
     db_cfg: &DbConfig,
     flipped: bool,
+    schema: &Schema,
 ) -> Result<(Db, Repl), String> {
-    let mut db = Db::open(Box::new(h.disk()), db_cfg.clone(), make_schema())
+    let mut db = Db::open(Box::new(h.disk()), db_cfg.clone(), schema.clone())
         .map_err(|e| format!("Db::open: {e}"))?;
     match Repl::open(Box::new(h.net()), Box::new(h.disk()), cfg.clone(), &mut db) {
         Ok((repl, _notice)) => Ok((db, repl)),
@@ -231,7 +336,13 @@ fn recover_node(sim: &Sim, node: &mut Node) -> Result<(), String> {
 }
 
 fn reopen(node: &mut Node) -> Result<(), String> {
-    let (db, repl) = open_node(&node.host, &node.repl_cfg, &node.db_cfg, node.flipped)?;
+    let (db, repl) = open_node(
+        &node.host,
+        &node.repl_cfg,
+        &node.db_cfg,
+        node.flipped,
+        &node.schema,
+    )?;
     node.repl = repl;
     node.db = Some(db);
     Ok(())
@@ -2057,6 +2168,475 @@ fn harness_catches_a_shipper_that_skips_crc_reverification() {
         .expect("the CRC-verified shipper must survive the victim's universe");
 }
 
+// ======================================================= replicated migrations
+//
+// Migrations T10 (spec §6): the scenario class the reviewed plan never
+// covered — a `#[table]` schema bump under replication. Reuses the Db/Repl
+// rig above (T6-T8), not the Kernel rig below (T8's own section) — these
+// properties call `db.migrate_schema()` by hand at the points a real
+// `Kernel::run`/`do_promote` would call it (spec §2/§4's role-aware gate).
+
+/// Seed 0x2EB8_0002: a FRESH v2 follower must Hello `position: None` (never
+/// write anything at open, even under a migration-bearing schema) and take
+/// the snapshot path — the regression tripwire for "gate writes at open".
+#[test]
+fn fresh_v2_follower_seeds_across_the_gate() {
+    let sim = Sim::with_faults(0x2EB8_0002, FaultConfig::none());
+    let db_cfg = seeding_db_cfg();
+
+    // Pre-upgrade history: seed v1 rows directly (a real pre-upgrade store
+    // on disk, independent of the primary node this test builds next).
+    {
+        let h = sim.host("p");
+        let mut seed_db = Db::open(Box::new(h.disk()), db_cfg.clone(), make_schema_v1()).unwrap();
+        seed_db
+            .transact(|tx| -> Result<(), ()> {
+                for i in 0..20u64 {
+                    tx.put(&WidgetV1 {
+                        id: Id::from_raw(i),
+                        count: i as u32,
+                    });
+                }
+                Ok(())
+            })
+            .unwrap();
+        seed_db.checkpoint().unwrap(); // clean shutdown: the tail is drained
+    }
+
+    // The primary boots on v2 and migrates — Kernel::run's role-aware gate
+    // ("single-node and primary migrate before serving"), reproduced by hand
+    // at this Db/Repl-level rig.
+    let mut p = spawn_node_with_schema(
+        &sim,
+        "p",
+        primary_cfg("p:1"),
+        db_cfg.clone(),
+        make_schema_v2(),
+    )
+    .unwrap();
+    p.db.as_mut().unwrap().migrate_schema().unwrap();
+
+    // GC past the base: commit new v2 rows past several checkpoint
+    // boundaries (seeding_db_cfg's checkpoint_every: 8).
+    for i in 20..60u64 {
+        p.db.as_mut()
+            .unwrap()
+            .transact(|tx| {
+                tx.put(&WidgetV2 {
+                    id: Id::from_raw(i),
+                    count: i as u32,
+                    note: format!("added-{i}"),
+                });
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
+    }
+    assert!(
+        p.db.as_ref().unwrap().log_base() > 0,
+        "GC must move the base past the migration"
+    );
+
+    // A FRESH v2 follower: even with a versioned/migration-bearing schema,
+    // Db::open must write nothing.
+    let mut f = spawn_node_with_schema(
+        &sim,
+        "f",
+        follower_cfg("f:1", "p:1"),
+        db_cfg,
+        make_schema_v2(),
+    )
+    .unwrap();
+    assert_eq!(
+        f.db.as_ref().unwrap().last_applied(),
+        None,
+        "a fresh v2 follower's open must write nothing — it must Hello position: None"
+    );
+
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert!(
+        total_seeds(&f) >= 1,
+        "a fresh follower below the primary's base must take the snapshot path"
+    );
+    assert!(
+        f.db.as_ref().unwrap().log_base() > 0,
+        "a seeded follower's WAL base must be above 0"
+    );
+    assert_converged(&sim, &mut p, &mut f).unwrap();
+
+    // The migrated rows, with their note values, arrived via the seed...
+    let mut rows: Vec<WidgetV2> = f.db.as_ref().unwrap().snapshot().unwrap().scan().unwrap();
+    rows.sort_by_key(|r| r.id.raw());
+    assert_eq!(rows.len(), 60);
+    for r in &rows[..20] {
+        assert_eq!(
+            r.note,
+            "v2",
+            "row {} must carry the migrated note",
+            r.id.raw()
+        );
+    }
+    for (i, r) in rows[20..].iter().enumerate() {
+        assert_eq!(r.note, format!("added-{}", i as u64 + 20));
+    }
+    // ...and so did the schema_versions row for "WidgetV2" — a completed
+    // migration, not an in-flight one.
+    let sv: SchemaVersion =
+        f.db.as_ref()
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .get(schema_version_id("WidgetV2"))
+            .unwrap()
+            .expect("the schema_versions row for WidgetV2 arrived via the seed");
+    assert_eq!(
+        (sv.version, sv.migrating_through, sv.migrating_to),
+        (2, None, None),
+        "the seeded schema_versions row must show a completed migration"
+    );
+}
+
+/// Seed 0x2EB8_0003: both nodes converge on v1, clean-shutdown, both restart
+/// on v2 — the primary migrates at its startup path, the follower's gate
+/// admits it read-only (nothing below-version left to replay past a clean
+/// checkpoint) and catches up entirely via shipped `MigratePut`s, never a
+/// re-seed.
+#[test]
+fn converged_v1_follower_catches_up_via_shipped_migrateputs() {
+    let sim = Sim::with_faults(0x2EB8_0003, FaultConfig::none());
+    let db_cfg = seeding_db_cfg();
+    let mut p = spawn_node_with_schema(
+        &sim,
+        "p",
+        primary_cfg("p:1"),
+        db_cfg.clone(),
+        make_schema_v1(),
+    )
+    .unwrap();
+    let mut f = spawn_node_with_schema(
+        &sim,
+        "f",
+        follower_cfg("f:1", "p:1"),
+        db_cfg.clone(),
+        make_schema_v1(),
+    )
+    .unwrap();
+
+    for i in 0..15u64 {
+        p.db.as_mut()
+            .unwrap()
+            .transact(|tx| {
+                tx.put(&WidgetV1 {
+                    id: Id::from_raw(i),
+                    count: i as u32,
+                });
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
+        drive_rounds(&sim, &mut [&mut p, &mut f], 3).unwrap();
+    }
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert_converged(&sim, &mut p, &mut f).unwrap();
+    assert_eq!(
+        f.repl.stats().seeds,
+        0,
+        "a live, kept-up follower must converge via shipped frames, never a seed"
+    );
+    assert_eq!(p.repl.stats().seeds, 0);
+
+    // Clean shutdown on both — follower first, then primary — each via an
+    // explicit checkpoint (this rig drives nodes directly, not through the
+    // kernel loop, so the clean-exit checkpoint is explicit).
+    f.db.as_mut().unwrap().checkpoint().unwrap();
+    f.db = None;
+    p.db.as_mut().unwrap().checkpoint().unwrap();
+    p.db = None;
+
+    // Restart the primary on v2 — its startup path migrates.
+    p.schema = make_schema_v2();
+    p.host.restart();
+    reopen(&mut p).unwrap();
+    p.db.as_mut().unwrap().migrate_schema().unwrap();
+
+    // Restart the follower on v2 — its gate is read-only: the store still
+    // holds v1 bytes, admitted because the clean checkpoint above left
+    // nothing below-version to replay; it catches up via shipped
+    // MigratePuts once reconnected, never running migrate_schema itself.
+    f.schema = make_schema_v2();
+    f.host.restart();
+    reopen(&mut f).unwrap();
+
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert_converged(&sim, &mut p, &mut f).unwrap();
+    assert_eq!(
+        f.repl.stats().seeds,
+        0,
+        "the follower must catch up via shipped MigratePuts, never a re-seed"
+    );
+    assert_eq!(p.repl.stats().seeds, 0);
+
+    // The follower's rows carry the migrated field...
+    let mut rows: Vec<WidgetV2> = f.db.as_ref().unwrap().snapshot().unwrap().scan().unwrap();
+    rows.sort_by_key(|r| r.id.raw());
+    assert_eq!(rows.len(), 15);
+    for r in &rows {
+        assert_eq!(
+            r.note,
+            "v2",
+            "row {} must carry the migrated note",
+            r.id.raw()
+        );
+    }
+    // ...and its scan_by-visible index state matches the primary's — the
+    // close-out apply rebuilt the follower's index at the same log position.
+    for k in 0..15u32 {
+        assert_eq!(
+            count_index_snapshot(p.db.as_ref().unwrap(), k),
+            count_index_snapshot(f.db.as_ref().unwrap(), k),
+            "index state for count={k} diverged between primary and follower"
+        );
+    }
+}
+
+/// Step 4's own fixture: `migrate_schema`'s batch records are tiny for a
+/// handful of rows (well under `FRAMES_BATCH_BYTES`, 256 KiB), so the real
+/// shipper would ship an entire small migration in one `Msg::Frames` —
+/// nothing to catch "mid-flight". Padding the migrated `note` to ~50 KiB
+/// makes each 2-row batch record ~100 KiB, so the shipper genuinely needs
+/// multiple rounds to deliver `migration_batch_size: 2` over ~10 rows,
+/// letting the test observe (and stop at) a real partial watermark on the
+/// follower before killing the primary.
+const GIZMO_NOTE_PAD: usize = 50_000;
+
+struct GizmoV1 {
+    id: Id<GizmoV1>,
+    count: u32,
+}
+impl Row for GizmoV1 {
+    const TABLE: &'static str = "GizmoV2";
+    const INDEXES: &'static [IndexDef<GizmoV1>] = &[];
+    const VERSION: u32 = 1;
+    const FINGERPRINT: Option<u64> = Some(0x2EB8_0004);
+    fn id(&self) -> Id<GizmoV1> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.count.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<GizmoV1> {
+        let input = &mut &bytes[..];
+        Ok(GizmoV1 {
+            id: Id::decode(input)?,
+            count: u32::decode(input)?,
+        })
+    }
+}
+impl RowShape for GizmoV1 {
+    const VERSION: u32 = 1;
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        Row::encode_row(self, out)
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<GizmoV1> {
+        <GizmoV1 as Row>::decode_row(bytes)
+    }
+}
+
+#[table(version = 2)]
+struct GizmoV2 {
+    id: Id<GizmoV2>,
+    count: u32,
+    note: String,
+}
+impl TableMigration for GizmoV2 {
+    type Prev = GizmoV1;
+    fn migrate(prev: GizmoV1) -> Result<GizmoV2, MigrationError> {
+        Ok(GizmoV2 {
+            id: Id::from_raw(prev.id.raw()),
+            count: prev.count,
+            note: "x".repeat(GIZMO_NOTE_PAD),
+        })
+    }
+}
+
+fn make_gizmo_schema_v1() -> Schema {
+    Schema::new().table::<GizmoV1>()
+}
+
+fn make_gizmo_schema_v2() -> Schema {
+    Schema::new()
+        .table::<GizmoV2>()
+        .migration::<GizmoV2>("GizmoV2")
+}
+
+fn gizmo_content(db: &Db) -> Vec<(u64, u32, String)> {
+    let mut rows: Vec<GizmoV2> = db.snapshot().unwrap().scan().unwrap();
+    rows.sort_by_key(|r| r.id.raw());
+    rows.into_iter()
+        .map(|r| (r.id.raw(), r.count, r.note))
+        .collect()
+}
+
+/// Seed 0x2EB8_0004: a primary mid-migration (some batches shipped, not all)
+/// dies; the promoted follower's `do_promote` gate (T7) resumes
+/// `migrate_schema` from exactly the shipped watermark and finishes it,
+/// landing on the same content as an uninterrupted single-node twin.
+#[test]
+fn promote_mid_migration_resumes_from_the_shipped_watermark() {
+    let sim = Sim::with_faults(0x2EB8_0004, FaultConfig::none());
+    let db_cfg = DbConfig {
+        migration_batch_size: 2,
+        ..no_gc_cfg()
+    };
+    const ROWS: u64 = 10;
+
+    // Pre-upgrade history on p's disk.
+    {
+        let h = sim.host("p");
+        let mut seed_db =
+            Db::open(Box::new(h.disk()), db_cfg.clone(), make_gizmo_schema_v1()).unwrap();
+        seed_db
+            .transact(|tx| -> Result<(), ()> {
+                for i in 0..ROWS {
+                    tx.put(&GizmoV1 {
+                        id: Id::from_raw(i),
+                        count: i as u32,
+                    });
+                }
+                Ok(())
+            })
+            .unwrap();
+        seed_db.checkpoint().unwrap();
+    }
+
+    let mut p = spawn_node_with_schema(
+        &sim,
+        "p",
+        primary_cfg("p:1"),
+        db_cfg.clone(),
+        make_gizmo_schema_v2(),
+    )
+    .unwrap();
+    let mut f = spawn_node_with_schema(
+        &sim,
+        "f",
+        follower_cfg("f:1", "p:1"),
+        db_cfg.clone(),
+        make_gizmo_schema_v2(),
+    )
+    .unwrap();
+
+    // The follower attaches and converges on the original v1 data first
+    // (no_gc_cfg: nothing GC'd, ordinary frame shipping, no seed needed).
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert_eq!(f.repl.stats().seeds, 0);
+
+    // The primary migrates — 5 batches (batch_size 2 over 10 rows) + 1
+    // close-out, each padded batch record alone big enough that the real
+    // shipper needs multiple rounds to deliver all of it.
+    p.db.as_mut().unwrap().migrate_schema().unwrap();
+
+    // Drive round by round, watching the follower's OWN persisted watermark,
+    // until it shows a genuinely in-flight migration — then stop, before it
+    // finishes, and kill the primary right there.
+    let mut mid_through: Option<u64> = None;
+    for _ in 0..64u32 {
+        drive_rounds(&sim, &mut [&mut p, &mut f], 1).unwrap();
+        let sv: Option<SchemaVersion> =
+            f.db.as_ref()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .get(schema_version_id("GizmoV2"))
+                .unwrap();
+        if let Some(sv) = sv
+            && sv.migrating_to.is_some()
+        {
+            mid_through = Some(sv.migrating_through.unwrap_or(0));
+            break;
+        }
+    }
+    let mid_through = mid_through.expect(
+        "the follower must be caught mid-migration (a partial, in-flight watermark) before the \
+         primary dies — the shipper delivered everything in one shot instead of across rounds",
+    );
+    eprintln!(
+        "caught the follower mid-migration at watermark {mid_through} (of {} rows)",
+        ROWS - 1
+    );
+    assert!(
+        mid_through < ROWS - 1,
+        "the interrupt must land interior (watermark {mid_through} of {} rows) — at the end, \
+         every batch already shipped and the promote would exercise only the empty close-out, \
+         never a genuine mid-table resume",
+        ROWS - 1
+    );
+
+    // Kill the primary — no drain, a real failover — and promote the
+    // follower; its do_promote gate (T7) resumes migrate_schema from
+    // exactly this shipped watermark.
+    p.host.crash_now();
+    f.flipped = true;
+    let reply = CtrlConn::open(&sim, "f:1", &Msg::CtrlPromote { secret: None })
+        .and_then(|mut cli| drive_ctrl(&sim, &mut [&mut f], &mut cli, CONVERGE_BUDGET))
+        .unwrap();
+    match reply {
+        Msg::CtrlOk { .. } => {}
+        other => panic!("promote of a mid-migration follower must succeed: {other:?}"),
+    }
+
+    // The uninterrupted twin: a fresh single node, seeded with the same rows,
+    // migrated in one uninterrupted `migrate_schema` call.
+    let twin = {
+        let h = sim.host("twin");
+        {
+            let mut seed_db =
+                Db::open(Box::new(h.disk()), db_cfg.clone(), make_gizmo_schema_v1()).unwrap();
+            seed_db
+                .transact(|tx| -> Result<(), ()> {
+                    for i in 0..ROWS {
+                        tx.put(&GizmoV1 {
+                            id: Id::from_raw(i),
+                            count: i as u32,
+                        });
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            seed_db.checkpoint().unwrap();
+        }
+        let mut db = Db::open(Box::new(h.disk()), db_cfg.clone(), make_gizmo_schema_v2()).unwrap();
+        db.migrate_schema().unwrap();
+        db
+    };
+
+    // Twin equality proves completeness, not exactly-once: GizmoV1
+    // prefix-decodes v2 bytes, so re-migrating an already-v2 row is invisible
+    // here. Exactly-once is pinned by the non-prefix fixture in
+    // charpente-core/tests/migrations.rs (T9).
+    let f_content = gizmo_content(f.db.as_ref().unwrap());
+    let twin_content = gizmo_content(&twin);
+    assert_eq!(f_content.len(), ROWS as usize);
+    assert_eq!(
+        f_content, twin_content,
+        "the promoted node's final table must equal the uninterrupted twin"
+    );
+
+    let sv: SchemaVersion = f
+        .db
+        .as_ref()
+        .unwrap()
+        .snapshot()
+        .unwrap()
+        .get(schema_version_id("GizmoV2"))
+        .unwrap()
+        .expect("GizmoV2's schema_versions row must exist after the promote finished migrating");
+    assert_eq!(
+        (sv.version, sv.migrating_through, sv.migrating_to),
+        (2, None, None),
+        "the promoted node's migration must be fully closed out — no in-flight markers left"
+    );
+}
+
 // ============================================================ control plane
 //
 // Task 7: switchover (zero-loss), promote (bounded-loss failover), and the
@@ -2746,7 +3326,7 @@ fn the_zero_loss_oracle_catches_a_promote_without_drain() {
 
 use charpente::http::{ApiError, App, AppConfig, Method, Request, Session};
 use charpente::kernel::{CronRow, Kernel, RecordedResponses, SimSource, Step};
-use charpente::{Tx, View, job, jobs, route, routes};
+use charpente::{Tx, job, jobs, route, routes};
 use charpente_core::job::JobRow;
 
 #[table]
