@@ -233,12 +233,25 @@ struct Client {
     /// How far `sync_ledger` has scanned `charpente.events` — server-
     /// relative, persists across reopens.
     next_scan_id: u64,
+    /// Ids `sync_ledger` proved aged out of retention: an id a scan stepped
+    /// over because its row was gone (first-returned-id > `next_scan_id`;
+    /// event ids are dense, so the skipped span was emitted then GC'd). No
+    /// future scan will ever return them — recorded here at scan time rather
+    /// than silently advancing `next_scan_id` past them, so `drain` can
+    /// CONFIRM a delivered frame whose row aged out before it was recorded.
+    /// This set is "which ids are gone", NOT "which are forgiven": the
+    /// received-only gate stays `pending` membership, in `drain`.
+    gone: BTreeSet<u64>,
     /// Ids strictly below this are forfeited: a bare reconnect's
     /// `next_event_id` at push time, so `settled()` never waits on them.
     /// Monotonic (a later forfeit is always a superset of an earlier one).
     floor: u64,
     /// Delivered frames not yet checked against the ledger: `(id, name,
-    /// json)`, oldest first.
+    /// json)`, oldest first. Every entry was RECEIVED live (pushed from a
+    /// tail delivery in `absorb`, the only live push site) — the structural
+    /// fact `drain` leans on to confirm an aged-out (`gone`) id whose ledger
+    /// row disappeared before it could be content-verified, without ever
+    /// forgiving an id the client never received.
     pending: VecDeque<(u64, &'static str, String)>,
     /// Every id ever content-verified (matched against the ledger) via
     /// `drain` — the membership bound `settled()` checks against, not a
@@ -265,6 +278,7 @@ impl Client {
             mode_key,
             ledger: BTreeMap::new(),
             next_scan_id: 0,
+            gone: BTreeSet::new(),
             floor: 0,
             pending: VecDeque::new(),
             verified: BTreeSet::new(),
@@ -339,6 +353,19 @@ impl Client {
     fn sync_ledger(&mut self, db: &Db) -> io::Result<()> {
         let snap = db.snapshot()?;
         let rows: Vec<EventRow> = snap.scan_from(self.next_scan_id, 4096)?;
+        // On-scan gap detection (never advance past a gap silently): event
+        // ids are dense below `next_event_id`, so any id in
+        // `[next_scan_id, first-returned-id)` has no row — it was emitted and
+        // then aged out of retention (GC deletes an oldest-first prefix). Its
+        // ledger row is gone for good; record it so `drain` can confirm a
+        // delivered frame at that id BY ID. Derived entirely from the scan
+        // already in hand — zero extra disk ops, so the injected-fault
+        // schedule is untouched.
+        if let Some(first) = rows.first() {
+            for gone in self.next_scan_id..first.id.raw() {
+                self.gone.insert(gone);
+            }
+        }
         for row in rows {
             self.next_scan_id = row.id.raw() + 1;
             let (name, json): (&'static str, String) = match row.name.as_str() {
@@ -405,13 +432,31 @@ impl Client {
     }
 
     /// Drains as much of `pending` as the current ledger allows (oldest
-    /// first, stopping — not failing — the moment an id hasn't been scanned
-    /// yet).
+    /// first). A delivered frame whose id `sync_ledger` proved aged out of
+    /// retention (`gone` — its row is gone and no future scan will ever
+    /// return it) can never be content-verified, so it is CONFIRMED BY ID
+    /// instead of blocking the drain forever. That confirmation resolves ONLY
+    /// ids the client actually RECEIVED: every `pending` entry was pushed
+    /// from a live tail delivery (`absorb`), so a `gone` pop here is always a
+    /// received-then-aged event, never a missing one — the ledger-scan side
+    /// has no business forgiving an id the client never got (that is the
+    /// subscribe-side 409 / gap-frame contract's job). A still-retained id
+    /// the ledger has not caught up to yet stops the drain (not fails),
+    /// retried after the next scan.
     fn drain(&mut self) -> Result<(), String> {
         while let Some(&(id, name, ref json)) = self.pending.front() {
             let json = json.clone();
             match self.try_match(id, name, &json) {
                 MatchOutcome::Matched => {
+                    self.pending.pop_front();
+                    self.verified.insert(id);
+                }
+                MatchOutcome::Pending if self.gone.contains(&id) => {
+                    // Received live (it is in `pending`) but its ledger row
+                    // aged out before `sync_ledger` recorded it: confirm by
+                    // id. A gone row is unverifiable, never misdelivered —
+                    // delivery-time `assert_strictly_increasing` already held
+                    // the strictly-increasing resume contract for it.
                     self.pending.pop_front();
                     self.verified.insert(id);
                 }
@@ -907,6 +952,102 @@ fn the_harness_catches_a_resume_that_skips_the_successor_event() {
     assert!(
         report.contains(&missing.to_string()),
         "the failure report must name the missing id: {report}"
+    );
+}
+
+/// The discriminating twin for the retention-gap confirmation `drain` grew
+/// this interlude (the fix for seed 0xbe2f0aa2f20f34c7: a live-delivered
+/// frame whose ledger row aged out before `sync_ledger` recorded it used to
+/// stall the client's drain forever). The confirmation resolves a
+/// delivered-then-aged id BY ID — but it must resolve ONLY ids the client
+/// actually RECEIVED, never mask a real delivery-path interior skip. Both
+/// halves below face the identical aged-out ledger (real checkpoint-driven
+/// GC, `event_retention: 4`); the ONLY difference is whether the still-
+/// RETAINED id `floor` was delivered.
+///   - honest: every id up to the tail was received live -> the below-floor
+///     ids confirm, the retained ids content-verify, the client settles.
+///   - skip: the retained id `floor` is never delivered -> the confirmation
+///     cannot touch it (it was never in `pending`), and the independent
+///     membership check `first_unaccounted` names it, so the client stays
+///     RED. This is the same over-excusing failure the T6 review caught the
+///     old high-water bound committing, now guarded at the new mechanism.
+///     Proven load-bearing by a guard-revert (interlude report): dropping
+///     the below-floor arm makes the HONEST half stop settling, while the
+///     skip half stays RED either way — the confirmation resolves
+///     received-and-aged ids and nothing else.
+#[test]
+fn the_below_floor_confirm_resolves_only_received_frames() {
+    let sim = Sim::with_faults(0x2EB2_6A9F, FaultConfig::none());
+    let mut app = realtime_app(&sim).unwrap();
+    // Enough emits that checkpoint-driven GC (event_retention: 4,
+    // checkpoint_every: 2) ages the oldest rows out while keeping the newest
+    // — a real floor > 0 to confirm delivered-then-aged ids against.
+    for n in 0..8u64 {
+        app.db_for_tests()
+            .transact(|tx| {
+                tx.emit(Ping { n });
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+    }
+    let floor = app.db_for_tests().event_floor().unwrap();
+    let next = app.db_for_tests().next_event_id().unwrap();
+    assert!(
+        floor > 0 && floor < next,
+        "test needs GC to have aged some rows out but kept others: floor={floor}, next={next}"
+    );
+
+    // The delivered frame for an id — content identical to what the store
+    // materialized (each emit's `Ping.n` is its own event id, ids dense).
+    let frame = |id: u64| -> (u64, &'static str, String) {
+        (
+            id,
+            "ping",
+            serde_json::to_string(&Ping { n: id }).expect("Ping serializes"),
+        )
+    };
+
+    // ---- honest: every id in [0, next) was received live ----
+    let mut honest = Client::new(PING_ONLY, None);
+    for id in 0..next {
+        honest.pending.push_back(frame(id));
+    }
+    honest.sync_and_drain(app.db_for_tests()).unwrap();
+    assert!(
+        honest.settled(),
+        "delivered-then-aged ids must confirm and the client settle: {}",
+        honest.unsettled_report()
+    );
+    assert!(
+        honest.verified.iter().any(|&id| id < floor),
+        "the below-floor confirmation must actually have fired here (an aged-out, \
+         never-in-ledger id was confirmed) — otherwise this test proves nothing"
+    );
+
+    // ---- skip: the still-RETAINED id `floor` is never delivered ----
+    let skip = floor;
+    let mut skipped = Client::new(PING_ONLY, None);
+    for id in 0..next {
+        if id == skip {
+            continue;
+        }
+        skipped.pending.push_back(frame(id));
+    }
+    skipped.sync_and_drain(app.db_for_tests()).unwrap();
+    assert!(
+        !skipped.settled(),
+        "a never-received still-retained id must keep the client unsettled — the retention \
+         confirmation must not mask a real delivery-path interior skip"
+    );
+    assert_eq!(
+        skipped.first_unaccounted(),
+        Some(skip),
+        "the skipped id must be named precisely, not merely detected"
+    );
+    assert!(
+        skipped.unsettled_report().contains(&skip.to_string()),
+        "the failure report must name the missing id: {}",
+        skipped.unsettled_report()
     );
 }
 
