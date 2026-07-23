@@ -792,6 +792,9 @@ impl View for Snapshot {
         Ok(out)
     }
 
+    /// Silent gap semantics: if `from_id` was GC'd, this starts at the next
+    /// surviving row instead of erroring — callers needing gap detection
+    /// must check contiguity themselves.
     fn scan_from<R: Row>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>> {
         let rows = match self.txn.open_table(rows_def(R::TABLE)) {
             Ok(rows) => rows,

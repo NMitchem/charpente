@@ -416,6 +416,15 @@ impl Wal {
         self.disk
     }
 
+    /// Borrows the `Disk` handle without consuming the log — `Db::checkpoint`
+    /// (db.rs) needs it to write the horizon breadcrumb sidecar (Design A,
+    /// `.superpowers/sdd/horizon-collapse-investigation.md`) after the
+    /// store's own checkpoint persists. Plumbing only; the log's own
+    /// recovery/cut logic is untouched by the breadcrumb.
+    pub(crate) fn disk(&self) -> &dyn Disk {
+        self.disk.as_ref()
+    }
+
     fn rotate(&mut self) -> io::Result<()> {
         self.guard(self.tail.sync())?; // sync-before-rotate keeps `sync` a whole-log barrier
         let name = segment_name(&self.cfg.dir, self.next_seq);

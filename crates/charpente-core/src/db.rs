@@ -22,7 +22,7 @@ use std::io;
 
 use crate::engine::{Engine, StateMachine};
 use crate::event::EventRow;
-use crate::io::Disk;
+use crate::io::{Disk, File};
 use crate::job::JobRow;
 use crate::log::{MAX_RECORD_BYTES, WalConfig, parse_segment_name, segment_name};
 use crate::table::{Codec, Id, Row, RowShape, Snapshot, Store, View, Writer};
@@ -919,6 +919,128 @@ fn check_replay_version(
     Ok(())
 }
 
+// ---------------------------------------------------- horizon breadcrumb
+
+/// Design A (`.superpowers/sdd/horizon-collapse-investigation.md`, Noah-ruled,
+/// progress.md line 252): the recovery-horizon rule's ONLY witness used to be
+/// the store's own `applied_seq` — a store discard-and-rebuild (`Db::open`,
+/// below) erases it before `Engine::recover` ever runs, so a durable
+/// corruption of an already-acked frame was silently cut instead of raising
+/// the named hard error (`log.rs`'s recovery-horizon check). This sidecar
+/// file, `<store_path>.horizon`, is a durable copy of the store's
+/// `applied_seq` at its last checkpoint, written and barriered strictly
+/// AFTER the store's own checkpoint persists — so it is always a lower bound
+/// on the true durable horizon, never an over-claim. `Db::open` reads it and
+/// feeds `max(store.applied_seq, breadcrumb)` into recovery instead of the
+/// store's value alone.
+///
+/// Two fixed 12-byte slots (`u64` LE `applied_seq` + its `u32` LE CRC) at
+/// offsets 0 and 12 in one file. `Disk` has no rename, so a write-new-then-
+/// rename scheme isn't available; two slots are the smallest mechanism that
+/// still satisfies "a torn UPDATE must not destroy the previous valid
+/// witness" (each `write_at` call is its own independently-torn op in the
+/// sim's crash model — module docs, `charpente-sim/src/disk.rs` — so a tear
+/// of one slot's bytes can never touch the other slot's already-durable
+/// bytes). Every write targets whichever slot holds the smaller (or
+/// invalid/absent) value, leaving the slot holding the larger value
+/// untouched; the read side takes the max of whichever slots verify. A
+/// missing, torn, or CRC-invalid breadcrumb degrades to exactly `None` —
+/// today's pre-breadcrumb semantics.
+const HORIZON_SLOT_BYTES: u64 = 12; // u64 LE applied_seq + u32 LE crc32
+
+fn horizon_path(store_path: &str) -> String {
+    format!("{store_path}.horizon")
+}
+
+/// Reads one slot; `None` for absent, short, or CRC-invalid — never an
+/// error, since a torn or missing breadcrumb must degrade silently to "no
+/// witness", exactly like no breadcrumb file existing at all.
+fn read_horizon_slot(file: &dyn File, len: u64, slot: u64) -> io::Result<Option<u64>> {
+    let offset = slot * HORIZON_SLOT_BYTES;
+    if len < offset + HORIZON_SLOT_BYTES {
+        return Ok(None);
+    }
+    let mut buf = [0u8; HORIZON_SLOT_BYTES as usize];
+    file.read_at(offset, &mut buf)?;
+    let value = u64::from_le_bytes(buf[0..8].try_into().expect("8-byte slice"));
+    let stored_crc = u32::from_le_bytes(buf[8..12].try_into().expect("4-byte slice"));
+    Ok(if crate::crc::crc32(&buf[0..8]) == stored_crc {
+        Some(value)
+    } else {
+        None
+    })
+}
+
+/// The breadcrumb witness: the max of whichever of the two slots verify, or
+/// `None` if the file is absent or neither slot verifies. Checks existence
+/// via `list` first (never `Disk::open`, which creates-if-absent) so a
+/// database that has never checkpointed pays no extra disk op reading a
+/// breadcrumb that doesn't exist.
+fn read_horizon_breadcrumb(disk: &dyn Disk, store_path: &str) -> io::Result<Option<u64>> {
+    let path = horizon_path(store_path);
+    if !disk.list(&path)?.iter().any(|name| name == &path) {
+        return Ok(None);
+    }
+    let file = disk.open(&path)?;
+    let len = file.len()?;
+    let a = read_horizon_slot(&*file, len, 0)?;
+    let b = read_horizon_slot(&*file, len, 1)?;
+    Ok(match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(v), None) | (None, Some(v)) => Some(v),
+        (None, None) => None,
+    })
+}
+
+/// Writes `applied_seq` into whichever slot holds the smaller (or invalid)
+/// existing value, then barriers the write (`File::sync` + `Disk::sync_dir`
+/// — the file's directory entry must survive a crash right after this
+/// returns, same fence-2 discipline as everywhere else). The OTHER slot —
+/// holding the prior checkpoint's still-valid witness — is never touched, so
+/// a crash mid-write leaves the breadcrumb readable at its PREVIOUS value,
+/// never gone and never over-claiming.
+fn write_horizon_breadcrumb(disk: &dyn Disk, store_path: &str, applied_seq: u64) -> io::Result<()> {
+    let path = horizon_path(store_path);
+    let file = disk.open(&path)?;
+    let len = file.len()?;
+    let a = read_horizon_slot(&*file, len, 0)?;
+    let b = read_horizon_slot(&*file, len, 1)?;
+    let slot = match (a, b) {
+        (None, _) => 0,
+        (_, None) => 1,
+        (Some(a), Some(b)) if a <= b => 0,
+        _ => 1,
+    };
+    let mut buf = [0u8; HORIZON_SLOT_BYTES as usize];
+    buf[0..8].copy_from_slice(&applied_seq.to_le_bytes());
+    let crc = crate::crc::crc32(&buf[0..8]);
+    buf[8..12].copy_from_slice(&crc.to_le_bytes());
+    file.write_at(slot * HORIZON_SLOT_BYTES, &buf)?;
+    file.sync()?;
+    disk.sync_dir(&path)?;
+    Ok(())
+}
+
+/// Deletes the breadcrumb file, if any — `Seeder::new` already discards
+/// `store_path` and every `wal/` segment because seeding always replaces the
+/// timeline, never merges into one (its own module doc); the breadcrumb is
+/// durable state ABOUT that discarded store and must go with it. Without
+/// this, a stale breadcrumb from a higher-numbered prior timeline sharing
+/// this disk (e.g. a demoted primary being re-seeded in place) would survive
+/// into the new timeline and over-claim protection for seqs the new
+/// timeline never actually acknowledged — the exact over-claim Design A's
+/// lower-bound invariant forbids.
+fn remove_horizon_breadcrumb(disk: &dyn Disk, store_path: &str) -> io::Result<()> {
+    let path = horizon_path(store_path);
+    match disk.remove(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    disk.sync_dir(&path)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------- db
 
 /// The composed deterministic core: WAL + store + schema. One `Db` is the
@@ -1022,6 +1144,21 @@ impl Db {
             }
         };
         let skip_through = store.applied_seq()?;
+        // The recovery-horizon WITNESS (horizon breadcrumb, above): a store
+        // discard leaves `skip_through` at `None`, but a durable breadcrumb
+        // from the store's last checkpoint can still supply the horizon —
+        // `max` because the breadcrumb is only ever a lower bound (never
+        // written ahead of the store's own checkpoint) and the store's own
+        // value, when present, is always at least as current. Deliberately
+        // NOT used for `TableMachine.skip_through` below: that field decides
+        // whether a replayed record's writes are already reflected in the
+        // store and must be skipped, which must stay tied to the store's
+        // TRUE state — a discarded (fresh, empty) store has nothing to skip,
+        // breadcrumb or not.
+        let witness = match read_horizon_breadcrumb(&*disk, &cfg.store_path)? {
+            Some(b) => Some(skip_through.map_or(b, |s| s.max(b))),
+            None => skip_through,
+        };
         // Recovery-horizon rule, vanished-prefix half (segment-mgmt T4; T2/T3
         // review adjudication). Checkpoint-driven gc can only ever leave the
         // log's floor at or below its own checkpoint's applied_seq + 1 (T2's
@@ -1033,7 +1170,7 @@ impl Db {
         // hard error mutates nothing (same peek style as the unopenable-store
         // branch above; `None` reads as horizon `0`, so a fresh store paired
         // with any compacted log is rejected the same way).
-        let horizon = skip_through.map_or(0, |applied| applied + 1);
+        let horizon = witness.map_or(0, |applied| applied + 1);
         let prefix = format!("{}/", cfg.wal.dir);
         match disk.list(&prefix)?.first() {
             Some(first) => {
@@ -1094,7 +1231,7 @@ impl Db {
             versions,
             saw_below: BTreeSet::new(),
         };
-        let mut engine = Engine::recover(disk, cfg.wal.clone(), machine, skip_through)?;
+        let mut engine = Engine::recover(disk, cfg.wal.clone(), machine, witness)?;
         // Recovery replay must not leak into the kernel's incremental feed —
         // the dispatcher rebuilds its due-heap from a Pending scan at open.
         engine.machine_mut().enqueued.clear();
@@ -1279,6 +1416,16 @@ impl Db {
         let store = &self.engine.machine().store;
         store.checkpoint()?;
         let applied = store.applied_seq()?;
+        // Horizon breadcrumb (Design A): written strictly AFTER the store's
+        // own checkpoint above persisted `applied`, so the breadcrumb is
+        // always a lower bound on the true durable horizon. A fresh store
+        // that has never applied anything (`applied = None`) has nothing to
+        // record — the breadcrumb, like the store, simply stays absent.
+        // Failure here has the SAME semantics as any other IO failure in
+        // this function: it bubbles up via `?`, no new poisoning invented.
+        if let Some(applied) = applied {
+            write_horizon_breadcrumb(self.engine.wal().disk(), &self.cfg.store_path, applied)?;
+        }
         let mut keep_from = applied.map_or(0, |s| s + 1);
         if let Some(pin) = &self.retention_pin {
             keep_from = keep_from.min(pin());
@@ -1684,10 +1831,13 @@ impl Seeder {
     /// `schema` must NOT include `JobRow`/`EventRow`/`SchemaVersion` —
     /// `Seeder` registers all three itself (mirroring `Db::open`), so a
     /// schema already carrying any (e.g. one recovered from a live `Db` via
-    /// `into_seeder`) would double-register. Discards any store file and
-    /// `wal/` segments already
-    /// at `disk`, dir-barriered — seeding always replaces a timeline, never
-    /// merges into one.
+    /// `into_seeder`) would double-register. Discards any store file,
+    /// horizon breadcrumb, and `wal/` segments already at `disk`, dir-
+    /// barriered — seeding always replaces a timeline, never merges into
+    /// one. The breadcrumb must go too: left behind, a stale breadcrumb from
+    /// a higher-numbered prior timeline sharing this disk (e.g. a demoted
+    /// primary re-seeded in place) would survive into the freshly seeded
+    /// timeline and over-claim protection for seqs it never acknowledged.
     pub fn new(disk: Box<dyn Disk>, cfg: DbConfig, schema: Schema) -> io::Result<Seeder> {
         match disk.remove(&cfg.store_path) {
             Ok(()) => {}
@@ -1695,6 +1845,7 @@ impl Seeder {
             Err(e) => return Err(e),
         }
         disk.sync_dir(&cfg.store_path)?;
+        remove_horizon_breadcrumb(&*disk, &cfg.store_path)?;
         let wal_prefix = format!("{}/", cfg.wal.dir);
         for name in disk.list(&wal_prefix)? {
             disk.remove(&name)?;
@@ -1753,6 +1904,13 @@ impl Seeder {
         } = self;
         store.set_import_meta(applied_seq, next_job_id, next_event_id, frontier_crc)?;
         store.checkpoint()?;
+        // Horizon breadcrumb (Design A), after the store checkpoint above
+        // persists — same ordering rule as `Db::checkpoint`. `Seeder::new`
+        // already cleared any stale breadcrumb, so this always lands in the
+        // otherwise-empty slot 0; a crash before this line leaves the
+        // breadcrumb absent (safe — the store's own `applied_seq`, once
+        // reopened via `Db::open` below, supplies the same witness anyway).
+        write_horizon_breadcrumb(&*disk, &cfg.store_path, applied_seq)?;
         drop(store); // graceful close before Db::open reopens the same file
         let name = segment_name(&cfg.wal.dir, applied_seq + 1);
         disk.open(&name)?;

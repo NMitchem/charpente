@@ -1286,6 +1286,356 @@ fn fresh_store_creation_crash_is_discarded_and_rebuilt() {
     );
 }
 
+// ---------------- M1 horizon-breadcrumb interlude (pre-SP6): horizon collapse
+// regression + breadcrumb properties
+
+/// Headline regression (`.superpowers/sdd/horizon-collapse-investigation.md`):
+/// `Db::open`'s store discard-and-rebuild used to erase the ONLY recovery-
+/// horizon witness (the store's own `applied_seq`), so a durable corruption
+/// of an already-acked, already-checkpointed WAL frame was silently CUT
+/// instead of raising the named corruption-of-acknowledged-records hard
+/// error — the store resurrected EMPTY, with no error at all. Design A
+/// (Noah-ruled, progress.md line 252): a durable horizon breadcrumb outside
+/// the store survives the discard and restores the witness. The control
+/// assertion (store intact) passes on both fixed and unfixed code; only the
+/// discard branch is the regression this test pins.
+#[test]
+fn store_discard_erases_the_horizon_but_the_breadcrumb_still_refuses_the_corrupt_frame() {
+    let sim = Sim::with_faults(0x486F_72C0, FaultConfig::none());
+    let cfg = DbConfig::default();
+
+    // 20 rows, one transaction each -> seq 0..19; checkpoint durably pins
+    // applied_seq = 19 (the horizon) and, with the fix, the breadcrumb too.
+    // One 64 MiB segment never rotates, so base_seq stays 0 -- the exact
+    // reachable window (base_seq > 0 is already refused earlier).
+    {
+        let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+        for i in 0..20u64 {
+            db.transact(|tx| {
+                tx.put(&invoice(i, 1, i as i64));
+                Ok::<_, io::Error>(())
+            })
+            .unwrap();
+        }
+        db.checkpoint().unwrap();
+    }
+
+    // Durably corrupt the first WAL frame's payload (offset 16, past the
+    // 16-byte header) -- media bitrot of an already-acked, already-applied,
+    // already-checkpointed record.
+    {
+        let segments = sim.disk().list("wal/").unwrap();
+        let file = sim.disk().open(&segments[0]).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_at(16, &mut byte).unwrap();
+        file.write_at(16, &[byte[0] ^ 0xFF]).unwrap();
+        file.sync().unwrap();
+    }
+
+    // Control: store INTACT. applied_seq = 19 is the durable horizon; the
+    // corrupt frame 0 is at-or-below it, so recovery refuses by name. This
+    // is correct today and must keep passing after the fix.
+    let intact_err = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema())
+        .expect_err("store intact: corruption of an acked frame must be a hard error");
+    assert!(
+        intact_err
+            .to_string()
+            .contains("corruption of acknowledged records"),
+        "control (store intact) should name the contract; got: {intact_err}"
+    );
+
+    // THE BUG: discard the store (the exact proxy the landed discard/
+    // rebuild regressions use elsewhere in this file -- production reaches
+    // the identical applied_seq=None state via Db::open's Store::open-failed
+    // discard-and-rebuild branch, e.g. the M0 page_manager fence). Horizon
+    // collapses to None UNLESS a breadcrumb outside the store supplies it.
+    sim.disk().remove(&cfg.store_path).unwrap();
+    match Db::open(Box::new(sim.disk()), cfg, app_schema()) {
+        Err(e) => {
+            assert!(
+                e.to_string().contains("corruption of acknowledged records"),
+                "expected the named corruption-of-acknowledged-records refusal; got: {e}"
+            );
+        }
+        Ok(db) => {
+            let rows = db.snapshot().unwrap().scan::<Invoice>().unwrap();
+            panic!(
+                "HORIZON-COLLAPSE SILENT LOSS: after discarding the store, Db::open returned \
+                 Ok with {} rows (expected the corrupt acked frame to refuse by name, exactly \
+                 like the intact-store control above). Discarding the store erased the only \
+                 durable horizon witness, and no breadcrumb protected it.",
+                rows.len()
+            );
+        }
+    }
+}
+
+/// Crash-point sweep: the breadcrumb write must be crash-safe. Seq 0..4 are
+/// durably checkpointed (and breadcrumbed) BEFORE any fault injection begins;
+/// a SECOND checkpoint (seq 5..9) is then interrupted at every possible disk
+/// op via `crash_disk_after`, with `crash_torn: 1.0` so every pending op that
+/// survives the crash survives as a genuine partial (torn) write — including
+/// a torn overwrite of the breadcrumb's target slot. Regardless of exactly
+/// when the crash landed, the FIRST checkpoint's witness (seq 4) must never
+/// be lost: it was durable, breadcrumbed, and barriered before the sweep's
+/// fault injection even started, so the OTHER (untouched) slot always still
+/// holds it even if this checkpoint's slot write was torn mid-flight.
+#[test]
+fn breadcrumb_write_is_crash_safe_the_old_checkpoint_stays_protected() {
+    let crash_cfg = FaultConfig {
+        crash_torn: 1.0,
+        ..FaultConfig::none()
+    };
+    for crash_after in 0..40u64 {
+        let sim = Sim::with_faults(0x0EA5_0002, crash_cfg.clone());
+        let cfg = DbConfig::default();
+        {
+            let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+            for i in 0..5u64 {
+                db.transact(|tx| {
+                    tx.put(&invoice(i, 1, i as i64));
+                    Ok::<_, io::Error>(())
+                })
+                .unwrap();
+            }
+            db.checkpoint().unwrap(); // durable: applied_seq = 4, breadcrumb = 4
+            for i in 5..10u64 {
+                db.transact(|tx| {
+                    tx.put(&invoice(i, 1, i as i64));
+                    Ok::<_, io::Error>(())
+                })
+                .unwrap();
+            }
+            sim.crash_disk_after(crash_after);
+            let _ = db.checkpoint(); // may Err mid-way; only what survives matters
+        }
+        sim.restart();
+
+        // Corrupt WAL frame 0 (at-or-below the OLD horizon of 4 regardless
+        // of whether the second checkpoint advanced it) and force the
+        // vulnerable path by discarding the store outright.
+        let segments = sim.disk().list("wal/").unwrap();
+        let file = sim.disk().open(&segments[0]).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_at(16, &mut byte).unwrap();
+        file.write_at(16, &[byte[0] ^ 0xFF]).unwrap();
+        file.sync().unwrap();
+        sim.disk().remove(&cfg.store_path).unwrap();
+
+        let err = Db::open(Box::new(sim.disk()), cfg, app_schema()).expect_err(&format!(
+            "crash_after={crash_after}: the pre-existing checkpoint at seq 4 must stay \
+             protected regardless of exactly when the SECOND checkpoint's breadcrumb write \
+             was interrupted"
+        ));
+        assert!(
+            err.to_string()
+                .contains("corruption of acknowledged records"),
+            "crash_after={crash_after}: expected the named refusal; got: {err}"
+        );
+    }
+}
+
+/// Legitimate above-horizon torn tails must still cut silently — the
+/// breadcrumb must never turn into a false-positive refusal machine.
+/// Checkpoint pins the breadcrumb at seq 9; seq 10 is committed but never
+/// checkpointed, so it sits strictly ABOVE the horizon. Corrupting it and
+/// discarding the store must still open cleanly, replaying only 0..=9.
+#[test]
+fn torn_tail_above_the_breadcrumb_still_cuts_silently() {
+    let sim = Sim::with_faults(0x0EA5_0003, FaultConfig::none());
+    let cfg = DbConfig::default();
+    {
+        let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+        for i in 0..10u64 {
+            db.transact(|tx| {
+                tx.put(&invoice(i, 1, i as i64));
+                Ok::<_, io::Error>(())
+            })
+            .unwrap();
+        }
+        db.checkpoint().unwrap(); // breadcrumb = 9
+        db.transact(|tx| {
+            tx.put(&invoice(10, 1, 10));
+            Ok::<_, io::Error>(())
+        })
+        .unwrap(); // seq 10, never checkpointed -- strictly above the horizon
+    }
+
+    // Corrupt frame 10's payload (past its header) so it fails verification.
+    let segments = sim.disk().list("wal/").unwrap();
+    let file = sim.disk().open(&segments[0]).unwrap();
+    // Frame layout: 16-byte header + payload, repeated. Frame 10 starts
+    // after ten prior (header + payload)-sized frames of identical shape
+    // (fixed-size Invoice rows), so scan forward by reading frame lengths
+    // rather than hand-computing an offset.
+    let mut offset = 0u64;
+    for _ in 0..10 {
+        let mut len_bytes = [0u8; 4];
+        file.read_at(offset + 8, &mut len_bytes).unwrap();
+        offset += 16 + u32::from_le_bytes(len_bytes) as u64;
+    }
+    let mut byte = [0u8; 1];
+    file.read_at(offset + 16, &mut byte).unwrap();
+    file.write_at(offset + 16, &[byte[0] ^ 0xFF]).unwrap();
+    file.sync().unwrap();
+
+    sim.disk().remove(&cfg.store_path).unwrap();
+    let db = Db::open(Box::new(sim.disk()), cfg, app_schema())
+        .expect("an above-horizon torn tail must still cut silently, breadcrumb or not");
+    let rows = db.snapshot().unwrap().scan::<Invoice>().unwrap();
+    assert_eq!(
+        ids(&rows),
+        (0..10).collect::<Vec<_>>(),
+        "recovery must cut exactly at the corrupt above-horizon frame, keeping 0..=9"
+    );
+}
+
+/// Benign rebuild with a breadcrumb present: a clean, uncorrupted log must
+/// replay in FULL after a store discard, even though the breadcrumb now
+/// feeds a non-`None` horizon into recovery. Proves the new mechanism adds
+/// no false-positive refusal on the ordinary (nothing actually corrupted)
+/// path -- the pre-existing discard/rebuild tests in this file never
+/// exercise the breadcrumb at all, since none of them ever checkpoint.
+#[test]
+fn store_discard_with_a_breadcrumb_and_a_clean_log_replays_everything() {
+    let sim = Sim::with_faults(0x0EA5_0004, FaultConfig::none());
+    let cfg = DbConfig::default();
+    {
+        let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+        for i in 0..10u64 {
+            db.transact(|tx| {
+                tx.put(&invoice(i, 1, i as i64));
+                Ok::<_, io::Error>(())
+            })
+            .unwrap();
+        }
+        db.checkpoint().unwrap(); // breadcrumb = 9
+        for i in 10..15u64 {
+            db.transact(|tx| {
+                tx.put(&invoice(i, 1, i as i64));
+                Ok::<_, io::Error>(())
+            })
+            .unwrap();
+        }
+    }
+
+    sim.disk().remove(&cfg.store_path).unwrap();
+    let db = Db::open(Box::new(sim.disk()), cfg, app_schema())
+        .expect("a clean, uncorrupted log must still rebuild in full");
+    let rows = db.snapshot().unwrap().scan::<Invoice>().unwrap();
+    assert_eq!(
+        ids(&rows),
+        (0..15).collect::<Vec<_>>(),
+        "every row, checkpointed or not, must survive a benign discard-and-rebuild"
+    );
+}
+
+/// `Seeder::finish` writes the breadcrumb too (brief-mandated touch point):
+/// a freshly seeded node is exactly as protected against store discard as
+/// one that reached the same state through ordinary `Db::checkpoint`.
+#[test]
+fn seeder_finish_writes_the_breadcrumb_so_a_reseeded_node_is_protected_too() {
+    let sim = Sim::with_faults(0x0EA5_0005, FaultConfig::none());
+    let cfg = DbConfig::default();
+
+    let mut seeder = Seeder::new(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+    let mut bytes = Vec::new();
+    invoice(1, 1, 100).encode_row(&mut bytes);
+    seeder.rows(Invoice::TABLE, &[(1, bytes)]).unwrap();
+    let mut db = seeder.finish(0, 0, 0, 0).unwrap(); // seeded at applied_seq = 0
+
+    // More traffic on top, then checkpoint again -- breadcrumb advances.
+    db.transact(|tx| {
+        tx.put(&invoice(2, 1, 200));
+        Ok::<_, io::Error>(())
+    })
+    .unwrap();
+    db.checkpoint().unwrap(); // breadcrumb = 1
+    drop(db);
+
+    // Corrupt the one frame in the seeded segment: `Seeder::finish` lays the
+    // segment at base_seq = applied_seq + 1 = 1, so the post-seed
+    // transaction above (seq 1) sits at offset 0 within it.
+    let segments = sim.disk().list("wal/").unwrap();
+    let file = sim.disk().open(&segments[0]).unwrap();
+    let mut byte = [0u8; 1];
+    file.read_at(16, &mut byte).unwrap();
+    file.write_at(16, &[byte[0] ^ 0xFF]).unwrap();
+    file.sync().unwrap();
+    sim.disk().remove(&cfg.store_path).unwrap();
+
+    let err = Db::open(Box::new(sim.disk()), cfg, app_schema()).expect_err(
+        "a seeded-then-checkpointed node must be exactly as protected as an ordinary one",
+    );
+    assert!(
+        err.to_string()
+            .contains("corruption of acknowledged records"),
+        "expected the named refusal; got: {err}"
+    );
+}
+
+/// `Seeder::new` must clear a stale breadcrumb left behind by a PRIOR,
+/// higher-numbered timeline sharing this disk (e.g. a demoted primary being
+/// re-seeded in place) -- otherwise the stale (high) value would survive the
+/// reseed and the read side's `max` would over-claim protection for seqs the
+/// new timeline never actually acknowledged, misfiring the corruption
+/// refusal on an ordinary, legitimate torn tail.
+#[test]
+fn seeder_new_clears_a_stale_breadcrumb_so_reseed_never_over_claims() {
+    let sim = Sim::with_faults(0x0EA5_0006, FaultConfig::none());
+    let cfg = DbConfig::default();
+
+    // Old timeline: push the breadcrumb up to a HIGH value (4).
+    {
+        let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+        for i in 0..5u64 {
+            db.transact(|tx| {
+                tx.put(&invoice(i, 1, i as i64));
+                Ok::<_, io::Error>(())
+            })
+            .unwrap();
+        }
+        db.checkpoint().unwrap(); // stale breadcrumb = 4, if left behind
+    }
+
+    // Reseed the SAME disk at a much LOWER position (0): the old store,
+    // wal/, and (with the fix) the stale breadcrumb are all discarded.
+    let seeder = Seeder::new(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
+    let mut db = seeder.finish(0, 0, 0, 0).unwrap(); // fresh timeline, applied_seq = 0
+
+    // One more, UNCHECKPOINTED transaction: seq 1, strictly above the new
+    // (low) horizon of 0. If the stale breadcrumb (4) had survived, seq 1
+    // would be wrongly treated as at-or-below it and refused as corruption
+    // instead of cut as an ordinary above-horizon torn tail.
+    db.transact(|tx| {
+        tx.put(&invoice(1, 1, 1));
+        Ok::<_, io::Error>(())
+    })
+    .unwrap();
+    drop(db);
+
+    // `Seeder::finish` lays the segment at base_seq = applied_seq + 1 = 1, so
+    // the post-seed transaction above (seq 1) sits at offset 0 within it.
+    let segments = sim.disk().list("wal/").unwrap();
+    let file = sim.disk().open(&segments[0]).unwrap();
+    let mut byte = [0u8; 1];
+    file.read_at(16, &mut byte).unwrap();
+    file.write_at(16, &[byte[0] ^ 0xFF]).unwrap();
+    file.sync().unwrap();
+    sim.disk().remove(&cfg.store_path).unwrap();
+
+    let db = Db::open(Box::new(sim.disk()), cfg, app_schema()).expect(
+        "the stale breadcrumb must not survive Seeder::new -- an ordinary above-horizon torn \
+         tail must still cut silently, not be misfired as corruption",
+    );
+    let rows = db.snapshot().unwrap().scan::<Invoice>().unwrap();
+    assert!(
+        rows.is_empty(),
+        "seq 1 was never checkpointed in the new timeline and must cut silently: {:?}",
+        ids(&rows)
+    );
+}
+
 // ------------------------------------------------------------- repl T3
 
 /// `forbid_writes` gates only effectful `transact`; reads (and effect-free

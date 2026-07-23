@@ -237,6 +237,25 @@ checkpointed store leaves at least one name-durable segment — except a crash i
 recognizes the shape and lays the segment `finish` would have (base = horizon + 1,
 nothing to replay) instead of starting a fresh log at 0 (found by replication T6, seed
 0xcaef83b2feb5edf5).
+A store discard-and-rebuild (§4) used to erase the store's own `applied_seq` *before*
+recovery ran, collapsing the horizon to `None` and reopening the exact hole this rule
+closes — the store WAS the witness, and the rebuild throws it away first, so a corrupt
+frame that was genuinely at-or-below the last checkpoint got cut instead of refused
+(horizon-collapse, `.superpowers/sdd/horizon-collapse-investigation.md`, fixed 2026-07-23).
+A durable horizon breadcrumb outside the store (`<store_path>.horizon`, written and
+barriered by `Db::checkpoint`/`Seeder::finish` strictly *after* the store's own checkpoint
+persists) survives the discard: `Db::open` now feeds `max(store.applied_seq, breadcrumb)`
+into recovery, so a corrupt frame at-or-below a prior checkpoint still refuses by name even
+once the store that recorded it is gone. Two fixed slots hold the breadcrumb (`Disk` has no
+rename), each write targeting the slot holding the smaller/invalid value, so a torn
+overwrite of one slot can never destroy the other's still-valid prior value; the breadcrumb
+is always a lower bound (never over-claims) and degrades silently to no witness at all if
+absent, torn, or CRC-invalid. `Seeder::new` discards any breadcrumb alongside the store and
+WAL it already discards, so a stale breadcrumb from a different, higher-numbered prior
+timeline sharing the disk can never survive a reseed and over-claim protection the new
+timeline never earned. The residual window *above* the last breadcrumbed checkpoint stays
+exactly as unprotected as ordinary above-horizon recovery always has been — Noah-ruled:
+normal-recovery parity, not fail-closed.
 (2) *Held.* `File::sync` does not persist a file's *directory entry*, so a freshly
 rotated-in segment's name (or a store file's, at creation) could vanish on power loss,
 taking acknowledged records with it, or a removed name could resurrect one a recovery
