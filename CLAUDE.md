@@ -428,6 +428,63 @@ do not reorder a milestone's dependency sequence.
   0 Critical/Important (ledgered polish notes: the shared "diverged:" label slightly
   over-claims for the benign laggard; the diverged-family refusals are fragment-pinned,
   not raw-client byte-exact — pre-existing class-wide).
-- Next: M1 sub-project 5 — migrations as log records; then error/introspection polish
-  (`charpente describe`), and the Vörtex-style black-box edge harness for the hyper
-  layer.
+- **M1 sub-project 5 done — migrations as log records (2026-07-19, spec
+  docs/superpowers/specs/2026-07-16-migrations-design.md, 11-task plan rev. 2 in
+  docs/superpowers/plans/2026-07-17-migrations.md, commits b03d644..285c351).** The
+  first implementation plan was REJECTED by a 4-agent adversarial review (dossier
+  .superpowers/sdd/migrations-plan-review.md — replay-decode brick, replace_row
+  old-value decode, fresh-follower breakage, T7 harness defect) and redesigned around
+  three Noah rulings before the rev. 2 plan landed. Shipped: `RowShape` + compile-time
+  version chains (`TableMigration`), `#[table(version = N)]`/`#[row_shape(version =
+  N)]` (macro-emitted assert-impl const forcing the migration impl to exist, plus a
+  structural fingerprint catching a forgotten version bump); the **upgrade barrier**
+  paired with the **role-aware post-replay schema gate** (decode-free below-version
+  WAL replay during recovery — envelope-only classification, row bytes never touched
+  under the wrong version — with the authoritative schema-gate check running
+  afterward on the below-version case, per the T11 fix-wave's spec §2
+  shipped-ordering amendment); the `MigratePut` log-record kind (Effect tag 4,
+  decode-free apply, close-out index rebuild reading only final bytes); the batched
+  resumable `Db::migrate_schema` executor (runs at kernel startup when
+  writes_allowed / at promote — never on an ordinary follower); adoption-at-first-
+  write (a table's `SchemaVersion` row piggybacks on its first data write, same
+  disk-op count, leaving frozen fault schedules undisturbed); and
+  `Hello.schema_digest` on the replication wire, appended without a proto bump,
+  refusing a schema-mismatched peer by name. The error surface: all SEVEN named
+  migration errors are test-pinned (the seventh — the in-flight-target-fingerprint
+  refusal — was added mid-plan by Noah ruling after a T9 interlude found a foreign v2
+  shape could silently resume another binary's migration), plus separately the
+  no-adoption-row corruption-class refusal pinned full-string in `fc3854f`.
+  Interludes: the T5/T6 boundary deviation (T5's gate and T6's first-write adoption
+  turned out mutually load-bearing — T5 alone broke every #[table] app including
+  invoicing — landed together as `575ac9d`+`caf94d7`); the T9 interlude `f1b711e`
+  (two product-level findings fixed: discard-and-rebuild recovery bricking
+  validly-migrated stores under the binary that migrated them, fixed by Candidate
+  B's decode-free replay keep-barrier; the cross-fingerprint in-flight resume
+  refusal above); and T9's third finding — the horizon-collapse silent-loss bug
+  (seed `0x6b436e3ea995cb6f`, a discard-and-rebuild that loses the applied_seq
+  horizon anchor and lets a corrupted first WAL frame silently truncate a whole log
+  to an empty store) — pre-existing since sub-project 1, not migrations-specific,
+  ledgered as the headline follow-up (dossier
+  .superpowers/sdd/horizon-collapse-investigation.md, Noah-ruled 2026-07-19: Design
+  A, a durable horizon breadcrumb, scheduled after T11). T10 proved
+  replicated-migration properties (seeds `0x2EB8_0002`..`0004`): a fresh v2 follower
+  seeds across the gate, a converged v1 follower catches up via shipped MigratePuts
+  only, and promote-mid-migration resumes from the shipped watermark identically to
+  an uninterrupted twin. T11 landed DESIGN §3 + GUIDE §12 (guide compile gate green)
+  and the invoicing add-a-field demo (`501c5c7`, ZERO guide friction — the
+  docs-sufficiency experiment's best outcome, 256-universe sim master seed
+  `0x6041349437974712`), the final whole-branch opus review (READY, 0 Critical over
+  17 commits), followed by the same-day fix wave `285c351` (spec §2
+  shipped-ordering amendment, the close-out guard promoted debug_assert→assert per
+  hard rule 4, a scan_raw_from u64::MAX brick guard + pin, and the plan's
+  six→seven-errors text fix), and the kernel-pin re-verification (worktree-isolated
+  revert-guard proof): outcome PIN-EXERCISES-BUG — pin seed `0x348270b38f166529`
+  still exercises its historical bug post-migrations. Follow-ups ledgered: the
+  horizon-collapse Design A fix (ruled, next up); `Db::poisoned()` reflects only
+  apply-side poison, not redb read-side poison (needs its own investigation); and
+  the final review's accepted minor-triage items.
+- Next: the horizon-collapse Design A fix (Noah-ruled 2026-07-19, dossier
+  .superpowers/sdd/horizon-collapse-investigation.md — durable horizon
+  breadcrumb, RED-first from the dossier's embedded repro); then M1 sub-project
+  6 — error/introspection polish (`charpente describe`) and the Vörtex-style
+  black-box edge harness for the hyper layer.
