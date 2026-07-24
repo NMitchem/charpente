@@ -483,8 +483,40 @@ do not reorder a milestone's dependency sequence.
   horizon-collapse Design A fix (ruled, next up); `Db::poisoned()` reflects only
   apply-side poison, not redb read-side poison (needs its own investigation); and
   the final review's accepted minor-triage items.
-- Next: the horizon-collapse Design A fix (Noah-ruled 2026-07-19, dossier
-  .superpowers/sdd/horizon-collapse-investigation.md — durable horizon
-  breadcrumb, RED-first from the dossier's embedded repro); then M1 sub-project
-  6 — error/introspection polish (`charpente describe`) and the Vörtex-style
-  black-box edge harness for the hyper layer.
+- **Horizon-collapse Design A fix landed (2026-07-24, interlude commits 3c800c3 +
+  d7d7116).** The durable horizon breadcrumb: a two-fixed-slot CRC'd sidecar
+  (`<store>.horizon`) written+barriered at `Db::checkpoint`/`Seeder::finish` strictly
+  after the store's own checkpoint persists; `Db::open` feeds
+  `max(store.applied_seq, breadcrumb)` into recovery, so a store discard-and-rebuild
+  can no longer silently truncate a whole log below a prior checkpoint (seed
+  0x6b436e3ea995cb6f's class now refuses by name). Torn overwrite preserves the prior
+  valid witness (40-crash-point sweep at crash_torn 1.0); `Seeder::new` clears a stale
+  prior-timeline breadcrumb (RED-proven necessary); the residual
+  above-last-checkpoint window stays silent per the ruling (normal-recovery parity);
+  `.horizon` is documented as part of the node's durable restore set (DESIGN §2).
+  Ruled landing order: the realtime flagship oracle first gained retention-gap
+  awareness (3c800c3 — a pre-existing harness race where `sync_ledger` silently
+  orphans a live-delivered id whose events row is retention-GC'd before the scan
+  reaches it, exposed by the breadcrumb's schedule shift at seed 0xbe2f0aa2f20f34c7;
+  the gone-arm confirms received-only ids, with a discriminating meta-test).
+  Evidence: 9/9 final-bytes sweep (fmt, clippy, guide gate, full workspace incl.
+  replication, 4 debug seed replays, both release tripwires, invoicing 1024u master
+  0x25f8da922cb6441b); whole-interlude opus review clean (0 Critical,
+  .superpowers/sdd/interlude-review-e978948-d7d7116.md), its one Important
+  discharged same-day: kernel pin 0x348270b38f166529 revert-guard re-verified
+  PIN-EXERCISES-BUG at d7d7116 (3 historical tests red incl. the pin itself,
+  identical dispatch.rs:158 panic; restored 25/25).
+- **M1 sub-project 6 OPEN (2026-07-24)** — introspection polish + the edge harness.
+  Spec approved (all 8 §6 rulings adopted as recommended, 1f76801) plus 3 Noah-ruled
+  pre-flight amendments (ea7fe4c): the Contract's events section is dropped in v0
+  (event NAMEs are provably unreachable without a macro change — SSE visibility via
+  `stream: true`); an empty-string peer secret becomes a named config error (the
+  ledgered "behaves as None" claim was disproven — `Some("")` admits any peer
+  presenting no proof); the harness vehicle is a committed
+  `examples/invoicing/src/bin/node.rs`. 14-task plan at
+  docs/superpowers/plans/2026-07-24-introspection-edge-harness.md (three phases:
+  describe, error-quality suite, edge harness; adversarial opus plan review gating
+  execution).
+- Next: execute sub-project 6 task-by-task (introspection → error-quality → edge
+  harness; the read-side-poison hunt HALTS for a Noah ruling at its
+  characterization), then the M1-close sweep and M1 COMPLETE.
