@@ -3,6 +3,7 @@
 //! machine-readable contract), `serve` (DESIGN.md §7).
 
 mod ctl;
+mod describe;
 mod sim;
 
 fn main() {
@@ -14,8 +15,9 @@ fn main() {
         (Some("test"), Some("--sim")) => sim::run(&args[2..]),
         (Some("promote"), _) => ctl::run(&args),
         (Some("switchover"), _) => ctl::run(&args),
+        (Some("describe"), _) => describe::run(&args[1..]),
         _ => {
-            eprintln!("{}\n{}", sim::USAGE, ctl::USAGE);
+            eprintln!("{}\n{}\n{}", sim::USAGE, ctl::USAGE, describe::USAGE);
             2
         }
     };
