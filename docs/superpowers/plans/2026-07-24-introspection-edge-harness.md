@@ -351,9 +351,10 @@ fn builtin_flags_mark_exactly_the_platform_tables_jobs_and_cron() {
   `data_dir` at a path that does not exist and assert it still succeeds AND the path
   does not exist afterward.
 - [ ] **Step 2: Run, verify failures.**
-- [ ] **Step 3: Implement** launch.rs. Ambient-IO sites (`temp_dir`, `remove_dir_all`,
-  `std::env::args` if deny-listed, `std::process::exit`) get site-local allows + the
-  rationale comment ("edge entry tooling, outside the deterministic core — DESIGN §1;
+- [ ] **Step 3: Implement** launch.rs. Of the ambient-IO calls, only
+  `std::fs::remove_dir_all` is actually deny-listed (plan review checked clippy.toml —
+  `temp_dir`/`process::exit`/`env::args` are not); that one site gets the site-local
+  allow + the rationale comment ("edge entry tooling, outside the deterministic core — DESIGN §1;
   the ephemeral dir exists so describe can never read or mutate production data").
   `dispatch` returns the exit code; `launch` calls `std::process::exit` only for
   nonzero (Ok(0) falls through to normal return in serve mode's park loop — mirror the
@@ -434,8 +435,14 @@ fn builtin_flags_mark_exactly_the_platform_tables_jobs_and_cron() {
   (exactly how examples/invoicing/tests/sim.rs constructs it), asserts
   `to_json(&app.describe())` equals the full pasted golden (raw string literal), and a
   second construction is byte-identical. Run it RED first with an empty golden, paste
-  the real output, review the paste against invoicing's actual 12 routes / 3 jobs /
-  1 cron / tables, then green.
+  the real output, review the paste against invoicing's actual surface — 12 routes,
+  and EXPECT THE BUILTINS (plan review): 4 jobs (3 app + the builtin-flagged
+  SessionSweep) and 2 cron (the app's daily-overdue-check + the builtin-flagged
+  platform sweep), plus the platform tables — then green.
+- [ ] **Step 1b: CLI↔golden cross-check** — extend T4's cli happy-path test to assert
+  the CLI's json stdout (ephemeral-disk path) equals the SAME golden literal
+  byte-for-byte (comment in each file cross-referencing the other pin) — closing the
+  sim-disk vs ephemeral-disk equivalence claim with an assert instead of an argument.
 - [ ] **Step 2: GUIDE §13** — written AFTER the golden exists so every quoted string is
   sourced from the pinning test (the auth-T9 discipline). Includes the one-line main
   migration, `charpente describe` usage, and the quoted JSON. GUIDE code blocks
@@ -553,11 +560,14 @@ compile_pass/ (trybuild `t.pass(...)`) — regressions that must KEEP compiling:
 
 **The migration:** each of the three local `is_injected` fns is REPLACED by
 `charpente_sim::checks::is_fault_fallout` ONLY IF its substring set is semantically
-identical to the shared one; where a local fn is deliberately narrower or wider (diff
-them first — kernel.rs's variant historically recognized extra latch wording), keep the
-local fn but reimplement its body over `classify` with a rationale comment stating the
-delta. No oracle may get looser: for each file, list old-vs-new recognized sets in the
-task report.
+identical to the shared one; where a local fn is deliberately narrower, keep the local
+fn but reimplement its body over `classify` with a rationale comment stating the
+delta. Plan-review ground truth to expect: transactions.rs:501 and http.rs:1122 are
+NARROWER (3 needles — simulated/injected/durable-horizon, no poison, no latch,
+deliberately) — those become e.g. `matches!(classify(t), Injected | DurableHorizon)`,
+NOT the 5-needle shared bool (wholesale replacement would LOOSEN the oracle);
+kernel.rs:661 is the identical-4-family case and can take the shared fn. No oracle may
+get looser: for each file, list old-vs-new recognized sets in the task report.
 
 **The reword-pinning meta-test (spec §8):** the honest claim is a SINGLE point of
 prose-coupling. Extend the checks.rs fixture so every variant is pinned to its exemplar
@@ -568,9 +578,13 @@ matches "durable horizon" only, and db.rs:1120's compacted-log text contains nei
 needle — it is Unrelated today and workloads handle it separately (replication.rs:3527).
 PIN THAT TRUTH: `classify(<db.rs:1120 text>) == Unrelated`, with a comment naming the
 replication workload's own arm as the handler). Then add the discriminator: a
-DELIBERATE reword of an exemplar (e.g. "WAL was poisoned earlier") must classify
+DELIBERATE reword of an exemplar that shares NO needle with any family (e.g. "the
+write-ahead log was corrupted by an earlier fault" — NOT "WAL was poisoned earlier",
+which still contains "poisoned" and would classify `Poisoned`) must classify
 `Unrelated` — proving a product-text reword now fails HERE, loudly and by name, instead
-of silently reclassifying inside some workload.
+of silently reclassifying inside some workload. Honesty note for the task report and
+the enum's doc: the typed classifier CENTRALIZES substring matching into `classify`;
+it does not eliminate prose-coupling — "a single point of prose-coupling" is the claim.
 
 - [ ] **Step 1:** RED — write the extended fixture + enum tests (enum doesn't exist).
 - [ ] **Step 2:** Implement `classify`; reimplement `is_fault_fallout` over it.
@@ -583,9 +597,10 @@ of silently reclassifying inside some workload.
 ### Task 8: Byte-exact pinning + the empty-peer-secret named config error
 
 **Files:**
-- Modify: `crates/charpente/src/repl/session.rs` (extract the diverged/mismatch format
-  bodies into testable `pub(crate) fn`s where they aren't already — diverged_ahead
-  :621, diverged_crc :635, diverged_behind :651 already are),
+- Modify: `crates/charpente/src/repl/session.rs` (NOTE, plan-review corrected:
+  diverged_ahead :621 / diverged_crc :635 / diverged_behind :651 are PRIVATE fns, not
+  pub(crate) — do not widen their visibility; tests reconstruct expected text with the
+  same format args from scenario-known values),
   `crates/charpente-core/src/engine.rs:144-151` (re-Hello string gains a shared marker
   const), `crates/charpente/src/repl/follower.rs:364` (matches the marker const),
   `crates/charpente/src/repl/mod.rs` (empty-secret refusal at `Repl` construction),
@@ -598,9 +613,16 @@ of silently reclassifying inside some workload.
 **The tightening rule (spec §3.3):** each fragment-pinned string family upgrades to
 `assert_eq!` against the expected text RECONSTRUCTED with the same format arguments the
 test already knows (the auth-401 discipline). Dynamic parts (seqs, CRCs, addrs) come
-from the test's own scenario values. Families in scope, with today's substring sites:
-- diverged_ahead + diverged_crc + diverged_behind (session.rs:621-663; tests
-  replication.rs:1091/:1231/:1480/:1562)
+from the test's own scenario values. **CRC carve-out (plan-review Important #2):** `diverged_ahead` and `diverged_crc`
+embed frame CRCs (session.rs:627, :637-638) the test neither computes nor receives as
+scenario input — these two families STAY fragment-pinned, upgraded to needle +
+known-value asserts (the seqs/base the test does know). Byte-exact applies to:
+diverged_behind, NotPrimary-421, the Hello not-a-primary refusal, protocol-version
+mismatch, role-file mismatch, and the re-Hello engine string. REHELLO_MARKER stays a
+plain `&str` const — not a typed wire variant (ruling 3 holds).
+Families in scope, with today's substring sites:
+- diverged_behind byte-exact; diverged_ahead + diverged_crc needle + known-value
+  (session.rs:621-663; tests replication.rs:1091/:1231/:1480/:1562)
 - NotPrimary 421 body (app.rs:511-517; tests http.rs:243-257, replication.rs:3814-3826)
 - Hello not-a-primary refusal (session.rs:571-577) and protocol-version mismatch
   (session.rs:559-564; test replication.rs:1622-1645)
@@ -609,7 +631,9 @@ from the test's own scenario values. Families in scope, with today's substring s
   byte-exact where they are already deterministically produced (log.rs's has the
   horizon-collapse regressions in charpente/tests/transactions.rs; db.rs's has the
   compacted-log test — find each string's existing deterministic producer and tighten
-  THERE; do not build a new rig for this).
+  THERE; do not build a new rig for this). CAVEAT (plan review): db.rs:1120 embeds the
+  redb open error as `{e}` — byte-exact only if the producer's `{e}` is provably
+  stable; otherwise needle + known-value (base seq), stated in the report.
 NOT in scope: converting any of these to typed WIRE variants (ruling 3 deferred that).
 
 **The re-Hello marker:** production code at follower.rs:364 substring-matches
@@ -660,10 +684,14 @@ an event encode error during tail delivery is whole-node-fatal (`?` chain:
 tail.rs:90-104 → kernel/mod.rs:339-346 → step → run → serve's kernel thread exits). No
 test pins it and no code comment states it. Build the pin exactly the way realtime.rs
 builds its kernels: an SSE subscription whose `SubEntry.encode_json` is a hand-built
-failing fn (construct the `Subscription` directly in the test — `entries: vec![SubEntry
-{ name: "note_added", encode_json: |_| Err(io::Error::other("encode exploded")) }]` —
-no macro change needed), emit a matching event, drive the kernel one step, and assert
-`Kernel::step`/`run` returns `Err` whose text contains "encode exploded". Then the
+failing fn — construct the full `Subscription` in a HAND-WRITTEN SSE route (no
+`#[route]` macro; implement `RouteDef` by hand returning `RouteGlue::Sse(glue)` whose
+glue builds `Subscription { entries: vec![SubEntry { name: "note_added", encode_json:
+|_| Err(io::Error::other("encode exploded")) }], key: None, cursor: None }` — the
+struct has `key`/`cursor` fields, http/mod.rs:200). The kernel `Tail` is private and
+`deliver_unit` is unreachable from an integration test — subscribe via the route,
+emit a matching event, and drive `Kernel::step` until the Tail arm runs; assert
+`step`/`run` returns `Err` whose text contains "encode exploded". Then the
 comment in tail.rs states the contract IN CODE: "an encode error here is deliberately
 whole-node-fatal (bubbles out of Kernel::run) — a tail that cannot render its frames is
 a build bug, not a client condition; the gentler per-tail-drop shape is a ledgered
@@ -674,9 +702,10 @@ stays deferred per spec §5.)
 driving `env!("CARGO_BIN_EXE_charpente")`:
 1. `promote_against_a_dead_port_exits_2_with_the_connect_message` — pick an unused
    loopback port (bind-then-drop to find one), run
-   `charpente promote --node 127.0.0.1:<port>`, assert exit 2 and stderr contains the
-   ctl.rs:184+ connect-failure text ("is the node running with replication configured"
-   — byte-exact against the reconstructed string, addr included).
+   `charpente promote --node 127.0.0.1:<port>`, assert exit 2 and stderr CONTAINS the
+   fragment "is the node running with replication configured" plus the addr (the
+   string at ctl.rs:201 embeds the OS error `{e}`, which varies by platform —
+   `contains`, not byte-exact, per plan review).
 2. `promote_against_a_garbage_reply_exits_2` — a std::net::TcpListener test stub
    (site-local allow + rationale: test drives the real CLI over loopback, the
    established serve.rs-test pattern) that accepts, writes `b"not a frame"`, closes;
@@ -817,13 +846,20 @@ scenario-script path in the message. This is the wire-level successor to the M0 
 acked-durability property (demo-app spec :135's deferral, discharged here).
 
 **The meta-test (spec §4.6 — the rig must have teeth):** the committed patch makes the
-kernel's request arm respond BEFORE the transaction commits, plus a 100ms sleep between
-ack and commit so a kill-after-ack reliably lands in the window (the patch is the WRONG
-build; the sleep is its sanctioned exaggeration, exactly like the WRONG-commit c0dbcea
-demo). Generate it by: `git worktree add` a throwaway at HEAD, hand-apply the
-two-line change in `crates/charpente/src/kernel/mod.rs`'s request arm (respond → sleep
-→ transact instead of transact → respond), `git diff > patches/wrong-ack-before-commit.patch`,
-remove the worktree. The meta-test:
+kernel's request arm ack BEFORE the write is even ATTEMPTED (plan-review Important #1:
+the transaction runs inside `handle_or_subscribe` at app.rs:412 — there is no
+"transact → respond" pair in the kernel arm to reorder, and an ack-before-*fsync*
+variant would survive kill -9 via the page cache, i.e. a toothless meta-test). The
+wrong build: in the `Ready::Request` arm of `crates/charpente/src/kernel/mod.rs`,
+inject a synthetic `Response { status: 200, … }` via the arm's reply channel BEFORE
+calling `handle_or_subscribe`, `std::thread::sleep(100ms)`, then run
+`let _ = self.app.handle_or_subscribe(…)` and discard its real response — the ack
+precedes the write ATTEMPT, so a kill in the window loses the write entirely (nothing
+in the page cache to recover). The oracle keys on status + client-chosen id, so the
+synthetic 200 is sufficient. (The sleep is the WRONG build's sanctioned exaggeration,
+exactly like the WRONG-commit c0dbcea demo.) Generate it by: `git worktree add` a
+throwaway at HEAD, hand-apply that injection,
+`git diff > patches/wrong-ack-before-commit.patch`, remove the worktree. The meta-test:
 1. `git worktree add <scratch> HEAD` + `git apply patches/wrong-ack-before-commit.patch`
    + build invoicing's node bin there (release);
 2. run the SAME oracle scenario with kill-on-ack forced every round against the wrong
@@ -865,6 +901,9 @@ proxy-observed ship-ack barrier: after each POST, wait until the follower's
 the zero-loss assertion is over converged ids, and the (acked − converged) tail is
 asserted ≤ the in-flight window and REPORTED in the scenario (this mirrors property
 8's converged-follower premise; a converged id missing after promote is the failure).
+**Anti-vacuity (plan-review Important #3):** assert `converged.len() >= 40` (of the
+50 writes) BEFORE the promote/zero-loss assertion — an empty or near-empty converged
+set must fail the oracle, never pass it (property-8 promised-nonempty parity).
 
 **Oracle 3 (automates the realtime demo-of-record):** one node; an SSE tail on
 `/events/feed` (invoicing's stream); generate events (finalize invoices / record
@@ -919,8 +958,10 @@ deterministic edge regression here; kernel-indicting → sim seed first (§4.4).
 **Hunt 3 — ctl against a real (or absent, or misbehaving) node end-to-end + the
 `CtrlSwitchover` secret arm.** With two live nodes from the T12 rig: `charpente
 switchover --primary <p> --to <f> --secret wrong` → exit 1 with the peer-secret
-refusal (byte-exact, the T8/auth-T7 pinned text — this closes the ledgered
-"CtrlSwitchover secret arm untested end-to-end"); with the right secret → exit 0 and
+refusal — byte-exact against a HARDCODED copy of the expected string in the edge test
+(`PEER_SECRET_REFUSAL` is pub(crate) at session.rs:512, not importable from the
+edge-harness crate; the hardcoded copy is itself a pin, its comment says so). This
+closes the ledgered "CtrlSwitchover secret arm untested end-to-end"; with the right secret → exit 0 and
 the handoff completes (write gate flips, old primary 421s naming the new).
 
 - [ ] **Step 1:** Hunt 1 sim characterization test (RED-first against the CLAIM if the
