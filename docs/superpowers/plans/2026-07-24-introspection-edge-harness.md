@@ -420,7 +420,7 @@ fn builtin_flags_mark_exactly_the_platform_tables_jobs_and_cron() {
 ### Task 5: Phase A docs + the invoicing golden
 
 **Files:**
-- Modify: `docs/DESIGN.md` (§7 — replace the describe promise with the shipped
+- Modify: `DESIGN.md` (repo root; §7 — replace the describe promise with the shipped
   mechanism: Contract via runtime registry walk, launch entry, CLI verb, ephemeral
   disk, the no-events-in-v0 note), `docs/GUIDE.md` (new §13 "describe — the machine-
   readable contract": launch migration recipe, the CLI verb, and the invoicing JSON
@@ -936,7 +936,7 @@ the handoff completes (write gate flips, old primary 421s naming the new).
 ### Task 14: Close-out — docs, doc hygiene, the sweep, M1 CLOSE
 
 **Files:**
-- Modify: `docs/DESIGN.md` (§7 edge-harness paragraph: what the rig proves, the §4.4
+- Modify: `DESIGN.md` (repo root; §7 edge-harness paragraph: what the rig proves, the §4.4
   honesty contract, where it lives; the §1 same-step wording fix — spec §5 doc-hygiene
   bullet), the replication spec's stale `fault:conn-drop` token
   (docs/superpowers/specs/2026-07-08-replication-design.md §4 — correct it to the

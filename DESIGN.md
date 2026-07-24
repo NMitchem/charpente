@@ -253,9 +253,12 @@ is always a lower bound (never over-claims) and degrades silently to no witness 
 absent, torn, or CRC-invalid. `Seeder::new` discards any breadcrumb alongside the store and
 WAL it already discards, so a stale breadcrumb from a different, higher-numbered prior
 timeline sharing the disk can never survive a reseed and over-claim protection the new
-timeline never earned. The residual window *above* the last breadcrumbed checkpoint stays
-exactly as unprotected as ordinary above-horizon recovery always has been — Noah-ruled:
-normal-recovery parity, not fail-closed.
+timeline never earned. The `.horizon` sidecar is part of the node's durable set: any
+manual file-level restore of `store` + `wal/` must copy it or delete it alongside them —
+a leftover sidecar from the node's prior life would over-claim and refuse (by name, never
+silently) a legitimate torn tail above the restored horizon. The residual window *above*
+the last breadcrumbed checkpoint stays exactly as unprotected as ordinary above-horizon
+recovery always has been — Noah-ruled: normal-recovery parity, not fail-closed.
 (2) *Held.* `File::sync` does not persist a file's *directory entry*, so a freshly
 rotated-in segment's name (or a store file's, at creation) could vanish on power loss,
 taking acknowledged records with it, or a removed name could resurrect one a recovery
