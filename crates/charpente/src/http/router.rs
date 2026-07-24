@@ -115,6 +115,13 @@ impl Router {
         }
     }
 
+    /// Describe-only reach: every mounted route, in registration order.
+    /// Never used by request matching itself (`find` walks `self.routes`
+    /// directly).
+    pub(crate) fn routes(&self) -> &[Route] {
+        &self.routes
+    }
+
     pub fn find(&self, method: Method, path: &str) -> RouteMatch<'_> {
         let Some(rest) = path.strip_prefix('/') else {
             return RouteMatch::PathNotFound;

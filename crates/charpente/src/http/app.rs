@@ -268,6 +268,31 @@ impl App {
         &self.config
     }
 
+    /// Describe-only reach: the mounted router, for `describe::Contract`'s
+    /// route walk. Never used by request handling itself.
+    pub(crate) fn router(&self) -> &Router {
+        &self.router
+    }
+
+    /// Describe-only reach: the registered job descriptors, in registration
+    /// order. Never used by request handling itself.
+    pub(crate) fn job_defs(&self) -> &[JobDef] {
+        &self.job_defs
+    }
+
+    /// Describe-only reach: the registered cron schedules, in registration
+    /// order. Never used by request handling itself.
+    pub(crate) fn cron_entries(&self) -> &[CronEntry] {
+        &self.cron_entries
+    }
+
+    /// Describe-only reach: whether `App::with_oidc` mounted a verifier.
+    /// Never used by request handling itself (that reads `self.oidc`
+    /// directly, for the `Arc` clone).
+    pub(crate) fn oidc_mounted(&self) -> bool {
+        self.oidc.is_some()
+    }
+
     pub(crate) fn db_mut(&mut self) -> &mut Db {
         self.db
             .as_mut()

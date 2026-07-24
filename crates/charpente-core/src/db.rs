@@ -1605,16 +1605,23 @@ impl Db {
         schema
             .tables
             .iter()
-            .map(|(&name, ops)| TableDescription {
-                name,
-                version: ops.version,
-                fingerprint: ops.fingerprint,
-                index_names: ops.index_names.clone(),
-                migrations: schema
+            .map(|(&name, ops)| {
+                let mut migrations: Vec<(u32, u32)> = schema
                     .migrations_for(name)
                     .iter()
                     .map(|s| (s.from_version, s.to_version))
-                    .collect(),
+                    .collect();
+                // Contract determinism beats registration order: ascending
+                // by from_version regardless of the order `.migration()`
+                // calls registered them in.
+                migrations.sort_by_key(|&(from, _)| from);
+                TableDescription {
+                    name,
+                    version: ops.version,
+                    fingerprint: ops.fingerprint,
+                    index_names: ops.index_names.clone(),
+                    migrations,
+                }
             })
             .collect()
     }

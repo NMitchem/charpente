@@ -123,4 +123,10 @@ fn describe_tables_reports_name_version_fingerprint_indexes_and_migrations() {
     assert_eq!(names, sorted, "describe_tables must be sorted-name ordered");
     assert!(names.contains(&"charpente.jobs"));
     assert!(names.contains(&"charpente.events"));
+
+    // A platform table with no indexes and no migrations reports empty
+    // Vecs, not some other absent-data encoding.
+    let jobs = tables.iter().find(|t| t.name == "charpente.jobs").unwrap();
+    assert_eq!(jobs.index_names, Vec::<&str>::new());
+    assert_eq!(jobs.migrations, vec![]);
 }

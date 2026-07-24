@@ -16,6 +16,7 @@ pub use charpente_macros::{event, job, route, row_shape, table};
 pub use serde;
 
 pub mod auth;
+pub mod describe;
 pub mod http;
 pub mod kernel;
 pub mod prod;
