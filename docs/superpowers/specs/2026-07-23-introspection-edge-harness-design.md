@@ -119,7 +119,8 @@ Contract {
   } ],
   jobs: [ JobInfo { name, retry: RetryInfo, builtin: bool } ],
   cron: [ CronInfo { name, interval_nanos: u64 } ],
-  events: [ EventInfo { name } ],  // see 1.4 — enumeration source is a ruling
+  // events: DROPPED in v0 (2026-07-24 amendment, §1.4) — SSE streams are
+  // visible via routes[].stream; the enumeration mechanism stays deferred.
   config: ConfigInfo {             // the operationally-load-bearing knobs, flattened
     body_cap, session_ttl,
     retain_segments, checkpoint_every, event_retention, migration_batch_size,
@@ -145,6 +146,13 @@ full emit-side event catalog (every `#[event]` type, whether or not an SSE route
 it) requires either a new `events![]` registry or a macro change to stamp `E::NAME` onto
 the `Route` — see ruling 6. TS codegen, which would consume the full catalog, stays a
 non-goal (§7).
+
+**Amended 2026-07-24 (plan pre-flight, Noah-ruled):** exploration proved event NAMEs are
+unreachable even for an SSE route without a macro change — `Subscription::of::<Ev>()`
+captures names only when the handler *runs*, inside a live transaction; the "distinct set
+of event NAMEs reachable through those routes" wording above was unbuildable as written.
+v0 ships **no `events` section at all**: SSE streams stay visible via `stream: true` on
+each route, and the full enumeration mechanism stays deferred per ruling 6.
 
 ### 1.5 Telemetry
 
@@ -260,6 +268,13 @@ sim — it does not replace it.
 - **Target: the stock invoicing release binary** (built via `cargo build --release`,
   unmodified — the same artifact `charpente serve`/`serve_replicated` produces). Real
   process, real hyper edge, real TCP.
+  **Amended 2026-07-24 (plan pre-flight, Noah-ruled):** invoicing's default `main`
+  hardcodes its addr/data-dir and never calls `serve_replicated`, so the rig's vehicle
+  is a second **committed** invoicing binary — `examples/invoicing/src/bin/node.rs`,
+  taking `--addr/--data-dir/--repl-listen/--role/--primary/--secret` over the same
+  `build_app` + `serve`/`serve_replicated`/`backup` paths. Still a stock repo artifact
+  built unmodified at harness time; the platform is untouched (extending
+  `charpente::launch`'s serve surface is the ledgered alternative).
 - **Network faults: a TCP proxy** the harness owns, sitting between the client and the
   app's listen port (and between replication peers for the failover oracle). It drops,
   delays, and partitions whole connections — the Vörtex model. Fault granularity is
@@ -358,7 +373,12 @@ Every named follow-up from the research (item 8), sorted. No silent drops.
 - *ctl connect-refusal + malformed-reply tests* → §4.5 (edge harness drives them end-to-
   end); the cheap deterministic cases can also land as `charpente-cli` unit tests in §3.
 - *`CtrlSwitchover` secret arm untested end-to-end* → §4.5 (edge harness). *`Some("")`
-  behaves as `None`* → a deterministic normalization test in §3 (cheap, no rig needed).
+  peer secret* — **amended 2026-07-24 (Noah-ruled):** exploration disproved the ledgered
+  "behaves as `None`" claim: `Some("")` takes the configured branch and admits any peer
+  presenting no proof (near-None inbound, while the operator believes auth is on). Lands
+  here as a **named config error** — an empty-string `peer_secret` is refused loudly
+  where `ReplConfig` is consumed, and `--secret` with an empty value is a CLI usage
+  error; both pinned by deterministic tests.
 - *serve.rs hardening #25* → §4.5 (the harness is the vehicle; actual hardening fixes land
   as findings with reproductions per 4.4).
 - *`Db::poisoned()` read-side gap* → §4.5 (named first hunt).
