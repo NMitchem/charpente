@@ -124,6 +124,9 @@ struct TableOps {
     rebuild_indexes: fn(&mut Writer<'_>) -> io::Result<()>,
     version: u32,
     fingerprint: Option<u64>,
+    // `IndexDef<R>` is generic per-`Row`, so no `&'static [&'static str]` of
+    // names exists to borrow — projected once at registration time instead.
+    index_names: Vec<&'static str>,
 }
 
 fn apply_put<R: Row>(w: &mut Writer<'_>, row: &[u8]) -> io::Result<()> {
@@ -136,6 +139,18 @@ fn apply_delete<R: Row>(w: &mut Writer<'_>, id: u64) -> io::Result<()> {
 
 fn rebuild_indexes<R: Row>(w: &mut Writer<'_>) -> io::Result<()> {
     w.rebuild_indexes_for::<R>()
+}
+
+/// One registered table's introspectable identity — the describe walk's raw
+/// material (spec §1.3). Read-only; constructed only by `Db::describe_tables`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableDescription {
+    pub name: &'static str,
+    pub version: u32,
+    pub fingerprint: Option<u64>,
+    pub index_names: Vec<&'static str>,
+    /// Registered migration steps as (from_version, to_version), ascending.
+    pub migrations: Vec<(u32, u32)>,
 }
 
 /// The set of tables a `Db` can replay log records into. Every `#[table]`
@@ -161,6 +176,7 @@ impl Schema {
                 rebuild_indexes: rebuild_indexes::<R>,
                 version: R::VERSION,
                 fingerprint: R::FINGERPRINT,
+                index_names: R::INDEXES.iter().map(|d| d.name).collect(),
             },
         );
         assert!(
@@ -1579,6 +1595,28 @@ impl Db {
     /// so this is the only reach to that walk order.
     pub fn table_names(&self) -> Vec<&'static str> {
         self.engine.machine().schema.table_names()
+    }
+
+    /// Every registered table in schema (sorted-name) order — the describe
+    /// walk (spec §1). Like `table_names`, this is a read of registry state
+    /// only; it never touches rows.
+    pub fn describe_tables(&self) -> Vec<TableDescription> {
+        let schema = &self.engine.machine().schema;
+        schema
+            .tables
+            .iter()
+            .map(|(&name, ops)| TableDescription {
+                name,
+                version: ops.version,
+                fingerprint: ops.fingerprint,
+                index_names: ops.index_names.clone(),
+                migrations: schema
+                    .migrations_for(name)
+                    .iter()
+                    .map(|s| (s.from_version, s.to_version))
+                    .collect(),
+            })
+            .collect()
     }
 
     /// One aggregate over every versioned table's `(name, version,
