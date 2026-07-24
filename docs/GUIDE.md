@@ -9,7 +9,8 @@ testing — writing `tests/sim.rs`, running `charpente test --sim`, and
 replaying a failure's seed. Section 9 is an error index: look up the
 message you're staring at. Section 10 covers replication; section 11
 covers realtime SSE subscriptions; section 12 covers migrations —
-evolving a `#[table]` row's shape safely.)*
+evolving a `#[table]` row's shape safely; section 13 covers `describe` —
+the machine-readable contract of a mounted app.)*
 
 ## 1. Project setup
 
@@ -3014,3 +3015,401 @@ tail a differently-versioned binary cannot prove is safe to decode.
 `Row::FINGERPRINT` defaults to `None`, and a table whose row type is `None`-fingerprinted
 is invisible to the gate — writing `Row` by hand instead of using `#[table]` silently
 opts that table out of drift protection. Use `#[table]`.
+
+## 13. describe — the machine-readable contract
+
+`charpente describe` renders the full shape of a mounted `App` — every table (with its
+version, structural fingerprint, indexes, and migration chain), every route (method,
+pattern, name, whether it requires auth, whether it's an SSE stream), every job (name,
+retry policy), every cron entry (name, interval), and the app's config — as one JSON (or
+human-readable) document. It is a pure walk of the app's own registries (DESIGN §7): no
+disk writes beyond the ephemeral describe run itself, no socket, no kernel loop. This is
+the "what exists" query an agent would otherwise burn context reconstructing by reading
+every `#[table]`/`#[route]`/`#[job]` item across the crate by hand.
+
+There are two ways to ask for it: from inside the app binary itself (`charpente::launch`,
+below), or from the outside without running the app at all (`charpente describe`, the CLI
+verb, further below).
+
+### The one-line main: `charpente::launch`
+
+`charpente::launch(addr, data_dir, build)` replaces a hand-rolled `fn main` that calls
+`App::open` and `charpente::serve::serve` directly (§5, §7). It owns argv dispatch: no
+verb serves the app exactly as before; `describe [--format json|human]` renders the
+contract to stdout and exits, without ever touching `data_dir`. `build` is the same
+`fn(Box<dyn Disk>, Box<dyn Entropy>) -> io::Result<App>` shape used everywhere else an
+app hands its construction over to the platform (sim tests, the CLI verb below) — the
+one function this migration asks you to factor `fn main`'s body into.
+
+```rust
+use charpente::core::io::{Disk, Entropy};
+use charpente::core::table::Id;
+use charpente::http::{ApiError, App, AppConfig};
+use charpente::{Schema, Tx, View, route, routes, table};
+use serde::Deserialize;
+
+#[table]
+struct Note {
+    id: Id<Note>,
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct NoteBody {
+    text: String,
+}
+
+#[route(POST "/notes/:id")]
+fn create_note(tx: &mut Tx, id: u64, body: NoteBody) -> Result<u64, ApiError> {
+    tx.put(&Note {
+        id: Id::from_raw(id),
+        text: body.text,
+    });
+    Ok(id)
+}
+
+fn build_app(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> std::io::Result<App> {
+    Ok(App::open(disk, Schema::new().table::<Note>(), entropy, AppConfig::default())?
+        .mount(routes![create_note]))
+}
+
+fn main() -> std::io::Result<()> {
+    charpente::launch("0.0.0.0:8080", "./data", build_app)
+}
+```
+
+That's the whole migration: no verb still serves on `"0.0.0.0:8080"` against `./data`
+exactly as a hand-rolled `main` would; `myapp describe` and `myapp describe --format json`
+are new, for free. An unrecognized verb or a bad `--format` value exits 2 with a pinned
+usage message:
+
+```text
+usage: <app> [describe [--format json|human]]  — no verb serves the app
+```
+
+### `charpente describe` — the CLI verb
+
+The CLI verb builds and runs any app crate's binary from the outside — no code changes to
+the app required, not even the `launch` migration above (it works against any binary that
+calls `charpente::launch`, which is what makes it a description of the app rather than
+something the app has to expose over HTTP itself):
+
+```text
+usage: charpente describe [--dir PATH] [--format json|human] [--bin NAME]
+       --dir PATH   the app crate directory to build and describe (default: .)
+       --bin NAME   which binary to describe when the crate has several (default: the sole binary, else the one named like the package)
+```
+
+```bash
+charpente describe --dir ./myapp --format json
+```
+
+`--dir` defaults to the current directory. `charpente describe` runs `cargo build` in
+that directory, picks its one binary target (or the one matching `--bin`, or the one
+named like the package when several exist and none is named), and execs it with
+`describe --format <F>` — the exact same argv path `charpente::launch` handles above.
+Cargo's own errors (a missing `Cargo.toml`, a build failure) are forwarded verbatim,
+never wrapped in a framework message.
+
+### The invoicing contract
+
+The full JSON `examples/invoicing` renders — 12 routes across customers, invoices, and
+API keys; 4 jobs (3 of the app's own plus the platform's built-in session sweep); 2 cron
+entries (the app's daily overdue-check plus the platform's built-in session sweep
+schedule); 13 tables (7 of the app's own plus 6 platform tables: `Session`, `ApiKey`,
+`CronRow`, and the three untyped internal tables backing jobs, events, and schema
+versions). Every `"builtin": true` entry above is a table, job, or cron entry the
+platform itself registers, not app code — this is how an agent tells its own surface
+apart from the platform's without memorizing a list:
+
+```json
+{
+  "charpente_version": "0.0.0",
+  "tables": [
+    {
+      "name": "ApiKey",
+      "version": 1,
+      "fingerprint": 11308777448940268015,
+      "indexes": [
+        "key_hash"
+      ],
+      "migrations": [],
+      "builtin": true
+    },
+    {
+      "name": "AppClock",
+      "version": 1,
+      "fingerprint": 1422665991556096363,
+      "indexes": [],
+      "migrations": [],
+      "builtin": false
+    },
+    {
+      "name": "CronRow",
+      "version": 1,
+      "fingerprint": 13750309978683829658,
+      "indexes": [
+        "name"
+      ],
+      "migrations": [],
+      "builtin": true
+    },
+    {
+      "name": "Customer",
+      "version": 1,
+      "fingerprint": 12205929389820576530,
+      "indexes": [],
+      "migrations": [],
+      "builtin": false
+    },
+    {
+      "name": "IdCounter",
+      "version": 1,
+      "fingerprint": 17814272651750401892,
+      "indexes": [],
+      "migrations": [],
+      "builtin": false
+    },
+    {
+      "name": "Invoice",
+      "version": 2,
+      "fingerprint": 16282652804679416816,
+      "indexes": [
+        "customer"
+      ],
+      "migrations": [
+        {
+          "from": 1,
+          "to": 2
+        }
+      ],
+      "builtin": false
+    },
+    {
+      "name": "LineItem",
+      "version": 1,
+      "fingerprint": 261905951631396626,
+      "indexes": [
+        "invoice"
+      ],
+      "migrations": [],
+      "builtin": false
+    },
+    {
+      "name": "Receipt",
+      "version": 1,
+      "fingerprint": 18357282543607550790,
+      "indexes": [
+        "invoice"
+      ],
+      "migrations": [],
+      "builtin": false
+    },
+    {
+      "name": "Reminder",
+      "version": 1,
+      "fingerprint": 13477227825039761833,
+      "indexes": [
+        "invoice"
+      ],
+      "migrations": [],
+      "builtin": false
+    },
+    {
+      "name": "Session",
+      "version": 1,
+      "fingerprint": 11676348087434866846,
+      "indexes": [
+        "token_hash"
+      ],
+      "migrations": [],
+      "builtin": true
+    },
+    {
+      "name": "charpente.events",
+      "version": 1,
+      "fingerprint": null,
+      "indexes": [],
+      "migrations": [],
+      "builtin": true
+    },
+    {
+      "name": "charpente.jobs",
+      "version": 1,
+      "fingerprint": null,
+      "indexes": [],
+      "migrations": [],
+      "builtin": true
+    },
+    {
+      "name": "charpente.schema_versions",
+      "version": 1,
+      "fingerprint": null,
+      "indexes": [],
+      "migrations": [],
+      "builtin": true
+    }
+  ],
+  "routes": [
+    {
+      "method": "POST",
+      "pattern": "/login",
+      "name": "login",
+      "auth": false,
+      "stream": false
+    },
+    {
+      "method": "POST",
+      "pattern": "/customers/:id",
+      "name": "create_customer",
+      "auth": true,
+      "stream": false
+    },
+    {
+      "method": "GET",
+      "pattern": "/customers/:id",
+      "name": "get_customer",
+      "auth": true,
+      "stream": false
+    },
+    {
+      "method": "GET",
+      "pattern": "/customers",
+      "name": "list_customers",
+      "auth": true,
+      "stream": false
+    },
+    {
+      "method": "POST",
+      "pattern": "/invoices/:id",
+      "name": "create_invoice",
+      "auth": true,
+      "stream": false
+    },
+    {
+      "method": "GET",
+      "pattern": "/invoices/:id",
+      "name": "get_invoice",
+      "auth": true,
+      "stream": false
+    },
+    {
+      "method": "GET",
+      "pattern": "/invoices",
+      "name": "list_invoices",
+      "auth": true,
+      "stream": false
+    },
+    {
+      "method": "POST",
+      "pattern": "/invoices/:id/finalize",
+      "name": "finalize_invoice",
+      "auth": true,
+      "stream": false
+    },
+    {
+      "method": "POST",
+      "pattern": "/invoices/:id/record-payment",
+      "name": "record_payment",
+      "auth": true,
+      "stream": false
+    },
+    {
+      "method": "GET",
+      "pattern": "/events/feed",
+      "name": "events_feed",
+      "auth": true,
+      "stream": true
+    },
+    {
+      "method": "POST",
+      "pattern": "/keys",
+      "name": "create_key",
+      "auth": true,
+      "stream": false
+    },
+    {
+      "method": "DELETE",
+      "pattern": "/keys/:id",
+      "name": "revoke_key",
+      "auth": true,
+      "stream": false
+    }
+  ],
+  "jobs": [
+    {
+      "name": "SessionSweep",
+      "retry": {
+        "max": 5,
+        "backoff_nanos": 30000000000
+      },
+      "builtin": true
+    },
+    {
+      "name": "SendReceipt",
+      "retry": {
+        "max": 5,
+        "backoff_nanos": 30000000000
+      },
+      "builtin": false
+    },
+    {
+      "name": "SendOverdueReminder",
+      "retry": {
+        "max": 5,
+        "backoff_nanos": 30000000000
+      },
+      "builtin": false
+    },
+    {
+      "name": "AdvanceDay",
+      "retry": {
+        "max": 5,
+        "backoff_nanos": 30000000000
+      },
+      "builtin": false
+    }
+  ],
+  "cron": [
+    {
+      "name": "charpente.session_sweep",
+      "interval_nanos": 86400000000000,
+      "builtin": true
+    },
+    {
+      "name": "daily-overdue-check",
+      "interval_nanos": 86400000000000,
+      "builtin": false
+    }
+  ],
+  "config": {
+    "body_cap": 1048576,
+    "session_ttl": 2592000000000000,
+    "store_path": "tables.redb",
+    "retain_segments": 2,
+    "checkpoint_every": 4096,
+    "event_retention": 65536,
+    "migration_batch_size": 1000,
+    "oidc": false
+  },
+  "telemetry": {}
+}
+```
+
+(`examples/invoicing/tests/describe_golden.rs` pins this exact document — byte-for-byte,
+including field order — and `crates/charpente-cli/tests/describe.rs` cross-checks that
+running `charpente describe --dir examples/invoicing --format json` renders the same
+bytes. `human` format renders the same information as fixed-width lines instead of JSON,
+starting with a `tables:` header.)
+
+### What's not here (yet)
+
+Two honesty notes. First: a `describe` run never touches the app's real data
+directory — it builds and opens the app against a fresh, throwaway temp directory the
+CLI verb (or `launch`, when invoked with the `describe` verb) creates and removes around
+the run, so it is always safe to run against a live server's data dir. Second: emitted
+event *types* are not enumerated here in v0 — `tx.emit`/`tx.emit_keyed` names are compiled
+into each `#[route(SSE …)]` handler's `Subscription`, not registered anywhere an app-wide
+walk could discover ahead of time (spec ruling 6). The only trace of realtime in the
+contract above is `"stream": true` on `events_feed` — the fact that a route serves SSE at
+all, not what it emits. Reading a route's handler is still how you find that out.

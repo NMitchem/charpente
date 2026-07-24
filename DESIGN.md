@@ -703,9 +703,34 @@ slot.
 
 Charpente treats the coding agent as the primary developer persona:
 
-- **Introspection endpoint.** `charpente describe` (and a matching HTTP surface in dev)
-  emits the full machine-readable contract: tables, indexes, routes, jobs, events, config,
-  telemetry — the "what exists" query agents otherwise burn context reconstructing.
+- **Introspection: `charpente describe` (v0, implemented).** `App::describe()` is a pure
+  walk of a mounted app's own registries — no disk writes beyond an ephemeral run's own
+  temp store, no socket, no kernel loop. It returns a `Contract`: tables (name, version,
+  structural fingerprint, indexes, migration chain), routes (method, pattern, name,
+  whether it requires auth, whether it's an SSE stream), jobs (name, retry policy), cron
+  (name, interval), and config, each serialized in registry order (routes/jobs/cron) or
+  sorted-name order (tables — `Db::describe_tables`'s `BTreeMap` walk); field order is
+  part of the pinned shape. A `builtin: bool` on each table/job/cron entry marks the
+  platform's own surface (`Session`, `ApiKey`, the internal job/event/schema-version
+  tables, the session-sweep job and its cron entry) apart from the app's, keyed on each
+  row's own `TABLE`/`NAME` const rather than a typed-in string list. `to_json`/`to_human`
+  render it as pretty JSON or fixed-width text. Two entry points ship it:
+  `charpente::launch(addr, data_dir, build)` is the standard app `fn main` — argv
+  dispatch owned by the platform instead of hand-rolled per app, so `describe` is free
+  the moment an app adopts it (no verb still serves, as a hand-rolled `main` would;
+  `describe [--format json|human]` renders the contract to stdout and exits); `charpente
+  describe [--dir PATH] [--format json|human] [--bin NAME]` is the CLI verb, which builds
+  any app crate from the outside (`cargo build`, picking `--bin` or the crate's sole/
+  package-named binary) and execs it through the same `describe` argv path — no code
+  change required of the app, and Cargo's own build errors (missing `Cargo.toml`, a
+  failing build) are forwarded verbatim rather than wrapped. Both paths build the app
+  against a fresh, throwaway temp directory that is created and removed around the run —
+  never the app's configured `data_dir` — so a describe is always safe to run next to a
+  live server's real data. Event *types* are deliberately not enumerated here in v0:
+  `tx.emit`/`tx.emit_keyed` names are compiled into each `#[route(SSE …)]` handler's
+  `Subscription` at the call site, not registered anywhere an app-wide registry walk
+  could discover ahead of time (ruling 6, sub-project 6 spec) — the contract reports only
+  whether a route streams (`stream: true`), not what it emits.
 - **Errors are prompts.** Compile-time and sim-failure output is structured for machine
   consumption: the exact contract violated, the file/line, the seed and fault schedule for
   sim failures, and the minimal repro command. Error quality is a feature with a test suite.

@@ -24,6 +24,285 @@ const USAGE: &str = "usage: charpente describe [--dir PATH] [--format json|human
        --dir PATH   the app crate directory to build and describe (default: .)\n\
        --bin NAME   which binary to describe when the crate has several (default: the sole binary, else the one named like the package)";
 
+// The SAME literal as examples/invoicing/tests/describe_golden.rs's
+// `GOLDEN` (describe T5 step 1b) — that file's sim-disk construction and
+// this CLI's ephemeral-disk `--dir`/`build`-then-exec path must render
+// byte-identical, so `happy_path_json_exits_zero_and_prints_the_contract`
+// asserts full equality against this copy rather than a substring. Kept in
+// sync by hand: this crate cannot depend on the `invoicing` example crate.
+const GOLDEN: &str = r#"{
+  "charpente_version": "0.0.0",
+  "tables": [
+    {
+      "name": "ApiKey",
+      "version": 1,
+      "fingerprint": 11308777448940268015,
+      "indexes": [
+        "key_hash"
+      ],
+      "migrations": [],
+      "builtin": true
+    },
+    {
+      "name": "AppClock",
+      "version": 1,
+      "fingerprint": 1422665991556096363,
+      "indexes": [],
+      "migrations": [],
+      "builtin": false
+    },
+    {
+      "name": "CronRow",
+      "version": 1,
+      "fingerprint": 13750309978683829658,
+      "indexes": [
+        "name"
+      ],
+      "migrations": [],
+      "builtin": true
+    },
+    {
+      "name": "Customer",
+      "version": 1,
+      "fingerprint": 12205929389820576530,
+      "indexes": [],
+      "migrations": [],
+      "builtin": false
+    },
+    {
+      "name": "IdCounter",
+      "version": 1,
+      "fingerprint": 17814272651750401892,
+      "indexes": [],
+      "migrations": [],
+      "builtin": false
+    },
+    {
+      "name": "Invoice",
+      "version": 2,
+      "fingerprint": 16282652804679416816,
+      "indexes": [
+        "customer"
+      ],
+      "migrations": [
+        {
+          "from": 1,
+          "to": 2
+        }
+      ],
+      "builtin": false
+    },
+    {
+      "name": "LineItem",
+      "version": 1,
+      "fingerprint": 261905951631396626,
+      "indexes": [
+        "invoice"
+      ],
+      "migrations": [],
+      "builtin": false
+    },
+    {
+      "name": "Receipt",
+      "version": 1,
+      "fingerprint": 18357282543607550790,
+      "indexes": [
+        "invoice"
+      ],
+      "migrations": [],
+      "builtin": false
+    },
+    {
+      "name": "Reminder",
+      "version": 1,
+      "fingerprint": 13477227825039761833,
+      "indexes": [
+        "invoice"
+      ],
+      "migrations": [],
+      "builtin": false
+    },
+    {
+      "name": "Session",
+      "version": 1,
+      "fingerprint": 11676348087434866846,
+      "indexes": [
+        "token_hash"
+      ],
+      "migrations": [],
+      "builtin": true
+    },
+    {
+      "name": "charpente.events",
+      "version": 1,
+      "fingerprint": null,
+      "indexes": [],
+      "migrations": [],
+      "builtin": true
+    },
+    {
+      "name": "charpente.jobs",
+      "version": 1,
+      "fingerprint": null,
+      "indexes": [],
+      "migrations": [],
+      "builtin": true
+    },
+    {
+      "name": "charpente.schema_versions",
+      "version": 1,
+      "fingerprint": null,
+      "indexes": [],
+      "migrations": [],
+      "builtin": true
+    }
+  ],
+  "routes": [
+    {
+      "method": "POST",
+      "pattern": "/login",
+      "name": "login",
+      "auth": false,
+      "stream": false
+    },
+    {
+      "method": "POST",
+      "pattern": "/customers/:id",
+      "name": "create_customer",
+      "auth": true,
+      "stream": false
+    },
+    {
+      "method": "GET",
+      "pattern": "/customers/:id",
+      "name": "get_customer",
+      "auth": true,
+      "stream": false
+    },
+    {
+      "method": "GET",
+      "pattern": "/customers",
+      "name": "list_customers",
+      "auth": true,
+      "stream": false
+    },
+    {
+      "method": "POST",
+      "pattern": "/invoices/:id",
+      "name": "create_invoice",
+      "auth": true,
+      "stream": false
+    },
+    {
+      "method": "GET",
+      "pattern": "/invoices/:id",
+      "name": "get_invoice",
+      "auth": true,
+      "stream": false
+    },
+    {
+      "method": "GET",
+      "pattern": "/invoices",
+      "name": "list_invoices",
+      "auth": true,
+      "stream": false
+    },
+    {
+      "method": "POST",
+      "pattern": "/invoices/:id/finalize",
+      "name": "finalize_invoice",
+      "auth": true,
+      "stream": false
+    },
+    {
+      "method": "POST",
+      "pattern": "/invoices/:id/record-payment",
+      "name": "record_payment",
+      "auth": true,
+      "stream": false
+    },
+    {
+      "method": "GET",
+      "pattern": "/events/feed",
+      "name": "events_feed",
+      "auth": true,
+      "stream": true
+    },
+    {
+      "method": "POST",
+      "pattern": "/keys",
+      "name": "create_key",
+      "auth": true,
+      "stream": false
+    },
+    {
+      "method": "DELETE",
+      "pattern": "/keys/:id",
+      "name": "revoke_key",
+      "auth": true,
+      "stream": false
+    }
+  ],
+  "jobs": [
+    {
+      "name": "SessionSweep",
+      "retry": {
+        "max": 5,
+        "backoff_nanos": 30000000000
+      },
+      "builtin": true
+    },
+    {
+      "name": "SendReceipt",
+      "retry": {
+        "max": 5,
+        "backoff_nanos": 30000000000
+      },
+      "builtin": false
+    },
+    {
+      "name": "SendOverdueReminder",
+      "retry": {
+        "max": 5,
+        "backoff_nanos": 30000000000
+      },
+      "builtin": false
+    },
+    {
+      "name": "AdvanceDay",
+      "retry": {
+        "max": 5,
+        "backoff_nanos": 30000000000
+      },
+      "builtin": false
+    }
+  ],
+  "cron": [
+    {
+      "name": "charpente.session_sweep",
+      "interval_nanos": 86400000000000,
+      "builtin": true
+    },
+    {
+      "name": "daily-overdue-check",
+      "interval_nanos": 86400000000000,
+      "builtin": false
+    }
+  ],
+  "config": {
+    "body_cap": 1048576,
+    "session_ttl": 2592000000000000,
+    "store_path": "tables.redb",
+    "retain_segments": 2,
+    "checkpoint_every": 4096,
+    "event_retention": 65536,
+    "migration_batch_size": 1000,
+    "oidc": false
+  },
+  "telemetry": {}
+}
+"#;
+
 #[test]
 fn bad_format_value_exits_two_and_pins_the_error_text() {
     let out = charpente()
@@ -116,6 +395,14 @@ fn happy_path_json_exits_zero_and_prints_the_contract() {
     // The FULL golden pin lives in T5's invoicing test — this survives
     // route additions with only that golden updating.
     assert!(stdout.contains("\"pattern\": \"/events/feed\""), "{stdout}");
+    // Byte-for-byte cross-check (describe T5 step 1b): the CLI's
+    // ephemeral-disk stdout and examples/invoicing/tests/describe_golden.rs's
+    // sim-disk `GOLDEN` are the SAME literal — this closes the sim-disk vs
+    // ephemeral-disk equivalence claim with an assert instead of an
+    // argument. Cross-referenced the other way in that file's `GOLDEN` doc
+    // comment. Duplicated by hand, not shared via `include!`: this crate
+    // cannot depend on the `invoicing` example crate.
+    assert_eq!(stdout, GOLDEN);
 }
 
 #[test]
