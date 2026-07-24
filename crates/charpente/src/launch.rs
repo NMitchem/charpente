@@ -29,7 +29,14 @@ pub fn launch(
     build: impl Fn(Box<dyn Disk>, Box<dyn Entropy>) -> io::Result<App>,
 ) -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match dispatch(&args, addr, data_dir, build, &mut io::stdout().lock())? {
+    match dispatch(
+        &args,
+        addr,
+        data_dir,
+        build,
+        &mut io::stdout().lock(),
+        &mut io::stderr().lock(),
+    )? {
         // Ok(0) falls through to a normal return — the process exits 0
         // naturally. A nonzero code (describe's usage errors) exits the
         // process directly; the `[]` serve arm never reaches this match at
@@ -47,14 +54,18 @@ enum Format {
 
 /// The testable core: parses `args` (argv after the binary name) and
 /// dispatches to serve or describe. `out` is where describe's rendered
-/// contract goes; usage/error text always goes to real stderr (it's not
-/// exercised by tests, per the brief).
+/// contract goes; `err` is where usage/error text goes — a separate
+/// injected writer, mirroring `out`'s own rationale (review fix, describe
+/// T3): every named error string here is product surface (CLAUDE.md hard
+/// rule 5) and must be pinned byte-exact by a test, which needs it captured
+/// the same way `out` is.
 pub(crate) fn dispatch(
     args: &[String],
     addr: &str,
     data_dir: &str,
     build: impl Fn(Box<dyn Disk>, Box<dyn Entropy>) -> io::Result<App>,
     out: &mut dyn io::Write,
+    err: &mut dyn io::Write,
 ) -> io::Result<i32> {
     let Some(verb) = args.first() else {
         let disk = ProdDisk::new(data_dir)?;
@@ -67,7 +78,7 @@ pub(crate) fn dispatch(
     };
 
     if verb != "describe" {
-        eprintln!("error: unknown verb '{verb}'\n\n{LAUNCH_USAGE}");
+        let _ = writeln!(err, "error: unknown verb '{verb}'\n\n{LAUNCH_USAGE}");
         return Ok(2);
     }
 
@@ -77,7 +88,8 @@ pub(crate) fn dispatch(
             "json" => Format::Json,
             "human" => Format::Human,
             other => {
-                eprintln!(
+                let _ = writeln!(
+                    err,
                     "error: --format must be json or human — got '{other}'\n\n{LAUNCH_USAGE}"
                 );
                 return Ok(2);
@@ -86,9 +98,15 @@ pub(crate) fn dispatch(
         // Not one of the two recognized describe shapes (extra args, a bare
         // "--format" with no value, an unrecognized flag, …) — no brief
         // case covers this; it collapses into the same unknown-verb family,
-        // naming the whole invocation rather than just the first token.
+        // naming the whole invocation rather than just the first token. Not
+        // a new string (review fix, describe T3): same "unknown verb"
+        // template as above, just naming the whole invocation.
         _ => {
-            eprintln!("error: unknown verb '{}'\n\n{LAUNCH_USAGE}", args.join(" "));
+            let _ = writeln!(
+                err,
+                "error: unknown verb '{}'\n\n{LAUNCH_USAGE}",
+                args.join(" ")
+            );
             return Ok(2);
         }
     };
@@ -142,22 +160,29 @@ mod tests {
     #[test]
     fn describe_returns_zero_and_prints_the_human_header() {
         let mut out = Vec::new();
+        let mut err = Vec::new();
         let code = dispatch(
             &["describe".to_string()],
             "127.0.0.1:0",
             MISSING_DATA_DIR,
             tiny_app,
             &mut out,
+            &mut err,
         )
         .unwrap();
         assert_eq!(code, 0);
         let text = String::from_utf8(out).unwrap();
         assert!(text.starts_with("tables:\n"), "{text}");
+        assert!(
+            err.is_empty(),
+            "a successful describe must print nothing to stderr"
+        );
     }
 
     #[test]
     fn describe_format_json_prints_a_json_object() {
         let mut out = Vec::new();
+        let mut err = Vec::new();
         let code = dispatch(
             &[
                 "describe".to_string(),
@@ -168,16 +193,25 @@ mod tests {
             MISSING_DATA_DIR,
             tiny_app,
             &mut out,
+            &mut err,
         )
         .unwrap();
         assert_eq!(code, 0);
         let text = String::from_utf8(out).unwrap();
         assert!(text.starts_with('{'), "{text}");
+        assert!(
+            err.is_empty(),
+            "a successful describe must print nothing to stderr"
+        );
     }
 
+    // Byte-exact pins (review fix, describe T3 — plan Global Constraints:
+    // every new named error string is pinned byte-exact by a test in the
+    // same task). `assert_eq!` on the FULL captured stderr, not substrings.
     #[test]
-    fn describe_bad_format_returns_two() {
+    fn describe_bad_format_returns_two_and_pins_the_error_text() {
         let mut out = Vec::new();
+        let mut err = Vec::new();
         let code = dispatch(
             &[
                 "describe".to_string(),
@@ -188,25 +222,74 @@ mod tests {
             MISSING_DATA_DIR,
             tiny_app,
             &mut out,
+            &mut err,
         )
         .unwrap();
         assert_eq!(code, 2);
-        assert!(out.is_empty(), "a rejected format must print nothing");
+        assert!(
+            out.is_empty(),
+            "a rejected format must print nothing to stdout"
+        );
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "error: --format must be json or human — got 'yaml'\n\n\
+             usage: <app> [describe [--format json|human]]  — no verb serves the app\n"
+        );
     }
 
     #[test]
-    fn unknown_verb_returns_two() {
+    fn unknown_verb_returns_two_and_pins_the_error_text() {
         let mut out = Vec::new();
+        let mut err = Vec::new();
         let code = dispatch(
             &["frobnicate".to_string()],
             "127.0.0.1:0",
             MISSING_DATA_DIR,
             tiny_app,
             &mut out,
+            &mut err,
         )
         .unwrap();
         assert_eq!(code, 2);
-        assert!(out.is_empty(), "an unknown verb must print nothing");
+        assert!(
+            out.is_empty(),
+            "an unknown verb must print nothing to stdout"
+        );
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "error: unknown verb 'frobnicate'\n\n\
+             usage: <app> [describe [--format json|human]]  — no verb serves the app\n"
+        );
+    }
+
+    // The malformed-`describe` catch-all (e.g. a bare `--format` with no
+    // value) is not a new string — it reuses the exact "unknown verb"
+    // template above, just naming the whole invocation. Pinned here too
+    // since it costs nothing extra and it flows through an already-pinned
+    // string (review fix, describe T3 — no NEW string introduced).
+    #[test]
+    fn malformed_describe_args_fall_back_to_the_unknown_verb_text() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = dispatch(
+            &["describe".to_string(), "--format".to_string()],
+            "127.0.0.1:0",
+            MISSING_DATA_DIR,
+            tiny_app,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(code, 2);
+        assert!(
+            out.is_empty(),
+            "a malformed describe must print nothing to stdout"
+        );
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "error: unknown verb 'describe --format'\n\n\
+             usage: <app> [describe [--format json|human]]  — no verb serves the app\n"
+        );
     }
 
     // Negative space (load-bearing): describe must never touch `data_dir`,
@@ -228,12 +311,14 @@ mod tests {
         );
 
         let mut out = Vec::new();
+        let mut err = Vec::new();
         let code = dispatch(
             &["describe".to_string()],
             "127.0.0.1:0",
             data_dir.to_str().unwrap(),
             tiny_app,
             &mut out,
+            &mut err,
         )
         .unwrap();
 
