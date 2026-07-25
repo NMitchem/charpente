@@ -1113,14 +1113,19 @@ fn http_state_matches(db: &Db, n: u64) -> Result<(), String> {
     Ok(())
 }
 
-// Two families suffice here (vs kernel.rs's three): this workload breaks and
-// restarts on the FIRST Io error, so no second op ever reaches a poisoned WAL
-// or redb's latched handle — their wordings cannot surface. The reopen-time
-// state checks remain the oracle either way. The WAL's durable-horizon hard
-// error (segment-mgmt T4/T5) is recognized too, for the same reason as
-// transactions.rs/kernel.rs: a legitimate fault-matrix consequence, not a bug.
+// Narrower than the shared 4-family `checks::classify` (vs kernel.rs, which
+// uses it directly): this workload breaks and restarts on the FIRST Io
+// error, so no second op ever reaches a poisoned WAL or redb's latched
+// handle — Poisoned/RedbLatch cannot surface, and recognizing them here
+// would only ever LOOSEN this oracle. The reopen-time state checks remain
+// the oracle either way. Injected and DurableHorizon only (the latter a
+// legitimate fault-matrix consequence, not a bug, same as transactions.rs).
 fn is_injected(text: &str) -> bool {
-    text.contains("simulated") || text.contains("injected") || text.contains("durable horizon")
+    matches!(
+        charpente_sim::checks::classify(text),
+        charpente_sim::checks::FaultReason::Injected
+            | charpente_sim::checks::FaultReason::DurableHorizon
+    )
 }
 
 /// One universe: recover → verify → requests through App::handle (an acked

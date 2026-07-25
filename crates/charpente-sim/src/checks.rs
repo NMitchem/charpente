@@ -5,8 +5,33 @@
 
 use crate::Sim;
 
-/// The recognized fault-fallout families (extracted from the internal
-/// suite, which had hand-rolled this four times):
+/// Why a universe's error text is (or is not) excusable fault fallout — the
+/// typed successor to substring-matching at call sites (spec §3.2). The
+/// prose stays product surface (DESIGN §7); classification keys on the
+/// variant. Centralizing does not eliminate prose-coupling — a reworded
+/// exemplar is still one `classify` body away from silently drifting to
+/// `Unrelated` — but it makes that coupling a SINGLE point instead of four
+/// (this file plus three test-local `is_injected` copies that had
+/// hand-rolled the same substring list), so a reword failure surfaces here,
+/// by name, instead of leaking into whichever workload's oracle saw the text
+/// first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultReason {
+    /// The sim's own injected-fault wordings (write/sync/read/misdirected).
+    Injected,
+    /// Our WAL/engine poison wording.
+    Poisoned,
+    /// redb's latch ("close and re-open the database").
+    RedbLatch,
+    /// The WAL's durable-horizon hard error (corruption of acked records —
+    /// loud by design, not a bug).
+    DurableHorizon,
+    /// Everything else: NOT fallout; fails the universe for adjudication.
+    Unrelated,
+}
+
+/// Classifies `text` (an error's Display/to_string output) into one of the
+/// four recognized fault-fallout families or `Unrelated`:
 ///  1. the sim's own injected-fault wordings — including the `read_error`
 ///     and `misdirected_write` axes (segment-mgmt T5), both of which are
 ///     "injected"/"simulated" too,
@@ -18,15 +43,27 @@ use crate::Sim;
 ///     already-acknowledged frame is a legitimate consequence of the fault
 ///     matrix, surfaced loudly by design — not a bug.
 ///
-/// Anything else is NOT fallout and must fail the universe for adjudication.
-/// Recognizing these cannot mask a real bug so long as the workload's
-/// end-state oracle (e.g. exactly-once on reopen) still runs either way.
+/// Anything else is `Unrelated`: NOT fallout, must fail the universe for
+/// adjudication. Recognizing these cannot mask a real bug so long as the
+/// workload's end-state oracle (e.g. exactly-once on reopen) still runs
+/// either way.
+pub fn classify(text: &str) -> FaultReason {
+    if text.contains("simulated") || text.contains("injected") {
+        FaultReason::Injected
+    } else if text.contains("poisoned") {
+        FaultReason::Poisoned
+    } else if text.contains("close and re-open the database") {
+        FaultReason::RedbLatch
+    } else if text.contains("durable horizon") {
+        FaultReason::DurableHorizon
+    } else {
+        FaultReason::Unrelated
+    }
+}
+
+/// `true` for every recognized family — see `classify`'s doc for the four.
 pub fn is_fault_fallout(text: &str) -> bool {
-    text.contains("simulated")
-        || text.contains("injected")
-        || text.contains("poisoned")
-        || text.contains("close and re-open the database")
-        || text.contains("durable horizon")
+    !matches!(classify(text), FaultReason::Unrelated)
 }
 
 /// True when a durable-corruption fault (`bit_flip` or `misdirected_write`)
@@ -164,6 +201,73 @@ mod tests {
         ] {
             assert!(!is_fault_fallout(real_bug), "must NOT classify: {real_bug}");
         }
+    }
+
+    // ---------------------------------------------------------- classify
+
+    #[test]
+    fn classify_pins_each_family_to_its_exemplar() {
+        use FaultReason::*;
+
+        for injected in [
+            "simulated disk write error (injected fault)",
+            "simulated fsync failure — durability of writes since the last successful sync is unknown",
+            "injected read error",
+        ] {
+            assert_eq!(classify(injected), Injected, "{injected}");
+        }
+        for poisoned in [
+            "WAL poisoned by an earlier IO failure",
+            "engine poisoned: a durable record failed to apply",
+        ] {
+            assert_eq!(classify(poisoned), Poisoned, "{poisoned}");
+        }
+        assert_eq!(
+            classify("Storage error: close and re-open the database"),
+            RedbLatch
+        );
+        assert_eq!(
+            classify(
+                "log frame 3 is invalid but at-or-below the store's durable horizon 7 — this is \
+                 corruption of acknowledged records, not a torn tail, and truncating it would \
+                 silently lose data; restore this node from a replica or backup (DESIGN §2)"
+            ),
+            DurableHorizon
+        );
+        for real_bug in [
+            "row decode: needed 8 bytes for u64, 3 left — schema drift or corruption",
+            "assertion failed: durable.is_some_and(|d| d >= applied)",
+            "exactly-once violated: hits 3, done 2 for key 7",
+        ] {
+            assert_eq!(classify(real_bug), Unrelated, "{real_bug}");
+        }
+
+        // db.rs's compacted-log rebuild refusal (Db::open) shares NO needle
+        // with any family today — it is Unrelated here, and the replication
+        // workload's own arm (tests/replication.rs, matching on "cannot be
+        // rebuilt from the log alone") is its handler, not this classifier.
+        // Pinned so a future needle addition can't silently absorb it here.
+        assert_eq!(
+            classify(
+                "table store cannot open (...) and the log is compacted to seq 3 — the records \
+                 below the store's last checkpoint no longer exist locally, so the store cannot \
+                 be rebuilt from the log alone; restore this node from a replica or backup, or \
+                 widen DbConfig::retain_segments (DESIGN §4)"
+            ),
+            Unrelated
+        );
+
+        // The reword discriminator: a deliberate rewording of the
+        // durable-horizon exemplar sharing NO needle with any recognized
+        // family (contrast "WAL was poisoned earlier", which still contains
+        // "poisoned" and would wrongly classify Poisoned). Proves a
+        // product-text reword now fails HERE, loudly and by name — the one
+        // prose-coupling point — instead of silently reclassifying inside
+        // whichever workload's oracle happened to see the text first.
+        assert_eq!(
+            classify("the write-ahead log was corrupted by an earlier fault"),
+            Unrelated
+        );
     }
 
     // ------------------------------------------- durable_corruption_fired

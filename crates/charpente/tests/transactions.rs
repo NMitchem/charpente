@@ -499,19 +499,20 @@ fn db_matches_model(snap: &Snapshot, n: u64) -> Result<(), String> {
 }
 
 fn is_injected(text: &str) -> bool {
-    // Only the sim's own fault wordings — any Io error (from transact's
-    // commit, or from checkpoint's own gc, which can now poison the WAL too)
-    // breaks and restarts the universe immediately, before a second op could
-    // ever reach an already-poisoned/latched handle, so this workload never
-    // sees the WAL/engine's "poisoned" guard text or redb's "close and
-    // re-open the database" latch — unlike kernel.rs's SUT, which absorbs
-    // request Io into 500s and keeps running. The WAL's durable-horizon hard
-    // error (segment-mgmt T4/T5) is recognized too: bit_flip/
-    // misdirected_write corrupting an already-acknowledged frame below the
-    // checkpoint horizon is a legitimate fault-matrix consequence surfaced
-    // loudly by design, not a bug (and it is permanent — a universe that
+    // Narrower than the shared 4-family `checks::classify`: any Io error
+    // (from transact's commit, or from checkpoint's own gc, which can now
+    // poison the WAL too) breaks and restarts the universe immediately,
+    // before a second op could ever reach an already-poisoned/latched
+    // handle, so this workload never sees Poisoned or RedbLatch — unlike
+    // kernel.rs's SUT, which absorbs request Io into 500s and keeps running.
+    // Recognizing those here would only ever LOOSEN this oracle. Injected
+    // and DurableHorizon only (the latter is permanent — a universe that
     // hits it on recovery retries into the every-attempt-died fallthrough).
-    text.contains("simulated") || text.contains("injected") || text.contains("durable horizon")
+    matches!(
+        charpente_sim::checks::classify(text),
+        charpente_sim::checks::FaultReason::Injected
+            | charpente_sim::checks::FaultReason::DurableHorizon
+    )
 }
 
 /// One universe: recover → verify against the oracle → mixed commits and

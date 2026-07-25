@@ -9,6 +9,13 @@ use charpente_core::io::Entropy;
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::migration::{MigrationError, TableMigration};
 use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, View};
+// This workload's own sequential reads (`exactly_once_holds`'s snapshot/scan
+// calls) can still hit a freshly armed crash mid-check, so all four
+// `checks::classify` families stay reachable here — unlike
+// transactions.rs/http.rs, which break-and-restart on the first Io error and
+// so use a narrower local wrapper. This is the identical-4-family case: the
+// shared classifier is used directly, no local wrapper needed.
+use charpente_sim::checks::is_fault_fallout;
 use charpente_sim::{FaultConfig, Sim};
 
 #[table]
@@ -658,33 +665,6 @@ fn kernel_crash_app(sim: &Sim) -> std::io::Result<App> {
     }))
 }
 
-fn is_injected(text: &str) -> bool {
-    // Recognized fault-fallout families — anything else must fail the
-    // universe for adjudication; the exactly-once check on reopen remains the
-    // oracle either way, so recognizing these can't mask a real bug:
-    //   1. injected/simulated wordings — the sim's own fault-injection sites.
-    //   2. our own poison wordings — the WAL/engine's poisoned-after-a-prior-
-    //      failure guard.
-    //   3. redb's latch — its own internal "already saw an IO error on this
-    //      handle" signal. Before the 2026-07-05 ruling, App::handle absorbed
-    //      a request's TxError::Io into a 500 and the kernel kept serving, so
-    //      a second request against the same already-broken handle could
-    //      surface this text. The request arm now stops the loop the moment
-    //      a request poisons the engine (Db::poisoned()), so within one
-    //      kernel run that path is closed; the text remains reachable from
-    //      this workload's own sequential reads (`exactly_once_holds`'s
-    //      snapshot/scan calls can still hit a freshly armed crash
-    //      mid-check) and stays recognized here for defense in depth.
-    //   4. the WAL's durable-horizon hard error (segment-mgmt T4/T5):
-    //      `bit_flip`/`misdirected_write` corrupting an already-acknowledged
-    //      frame is a legitimate consequence of the fault matrix, not a bug.
-    text.contains("simulated")
-        || text.contains("injected")
-        || text.contains("poisoned")
-        || text.contains("close and re-open the database")
-        || text.contains("durable horizon")
-}
-
 /// The exactly-once invariant: every Done job that writes to `Counter` — both
 /// `CountUp{slot}` and `Flaky{roll}` (Flaky rolls 0/1 can never reach Done;
 /// they fail deterministically and die Dead, so every Done Flaky wrote
@@ -734,7 +714,7 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
         let mut app = match kernel_crash_app(sim) {
             Ok(app) => app,
             Err(e) => {
-                if !is_injected(&e.to_string()) {
+                if !is_fault_fallout(&e.to_string()) {
                     return Err(format!("open failed non-injected: {e}"));
                 }
                 sim.restart();
@@ -749,7 +729,7 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
         match exactly_once_holds(&mut app) {
             Ok(()) => {}
             Err(msg) => {
-                if !is_injected(&msg) {
+                if !is_fault_fallout(&msg) {
                     return Err(msg);
                 }
                 sim.restart();
@@ -782,7 +762,7 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
         }) {
             Ok(()) => {}
             Err(TxError::Io(e)) => {
-                if !is_injected(&e.to_string()) {
+                if !is_fault_fallout(&e.to_string()) {
                     return Err(format!("Flaky pre-enqueue failed non-injected: {e}"));
                 }
                 sim.restart();
@@ -823,7 +803,7 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
             out
         })();
         if let Err(e) = run
-            && !is_injected(&e.to_string())
+            && !is_fault_fallout(&e.to_string())
         {
             return Err(format!("kernel stopped non-injected: {e}"));
         }
@@ -839,13 +819,13 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
             Ok(mut app) => match exactly_once_holds(&mut app) {
                 Ok(()) => return Ok(()),
                 Err(msg) => {
-                    if !is_injected(&msg) {
+                    if !is_fault_fallout(&msg) {
                         return Err(msg);
                     }
                     sim.restart();
                 }
             },
-            Err(e) if is_injected(&e.to_string()) => sim.restart(),
+            Err(e) if is_fault_fallout(&e.to_string()) => sim.restart(),
             Err(e) => return Err(format!("final open failed non-injected: {e}")),
         }
     }
