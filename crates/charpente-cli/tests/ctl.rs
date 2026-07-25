@@ -12,6 +12,7 @@
 //! test's own thread services the listener (accept, recv, send the scripted
 //! reply) while the child runs concurrently, then collects its output.
 
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
 use charpente::core::io::Net;
@@ -180,4 +181,156 @@ fn switchover_prints_the_ctrl_err_message_to_stderr_and_exits_one() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("cannot switch over"), "{stderr}");
+}
+
+/// A dead port (bind-then-drop to find one that was free, then release it):
+/// `net.connect` itself fails, before any framing or reply is involved, so
+/// the CLI's connect-failure message (ctl.rs's `run`, "is the node running
+/// with replication configured...") is what must name the address and exit
+/// 2 -- distinct from the `CtrlErr`/`Refuse` (exit 1) and malformed-reply
+/// (exit 2, but post-connect) paths the other tests here cover.
+#[test]
+fn promote_against_a_dead_port_exits_2_with_the_connect_message() {
+    let net = ProdNet;
+    let dead = net
+        .listen("127.0.0.1:0")
+        .expect("bind an ephemeral loopback port");
+    let addr = dead.local_addr();
+    drop(dead); // release the port -- nothing listens on `addr` from here on
+
+    #[allow(clippy::disallowed_methods)] // edge tooling -- see charpente() above
+    let out = charpente()
+        .args(["promote", "--node", &addr])
+        .output()
+        .expect("run the charpente binary");
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("is the node running with replication configured"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(&addr), "{stderr}");
+}
+
+/// A peer that answers with bytes `decode` cannot parse. Unlike `drive`'s
+/// `ProdNet`/`Msg` round-trip (every other test here), this needs to hand
+/// back framing-valid-but-content-garbage bytes, so the stub speaks plain
+/// `std::net::TcpListener`/`TcpStream` directly rather than the `Net` trait
+/// -- mirroring `charpente/src/serve.rs`'s own test convention of a raw
+/// socket standing in for "the other end of the wire" (that file's
+/// `#![allow(clippy::disallowed_methods, clippy::disallowed_types)]` file
+/// header). Edge-tooling test code: CLAUDE.md hard rule 1 fences the
+/// deterministic core, not a test's own stub peer.
+///
+/// The payload is wrapped in `ProdConn::send`'s own `[len: u32
+/// le][bytes]` framing (prod.rs) rather than sent as bare bytes: bare
+/// `b"not a frame"` gets read as a (huge, bogus) length prefix by that same
+/// framing and the CLI just waits out the 30s timeout instead of ever
+/// calling `decode` -- exercising the timeout path, not the decode-error one
+/// this test targets, and 30x slower to boot.
+#[test]
+fn promote_against_a_garbage_reply_exits_2() {
+    #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral loopback port");
+    #[allow(clippy::disallowed_methods)]
+    let addr = listener.local_addr().expect("local_addr").to_string();
+
+    #[allow(clippy::disallowed_methods)] // edge tooling -- see charpente() above
+    let child = charpente()
+        .args(["promote", "--node", &addr])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the charpente binary");
+
+    #[allow(clippy::disallowed_methods)]
+    let (mut stream, _) = listener.accept().expect("accept the CLI's connection");
+    // Drain the CLI's own CtrlPromote message first -- closing the socket
+    // with unread inbound bytes still buffered turns the FIN into an RST,
+    // which the CLI would see as a connection failure, not a decode error.
+    let mut sent = [0u8; 4096];
+    let _ = stream.read(&mut sent).expect("read the CLI's request");
+    let payload = b"not a frame";
+    let mut framed = Vec::with_capacity(4 + payload.len());
+    framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    framed.extend_from_slice(payload);
+    stream
+        .write_all(&framed)
+        .expect("write the framed garbage reply");
+    drop(stream); // close the connection once the garbage bytes are sent
+
+    let out = child
+        .wait_with_output()
+        .expect("wait for the charpente binary to exit");
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("malformed reply from the node"), "{stderr}");
+}
+
+/// Usage errors never reach the network at all (`ctl::run` returns on
+/// `parse`'s `Err` before `net.connect`): missing `--to`, a valueless
+/// `--secret`, and an explicitly empty `--secret ''` (the 2026-07-24
+/// same-usage-error amendment, unit-tested in ctl.rs's own `#[cfg(test)]`
+/// module) all exit 2 with the usage string, exercised here at the real
+/// binary boundary rather than only through `parse`/`optional_flag`
+/// directly.
+#[test]
+fn switchover_usage_errors_exit_2() {
+    #[allow(clippy::disallowed_methods)] // edge tooling -- see charpente() above
+    let missing_to = charpente()
+        .args(["switchover", "--primary", "127.0.0.1:9000"])
+        .output()
+        .expect("run the charpente binary");
+    assert_eq!(missing_to.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&missing_to.stderr);
+    assert!(stderr.contains("charpente promote"), "{stderr}");
+    assert!(stderr.contains("charpente switchover"), "{stderr}");
+
+    #[allow(clippy::disallowed_methods)] // edge tooling -- see charpente() above
+    let valueless_secret = charpente()
+        .args([
+            "switchover",
+            "--primary",
+            "127.0.0.1:9000",
+            "--to",
+            "127.0.0.1:9001",
+            "--secret",
+        ])
+        .output()
+        .expect("run the charpente binary");
+    assert_eq!(valueless_secret.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&valueless_secret.stderr);
+    assert!(stderr.contains("--secret requires a value"), "{stderr}");
+
+    #[allow(clippy::disallowed_methods)] // edge tooling -- see charpente() above
+    let empty_secret = charpente()
+        .args([
+            "switchover",
+            "--primary",
+            "127.0.0.1:9000",
+            "--to",
+            "127.0.0.1:9001",
+            "--secret",
+            "",
+        ])
+        .output()
+        .expect("run the charpente binary");
+    assert_eq!(empty_secret.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&empty_secret.stderr);
+    assert!(stderr.contains("--secret requires a value"), "{stderr}");
 }

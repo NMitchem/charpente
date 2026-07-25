@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use charpente::event;
-use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, Method, Request, Subscription};
+use charpente::http::{
+    ApiError, App, AppConfig, Ctx, Cursor, Method, Request, Route, RouteDef, RouteGlue, SubEntry,
+    Subscription,
+};
 use charpente::kernel::{Kernel, RecordedResponses, SimSinkHandle, SimSource, SinkHandles, Step};
 use charpente::repl::protocol::{Msg, decode, encode};
 use charpente::repl::role::Role;
@@ -1081,6 +1084,104 @@ fn the_harness_refuses_a_diverged_409_without_durable_corruption() {
         .absorb(&sim, app.db(), &[(409, body)], Some((true, 0)), &sinks)
         .expect_err("the corruption-gated excuse must not fire without durable corruption");
     assert!(err.contains("diverged"), "{err}");
+}
+
+/// The encode-error contract (spec §5): `deliver_unit` (kernel/tail.rs)
+/// bubbles a `SubEntry::encode_json` failure with `?`, which bubbles again at
+/// the `Ready::Tail` call site (kernel/mod.rs) out of `Kernel::step`/`run` —
+/// whole-node-fatal, not a per-tail drop. No `#[route(SSE ...)]` handler can
+/// produce a failing encoder (the macro only emits `Subscription::of::<Ev>()`'s
+/// real, working one), so this subscribes through a HAND-WRITTEN `RouteDef` —
+/// no macro — whose glue builds a `Subscription` with a `SubEntry` closure
+/// that always errors.
+struct FailingFeed;
+
+fn failing_feed_glue(
+    _tx: &mut Tx,
+    _ctx: &Ctx,
+    _captures: &[String],
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    Ok(Subscription {
+        entries: vec![SubEntry {
+            name: "note_added",
+            encode_json: |_: &[u8]| -> io::Result<String> {
+                Err(io::Error::other("encode exploded"))
+            },
+        }],
+        key: None,
+        cursor,
+    })
+}
+
+impl RouteDef for FailingFeed {
+    fn route() -> Route {
+        Route {
+            method: Method::Get,
+            pattern: "/feed-failing",
+            auth: false,
+            name: "FailingFeed",
+            glue: RouteGlue::Sse(failing_feed_glue),
+        }
+    }
+}
+
+#[event]
+struct NoteAdded {
+    n: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct NoteBody {
+    n: u64,
+}
+
+#[route(POST "/note")]
+fn emit_note(tx: &mut Tx, body: NoteBody) -> Result<(), ApiError> {
+    tx.emit(NoteAdded { n: body.n });
+    Ok(())
+}
+
+#[test]
+fn tail_encode_error_is_whole_node_fatal() {
+    let sim = Sim::with_faults(0x2EB2_FA11, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(vec![FailingFeed::route()])
+    .mount(routes![emit_note]);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+
+    let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 10 * SEC);
+    let t = sim.now().as_nanos();
+    source.push_at(t, Request::new(Method::Get, "/feed-failing"));
+    source.push_at(
+        t,
+        Request::new(Method::Post, "/note").json(&NoteBody { n: 1 }),
+    );
+
+    // Step 1: the subscribe registers the tail (no events exist yet, so it is
+    // not ready this step).
+    kernel
+        .step(&mut source)
+        .expect("the subscribe request must not itself fail");
+    // Step 2: the emit request commits the event the tail is waiting for.
+    kernel
+        .step(&mut source)
+        .expect("the emit request must not itself fail");
+    // Step 3: nothing is left in the script, so the only ready source is the
+    // now-behind tail -- deliver_unit's encode_json call fails, and that
+    // failure must bubble all the way out of `step` (`Step` has no `Debug`,
+    // so this can't go through `expect_err`).
+    let err = match kernel.step(&mut source) {
+        Ok(_) => panic!("an encode error must bubble out of Kernel::step, not be absorbed"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("encode exploded"), "{err}");
 }
 
 // ==================================== multi-node: follower tails + failover

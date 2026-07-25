@@ -96,6 +96,11 @@ pub fn deliver_unit(tail: &mut Tail, db: &Db) -> io::Result<bool> {
         let Some(entry) = tail.sub.entries.iter().find(|e| e.name == row.name) else {
             continue;
         };
+        // An encode error here is deliberately whole-node-fatal (bubbles out
+        // of Kernel::run) — a tail that cannot render its frames is a build
+        // bug, not a client condition; the gentler per-tail-drop shape is a
+        // ledgered follow-up, and THIS test is its pin:
+        // realtime.rs::tail_encode_error_is_whole_node_fatal.
         let frame = EventFrame {
             id: row.id.raw(),
             seq: row.seq,
