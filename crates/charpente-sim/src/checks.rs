@@ -47,6 +47,16 @@ pub enum FaultReason {
 /// adjudication. Recognizing these cannot mask a real bug so long as the
 /// workload's end-state oracle (e.g. exactly-once on reopen) still runs
 /// either way.
+///
+/// First-match-wins, and the order is load-bearing: transactions.rs's and
+/// http.rs's narrower `matches!(classify(t), Injected | DurableHorizon)`
+/// wrappers equal their old 3-needle `contains` ORs only because `Injected`
+/// is tested before `Poisoned`/`RedbLatch` — text carrying both an injected
+/// wording and a poison wording must land `Injected`, not `Poisoned`, or
+/// those two call sites would silently start rejecting text they used to
+/// accept. Reordering the arms below is exactly the class of drift this
+/// classifier exists to prevent; see the precedence pin in
+/// `classify_pins_each_family_to_its_exemplar`.
 pub fn classify(text: &str) -> FaultReason {
     if text.contains("simulated") || text.contains("injected") {
         FaultReason::Injected
@@ -226,6 +236,22 @@ mod tests {
             classify("Storage error: close and re-open the database"),
             RedbLatch
         );
+
+        // Precedence pin (review I1): transactions.rs's/http.rs's narrower
+        // `matches!(classify(t), Injected | DurableHorizon)` wrappers equal
+        // their old 3-needle OR only because `Injected` is tested before
+        // `Poisoned`/`RedbLatch` above. A text carrying both an injected AND
+        // a poisoned wording must land `Injected` — is_fault_fallout's own
+        // tests are order-invariant (a union can't see arm order) and every
+        // other exemplar here is single-family, so nothing else in the
+        // workspace would catch an arm reorder that demoted `Injected`.
+        assert_eq!(
+            classify(
+                "simulated disk write error (injected fault) — WAL poisoned by an earlier IO failure"
+            ),
+            Injected
+        );
+
         assert_eq!(
             classify(
                 "log frame 3 is invalid but at-or-below the store's durable horizon 7 — this is \
