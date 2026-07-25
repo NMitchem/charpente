@@ -16,7 +16,15 @@
 //! - **The sim is the reproduction authority.** `charpente-sim` owns every
 //!   claim about power-loss and torn-write durability. This crate never
 //!   substitutes for that — it only extends coverage to real process/wire
-//!   behavior the sim's virtual `Disk`/`Net` can't exercise.
+//!   behavior the sim's virtual `Disk`/`Net` can't exercise. Operatively
+//!   (hard rule 3's promise, extended past the sim's own boundary): a finding
+//!   this rig makes that indicts the kernel or core gets reproduced in the
+//!   sim, with a pinned seed, BEFORE it is fixed — the edge harness finds,
+//!   the sim reproduces. A genuinely edge-only finding (something with no sim
+//!   analogue — a real signal, a real socket close, a real chunked-encoding
+//!   byte) lands a deterministic edge regression test instead. Either way,
+//!   this crate never becomes a place a bug gets "fixed" without a
+//!   reproduction somewhere that can prove it stays fixed.
 //! - **Connection/process fault granularity only.** The faults available
 //!   here are "kill this process", "pause/resume this process", "sever this
 //!   connection", "refuse new connections", "delay forwarded bytes" — never
@@ -30,11 +38,18 @@
 //!   durability against actual media failure or a power outage stays the
 //!   simulator's claim, never this crate's.
 //!
-//! Every test in this crate (and in its `tests/` integration files) is
-//! `#[ignore]`: none of it runs under `cargo test --workspace`'s default
+//! Every test here that touches a process, a socket, or the filesystem is
+//! `#[ignore]`: it does not run under `cargo test --workspace`'s default
 //! pass, since it builds release binaries and drives real processes over
-//! real TCP (seconds, not milliseconds, per test). Run explicitly via
-//! `scripts/edge-harness.sh` or `cargo test -p edge-harness -- --ignored`.
+//! real TCP (seconds, not milliseconds, per test). Run that matrix
+//! explicitly via `scripts/edge-harness.sh` or `cargo test -p edge-harness
+//! -- --ignored`. The zero-IO unit tests — the artifact scan (`find_bins`,
+//! `extract_field`, `wait_addr`) and the wire parsers (`parse_response`,
+//! `as_json_string`, `parse_sse_frame`) — are NOT ignored: they cost
+//! microseconds and guard the code every scenario above them depends on, so
+//! a regression there must fail the ordinary sweep rather than wait for
+//! someone to run the matrix by hand (Noah's ruling, 2026-07-25, narrowing
+//! plan ruling 4's blanket wording).
 
 pub mod child;
 pub mod client;

@@ -108,21 +108,38 @@ impl ChildNode {
     }
 
     /// SIGSTOP, via the `kill` utility — std has no direct signal send
-    /// besides `Child::kill`'s SIGKILL.
+    /// besides `Child::kill`'s SIGKILL. Panics if the signal didn't fire
+    /// (review finding I5): a scenario's whole product is honest oracles, so
+    /// silently recording a fault that never applied — `kill` missing from
+    /// PATH, the pid already gone — is the same defect class as the step-6
+    /// "swallowed injected fault misclassified as unrelated poison" bug.
     pub fn pause(&mut self, scenario: &mut Scenario) {
         let pid = self.child.id();
-        let _ = Command::new("kill")
+        let status = Command::new("kill")
             .args(["-STOP", &pid.to_string()])
-            .status();
+            .status()
+            .expect("the `kill` utility itself failed to run");
+        assert!(
+            status.success(),
+            "pause (SIGSTOP) pid {pid} did not fire ({status}) — refusing to record a fault \
+             that never applied"
+        );
         scenario.record(format!("pause (SIGSTOP) pid {pid}"));
     }
 
-    /// SIGCONT, undoing `pause`.
+    /// SIGCONT, undoing `pause`. Same fired-or-panic guarantee as `pause`
+    /// (review finding I5).
     pub fn resume(&mut self, scenario: &mut Scenario) {
         let pid = self.child.id();
-        let _ = Command::new("kill")
+        let status = Command::new("kill")
             .args(["-CONT", &pid.to_string()])
-            .status();
+            .status()
+            .expect("the `kill` utility itself failed to run");
+        assert!(
+            status.success(),
+            "resume (SIGCONT) pid {pid} did not fire ({status}) — refusing to record a fault \
+             that never applied"
+        );
         scenario.record(format!("resume (SIGCONT) pid {pid}"));
     }
 
@@ -131,15 +148,30 @@ impl ChildNode {
     /// previous process's listen socket can take a moment to release the
     /// address after it dies, and this crate has no dependency to set
     /// `SO_REUSEADDR` itself.
+    ///
+    /// Kills+waits the CURRENT child first (review finding I1) — idempotent
+    /// with a prior `kill9` (std's `Child::kill` short-circuits to `Ok(())`
+    /// once `wait` has recorded a status). Without this, a `restart` not
+    /// preceded by `kill9` can race a successful port-connect probe against a
+    /// still-listening PREVIOUS process: the probe answers instantly, this
+    /// function believes it restarted, and the old process leaks with no
+    /// handle left to kill it. The same class of foreign-listener risk
+    /// (any process squatting on the address, not just our own predecessor)
+    /// is why a successful connect alone still isn't proof — see below.
     pub fn restart(&mut self, scenario: &mut Scenario) -> io::Result<()> {
         let old_pid = self.child.id();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+
         let addr = wait_addr(&self.args)
             .expect("ChildNode always has a waitable address (checked in spawn)");
 
         let mut last_err = None;
         for attempt in 1..=RESTART_ATTEMPTS {
             let mut child = spawn_once(&self.bin, &self.args, &self.stdout_log, &self.stderr_log)?;
-            match wait_for_port_or_exit(&mut child, &addr, RESTART_ATTEMPT_TIMEOUT) {
+            let outcome = wait_for_port_or_exit(&mut child, &addr, RESTART_ATTEMPT_TIMEOUT)
+                .and_then(|()| require_still_running(&mut child, &addr));
+            match outcome {
                 Ok(()) => {
                     let new_pid = child.id();
                     self.child = child;
@@ -157,6 +189,22 @@ impl ChildNode {
             }
         }
         Err(last_err.expect("RESTART_ATTEMPTS >= 1, so a final error is always recorded"))
+    }
+}
+
+/// The port accepting a connection is not proof `child` is the one serving
+/// it — a foreign or still-listening process can answer the same probe
+/// while `child` has already died (e.g. of `EADDRINUSE`). Call this
+/// immediately after a successful `wait_for_port_or_exit` (review finding
+/// I1): requires the freshly spawned child to still be running before
+/// `restart` declares success.
+fn require_still_running(child: &mut Child, addr: &str) -> io::Result<()> {
+    match child.try_wait()? {
+        None => Ok(()),
+        Some(status) => Err(io::Error::other(format!(
+            "node at {addr} accepted a connection but the spawned process had already exited \
+             ({status}) — a foreign or still-listening process is bound to that address"
+        ))),
     }
 }
 
@@ -342,8 +390,55 @@ mod tests {
         );
     }
 
+    // Review finding I1: the port accepting a connection is not proof a
+    // given child is the one serving it — a foreign or still-listening
+    // process can answer while the child has already exited. Proven directly
+    // against `require_still_running` (no timing race: the child is fully
+    // reaped via a real `wait()` before the check runs, unlike driving this
+    // through `restart`'s own retry loop, where a fast-exiting child racing
+    // an already-warm foreign listener made an earlier version of this test
+    // flaky).
     #[test]
     #[ignore]
+    fn require_still_running_detects_an_already_exited_child() {
+        let mut child = Command::new("true").spawn().unwrap();
+        child.wait().unwrap(); // guaranteed fully exited, no race
+        let err = require_still_running(&mut child, "127.0.0.1:0").unwrap_err();
+        assert!(err.to_string().contains("already exited"), "{err}");
+    }
+
+    #[test]
+    #[ignore]
+    fn require_still_running_passes_for_a_live_child() {
+        let mut child = Command::new("sleep").arg("5").spawn().unwrap();
+        require_still_running(&mut child, "127.0.0.1:0").unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // Review finding I5: pause/resume must never record a fault as applied
+    // when the signal didn't actually fire. Kills+reaps the child first so
+    // its pid is gone, then `pause` targeting that same (now-dead) pid must
+    // panic rather than silently recording a successful pause.
+    #[test]
+    #[ignore]
+    #[should_panic(expected = "did not fire")]
+    fn pause_panics_when_the_signal_does_not_fire() {
+        let mut child = Command::new("sleep").arg("60").spawn().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let mut node = ChildNode {
+            child,
+            bin: PathBuf::from("sleep"),
+            args: vec!["60".to_string()],
+            stdout_log: PathBuf::from("/dev/null"),
+            stderr_log: PathBuf::from("/dev/null"),
+        };
+        let mut scenario = Scenario::new(&std::env::temp_dir(), "pause_panic_test").unwrap();
+        node.pause(&mut scenario);
+    }
+
+    #[test]
     fn wait_addr_prefers_addr_over_repl_listen() {
         let args = vec![
             "--repl-listen".to_string(),
@@ -355,21 +450,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn wait_addr_falls_back_to_repl_listen_for_a_backup_node() {
         let args = vec!["--repl-listen".to_string(), "127.0.0.1:3".to_string()];
         assert_eq!(wait_addr(&args), Some("127.0.0.1:3".to_string()));
     }
 
     #[test]
-    #[ignore]
     fn wait_addr_none_when_neither_flag_is_present() {
         let args = vec!["--data-dir".to_string(), "/tmp/x".to_string()];
         assert_eq!(wait_addr(&args), None);
     }
 
     #[test]
-    #[ignore]
     fn extract_field_reads_up_to_the_closing_quote() {
         let line = r#"{"reason":"compiler-artifact","target":{"name":"node"},"executable":"/tmp/target/release/node"}"#;
         assert_eq!(
@@ -380,7 +472,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn find_bins_pairs_name_and_executable_skipping_null() {
         let stdout = concat!(
             "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"node\"},\"executable\":null}\n",
