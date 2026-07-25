@@ -165,6 +165,20 @@ impl Repl {
         cfg: ReplConfig,
         db: &mut Db,
     ) -> io::Result<(Repl, Option<String>)> {
+        // Before any socket/state work (2026-07-24 amendment): `Some("")`
+        // would admit any peer presenting no proof at all — almost never
+        // what a configured secret intends, and easy to reach via an empty
+        // env var or a shell-quoting slip (`--secret ''`). Refused by name
+        // instead of silently behaving like `None`.
+        if cfg.peer_secret.as_deref() == Some("") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ReplConfig.peer_secret is Some(\"\") — an empty peer secret authenticates \
+                 any peer that presents no proof, which is almost never what a configured \
+                 secret intends; set a real secret, or use None to explicitly accept all \
+                 peers (DESIGN §8)",
+            ));
+        }
         let (role, notice) = load_role(&*role_disk, &cfg.initial_role)?;
 
         let pin_floor = Arc::new(Mutex::new(u64::MAX));

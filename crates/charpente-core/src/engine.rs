@@ -24,6 +24,12 @@ pub struct Engine<S: StateMachine> {
     poisoned: bool,
 }
 
+/// The substring `submit_batch`'s out-of-order-seq error names, and
+/// `follower.rs`'s `apply_and_ack` substring-matches to distinguish "drop and
+/// re-Hello" from a genuine `Db` fault/poison. Shared so a reword of one side
+/// cannot silently break the other (error-suite T8).
+pub const REHELLO_MARKER: &str = "re-Hello";
+
 // `Wal` holds a `Box<dyn Disk>`/`Box<dyn File>` and `S` is caller-defined, so
 // neither is `Debug`-bound; this impl exposes only the state that is (used
 // by `Result::unwrap_err` on a `recover` call, e.g. in tests).
@@ -146,7 +152,7 @@ impl<S: StateMachine> Engine<S> {
                     format!(
                         "shipped frame carries seq {seq} but this log expects seq {} — the ship \
                          stream is out of order or from a different timeline; reconnect and \
-                         re-Hello",
+                         {REHELLO_MARKER}",
                         self.wal.next_seq()
                     ),
                 ));

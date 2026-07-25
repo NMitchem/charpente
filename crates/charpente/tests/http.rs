@@ -255,9 +255,14 @@ fn writes_on_a_follower_get_421_naming_the_primary() {
         text: "bye".into(),
     }));
     assert_eq!(resp.status, 421, "{}", body_text(&resp));
-    let body = body_text(&resp);
-    assert!(body.contains("primary-1:9000"), "{body}");
-    assert!(body.contains("follower"), "{body}");
+    // Byte-exact (error-suite T8): reconstructed from app.rs's own format
+    // args (the primary address the test just configured) via the same
+    // `{"error": ...}` envelope decode the auth-401 tests use.
+    assert_eq!(
+        error_text(&resp),
+        "this node is a read-only follower — writes go to the primary at primary-1:9000; retry \
+         there (the request was not committed)"
+    );
 
     // A read route still answers 200 — the write gate never touches reads.
     let get = app.handle(Request::new(Method::Get, "/notes/1"));

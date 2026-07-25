@@ -104,16 +104,19 @@ fn require_flag(args: &[String], name: &str) -> Result<String, String> {
 
 /// Scans `args` for `name`, returning its value when present. Absent
 /// entirely is `Ok(None)` (the flag is optional); present with no following
-/// value is still a usage error, the same as `require_flag`.
+/// value is still a usage error, the same as `require_flag`. An explicitly
+/// EMPTY value (`--secret ''`) takes the same usage-error path (2026-07-24
+/// amendment): it would reach `ReplConfig.peer_secret` as `Some("")`, which
+/// `Repl::open` refuses by name anyway — failing at the usage seam instead
+/// gives the operator the fix immediately, not after a connect round-trip.
 fn optional_flag(args: &[String], name: &str) -> Result<Option<String>, String> {
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         if flag == name {
-            return iter
-                .next()
-                .cloned()
-                .map(Some)
-                .ok_or_else(|| format!("error: {name} requires a value\n\n{USAGE}"));
+            return match iter.next() {
+                Some(value) if !value.is_empty() => Ok(Some(value.clone())),
+                _ => Err(format!("error: {name} requires a value\n\n{USAGE}")),
+            };
         }
     }
     Ok(None)
@@ -318,6 +321,30 @@ mod tests {
         let err = parse(&args(&["promote", "--node", "127.0.0.1:9000", "--secret"])).unwrap_err();
         assert!(err.contains("charpente promote"), "{err}");
         assert!(err.contains("charpente switchover"), "{err}");
+    }
+
+    /// `--secret ''` is a shell-quoting slip away from a valueless `--secret`
+    /// and would otherwise reach `ReplConfig.peer_secret` as `Some("")` — the
+    /// exact shape `Repl::open` refuses by name (2026-07-24 amendment). Caught
+    /// here at the usage seam: same error, same exit 2, byte-exact with the
+    /// valueless case (not just "some usage error").
+    #[test]
+    fn parse_promote_secret_with_an_empty_value_is_the_same_usage_error_as_no_value() {
+        let empty = parse(&args(&[
+            "promote",
+            "--node",
+            "127.0.0.1:9000",
+            "--secret",
+            "",
+        ]))
+        .unwrap_err();
+        let missing =
+            parse(&args(&["promote", "--node", "127.0.0.1:9000", "--secret"])).unwrap_err();
+        assert_eq!(empty, missing);
+        assert_eq!(
+            empty,
+            format!("error: --secret requires a value\n\n{USAGE}")
+        );
     }
 
     #[test]

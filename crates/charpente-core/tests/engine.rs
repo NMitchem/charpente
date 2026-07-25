@@ -16,7 +16,7 @@
 
 use std::io;
 
-use charpente_core::engine::{Engine, StateMachine};
+use charpente_core::engine::{Engine, REHELLO_MARKER, StateMachine};
 use charpente_core::io::Disk;
 use charpente_core::log::{Wal, WalConfig};
 use charpente_sim::{FaultConfig, Sim};
@@ -116,5 +116,34 @@ fn recover_seeds_last_applied_even_when_the_retained_segment_is_empty() {
         engine.last_applied(),
         Some(base - 1),
         "recovery must seed last_applied from the log's floor even with nothing to replay"
+    );
+}
+
+/// Error-suite T8: `follower.rs`'s `apply_and_ack` substring-matches this
+/// exact error to decide "drop and re-Hello" (a seq gap) from a genuine `Db`
+/// fault it must propagate instead. Byte-exact AND asserting `contains(the
+/// shared marker const)` in the same test — a reword of the format string
+/// that drops the marker, or a rename of the const's value on either side,
+/// cannot drift without failing here.
+#[test]
+fn submit_batch_out_of_order_seq_names_the_shared_rehello_marker() {
+    let sim = Sim::with_faults(0xE7E1_0003, FaultConfig::none());
+    let mut engine =
+        Engine::recover(Box::new(sim.disk()), wal_cfg(), Counter::default(), None).unwrap();
+
+    let err = engine
+        .submit_batch(&[(5, vec![1, 2, 3])])
+        .expect_err("a shipped frame at the wrong seq must be a named error");
+    let msg = err.to_string();
+    assert_eq!(
+        msg,
+        format!(
+            "shipped frame carries seq 5 but this log expects seq 0 — the ship stream is out \
+             of order or from a different timeline; reconnect and {REHELLO_MARKER}"
+        )
+    );
+    assert!(
+        msg.contains(REHELLO_MARKER),
+        "the engine string must contain the exact marker follower.rs matches on: {msg}"
     );
 }

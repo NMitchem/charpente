@@ -1088,12 +1088,29 @@ fn diverged_follower_is_refused_by_name() {
     recover_node(&sim, &mut f).unwrap();
     let err = run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET)
         .expect_err("a diverged rejoin must surface as an error, never a merge");
-    for needle in ["diverged", "seq", "crc", "re-seed", "fresh data dir"] {
-        assert!(
-            err.contains(needle),
-            "diverged refusal missing {needle:?}: {err}"
-        );
-    }
+    // Needle + known-value, not byte-exact (error-suite T8's CRC carve-out):
+    // `diverged_ahead` embeds the follower's frame CRC, which this test
+    // neither computes nor receives — but every OTHER format arg is known
+    // (the fork lands at seq p_last_before+1; the primary's last is
+    // unchanged), so the reconstruction covers everything except the two
+    // `{:#010x}` crc values.
+    let pos_seq = p_last_before.expect("the primary has committed records") + 1;
+    let last = p_last_before.expect("the primary has committed records");
+    assert!(
+        err.contains(&format!(
+            "diverged: the follower is ahead at seq {pos_seq} (crc "
+        )),
+        "refusal must name the follower's forked seq {pos_seq}: {err}"
+    );
+    assert!(
+        err.contains(&format!(
+            "but this primary's last durable position is seq {last} (crc n/a) — the follower \
+             holds records this primary never had (or lost), a forked timeline that can never \
+             be merged; re-seed the follower from a fresh data dir (stop it, delete its data \
+             dir, restart to snapshot-seed from this primary)"
+        )),
+        "refusal must name the primary's last durable seq {last} and the fix: {err}"
+    );
     // Nothing was merged: the primary's state is unchanged.
     assert_eq!(
         p.db.as_ref().unwrap().last_applied(),
@@ -1228,17 +1245,25 @@ fn a_seeded_follower_with_zero_frames_refuses_a_lossy_primary() {
     sim.repair("p", "f");
     let err = run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET)
         .expect_err("a seeded follower ahead of a lossy primary must be refused, never re-seeded");
-    for needle in ["diverged", "seq", "crc", "re-seed", "fresh data dir"] {
-        assert!(err.contains(needle), "refusal missing {needle:?}: {err}");
-    }
-    // The refusal names BOTH positions: the follower's frontier and the primary's last.
+    // Needle + known-value, not byte-exact (error-suite T8's CRC carve-out):
+    // `diverged_ahead` embeds a frame CRC this test neither computes nor
+    // receives — every other format arg (the follower's frontier, the
+    // primary's post-cut last) is known, so the reconstruction covers
+    // everything except the two `{:#010x}` crc values.
     assert!(
-        err.contains(&f_frontier.to_string()),
+        err.contains(&format!(
+            "diverged: the follower is ahead at seq {f_frontier} (crc "
+        )),
         "refusal must name the follower's frontier {f_frontier}: {err}"
     );
     assert!(
-        err.contains(&p_last_after.to_string()),
-        "refusal must name the primary's last {p_last_after}: {err}"
+        err.contains(&format!(
+            "but this primary's last durable position is seq {p_last_after} (crc n/a) — the \
+             follower holds records this primary never had (or lost), a forked timeline that \
+             can never be merged; re-seed the follower from a fresh data dir (stop it, delete \
+             its data dir, restart to snapshot-seed from this primary)"
+        )),
+        "refusal must name the primary's last {p_last_after} and the fix: {err}"
     );
     // No wipe: the follower still holds exactly what it seeded.
     assert_eq!(
@@ -1400,6 +1425,27 @@ fn a_seeded_follower_that_advanced_then_lost_its_log_reseeds_not_refused() {
 
 // ------------------------------------------- property: diverged BEHIND (Design B)
 
+/// Reconstructs `session::diverged_behind`'s exact text from scenario-known
+/// values (error-suite T8's byte-exact family — `diverged_behind` embeds no
+/// CRC, so unlike `diverged_ahead`/`diverged_crc` it fully reconstructs).
+/// `session::diverged_behind` stays a private fn (plan-review correction: not
+/// widened to `pub(crate)`), so this is typed out rather than called — typing
+/// it out is what actually pins the text; calling the fn again would just
+/// check it against itself.
+fn expected_diverged_behind(pos_seq: u64, base: u64) -> String {
+    format!(
+        "diverged: the follower holds a proven record at seq {pos_seq}, but this primary has \
+         GC'd every record below its retained base {base} — with no frame at or below seq \
+         {pos_seq} to compare, this primary cannot prove the follower's records are a prefix of \
+         its own timeline, and re-seeding here would silently overwrite whatever the follower \
+         holds; if the follower merely lagged past the retained window, re-seed it deliberately \
+         from a fresh data dir (stop it, delete its data dir, restart to snapshot-seed from this \
+         primary); if instead this primary forked below the follower (recovered past an \
+         above-horizon corruption cut and kept serving), promote the follower and re-seed this \
+         node from it"
+    )
+}
+
 /// The diverged-BEHIND re-seed hole (dossier
 /// `.superpowers/sdd/diverged-behind-investigation.md`, Noah-ruled Design B,
 /// 2026-07-16): a converged follower holding a PROVEN record at seq N
@@ -1477,17 +1523,12 @@ fn a_converged_follower_below_a_forked_primarys_base_is_refused_not_rewound() {
     let err = run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).expect_err(
         "a converged follower below a forked primary's base must be refused, never re-seeded",
     );
-    for needle in ["diverged", "seq", "re-seed", "fresh data dir", "promote"] {
-        assert!(err.contains(needle), "refusal missing {needle:?}: {err}");
-    }
-    // The refusal names BOTH concrete positions: the follower's seq and the base.
-    assert!(
-        err.contains(&n.to_string()),
-        "refusal must name the follower's position {n}: {err}"
-    );
-    assert!(
-        err.contains(&p_base.to_string()),
-        "refusal must name the primary's retained base {p_base}: {err}"
+    // Byte-exact (error-suite T8): `diverged_behind` embeds no CRC, so the
+    // whole surfaced error — the follower's own step() context plus the
+    // refusal text — reconstructs fully from n and p_base.
+    assert_eq!(
+        err,
+        format!("f step: {}", expected_diverged_behind(n, p_base))
     );
     // No wipe: the follower took no seed and its bytes are unchanged.
     assert_eq!(
@@ -1559,16 +1600,12 @@ fn a_same_timeline_laggard_below_the_base_is_refused_not_reseeded() {
     // refused by name, not re-seeded, even though its records are a clean prefix.
     let err = run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET)
         .expect_err("a positioned laggard below the base must be refused, never re-seeded");
-    for needle in ["diverged", "seq", "re-seed", "fresh data dir", "promote"] {
-        assert!(err.contains(needle), "refusal missing {needle:?}: {err}");
-    }
-    assert!(
-        err.contains(&k.to_string()),
-        "refusal must name the follower's position {k}: {err}"
-    );
-    assert!(
-        err.contains(&p_base.to_string()),
-        "refusal must name the primary's retained base {p_base}: {err}"
+    // Byte-exact (error-suite T8): same reconstruction as the forked-behind
+    // twin above — `diverged_behind` cannot tell this benign laggard apart
+    // from that data-losing case, so it is the identical text with k/p_base.
+    assert_eq!(
+        err,
+        format!("f step: {}", expected_diverged_behind(k, p_base))
     );
     // Refused, not re-seeded: no new seed, and f still sits at K (never rewound
     // onto the far-ahead primary).
@@ -1640,12 +1677,20 @@ fn hello_with_a_future_protocol_version_is_refused_naming_both_versions() {
     .unwrap();
     match reply {
         Msg::Refuse { message } => {
-            for needle in ["protocol version", "expected"] {
-                assert!(
-                    message.contains(needle),
-                    "version refusal missing {needle:?}: {message}"
-                );
-            }
+            // Byte-exact (error-suite T8): reconstructed from decide_hello's
+            // own format args — both sides of the mismatch are the test's own
+            // scenario values (PROTO_VERSION and PROTO_VERSION + 1).
+            let proto = charpente::repl::PROTO_VERSION + 1;
+            assert_eq!(
+                message,
+                format!(
+                    "replication protocol version mismatch: this node speaks protocol version \
+                     {}, but the peer's Hello declared version {proto} — upgrade the older \
+                     binary so both speak the expected version {}",
+                    charpente::repl::PROTO_VERSION,
+                    charpente::repl::PROTO_VERSION
+                )
+            );
         }
         other => panic!("expected Refuse, got {other:?}"),
     }
@@ -1672,13 +1717,14 @@ fn hello_to_a_follower_is_refused_naming_the_not_a_primary_state() {
     .unwrap();
     match reply {
         Msg::Refuse { message } => {
-            assert!(
-                message.contains("not a primary"),
-                "missing not-a-primary: {message}"
-            );
-            assert!(
-                message.contains("p:1"),
-                "missing the real primary's address: {message}"
+            // Byte-exact (error-suite T8): reconstructed from decide_hello's
+            // own format args — "p:1" is the follower's configured primary,
+            // named twice by the same binding in the format string.
+            assert_eq!(
+                message,
+                "this node is not a primary (it is a follower of p:1) — replication Hellos \
+                 are served only by the primary, and a follower never feeds another follower \
+                 (no cascading); point the follower at p:1 instead"
             );
         }
         other => panic!("expected Refuse, got {other:?}"),
@@ -1858,6 +1904,42 @@ fn peer_secret_unconfigured_node_accepts_a_followers_unrequired_proof() {
     }
     run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
     assert_converged(&sim, &mut p, &mut f).unwrap();
+}
+
+/// The empty-secret config error (2026-07-24 amendment): `Some("")` would
+/// authenticate any peer presenting no proof at all — almost never what a
+/// configured secret intends — so `Repl::open` refuses it by name, before any
+/// socket/state work, on EITHER role (the check runs before `load_role`
+/// branches on the durable role at all). Two-host sim, deterministic
+/// (`FaultConfig::none()`): a primary config and a follower config each carry
+/// `peer_secret: Some(String::new())` and are refused with the identical text.
+#[test]
+fn empty_peer_secret_is_refused_as_a_named_config_error_on_either_role() {
+    let sim = Sim::with_faults(0x2EB1_00EE, FaultConfig::none());
+    const EXPECTED: &str = "ReplConfig.peer_secret is Some(\"\") — an empty peer secret \
+         authenticates any peer that presents no proof, which is almost never what a \
+         configured secret intends; set a real secret, or use None to explicitly accept all \
+         peers (DESIGN §8)";
+
+    let mut bad_primary = primary_cfg("p:1");
+    bad_primary.peer_secret = Some(String::new());
+    let err = spawn_node(&sim, "p", bad_primary, DbConfig::default())
+        .err()
+        .expect("an empty peer secret must be refused before any socket/state work");
+    assert_eq!(err, format!("p: Repl::open: {EXPECTED}"));
+    // Refused before `load_role`'s first-boot write: no durable role file.
+    assert!(
+        sim.host("p").disk().list("role").unwrap().is_empty(),
+        "the empty-secret refusal must fire before any state is touched"
+    );
+
+    let mut bad_follower = follower_cfg("f:1", "p:1");
+    bad_follower.peer_secret = Some(String::new());
+    let err = spawn_node(&sim, "f", bad_follower, DbConfig::default())
+        .err()
+        .expect("a follower config with an empty secret must be refused too");
+    assert_eq!(err, format!("f: Repl::open: {EXPECTED}"));
+    assert!(sim.host("f").disk().list("role").unwrap().is_empty());
 }
 
 // --------------------------------------------- error-surface pin: empty ship
@@ -3821,10 +3903,13 @@ fn follower_kernel_serves_reads_never_jobs_or_cron() {
     )
     .unwrap();
     assert_eq!(status, 421, "the follower refuses writes");
-    assert!(
-        String::from_utf8_lossy(&body).contains("p:1"),
-        "the 421 names the primary: {}",
-        String::from_utf8_lossy(&body)
+    // Byte-exact (error-suite T8): decode the `{"error": ...}` envelope (the
+    // auth-401 discipline) rather than a raw-bytes `contains`.
+    let decoded: serde_json::Value = serde_json::from_slice(&body).expect("421 body is JSON");
+    assert_eq!(
+        decoded["error"],
+        "this node is a read-only follower — writes go to the primary at p:1; retry there \
+         (the request was not committed)"
     );
 }
 

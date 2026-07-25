@@ -12,6 +12,7 @@
 use std::collections::VecDeque;
 use std::io;
 
+use charpente_core::engine::REHELLO_MARKER;
 use charpente_core::io::{Conn, Net};
 use charpente_core::log::frame_crc;
 
@@ -361,7 +362,7 @@ impl Follower {
             // the ship stream is out of order or from a different timeline —
             // drop and re-Hello, letting the primary resume from our real
             // position. Any other error is a Db fault/poison the node recovers.
-            Err(e) if e.to_string().contains("re-Hello") => {
+            Err(e) if e.to_string().contains(REHELLO_MARKER) => {
                 self.disconnect(now);
                 Ok(())
             }

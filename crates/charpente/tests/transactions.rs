@@ -1112,15 +1112,16 @@ fn unopenable_store_with_compacted_wal_is_a_named_hard_error() {
         .unwrap();
     }
     db.checkpoint().unwrap();
+    let base = sim
+        .disk()
+        .list("wal/")
+        .unwrap()
+        .iter()
+        .map(|n| segment_base(n))
+        .min()
+        .unwrap();
     assert!(
-        sim.disk()
-            .list("wal/")
-            .unwrap()
-            .iter()
-            .map(|n| segment_base(n))
-            .min()
-            .unwrap()
-            > 0,
+        base > 0,
         "setup must actually compact the log before mangling the store"
     );
     // Graceful close: redb durably flushes, so header layout == file length.
@@ -1134,12 +1135,25 @@ fn unopenable_store_with_compacted_wal_is_a_named_hard_error() {
 
     let err = Db::open(Box::new(sim.disk()), cfg, app_schema()).unwrap_err();
     let msg = err.to_string();
-    for needle in ["cannot open", "compacted", "restore", "retain_segments"] {
-        assert!(
-            msg.contains(needle),
-            "error must name the state and the fix: {msg}"
-        );
-    }
+    // Needle + known-value, not byte-exact (error-suite T8): db.rs's `{e}`
+    // embeds redb's own panic-payload text (a literal Rust `assert!` source
+    // string from the fenced page_manager.rs quirk — upstream, version-tied,
+    // not ours to pin). Everything else is a scenario-known format arg (the
+    // compacted base), so it's checked byte-exact around that one opaque
+    // span.
+    assert!(
+        msg.starts_with("table store cannot open ("),
+        "error must open with the named state: {msg}"
+    );
+    assert!(
+        msg.ends_with(&format!(
+            ") and the log is compacted to seq {base} — the records below the store's last \
+             checkpoint no longer exist locally, so the store cannot be rebuilt from the log \
+             alone; restore this node from a replica or backup, or widen \
+             DbConfig::retain_segments (DESIGN §4)"
+        )),
+        "error must name the compacted base {base} and the fix: {msg}"
+    );
 }
 
 // -------------------------------------------------- segment-mgmt T4: horizon
@@ -1169,13 +1183,17 @@ fn db_open_routes_the_store_horizon_into_recovery() {
     file.sync().unwrap();
 
     let err = Db::open(Box::new(sim.disk()), DbConfig::default(), app_schema()).unwrap_err();
-    let msg = err.to_string();
-    for needle in ["invalid", "durable horizon", "acknowledged", "restore"] {
-        assert!(
-            msg.contains(needle),
-            "Db::open must route the store's horizon into recovery, not open with fewer rows: {msg}"
-        );
-    }
+    // Byte-exact (error-suite T8): the corrupted frame is always frame 0 (a
+    // fixed 16-byte header, corrupted within it regardless of payload size),
+    // and the checkpoint above durably pins the horizon at 9 — both format
+    // args are scenario-known, so log.rs's corruption-of-acknowledged-records
+    // string reconstructs in full.
+    assert_eq!(
+        err.to_string(),
+        "log frame 0 is invalid but at-or-below the store's durable horizon 9 — this is \
+         corruption of acknowledged records, not a torn tail, and truncating it would silently \
+         lose data; restore this node from a replica or backup (DESIGN §2)"
+    );
 }
 
 /// The other half of the recovery-horizon rule (T2/T3 review adjudication):
@@ -1333,16 +1351,23 @@ fn store_discard_erases_the_horizon_but_the_breadcrumb_still_refuses_the_corrupt
         file.sync().unwrap();
     }
 
+    // Byte-exact (error-suite T8): the corrupted frame is always frame 0, and
+    // this checkpoint durably pins the horizon at 19 (20 rows, seq 0..19) —
+    // both format args are scenario-known, whether the horizon comes from the
+    // intact store's applied_seq (control) or the breadcrumb (discard, below).
+    const EXPECTED: &str = "log frame 0 is invalid but at-or-below the store's durable horizon \
+         19 — this is corruption of acknowledged records, not a torn tail, and truncating it \
+         would silently lose data; restore this node from a replica or backup (DESIGN §2)";
+
     // Control: store INTACT. applied_seq = 19 is the durable horizon; the
     // corrupt frame 0 is at-or-below it, so recovery refuses by name. This
     // is correct today and must keep passing after the fix.
     let intact_err = Db::open(Box::new(sim.disk()), cfg.clone(), app_schema())
         .expect_err("store intact: corruption of an acked frame must be a hard error");
-    assert!(
-        intact_err
-            .to_string()
-            .contains("corruption of acknowledged records"),
-        "control (store intact) should name the contract; got: {intact_err}"
+    assert_eq!(
+        intact_err.to_string(),
+        EXPECTED,
+        "control (store intact) should name the contract"
     );
 
     // THE BUG: discard the store (the exact proxy the landed discard/
@@ -1353,9 +1378,10 @@ fn store_discard_erases_the_horizon_but_the_breadcrumb_still_refuses_the_corrupt
     sim.disk().remove(&cfg.store_path).unwrap();
     match Db::open(Box::new(sim.disk()), cfg, app_schema()) {
         Err(e) => {
-            assert!(
-                e.to_string().contains("corruption of acknowledged records"),
-                "expected the named corruption-of-acknowledged-records refusal; got: {e}"
+            assert_eq!(
+                e.to_string(),
+                EXPECTED,
+                "expected the named corruption-of-acknowledged-records refusal"
             );
         }
         Ok(db) => {
@@ -1568,10 +1594,14 @@ fn seeder_finish_writes_the_breadcrumb_so_a_reseeded_node_is_protected_too() {
     let err = Db::open(Box::new(sim.disk()), cfg, app_schema()).expect_err(
         "a seeded-then-checkpointed node must be exactly as protected as an ordinary one",
     );
-    assert!(
-        err.to_string()
-            .contains("corruption of acknowledged records"),
-        "expected the named refusal; got: {err}"
+    // Byte-exact (error-suite T8): the corrupted frame is the segment's only
+    // frame, seq 1 (the post-seed commit), and the checkpoint above pins the
+    // breadcrumb at 1 — both format args are scenario-known.
+    assert_eq!(
+        err.to_string(),
+        "log frame 1 is invalid but at-or-below the store's durable horizon 1 — this is \
+         corruption of acknowledged records, not a torn tail, and truncating it would silently \
+         lose data; restore this node from a replica or backup (DESIGN §2)"
     );
 }
 

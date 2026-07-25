@@ -225,12 +225,17 @@ mod tests {
         let (role, notice) = load_role(&disk, &config).unwrap();
         assert_eq!(role, Role::Primary, "the durable role wins over config");
         let notice = notice.expect("a demote mismatch must produce a notice");
-        for needle in ["role file", "config", "re-seed"] {
-            assert!(
-                notice.contains(needle),
-                "notice missing {needle:?}: {notice}"
-            );
-        }
+        // Byte-exact (error-suite T8): reconstructed from `describe`'s own
+        // shape for these two scenario-known roles, not by calling
+        // `mismatch_notice` again (that would just check the function
+        // against itself).
+        assert_eq!(
+            notice,
+            "role file says primary, but config says follower of new-primary:9000 — the \
+             durable role file always wins over config, never the reverse; demoting a primary \
+             requires a fresh data dir (re-seed) — a demoted primary's log may have diverged, \
+             and re-seeding is the only safe rejoin"
+        );
     }
 
     #[test]
@@ -254,10 +259,13 @@ mod tests {
             }
         );
         let notice = notice.expect("a mismatch must produce a notice");
-        assert!(notice.contains("a:9000") && notice.contains("b:9000"));
-        assert!(
-            !notice.contains("re-seed"),
-            "the re-seed clause is scoped to the demote case: {notice}"
+        // Byte-exact (error-suite T8): non-demote mismatches carry no re-seed
+        // clause at all — the reconstruction proves that by its absence, not
+        // just a negative `contains` check.
+        assert_eq!(
+            notice,
+            "role file says backup of a:9000, but config says backup of b:9000 — the durable \
+             role file always wins over config, never the reverse"
         );
     }
 
