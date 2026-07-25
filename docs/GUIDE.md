@@ -544,10 +544,10 @@ call covered in §4.
 ### The `#[route]` argument convention
 
 `#[route(METHOD "/path/:param", ...)]` goes on a free function (`METHOD` is
-one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`; the trailing `, auth` flag is
-optional and covered under Sessions below). The macro checks the function's
-argument list against the path and emits the glue that extracts, decodes,
-and dispatches to it:
+one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `SSE`; the trailing `, auth`
+flag is optional and covered under Sessions below). The macro checks the
+function's argument list against the path and emits the glue that extracts,
+decodes, and dispatches to it:
 
 - The first argument must be named exactly `tx`, typed `&mut Tx`.
 - Then one argument per `:param` in the path, **in path order**, each named
@@ -1074,7 +1074,7 @@ fn get_note(tx: &mut Tx, key: u64) -> Result<String, ApiError> {
 // route path isn't a string literal, or doesn't start with '/', or names
 // an unknown method — each fails at the same macro-argument-parsing step
 // with its own named message (e.g. "route path must start with '/' — got
-// \"notes\"", "unknown method PUSH — one of GET, POST, PUT, PATCH, DELETE").
+// \"notes\"", "unknown method PUSH — one of GET, POST, PUT, PATCH, DELETE, SSE").
 ```
 
 ## 6. Jobs
@@ -2172,7 +2172,7 @@ a #[route] handler's first argument must be `tx: &mut Tx` — `ping` is missing 
 `get_note` takes 0 argument(s) after `tx` (excluding `ctx`) but the path "/notes/:id" has 1 :param(s) — write one argument per :param (same name, path order) plus at most one JSON body argument
 this argument must be named `id` to match :id in "/notes/:id" — got `key`
 route path must start with '/' — got "notes"
-unknown method PUSH — one of GET, POST, PUT, PATCH, DELETE
+unknown method PUSH — one of GET, POST, PUT, PATCH, DELETE, SSE
 the route path must be a string literal — e.g. #[route(GET "/notes/:id")]
 the only route flag is `auth` — write `#[route(GET "/path", auth)]`
 #[route] handlers are free functions — no `self`
@@ -2182,7 +2182,7 @@ write `#[route(METHOD "/path")]` — e.g. #[route(GET "/notes/:id")]
 
 §5's "What `#[route]` rejects" walks through the first three with full
 examples. The rest, in order: the path literal doesn't start with `/`; the
-method name isn't one of `GET`/`POST`/`PUT`/`PATCH`/`DELETE`; the path
+method name isn't one of `GET`/`POST`/`PUT`/`PATCH`/`DELETE`/`SSE`; the path
 isn't a string literal at all (e.g. a `const`); the trailing flag after the
 path isn't `auth`; the handler takes `self` (route handlers are free
 functions); a `:` segment has nothing after it; and the macro's own
