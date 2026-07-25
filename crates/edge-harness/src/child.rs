@@ -160,8 +160,17 @@ impl ChildNode {
     /// is why a successful connect alone still isn't proof — see below.
     pub fn restart(&mut self, scenario: &mut Scenario) -> io::Result<()> {
         let old_pid = self.child.id();
+        let was_running = matches!(self.child.try_wait(), Ok(None));
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if was_running {
+            // The script is this crate's repro artifact: a restart that had
+            // to SIGKILL a live node says so, rather than reading as if the
+            // node had already stopped.
+            scenario.record(format!(
+                "restart: SIGKILLed the still-running pid {old_pid}"
+            ));
+        }
 
         let addr = wait_addr(&self.args)
             .expect("ChildNode always has a waitable address (checked in spawn)");
@@ -405,6 +414,43 @@ mod tests {
         child.wait().unwrap(); // guaranteed fully exited, no race
         let err = require_still_running(&mut child, "127.0.0.1:0").unwrap_err();
         assert!(err.to_string().contains("already exited"), "{err}");
+    }
+
+    // Review finding I1, the other half: `restart` must kill the CURRENT
+    // child before spawning a replacement — a `restart` not preceded by
+    // `kill9` otherwise leaks a still-listening process with no handle left
+    // to kill it. Deterministic (no ports, no timing): `bin` points at a
+    // path that does not exist, so `restart` kills+waits the old child and
+    // then fails on attempt 1's spawn, leaving the old pid provably dead.
+    #[test]
+    #[ignore]
+    fn restart_kills_the_previous_child_before_respawning() {
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let old_pid = child.id();
+        let mut node = ChildNode {
+            child,
+            bin: PathBuf::from("/nonexistent/edge-harness-no-such-binary"),
+            args: vec!["--addr".to_string(), "127.0.0.1:9".to_string()],
+            stdout_log: PathBuf::from("/dev/null"),
+            stderr_log: PathBuf::from("/dev/null"),
+        };
+        let mut scenario = Scenario::new(&std::env::temp_dir(), "restart_kill_first_test").unwrap();
+        node.restart(&mut scenario)
+            .expect_err("a nonexistent bin cannot respawn");
+
+        let alive = Command::new("kill")
+            .args(["-0", &old_pid.to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(
+            !alive,
+            "restart must kill the previous child first (pid {old_pid} still alive)"
+        );
+
+        let dir = scenario.dir().to_path_buf();
+        drop(scenario);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

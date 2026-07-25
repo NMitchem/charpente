@@ -1,5 +1,5 @@
 //! `edge-harness`: the M1 sub-project 6 edge rig (spec docs/superpowers/
-//! specs/2026-07-24-introspection-edge-harness-design.md §4.4). It drives
+//! specs/2026-07-23-introspection-edge-harness-design.md §4.4). It drives
 //! REAL built binaries (`examples/invoicing/src/bin/node.rs`, the `charpente`
 //! CLI) over REAL TCP with process- and connection-level faults, proving
 //! things the simulator's virtual IO cannot: real hyper framing, real

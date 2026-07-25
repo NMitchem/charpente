@@ -23,15 +23,22 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Resolves `addr` and connects with a bound wait — `TcpStream::connect`
 /// alone has no timeout at all (a SYN that never gets ACKed can hang
-/// indefinitely).
+/// indefinitely). Tries every resolved address, as `TcpStream::connect`
+/// does: a name resolving to `::1` first while the node listens on
+/// `127.0.0.1` must still connect, not fail on the first candidate.
 fn connect_with_timeout(addr: &str, timeout: Duration) -> io::Result<TcpStream> {
-    let sockaddr = addr
+    let candidates: Vec<_> = addr
         .to_socket_addrs()
         .map_err(|e| io::Error::other(format!("could not resolve {addr}: {e}")))?
-        .next()
-        .ok_or_else(|| io::Error::other(format!("no addresses resolved for {addr}")))?;
-    TcpStream::connect_timeout(&sockaddr, timeout)
-        .map_err(|e| map_timeout(e, "connect", addr, timeout))
+        .collect();
+    let mut last = None;
+    for sockaddr in candidates {
+        match TcpStream::connect_timeout(&sockaddr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last = Some(map_timeout(e, "connect", addr, timeout)),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::other(format!("no addresses resolved for {addr}"))))
 }
 
 /// Renames a raw socket-timeout error (often just "Resource temporarily
@@ -102,7 +109,7 @@ pub struct SseFrame {
 
 /// A live SSE connection: the still-open reader plus whatever partial frame
 /// bytes have been read but not yet parsed. `poisoned`, once set, means a
-/// prior read timed out mid-chunk (see `next_frame`) and this tail's byte
+/// prior read failed mid-chunk (see `next_frame`) and this tail's byte
 /// stream is desynced — every subsequent call refuses instead of parsing
 /// whatever bytes happen to show up next as a fresh frame (review finding I4).
 pub struct SseTail {
@@ -112,22 +119,26 @@ pub struct SseTail {
 }
 
 impl SseTail {
-    /// Blocks for up to `timeout` for the next complete SSE frame.
-    /// `Ok(None)` means the connection closed cleanly (EOF); `Err` with
+    /// `timeout` bounds each underlying socket read, so a frame arriving in
+    /// several chunks can take longer than `timeout` overall; what the bound
+    /// guarantees is that this call never blocks indefinitely on a silent
+    /// peer. `Ok(None)` means the connection closed cleanly (EOF); `Err` with
     /// `ErrorKind::TimedOut` means no frame arrived within `timeout` — the
     /// two are deliberately distinct (review finding I4): T12's oracles need
     /// "the stream ended" and "it's just quiet" to be different facts (e.g.
     /// a divergence's `charpente.gap` terminal frame vs. an idle heartbeat
     /// gap are not the same thing).
     ///
-    /// A read that times out strictly BETWEEN frames (waiting for a fresh
-    /// chunk's size line, nothing committed yet) is safely retryable. A read
-    /// that times out or otherwise fails AFTER the size line was parsed —
-    /// i.e. partway through the exact-length body/CRLF `read_exact`s — is
-    /// not: `read_exact`'s own contract leaves it unspecified how many bytes
-    /// it actually consumed before failing, so the stream is desynced and
-    /// this tail poisons itself; every later call fails immediately by name
-    /// rather than risking a silent garbage parse.
+    /// A read that fails strictly BETWEEN frames — waiting for a fresh
+    /// chunk's size line with none of it consumed yet — is safely retryable.
+    /// A read that fails once ANY of a chunk has been consumed (a partial
+    /// size line, or partway through the exact-length body/CRLF
+    /// `read_exact`s) is not: those bytes are gone from the stream and
+    /// neither `read_line` nor `read_exact` says how many it took, so the
+    /// stream is desynced and this tail poisons itself; every later call
+    /// fails immediately by name rather than risking a silent garbage parse.
+    /// Timeouts and hard failures (a peer that closes mid-chunk) poison
+    /// alike — a stream cut mid-frame must never later report a clean close.
     pub fn next_frame(&mut self, timeout: Duration) -> io::Result<Option<SseFrame>> {
         if let Some(reason) = &self.poisoned {
             return Err(io::Error::other(format!(
@@ -157,18 +168,23 @@ impl SseTail {
                     ));
                 }
                 Err(ChunkError::Boundary(e)) => return Err(e),
-                Err(ChunkError::MidChunk(e)) if is_timeout(&e) => {
-                    let reason = format!("a read timed out mid-chunk after {timeout:?} ({e})");
+                Err(ChunkError::MidChunk(e)) => {
+                    let kind = if is_timeout(&e) {
+                        io::ErrorKind::TimedOut
+                    } else {
+                        e.kind()
+                    };
+                    let reason =
+                        format!("a read failed mid-chunk under a {timeout:?} deadline ({e})");
                     self.poisoned = Some(reason.clone());
                     return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
+                        kind,
                         format!(
                             "SseTail desynced: {reason} — this tail is now poisoned, reconnect \
                              with Http::sse_tail instead of reading further"
                         ),
                     ));
                 }
-                Err(ChunkError::MidChunk(e)) => return Err(e),
             }
         }
     }
@@ -199,14 +215,14 @@ enum ChunkRead {
     Eof,
 }
 
-/// Distinguishes WHERE in one chunk's three reads (size line, body, CRLF) a
-/// failure landed (review finding I4). `Boundary` — the size-line read
-/// itself failed — is safe to retry in the common case (nothing has been
-/// committed for this chunk yet; the read was simply waiting for the next
-/// one to start). `MidChunk` — the size line already parsed, so the reader
-/// has committed to reading exactly `size + 2` more bytes — is NOT safe:
-/// `read_exact` leaves it unspecified how many of those bytes it actually
-/// consumed before failing, so the stream can no longer be trusted to be
+/// Distinguishes whether a failure inside one chunk's three reads (size
+/// line, body, CRLF) consumed any of the stream (review finding I4).
+/// `Boundary` — the size-line read failed with nothing of it consumed — is
+/// safe to retry: the read was simply waiting for the next chunk to start.
+/// `MidChunk` — anything consumed already, whether a partial size line or
+/// part of the `size + 2` bytes the reader has committed to — is NOT safe:
+/// neither `read_line` nor `read_exact` reports how many bytes it took
+/// before failing, so the stream can no longer be trusted to be
 /// chunk-aligned.
 enum ChunkError {
     Boundary(io::Error),
@@ -217,9 +233,15 @@ enum ChunkError {
 /// chunked — no `Content-Length` on an unbounded stream).
 fn read_one_chunk(reader: &mut BufReader<TcpStream>) -> Result<ChunkRead, ChunkError> {
     let mut size_line = String::new();
-    let n = reader
-        .read_line(&mut size_line)
-        .map_err(ChunkError::Boundary)?;
+    // `read_line` appends and `consume`s as it goes, so a failure with bytes
+    // already in `size_line` has eaten part of the size line — they are gone
+    // from the stream, and a retry would read the remainder as a whole size
+    // ("1" eaten out of "1a", "a\r\n" read back as 0xa) and desync silently.
+    let n = match reader.read_line(&mut size_line) {
+        Ok(n) => n,
+        Err(e) if size_line.is_empty() => return Err(ChunkError::Boundary(e)),
+        Err(e) => return Err(ChunkError::MidChunk(e)),
+    };
     if n == 0 {
         return Ok(ChunkRead::Eof);
     }
@@ -570,7 +592,8 @@ mod tests {
             .next_frame(Duration::from_millis(200))
             .expect_err("a mid-chunk timeout must be a named error, not silent garbage");
         let msg = err.to_string();
-        assert!(msg.contains("desync") || msg.contains("poison"), "{msg}");
+        assert!(msg.contains("SseTail desynced:"), "{msg}");
+        assert!(msg.contains("this tail is now poisoned"), "{msg}");
 
         // The tail must now refuse everything further, fast (no more IO —
         // even a tiny timeout budget is enough since the check short-circuits
@@ -579,6 +602,77 @@ mod tests {
             .next_frame(Duration::from_millis(10))
             .expect_err("a poisoned tail must keep refusing");
         let msg2 = err2.to_string();
-        assert!(msg2.contains("desync") || msg2.contains("poison"), "{msg2}");
+        assert!(msg2.contains("SseTail is poisoned"), "{msg2}");
+    }
+
+    /// Review finding I4, size-line half: a read that times out with part of
+    /// the chunk size line already consumed is NOT retryable — `read_line`
+    /// ate those bytes, so a retry would read the remainder as a whole size
+    /// ("1" eaten out of "1a", "a\r\n" read back as 0xa) and desync in
+    /// silence. It must poison like any other mid-chunk failure.
+    #[test]
+    #[ignore]
+    fn next_frame_poisons_the_tail_after_a_partial_size_line() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut stream = drain_request(stream);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
+                    .unwrap();
+                // The first digit of a two-digit size line, then silence —
+                // the rest of "1a\r\n" never arrives.
+                stream.write_all(b"1").unwrap();
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+
+        let mut http = Http::new(addr);
+        let mut tail = http.sse_tail("/feed", None).unwrap();
+        let err = tail
+            .next_frame(Duration::from_millis(200))
+            .expect_err("a half-consumed size line is a desync, not a retryable quiet period");
+        assert!(err.to_string().contains("SseTail desynced:"), "{err}");
+
+        let err2 = tail
+            .next_frame(Duration::from_millis(10))
+            .expect_err("a half-consumed size line must poison the tail");
+        assert!(err2.to_string().contains("SseTail is poisoned"), "{err2}");
+    }
+
+    /// Review finding I4, hard-failure half: a peer that closes the
+    /// connection PARTWAY through a chunk has cut the stream mid-frame. That
+    /// must poison the tail too — otherwise the first call errors and the
+    /// next one reads 0 bytes and reports `Ok(None)`, i.e. a clean close for
+    /// a stream that was truncated mid-frame (exactly the conflation I4
+    /// exists to prevent).
+    #[test]
+    #[ignore]
+    fn next_frame_poisons_the_tail_after_a_mid_chunk_close() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut stream = drain_request(stream);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
+                    .unwrap();
+                // 10 bytes promised, 3 delivered, then the peer closes.
+                stream.write_all(b"a\r\nabc").unwrap();
+            }
+        });
+
+        let mut http = Http::new(addr);
+        let mut tail = http.sse_tail("/feed", None).unwrap();
+        let err = tail
+            .next_frame(Duration::from_secs(2))
+            .expect_err("a close mid-chunk is a truncation, not a clean end");
+        assert!(err.to_string().contains("SseTail desynced:"), "{err}");
+
+        let err2 = tail
+            .next_frame(Duration::from_secs(2))
+            .expect_err("a truncated stream must never later report a clean close");
+        assert!(err2.to_string().contains("SseTail is poisoned"), "{err2}");
     }
 }
