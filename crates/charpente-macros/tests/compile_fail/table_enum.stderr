@@ -1,0 +1,5 @@
+error: #[table] applies to structs — enums and unions cannot be rows
+ --> tests/compile_fail/table_enum.rs:4:1
+  |
+4 | enum E {
+  | ^^^^

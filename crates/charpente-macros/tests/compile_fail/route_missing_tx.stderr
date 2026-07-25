@@ -1,0 +1,5 @@
+error: a #[route] handler's first argument must be `tx: &mut Tx` — `handler` is missing it
+ --> tests/compile_fail/route_missing_tx.rs:4:1
+  |
+4 | fn handler() -> Result<(), charpente::http::ApiError> {
+  | ^^

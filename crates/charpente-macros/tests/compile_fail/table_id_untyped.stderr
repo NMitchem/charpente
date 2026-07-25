@@ -1,0 +1,5 @@
+error: the `id` field of a #[table] must be `Id<W>` — a typed id, never a bare integer
+ --> tests/compile_fail/table_id_untyped.rs:5:9
+  |
+5 |     id: u64,
+  |         ^^^

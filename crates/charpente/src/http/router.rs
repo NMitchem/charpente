@@ -45,7 +45,7 @@ pub trait RouteDef {
 
 #[macro_export]
 macro_rules! routes {
-    ($($handler:ident),* $(,)?) => {
+    ($($handler:path),* $(,)?) => {
         ::std::vec![$(<$handler as $crate::http::RouteDef>::route()),*]
     };
 }

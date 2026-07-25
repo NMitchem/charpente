@@ -69,7 +69,7 @@ pub trait JobEntry {
 
 #[macro_export]
 macro_rules! jobs {
-    ($($job:ident),* $(,)?) => {
+    ($($job:path),* $(,)?) => {
         ::std::vec![$(<$job as $crate::kernel::JobEntry>::def()),*]
     };
 }

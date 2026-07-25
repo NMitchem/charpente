@@ -1,0 +1,5 @@
+error: unknown retry field `count` — write `#[job]` or `#[job(retry(max = <int>, backoff = "<n><unit>"))]` (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff = "10s"))]`
+  --> tests/compile_fail/job_bad_retry.rs:10:13
+   |
+10 | #[job(retry(count = 3))]
+   |             ^^^^^

@@ -608,6 +608,10 @@ fn build_app(data_dir: &str) -> std::io::Result<App> {
 }
 ```
 
+`routes![...]` accepts path-qualified handlers too, not just bare
+identifiers in scope — `routes![handlers::create_note]` works exactly like
+`routes![create_note]` after `use handlers::create_note;`.
+
 `Request`'s shape (what a handler ultimately runs against, one layer down):
 `method: Method`, `path: String`, `query: BTreeMap<String, String>`,
 `headers: BTreeMap<String, String>` (keys lowercased), `body: Vec<u8>`.
@@ -1202,6 +1206,10 @@ fn build_app(data_dir: &str) -> std::io::Result<App> {
 Mounting the same job type twice — in one `mount_jobs` call, or across
 several — panics at mount time: `"job \"CountUp\" registered twice — each
 #[job] type is mounted once"`.
+
+Like `routes![...]`, `jobs![...]` accepts path-qualified job types too —
+`jobs![jobs::CountUp]` works exactly like `jobs![CountUp]` after
+`use jobs::CountUp;`.
 
 ### Enqueueing: `enqueue` vs `enqueue_keyed`
 

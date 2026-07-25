@@ -15,3 +15,15 @@ workspace = true
 proc-macro2 = "1.0.106"
 quote = "1.0.46"
 syn = { version = "2.0.118", features = ["full"] }
+
+[dev-dependencies]
+# Compile-fail/pass pinning for the three macros' error surface (hard rule 5).
+# Test-only tooling outside the deterministic boundary — no nondeterminism
+# deny-list entry needed (it never runs in a shipped binary, only spawns
+# rustc subprocesses from `cargo test`, same category as `cargo` itself).
+trybuild = "1"
+# Cyclic dev-dependency: charpente-macros is what charpente re-exports, so
+# case files need `::charpente::` paths to compile (macro-path unification).
+# Legal cargo — dev-dependency cycles don't participate in the build-dep
+# graph the compiler needs to break.
+charpente = { path = "../charpente" }

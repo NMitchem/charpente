@@ -1,0 +1,5 @@
+error: #[table] structs cannot be generic — a table is one concrete row shape; make `W` non-generic
+ --> tests/compile_fail/table_generic.rs:4:9
+  |
+4 | struct W<T> {
+  |         ^
