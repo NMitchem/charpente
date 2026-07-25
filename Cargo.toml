@@ -36,3 +36,14 @@ disallowed_types = "deny"
 # hard rule 4's assertions-stay-on ethos. Revisit when M2's engine replaces redb.
 [profile.release.package.redb]
 debug-assertions = true
+
+# Sim runtime is dominated by redb, and in an unoptimized build its zeroed-page
+# allocator (`cached_file::zero_filled_arc`) fills byte-by-byte through an
+# iterator instead of a memset — ~34% of a universe's CPU by profile. `opt-level`
+# is orthogonal to `debug-assertions` (left on, per the override above and dev's
+# default), so redb's `debug_assertions`-gated page walk still runs and still
+# draws the same sim IO rolls: branch selection is unchanged, only its speed.
+# The seed promise is what guards this claim, not the reasoning — the CI
+# tripwire replays across both build modes.
+[profile.dev.package.redb]
+opt-level = 3
