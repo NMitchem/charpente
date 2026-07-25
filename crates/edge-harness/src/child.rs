@@ -160,7 +160,17 @@ impl ChildNode {
     /// is why a successful connect alone still isn't proof — see below.
     pub fn restart(&mut self, scenario: &mut Scenario) -> io::Result<()> {
         let old_pid = self.child.id();
-        let was_running = matches!(self.child.try_wait(), Ok(None));
+        // `Ok(None)` folded a `try_wait` failure into "wasn't running" here
+        // before (review finding 6) — the inverse of the defect class this
+        // crate panics over elsewhere (I5's fired-or-panic pause/resume): a
+        // `try_wait` error would silently write a script claiming the node
+        // had already stopped when it was in fact still running and about
+        // to be SIGKILLed.
+        let was_running = self
+            .child
+            .try_wait()
+            .expect("try_wait on an unreaped child")
+            .is_none();
         let _ = self.child.kill();
         let _ = self.child.wait();
         if was_running {
@@ -446,6 +456,18 @@ mod tests {
         assert!(
             !alive,
             "restart must kill the previous child first (pid {old_pid} still alive)"
+        );
+
+        // Review finding 6: the implicit SIGKILL of a still-running node
+        // must be recorded in the script, not silently read as if the node
+        // had already stopped.
+        let path = scenario.dump().unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains(&format!(
+                "restart: SIGKILLed the still-running pid {old_pid}"
+            )),
+            "{contents}"
         );
 
         let dir = scenario.dir().to_path_buf();

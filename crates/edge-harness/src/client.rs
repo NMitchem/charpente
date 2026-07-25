@@ -160,7 +160,26 @@ impl SseTail {
                 Ok(ChunkRead::Chunk(chunk)) => {
                     self.pending.push_str(&String::from_utf8_lossy(&chunk));
                 }
-                Ok(ChunkRead::Eof) => return Ok(None),
+                Ok(ChunkRead::Eof) => {
+                    // Negative-space (hard rule 4): a non-empty `pending`
+                    // here is by construction a partial SSE frame (a
+                    // complete one would already have been drained by the
+                    // `find("\n\n")` arm above) — silently discarding it
+                    // would report a clean close for a stream cut
+                    // mid-frame, exactly the conflation this poison
+                    // mechanism exists to prevent. NOT reachable against
+                    // charpente today (serve.rs's `encode_frame` emits one
+                    // complete frame per `Bytes`, hyper writes one chunk per
+                    // `Frame::data`) — independent review of 2bfdf16,
+                    // finding 3.
+                    assert!(
+                        self.pending.is_empty(),
+                        "SseTail: EOF with {} byte(s) of an unterminated frame still pending — \
+                         a stream cut mid-frame must never report a clean close",
+                        self.pending.len()
+                    );
+                    return Ok(None);
+                }
                 Err(ChunkError::Boundary(e)) if is_timeout(&e) => {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -215,15 +234,17 @@ enum ChunkRead {
     Eof,
 }
 
-/// Distinguishes whether a failure inside one chunk's three reads (size
-/// line, body, CRLF) consumed any of the stream (review finding I4).
-/// `Boundary` — the size-line read failed with nothing of it consumed — is
-/// safe to retry: the read was simply waiting for the next chunk to start.
-/// `MidChunk` — anything consumed already, whether a partial size line or
+/// Distinguishes whether a failure inside one chunk's reads (size line,
+/// body, CRLF) consumed any of the stream (review finding I4, sharpened by
+/// the independent review of 2bfdf16, findings 1+2). `Boundary` — the
+/// size-line read failed with nothing of it consumed — is safe to retry: the
+/// read was simply waiting for the next chunk to start. `MidChunk` —
+/// anything consumed already, whether a partial or malformed size line, or
 /// part of the `size + 2` bytes the reader has committed to — is NOT safe:
-/// neither `read_line` nor `read_exact` reports how many bytes it took
-/// before failing, so the stream can no longer be trusted to be
-/// chunk-aligned.
+/// once the size line's bytes are off the wire, `read_line` succeeding and
+/// `from_str_radix` failing on its content is not "nothing consumed" just
+/// because the failure is a parse failure, not an IO failure — the stream
+/// can no longer be trusted to be chunk-aligned.
 enum ChunkError {
     Boundary(io::Error),
     MidChunk(io::Error),
@@ -232,21 +253,35 @@ enum ChunkError {
 /// Reads one chunked-transfer-encoding chunk (serve.rs's SSE body is always
 /// chunked — no `Content-Length` on an unbounded stream).
 fn read_one_chunk(reader: &mut BufReader<TcpStream>) -> Result<ChunkRead, ChunkError> {
-    let mut size_line = String::new();
-    // `read_line` appends and `consume`s as it goes, so a failure with bytes
-    // already in `size_line` has eaten part of the size line — they are gone
-    // from the stream, and a retry would read the remainder as a whole size
-    // ("1" eaten out of "1a", "a\r\n" read back as 0xa) and desync silently.
-    let n = match reader.read_line(&mut size_line) {
+    // `read_until` into a `Vec<u8>` has no UTF-8 validation and no
+    // truncation-on-error guard — unlike `read_line`'s `String`, whose
+    // internal `Guard::drop` resets the buffer to empty when the appended
+    // bytes fail UTF-8 validation, AFTER `consume()` already ate them off
+    // the wire. `raw.is_empty()` is therefore an honest "nothing consumed
+    // yet" check even for non-UTF-8 input (independent review of 2bfdf16,
+    // finding 2).
+    let mut raw = Vec::new();
+    let n = match reader.read_until(b'\n', &mut raw) {
         Ok(n) => n,
-        Err(e) if size_line.is_empty() => return Err(ChunkError::Boundary(e)),
+        Err(e) if raw.is_empty() => return Err(ChunkError::Boundary(e)),
         Err(e) => return Err(ChunkError::MidChunk(e)),
     };
     if n == 0 {
         return Ok(ChunkRead::Eof);
     }
+    // Past this point the size line's bytes are unconditionally off the
+    // wire — a malformed line (bad UTF-8, bad hex, a chunk extension like
+    // "a;ext") is a desync, not a retryable boundary, no matter which step
+    // of decoding it (finding 1: `read_line` succeeding and consuming a
+    // whole line is not "nothing consumed", regardless of what the content
+    // turns out to be).
+    let size_line = std::str::from_utf8(&raw).map_err(|e| {
+        ChunkError::MidChunk(io::Error::other(format!(
+            "malformed chunk size line {raw:?}: {e}"
+        )))
+    })?;
     let size = usize::from_str_radix(size_line.trim(), 16).map_err(|e| {
-        ChunkError::Boundary(io::Error::other(format!(
+        ChunkError::MidChunk(io::Error::other(format!(
             "malformed chunk size {size_line:?}: {e}"
         )))
     })?;
@@ -638,6 +673,73 @@ mod tests {
         let err2 = tail
             .next_frame(Duration::from_millis(10))
             .expect_err("a half-consumed size line must poison the tail");
+        assert!(err2.to_string().contains("SseTail is poisoned"), "{err2}");
+    }
+
+    /// Independent review of 2bfdf16, finding 1: a malformed chunk size —
+    /// here a chunk extension (`a;ext`), valid chunked-encoding syntax but
+    /// not valid hex — is not a retryable boundary just because
+    /// `from_str_radix` is the thing that failed. `read_line` already
+    /// consumed the whole line off the wire; only the content was
+    /// unparseable. This must poison like any other mid-chunk failure.
+    #[test]
+    #[ignore]
+    fn next_frame_poisons_the_tail_after_a_malformed_chunk_size() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut stream = drain_request(stream);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
+                    .unwrap();
+                stream.write_all(b"a;ext\r\n").unwrap();
+            }
+        });
+
+        let mut http = Http::new(addr);
+        let mut tail = http.sse_tail("/feed", None).unwrap();
+        let err = tail
+            .next_frame(Duration::from_secs(2))
+            .expect_err("a malformed chunk size is a desync, not a retryable boundary");
+        assert!(err.to_string().contains("SseTail desynced:"), "{err}");
+
+        let err2 = tail
+            .next_frame(Duration::from_secs(2))
+            .expect_err("a malformed chunk size must poison the tail, not read as a clean EOF");
+        assert!(err2.to_string().contains("SseTail is poisoned"), "{err2}");
+    }
+
+    /// Independent review of 2bfdf16, finding 2: `read_line`'s consumed-byte
+    /// guard is dishonest for non-UTF-8 input — its internal `Guard::drop`
+    /// resets the `String` to empty on a UTF-8 validation failure AFTER
+    /// `consume()` already ate the bytes off the wire, so
+    /// `size_line.is_empty()` reads true when bytes are actually gone.
+    #[test]
+    #[ignore]
+    fn next_frame_poisons_the_tail_after_a_non_utf8_size_line() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut stream = drain_request(stream);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
+                    .unwrap();
+                stream.write_all(b"\xff\xfe\r\n").unwrap();
+            }
+        });
+
+        let mut http = Http::new(addr);
+        let mut tail = http.sse_tail("/feed", None).unwrap();
+        let err = tail
+            .next_frame(Duration::from_secs(2))
+            .expect_err("a non-UTF-8 size line is a desync, not a retryable boundary");
+        assert!(err.to_string().contains("SseTail desynced:"), "{err}");
+
+        let err2 = tail
+            .next_frame(Duration::from_secs(2))
+            .expect_err("a non-UTF-8 size line must poison the tail, not read as a clean EOF");
         assert!(err2.to_string().contains("SseTail is poisoned"), "{err2}");
     }
 
