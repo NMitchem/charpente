@@ -997,7 +997,7 @@ fn file_state<'a>(
 
 impl File for SimFile {
     fn len(&self) -> io::Result<u64> {
-        self.op(|state, _, path| Ok(file_state(state, &self.host, path).view().len() as u64))
+        self.op(|state, _, path| Ok(file_state(state, &self.host, path).view_len()))
     }
 
     fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
@@ -1009,18 +1009,18 @@ impl File for SimFile {
                 // never touches the file's content or pending queue.
                 return Err(io::Error::other("injected read error"));
             }
-            let view = file_state(state, &self.host, path).view();
+            let file = file_state(state, &self.host, path);
+            let len = file.view_len();
             let end = offset.checked_add(out.len() as u64).expect("read_at range overflowed u64");
-            if end > view.len() as u64 {
+            if end > len {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     format!(
-                        "read_at past end of \"{path}\": requested [{offset}, {end}) but len is {} — contract: read_at reads exactly out.len() bytes inside the file",
-                        view.len()
+                        "read_at past end of \"{path}\": requested [{offset}, {end}) but len is {len} — contract: read_at reads exactly out.len() bytes inside the file"
                     ),
                 ));
             }
-            out.copy_from_slice(&view[offset as usize..end as usize]);
+            file.read_into(offset, out);
             Ok(())
         })
     }
@@ -1081,8 +1081,11 @@ impl File for SimFile {
                 ));
             }
             let file = file_state(state, &self.host, path);
-            file.durable = file.view();
-            file.pending.clear();
+            // Same result as `file.durable = file.view()`, minus the clone of the
+            // durable image that `view()` would make and then discard — the
+            // shape `collapse` already uses.
+            let pending = std::mem::take(&mut file.pending);
+            file.durable = crate::disk::apply(std::mem::take(&mut file.durable), &pending);
             Ok(())
         })
     }
@@ -1576,7 +1579,14 @@ pub fn run_universes_swarm_with_in(
         eprintln!(
             "charpente-sim [{test_file}]: replaying seed {seed:#018x} — coverage requirements skipped under CHARPENTE_SEED"
         );
-        run_one_swarm_with(package, test_file, seed, &adjust, &f);
+        let coverage = run_one_swarm_with(package, test_file, seed, &adjust, &f);
+        // The batch path reports coverage; a single-seed replay was throwing it
+        // away, which is what you most want when asking why *this* universe
+        // behaved (or cost) the way it did.
+        eprintln!("charpente-sim [{test_file}]: coverage for this universe:");
+        for (key, count) in &coverage {
+            eprintln!("  {key}: {count}");
+        }
         return;
     }
     eprintln!(

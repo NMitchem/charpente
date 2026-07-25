@@ -41,6 +41,7 @@ pub(crate) struct FileState {
     pub pending: Vec<PendingOp>,
 }
 
+#[derive(Debug)] // so a differential-test failure can name the exact op sequence
 pub(crate) enum PendingOp {
     Write { offset: u64, data: Vec<u8> },
     SetLen { len: u64 },
@@ -68,10 +69,81 @@ pub(crate) fn apply(mut bytes: Vec<u8>, ops: &[PendingOp]) -> Vec<u8> {
 }
 
 impl FileState {
-    /// What reads see: durable bytes with the page cache overlaid.
+    /// What reads see: durable bytes with the page cache overlaid. This is the
+    /// reference definition — `view_len`/`read_into` must agree with it byte for
+    /// byte, and the differential test in this module is what holds them to it.
+    /// Test-only since those two replaced it on every production path: reads no
+    /// longer rebuild the whole image to answer a length or a range.
+    #[cfg(test)]
     pub fn view(&self) -> Vec<u8> {
         apply(self.durable.clone(), &self.pending)
     }
+
+    /// `view().len()` without building the image.
+    pub fn view_len(&self) -> u64 {
+        let mut len = self.durable.len() as u64;
+        for op in &self.pending {
+            match op {
+                // A write only ever extends: `apply` resizes when the write
+                // ends past the current length, never when it ends inside.
+                PendingOp::Write { offset, data } => len = len.max(offset + data.len() as u64),
+                PendingOp::SetLen { len: l } => len = *l,
+            }
+        }
+        len
+    }
+
+    /// `view()[offset..offset + out.len()]` without building the image. The
+    /// caller bounds-checks against `view_len` first (reads past the end are a
+    /// contract violation, reported there).
+    pub fn read_into(&self, offset: u64, out: &mut [u8]) {
+        // Zero is what every unsourced byte reads as: past the durable image,
+        // inside the gap a write past the end leaves behind, and beyond a
+        // truncation that a later op re-extends over.
+        out.fill(0);
+        let mut len = self.durable.len() as u64;
+        splice(&self.durable, 0, offset, out);
+        for op in &self.pending {
+            match op {
+                PendingOp::Write { offset: at, data } => {
+                    splice(data, *at, offset, out);
+                    len = len.max(at + data.len() as u64);
+                }
+                PendingOp::SetLen { len: l } => {
+                    // Truncation drops bytes the window may already hold; a
+                    // later extension brings them back as zeros, never as the
+                    // old content.
+                    if *l < len {
+                        zero(*l, len, offset, out);
+                    }
+                    len = *l;
+                }
+            }
+        }
+    }
+}
+
+/// Copies `src` — which occupies absolute `[at, at + src.len())` in the file —
+/// into the read window that starts at absolute `from`. Anything outside the
+/// window is dropped.
+fn splice(src: &[u8], at: u64, from: u64, out: &mut [u8]) {
+    let lo = at.max(from);
+    let hi = (at + src.len() as u64).min(from + out.len() as u64);
+    if lo >= hi {
+        return;
+    }
+    let (d, s, n) = ((lo - from) as usize, (lo - at) as usize, (hi - lo) as usize);
+    out[d..d + n].copy_from_slice(&src[s..s + n]);
+}
+
+/// Zeros absolute `[a, b)` inside the same window.
+fn zero(a: u64, b: u64, from: u64, out: &mut [u8]) {
+    let lo = a.max(from);
+    let hi = b.min(from + out.len() as u64);
+    if lo >= hi {
+        return;
+    }
+    out[(lo - from) as usize..(hi - from) as usize].fill(0);
 }
 
 /// Crash-collapses one file: every pending op independently survives, tears,
@@ -317,5 +389,68 @@ mod tests {
             saw_non_prefix,
             "subset tears must include non-prefix patterns"
         );
+    }
+
+    /// `view()` is the oracle. The fast paths must agree with it for every
+    /// (durable, pending) shape the fault matrix can produce — writes past the
+    /// end, truncations, re-extensions after a truncation, empty writes that
+    /// extend by gap alone — and for reads straddling all of them. A fast path
+    /// that disagrees here would make the simulator lie rather than fail, which
+    /// is the one failure mode the sim cannot afford.
+    #[test]
+    fn fast_paths_agree_with_the_view_reference() {
+        let mut rng = Rng::new(0xD15C_0001);
+        for _ in 0..3000 {
+            let mut durable = vec![0u8; rng.below(1500) as usize];
+            rng.fill(&mut durable);
+            let mut file = FileState {
+                durable,
+                pending: Vec::new(),
+            };
+            for _ in 0..rng.below(7) {
+                if rng.chance(0.3) {
+                    file.pending.push(PendingOp::SetLen {
+                        len: rng.below(2000),
+                    });
+                } else {
+                    let offset = rng.below(2000);
+                    let mut data = vec![0u8; rng.below(400) as usize];
+                    rng.fill(&mut data);
+                    file.pending.push(PendingOp::Write { offset, data });
+                }
+            }
+
+            // Op shapes, not op contents: the payload bytes are random and
+            // reproducible from the seed, so dumping them buries the shape that
+            // actually explains the failure.
+            let shape: Vec<String> = file
+                .pending
+                .iter()
+                .map(|op| match op {
+                    PendingOp::Write { offset, data } => format!("W@{offset}+{}", data.len()),
+                    PendingOp::SetLen { len } => format!("L={len}"),
+                })
+                .collect();
+            let shape = format!("durable {} then [{}]", file.durable.len(), shape.join(", "));
+
+            let reference = file.view();
+            assert_eq!(
+                file.view_len(),
+                reference.len() as u64,
+                "view_len disagreed with view() over {shape}"
+            );
+            if reference.is_empty() {
+                continue;
+            }
+            let start = rng.below(reference.len() as u64);
+            let n = rng.below(reference.len() as u64 - start + 1);
+            let mut out = vec![0xAA; n as usize];
+            file.read_into(start, &mut out);
+            assert_eq!(
+                out,
+                reference[start as usize..(start + n) as usize],
+                "read_into({start}, {n}) disagreed with view() over {shape}"
+            );
+        }
     }
 }
