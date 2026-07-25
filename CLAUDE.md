@@ -517,6 +517,24 @@ do not reorder a milestone's dependency sequence.
   docs/superpowers/plans/2026-07-24-introspection-edge-harness.md (three phases:
   describe, error-quality suite, edge harness; adversarial opus plan review gating
   execution).
-- Next: execute sub-project 6 task-by-task (introspection → error-quality → edge
-  harness; the read-side-poison hunt HALTS for a Noah ruling at its
-  characterization), then the M1-close sweep and M1 COMPLETE.
+  **Execution state (2026-07-25, HEAD 9c111b1): 9 of 14 tasks closed.** The
+  authoritative running record is the ledger
+  `.superpowers/sdd/2026-07-24-introspection-edge-harness/progress.md` — this entry
+  is a pointer until T14 writes the close-out. Phase A (describe, T1–T5) complete;
+  Phase B (error quality, T6–T9) complete at 93bcc56. T10 (edge-harness crate +
+  `examples/invoicing/src/bin/node.rs`) is in flight: implementation 39b0b37, opus
+  review raised 5 Importants, fix round 1 landed 9c111b1 (restart child-identity,
+  client timeouts, SSE timeout-vs-EOF, signal asserts) together with Noah's
+  2026-07-25 ruling un-ignoring the 10 zero-IO edge tests — which amends plan ruling
+  4's blanket `#[ignore]` wording, a docs debt T14 still owes. T10 is NOT closed: the
+  ledger has no `Task 10: complete` line and the fix-round diff
+  `review-516a83d..9c111b1.diff` has no verdict file. Two commits between T9 and T10's
+  fix round (f5cfc98, 516a83d) are not plan tasks — they are the Noah-approved
+  `sim-disk-fastpath` performance work (~2.6x on the sim suite), cherry-picked onto
+  main with replay identity proven.
+- Next: adjudicate T10's fix-round review and write its closing ledger line, then
+  T11 (acked-implies-durable wire oracle + the ack-before-commit teeth meta-test),
+  T12 (promote/failover + realtime-resume wire oracles), T13 (named hunts — the
+  read-side-poison hunt HALTS for a Noah ruling at its characterization), T14 (final
+  review, close-out sweep, M1 COMPLETE, push). Local `main` is 17 commits ahead of
+  `origin/main`; the push is deliberately deferred to T14.
