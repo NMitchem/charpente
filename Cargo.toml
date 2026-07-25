@@ -8,6 +8,7 @@ members = [
     "crates/charpente-cli",
     "crates/sim-fixture",
     "crates/guide-examples",
+    "crates/edge-harness",
     "examples/invoicing",
 ]
 

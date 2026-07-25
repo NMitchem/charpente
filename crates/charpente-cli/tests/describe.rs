@@ -405,6 +405,35 @@ fn happy_path_json_exits_zero_and_prints_the_contract() {
     assert_eq!(stdout, GOLDEN);
 }
 
+// Edge T10 interplay: `examples/invoicing` gained a SECOND bin
+// (`src/bin/node.rs`, the edge-harness's process-control vehicle) — this
+// pins that `describe` (called with no `--bin`) still disambiguates to the
+// `invoicing` bin via the package-name default (describe T4's `choose_bin`),
+// rather than erroring "several binaries ... pass --bin". The two
+// `happy_path_*` tests above already exercise this path implicitly (they
+// pass no `--bin` either); this test names the guarantee explicitly now that
+// a real second bin exists to be ambiguous with.
+#[test]
+fn describe_still_resolves_to_the_invoicing_bin_by_package_name_now_that_node_exists() {
+    let out = charpente()
+        .args(["describe", "--dir", &invoicing_dir(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "describe must not report bin ambiguity now that node.rs exists: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"charpente_version\""), "{stdout}");
+}
+
 #[test]
 fn happy_path_human_exits_zero_and_prints_the_contract() {
     let out = charpente()

@@ -1,0 +1,10 @@
+[package]
+name = "edge-harness"
+description = "M1 sub-project 6 edge rig: process/connection-level fault injection against real built binaries over real TCP."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true

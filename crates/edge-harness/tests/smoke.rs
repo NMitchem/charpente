@@ -1,0 +1,128 @@
+//! The T10 exit criterion: one invoicing `node` behind a `TcpProxy` serves a
+//! login, a write, and a read, survives `kill -9`, and serves the same read
+//! again after a plain restart against the SAME data directory — proving ack
+//! ordering and crash recovery end-to-end over real TCP. Per the crate's
+//! honesty contract: `kill -9` is not power loss (the OS page cache survives
+//! it), so this proves the restart path, never durability against media
+//! failure — that claim stays the simulator's.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use edge_harness::{ChildNode, Http, Scenario, TcpProxy, build_bins};
+
+fn temp_dir(tag: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "edge-harness-{tag}-{}-{nanos:x}",
+        std::process::id()
+    ))
+}
+
+/// Reserves a loopback port by binding to `:0` and dropping the listener —
+/// the node needs a knowable, fixed `--addr` up front so the restarted
+/// process can rebind to the exact same address the proxy forwards to.
+fn free_addr() -> String {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("loopback bind")
+        .local_addr()
+        .expect("bound listener has an address")
+        .to_string()
+}
+
+#[test]
+#[ignore]
+fn smoke_single_node_serves_and_survives_restart() {
+    let bins = build_bins().expect("build_bins");
+
+    let scenario_root = temp_dir("scenario-root");
+    std::fs::create_dir_all(&scenario_root).expect("scenario root dir");
+    let mut scenario = Scenario::new(
+        &scenario_root,
+        "smoke_single_node_serves_and_survives_restart",
+    )
+    .expect("Scenario::new");
+
+    let data_dir = temp_dir("data");
+    let node_addr = free_addr();
+    let args = vec![
+        "--addr".to_string(),
+        node_addr.clone(),
+        "--data-dir".to_string(),
+        data_dir.to_str().unwrap().to_string(),
+    ];
+
+    let mut node = ChildNode::spawn(&bins.node, &args, &mut scenario).expect("spawn node");
+    let proxy = TcpProxy::start(&node_addr).expect("start proxy");
+
+    let mut http = Http::new(proxy.addr());
+
+    let login = http.post("/login", "\"edge-tester\"").expect("login");
+    assert_eq!(
+        login.status,
+        200,
+        "login: {}",
+        String::from_utf8_lossy(&login.body)
+    );
+    let token = login
+        .as_json_string()
+        .expect("login's body is a JSON string token");
+    http.set_session(token);
+    scenario.record("logged in through the proxy; session established");
+
+    let create = http
+        .post(
+            "/customers/1",
+            r#"{"name":"Ada Lovelace","email":"ada@example.com"}"#,
+        )
+        .expect("create customer");
+    assert_eq!(
+        create.status,
+        200,
+        "create customer: {}",
+        String::from_utf8_lossy(&create.body)
+    );
+    scenario.record("POSTed customer 1 through the proxy");
+
+    let get1 = http.get("/customers/1").expect("get customer");
+    assert_eq!(
+        get1.status,
+        200,
+        "get customer: {}",
+        String::from_utf8_lossy(&get1.body)
+    );
+    let body1 = String::from_utf8_lossy(&get1.body).to_string();
+    assert!(body1.contains("Ada Lovelace"), "{body1}");
+    scenario.record("GET customer 1 through the proxy — present before the kill");
+
+    node.kill9(&mut scenario);
+    node.restart(&mut scenario).expect("restart node");
+
+    let get2 = http
+        .get("/customers/1")
+        .expect("get customer after restart");
+    assert_eq!(
+        get2.status,
+        200,
+        "get customer after restart: {}",
+        String::from_utf8_lossy(&get2.body)
+    );
+    let body2 = String::from_utf8_lossy(&get2.body).to_string();
+    assert!(body2.contains("Ada Lovelace"), "{body2}");
+    scenario.record("GET customer 1 through the proxy — survived kill9 + restart");
+
+    let script = scenario.dump().expect("scenario dump");
+    assert!(
+        script.exists(),
+        "scenario script must exist: {}",
+        script.display()
+    );
+    eprintln!("scenario script: {}", script.display());
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let _ = std::fs::remove_dir_all(&scenario_root);
+}
