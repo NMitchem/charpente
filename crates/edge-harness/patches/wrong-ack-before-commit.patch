@@ -1,0 +1,36 @@
+diff --git a/crates/charpente/src/kernel/mod.rs b/crates/charpente/src/kernel/mod.rs
+index c60ca9d..6d6ee0b 100644
+--- a/crates/charpente/src/kernel/mod.rs
++++ b/crates/charpente/src/kernel/mod.rs
+@@ -284,18 +284,19 @@ impl Kernel {
+         match choice {
+             Ready::Request => {
+                 let (request, reply) = self.pending.take().expect("checked above");
+-                match self.app.handle_or_subscribe(request, now) {
+-                    Handled::Response(response) => reply.send(response),
+-                    Handled::Subscribe(sub) => {
+-                        match validate_subscribe(self.app.db(), sub.cursor) {
+-                            Ok(next_id) => {
+-                                let sink = reply.stream(Response::sse_headers());
+-                                self.tails.push(Tail { sub, sink, next_id });
+-                            }
+-                            Err(response) => reply.send(response),
+-                        }
+-                    }
+-                }
++                // WRONG BUILD — edge-harness T11 meta-test injection
++                // (patches/wrong-ack-before-commit.patch). NEVER MERGE: acks
++                // the client BEFORE the write is even attempted, so a kill in
++                // this window loses the write entirely — nothing in the page
++                // cache to recover, unlike an ack-before-fsync variant (which
++                // a real kill -9 would survive and so would be toothless).
++                reply.send(Response {
++                    status: 200,
++                    headers: Default::default(),
++                    body: Vec::new(),
++                });
++                std::thread::sleep(std::time::Duration::from_millis(100));
++                let _ = self.app.handle_or_subscribe(request, now);
+                 self.stats.requests += 1;
+                 // Spec 2026-07-05 (request-arm ruling): a request-path Io
+                 // is absorbed into a 500 for the client, but a poisoned
