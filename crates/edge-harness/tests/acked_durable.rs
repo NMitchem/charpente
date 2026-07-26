@@ -193,17 +193,27 @@ fn record_plan(scenario: &mut Scenario, rounds: u64, forced: bool, kill_rounds: 
     ));
 }
 
+/// `(id, reason)` pairs — used both for ids that never acked (`drive`) and
+/// ids that acked but didn't read back (`VerifyFailure::missing`). A named
+/// alias per clippy's `type_complexity` (the bare nested tuple-of-Vec type
+/// tripped it at the `-D warnings` gate).
+type IdReasons = Vec<(u64, String)>;
+
 /// Drives `rounds` POST rounds against `node`/`http`, killing+restarting at
 /// each round in `kill_rounds` (a randomized 0/1/5/20ms delay after the
 /// observed ack). Returns every id whose creation was acked (200, and ONLY
-/// 200). Verification is a SEPARATE step (`verify`) rather than folded in
-/// here: a build with the T11 meta-test's injected fault fakes EVERY
-/// response the SAME way, GETs included — reading back through the very
-/// node under test would make "the id is present" and "the node always
-/// fakes 200" the same observation. `run_oracle` verifies through the same
-/// (trustworthy) stock node it drove with; `run_oracle_against_wrong_build`
-/// swaps to a stock node for verification instead of trusting the wrong
-/// build's own reads (see that function's doc comment).
+/// 200), plus every id that did NOT ack alongside why (re-review follow-up:
+/// once I4 gates strictly on `acked.len() == rounds`, WHY a round failed is
+/// the first thing an operator wants — previously that reason lived only in
+/// the scenario log, not in the vacuity failure message itself).
+/// Verification is a SEPARATE step (`verify`) rather than folded in here: a
+/// build with the T11 meta-test's injected fault fakes EVERY response the
+/// SAME way, GETs included — reading back through the very node under test
+/// would make "the id is present" and "the node always fakes 200" the same
+/// observation. `run_oracle` verifies through the same (trustworthy) stock
+/// node it drove with; `run_oracle_against_wrong_build` swaps to a stock
+/// node for verification instead of trusting the wrong build's own reads
+/// (see that function's doc comment).
 ///
 /// `relogin_after_restart`: the honest run logs back in after every restart
 /// (the brief's literal "restarts, and re-logins"). The wrong-build run
@@ -217,9 +227,10 @@ fn drive(
     rounds: u64,
     kill_rounds: &HashSet<u64>,
     relogin_after_restart: bool,
-) -> Result<Vec<u64>, String> {
+) -> Result<(Vec<u64>, IdReasons), String> {
     let mut rng = Rng::new();
     let mut acked: Vec<u64> = Vec::new();
+    let mut not_acked: Vec<(u64, String)> = Vec::new();
     for round in 1..=rounds {
         let id = round;
         let body = format!(r#"{{"name":"Round {id}","email":"round{id}@example.com"}}"#);
@@ -235,11 +246,13 @@ fn drive(
                     "round {round}: POST /customers/{id} -> {} (not acked)",
                     resp.status
                 ));
+                not_acked.push((id, format!("status {}", resp.status)));
             }
             Err(e) => {
                 scenario.record(format!(
                     "round {round}: POST /customers/{id} failed: {e} (not acked)"
                 ));
+                not_acked.push((id, format!("request failed: {e}")));
             }
         }
 
@@ -261,7 +274,26 @@ fn drive(
             }
         }
     }
-    Ok(acked)
+    Ok((acked, not_acked))
+}
+
+/// Refuses to proceed unless every round acked. Shared by both `run_oracle`
+/// and `run_oracle_against_wrong_build`'s closures — re-review "New Breakage
+/// #3": without this check INSIDE the closure, a partial ack returns `Ok`
+/// from the closure, `finish` deletes the evidence on that `Ok`, and only
+/// THEN does a caller's own `acked_len == rounds()` assertion fire — against
+/// evidence that's already gone. `not_acked` (see `drive`) is folded into
+/// the message so an operator sees WHY, not just how many.
+fn require_full_ack(acked: &[u64], not_acked: &[(u64, String)], rounds: u64) -> Result<(), String> {
+    if acked.len() != rounds as usize {
+        return Err(format!(
+            "the oracle is vacuous: only {}/{rounds} rounds acked (every round should ack — \
+             POST /customers/:id has no reason to fail here); not acked: {not_acked:?}; \
+             refusing to run a durability check over a partial or empty set",
+            acked.len()
+        ));
+    }
+    Ok(())
 }
 
 /// A durability-oracle failure: the missing acked ids, each with why it
@@ -273,10 +305,13 @@ fn drive(
 /// not a 401 from a broken verify session, a 500, or a transport hiccup a
 /// flaky proxy dial can produce (`src/proxy.rs`'s `relay` returns silently
 /// on a failed upstream dial, which a client sees as an immediate EOF).
-/// `message` itself carries the same distinction (see `verify`): only a set
-/// of missing ids that are ALL genuinely-absent ("status 404") earns the
-/// "acked-implies-durable violated" wording — anything else is worded as a
-/// rig failure, never the headline durability claim.
+/// `message` itself carries a three-way version of the same distinction (see
+/// `verify`): ALL missing ids genuinely-absent ("status 404") earns the
+/// unqualified "acked-implies-durable violated" wording; ZERO of them do is
+/// worded as a pure rig failure; a MIX says so explicitly and still counts
+/// as a violation, since at least one row is confirmed gone — a false
+/// "rig failure" verdict on a mixed loss would be the worse direction for a
+/// headline claim (re-review "New Breakage").
 struct VerifyFailure {
     missing: Vec<(u64, String)>,
     message: String,
@@ -301,11 +336,24 @@ fn verify(http: &mut Http, scenario: &mut Scenario, acked: &[u64]) -> Result<(),
         // side proves nothing about durability — it means the rig could not
         // even ask the question, not that an acked write vanished. Naming
         // that "acked-implies-durable violated" would misname the headline
-        // product claim (hard rule 5). Only "status 404" for every missing
-        // id — a live server genuinely reporting the row absent — earns that
-        // phrase; anything else is a distinctly-worded rig failure.
-        let all_genuinely_absent = missing.iter().all(|(_, reason)| reason == "status 404");
-        let message = if all_genuinely_absent {
+        // product claim (hard rule 5). Only "status 404" for a missing id —
+        // a live server genuinely reporting the row absent — is real
+        // evidence; anything else is a rig failure.
+        //
+        // Re-review "New Breakage": an all-or-nothing check on the FIRST
+        // fix round misnamed a real violation as a rig failure whenever the
+        // loss was mixed (39 genuine 404s plus one transport hiccup printed
+        // "not a proven durability violation") — a false negative on a
+        // headline claim is the worse direction (someone reads that and
+        // discards a real finding). Three-way classification instead: ALL
+        // 404 is the clean violation wording; ZERO 404 is the pure rig
+        // failure wording; anything in between says so explicitly and keeps
+        // the "violated" phrase, since at least one row IS confirmed gone.
+        let confirmed = missing
+            .iter()
+            .filter(|(_, reason)| reason == "status 404")
+            .count();
+        let message = if confirmed == missing.len() {
             format!(
                 "acked-implies-durable violated: {} of {} acked id(s) missing: {missing:?} — \
                  scenario script: {}",
@@ -313,7 +361,7 @@ fn verify(http: &mut Http, scenario: &mut Scenario, acked: &[u64]) -> Result<(),
                 acked.len(),
                 script_path.display()
             )
-        } else {
+        } else if confirmed == 0 {
             format!(
                 "acked-implies-durable oracle could not verify {} of {} acked id(s) — RIG \
                  FAILURE, not a proven durability violation (at least one GET failed for a \
@@ -321,6 +369,14 @@ fn verify(http: &mut Http, scenario: &mut Scenario, acked: &[u64]) -> Result<(),
                  or a transport hiccup): {missing:?} — scenario script: {}",
                 missing.len(),
                 acked.len(),
+                script_path.display()
+            )
+        } else {
+            format!(
+                "acked-implies-durable violated: {confirmed} of {} missing id(s) are \
+                 genuinely absent (status 404) — a durability violation may be present \
+                 alongside a rig failure: {missing:?} — scenario script: {}",
+                missing.len(),
                 script_path.display()
             )
         };
@@ -342,6 +398,19 @@ fn verify(http: &mut Http, scenario: &mut Scenario, acked: &[u64]) -> Result<(),
 /// on a real finding. A real finding's primary evidence — the scenario log
 /// AND the crash-torn data directory the message points at — must still
 /// exist when someone goes to read it.
+///
+/// Re-review "New Breakage #1": the retained log used to end wherever the
+/// last successful step happened to leave it — the verdict (that the run
+/// failed, and why) lived only in stderr, never in the file the message
+/// points an operator at. The failure is now recorded into the scenario
+/// BEFORE `dump()`, so the retained log is a complete repro artifact on its
+/// own. Wording note (re-review controller doubt #3): this function doesn't
+/// know whether an `Err` here is a genuine finding or a caller's DESIGNED
+/// outcome (`run_oracle_against_wrong_build`'s wrong-build phase is expected
+/// to fail every time) — the retained-evidence message says so honestly
+/// rather than asserting every `Err` is a finding; a caller that already
+/// knows the failure was designed and has finished characterizing it is
+/// free to clean up afterward (see the meta-test).
 fn finish(
     tag: &str,
     scenario: &mut Scenario,
@@ -349,6 +418,10 @@ fn finish(
     scenario_root: &Path,
     result: Result<(), String>,
 ) -> Result<(), String> {
+    match &result {
+        Err(e) => scenario.record(format!("FAILED: {e}")),
+        Ok(()) => scenario.record("run succeeded"),
+    }
     let script = scenario.dump().map_err(|e| e.to_string())?;
     match &result {
         Err(e) => {
@@ -359,7 +432,8 @@ fn finish(
             eprintln!("edge-harness acked_durable[{tag}]: {e}");
             eprintln!(
                 "edge-harness acked_durable[{tag}]: NOT deleting data dir ({}) or scenario \
-                 root ({}) — this is a real finding's evidence",
+                 root ({}) — preserved for inspection; the caller decides whether this \
+                 failure is a genuine finding or an expected, already-characterized outcome",
                 data_dir.display(),
                 scenario_root.display()
             );
@@ -404,7 +478,7 @@ fn run_oracle(node_bin: &Path, tag: &str, force_kill_every_round: bool) -> Resul
         };
         record_plan(&mut scenario, rounds, force_kill_every_round, &kill_rounds);
 
-        let acked = drive(
+        let (acked, not_acked) = drive(
             &mut node,
             &mut http,
             &mut scenario,
@@ -421,15 +495,9 @@ fn run_oracle(node_bin: &Path, tag: &str, force_kill_every_round: bool) -> Resul
         // failure kind from a durability loss on purpose — this is "the rig
         // never got anything to check", not "an acked write vanished" —
         // hence its own wording, never the "acked-implies-durable violated"
-        // phrase `verify` uses.
-        if acked.len() != rounds as usize {
-            return Err(format!(
-                "the oracle is vacuous: only {}/{rounds} rounds acked on the stock build \
-                 (every round should ack — POST /customers/:id has no reason to fail here); \
-                 refusing to run a durability check over a partial or empty set",
-                acked.len()
-            ));
-        }
+        // phrase `verify` uses. `require_full_ack` folds in WHY (re-review
+        // follow-up).
+        require_full_ack(&acked, &not_acked, rounds)?;
         scenario.record(format!(
             "all {rounds} rounds acked — proceeding to verification"
         ));
@@ -593,11 +661,19 @@ fn find_node_bin(stdout: &str) -> Option<PathBuf> {
 /// AND `verify` both run (0/empty if an earlier phase — build, bootstrap,
 /// drive itself — failed first instead), so a caller can assert the
 /// SPECIFIC shape of a durability loss rather than trusting a substring
-/// match on `result`'s message alone (review I1).
+/// match on `result`'s message alone (review I1). `data_dir`/`scenario_root`
+/// are exposed so a caller who has FULLY characterized an expected failure
+/// (the wrong-build phase's `Err` is the designed outcome, not a finding —
+/// re-review controller doubt #3) can clean them up once its own assertions
+/// pass, without weakening `finish`'s keep-on-`Err` rule for every other
+/// caller (including the positive-control call below, where an `Err` IS
+/// unexpected and must stay preserved).
 struct WrongBuildRun {
     result: Result<(), String>,
     missing: Vec<(u64, String)>,
     acked_len: usize,
+    data_dir: PathBuf,
+    scenario_root: PathBuf,
 }
 
 /// The meta-test's run: bootstraps a real session via `stock_bin` against a
@@ -622,11 +698,14 @@ struct WrongBuildRun {
 /// "everything missing" indistinguishable from a genuine durability loss.
 fn run_oracle_against_wrong_build(stock_bin: &Path, wrong_bin: &Path, tag: &str) -> WrongBuildRun {
     let scenario_root = temp_dir(&format!("{tag}-scenario-root"));
+    let data_dir = temp_dir(&format!("{tag}-data"));
     if let Err(e) = std::fs::create_dir_all(&scenario_root) {
         return WrongBuildRun {
             result: Err(e.to_string()),
             missing: Vec::new(),
             acked_len: 0,
+            data_dir,
+            scenario_root,
         };
     }
     let mut scenario = match Scenario::new(&scenario_root, tag) {
@@ -636,10 +715,11 @@ fn run_oracle_against_wrong_build(stock_bin: &Path, wrong_bin: &Path, tag: &str)
                 result: Err(e.to_string()),
                 missing: Vec::new(),
                 acked_len: 0,
+                data_dir,
+                scenario_root,
             };
         }
     };
-    let data_dir = temp_dir(&format!("{tag}-data"));
 
     let mut missing: Vec<(u64, String)> = Vec::new();
     let mut acked_len: usize = 0;
@@ -691,7 +771,7 @@ fn run_oracle_against_wrong_build(stock_bin: &Path, wrong_bin: &Path, tag: &str)
         let kill_rounds: HashSet<u64> = (1..=rounds).collect();
         record_plan(&mut scenario, rounds, true, &kill_rounds);
 
-        let acked = drive(
+        let (acked, not_acked) = drive(
             &mut node,
             &mut http,
             &mut scenario,
@@ -700,6 +780,19 @@ fn run_oracle_against_wrong_build(stock_bin: &Path, wrong_bin: &Path, tag: &str)
             false,
         )?;
         acked_len = acked.len();
+        // Re-review "New Breakage #3": without this check INSIDE the
+        // closure, a partial ack here would return `Ok`, `finish` would
+        // delete the evidence on that `Ok`, and only the caller's OWN
+        // `acked_len == rounds()` assertion (the positive control's, or a
+        // future one on the wrong-build half) would catch it afterward —
+        // against evidence already gone. This also gives both halves of
+        // this function the full `acked_len == rounds()` strength I1's
+        // original wording asked for.
+        require_full_ack(&acked, &not_acked, rounds)?;
+        scenario.record(format!(
+            "all {rounds} rounds acked — proceeding to phase 2 (kill, swap to stock for \
+             verification)"
+        ));
 
         // Phase 2: kill the wrong build for good and swap to the STOCK
         // build, on the SAME data directory, for the verification reads —
@@ -738,6 +831,8 @@ fn run_oracle_against_wrong_build(stock_bin: &Path, wrong_bin: &Path, tag: &str)
         result,
         missing,
         acked_len,
+        data_dir,
+        scenario_root,
     }
 }
 
@@ -760,9 +855,15 @@ fn acked_implies_durable_meta_test_has_teeth() {
     if let Err(e) = &control.result {
         panic!(
             "positive control failed: a stock node driving itself through the wrong-build \
-             wiring (bootstrap -> drive -> kill -> swap-to-verify) must report every row \
-             present. If this fails, the verify swap itself is broken and the red half below \
-             cannot be trusted to mean anything: {e}"
+             wiring (bootstrap -> drive with kill forced every round -> kill -> \
+             swap-to-verify) reported a failure. This alone cannot distinguish two readings \
+             (re-review \"New Breakage\"): EITHER the verify swap itself is broken (the more \
+             likely explanation, and the one the red half below depends on), OR this is a \
+             genuine acked-implies-durable violation on the STOCK build under \
+             kill-on-every-round — strictly harsher than the honest run's \
+             {HONEST_KILL_ROUNDS} randomized kills, so a real wire-level loss could \
+             plausibly surface here first. Check the retained scenario log named in the \
+             error below before assuming it's the rig: {e}"
         );
     }
     assert!(
@@ -840,4 +941,93 @@ fn acked_implies_durable_meta_test_has_teeth() {
              teeth"
         );
     }
+
+    // Re-review controller doubt #3: the wrong-build run's `Err` is the
+    // DESIGNED outcome, not a finding — `finish`'s generic keep-on-`Err`
+    // rule left its data dir + scenario root on disk (~628K measured),
+    // accumulating under `$TMPDIR` on every meta-test run forever. Now that
+    // every assertion above has passed, this failure is fully characterized
+    // as the intended teeth-proof (every acked id genuinely 404, none left
+    // ambiguous) and the evidence is spent — clean up here rather than
+    // leaving it to rot. `run_oracle` and the positive control above keep
+    // `finish`'s keep-on-`Err` behavior untouched: an unexpected failure in
+    // either still preserves its evidence indefinitely.
+    let _ = std::fs::remove_dir_all(&run.data_dir);
+    let _ = std::fs::remove_dir_all(&run.scenario_root);
+}
+
+// ---------------------------------------------------------- named-error pins
+
+/// Re-review controller doubt #2: pins `verify`'s pure-rig-failure branch
+/// byte-exact for everything this crate itself composes. Deterministic and
+/// process-free — a closed loopback port fails every GET at the TCP layer
+/// near-instantly, no built binary and no spawned process required — so
+/// this is NOT `#[ignore]`d, per T10's convention that only process-/socket-
+/// spawning tests carry that attribute.
+///
+/// NOT a literal byte-exact match of the WHOLE message: the per-id reason
+/// (`{e}` inside `verify`'s `format!("request failed: {e}")`) embeds the
+/// OS's own connect-refused text, which differs by platform — e.g.
+/// "Connection refused (os error 61)" on macOS vs. a different os-error
+/// number on Linux CI (`.github/workflows/ci.yml` runs `ubuntu-latest`).
+/// Hardcoding that text would make this pin fail on CI while passing here.
+/// So this pins every part of the message under this crate's control (the
+/// "RIG FAILURE" wording, the K-of-N counts, the scenario-script path) via
+/// prefix/suffix around the OS-dependent middle, and separately asserts the
+/// STABLE "request failed: " prefix on every reason — genuinely byte-exact
+/// on the product surface this crate owns, portable on the part it doesn't.
+#[test]
+fn verify_names_a_rig_failure_distinctly_from_a_durability_violation() {
+    let closed_addr = free_addr(); // bound, then dropped — nothing listens on it
+    let mut http = Http::new(closed_addr);
+    let scenario_root = temp_dir("rig-failure-pin-scenario-root");
+    std::fs::create_dir_all(&scenario_root).expect("create scenario root");
+    let mut scenario = Scenario::new(&scenario_root, "rig-failure-pin").expect("Scenario::new");
+
+    let acked = vec![1, 2, 3];
+    let failure =
+        verify(&mut http, &mut scenario, &acked).expect_err("a closed port must fail every GET");
+
+    assert_eq!(failure.missing.len(), 3, "{:?}", failure.missing);
+    for (id, reason) in &failure.missing {
+        assert!(
+            reason.starts_with("request failed: "),
+            "id {id}: expected a transport-failure reason, got {reason:?}"
+        );
+    }
+
+    let expected_prefix = "acked-implies-durable oracle could not verify 3 of 3 acked id(s) \
+                            — RIG FAILURE, not a proven durability violation (at least one GET \
+                            failed for a reason other than a genuine \"status 404\" — an auth \
+                            failure, a server error, or a transport hiccup): [(1, \"request \
+                            failed: ";
+    assert!(
+        failure.message.starts_with(expected_prefix),
+        "message prefix mismatch:\n  got:      {:?}\n  expected prefix: {:?}",
+        failure.message,
+        expected_prefix
+    );
+
+    let script_path = scenario.dir().join("scenario.log");
+    let expected_suffix = format!(" — scenario script: {}", script_path.display());
+    assert!(
+        failure.message.ends_with(&expected_suffix),
+        "message suffix mismatch:\n  got:      {:?}\n  expected suffix: {:?}",
+        failure.message,
+        expected_suffix
+    );
+
+    assert!(
+        !failure.message.contains("acked-implies-durable violated"),
+        "a pure rig failure must never contain the durability-violation phrase: {:?}",
+        failure.message
+    );
+
+    // `verify` never calls `scenario.dump()` itself (only `finish` does) —
+    // drop explicitly so `Scenario`'s own `Drop` impl writes `scenario.log`
+    // BEFORE this cleanup removes the directory it would write into,
+    // instead of racing the implicit end-of-scope drop against
+    // `remove_dir_all` and printing a spurious "No such file" error.
+    drop(scenario);
+    let _ = std::fs::remove_dir_all(&scenario_root);
 }
