@@ -284,18 +284,21 @@ fn drain_up_to(
     read
 }
 
-/// Why `drain_resume` stopped. Mirrors `acked_durable.rs`'s `classify`
-/// three-way split's spirit, narrowed to two branches: this oracle reads ONE
-/// continuous stream (one stop reason), not N independent GETs, so there is
-/// no "mixed" case — either the stream could be read to a clean stopping
-/// point (a genuine resume-loss claim is meaningful) or it failed outright
-/// (the rig could not finish asking the question).
+/// Why `drain_resume` stopped. Three branches (review Important 2 added
+/// `BudgetExhausted`, split out of `Drained`): a stream that goes quiet for
+/// `MAX_CONSECUTIVE_TIMEOUTS` reads or closes cleanly, WITH a live
+/// connection and a valid cursor, is genuine evidence the server never sent
+/// a still-missing frame — that stays `Drained`, the only variant
+/// `classify_resume` may word as a violation. Exhausting THIS RIG'S OWN
+/// `max_frames` read budget says nothing about the server at all — it is
+/// the rig deciding to stop asking, not the server refusing to answer — so
+/// it gets its own variant and its own non-violation wording. Folding it
+/// into `Drained` (as an earlier version of this file did) let a healthy
+/// but slightly slower resume print the headline "realtime-resume
+/// violated" phrase for a stop condition of this rig's own choosing.
 enum StopReason {
-    /// The frame-read budget ran out, delivery went quiet for
-    /// `MAX_CONSECUTIVE_TIMEOUTS` reads, or the connection closed cleanly —
-    /// none of these are a protocol/IO error, so any id still missing here
-    /// is the oracle's headline claim.
     Drained(String),
+    BudgetExhausted(String),
     /// The read failed outright (a connection error, or `SseTail`'s own
     /// desync-poison latch) — the rig could not finish draining the stream.
     RigFailure(String),
@@ -307,27 +310,75 @@ struct ResumeDrain {
     stop: StopReason,
 }
 
+/// Extracts the numeric event id — the part before the `.` — from a wire
+/// SSE frame id (`"<id>.<seq>"`, DESIGN §6's cursor format, `serve.rs`'s
+/// `encode_frame`). `None` if it doesn't parse.
+fn frame_event_id(wire_id: &str) -> Option<u64> {
+    wire_id.split('.').next()?.parse().ok()
+}
+
 /// Reads the resumed connection until every id in `want` is found, the
 /// frame budget is exhausted, delivery goes quiet, or the read fails
-/// outright — see `StopReason`.
-fn drain_resume(tail: &mut SseTail, want: &BTreeSet<u64>, max_frames: usize) -> ResumeDrain {
+/// outright — see `StopReason`. Also enforces two whole-stream invariants
+/// as it reads (review Important 1 — "EXACTLY the missed ids" was
+/// previously only set-equality, so a stream that reordered or duplicated
+/// frames within itself was invisible): the numeric event id must strictly
+/// increase across EVERY frame, any type (a real `Last-Event-ID` client
+/// would misorder or silently drop events on a stream that didn't hold
+/// this), and no `invoice_finalized` id may be found twice WITHIN this one
+/// resumed connection (distinct from `redelivery_violation_message`'s
+/// cross-phase check against ids already seen before the kill). Returns
+/// `Err` rather than asserting/panicking (review Minor 10) so a violation
+/// here still flows through the caller's `finish` — the scenario's
+/// recorded evidence must survive it, not be skipped by an unwind.
+fn drain_resume(
+    tail: &mut SseTail,
+    want: &BTreeSet<u64>,
+    max_frames: usize,
+) -> Result<ResumeDrain, String> {
     let mut found = BTreeSet::new();
     let mut frames_read = 0usize;
     let mut consecutive_timeouts = 0u32;
+    let mut last_event_id: Option<u64> = None;
     let stop = loop {
         if want.is_subset(&found) {
             break StopReason::Drained("every wanted id was found".to_string());
         }
         if frames_read >= max_frames {
-            break StopReason::Drained(format!("hit the {max_frames}-frame read budget"));
+            break StopReason::BudgetExhausted(format!("hit the {max_frames}-frame read budget"));
         }
         match tail.next_frame(FRAME_READ_TIMEOUT) {
             Ok(Some(frame)) => {
                 frames_read += 1;
                 consecutive_timeouts = 0;
+                let Some(event_id) = frame_event_id(&frame.id) else {
+                    return Err(format!(
+                        "resumed stream: a frame carried an unparseable id {:?} (expected \
+                         \"<id>.<seq>\"): frame {frame:?}",
+                        frame.id
+                    ));
+                };
+                if let Some(last) = last_event_id
+                    && event_id <= last
+                {
+                    return Err(format!(
+                        "realtime-resume violated: frame id {event_id} did not strictly \
+                         increase after {last} on the resumed stream — a real Last-Event-ID \
+                         client would misorder or silently miss events this way; frame: {frame:?}"
+                    ));
+                }
+                last_event_id = Some(event_id);
                 if frame.event == "invoice_finalized"
                     && let Some(id) = extract_u64_field(&frame.data, "invoice")
                 {
+                    if found.contains(&id) {
+                        return Err(format!(
+                            "realtime-resume violated: invoice_finalized({id}) was delivered \
+                             more than once WITHIN this one resumed connection — a duplicate/\
+                             re-delivery bug on a single stream, distinct from a cross-phase \
+                             redelivery"
+                        ));
+                    }
                     found.insert(id);
                 }
             }
@@ -347,11 +398,11 @@ fn drain_resume(tail: &mut SseTail, want: &BTreeSet<u64>, max_frames: usize) -> 
             Err(e) => break StopReason::RigFailure(e.to_string()),
         }
     };
-    ResumeDrain {
+    Ok(ResumeDrain {
         found,
         frames_read,
         stop,
-    }
+    })
 }
 
 // -------------------------------------------------------------- vacuity + classify
@@ -383,13 +434,14 @@ fn resume_drained_nothing_message(missing_len: usize) -> String {
 }
 
 /// Composes the resume-oracle failure message: `Drained` (no protocol/IO
-/// error) earns the unqualified "realtime-resume violated" wording;
-/// `RigFailure` is worded as a pure rig failure, never the violation phrase
-/// (mirrors `acked_durable.rs`'s `classify` two of its three branches — see
-/// `StopReason`'s doc comment for why there is no third, mixed branch here).
-/// Pure and separate from `drain_resume`'s real read loop on purpose, same
-/// rationale as `classify`: the `classify_resume_*` tests below hand-build
-/// `missing`/`stop` and pin all branches byte-exact with zero syscalls.
+/// error, and not this rig's own stopping choice) earns the unqualified
+/// "realtime-resume violated" wording; `BudgetExhausted` and `RigFailure`
+/// are both worded to never contain that phrase — one names the rig's own
+/// frame-count budget as the reason it can't conclude (review Important 2),
+/// the other a hard read failure. Pure and separate from `drain_resume`'s
+/// real read loop on purpose, same rationale as `classify`: the
+/// `classify_resume_*` tests below hand-build `missing`/`stop` and pin all
+/// branches byte-exact with zero syscalls.
 fn classify_resume(missing: &BTreeSet<u64>, stop: &StopReason, acked_len: usize) -> String {
     // Hard rule 4 (negative space), same guard as `acked_durable.rs`'s
     // `classify`: nothing stops a future caller from passing an empty
@@ -406,6 +458,15 @@ fn classify_resume(missing: &BTreeSet<u64>, stop: &StopReason, acked_len: usize)
              ids {missing_list:?}",
             missing.len()
         ),
+        StopReason::BudgetExhausted(reason) => format!(
+            "realtime-resume oracle could not conclude: {} of {acked_len} miss-phase \
+             invoice(s) were still outstanding when this rig's OWN read budget ran out \
+             ({reason}) — NOT evidence of a resume violation (the rig stopped asking; the \
+             server was never shown to have failed to send anything). Raise \
+             RESUME_MAX_FRAMES or investigate why more frames arrived than expected: missing \
+             invoice ids {missing_list:?}",
+            missing.len()
+        ),
         StopReason::RigFailure(reason) => format!(
             "realtime-resume oracle could not verify {} of {acked_len} miss-phase invoice(s) — \
              RIG FAILURE, not a proven resume violation (the resumed connection failed before \
@@ -413,6 +474,43 @@ fn classify_resume(missing: &BTreeSet<u64>, stop: &StopReason, acked_len: usize)
             missing.len()
         ),
     }
+}
+
+/// The redelivery violation: an id the resumed connection served that the
+/// client had already consumed before the kill — an exact `Last-Event-ID`
+/// resume must never repeat a frame. Pure, so it joins every other verdict
+/// string in this file pinned byte-exact (review Minor 7 — this used to be
+/// built inline in the IO path and was the only unpinned verdict in either
+/// file).
+fn redelivery_violation_message(redelivered: &BTreeSet<u64>) -> String {
+    assert!(
+        !redelivered.is_empty(),
+        "redelivery_violation_message: called with no redelivered ids — a redelivery verdict \
+         requires at least one"
+    );
+    format!(
+        "realtime-resume violated: the resumed connection RE-delivered {} id(s) already seen \
+         before the kill: {redelivered:?} — Last-Event-ID resume must never repeat a frame the \
+         client already consumed",
+        redelivered.len()
+    )
+}
+
+/// The symmetric violation: an id the resumed connection delivered that was
+/// neither missing nor a redelivery — this oracle never writes during the
+/// resume phase, so there is no legitimate source for one. Extracted and
+/// pinned alongside `redelivery_violation_message` for the same reason.
+fn unexpected_delivery_message(unexpected: &BTreeSet<u64>) -> String {
+    assert!(
+        !unexpected.is_empty(),
+        "unexpected_delivery_message: called with no unexpected ids — a verdict requires at \
+         least one"
+    );
+    format!(
+        "realtime-resume violated: the resumed stream delivered id(s) that were neither \
+         missing nor a redelivery — unexpected: {unexpected:?} (this oracle never writes \
+         during the resume phase)"
+    )
 }
 
 // ------------------------------------------------------------------ teardown
@@ -553,16 +651,22 @@ fn run_oracle(node_bin: &Path) -> Result<(), String> {
             .ok_or_else(|| "no frame was ever read before the kill — no cursor to resume from (the live phase should have set one)".to_string())?;
 
         // ---- kill mid-stream, restart, resume ----------------------------
-        drop(tail); // the old connection is about to die anyway
+        // The tail stays open THROUGH the kill (review Minor 4 — this used
+        // to `drop(tail)` first, so the server saw a clean client
+        // disconnect and only then died with no live SSE connection at
+        // all, which is not "kill9 mid-stream"). Dropped only after, once
+        // the process is already gone, to release our side of a socket
+        // nothing is listening on anymore.
         scenario.record("killing the node mid-stream, with events still undelivered");
         node.kill9(&mut scenario);
+        drop(tail);
         node.restart(&mut scenario).map_err(|e| e.to_string())?;
         scenario.record("node restarted — reconnecting with Last-Event-ID from before the kill");
 
         let mut resumed_tail = http
             .sse_tail("/events/feed", Some(&resume_cursor))
             .map_err(|e| format!("reconnecting the SSE tail after restart failed: {e}"))?;
-        let drain = drain_resume(&mut resumed_tail, &missing_before_kill, RESUME_MAX_FRAMES);
+        let drain = drain_resume(&mut resumed_tail, &missing_before_kill, RESUME_MAX_FRAMES)?;
         scenario.record(format!(
             "resume drain: read {} frame(s), found {:?}",
             drain.frames_read, drain.found
@@ -582,12 +686,7 @@ fn run_oracle(node_bin: &Path) -> Result<(), String> {
             .copied()
             .collect();
         if !redelivered.is_empty() {
-            return Err(format!(
-                "realtime-resume violated: the resumed connection RE-delivered {} id(s) already \
-                 seen before the kill: {redelivered:?} — Last-Event-ID resume must never repeat \
-                 a frame the client already consumed",
-                redelivered.len()
-            ));
+            return Err(redelivery_violation_message(&redelivered));
         }
 
         let still_missing: BTreeSet<u64> = missing_before_kill
@@ -604,18 +703,17 @@ fn run_oracle(node_bin: &Path) -> Result<(), String> {
         // Symmetric check: the resumed set must be EXACTLY the missing set,
         // not a superset either (an id neither missing nor a redelivery
         // would be a genuinely unexpected event — this oracle never creates
-        // invoices during the resume phase).
+        // invoices during the resume phase). `Err`, not `assert!` (review
+        // Minor 10) — a violation here should still flow through `finish`
+        // so its evidence survives, rather than an unwind bypassing it.
         let unexpected: BTreeSet<u64> = drain
             .found
             .difference(&missing_before_kill)
             .copied()
             .collect();
-        assert!(
-            unexpected.is_empty(),
-            "realtime-resume: the resumed stream delivered id(s) that were neither missing nor \
-             a redelivery — unexpected: {unexpected:?} (this oracle never writes during the \
-             resume phase)"
-        );
+        if !unexpected.is_empty() {
+            return Err(unexpected_delivery_message(&unexpected));
+        }
 
         scenario.record(format!(
             "resume verified: exactly the {} missing invoice id(s) arrived, no redelivery, no \
@@ -679,13 +777,36 @@ fn realtime_resume_wire_oracle() {
 #[test]
 fn classify_resume_drained_is_an_unqualified_violation() {
     let missing: BTreeSet<u64> = [7, 12].into_iter().collect();
-    let stop = StopReason::Drained("hit the 30-frame read budget".to_string());
+    // Review Important 2: budget exhaustion no longer routes through
+    // `Drained` (see `classify_resume_budget_exhausted_is_not_a_violation`
+    // below) — quiescence is one of the two reasons that legitimately do.
+    let stop = StopReason::Drained("3 consecutive timeouts with nothing new arriving".to_string());
     let message = classify_resume(&missing, &stop, 10);
     assert_eq!(
         message,
         "realtime-resume violated: 2 of 10 miss-phase invoice(s) never arrived on the resumed \
-         stream even though it drained cleanly (hit the 30-frame read budget): missing invoice \
-         ids [7, 12]"
+         stream even though it drained cleanly (3 consecutive timeouts with nothing new \
+         arriving): missing invoice ids [7, 12]"
+    );
+}
+
+#[test]
+fn classify_resume_budget_exhausted_is_not_a_violation() {
+    let missing: BTreeSet<u64> = [7, 12].into_iter().collect();
+    let stop = StopReason::BudgetExhausted("hit the 30-frame read budget".to_string());
+    let message = classify_resume(&missing, &stop, 10);
+    assert_eq!(
+        message,
+        "realtime-resume oracle could not conclude: 2 of 10 miss-phase invoice(s) were still \
+         outstanding when this rig's OWN read budget ran out (hit the 30-frame read budget) — \
+         NOT evidence of a resume violation (the rig stopped asking; the server was never \
+         shown to have failed to send anything). Raise RESUME_MAX_FRAMES or investigate why \
+         more frames arrived than expected: missing invoice ids [7, 12]"
+    );
+    assert!(
+        !message.contains("realtime-resume violated"),
+        "the rig's own frame budget running out must never speak in the violation's voice: \
+         {message:?}"
     );
 }
 
@@ -765,4 +886,48 @@ fn extract_error_message_unescapes_the_cursor_400_body() {
 #[test]
 fn extract_error_message_none_without_an_error_field() {
     assert_eq!(extract_error_message(br#"{"id":1}"#), None);
+}
+
+#[test]
+fn frame_event_id_reads_the_numeric_prefix() {
+    assert_eq!(frame_event_id("12.34"), Some(12));
+    assert_eq!(frame_event_id("0.0"), Some(0));
+    assert_eq!(frame_event_id("not-a-cursor"), None);
+    assert_eq!(frame_event_id(""), None);
+}
+
+#[test]
+fn redelivery_violation_message_names_the_repeated_ids() {
+    let redelivered: BTreeSet<u64> = [5, 6].into_iter().collect();
+    let msg = redelivery_violation_message(&redelivered);
+    assert_eq!(
+        msg,
+        "realtime-resume violated: the resumed connection RE-delivered 2 id(s) already seen \
+         before the kill: {5, 6} — Last-Event-ID resume must never repeat a frame the client \
+         already consumed"
+    );
+}
+
+#[test]
+#[should_panic(expected = "a redelivery verdict requires at least one")]
+fn redelivery_violation_message_panics_on_an_empty_set() {
+    let _ = redelivery_violation_message(&BTreeSet::new());
+}
+
+#[test]
+fn unexpected_delivery_message_names_the_extra_ids() {
+    let unexpected: BTreeSet<u64> = [9].into_iter().collect();
+    let msg = unexpected_delivery_message(&unexpected);
+    assert_eq!(
+        msg,
+        "realtime-resume violated: the resumed stream delivered id(s) that were neither \
+         missing nor a redelivery — unexpected: {9} (this oracle never writes during the \
+         resume phase)"
+    );
+}
+
+#[test]
+#[should_panic(expected = "a verdict requires at least one")]
+fn unexpected_delivery_message_panics_on_an_empty_set() {
+    let _ = unexpected_delivery_message(&BTreeSet::new());
 }

@@ -549,19 +549,25 @@ fn run_oracle(
             }
         }
         let non_converged_tail = acked.len() - converged.len();
-        // The bound DECISIONS §6 promises: loss outside the converged set
-        // is confined to the acked-but-never-observed-converged tail,
-        // never larger than it — checked explicitly (not just implicitly
-        // true by construction) so a future refactor that widened
-        // `tail_missing` beyond the tail itself would fail loudly here
-        // rather than silently.
-        assert!(
-            tail_missing.len() <= non_converged_tail,
-            "tail_missing ({}) exceeds the non-converged tail itself ({}) — a bookkeeping bug, \
-             not a bounded-loss window",
-            tail_missing.len(),
-            non_converged_tail
-        );
+        // Bookkeeping invariant, NOT the DECISIONS §6 bound (review Minor
+        // 6 — the previous comment here over-read this check): `tail_missing`
+        // is a subset of the non-converged tail by construction (the
+        // `if converged_set.contains` branch above is exhaustive), so this
+        // can only ever fail on a bug in THIS function, never on a real
+        // DECISIONS §6 outcome. The genuine §6 bound in this oracle is
+        // `MIN_CONVERGED`, which caps the tail itself at ≤10 of 50 (checked
+        // earlier, before promote — see the `converged.len() < MIN_CONVERGED`
+        // gate above). `Err`, not `assert!` (review Minor 10): a violation
+        // here should still flow through `finish` so its evidence survives,
+        // rather than an unwind bypassing the recorded `FAILED:` line.
+        if tail_missing.len() > non_converged_tail {
+            return Err(format!(
+                "tail_missing ({}) exceeds the non-converged tail itself ({}) — a bookkeeping \
+                 bug in this function, not a bounded-loss window",
+                tail_missing.len(),
+                non_converged_tail
+            ));
+        }
         scenario.record(describe_tail_loss(&tail_missing, non_converged_tail));
         if !missing.is_empty() {
             return Err(classify_converged_loss(&missing, converged.len()));
@@ -604,7 +610,13 @@ fn run_oracle(
                 "--role".to_string(),
                 "follower".to_string(),
                 "--primary".to_string(),
-                follower_addr.clone(),
+                // The REPL address, not the HTTP one (review Minor 5 —
+                // this used to be `follower_addr`, the new primary's HTTP
+                // port; a real operator points a follower's `--primary` at
+                // the peer's replication listen address, and the pinned
+                // notice below must embed the port an actual follower
+                // client would dial).
+                follower_repl_addr.clone(),
                 "--secret".to_string(),
                 SECRET.to_string(),
             ],
@@ -617,7 +629,7 @@ fn run_oracle(
         old_primary_restart = Some(old_primary);
 
         let expected_notice = format!(
-            "role file says primary, but config says follower of {follower_addr} — the \
+            "role file says primary, but config says follower of {follower_repl_addr} — the \
              durable role file always wins over config, never the reverse; demoting a primary \
              requires a fresh data dir (re-seed) — a demoted primary's log may have diverged, \
              and re-seeding is the only safe rejoin"
@@ -689,6 +701,7 @@ fn run_oracle(
     drop(old_primary_restart); // kills the rogue restarted old primary (ChildNode's Drop)
 
     finish(
+        tag,
         &mut scenario,
         &[&primary_data, &follower_data],
         &scenario_root,
@@ -703,7 +716,12 @@ fn run_oracle(
 /// (`RunStats` for `run_oracle`, `()` for `run_known_gap_oracle`) so a
 /// caller that needs the run's observed stats — not just pass/fail — can
 /// get them back on success without re-deriving them from the scenario log.
+/// `tag` names which caller is reporting (review Minor 8 — this used to
+/// hardcode "failover", so a `run_known_gap_oracle` failure printed under
+/// the wire oracle's name; `realtime_resume.rs`'s `finish` already took a
+/// `tag` for exactly this reason).
 fn finish<T>(
+    tag: &str,
     scenario: &mut Scenario,
     data_dirs: &[&std::path::Path],
     scenario_root: &std::path::Path,
@@ -717,12 +735,12 @@ fn finish<T>(
     match &result {
         Err(e) => {
             eprintln!(
-                "edge-harness failover: FAILED — scenario script at {}",
+                "edge-harness {tag}: FAILED — scenario script at {}",
                 script.display()
             );
-            eprintln!("edge-harness failover: {e}");
+            eprintln!("edge-harness {tag}: {e}");
             eprintln!(
-                "edge-harness failover: NOT deleting data dir(s) ({}) or scenario root ({}) — \
+                "edge-harness {tag}: NOT deleting data dir(s) ({}) or scenario root ({}) — \
                  preserved for inspection",
                 data_dirs
                     .iter()
@@ -1116,6 +1134,7 @@ fn run_known_gap_oracle(
     drop(old_primary_restart);
 
     finish(
+        tag,
         &mut scenario,
         &[&primary_data, &follower_data],
         &scenario_root,
@@ -1275,5 +1294,30 @@ fn describe_tail_loss_mixed_names_the_unverifiable_remainder() {
         !msg.contains("violated"),
         "the tail's expected loss must never share `classify_converged_loss`'s violation \
          wording, even in the mixed case: {msg:?}"
+    );
+}
+
+/// Review Minor 12: `describe_tail_loss` folds `confirmed == 0` (every tail
+/// id unverifiable for a rig reason, none confirmed) into the same branch
+/// as the mixed case — honest text, but previously the one sub-case of the
+/// function with no pin.
+#[test]
+fn describe_tail_loss_zero_confirmed_is_worded_honestly_as_unverifiable() {
+    let tail_missing: IdReasons = vec![
+        (49, "status 401".to_string()),
+        (50, "status 500".to_string()),
+    ];
+    let msg = describe_tail_loss(&tail_missing, 2);
+    assert_eq!(
+        msg,
+        "0 of 2 non-converged-tail id(s) confirmed genuinely absent (status 404, DECISIONS §6 \
+         bounded loss, expected); 2 could NOT be verified for a rig reason (not evidence of the \
+         bounded-loss window, just a check that couldn't finish): [(49, \"status 401\"), (50, \
+         \"status 500\")]"
+    );
+    assert!(
+        !msg.contains("violated"),
+        "the tail's expected loss must never share `classify_converged_loss`'s violation \
+         wording, even when zero of the tail's ids are confirmed genuinely absent: {msg:?}"
     );
 }
