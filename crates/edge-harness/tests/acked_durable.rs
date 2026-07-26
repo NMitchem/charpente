@@ -344,6 +344,19 @@ struct VerifyFailure {
 /// (process-, socket-, or filesystem-touching → `#[ignore]`; see
 /// `scripts/edge-harness.sh`).
 fn classify(missing: &IdReasons, acked_len: usize, script_path: &Path) -> String {
+    // Hard rule 4 (negative space): `verify` only ever calls this under
+    // `if !missing.is_empty()`, but the extraction made `classify`
+    // independently callable — and the three `classify_*` tests below DO
+    // call it directly — so nothing stops a future caller from passing an
+    // empty `missing`. Without this guard, `classify(&[], 40, path)`
+    // satisfies `confirmed == missing.len()` (0 == 0) and returns
+    // "acked-implies-durable violated: 0 of 40 acked id(s) missing: []" —
+    // the headline claim, asserted on zero evidence (re-review round 3
+    // Minor).
+    assert!(
+        !missing.is_empty(),
+        "classify: called with no missing ids — a durability verdict requires at least one"
+    );
     let confirmed = missing
         .iter()
         .filter(|(_, reason)| reason == "status 404")
@@ -1007,16 +1020,21 @@ fn acked_implies_durable_meta_test_has_teeth() {
 // instead of borrowed from the OS's own connect-refused string — genuinely
 // byte-exact end to end, not prefix/suffix around a platform-dependent gap.
 
-/// `classify`, all-404: the unqualified violation wording, unchanged from
-/// round 1's pin target.
+/// `classify`, all-404: the unqualified violation wording. 2 missing of 3
+/// acked (re-review round 3 Minor — round 2's 2-of-2 couldn't tell
+/// `{missing.len()} of {acked_len}` apart from the reverse or from
+/// `{missing.len()} of {missing.len()}`; distinct counts here catch an
+/// interpolation swap). Also documents a legitimately reachable case: a
+/// PARTIAL all-404 loss (2 of 3, not 3 of 3) — precisely what the
+/// meta-test's tightened `n`-of-`n` guard exists to exclude.
 #[test]
 fn classify_all_404_is_an_unqualified_violation() {
     let missing: IdReasons = vec![(1, "status 404".to_string()), (2, "status 404".to_string())];
     let script_path = Path::new("/tmp/edge-harness-example/scenario.log");
-    let message = classify(&missing, 2, script_path);
+    let message = classify(&missing, 3, script_path);
     assert_eq!(
         message,
-        "acked-implies-durable violated: 2 of 2 acked id(s) missing: [(1, \"status 404\"), \
+        "acked-implies-durable violated: 2 of 3 acked id(s) missing: [(1, \"status 404\"), \
          (2, \"status 404\")] — scenario script: /tmp/edge-harness-example/scenario.log"
     );
 }
@@ -1049,17 +1067,25 @@ fn classify_zero_404_is_a_pure_rig_failure() {
 /// `acked_len` denominator like the other two branches (re-review round 2
 /// Minor — the previous wording asserted "violated" and hedged "may be
 /// present" in the same sentence, and alone among the three branches
-/// omitted the acked-id scale).
+/// omitted the acked-id scale). 2 confirmed + 1 rig-failure of 5 acked
+/// (re-review round 3 Minor — round 2's 1-confirmed/1-rig couldn't tell
+/// `confirmed` apart from `missing.len() - confirmed`; distinct counts
+/// here catch a swap of those two interpolations).
 #[test]
 fn classify_mixed_confirms_a_violation_without_hedging() {
-    let missing: IdReasons = vec![(1, "status 404".to_string()), (2, "status 500".to_string())];
+    let missing: IdReasons = vec![
+        (1, "status 404".to_string()),
+        (2, "status 404".to_string()),
+        (3, "status 500".to_string()),
+    ];
     let script_path = Path::new("/tmp/edge-harness-example/scenario.log");
     let message = classify(&missing, 5, script_path);
     assert_eq!(
         message,
-        "acked-implies-durable violated: 1 of 5 acked id(s) confirmed genuinely absent \
+        "acked-implies-durable violated: 2 of 5 acked id(s) confirmed genuinely absent \
          (status 404) alongside 1 GET(s) that failed for a rig reason: [(1, \"status 404\"), \
-         (2, \"status 500\")] — scenario script: /tmp/edge-harness-example/scenario.log"
+         (2, \"status 404\"), (3, \"status 500\")] — scenario script: \
+         /tmp/edge-harness-example/scenario.log"
     );
 }
 
