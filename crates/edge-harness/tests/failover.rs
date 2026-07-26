@@ -20,6 +20,19 @@
 //! premise — a converged id must never be lost); the acked-but-never-
 //! observed-converged tail is reported in the scenario, never silently
 //! dropped, and checked too, but its loss (if any) is not a failure.
+//!
+//! **KNOWN GAP (ruled 2026-07-26, characterize-now/fix-deferred to T13/
+//! T14):** `run_oracle`'s negative arm and the separate
+//! `failover_known_gap_silent_dual_primary_resurrection` test below
+//! together characterize a real product gap found while writing this task:
+//! restarting an old primary after a `promote` with a config that
+//! CONTRADICTS the durable role file (an attempted demote) prints the
+//! `role.rs` notice to stderr but does not stop the node from serving as a
+//! live second primary; restarting it with its ORIGINAL, unchanged config
+//! (no attempted demote) produces no notice at all — a silent second
+//! writable primary. See `failover_known_gap_silent_dual_primary_resurrection`
+//! for the full characterization and `DESIGN.md:612-613`, which the
+//! promote/failover path does not currently uphold.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::collections::HashSet;
@@ -543,17 +556,25 @@ fn run_oracle(node_bin: &std::path::Path, charpente_bin: &std::path::Path) -> Re
             "negative arm confirmed: the restarted old primary's stderr prints the pinned \
              demote/re-seed refusal byte-exact",
         );
-        // NOTE (spec/brief discrepancy — reported to the dispatcher before
-        // writing this test, awaiting a ruling): the brief additionally
-        // claims the restarted old primary "exits nonzero". Empirically
-        // (manual verification against the stock build, and every run of
-        // this oracle) `Repl::open` does NOT error, and `serve_replicated`
-        // does not exit on this notice — the durable role (Primary) wins
-        // over config, so the process keeps running as a live primary,
-        // printing the notice as the operator's cue to intervene, not as a
-        // self-enforced refusal. This oracle asserts only what the stock
-        // build actually does (the notice, byte-exact); it does not assert
-        // an exit code the current code never produces.
+        // RULED (Noah, 2026-07-26 — see task-12-report.md): the brief's
+        // literal text additionally claimed the restarted old primary
+        // "exits nonzero". It doesn't, and this is a brief error, not a
+        // product bug — GUIDE.md:2379-2382 is the accurate spec ("a
+        // mismatch between the two is surfaced on stderr ... config never
+        // silently re-roles a node"; no exit is documented). Confirmed
+        // against the stock build: `Repl::open` does NOT error, and
+        // `serve_replicated` does not exit on this notice — the durable
+        // role (Primary) wins over config, so the process keeps running as
+        // a live primary, printing the notice as the operator's cue to
+        // intervene, never a self-enforced refusal. This assertion is
+        // therefore scoped to what the stock build actually does (the
+        // notice, byte-exact) and asserts no exit code.
+        //
+        // This restart used a config that CONTRADICTS the role file
+        // (`--role follower`), which is what produces the notice at all —
+        // see `failover_known_gap_silent_dual_primary_resurrection` below
+        // for the weaker, silent variant (an operator restart with the
+        // ORIGINAL `--role primary` config produces no notice whatsoever).
 
         Ok(())
     })();
@@ -622,6 +643,304 @@ fn failover_wire_oracle() {
         "failover must promote the follower with zero loss over converged ids, and the \
          restarted old primary must print the pinned demote/re-seed refusal — see stderr above \
          for the scenario script",
+    );
+}
+
+// ------------------------------------------------ KNOWN GAP characterization
+//
+// Ruled by Noah, 2026-07-26 (task-12-report.md carries the full finding):
+// characterize the shipped behavior now, decide the fix at T13/T14 (T13's
+// HALT-for-ruling slot, alongside Hunt 1's read-side-poison
+// characterization). This is deliberately its OWN test, visibly separate
+// from `failover_wire_oracle`'s guarantee assertions above — it does not
+// assert a guarantee; it records a fact about the stock build so a future
+// fix has something to turn red against. DO NOT weaken, delete, or fold
+// this into a passing assertion to "fix" a red run here — if the product
+// changes this behavior, UPDATE this test to assert the new, safer
+// behavior; a red run here after a product change is this test doing its
+// job, not a regression to work around.
+//
+// DESIGN.md:612-613 states, of the `HandingOff`/switchover path only: "it
+// never silently resumes `Primary`, so no interleaving yields two writable
+// primaries." That claim does not hold for the `promote`/failover path:
+// restarting an old primary with its ORIGINAL, unchanged `--role primary`
+// config (no attempted demote — the operator just restarts the node as it
+// was configured before) produces NO stderr notice at all (contrast
+// `run_oracle`'s negative arm above, which restarts with a CONTRADICTING
+// `--role follower` config and DOES get the notice — the notice is not a
+// general safety net, it only fires when the restart config happens to
+// disagree with the durable role file). The resurrected old primary comes
+// up fully writable, answers reads for its own (stale, possibly-diverged)
+// data, and accepts new writes — a second live primary with no operator
+// warning whatsoever. Because a demoted-but-resurrected primary's log may
+// have diverged from the new primary's, the mandated remedy (wipe and
+// re-seed) DESTROYS whatever the resurrected node accepted in the
+// meantime — this is acked-write loss, the exact guarantee this whole
+// harness exists to defend, reachable purely through an ordinary "restart
+// the old box the same way it was configured before" operator action.
+//
+// Also characterized here: neither node is aware of the other. Each's
+// `follower` client is `None` once durably `Primary` (`repl/mod.rs`'s
+// `Repl::open`), so there is no wire-level signal either side could use to
+// notice the conflict — confirmed below by writing through EACH "primary"
+// and showing the write never appears on the other.
+fn run_known_gap_oracle(
+    node_bin: &std::path::Path,
+    charpente_bin: &std::path::Path,
+) -> Result<(), String> {
+    let tag = "failover_known_gap";
+    let scenario_root = temp_dir(&format!("{tag}-scenario-root"));
+    std::fs::create_dir_all(&scenario_root).map_err(|e| e.to_string())?;
+    let mut scenario = Scenario::new(&scenario_root, tag).map_err(|e| e.to_string())?;
+    let primary_data = temp_dir(&format!("{tag}-primary-data"));
+    let follower_data = temp_dir(&format!("{tag}-follower-data"));
+    let mut repl_proxy: Option<TcpProxy> = None;
+    let mut old_primary_restart: Option<ChildNode> = None;
+
+    let result = (|| -> Result<(), String> {
+        let primary_addr = free_addr();
+        let primary_repl_addr = free_addr();
+        let follower_addr = free_addr();
+        let follower_repl_addr = free_addr();
+
+        let mut primary = ChildNode::spawn(
+            node_bin,
+            &[
+                "--addr".to_string(),
+                primary_addr.clone(),
+                "--data-dir".to_string(),
+                primary_data.to_str().unwrap().to_string(),
+                "--repl-listen".to_string(),
+                primary_repl_addr.clone(),
+                "--role".to_string(),
+                "primary".to_string(),
+                "--secret".to_string(),
+                SECRET.to_string(),
+            ],
+            &mut scenario,
+        )
+        .map_err(|e| format!("spawning the primary failed: {e}"))?;
+
+        let proxy = TcpProxy::start(&primary_repl_addr).map_err(|e| e.to_string())?;
+        let proxy_addr = proxy.addr();
+        repl_proxy = Some(proxy);
+
+        // Kept alive (unread) purely so its `Drop` doesn't kill the
+        // follower process partway through the scenario.
+        let _follower = ChildNode::spawn(
+            node_bin,
+            &[
+                "--addr".to_string(),
+                follower_addr.clone(),
+                "--data-dir".to_string(),
+                follower_data.to_str().unwrap().to_string(),
+                "--repl-listen".to_string(),
+                follower_repl_addr.clone(),
+                "--role".to_string(),
+                "follower".to_string(),
+                "--primary".to_string(),
+                proxy_addr,
+                "--secret".to_string(),
+                SECRET.to_string(),
+            ],
+            &mut scenario,
+        )
+        .map_err(|e| format!("spawning the follower failed: {e}"))?;
+
+        let mut primary_http = Http::new(&primary_addr);
+        let token = login(&mut primary_http, &mut scenario)?;
+        let mut follower_http = Http::new(&follower_addr);
+        follower_http.set_session(token.clone());
+
+        // One converged write, so there is durable state on the primary
+        // worth resurrecting/protecting.
+        let resp = primary_http
+            .post("/customers/1", r#"{"name":"A","email":"a@example.com"}"#)
+            .map_err(|e| format!("seed write failed: {e}"))?;
+        if resp.status != 200 {
+            return Err(format!("seed write: expected 200, got {}", resp.status));
+        }
+        if !wait_converged(&mut follower_http, 1) {
+            return Err(
+                "seed write never converged to the follower within the timeout — cannot \
+                 characterize the gap without a converged row to check"
+                    .to_string(),
+            );
+        }
+        scenario.record("seed write (id 1) converged to the follower");
+
+        primary.kill9(&mut scenario);
+        scenario.record("primary killed for good");
+
+        let promote = Command::new(charpente_bin)
+            .args(["promote", "--node", &follower_repl_addr, "--secret", SECRET])
+            .output()
+            .map_err(|e| format!("running `charpente promote` failed to launch: {e}"))?;
+        if !promote.status.success() {
+            return Err(format!(
+                "charpente promote exited non-zero ({:?}) — stdout {:?} stderr {:?}",
+                promote.status.code(),
+                String::from_utf8_lossy(&promote.stdout),
+                String::from_utf8_lossy(&promote.stderr)
+            ));
+        }
+        scenario.record("follower promoted to primary");
+
+        // ---- resurrect the old primary with its ORIGINAL, unchanged ----
+        // ---- config — no attempted demote, unlike run_oracle's negative --
+        // ---- arm. Fresh ports (same rationale as run_oracle: avoid a ----
+        // ---- TIME_WAIT collision right after kill9), SAME data dir. ----
+        let old_addr = free_addr();
+        let old_repl_addr = free_addr();
+        let old_primary = ChildNode::spawn(
+            node_bin,
+            &[
+                "--addr".to_string(),
+                old_addr.clone(),
+                "--data-dir".to_string(),
+                primary_data.to_str().unwrap().to_string(),
+                "--repl-listen".to_string(),
+                old_repl_addr,
+                "--role".to_string(),
+                "primary".to_string(),
+                "--secret".to_string(),
+                SECRET.to_string(),
+            ],
+            &mut scenario,
+        )
+        .map_err(|e| {
+            format!("restarting the old primary (original config, no demote attempt) failed: {e}")
+        })?;
+        let stderr_path = old_primary.stderr_log().to_path_buf();
+        old_primary_restart = Some(old_primary);
+
+        // Give `Repl::open` a fair window to print anything it's going to
+        // print — `run_oracle`'s negative arm observes the (contradicting-
+        // config) notice appearing within tens of ms, so 2s is generous
+        // margin; here we're waiting to confirm the ABSENCE of one, so a
+        // fixed sleep — not a poll-until-found loop — is the honest check.
+        std::thread::sleep(Duration::from_secs(2));
+        let stderr_contents = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        if stderr_contents.contains("charpente replication:") {
+            return Err(format!(
+                "KNOWN GAP CHARACTERIZATION MISMATCH: expected NO \"charpente replication:\" \
+                 notice when the old primary restarts with its ORIGINAL, unchanged config (no \
+                 attempted demote) — got {stderr_contents:?}. If this is because a fix landed, \
+                 UPDATE this test to assert the new (safer) behavior; do not just delete this \
+                 check."
+            ));
+        }
+        scenario.record(
+            "confirmed: restarting the old primary with its ORIGINAL config prints NO stderr \
+             notice at all (contrast run_oracle's negative arm, which DOES get a notice from a \
+             contradicting config)",
+        );
+
+        let mut old_http = Http::new(&old_addr);
+        // Sessions are durable and replicate like any other table row (auth
+        // T2) — the token minted through the original primary before it
+        // died is still valid against the resurrected old primary, which
+        // opened the SAME data dir.
+        old_http.set_session(token);
+        let old_resp = old_http
+            .get("/customers/1")
+            .map_err(|e| format!("GET on the silently-resurrected old primary failed: {e}"))?;
+        if old_resp.status != 200 {
+            return Err(format!(
+                "KNOWN GAP CHARACTERIZATION MISMATCH: expected the resurrected old primary to \
+                 silently serve its own stale data (status 200), got {}",
+                old_resp.status
+            ));
+        }
+        let write_resp = old_http
+            .post("/customers/99", r#"{"name":"Z","email":"z@example.com"}"#)
+            .map_err(|e| format!("POST on the silently-resurrected old primary failed: {e}"))?;
+        if write_resp.status != 200 {
+            return Err(format!(
+                "KNOWN GAP CHARACTERIZATION MISMATCH: expected the resurrected old primary to \
+                 silently accept a new write (status 200), got {}",
+                write_resp.status
+            ));
+        }
+        scenario.record(
+            "confirmed: the resurrected old primary is a fully live, silently writable second \
+             primary — serves reads (200) and accepts new writes (200), no warning anywhere",
+        );
+
+        // ---- mutual non-awareness: a write through EACH "primary" must ---
+        // ---- never appear on the other — neither dials the other once ---
+        // ---- both are durably Primary (repl/mod.rs's Repl::open).      ---
+        let new_write = follower_http
+            .post(
+                "/customers/200",
+                r#"{"name":"Via new primary","email":"n@example.com"}"#,
+            )
+            .map_err(|e| format!("write through the promoted (new) primary failed: {e}"))?;
+        if new_write.status != 200 {
+            return Err(format!(
+                "write through the promoted primary: expected 200, got {}",
+                new_write.status
+            ));
+        }
+        // id 99 was written through the OLD primary above, never through
+        // the new one — if the new primary can see it, they are NOT
+        // isolated from each other (a materially different, worse finding
+        // than the one this test otherwise characterizes).
+        let cross_check_a = follower_http
+            .get("/customers/99")
+            .map_err(|e| format!("cross-check GET on the promoted primary failed: {e}"))?;
+        if cross_check_a.status != 404 {
+            return Err(format!(
+                "MUTUAL-AWARENESS CHECK FAILED: id 99 was written ONLY through the resurrected \
+                 old primary, but the promoted (new) primary answered its GET with status {} \
+                 (expected 404) — the two primaries are NOT isolated from each other, which is \
+                 a materially different and worse finding than the one documented above",
+                cross_check_a.status
+            ));
+        }
+        // Symmetric direction: id 200 was written only through the new
+        // primary, above — the old (resurrected) primary must not see it.
+        let cross_check_b = old_http
+            .get("/customers/200")
+            .map_err(|e| format!("cross-check GET on the resurrected old primary failed: {e}"))?;
+        if cross_check_b.status != 404 {
+            return Err(format!(
+                "MUTUAL-AWARENESS CHECK FAILED: id 200 was written ONLY through the promoted \
+                 (new) primary, but the resurrected old primary answered its GET with status {} \
+                 (expected 404) — the two primaries are NOT isolated from each other, which is \
+                 a materially different and worse finding than the one documented above",
+                cross_check_b.status
+            ));
+        }
+        scenario.record(
+            "confirmed: the two primaries are mutually unaware — a write through either never \
+             appears on the other (each's follower client is None once durably Primary)",
+        );
+
+        Ok(())
+    })();
+
+    if let Some(proxy) = &repl_proxy {
+        proxy.stop(&mut scenario);
+    }
+    drop(old_primary_restart);
+
+    finish(
+        &mut scenario,
+        &[&primary_data, &follower_data],
+        &scenario_root,
+        result,
+    )
+}
+
+#[test]
+#[ignore]
+fn failover_known_gap_silent_dual_primary_resurrection() {
+    let bins = build_bins().expect("build_bins");
+    run_known_gap_oracle(&bins.node, &bins.charpente).expect(
+        "KNOWN GAP characterization mismatch — see stderr above for the scenario script; if a \
+         product fix landed, update this test's assertions rather than deleting them (module \
+         doc comment and comment block above `run_known_gap_oracle` carry the full context)",
     );
 }
 
