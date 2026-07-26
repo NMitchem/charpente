@@ -404,6 +404,7 @@ use charpente::routes;
 use charpente_core::io::Instant;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const SEC: u64 = 1_000_000_000;
@@ -540,6 +541,357 @@ fn kernel_stops_after_a_request_poisons_the_engine() {
         "the poisoning request got its 500; the next was never served"
     );
     assert_eq!(replies[0].status, 500);
+}
+
+// ------------- KNOWN GAP: a latched redb handle vs `Db::poisoned()` (T13 H1)
+//
+// Edge sub-project T13, Hunt 1 (ledgered production follow-up, progress.md
+// line 238 / spec §4.5). `Db::poisoned()` reflects only APPLY-side poison: the
+// engine's "a durable record failed to apply" flag and its WAL's fsyncgate
+// flag (`engine.rs`'s `poisoned()`). redb has a SECOND, independent poison of
+// its own — `CheckedBackend` (redb 4.1.0 `cached_file.rs:121`) sets `io_failed`
+// on ANY backend error (read, write, set_len, sync_data) and every later
+// backend op then returns `StorageError::PreviousIo`, "Previous I/O error
+// occurred. Please close and re-open the database." Nothing maps that latch
+// onto `Db::poisoned()`, and the kernel's request arm has no other stop
+// condition after a 500 (the 2026-07-05 ruling, pinned by
+// `kernel_stops_after_a_request_poisons_the_engine` above). So a node can be
+// serving off a store handle that is permanently dead for writes while
+// `Db::poisoned()` reports healthy.
+//
+// **The brief's predicted mechanism does not hold, and this test pins why.**
+// T13's brief expected a request-path READ fault to set the latch and every
+// later request to keep 500ing. A store read cannot be faulted on a live
+// handle in this build at all: redb's open path walks every page (forced on in
+// BOTH build modes by the root `Cargo.toml`'s `[profile.*.package.redb]`
+// debug-assertions override, so the seed promise stays cross-mode), and its
+// 1 GiB read cache then answers every subsequent read without touching the
+// `Disk` boundary. Measured while writing this test: a 10k-row store plus 300
+// further write transactions and 300 reads produce ZERO post-open reads at the
+// boundary — the assertion below pins that, so this comment fails loudly if
+// redb's caching or that override ever changes and the read-side variant
+// becomes reachable again. The latch is therefore reached the only way it is
+// reachable here: the store's own checkpoint fsync.
+//
+// What the shipped build actually does, and what this test characterizes: the
+// latch is silent on the read side. Reads keep answering 200 off the page
+// cache, `Db::poisoned()` stays false, the kernel keeps serving, and NOTHING
+// tells an operator anything — the window closes only when the next write
+// transaction converts the latch into apply-side poison. That is a weaker
+// symptom than the brief predicted (no 500 storm) and a worse one for
+// observability (no signal at all).
+//
+// This test CHARACTERIZES; it asserts no guarantee. HELD for a Noah ruling
+// (task-13-report.md): the fix touches the step-7 request-arm ruling and is a
+// product decision. DO NOT weaken or delete it to make a red run green — if
+// the product changes this behavior, UPDATE it to assert the new, safer
+// behavior; a red run here after a product change is this test doing its job.
+
+/// A pure read path: no effects, so nothing it does can reach the WAL, and any
+/// status it returns is the store's answer alone.
+#[route(GET "/count/:id")]
+fn read_count(tx: &mut Tx, id: Id<Counter>) -> Result<u64, ApiError> {
+    Ok(tx.get(id)?.map_or(0, |c| c.hits))
+}
+
+/// A pure store write — no enqueue, so servicing it never also arms the job
+/// arm and the reply sequence below stays exactly one reply per request.
+#[route(POST "/bump/:id")]
+fn bump_count(tx: &mut Tx, id: Id<Counter>) -> Result<u64, ApiError> {
+    let hits = tx.get(id)?.map_or(0, |c| c.hits) + 1;
+    tx.put(&Counter { id, hits });
+    Ok(hits)
+}
+
+/// Delegates every call to the sim's own disk with one deliberate exception:
+/// while `armed`, the next `sync` of `store_path` fails ONCE — with the sim
+/// `sync_error` axis's exact wording, so `checks::classify` still reads it as
+/// `Injected` — and then disarms.
+///
+/// Why the store's `sync` and not a `write_at`: `Store::apply` commits at
+/// `Durability::None` (no fsync), so the ONLY store sync is
+/// `Store::checkpoint`'s. Targeting `sync` therefore lands the fault on the
+/// checkpoint deterministically, never on a request's apply — where it would
+/// poison the engine apply-side and characterize the already-ruled path
+/// instead of this one. One-shot, and `fired` is asserted == 1, so the
+/// persistence observed afterwards can only be redb's latch and not repeated
+/// injection.
+///
+/// `reads` counts every store read that reaches this boundary — the
+/// measurement behind the module comment's unreachability claim.
+struct OneShotStoreSyncFaultDisk {
+    inner: charpente_sim::SimDisk,
+    store_path: String,
+    armed: Arc<AtomicBool>,
+    fired: Arc<AtomicU64>,
+    reads: Arc<AtomicU64>,
+}
+
+struct StoreFaultFile {
+    inner: Box<dyn charpente_core::io::File>,
+    /// `None` for every file but the store — the WAL is delegated untouched.
+    fault: Option<(Arc<AtomicBool>, Arc<AtomicU64>, Arc<AtomicU64>)>,
+}
+
+impl charpente_core::io::Disk for OneShotStoreSyncFaultDisk {
+    fn open(&self, path: &str) -> std::io::Result<Box<dyn charpente_core::io::File>> {
+        let inner = self.inner.open(path)?;
+        let fault = (path == self.store_path)
+            .then(|| (self.armed.clone(), self.fired.clone(), self.reads.clone()));
+        Ok(Box::new(StoreFaultFile { inner, fault }))
+    }
+
+    fn remove(&self, path: &str) -> std::io::Result<()> {
+        self.inner.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> std::io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+impl charpente_core::io::File for StoreFaultFile {
+    fn len(&self) -> std::io::Result<u64> {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        if let Some((_, _, reads)) = &self.fault {
+            reads.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.read_at(offset, out)
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        self.inner.write_at(offset, data)
+    }
+
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.inner.set_len(len)
+    }
+
+    fn sync(&self) -> std::io::Result<()> {
+        if let Some((armed, fired, _)) = &self.fault
+            && armed.swap(false, Ordering::SeqCst)
+        {
+            fired.fetch_add(1, Ordering::SeqCst);
+            return Err(std::io::Error::other(
+                "simulated fsync failure — durability of writes since the last successful sync \
+                 is unknown",
+            ));
+        }
+        self.inner.sync()
+    }
+}
+
+/// `ScriptedSource`, plus: arms `armed` the moment it hands over its FIRST
+/// request. That is the whole reason this source exists rather than arming
+/// before `Kernel::run` — `run`'s startup schema gate (`migrate_schema`) and
+/// `Kernel::new` both touch the store before any request is polled, and either
+/// would consume the one-shot injection at a site that is not the request arm
+/// under test.
+struct ArmingSource {
+    inner: ScriptedSource,
+    armed: Arc<AtomicBool>,
+    polled: u64,
+}
+
+impl RequestSource for ArmingSource {
+    fn poll(&mut self) -> Option<(Request, Reply)> {
+        let out = self.inner.poll()?;
+        self.polled += 1;
+        if self.polled == 1 {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+        Some(out)
+    }
+
+    fn wait_until(&mut self, deadline: Option<Instant>) -> Wake {
+        self.inner.wait_until(deadline)
+    }
+}
+
+/// `checkpoint_every: 1` so the FIRST write request runs the cadence
+/// checkpoint inside its own `transact` — the fault lands on the request path,
+/// not on a test-invoked `Db::checkpoint` call the kernel never makes.
+fn latch_config() -> AppConfig {
+    AppConfig {
+        db: charpente::DbConfig {
+            checkpoint_every: 1,
+            ..crash_config().db
+        },
+        ..crash_config()
+    }
+}
+
+#[test]
+fn kernel_keeps_serving_with_a_latched_store_known_gap() {
+    let sim = Sim::with_faults(0x0DED_0002, FaultConfig::none());
+    // Phase 1 (plain disk, no injector): commit and CHECKPOINT some rows, so
+    // the GETs below read committed durable state, then drop the handle.
+    {
+        let mut warm = App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Counter>(),
+            Box::new(sim.entropy()),
+            latch_config(),
+        )
+        .unwrap();
+        warm.db_for_tests()
+            .transact(|tx| {
+                tx.put(&Counter {
+                    id: Id::from_raw(1),
+                    hits: 7,
+                });
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+    }
+
+    // Phase 2: a fresh handle over the injector disk.
+    let armed = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicU64::new(0));
+    let reads = Arc::new(AtomicU64::new(0));
+    let app = App::open(
+        Box::new(OneShotStoreSyncFaultDisk {
+            inner: sim.disk(),
+            store_path: latch_config().db.store_path.clone(),
+            armed: armed.clone(),
+            fired: fired.clone(),
+            reads: reads.clone(),
+        }),
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        latch_config(),
+    )
+    .unwrap()
+    .mount(routes![read_count, bump_count]);
+
+    // One write (whose in-transact checkpoint eats the fault), then two reads
+    // — deliberately NO second write, so the latched window is still open when
+    // the run ends and `Db::poisoned()` can be observed inside it.
+    let (inner, replies) = scripted_source(vec![
+        Request::new(Method::Post, "/bump/1"),
+        Request::new(Method::Get, "/count/1"),
+        Request::new(Method::Get, "/count/1"),
+    ]);
+    let mut source = ArmingSource {
+        inner,
+        armed,
+        polled: 0,
+    };
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let reads_at_open = reads.load(Ordering::SeqCst);
+    let run = kernel.run(&mut source);
+
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the injector must fire EXACTLY once — the persistence observed below is only evidence \
+         of redb's latch if nothing kept re-injecting"
+    );
+    // The mechanism pin (module comment): no store read reaches the `Disk`
+    // boundary after open, which is why a request-path READ fault — the shape
+    // T13's brief predicted — is unreachable in this build. If this ever
+    // fails, redb's caching or the debug-assertions page-walk override
+    // changed, the read-side variant is live again, and the brief's original
+    // shape needs re-testing.
+    assert!(
+        reads_at_open > 0,
+        "anti-vacuity: zero store reads were counted even at open, so this injector is not \
+         attached to the store file at all and the equality below would hold trivially"
+    );
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        reads_at_open,
+        "a store read reached the Disk boundary after open ({} at open, {} after the run) — \
+         redb's post-open read caching changed, so the request-path READ fault this gap was \
+         first predicted through is reachable again",
+        reads_at_open,
+        reads.load(Ordering::SeqCst)
+    );
+
+    let replies = replies.lock().unwrap();
+    assert_eq!(
+        replies.len(),
+        3,
+        "the kernel served every scripted request — it never stopped"
+    );
+    // The write's cadence checkpoint fails, so it 500s (its WAL record DID
+    // commit — the 500's own wording is honest about that ambiguity).
+    assert_eq!(replies[0].status, 500);
+    let body = String::from_utf8_lossy(&replies[0].body);
+    assert!(
+        body.contains("simulated fsync failure"),
+        "the write's 500 should name the injected fault: {body}"
+    );
+    // THE GAP, part 1: with the store handle latched, the reads that follow
+    // are answered 200 off redb's page cache. No 500, no warning, nothing.
+    for (i, reply) in replies.iter().enumerate().skip(1) {
+        assert_eq!(
+            reply.status,
+            200,
+            "request {i} (a read) is answered off redb's page cache even though the store \
+             handle is latched: {}",
+            String::from_utf8_lossy(&reply.body)
+        );
+    }
+    // The loop's exit was the source's `Shutdown`, whose clean-shutdown
+    // checkpoint is refused by the same latch — NOT the poison stop, which
+    // never fired.
+    let err = run.expect_err("the clean-shutdown checkpoint hits the latch");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("close and re-open the database"),
+        "the loop's only failure should be the shutdown checkpoint hitting redb's latch: {msg}"
+    );
+    assert!(
+        !msg.contains("kernel stopped"),
+        "KNOWN GAP: the kernel must NOT have stopped for poison — it served all 3 requests \
+         first: {msg}"
+    );
+
+    // THE GAP, part 2 (the headline): redb's latch is live — proven by the
+    // shutdown checkpoint's refusal above — and `Db::poisoned()` still reports
+    // healthy. Flipping this to `assert!(poisoned)` is the mutation proof that
+    // it has teeth (task-13-report.md); a fix that gives redb's latch the same
+    // standing as an apply-side fault turns it red, by design.
+    let mut app = kernel.into_app();
+    assert!(
+        !app.db_for_tests().poisoned(),
+        "KNOWN GAP: a latched redb handle leaves Db::poisoned() false — if this is now true, \
+         the read-side poison fix landed; update this test to assert the new behavior rather \
+         than deleting it"
+    );
+
+    // And the window's only natural end: the next WRITE turns the latch into
+    // apply-side poison (which the kernel's request arm does stop on). So the
+    // gap is not that the node never notices — it is that a read-serving node
+    // never does.
+    let write = app.db_for_tests().transact(|tx| {
+        tx.put(&Counter {
+            id: Id::from_raw(2),
+            hits: 1,
+        });
+        Ok::<(), std::io::Error>(())
+    });
+    let write_err = match write {
+        Err(TxError::Io(e)) => e.to_string(),
+        other => panic!("expected the next write to fail on the latch, got {other:?}"),
+    };
+    assert!(
+        write_err.contains("close and re-open the database"),
+        "the next write should hit redb's latch at apply: {write_err}"
+    );
+    assert!(
+        app.db_for_tests().poisoned(),
+        "the latch becomes apply-side poison at the next write — that, and only that, is what \
+         eventually stops the kernel today"
+    );
 }
 
 #[test]
