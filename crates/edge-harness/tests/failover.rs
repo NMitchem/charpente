@@ -246,7 +246,30 @@ fn vacuous_ack_message(acked_len: usize, not_acked: &IdReasons) -> String {
 
 // --------------------------------------------------------------- the oracle
 
-fn run_oracle(node_bin: &std::path::Path, charpente_bin: &std::path::Path) -> Result<(), String> {
+/// What a successful `run_oracle` run observed — used by
+/// `failover_non_converged_tail_is_exercised_and_bounded` to prove the
+/// acked-but-not-converged tail's reporting path actually executes and
+/// stays within bounds, not just that it CAN in principle (review item 4,
+/// 2026-07-26: a branch nobody has ever run may simply not work).
+struct RunStats {
+    converged_len: usize,
+    non_converged_tail: usize,
+    missing_from_tail_len: usize,
+}
+
+/// `cut_peer_link_before_round`: when `Some(r)`, the peer-link proxy is
+/// permanently stopped (`TcpProxy::stop`) immediately before round `r` is
+/// processed — every round from `r` on acks normally (the client talks to
+/// the primary directly, never through the peer-link proxy) but can never
+/// SHIP to the follower again, deterministically producing acked-but-
+/// never-converged ids instead of leaving that outcome to loopback timing
+/// luck. `None` (used by `failover_wire_oracle`) never cuts the link —
+/// unchanged behavior from before this parameter existed.
+fn run_oracle(
+    node_bin: &std::path::Path,
+    charpente_bin: &std::path::Path,
+    cut_peer_link_before_round: Option<u64>,
+) -> Result<RunStats, String> {
     let tag = "failover";
     let scenario_root = temp_dir(&format!("{tag}-scenario-root"));
     std::fs::create_dir_all(&scenario_root).map_err(|e| e.to_string())?;
@@ -256,7 +279,7 @@ fn run_oracle(node_bin: &std::path::Path, charpente_bin: &std::path::Path) -> Re
     let mut repl_proxy: Option<TcpProxy> = None;
     let mut old_primary_restart: Option<ChildNode> = None;
 
-    let result = (|| -> Result<(), String> {
+    let result = (|| -> Result<RunStats, String> {
         let primary_addr = free_addr();
         let primary_repl_addr = free_addr();
         let follower_addr = free_addr();
@@ -329,6 +352,21 @@ fn run_oracle(node_bin: &std::path::Path, charpente_bin: &std::path::Path) -> Re
         let mut converged: Vec<u64> = Vec::new();
 
         for round in 1..=ROUNDS {
+            if cut_peer_link_before_round == Some(round) {
+                // Deliberately, permanently sever the peer link so every
+                // round from here on can still ACK (the client talks to the
+                // primary directly) but can never SHIP to the follower
+                // again — the non-converged-tail branch below, exercised on
+                // purpose instead of left to loopback timing luck.
+                repl_proxy
+                    .as_ref()
+                    .expect("the peer-link proxy is always Some by this point")
+                    .stop(&mut scenario);
+                scenario.record(format!(
+                    "round {round}: peer link deliberately cut for good — every round from \
+                     here on can ack but can never converge"
+                ));
+            }
             let id = round;
             let body = format!(r#"{{"name":"Round {id}","email":"round{id}@example.com"}}"#);
             match primary_http.post(&format!("/customers/{id}"), &body) {
@@ -455,6 +493,19 @@ fn run_oracle(node_bin: &std::path::Path, charpente_bin: &std::path::Path) -> Re
             }
         }
         let non_converged_tail = acked.len() - converged.len();
+        // The bound DECISIONS §6 promises: loss outside the converged set
+        // is confined to the acked-but-never-observed-converged tail,
+        // never larger than it — checked explicitly (not just implicitly
+        // true by construction) so a future refactor that widened
+        // `also_missing_from_tail` beyond the tail itself would fail loudly
+        // here rather than silently.
+        assert!(
+            also_missing_from_tail.len() <= non_converged_tail,
+            "also_missing_from_tail ({}) exceeds the non-converged tail itself ({}) — a \
+             bookkeeping bug, not a bounded-loss window",
+            also_missing_from_tail.len(),
+            non_converged_tail
+        );
         scenario.record(format!(
             "post-promote check: {} of {} CONVERGED id(s) missing; {} of {non_converged_tail} \
              non-converged-tail id(s) also missing (DECISIONS §6 bounded loss — reported, not a \
@@ -576,7 +627,11 @@ fn run_oracle(node_bin: &std::path::Path, charpente_bin: &std::path::Path) -> Re
         // for the weaker, silent variant (an operator restart with the
         // ORIGINAL `--role primary` config produces no notice whatsoever).
 
-        Ok(())
+        Ok(RunStats {
+            converged_len: converged.len(),
+            non_converged_tail,
+            missing_from_tail_len: also_missing_from_tail.len(),
+        })
     })();
 
     if let Some(proxy) = &repl_proxy {
@@ -595,16 +650,19 @@ fn run_oracle(node_bin: &std::path::Path, charpente_bin: &std::path::Path) -> Re
 /// Dumps the scenario script, prints it on failure, and cleans up temp dirs
 /// ONLY on success — `acked_durable.rs`'s `finish`, same rationale (crate
 /// honesty contract: a real finding's evidence must still exist afterward),
-/// adapted for TWO data directories (primary + follower).
-fn finish(
+/// adapted for TWO data directories (primary + follower). Generic over `T`
+/// (`RunStats` for `run_oracle`, `()` for `run_known_gap_oracle`) so a
+/// caller that needs the run's observed stats — not just pass/fail — can
+/// get them back on success without re-deriving them from the scenario log.
+fn finish<T>(
     scenario: &mut Scenario,
     data_dirs: &[&std::path::Path],
     scenario_root: &std::path::Path,
-    result: Result<(), String>,
-) -> Result<(), String> {
+    result: Result<T, String>,
+) -> Result<T, String> {
     match &result {
         Err(e) => scenario.record(format!("FAILED: {e}")),
-        Ok(()) => scenario.record("run succeeded"),
+        Ok(_) => scenario.record("run succeeded"),
     }
     let script = scenario.dump().map_err(|e| e.to_string())?;
     match &result {
@@ -625,7 +683,7 @@ fn finish(
                 scenario_root.display()
             );
         }
-        Ok(()) => {
+        Ok(_) => {
             for dir in data_dirs {
                 let _ = std::fs::remove_dir_all(dir);
             }
@@ -639,10 +697,73 @@ fn finish(
 #[ignore]
 fn failover_wire_oracle() {
     let bins = build_bins().expect("build_bins");
-    run_oracle(&bins.node, &bins.charpente).expect(
+    run_oracle(&bins.node, &bins.charpente, None).expect(
         "failover must promote the follower with zero loss over converged ids, and the \
          restarted old primary must print the pinned demote/re-seed refusal — see stderr above \
          for the scenario script",
+    );
+}
+
+/// Round the peer link is cut at for `failover_non_converged_tail_is_exercised_and_bounded`:
+/// leaves the last `ROUNDS - CUT_ROUND + 1` rounds unable to converge — 2 of
+/// 50, well clear of `MIN_CONVERGED` (48 still converge, comfortably above
+/// the 40 floor). Kept small on purpose: `TcpProxy::stop` is permanent, so
+/// every round after the cut deterministically burns the full
+/// `CONVERGE_TIMEOUT` (3s) waiting for a convergence that can never
+/// arrive — 2 rounds is enough for a non-empty tail with a one-round margin
+/// against a boundary timing edge case, without needlessly slowing the test.
+const CUT_ROUND: u64 = 49;
+
+/// Review item 4 (2026-07-26): `run_oracle`'s acked-but-not-converged tail
+/// reporting path had never executed in this environment — loopback
+/// replication converges all 50 rounds every time, so the branch that
+/// checks the tail and asserts it's bounded was exercised only by
+/// construction, never by a real gap. This test forces one: cutting the
+/// peer link partway through (`cut_peer_link_before_round`) deterministically
+/// produces acked-but-never-converged ids, so the reporting path — and the
+/// `also_missing_from_tail.len() <= non_converged_tail` bound — actually
+/// runs against real evidence instead of a permanently-empty tail.
+///
+/// Asserts on `RunStats` (not just that `run_oracle` returned `Ok`, which
+/// alone would only prove the CONVERGED-id zero-loss guarantee held — the
+/// same thing `failover_wire_oracle` already proves):
+/// - `non_converged_tail >= 1`: the cut actually produced a non-empty tail
+///   (anti-vacuity — a `0`-tail run here would mean the cut didn't work).
+/// - `missing_from_tail_len >= 1`: at least one tail id is CONFIRMED
+///   genuinely absent on the promoted follower after promote — the branch
+///   fires with real evidence, not just a `0` that could mean either
+///   "checked and found nothing missing" or "never checked."
+#[test]
+#[ignore]
+fn failover_non_converged_tail_is_exercised_and_bounded() {
+    let bins = build_bins().expect("build_bins");
+    let stats = run_oracle(&bins.node, &bins.charpente, Some(CUT_ROUND)).expect(
+        "failover must still hold its CONVERGED-id zero-loss guarantee even with a deliberately \
+         severed peer link late in the run — see stderr above for the scenario script",
+    );
+    assert!(
+        stats.non_converged_tail >= 1,
+        "the deliberate peer-link cut at round {CUT_ROUND} produced NO non-converged tail \
+         (non_converged_tail == 0) — the cut did not work as intended, so this run proves \
+         nothing about the tail-reporting path; got: converged_len={}, non_converged_tail={}",
+        stats.converged_len,
+        stats.non_converged_tail
+    );
+    assert!(
+        stats.missing_from_tail_len >= 1,
+        "the non-converged tail was non-empty ({} id(s)) but ZERO of them were confirmed \
+         missing on the promoted follower — either the cut didn't actually prevent shipping \
+         (weakening this test's proof that the reporting path runs against real evidence), or \
+         DECISIONS §6 loss just didn't happen to occur this run; either way this test's whole \
+         point — proving the branch fires with a real, non-zero, CONFIRMED loss — did not hold",
+        stats.non_converged_tail
+    );
+    assert!(
+        stats.converged_len >= MIN_CONVERGED,
+        "the cut at round {CUT_ROUND} ate into the CONVERGED set itself ({} < {MIN_CONVERGED}) \
+         — CUT_ROUND is too early; run_oracle would already have refused as vacuous before \
+         reaching here, so this assert is a second, independent confirmation",
+        stats.converged_len
     );
 }
 
