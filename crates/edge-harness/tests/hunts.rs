@@ -15,20 +15,26 @@
 //! would be this task deciding a product question that hasn't been decided.
 //!
 //! **Hunt 1 has no edge companion, deliberately.** T13's brief expected one:
-//! a wire-visible "persistent 500s on GETs after a latched store read". Both
-//! halves of that premise turned out false, so writing the test would have
-//! meant asserting something that does not happen:
-//!   1. There is no persistent-500 symptom. `crates/charpente/tests/
-//!      kernel.rs`'s `kernel_keeps_serving_with_a_latched_store_known_gap`
-//!      characterizes what the shipped build actually does — with redb's
-//!      handle latched, reads are answered **200 off redb's page cache**, and
-//!      `Db::poisoned()` stays false. The wire shows nothing at all until the
-//!      next write.
-//!   2. This crate cannot reach the state anyway. Per the crate's honesty
-//!      contract, the faults available here are process- and
-//!      connection-granular; faulting the store's own IO is the simulator's
-//!      job, and `chmod` cannot help — the node holds the store open, and
-//!      Unix permissions are checked at `open`, not per write on a live fd.
+//! a wire-visible "persistent 500s on GETs after a latched store read".
+//! Writing it would have meant asserting a symptom this rig has no way to
+//! produce:
+//!   1. There is no persistent-500 symptom **in the store shape this crate
+//!      could build**. `crates/charpente/tests/kernel.rs`'s
+//!      `kernel_keeps_serving_with_a_latched_store_known_gap` characterizes
+//!      what the shipped build does for a store inside redb's read cache —
+//!      with the handle latched, reads are answered **200 off the page
+//!      cache**, `Db::poisoned()` stays false, and the wire shows nothing at
+//!      all until the next write. On a store LARGER than that cache the 500s
+//!      are real (T13 fix round 2, N-1/I-1) — so this leg is a statement
+//!      about the deployment shape reachable from here, not about the
+//!      platform.
+//!   2. This crate cannot reach the state at all — decisive, and unaffected
+//!      by leg 1's scoping. Per the crate's honesty contract, the faults
+//!      available here are process- and connection-granular; faulting the
+//!      store's own IO is the simulator's job, and `chmod` cannot help — the
+//!      node holds the store open, and Unix permissions are checked at
+//!      `open`, not per write on a live fd. There is no route from here to a
+//!      latched store handle in EITHER shape.
 //!
 //! The gap itself is characterized in the sim, where it belongs, and the fix
 //! proposal is HELD for a ruling (task-13-report.md).

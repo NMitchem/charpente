@@ -581,14 +581,17 @@ fn kernel_stops_after_a_request_poisons_the_engine() {
 // honest statement of this gap is:
 //
 //   * **cache-resident store** (this test): the latch is SILENT — reads keep
-//     answering 200 from cache, nothing surfaces at all;
+//     answering 200 from cache, nothing surfaces at all. MEASURED.
 //   * **larger-than-cache store**: the latch is LOUD — reads that miss the cache
-//     500 — but `Db::poisoned()` is false in BOTH shapes, the kernel keeps
-//     serving in both, and the fix is the same one.
+//     500. DERIVED, not measured (T13 fix round 2, N-1): the premises above are
+//     verified in redb's source, but no store over the 1 GiB bound was ever
+//     built — proving this empirically is not a good use of the milestone.
 //
-// The characterization below is unaffected either way: what it pins is the
-// latch and `poisoned()`'s blindness to it, which are identical in both shapes.
-// Anyone designing the fix must handle both (task-13-report.md, proposal 1).
+// `Db::poisoned()` is false in BOTH shapes, the kernel keeps serving in both,
+// and the fix is the same one. The characterization below is unaffected either
+// way: what it pins is the latch and `poisoned()`'s blindness to it, which are
+// identical in both shapes. Anyone designing the fix must handle both
+// (task-13-report.md, proposal 1).
 //
 // What the shipped build does in the shape this test builds: the latch is
 // silent. Reads keep answering 200 off the page cache, `Db::poisoned()` stays
@@ -596,6 +599,18 @@ fn kernel_stops_after_a_request_poisons_the_engine() {
 // window closes only when the next write transaction converts the latch into
 // apply-side poison. That is a weaker symptom than the brief predicted (no 500
 // storm) and a worse one for observability (no signal at all).
+//
+// **That one-write window is this (cache-resident) shape's, not a general
+// bound** (T13 fix round 2, N-3). `Database::begin_write` is latch-gated
+// (`db.rs:1037-1039`) but `begin_read` is NOT — neither impl calls
+// `check_io_errors` (`db.rs:404`, `db.rs:508`), which is also why the GETs below
+// still return 200. So on a larger-than-cache store a write transaction whose
+// handler reads a non-resident page (the ordinary get-then-put shape — the
+// `bump_count` route below does exactly that) fails INSIDE the handler, returns
+// a plain 500, and never reaches `begin_write`: no append, no apply, no poison.
+// Such a node can 500 every request indefinitely with `poisoned()` false and the
+// kernel serving. The window is bounded only when a write reaches `begin_write`,
+// which a read-first transaction on a cache-missing store may never do.
 //
 // This test CHARACTERIZES; it asserts no guarantee. RULED (Noah, 2026-07-26):
 // deferred to M2, characterization kept — the fix touches the step-7 request-arm
