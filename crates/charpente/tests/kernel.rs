@@ -559,33 +559,56 @@ fn kernel_stops_after_a_request_poisons_the_engine() {
 // serving off a store handle that is permanently dead for writes while
 // `Db::poisoned()` reports healthy.
 //
-// **The brief's predicted mechanism does not hold, and this test pins why.**
-// T13's brief expected a request-path READ fault to set the latch and every
-// later request to keep 500ing. A store read cannot be faulted on a live
-// handle in this build at all: redb's open path walks every page (forced on in
-// BOTH build modes by the root `Cargo.toml`'s `[profile.*.package.redb]`
-// debug-assertions override, so the seed promise stays cross-mode), and its
-// 1 GiB read cache then answers every subsequent read without touching the
-// `Disk` boundary. Measured while writing this test: a 10k-row store plus 300
-// further write transactions and 300 reads produce ZERO post-open reads at the
-// boundary — the assertion below pins that, so this comment fails loudly if
-// redb's caching or that override ever changes and the read-side variant
-// becomes reachable again. The latch is therefore reached the only way it is
-// reachable here: the store's own checkpoint fsync.
+// **The brief's predicted mechanism does not hold FOR A CACHE-RESIDENT STORE,
+// which is the shape this test builds.** T13's brief expected a request-path
+// READ fault to set the latch and every later request to keep 500ing. Here a
+// store read never reaches the `Disk` boundary at all, so there is no read to
+// fault: redb's open path walks every page (forced on in BOTH build modes by
+// the root `Cargo.toml`'s `[profile.*.package.redb]` debug-assertions
+// override, so the seed promise stays cross-mode), and its read cache then
+// answers every subsequent read from memory. Measured while writing this test:
+// a 10k-row store plus 300 further write transactions and 300 reads produce
+// ZERO post-open reads at the boundary. The latch is therefore reached the only
+// way it is reachable here: the store's own checkpoint fsync.
 //
-// What the shipped build actually does, and what this test characterizes: the
-// latch is silent on the read side. Reads keep answering 200 off the page
-// cache, `Db::poisoned()` stays false, the kernel keeps serving, and NOTHING
-// tells an operator anything — the window closes only when the next write
-// transaction converts the latch into apply-side poison. That is a weaker
-// symptom than the brief predicted (no 500 storm) and a worse one for
-// observability (no signal at all).
+// **That is a bound, not an absolute** (T13 review, I-1). redb's read cache is a
+// bounded, EVICTING LRU (`cached_file.rs:236`'s striped `LRUCache`,
+// `evict_from_read_cache`) sized by `max_cache_size`, 1 GiB by default
+// (`db.rs:1126`) and not configured by `Store::open`. Once a store's working set
+// exceeds that bound the open-time page walk itself evicts, later reads miss,
+// and store reads DO reach the boundary — at which point the brief's original
+// mechanism is reachable and the symptom is the 500 storm it predicted. So the
+// honest statement of this gap is:
 //
-// This test CHARACTERIZES; it asserts no guarantee. HELD for a Noah ruling
-// (task-13-report.md): the fix touches the step-7 request-arm ruling and is a
-// product decision. DO NOT weaken or delete it to make a red run green — if
-// the product changes this behavior, UPDATE it to assert the new, safer
-// behavior; a red run here after a product change is this test doing its job.
+//   * **cache-resident store** (this test): the latch is SILENT — reads keep
+//     answering 200 from cache, nothing surfaces at all;
+//   * **larger-than-cache store**: the latch is LOUD — reads that miss the cache
+//     500 — but `Db::poisoned()` is false in BOTH shapes, the kernel keeps
+//     serving in both, and the fix is the same one.
+//
+// The characterization below is unaffected either way: what it pins is the
+// latch and `poisoned()`'s blindness to it, which are identical in both shapes.
+// Anyone designing the fix must handle both (task-13-report.md, proposal 1).
+//
+// What the shipped build does in the shape this test builds: the latch is
+// silent. Reads keep answering 200 off the page cache, `Db::poisoned()` stays
+// false, the kernel keeps serving, and NOTHING tells an operator anything — the
+// window closes only when the next write transaction converts the latch into
+// apply-side poison. That is a weaker symptom than the brief predicted (no 500
+// storm) and a worse one for observability (no signal at all).
+//
+// This test CHARACTERIZES; it asserts no guarantee. RULED (Noah, 2026-07-26):
+// deferred to M2, characterization kept — the fix touches the step-7 request-arm
+// ruling and needs its own sim properties. DO NOT weaken or delete this to make
+// a red run green — if the product changes this behavior, UPDATE it to assert
+// the new, safer behavior; a red run here after a product change is this test
+// doing its job.
+//
+// **For the future fixer: the FIRST assert to redden is not the headline one.**
+// With read-side poison implemented, the kernel's request arm stops after
+// request 1's 500, so `replies.len() == 3` below fails before the
+// `!poisoned()` assertion is ever reached. Both are red, and that earlier
+// failure is the fix working — not a second, unrelated break.
 
 /// A pure read path: no effects, so nothing it does can reach the WAL, and any
 /// status it returns is the store's answer alone.
@@ -794,12 +817,21 @@ fn kernel_keeps_serving_with_a_latched_store_known_gap() {
         "the injector must fire EXACTLY once — the persistence observed below is only evidence \
          of redb's latch if nothing kept re-injecting"
     );
-    // The mechanism pin (module comment): no store read reaches the `Disk`
-    // boundary after open, which is why a request-path READ fault — the shape
-    // T13's brief predicted — is unreachable in this build. If this ever
-    // fails, redb's caching or the debug-assertions page-walk override
-    // changed, the read-side variant is live again, and the brief's original
-    // shape needs re-testing.
+    // The mechanism tripwire (module comment): no store read reaches the
+    // `Disk` boundary after open in THIS store's shape, which is why a
+    // request-path READ fault — the shape T13's brief predicted — has nothing
+    // to fault here.
+    //
+    // Read it for exactly what it proves, and no more (T13 review, M-5). Only
+    // the PRE-latch part of the window is evidence about caching; after the
+    // latch, `CheckedBackend::read` short-circuits on `io_failed` before ever
+    // calling the backend, so the equality would hold post-latch even with no
+    // cache at all. And this store is ~2 rows, far under redb's 1 GiB
+    // `max_cache_size`, so the equality is insensitive to a change in that
+    // bound — a shrunken cache would still not redden it. What actually
+    // carries the "reads stay silent" half of the characterization is the
+    // 200-status assertion further down: those are reads that were SERVED,
+    // from cache, while the handle was latched.
     assert!(
         reads_at_open > 0,
         "anti-vacuity: zero store reads were counted even at open, so this injector is not \
@@ -809,8 +841,11 @@ fn kernel_keeps_serving_with_a_latched_store_known_gap() {
         reads.load(Ordering::SeqCst),
         reads_at_open,
         "a store read reached the Disk boundary after open ({} at open, {} after the run) — \
-         redb's post-open read caching changed, so the request-path READ fault this gap was \
-         first predicted through is reachable again",
+         redb stopped serving this (cache-resident) store's reads from memory, so the \
+         request-path READ fault this gap was first predicted through has something to fault \
+         again. NOTE this equality is a tripwire, not a proof of unreachability in general: \
+         redb's read cache is a bounded evicting LRU, so a store larger than it always reaches \
+         the boundary (see the module comment's two shapes)",
         reads_at_open,
         reads.load(Ordering::SeqCst)
     );

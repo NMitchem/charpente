@@ -204,6 +204,16 @@ fn raw_exchange(
                 break;
             }
             Ok(n) => {
+                // Breaking on the FIRST segment is deliberate, and its
+                // remainder is picked up by the `read_to_end` drain below
+                // (which appends to this same buffer). A response spanning
+                // several segments could in principle lose its tail to an RST
+                // between the two — considered and left as-is (T13 review,
+                // M-2): the failure direction is a FALSE ALARM, never a mask
+                // (a short read fails the probe's byte-exact check and prints
+                // the raw bytes), and every response these probes expect is
+                // well under one segment. Fixing it properly means draining
+                // and uploading concurrently, which is not worth a thread here.
                 response.extend_from_slice(&buf[..n]);
                 early_response = true;
                 break;
@@ -600,24 +610,32 @@ fn hunt2_slow_loris_does_not_block_a_fresh_connection() {
                 }
             }
             scenario.record(format!(
-                "slow-loris: drip round {round}/{LORIS_DRIPS} — {alive_after_drips} of \
-                 {LORIS_CONNECTIONS} connections still accepted a byte"
+                "slow-loris: drip round {round}/{LORIS_DRIPS} — a one-byte write succeeded \
+                 locally on {alive_after_drips} of {LORIS_CONNECTIONS} connections"
             ));
         }
 
         assert_still_live(&addr, "slow-loris", Duration::from_secs(2), &mut scenario)?;
 
-        // RECORDED, never asserted: how many of the stalled connections the
-        // node was still holding. Today's answer is all of them (no
-        // `header_read_timeout` is configured in `serve.rs`'s `http_edge`);
-        // a future decision to add one would change this number, and this
-        // probe must not fail when it does.
+        // RECORDED, never asserted. Worded for what was actually OBSERVED
+        // (T13 review, M-4): a successful one-byte `write_all` is a local
+        // socket-buffer success, not proof the peer still holds the
+        // connection — a write into an already-closed socket succeeds at
+        // least once before the RST comes back. So the count below is a
+        // PROXY. What makes "the node held them" the right reading is the
+        // source, not the count: `serve.rs`'s `http_edge` (serve.rs:211-213)
+        // builds `http1::Builder::new()` with no `header_read_timeout` and no
+        // connection budget, so nothing in the node is capable of closing
+        // them. A future decision to add a timeout would change both the
+        // count and that reading, and this probe must not fail when it does.
         scenario.record(format!(
-            "slow-loris: RECORDED (not asserted) — {alive_after_drips} of {LORIS_CONNECTIONS} \
-             stalled connections were still held after {LORIS_DRIPS} drip round(s). serve.rs's \
-             http_edge sets no header_read_timeout and no connection budget, so a client can \
-             hold these indefinitely: one tokio task and one fd each. Bounding that is a \
-             product decision (#25), not this probe's to assert."
+            "slow-loris: RECORDED (not asserted) — one-byte writes still succeeded locally on \
+             {alive_after_drips} of {LORIS_CONNECTIONS} stalled connections after {LORIS_DRIPS} \
+             drip round(s) (a proxy for still-held, not proof: a write into a closed socket \
+             succeeds locally at least once). serve.rs's http_edge sets no header_read_timeout \
+             and no connection budget, so nothing in the node closes them and a client can hold \
+             them indefinitely: one tokio task and one fd each. Bounding that is a product \
+             decision (#25), not this probe's to assert."
         ));
         Ok(())
     })();
@@ -645,6 +663,14 @@ fn hunt2_slow_loris_does_not_block_a_fresh_connection() {
 // stays the right tool for a stopped SERVER (already covered by `client.rs`'s
 // `request_times_out_against_a_silent_server`); it is not the right tool
 // here, since this crate has no client process to stop.
+//
+// **Scope of the recorded finding** (T13 review, M-3): these peers request
+// `/customers`, whose response fits inside the socket buffers, so the node's
+// write completes and its connection task lingers on an idle keep-alive rather
+// than on a BLOCKED write. So the "no write timeout" note recorded below is
+// read off `serve.rs` (there is none), not stress-tested — actually blocking a
+// node's response write needs a body larger than the buffers or a client with
+// a shrunken `SO_RCVBUF`, neither of which this probe does.
 
 const HALF_OPEN_PEERS: usize = 20;
 
@@ -695,10 +721,13 @@ fn hunt2_peers_that_never_read_do_not_wedge_the_accept_loop() {
         assert_still_live(&addr, "half-open", Duration::from_secs(2), &mut scenario)?;
 
         scenario.record(format!(
-            "half-open: RECORDED (not asserted) — {HALF_OPEN_PEERS} connection tasks are still \
-             held with unread responses. serve.rs sets no write timeout and no idle timeout, so \
-             a peer that never reads holds its task and fd until it disconnects. Bounding that \
-             is a product decision (#25), not this probe's to assert."
+            "half-open: RECORDED (not asserted) — {HALF_OPEN_PEERS} keep-alive connections are \
+             open with their responses unread. serve.rs sets no write timeout and no idle \
+             timeout (read off the source, not stress-tested here: /customers' response fits \
+             the socket buffers, so the node's write completed and its task lingers on an idle \
+             keep-alive rather than a blocked write). A peer that never reads therefore holds \
+             its task and fd until it disconnects. Bounding that is a product decision (#25), \
+             not this probe's to assert."
         ));
         // Explicit, not implicit: the peers are dropped only after the
         // liveness check, so the check ran against a node that really was
