@@ -155,6 +155,15 @@ fn rounds() -> u64 {
             .ok()
             .filter(|&n| n > 0)
             .unwrap_or_else(|| {
+                // This panic text is deliberately WAIVED from the plan's
+                // "every new named error string is pinned byte-exact"
+                // constraint (re-review, both rounds): pinning it means
+                // setting `EDGE_ACKED_DURABLE_ROUNDS` to an invalid value
+                // for the duration of a test, and it's a process-global env
+                // var every other test in this binary also reads via
+                // `rounds()` — a race against `cargo test`'s default
+                // multi-threaded test runner, not a hazard worth taking on
+                // for a developer-knob's error text.
                 panic!(
                     "EDGE_ACKED_DURABLE_ROUNDS={raw:?} is not a positive integer round count — \
                  unset it to run the default of {DEFAULT_ROUNDS} rounds, or set it to a \
@@ -193,10 +202,12 @@ fn record_plan(scenario: &mut Scenario, rounds: u64, forced: bool, kill_rounds: 
     ));
 }
 
-/// `(id, reason)` pairs — used both for ids that never acked (`drive`) and
-/// ids that acked but didn't read back (`VerifyFailure::missing`). A named
-/// alias per clippy's `type_complexity` (the bare nested tuple-of-Vec type
-/// tripped it at the `-D warnings` gate).
+/// `(id, reason)` pairs — used for ids that never acked (`drive`,
+/// `require_full_ack`) and ids that acked but didn't read back
+/// (`VerifyFailure::missing`, `WrongBuildRun::missing`). A named alias per
+/// clippy's `type_complexity` (the bare nested tuple-of-Vec type tripped it
+/// at the `-D warnings` gate on `drive`'s return type); applied at every
+/// site of this shape, not just the one that forced it (re-review round 2).
 type IdReasons = Vec<(u64, String)>;
 
 /// Drives `rounds` POST rounds against `node`/`http`, killing+restarting at
@@ -230,7 +241,7 @@ fn drive(
 ) -> Result<(Vec<u64>, IdReasons), String> {
     let mut rng = Rng::new();
     let mut acked: Vec<u64> = Vec::new();
-    let mut not_acked: Vec<(u64, String)> = Vec::new();
+    let mut not_acked: IdReasons = Vec::new();
     for round in 1..=rounds {
         let id = round;
         let body = format!(r#"{{"name":"Round {id}","email":"round{id}@example.com"}}"#);
@@ -284,7 +295,7 @@ fn drive(
 /// THEN does a caller's own `acked_len == rounds()` assertion fire — against
 /// evidence that's already gone. `not_acked` (see `drive`) is folded into
 /// the message so an operator sees WHY, not just how many.
-fn require_full_ack(acked: &[u64], not_acked: &[(u64, String)], rounds: u64) -> Result<(), String> {
+fn require_full_ack(acked: &[u64], not_acked: &IdReasons, rounds: u64) -> Result<(), String> {
     if acked.len() != rounds as usize {
         return Err(format!(
             "the oracle is vacuous: only {}/{rounds} rounds acked (every round should ack — \
@@ -305,23 +316,76 @@ fn require_full_ack(acked: &[u64], not_acked: &[(u64, String)], rounds: u64) -> 
 /// not a 401 from a broken verify session, a 500, or a transport hiccup a
 /// flaky proxy dial can produce (`src/proxy.rs`'s `relay` returns silently
 /// on a failed upstream dial, which a client sees as an immediate EOF).
-/// `message` itself carries a three-way version of the same distinction (see
-/// `verify`): ALL missing ids genuinely-absent ("status 404") earns the
-/// unqualified "acked-implies-durable violated" wording; ZERO of them do is
-/// worded as a pure rig failure; a MIX says so explicitly and still counts
-/// as a violation, since at least one row is confirmed gone — a false
-/// "rig failure" verdict on a mixed loss would be the worse direction for a
-/// headline claim (re-review "New Breakage").
+/// `message` itself carries a three-way version of the same distinction —
+/// see `classify` — via `verify`.
 struct VerifyFailure {
-    missing: Vec<(u64, String)>,
+    missing: IdReasons,
     message: String,
+}
+
+/// Composes `VerifyFailure::message`'s three-way classification: ALL missing
+/// ids genuinely-absent ("status 404") earns the unqualified
+/// "acked-implies-durable violated" wording; ZERO of them do is worded as a
+/// pure rig failure; a MIX states the violation once (no hedge) and still
+/// counts as one, since at least one row is confirmed gone — a false "rig
+/// failure" verdict on a mixed loss would be the worse direction for a
+/// headline claim (re-review "New Breakage", both rounds).
+///
+/// Pure and separated from `verify`'s real GET loop on purpose (re-review
+/// "Important," round 2): pinning this byte-exact previously meant either
+/// hardcoding the OS's own connect-refused text (platform-dependent — see
+/// the removed `verify_names_a_rig_failure_...` test's old rationale) or
+/// driving a real socket/filesystem scenario just to reach a
+/// string-formatting decision. With `missing` as a plain argument, the
+/// `classify_*` tests below hand-build it and pin all three branches
+/// byte-exact — reason text included, since the test supplies it instead of
+/// borrowing the OS's — with zero syscalls, joining the crate's un-ignored
+/// zero-IO tests by the same criterion `src/child.rs`/`src/client.rs` use
+/// (process-, socket-, or filesystem-touching → `#[ignore]`; see
+/// `scripts/edge-harness.sh`).
+fn classify(missing: &IdReasons, acked_len: usize, script_path: &Path) -> String {
+    let confirmed = missing
+        .iter()
+        .filter(|(_, reason)| reason == "status 404")
+        .count();
+    if confirmed == missing.len() {
+        format!(
+            "acked-implies-durable violated: {} of {acked_len} acked id(s) missing: \
+             {missing:?} — scenario script: {}",
+            missing.len(),
+            script_path.display()
+        )
+    } else if confirmed == 0 {
+        format!(
+            "acked-implies-durable oracle could not verify {} of {acked_len} acked id(s) — \
+             RIG FAILURE, not a proven durability violation (at least one GET failed for a \
+             reason other than a genuine \"status 404\" — an auth failure, a server error, \
+             or a transport hiccup): {missing:?} — scenario script: {}",
+            missing.len(),
+            script_path.display()
+        )
+    } else {
+        // Re-review round 2 Minors: state the violation once (the previous
+        // wording both asserted "violated" and hedged "may be present" in
+        // the same sentence) and carry the `acked_len` denominator like the
+        // other two branches (the previous wording dropped it, the one
+        // branch whose evidence is mixed also omitting the scale of the
+        // loss).
+        format!(
+            "acked-implies-durable violated: {confirmed} of {acked_len} acked id(s) \
+             confirmed genuinely absent (status 404) alongside {} GET(s) that failed for a \
+             rig reason: {missing:?} — scenario script: {}",
+            missing.len() - confirmed,
+            script_path.display()
+        )
+    }
 }
 
 /// GETs every `acked` id and returns `Err` (naming the scenario script) the
 /// moment any is missing. The caller is responsible for `http` pointing at a
 /// TRUSTWORTHY reader (see `drive`'s doc comment).
 fn verify(http: &mut Http, scenario: &mut Scenario, acked: &[u64]) -> Result<(), VerifyFailure> {
-    let mut missing = Vec::new();
+    let mut missing: IdReasons = Vec::new();
     for id in acked {
         match http.get(&format!("/customers/{id}")) {
             Ok(resp) if resp.status == 200 => {}
@@ -332,54 +396,7 @@ fn verify(http: &mut Http, scenario: &mut Scenario, acked: &[u64]) -> Result<(),
 
     if !missing.is_empty() {
         let script_path = scenario.dir().join("scenario.log");
-        // Review I1 (second half): a 401/500/transport hiccup on the verify
-        // side proves nothing about durability — it means the rig could not
-        // even ask the question, not that an acked write vanished. Naming
-        // that "acked-implies-durable violated" would misname the headline
-        // product claim (hard rule 5). Only "status 404" for a missing id —
-        // a live server genuinely reporting the row absent — is real
-        // evidence; anything else is a rig failure.
-        //
-        // Re-review "New Breakage": an all-or-nothing check on the FIRST
-        // fix round misnamed a real violation as a rig failure whenever the
-        // loss was mixed (39 genuine 404s plus one transport hiccup printed
-        // "not a proven durability violation") — a false negative on a
-        // headline claim is the worse direction (someone reads that and
-        // discards a real finding). Three-way classification instead: ALL
-        // 404 is the clean violation wording; ZERO 404 is the pure rig
-        // failure wording; anything in between says so explicitly and keeps
-        // the "violated" phrase, since at least one row IS confirmed gone.
-        let confirmed = missing
-            .iter()
-            .filter(|(_, reason)| reason == "status 404")
-            .count();
-        let message = if confirmed == missing.len() {
-            format!(
-                "acked-implies-durable violated: {} of {} acked id(s) missing: {missing:?} — \
-                 scenario script: {}",
-                missing.len(),
-                acked.len(),
-                script_path.display()
-            )
-        } else if confirmed == 0 {
-            format!(
-                "acked-implies-durable oracle could not verify {} of {} acked id(s) — RIG \
-                 FAILURE, not a proven durability violation (at least one GET failed for a \
-                 reason other than a genuine \"status 404\" — an auth failure, a server error, \
-                 or a transport hiccup): {missing:?} — scenario script: {}",
-                missing.len(),
-                acked.len(),
-                script_path.display()
-            )
-        } else {
-            format!(
-                "acked-implies-durable violated: {confirmed} of {} missing id(s) are \
-                 genuinely absent (status 404) — a durability violation may be present \
-                 alongside a rig failure: {missing:?} — scenario script: {}",
-                missing.len(),
-                script_path.display()
-            )
-        };
+        let message = classify(&missing, acked.len(), &script_path);
         return Err(VerifyFailure { missing, message });
     }
     scenario.record(format!("verified: all {} acked id(s) present", acked.len()));
@@ -410,7 +427,13 @@ fn verify(http: &mut Http, scenario: &mut Scenario, acked: &[u64]) -> Result<(),
 /// to fail every time) — the retained-evidence message says so honestly
 /// rather than asserting every `Err` is a finding; a caller that already
 /// knows the failure was designed and has finished characterizing it is
-/// free to clean up afterward (see the meta-test).
+/// free to clean up afterward. As of this round, exactly ONE caller does:
+/// `acked_implies_durable_meta_test_has_teeth` removes the wrong-build run's
+/// `WrongBuildRun::data_dir`/`scenario_root` itself, AFTER its own teeth
+/// assertions pass — `run_oracle` and the positive-control call never do,
+/// so their evidence is preserved indefinitely on every `Err`. A future
+/// third caller of `run_oracle`/`run_oracle_against_wrong_build` should not
+/// assume `finish` cleans up on its behalf.
 fn finish(
     tag: &str,
     scenario: &mut Scenario,
@@ -670,7 +693,7 @@ fn find_node_bin(stdout: &str) -> Option<PathBuf> {
 /// unexpected and must stay preserved).
 struct WrongBuildRun {
     result: Result<(), String>,
-    missing: Vec<(u64, String)>,
+    missing: IdReasons,
     acked_len: usize,
     data_dir: PathBuf,
     scenario_root: PathBuf,
@@ -721,7 +744,7 @@ fn run_oracle_against_wrong_build(stock_bin: &Path, wrong_bin: &Path, tag: &str)
         }
     };
 
-    let mut missing: Vec<(u64, String)> = Vec::new();
+    let mut missing: IdReasons = Vec::new();
     let mut acked_len: usize = 0;
 
     let result = (|| -> Result<(), String> {
@@ -909,11 +932,22 @@ fn acked_implies_durable_meta_test_has_teeth() {
          under kill-on-every-ack — a green result here means this oracle has no teeth \
          (spec §4.6)",
     );
+    // Re-review round 2 Minor: `classify`'s mixed branch also emits
+    // "acked-implies-durable violated" now (a mix still counts as a
+    // violation), so a bare substring check no longer excludes a
+    // partly-rig failure by itself — pin the UNQUALIFIED all-404 prefix,
+    // which only `classify`'s all-404 branch produces. The per-entry
+    // `assert_eq!(reason, "status 404")` below still catches a mixed loss
+    // on its own, but a layered defence should not quietly lose a layer.
+    let n = run.acked_len;
     assert!(
-        err.contains("acked-implies-durable violated"),
-        "the wrong build must fail on the SPECIFIC missing-acked-id oracle, not some unrelated \
-         build/spawn/login error — otherwise a build break could masquerade as the oracle \
-         having teeth: {err}"
+        err.contains(&format!(
+            "acked-implies-durable violated: {n} of {n} acked id(s) missing"
+        )),
+        "the wrong build must fail on the SPECIFIC all-ids-missing durability oracle, not \
+         some unrelated build/spawn/login error OR a partial/mixed loss — otherwise a build \
+         break (or a rig hiccup mixed with a real loss) could masquerade as the oracle \
+         having full teeth: {err}"
     );
 
     // Review I1: the failure must be a REAL durability loss, not a 401 from
@@ -957,77 +991,90 @@ fn acked_implies_durable_meta_test_has_teeth() {
 }
 
 // ---------------------------------------------------------- named-error pins
+//
+// Re-review round 2 "Important": the crate's un-ignored set is exactly the
+// 10 pure parse/scan tests in `src/child.rs`/`src/client.rs` — zero
+// syscalls, every one. A first draft of the pins below drove `verify`
+// through a closed loopback port to reach `classify`'s branches, which was
+// the crate's 11th un-ignored test AND the only one performing a syscall
+// (a bound-then-dropped listener, three real `connect()` calls, a temp
+// dir, a `Scenario::Drop` file write) — contradicting the file's own
+// stated criterion one file over. `classify` and `require_full_ack` are
+// both pure functions of their arguments (no `Http`, no `Scenario`, no
+// filesystem), so the fix is to pin them directly with hand-built
+// `IdReasons` values instead: zero syscalls, and a STRONGER pin than the
+// socket-based version, since the reason text is now supplied by the test
+// instead of borrowed from the OS's own connect-refused string — genuinely
+// byte-exact end to end, not prefix/suffix around a platform-dependent gap.
 
-/// Re-review controller doubt #2: pins `verify`'s pure-rig-failure branch
-/// byte-exact for everything this crate itself composes. Deterministic and
-/// process-free — a closed loopback port fails every GET at the TCP layer
-/// near-instantly, no built binary and no spawned process required — so
-/// this is NOT `#[ignore]`d, per T10's convention that only process-/socket-
-/// spawning tests carry that attribute.
-///
-/// NOT a literal byte-exact match of the WHOLE message: the per-id reason
-/// (`{e}` inside `verify`'s `format!("request failed: {e}")`) embeds the
-/// OS's own connect-refused text, which differs by platform — e.g.
-/// "Connection refused (os error 61)" on macOS vs. a different os-error
-/// number on Linux CI (`.github/workflows/ci.yml` runs `ubuntu-latest`).
-/// Hardcoding that text would make this pin fail on CI while passing here.
-/// So this pins every part of the message under this crate's control (the
-/// "RIG FAILURE" wording, the K-of-N counts, the scenario-script path) via
-/// prefix/suffix around the OS-dependent middle, and separately asserts the
-/// STABLE "request failed: " prefix on every reason — genuinely byte-exact
-/// on the product surface this crate owns, portable on the part it doesn't.
+/// `classify`, all-404: the unqualified violation wording, unchanged from
+/// round 1's pin target.
 #[test]
-fn verify_names_a_rig_failure_distinctly_from_a_durability_violation() {
-    let closed_addr = free_addr(); // bound, then dropped — nothing listens on it
-    let mut http = Http::new(closed_addr);
-    let scenario_root = temp_dir("rig-failure-pin-scenario-root");
-    std::fs::create_dir_all(&scenario_root).expect("create scenario root");
-    let mut scenario = Scenario::new(&scenario_root, "rig-failure-pin").expect("Scenario::new");
-
-    let acked = vec![1, 2, 3];
-    let failure =
-        verify(&mut http, &mut scenario, &acked).expect_err("a closed port must fail every GET");
-
-    assert_eq!(failure.missing.len(), 3, "{:?}", failure.missing);
-    for (id, reason) in &failure.missing {
-        assert!(
-            reason.starts_with("request failed: "),
-            "id {id}: expected a transport-failure reason, got {reason:?}"
-        );
-    }
-
-    let expected_prefix = "acked-implies-durable oracle could not verify 3 of 3 acked id(s) \
-                            — RIG FAILURE, not a proven durability violation (at least one GET \
-                            failed for a reason other than a genuine \"status 404\" — an auth \
-                            failure, a server error, or a transport hiccup): [(1, \"request \
-                            failed: ";
-    assert!(
-        failure.message.starts_with(expected_prefix),
-        "message prefix mismatch:\n  got:      {:?}\n  expected prefix: {:?}",
-        failure.message,
-        expected_prefix
+fn classify_all_404_is_an_unqualified_violation() {
+    let missing: IdReasons = vec![(1, "status 404".to_string()), (2, "status 404".to_string())];
+    let script_path = Path::new("/tmp/edge-harness-example/scenario.log");
+    let message = classify(&missing, 2, script_path);
+    assert_eq!(
+        message,
+        "acked-implies-durable violated: 2 of 2 acked id(s) missing: [(1, \"status 404\"), \
+         (2, \"status 404\")] — scenario script: /tmp/edge-harness-example/scenario.log"
     );
+}
 
-    let script_path = scenario.dir().join("scenario.log");
-    let expected_suffix = format!(" — scenario script: {}", script_path.display());
-    assert!(
-        failure.message.ends_with(&expected_suffix),
-        "message suffix mismatch:\n  got:      {:?}\n  expected suffix: {:?}",
-        failure.message,
-        expected_suffix
+/// `classify`, zero-404: a pure rig failure — must never contain the
+/// durability-violation phrase (review I1's second half).
+#[test]
+fn classify_zero_404_is_a_pure_rig_failure() {
+    let missing: IdReasons = vec![
+        (1, "status 401".to_string()),
+        (2, "request failed: connection reset".to_string()),
+    ];
+    let script_path = Path::new("/tmp/edge-harness-example/scenario.log");
+    let message = classify(&missing, 3, script_path);
+    assert_eq!(
+        message,
+        "acked-implies-durable oracle could not verify 2 of 3 acked id(s) — RIG FAILURE, not \
+         a proven durability violation (at least one GET failed for a reason other than a \
+         genuine \"status 404\" — an auth failure, a server error, or a transport hiccup): \
+         [(1, \"status 401\"), (2, \"request failed: connection reset\")] — scenario script: \
+         /tmp/edge-harness-example/scenario.log"
     );
-
     assert!(
-        !failure.message.contains("acked-implies-durable violated"),
-        "a pure rig failure must never contain the durability-violation phrase: {:?}",
-        failure.message
+        !message.contains("acked-implies-durable violated"),
+        "a pure rig failure must never contain the durability-violation phrase: {message:?}"
     );
+}
 
-    // `verify` never calls `scenario.dump()` itself (only `finish` does) —
-    // drop explicitly so `Scenario`'s own `Drop` impl writes `scenario.log`
-    // BEFORE this cleanup removes the directory it would write into,
-    // instead of racing the implicit end-of-scope drop against
-    // `remove_dir_all` and printing a spurious "No such file" error.
-    drop(scenario);
-    let _ = std::fs::remove_dir_all(&scenario_root);
+/// `classify`, mixed: states the violation once (no hedge) and carries the
+/// `acked_len` denominator like the other two branches (re-review round 2
+/// Minor — the previous wording asserted "violated" and hedged "may be
+/// present" in the same sentence, and alone among the three branches
+/// omitted the acked-id scale).
+#[test]
+fn classify_mixed_confirms_a_violation_without_hedging() {
+    let missing: IdReasons = vec![(1, "status 404".to_string()), (2, "status 500".to_string())];
+    let script_path = Path::new("/tmp/edge-harness-example/scenario.log");
+    let message = classify(&missing, 5, script_path);
+    assert_eq!(
+        message,
+        "acked-implies-durable violated: 1 of 5 acked id(s) confirmed genuinely absent \
+         (status 404) alongside 1 GET(s) that failed for a rig reason: [(1, \"status 404\"), \
+         (2, \"status 500\")] — scenario script: /tmp/edge-harness-example/scenario.log"
+    );
+}
+
+/// `require_full_ack`'s vacuity message — unpinned before this round (I4's
+/// message text changed shape when `not_acked` was folded in, and stayed
+/// unpinned through round 1).
+#[test]
+fn require_full_ack_names_a_vacuous_run() {
+    let acked = vec![1, 2];
+    let not_acked: IdReasons = vec![(3, "status 401".to_string())];
+    let err = require_full_ack(&acked, &not_acked, 3).unwrap_err();
+    assert_eq!(
+        err,
+        "the oracle is vacuous: only 2/3 rounds acked (every round should ack — POST \
+         /customers/:id has no reason to fail here); not acked: [(3, \"status 401\")]; \
+         refusing to run a durability check over a partial or empty set"
+    );
 }
