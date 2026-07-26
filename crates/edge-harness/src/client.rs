@@ -646,7 +646,7 @@ mod tests {
     }
 
     /// Review finding I4, size-line half: a read that times out with part of
-    /// the chunk size line already consumed is NOT retryable — `read_line`
+    /// the chunk size line already consumed is NOT retryable — `read_until`
     /// ate those bytes, so a retry would read the remainder as a whole size
     /// ("1" eaten out of "1a", "a\r\n" read back as 0xa) and desync in
     /// silence. It must poison like any other mid-chunk failure.

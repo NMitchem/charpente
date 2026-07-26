@@ -133,12 +133,18 @@ impl TcpProxy {
 }
 
 fn relay(client: TcpStream, upstream: &str, state: Arc<Mutex<ProxyState>>) {
-    let Ok(upstream_conn) = TcpStream::connect(upstream) else {
-        return;
-    };
+    // Registered BEFORE dialing upstream (review Minor 9): a client
+    // accepted here is already a live connection through this proxy even
+    // though the upstream dial hasn't finished — registering only after
+    // `connect` returns left a window where `stop`/`drop_all`'s drain could
+    // neither see nor sever a connection that had already passed the
+    // accept-loop's `stopped` check.
     if let Ok(clone) = client.try_clone() {
         state.lock().unwrap().conns.push(clone);
     }
+    let Ok(upstream_conn) = TcpStream::connect(upstream) else {
+        return;
+    };
     let (Ok(client_to_up), Ok(up_to_client)) = (client.try_clone(), upstream_conn.try_clone())
     else {
         return;
