@@ -8,6 +8,10 @@
 # sweep. Noah's ruling, 2026-07-25.)
 # `--test-threads=1`: tests bind real loopback ports and spawn real
 # processes; serializing avoids port collisions between tests.
+# Env knobs: EDGE_ACKED_DURABLE_ROUNDS overrides the acked-implies-durable
+# oracle's round count (tests/acked_durable.rs; default 40). Must be a
+# positive integer — an unparseable or zero value panics naming the bad
+# value rather than silently running the default.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 exec cargo test -p edge-harness -- --ignored --test-threads=1
