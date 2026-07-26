@@ -21,6 +21,12 @@ struct ProxyState {
     partitioned: bool,
     delay_ms: u64,
     conns: Vec<TcpStream>,
+    /// Set by `stop` (T12 routed prerequisite — T10's M2): once true, the
+    /// accept loop shuts down the connection that triggered it and exits
+    /// instead of spawning a relay, freeing the listening port so a scenario
+    /// that needs more than one proxy in sequence (Oracle 2's peer link)
+    /// isn't stuck on a permanently bound ephemeral address.
+    stopped: bool,
 }
 
 /// A TCP fault proxy in front of one upstream address. Every accepted
@@ -41,16 +47,25 @@ impl TcpProxy {
             partitioned: false,
             delay_ms: 0,
             conns: Vec::new(),
+            stopped: false,
         }));
         let upstream = upstream.to_string();
         let accept_state = state.clone();
         thread::spawn(move || {
             for incoming in listener.incoming() {
                 let Ok(client) = incoming else { continue };
-                if accept_state.lock().unwrap().partitioned {
+                let st = accept_state.lock().unwrap();
+                if st.stopped {
+                    drop(st);
+                    let _ = client.shutdown(Shutdown::Both);
+                    break; // drop `listener` — frees the ephemeral port
+                }
+                if st.partitioned {
+                    drop(st);
                     let _ = client.shutdown(Shutdown::Both);
                     continue;
                 }
+                drop(st);
                 let upstream = upstream.clone();
                 let state = accept_state.clone();
                 thread::spawn(move || relay(client, &upstream, state));
@@ -86,6 +101,34 @@ impl TcpProxy {
     pub fn delay_ms(&self, ms: u64, scenario: &mut Scenario) {
         self.state.lock().unwrap().delay_ms = ms;
         scenario.record(format!("proxy.delay_ms({ms})"));
+    }
+
+    /// Stops this proxy for good: severs every live connection (like
+    /// `drop_all`), refuses any connection already in flight to the accept
+    /// loop, and frees the listening port — a scenario that needs more than
+    /// one `TcpProxy` in sequence (T10 routed prerequisite M2, e.g. Oracle
+    /// 2's peer link, torn down once the primary/follower pairing under it
+    /// is retired) calls this rather than leaking a forwarding thread and an
+    /// ephemeral port per proxy for the rest of the process's life.
+    /// Idempotent — a second `stop` is a harmless no-op, not a double-record.
+    pub fn stop(&self, scenario: &mut Scenario) {
+        let mut state = self.state.lock().unwrap();
+        if state.stopped {
+            return;
+        }
+        state.stopped = true;
+        let n = state.conns.len();
+        for conn in state.conns.drain(..) {
+            let _ = conn.shutdown(Shutdown::Both);
+        }
+        drop(state);
+        scenario.record(format!(
+            "proxy.stop: severed {n} live connection(s), refusing all further ones"
+        ));
+        // The accept loop blocks in `listener.incoming()`; a self-connect
+        // wakes it so it observes `stopped` and exits (see the loop body
+        // above) instead of leaking a thread parked on `accept()` forever.
+        let _ = TcpStream::connect(&self.addr);
     }
 }
 
@@ -180,6 +223,56 @@ mod tests {
             matches!(read, Ok(0)) || read.is_err(),
             "expected a closed connection while partitioned, got {read:?}"
         );
+        std::fs::remove_dir_all(scenario.dir()).unwrap();
+    }
+
+    /// T10 routed prerequisite M2: `stop` must sever a live connection AND
+    /// free the port so a second, independent proxy can bind to it — the
+    /// exact sequential-reuse need Oracle 2 has for the peer link. Binding a
+    /// second listener to the exact address `stop` just vacated is the
+    /// proof; a leaked accept thread would leave the address in use (or the
+    /// live connection un-severed) and this would fail with `AddrInUse` or a
+    /// successful echo instead.
+    #[test]
+    #[ignore]
+    fn stop_severs_live_connections_and_frees_the_port() {
+        let upstream_addr = spawn_echo_upstream();
+        let proxy = TcpProxy::start(&upstream_addr).unwrap();
+        let proxy_addr = proxy.addr();
+        let mut scenario = Scenario::new(&std::env::temp_dir(), "proxy_stop_test").unwrap();
+
+        let mut client = TcpStream::connect(&proxy_addr).unwrap();
+        proxy.stop(&mut scenario);
+
+        // The live connection must be severed, not left echoing.
+        client.write_all(b"hello").unwrap();
+        let mut buf = [0u8; 5];
+        let read = client.read(&mut buf);
+        assert!(
+            matches!(read, Ok(0)) || read.is_err(),
+            "expected the live connection to be severed by stop, got {read:?}"
+        );
+
+        // Idempotent: a second stop is a no-op, not a panic or a double record.
+        proxy.stop(&mut scenario);
+
+        // The port must be free: a second, unrelated listener can bind the
+        // exact address this proxy vacated. Retried briefly since the OS can
+        // take a moment to release the address after the accept thread's
+        // listener drops.
+        let mut bound = None;
+        for _ in 0..50 {
+            if let Ok(l) = TcpListener::bind(&proxy_addr) {
+                bound = Some(l);
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            bound.is_some(),
+            "stop must free the listening port {proxy_addr} — a second listener could not bind it"
+        );
+
         std::fs::remove_dir_all(scenario.dir()).unwrap();
     }
 }

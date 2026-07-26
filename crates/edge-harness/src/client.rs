@@ -134,11 +134,15 @@ impl SseTail {
     /// A read that fails once ANY of a chunk has been consumed (a partial
     /// size line, or partway through the exact-length body/CRLF
     /// `read_exact`s) is not: those bytes are gone from the stream and
-    /// neither `read_line` nor `read_exact` says how many it took, so the
-    /// stream is desynced and this tail poisons itself; every later call
-    /// fails immediately by name rather than risking a silent garbage parse.
-    /// Timeouts and hard failures (a peer that closes mid-chunk) poison
-    /// alike — a stream cut mid-frame must never later report a clean close.
+    /// neither `read_until` nor `read_exact` says how many it took, so the
+    /// stream is desynced and this tail poisons itself. The same holds when
+    /// the read itself SUCCEEDS but its content doesn't parse (a malformed
+    /// hex size, a chunk extension, non-UTF-8 bytes): the size line's bytes
+    /// are still off the wire, so a fully-read-but-unparseable line poisons
+    /// exactly like an IO failure would — every later call fails immediately
+    /// by name rather than risking a silent garbage parse. Timeouts and hard
+    /// failures (a peer that closes mid-chunk) poison alike — a stream cut
+    /// mid-frame must never later report a clean close.
     pub fn next_frame(&mut self, timeout: Duration) -> io::Result<Option<SseFrame>> {
         if let Some(reason) = &self.poisoned {
             return Err(io::Error::other(format!(
@@ -174,9 +178,10 @@ impl SseTail {
                     // finding 3.
                     assert!(
                         self.pending.is_empty(),
-                        "SseTail: EOF with {} byte(s) of an unterminated frame still pending — \
-                         a stream cut mid-frame must never report a clean close",
-                        self.pending.len()
+                        "SseTail: EOF with {} byte(s) of an unterminated frame still pending: \
+                         {:?} — a stream cut mid-frame must never report a clean close",
+                        self.pending.len(),
+                        self.pending
                     );
                     return Ok(None);
                 }
@@ -241,7 +246,7 @@ enum ChunkRead {
 /// read was simply waiting for the next chunk to start. `MidChunk` —
 /// anything consumed already, whether a partial or malformed size line, or
 /// part of the `size + 2` bytes the reader has committed to — is NOT safe:
-/// once the size line's bytes are off the wire, `read_line` succeeding and
+/// once the size line's bytes are off the wire, `read_until` succeeding and
 /// `from_str_radix` failing on its content is not "nothing consumed" just
 /// because the failure is a parse failure, not an IO failure — the stream
 /// can no longer be trusted to be chunk-aligned.
@@ -272,7 +277,7 @@ fn read_one_chunk(reader: &mut BufReader<TcpStream>) -> Result<ChunkRead, ChunkE
     // Past this point the size line's bytes are unconditionally off the
     // wire — a malformed line (bad UTF-8, bad hex, a chunk extension like
     // "a;ext") is a desync, not a retryable boundary, no matter which step
-    // of decoding it (finding 1: `read_line` succeeding and consuming a
+    // of decoding it (finding 1: `read_until` succeeding and consuming a
     // whole line is not "nothing consumed", regardless of what the content
     // turns out to be).
     let size_line = std::str::from_utf8(&raw).map_err(|e| {
@@ -679,7 +684,7 @@ mod tests {
     /// Independent review of 2bfdf16, finding 1: a malformed chunk size —
     /// here a chunk extension (`a;ext`), valid chunked-encoding syntax but
     /// not valid hex — is not a retryable boundary just because
-    /// `from_str_radix` is the thing that failed. `read_line` already
+    /// `from_str_radix` is the thing that failed. `read_until` already
     /// consumed the whole line off the wire; only the content was
     /// unparseable. This must poison like any other mid-chunk failure.
     #[test]
@@ -776,5 +781,42 @@ mod tests {
             .next_frame(Duration::from_secs(2))
             .expect_err("a truncated stream must never later report a clean close");
         assert!(err2.to_string().contains("SseTail is poisoned"), "{err2}");
+    }
+
+    /// T10 re-review, routed to T12: the negative-space assert in
+    /// `next_frame`'s `Eof` arm ("EOF with N byte(s) of an unterminated
+    /// frame still pending") had ZERO coverage — nothing proved it fires or
+    /// that its message says what it claims. The precondition IS reachable
+    /// through the ordinary public API with an adversarial stub (the
+    /// original review's "not reachable" was about charpente's own SERVER,
+    /// which always emits one complete frame per chunk — not about a stub
+    /// deliberately withholding the trailing blank line): a stub that writes
+    /// a COMPLETE chunk ("5\r\nid: 1\r\n" — chunk size 5, exactly "id: 1",
+    /// its trailing CRLF) and then closes yields `Chunk(b"id: 1")` ->
+    /// `pending = "id: 1"` (no "\n\n", so no frame is emitted) -> the next
+    /// `read_one_chunk` sees an immediate EOF on the size-line read -> the
+    /// `Eof` arm fires with a non-empty `pending`, which must panic rather
+    /// than silently report a clean close.
+    #[test]
+    #[ignore]
+    #[should_panic(expected = "unterminated frame still pending")]
+    fn next_frame_panics_on_eof_with_an_unterminated_frame_pending() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut stream = drain_request(stream);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
+                    .unwrap();
+                // One complete chunk, no terminating blank line — the peer
+                // closes right after, mid-frame.
+                stream.write_all(b"5\r\nid: 1\r\n").unwrap();
+            }
+        });
+
+        let mut http = Http::new(addr);
+        let mut tail = http.sse_tail("/feed", None).unwrap();
+        let _ = tail.next_frame(Duration::from_secs(2));
     }
 }

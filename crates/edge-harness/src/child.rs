@@ -143,6 +143,15 @@ impl ChildNode {
         scenario.record(format!("resume (SIGCONT) pid {pid}"));
     }
 
+    /// This node's tee'd stderr log path (T10 routed prerequisite M3) — a
+    /// scenario that must assert a node's printed refusal text (e.g. the
+    /// demote/re-seed notice in `repl::role`'s `mismatch_notice`, which goes
+    /// to stderr via `serve.rs`'s `eprintln!`) reads this file rather than
+    /// reaching into the child's own stdio pipes.
+    pub fn stderr_log(&self) -> &Path {
+        &self.stderr_log
+    }
+
     /// Respawns the SAME `bin`/`args` (so the same `--data-dir`) — the
     /// operator's real remedy after a crash. Retries a handful of times: the
     /// previous process's listen socket can take a moment to release the
