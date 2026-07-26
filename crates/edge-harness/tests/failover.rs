@@ -180,6 +180,23 @@ fn wait_converged(follower_http: &mut Http, id: u64) -> bool {
 /// every site of this shape).
 type IdReasons = Vec<(u64, String)>;
 
+/// The genuine-vs-rig-failure predicate every classification in this file
+/// shares: a GET that came back `status 404` is a CONFIRMED absence (the
+/// row really isn't there); anything else (401, 500, a transport error) is
+/// the rig failing to answer the question, not evidence the row is gone.
+/// Extracted so `classify_converged_loss` (the violation path) and
+/// `describe_tail_loss`/the tail-exercising test (the expected, non-
+/// violation DECISIONS §6 path) apply the IDENTICAL discrimination rather
+/// than each growing its own — the same class of hole T11 was built to
+/// close (a rig failure silently counted as a genuine loss, in either
+/// direction).
+fn confirmed_absent_count(reasons: &IdReasons) -> usize {
+    reasons
+        .iter()
+        .filter(|(_, reason)| reason == "status 404")
+        .count()
+}
+
 /// Composes the post-promote loss message for converged ids: the SAME
 /// three-way classification shape as `acked_durable.rs`'s `classify`
 /// (genuine-absence / pure-rig-failure / mixed), applied to "a converged id
@@ -194,10 +211,7 @@ fn classify_converged_loss(missing: &IdReasons, converged_len: usize) -> String 
         "classify_converged_loss: called with no missing ids — a failover verdict requires at \
          least one"
     );
-    let confirmed = missing
-        .iter()
-        .filter(|(_, reason)| reason == "status 404")
-        .count();
+    let confirmed = confirmed_absent_count(missing);
     if confirmed == missing.len() {
         format!(
             "failover violated: {} of {converged_len} converged id(s) missing on the promoted \
@@ -218,6 +232,40 @@ fn classify_converged_loss(missing: &IdReasons, converged_len: usize) -> String 
              genuinely absent (status 404) on the promoted follower, alongside {} GET(s) that \
              failed for a rig reason: {missing:?}",
             missing.len() - confirmed
+        )
+    }
+}
+
+/// The DECISIONS §6 counterpart to `classify_converged_loss`, for the
+/// acked-but-not-observed-converged TAIL — expected, bounded loss, never a
+/// violation, but the SAME `confirmed_absent_count` predicate applies: a
+/// tail id missing because the GET hit a rig failure (a 401, a 500, a
+/// transport hiccup) is not evidence of the bounded-loss window this
+/// oracle is supposed to be naming — it's evidence the check itself
+/// couldn't finish, which deserves distinct wording just as much on the
+/// expected side as on the violation side. Never returns text containing
+/// "violated" — that word is `classify_converged_loss`'s alone.
+fn describe_tail_loss(tail_missing: &IdReasons, non_converged_tail: usize) -> String {
+    if tail_missing.is_empty() {
+        return format!(
+            "0 of {non_converged_tail} non-converged-tail id(s) missing — every acked-but-not-\
+             observed-converged id made it to the follower anyway"
+        );
+    }
+    let confirmed = confirmed_absent_count(tail_missing);
+    if confirmed == tail_missing.len() {
+        format!(
+            "{confirmed} of {non_converged_tail} non-converged-tail id(s) confirmed genuinely \
+             absent (status 404) on the promoted follower — DECISIONS §6 bounded loss, expected \
+             and not a failure by itself: {tail_missing:?}"
+        )
+    } else {
+        format!(
+            "{confirmed} of {non_converged_tail} non-converged-tail id(s) confirmed genuinely \
+             absent (status 404, DECISIONS §6 bounded loss, expected); {} could NOT be verified \
+             for a rig reason (not evidence of the bounded-loss window, just a check that \
+             couldn't finish): {tail_missing:?}",
+            tail_missing.len() - confirmed
         )
     }
 }
@@ -251,10 +299,14 @@ fn vacuous_ack_message(acked_len: usize, not_acked: &IdReasons) -> String {
 /// acked-but-not-converged tail's reporting path actually executes and
 /// stays within bounds, not just that it CAN in principle (review item 4,
 /// 2026-07-26: a branch nobody has ever run may simply not work).
+/// `tail_missing` carries the REASON per id (not just the id) so a caller
+/// can apply `confirmed_absent_count` itself — the same discrimination
+/// `classify_converged_loss` applies to the converged set, reused here
+/// rather than a parallel "any non-200 counts" check.
 struct RunStats {
     converged_len: usize,
     non_converged_tail: usize,
-    missing_from_tail_len: usize,
+    tail_missing: IdReasons,
 }
 
 /// `cut_peer_link_before_round`: when `Some(r)`, the peer-link proxy is
@@ -467,9 +519,13 @@ fn run_oracle(
         }
         scenario.record("promote: exit 0, stdout names the DECISIONS §6 bounded-loss window");
 
-        // ---- verify: every CONVERGED id survives on the promoted follower
+        // ---- verify: every CONVERGED id survives on the promoted follower;
+        // ---- the non-converged tail is checked too, but reported (via
+        // ---- describe_tail_loss) rather than folded into the violation
+        // ---- check — DECISIONS §6 bounded loss there is expected, not a
+        // ---- failure by itself.
         let mut missing: IdReasons = Vec::new();
-        let mut also_missing_from_tail: Vec<u64> = Vec::new();
+        let mut tail_missing: IdReasons = Vec::new();
         let converged_set: HashSet<u64> = converged.iter().copied().collect();
         for &id in &acked {
             match follower_http.get(&format!("/customers/{id}")) {
@@ -479,7 +535,7 @@ fn run_oracle(
                     if converged_set.contains(&id) {
                         missing.push((id, reason));
                     } else {
-                        also_missing_from_tail.push(id);
+                        tail_missing.push((id, reason));
                     }
                 }
                 Err(e) => {
@@ -487,7 +543,7 @@ fn run_oracle(
                     if converged_set.contains(&id) {
                         missing.push((id, reason));
                     } else {
-                        also_missing_from_tail.push(id);
+                        tail_missing.push((id, reason));
                     }
                 }
             }
@@ -497,23 +553,16 @@ fn run_oracle(
         // is confined to the acked-but-never-observed-converged tail,
         // never larger than it — checked explicitly (not just implicitly
         // true by construction) so a future refactor that widened
-        // `also_missing_from_tail` beyond the tail itself would fail loudly
-        // here rather than silently.
+        // `tail_missing` beyond the tail itself would fail loudly here
+        // rather than silently.
         assert!(
-            also_missing_from_tail.len() <= non_converged_tail,
-            "also_missing_from_tail ({}) exceeds the non-converged tail itself ({}) — a \
-             bookkeeping bug, not a bounded-loss window",
-            also_missing_from_tail.len(),
+            tail_missing.len() <= non_converged_tail,
+            "tail_missing ({}) exceeds the non-converged tail itself ({}) — a bookkeeping bug, \
+             not a bounded-loss window",
+            tail_missing.len(),
             non_converged_tail
         );
-        scenario.record(format!(
-            "post-promote check: {} of {} CONVERGED id(s) missing; {} of {non_converged_tail} \
-             non-converged-tail id(s) also missing (DECISIONS §6 bounded loss — reported, not a \
-             failure by itself)",
-            missing.len(),
-            converged.len(),
-            also_missing_from_tail.len()
-        ));
+        scenario.record(describe_tail_loss(&tail_missing, non_converged_tail));
         if !missing.is_empty() {
             return Err(classify_converged_loss(&missing, converged.len()));
         }
@@ -630,7 +679,7 @@ fn run_oracle(
         Ok(RunStats {
             converged_len: converged.len(),
             non_converged_tail,
-            missing_from_tail_len: also_missing_from_tail.len(),
+            tail_missing,
         })
     })();
 
@@ -714,32 +763,50 @@ fn failover_wire_oracle() {
 /// against a boundary timing edge case, without needlessly slowing the test.
 const CUT_ROUND: u64 = 49;
 
-/// Review item 4 (2026-07-26): `run_oracle`'s acked-but-not-converged tail
-/// reporting path had never executed in this environment — loopback
-/// replication converges all 50 rounds every time, so the branch that
-/// checks the tail and asserts it's bounded was exercised only by
-/// construction, never by a real gap. This test forces one: cutting the
-/// peer link partway through (`cut_peer_link_before_round`) deterministically
-/// produces acked-but-never-converged ids, so the reporting path — and the
-/// `also_missing_from_tail.len() <= non_converged_tail` bound — actually
-/// runs against real evidence instead of a permanently-empty tail.
+/// Review item 4 (2026-07-26, sharpened in a second review pass the same
+/// day): `run_oracle`'s acked-but-not-converged tail reporting path had
+/// never executed in this environment — loopback replication converges
+/// all 50 rounds every time, so the discrimination Oracle 2's whole
+/// honesty claim rests on (zero loss over CONVERGED ids; the tail is
+/// bounded, reported, and NOT a violation) had only ever been tested on
+/// the trivial "everything converged, nothing was lost" path. If the
+/// converged-vs-tail bookkeeping were wrong in either direction, that
+/// version of this test would still have passed. This test forces a real
+/// tail: cutting the peer link partway through
+/// (`cut_peer_link_before_round`) deterministically produces acked-but-
+/// never-converged ids, so both halves of the claim run against real
+/// evidence:
 ///
-/// Asserts on `RunStats` (not just that `run_oracle` returned `Ok`, which
-/// alone would only prove the CONVERGED-id zero-loss guarantee held — the
-/// same thing `failover_wire_oracle` already proves):
-/// - `non_converged_tail >= 1`: the cut actually produced a non-empty tail
-///   (anti-vacuity — a `0`-tail run here would mean the cut didn't work).
-/// - `missing_from_tail_len >= 1`: at least one tail id is CONFIRMED
-///   genuinely absent on the promoted follower after promote — the branch
-///   fires with real evidence, not just a `0` that could mean either
-///   "checked and found nothing missing" or "never checked."
+/// 1. **The guarantee still holds**: `run_oracle` returning `Ok` at all is
+///    itself proof the CONVERGED set had zero loss — a converged-set loss
+///    would have made it return `Err(classify_converged_loss(..))` and
+///    this `.expect()` would panic. This is also proof the oracle did NOT
+///    classify the tail loss as a violation: `classify_converged_loss`
+///    only ever fires on the converged set, never the tail.
+/// 2. **The tail loss is real, not vacuous, and reuses the SAME
+///    genuine-vs-rig-failure discrimination as the guarantee side**
+///    (`confirmed_absent_count` — the predicate `classify_converged_loss`
+///    itself uses — applied to `stats.tail_missing` rather than a
+///    parallel "any non-200 counts" check):
+///    - `non_converged_tail >= 1` — the cut actually produced a non-empty
+///      tail (anti-vacuity: `0` here would mean the cut didn't work).
+///    - `confirmed_absent_count(&stats.tail_missing) >= 1` — at least one
+///      tail id is CONFIRMED genuinely absent (status 404), not merely
+///      "some GET on it didn't return 200" — a rig failure (401/500/
+///      transport hiccup) on a tail id would NOT count as evidence of the
+///      bounded-loss window this test exists to exercise.
+///    - `converged_len >= MIN_CONVERGED` — a second, independent
+///      confirmation that the cut didn't eat into the guarantee-bearing
+///      set (the first being that `run_oracle` didn't already refuse as
+///      vacuous before reaching here).
 #[test]
 #[ignore]
 fn failover_non_converged_tail_is_exercised_and_bounded() {
     let bins = build_bins().expect("build_bins");
     let stats = run_oracle(&bins.node, &bins.charpente, Some(CUT_ROUND)).expect(
-        "failover must still hold its CONVERGED-id zero-loss guarantee even with a deliberately \
-         severed peer link late in the run — see stderr above for the scenario script",
+        "failover must still hold its CONVERGED-id zero-loss guarantee (and must NOT classify \
+         the deliberately-severed tail as a violation) even with a peer link cut late in the \
+         run — see stderr above for the scenario script",
     );
     assert!(
         stats.non_converged_tail >= 1,
@@ -749,14 +816,16 @@ fn failover_non_converged_tail_is_exercised_and_bounded() {
         stats.converged_len,
         stats.non_converged_tail
     );
+    let confirmed = confirmed_absent_count(&stats.tail_missing);
     assert!(
-        stats.missing_from_tail_len >= 1,
-        "the non-converged tail was non-empty ({} id(s)) but ZERO of them were confirmed \
-         missing on the promoted follower — either the cut didn't actually prevent shipping \
-         (weakening this test's proof that the reporting path runs against real evidence), or \
-         DECISIONS §6 loss just didn't happen to occur this run; either way this test's whole \
-         point — proving the branch fires with a real, non-zero, CONFIRMED loss — did not hold",
-        stats.non_converged_tail
+        confirmed >= 1,
+        "the non-converged tail was non-empty ({} id(s): {:?}) but ZERO were CONFIRMED \
+         genuinely absent (status 404) — either the cut didn't actually prevent shipping, or \
+         every GET on a tail id failed for a rig reason instead of a genuine 404; either way \
+         this run does not prove the DECISIONS §6 bounded-loss window was actually exercised, \
+         only that something else went wrong",
+        stats.non_converged_tail,
+        stats.tail_missing
     );
     assert!(
         stats.converged_len >= MIN_CONVERGED,
@@ -1142,5 +1211,69 @@ fn vacuous_ack_message_names_the_shortfall() {
         "the failover oracle is vacuous: only 49/50 rounds acked against the primary (every \
          round should ack); not acked: [(7, \"status 401\")]; refusing to run a failover check \
          over a partial write phase"
+    );
+}
+
+#[test]
+fn confirmed_absent_count_only_counts_genuine_404s() {
+    let reasons: IdReasons = vec![
+        (1, "status 404".to_string()),
+        (2, "status 401".to_string()),
+        (3, "status 404".to_string()),
+        (4, "request failed: connection reset".to_string()),
+    ];
+    assert_eq!(confirmed_absent_count(&reasons), 2);
+    assert_eq!(confirmed_absent_count(&Vec::new()), 0);
+}
+
+#[test]
+fn describe_tail_loss_empty_tail_names_zero_missing() {
+    let msg = describe_tail_loss(&Vec::new(), 3);
+    assert_eq!(
+        msg,
+        "0 of 3 non-converged-tail id(s) missing — every acked-but-not-observed-converged id \
+         made it to the follower anyway"
+    );
+}
+
+#[test]
+fn describe_tail_loss_all_confirmed_is_expected_bounded_loss_not_a_violation() {
+    let tail_missing: IdReasons = vec![
+        (49, "status 404".to_string()),
+        (50, "status 404".to_string()),
+    ];
+    let msg = describe_tail_loss(&tail_missing, 2);
+    assert_eq!(
+        msg,
+        "2 of 2 non-converged-tail id(s) confirmed genuinely absent (status 404) on the \
+         promoted follower — DECISIONS §6 bounded loss, expected and not a failure by itself: \
+         [(49, \"status 404\"), (50, \"status 404\")]"
+    );
+    assert!(
+        !msg.contains("violated"),
+        "the tail's expected loss must never share `classify_converged_loss`'s violation \
+         wording: {msg:?}"
+    );
+}
+
+#[test]
+fn describe_tail_loss_mixed_names_the_unverifiable_remainder() {
+    let tail_missing: IdReasons = vec![
+        (48, "status 404".to_string()),
+        (49, "status 404".to_string()),
+        (50, "status 500".to_string()),
+    ];
+    let msg = describe_tail_loss(&tail_missing, 3);
+    assert_eq!(
+        msg,
+        "2 of 3 non-converged-tail id(s) confirmed genuinely absent (status 404, DECISIONS §6 \
+         bounded loss, expected); 1 could NOT be verified for a rig reason (not evidence of the \
+         bounded-loss window, just a check that couldn't finish): [(48, \"status 404\"), (49, \
+         \"status 404\"), (50, \"status 500\")]"
+    );
+    assert!(
+        !msg.contains("violated"),
+        "the tail's expected loss must never share `classify_converged_loss`'s violation \
+         wording, even in the mixed case: {msg:?}"
     );
 }
