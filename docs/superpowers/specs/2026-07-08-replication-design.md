@@ -179,7 +179,7 @@ replays unchanged.
 close and must re-`Hello`) and `FaultConfig.ship_latency` (per-message latency spikes on
 replication conns), both drawn from field-keyed sub-streams per the frozen-replay
 contract (spec 2026-07-07 §4); the legacy sequential draw is untouched. Existing
-`partition`/`repair` compose. Auto-covered keys: `fault:conn-drop`, `crash:host`.
+`partition`/`repair` compose. Auto-covered keys: `fault:conn_drop`, `crash:host`.
 *Amendment (task 2, landed):* `ship_latency` shipped as `FaultConfig.net_spike`, applied
 to every conn — the sim cannot and should not know which conns are "replication"; a
 superset that still covers them (coverage keys as landed: `fault:conn_drop`,

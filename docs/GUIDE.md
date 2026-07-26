@@ -1720,19 +1720,30 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
 
 ### The checkers
 
-`charpente_sim::checks` ships four reusable oracles — reach for these
+`charpente_sim::checks` ships six reusable oracles — reach for these
 before hand-rolling the same logic a fourth time:
 
 - `is_fault_fallout(text: &str) -> bool` — classifies an error's *text*:
   is this the harness's own injected fault (or its consequences) rather
   than a bug your workload should fail on? It recognizes the sim's
-  injected-fault wording (including the `read_error` and
-  `misdirected_write` axes), the WAL/engine poison wording, the WAL's
-  durable-horizon hard error (bit-level corruption of an already-
-  acknowledged frame — a fault-matrix consequence, not a bug), and redb's
-  "close and re-open the database" latch. Used inside a workload to turn
-  "the disk broke, as instructed" into "no answer this round" rather than
-  a hard failure — never to swallow anything else.
+  injected-fault wording (including the `read_error` axis), the WAL/engine
+  poison wording, the WAL's durable-horizon hard error (bit-level corruption
+  of an already-acknowledged frame — a fault-matrix consequence, not a bug),
+  and redb's "close and re-open the database" latch. Used inside a workload
+  to turn "the disk broke, as instructed" into "no answer this round" rather
+  than a hard failure — never to swallow anything else. (`misdirected_write`
+  is not in that list and cannot be: it returns `Ok`, so it has no wording —
+  what you eventually see is the corrupt frame it left behind.)
+- `classify(text: &str) -> FaultReason` — the same judgement, typed:
+  `Injected`, `Poisoned`, `RedbLatch`, `DurableHorizon`, or `Unrelated`
+  (`is_fault_fallout` is `!matches!(…, Unrelated)`). Use it when your
+  workload wants to accept some families and fail on others — e.g. "an
+  injected fault or a durable-horizon error is fallout this round, but a
+  poisoned engine is a finding". Matching on a variant instead of on
+  substrings keeps the prose coupling in one place: if a platform error
+  string is ever reworded, `classify` is the single site that must change,
+  and it fails by name instead of leaking a wrong classification into
+  whichever oracle saw the text first.
 - `replays_identically(seed: u64, workload: impl Fn(&mut Sim) -> Result<T, String>) -> Result<(), String>`
   — the determinism oracle. Runs `workload` twice, each on its own fresh
   `Sim::new(seed)`, and fails if the returned value or the durable
@@ -1759,12 +1770,26 @@ before hand-rolling the same logic a fourth time:
   excused only in universes where corruption was actually injected — the
   strong oracle stands everywhere else. Never use it to excuse wrong data
   or a consistency violation (a cut reverts state to a prefix, which stays
-  consistent).
+  consistent). Note this is the *single-node* excuse: a workload with a
+  converged follower keeps none of it, because a record the primary lost to
+  media corruption still lives on the follower.
+- `dir_entry_loss_fired(sim: &Sim) -> bool` — the same fire-time-marked
+  discipline for the `dir_entry_loss` axis (a pending directory create
+  vanished, or a pending removal resurrected). A workload that routes
+  `Db::open`'s "a segment is missing … refusing to guess" to a restore path
+  must do so *only* when this returns true: the platform never leaves a
+  durable directory gap on its own, so a gap in a universe where the axis
+  never fired is a real regression and must fail loud.
 
 ```rust,ignore
+pub fn classify(text: &str) -> FaultReason   // Injected | Poisoned | RedbLatch
+                                             // | DurableHorizon | Unrelated
+
 pub fn is_fault_fallout(text: &str) -> bool
 
 pub fn durable_corruption_fired(sim: &Sim) -> bool
+
+pub fn dir_entry_loss_fired(sim: &Sim) -> bool
 
 pub fn replays_identically<T: PartialEq + std::fmt::Debug>(
     seed: u64,
@@ -2123,6 +2148,26 @@ The same discipline extends outward: `run_universes!`/`run_universes_swarm!`
 --sim --seed 0x…` are the same idea at two different layers: a failure's
 seed is always enough, on its own, to see the exact same universe again.
 
+### A note on the edge harness (platform dev tooling, not app surface)
+
+The repo also carries `crates/edge-harness`, which drives real built binaries
+over real TCP with process- and connection-level faults (`kill -9`,
+SIGSTOP/SIGCONT, severed or delayed connections) to prove the wire-level
+versions of three guarantees: acked-implies-durable across a kill and a
+restart, zero loss over converged writes across `charpente promote`, and exact
+`Last-Event-ID` SSE resume. **It is not part of your app's testing story and
+there is nothing to adopt** — `charpente test --sim` above is the app-level
+interface, and it is where your properties belong. Two things are worth
+knowing anyway. First, the boundary: `kill -9` is not power loss (killing a
+process does not drop the OS page cache), so that rig proves ack *ordering*
+and end-to-end crash recovery through real hyper/TCP, while the simulator
+above owns power-loss and torn-write durability — if you are reasoning about
+what charpente's durability claims rest on, they rest on the sim. Second, it
+makes no seed promise: a scenario's reproduction is a recorded script file, not
+a seed, which is exactly why app-level properties belong in sim. Its
+process-touching tests are `#[ignore]`d out of the ordinary sweep and run on
+demand via `scripts/edge-harness.sh`.
+
 ## 9. Error index
 
 A lookup, not a tutorial: find the message you're staring at (or its
@@ -2365,6 +2410,16 @@ loop check this directly — per the step-7 ruling, the request arm now stops
 serving once a request's own 500 leaves the engine poisoned, rather than
 keep accepting traffic against a dead engine.
 
+One honest limit on that signal: `Db::poisoned()` reports *charpente's* poison
+(a failed WAL sync, a failed apply). It does not see redb's own handle latch,
+which any storage error sets — most reachably a failed checkpoint fsync — after
+which every later redb operation fails with "close and re-open the database"
+while `poisoned()` still says false and the kernel keeps serving. Restarting
+the process is the correct response there too; what is missing is the platform
+noticing on your behalf. Known gap, characterized by
+`crates/charpente/tests/kernel.rs`'s
+`kernel_keeps_serving_with_a_latched_store_known_gap` and on the M2 backlog.
+
 ## 10. Replication
 
 One primary accepts writes; followers replay its log and arrive at
@@ -2394,6 +2449,20 @@ named message, before any state moves:
 ```text
 peer secret missing or mismatched — set ReplConfig.peer_secret to match this node (or run the CLI verb with --secret)
 ```
+
+`Some("")` is not a third option: an empty secret would admit any peer that
+presents no proof at all — near-`None` inbound, while you believe auth is on —
+which is easy to reach through an empty env var or a shell-quoting slip. It is
+refused by name where `ReplConfig` is consumed, before any socket or state
+work:
+
+```text
+ReplConfig.peer_secret is Some("") — an empty peer secret authenticates any peer that presents no proof, which is almost never what a configured secret intends; set a real secret, or use None to explicitly accept all peers (DESIGN §8)
+```
+
+and `--secret ''` on either CLI verb is the same usage error as omitting the
+value (`error: --secret requires a value`, exit 2). If you mean "accept every
+peer", write `None` and mean it.
 
 The replication wire is plaintext TCP: `peer_secret` authenticates peers, it
 does not encrypt the link (a private network is the deployment assumption;
@@ -2479,6 +2548,19 @@ role file:
   has acked every record does it hand off — no acked record is lost. If the
   target cannot catch up before the deadline, the switchover aborts and the
   primary resumes.
+
+**After a `promote`, the old primary must be wiped before it is ever started
+again.** Its durable role file still says `Primary`, and the durable role always
+wins over config, so restarting it as it was configured brings up a *second*
+writable primary on a diverged timeline — and nothing warns you: neither node
+dials the other, so neither can notice, and the resurrected node will accept and
+ack new writes. Those writes are then destroyed by the only remedy available
+(the fresh-data-dir re-seed below). So: promote the follower, then treat the old
+box as a *new* node — stop it, clear its data directory, and let it re-seed as a
+follower of the new primary. A switchover does not have this hazard (the
+handed-off primary demotes itself durably); this is specific to promote, and it
+is a known gap the platform does not currently detect for you (DESIGN §5,
+characterized by `crates/edge-harness/tests/failover.rs`).
 
 Both travel as control messages over the replication port, issued with the
 `charpente` CLI:

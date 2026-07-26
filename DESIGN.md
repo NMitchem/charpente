@@ -156,7 +156,9 @@ replicated driver can own it differently without forking the decision code. Repl
 (or a draining primary — `is_primary` is false while handing off) serves reads and ships
 its log but never runs jobs or cron (those would hit `TxError::NotPrimary`), and a
 follower→primary flip inside `Repl::step` rebuilds the due-heap and cron from the
-replicated store on the next iteration. A repl-configured node also caps every idle wait at
+replicated store **in the same step** (`Kernel::after_repl_step`, called from the
+`Ready::Repl` arm before it returns) — a promoted node never services a request or a job
+against a stale heap. A repl-configured node also caps every idle wait at
 a 5ms park tick, so in-flight replication IO — sim messages or prod TCP — is polled
 promptly regardless of the next job/cron deadline. Realtime (M1 sub-project 3) adds a fifth
 ready source, `Tail`: unlike the deadline-carrying sources (jobs, cron, repl) it is never
@@ -609,8 +611,19 @@ shipped are the DECISIONS §6 window, lost honestly and named. A node that resta
 durable `HandingOff(to)` stays write-stopped and resolves against `to`: a probe `Hello`
 answered as a primary demotes it to `Follower(to)` (a diverged refusal is the operator's
 re-seed signal, surfaced as the step error); `to` unreachable or not-yet-primary keeps it
-`HandingOff` on a reconnect cadence — it never silently resumes `Primary`, so no
-interleaving yields two writable primaries.
+`HandingOff` on a reconnect cadence — a node in durable `HandingOff` never silently
+resumes `Primary`, so no *switchover* interleaving yields two writable primaries. **The
+promote path does not carry that property, and that is a known gap** (M1 sub-project 6,
+T12): a node promoted *away from* — killed while `Primary`, its follower promoted
+underneath it — still has `Primary` in its own durable role file, and the durable role
+always wins, so restarting it with its original config resumes it as a second writable
+primary with no notice at all (neither node dials the other, so neither can observe the
+conflict). Two live, mutually invisible, diverged timelines; the mandated fresh-data-dir
+re-seed then destroys every write the resurrected node acked. Characterized, not fixed, by
+`crates/edge-harness/tests/failover.rs`'s
+`failover_known_gap_silent_dual_primary_resurrection` (`#[ignore]`, so its tripwire fires
+only under `scripts/edge-harness.sh`); the fix proposal — a durable witness set probed
+before any `Primary` resume — is M2 backlog (CLAUDE.md's follow-up entry).
 
 **Surfaces (v1, implemented).** The kernel wires the data + control plane in (M1
 replication T8): `Kernel::with_replication(app, clock, repl)` runs the `Repl` engine as the
@@ -750,12 +763,47 @@ Charpente treats the coding agent as the primary developer persona:
   reproduction (`--seed 0x9f3a...`), so the agent's fix-verify cycle needs no flaky-test
   triage. `--format json` is the machine-readable surface: per-failure `{test, seed,
   master_seed, config, message, repro}`, `coverage`, `missing_coverage` (`{test, key}`
-  pairs for `require`d keys never hit), and a trailing `summary`. Ships with a three-item
+  pairs for `require`d keys never hit), and a trailing `summary`. Ships with the public
   checker library (`charpente_sim::checks`): `is_fault_fallout` (the injected/poisoned/
-  redb-latch fallout classifier, productized out of four hand-rolled internal copies),
-  `replays_identically` (determinism oracle), and `acked_implies_durable` (the
-  request-level ack-durability property, generalized for app workloads). Exit codes: 0
-  green, 1 sim failures or unmet coverage, 2 build/usage/infrastructure error.
+  redb-latch/durable-horizon fallout classifier, productized out of four hand-rolled
+  internal copies) and its typed form `classify` → `FaultReason`, for a workload that
+  accepts some families and fails on others (sub-project 6 T7 — first-match arm order is
+  load-bearing and pinned); `replays_identically` (determinism oracle);
+  `acked_implies_durable` (the request-level ack-durability property, generalized for app
+  workloads); and the two fire-time-marked axis companions `durable_corruption_fired` and
+  `dir_entry_loss_fired`, which excuse a shortfall only in universes where that fault
+  actually fired. Exit codes: 0 green, 1 sim failures or unmet coverage, 2
+  build/usage/infrastructure error.
+- **The edge harness (v0, implemented; `crates/edge-harness`).** The sim owns everything
+  below the IO traits; the edge harness owns everything above them that only a real
+  process can show. It drives **real built binaries** (`examples/invoicing/src/bin/node.rs`
+  and the `charpente` CLI) over **real TCP** with process- and connection-granular faults
+  — `kill -9`, SIGSTOP/SIGCONT, an in-process proxy that severs live connections, refuses
+  new ones, or delays forwarded bytes — and proves three wire-level guarantees end to end
+  (M1 sub-project 6, T11–T12): acked-implies-durable across a kill and a restart against
+  the same data directory; zero loss over *converged* writes across `charpente promote`
+  (with the non-converged tail reported separately — that tail is DECISIONS §6's window,
+  not a violation); and exact `Last-Event-ID` SSE resume across a mid-stream kill
+  (set-equality with the missing set, so an interior skip cannot pass). Each oracle carries
+  an anti-vacuity floor and a positive control: the ack-before-commit meta-test drives a
+  deliberately-wrong build (`crates/edge-harness/patches/`) and demands the oracle go red
+  by name, which is what stops a green run from meaning "the rig did nothing". **The
+  honesty contract (spec §4.4) bounds what this can claim.** `kill -9` is *not* power loss
+  — process death does not drop the OS page cache — so what these oracles prove is ack
+  **ordering** (nothing crosses the wire as acked before the commit path ran) plus
+  end-to-end crash recovery through real hyper/TCP; power-loss and torn-write durability
+  remain the simulator's claim alone, and the crate's own docs say so rather than
+  overclaiming. There is **no seed promise** here: a scenario's reproduction is the script
+  file it records (every fault action and observation, in order, dumped on drop and named
+  loudly on failure), replayed by hand. And the sim stays the reproduction authority: a
+  finding this rig makes that indicts the kernel or core gets reproduced in sim, with a
+  pinned seed, *before* it is fixed (hard rule 3, extended past the sim's boundary);
+  something genuinely edge-only — a real signal, a real socket close — lands a
+  deterministic edge regression instead. Because each scenario builds release binaries and
+  drives real processes, every test that touches a process, a socket or the filesystem is
+  `#[ignore]` and the matrix runs on demand via `scripts/edge-harness.sh`; the crate's
+  zero-syscall tests (parsers, classifiers, and the byte-exact pins for every verdict
+  string an operator would read) are not ignored and run in the ordinary sweep.
 - **Skill/docs layout.** Documentation ships as both human prose and a machine-readable
   pack designed to be loaded into an agent's context (the framework's conventions are only
   worth having if the agent applying them has them in scope).

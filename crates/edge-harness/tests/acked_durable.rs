@@ -1005,14 +1005,14 @@ fn acked_implies_durable_meta_test_has_teeth() {
 
 // ---------------------------------------------------------- named-error pins
 //
-// Re-review round 2 "Important": the crate's un-ignored set is exactly the
-// 10 pure parse/scan tests in `src/child.rs`/`src/client.rs` — zero
-// syscalls, every one. A first draft of the pins below drove `verify`
-// through a closed loopback port to reach `classify`'s branches, which was
-// the crate's 11th un-ignored test AND the only one performing a syscall
+// Re-review round 2 "Important": the crate's un-ignored set is exactly its
+// zero-syscall tests — that criterion, not a count, is the rule
+// (`src/lib.rs`'s crate doc and `scripts/edge-harness.sh` state it; the set
+// has grown every task since). A first draft of the pins below drove `verify`
+// through a closed loopback port to reach `classify`'s branches, which
+// would have been the crate's ONLY un-ignored test performing a syscall
 // (a bound-then-dropped listener, three real `connect()` calls, a temp
-// dir, a `Scenario::Drop` file write) — contradicting the file's own
-// stated criterion one file over. `classify` and `require_full_ack` are
+// dir, a `Scenario::Drop` file write) — contradicting the criterion above. `classify` and `require_full_ack` are
 // both pure functions of their arguments (no `Http`, no `Scenario`, no
 // filesystem), so the fix is to pin them directly with hand-built
 // `IdReasons` values instead: zero syscalls, and a STRONGER pin than the

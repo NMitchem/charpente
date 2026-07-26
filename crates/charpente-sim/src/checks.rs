@@ -17,7 +17,9 @@ use crate::Sim;
 /// first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultReason {
-    /// The sim's own injected-fault wordings (write/sync/read/misdirected).
+    /// The sim's own injected-fault wordings (write/sync/read, and the
+    /// crash-disk-is-gone text). `misdirected_write` is deliberately absent:
+    /// it returns `Ok` and has no wording at all — see `classify`.
     Injected,
     /// Our WAL/engine poison wording.
     Poisoned,
@@ -33,8 +35,13 @@ pub enum FaultReason {
 /// Classifies `text` (an error's Display/to_string output) into one of the
 /// four recognized fault-fallout families or `Unrelated`:
 ///  1. the sim's own injected-fault wordings — including the `read_error`
-///     and `misdirected_write` axes (segment-mgmt T5), both of which are
-///     "injected"/"simulated" too,
+///     axis (segment-mgmt T5), whose error text is "injected" too.
+///     `misdirected_write` is NOT in this family and cannot be: it returns
+///     `Ok` with the payload landed past the requested offset, so it produces
+///     no error text of its own (T7 review, corrected at T14 — the earlier
+///     doc listed it here). What surfaces later is the corrupt frame it
+///     leaves behind: family 4 below when the frame is provably durable, and
+///     an ordinary torn-tail cut otherwise,
 ///  2. our WAL/engine poison wording,
 ///  3. redb's latch ("close and re-open the database") — its internal
 ///     already-saw-an-IO-error signal,

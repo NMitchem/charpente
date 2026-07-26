@@ -55,9 +55,15 @@ Copied from the spec and CLAUDE.md; every task's requirements implicitly include
   in each file's established range convention.
 - **Workflow**: commit directly to `main`, no Co-Authored-By trailers. One commit per
   task unless a task says otherwise.
-- **Edge harness CI story (ruling 4)**: every `edge-harness` test is `#[ignore]` — the
-  full matrix runs on demand (`scripts/edge-harness.sh` + locally before the M1-close
-  claim), never per-push. `.github/workflows/ci.yml` is NOT modified by this plan.
+- **Edge harness CI story (ruling 4)**: every `edge-harness` test that touches a
+  process, a socket or the filesystem is `#[ignore]` — the full matrix runs on demand
+  (`scripts/edge-harness.sh` + locally before the M1-close claim), never per-push.
+  `.github/workflows/ci.yml` is NOT modified by this plan. *(Amended 2026-07-25 by
+  Noah's ruling, which narrowed this bullet's original blanket wording: the crate's
+  zero-syscall tests — parsers, classifiers, verdict-string pins — are NOT ignored and
+  do run in the ordinary sweep. The shipped rule is the criterion stated in
+  `scripts/edge-harness.sh:3-8` and `crates/edge-harness/src/lib.rs`'s crate doc, not a
+  count.)*
 - **Kill -9 honesty**: killing a process does NOT drop OS-page-cache writes — process
   death is not power loss. The harness therefore proves ACK ORDERING (nothing is acked
   before the commit path ran) and end-to-end crash recovery through real hyper/TCP; the

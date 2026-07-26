@@ -38,18 +38,21 @@
 //!   durability against actual media failure or a power outage stays the
 //!   simulator's claim, never this crate's.
 //!
-//! Every test here that touches a process, a socket, or the filesystem is
-//! `#[ignore]`: it does not run under `cargo test --workspace`'s default
-//! pass, since it builds release binaries and drives real processes over
-//! real TCP (seconds, not milliseconds, per test). Run that matrix
-//! explicitly via `scripts/edge-harness.sh` or `cargo test -p edge-harness
-//! -- --ignored`. The zero-IO unit tests — the artifact scan (`find_bins`,
-//! `extract_field`, `wait_addr`) and the wire parsers (`parse_response`,
-//! `as_json_string`, `parse_sse_frame`) — are NOT ignored: they cost
-//! microseconds and guard the code every scenario above them depends on, so
-//! a regression there must fail the ordinary sweep rather than wait for
-//! someone to run the matrix by hand (Noah's ruling, 2026-07-25, narrowing
-//! plan ruling 4's blanket wording).
+//! **The `#[ignore]` line is drawn by one criterion, crate-wide: syscalls.**
+//! Every test that touches a process, a socket, or the filesystem is
+//! `#[ignore]` — it does not run under `cargo test --workspace`'s default
+//! pass, since it builds release binaries and drives real processes over real
+//! TCP (seconds, not milliseconds, per test). Run that matrix explicitly via
+//! `scripts/edge-harness.sh` (which states the same rule) or `cargo test -p
+//! edge-harness -- --ignored`. Every zero-syscall test — the artifact scan and
+//! wire parsers here in `src/`, and the pure verdict/classifier pins that each
+//! oracle and hunt keeps next to the wire assertion it protects — is NOT
+//! ignored: those cost microseconds and guard the code every scenario above
+//! them depends on, so a regression there must fail the ordinary sweep rather
+//! than wait for someone to run the matrix by hand (Noah's ruling,
+//! 2026-07-25, narrowing plan ruling 4's blanket wording). `cargo test -p
+//! edge-harness` prints the current split; this doc deliberately states the
+//! criterion rather than a count, which every later task invalidates.
 
 pub mod child;
 pub mod client;

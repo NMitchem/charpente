@@ -37,7 +37,10 @@
 //!      latched store handle in EITHER shape.
 //!
 //! The gap itself is characterized in the sim, where it belongs, and the fix
-//! proposal is HELD for a ruling (task-13-report.md).
+//! proposal is DEFERRED TO M2 by ruling (Noah, 2026-07-26) — that is the
+//! proposal's final state, not a pending one, so nothing here is waiting on a
+//! decision. The proposal, its recommendation and the policy fork it leaves
+//! open are in task-13-report.md and in CLAUDE.md's M2 follow-up entry.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::io::{self, Read, Write};

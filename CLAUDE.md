@@ -313,7 +313,10 @@ do not reorder a milestone's dependency sequence.
   loopback `serve_replicated` invoicing nodes, 50/50 acked curl writes survive
   `kill -9` + `charpente promote` (0 missing on the promoted follower, which then
   accepts writes), promote reply names the DECISIONS §6 bounded-loss window, restarted
-  old primary prints the pinned demote/re-seed refusal — transcript in the ledger.
+  old primary prints the pinned demote/re-seed **notice** (a role/config-mismatch
+  stderr line — it is not a refusal, and sub-project 6's T12 shows that a restart with
+  the *original* primary config prints nothing at all: the dual-primary gap in the M2
+  backlog below) — transcript in the ledger.
   Follow-up backlog (ledgered in the sub-project close-out entry): typed error kinds at
   the trust-boundary seams (re-Hello/not-a-primary/RESTORE_NEEDED substrings), seed
   0x94a70e2360154b09 explicitly triaged unpinned, swarm inconclusive-rate/runtime
@@ -506,35 +509,242 @@ do not reorder a milestone's dependency sequence.
   discharged same-day: kernel pin 0x348270b38f166529 revert-guard re-verified
   PIN-EXERCISES-BUG at d7d7116 (3 historical tests red incl. the pin itself,
   identical dispatch.rs:158 panic; restored 25/25).
-- **M1 sub-project 6 OPEN (2026-07-24)** — introspection polish + the edge harness.
-  Spec approved (all 8 §6 rulings adopted as recommended, 1f76801) plus 3 Noah-ruled
-  pre-flight amendments (ea7fe4c): the Contract's events section is dropped in v0
-  (event NAMEs are provably unreachable without a macro change — SSE visibility via
-  `stream: true`); an empty-string peer secret becomes a named config error (the
-  ledgered "behaves as None" claim was disproven — `Some("")` admits any peer
-  presenting no proof); the harness vehicle is a committed
-  `examples/invoicing/src/bin/node.rs`. 14-task plan at
-  docs/superpowers/plans/2026-07-24-introspection-edge-harness.md (three phases:
-  describe, error-quality suite, edge harness; adversarial opus plan review gating
-  execution).
-  **Execution state (2026-07-25, HEAD 9c111b1): 9 of 14 tasks closed.** The
-  authoritative running record is the ledger
-  `.superpowers/sdd/2026-07-24-introspection-edge-harness/progress.md` — this entry
-  is a pointer until T14 writes the close-out. Phase A (describe, T1–T5) complete;
-  Phase B (error quality, T6–T9) complete at 93bcc56. T10 (edge-harness crate +
-  `examples/invoicing/src/bin/node.rs`) is in flight: implementation 39b0b37, opus
-  review raised 5 Importants, fix round 1 landed 9c111b1 (restart child-identity,
-  client timeouts, SSE timeout-vs-EOF, signal asserts) together with Noah's
-  2026-07-25 ruling un-ignoring the 10 zero-IO edge tests — which amends plan ruling
-  4's blanket `#[ignore]` wording, a docs debt T14 still owes. T10 is NOT closed: the
-  ledger has no `Task 10: complete` line and the fix-round diff
-  `review-516a83d..9c111b1.diff` has no verdict file. Two commits between T9 and T10's
-  fix round (f5cfc98, 516a83d) are not plan tasks — they are the Noah-approved
-  `sim-disk-fastpath` performance work (~2.6x on the sim suite), cherry-picked onto
-  main with replay identity proven.
-- Next: adjudicate T10's fix-round review and write its closing ledger line, then
-  T11 (acked-implies-durable wire oracle + the ack-before-commit teeth meta-test),
-  T12 (promote/failover + realtime-resume wire oracles), T13 (named hunts — the
-  read-side-poison hunt HALTS for a Noah ruling at its characterization), T14 (final
-  review, close-out sweep, M1 COMPLETE, push). Local `main` is 17 commits ahead of
-  `origin/main`; the push is deliberately deferred to T14.
+- **M1 sub-project 6 done — introspection polish + the edge harness (2026-07-27, spec
+  docs/superpowers/specs/2026-07-23-introspection-edge-harness-design.md (1f76801) + 3
+  Noah-ruled pre-flight amendments (ea7fe4c), 14-task plan
+  docs/superpowers/plans/2026-07-24-introspection-edge-harness.md (8032611) +
+  adversarial-review amendments (66b3673), commits 66b3673..6822554 in three phases plus
+  this close-out commit; the authoritative task-by-task record is the ledger
+  `.superpowers/sdd/2026-07-24-introspection-edge-harness/progress.md`).**
+  **Phase A — `charpente describe` (T1–T5, 9a1b9d4..ffc5ca4).** `App::describe()` is a
+  pure walk of a mounted app's own registries returning a `Contract` — tables (version,
+  structural fingerprint, indexes, migration chain), routes (method, pattern, name, auth,
+  `stream`), jobs (retry policy), cron, config — with `to_json`/`to_human` renderers and a
+  `builtin: bool` keyed on each row's own `TABLE`/`NAME` const separating the platform's
+  surface from the app's. Two entry points: `charpente::launch(addr, data_dir, build)`
+  (the standard app `fn main`, so `describe` is free the moment an app adopts it; an
+  unknown verb is a usage error, exit 2, never a silent serve) and `charpente describe
+  [--dir PATH] [--format json|human] [--bin NAME]`, which builds any app crate from the
+  outside and execs it through the same argv path. Both run against a throwaway temp dir,
+  never the app's `data_dir`, so a describe is safe next to a live server. The contract is
+  pinned three ways (invoicing golden, the CLI cross-check mechanically tied to it — the
+  same 5329-byte literal in both, re-verified by the final review — and a determinism test)
+  plus
+  GUIDE §13. Event NAMEs are deliberately absent (ruling 6: unreachable without a macro
+  change; `stream: true` is realtime's only trace in the contract).
+  **Phase B — error quality (T6–T9, 447d7f1..93bcc56).** The trybuild compile-fail suite
+  (9 `.stderr` pins + 2 pass regressions) over the macro errors the M0 demo agent actually
+  hit; `checks::classify`/`FaultReason` productized out of four hand-rolled `is_injected`
+  copies, its first-match arm order load-bearing and pinned; every named replication error
+  string byte-exact (diverged family, NotPrimary, role, re-Hello marker) plus the
+  `Some("")` peer-secret named config error (the ledgered "behaves as `None`" claim was
+  disproven — it admits any peer presenting no proof); the realtime encode-error
+  whole-node-fatal pinning meta-test (a hard-rule-3 gap closed); binary-level
+  `charpente-cli` ctl tests.
+  **Phase C — the edge harness (T10–T13, 39b0b37..6822554).** `crates/edge-harness` plus
+  the committed `examples/invoicing/src/bin/node.rs` vehicle: child control (kill9,
+  pause/resume, restart with child-identity asserts), a TCP fault proxy (sever, refuse,
+  delay), a blocking HTTP/1.1 + SSE client, and the scenario script as the repro artifact —
+  no seed promise, the §4.4 honesty contract now in DESIGN §7. **Three wire oracles, all
+  green against stock:** (1) *acked-implies-durable* across `kill -9` + restart on the same
+  data dir, with the ack-before-commit teeth meta-test driving a committed wrong-build
+  patch in a throwaway worktree and demanding the oracle go red by name — plus the positive
+  control (stock binary through the wrong-build wiring, asserted `Ok`) that closes the
+  "the redness proves nothing" hole; (2) *promote/failover zero loss over CONVERGED writes*
+  (ship-ack barrier, `MIN_CONVERGED` 40 of 50, the real `charpente promote` CLI asserted
+  for exit 0 and the DECISIONS §6 window text, the non-converged tail reported and never
+  folded into the violation, with a deterministic test that forces the tail branch by
+  cutting the peer link at round 49); (3) *exact `Last-Event-ID` SSE resume* across a
+  genuinely mid-stream kill, exactness enforced four ways (set-equality with the missing
+  set, no intersection with what was consumed pre-kill, strict in-stream id monotonicity,
+  superset). T13's three named hunts: four `serve.rs` #25 probes (no hangs, no crashes; the
+  two absent contracts — no `header_read_timeout`/connection budget, no write/idle timeout —
+  RECORDED not asserted, since asserting one would be this task deciding #25),
+  `charpente switchover` end-to-end including the `CtrlSwitchover` secret arm (closing that
+  ledgered item), and the `Db::poisoned()` hunt, whose brief-predicted mechanism was
+  **disproven by measurement** and the disproof itself pinned. **Two gaps found,
+  characterized, and ruled DEFERRED TO M2 (Noah, 2026-07-26) rather than fixed in a
+  close-out task** — both carried in the M2 backlog below, each behind a test that turns
+  red the day a fix lands. Kill -9 honesty is stated everywhere it matters (crate doc,
+  DESIGN §7, GUIDE §8): process death does not drop the OS page cache, so the rig proves
+  ack *ordering* plus end-to-end crash recovery through real hyper/TCP, and power-loss /
+  torn-write durability stays the simulator's claim alone.
+  Two commits in the range are not plan tasks: `f5cfc98` + `516a83d`, the Noah-approved
+  `sim-disk-fastpath` performance work (~2.6x on the sim suite), cherry-picked onto main
+  with replay identity independently proven twice.
+  Final whole-branch opus review (`final-review.md`, dc87dec..6822554 — 35 commits, 72
+  files, ~11.5k insertions): **READY TO MERGE, 0 Critical**, conditional on four record
+  corrections, all landed in this close-out (I-1 DESIGN's promote-path dual-primary claim —
+  a shipped spec sentence the branch's own green test disproved; the "only natural end of
+  the window" claim scoped to the cache-resident shape at both sites; `hunts.rs`'s stale
+  "HELD for a ruling"; the unqualified `begin_write` mechanism). Its verdict on the three
+  oracles, each judged as a skeptic asking "can this be green while the guarantee is
+  false?": oracle 1 not in the class it claims and the claim is stated honestly ("the
+  anti-vacuity layering is the strongest I have seen in this repo"), oracle 2 "I could not
+  construct a way", oracle 3 only in bounded, disclosed ways. The close-out also discharged
+  the docs debt T6–T12 had routed here (the `misdirected_write`-is-not-a-wording correction
+  in `checks`, the four-vs-six checker census in GUIDE §8 and DESIGN §7, the GUIDE
+  `Some("")` refusal, the GUIDE promote-wipe warning, the replication spec's
+  `fault:conn-drop`→`conn_drop` token, plan ruling 4's blanket `#[ignore]` wording, and two
+  stale censuses of the edge crate's un-ignored set — all now stated as criteria, not
+  counts).
+  Evidence — 9/9 final-bytes close-out sweep, every stage green (spec §8; full log archived
+  at `.superpowers/sdd/2026-07-24-introspection-edge-harness/task-14-sweep.log`): `cargo
+  fmt --all --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean;
+  `cargo build -p guide-examples` (the GUIDE compile gate) clean; `cargo test --workspace`
+  **twice** — 48 test binaries, **506 passed / 0 failed / 31 ignored** both times (10m18s
+  and 9m25s; the replication suite's 32 tests dominate at 478s / 454s); debug pinned
+  replays `CHARPENTE_SEED=0x8bee1752811ae873` (charpente-sim crash_recovery, 4/4) and
+  `0x348270b38f166529` (charpente kernel, 26/26, including the new latch
+  characterization); the two release mode-skew tripwires exactly as `ci.yml` runs them,
+  `0x8bee1752811ae873` (release crash_recovery, 4/4) and `0xff159ed76d2806e4` (release
+  `late_follower_seeds_below_the_gcd_base_and_converges`, 1/1); a fresh invoicing
+  1024-universe batch, **all green, master seed `0x943560695b136113`**; and the full edge
+  matrix `scripts/edge-harness.sh` — **31/31 `#[ignore]` scenarios green in 49s**, which is
+  the demo-of-record: all three wire oracles plus the teeth meta-test, both known-gap
+  characterizations, the four hunt probes, the switchover secret arm, and the smoke
+  scenario, against stock binaries. Crate census after the close-out (observed, not
+  quoted): edge-harness **55 un-ignored / 31 ignored, 86 total** — the final review's
+  55/30/85 plus this task's one new `Scenario` test.
+- **M1 COMPLETE (2026-07-27).** Both PLAN M1 exit criteria are discharged, each with an
+  oracle at two layers: *a follower promoted mid-write-load loses nothing and serves reads
+  throughout* — in-sim property 8 (sub-project 2) plus the wire oracle above, over
+  converged ids, with the acked-but-unconverged tail named as DECISIONS §6's window rather
+  than hidden; *a reconnecting realtime client provably misses no events* — the in-sim
+  membership oracle with its skip/dup discriminating twins (sub-project 3) plus the exact
+  `Last-Event-ID` wire oracle above. Six sub-projects (WAL segment management, replication,
+  realtime SSE, auth, migrations-as-log-records, introspection + the edge harness) plus
+  three ruled interludes (mode-skew, diverged-BEHIND, horizon-collapse Design A). **Named
+  deferrals, so the claim is not read wider than it is:** WebSockets and TS client codegen
+  (spec non-goals, sub-project 3), object-storage backup (`serve::backup` is a promotable
+  follower, not a snapshot shipper), and multi-tenancy as typed key prefixes, which DESIGN
+  §9 already carries as its own future design. None of the three gates an exit criterion.
+- Next: **push** — one metered CI run, deliberately deferred through the whole sub-project
+  (local-first verification is the sweep above; Noah confirms). Then M2 per PLAN, with the
+  two ruled follow-ups below re-decided at their policy forks before either is implemented.
+
+## M2 follow-up backlog (carried from M1, ruled — written to be read cold)
+
+- **The checkpoint-latch gap: `Db::poisoned()` does not see redb's handle latch.**
+  charpente has two independent "this storage is broken" flags and only knows about one.
+  Ours is `Db::poisoned()`, set when a durable record fails to apply or the WAL's fsync
+  fails. redb has its own: any error from the storage backend sets
+  `CheckedBackend.io_failed`, after which every backend operation returns `PreviousIo`
+  ("Previous I/O error occurred. Please close and re-open the database"). Nothing maps
+  redb's latch onto ours. Two mechanisms reach it on a live handle: the store's
+  **checkpoint fsync** — always available, because `Store::apply` commits at
+  `Durability::None`, so the checkpoint's is the *only* store sync — and a **failed store
+  read**, but only on a store whose working set exceeds redb's evicting 1 GiB read cache (a
+  smaller one is served from memory and never touches the disk boundary after open).
+  Common to both shapes: the write whose checkpoint failed gets a 500 while its record *is*
+  durable in the WAL; `Db::poisoned()` is **false**; the kernel keeps serving; and the node
+  can no longer checkpoint, so WAL GC and the `.horizon` breadcrumb are both frozen. What
+  differs is what an operator can see — and the two rows do **not** have the same standing:
+  a **cache-resident store is completely silent** (reads answered 200 off redb's page
+  cache; no 500, no log line, nothing on the wire) — **MEASURED**; a **store larger than
+  the read cache is loud** (cache-missing reads 500 while every platform health signal
+  still says fine) — **DERIVED, not measured**: its premises are verified in redb's source,
+  but no store over the 1 GiB bound was ever built, and proving it would mean constructing
+  one. Do not promote that row without measuring it. How the window ends differs too, and
+  this is the sharper half: on a cache-resident store the window is **one write wide** (the
+  next write reaches the latch-gated `begin_write`, poisons apply-side, and stops the
+  kernel — while a read-only node stays in the window indefinitely, reporting healthy
+  forever); on a larger store the window **may never close**, because `begin_read` is *not*
+  latch-gated (verified in both redb `begin_read` impls), so a read-first write transaction
+  — the ordinary get-then-put shape — fails inside the handler, returns a plain 500, and
+  never reaches `begin_write`: no append, no apply, no poison. Verified **not** a
+  disk-exhaustion hazard in either shape: after the latch the WAL takes at most two more
+  records and is then frozen. **Recommended fix:** a sticky `store_failed` flag on `Db`,
+  set wherever a `Store` call fails with redb's `PreviousIo` tell (checkpoint, apply,
+  snapshot, scan — the read paths are in the set deliberately, so the fix never depends on
+  a write reaching `begin_write`), OR-ed into `Db::poisoned()`; the kernel's request arm
+  then stops on it exactly as it already stops on apply-side poison (the 2026-07-05 step-7
+  ruling), giving the operator the restart redb's own message asks for. No new protocol, no
+  new durable state, no WAL change. **The policy fork is the deliverable and was
+  deliberately NOT ruled:** (a) stop on the latch immediately, or (b) keep serving reads but
+  surface the state (a loud notice at the first latched checkpoint plus a `Db::degraded()`
+  distinct from `poisoned()`), accepting that those reads come off a cache that can never
+  be refilled. T13 recommended (a) — on a large store it is the *only* thing that ends the
+  state, and on a small one it merely moves an already-certain stop earlier — but
+  **re-decide this with M2's context rather than inheriting it as settled**: (a) also makes
+  a read-only node's snapshot path a new stop site the step-7 ruling never considered, and
+  it matches on redb's error prose, the same one-place coupling `checks::classify` carries.
+  **Tripwire:** `crates/charpente/tests/kernel.rs`'s
+  `kernel_keeps_serving_with_a_latched_store_known_gap` (seed `0x0DED_0002`) is written to
+  turn red the day this lands — `replies.len() == 3` reddens *first*, before the
+  `!poisoned()` headline, and that earlier failure is the fix working, not a second break.
+  Update it; never delete it. It is un-ignored, so it runs in every `cargo test
+  --workspace`. Full write-up: proposal 1 of
+  `.superpowers/sdd/2026-07-24-introspection-edge-harness/task-13-report.md`.
+- **The dual-primary gap: silent primary resurrection after a promote.** A primary dies; an
+  operator promotes the follower; later the old box comes back and is restarted **exactly
+  as it was configured** — same `--role primary`, same data dir. Its durable role file says
+  `Primary` and the durable role always wins over config, so it resumes as a primary with
+  **no notice at all**: `role.rs`'s notice fires only when the restart config *contradicts*
+  the role file, so it is a config-mismatch message, not a safety net. Neither node dials
+  the other (each node's follower client is `None` once it is durably `Primary`), so nothing
+  on either side can observe the conflict. Result: two live, writable, mutually invisible
+  primaries on diverged timelines — the resurrected node serves stale reads *and accepts new
+  writes, acking them* — and the mandated remedy for a demoted primary is a fresh data dir
+  plus a re-seed, which **destroys every write it acked in the meantime**. Acked-write loss
+  reached through an ordinary "restart the old box the way it was" action. **Recommended
+  fix:** extend to the `Primary`-resume path the probe-on-restart discipline `HandingOff`
+  resume already has, via one piece of new durable state — a **witness set**, the listen
+  addresses of the followers this node has shipped to, written alongside the role file
+  whenever a ship session is established. A node starting in durable `Primary` with a
+  non-empty witness set probes each witness with the existing `Hello` machinery *before*
+  allowing writes; a witness that answers **as a primary** is conclusive on its own (the
+  only way a node this one shipped to is now a primary is that it was promoted or handed
+  off to), and the resurrected node then refuses by name with the fresh-data-dir remedy, in
+  the shape `decide_hello`'s `diverged_behind` arm already uses. An empty witness set always
+  resumes silently, so single-node primaries are untouched. This is deliberately smaller
+  than the ledgered **Design C** (a durable timeline epoch at fork points, carried on
+  `Hello`) and **compatible with it**: no protocol field is needed, because "the peer
+  answers as a primary" is already distinguishable on today's wire, and an epoch would
+  *sharpen* the refusal rather than replace the probe. **The policy fork is the deliverable
+  and was deliberately NOT ruled:** what does a node do when its witnesses are
+  **unreachable**? Refusing is safe but breaks every ordinary restart of a primary whose
+  follower merely happens to be down (a single-node-plus-dead-follower deployment would
+  never start); resuming keeps availability but leaves the gap open in exactly the scenario
+  where it bites. T13 recommended resuming with a loud notice naming the unreached witnesses
+  and the risk — mirroring how `HandingOff` resume treats an unreachable `to` as "keep
+  trying" — with strict-refuse available as an opt-in `ReplConfig` flag; **re-decide it with
+  M2's context.** Costs: durable state that must survive crashes and stay accurate as
+  followers come and go, plus network IO on the startup path (a probe timeout added to every
+  primary's start). **Tripwire:** `crates/edge-harness/tests/failover.rs`'s
+  `failover_known_gap_silent_dual_primary_resurrection`, which proves the two primaries
+  genuinely cannot see each other rather than assuming it, and goes red on any fix that
+  makes the resurrected node refuse, demote, or warn. **Note the asymmetry with the gap
+  above:** this test is `#[ignore]`, so its red appears only under
+  `scripts/edge-harness.sh`, never in `cargo test --workspace`. That follows from plan
+  ruling 4 and is not a defect, but an M2 reader must know it. DESIGN §5's promote paragraph
+  now names this gap; GUIDE §10 carries the operator warning. Full write-up: proposal 2 of
+  the same report.
+- **Retired follow-up wording.** The migrations close-out's follow-up "`Db::poisoned()`
+  reflects only apply-side poison, not redb **read-side** poison" is retired as imprecise:
+  the reachable-anywhere mechanism is the **checkpoint fsync**, and the read mechanism is
+  size-conditional. The checkpoint-latch entry above is the accurate replacement.
+- **Deferred items triaged by the final review — recorded, not acted on.** *Ship as is:*
+  the `temp_dir`/`free_addr`/`extract_field`/`find_node_bin`/`Rng` helper copies duplicated
+  across edge test files (verified identical today, and no silent-pass path exists — a
+  broken `find_node_bin` returns `None` or the stock path, which `assert_ne!` catches);
+  `acked_durable.rs` at ~1100 lines (about half is rationale prose a future reader needs at
+  the site); `finish`'s four copies with three signatures (a fifth would be the moment to
+  consolidate); the two T11 pin waivers; T12's fresh-timeline 409 arm, its connection
+  over-count in the scenario log, and `StopReason`'s uneven per-variant docs. *Fix in M2:*
+  `TcpProxy::stop`'s residual sub-microsecond registration window — one connection can
+  survive a cut; the failure direction is loud (the tail test fails naming "the cut did not
+  work as intended"), and the structural close is to clone inside the accept loop's existing
+  critical section. *Notes worth knowing:* `classify`'s arm order is pinned for
+  Injected-before-Poisoned but not DurableHorizon-last (stricter, not looser; no shipped
+  string carries both needles); the nine trybuild `.stderr` pins render against whatever
+  `dtolnay/rust-toolchain@stable` resolves to, so a rustc rendering change reddens nine
+  tests at once (deliberate and loud); GUIDE §13's quoted contract JSON is byte-identical to
+  the pinned golden today but nothing mechanically holds it there; the edge meta-test adds
+  and removes a `git worktree` against the real checkout, so a matrix run killed mid-test
+  leaves a stale entry until the next run's `prune`.
+- **One correction to the ledger's own record** (found by the final review): T11's pin
+  waiver for the "oracle is vacuous" string was recorded as if the string were unpinned. It
+  **is** pinned byte-exact by `require_full_ack_names_a_vacuous_run`
+  (`acked_durable.rs:1096`); the waiver covers only reaching it end-to-end at the wire,
+  which needs a non-acking build.

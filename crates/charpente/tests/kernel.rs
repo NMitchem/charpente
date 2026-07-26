@@ -918,10 +918,14 @@ fn kernel_keeps_serving_with_a_latched_store_known_gap() {
          than deleting it"
     );
 
-    // And the window's only natural end: the next WRITE turns the latch into
-    // apply-side poison (which the kernel's request arm does stop on). So the
-    // gap is not that the node never notices — it is that a read-serving node
-    // never does.
+    // And the window's only natural end FOR A CACHE-RESIDENT STORE — the shape
+    // this test builds: the next WRITE turns the latch into apply-side poison
+    // (which the kernel's request arm does stop on). So the gap here is not that
+    // the node never notices — it is that a read-serving node never does. On a
+    // larger-than-cache store there may be no natural end at all: `begin_read`
+    // is ungated, so a read-first write transaction fails inside its handler,
+    // never reaches the latch-gated `begin_write`, and never poisons
+    // (task-13-report.md, N-3).
     let write = app.db_for_tests().transact(|tx| {
         tx.put(&Counter {
             id: Id::from_raw(2),
