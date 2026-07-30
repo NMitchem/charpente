@@ -64,8 +64,11 @@ rule was never wired to the store boundary.
    MANIFESTO §8 ("optional guarantees are no guarantees") makes a node that
    reports healthy while structurally unable to make progress the silent-wrongness
    class this project exists to delete.
-3. **Typed detection at the boundary.** Not a prose match on redb's `Display`
-   text. See §1.
+3. **Detection at charpente's own disk boundary** (amended 2026-07-30, before
+   implementation — the original ruling was "typed detection at the `redb_err`
+   boundary", superseded once `CheckedBackend`'s set-condition was read; the
+   discarded alternative and the reason are kept in §1 so the amendment is not
+   re-litigated). Not a prose match on redb's `Display` text either way.
 4. **Fix both shapes; measure only the cheap one.** The read paths are in the
    flag-setting set, so the fix covers the larger-than-cache shape by
    construction — but no store over redb's 1 GiB bound will be built to prove the
@@ -74,67 +77,66 @@ rule was never wired to the store boundary.
    this spec says so at the site.
 5. **The cause stays distinct from apply-poison.** See §3.
 
-## 1. Detection: typed at the boundary
+## 1. Detection: charpente's own disk boundary
 
-`redb::StorageError::PreviousIo` is a typed variant
-(`redb-4.1.0/src/error.rs:16`), as is `redb::Error::PreviousIo` (`:559`). T13's
-proposal reached for a prose match only because charpente destroys the type at
-its own boundary: `redb_err` (`crates/charpente-core/src/table.rs:283-285`) is
-generic over `impl fmt::Display` and flattens every redb error into
-`io::Error::other(format!("table store (redb): {e}"))`.
+redb's latch is set in exactly one place and on exactly one condition.
+`CheckedBackend` (`redb-4.1.0/src/tree_store/page_store/cached_file.rs:118-198`)
+wraps a `Box<dyn StorageBackend>` and sets `io_failed` when **that inner backend
+returns `Err`** — five sites, one per method: `len` (`:158`), `read` (`:167`),
+`set_len` (`:176`), `sync_data` (`:185`), `write` (`:194`). The only other write
+to `io_failed` is `close()` (`:148`), which sets it unconditionally as part of a
+deliberate graceful close.
 
-The fix is to stop destroying it.
+The inner backend **is charpente's own `DiskBackend`**
+(`crates/charpente-core/src/table.rs:938-970`), whose `StorageBackend` impl is
+five one-line delegations to `File`, in one-to-one correspondence with redb's
+five latch sites.
 
-- Introduce a private trait — `IsPreviousIo`, one method returning `bool` —
-  implemented for each redb error type `redb_err` actually receives. **The impl
-  set is enumerated by the compiler, not guessed here:** changing `redb_err`'s
-  bound makes every call site that passes an un-impl'd type a compile error, and
-  the implementation task adds exactly those impls. (`redb::TableError` is the
-  only one named explicitly in charpente's source today; the rest arrive through
-  inference.)
-- `redb_err`'s body builds a private `StoreError { previous_io: bool, msg:
-  String }` implementing `std::error::Error`, wrapped via `io::Error::other`.
-  Callers recover the flag by `io::Error::get_ref` + `downcast_ref::<StoreError>`.
-- **Every `map_err(redb_err)` call site stays byte-identical.** Only the
-  function's bound and body change.
+So charpente does not need to *detect* redb's latch downstream. It can **observe
+the identical condition at the same instant, one layer down**: set a sticky flag
+in each of `DiskBackend`'s five methods when the inner `File` call returns `Err`.
+`close` is deliberately **not** mirrored — a graceful close is not a failure.
 
-`StoreError`'s `Display` must reproduce today's `"table store (redb): {e}"`
-string exactly. One site already depends on that prefix
-(`table.rs:314`, the open-time panic conversion), and the sim's error-classification
-surface reads these strings.
+**What this deletes** versus the originally-ruled typed-detection design: no
+`IsPreviousIo` trait, no `StoreError` wrapper type, no `downcast_ref`, no change
+to any of the ~89 `map_err(redb_err)` call sites, and — the largest saving — **no
+flag threading into `Snapshot` or `Writer` at all.** A failed store read *is*
+`DiskBackend::read` returning `Err`, so the read-path arm that Scope ruling 4
+depends on is covered at the source. `Snapshot` and `Writer` are untouched by
+this spec.
+
+**The trade, stated so it is not rediscovered later.** This replaces a *typed*
+coupling with a *structural* one. Typed `PreviousIo` detection would catch a
+latch however it arose; the backend flag catches it only where redb's condition
+is "the backend errored." Those are the same set in redb 4.1.0 — verified above,
+`close()` being the sole exception and one we intentionally exclude — but a
+future redb that latched on some internal consistency check would leave our flag
+silently under-reporting.
+
+That risk is **pinned, not assumed**: the tripwire test (§6) builds a genuinely
+latched store, so it asserts the correspondence directly. If redb ever adds a
+latch path charpente does not mirror, that test goes red. This is the same
+treatment the repo gives its other version-coupled assumptions.
 
 **What this does not do.** `checks::classify`
 (`crates/charpente-sim/src/checks.rs:72`) matches redb's latch prose today and
 will continue to. It classifies message *strings* by design and has no error
-value to inspect. This spec does not remove that coupling; it avoids adding a
-second one on the product path. Anyone reading CLAUDE.md's note about
+value to inspect. This spec does not remove that coupling; it adds no new one of
+any kind on the product path. Anyone reading CLAUDE.md's note about
 prose-coupling liability should understand the two sites are different in kind.
 
 ## 2. Stickiness: where the flag lives
 
-On `Store`, not on `Db`.
+An `Arc<AtomicBool>`, created in `Store::open`, held by both `DiskBackend` (which
+sets it) and `Store` (which reads it), exposed as `Store::failed()`.
 
-`Store::apply`, `checkpoint`, and `snapshot` all take `&self`, so the flag is an
-`AtomicBool` (interior mutability is required, and an atomic bool is not a
-nondeterminism source — the kernel is single-threaded and the deny-list does not
-reach it). Exposed as `Store::failed()`.
+An atomic bool is required because `DiskBackend`'s `StorageBackend` methods take
+`&self`, and it is not a nondeterminism source — the kernel is single-threaded
+and the deny-list does not reach it.
 
-Placing it on `Store` rather than `Db` is what makes the read-path arm work:
-`Snapshot` and `Writer` hold the same handle, so their reads set the same flag
-without a second mechanism.
-
-Concretely the flag is an `Arc<AtomicBool>` owned by `Store` and cloned into
-`Snapshot` and `Writer` when they are constructed, so all three share one latch
-state.
-
-**Sites that set it: all of them, set inside `charpente-core::table`** — not at
-the `Db` layer, which owns neither the handle nor the flag and cannot see
-`Snapshot`/`Writer` reads at all. Each `Store`/`Snapshot`/`Writer` method funnels
-its `io::Result` through one small `note()` helper that sets the flag when the
-error downcasts to `previous_io`. The set covers `checkpoint`, `apply`,
-`snapshot`, `import`, `gc_events`, `set_import_meta`, `applied_seq`, and the
-`Snapshot` readers (`scan_raw`, `scan_raw_from`, `next_job_id`, `next_event_id`,
-`seed_frontier`).
+The flag is **sticky and never cleared**, matching redb: once latched,
+`check_failure` (`cached_file.rs:134-144`) short-circuits before ever calling the
+backend again, so the two states cannot drift apart afterwards.
 
 `Db`'s only role is to read `Store::failed()` and OR it into `poisoned()` (§3).
 
@@ -217,13 +219,25 @@ unfixed code.
   `!poisoned()` headline; that earlier failure is the fix working, not a second
   break. CLAUDE.md's backlog entry already warns a reader about exactly this
   ordering, and the entry is retired as part of this work.
-- **A read-path test.** Proves `snapshot`/`scan` set the flag with no write
-  involved. This is the arm with no measurement behind it (§ Scope ruling 4), so
-  it carries that arm's weight on its own.
-- **A negative test.** A non-latch store error must **not** set the flag —
-  guarding against silently degrading into "any store error is sticky", the
-  option considered and rejected in brainstorming. Without this, the typed
-  detection could rot into the broad one and no test would notice.
+- **The correspondence assertion** (new under the amended §1). The tripwire
+  builds a genuinely latched store, so it must assert that charpente's flag is
+  set *there* — that is what pins the structural coupling §1 accepts. If a future
+  redb latches through a path `DiskBackend` does not observe, this assertion is
+  what goes red.
+- **A read-path test.** Proves a failed store **read** sets the flag with no
+  write involved — the `DiskBackend::read` arm. This is the arm with no
+  measurement behind it (§ Scope ruling 4), so it carries that arm's weight on
+  its own.
+- **A negative test.** Note the amended §1 changes what this must assert. Every
+  *disk-boundary* error now sets the flag — that is not over-breadth, it is
+  exactly redb's own condition. What must **not** set it is a store error that
+  never reached the disk boundary: a row-decode failure, or
+  `TableError::TableDoesNotExist`, both of which `Store` already handles as
+  ordinary results. Without this test, the flag could drift into "any error
+  whatsoever is fatal" and nothing would notice.
+- **A graceful-close test.** `close` is deliberately not mirrored (§1). A normal
+  `Database::drop` must leave the flag clear, so a clean shutdown is never
+  reported as a latch.
 - **An anti-vacuity check** on the read-path test, in the style the existing
   tripwire already uses: prove the injector is attached and the store read
   actually reaches the `Disk` boundary, so the test cannot pass trivially.
@@ -232,7 +246,7 @@ unfixed code.
 
 | File | Change |
 |---|---|
-| `crates/charpente-core/src/table.rs` | `IsPreviousIo` trait + impls; `redb_err` body → `StoreError`; the shared `Arc<AtomicBool>` + `Store::failed()`; the `note()` helper on every `Store`/`Snapshot`/`Writer` result |
+| `crates/charpente-core/src/table.rs` | The shared `Arc<AtomicBool>` created in `Store::open`; a field on `DiskBackend` and on `Store`; five `Err`-observing edits in the `StorageBackend` impl; `Store::failed()`. `redb_err`, `Snapshot`, and `Writer` are untouched |
 | `crates/charpente-core/src/db.rs` | Distinct cause variant; `poisoned()` ORs in `Store::failed()` |
 | `crates/charpente/src/kernel/mod.rs` | Distinct stop message for the store-latch cause |
 | `crates/charpente/tests/kernel.rs` | Tripwire updated; read-path and negative tests added |
@@ -248,7 +262,8 @@ unfixed code.
 - Anything in the dual-primary gap.
 - A `Db::degraded()` predicate, or any read-serving-while-latched mode — rejected
   by ruling 2.
-- Reworking redb's error handling beyond the single `redb_err` boundary.
+- Any change to `redb_err`, the ~89 `map_err(redb_err)` call sites, `Snapshot`,
+  or `Writer` — the amended §1 needs none of them.
 
 ## 9. Evidence bar
 
