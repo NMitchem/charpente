@@ -302,11 +302,29 @@ impl Kernel {
                 // engine serves no one — stop; restart-and-recover is the
                 // only exit from poison. Non-poisoning faults continue.
                 if self.app.db_mut().poisoned() {
-                    return Err(io::Error::other(
+                    // Check the store cause FIRST: a latched store can also
+                    // poison the engine (its apply fails too), and the store
+                    // latch is the root cause — reporting apply-poison there
+                    // would tell the operator durability is unknowable when
+                    // the WAL is in fact intact.
+                    let store = self.app.db_mut().store_failed();
+                    // The parenthetical MUST keep redb's own remedy prose
+                    // ("close and re-open the database") verbatim: that is the
+                    // needle `checks::classify` matches to call a latch fault
+                    // fallout rather than an unexplained bug (checks.rs:72),
+                    // and spec §8 makes touching that matcher a non-goal. A
+                    // paraphrase here reads fine and silently fails every sim
+                    // universe whose injected fault latches the store.
+                    return Err(io::Error::other(if store {
+                        "kernel stopped: the store handle is dead after a disk IO failure \
+                         (redb refuses every further operation until you close and re-open \
+                         the database) — durable state is intact and the WAL is \
+                         authoritative; restart the process to recover"
+                    } else {
                         "kernel stopped: the engine is poisoned (a request-path IO failure \
                          made durability unknowable) — the request received its 500; \
-                         restart the process to recover from the WAL",
-                    ));
+                         restart the process to recover from the WAL"
+                    }));
                 }
             }
             Ready::Job => match self.dispatcher.run_due(self.app.db_mut(), now)? {

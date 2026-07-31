@@ -1635,10 +1635,20 @@ impl Db {
         schema_digest_of(&self.engine.machine().schema)
     }
 
-    /// True once the engine or its WAL is poisoned — every further transact
-    /// fails. Callers (the kernel loop) stop and restart to recover.
+    /// True once the engine, its WAL, or the store handle is poisoned — every
+    /// further transact fails. Callers (the kernel loop) stop and restart to
+    /// recover.
     pub fn poisoned(&self) -> bool {
-        self.engine.poisoned()
+        self.engine.poisoned() || self.store_failed()
+    }
+
+    /// True once the store handle is dead (see `Store::failed`). Distinct from
+    /// engine/WAL poison, and the distinction is load-bearing for the operator:
+    /// engine poison means durability became UNKNOWABLE, while a store latch
+    /// leaves the WAL intact and authoritative. Both remedies are a process
+    /// restart; only one of them implies possible state loss.
+    pub fn store_failed(&self) -> bool {
+        self.engine.machine().store.failed()
     }
 
     /// The pure post-replay gate walk: returns the first named refusal.

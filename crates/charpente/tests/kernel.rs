@@ -543,87 +543,81 @@ fn kernel_stops_after_a_request_poisons_the_engine() {
     assert_eq!(replies[0].status, 500);
 }
 
-// ------------- KNOWN GAP: a latched redb handle vs `Db::poisoned()` (T13 H1)
+// ------------- FIX: a latched redb handle now poisons `Db::poisoned()`
+// (M2 sub-project 0a, spec docs/superpowers/specs/2026-07-30-store-latch-poison-design.md)
 //
-// Edge sub-project T13, Hunt 1 (ledgered production follow-up, progress.md
-// line 238 / spec §4.5). `Db::poisoned()` reflects only APPLY-side poison: the
-// engine's "a durable record failed to apply" flag and its WAL's fsyncgate
-// flag (`engine.rs`'s `poisoned()`). redb has a SECOND, independent poison of
-// its own — `CheckedBackend` (redb 4.1.0 `cached_file.rs:121`) sets `io_failed`
-// on ANY backend error (read, write, set_len, sync_data) and every later
-// backend op then returns `StorageError::PreviousIo`, "Previous I/O error
-// occurred. Please close and re-open the database." Nothing maps that latch
-// onto `Db::poisoned()`, and the kernel's request arm has no other stop
-// condition after a 500 (the 2026-07-05 ruling, pinned by
-// `kernel_stops_after_a_request_poisons_the_engine` above). So a node can be
-// serving off a store handle that is permanently dead for writes while
-// `Db::poisoned()` reports healthy.
+// Formerly a KNOWN GAP (edge sub-project T13, Hunt 1 — ledgered production
+// follow-up, progress.md line 238 / spec §4.5). `Db::poisoned()` reflected
+// only APPLY-side poison: the engine's "a durable record failed to apply"
+// flag and its WAL's fsyncgate flag (`engine.rs`'s `poisoned()`). redb has a
+// SECOND, independent poison of its own — `CheckedBackend` (redb 4.1.0
+// `cached_file.rs:121`) sets `io_failed` on ANY backend error (read, write,
+// set_len, sync_data) and every later backend op then returns
+// `StorageError::PreviousIo`, "Previous I/O error occurred. Please close and
+// re-open the database." Nothing mapped that latch onto `Db::poisoned()`, and
+// the kernel's request arm had no other stop condition after a 500 (the
+// 2026-07-05 ruling, pinned by `kernel_stops_after_a_request_poisons_the_engine`
+// above) — so a node could serve off a store handle that was permanently dead
+// for writes while `Db::poisoned()` reported healthy.
 //
-// **The brief's predicted mechanism does not hold FOR A CACHE-RESIDENT STORE,
-// which is the shape this test builds.** T13's brief expected a request-path
-// READ fault to set the latch and every later request to keep 500ing. Here a
-// store read never reaches the `Disk` boundary at all, so there is no read to
-// fault: redb's open path walks every page (forced on in BOTH build modes by
-// the root `Cargo.toml`'s `[profile.*.package.redb]` debug-assertions
-// override, so the seed promise stays cross-mode), and its read cache then
-// answers every subsequent read from memory. Measured while writing this test:
-// a 10k-row store plus 300 further write transactions and 300 reads produce
-// ZERO post-open reads at the boundary. The latch is therefore reached the only
-// way it is reachable here: the store's own checkpoint fsync.
+// `Store::failed()` (sub-project 0a, Task 1) now observes redb's identical
+// `io_failed` condition one layer down, at charpente's own `DiskBackend`, and
+// `Db::poisoned()` ORs it in — so the kernel's existing request-arm stop fires
+// on a latched store with no new control flow, only a distinct message
+// (`Db::store_failed()` selects it): a store latch leaves the WAL intact and
+// authoritative, unlike apply-poison, which means durability became
+// unknowable.
 //
-// **That is a bound, not an absolute** (T13 review, I-1). redb's read cache is a
-// bounded, EVICTING LRU (`cached_file.rs:236`'s striped `LRUCache`,
+// **The brief's originally predicted mechanism did not hold FOR A
+// CACHE-RESIDENT STORE, which is the shape this test builds.** T13's brief
+// expected a request-path READ fault to set the latch and every later request
+// to keep 500ing. Here a store read never reaches the `Disk` boundary at all,
+// so there is no read to fault: redb's open path walks every page (forced on
+// in BOTH build modes by the root `Cargo.toml`'s `[profile.*.package.redb]`
+// debug-assertions override, so the seed promise stays cross-mode), and its
+// read cache then answers every subsequent read from memory. Measured while
+// writing the original characterization: a 10k-row store plus 300 further
+// write transactions and 300 reads produce ZERO post-open reads at the
+// boundary. The latch is therefore reached the only way it is reachable here:
+// the store's own checkpoint fsync — exactly the mechanism this test drives.
+//
+// **That is a bound, not an absolute** (T13 review, I-1). redb's read cache is
+// a bounded, EVICTING LRU (`cached_file.rs:236`'s striped `LRUCache`,
 // `evict_from_read_cache`) sized by `max_cache_size`, 1 GiB by default
-// (`db.rs:1126`) and not configured by `Store::open`. Once a store's working set
-// exceeds that bound the open-time page walk itself evicts, later reads miss,
-// and store reads DO reach the boundary — at which point the brief's original
-// mechanism is reachable and the symptom is the 500 storm it predicted. So the
-// honest statement of this gap is:
+// (`db.rs:1126`) and not configured by `Store::open`. Once a store's working
+// set exceeds that bound the open-time page walk itself evicts, later reads
+// miss, and store reads DO reach the boundary — at which point a failed read
+// sets `Store::failed()` too (its read arm, covering this shape by
+// construction; spec §2). This shape stays DERIVED, not measured (T13 fix
+// round 2, N-1 / spec Scope ruling 4): the premises above are verified in
+// redb's source, but no store over the 1 GiB bound was ever built.
 //
-//   * **cache-resident store** (this test): the latch is SILENT — reads keep
-//     answering 200 from cache, nothing surfaces at all. MEASURED.
-//   * **larger-than-cache store**: the latch is LOUD — reads that miss the cache
-//     500. DERIVED, not measured (T13 fix round 2, N-1): the premises above are
-//     verified in redb's source, but no store over the 1 GiB bound was ever
-//     built — proving this empirically is not a good use of the milestone.
+//   * **cache-resident store** (this test): the latch was SILENT before this
+//     fix — reads kept answering 200 from cache, nothing surfaced at all.
+//     MEASURED. Now: the write whose checkpoint hits the latch poisons the Db
+//     immediately, and the kernel stops before either scripted read is
+//     served — the silence never gets a chance to matter.
+//   * **larger-than-cache store**: the latch was already LOUD — reads that
+//     miss the cache 500. DERIVED, not measured. Now those same failed reads
+//     also set `Store::failed()`, so `Db::poisoned()` catches the case the
+//     brief predicted without a dedicated 500-storm test (`begin_read` stays
+//     ungated in redb, `db.rs:404`/`db.rs:508`, so this is the only place the
+//     larger-than-cache shape gets covered).
 //
-// `Db::poisoned()` is false in BOTH shapes, the kernel keeps serving in both,
-// and the fix is the same one. The characterization below is unaffected either
-// way: what it pins is the latch and `poisoned()`'s blindness to it, which are
-// identical in both shapes. Anyone designing the fix must handle both
-// (task-13-report.md, proposal 1).
+// **The correspondence assertion** (`db_poisoned`, below) is the load-bearing
+// one. This test builds a genuinely latched store — proven by `fired == 1`
+// plus the mechanism above — so it is the one place that can assert
+// `Db::poisoned()` tracks redb's real `io_failed` state rather than
+// charpente's belief about it. If a future redb version latches through a
+// path `DiskBackend` does not observe, THIS is the assertion that goes red
+// (spec §1's trade, stated so it is not rediscovered later).
 //
-// What the shipped build does in the shape this test builds: the latch is
-// silent. Reads keep answering 200 off the page cache, `Db::poisoned()` stays
-// false, the kernel keeps serving, and NOTHING tells an operator anything — the
-// window closes only when the next write transaction converts the latch into
-// apply-side poison. That is a weaker symptom than the brief predicted (no 500
-// storm) and a worse one for observability (no signal at all).
-//
-// **That one-write window is this (cache-resident) shape's, not a general
-// bound** (T13 fix round 2, N-3). `Database::begin_write` is latch-gated
-// (`db.rs:1037-1039`) but `begin_read` is NOT — neither impl calls
-// `check_io_errors` (`db.rs:404`, `db.rs:508`), which is also why the GETs below
-// still return 200. So on a larger-than-cache store a write transaction whose
-// handler reads a non-resident page (the ordinary get-then-put shape — the
-// `bump_count` route below does exactly that) fails INSIDE the handler, returns
-// a plain 500, and never reaches `begin_write`: no append, no apply, no poison.
-// Such a node can 500 every request indefinitely with `poisoned()` false and the
-// kernel serving. The window is bounded only when a write reaches `begin_write`,
-// which a read-first transaction on a cache-missing store may never do.
-//
-// This test CHARACTERIZES; it asserts no guarantee. RULED (Noah, 2026-07-26):
-// deferred to M2, characterization kept — the fix touches the step-7 request-arm
-// ruling and needs its own sim properties. DO NOT weaken or delete this to make
-// a red run green — if the product changes this behavior, UPDATE it to assert
-// the new, safer behavior; a red run here after a product change is this test
-// doing its job.
-//
-// **For the future fixer: the FIRST assert to redden is not the headline one.**
-// With read-side poison implemented, the kernel's request arm stops after
-// request 1's 500, so `replies.len() == 3` below fails before the
-// `!poisoned()` assertion is ever reached. Both are red, and that earlier
-// failure is the fix working — not a second, unrelated break.
+// **For a reader diffing against the old characterization: the FIRST
+// assertion to change is not the headline one.** `replies.len()` now reads 1,
+// not 3 — the kernel stops after the latched write's 500, before either
+// scripted read is served. That earlier redness (observed against unfixed
+// code before this fix landed) is the fix working, not a second, unrelated
+// break.
 
 /// A pure read path: no effects, so nothing it does can reach the WAL, and any
 /// status it returns is the store's answer alone.
@@ -767,7 +761,7 @@ fn latch_config() -> AppConfig {
 }
 
 #[test]
-fn kernel_keeps_serving_with_a_latched_store_known_gap() {
+fn kernel_stops_on_a_latched_store() {
     let sim = Sim::with_faults(0x0DED_0002, FaultConfig::none());
     // Phase 1 (plain disk, no injector): commit and CHECKPOINT some rows, so
     // the GETs below read committed durable state, then drop the handle.
@@ -825,6 +819,7 @@ fn kernel_keeps_serving_with_a_latched_store_known_gap() {
     let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
     let reads_at_open = reads.load(Ordering::SeqCst);
     let run = kernel.run(&mut source);
+    let db_poisoned = kernel.app().db().poisoned();
 
     assert_eq!(
         fired.load(Ordering::SeqCst),
@@ -866,85 +861,52 @@ fn kernel_keeps_serving_with_a_latched_store_known_gap() {
     );
 
     let replies = replies.lock().unwrap();
+    // THE FIX (was: the gap). The write's cadence checkpoint hits the store
+    // latch, which now poisons the Db, so the kernel stops after replying to
+    // the request that hit it. The two scripted reads are never served.
     assert_eq!(
         replies.len(),
-        3,
-        "the kernel served every scripted request — it never stopped"
+        1,
+        "the kernel must stop at the latched write, not serve on: {} replies",
+        replies.len()
     );
-    // The write's cadence checkpoint fails, so it 500s (its WAL record DID
-    // commit — the 500's own wording is honest about that ambiguity).
+    // The write still gets its honest 500 first — the record IS in the WAL.
     assert_eq!(replies[0].status, 500);
     let body = String::from_utf8_lossy(&replies[0].body);
     assert!(
         body.contains("simulated fsync failure"),
         "the write's 500 should name the injected fault: {body}"
     );
-    // THE GAP, part 1: with the store handle latched, the reads that follow
-    // are answered 200 off redb's page cache. No 500, no warning, nothing.
-    for (i, reply) in replies.iter().enumerate().skip(1) {
-        assert_eq!(
-            reply.status,
-            200,
-            "request {i} (a read) is answered off redb's page cache even though the store \
-             handle is latched: {}",
-            String::from_utf8_lossy(&reply.body)
-        );
-    }
-    // The loop's exit was the source's `Shutdown`, whose clean-shutdown
-    // checkpoint is refused by the same latch — NOT the poison stop, which
-    // never fired.
-    let err = run.expect_err("the clean-shutdown checkpoint hits the latch");
+    // THE CORRESPONDENCE ASSERTION (spec §1). This store is genuinely latched
+    // — redb answers PreviousIo from here on. charpente must agree. If a
+    // future redb latches through a path DiskBackend does not observe, THIS
+    // is the assertion that goes red, and the fix is to mirror the new path.
+    assert!(
+        db_poisoned,
+        "the store handle is latched, so Db::poisoned() must be true — \
+         charpente's flag has drifted from redb's io_failed condition"
+    );
+    // And the stop must say WHICH poison, because the remedies differ in what
+    // they imply about durable state.
+    let err = run.expect_err("a poisoned Db stops the kernel");
     let msg = err.to_string();
-    assert!(
-        msg.contains("close and re-open the database"),
-        "the loop's only failure should be the shutdown checkpoint hitting redb's latch: {msg}"
+    assert_eq!(
+        msg,
+        "kernel stopped: the store handle is dead after a disk IO failure \
+         (redb refuses every further operation until you close and re-open \
+         the database) — durable state is intact and the WAL is \
+         authoritative; restart the process to recover",
+        "the store-latch stop must be pinned byte-exact and must NOT reuse the \
+         apply-poison wording, which claims durability became unknowable"
     );
+    // The stop must stay classifiable as redb-latch fallout, not an
+    // unexplained bug: spec §8 forbids touching `checks::classify`, so the
+    // coupling is satisfied from this side, by carrying redb's own prose.
+    // Without this, every sim universe whose injected fault latches the store
+    // fails as `Unrelated` (found by the auth suite, T2).
     assert!(
-        !msg.contains("kernel stopped"),
-        "KNOWN GAP: the kernel must NOT have stopped for poison — it served all 3 requests \
-         first: {msg}"
-    );
-
-    // THE GAP, part 2 (the headline): redb's latch is live — proven by the
-    // shutdown checkpoint's refusal above — and `Db::poisoned()` still reports
-    // healthy. Flipping this to `assert!(poisoned)` is the mutation proof that
-    // it has teeth (task-13-report.md); a fix that gives redb's latch the same
-    // standing as an apply-side fault turns it red, by design.
-    let mut app = kernel.into_app();
-    assert!(
-        !app.db_for_tests().poisoned(),
-        "KNOWN GAP: a latched redb handle leaves Db::poisoned() false — if this is now true, \
-         the read-side poison fix landed; update this test to assert the new behavior rather \
-         than deleting it"
-    );
-
-    // And the window's only natural end FOR A CACHE-RESIDENT STORE — the shape
-    // this test builds: the next WRITE turns the latch into apply-side poison
-    // (which the kernel's request arm does stop on). So the gap here is not that
-    // the node never notices — it is that a read-serving node never does. On a
-    // larger-than-cache store there may be no natural end at all: `begin_read`
-    // is ungated, so a read-first write transaction fails inside its handler,
-    // never reaches the latch-gated `begin_write`, and never poisons
-    // (task-13-report.md, N-3).
-    let write = app.db_for_tests().transact(|tx| {
-        tx.put(&Counter {
-            id: Id::from_raw(2),
-            hits: 1,
-        });
-        Ok::<(), std::io::Error>(())
-    });
-    let write_err = match write {
-        Err(TxError::Io(e)) => e.to_string(),
-        other => panic!("expected the next write to fail on the latch, got {other:?}"),
-    };
-    assert!(
-        write_err.contains("close and re-open the database"),
-        "the next write should hit redb's latch at apply: {write_err}"
-    );
-    assert!(
-        app.db_for_tests().poisoned(),
-        "the latch becomes apply-side poison at the next write — that, and only that, is what \
-         eventually stops the kernel today"
+        charpente_sim::checks::is_fault_fallout(&msg),
+        "the store-latch stop must classify as fault fallout: {msg}"
     );
 }
 

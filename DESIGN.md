@@ -471,6 +471,42 @@ back to an older, still self-consistent root that under-reports `applied_seq`; v
 defend store-file bitrot (the corruption fault axes are scoped to `wal/`, §1), redb + M1
 restore is the answer, and M2's own engine owns page checksums.
 
+**Store-handle poison (M2 sub-project 0a, implemented).** The store boundary
+now follows the same fsyncgate rule as the log (§2 above, DESIGN.md:212-214):
+an un-retryable IO failure poisons, and restart-and-recover is the only exit.
+redb has its own independent latch: any error from its inner `StorageBackend`
+sets `CheckedBackend.io_failed` (five sites — `len`, `read`, `set_len`,
+`sync_data`, `write`), after which every further backend call returns
+`PreviousIo` ("close and re-open the database"). Because that inner backend
+*is* charpente's `DiskBackend`, charpente observes the identical condition at
+its own disk boundary, one layer down — a sticky `Arc<AtomicBool>`, created in
+`Store::open`, set in each of `DiskBackend`'s five methods on `Err`, exposed as
+`Store::failed()` (a graceful `close()` is deliberately not mirrored — it is
+not a failure). `Db::poisoned()` ORs it in via `Db::store_failed()`, so the
+kernel's existing request-arm poison stop (the 2026-07-05 ruling, §7) fires
+with no new control flow; only the stop message is distinct, because a store
+latch leaves the WAL intact and authoritative, unlike apply-poison, which
+means durability became unknowable. A test at the kernel level asserts the
+correspondence directly, against a genuinely latched store, so a future redb
+that latches through a path `DiskBackend` does not observe would turn it red.
+
+Two shapes share the fix but not its evidentiary standing. On a
+**cache-resident store — MEASURED** — the only reachable trigger is the
+store's own checkpoint fsync (`Store::apply` commits at `Durability::None`, so
+checkpoint is the only store sync); before this fix the latch was completely
+silent, since reads kept answering 200 off redb's page cache, and the window
+closed only when the next write converted the latch into apply-side poison —
+or never closed at all on a node taking no further writes. On a **store larger
+than redb's 1 GiB evicting read cache — DERIVED, not measured** —
+cache-missing reads also reach the disk boundary and set the same flag, which
+covers the shape where a read-first write transaction (the ordinary
+get-then-put handler) fails inside the handler and never reaches the
+latch-gated `begin_write` (`begin_read` is not latch-gated in either redb
+impl) — without the read arm such a node would 500 indefinitely with
+`poisoned()` false. That row is justified on redb's verified source, not a
+measurement: no store over the 1 GiB bound was built to prove the symptom, by
+design.
+
 **Snapshots & reads.** MVCC snapshots at log positions; read-only queries (and follower
 reads) run against snapshots without touching the write path. Blob columns over a
 configurable size spill to a content-addressed blob store (same log-commit discipline for

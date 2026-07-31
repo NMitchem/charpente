@@ -617,7 +617,13 @@ impl Client {
 
 const EPOCHS: u32 = 5;
 const ROUNDS_PER_EPOCH: u32 = 4;
+/// Settle attempts: how many times the client is handed a live node to
+/// reconnect to and catch up from.
 const SETTLE_ATTEMPTS: u32 = 12;
+/// Tries `settle_boot` spends getting one of those nodes up, and how many of
+/// them share a power cycle — see `settle_boot`.
+const SETTLE_BOOT_TRIES: u32 = 64;
+const SETTLE_CYCLE_EVERY: u32 = 8;
 
 /// Builds this round's subscribe request (if the client needs one) and
 /// queues its stall closure, returning `(was_bare, boundary)` for
@@ -654,6 +660,52 @@ fn push_subscribe(
     };
     source.push_at(t, req);
     Ok((was_bare, boundary))
+}
+
+/// Brings a node up for one settle attempt, retrying through injected
+/// faults. `Ok(None)` means the budget ran out with nothing serving.
+///
+/// A `Db::open`/`Kernel::new` that died on an injected write error is a
+/// process that FAILED TO START — it is not a power cycle, and modelling it
+/// as one is what makes a node unbootable rather than merely hard to boot.
+/// `Store::apply` commits at `Durability::None`, so every `Sim::restart`
+/// vanishes the store's uncheckpointed state and forces the next open to
+/// discard, rebuild from the WAL, and re-`persist_store_at_open` — more
+/// writes at the same per-write failure odds, on every single try. Measured
+/// on seed `0x536007ad99fd90bf` (`write_error` 0.144): power-cycling before
+/// each try, **0 of 20_000 boots** ever served a subscribe; retrying in
+/// place, the same universe is serving after ~16 power cycles. Retrying in
+/// place is also the faithful model — the machine did not lose power, so the
+/// page cache is still there for the next process to open.
+///
+/// The periodic power cycle is not optional: a pending `crash_disk_after`
+/// countdown can fire mid-boot, and a crashed sim disk answers every
+/// operation with `crashed_error` until `Sim::restart` — so an in-place
+/// retry loop with no cycle at all would spin until its budget expired.
+fn settle_boot(sim: &Sim) -> Result<Option<Kernel>, String> {
+    for try_n in 0..SETTLE_BOOT_TRIES {
+        if try_n > 0 && try_n.is_multiple_of(SETTLE_CYCLE_EVERY) {
+            sim.restart();
+        }
+        let app = match realtime_app(sim) {
+            Ok(app) => app,
+            Err(e) => {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("settle open failed non-injected: {e}"));
+                }
+                continue;
+            }
+        };
+        match Kernel::new(app, Box::new(sim.clock())) {
+            Ok(kernel) => return Ok(Some(kernel)),
+            Err(e) => {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("settle Kernel::new failed non-injected: {e}"));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// One universe: a kernel and one reconnecting client, driven through
@@ -748,29 +800,33 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
     // Settle: drain any remaining backlog with no new emits, retrying
     // through whatever injected faults remain, until the client has caught
     // up to everything the ledger says it should have.
+    //
+    // Each attempt boots its node through `settle_boot` rather than a single
+    // `Db::open`, because "the client failed to catch up" and "there was no
+    // node to catch up FROM" are different facts and only the first is this
+    // property's subject. That distinction became load-bearing with M2
+    // sub-project 0a: a latched store now poisons the node, so an epoch whose
+    // store latches ends with the client disconnected instead of quietly
+    // fed off redb's page cache — the client must then reconnect, and a
+    // `write_error` rate high enough to latch a store is also high enough to
+    // make `Db::open` itself a coin-flip.
+    //
+    // This CANNOT mask a missed event, and that is the only thing about it
+    // worth checking twice. Retries add chances to RECEIVE, nothing else:
+    // `verified` grows solely through `drain` matching a frame the server
+    // actually delivered, and a resume reads from `cursor.id + 1`, so an id
+    // the platform ever skips is one the cursor has already moved past —
+    // no later reconnect requests it, no later reconnect delivers it, and
+    // `first_unaccounted` keeps naming it however many attempts follow. The
+    // budgets bound how long the client may keep trying; they do not touch
+    // what counts as caught up.
     for _attempt in 0..SETTLE_ATTEMPTS {
         if client.settled() {
             break;
         }
-        let app = match realtime_app(sim) {
-            Ok(app) => app,
-            Err(e) => {
-                if !is_fault_fallout(&e.to_string()) {
-                    return Err(format!("settle open failed non-injected: {e}"));
-                }
-                sim.restart();
-                continue;
-            }
-        };
-        let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
-            Ok(k) => k,
-            Err(e) => {
-                if !is_fault_fallout(&e.to_string()) {
-                    return Err(format!("settle Kernel::new failed non-injected: {e}"));
-                }
-                sim.restart();
-                continue;
-            }
+        let Some(mut kernel) = settle_boot(sim)? else {
+            sim.restart();
+            continue;
         };
         client.need_subscribe = true;
         client.current_handle = None;
