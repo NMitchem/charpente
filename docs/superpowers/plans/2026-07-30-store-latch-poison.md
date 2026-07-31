@@ -27,9 +27,13 @@ plan and the spec disagree, stop and reconcile before coding.
 - **Hard rule 1 — no ambient nondeterminism in the core.** `AtomicBool` is
   permitted (not a deny-list type; the kernel is single-threaded). Add no clock,
   RNG, thread, or direct filesystem call.
-- **Hard rule 3 — RED first.** Every test below must be *observed failing* against
-  unfixed code before its implementation step. A test never seen red is not
-  evidence. Record the observed failure text in the ledger.
+- **Hard rule 3 — RED first.** Every test that asserts a *behavior change* must be
+  *observed failing* against unfixed code before its implementation step. A test
+  never seen red is not evidence. Record the observed failure text in the ledger.
+  Exempt, and labelled as such at their site: tests that assert an **absence**
+  (the flag must NOT be set), which cannot be meaningfully red-first — they are
+  regression guards whose red value is realized only if a later change
+  over-broadens the flag. T1 Steps 5-6 are the only such tests in this plan.
 - **Hard rule 4 — assertions stay on in release.** Use `assert!`, never
   `debug_assert!`, for anything load-bearing.
 - **Hard rule 5 — error messages are product surface.** Every named string is
