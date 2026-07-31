@@ -591,6 +591,9 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
                     Err(TxError::NotPrimary { .. }) => {
                         unreachable!("this workload never calls forbid_writes")
                     }
+                    Err(TxError::Verifying { .. }) => {
+                        unreachable!("this workload never calls verify_writes")
+                    }
                     Ok(()) => unreachable!("the closure always aborts"),
                 }
                 if db.last_applied() != before {
@@ -605,6 +608,9 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
                 Err(TxError::Io(_)) => break, // died mid-commit; durable or not
                 Err(TxError::NotPrimary { .. }) => {
                     unreachable!("this workload never calls forbid_writes")
+                }
+                Err(TxError::Verifying { .. }) => {
+                    unreachable!("this workload never calls verify_writes")
                 }
             }
             if entropy.next_u64().is_multiple_of(4)
@@ -1718,6 +1724,77 @@ fn forbidden_writes_fail_with_not_primary_and_reads_still_work() {
     })
     .unwrap();
     assert_eq!(db.last_applied(), Some(1), "allow_writes restores commits");
+}
+
+/// M2 sub-project 0b task 3: `verify_writes` gates only effectful `transact`,
+/// same as `forbid_writes` — reads (and effect-free transactions) are
+/// unaffected. This is the placement ruling (task-3 dispatch addition 1):
+/// the gate check sits after `transact`'s `tx.effects.is_empty()` early
+/// return, so an effect-free transaction never reaches it. Getting the
+/// placement wrong (checking the gate before running `f`) would silently
+/// invert the "serves reads" half of Noah's ruling while every write-side
+/// test still passed — this test is what pins that placement.
+#[test]
+fn witness_verification_gates_writes_but_reads_still_work() {
+    const SEED: u64 = 0x9012_0009;
+    let (_sim, mut db) = quiet_db(SEED);
+    db.transact(|tx| {
+        tx.put(&invoice(1, 1, 100));
+        Ok::<_, io::Error>(())
+    })
+    .unwrap();
+    assert!(db.writes_allowed());
+
+    db.verify_writes(vec!["127.0.0.1:7001".to_string()]);
+    assert!(!db.writes_allowed());
+
+    // A read-only transaction (no effects) still works — the gate never
+    // sees it.
+    let amount = db
+        .transact(|tx| {
+            Ok::<_, io::Error>(tx.get::<Invoice>(Id::from_raw(1))?.map(|i| i.amount_cents))
+        })
+        .unwrap();
+    assert_eq!(amount, Some(100));
+
+    // An effectful transaction is rejected, naming the unreached witness —
+    // never a primary, since this node doesn't know whether one exists —
+    // and writes nothing (last_applied is unchanged).
+    let err = db
+        .transact(|tx| {
+            tx.put(&invoice(2, 1, 200));
+            Ok::<_, io::Error>(())
+        })
+        .unwrap_err();
+    match err {
+        TxError::Verifying { unreached } => {
+            assert_eq!(unreached, vec!["127.0.0.1:7001".to_string()]);
+        }
+        other => panic!("expected Verifying, got {other:?}"),
+    }
+    assert_eq!(
+        db.last_applied(),
+        Some(0),
+        "the rejected transaction wrote nothing"
+    );
+
+    db.allow_writes();
+    assert!(db.writes_allowed());
+    db.transact(|tx| {
+        tx.put(&invoice(2, 1, 200));
+        Ok::<_, io::Error>(())
+    })
+    .unwrap();
+    assert_eq!(db.last_applied(), Some(1), "allow_writes restores commits");
+}
+
+/// Negative space (hard rule 4): an empty witness list has nothing to
+/// verify — the caller meant `allow_writes`, not `verify_writes`.
+#[test]
+#[should_panic(expected = "empty witness list")]
+fn verify_writes_with_an_empty_witness_list_panics() {
+    let (_sim, mut db) = quiet_db(0x9012_000A);
+    db.verify_writes(vec![]);
 }
 
 /// A row-content snapshot of both tables, keyed by id — the equality check

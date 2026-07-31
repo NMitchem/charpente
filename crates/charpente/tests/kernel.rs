@@ -1173,6 +1173,12 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
                     "Flaky pre-enqueue: impossible NotPrimary rejection (primary {primary})"
                 ));
             }
+            Err(TxError::Verifying { unreached }) => {
+                // This workload never calls verify_writes.
+                return Err(format!(
+                    "Flaky pre-enqueue: impossible Verifying rejection (unreached {unreached:?})"
+                ));
+            }
         }
 
         let run = (|| -> Result<(), std::io::Error> {

@@ -204,6 +204,17 @@ impl Dispatcher {
                      dispatch or cron on a follower (DESIGN §5)",
                 ))
             }
+            Err(TxError::Verifying { .. }) => {
+                // Same shape as the NotPrimary arm above: unreachable today
+                // (M2 sub-project 0b: Task 5 must sequence the witness probe
+                // before dispatch/cron ever run, the same way it must before
+                // migrate_schema). If it ever fires, that sequencing broke.
+                self.due.insert((due_at, id));
+                Err(io::Error::other(
+                    "BUG: a job/cron transaction hit Verifying — the kernel must not run \
+                     dispatch or cron on a write-gated node (M2 sub-project 0b)",
+                ))
+            }
             Err(TxError::App(JobError::App(err))) => {
                 // Every fallible step below (the policy re-read, the
                 // failure-record transact) is run through this closure so
@@ -249,6 +260,10 @@ impl Dispatcher {
                         TxError::NotPrimary { .. } => io::Error::other(
                             "BUG: a job/cron transaction hit NotPrimary — the kernel must not \
                              run dispatch or cron on a follower (DESIGN §5)",
+                        ),
+                        TxError::Verifying { .. } => io::Error::other(
+                            "BUG: a job/cron transaction hit Verifying — the kernel must not \
+                             run dispatch or cron on a write-gated node (M2 sub-project 0b)",
                         ),
                     })
                 };

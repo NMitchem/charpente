@@ -470,23 +470,28 @@ a transaction that doesn't panics with "transaction effects are N bytes but
 one log record holds at most 16777216 — split the work into smaller
 transactions".
 
-### `TxError`'s three variants
+### `TxError`'s four variants
 
-`TxError<E>` has three variants, and this block matches the real type — a
+`TxError<E>` has four variants, and this block matches the real type — a
 variant rename or addition breaks the guide's compile gate:
 
 ```rust
 use charpente::TxError;
 
-/// The three arms differ in what they promise: `App` means nothing was
+/// The four arms differ in what they promise: `App` means nothing was
 /// written; `Io` means the outcome is unknown (details below); `NotPrimary`
-/// means this node is a read-only follower and nothing was even attempted.
+/// means this node is a read-only follower and nothing was even attempted;
+/// `Verifying` means this node cannot yet tell whether it is allowed to
+/// write, and nothing was attempted either.
 fn describe<E: std::fmt::Display>(err: &TxError<E>) -> String {
     match err {
         TxError::App(e) => format!("rejected by the app — nothing was written: {e}"),
         TxError::Io(e) => format!("platform IO failure — outcome unknown: {e}"),
         TxError::NotPrimary { primary } => {
             format!("read-only follower — writes go to {primary} instead")
+        }
+        TxError::Verifying { unreached } => {
+            format!("still verifying witnesses {unreached:?} — writes are on hold")
         }
     }
 }
@@ -505,6 +510,18 @@ so treat `TxError::Io` as "unknown," never as "definitely didn't happen."
 write and this node has been marked a read-only follower
 (`Db::forbid_writes`, DESIGN §5) — reads and effect-free transactions never
 see it; the HTTP layer maps it to 421, naming `primary`.
+
+`Verifying { unreached }` (M2 sub-project 0b) also fires only when `f` had
+at least one effect to write — reads and effect-free transactions never see
+it either. It means this node was a durable primary before it restarted and
+has not yet confirmed that none of its followers (its "witnesses") were
+promoted while it was down (`Db::verify_writes`). Unlike `NotPrimary`, there
+is no primary address to name: this node does not know whether one exists
+elsewhere, and it may still be the legitimate primary itself. `unreached`
+lists the witnesses that have not yet answered; the HTTP layer maps it to
+503, naming them. The state is transient — writes resume automatically
+(`Db::allow_writes`) the moment every witness confirms it was never
+promoted, with no caller action needed.
 
 ### What a transaction cannot do
 

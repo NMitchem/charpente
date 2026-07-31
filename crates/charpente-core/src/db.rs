@@ -96,6 +96,19 @@ pub enum TxError<E> {
     NotPrimary {
         primary: String,
     },
+    /// The witness-verification rejection (M2 sub-project 0b, dual-primary
+    /// gap): this node was a durable primary before restarting and has not
+    /// yet confirmed that none of the followers it shipped to (its
+    /// "witnesses") were promoted in its absence (`Db::verify_writes`).
+    /// Unlike `NotPrimary`, this node does not know whether a primary exists
+    /// elsewhere — it may still be the legitimate one — so there is nothing
+    /// honest to name as "the" primary. `unreached` lists the witnesses that
+    /// have not yet answered; the gate resolves automatically (to `Allowed`
+    /// or a demotion) once every witness has. Reads and effect-free
+    /// transactions never see this, same as `NotPrimary`.
+    Verifying {
+        unreached: Vec<String>,
+    },
 }
 
 /// Collapses a `TxError` from a platform-internal transaction (the schema
@@ -109,6 +122,10 @@ fn tx_err_to_io<E: fmt::Debug>(e: TxError<E>) -> io::Error {
         TxError::NotPrimary { primary } => io::Error::other(format!(
             "schema migration ran on a non-primary node (primary: {primary}) — unreachable: \
              migrate_schema asserts writes are allowed before running"
+        )),
+        TxError::Verifying { unreached } => io::Error::other(format!(
+            "schema migration ran on a witness-verifying node (unreached: {unreached:?}) — \
+             unreachable: migrate_schema asserts writes are allowed before running"
         )),
     }
 }
@@ -1059,6 +1076,18 @@ fn remove_horizon_breadcrumb(disk: &dyn Disk, store_path: &str) -> io::Result<()
 
 // ---------------------------------------------------------------- db
 
+/// `Db`'s write gate (M2 sub-project 0b): three states, not a boolean or an
+/// `Option`, because `Verifying` is neither "allowed" nor "forbidden and I
+/// know where to send you" — it is "forbidden, and I don't yet know whether
+/// I'm even in the wrong." Private to `Db`; `TxError::Verifying` is the
+/// public surface a caller ever sees.
+#[derive(Debug, Clone)]
+enum WriteGate {
+    Allowed,
+    NotPrimary(String),
+    Verifying(Vec<String>),
+}
+
 /// The composed deterministic core: WAL + store + schema. One `Db` is the
 /// single writer; `transact` takes `&mut self`, so transactions are
 /// serializable because two cannot exist at once.
@@ -1071,10 +1100,11 @@ pub struct Db {
     cfg: DbConfig,
     retention_pin: Option<Box<dyn Fn() -> u64 + Send>>,
     records_since_checkpoint: u64,
-    /// `Some(primary)` once `forbid_writes` has marked this node a read-only
-    /// follower; `None` (the default) allows commits. Gates `transact` only
+    /// `WriteGate::Allowed` (the default) permits commits; `NotPrimary`
+    /// (`forbid_writes`) and `Verifying` (`verify_writes`) both refuse every
+    /// effectful `transact` with their own `TxError`. Gates `transact` only
     /// — `apply_shipped` is the follower's own write path and bypasses it.
-    not_primary: Option<String>,
+    gate: WriteGate,
     /// Tables that already carry a `charpente.schema_versions` row (T6's
     /// first-write adoption): rebuilt from the store at open and by
     /// `migrate_schema`. Omitted from `Debug` like `retention_pin`.
@@ -1087,7 +1117,7 @@ impl fmt::Debug for Db {
             .field("engine", &self.engine)
             .field("cfg", &self.cfg)
             .field("records_since_checkpoint", &self.records_since_checkpoint)
-            .field("not_primary", &self.not_primary)
+            .field("gate", &self.gate)
             .finish()
     }
 }
@@ -1265,7 +1295,7 @@ impl Db {
             cfg,
             retention_pin: None,
             records_since_checkpoint: 0,
-            not_primary: None,
+            gate: WriteGate::Allowed,
             adopted: BTreeSet::new(),
         };
         // Post-replay: the authoritative pure checks against the now-current
@@ -1308,10 +1338,18 @@ impl Db {
         if tx.effects.is_empty() {
             return Ok(out);
         }
-        if let Some(primary) = &self.not_primary {
-            return Err(TxError::NotPrimary {
-                primary: primary.clone(),
-            });
+        match &self.gate {
+            WriteGate::Allowed => {}
+            WriteGate::NotPrimary(primary) => {
+                return Err(TxError::NotPrimary {
+                    primary: primary.clone(),
+                });
+            }
+            WriteGate::Verifying(unreached) => {
+                return Err(TxError::Verifying {
+                    unreached: unreached.clone(),
+                });
+            }
         }
         // First-write adoption (spec §1): the first write to a versioned
         // table carries that table's `charpente.schema_versions` row, so the
@@ -1532,16 +1570,36 @@ impl Db {
     /// writes go instead (DESIGN §5). Reads and effect-free transactions are
     /// unaffected; `apply_shipped` is a separate path this never gates.
     pub fn forbid_writes(&mut self, primary: String) {
-        self.not_primary = Some(primary);
+        self.gate = WriteGate::NotPrimary(primary);
     }
 
-    /// Restores commits — the primary role, or a promoted follower's first act.
+    /// Restores commits — the primary role, or a promoted follower's first
+    /// act, or a witness-verifying node once every witness has answered.
     pub fn allow_writes(&mut self) {
-        self.not_primary = None;
+        self.gate = WriteGate::Allowed;
+    }
+
+    /// Marks this node write-gated-pending-verification (M2 sub-project 0b):
+    /// a durable primary that just restarted with a non-empty witness set,
+    /// unsure whether one of its followers was promoted while it was down.
+    /// Every further effectful `transact` returns `TxError::Verifying {
+    /// unreached }` naming the witnesses that have not yet confirmed they
+    /// were never promoted — never a primary address, since this node may
+    /// still be the legitimate one. Reads and effect-free transactions are
+    /// unaffected, same as `forbid_writes`. The caller (Task 5's boot probe)
+    /// resolves the gate by calling `allow_writes` once every witness
+    /// answers "not a primary", or `forbid_writes` if one answers "primary".
+    pub fn verify_writes(&mut self, unreached: Vec<String>) {
+        assert!(
+            !unreached.is_empty(),
+            "Db::verify_writes called with an empty witness list — call allow_writes instead; \
+             an empty list has nothing left to verify"
+        );
+        self.gate = WriteGate::Verifying(unreached);
     }
 
     pub fn writes_allowed(&self) -> bool {
-        self.not_primary.is_none()
+        matches!(self.gate, WriteGate::Allowed)
     }
 
     /// Applies frames shipped from the primary: the follower's only write

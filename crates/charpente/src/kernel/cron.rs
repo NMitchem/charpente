@@ -133,5 +133,10 @@ fn flatten(e: TxError<io::Error>) -> io::Error {
             "BUG: a job/cron transaction hit NotPrimary — the kernel must not run dispatch or \
              cron on a follower (DESIGN §5)",
         ),
+        TxError::Verifying { .. } => io::Error::other(
+            "BUG: a job/cron transaction hit Verifying — the kernel must not run dispatch or \
+             cron on a write-gated node (M2 sub-project 0b: Task 5 must sequence the witness \
+             probe before dispatch/cron, the same way it must before migrate_schema)",
+        ),
     }
 }

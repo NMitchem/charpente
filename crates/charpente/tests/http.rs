@@ -270,6 +270,70 @@ fn writes_on_a_follower_get_421_naming_the_primary() {
     assert_eq!(body_text(&get), "\"hi\"");
 }
 
+/// M2 sub-project 0b task 3: `TxError::Verifying` maps to 503, naming the
+/// unreached witness rather than a primary. Unlike `NotPrimary`, this node
+/// does not know whether a primary exists elsewhere — it may still be the
+/// legitimate one — so there is nothing honest to name; reads are
+/// unaffected by the gate, same as `NotPrimary`.
+#[test]
+fn a_verifying_node_refuses_writes_with_503_and_names_the_unreached_witnesses() {
+    const SEED: u64 = 0x9012_0007;
+    let (_sim, mut app) = quiet_app(SEED);
+    let created = app.handle(Request::new(Method::Post, "/notes").json(&CreateNote {
+        id: 1,
+        text: "hi".into(),
+    }));
+    assert_eq!(created.status, 200, "{}", body_text(&created));
+
+    app.db_for_tests()
+        .verify_writes(vec!["127.0.0.1:7001".into()]);
+
+    let resp = app.handle(Request::new(Method::Post, "/notes").json(&CreateNote {
+        id: 2,
+        text: "bye".into(),
+    }));
+    assert_eq!(resp.status, 503, "{}", body_text(&resp));
+    assert_eq!(
+        error_text(&resp),
+        "this node is not accepting writes yet: it was a primary before restarting and has \
+         not confirmed that its follower 127.0.0.1:7001 was never promoted — reads are being \
+         served normally, and writes resume automatically once that node answers; if it is \
+         gone for good, see the witness-set remedy in the guide"
+    );
+
+    // A read route still answers 200 — the write gate never touches reads.
+    let get = app.handle(Request::new(Method::Get, "/notes/1"));
+    assert_eq!(get.status, 200);
+    assert_eq!(body_text(&get), "\"hi\"");
+}
+
+/// The plural rendering (hard rule 5: both renderings are pinned byte-exact,
+/// not just the singular one the brief quotes verbatim): "its follower X"
+/// becomes "its followers X, Y" once more than one witness is unreached.
+#[test]
+fn a_verifying_node_pluralizes_the_503_body_for_multiple_unreached_witnesses() {
+    const SEED: u64 = 0x9012_0008;
+    let (_sim, mut app) = quiet_app(SEED);
+
+    app.db_for_tests().verify_writes(vec![
+        "127.0.0.1:7001".to_string(),
+        "127.0.0.1:7002".to_string(),
+    ]);
+
+    let resp = app.handle(Request::new(Method::Post, "/notes").json(&CreateNote {
+        id: 1,
+        text: "hi".into(),
+    }));
+    assert_eq!(resp.status, 503, "{}", body_text(&resp));
+    assert_eq!(
+        error_text(&resp),
+        "this node is not accepting writes yet: it was a primary before restarting and has \
+         not confirmed that its followers 127.0.0.1:7001, 127.0.0.1:7002 were never promoted \
+         — reads are being served normally, and writes resume automatically once those nodes \
+         answer; if they are gone for good, see the witness-set remedy in the guide"
+    );
+}
+
 #[test]
 fn sessions_login_auth_logout() {
     let (_sim, mut app) = quiet_app(0x47C);

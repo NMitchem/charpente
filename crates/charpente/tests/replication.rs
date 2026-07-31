@@ -539,6 +539,13 @@ fn commit_widget(sim: &Sim, node: &mut Node, i: u64) -> Result<(), String> {
         Err(TxError::NotPrimary { primary }) => {
             Err(format!("commit refused: not primary of {primary}"))
         }
+        Err(TxError::Verifying { unreached }) => {
+            // This suite never calls verify_writes (M2 sub-project 0b's
+            // boot-time probe is Task 5, not yet wired into the kernel).
+            Err(format!(
+                "commit refused: impossible Verifying rejection (unreached {unreached:?})"
+            ))
+        }
     }
 }
 
@@ -2801,6 +2808,13 @@ fn write_once(sim: &Sim, node: &mut Node, i: u64) -> Result<WriteOutcome, String
         }
         Err(TxError::Io(e)) => Err(format!("commit io: {e}")),
         Err(TxError::App(e)) => Err(format!("commit app: {e}")),
+        Err(TxError::Verifying { unreached }) => {
+            // This suite never calls verify_writes (M2 sub-project 0b's
+            // boot-time probe is Task 5, not yet wired into the kernel).
+            Err(format!(
+                "commit refused: impossible Verifying rejection (unreached {unreached:?})"
+            ))
+        }
     }
 }
 

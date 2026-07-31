@@ -521,8 +521,8 @@ fn build_ctx(
 }
 
 /// `TxError<ApiError>` -> `Response`, shared by both route flavors: `App`
-/// names the handler's own rejection; `Io`/`NotPrimary` name the platform
-/// failure and the fix (hard rule 5).
+/// names the handler's own rejection; `Io`/`NotPrimary`/`Verifying` name the
+/// platform failure and the fix (hard rule 5).
 fn tx_error_response(err: TxError<ApiError>) -> Response {
     match err {
         TxError::App(e) => e.response(),
@@ -540,6 +540,31 @@ fn tx_error_response(err: TxError<ApiError>) -> Response {
                  {primary}; retry there (the request was not committed)"
             ),
         ),
+        TxError::Verifying { unreached } => Response::error(503, &verifying_message(&unreached)),
+    }
+}
+
+/// The witness-verification 503 body (M2 sub-project 0b): this node cannot
+/// name a primary, unlike `NotPrimary`, because it does not know whether one
+/// exists elsewhere — it may still be the legitimate one. Pluralises
+/// "follower"/"node"/"it" when more than one witness is still unreached
+/// (hard rule 5: both renderings are pinned byte-exact, `http.rs`).
+fn verifying_message(unreached: &[String]) -> String {
+    let list = unreached.join(", ");
+    if unreached.len() > 1 {
+        format!(
+            "this node is not accepting writes yet: it was a primary before restarting and has \
+             not confirmed that its followers {list} were never promoted — reads are being \
+             served normally, and writes resume automatically once those nodes answer; if they \
+             are gone for good, see the witness-set remedy in the guide"
+        )
+    } else {
+        format!(
+            "this node is not accepting writes yet: it was a primary before restarting and has \
+             not confirmed that its follower {list} was never promoted — reads are being \
+             served normally, and writes resume automatically once that node answers; if it is \
+             gone for good, see the witness-set remedy in the guide"
+        )
     }
 }
 
