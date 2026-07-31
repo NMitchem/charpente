@@ -15,6 +15,8 @@
 use std::fmt;
 use std::io;
 use std::marker::PhantomData;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use redb::{
     Builder, Database, Durability, ReadableDatabase, ReadableTable, StorageBackend, TableDefinition,
@@ -259,6 +261,8 @@ pub trait View {
 /// boundary (enforced by the clippy deny-list).
 pub struct Store {
     db: Database,
+    /// Shared with this store's `DiskBackend` — see its `latch` field.
+    latch: Arc<AtomicBool>,
 }
 
 const META: TableDefinition<&str, u64> = TableDefinition::new("charpente.meta");
@@ -300,8 +304,12 @@ impl Store {
         // open failure so Db::open's discard-and-rebuild path engages; scoped
         // to open only — a redb panic during operation still propagates.
         // Reported upstream; drop the fence when redb returns Err here.
+        let latch = Arc::new(AtomicBool::new(false));
         let db = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Builder::new().create_with_backend(DiskBackend { file })
+            Builder::new().create_with_backend(DiskBackend {
+                file,
+                latch: latch.clone(),
+            })
         }))
         .map_err(|panic| {
             let msg = panic
@@ -315,7 +323,7 @@ impl Store {
             ))
         })?
         .map_err(redb_err)?;
-        Ok(Store { db })
+        Ok(Store { db, latch })
     }
 
     /// The log position this store's *committed* state corresponds to.
@@ -418,6 +426,18 @@ impl Store {
         }
         txn.commit().map_err(redb_err)?;
         Ok(())
+    }
+
+    /// True once this store's handle is dead: some disk operation returned
+    /// `Err`, which is precisely when redb latches `CheckedBackend.io_failed`
+    /// and starts refusing every operation with `PreviousIo`. Sticky, and
+    /// never cleared — redb's latch is not clearable either; the only exit is
+    /// closing and re-opening the database (i.e. restarting the process).
+    ///
+    /// Durable state is NOT implicated: the WAL is intact and committed
+    /// records are durable. Only this handle is unusable.
+    pub fn failed(&self) -> bool {
+        self.latch.load(Ordering::SeqCst)
     }
 
     /// An MVCC snapshot: sees a consistent state, never blocks writers.
@@ -937,6 +957,13 @@ impl Snapshot {
 /// redb's IO inside the simulation boundary.
 struct DiskBackend {
     file: Box<dyn File>,
+    /// Set whenever an operation below returns `Err`. redb's own
+    /// `CheckedBackend` latches on exactly this condition and no other
+    /// (redb-4.1.0 cached_file.rs:154-197), so this mirrors redb's
+    /// `io_failed` rather than inferring it from a downstream error. redb's
+    /// `close()` also sets `io_failed` (:148) — deliberately NOT mirrored
+    /// here: a graceful close is not a failure.
+    latch: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for DiskBackend {
@@ -945,24 +972,112 @@ impl fmt::Debug for DiskBackend {
     }
 }
 
+impl DiskBackend {
+    /// Mirrors redb's latch: set on `Err`, never cleared.
+    fn note<T>(&self, r: Result<T, io::Error>) -> Result<T, io::Error> {
+        if r.is_err() {
+            self.latch.store(true, Ordering::SeqCst);
+        }
+        r
+    }
+}
+
 impl StorageBackend for DiskBackend {
     fn len(&self) -> Result<u64, io::Error> {
-        self.file.len()
+        self.note(self.file.len())
     }
 
     fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), io::Error> {
-        self.file.read_at(offset, out)
+        self.note(self.file.read_at(offset, out))
     }
 
     fn set_len(&self, len: u64) -> Result<(), io::Error> {
-        self.file.set_len(len)
+        self.note(self.file.set_len(len))
     }
 
     fn sync_data(&self) -> Result<(), io::Error> {
-        self.file.sync()
+        self.note(self.file.sync())
     }
 
     fn write(&self, offset: u64, data: &[u8]) -> Result<(), io::Error> {
-        self.file.write_at(offset, data)
+        self.note(self.file.write_at(offset, data))
+    }
+}
+
+#[cfg(test)]
+mod latch_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A `File` whose every operation fails, so each `DiskBackend` method can
+    /// be driven down its error arm independently.
+    struct AlwaysErr;
+
+    impl crate::io::File for AlwaysErr {
+        fn len(&self) -> io::Result<u64> {
+            Err(io::Error::other("injected len failure"))
+        }
+        fn read_at(&self, _offset: u64, _out: &mut [u8]) -> io::Result<()> {
+            Err(io::Error::other("injected read failure"))
+        }
+        fn write_at(&self, _offset: u64, _data: &[u8]) -> io::Result<()> {
+            Err(io::Error::other("injected write failure"))
+        }
+        fn set_len(&self, _len: u64) -> io::Result<()> {
+            Err(io::Error::other("injected set_len failure"))
+        }
+        fn sync(&self) -> io::Result<()> {
+            Err(io::Error::other("injected sync failure"))
+        }
+    }
+
+    fn backend() -> (DiskBackend, Arc<AtomicBool>) {
+        let latch = Arc::new(AtomicBool::new(false));
+        let backend = DiskBackend {
+            file: Box::new(AlwaysErr),
+            latch: latch.clone(),
+        };
+        (backend, latch)
+    }
+
+    // Each of redb's five latch sites (cached_file.rs:158/167/176/185/194) has
+    // exactly one DiskBackend counterpart. If redb grows a sixth, the tripwire
+    // in crates/charpente/tests/kernel.rs is what catches it.
+
+    #[test]
+    fn a_failed_len_latches() {
+        let (b, latch) = backend();
+        assert!(!latch.load(Ordering::SeqCst), "clean before");
+        assert!(b.len().is_err());
+        assert!(latch.load(Ordering::SeqCst), "len must latch on Err");
+    }
+
+    #[test]
+    fn a_failed_read_latches() {
+        let (b, latch) = backend();
+        let mut out = [0u8; 8];
+        assert!(b.read(0, &mut out).is_err());
+        assert!(latch.load(Ordering::SeqCst), "read must latch on Err");
+    }
+
+    #[test]
+    fn a_failed_set_len_latches() {
+        let (b, latch) = backend();
+        assert!(b.set_len(64).is_err());
+        assert!(latch.load(Ordering::SeqCst), "set_len must latch on Err");
+    }
+
+    #[test]
+    fn a_failed_sync_data_latches() {
+        let (b, latch) = backend();
+        assert!(b.sync_data().is_err());
+        assert!(latch.load(Ordering::SeqCst), "sync_data must latch on Err");
+    }
+
+    #[test]
+    fn a_failed_write_latches() {
+        let (b, latch) = backend();
+        assert!(b.write(0, &[1, 2, 3]).is_err());
+        assert!(latch.load(Ordering::SeqCst), "write must latch on Err");
     }
 }
