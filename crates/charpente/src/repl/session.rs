@@ -520,6 +520,14 @@ const SCHEMA_DIGEST_MISMATCH: &str = "replication schema mismatch: this node's #
      both nodes from the same source and restart them (stop both, upgrade both, start the \
      primary first)";
 
+/// The bound on the address echoed by `invalid_listen_refusal` (Minor #7,
+/// fix round 1): `MAX_MESSAGE_BYTES` is 17 MiB, so an unbounded echo lets a
+/// peer force this refusal — allocated, encoded, sent back, and surfaced to
+/// operators — to balloon to megabytes. Not an amplification attack (the
+/// peer already sent us those bytes), but waste and log-flooding; every
+/// other refusal in the ladder echoes bounded data.
+const ECHOED_LISTEN_ADDRESS_BYTES: usize = 200;
+
 /// The invalid-listen-address refusal (M2 sub-project 0b task 2, dispatch
 /// Correction 4): pinned verbatim by tests. `Hello.listen` arrives
 /// peer-supplied and unvalidated off the wire; an address `store_witnesses`
@@ -530,10 +538,21 @@ const SCHEMA_DIGEST_MISMATCH: &str = "replication schema mismatch: this node's #
 /// nor shipping to a peer this node can never durably record as a witness
 /// (silently reopening the dual-primary gap the witness set exists to
 /// close). `listen: None` stays legal — a peer that advertises no address
-/// simply is not a witness candidate.
+/// simply is not a witness candidate. The echoed address is bounded to
+/// `ECHOED_LISTEN_ADDRESS_BYTES`, cut on a UTF-8 char boundary (never split
+/// mid-character), with a literal "..." marking a truncation.
 fn invalid_listen_refusal(addr: &str) -> String {
+    let mut cut = addr.len().min(ECHOED_LISTEN_ADDRESS_BYTES);
+    while cut > 0 && !addr.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let shown = if cut < addr.len() {
+        format!("{}...", &addr[..cut])
+    } else {
+        addr.to_string()
+    };
     format!(
-        "Hello listen address {addr:?} is invalid — a witness address must be non-empty and \
+        "Hello listen address {shown:?} is invalid — a witness address must be non-empty and \
          must not contain ASCII whitespace (space, tab, CR, or LF); this node cannot durably \
          record it as a witness, so the connection is refused rather than shipped-but-unrecorded"
     )

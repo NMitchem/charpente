@@ -404,7 +404,18 @@ impl Repl {
                 // `Decision::Snapshot` only set `listen`/`phase`, never send).
                 // Recording here — right after `service`, on every
                 // round-robin step — makes a new witness durable strictly
-                // before any frame can reach that peer.
+                // before any frame can reach that peer, ON THE SUCCESS PATH
+                // (fix round 1, Minor #2 — the original wording claimed this
+                // unconditionally, which is false: if `record_witnesses`
+                // itself fails, step N+1 services the SAME session again,
+                // still `Phase::Shipping`, and `service` ships any backlog
+                // FIRST — a frame CAN reach the peer before a retried
+                // witness lands). Production safety on the failure path does
+                // NOT come from this ordering; it comes from `Kernel::step`'s
+                // `Ready::Repl` arm propagating this `?` straight out of the
+                // whole kernel loop (fail-stop, not an in-process retry) —
+                // the only retry in production is the next process start,
+                // where `Repl::open` reloads `witnesses` fresh from disk.
                 self.record_witnesses()?;
                 self.recompute_pin();
                 return Ok(());

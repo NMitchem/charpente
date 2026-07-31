@@ -10,6 +10,8 @@
 //! bug).
 
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use charpente::repl::Repl;
@@ -24,8 +26,6 @@ use charpente_core::migration::{MigrationError, SchemaVersion, TableMigration, s
 use charpente_core::table::{Codec, IndexDef, Row, RowShape, View};
 use charpente_sim::checks::{dir_entry_loss_fired, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim, SimClock, SimHost, run_universes_swarm_with};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 // ------------------------------------------------------------- fixtures
 
@@ -210,7 +210,7 @@ fn spawn_node_with_schema(
     // Open can hit injected faults (a failed sync during store/WAL creation);
     // restart the fresh host and retry, exactly as recovery does.
     for _ in 0..RECOVER_ATTEMPTS {
-        match open_node(&h, &cfg, &db_cfg, false, &schema) {
+        match open_node(sim, &h, &cfg, &db_cfg, false, &schema) {
             Ok((db, repl)) => {
                 return Ok(Node {
                     host: h,
@@ -256,6 +256,7 @@ fn finish_universe(sim: &Sim, r: Result<(), String>) -> Result<(), String> {
 }
 
 fn open_node(
+    sim: &Sim,
     h: &SimHost,
     cfg: &ReplConfig,
     db_cfg: &DbConfig,
@@ -266,23 +267,35 @@ fn open_node(
         .map_err(|e| format!("Db::open: {e}"))?;
     match Repl::open(Box::new(h.net()), Box::new(h.disk()), cfg.clone(), &mut db) {
         Ok((repl, _notice)) => Ok((db, repl)),
-        // A torn witness file (M2 sub-project 0b task 2), checked BEFORE the
-        // role-file arm below since both error strings share the substring
-        // "integrity check": unlike the role file, there is no config-
-        // derived witness set to re-init from, and witnesses.rs's own fix
-        // text is explicit that deleting it is safe ONLY when the operator
-        // is certain no follower of this node was ever promoted — a fact
-        // this harness cannot prove in a swarm-fuzzed universe (a witness
-        // can be recorded by an ordinary running primary with no role flip
-        // at all, so `flipped` is not a safe proxy here either, where it
-        // exists). Always inconclusive: the operator-restore path is the
-        // fix. (This comment is kept byte-identical at every copy of this
-        // arm — replication.rs's two sites, auth.rs, realtime.rs — so a
-        // future reviewer can diff them; see task-2-report.md.)
+        // A torn witness file (M2 sub-project 0b task 2): keyed on its own
+        // full, non-overlapping needle ("witness file failed its integrity
+        // check"), an independent arm from the role-file arm below (keyed on
+        // ITS own full needle, "role file failed its integrity check") — the
+        // two are mutually exclusive by construction, so arm ORDER is
+        // irrelevant; both need the FULL string rather than the shared
+        // "integrity check" substring precisely because that substring alone
+        // cannot tell them apart. Unlike the role file, there is no
+        // config-derived witness set to re-init from, and witnesses.rs's own
+        // fix text is explicit that deleting it is safe ONLY when the
+        // operator is certain no follower of this node was ever promoted —
+        // a fact this harness cannot prove in a swarm-fuzzed universe (a
+        // witness can be recorded by an ordinary running primary with no
+        // role flip at all, so `flipped` is not a safe proxy here either,
+        // where it exists). Always inconclusive: the operator-restore path
+        // is the fix. Counted separately from the generic inconclusive
+        // bucket ("repl:witness-file-inconclusive") so this residual,
+        // newly-introduced permanent-unavailability path stays measurable,
+        // not invisible (fix round 1, Noah's ruling — a genuinely torn
+        // NON-empty witness file is a real design fork, escalated
+        // separately, not fixed here). (This comment is kept byte-identical
+        // at every copy of this arm — replication.rs's two sites, auth.rs,
+        // realtime.rs — so a future reviewer can diff them; see
+        // task-2-report.md.)
         Err(e)
             if e.to_string()
                 .contains("witness file failed its integrity check") =>
         {
+            sim.cover("repl:witness-file-inconclusive");
             Err(format!(
                 "{INCONCLUSIVE}: {} torn witness file — the operator restore path is the fix: {e}",
                 h.name()
@@ -335,7 +348,7 @@ fn recover_node(sim: &Sim, node: &mut Node) -> Result<(), String> {
     let mut last = String::new();
     for _ in 0..RECOVER_ATTEMPTS {
         node.host.restart();
-        match reopen(node) {
+        match reopen(sim, node) {
             Ok(()) => return Ok(()),
             Err(e) if is_fault_fallout(&e) => last = e, // open faulted; restart and retry
             // The designed unrestorable-locally hard error: a crash bricked the
@@ -363,8 +376,9 @@ fn recover_node(sim: &Sim, node: &mut Node) -> Result<(), String> {
     ))
 }
 
-fn reopen(node: &mut Node) -> Result<(), String> {
+fn reopen(sim: &Sim, node: &mut Node) -> Result<(), String> {
     let (db, repl) = open_node(
+        sim,
         &node.host,
         &node.repl_cfg,
         &node.db_cfg,
@@ -1253,7 +1267,7 @@ fn a_seeded_follower_with_zero_frames_refuses_a_lossy_primary() {
     p.host.crash_now(); // crashed disk: the Db drop below cannot gracefully persist
     p.db = None;
     p.host.restart(); // collapse unsynced (store reverts to the checkpoint), reboot
-    reopen(&mut p).expect("an above-horizon cut recovers cleanly, not RESTORE_NEEDED");
+    reopen(&sim, &mut p).expect("an above-horizon cut recovers cleanly, not RESTORE_NEEDED");
     let p_last_after =
         p.db.as_ref()
             .unwrap()
@@ -1429,7 +1443,7 @@ fn a_seeded_follower_that_advanced_then_lost_its_log_reseeds_not_refused() {
     }
     disk.sync_dir("wal/").unwrap();
     f.host.restart();
-    reopen(&mut f).unwrap();
+    reopen(&sim, &mut f).unwrap();
     assert_eq!(f.db.as_ref().unwrap().last_applied(), Some(advanced));
     assert_eq!(
         f.db.as_ref().unwrap().log_base(),
@@ -1513,7 +1527,7 @@ fn a_converged_follower_below_a_forked_primarys_base_is_refused_not_rewound() {
     p.host.crash_now();
     p.db = None;
     p.host.restart();
-    reopen(&mut p).expect("an above-horizon cut recovers cleanly, not RESTORE_NEEDED");
+    reopen(&sim, &mut p).expect("an above-horizon cut recovers cleanly, not RESTORE_NEEDED");
     let p_after_cut = p.db.as_ref().unwrap().last_applied().expect("p recovered");
     assert!(
         p_after_cut < n,
@@ -2464,7 +2478,7 @@ fn converged_v1_follower_catches_up_via_shipped_migrateputs() {
     // Restart the primary on v2 — its startup path migrates.
     p.schema = make_schema_v2();
     p.host.restart();
-    reopen(&mut p).unwrap();
+    reopen(&sim, &mut p).unwrap();
     p.db.as_mut().unwrap().migrate_schema().unwrap();
 
     // Restart the follower on v2 — its gate is read-only: the store still
@@ -2473,7 +2487,7 @@ fn converged_v1_follower_catches_up_via_shipped_migrateputs() {
     // MigratePuts once reconnected, never running migrate_schema itself.
     f.schema = make_schema_v2();
     f.host.restart();
-    reopen(&mut f).unwrap();
+    reopen(&sim, &mut f).unwrap();
 
     run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
     assert_converged(&sim, &mut p, &mut f).unwrap();
@@ -3567,23 +3581,35 @@ fn open_kernel(
         app.db_for_tests(),
     ) {
         Ok((repl, _notice)) => repl,
-        // A torn witness file (M2 sub-project 0b task 2), checked BEFORE the
-        // role-file arm below since both error strings share the substring
-        // "integrity check": unlike the role file, there is no config-
-        // derived witness set to re-init from, and witnesses.rs's own fix
-        // text is explicit that deleting it is safe ONLY when the operator
-        // is certain no follower of this node was ever promoted — a fact
-        // this harness cannot prove in a swarm-fuzzed universe (a witness
-        // can be recorded by an ordinary running primary with no role flip
-        // at all, so `flipped` is not a safe proxy here either, where it
-        // exists). Always inconclusive: the operator-restore path is the
-        // fix. (This comment is kept byte-identical at every copy of this
-        // arm — replication.rs's two sites, auth.rs, realtime.rs — so a
-        // future reviewer can diff them; see task-2-report.md.)
+        // A torn witness file (M2 sub-project 0b task 2): keyed on its own
+        // full, non-overlapping needle ("witness file failed its integrity
+        // check"), an independent arm from the role-file arm below (keyed on
+        // ITS own full needle, "role file failed its integrity check") — the
+        // two are mutually exclusive by construction, so arm ORDER is
+        // irrelevant; both need the FULL string rather than the shared
+        // "integrity check" substring precisely because that substring alone
+        // cannot tell them apart. Unlike the role file, there is no
+        // config-derived witness set to re-init from, and witnesses.rs's own
+        // fix text is explicit that deleting it is safe ONLY when the
+        // operator is certain no follower of this node was ever promoted —
+        // a fact this harness cannot prove in a swarm-fuzzed universe (a
+        // witness can be recorded by an ordinary running primary with no
+        // role flip at all, so `flipped` is not a safe proxy here either,
+        // where it exists). Always inconclusive: the operator-restore path
+        // is the fix. Counted separately from the generic inconclusive
+        // bucket ("repl:witness-file-inconclusive") so this residual,
+        // newly-introduced permanent-unavailability path stays measurable,
+        // not invisible (fix round 1, Noah's ruling — a genuinely torn
+        // NON-empty witness file is a real design fork, escalated
+        // separately, not fixed here). (This comment is kept byte-identical
+        // at every copy of this arm — replication.rs's two sites, auth.rs,
+        // realtime.rs — so a future reviewer can diff them; see
+        // task-2-report.md.)
         Err(e)
             if e.to_string()
                 .contains("witness file failed its integrity check") =>
         {
+            sim.cover("repl:witness-file-inconclusive");
             return Err(format!(
                 "{INCONCLUSIVE}: {} torn witness file — the operator restore path is the fix: {e}",
                 h.name()
@@ -4509,6 +4535,17 @@ const WITNESS_RETRY_SEED: u64 = 0x2EB1_0104;
 /// fresh from disk, which would mask the very bug this test exists to catch
 /// (the in-memory-vs-disk divergence only shows up across two `step` calls
 /// on the SAME live `Repl`).
+///
+/// Fix round 1, Minor #2: this drives a mode production never reaches.
+/// `Kernel::step`'s `Ready::Repl` arm propagates a failed `record_witnesses`
+/// straight out of the whole kernel loop (fail-stop) rather than taking a
+/// second `step` on the live `Repl` the way this test does — production's
+/// only retry is the next process start, where `Repl::open` reloads
+/// `witnesses` fresh from disk. This test still proves the property that
+/// matters for BOTH paths: `record_witnesses`'s in-memory mirror never
+/// claims a write landed before it did, so neither an in-process retry
+/// (this test) nor a fresh-process retry (production) is starved by a
+/// stale "already known" guard.
 #[test]
 fn a_failed_witness_write_is_retried_not_silently_dropped() {
     let sim = Sim::with_faults(WITNESS_RETRY_SEED, FaultConfig::none());
@@ -4578,7 +4615,7 @@ fn a_failed_witness_write_is_retried_not_silently_dropped() {
             }
         }
         match next {
-            Some(t) if t > now => sim.clock().sleep(std::time::Duration::from_nanos(t - now)),
+            Some(t) if t > now => sim.clock().sleep(Duration::from_nanos(t - now)),
             _ => break,
         }
     }
@@ -4656,6 +4693,54 @@ fn a_hello_with_an_invalid_listen_address_is_refused_by_name() {
          cannot durably record it as a witness, so the connection is refused rather than \
          shipped-but-unrecorded"
     );
+    // Minor #5 (fix round 1): the refused peer must never have become a
+    // witness — the whole point of refusing before a ship session exists.
+    assert_eq!(
+        load_witnesses(&p.host.disk()).unwrap(),
+        Vec::<String>::new(),
+        "a refused Hello must never leave the refused address in the witness set"
+    );
+
+    // Minor #6 (fix round 1): the empty-string half of `valid_witness_address`
+    // was unpinned — only the whitespace half was exercised above.
+    let conn_empty = sim
+        .host("c-empty")
+        .net()
+        .connect("p:1")
+        .expect("connect to the primary's listener");
+    conn_empty
+        .send(&encode(&Msg::Hello {
+            proto: PROTO_VERSION,
+            listen: Some(String::new()),
+            position: None,
+            secret: None,
+            schema_digest,
+        }))
+        .unwrap();
+    let mut reply_empty = None;
+    for _ in 0..64 {
+        drive_rounds(&sim, &mut [&mut p], 1).unwrap();
+        match conn_empty.recv(&mut buf) {
+            Ok(Some(n)) => {
+                reply_empty = Some(decode(&buf[..n]).unwrap());
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => panic!("conn recv failed: {e}"),
+        }
+    }
+    let Some(Msg::Refuse {
+        message: empty_message,
+    }) = reply_empty
+    else {
+        panic!("expected a Refuse reply for an empty listen address, got {reply_empty:?}");
+    };
+    assert_eq!(
+        empty_message,
+        "Hello listen address \"\" is invalid — a witness address must be non-empty and must \
+         not contain ASCII whitespace (space, tab, CR, or LF); this node cannot durably record \
+         it as a witness, so the connection is refused rather than shipped-but-unrecorded"
+    );
 
     // `listen: None` stays legal — a peer that advertises no address simply
     // is not a witness candidate, and must never be refused for it.
@@ -4685,9 +4770,85 @@ fn a_hello_with_an_invalid_listen_address_is_refused_by_name() {
             Err(e) => panic!("conn recv failed: {e}"),
         }
     }
+    // Minor #4 (fix round 1): assert the POSITIVE shape, not merely
+    // "not a Refuse" — the old assertion was trivially true when reply2
+    // stayed `None` (a 64-round timeout), which would silently pass even a
+    // regression that dropped the Hello entirely. Proven vacuous by
+    // mutation before this fix: forcing 0 rounds (reply2 stays `None`, the
+    // exact shape a dropped Hello leaves) still passed the old assertion.
+    // A live, correctly-serviced Frames/Snapshot session sends one of these
+    // three message kinds first (Frames when there's a backlog, Heartbeat
+    // when idle, SnapshotStart when the log has been compacted).
     assert!(
-        !matches!(reply2, Some(Msg::Refuse { .. })),
-        "a Hello with listen: None must never be refused, got {reply2:?}"
+        matches!(
+            reply2,
+            Some(Msg::Frames { .. } | Msg::Heartbeat { .. } | Msg::SnapshotStart { .. })
+        ),
+        "a Hello with listen: None must be served (Frames/Heartbeat/SnapshotStart), not \
+         refused and not silently dropped — got {reply2:?}"
+    );
+}
+
+const LONG_INVALID_LISTEN_SEED: u64 = 0x2EB1_0107;
+
+/// Minor #7 (fix round 1): `MAX_MESSAGE_BYTES` is 17 MiB, so an unbounded
+/// echo of a peer-controlled `listen` address lets a peer force this
+/// refusal to balloon to megabytes — allocated, encoded, sent back, and
+/// logged by an operator. Not an amplification attack (the peer already
+/// sent us those bytes) but waste and log-flooding, and every other
+/// refusal in the ladder echoes bounded data. A 250-byte invalid (contains
+/// a space) address must come back truncated.
+#[test]
+fn a_long_invalid_listen_address_is_truncated_in_the_refusal() {
+    let sim = Sim::with_faults(LONG_INVALID_LISTEN_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let schema_digest = p.db.as_ref().unwrap().schema_digest();
+
+    let long_addr = format!("{} x", "a".repeat(250)); // invalid (space), 252 bytes
+    let conn = sim
+        .host("c-long")
+        .net()
+        .connect("p:1")
+        .expect("connect to the primary's listener");
+    conn.send(&encode(&Msg::Hello {
+        proto: PROTO_VERSION,
+        listen: Some(long_addr.clone()),
+        position: None,
+        secret: None,
+        schema_digest,
+    }))
+    .unwrap();
+
+    let mut buf = vec![0u8; MAX_MESSAGE_BYTES];
+    let mut reply = None;
+    for _ in 0..64 {
+        drive_rounds(&sim, &mut [&mut p], 1).unwrap();
+        match conn.recv(&mut buf) {
+            Ok(Some(n)) => {
+                reply = Some(decode(&buf[..n]).unwrap());
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => panic!("conn recv failed: {e}"),
+        }
+    }
+    let Some(Msg::Refuse { message }) = reply else {
+        panic!("expected a Refuse reply, got {reply:?}");
+    };
+    assert!(
+        !message.contains(&long_addr),
+        "the refusal must not echo the full peer-controlled address verbatim: {message}"
+    );
+    let expected_shown = format!("{}...", &long_addr[..200]);
+    assert_eq!(
+        message,
+        format!(
+            "Hello listen address {expected_shown:?} is invalid — a witness address must be \
+             non-empty and must not contain ASCII whitespace (space, tab, CR, or LF); this node \
+             cannot durably record it as a witness, so the connection is refused rather than \
+             shipped-but-unrecorded"
+        ),
+        "the truncated refusal's exact shape must be pinned (hard rule 5)"
     );
 }
 

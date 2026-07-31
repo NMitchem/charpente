@@ -100,6 +100,25 @@ pub fn load_witnesses(disk: &dyn Disk) -> io::Result<Vec<String>> {
     }
     let file = disk.open(WITNESS_FILE)?;
     let len = file.len()?;
+    // A 0-byte file is unambiguous, not a torn set (fix round 1, Noah's
+    // ruling): `store_witnesses` can never PRODUCE one — even the empty set
+    // writes "\n0 <crc>" (non-empty), and it only ever calls `set_len` with
+    // that positive length, never 0. The only way to reach length 0 is
+    // `disk.open`'s create-if-absent (`store_witnesses`'s first line)
+    // leaving a fresh, present file that a `write_at` never successfully
+    // extended — a real write failure, or a crash before any bytes land —
+    // i.e. "created but never written", exactly "no witnesses", never a
+    // genuinely torn (necessarily non-empty, necessarily length > 0) set.
+    // Treating it as anything else would brick every future `Repl::open` on
+    // this node (primary, follower, or backup — this runs unconditionally
+    // there, before any role branching) from a single transient write
+    // failure that never reached disk. A genuinely torn NON-empty file
+    // (length > 0, unparseable or CRC/count-mismatched) still falls through
+    // to the named hard error below — this carve-out is scoped to length 0
+    // only.
+    if len == 0 {
+        return Ok(Vec::new());
+    }
     let mut buf = vec![0u8; len as usize];
     file.read_at(0, &mut buf)?;
     let text = String::from_utf8(buf).map_err(|_| corrupt_witness_error("not valid UTF-8"))?;
@@ -142,6 +161,22 @@ mod tests {
     fn an_absent_file_is_an_empty_set() {
         let sim = Sim::with_faults(0x0DEE_0001, FaultConfig::none());
         assert_eq!(load_witnesses(&sim.disk()).unwrap(), Vec::<String>::new());
+    }
+
+    // IMPORTANT #1 (fix round 1, Noah's ruling): a 0-byte witness file is
+    // unambiguous, not a torn set — `disk.open` alone (`store_witnesses`'s
+    // first line) creates a fresh, present, 0-length file entry, exactly
+    // what a failed FIRST `write_at` (a real IO error, or a crash before
+    // any bytes land) leaves behind. Before the fix this reads as
+    // "missing the crc line", a hard error `Repl::open` calls unconditionally
+    // on every role, bricking every future start of this node from a single
+    // transient write failure that never reached disk.
+    #[test]
+    fn a_zero_byte_witness_file_is_an_empty_set_not_a_torn_one() {
+        let sim = Sim::with_faults(0x0DEE_000C, FaultConfig::none());
+        let disk = sim.disk();
+        let _file = disk.open(WITNESS_FILE).unwrap(); // creates a present, 0-length entry
+        assert_eq!(load_witnesses(&disk).unwrap(), Vec::<String>::new());
     }
 
     #[test]
