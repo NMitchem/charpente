@@ -28,6 +28,7 @@ mod follower;
 pub mod protocol;
 pub mod role;
 mod session;
+pub mod witnesses;
 
 /// The wire protocol version this binary speaks; carried in every `Hello`
 /// and checked against the peer's (spec §5's version-mismatch surface).
