@@ -75,6 +75,16 @@ it together, and neither closes it alone:
 Reject by **named error, never `assert!`** — despite hard rule 4, this input is peer-supplied, and
 an assert there is a remotely-triggerable panic.
 
+> **The Step 1 and Step 3 code blocks below predate this amendment and were deliberately left
+> unedited as the historical record of what was dispatched. They are NOT the shipped design:**
+> Step 1's test asserts `(crc mismatch)` for the `set_len(15)` tear, an arm the amended format
+> provably no longer takes (it now lands in `missing the crc line`, structurally — with whitespace
+> banned, the trailer's space is the file's only space byte, so any truncation that drops a
+> trailing address removes it); Step 3 still shows the countless format, no address validation, and
+> a `trim_end_matches` that is dead under the amended parse. Step 4's "6 passed" is 11 as shipped.
+> **`crates/charpente/src/repl/witnesses.rs` is authoritative.** Do not re-execute these blocks
+> literally — doing so writes code the Format section above forbids.
+
 **Why CRC.** A torn witness write must fail by name, never parse as a *shorter* set — a shorter set is a *less safe* set, so silent truncation is the dangerous direction. This is the same reasoning `role.rs:11-21` records for a torn role line.
 
 - [ ] **Step 1: Write the failing tests**
