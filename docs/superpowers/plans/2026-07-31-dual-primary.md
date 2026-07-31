@@ -27,7 +27,7 @@
 
 | File | Responsibility |
 |---|---|
-| `crates/charpente/src/repl/witnesses.rs` (**new**) | The durable witness file: load, store, add-if-new, clear. CRC'd, torn-write-safe. Pure — no `Net`, no `Repl`. |
+| `crates/charpente/src/repl/witnesses.rs` (**new**) | The durable witness file: load, store, clear (add-if-new lives in Task 2's `Repl::record_witnesses`, not here). CRC'd, torn-write-safe. Pure — no `Net`, no `Repl`. |
 | `crates/charpente/src/repl/probe.rs` (**new**) | `WitnessProbe`: classify-and-disconnect client. Sends `Hello`, classifies the first response, never applies a frame. |
 | `crates/charpente-core/src/db.rs` | Write gate widened from `Option<String>` to three states; new `TxError` variant. |
 | `crates/charpente/src/repl/mod.rs` | Wiring: record witnesses from ship sessions; the boot gate; probe stepping; the deadline notice. |
@@ -58,7 +58,22 @@ impossible to commit green on its own; (2) the integration tests reach `role` as
   - `pub fn store_witnesses(disk: &dyn Disk, addrs: &[String]) -> io::Result<()>`
   - `pub fn clear_witnesses(disk: &dyn Disk) -> io::Result<()>`
 
-**Format.** `<addr>\n<addr>\n…\n<crc32 hex>` — the CRC is over the addresses joined by `\n` (no trailing newline), exactly mirroring `role.rs`'s `line_crc` over its single line. The empty set stores as a file containing only the CRC of the empty string, so "cleared" and "never written" are indistinguishable on read and both yield `vec![]`.
+**Format.** `<addr>\n<addr>\n…\n<n> <crc32 hex>` — addresses joined by `\n`, then a trailer line carrying the COUNT and the CRC of the joined body. The empty set stores as `"\n0 <crc of empty>"`, so "cleared" and "never written" are indistinguishable on read and both yield `vec![]`.
+
+**AMENDED 2026-07-31 (Noah's ruling, after the Task 1 review).** The original format was
+`…\n<crc32 hex>` with no count. The reviewer constructed a truncation that loads cleanly as a
+SHORTER set: `["10.0.0.1:7001", "ce6f4d26host.internal:7002"]` cut to 22 bytes, because
+`ce6f4d26 == crc32("10.0.0.1:7001")`. That is ~2⁻³² for arbitrary addresses but **constructible**,
+because addresses are peer-supplied off the wire (`Hello.listen`, unvalidated). Two changes close
+it together, and neither closes it alone:
+1. the count `n`, checked against the parsed address count on load — shortening must now match
+   both a CRC and a count;
+2. `store_witnesses` **rejects any address that is empty or contains ASCII whitespace** (space,
+   tab, CR, LF) by named error. Without this, a crafted address containing `"1 ce6f4d26"` supplies
+   the trailer bytes itself and defeats the count too. A real listen address has no whitespace.
+
+Reject by **named error, never `assert!`** — despite hard rule 4, this input is peer-supplied, and
+an assert there is a remotely-triggerable panic.
 
 **Why CRC.** A torn witness write must fail by name, never parse as a *shorter* set — a shorter set is a *less safe* set, so silent truncation is the dangerous direction. This is the same reasoning `role.rs:11-21` records for a torn role line.
 
