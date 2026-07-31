@@ -19,15 +19,20 @@
 //! Writing it would have meant asserting a symptom this rig has no way to
 //! produce:
 //!   1. There is no persistent-500 symptom **in the store shape this crate
-//!      could build**. `crates/charpente/tests/kernel.rs`'s
-//!      `kernel_keeps_serving_with_a_latched_store_known_gap` characterizes
-//!      what the shipped build does for a store inside redb's read cache —
-//!      with the handle latched, reads are answered **200 off the page
-//!      cache**, `Db::poisoned()` stays false, and the wire shows nothing at
-//!      all until the next write. On a store LARGER than that cache the 500s
-//!      are real (T13 fix round 2, N-1/I-1) — so this leg is a statement
-//!      about the deployment shape reachable from here, not about the
-//!      platform.
+//!      could build** — and that held both before and after the gap was
+//!      closed, for opposite reasons. When T13 wrote this leg, a store inside
+//!      redb's read cache kept being served: reads answered **200 off the
+//!      page cache**, `Db::poisoned()` false, nothing on the wire until the
+//!      next write. M2 sub-project 0a (2026-07-31) closed that — a latched
+//!      store now poisons the node and the kernel stops, characterized by
+//!      `crates/charpente/tests/kernel.rs`'s `kernel_stops_on_a_latched_store`
+//!      (this leg's original citation, renamed when it stopped describing a
+//!      gap). So there is still nothing here to catch: before, because the
+//!      reads succeeded; now, because the node stops serving instead of
+//!      emitting a persistent-500 stream. On a store LARGER than that cache
+//!      the 500s are real (T13 fix round 2, N-1/I-1) — so this leg is a
+//!      statement about the deployment shape reachable from here, not about
+//!      the platform.
 //!   2. This crate cannot reach the state at all — decisive, and unaffected
 //!      by leg 1's scoping. Per the crate's honesty contract, the faults
 //!      available here are process- and connection-granular; faulting the

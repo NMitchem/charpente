@@ -619,63 +619,96 @@ do not reorder a milestone's dependency sequence.
   (spec non-goals, sub-project 3), object-storage backup (`serve::backup` is a promotable
   follower, not a snapshot shipper), and multi-tenancy as typed key prefixes, which DESIGN
   §9 already carries as its own future design. None of the three gates an exit criterion.
-- Next: **push** — one metered CI run, deliberately deferred through the whole sub-project
-  (local-first verification is the sweep above; Noah confirms). Then M2 per PLAN, with the
-  two ruled follow-ups below re-decided at their policy forks before either is implemented.
+- **M2 sub-project 0a done — the checkpoint-latch gap CLOSED (2026-07-31, spec
+  docs/superpowers/specs/2026-07-30-store-latch-poison-design.md, 4-task plan
+  docs/superpowers/plans/2026-07-30-store-latch-poison.md, ledger
+  .superpowers/sdd/2026-07-30-store-latch-poison/progress.md, commits e57e62c..this
+  commit).**
+  The first M2 backlog item, retired from the backlog below. The gap: charpente had two
+  independent "storage is broken" flags and saw only one, so a node whose checkpoint fsync
+  failed gave a 500 to a record that **was** durable, reported `poisoned() == false`, kept
+  serving, and could never checkpoint again — freezing WAL GC and the `.horizon`
+  breadcrumb behind a checkpoint that would never succeed.
+  **Mechanism:** `DiskBackend` sets a sticky `Arc<AtomicBool>` whenever its inner `File`
+  call returns `Err` — precisely redb's own condition, verified site-by-site against
+  `CheckedBackend` (`cached_file.rs`: `len`/`read`/`set_len`/`sync_data`/`write`, each an
+  unconditional `if result.is_err()`; `check_failure` short-circuits before touching the
+  backend, so the flags cannot drift after latching). `close` is deliberately **not**
+  mirrored: it runs only from `Database::drop`, so a flag set there could never be read by
+  a live `Store`. Exposed as `Store::failed()`, OR-ed into `Db::poisoned()` via
+  `Db::store_failed()`, so the kernel's existing request-arm stop (the 2026-07-05 ruling)
+  fires with no new control flow, no new durable state, and no protocol change. The cause
+  stays distinct in the stop message because the two imply opposite things about durable
+  state — a store latch leaves the WAL intact and authoritative; apply-poison means
+  durability became unknowable — and both strings are pinned byte-exact.
+  **Policy fork ruled (a): stop on the latch**, not (b) serve degraded reads behind a
+  `Db::degraded()`. On a large store (a) is the only thing that ends the state; on a small
+  one it moves an already-certain stop earlier.
+  **The prose coupling is load-bearing, not decorative.** The stop message carries redb's
+  own remedy prose ("close and re-open the database") verbatim, because `checks::classify`
+  matches message *strings* and spec §8 makes touching it a non-goal. The plan's paraphrase
+  hit none of `classify`'s four needles and silently classified every fault-caused latch
+  stop as `Unrelated` — 212 invoicing universes plus 7 suite tests. Guarded from the
+  message side by a rationale comment at the site and an `is_fault_fallout` assertion in
+  the tripwire, so a reword reddens locally. This is now a **second** deliberate prose
+  coupling; spec §1 says so (its earlier "adds no new one of any kind" claim was false as
+  shipped and is corrected).
+  **The correspondence assertion** — what makes the structural-coupling trade safe — lives
+  in `kernel_stops_on_a_latched_store` (`crates/charpente/tests/kernel.rs`, seed
+  `0x0DED_0002`). That is the former `kernel_keeps_serving_with_a_latched_store_known_gap`,
+  **updated and renamed exactly as the retired entry instructed, never deleted**; it is
+  un-ignored, so it runs in every `cargo test --workspace`. It takes **two** assertions:
+  `Db::poisoned()` (charpente's mirror) and a `Db::checkpoint()` that must fail carrying
+  redb's own `PreviousIo` prose. Either alone cannot tell a correct latch from a drifted
+  one. **Scope it honestly:** both ride the checkpoint-fsync path, so together they pin
+  drift on *that path* in either direction — including the over-approximation, where a redb
+  that stopped latching there would otherwise leave charpente poisoning healthy nodes into
+  permanent unavailability with the suite green. A future redb growing an entirely **new**
+  latch path that `DiskBackend` never sees is **not** caught mechanically; that stays a
+  redb-upgrade review item against the five-site census (DESIGN §4, spec §1).
+  **The DERIVED caveat is kept, not promoted.** Two shapes share the fix but not their
+  evidentiary standing: the **cache-resident** store is **MEASURED**; the store larger than
+  redb's 1 GiB evicting read cache is **DERIVED, not measured** — its premises are verified
+  in redb's source (`begin_read` is not latch-gated in either impl, so a read-first write
+  transaction fails inside the handler and never reaches the latch-gated `begin_write`),
+  but no store over that bound was ever built. Do not promote that row without measuring
+  it. Incidentally re-confirmed while proving the tripwire's teeth: swapping its probe to
+  `snapshot()` reddens *because the snapshot succeeds* on a latched handle.
+  **Review** (`5e6412e..03a2158`, opus): READY with fixes, 0 Critical. Both Importants were
+  test-integrity gaps — assertions that could not fail for the reason they stated while
+  DESIGN and the spec claimed they could — fixed same-day in `55ae976`: the correspondence
+  assertion had been reading only charpente's own flag (the over-approximation direction
+  entirely unpinned, and the repo's only live sighting of redb's `PreviousIo` prose lost
+  with the old tripwire's tail), and `a_graceful_close_does_not_latch` was structurally
+  vacuous because `Store::open` mints a fresh flag (`table.rs:307`), so any re-opened store
+  reads clean by construction. The close guard moved one layer down to
+  `latch_tests::a_close_does_not_latch` against `DiskBackend` itself, proven red against a
+  faithful mutation of redb's own close shape (latch, then return `Ok`). GUIDE §9's
+  poisoned-engine section carries the operator paragraph: committed data is safe, the
+  remedy is a process restart, and a restart on still-failing hardware will latch again.
+  **Evidence** — 11-stage sweep, every stage green (archived at
+  `.superpowers/sdd/2026-07-30-store-latch-poison/task-4-sweep.log`): `cargo fmt --all
+  --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo
+  build -p guide-examples` (the GUIDE compile gate) clean; `cargo test --workspace` **three
+  times**, all green — 49 test binaries, **515 passed / 0 failed / 31 ignored** (514→515 is
+  this sub-project's one new test, `a_close_does_not_latch`; the first pass predated a
+  comment-only edit to `hunts.rs`, so passes 2 and 3 are the two covering the final bytes);
+  pinned debug replays `CHARPENTE_SEED=0x8bee1752811ae873` (charpente-sim crash_recovery)
+  and `0x348270b38f166529` (charpente kernel); both release mode-skew tripwires exactly as
+  `ci.yml` runs them (`0x8bee1752811ae873` release crash_recovery, `0xff159ed76d2806e4`
+  release `late_follower_seeds_below_the_gcd_base_and_converges`); a fresh invoicing
+  1024-universe batch, **all green, master seed `0x58f5254bad001f64`**; and the edge matrix
+  `scripts/edge-harness.sh`, **31/31 `#[ignore]` scenarios green** — run because T3 touched
+  replication behavior. Note for whoever runs the next sweep: pipe cargo through `tee`, not
+  `tail`. `tail` eats the aggregate counts *and* replaces cargo's exit status with its own,
+  which is how the T1 sweep lost its counts and how this one nearly did.
+- Next: **push** — one metered CI run, deliberately deferred through M1's whole final
+  sub-project and this one (local-first verification is the sweep above; Noah confirms).
+  Then M2 per PLAN, with the one remaining ruled follow-up below (the dual-primary gap)
+  re-decided at its policy fork before it is implemented.
 
 ## M2 follow-up backlog (carried from M1, ruled — written to be read cold)
 
-- **The checkpoint-latch gap: `Db::poisoned()` does not see redb's handle latch.**
-  charpente has two independent "this storage is broken" flags and only knows about one.
-  Ours is `Db::poisoned()`, set when a durable record fails to apply or the WAL's fsync
-  fails. redb has its own: any error from the storage backend sets
-  `CheckedBackend.io_failed`, after which every backend operation returns `PreviousIo`
-  ("Previous I/O error occurred. Please close and re-open the database"). Nothing maps
-  redb's latch onto ours. Two mechanisms reach it on a live handle: the store's
-  **checkpoint fsync** — always available, because `Store::apply` commits at
-  `Durability::None`, so the checkpoint's is the *only* store sync — and a **failed store
-  read**, but only on a store whose working set exceeds redb's evicting 1 GiB read cache (a
-  smaller one is served from memory and never touches the disk boundary after open).
-  Common to both shapes: the write whose checkpoint failed gets a 500 while its record *is*
-  durable in the WAL; `Db::poisoned()` is **false**; the kernel keeps serving; and the node
-  can no longer checkpoint, so WAL GC and the `.horizon` breadcrumb are both frozen. What
-  differs is what an operator can see — and the two rows do **not** have the same standing:
-  a **cache-resident store is completely silent** (reads answered 200 off redb's page
-  cache; no 500, no log line, nothing on the wire) — **MEASURED**; a **store larger than
-  the read cache is loud** (cache-missing reads 500 while every platform health signal
-  still says fine) — **DERIVED, not measured**: its premises are verified in redb's source,
-  but no store over the 1 GiB bound was ever built, and proving it would mean constructing
-  one. Do not promote that row without measuring it. How the window ends differs too, and
-  this is the sharper half: on a cache-resident store the window is **one write wide** (the
-  next write reaches the latch-gated `begin_write`, poisons apply-side, and stops the
-  kernel — while a read-only node stays in the window indefinitely, reporting healthy
-  forever); on a larger store the window **may never close**, because `begin_read` is *not*
-  latch-gated (verified in both redb `begin_read` impls), so a read-first write transaction
-  — the ordinary get-then-put shape — fails inside the handler, returns a plain 500, and
-  never reaches `begin_write`: no append, no apply, no poison. Verified **not** a
-  disk-exhaustion hazard in either shape: after the latch the WAL takes at most two more
-  records and is then frozen. **Recommended fix:** a sticky `store_failed` flag on `Db`,
-  set wherever a `Store` call fails with redb's `PreviousIo` tell (checkpoint, apply,
-  snapshot, scan — the read paths are in the set deliberately, so the fix never depends on
-  a write reaching `begin_write`), OR-ed into `Db::poisoned()`; the kernel's request arm
-  then stops on it exactly as it already stops on apply-side poison (the 2026-07-05 step-7
-  ruling), giving the operator the restart redb's own message asks for. No new protocol, no
-  new durable state, no WAL change. **The policy fork is the deliverable and was
-  deliberately NOT ruled:** (a) stop on the latch immediately, or (b) keep serving reads but
-  surface the state (a loud notice at the first latched checkpoint plus a `Db::degraded()`
-  distinct from `poisoned()`), accepting that those reads come off a cache that can never
-  be refilled. T13 recommended (a) — on a large store it is the *only* thing that ends the
-  state, and on a small one it merely moves an already-certain stop earlier — but
-  **re-decide this with M2's context rather than inheriting it as settled**: (a) also makes
-  a read-only node's snapshot path a new stop site the step-7 ruling never considered, and
-  it matches on redb's error prose, the same one-place coupling `checks::classify` carries.
-  **Tripwire:** `crates/charpente/tests/kernel.rs`'s
-  `kernel_keeps_serving_with_a_latched_store_known_gap` (seed `0x0DED_0002`) is written to
-  turn red the day this lands — `replies.len() == 3` reddens *first*, before the
-  `!poisoned()` headline, and that earlier failure is the fix working, not a second break.
-  Update it; never delete it. It is un-ignored, so it runs in every `cargo test
-  --workspace`. Full write-up: proposal 1 of
-  `.superpowers/sdd/2026-07-24-introspection-edge-harness/task-13-report.md`.
 - **The dual-primary gap: silent primary resurrection after a promote.** A primary dies; an
   operator promotes the follower; later the old box comes back and is restarted **exactly
   as it was configured** — same `--role primary`, same data dir. Its durable role file says
@@ -723,7 +756,10 @@ do not reorder a milestone's dependency sequence.
 - **Retired follow-up wording.** The migrations close-out's follow-up "`Db::poisoned()`
   reflects only apply-side poison, not redb **read-side** poison" is retired as imprecise:
   the reachable-anywhere mechanism is the **checkpoint fsync**, and the read mechanism is
-  size-conditional. The checkpoint-latch entry above is the accurate replacement.
+  size-conditional. Both wordings are moot as of 2026-07-31: the gap itself is closed —
+  `Db::poisoned()` now reflects the store latch too — and the accurate account is the
+  sub-project 0a close-out in "Current state" above. Kept here only so the old wording is
+  not re-derived from the migrations ledger as if it were still open.
 - **Deferred items triaged by the final review — recorded, not acted on.** *Ship as is:*
   the `temp_dir`/`free_addr`/`extract_field`/`find_node_bin`/`Rng` helper copies duplicated
   across edge test files (verified identical today, and no silent-pass path exists — a

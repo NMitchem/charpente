@@ -231,15 +231,20 @@ unfixed code.
 
 - **The tripwire.** `kernel_keeps_serving_with_a_latched_store_known_gap`
   (`crates/charpente/tests/kernel.rs:770`, seed `0x0DED_0002`) is **updated,
-  never deleted**. Its `replies.len() == 3` assertion reddens *before* the
+  never deleted** — shipped as `kernel_stops_on_a_latched_store`, because the
+  old name described the gap rather than the mechanism, and the gap is gone.
+  Its `replies.len() == 3` assertion reddens *before* the
   `!poisoned()` headline; that earlier failure is the fix working, not a second
   break. CLAUDE.md's backlog entry already warns a reader about exactly this
   ordering, and the entry is retired as part of this work.
 - **The correspondence assertion** (new under the amended §1). The tripwire
-  builds a genuinely latched store, so it must assert that charpente's flag is
-  set *there* — that is what pins the structural coupling §1 accepts. If a future
-  redb latches through a path `DiskBackend` does not observe, this assertion is
-  what goes red.
+  builds a genuinely latched store, so it must assert the correspondence *there*
+  — that is what pins the structural coupling §1 accepts. As shipped this takes
+  **two** assertions, not one: charpente's flag, and redb's own refusal (a
+  `Db::checkpoint()` that must fail carrying `PreviousIo`). Asserting only
+  charpente's flag cannot distinguish a correct latch from a drifted one, and
+  leaves the over-approximation direction entirely unpinned. See §1 for the
+  honest scope — both observations ride the checkpoint-fsync path.
 - **A read-path test.** Proves a failed store **read** sets the flag with no
   write involved — the `DiskBackend::read` arm. This is the arm with no
   measurement behind it (§ Scope ruling 4), so it carries that arm's weight on

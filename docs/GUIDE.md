@@ -2410,15 +2410,38 @@ loop check this directly — per the step-7 ruling, the request arm now stops
 serving once a request's own 500 leaves the engine poisoned, rather than
 keep accepting traffic against a dead engine.
 
-One honest limit on that signal: `Db::poisoned()` reports *charpente's* poison
-(a failed WAL sync, a failed apply). It does not see redb's own handle latch,
-which any storage error sets — most reachably a failed checkpoint fsync — after
-which every later redb operation fails with "close and re-open the database"
-while `poisoned()` still says false and the kernel keeps serving. Restarting
-the process is the correct response there too; what is missing is the platform
-noticing on your behalf. Known gap, characterized by
-`crates/charpente/tests/kernel.rs`'s
-`kernel_keeps_serving_with_a_latched_store_known_gap` and on the M2 backlog.
+The stop names *which* poison, because the two imply opposite things about
+your data:
+
+```text
+kernel stopped: the engine is poisoned (a request-path IO failure made durability unknowable) — the request received its 500; restart the process to recover from the WAL
+kernel stopped: the store handle is dead after a disk IO failure (redb refuses every further operation until you close and re-open the database) — durable state is intact and the WAL is authoritative; restart the process to recover
+```
+
+The second is the **store latch**, and it is worth understanding because the
+message is reassuring on purpose. redb keeps its own independent "this handle
+is broken" flag: any error from its storage backend sets it, after which every
+later redb call fails with "close and re-open the database". The reachable
+trigger is the store's own checkpoint fsync — `Store::apply` commits at
+`Durability::None`, so the checkpoint is the only store sync charpente makes.
+charpente observes that same condition at its own disk boundary and folds it
+into `Db::poisoned()`, so the kernel stops exactly as it does for engine
+poison.
+
+Read the message literally: **committed data is safe.** A store latch is not a
+durability failure. The WAL is intact and authoritative, and the write whose
+checkpoint failed is already in it — that write got a 500, but it is on disk.
+What died is the *handle*, and with it the node's ability to checkpoint at all,
+which is why serving on would be wrong rather than merely untidy: WAL GC and
+the `.horizon` breadcrumb both stall behind a checkpoint that can never
+succeed again. The remedy is a process restart, which re-opens the database and
+replays from the WAL (§3) — the same restart-and-recover exit as every other
+error in this family.
+
+The one thing a restart does not fix is the disk. The latch is a *symptom*:
+some IO genuinely failed. Restarting on hardware that is still failing will
+latch again, probably quickly. Treat a store-latch stop as a hardware signal
+first and a charpente event second.
 
 ## 10. Replication
 
