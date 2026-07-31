@@ -2576,6 +2576,12 @@ routes work everywhere.
 
 ### What a restarting primary does
 
+> **Not armed yet.** This section describes the error surface the witness-set
+> probe uses; nothing in the platform enters this state today, so the promote
+> warning below still applies in full — a restarted old primary currently comes
+> up writable with no notice. Read the two together, and the warning wins until
+> the probe lands.
+
 A node that was a durable primary before it restarted, and has not yet
 confirmed that none of the followers it shipped to (its "witnesses") were
 promoted while it was down, also refuses writes — but it cannot name a

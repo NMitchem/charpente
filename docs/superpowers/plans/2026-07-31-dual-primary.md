@@ -396,6 +396,17 @@ witness would block writes after a later legitimate promotion."
 
 **Why this task exists.** `db.rs:1077` models the gate as `not_primary: Option<String>` and surfaces it as `TxError::NotPrimary { primary }` → 421 naming where to go instead. A witness-gated node has **no primary to name** — it does not know whether one exists, and it may itself still be the legitimate primary. Telling a client "go to X" would be a lie. So the gate needs a third state and its own honest error. This is a **pre-release breaking change to the public `TxError` enum**, in the same class as realtime's `emit` format change.
 
+> **HISTORICAL — Task 3's interface sketch and the Step 1 body below are left
+> unedited as the record of what was dispatched. They are NOT the shipped design**
+> (superseded by `99f81a1` + `2cad5fc`): `WriteGate::Verifying` carries the witness
+> list (`Verifying(Vec<String>)`, mirroring `NotPrimary(String)`) because
+> `TxError::Verifying { unreached }` has to report it, and the enum carries no `pub`
+> at all rather than the `pub` written here. The 503 body's closing clause shipped as
+> "see GUIDE §10's witness-set remedy" — the section is named, so the reference is
+> greppable. The shipped strings are authoritative in `crates/charpente/src/http/app.rs`
+> and pinned byte-exact in `crates/charpente/tests/http.rs`; do not re-execute the
+> blocks below.
+
 **Interfaces:**
 - Produces:
   - `pub enum WriteGate { Allowed, NotPrimary(String), Verifying }` (private to `Db`; the field type)

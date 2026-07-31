@@ -207,18 +207,21 @@ impl Dispatcher {
             Err(TxError::Verifying { .. }) => {
                 // Same shape as the NotPrimary arm above: unreachable today
                 // because nothing sets Verifying yet. When it does, the fix
-                // is a gate check at the call site — mirror migrate_schema's
-                // writes_allowed() guard (kernel/mod.rs:184) at :151 and the
-                // Ready::Job/Ready::Cron pushes — not a probe-first
-                // sequence: a witness may stay unreached indefinitely, so
-                // the probe can never finish before dispatch would run.
+                // is a gate check at the call site — mirror Kernel::run's
+                // writes_allowed() guard on migrate_schema at Kernel::build's
+                // was_primary-gated cron.upsert and the Ready::Job/Ready::Cron
+                // pushes — not a probe-first sequence: a witness may stay
+                // unreached indefinitely, so the probe can never finish
+                // before dispatch would run.
                 self.due.insert((due_at, id));
                 Err(io::Error::other(
                     "BUG: a job/cron transaction hit Verifying — the kernel must not run \
                      dispatch or cron on a write-gated node (M2 sub-project 0b: the fix is \
-                     a gate check at the call site, not a probe-first sequence — mirror \
-                     migrate_schema's guard, kernel/mod.rs:184, at kernel/mod.rs:151 and \
-                     the Ready::Job/Ready::Cron pushes)",
+                     a gate check at the call site, not a probe-first sequence — a witness \
+                     may stay unreached indefinitely, so the probe can never finish first; \
+                     mirror Kernel::run's writes_allowed() guard on migrate_schema at \
+                     Kernel::build's was_primary-gated cron.upsert and the \
+                     Ready::Job/Ready::Cron pushes)",
                 ))
             }
             Err(TxError::App(JobError::App(err))) => {
@@ -271,8 +274,11 @@ impl Dispatcher {
                             "BUG: a job/cron transaction hit Verifying — the kernel must not \
                              run dispatch or cron on a write-gated node (M2 sub-project 0b: \
                              the fix is a gate check at the call site, not a probe-first \
-                             sequence — mirror migrate_schema's guard, kernel/mod.rs:184, at \
-                             kernel/mod.rs:151 and the Ready::Job/Ready::Cron pushes)",
+                             sequence — a witness may stay unreached indefinitely, so the \
+                             probe can never finish first; mirror Kernel::run's \
+                             writes_allowed() guard on migrate_schema at Kernel::build's \
+                             was_primary-gated cron.upsert and the Ready::Job/Ready::Cron \
+                             pushes)",
                         ),
                     })
                 };
