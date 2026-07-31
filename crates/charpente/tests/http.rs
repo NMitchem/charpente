@@ -298,7 +298,7 @@ fn a_verifying_node_refuses_writes_with_503_and_names_the_unreached_witnesses() 
         "this node is not accepting writes yet: it was a primary before restarting and has \
          not confirmed that its follower 127.0.0.1:7001 was never promoted — reads are being \
          served normally, and writes resume automatically once that node answers; if it is \
-         gone for good, see the witness-set remedy in the guide"
+         gone for good, see GUIDE §10's witness-set remedy"
     );
 
     // A read route still answers 200 — the write gate never touches reads.
@@ -330,7 +330,7 @@ fn a_verifying_node_pluralizes_the_503_body_for_multiple_unreached_witnesses() {
         "this node is not accepting writes yet: it was a primary before restarting and has \
          not confirmed that its followers 127.0.0.1:7001, 127.0.0.1:7002 were never promoted \
          — reads are being served normally, and writes resume automatically once those nodes \
-         answer; if they are gone for good, see the witness-set remedy in the guide"
+         answer; if they are gone for good, see GUIDE §10's witness-set remedy"
     );
 }
 

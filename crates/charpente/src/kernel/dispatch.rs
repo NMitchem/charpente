@@ -206,13 +206,19 @@ impl Dispatcher {
             }
             Err(TxError::Verifying { .. }) => {
                 // Same shape as the NotPrimary arm above: unreachable today
-                // (M2 sub-project 0b: Task 5 must sequence the witness probe
-                // before dispatch/cron ever run, the same way it must before
-                // migrate_schema). If it ever fires, that sequencing broke.
+                // because nothing sets Verifying yet. When it does, the fix
+                // is a gate check at the call site — mirror migrate_schema's
+                // writes_allowed() guard (kernel/mod.rs:184) at :151 and the
+                // Ready::Job/Ready::Cron pushes — not a probe-first
+                // sequence: a witness may stay unreached indefinitely, so
+                // the probe can never finish before dispatch would run.
                 self.due.insert((due_at, id));
                 Err(io::Error::other(
                     "BUG: a job/cron transaction hit Verifying — the kernel must not run \
-                     dispatch or cron on a write-gated node (M2 sub-project 0b)",
+                     dispatch or cron on a write-gated node (M2 sub-project 0b: the fix is \
+                     a gate check at the call site, not a probe-first sequence — mirror \
+                     migrate_schema's guard, kernel/mod.rs:184, at kernel/mod.rs:151 and \
+                     the Ready::Job/Ready::Cron pushes)",
                 ))
             }
             Err(TxError::App(JobError::App(err))) => {
@@ -263,7 +269,10 @@ impl Dispatcher {
                         ),
                         TxError::Verifying { .. } => io::Error::other(
                             "BUG: a job/cron transaction hit Verifying — the kernel must not \
-                             run dispatch or cron on a write-gated node (M2 sub-project 0b)",
+                             run dispatch or cron on a write-gated node (M2 sub-project 0b: \
+                             the fix is a gate check at the call site, not a probe-first \
+                             sequence — mirror migrate_schema's guard, kernel/mod.rs:184, at \
+                             kernel/mod.rs:151 and the Ready::Job/Ready::Cron pushes)",
                         ),
                     })
                 };

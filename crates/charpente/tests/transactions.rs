@@ -1797,6 +1797,49 @@ fn verify_writes_with_an_empty_witness_list_panics() {
     db.verify_writes(vec![]);
 }
 
+/// Negative space (hard rule 4, fix round 1 M-3): `verify_writes` over an
+/// honest `NotPrimary` would silently replace a "go to X" 421 with an "I
+/// might still be the primary" 503 — a real regression in what the caller
+/// is told. Refused by name instead.
+#[test]
+#[should_panic(expected = "forbid_writes was already in effect")]
+fn verify_writes_over_an_honest_not_primary_panics() {
+    let (_sim, mut db) = quiet_db(0x9012_000B);
+    db.forbid_writes("127.0.0.1:9090".to_string());
+    db.verify_writes(vec!["127.0.0.1:7001".to_string()]);
+}
+
+/// `Verifying -> Verifying` must stay legal (fix round 1 M-3's own
+/// clarification): the witness list only ever shrinks as witnesses answer,
+/// so re-calling `verify_writes` with a smaller list is the normal, expected
+/// resolution path, not a caller bug.
+#[test]
+fn verify_writes_can_shrink_the_witness_list() {
+    let (_sim, mut db) = quiet_db(0x9012_000C);
+    db.verify_writes(vec![
+        "127.0.0.1:7001".to_string(),
+        "127.0.0.1:7002".to_string(),
+    ]);
+    assert!(!db.writes_allowed());
+
+    // One witness answers "not a primary" — the list shrinks, still Verifying.
+    db.verify_writes(vec!["127.0.0.1:7002".to_string()]);
+    assert!(!db.writes_allowed());
+
+    let err = db
+        .transact(|tx| {
+            tx.put(&invoice(1, 1, 100));
+            Ok::<_, io::Error>(())
+        })
+        .unwrap_err();
+    match err {
+        TxError::Verifying { unreached } => {
+            assert_eq!(unreached, vec!["127.0.0.1:7002".to_string()]);
+        }
+        other => panic!("expected Verifying, got {other:?}"),
+    }
+}
+
 /// A row-content snapshot of both tables, keyed by id — the equality check
 /// two independently-built `Db`s' scans get compared against.
 type TableContents = (BTreeMap<u64, String>, BTreeMap<u64, (u64, i64, bool)>);

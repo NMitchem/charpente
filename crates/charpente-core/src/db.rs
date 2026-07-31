@@ -113,8 +113,10 @@ pub enum TxError<E> {
 
 /// Collapses a `TxError` from a platform-internal transaction (the schema
 /// migration executor) into a plain `io::Error`: those transactions have no
-/// application error type worth preserving, and `NotPrimary` is unreachable
-/// (`migrate_schema` asserts writes are allowed before running).
+/// application error type worth preserving, and both `NotPrimary` and
+/// `Verifying` are unreachable (`migrate_schema` asserts `writes_allowed()`
+/// before running, and both variants are exactly the states where that's
+/// false).
 fn tx_err_to_io<E: fmt::Debug>(e: TxError<E>) -> io::Error {
     match e {
         TxError::Io(e) => e,
@@ -1081,7 +1083,7 @@ fn remove_horizon_breadcrumb(disk: &dyn Disk, store_path: &str) -> io::Result<()
 /// know where to send you" — it is "forbidden, and I don't yet know whether
 /// I'm even in the wrong." Private to `Db`; `TxError::Verifying` is the
 /// public surface a caller ever sees.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum WriteGate {
     Allowed,
     NotPrimary(String),
@@ -1594,6 +1596,14 @@ impl Db {
             !unreached.is_empty(),
             "Db::verify_writes called with an empty witness list — call allow_writes instead; \
              an empty list has nothing left to verify"
+        );
+        assert!(
+            !matches!(self.gate, WriteGate::NotPrimary(_)),
+            "Db::verify_writes called while forbid_writes was already in effect — this would \
+             replace an honest \"go to X\" 421 with an \"I might still be the primary\" 503; \
+             call forbid_writes (or allow_writes) instead of layering verify_writes on top of \
+             NotPrimary. Verifying -> Verifying stays legal — the witness list shrinks as \
+             witnesses answer."
         );
         self.gate = WriteGate::Verifying(unreached);
     }

@@ -2574,6 +2574,30 @@ primary-host:9090; retry there (the request was not committed)
 A read-only transaction (no effects) commits on a follower unchanged, so GET
 routes work everywhere.
 
+### What a restarting primary does
+
+A node that was a durable primary before it restarted, and has not yet
+confirmed that none of the followers it shipped to (its "witnesses") were
+promoted while it was down, also refuses writes — but it cannot name a
+primary the way a follower does, because it does not know whether one
+exists elsewhere; it may still be the legitimate one. An effectful
+transaction is refused with `TxError::Verifying`, which the HTTP layer maps
+to **503** naming the witnesses still unreached:
+
+```text
+HTTP/1.1 503 Service Unavailable
+this node is not accepting writes yet: it was a primary before restarting and has
+not confirmed that its follower 127.0.0.1:7001 was never promoted — reads are being
+served normally, and writes resume automatically once that node answers; if it is
+gone for good, see GUIDE §10's witness-set remedy
+```
+
+Same as the 421, this is a read-side no-op — a read-only transaction (no
+effects) still commits normally, the gate never touches reads — and it is
+transient: writes resume automatically the moment every witness confirms it
+was never promoted, with no operator action needed for a witness that
+answers.
+
 ### Promotion and switchover
 
 Two operator moves change which node is primary, both crash-safe on the durable

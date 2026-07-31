@@ -550,20 +550,26 @@ fn tx_error_response(err: TxError<ApiError>) -> Response {
 /// "follower"/"node"/"it" when more than one witness is still unreached
 /// (hard rule 5: both renderings are pinned byte-exact, `http.rs`).
 fn verifying_message(unreached: &[String]) -> String {
+    assert!(
+        !unreached.is_empty(),
+        "verifying_message called with an empty witness list — Db::verify_writes already \
+         refuses to construct TxError::Verifying with one, so this is a caller bug, not a \
+         renderable state"
+    );
     let list = unreached.join(", ");
     if unreached.len() > 1 {
         format!(
             "this node is not accepting writes yet: it was a primary before restarting and has \
              not confirmed that its followers {list} were never promoted — reads are being \
              served normally, and writes resume automatically once those nodes answer; if they \
-             are gone for good, see the witness-set remedy in the guide"
+             are gone for good, see GUIDE §10's witness-set remedy"
         )
     } else {
         format!(
             "this node is not accepting writes yet: it was a primary before restarting and has \
              not confirmed that its follower {list} was never promoted — reads are being \
              served normally, and writes resume automatically once that node answers; if it is \
-             gone for good, see the witness-set remedy in the guide"
+             gone for good, see GUIDE §10's witness-set remedy"
         )
     }
 }

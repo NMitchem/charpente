@@ -135,8 +135,11 @@ fn flatten(e: TxError<io::Error>) -> io::Error {
         ),
         TxError::Verifying { .. } => io::Error::other(
             "BUG: a job/cron transaction hit Verifying — the kernel must not run dispatch or \
-             cron on a write-gated node (M2 sub-project 0b: Task 5 must sequence the witness \
-             probe before dispatch/cron, the same way it must before migrate_schema)",
+             cron on a write-gated node (M2 sub-project 0b: the fix is a gate check at the \
+             call sites, not a probe-first sequence — a witness may stay unreached \
+             indefinitely, so the probe can never finish before dispatch/cron would run; \
+             mirror migrate_schema's writes_allowed() guard, kernel/mod.rs:184, at \
+             kernel/mod.rs:151 and the Ready::Job/Ready::Cron pushes)",
         ),
     }
 }
