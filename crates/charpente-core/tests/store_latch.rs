@@ -1,6 +1,11 @@
 //! The latch flag's boundary (spec §6). Every *disk-boundary* error latches —
 //! that is redb's own condition, mirrored deliberately. What must never latch
-//! is a store error that no disk operation produced, or a clean shutdown.
+//! is a store error that no disk operation produced, or a healthy sync.
+//!
+//! The clean-shutdown half of the boundary is NOT assertable here: `Store::open`
+//! mints a fresh flag (table.rs:307), so anything re-opened reads clean whether
+//! or not `close` latched. It is guarded one layer down, against `DiskBackend`
+//! itself, by `table.rs`'s `latch_tests::a_close_does_not_latch`.
 
 use charpente_core::table::Store;
 use charpente_sim::{FaultConfig, Sim};
@@ -34,22 +39,25 @@ fn a_missing_table_does_not_latch() {
 }
 
 #[test]
-fn a_graceful_close_does_not_latch() {
+fn a_healthy_checkpoint_and_reopen_do_not_latch() {
     let sim = Sim::with_faults(0x0DED_0005, FaultConfig::none());
-    // redb's own CheckedBackend::close sets io_failed unconditionally
-    // (cached_file.rs:148). charpente deliberately does not mirror that, so a
-    // store dropped cleanly and re-opened must come back unlatched.
     {
         let store = store(&sim);
+        // A checkpoint is the only store sync charpente makes (Store::apply
+        // commits at Durability::None), so this is the exact call the latch
+        // fires on when the disk is faulty — here it must not.
         store.checkpoint().unwrap();
         assert!(
             !store.failed(),
             "checkpoint on a healthy store must not latch"
         );
     }
+    // Not evidence about `close` — see the module comment. What it does carry:
+    // opening over an EXISTING checkpointed file reads redb's header at the
+    // disk boundary, and those reads must not latch either.
     let reopened = store(&sim);
     assert!(
         !reopened.failed(),
-        "a store re-opened after a clean close must not report a latch"
+        "re-opening a healthy checkpointed store must not report a latch"
     );
 }

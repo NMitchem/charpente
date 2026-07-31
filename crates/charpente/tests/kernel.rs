@@ -838,10 +838,11 @@ fn kernel_stops_on_a_latched_store() {
     // calling the backend, so the equality would hold post-latch even with no
     // cache at all. And this store is ~2 rows, far under redb's 1 GiB
     // `max_cache_size`, so the equality is insensitive to a change in that
-    // bound — a shrunken cache would still not redden it. What actually
-    // carries the "reads stay silent" half of the characterization is the
-    // 200-status assertion further down: those are reads that were SERVED,
-    // from cache, while the handle was latched.
+    // bound — a shrunken cache would still not redden it. The "reads stay
+    // silent" half of the old characterization is no longer observable in this
+    // test at all: the fix stops the kernel before either scripted GET is
+    // served, so there are no 200s left to point at. It survives only as
+    // DESIGN §4's MEASURED row, recorded from this test's pre-fix behaviour.
     assert!(
         reads_at_open > 0,
         "anti-vacuity: zero store reads were counted even at open, so this injector is not \
@@ -877,14 +878,39 @@ fn kernel_stops_on_a_latched_store() {
         body.contains("simulated fsync failure"),
         "the write's 500 should name the injected fault: {body}"
     );
-    // THE CORRESPONDENCE ASSERTION (spec §1). This store is genuinely latched
-    // — redb answers PreviousIo from here on. charpente must agree. If a
-    // future redb latches through a path DiskBackend does not observe, THIS
-    // is the assertion that goes red, and the fix is to mirror the new path.
+    // THE CORRESPONDENCE ASSERTION (spec §1), and it takes BOTH halves: one
+    // reading charpente's mirror, one reading redb itself. A test that consults
+    // only the mirror cannot tell a correct latch from a drifted one.
+    //
+    // Scope it honestly. Both halves ride the checkpoint-fsync path — a path
+    // `DiskBackend` observes — so together they pin drift ON THAT PATH in
+    // either direction: redb latching where charpente missed it (the
+    // under-approximation, caught by the mirror half), and charpente latching
+    // where redb no longer does (the over-approximation, which would poison
+    // healthy nodes into permanent unavailability, and which ONLY the redb half
+    // catches). What no assertion here catches is a future redb growing an
+    // entirely new latch path that `DiskBackend` never sees; that stays a
+    // redb-upgrade review item against spec §1's five-site census.
     assert!(
         db_poisoned,
         "the store handle is latched, so Db::poisoned() must be true — \
          charpente's flag has drifted from redb's io_failed condition"
+    );
+    // The redb half. `checkpoint` is the probe because `begin_write` IS
+    // latch-gated while `begin_read` is not (DESIGN §4), so a read would prove
+    // nothing. This is also the repo's only LIVE observation of redb's real
+    // PreviousIo prose — which is `checks::classify`'s third needle, and the
+    // string the stop message below deliberately carries.
+    let mut app = kernel.into_app();
+    let refused = app
+        .db_for_tests()
+        .checkpoint()
+        .expect_err("redb must refuse a checkpoint on a latched handle");
+    assert!(
+        refused
+            .to_string()
+            .contains("close and re-open the database"),
+        "redb itself — not just charpente's mirror of it — must be refusing: {refused}"
     );
     // And the stop must say WHICH poison, because the remedies differ in what
     // they imply about durable state.
@@ -905,7 +931,7 @@ fn kernel_stops_on_a_latched_store() {
     // Without this, every sim universe whose injected fault latches the store
     // fails as `Unrelated` (found by the auth suite, T2).
     assert!(
-        charpente_sim::checks::is_fault_fallout(&msg),
+        is_fault_fallout(&msg),
         "the store-latch stop must classify as fault fallout: {msg}"
     );
 }

@@ -487,8 +487,16 @@ kernel's existing request-arm poison stop (the 2026-07-05 ruling, §7) fires
 with no new control flow; only the stop message is distinct, because a store
 latch leaves the WAL intact and authoritative, unlike apply-poison, which
 means durability became unknowable. A test at the kernel level asserts the
-correspondence directly, against a genuinely latched store, so a future redb
-that latches through a path `DiskBackend` does not observe would turn it red.
+correspondence against a genuinely latched store, and it takes two assertions
+to do it: one reading charpente's flag, one reading redb's own refusal (a test
+that consulted only the mirror could not tell a correct latch from a drifted
+one). Both ride the checkpoint-fsync path, so what they pin is drift on that
+path in either direction — charpente missing a latch redb took, or charpente
+latching where redb no longer does, which would poison healthy nodes into
+permanent unavailability and which only the redb-side assertion catches. A
+future redb that grows an entirely new latch path, one `DiskBackend` never
+sees, is not caught mechanically; that stays a review item against the
+five-site census above, to be re-walked on every redb upgrade.
 
 Two shapes share the fix but not its evidentiary standing. On a
 **cache-resident store — MEASURED** — the only reachable trigger is the

@@ -1080,4 +1080,27 @@ mod latch_tests {
         assert!(b.write(0, &[1, 2, 3]).is_err());
         assert!(latch.load(Ordering::SeqCst), "write must latch on Err");
     }
+
+    /// The sixth site, and the one deliberately NOT mirrored: redb's
+    /// `CheckedBackend::close` sets `io_failed` unconditionally
+    /// (cached_file.rs:146-152), because it is reachable only from
+    /// `Database::drop`, so the flag it sets can never be read by a live
+    /// `Store`. This is the guard on that divergence — it reddens the moment a
+    /// `close` override routes anything through `note`. It has to live here:
+    /// the same claim is unassertable through `Store`, since `Store::open`
+    /// mints a fresh flag (table.rs:307) and any re-opened store reads clean by
+    /// construction.
+    #[test]
+    fn a_close_does_not_latch() {
+        let (b, latch) = backend();
+        assert!(
+            b.close().is_ok(),
+            "close must take redb's default Ok arm — DiskBackend does not override it"
+        );
+        assert!(
+            !latch.load(Ordering::SeqCst),
+            "close must not latch: a clean shutdown is not a failure, and mirroring redb here \
+             would set a flag no live Store could ever observe"
+        );
+    }
 }

@@ -113,17 +113,33 @@ is "the backend errored." Those are the same set in redb 4.1.0 — verified abov
 future redb that latched on some internal consistency check would leave our flag
 silently under-reporting.
 
-That risk is **pinned, not assumed**: the tripwire test (§6) builds a genuinely
-latched store, so it asserts the correspondence directly. If redb ever adds a
-latch path charpente does not mirror, that test goes red. This is the same
-treatment the repo gives its other version-coupled assumptions.
+That risk is **pinned in one direction and open in the other — state it
+exactly.** The tripwire test (§6) builds a genuinely latched store and asserts
+both flags: charpente's mirror, and redb's own refusal. But both observations
+ride the checkpoint-fsync path, which is a path `DiskBackend` *does* observe.
+So the test catches drift on that path either way — including the
+over-approximation, where a redb that stopped latching there would otherwise
+leave charpente poisoning a healthy node with the suite still green.
+
+What it does **not** catch is the risk named in the paragraph directly above:
+a future redb latching on some internal consistency check, through a path
+`DiskBackend` never sees, leaves our flag silently under-reporting and this
+test green. That direction is not mechanically pinned by anything; it is a
+redb-upgrade review item against the five-site census.
 
 **What this does not do.** `checks::classify`
 (`crates/charpente-sim/src/checks.rs:72`) matches redb's latch prose today and
 will continue to. It classifies message *strings* by design and has no error
-value to inspect. This spec does not remove that coupling; it adds no new one of
-any kind on the product path. Anyone reading CLAUDE.md's note about
-prose-coupling liability should understand the two sites are different in kind.
+value to inspect. This spec does not remove that coupling — and, as shipped, it
+adds a second, deliberate one: the kernel's store-latch stop message carries
+redb's own remedy prose verbatim so `classify` keeps recognising it. That was
+forced, not chosen — §8 makes touching `classify` a non-goal, so the coupling
+had to be satisfied from the message side; the plan's paraphrase hit none of
+`classify`'s four needles and misclassified every fault-caused latch stop as
+`Unrelated`. The site is guarded by a rationale comment and an
+`is_fault_fallout` assertion in the tripwire. Anyone reading CLAUDE.md's note
+about prose-coupling liability should understand that these sites are different
+in kind from a typed check, and that there are now two of them.
 
 ## 2. Stickiness: where the flag lives
 
