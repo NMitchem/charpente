@@ -146,7 +146,32 @@ fn open_auth_kernel(
         app.db_for_tests(),
     ) {
         Ok((repl, _notice)) => repl,
-        Err(e) if e.to_string().contains("integrity check") => {
+        // A torn witness file (M2 sub-project 0b task 2), checked BEFORE the
+        // role-file arm below since both error strings share the substring
+        // "integrity check": unlike the role file, there is no config-
+        // derived witness set to re-init from, and witnesses.rs's own fix
+        // text is explicit that deleting it is safe ONLY when the operator
+        // is certain no follower of this node was ever promoted — a fact
+        // this harness cannot prove in a swarm-fuzzed universe (a witness
+        // can be recorded by an ordinary running primary with no role flip
+        // at all, so `flipped` is not a safe proxy here either, where it
+        // exists). Always inconclusive: the operator-restore path is the
+        // fix. (This comment is kept byte-identical at every copy of this
+        // arm — replication.rs's two sites, auth.rs, realtime.rs — so a
+        // future reviewer can diff them; see task-2-report.md.)
+        Err(e)
+            if e.to_string()
+                .contains("witness file failed its integrity check") =>
+        {
+            return Err(format!(
+                "{INCONCLUSIVE}: {} torn witness file — the operator restore path is the fix: {e}",
+                h.name()
+            ));
+        }
+        Err(e)
+            if e.to_string()
+                .contains("role file failed its integrity check") =>
+        {
             let _ = h.disk().remove("role");
             let _ = h.disk().sync_dir("role");
             Repl::open(

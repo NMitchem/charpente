@@ -17,6 +17,7 @@ use crate::Db;
 use crate::auth::{ct_eq_hex, hash_token};
 use crate::repl::protocol::{Msg, decode, encode};
 use crate::repl::role::Role;
+use crate::repl::witnesses::valid_witness_address;
 use crate::repl::{
     FRAMES_BATCH_BYTES, HEARTBEAT_NANOS, HELLO_DEADLINE_NANOS, MAX_MESSAGE_BYTES, PROTO_VERSION,
     SNAPSHOT_BATCH_BYTES,
@@ -275,6 +276,7 @@ impl Session {
                     role,
                     db,
                     proto,
+                    &listen,
                     position,
                     peer_secret,
                     &secret,
@@ -518,6 +520,25 @@ const SCHEMA_DIGEST_MISMATCH: &str = "replication schema mismatch: this node's #
      both nodes from the same source and restart them (stop both, upgrade both, start the \
      primary first)";
 
+/// The invalid-listen-address refusal (M2 sub-project 0b task 2, dispatch
+/// Correction 4): pinned verbatim by tests. `Hello.listen` arrives
+/// peer-supplied and unvalidated off the wire; an address `store_witnesses`
+/// would reject (empty, or containing ASCII whitespace) is refused here,
+/// before a ship session is ever established — neither propagating the
+/// error (a remotely-triggerable node failure, since with no peer secret
+/// configured any client reaching the replication port controls `listen`)
+/// nor shipping to a peer this node can never durably record as a witness
+/// (silently reopening the dual-primary gap the witness set exists to
+/// close). `listen: None` stays legal — a peer that advertises no address
+/// simply is not a witness candidate.
+fn invalid_listen_refusal(addr: &str) -> String {
+    format!(
+        "Hello listen address {addr:?} is invalid — a witness address must be non-empty and \
+         must not contain ASCII whitespace (space, tab, CR, or LF); this node cannot durably \
+         record it as a witness, so the connection is refused rather than shipped-but-unrecorded"
+    )
+}
+
 /// True when `presented` proves `peer_secret` (spec §5): `peer_secret: None`
 /// accepts everything (and a presented proof it did not ask for is ignored,
 /// not an error); `Some` requires `ct_eq_hex(hash_token(presented),
@@ -538,16 +559,21 @@ fn secret_matches(peer_secret: &Option<String>, presented: &Option<String>) -> b
 /// peer secret mismatch → refuse, before any other check (spec §5, auth T7);
 /// version mismatch → refuse (both versions); schema digest mismatch →
 /// refuse (migrations spec §5, before any role logic — a schema-mismatched
-/// peer must never seed or ship frames); not-a-primary → refuse; follower
-/// ahead → refuse (diverged); a positioned follower below the retained base →
-/// refuse (diverged behind — the primary GC'd its witness, Design B);
-/// position retained → verify the frame CRC (mismatch → diverged, match →
-/// resume); empty position → snapshot when the log has been compacted, else
-/// frames from 0.
+/// peer must never seed or ship frames); an invalid `listen` address →
+/// refuse (M2 sub-project 0b task 2 — a `listen` this node could never
+/// durably record as a witness must never become a ship session, rather
+/// than reopening the dual-primary gap the witness set exists to close);
+/// not-a-primary → refuse; follower ahead → refuse (diverged); a positioned
+/// follower below the retained base → refuse (diverged behind — the primary
+/// GC'd its witness, Design B); position retained → verify the frame CRC
+/// (mismatch → diverged, match → resume); empty position → snapshot when the
+/// log has been compacted, else frames from 0.
+#[allow(clippy::too_many_arguments)] // one more ladder check (M2 0b task 2), each an independent field
 fn decide_hello(
     role: &Role,
     db: &Db,
     proto: u8,
+    listen: &Option<String>,
     position: Option<(u64, u32)>,
     peer_secret: &Option<String>,
     presented_secret: &Option<String>,
@@ -565,6 +591,11 @@ fn decide_hello(
     }
     if schema_digest != db.schema_digest() {
         return Ok(Decision::Refuse(SCHEMA_DIGEST_MISMATCH.to_string()));
+    }
+    if let Some(addr) = listen
+        && !valid_witness_address(addr)
+    {
+        return Ok(Decision::Refuse(invalid_listen_refusal(addr)));
     }
     match role {
         Role::Primary | Role::HandingOff { .. } => {}

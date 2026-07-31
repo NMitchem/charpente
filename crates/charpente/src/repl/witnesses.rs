@@ -31,6 +31,20 @@ fn corrupt_witness_error(reason: &str) -> io::Error {
     )
 }
 
+/// True when `addr` is safe to store as a witness (I-2, 2026-07-31 review):
+/// non-empty and free of ASCII whitespace — the two shapes that could forge
+/// the witness file's own `<count> <crc>` trailer. Shared with the Hello
+/// refusal in `session.rs`'s `decide_hello` (M2 sub-project 0b task 2,
+/// dispatch Correction 4): `Hello.listen` arrives peer-supplied and
+/// unvalidated off the wire, so an address this function would reject must
+/// never reach a ship session — refused at the trust boundary, before
+/// `store_witnesses` ever sees it, rather than either failing this node on
+/// `store_witnesses`'s `Err` (a remotely-triggerable node failure) or
+/// shipping to a peer this node can never durably record.
+pub(crate) fn valid_witness_address(addr: &str) -> bool {
+    !addr.is_empty() && !addr.bytes().any(|b| b.is_ascii_whitespace())
+}
+
 /// I-2 (2026-07-31 review): named rejection, never `assert!()` — an address
 /// arrives peer-supplied off the wire (`Hello.listen`), unvalidated, so an
 /// assert here would be a remotely-triggerable panic. Deliberately narrow:
@@ -57,7 +71,7 @@ fn invalid_witness_address_error(addr: &str) -> io::Error {
 /// other (necessarily shorter, necessarily less safe) set.
 pub fn store_witnesses(disk: &dyn Disk, addrs: &[String]) -> io::Result<()> {
     for addr in addrs {
-        if addr.is_empty() || addr.bytes().any(|b| b.is_ascii_whitespace()) {
+        if !valid_witness_address(addr) {
             return Err(invalid_witness_address_error(addr));
         }
     }

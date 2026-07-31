@@ -23,6 +23,7 @@ use crate::repl::follower::Follower;
 use crate::repl::protocol::Msg;
 use crate::repl::role::{Role, load_role, store_role};
 use crate::repl::session::{PendingCtrl, Session};
+use crate::repl::witnesses::{clear_witnesses, load_witnesses, store_witnesses};
 
 mod follower;
 pub mod protocol;
@@ -153,6 +154,12 @@ pub struct Repl {
     /// pin) when there are no sessions.
     pin_floor: Arc<Mutex<u64>>,
     stats: ReplStats,
+    /// Listen addresses this node has shipped to, mirrored from the durable
+    /// `witnesses` file (M2 sub-project 0b task 2). Cleared on every durable
+    /// flip away from `Primary` — a demoted-and-re-seeded node is on a new
+    /// timeline, and a stale witness would block writes after a future
+    /// legitimate promotion. Task 5 gates boot on probing this set.
+    witnesses: Vec<String>,
 }
 
 impl Repl {
@@ -181,6 +188,7 @@ impl Repl {
             ));
         }
         let (role, notice) = load_role(&*role_disk, &cfg.initial_role)?;
+        let witnesses = load_witnesses(&*role_disk)?;
 
         let pin_floor = Arc::new(Mutex::new(u64::MAX));
         db.pin_retention(Box::new({
@@ -234,6 +242,7 @@ impl Repl {
                 switchover: None,
                 pin_floor,
                 stats: ReplStats::default(),
+                witnesses,
             },
             notice,
         ))
@@ -388,6 +397,15 @@ impl Repl {
                 self.rr_cursor = (idx + 1) % n;
                 let role = self.role.clone();
                 self.sessions[idx].service(db, now, &role, &self.peer_secret)?;
+                // `Session::service` returns immediately after handling an
+                // inbound message (`return self.handle(...)`, session.rs:218),
+                // so the Hello that sets `listen` and that session's first
+                // *shipping* step are different steps (`Decision::Frames`/
+                // `Decision::Snapshot` only set `listen`/`phase`, never send).
+                // Recording here — right after `service`, on every
+                // round-robin step — makes a new witness durable strictly
+                // before any frame can reach that peer.
+                self.record_witnesses()?;
                 self.recompute_pin();
                 return Ok(());
             }
@@ -713,6 +731,11 @@ impl Repl {
         self.role = Role::Follower {
             primary: to.to_string(),
         };
+        // Clear-on-flip (dispatch Correction 1, site 1): a demoted-and-
+        // re-seeded node is on a new timeline, and a stale witness would
+        // block writes after a future legitimate promotion.
+        clear_witnesses(&*self.role_disk)?;
+        self.witnesses.clear();
         db.forbid_writes(to.to_string());
         // Reply on the control conn while it is still in the Vec.
         self.reply_ctrl(
@@ -807,6 +830,10 @@ impl Repl {
         self.role = Role::Follower {
             primary: to.to_string(),
         };
+        // Clear-on-flip (dispatch Correction 1, site 2): same reasoning as
+        // `complete_switchover`'s clear above.
+        clear_witnesses(&*self.role_disk)?;
+        self.witnesses.clear();
         db.forbid_writes(to.to_string());
         self.sessions.clear();
         self.recompute_pin();
@@ -869,6 +896,41 @@ impl Repl {
         }
         f.ack_seed(start.applied_seq, clock.now().as_nanos());
         Ok(new_db)
+    }
+
+    /// Persists any newly-known peer listen address. Called after a session
+    /// is serviced (mod.rs `step`): `Session::handle` sets `listen` only on
+    /// the two `Decision` arms that agree to ship (session.rs:287-296,
+    /// `Frames` and `Snapshot`), so a refused peer is never a witness, and
+    /// `decide_hello` refuses an unrecordable `listen` before either
+    /// `Decision` is reached (session.rs) — so every address seen here is
+    /// already valid and `store_witnesses`'s `Err` below can only be a
+    /// genuine IO fault, never a rejected address.
+    ///
+    /// Persists BEFORE committing to the in-memory mirror (dispatch
+    /// Correction 3): a push-then-store shape would mark an address "known"
+    /// in memory the instant a (possibly failing) store is attempted, so a
+    /// later step's `!self.witnesses.contains(addr)` guard would then be
+    /// false and a failed durable write would never be retried — the
+    /// witness lost from disk forever while memory claims it is there.
+    fn record_witnesses(&mut self) -> io::Result<()> {
+        let mut fresh: Vec<String> = Vec::new();
+        for s in &self.sessions {
+            if let Some(addr) = &s.listen
+                && !self.witnesses.contains(addr)
+                && !fresh.contains(addr)
+            {
+                fresh.push(addr.clone());
+            }
+        }
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        let mut next = self.witnesses.clone();
+        next.extend(fresh);
+        store_witnesses(&*self.role_disk, &next)?;
+        self.witnesses = next;
+        Ok(())
     }
 
     fn recompute_pin(&self) {

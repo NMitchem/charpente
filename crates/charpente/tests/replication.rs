@@ -15,14 +15,17 @@ use std::time::Duration;
 use charpente::repl::Repl;
 use charpente::repl::protocol::{Msg, decode, encode};
 use charpente::repl::role::Role;
-use charpente::repl::{MAX_MESSAGE_BYTES, ReplConfig};
+use charpente::repl::witnesses::load_witnesses;
+use charpente::repl::{MAX_MESSAGE_BYTES, PROTO_VERSION, ReplConfig};
 use charpente::{Db, DbConfig, Id, Job, Schema, TxError, table};
-use charpente_core::io::{Clock, Conn, Disk, Net};
+use charpente_core::io::{Clock, Conn, Disk, File, Net};
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::migration::{MigrationError, SchemaVersion, TableMigration, schema_version_id};
 use charpente_core::table::{Codec, IndexDef, Row, RowShape, View};
 use charpente_sim::checks::{dir_entry_loss_fired, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim, SimClock, SimHost, run_universes_swarm_with};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 // ------------------------------------------------------------- fixtures
 
@@ -263,6 +266,28 @@ fn open_node(
         .map_err(|e| format!("Db::open: {e}"))?;
     match Repl::open(Box::new(h.net()), Box::new(h.disk()), cfg.clone(), &mut db) {
         Ok((repl, _notice)) => Ok((db, repl)),
+        // A torn witness file (M2 sub-project 0b task 2), checked BEFORE the
+        // role-file arm below since both error strings share the substring
+        // "integrity check": unlike the role file, there is no config-
+        // derived witness set to re-init from, and witnesses.rs's own fix
+        // text is explicit that deleting it is safe ONLY when the operator
+        // is certain no follower of this node was ever promoted — a fact
+        // this harness cannot prove in a swarm-fuzzed universe (a witness
+        // can be recorded by an ordinary running primary with no role flip
+        // at all, so `flipped` is not a safe proxy here either, where it
+        // exists). Always inconclusive: the operator-restore path is the
+        // fix. (This comment is kept byte-identical at every copy of this
+        // arm — replication.rs's two sites, auth.rs, realtime.rs — so a
+        // future reviewer can diff them; see task-2-report.md.)
+        Err(e)
+            if e.to_string()
+                .contains("witness file failed its integrity check") =>
+        {
+            Err(format!(
+                "{INCONCLUSIVE}: {} torn witness file — the operator restore path is the fix: {e}",
+                h.name()
+            ))
+        }
         // Sim-found bug (seeds 0x23b5e7e7f2132438 unparseable-tear,
         // 0x51dacce702b667c8 parseable-tear naming a ghost primary): a torn
         // first-boot role write. Fixed in role.rs by the CRC integrity line —
@@ -276,7 +301,10 @@ fn open_node(
         // backup" — because config may resurrect a demoted primary as writable
         // (sim-found, seed 0x668365a4e50671ba, pinned below): the harness has
         // no restore rig yet, so the universe is honestly inconclusive.
-        Err(e) if e.to_string().contains("integrity check") => {
+        Err(e)
+            if e.to_string()
+                .contains("role file failed its integrity check") =>
+        {
             if flipped {
                 return Err(format!(
                     "{INCONCLUSIVE}: {} torn role file after a role flip — the operator \
@@ -3205,6 +3233,14 @@ fn crash_between_handoff_and_demote_never_yields_two_writable_primaries() {
     }
     run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
     assert_one_writable(&p, &f).unwrap();
+    // Clear-on-flip, site 2 sanity (task-2 dispatch, Correction 1): p must
+    // have durably recorded f as a witness before anything below flips it
+    // away from Primary, or the clear assertion at the end proves nothing.
+    assert_eq!(
+        load_witnesses(&p.host.disk()).unwrap(),
+        vec!["f:1".to_string()],
+        "sanity: p must have durably recorded f as a witness before the crash/resolve below"
+    );
 
     // Begin the switchover and drive to the HandedOff instant (HandOff sent,
     // HandOffDone not yet processed).
@@ -3266,6 +3302,17 @@ fn crash_between_handoff_and_demote_never_yields_two_writable_primaries() {
     }
     assert!(demoted, "p must resolve to a follower of f");
     assert_one_writable(&p, &f).unwrap();
+    // Clear-on-flip, site 2 (task-2 dispatch, Correction 1): `resolve_to_follower`
+    // (mod.rs's crash-interrupted-switchover demote path, distinct from the
+    // graceful `complete_switchover` covered by
+    // `a_graceful_switchover_clears_the_outgoing_primarys_witnesses`) must
+    // clear p's witnesses on its durable flip to Follower.
+    assert_eq!(
+        load_witnesses(&p.host.disk()).unwrap(),
+        Vec::<String>::new(),
+        "resolve_to_follower must clear p's witnesses on the durable demote — a stale witness \
+         would block writes after a future legitimate promotion"
+    );
 
     run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
     assert_converged(&sim, &mut p, &mut f).unwrap();
@@ -3520,7 +3567,32 @@ fn open_kernel(
         app.db_for_tests(),
     ) {
         Ok((repl, _notice)) => repl,
-        Err(e) if e.to_string().contains("integrity check") => {
+        // A torn witness file (M2 sub-project 0b task 2), checked BEFORE the
+        // role-file arm below since both error strings share the substring
+        // "integrity check": unlike the role file, there is no config-
+        // derived witness set to re-init from, and witnesses.rs's own fix
+        // text is explicit that deleting it is safe ONLY when the operator
+        // is certain no follower of this node was ever promoted — a fact
+        // this harness cannot prove in a swarm-fuzzed universe (a witness
+        // can be recorded by an ordinary running primary with no role flip
+        // at all, so `flipped` is not a safe proxy here either, where it
+        // exists). Always inconclusive: the operator-restore path is the
+        // fix. (This comment is kept byte-identical at every copy of this
+        // arm — replication.rs's two sites, auth.rs, realtime.rs — so a
+        // future reviewer can diff them; see task-2-report.md.)
+        Err(e)
+            if e.to_string()
+                .contains("witness file failed its integrity check") =>
+        {
+            return Err(format!(
+                "{INCONCLUSIVE}: {} torn witness file — the operator restore path is the fix: {e}",
+                h.name()
+            ));
+        }
+        Err(e)
+            if e.to_string()
+                .contains("role file failed its integrity check") =>
+        {
             if flipped {
                 return Err(format!(
                     "{INCONCLUSIVE}: {} torn role file after a role flip — the operator restore \
@@ -4320,4 +4392,356 @@ fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
     // And the replicated jobs stayed exactly-once through it all.
     bump_exactly_once(sim, &mut f)?;
     Ok(())
+}
+
+// ============================================================ M2 sub-project
+// 0b task 2: the durable witness set — recording every follower a primary
+// ships to (spec docs/superpowers/specs/2026-07-31-dual-primary-design.md
+// §1; dispatch .superpowers/sdd/2026-07-31-dual-primary/task-2-brief.md,
+// with four corrections layered on top by the dispatching agent — exact
+// placement, persist-before-memory ordering, and the trust-boundary
+// refusal for an unrecordable `listen`).
+
+const RECORDS_WITNESS_SEED: u64 = 0x2EB1_0103;
+
+/// The headline: a primary durably records each follower it ships to,
+/// asserted through a restart — the point of the set is that it survives
+/// one.
+#[test]
+fn a_primary_records_each_follower_it_ships_to_as_a_witness() {
+    let sim = Sim::with_faults(RECORDS_WITNESS_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+
+    for i in 0..10u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+        drive_rounds(&sim, &mut [&mut p, &mut f], 3).unwrap();
+    }
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert_converged(&sim, &mut p, &mut f).unwrap();
+
+    // Restart p — the point of the set is that it survives a restart.
+    recover_node(&sim, &mut p).unwrap();
+
+    let witnesses = load_witnesses(&p.host.disk()).unwrap();
+    assert_eq!(
+        witnesses,
+        vec!["f:1".to_string()],
+        "the primary must durably record every follower it agreed to ship to"
+    );
+}
+
+// -------------------------------------------------- retry (Correction 3)
+
+/// A `Disk` decorator used only by the retry-property test below: it fails
+/// the first `fail_remaining` `write_at` calls on exactly one path (the
+/// witness file), passing every other call — and every other path —
+/// straight through to `inner`.
+struct FlakyWitnessDisk {
+    inner: Box<dyn Disk>,
+    fail_remaining: Arc<AtomicU32>,
+}
+
+impl Disk for FlakyWitnessDisk {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        let file = self.inner.open(path)?;
+        if path == charpente::repl::witnesses::WITNESS_FILE {
+            Ok(Box::new(FlakyFile {
+                inner: file,
+                fail_remaining: self.fail_remaining.clone(),
+            }))
+        } else {
+            Ok(file)
+        }
+    }
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+struct FlakyFile {
+    inner: Box<dyn File>,
+    fail_remaining: Arc<AtomicU32>,
+}
+
+impl File for FlakyFile {
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.inner.read_at(offset, out)
+    }
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        if self.fail_remaining.load(Ordering::SeqCst) > 0 {
+            self.fail_remaining.fetch_sub(1, Ordering::SeqCst);
+            return Err(io::Error::other("injected test fault: witness write"));
+        }
+        self.inner.write_at(offset, data)
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn sync(&self) -> io::Result<()> {
+        self.inner.sync()
+    }
+}
+
+const WITNESS_RETRY_SEED: u64 = 0x2EB1_0104;
+
+/// Correction 3 (task-2 dispatch): `record_witnesses` must persist BEFORE
+/// committing to the in-memory mirror. A push-then-store shape would mark
+/// the address "known" in memory the instant the (failed) store is
+/// attempted, so the next step's `!self.witnesses.contains(addr)` guard
+/// would then be false and the durable write would never be retried — the
+/// witness lost from disk forever while memory claims it is there
+/// (`witnesses.rs`'s own doc names exactly this hazard on the read side —
+/// "a torn write must never parse as a SHORTER set"; this is the write-side
+/// analogue: a failed write must never be silently treated as a landed one).
+///
+/// Drives the primary's `Repl` directly rather than through the harness's
+/// `step_node`/`recover_node` auto-recovery: a restart reloads `witnesses`
+/// fresh from disk, which would mask the very bug this test exists to catch
+/// (the in-memory-vs-disk divergence only shows up across two `step` calls
+/// on the SAME live `Repl`).
+#[test]
+fn a_failed_witness_write_is_retried_not_silently_dropped() {
+    let sim = Sim::with_faults(WITNESS_RETRY_SEED, FaultConfig::none());
+    let ph = sim.host("p");
+    let fh = sim.host("f");
+
+    let mut pdb =
+        Db::open(Box::new(ph.disk()), DbConfig::default(), make_schema()).expect("primary db");
+    let fail_remaining = Arc::new(AtomicU32::new(1));
+    let flaky = FlakyWitnessDisk {
+        inner: Box::new(ph.disk()),
+        fail_remaining: fail_remaining.clone(),
+    };
+    let (mut prepl, _) = Repl::open(
+        Box::new(ph.net()),
+        Box::new(flaky),
+        primary_cfg("p:1"),
+        &mut pdb,
+    )
+    .expect("primary repl");
+
+    let mut fdb =
+        Db::open(Box::new(fh.disk()), DbConfig::default(), make_schema()).expect("follower db");
+    let (mut frepl, _) = Repl::open(
+        Box::new(fh.net()),
+        Box::new(fh.disk()),
+        follower_cfg("f:1", "p:1"),
+        &mut fdb,
+    )
+    .expect("follower repl");
+
+    let mut failures = 0u32;
+    for _ in 0..500u32 {
+        let now = sim.now().as_nanos();
+        prepl.pump_io(now);
+        frepl.pump_io(now);
+        let mut worked = false;
+        if frepl.has_work(&fdb, now) {
+            frepl
+                .step(&mut fdb, &sim.clock())
+                .expect("follower step: no faults injected on f");
+            worked = true;
+        }
+        if prepl.has_work(&pdb, now) {
+            match prepl.step(&mut pdb, &sim.clock()) {
+                Ok(()) => {}
+                Err(e) => {
+                    failures += 1;
+                    assert_eq!(failures, 1, "the injected fault must only fire once: {e}");
+                    assert!(
+                        e.to_string().contains("injected"),
+                        "expected the injected witness fault, got: {e}"
+                    );
+                }
+            }
+            worked = true;
+        }
+        if worked {
+            continue;
+        }
+        let mut next = sim.next_wakeup();
+        for d in [prepl.next_deadline(now), frepl.next_deadline(now)] {
+            if let Some(d) = d
+                && d > now
+            {
+                next = Some(next.map_or(d, |x| x.min(d)));
+            }
+        }
+        match next {
+            Some(t) if t > now => sim.clock().sleep(std::time::Duration::from_nanos(t - now)),
+            _ => break,
+        }
+    }
+
+    assert_eq!(
+        failures, 1,
+        "the injected witness write failure never fired — test setup is wrong"
+    );
+    match load_witnesses(&ph.disk()) {
+        Ok(w) => assert_eq!(
+            w,
+            vec!["f:1".to_string()],
+            "a failed witness write must be retried on a later step and land durably"
+        ),
+        Err(e) => panic!(
+            "expected the retried write to land the witness durably, but load_witnesses failed \
+             instead ({e}) — the failed attempt was likely committed to the in-memory mirror \
+             before the disk write succeeded, so the retry never re-attempted store_witnesses \
+             at all"
+        ),
+    }
+}
+
+// ----------------------------------------------- refusal (Correction 4)
+
+const INVALID_LISTEN_SEED: u64 = 0x2EB1_0105;
+
+/// Correction 4 (task-2 dispatch): a Hello whose `listen` address
+/// `store_witnesses` would reject (empty, or containing ASCII whitespace)
+/// must be refused by name before a ship session is ever established. With
+/// no peer secret configured, ANY client reaching the replication port
+/// controls `listen` — so this is the trust-boundary check that keeps an
+/// unrecordable peer from silently reopening the dual-primary gap the
+/// witness set exists to close. `listen: None` stays legal.
+#[test]
+fn a_hello_with_an_invalid_listen_address_is_refused_by_name() {
+    let sim = Sim::with_faults(INVALID_LISTEN_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let schema_digest = p.db.as_ref().unwrap().schema_digest();
+
+    let conn = sim
+        .host("c")
+        .net()
+        .connect("p:1")
+        .expect("connect to the primary's listener");
+    conn.send(&encode(&Msg::Hello {
+        proto: PROTO_VERSION,
+        listen: Some("10.0.0.1 7001".to_string()), // contains a space
+        position: None,
+        secret: None,
+        schema_digest,
+    }))
+    .unwrap();
+
+    let mut buf = vec![0u8; MAX_MESSAGE_BYTES];
+    let mut reply = None;
+    for _ in 0..64 {
+        drive_rounds(&sim, &mut [&mut p], 1).unwrap();
+        match conn.recv(&mut buf) {
+            Ok(Some(n)) => {
+                reply = Some(decode(&buf[..n]).unwrap());
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => panic!("conn recv failed: {e}"),
+        }
+    }
+    let Some(Msg::Refuse { message }) = reply else {
+        panic!("expected a Refuse reply, got {reply:?}");
+    };
+    assert_eq!(
+        message,
+        "Hello listen address \"10.0.0.1 7001\" is invalid — a witness address must be \
+         non-empty and must not contain ASCII whitespace (space, tab, CR, or LF); this node \
+         cannot durably record it as a witness, so the connection is refused rather than \
+         shipped-but-unrecorded"
+    );
+
+    // `listen: None` stays legal — a peer that advertises no address simply
+    // is not a witness candidate, and must never be refused for it.
+    let conn2 = sim
+        .host("c2")
+        .net()
+        .connect("p:1")
+        .expect("connect to the primary's listener");
+    conn2
+        .send(&encode(&Msg::Hello {
+            proto: PROTO_VERSION,
+            listen: None,
+            position: None,
+            secret: None,
+            schema_digest,
+        }))
+        .unwrap();
+    let mut reply2 = None;
+    for _ in 0..64 {
+        drive_rounds(&sim, &mut [&mut p], 1).unwrap();
+        match conn2.recv(&mut buf) {
+            Ok(Some(n)) => {
+                reply2 = Some(decode(&buf[..n]).unwrap());
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => panic!("conn recv failed: {e}"),
+        }
+    }
+    assert!(
+        !matches!(reply2, Some(Msg::Refuse { .. })),
+        "a Hello with listen: None must never be refused, got {reply2:?}"
+    );
+}
+
+// ------------------------------------------- clear-on-flip (Correction 1)
+
+const SWITCHOVER_CLEARS_WITNESSES_SEED: u64 = 0x2EB1_0106;
+
+/// Clear-on-flip, site 1: `complete_switchover` (mod.rs — the graceful
+/// HandOffDone completion) must clear the outgoing primary's witness set on
+/// its durable flip to Follower. Deterministic, fault-free. Site 2
+/// (`resolve_to_follower`, the crash-interrupted-switchover demote path) is
+/// exercised — with a witness assertion added by this task — by
+/// `crash_between_handoff_and_demote_never_yields_two_writable_primaries`
+/// above, so it is not duplicated here.
+#[test]
+fn a_graceful_switchover_clears_the_outgoing_primarys_witnesses() {
+    let sim = Sim::with_faults(SWITCHOVER_CLEARS_WITNESSES_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    for i in 0..10u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert_eq!(
+        load_witnesses(&p.host.disk()).unwrap(),
+        vec!["f:1".to_string()],
+        "sanity: p must have durably recorded f as a witness before the switchover"
+    );
+
+    p.flipped = true;
+    f.flipped = true;
+    let mut cli = CtrlConn::open(
+        &sim,
+        "p:1",
+        &Msg::CtrlSwitchover {
+            to: "f:1".to_string(),
+            secret: None,
+        },
+    )
+    .unwrap();
+    let reply = drive_ctrl(&sim, &mut [&mut p, &mut f], &mut cli, CONVERGE_BUDGET).unwrap();
+    assert!(
+        matches!(reply, Msg::CtrlOk { .. }),
+        "expected a clean, fault-free switchover: {reply:?}"
+    );
+    assert!(
+        matches!(p.repl.role(), Role::Follower { .. }),
+        "p must be a follower after the switchover, got {:?}",
+        p.repl.role()
+    );
+    assert_eq!(
+        load_witnesses(&p.host.disk()).unwrap(),
+        Vec::<String>::new(),
+        "complete_switchover must clear p's witnesses on the durable flip to Follower — a \
+         stale witness would block writes after a future legitimate promotion"
+    );
 }
