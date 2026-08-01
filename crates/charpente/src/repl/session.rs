@@ -17,7 +17,7 @@ use crate::Db;
 use crate::auth::{ct_eq_hex, hash_token};
 use crate::repl::protocol::{Msg, decode, encode};
 use crate::repl::role::Role;
-use crate::repl::witnesses::valid_witness_address;
+use crate::repl::witnesses::{MAX_WITNESS_ADDRESS_BYTES, valid_witness_address};
 use crate::repl::{
     FRAMES_BATCH_BYTES, HEARTBEAT_NANOS, HELLO_DEADLINE_NANOS, MAX_MESSAGE_BYTES, PROTO_VERSION,
     SNAPSHOT_BATCH_BYTES,
@@ -529,18 +529,23 @@ const SCHEMA_DIGEST_MISMATCH: &str = "replication schema mismatch: this node's #
 const ECHOED_LISTEN_ADDRESS_BYTES: usize = 200;
 
 /// The invalid-listen-address refusal (M2 sub-project 0b task 2, dispatch
-/// Correction 4): pinned verbatim by tests. `Hello.listen` arrives
-/// peer-supplied and unvalidated off the wire; an address `store_witnesses`
-/// would reject (empty, or containing ASCII whitespace) is refused here,
-/// before a ship session is ever established — neither propagating the
-/// error (a remotely-triggerable node failure, since with no peer secret
-/// configured any client reaching the replication port controls `listen`)
-/// nor shipping to a peer this node can never durably record as a witness
-/// (silently reopening the dual-primary gap the witness set exists to
-/// close). `listen: None` stays legal — a peer that advertises no address
+/// Correction 4; length rule folded in by task 1b, Task 3 review M-5):
+/// pinned verbatim by tests. `Hello.listen` arrives peer-supplied and
+/// unvalidated off the wire; an address `store_witnesses` would reject
+/// (empty, over `MAX_WITNESS_ADDRESS_BYTES`, or containing ASCII whitespace)
+/// is refused here, before a ship session is ever established — neither
+/// propagating the error (a remotely-triggerable node failure, since with no
+/// peer secret configured any client reaching the replication port controls
+/// `listen`) nor shipping to a peer this node can never durably record as a
+/// witness (silently reopening the dual-primary gap the witness set exists
+/// to close). `listen: None` stays legal — a peer that advertises no address
 /// simply is not a witness candidate. The echoed address is bounded to
 /// `ECHOED_LISTEN_ADDRESS_BYTES`, cut on a UTF-8 char boundary (never split
-/// mid-character), with a literal "..." marking a truncation.
+/// mid-character), with a literal "..." marking a truncation — a backstop
+/// independent of `MAX_WITNESS_ADDRESS_BYTES`, since the two bounds guard
+/// different things (this one bounds what gets echoed back to the wire;
+/// that one bounds what gets stored durably and, from Task 5 onward,
+/// `join(", ")`-ed into every `TxError::Verifying` 503 body).
 fn invalid_listen_refusal(addr: &str) -> String {
     let mut cut = addr.len().min(ECHOED_LISTEN_ADDRESS_BYTES);
     while cut > 0 && !addr.is_char_boundary(cut) {
@@ -552,9 +557,10 @@ fn invalid_listen_refusal(addr: &str) -> String {
         addr.to_string()
     };
     format!(
-        "Hello listen address {shown:?} is invalid — a witness address must be non-empty and \
-         must not contain ASCII whitespace (space, tab, CR, or LF); this node cannot durably \
-         record it as a witness, so the connection is refused rather than shipped-but-unrecorded"
+        "Hello listen address {shown:?} is invalid — a witness address must be non-empty, at \
+         most {MAX_WITNESS_ADDRESS_BYTES} bytes, and must not contain ASCII whitespace (space, \
+         tab, CR, or LF); this node cannot durably record it as a witness, so the connection is \
+         refused rather than shipped-but-unrecorded"
     )
 }
 

@@ -4485,7 +4485,10 @@ struct FlakyWitnessDisk {
 impl Disk for FlakyWitnessDisk {
     fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
         let file = self.inner.open(path)?;
-        if path == charpente::repl::witnesses::WITNESS_FILE {
+        // Slot 0 specifically: this test's node ships to exactly one
+        // follower, so its one-and-only witness write is always the
+        // FIRST-EVER store, which always targets slot 0 (task 1b).
+        if path == charpente::repl::witnesses::witness_path(0) {
             Ok(Box::new(FlakyFile {
                 inner: file,
                 fail_remaining: self.fail_remaining.clone(),
@@ -4703,9 +4706,9 @@ fn a_hello_with_an_invalid_listen_address_is_refused_by_name() {
     assert_eq!(
         message,
         "Hello listen address \"10.0.0.1 7001\" is invalid — a witness address must be \
-         non-empty and must not contain ASCII whitespace (space, tab, CR, or LF); this node \
-         cannot durably record it as a witness, so the connection is refused rather than \
-         shipped-but-unrecorded"
+         non-empty, at most 300 bytes, and must not contain ASCII whitespace (space, tab, CR, \
+         or LF); this node cannot durably record it as a witness, so the connection is refused \
+         rather than shipped-but-unrecorded"
     );
     // Minor #5 (fix round 1): the refused peer must never have become a
     // witness — the whole point of refusing before a ship session exists.
@@ -4751,9 +4754,10 @@ fn a_hello_with_an_invalid_listen_address_is_refused_by_name() {
     };
     assert_eq!(
         empty_message,
-        "Hello listen address \"\" is invalid — a witness address must be non-empty and must \
-         not contain ASCII whitespace (space, tab, CR, or LF); this node cannot durably record \
-         it as a witness, so the connection is refused rather than shipped-but-unrecorded"
+        "Hello listen address \"\" is invalid — a witness address must be non-empty, at most \
+         300 bytes, and must not contain ASCII whitespace (space, tab, CR, or LF); this node \
+         cannot durably record it as a witness, so the connection is refused rather than \
+         shipped-but-unrecorded"
     );
 
     // `listen: None` stays legal — a peer that advertises no address simply
@@ -4858,9 +4862,9 @@ fn a_long_invalid_listen_address_is_truncated_in_the_refusal() {
         message,
         format!(
             "Hello listen address {expected_shown:?} is invalid — a witness address must be \
-             non-empty and must not contain ASCII whitespace (space, tab, CR, or LF); this node \
-             cannot durably record it as a witness, so the connection is refused rather than \
-             shipped-but-unrecorded"
+             non-empty, at most 300 bytes, and must not contain ASCII whitespace (space, tab, \
+             CR, or LF); this node cannot durably record it as a witness, so the connection is \
+             refused rather than shipped-but-unrecorded"
         ),
         "the truncated refusal's exact shape must be pinned (hard rule 5)"
     );

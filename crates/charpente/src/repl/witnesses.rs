@@ -5,13 +5,61 @@
 //! defence, so this file's integrity matters in one direction especially:
 //! a torn write must never parse as a SHORTER set, because a shorter set is
 //! a weaker check. Same discipline as `role.rs`, for the same reason.
+//!
+//! **Two files, not two slots in one file** (M2 sub-project 0b task 1b,
+//! Noah-ruled 2026-07-31; supersedes task 1's single-file shipped format —
+//! see progress.md's NOAH RULING). `Repl::open` reads this set
+//! UNCONDITIONALLY, before any role branching, so a single-file design made
+//! an ordinary crash mid-write a node that will not start on ANY role until
+//! an operator deletes a file — measured, not hypothetical (three of the six
+//! seeds the sim originally surfaced still hit it after the `len == 0` fix:
+//! `0xcf0f5dadefceffaa`, `0x8823f079aa216fa5`, auth's `0x2520d533c9464058`).
+//! `.horizon` (`charpente_core::db`) is the precedent for the PRINCIPLE —
+//! keep a prior valid witness, never a torn one — but not for the SHAPE:
+//! its slots are 12 fixed bytes, so two fit in one file with no overlap. A
+//! witness set is variable-length, so packing two into one file would force
+//! a maximum-size cap (and the failure mode of exceeding it); two files
+//! avoid the cap entirely.
+//!
+//! Each file's trailer carries a **generation**: `<addr>\n…\n<gen> <count>
+//! <crc32 hex>`. Generation is a `u64`, monotonically increasing on every
+//! store — it is what "newer" means for a witness set (there is no natural
+//! ordering on the addresses themselves the way `applied_seq` orders
+//! horizons). `store_witnesses` always writes the slot that does NOT
+//! currently hold the max valid generation, so a torn write can never touch
+//! the other slot's already-durable, still-valid bytes (verified against the
+//! sim's crash model, `charpente-sim/src/disk.rs`: tearing operates on one
+//! pending write op, dropping a strict subset of THAT op's sectors, and
+//! decisions are independent across ops — so a torn write to one file cannot
+//! touch the other file's already-durable bytes). `load_witnesses` returns
+//! the valid slot with the higher generation, falling back to the other slot
+//! when exactly one is torn. **This is the one-copy-corruption rescue only.**
+//! If NEITHER slot verifies (and at least one is present and non-empty —
+//! i.e. not simply "never written"), that is still the named hard error:
+//! this node then has no information about its witnesses, and guessing
+//! "empty" is exactly the unsafe direction the CRC exists to prevent. A torn
+//! FIRST-EVER write (the other slot never having existed at all) is
+//! deliberately NOT special-cased into a silent empty fallback either — a
+//! present, non-empty, failing slot cannot be distinguished, from the file
+//! alone, from at-rest corruption of a slot that once held a real witness
+//! (media bit rot, tampering) while its sibling was never needed. Losing
+//! that information silently would be exactly what the CRC exists to catch.
+//! So the residual "no rescue available" bucket is expected to fall close to
+//! (not provably to exactly) zero: it now only catches genuine two-copy
+//! corruption and the structurally-unavoidable case of a first-ever write
+//! that both crashed AND has no predecessor to fall back to.
 
 use std::io;
 
 use charpente_core::crc::Crc32;
 use charpente_core::io::Disk;
 
-pub const WITNESS_FILE: &str = "witnesses";
+/// The path for one of the two witness slots (0 or 1). `WITNESS_FILE` as a
+/// single name is gone (task 1b) — every caller, in this module and in
+/// tests, names a slot explicitly.
+pub fn witness_path(slot: u8) -> String {
+    format!("witnesses.{slot}")
+}
 
 fn body_crc(body: &str) -> u32 {
     let mut crc = Crc32::new();
@@ -19,130 +67,224 @@ fn body_crc(body: &str) -> u32 {
     crc.finish()
 }
 
-fn corrupt_witness_error(reason: &str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!(
-            "witness file failed its integrity check ({reason}) — a torn write or corruption; \
-             the safe repair is to delete the \"{WITNESS_FILE}\" file ONLY if you are certain \
-             no follower of this node was ever promoted, since an empty witness set lets this \
-             node resume as a primary unchecked"
-        ),
-    )
-}
+/// The bound on a witness address (Task 3 review, M-5; folded into task 1b).
+/// A legitimate `host:port` maxes at 253 bytes (the longest DNS name) + 1
+/// (`:`) + 5 (the longest port, `65535`) = 259 bytes; 300 is a generous, not
+/// tight, ceiling above that. Without a bound, a peer-supplied `Hello.listen`
+/// of arbitrary size is otherwise a *valid* witness — landing durably in the
+/// witness file and, from Task 5 onward, `join(", ")`-ed unbounded into
+/// every `TxError::Verifying` 503 body. Shared with the trust-boundary
+/// refusal in `session.rs`'s `decide_hello` via `valid_witness_address`
+/// below (Task 2 review: "the two rules cannot drift apart" — keep it that
+/// way).
+pub(crate) const MAX_WITNESS_ADDRESS_BYTES: usize = 300;
 
-/// True when `addr` is safe to store as a witness (I-2, 2026-07-31 review):
-/// non-empty and free of ASCII whitespace — the two shapes that could forge
-/// the witness file's own `<count> <crc>` trailer. Shared with the Hello
-/// refusal in `session.rs`'s `decide_hello` (M2 sub-project 0b task 2,
-/// dispatch Correction 4): `Hello.listen` arrives peer-supplied and
-/// unvalidated off the wire, so an address this function would reject must
-/// never reach a ship session — refused at the trust boundary, before
-/// `store_witnesses` ever sees it, rather than either failing this node on
-/// `store_witnesses`'s `Err` (a remotely-triggerable node failure) or
-/// shipping to a peer this node can never durably record.
+/// True when `addr` is safe to store as a witness (I-2, 2026-07-31 review;
+/// length bound folded in by task 1b, Task 3 review M-5): non-empty, at most
+/// `MAX_WITNESS_ADDRESS_BYTES`, and free of ASCII whitespace — the shapes
+/// that could either forge the witness file's own `<gen> <count> <crc>`
+/// trailer or let one peer balloon this file and every refusal that echoes
+/// it. Shared with the Hello refusal in `session.rs`'s `decide_hello` (M2
+/// sub-project 0b task 2, dispatch Correction 4): `Hello.listen` arrives
+/// peer-supplied and unvalidated off the wire, so an address this function
+/// would reject must never reach a ship session — refused at the trust
+/// boundary, before `store_witnesses` ever sees it, rather than either
+/// failing this node on `store_witnesses`'s `Err` (a remotely-triggerable
+/// node failure) or shipping to a peer this node can never durably record.
 pub(crate) fn valid_witness_address(addr: &str) -> bool {
-    !addr.is_empty() && !addr.bytes().any(|b| b.is_ascii_whitespace())
+    !addr.is_empty()
+        && addr.len() <= MAX_WITNESS_ADDRESS_BYTES
+        && !addr.bytes().any(|b| b.is_ascii_whitespace())
 }
 
 /// I-2 (2026-07-31 review): named rejection, never `assert!()` — an address
-/// arrives peer-supplied off the wire (`Hello.listen`), unvalidated, so an
-/// assert here would be a remotely-triggerable panic. Deliberately narrow:
-/// it rejects only the two shapes that could forge the trailer's own
-/// `<count> <crc>` form (an empty address collapses the `join`; a
-/// whitespace-containing one can embed a fake trailer — see the plan
-/// amendment's constructed example), not a general well-formedness check on
-/// the address itself.
+/// arrives peer-supplied off the wire (`Hello.listen`), unvalidated. Rejects
+/// exactly the shapes `valid_witness_address` above rejects.
 fn invalid_witness_address_error(addr: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
         format!(
-            "witness address {addr:?} is invalid — a witness address must be non-empty and \
-             must not contain ASCII whitespace (space, tab, CR, or LF); a whitespace-containing \
-             address could otherwise forge the witness file's own \"<count> <crc>\" trailer"
+            "witness address {addr:?} is invalid — a witness address must be non-empty, at \
+             most {MAX_WITNESS_ADDRESS_BYTES} bytes, and must not contain ASCII whitespace \
+             (space, tab, CR, or LF); a whitespace-containing address could otherwise forge the \
+             witness file's own \"<gen> <count> <crc32 hex>\" trailer, and an unbounded one \
+             could balloon this file and every refusal that echoes it"
         ),
     )
 }
 
-/// Writes the durable witness file — `<addr>\n…\n<n> <crc32 hex>` — with
-/// `write_at` + `set_len` + `sync` + `sync_dir`: a witness must be durable
-/// before a probe can rely on it, and a write a crash TORE must fail
-/// `load_witnesses`'s integrity check by name rather than parse as some
-/// other (necessarily shorter, necessarily less safe) set.
-pub fn store_witnesses(disk: &dyn Disk, addrs: &[String]) -> io::Result<()> {
-    for addr in addrs {
-        if !valid_witness_address(addr) {
-            return Err(invalid_witness_address_error(addr));
-        }
-    }
-    let body = addrs.join("\n");
-    let content = format!("{body}\n{} {:08x}", addrs.len(), body_crc(&body));
-    let bytes = content.as_bytes();
-    let file = disk.open(WITNESS_FILE)?;
-    file.write_at(0, bytes)?;
-    file.set_len(bytes.len() as u64)?;
-    file.sync()?;
-    disk.sync_dir(WITNESS_FILE)?;
-    Ok(())
+/// The both-copies-corrupt hard error. `corrupt_witness_error`'s remedy
+/// names both slot paths: with two files, "delete the file" (task 1's
+/// shipped text) no longer names a fix, and this hard error now fires only
+/// when NEITHER slot can be trusted.
+fn corrupt_witness_error(reason_0: &str, reason_1: &str) -> io::Error {
+    let (p0, p1) = (witness_path(0), witness_path(1));
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "witness file failed its integrity check ({p0}: {reason_0}; {p1}: {reason_1}) — a \
+             torn write or corruption; the safe repair is to delete BOTH \"{p0}\" and \"{p1}\" \
+             ONLY if you are certain no follower of this node was ever promoted, since an empty \
+             witness set lets this node resume as a primary unchecked"
+        ),
+    )
 }
 
-/// Reads the durable witness file; absent → `Ok(vec![])` (never written and
-/// explicitly cleared are indistinguishable on read, both meaning "no
-/// witnesses"). Verifies the CRC over the joined body AND that the
-/// trailer's count matches the parsed address count — the count closes a
-/// gap the CRC alone does not: a crafted peer address whose bytes happen to
-/// collide with the CRC of a shorter prefix (constructible, not merely
-/// unlucky, since addresses are peer-supplied) would otherwise parse as a
-/// shorter, unsafe set (2026-07-31 review finding; plan amendment).
-pub fn load_witnesses(disk: &dyn Disk) -> io::Result<Vec<String>> {
-    if !disk.list(WITNESS_FILE)?.iter().any(|n| n == WITNESS_FILE) {
-        return Ok(Vec::new());
+/// One witness slot's state, read fresh from disk.
+#[derive(Debug)]
+enum SlotState {
+    /// Absent, or present-but-0-byte (fix round 1, Noah's ruling; unchanged
+    /// per-file reasoning — see `read_witness_slot`): unambiguously "no
+    /// witness here", never a torn set.
+    Empty,
+    /// Parsed, CRC-checked, and count-checked clean.
+    Valid { generation: u64, addrs: Vec<String> },
+    /// Present, non-empty, and fails one of the integrity checks — the
+    /// named reason, matching the single-file design's original arms
+    /// ("not valid UTF-8", "missing the crc line", "crc mismatch", "count
+    /// mismatch").
+    Torn(&'static str),
+}
+
+/// Reads one slot. IO errors (a real `Disk` failure) propagate via `?`;
+/// integrity failures become `SlotState::Torn` rather than an `Err`, because
+/// `load_witnesses` must inspect BOTH slots before deciding whether a
+/// failure here is rescuable by the other slot.
+fn read_witness_slot(disk: &dyn Disk, slot: u8) -> io::Result<SlotState> {
+    let path = witness_path(slot);
+    if !disk.list(&path)?.iter().any(|n| n == &path) {
+        return Ok(SlotState::Empty);
     }
-    let file = disk.open(WITNESS_FILE)?;
+    let file = disk.open(&path)?;
     let len = file.len()?;
-    // A 0-byte file is unambiguous, not a torn set (fix round 1, Noah's
-    // ruling): `store_witnesses` can never PRODUCE one — even the empty set
-    // writes "\n0 <crc>" (non-empty), and it only ever calls `set_len` with
-    // that positive length, never 0. The only way to reach length 0 is
-    // `disk.open`'s create-if-absent (`store_witnesses`'s first line)
-    // leaving a fresh, present file that a `write_at` never successfully
-    // extended — a real write failure, or a crash before any bytes land —
-    // i.e. "created but never written", exactly "no witnesses", never a
-    // genuinely torn (necessarily non-empty, necessarily length > 0) set.
-    // Treating it as anything else would brick every future `Repl::open` on
-    // this node (primary, follower, or backup — this runs unconditionally
-    // there, before any role branching) from a single transient write
-    // failure that never reached disk. A genuinely torn NON-empty file
-    // (length > 0, unparseable or CRC/count-mismatched) still falls through
-    // to the named hard error below — this carve-out is scoped to length 0
-    // only.
+    // Same carve-out as the single-file design, applied per-file: a 0-byte
+    // slot is what `disk.open`'s create-if-absent leaves behind when the
+    // first `write_at` never landed (a real IO failure, or a crash before
+    // any bytes land) — unambiguous, not a torn set. `store_witnesses` never
+    // PRODUCES a 0-byte file: even the empty set writes a non-empty trailer.
     if len == 0 {
-        return Ok(Vec::new());
+        return Ok(SlotState::Empty);
     }
     let mut buf = vec![0u8; len as usize];
     file.read_at(0, &mut buf)?;
-    let text = String::from_utf8(buf).map_err(|_| corrupt_witness_error("not valid UTF-8"))?;
-    let (body, trailer) = text
-        .rsplit_once('\n')
-        .ok_or_else(|| corrupt_witness_error("missing the crc line"))?;
-    let (n_str, crc_str) = trailer
-        .split_once(' ')
-        .ok_or_else(|| corrupt_witness_error("missing the crc line"))?;
+    let text = match String::from_utf8(buf) {
+        Ok(t) => t,
+        Err(_) => return Ok(SlotState::Torn("not valid UTF-8")),
+    };
+    let Some((body, trailer)) = text.rsplit_once('\n') else {
+        return Ok(SlotState::Torn("missing the crc line"));
+    };
+    let fields: Vec<&str> = trailer.split(' ').collect();
+    let (gen_str, n_str, crc_str) = match fields[..] {
+        [g, n, c] => (g, n, c),
+        _ => return Ok(SlotState::Torn("missing the crc line")),
+    };
+    let (Ok(generation), Ok(n)) = (gen_str.parse::<u64>(), n_str.parse::<usize>()) else {
+        return Ok(SlotState::Torn("missing the crc line"));
+    };
     if format!("{:08x}", body_crc(body)) != crc_str {
-        return Err(corrupt_witness_error("crc mismatch"));
+        return Ok(SlotState::Torn("crc mismatch"));
     }
     let addrs: Vec<String> = body
         .split('\n')
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect();
-    let n: usize = n_str
-        .parse()
-        .map_err(|_| corrupt_witness_error("missing the crc line"))?;
     if n != addrs.len() {
-        return Err(corrupt_witness_error("count mismatch"));
+        return Ok(SlotState::Torn("count mismatch"));
     }
-    Ok(addrs)
+    Ok(SlotState::Valid { generation, addrs })
+}
+
+fn slot_reason(s: &SlotState) -> &'static str {
+    match s {
+        SlotState::Empty => "absent",
+        SlotState::Torn(r) => r,
+        SlotState::Valid { .. } => {
+            unreachable!("load_witnesses never asks for a reason on a valid slot")
+        }
+    }
+}
+
+/// Writes the durable witness set: reads both slots, computes the next
+/// generation, and writes the slot that does NOT currently hold the max
+/// valid generation (slot 0 when neither slot is valid) — `write_at` +
+/// `set_len` + `sync` + `sync_dir`, same barrier discipline as before. The
+/// OTHER slot is never touched, so a crash here can only ever cost the
+/// update just attempted, never a previously-landed one.
+pub fn store_witnesses(disk: &dyn Disk, addrs: &[String]) -> io::Result<()> {
+    for addr in addrs {
+        if !valid_witness_address(addr) {
+            return Err(invalid_witness_address_error(addr));
+        }
+    }
+    let gen_of = |s: &SlotState| match s {
+        SlotState::Valid { generation, .. } => Some(*generation),
+        _ => None,
+    };
+    let a = read_witness_slot(disk, 0)?;
+    let b = read_witness_slot(disk, 1)?;
+    let (generation, target): (u64, u8) = match (gen_of(&a), gen_of(&b)) {
+        (None, None) => (0, 0),
+        (Some(ga), None) => (ga + 1, 1),
+        (None, Some(gb)) => (gb + 1, 0),
+        (Some(ga), Some(gb)) if ga >= gb => (ga + 1, 1),
+        (Some(_), Some(gb)) => (gb + 1, 0),
+    };
+    let body = addrs.join("\n");
+    let content = format!(
+        "{body}\n{generation} {} {:08x}",
+        addrs.len(),
+        body_crc(&body)
+    );
+    let bytes = content.as_bytes();
+    let path = witness_path(target);
+    let file = disk.open(&path)?;
+    file.write_at(0, bytes)?;
+    file.set_len(bytes.len() as u64)?;
+    file.sync()?;
+    disk.sync_dir(&path)?;
+    Ok(())
+}
+
+/// Reads the durable witness set. Both slots absent (or both 0-byte) →
+/// `Ok(vec![])` — never written and explicitly cleared are indistinguishable
+/// on read, both meaning "no witnesses", today's semantics unchanged.
+/// Exactly one slot valid → that slot's set (the one-copy-corruption
+/// rescue, or simply the ordinary case before a second slot is ever used).
+/// Both valid → the higher generation wins, regardless of which set is
+/// longer (a torn overwrite that happens to leave the OLDER slot holding
+/// more addresses must never be mistaken for "newer"). Neither valid, and at
+/// least one slot is present and non-empty → the named hard error: this
+/// node has no information about its witnesses, and guessing "empty" here
+/// is exactly the unsafe direction the CRC exists to prevent (this is
+/// unchanged from the single-file design's contract; only the slot count
+/// changed).
+pub fn load_witnesses(disk: &dyn Disk) -> io::Result<Vec<String>> {
+    let a = read_witness_slot(disk, 0)?;
+    let b = read_witness_slot(disk, 1)?;
+    match (a, b) {
+        (
+            SlotState::Valid {
+                generation: ga,
+                addrs: aa,
+            },
+            SlotState::Valid {
+                generation: gb,
+                addrs: ab,
+            },
+        ) => {
+            assert_ne!(
+                ga, gb,
+                "two witness slots must never validate at the same generation — store_witnesses \
+                 always advances past the max valid generation it observed"
+            );
+            Ok(if ga > gb { aa } else { ab })
+        }
+        (SlotState::Valid { addrs, .. }, _) | (_, SlotState::Valid { addrs, .. }) => Ok(addrs),
+        (SlotState::Empty, SlotState::Empty) => Ok(Vec::new()),
+        (a, b) => Err(corrupt_witness_error(slot_reason(&a), slot_reason(&b))),
+    }
 }
 
 /// Clears the witness set (stores empty) — after a probe confirms none of
@@ -175,7 +317,7 @@ mod tests {
     fn a_zero_byte_witness_file_is_an_empty_set_not_a_torn_one() {
         let sim = Sim::with_faults(0x0DEE_000C, FaultConfig::none());
         let disk = sim.disk();
-        let _file = disk.open(WITNESS_FILE).unwrap(); // creates a present, 0-length entry
+        let _file = disk.open(&witness_path(0)).unwrap(); // creates a present, 0-length entry
         assert_eq!(load_witnesses(&disk).unwrap(), Vec::<String>::new());
     }
 
@@ -214,6 +356,15 @@ mod tests {
     // the reviewer's example: ["10.0.0.1:7001", "ce6f4d26host.internal:7002"]
     // cut to 22 bytes, since "ce6f4d26" == crc32("10.0.0.1:7001")).
     //
+    // AMENDED AGAIN (task 1b): the trailer gained a leading generation
+    // field (`<gen> <n> <crc32 hex>`) and the format split into two files
+    // (`witness_path(0)`/`witness_path(1)`). This test's own reasoning is
+    // untouched: with content "127.0.0.1:7001\n127.0.0.1:7002\n0 2 <8 hex>",
+    // the ONLY byte in the whole file that is ever a space is inside the
+    // trailer — no address can contain one — so a truncation that drops a
+    // trailing address still can never coincidentally leave behind a
+    // space-shaped trailer.
+    //
     // A consequence of validating addresses whitespace-free: with content
     // "127.0.0.1:7001\n127.0.0.1:7002\n2 <8 hex>", the ONLY byte in the
     // whole file that is ever a space is the one real trailer's separator —
@@ -230,13 +381,19 @@ mod tests {
     // to "a\nb\n2 dead" leaves a parseable trailer whose count is right and
     // whose crc is wrong — so the arm is unreachable-by-address-dropping-
     // truncation, not unreachable in general; don't simplify it away.
+    //
+    // This test's `store_witnesses` call is this disk's FIRST-EVER witness
+    // write, so it lands entirely in slot 0 and slot 1 stays absent; the
+    // truncated slot 0 has no sibling to be rescued by (task 1b's module doc:
+    // a torn first-ever write is deliberately not special-cased into a
+    // silent empty fallback), so this must still be the named hard error.
     #[test]
     fn a_tear_that_drops_the_second_address_is_caught_not_parsed_as_a_shorter_set() {
         let sim = Sim::with_faults(0x0DEE_0005, FaultConfig::none());
         let disk = sim.disk();
         let addrs = vec!["127.0.0.1:7001".to_string(), "127.0.0.1:7002".to_string()];
         store_witnesses(&disk, &addrs).unwrap();
-        let file = disk.open(WITNESS_FILE).unwrap();
+        let file = disk.open(&witness_path(0)).unwrap();
         file.set_len(15).unwrap();
         file.sync().unwrap();
 
@@ -262,10 +419,11 @@ mod tests {
             .expect_err("a tear that drops an address must not silently succeed");
         assert_eq!(
             err.to_string(),
-            "witness file failed its integrity check (missing the crc line) — a torn write or \
-             corruption; the safe repair is to delete the \"witnesses\" file ONLY if you are \
-             certain no follower of this node was ever promoted, since an empty witness set \
-             lets this node resume as a primary unchecked"
+            "witness file failed its integrity check (witnesses.0: missing the crc line; \
+             witnesses.1: absent) — a torn write or corruption; the safe repair is to delete \
+             BOTH \"witnesses.0\" and \"witnesses.1\" ONLY if you are certain no follower of \
+             this node was ever promoted, since an empty witness set lets this node resume as \
+             a primary unchecked"
         );
     }
 
@@ -274,12 +432,13 @@ mod tests {
         let sim = Sim::with_faults(0x0DEE_0006, FaultConfig::none());
         let disk = sim.disk();
         store_witnesses(&disk, &["127.0.0.1:7001".to_string()]).unwrap();
-        let file = disk.open(WITNESS_FILE).unwrap();
+        let file = disk.open(&witness_path(0)).unwrap();
         file.set_len(5).unwrap();
         file.sync().unwrap();
         let err = load_witnesses(&disk).expect_err("a tear with no newline must fail by name");
         assert!(
-            err.to_string().contains("(missing the crc line)"),
+            err.to_string()
+                .contains("witnesses.0: missing the crc line"),
             "expected the missing-line arm, got: {err}"
         );
     }
@@ -294,7 +453,7 @@ mod tests {
         let disk = sim.disk();
         let addrs = vec!["127.0.0.1:7001".to_string(), "127.0.0.1:7002".to_string()];
         store_witnesses(&disk, &addrs).unwrap();
-        let file = disk.open(WITNESS_FILE).unwrap();
+        let file = disk.open(&witness_path(0)).unwrap();
         file.write_at(0, b"227.0.0.1:7001").unwrap();
         file.sync().unwrap();
 
@@ -302,10 +461,11 @@ mod tests {
             load_witnesses(&disk).expect_err("a length-preserving bit flip must not validate");
         assert_eq!(
             err.to_string(),
-            "witness file failed its integrity check (crc mismatch) — a torn write or \
-             corruption; the safe repair is to delete the \"witnesses\" file ONLY if you are \
-             certain no follower of this node was ever promoted, since an empty witness set \
-             lets this node resume as a primary unchecked"
+            "witness file failed its integrity check (witnesses.0: crc mismatch; witnesses.1: \
+             absent) — a torn write or corruption; the safe repair is to delete BOTH \
+             \"witnesses.0\" and \"witnesses.1\" ONLY if you are certain no follower of this \
+             node was ever promoted, since an empty witness set lets this node resume as a \
+             primary unchecked"
         );
     }
 
@@ -318,8 +478,8 @@ mod tests {
         let disk = sim.disk();
         let addrs = ["127.0.0.1:7001".to_string(), "127.0.0.1:7002".to_string()];
         let body = addrs.join("\n");
-        let corrupted = format!("{body}\n{} {:08x}", addrs.len() + 1, body_crc(&body));
-        let file = disk.open(WITNESS_FILE).unwrap();
+        let corrupted = format!("{body}\n0 {} {:08x}", addrs.len() + 1, body_crc(&body));
+        let file = disk.open(&witness_path(0)).unwrap();
         file.write_at(0, corrupted.as_bytes()).unwrap();
         file.set_len(corrupted.len() as u64).unwrap();
         file.sync().unwrap();
@@ -328,10 +488,11 @@ mod tests {
             load_witnesses(&disk).expect_err("a crc-valid but count-wrong file must not validate");
         assert_eq!(
             err.to_string(),
-            "witness file failed its integrity check (count mismatch) — a torn write or \
-             corruption; the safe repair is to delete the \"witnesses\" file ONLY if you are \
-             certain no follower of this node was ever promoted, since an empty witness set \
-             lets this node resume as a primary unchecked"
+            "witness file failed its integrity check (witnesses.0: count mismatch; witnesses.1: \
+             absent) — a torn write or corruption; the safe repair is to delete BOTH \
+             \"witnesses.0\" and \"witnesses.1\" ONLY if you are certain no follower of this \
+             node was ever promoted, since an empty witness set lets this node resume as a \
+             primary unchecked"
         );
     }
 
@@ -341,7 +502,7 @@ mod tests {
     fn a_non_utf8_file_fails_integrity_by_name() {
         let sim = Sim::with_faults(0x0DEE_0009, FaultConfig::none());
         let disk = sim.disk();
-        let file = disk.open(WITNESS_FILE).unwrap();
+        let file = disk.open(&witness_path(0)).unwrap();
         let bytes = b"\xff\xfe\n0000";
         file.write_at(0, bytes).unwrap();
         file.set_len(bytes.len() as u64).unwrap();
@@ -350,10 +511,11 @@ mod tests {
         let err = load_witnesses(&disk).expect_err("non-UTF-8 bytes must fail by name");
         assert_eq!(
             err.to_string(),
-            "witness file failed its integrity check (not valid UTF-8) — a torn write or \
-             corruption; the safe repair is to delete the \"witnesses\" file ONLY if you are \
-             certain no follower of this node was ever promoted, since an empty witness set \
-             lets this node resume as a primary unchecked"
+            "witness file failed its integrity check (witnesses.0: not valid UTF-8; \
+             witnesses.1: absent) — a torn write or corruption; the safe repair is to delete \
+             BOTH \"witnesses.0\" and \"witnesses.1\" ONLY if you are certain no follower of \
+             this node was ever promoted, since an empty witness set lets this node resume as \
+             a primary unchecked"
         );
     }
 
@@ -367,9 +529,11 @@ mod tests {
             .expect_err("an empty address must be rejected, not stored");
         assert_eq!(
             err.to_string(),
-            "witness address \"\" is invalid — a witness address must be non-empty and must \
-             not contain ASCII whitespace (space, tab, CR, or LF); a whitespace-containing \
-             address could otherwise forge the witness file's own \"<count> <crc>\" trailer"
+            "witness address \"\" is invalid — a witness address must be non-empty, at most \
+             300 bytes, and must not contain ASCII whitespace (space, tab, CR, or LF); a \
+             whitespace-containing address could otherwise forge the witness file's own \
+             \"<gen> <count> <crc32 hex>\" trailer, and an unbounded one could balloon this \
+             file and every refusal that echoes it"
         );
     }
 
@@ -388,11 +552,171 @@ mod tests {
             assert_eq!(
                 err.to_string(),
                 format!(
-                    "witness address {bad:?} is invalid — a witness address must be non-empty \
-                     and must not contain ASCII whitespace (space, tab, CR, or LF); a \
-                     whitespace-containing address could otherwise forge the witness file's \
-                     own \"<count> <crc>\" trailer"
+                    "witness address {bad:?} is invalid — a witness address must be non-empty, \
+                     at most 300 bytes, and must not contain ASCII whitespace (space, tab, CR, \
+                     or LF); a whitespace-containing address could otherwise forge the witness \
+                     file's own \"<gen> <count> <crc32 hex>\" trailer, and an unbounded one \
+                     could balloon this file and every refusal that echoes it"
                 )
+            );
+        }
+    }
+
+    // M-5 (Task 3 review, folded into task 1b): the length half of
+    // `valid_witness_address`, previously untested — only whitespace and
+    // emptiness were pinned.
+    #[test]
+    fn store_rejects_an_address_over_the_length_bound() {
+        let sim = Sim::with_faults(0x0DEE_0010, FaultConfig::none());
+        let disk = sim.disk();
+        let too_long = "a".repeat(MAX_WITNESS_ADDRESS_BYTES + 1);
+        let err = store_witnesses(&disk, std::slice::from_ref(&too_long))
+            .expect_err("an address over the length bound must be rejected, not stored");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "witness address {too_long:?} is invalid — a witness address must be \
+                 non-empty, at most 300 bytes, and must not contain ASCII whitespace (space, \
+                 tab, CR, or LF); a whitespace-containing address could otherwise forge the \
+                 witness file's own \"<gen> <count> <crc32 hex>\" trailer, and an unbounded one \
+                 could balloon this file and every refusal that echoes it"
+            )
+        );
+        // The boundary itself must still be accepted — this is a MAX, not a
+        // stricter cutoff.
+        let exactly_at_bound = "b".repeat(MAX_WITNESS_ADDRESS_BYTES);
+        store_witnesses(&disk, std::slice::from_ref(&exactly_at_bound)).unwrap();
+        assert_eq!(load_witnesses(&disk).unwrap(), vec![exactly_at_bound]);
+    }
+
+    // Task 1b, evidence item 5: generation, not address-set length, decides
+    // which slot wins — a torn overwrite that happens to leave the OLDER
+    // slot holding a LONGER set must never be mistaken for "newer".
+    #[test]
+    fn generation_not_length_decides_the_newer_slot_across_alternation() {
+        let sim = Sim::with_faults(0x0DEE_000E, FaultConfig::none());
+        let disk = sim.disk();
+
+        // gen 0 -> slot 0, a long (3-address) set.
+        let long = vec!["a:1".to_string(), "b:2".to_string(), "c:3".to_string()];
+        store_witnesses(&disk, &long).unwrap();
+        assert_eq!(load_witnesses(&disk).unwrap(), long);
+
+        // gen 1 -> slot 1, a short (1-address) set — NOT a superset, so this
+        // exercises a real shrink, not just an append.
+        let short = vec!["x:9".to_string()];
+        store_witnesses(&disk, &short).unwrap();
+        assert_eq!(
+            load_witnesses(&disk).unwrap(),
+            short,
+            "the newer (shorter) generation must win over the older (longer) one"
+        );
+
+        // gen 2 -> slot 0 again (round-robin), back to something long.
+        let long_again = vec!["p:1".to_string(), "q:2".to_string()];
+        store_witnesses(&disk, &long_again).unwrap();
+        assert_eq!(load_witnesses(&disk).unwrap(), long_again);
+
+        // gen 3 -> slot 1, empty (a clear) — still newer, still wins.
+        clear_witnesses(&disk).unwrap();
+        assert_eq!(load_witnesses(&disk).unwrap(), Vec::<String>::new());
+    }
+
+    // Task 1b, evidence item 4: the both-corrupt pin. Two independently
+    // corrupt copies mean this node has NO information about its
+    // witnesses — the fallback must not quietly swallow this into "empty".
+    // Reached here by direct corruption of two slots that both ONCE held
+    // real, valid, DIFFERENT generations (so this is not the first-ever-
+    // write case above): natural single-crash tearing can never produce
+    // this state (a torn write only ever touches the slot currently being
+    // overwritten, never the sibling holding the last valid copy), so this
+    // models at-rest corruption (bit rot, tampering) of both slots.
+    #[test]
+    fn both_slots_corrupt_is_still_the_named_hard_error() {
+        let sim = Sim::with_faults(0x0DEE_000F, FaultConfig::none());
+        let disk = sim.disk();
+        store_witnesses(&disk, &["127.0.0.1:7001".to_string()]).unwrap(); // gen 0 -> slot 0
+        store_witnesses(&disk, &["127.0.0.1:7002".to_string()]).unwrap(); // gen 1 -> slot 1
+        assert_eq!(
+            load_witnesses(&disk).unwrap(),
+            vec!["127.0.0.1:7002".to_string()],
+            "sanity: slot 1 must be the live generation before both are corrupted"
+        );
+
+        for slot in [0u8, 1u8] {
+            let file = disk.open(&witness_path(slot)).unwrap();
+            let bytes = b"\xff\xfe\n0000";
+            file.write_at(0, bytes).unwrap();
+            file.set_len(bytes.len() as u64).unwrap();
+            file.sync().unwrap();
+        }
+
+        let err = load_witnesses(&disk)
+            .expect_err("two independently corrupt slots must never resolve to empty");
+        assert_eq!(
+            err.to_string(),
+            "witness file failed its integrity check (witnesses.0: not valid UTF-8; \
+             witnesses.1: not valid UTF-8) — a torn write or corruption; the safe repair is to \
+             delete BOTH \"witnesses.0\" and \"witnesses.1\" ONLY if you are certain no \
+             follower of this node was ever promoted, since an empty witness set lets this \
+             node resume as a primary unchecked"
+        );
+    }
+
+    // Task 1b, evidence item 3: the unit-level torn-overwrite sweep, in the
+    // shape `.horizon` got (`breadcrumb_write_is_crash_safe_the_old_checkpoint_
+    // stays_protected`, transactions.rs). Slot 0 lands a clean gen-0 witness
+    // BEFORE any fault injection begins; a SECOND store (gen 1, slot 1) is
+    // then interrupted at every possible disk op via `crash_disk_after`,
+    // with `crash_torn: 1.0` so every surviving pending op is a genuine
+    // partial write. A single `store_witnesses` call for this scenario
+    // costs exactly 10 disk ops (read slot 0: list+open+len+read_at = 4;
+    // read slot 1 absent: list = 1; write slot 1: open+write_at+set_len+
+    // sync+sync_dir = 5). Content becomes durable at op index 8 (`sync`) —
+    // a crash at op index 9 (`sync_dir`, the LAST op) fires only after that
+    // `sync` already committed the new generation, so it does not tear
+    // content (`FaultConfig::none()`'s `dir_entry_loss: 0.0` here means the
+    // directory entry for a freshly-created file is unconditionally kept
+    // regardless of `sync_dir`'s own fate). So indices 0..=8 (9 crash
+    // points) are the ones that can interrupt BEFORE content durably
+    // lands — asserted below so a future refactor that changes the op
+    // count, or the point content becomes durable, fails loudly here
+    // rather than silently exercising fewer interruption points than
+    // intended.
+    #[test]
+    fn a_torn_overwrite_preserves_the_prior_valid_witness() {
+        let crash_cfg = FaultConfig {
+            crash_torn: 1.0,
+            ..FaultConfig::none()
+        };
+        let old = vec!["127.0.0.1:7001".to_string()];
+        let new = vec!["127.0.0.1:7001".to_string(), "127.0.0.1:7002".to_string()];
+        const OPS_BEFORE_CONTENT_IS_DURABLE: u64 = 9; // op indices 0..=8; index 8 is `sync`
+        for crash_after in 0..OPS_BEFORE_CONTENT_IS_DURABLE {
+            let sim = Sim::with_faults(0x0DEE_000D, crash_cfg.clone());
+            let disk = sim.disk();
+            store_witnesses(&disk, &old).unwrap(); // gen 0 -> slot 0, durable before the sweep
+
+            sim.crash_disk_after(crash_after);
+            let result = store_witnesses(&disk, &new); // gen 1 -> slot 1, interrupted
+            assert!(
+                result.is_err(),
+                "crash_after={crash_after}: expected the crash to interrupt this call before \
+                 its content-durable op (index {OPS_BEFORE_CONTENT_IS_DURABLE}) — got Ok, so \
+                 the op-count assumption above needs revisiting"
+            );
+            sim.restart();
+
+            let got = load_witnesses(&disk).unwrap_or_else(|e| {
+                panic!(
+                    "crash_after={crash_after}: a torn overwrite must never surface as a hard \
+                     error over an untouched valid predecessor: {e}"
+                )
+            });
+            assert_eq!(
+                got, old,
+                "crash_after={crash_after}: a torn overwrite must leave the PREVIOUS valid \
+                 witness set readable, never empty and never the (possibly torn) new one"
             );
         }
     }
