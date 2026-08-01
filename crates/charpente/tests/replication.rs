@@ -4485,9 +4485,11 @@ struct FlakyWitnessDisk {
 impl Disk for FlakyWitnessDisk {
     fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
         let file = self.inner.open(path)?;
-        // Slot 0 specifically: this test's node ships to exactly one
-        // follower, so its one-and-only witness write is always the
-        // FIRST-EVER store, which always targets slot 0 (task 1b).
+        // Slot 0 specifically: `Repl::open` establishes slot 0 at generation
+        // 0 and slot 1 at generation 1 (fix round 1, §2), so the first REAL
+        // witness write targets slot 0 — the slot not holding the max valid
+        // generation. This test's node ships to exactly one follower, so
+        // that is its one-and-only witness write.
         if path == charpente::repl::witnesses::witness_path(0) {
             Ok(Box::new(FlakyFile {
                 inner: file,
@@ -4571,7 +4573,11 @@ fn a_failed_witness_write_is_retried_not_silently_dropped() {
 
     let mut pdb =
         Db::open(Box::new(ph.disk()), DbConfig::default(), make_schema()).expect("primary db");
-    let fail_remaining = Arc::new(AtomicU32::new(1));
+    // Armed AFTER `Repl::open`, not before (fix round 1, §2): open now
+    // ESTABLISHES both witness slots, so a fault armed here would be spent
+    // on initialization instead of on the first real witness write, which is
+    // the write this test exists to interrupt.
+    let fail_remaining = Arc::new(AtomicU32::new(0));
     let flaky = FlakyWitnessDisk {
         inner: Box::new(ph.disk()),
         fail_remaining: fail_remaining.clone(),
@@ -4583,6 +4589,7 @@ fn a_failed_witness_write_is_retried_not_silently_dropped() {
         &mut pdb,
     )
     .expect("primary repl");
+    fail_remaining.store(1, Ordering::SeqCst);
 
     let mut fdb =
         Db::open(Box::new(fh.disk()), DbConfig::default(), make_schema()).expect("follower db");
@@ -4867,6 +4874,178 @@ fn a_long_invalid_listen_address_is_truncated_in_the_refusal() {
              refused rather than shipped-but-unrecorded"
         ),
         "the truncated refusal's exact shape must be pinned (hard rule 5)"
+    );
+}
+
+const WITNESS_INIT_ORDERING_SEED: u64 = 0x2EB1_0109;
+
+/// Fix round 1, §2 evidence item 3 — the ORDERING the whole soundness
+/// argument rests on, pinned rather than left as prose.
+///
+/// `open_witnesses` reads "a torn slot whose sibling is absent" as an empty
+/// set. That is sound only because the state is reachable *only before
+/// initialization completed*, and at that moment the true witness set is
+/// necessarily empty. What makes it "only before" is placement:
+/// initialization runs inside `Repl::open`, so it is finished before the
+/// caller holds a `Repl` at all — before `pump_io`, before `step`, before any
+/// Hello can be serviced and any frame can ship.
+///
+/// So this test drives NOTHING. It asserts the invariant at the instant
+/// `Repl::open` returns, which is the earliest instant any shipping could
+/// begin: both slots exist, and either one alone still answers, so the very
+/// first real witness write already has a predecessor to fall back to.
+#[test]
+fn both_witness_slots_are_established_before_any_frame_can_ship() {
+    for wreck in [0u8, 1u8] {
+        let sim = Sim::with_faults(WITNESS_INIT_ORDERING_SEED, FaultConfig::none());
+        let ph = sim.host("p");
+        let mut pdb =
+            Db::open(Box::new(ph.disk()), DbConfig::default(), make_schema()).expect("primary db");
+        let (prepl, _) = Repl::open(
+            Box::new(ph.net()),
+            Box::new(ph.disk()),
+            primary_cfg("p:1"),
+            &mut pdb,
+        )
+        .expect("primary repl");
+        assert_eq!(
+            prepl.stats().seeds,
+            0,
+            "sanity: this node has done no replication work yet"
+        );
+
+        let disk = ph.disk();
+        for slot in [0u8, 1u8] {
+            let path = charpente::repl::witnesses::witness_path(slot);
+            assert!(
+                disk.list(&path).unwrap().iter().any(|n| n == &path),
+                "slot {slot} must be established the instant Repl::open returns, before any \
+                 frame can ship"
+            );
+        }
+
+        let path = charpente::repl::witnesses::witness_path(wreck);
+        let file = disk.open(&path).unwrap();
+        file.write_at(0, b"\xff\xfe").unwrap();
+        file.sync().unwrap();
+        assert_eq!(
+            load_witnesses(&disk).unwrap(),
+            Vec::<String>::new(),
+            "with slot {wreck} destroyed the surviving slot must still answer — before this \
+             task, a torn first-ever witness write had no sibling and hard-errored, bricking \
+             node startup on every role"
+        );
+    }
+}
+
+const OVERLONG_LISTEN_SEED: u64 = 0x2EB1_0108;
+
+/// Minor #3 (fix round 1): the LENGTH rule had no trust-boundary pin. The
+/// three refusal tests above all carry addresses that are already invalid
+/// for whitespace or emptiness, so they pin the refusal's new *text* without
+/// ever exercising the new *rule* at the wire — and the length rule is the
+/// one that arrived latest, on the peer-supplied path `MAX_WITNESS_ADDRESS_-
+/// BYTES` exists for. This Hello's `listen` is otherwise perfectly
+/// well-formed: no whitespace, non-empty, a plausible `host:port` shape. Only
+/// its length makes it unrecordable.
+#[test]
+fn a_hello_with_an_overlong_but_well_formed_listen_address_is_refused() {
+    let sim = Sim::with_faults(OVERLONG_LISTEN_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let schema_digest = p.db.as_ref().unwrap().schema_digest();
+
+    // 301 bytes: whitespace-free, non-empty, `host:port`-shaped — invalid on
+    // length alone (the bound is 300).
+    let overlong = format!("{}:7001", "h".repeat(296));
+    assert_eq!(overlong.len(), 301);
+
+    let conn = sim
+        .host("c-overlong")
+        .net()
+        .connect("p:1")
+        .expect("connect to the primary's listener");
+    conn.send(&encode(&Msg::Hello {
+        proto: PROTO_VERSION,
+        listen: Some(overlong.clone()),
+        position: None,
+        secret: None,
+        schema_digest,
+    }))
+    .unwrap();
+
+    let mut buf = vec![0u8; MAX_MESSAGE_BYTES];
+    let mut reply = None;
+    for _ in 0..64 {
+        drive_rounds(&sim, &mut [&mut p], 1).unwrap();
+        match conn.recv(&mut buf) {
+            Ok(Some(n)) => {
+                reply = Some(decode(&buf[..n]).unwrap());
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => panic!("conn recv failed: {e}"),
+        }
+    }
+    let Some(Msg::Refuse { message }) = reply else {
+        panic!("expected a Refuse reply for an over-length listen address, got {reply:?}");
+    };
+    let expected_shown = format!("{}...", &overlong[..200]);
+    assert_eq!(
+        message,
+        format!(
+            "Hello listen address {expected_shown:?} is invalid — a witness address must be \
+             non-empty, at most 300 bytes, and must not contain ASCII whitespace (space, tab, \
+             CR, or LF); this node cannot durably record it as a witness, so the connection is \
+             refused rather than shipped-but-unrecorded"
+        )
+    );
+    assert_eq!(
+        load_witnesses(&p.host.disk()).unwrap(),
+        Vec::<String>::new(),
+        "an over-length address must never reach the witness set"
+    );
+
+    // The boundary is a MAX, not a stricter cutoff: exactly 300 bytes is
+    // served, so the refusal cannot be passing for an off-by-one reason.
+    let at_bound = format!("{}:7001", "h".repeat(295));
+    assert_eq!(at_bound.len(), 300);
+    let conn_ok = sim
+        .host("c-at-bound")
+        .net()
+        .connect("p:1")
+        .expect("connect to the primary's listener");
+    conn_ok
+        .send(&encode(&Msg::Hello {
+            proto: PROTO_VERSION,
+            listen: Some(at_bound.clone()),
+            position: None,
+            secret: None,
+            schema_digest,
+        }))
+        .unwrap();
+    let mut reply_ok = None;
+    for _ in 0..64 {
+        drive_rounds(&sim, &mut [&mut p], 1).unwrap();
+        match conn_ok.recv(&mut buf) {
+            Ok(Some(n)) => {
+                reply_ok = Some(decode(&buf[..n]).unwrap());
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => panic!("conn recv failed: {e}"),
+        }
+    }
+    assert!(
+        matches!(
+            reply_ok,
+            Some(Msg::Frames { .. } | Msg::Heartbeat { .. } | Msg::SnapshotStart { .. })
+        ),
+        "a Hello at exactly the length bound must be served, not refused — got {reply_ok:?}"
+    );
+    assert_eq!(
+        load_witnesses(&p.host.disk()).unwrap(),
+        vec![at_bound],
+        "the served peer must be recorded as a witness"
     );
 }
 

@@ -25,7 +25,14 @@
 //! <crc32 hex>`. Generation is a `u64`, monotonically increasing on every
 //! store — it is what "newer" means for a witness set (there is no natural
 //! ordering on the addresses themselves the way `applied_seq` orders
-//! horizons). `store_witnesses` always writes the slot that does NOT
+//! horizons). **The CRC covers everything except itself** — body, the
+//! separating newline, generation and count (fix round 1, I-2). The
+//! generation is the field that decides which slot wins, so leaving it
+//! outside the checksum let one ASCII-digit bit flip either hand back the
+//! older, SHORTER set with no error at all, or tie the two slots. The count
+//! is still cross-checked against the parsed address count, and that check
+//! is not redundant with the CRC: it is what catches an adversary who CAN
+//! recompute the CRC. `store_witnesses` always writes the slot that does NOT
 //! currently hold the max valid generation, so a torn write can never touch
 //! the other slot's already-durable, still-valid bytes (verified against the
 //! sim's crash model, `charpente-sim/src/disk.rs`: tearing operates on one
@@ -37,17 +44,38 @@
 //! If NEITHER slot verifies (and at least one is present and non-empty —
 //! i.e. not simply "never written"), that is still the named hard error:
 //! this node then has no information about its witnesses, and guessing
-//! "empty" is exactly the unsafe direction the CRC exists to prevent. A torn
-//! FIRST-EVER write (the other slot never having existed at all) is
-//! deliberately NOT special-cased into a silent empty fallback either — a
-//! present, non-empty, failing slot cannot be distinguished, from the file
-//! alone, from at-rest corruption of a slot that once held a real witness
-//! (media bit rot, tampering) while its sibling was never needed. Losing
-//! that information silently would be exactly what the CRC exists to catch.
-//! So the residual "no rescue available" bucket is expected to fall close to
-//! (not provably to exactly) zero: it now only catches genuine two-copy
-//! corruption and the structurally-unavoidable case of a first-ever write
-//! that both crashed AND has no predecessor to fall back to.
+//! "empty" is exactly the unsafe direction the CRC exists to prevent.
+//!
+//! **Both slots are established at `Repl::open`, before any real content is
+//! ever written** (fix round 1, I-3 + Noah ruling 1, 2026-08-01).
+//! `open_witnesses` is the startup entry point: it resolves the set and then
+//! stores it until BOTH slots hold a valid copy — on a fresh data dir, two
+//! ~12-byte empty-set writes, once per data-dir lifetime. The invariant that
+//! buys, and everything below follows from it: **after `Repl::open` returns
+//! `Ok`, both slots are present and valid.**
+//!
+//! That is what makes the last combination — a torn slot whose sibling is
+//! ABSENT — safe to read as "empty", which it was NOT before. Initialization
+//! runs at `Repl::open`, strictly before any Hello is serviced or any frame
+//! ships, so `(Torn, Absent)` is reachable only before initialization
+//! completed, and at that moment the true witness set is necessarily empty;
+//! writing over the torn slot there is self-healing, not lossy. After
+//! initialization a sole surviving valid copy never has an absent sibling —
+//! nothing in this crate ever removes a witness file, and a slot's directory
+//! entry is barriered by `sync_dir` before its store returns — so the way
+//! back into that state is corruption of BOTH copies, which is the two-copy
+//! class above and still hard-errors. Kept deliberately narrow: the
+//! permissive reading lives ONLY in `open_witnesses`, the one caller that
+//! establishes its own premise; `load_witnesses` still hard-errors on it.
+//!
+//! The honest residual, stated because that inference is a protocol
+//! invariant and not evidence in the bytes: if something outside this module
+//! deletes exactly ONE slot file while the other is corrupt, this node reads
+//! an empty set and resumes unchecked. **Any future code that removes a
+//! witness file must remove BOTH slots or neither** — the constraint the
+//! code itself cannot express. (`Seeder::new` removes the store, the
+//! `.horizon` breadcrumb and `wal/*`, and deliberately not these; see the
+//! task 1 review's M-5.)
 
 use std::io;
 
@@ -61,9 +89,14 @@ pub fn witness_path(slot: u8) -> String {
     format!("witnesses.{slot}")
 }
 
-fn body_crc(body: &str) -> u32 {
+/// The CRC over everything a slot file holds except the checksum field
+/// itself — `"<addr>\n…\n<gen> <count>"` (fix round 1, I-2). Covering the
+/// generation is the point: it is the field `load_witnesses` uses to pick a
+/// winner, and outside the checksum a single ASCII-digit flip could silently
+/// promote the older, shorter set.
+fn covered_crc(covered: &str) -> u32 {
     let mut crc = Crc32::new();
-    crc.update(body.as_bytes());
+    crc.update(covered.as_bytes());
     crc.finish()
 }
 
@@ -130,6 +163,51 @@ fn corrupt_witness_error(reason_0: &str, reason_1: &str) -> io::Error {
     )
 }
 
+/// Fix round 1, Noah ruling 3 (2026-08-01): a named hard error, not the
+/// `assert_ne!` this replaced. Two slots validating at one generation cannot
+/// arise from `store_witnesses` — it always advances past the max valid
+/// generation it observed — so the reachable trigger is disk corruption,
+/// which this module explicitly expects and exists to detect (its doc above
+/// names bit rot and tampering as design inputs). That puts it under hard
+/// rule 5, not hard rule 4's negative space. Direct precedent: `Store::open`
+/// converts open-time panics into open failures (2026-07-05, DESIGN §4);
+/// `Repl::open` reads this set unconditionally before any role branching, so
+/// a panic here bricks the node on EVERY role — the same shape one layer up.
+/// Shares `corrupt_witness_error`'s leading phrase so the harness classifiers
+/// that route witness-integrity failures see this one too.
+fn duplicate_generation_error(generation: u64) -> io::Error {
+    let (p0, p1) = (witness_path(0), witness_path(1));
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "witness file failed its integrity check (\"{p0}\" and \"{p1}\" both validate at \
+             generation {generation}) — store_witnesses always advances past the max valid \
+             generation it observed, so two slots can never legitimately share one; this is \
+             corruption whose checksums happened to survive. The safe repair is to delete BOTH \
+             \"{p0}\" and \"{p1}\" ONLY if you are certain no follower of this node was ever \
+             promoted, since an empty witness set lets this node resume as a primary unchecked"
+        ),
+    )
+}
+
+/// Fix round 1, I-2 (secondary): the generation counter is a `u64` bumped
+/// once per witness-set change, so reaching this needs a corrupted
+/// generation field that still passes the CRC. Named rather than left to
+/// wrap in release — see the guard in `store_witnesses`.
+fn generation_overflow_error() -> io::Error {
+    let (p0, p1) = (witness_path(0), witness_path(1));
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "witness file generation counter is at u64::MAX and cannot advance — one witness \
+             set change per generation could not reach this, so a slot's generation field is \
+             corrupt despite a matching checksum. The safe repair is to delete BOTH \"{p0}\" \
+             and \"{p1}\" ONLY if you are certain no follower of this node was ever promoted, \
+             since an empty witness set lets this node resume as a primary unchecked"
+        ),
+    )
+}
+
 /// One witness slot's state, read fresh from disk.
 #[derive(Debug)]
 enum SlotState {
@@ -140,9 +218,11 @@ enum SlotState {
     /// Parsed, CRC-checked, and count-checked clean.
     Valid { generation: u64, addrs: Vec<String> },
     /// Present, non-empty, and fails one of the integrity checks — the
-    /// named reason, matching the single-file design's original arms
-    /// ("not valid UTF-8", "missing the crc line", "crc mismatch", "count
-    /// mismatch").
+    /// named reason ("not valid UTF-8", "malformed trailer", "unparseable
+    /// generation or count", "crc mismatch", "count mismatch"). Fix round 1,
+    /// Minor #1: the first three were one string ("missing the crc line")
+    /// covering three distinct malformations, two of which HAVE a crc line —
+    /// an operator-facing reason that was simply wrong (hard rule 5).
     Torn(&'static str),
 }
 
@@ -162,6 +242,10 @@ fn read_witness_slot(disk: &dyn Disk, slot: u8) -> io::Result<SlotState> {
     // first `write_at` never landed (a real IO failure, or a crash before
     // any bytes land) — unambiguous, not a torn set. `store_witnesses` never
     // PRODUCES a 0-byte file: even the empty set writes a non-empty trailer.
+    // SCOPED TO LENGTH 0 ONLY, and it must stay that way: a genuinely torn
+    // NON-empty file still falls through to the named hard error below.
+    // Widening this to "short files" would swallow exactly the tears the
+    // checksum exists to catch.
     if len == 0 {
         return Ok(SlotState::Empty);
     }
@@ -171,18 +255,23 @@ fn read_witness_slot(disk: &dyn Disk, slot: u8) -> io::Result<SlotState> {
         Ok(t) => t,
         Err(_) => return Ok(SlotState::Torn("not valid UTF-8")),
     };
-    let Some((body, trailer)) = text.rsplit_once('\n') else {
-        return Ok(SlotState::Torn("missing the crc line"));
+    // The checksum field is the tail after the LAST space; everything before
+    // it is what the checksum covers. Addresses are validated whitespace-free
+    // (`valid_witness_address`), so the only two spaces in a well-formed file
+    // are the trailer's own separators.
+    let Some((covered, crc_str)) = text.rsplit_once(' ') else {
+        return Ok(SlotState::Torn("malformed trailer"));
     };
-    let fields: Vec<&str> = trailer.split(' ').collect();
-    let (gen_str, n_str, crc_str) = match fields[..] {
-        [g, n, c] => (g, n, c),
-        _ => return Ok(SlotState::Torn("missing the crc line")),
+    let Some((body, counts)) = covered.rsplit_once('\n') else {
+        return Ok(SlotState::Torn("malformed trailer"));
+    };
+    let Some((gen_str, n_str)) = counts.split_once(' ') else {
+        return Ok(SlotState::Torn("malformed trailer"));
     };
     let (Ok(generation), Ok(n)) = (gen_str.parse::<u64>(), n_str.parse::<usize>()) else {
-        return Ok(SlotState::Torn("missing the crc line"));
+        return Ok(SlotState::Torn("unparseable generation or count"));
     };
-    if format!("{:08x}", body_crc(body)) != crc_str {
+    if format!("{:08x}", covered_crc(covered)) != crc_str {
         return Ok(SlotState::Torn("crc mismatch"));
     }
     let addrs: Vec<String> = body
@@ -201,7 +290,7 @@ fn slot_reason(s: &SlotState) -> &'static str {
         SlotState::Empty => "absent",
         SlotState::Torn(r) => r,
         SlotState::Valid { .. } => {
-            unreachable!("load_witnesses never asks for a reason on a valid slot")
+            unreachable!("resolve never asks for a reason on a valid slot")
         }
     }
 }
@@ -224,6 +313,24 @@ pub fn store_witnesses(disk: &dyn Disk, addrs: &[String]) -> io::Result<()> {
     };
     let a = read_witness_slot(disk, 0)?;
     let b = read_witness_slot(disk, 1)?;
+    // Fix round 1, I-2 (secondary): every arm below increments the MAX valid
+    // generation observed — arm by arm, the value being `+ 1`-ed is the max
+    // in that arm — so guarding the max once here covers all five. The
+    // workspace sets no `overflow-checks` override (the root `Cargo.toml`
+    // overrides only redb's `debug-assertions`/`opt-level`), so an unguarded
+    // wrap in release would silently mint a generation BELOW its sibling and
+    // hand back the older set forever. Near-unreachable now that the CRC
+    // covers the generation, which is why it is a cheap explicit guard.
+    if [gen_of(&a), gen_of(&b)].into_iter().flatten().max() == Some(u64::MAX) {
+        return Err(generation_overflow_error());
+    }
+    // NOTE (fix round 1, Minor #5): `(None, None)` here silently RECOVERS
+    // from a both-corrupt state by writing generation 0 into slot 0, while
+    // `load_witnesses` hard-errors on it. Unreachable today — `Repl::open`
+    // loads before it ever stores, and fails there — and deliberately left
+    // as-is rather than made to agree: a caller that has already decided the
+    // set (`open_witnesses`) wants exactly this self-healing write. Recorded
+    // so the divergence is not later mistaken for an oversight.
     let (generation, target): (u64, u8) = match (gen_of(&a), gen_of(&b)) {
         (None, None) => (0, 0),
         (Some(ga), None) => (ga + 1, 1),
@@ -232,11 +339,8 @@ pub fn store_witnesses(disk: &dyn Disk, addrs: &[String]) -> io::Result<()> {
         (Some(_), Some(gb)) => (gb + 1, 0),
     };
     let body = addrs.join("\n");
-    let content = format!(
-        "{body}\n{generation} {} {:08x}",
-        addrs.len(),
-        body_crc(&body)
-    );
+    let covered = format!("{body}\n{generation} {}", addrs.len());
+    let content = format!("{covered} {:08x}", covered_crc(&covered));
     let bytes = content.as_bytes();
     let path = witness_path(target);
     let file = disk.open(&path)?;
@@ -260,9 +364,26 @@ pub fn store_witnesses(disk: &dyn Disk, addrs: &[String]) -> io::Result<()> {
 /// is exactly the unsafe direction the CRC exists to prevent (this is
 /// unchanged from the single-file design's contract; only the slot count
 /// changed).
+///
+/// **Node startup calls `open_witnesses`, not this.** This one is the
+/// unvarnished reader: it reports what the bytes say and nothing more, and it
+/// hard-errors on a torn slot with an absent sibling. `open_witnesses` is
+/// entitled to read that combination as empty, and earns the entitlement by
+/// establishing both slots — a caller that has not done that must not inherit
+/// the reading.
 pub fn load_witnesses(disk: &dyn Disk) -> io::Result<Vec<String>> {
     let a = read_witness_slot(disk, 0)?;
     let b = read_witness_slot(disk, 1)?;
+    resolve(a, b, false)
+}
+
+/// Resolves both slots into the witness set. `establishing` is true only for
+/// `open_witnesses`, and selects the ONE extra arm it is entitled to: a torn
+/// slot whose sibling is absent reads as empty. That arm is sound only
+/// because `open_witnesses` is about to make it unreachable — see the module
+/// doc's invariant — which is exactly why it is a parameter here instead of
+/// a property of the parser, where every caller would inherit it.
+fn resolve(a: SlotState, b: SlotState, establishing: bool) -> io::Result<Vec<String>> {
     match (a, b) {
         (
             SlotState::Valid {
@@ -274,17 +395,57 @@ pub fn load_witnesses(disk: &dyn Disk) -> io::Result<Vec<String>> {
                 addrs: ab,
             },
         ) => {
-            assert_ne!(
-                ga, gb,
-                "two witness slots must never validate at the same generation — store_witnesses \
-                 always advances past the max valid generation it observed"
-            );
+            if ga == gb {
+                return Err(duplicate_generation_error(ga));
+            }
             Ok(if ga > gb { aa } else { ab })
         }
         (SlotState::Valid { addrs, .. }, _) | (_, SlotState::Valid { addrs, .. }) => Ok(addrs),
         (SlotState::Empty, SlotState::Empty) => Ok(Vec::new()),
+        (SlotState::Torn(_), SlotState::Empty) | (SlotState::Empty, SlotState::Torn(_))
+            if establishing =>
+        {
+            Ok(Vec::new())
+        }
         (a, b) => Err(corrupt_witness_error(slot_reason(&a), slot_reason(&b))),
     }
+}
+
+/// The startup entry point (`Repl::open`): resolves the witness set AND
+/// establishes the two-valid-copies invariant before returning — after this
+/// returns `Ok`, both slots are present and valid.
+///
+/// The store count is exact, not a retry loop: `store_witnesses` always
+/// targets the slot NOT holding the max valid generation, so one store makes
+/// an invalid slot valid without disturbing a valid one. Zero valid slots
+/// therefore need two stores (the first lands slot 0 at generation 0, the
+/// second slot 1 at generation 1), one valid slot needs one, two need none.
+/// Zero-valid is only ever reached with an empty resolved set — the other
+/// zero-valid combination, both slots torn, is the two-copy hard error and
+/// never gets here.
+///
+/// On a fresh data dir this is the whole of the initialization the module
+/// doc's argument rests on: two ~12-byte empty-set writes, once per data-dir
+/// lifetime, strictly before any Hello is serviced or any frame ships.
+///
+/// The postcondition is pinned by test, not by an `assert!` here: re-reading
+/// both slots to check it would cost two disk ops on every start, and a
+/// failing assertion would panic inside `Repl::open` — the exact shape ruling
+/// 3 just converted away from. See `open_repairs_every_startup_state_and_-
+/// refuses_only_two_copy_corruption` below and, at the integration level,
+/// `both_witness_slots_are_established_before_any_frame_can_ship`.
+pub fn open_witnesses(disk: &dyn Disk) -> io::Result<Vec<String>> {
+    let a = read_witness_slot(disk, 0)?;
+    let b = read_witness_slot(disk, 1)?;
+    let valid = [&a, &b]
+        .into_iter()
+        .filter(|s| matches!(s, SlotState::Valid { .. }))
+        .count();
+    let set = resolve(a, b, true)?;
+    for _ in valid..2 {
+        store_witnesses(disk, &set)?;
+    }
+    Ok(set)
 }
 
 /// Clears the witness set (stores empty) — after a probe confirms none of
@@ -356,31 +517,29 @@ mod tests {
     // the reviewer's example: ["10.0.0.1:7001", "ce6f4d26host.internal:7002"]
     // cut to 22 bytes, since "ce6f4d26" == crc32("10.0.0.1:7001")).
     //
-    // AMENDED AGAIN (task 1b): the trailer gained a leading generation
-    // field (`<gen> <n> <crc32 hex>`) and the format split into two files
-    // (`witness_path(0)`/`witness_path(1)`). This test's own reasoning is
-    // untouched: with content "127.0.0.1:7001\n127.0.0.1:7002\n0 2 <8 hex>",
-    // the ONLY byte in the whole file that is ever a space is inside the
-    // trailer — no address can contain one — so a truncation that drops a
-    // trailing address still can never coincidentally leave behind a
-    // space-shaped trailer.
+    // AMENDED AGAIN (task 1b, then fix round 1): the format split into two
+    // files (`witness_path(0)`/`witness_path(1)`), the trailer gained a
+    // leading generation field, and the crc now covers everything before
+    // itself — so the shipped content here is
+    // "127.0.0.1:7001\n127.0.0.1:7002\n0 2 <8 hex>" and the checksummed
+    // prefix is "127.0.0.1:7001\n127.0.0.1:7002\n0 2".
     //
-    // A consequence of validating addresses whitespace-free: with content
-    // "127.0.0.1:7001\n127.0.0.1:7002\n2 <8 hex>", the ONLY byte in the
-    // whole file that is ever a space is the one real trailer's separator —
-    // no address can contain one. So any truncation that drops a trailing
-    // address (landing inside the second address, before the real trailer)
-    // can NEVER coincidentally leave behind a space-shaped "<n> <crc>"
-    // trailer; it is structurally caught by the missing-crc-line arm, not
+    // A consequence of validating addresses whitespace-free: the ONLY spaces
+    // in the whole file are the trailer's own two separators — no address can
+    // contain one. So any truncation that drops a trailing address (landing
+    // inside the second address, before the real trailer) can NEVER
+    // coincidentally leave behind a space-shaped "<gen> <n> <crc>" trailer;
+    // it is structurally caught by the malformed-trailer arm, not
     // crc-mismatch. Reaching crc-mismatch (or count-mismatch) now requires a
     // corruption that preserves the trailer's shape — a length-preserving
     // bit flip, or a hand-crafted count — which is exactly what the two
     // tests after this one exercise. This unreachability is scoped to
     // truncations that SHORTEN the address set: a tear landing INSIDE the
-    // trailer itself still reaches crc-mismatch — cutting "a\nb\n2 <crc>"
-    // to "a\nb\n2 dead" leaves a parseable trailer whose count is right and
-    // whose crc is wrong — so the arm is unreachable-by-address-dropping-
-    // truncation, not unreachable in general; don't simplify it away.
+    // trailer itself still reaches crc-mismatch — cutting "a\nb\n0 2 <crc>"
+    // to "a\nb\n0 2 dead" leaves a parseable trailer whose generation and
+    // count are right and whose crc is wrong — so the arm is
+    // unreachable-by-address-dropping-truncation, not unreachable in
+    // general; don't simplify it away.
     //
     // This test's `store_witnesses` call is this disk's FIRST-EVER witness
     // write, so it lands entirely in slot 0 and slot 1 stays absent; the
@@ -419,7 +578,7 @@ mod tests {
             .expect_err("a tear that drops an address must not silently succeed");
         assert_eq!(
             err.to_string(),
-            "witness file failed its integrity check (witnesses.0: missing the crc line; \
+            "witness file failed its integrity check (witnesses.0: malformed trailer; \
              witnesses.1: absent) — a torn write or corruption; the safe repair is to delete \
              BOTH \"witnesses.0\" and \"witnesses.1\" ONLY if you are certain no follower of \
              this node was ever promoted, since an empty witness set lets this node resume as \
@@ -428,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unparseable_tear_names_the_missing_crc_line() {
+    fn an_unparseable_tear_names_a_malformed_trailer() {
         let sim = Sim::with_faults(0x0DEE_0006, FaultConfig::none());
         let disk = sim.disk();
         store_witnesses(&disk, &["127.0.0.1:7001".to_string()]).unwrap();
@@ -437,9 +596,8 @@ mod tests {
         file.sync().unwrap();
         let err = load_witnesses(&disk).expect_err("a tear with no newline must fail by name");
         assert!(
-            err.to_string()
-                .contains("witnesses.0: missing the crc line"),
-            "expected the missing-line arm, got: {err}"
+            err.to_string().contains("witnesses.0: malformed trailer"),
+            "expected the malformed-trailer arm, got: {err}"
         );
     }
 
@@ -469,16 +627,22 @@ mod tests {
         );
     }
 
-    // A crc that matches the real body (the crc does not cover `n`) paired
-    // with a wrong count proves the count check is load-bearing on its own,
-    // not merely redundant with the crc.
+    // The count check is load-bearing on its own, not merely redundant with
+    // the crc. AMENDED (fix round 1, I-2): now that the crc covers the count
+    // too, the forged file must carry a crc recomputed OVER the forged count
+    // — which is precisely the adversary the count check exists for (one who
+    // CAN recompute the checksum: peer-chosen address bytes are the material
+    // for that). The forgery is crc-VALID here; only the cross-check against
+    // the parsed address count catches it. Weakening this to a crc-only
+    // failure would delete the reason the count field exists.
     #[test]
     fn a_count_mismatch_is_caught_by_name() {
         let sim = Sim::with_faults(0x0DEE_0008, FaultConfig::none());
         let disk = sim.disk();
         let addrs = ["127.0.0.1:7001".to_string(), "127.0.0.1:7002".to_string()];
         let body = addrs.join("\n");
-        let corrupted = format!("{body}\n0 {} {:08x}", addrs.len() + 1, body_crc(&body));
+        let covered = format!("{body}\n0 {}", addrs.len() + 1); // count deliberately wrong
+        let corrupted = format!("{covered} {:08x}", covered_crc(&covered));
         let file = disk.open(&witness_path(0)).unwrap();
         file.write_at(0, corrupted.as_bytes()).unwrap();
         file.set_len(corrupted.len() as u64).unwrap();
@@ -589,36 +753,89 @@ mod tests {
         assert_eq!(load_witnesses(&disk).unwrap(), vec![exactly_at_bound]);
     }
 
+    /// Both slots' raw bytes, `None` for a slot that does not exist yet.
+    fn slot_bytes(disk: &dyn Disk) -> [Option<Vec<u8>>; 2] {
+        [0u8, 1u8].map(|slot| {
+            let path = witness_path(slot);
+            if !disk.list(&path).unwrap().iter().any(|n| n == &path) {
+                return None;
+            }
+            let file = disk.open(&path).unwrap();
+            let mut buf = vec![0u8; file.len().unwrap() as usize];
+            file.read_at(0, &mut buf).unwrap();
+            Some(buf)
+        })
+    }
+
     // Task 1b, evidence item 5: generation, not address-set length, decides
     // which slot wins — a torn overwrite that happens to leave the OLDER
     // slot holding a LONGER set must never be mistaken for "newer".
+    //
+    // FIX ROUND 1, I-1: this test now also pins the write TARGET, because
+    // target selection was otherwise unpinned in the `(Some, Some)` case and
+    // a mutation to `(Some(_), Some(gb)) => (gb + 1, 1)` — overwriting the
+    // MAX-generation slot whenever slot 1 is the newer of two valid slots —
+    // passed all 16 witness tests green. Under that mutation slot 0 freezes
+    // at generation 0 forever, and two things follow: the fallback stops
+    // being exactly one generation behind (so it drops witnesses this node
+    // HAS shipped to — the dual-primary gap, reopened silently), and the
+    // next store after a tear targets the frozen slot, so a second tear
+    // destroys the only valid copy. The sweep below pins the `(Some, None)`
+    // direction; only `(Some, Some)` needed this. Snapshot-and-compare, so
+    // the assertion is "exactly this slot changed", not "the load still
+    // looks right".
     #[test]
     fn generation_not_length_decides_the_newer_slot_across_alternation() {
         let sim = Sim::with_faults(0x0DEE_000E, FaultConfig::none());
         let disk = sim.disk();
 
+        let expect_only =
+            |before: &[Option<Vec<u8>>; 2], after: &[Option<Vec<u8>>; 2], hit: usize| {
+                let miss = 1 - hit;
+                assert_ne!(
+                    before[hit], after[hit],
+                    "the store was supposed to land in slot {hit}, and that slot's bytes did not \
+                 change"
+                );
+                assert_eq!(
+                    before[miss], after[miss],
+                    "the store landed in slot {miss} as well as (or instead of) slot {hit} — \
+                 store_witnesses must never touch the slot holding the max valid generation"
+                );
+            };
+
         // gen 0 -> slot 0, a long (3-address) set.
         let long = vec!["a:1".to_string(), "b:2".to_string(), "c:3".to_string()];
+        let before = slot_bytes(&disk);
         store_witnesses(&disk, &long).unwrap();
+        expect_only(&before, &slot_bytes(&disk), 0);
         assert_eq!(load_witnesses(&disk).unwrap(), long);
 
         // gen 1 -> slot 1, a short (1-address) set — NOT a superset, so this
         // exercises a real shrink, not just an append.
         let short = vec!["x:9".to_string()];
+        let before = slot_bytes(&disk);
         store_witnesses(&disk, &short).unwrap();
+        expect_only(&before, &slot_bytes(&disk), 1);
         assert_eq!(
             load_witnesses(&disk).unwrap(),
             short,
             "the newer (shorter) generation must win over the older (longer) one"
         );
 
-        // gen 2 -> slot 0 again (round-robin), back to something long.
+        // gen 2 -> slot 0 again (round-robin), back to something long. This
+        // is the `(Some(0), Some(1))` arm — the one mutation C breaks.
         let long_again = vec!["p:1".to_string(), "q:2".to_string()];
+        let before = slot_bytes(&disk);
         store_witnesses(&disk, &long_again).unwrap();
+        expect_only(&before, &slot_bytes(&disk), 0);
         assert_eq!(load_witnesses(&disk).unwrap(), long_again);
 
-        // gen 3 -> slot 1, empty (a clear) — still newer, still wins.
+        // gen 3 -> slot 1, empty (a clear) — still newer, still wins. The
+        // `(Some(2), Some(1))` arm, i.e. the `ga >= gb` half.
+        let before = slot_bytes(&disk);
         clear_witnesses(&disk).unwrap();
+        expect_only(&before, &slot_bytes(&disk), 1);
         assert_eq!(load_witnesses(&disk).unwrap(), Vec::<String>::new());
     }
 
@@ -683,6 +900,11 @@ mod tests {
     // count, or the point content becomes durable, fails loudly here
     // rather than silently exercising fewer interruption points than
     // intended.
+    //
+    // FIX ROUND 1, Minor #4: the sweep ran on ONE seed, so `tear`'s
+    // `keep = rng.below(len)` was a single fixed draw at each crash point.
+    // An inner seed loop costs nothing and widens the torn shapes actually
+    // exercised.
     #[test]
     fn a_torn_overwrite_preserves_the_prior_valid_witness() {
         let crash_cfg = FaultConfig {
@@ -692,32 +914,221 @@ mod tests {
         let old = vec!["127.0.0.1:7001".to_string()];
         let new = vec!["127.0.0.1:7001".to_string(), "127.0.0.1:7002".to_string()];
         const OPS_BEFORE_CONTENT_IS_DURABLE: u64 = 9; // op indices 0..=8; index 8 is `sync`
-        for crash_after in 0..OPS_BEFORE_CONTENT_IS_DURABLE {
-            let sim = Sim::with_faults(0x0DEE_000D, crash_cfg.clone());
+        for seed in [
+            0x0DEE_000D_u64,
+            0x0DEE_0011,
+            0x0DEE_0012,
+            0x0DEE_0013,
+            0x0DEE_0014,
+        ] {
+            for crash_after in 0..OPS_BEFORE_CONTENT_IS_DURABLE {
+                let sim = Sim::with_faults(seed, crash_cfg.clone());
+                let disk = sim.disk();
+                store_witnesses(&disk, &old).unwrap(); // gen 0 -> slot 0, durable before the sweep
+
+                sim.crash_disk_after(crash_after);
+                let result = store_witnesses(&disk, &new); // gen 1 -> slot 1, interrupted
+                assert!(
+                    result.is_err(),
+                    "seed={seed:#x} crash_after={crash_after}: expected the crash to interrupt \
+                     this call before its content-durable op (index \
+                     {OPS_BEFORE_CONTENT_IS_DURABLE}) — got Ok, so the op-count assumption above \
+                     needs revisiting"
+                );
+                sim.restart();
+
+                let got = load_witnesses(&disk).unwrap_or_else(|e| {
+                    panic!(
+                        "seed={seed:#x} crash_after={crash_after}: a torn overwrite must never \
+                         surface as a hard error over an untouched valid predecessor: {e}"
+                    )
+                });
+                assert_eq!(
+                    got, old,
+                    "seed={seed:#x} crash_after={crash_after}: a torn overwrite must leave the \
+                     PREVIOUS valid witness set readable, never empty and never the (possibly \
+                     torn) new one"
+                );
+            }
+        }
+    }
+
+    // FIX ROUND 1, I-2. Both shapes the reviewer demonstrated on stock code
+    // with genuine single-bit ASCII-digit flips of a slot's GENERATION,
+    // body untouched. Before the crc covered the generation:
+    //   * `'0'`(0x30) -> `'2'`(0x32) in the OLDER slot promoted it, so
+    //     `load_witnesses` returned the older, SHORTER set with NO error —
+    //     verbatim the direction this module's first paragraph forbids;
+    //   * `'0'` -> `'1'` tied the siblings and fired the `assert_ne!`, a
+    //     panic inside `Repl::open` before any role branching.
+    // Both are now caught by name at the corrupted slot, and the surviving
+    // sibling answers.
+    #[test]
+    fn a_bit_flipped_generation_is_caught_by_the_crc_not_obeyed() {
+        for (flip_to, case) in [
+            (b'2', "promotes the older slot"),
+            (b'1', "ties the siblings"),
+        ] {
+            let sim = Sim::with_faults(0x0DEE_0015, FaultConfig::none());
             let disk = sim.disk();
-            store_witnesses(&disk, &old).unwrap(); // gen 0 -> slot 0, durable before the sweep
+            let old = vec!["a:1".to_string(), "b:2".to_string()];
+            let new = vec!["c:3".to_string()];
+            store_witnesses(&disk, &old).unwrap(); // gen 0 -> slot 0 (the LONGER set)
+            store_witnesses(&disk, &new).unwrap(); // gen 1 -> slot 1 (the live one)
 
-            sim.crash_disk_after(crash_after);
-            let result = store_witnesses(&disk, &new); // gen 1 -> slot 1, interrupted
-            assert!(
-                result.is_err(),
-                "crash_after={crash_after}: expected the crash to interrupt this call before \
-                 its content-durable op (index {OPS_BEFORE_CONTENT_IS_DURABLE}) — got Ok, so \
-                 the op-count assumption above needs revisiting"
-            );
-            sim.restart();
+            // Flip the single generation digit in slot 0's trailer. Its
+            // offset is the byte right after the last '\n'.
+            let file = disk.open(&witness_path(0)).unwrap();
+            let mut buf = vec![0u8; file.len().unwrap() as usize];
+            file.read_at(0, &mut buf).unwrap();
+            let gen_at = buf.iter().rposition(|b| *b == b'\n').unwrap() + 1;
+            assert_eq!(buf[gen_at], b'0', "{case}: expected slot 0 at generation 0");
+            file.write_at(gen_at as u64, &[flip_to]).unwrap();
+            file.sync().unwrap();
 
-            let got = load_witnesses(&disk).unwrap_or_else(|e| {
-                panic!(
-                    "crash_after={crash_after}: a torn overwrite must never surface as a hard \
-                     error over an untouched valid predecessor: {e}"
-                )
-            });
             assert_eq!(
-                got, old,
-                "crash_after={crash_after}: a torn overwrite must leave the PREVIOUS valid \
-                 witness set readable, never empty and never the (possibly torn) new one"
+                load_witnesses(&disk).unwrap(),
+                new,
+                "{case}: a corrupted generation must never decide the answer — the intact \
+                 sibling must win"
             );
         }
+    }
+
+    // FIX ROUND 1, Noah ruling 3: the former `assert_ne!` on two slots
+    // validating at one generation is a NAMED hard error. Its only reachable
+    // trigger is disk corruption, which this module expects and exists to
+    // detect, and `Repl::open` reads the set before any role branching — so a
+    // panic there bricked the node on every role. Constructed by hand: no
+    // sequence of `store_witnesses` calls can produce it.
+    #[test]
+    fn two_slots_at_one_generation_are_a_named_hard_error_not_a_panic() {
+        let sim = Sim::with_faults(0x0DEE_0016, FaultConfig::none());
+        let disk = sim.disk();
+        store_witnesses(&disk, &["a:1".to_string()]).unwrap(); // gen 0 -> slot 0
+        store_witnesses(&disk, &["b:2".to_string()]).unwrap(); // gen 1 -> slot 1
+
+        // Rewrite slot 1 at generation 0, checksum and count consistent —
+        // a corruption whose checksum happens to survive.
+        let covered = "b:2\n0 1".to_string();
+        let forged = format!("{covered} {:08x}", covered_crc(&covered));
+        let file = disk.open(&witness_path(1)).unwrap();
+        file.write_at(0, forged.as_bytes()).unwrap();
+        file.set_len(forged.len() as u64).unwrap();
+        file.sync().unwrap();
+
+        let err = load_witnesses(&disk)
+            .expect_err("two slots at one generation must fail by name, not panic");
+        assert_eq!(
+            err.to_string(),
+            "witness file failed its integrity check (\"witnesses.0\" and \"witnesses.1\" both \
+             validate at generation 0) — store_witnesses always advances past the max valid \
+             generation it observed, so two slots can never legitimately share one; this is \
+             corruption whose checksums happened to survive. The safe repair is to delete BOTH \
+             \"witnesses.0\" and \"witnesses.1\" ONLY if you are certain no follower of this \
+             node was ever promoted, since an empty witness set lets this node resume as a \
+             primary unchecked"
+        );
+    }
+
+    // FIX ROUND 1, §2 (Noah ruling 1): `open_witnesses` establishes two
+    // valid empty-set copies before any content is ever written, so the
+    // torn-FIRST-EVER-write residual — which `load_witnesses` alone cannot
+    // rescue, having no predecessor to fall back to — is closed.
+    #[test]
+    fn open_establishes_two_valid_copies_on_a_fresh_data_dir() {
+        let sim = Sim::with_faults(0x0DEE_0017, FaultConfig::none());
+        let disk = sim.disk();
+        assert_eq!(open_witnesses(&disk).unwrap(), Vec::<String>::new());
+
+        // The invariant, stated as the property it buys: EITHER slot alone
+        // now suffices, so the very first real witness write already has a
+        // predecessor to fall back to.
+        let [s0, s1] = slot_bytes(&disk);
+        let (s0, s1) = (s0.expect("slot 0 established"), s1.expect("slot 1"));
+        assert_ne!(s0, s1, "the two slots must hold distinct generations");
+
+        for wreck in [0u8, 1u8] {
+            let sim = Sim::with_faults(0x0DEE_0017, FaultConfig::none());
+            let disk = sim.disk();
+            open_witnesses(&disk).unwrap();
+            let file = disk.open(&witness_path(wreck)).unwrap();
+            file.write_at(0, b"\xff\xfe").unwrap();
+            file.sync().unwrap();
+            assert_eq!(
+                load_witnesses(&disk).unwrap(),
+                Vec::<String>::new(),
+                "with slot {wreck} destroyed the surviving slot must still answer, with no \
+                 hard error — that is the whole point of establishing both at open"
+            );
+        }
+    }
+
+    // The predicate, arm by arm: `open_witnesses` must leave BOTH slots
+    // valid from every startup state it accepts, and must still refuse the
+    // two-copy-corruption state. Also idempotent — a second open on an
+    // established dir writes nothing, so this costs two writes per data-dir
+    // lifetime, not two per start.
+    #[test]
+    fn open_repairs_every_startup_state_and_refuses_only_two_copy_corruption() {
+        let wreck = |disk: &dyn Disk, slot: u8| {
+            let file = disk.open(&witness_path(slot)).unwrap();
+            file.write_at(0, b"\xff\xfe").unwrap();
+            file.set_len(2).unwrap();
+            file.sync().unwrap();
+        };
+        let fresh = || {
+            let sim = Sim::with_faults(0x0DEE_0018, FaultConfig::none());
+            let disk = sim.disk();
+            (sim, disk)
+        };
+
+        // (Torn, absent): the residual. Reachable only before initialization
+        // completed, so the true set is necessarily empty — self-healed.
+        let (_sim, disk) = fresh();
+        store_witnesses(&disk, &["a:1".to_string()]).unwrap();
+        wreck(&disk, 0);
+        assert_eq!(open_witnesses(&disk).unwrap(), Vec::<String>::new());
+        assert!(slot_bytes(&disk).iter().all(Option::is_some));
+        assert_eq!(load_witnesses(&disk).unwrap(), Vec::<String>::new());
+
+        // (Valid non-empty, torn): the set survives and the torn slot is
+        // repaired to match it — never emptied.
+        let (_sim, disk) = fresh();
+        open_witnesses(&disk).unwrap();
+        store_witnesses(&disk, &["a:1".to_string()]).unwrap();
+        let live = load_witnesses(&disk).unwrap();
+        assert_eq!(live, vec!["a:1".to_string()]);
+        // Wreck whichever slot is NOT the live one, then also the live one's
+        // sibling case below.
+        wreck(&disk, 1);
+        assert_eq!(open_witnesses(&disk).unwrap(), live);
+        assert_eq!(load_witnesses(&disk).unwrap(), live);
+        wreck(&disk, 0);
+        assert_eq!(open_witnesses(&disk).unwrap(), live);
+        assert_eq!(load_witnesses(&disk).unwrap(), live);
+
+        // Idempotence: an established dir is left byte-for-byte alone.
+        let before = slot_bytes(&disk);
+        open_witnesses(&disk).unwrap();
+        assert_eq!(
+            before,
+            slot_bytes(&disk),
+            "a second open on an established data dir must write nothing"
+        );
+
+        // (Torn, torn) is still the named hard error — `open_witnesses` gets
+        // no license to guess "empty" when BOTH copies are gone.
+        let (_sim, disk) = fresh();
+        open_witnesses(&disk).unwrap();
+        store_witnesses(&disk, &["a:1".to_string()]).unwrap();
+        wreck(&disk, 0);
+        wreck(&disk, 1);
+        let err = open_witnesses(&disk).expect_err("two corrupt copies must never resolve empty");
+        assert!(
+            err.to_string()
+                .starts_with("witness file failed its integrity check"),
+            "got: {err}"
+        );
     }
 }

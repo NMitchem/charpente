@@ -756,15 +756,26 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
         for _round in 0..ROUNDS_PER_EPOCH {
             let mut subscribe = None;
             if client.need_subscribe {
-                subscribe = Some(push_subscribe(
-                    sim,
-                    &kernel,
-                    &mut source,
-                    path,
-                    client.cursor,
-                    t,
-                )?);
-                t += SEC;
+                // `push_subscribe` reads `next_event_id` off the live `Db`,
+                // so it fails whenever the store has latched — classified
+                // exactly like the `kernel.run` call below, and recovered the
+                // same way (a restart mints a fresh redb handle and a fresh
+                // latch flag). Without this the universe fails outright on an
+                // injected fault; see the fix-round report's latent finding,
+                // seed 0xdc154f8c66271f15.
+                match push_subscribe(sim, &kernel, &mut source, path, client.cursor, t) {
+                    Ok(info) => {
+                        subscribe = Some(info);
+                        t += SEC;
+                    }
+                    Err(e) if is_fault_fallout(&e) => {
+                        sim.restart();
+                        client.need_subscribe = true;
+                        client.current_handle = None;
+                        break;
+                    }
+                    Err(e) => return Err(format!("push_subscribe failed non-injected: {e}")),
+                }
             }
 
             let n_emits = 1 + sim.entropy().next_u64() % 3;
@@ -836,7 +847,17 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
         let responses = source.responses();
         let t = sim.now().as_nanos();
 
-        let subscribe = push_subscribe(sim, &kernel, &mut source, path, client.cursor, t)?;
+        // Same classification as the epoch loop above and as this attempt's
+        // own `kernel.run` below: a latched store makes this read fail, and
+        // the recovery is a restart, not a universe failure.
+        let subscribe = match push_subscribe(sim, &kernel, &mut source, path, client.cursor, t) {
+            Ok(info) => info,
+            Err(e) if is_fault_fallout(&e) => {
+                sim.restart();
+                continue;
+            }
+            Err(e) => return Err(format!("settle push_subscribe failed non-injected: {e}")),
+        };
 
         let run_result = kernel.run(&mut source);
         let new_responses = responses
@@ -1671,7 +1692,18 @@ fn drive_client_to_settled(
                     .kernel
                     .as_ref()
                     .ok_or_else(|| format!("{INCONCLUSIVE}: target has no kernel"))?;
-                push_subscribe(sim, kernel, &mut node.source, path, client.cursor, now)?
+                // A latched store makes this read fail (M2 sub-project 0a).
+                // This property has no restore rig, so it takes the same
+                // disposition as "target has no kernel" two lines above:
+                // inconclusive, never a universe failure. Seed
+                // 0xdc154f8c66271f15 is the reproduction.
+                match push_subscribe(sim, kernel, &mut node.source, path, client.cursor, now) {
+                    Ok(info) => info,
+                    Err(e) if is_fault_fallout(&e) => {
+                        return Err(format!("{INCONCLUSIVE}: subscribe read faulted: {e}"));
+                    }
+                    Err(e) => return Err(e),
+                }
             };
             let mut got = None;
             for _ in 0..RT_STEP_BUDGET {

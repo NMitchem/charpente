@@ -23,7 +23,7 @@ use crate::repl::follower::Follower;
 use crate::repl::protocol::Msg;
 use crate::repl::role::{Role, load_role, store_role};
 use crate::repl::session::{PendingCtrl, Session};
-use crate::repl::witnesses::{clear_witnesses, load_witnesses, store_witnesses};
+use crate::repl::witnesses::{clear_witnesses, open_witnesses, store_witnesses};
 
 mod follower;
 pub mod protocol;
@@ -188,7 +188,13 @@ impl Repl {
             ));
         }
         let (role, notice) = load_role(&*role_disk, &cfg.initial_role)?;
-        let witnesses = load_witnesses(&*role_disk)?;
+        // `open_witnesses`, not `load_witnesses`: this call also ESTABLISHES
+        // both witness slots (two empty-set writes on a fresh data dir), and
+        // it runs here — before the listener is opened, before any Hello can
+        // be serviced, before any frame can ship. That ordering is what makes
+        // "a torn slot with an absent sibling means empty" sound; see
+        // `witnesses.rs`'s module doc.
+        let witnesses = open_witnesses(&*role_disk)?;
 
         let pin_floor = Arc::new(Mutex::new(u64::MAX));
         db.pin_retention(Box::new({

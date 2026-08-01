@@ -60,6 +60,14 @@ impossible to commit green on its own; (2) the integration tests reach `role` as
 
 **Format.** `<addr>\n<addr>\n…\n<n> <crc32 hex>` — addresses joined by `\n`, then a trailer line carrying the COUNT and the CRC of the joined body. The empty set stores as `"\n0 <crc of empty>"`, so "cleared" and "never written" are indistinguishable on read and both yield `vec![]`.
 
+> **SUPERSEDED TWICE — this section is the historical Task 1 format.** Task 1b (Noah-ruled
+> 2026-07-31) split it into **two files** (`witnesses.0`/`witnesses.1`, so `WITNESS_FILE` is gone)
+> and added a **generation** to the trailer; Task 1b's fix round 1 (Noah-ruled 2026-08-01) brought
+> the generation and count **inside the CRC** and added `open_witnesses`, which establishes both
+> slots at `Repl::open` before any content is ever written. The shipped format is
+> `<addr>\n…\n<gen> <count> <crc32 hex>`, the CRC covering everything before itself.
+> **`crates/charpente/src/repl/witnesses.rs` is authoritative.**
+
 **AMENDED 2026-07-31 (Noah's ruling, after the Task 1 review).** The original format was
 `…\n<crc32 hex>` with no count. The reviewer constructed a truncation that loads cleanly as a
 SHORTER set: `["10.0.0.1:7001", "ce6f4d26host.internal:7002"]` cut to 22 bytes, because
@@ -78,7 +86,9 @@ an assert there is a remotely-triggerable panic.
 > **The Step 1 and Step 3 code blocks below predate this amendment and were deliberately left
 > unedited as the historical record of what was dispatched. They are NOT the shipped design:**
 > Step 1's test asserts `(crc mismatch)` for the `set_len(15)` tear, an arm the amended format
-> provably no longer takes (it now lands in `missing the crc line`, structurally — with whitespace
+> provably no longer takes (it now lands in `malformed trailer` — the arm was called
+> `missing the crc line` until task 1b's fix round split that one string across the three
+> distinct malformations it covered — structurally: with whitespace
 > banned, the trailer's space is the file's only space byte, so any truncation that drops a
 > trailing address removes it); Step 3 still shows the countless format, no address validation, and
 > a `trim_end_matches` that is dead under the amended parse. Step 4's "6 passed" is 11 as shipped.
