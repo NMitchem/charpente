@@ -21,10 +21,11 @@
 //! a maximum-size cap (and the failure mode of exceeding it); two files
 //! avoid the cap entirely.
 //!
-//! Each file's trailer carries a **generation**: `<addr>\n…\n<gen> <count>
-//! <crc32 hex>`. Generation is a `u64`, monotonically increasing on every
-//! store — it is what "newer" means for a witness set (there is no natural
-//! ordering on the addresses themselves the way `applied_seq` orders
+//! Each file begins with a format marker line and ends with a trailer
+//! carrying a **generation**: `charpente-witnesses-v1\n<addr>\n…\n<gen>
+//! <count> <crc32 hex>`. Generation is a `u64`, monotonically increasing
+//! on every store — it is what "newer" means for a witness set (there is
+//! no natural ordering on the addresses themselves the way `applied_seq` orders
 //! horizons). **The CRC covers everything except itself** — body, the
 //! separating newline, generation and count (fix round 1, I-2). The
 //! generation is the field that decides which slot wins, so leaving it
@@ -46,11 +47,34 @@
 //! this node then has no information about its witnesses, and guessing
 //! "empty" is exactly the unsafe direction the CRC exists to prevent.
 //!
+//! **The marker line is parsed FIRST, before and independently of the CRC**
+//! (fix round 2, Noah decision C, 2026-08-01). Without it a format bump is
+//! indistinguishable from corruption, and composed with the repair below it
+//! becomes silence *plus overwrite*: a pre-marker data dir would read as a
+//! torn slot, resolve to empty, and have its still-plainly-readable addresses
+//! written over on the first start. A slot whose first line exists and is not
+//! the marker is therefore a THIRD state — neither `Torn` nor `Empty` —
+//! and a named hard error that fires **even when the sibling is absent**,
+//! which is the one arm that would otherwise swallow it. Two consequences, both
+//! deliberate. (1) A corruption that destroys the marker now reports as
+//! wrong-format rather than as a tear; both are hard errors with overlapping
+//! remedies, and it fails loud either way. (2) The wrong-format state sits in
+//! exactly `Torn`'s place in the resolve lattice otherwise — a valid sibling
+//! still rescues it — so no rescue this module already promised is narrowed.
+//! That is also why ruling 1's self-heal survives: the only writes made with
+//! an absent sibling are the two ~36-byte establishing writes, and a
+//! sub-sector write tears to a strict byte PREFIX (`charpente-sim`'s `tear`),
+//! whose first line is either the marker itself or — for a prefix shorter
+//! than the marker line, including the all-NUL shape a surviving `set_len`
+//! leaves — absent entirely. A tear can produce a *different* first line
+//! only by losing the first sector of a multi-sector write, needing a witness
+//! set over 512 bytes; the establishing writes never are.
+//!
 //! **Both slots are established at `Repl::open`, before any real content is
 //! ever written** (fix round 1, I-3 + Noah ruling 1, 2026-08-01).
 //! `open_witnesses` is the startup entry point: it resolves the set and then
 //! stores it until BOTH slots hold a valid copy — on a fresh data dir, two
-//! ~12-byte empty-set writes, once per data-dir lifetime. The invariant that
+//! ~36-byte empty-set writes, once per data-dir lifetime. The invariant that
 //! buys, and everything below follows from it: **after `Repl::open` returns
 //! `Ok`, both slots are present and valid.**
 //!
@@ -69,13 +93,23 @@
 //! establishes its own premise; `load_witnesses` still hard-errors on it.
 //!
 //! The honest residual, stated because that inference is a protocol
-//! invariant and not evidence in the bytes: if something outside this module
-//! deletes exactly ONE slot file while the other is corrupt, this node reads
-//! an empty set and resumes unchecked. **Any future code that removes a
-//! witness file must remove BOTH slots or neither** — the constraint the
-//! code itself cannot express. (`Seeder::new` removes the store, the
-//! `.horizon` breadcrumb and `wal/*`, and deliberately not these; see the
-//! task 1 review's M-5.)
+//! invariant and not evidence in the bytes (fix round 2, M-3: restated
+//! against the post-marker world, and with the cost it was missing). It needs
+//! the **conjunction** of one slot gone and the other corrupt: deleting one
+//! slot alone leaves `(Valid, Empty)`, which answers correctly and repairs
+//! itself. Reach that conjunction from outside this module and the node reads
+//! an empty set and resumes unchecked — **and the repair is destructive**,
+//! so whatever addresses were still plainly readable in the corrupt slot are
+//! overwritten on that first start. The residual is "reads empty AND erases
+//! the only trace", which is why the constraint below is absolute. The one
+//! instance of the class that was ever *live* — a data dir written by an
+//! older witness format, which reached this state with no deletion involved
+//! at all — is no longer in it: the marker line above turns that into the
+//! named wrong-format error, before the CRC and before any repair.
+//! **Any future code that removes a witness file must remove BOTH slots or
+//! neither** — the constraint the code itself cannot express. (`Seeder::new`
+//! removes the store, the `.horizon` breadcrumb and `wal/*`, and deliberately
+//! not these; see the task 1 review's M-5.)
 
 use std::io;
 
@@ -89,8 +123,18 @@ pub fn witness_path(slot: u8) -> String {
     format!("witnesses.{slot}")
 }
 
+/// The first line of every slot file (fix round 2, Noah decision C). Bumped
+/// whenever the on-disk shape changes, so a data dir written by another
+/// format is a named error instead of unreadable bytes indistinguishable from
+/// corruption. Whitespace-free on purpose: the parser's "the only spaces in a
+/// well-formed file are the trailer's own two separators" reasoning — what
+/// makes an address-dropping truncation structurally catchable — must keep
+/// holding over the whole file, marker included.
+const WITNESS_FORMAT_MARKER: &str = "charpente-witnesses-v1";
+
 /// The CRC over everything a slot file holds except the checksum field
-/// itself — `"<addr>\n…\n<gen> <count>"` (fix round 1, I-2). Covering the
+/// itself — `"charpente-witnesses-v1\n<addr>\n…\n<gen> <count>"` (fix
+/// round 1, I-2; the marker joined the covered region in round 2). Covering the
 /// generation is the point: it is the field `load_witnesses` uses to pick a
 /// winner, and outside the checksum a single ASCII-digit flip could silently
 /// promote the older, shorter set.
@@ -190,6 +234,32 @@ fn duplicate_generation_error(generation: u64) -> io::Error {
     )
 }
 
+/// Fix round 2 (Noah decision C): a slot whose first line is not this build's
+/// format marker. Distinct from `corrupt_witness_error` because the diagnosis
+/// and the first remedy differ — corruption says "these bytes were damaged",
+/// this says "these bytes were written by a different charpente" — and
+/// distinct from it in text too: it deliberately does NOT share the "witness
+/// file failed its integrity check" phrase the harness classifiers route to
+/// an inconclusive universe. In sim there is exactly one binary and every
+/// data dir is fresh, so a wrong-format slot there means this module's writer
+/// and reader disagree, which is a bug that must fail loudly rather than be
+/// excused as fault fallout.
+fn foreign_format_error(reason_0: &str, reason_1: &str) -> io::Error {
+    let (p0, p1) = (witness_path(0), witness_path(1));
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "witness file was written in a different format ({p0}: {reason_0}; {p1}: \
+             {reason_1}) — every slot this build writes begins with the marker line \
+             \"{WITNESS_FORMAT_MARKER}\", so a slot without it came from a different charpente \
+             version (or corruption destroyed the marker). Run the build that wrote this data \
+             dir, or delete BOTH \"{p0}\" and \"{p1}\" ONLY if you are certain no follower of \
+             this node was ever promoted, since an empty witness set lets this node resume as a \
+             primary unchecked"
+        ),
+    )
+}
+
 /// Fix round 1, I-2 (secondary): the generation counter is a `u64` bumped
 /// once per witness-set change, so reaching this needs a corrupted
 /// generation field that still passes the CRC. Named rather than left to
@@ -224,12 +294,18 @@ enum SlotState {
     /// covering three distinct malformations, two of which HAVE a crc line —
     /// an operator-facing reason that was simply wrong (hard rule 5).
     Torn(&'static str),
+    /// Present, non-empty, and its first line is not `WITNESS_FORMAT_MARKER`
+    /// (fix round 2). The third state: never rescued by the establishing arm
+    /// the way `Torn` is, because "no marker" is what a data dir written by
+    /// another format looks like, and reading that as empty would both resume
+    /// unchecked and overwrite the addresses still readable in it.
+    ForeignFormat,
 }
 
 /// Reads one slot. IO errors (a real `Disk` failure) propagate via `?`;
-/// integrity failures become `SlotState::Torn` rather than an `Err`, because
-/// `load_witnesses` must inspect BOTH slots before deciding whether a
-/// failure here is rescuable by the other slot.
+/// integrity and format failures become `SlotState::Torn`/`ForeignFormat`
+/// rather than an `Err`, because `load_witnesses` must inspect BOTH slots
+/// before deciding whether a failure here is rescuable by the other slot.
 fn read_witness_slot(disk: &dyn Disk, slot: u8) -> io::Result<SlotState> {
     let path = witness_path(slot);
     if !disk.list(&path)?.iter().any(|n| n == &path) {
@@ -255,14 +331,33 @@ fn read_witness_slot(disk: &dyn Disk, slot: u8) -> io::Result<SlotState> {
         Ok(t) => t,
         Err(_) => return Ok(SlotState::Torn("not valid UTF-8")),
     };
+    // THE FORMAT MARKER IS PARSED FIRST — before, and independently of, the
+    // CRC (fix round 2). Behind the CRC it could not work: a foreign-format
+    // file fails the checksum, reads as `Torn`, and with an absent sibling
+    // lands in exactly the silent re-initialization the marker exists to
+    // remove. A file with no newline at all has no first line of ANY format —
+    // it is a fragment, not a foreign file (it is also what a sub-sector tear
+    // of an establishing write leaves), so the torn arms below own it.
+    match text.split_once('\n') {
+        Some((first_line, _)) if first_line != WITNESS_FORMAT_MARKER => {
+            return Ok(SlotState::ForeignFormat);
+        }
+        Some(_) => {}
+        None => return Ok(SlotState::Torn("malformed trailer")),
+    }
     // The checksum field is the tail after the LAST space; everything before
     // it is what the checksum covers. Addresses are validated whitespace-free
-    // (`valid_witness_address`), so the only two spaces in a well-formed file
-    // are the trailer's own separators.
+    // (`valid_witness_address`) and the marker is whitespace-free too, so the
+    // only two spaces in a well-formed file are the trailer's own separators.
     let Some((covered, crc_str)) = text.rsplit_once(' ') else {
         return Ok(SlotState::Torn("malformed trailer"));
     };
-    let Some((body, counts)) = covered.rsplit_once('\n') else {
+    let Some((marked_body, counts)) = covered.rsplit_once('\n') else {
+        return Ok(SlotState::Torn("malformed trailer"));
+    };
+    // The marker matched above, so this only fails when the body line itself
+    // is gone — `marked_body` is the marker with nothing after it.
+    let Some((_marker, body)) = marked_body.split_once('\n') else {
         return Ok(SlotState::Torn("malformed trailer"));
     };
     let Some((gen_str, n_str)) = counts.split_once(' ') else {
@@ -289,6 +384,7 @@ fn slot_reason(s: &SlotState) -> &'static str {
     match s {
         SlotState::Empty => "absent",
         SlotState::Torn(r) => r,
+        SlotState::ForeignFormat => "no format marker",
         SlotState::Valid { .. } => {
             unreachable!("resolve never asks for a reason on a valid slot")
         }
@@ -339,7 +435,10 @@ pub fn store_witnesses(disk: &dyn Disk, addrs: &[String]) -> io::Result<()> {
         (Some(_), Some(gb)) => (gb + 1, 0),
     };
     let body = addrs.join("\n");
-    let covered = format!("{body}\n{generation} {}", addrs.len());
+    let covered = format!(
+        "{WITNESS_FORMAT_MARKER}\n{body}\n{generation} {}",
+        addrs.len()
+    );
     let content = format!("{covered} {:08x}", covered_crc(&covered));
     let bytes = content.as_bytes();
     let path = witness_path(target);
@@ -363,7 +462,9 @@ pub fn store_witnesses(disk: &dyn Disk, addrs: &[String]) -> io::Result<()> {
 /// node has no information about its witnesses, and guessing "empty" here
 /// is exactly the unsafe direction the CRC exists to prevent (this is
 /// unchanged from the single-file design's contract; only the slot count
-/// changed).
+/// changed). A slot with no format marker is its own named error on the same
+/// terms, and — unlike a torn one — is never rescued by the establishing
+/// arm.
 ///
 /// **Node startup calls `open_witnesses`, not this.** This one is the
 /// unvarnished reader: it reports what the bytes say and nothing more, and it
@@ -407,6 +508,18 @@ fn resolve(a: SlotState, b: SlotState, establishing: bool) -> io::Result<Vec<Str
         {
             Ok(Vec::new())
         }
+        // Fix round 2: a wrong-format slot reaches here from every
+        // combination the establishing arm above does not rescue — including
+        // `(ForeignFormat, Empty)`, which that arm deliberately does not
+        // match. It reports as wrong-format rather than as corruption
+        // whenever either slot carries it, because that is the more
+        // actionable of the two diagnoses and its first remedy (run the build
+        // that wrote this dir) does not appear in the other.
+        (a, b)
+            if matches!(a, SlotState::ForeignFormat) || matches!(b, SlotState::ForeignFormat) =>
+        {
+            Err(foreign_format_error(slot_reason(&a), slot_reason(&b)))
+        }
         (a, b) => Err(corrupt_witness_error(slot_reason(&a), slot_reason(&b))),
     }
 }
@@ -425,8 +538,16 @@ fn resolve(a: SlotState, b: SlotState, establishing: bool) -> io::Result<Vec<Str
 /// never gets here.
 ///
 /// On a fresh data dir this is the whole of the initialization the module
-/// doc's argument rests on: two ~12-byte empty-set writes, once per data-dir
+/// doc's argument rests on: two ~36-byte empty-set writes, once per data-dir
 /// lifetime, strictly before any Hello is serviced or any frame ships.
+///
+/// The cost of repairing on every not-both-valid state rather than only on
+/// "no established set" (fix round 2, M-6): a node whose sibling slot is torn
+/// must now complete a successful WRITE to start, where before it only had to
+/// read. Narrow (one slot corrupt), loud (the store's own `Err`), and
+/// retryable (the next start repairs), and it buys closing
+/// `(Valid(non-empty), Empty)` — the precursor state to exactly the brick
+/// ruling 1 removed — but it is a real widening of what startup depends on.
 ///
 /// The postcondition is pinned by test, not by an `assert!` here: re-reading
 /// both slots to check it would cost two disk ops on every start, and a
@@ -517,15 +638,16 @@ mod tests {
     // the reviewer's example: ["10.0.0.1:7001", "ce6f4d26host.internal:7002"]
     // cut to 22 bytes, since "ce6f4d26" == crc32("10.0.0.1:7001")).
     //
-    // AMENDED AGAIN (task 1b, then fix round 1): the format split into two
-    // files (`witness_path(0)`/`witness_path(1)`), the trailer gained a
-    // leading generation field, and the crc now covers everything before
-    // itself — so the shipped content here is
-    // "127.0.0.1:7001\n127.0.0.1:7002\n0 2 <8 hex>" and the checksummed
-    // prefix is "127.0.0.1:7001\n127.0.0.1:7002\n0 2".
+    // AMENDED AGAIN (task 1b, then fix rounds 1 and 2): the format split into
+    // two files (`witness_path(0)`/`witness_path(1)`), the trailer gained a
+    // leading generation field, the file gained a leading format-marker line,
+    // and the crc covers everything before itself — so the shipped content
+    // here is "charpente-witnesses-v1\n127.0.0.1:7001\n127.0.0.1:7002\n0 2
+    // <8 hex>" and the checksummed prefix is everything before that hex.
     //
-    // A consequence of validating addresses whitespace-free: the ONLY spaces
-    // in the whole file are the trailer's own two separators — no address can
+    // A consequence of validating addresses whitespace-free (and of keeping
+    // the marker whitespace-free): the ONLY spaces in the whole file are the
+    // trailer's own two separators — no address can
     // contain one. So any truncation that drops a trailing address (landing
     // inside the second address, before the real trailer) can NEVER
     // coincidentally leave behind a space-shaped "<gen> <n> <crc>" trailer;
@@ -552,8 +674,12 @@ mod tests {
         let disk = sim.disk();
         let addrs = vec!["127.0.0.1:7001".to_string(), "127.0.0.1:7002".to_string()];
         store_witnesses(&disk, &addrs).unwrap();
+        // The marker line plus the first address and its newline (fix round
+        // 2): the cut has to land PAST the marker, or this exercises the
+        // wrong-format arm instead of the torn one.
+        let cut = (WITNESS_FORMAT_MARKER.len() + 1 + "127.0.0.1:7001\n".len()) as u64;
         let file = disk.open(&witness_path(0)).unwrap();
-        file.set_len(15).unwrap();
+        file.set_len(cut).unwrap();
         file.sync().unwrap();
 
         // Proves the test means something: the surviving bytes really do
@@ -561,12 +687,15 @@ mod tests {
         // address dropped entirely), not zero elements and not still two —
         // otherwise this truncation wouldn't exercise the dangerous shape
         // at all.
-        let mut buf = vec![0u8; 15];
+        let mut buf = vec![0u8; cut as usize];
         file.read_at(0, &mut buf).unwrap();
         let survived = String::from_utf8(buf).unwrap();
-        let naive_body = survived
-            .rsplit_once('\n')
-            .map_or(survived.as_str(), |(b, _)| b);
+        let (marker, rest) = survived.split_once('\n').expect("the marker line survived");
+        assert_eq!(
+            marker, WITNESS_FORMAT_MARKER,
+            "the cut must leave the marker intact, or this test exercises the wrong-format arm"
+        );
+        let naive_body = rest.rsplit_once('\n').map_or(rest, |(b, _)| b);
         let naive_addrs: Vec<&str> = naive_body.split('\n').filter(|s| !s.is_empty()).collect();
         assert_eq!(
             naive_addrs,
@@ -592,7 +721,10 @@ mod tests {
         let disk = sim.disk();
         store_witnesses(&disk, &["127.0.0.1:7001".to_string()]).unwrap();
         let file = disk.open(&witness_path(0)).unwrap();
-        file.set_len(5).unwrap();
+        // Past the marker line (fix round 2), so this stays the torn arm:
+        // marker + newline + two body bytes, no space anywhere after it.
+        file.set_len((WITNESS_FORMAT_MARKER.len() + 3) as u64)
+            .unwrap();
         file.sync().unwrap();
         let err = load_witnesses(&disk).expect_err("a tear with no newline must fail by name");
         assert!(
@@ -612,7 +744,9 @@ mod tests {
         let addrs = vec!["127.0.0.1:7001".to_string(), "127.0.0.1:7002".to_string()];
         store_witnesses(&disk, &addrs).unwrap();
         let file = disk.open(&witness_path(0)).unwrap();
-        file.write_at(0, b"227.0.0.1:7001").unwrap();
+        // Over the FIRST ADDRESS, which now starts just past the marker line.
+        file.write_at((WITNESS_FORMAT_MARKER.len() + 1) as u64, b"227.0.0.1:7001")
+            .unwrap();
         file.sync().unwrap();
 
         let err =
@@ -641,7 +775,8 @@ mod tests {
         let disk = sim.disk();
         let addrs = ["127.0.0.1:7001".to_string(), "127.0.0.1:7002".to_string()];
         let body = addrs.join("\n");
-        let covered = format!("{body}\n0 {}", addrs.len() + 1); // count deliberately wrong
+        // count deliberately wrong
+        let covered = format!("{WITNESS_FORMAT_MARKER}\n{body}\n0 {}", addrs.len() + 1);
         let corrupted = format!("{covered} {:08x}", covered_crc(&covered));
         let file = disk.open(&witness_path(0)).unwrap();
         file.write_at(0, corrupted.as_bytes()).unwrap();
@@ -1010,7 +1145,7 @@ mod tests {
 
         // Rewrite slot 1 at generation 0, checksum and count consistent —
         // a corruption whose checksum happens to survive.
-        let covered = "b:2\n0 1".to_string();
+        let covered = format!("{WITNESS_FORMAT_MARKER}\nb:2\n0 1");
         let forged = format!("{covered} {:08x}", covered_crc(&covered));
         let file = disk.open(&witness_path(1)).unwrap();
         file.write_at(0, forged.as_bytes()).unwrap();
@@ -1129,6 +1264,191 @@ mod tests {
             err.to_string()
                 .starts_with("witness file failed its integrity check"),
             "got: {err}"
+        );
+    }
+
+    // FIX ROUND 2, M-1: the reason string split out in fix round 1 shipped
+    // without a pin, so nothing held its wording (hard rule 5). The crc here
+    // is computed over the forged trailer and is VALID — the generation is
+    // caught on its own merits, by the parse, before the checksum is even
+    // consulted.
+    #[test]
+    fn an_unparseable_generation_is_caught_by_name() {
+        let sim = Sim::with_faults(0x0DEE_0019, FaultConfig::none());
+        let disk = sim.disk();
+        let covered = format!("{WITNESS_FORMAT_MARKER}\na:1\nx 1");
+        let forged = format!("{covered} {:08x}", covered_crc(&covered));
+        let file = disk.open(&witness_path(0)).unwrap();
+        file.write_at(0, forged.as_bytes()).unwrap();
+        file.set_len(forged.len() as u64).unwrap();
+        file.sync().unwrap();
+
+        let err =
+            load_witnesses(&disk).expect_err("a generation that does not parse must not validate");
+        assert_eq!(
+            err.to_string(),
+            "witness file failed its integrity check (witnesses.0: unparseable generation or \
+             count; witnesses.1: absent) — a torn write or corruption; the safe repair is to \
+             delete BOTH \"witnesses.0\" and \"witnesses.1\" ONLY if you are certain no follower \
+             of this node was ever promoted, since an empty witness set lets this node resume as \
+             a primary unchecked"
+        );
+    }
+
+    // FIX ROUND 2, M-2: `generation_overflow_error` is near-unreachable now
+    // that the crc covers the generation — which is the argument for pinning
+    // it cheaply, not for leaving it unpinned. Reached by hand: a slot whose
+    // generation field reads `u64::MAX` with a checksum that matches it.
+    #[test]
+    fn a_generation_at_u64_max_is_a_named_hard_error() {
+        let sim = Sim::with_faults(0x0DEE_001A, FaultConfig::none());
+        let disk = sim.disk();
+        let covered = format!("{WITNESS_FORMAT_MARKER}\na:1\n{} 1", u64::MAX);
+        let forged = format!("{covered} {:08x}", covered_crc(&covered));
+        let file = disk.open(&witness_path(0)).unwrap();
+        file.write_at(0, forged.as_bytes()).unwrap();
+        file.set_len(forged.len() as u64).unwrap();
+        file.sync().unwrap();
+        assert_eq!(
+            load_witnesses(&disk).unwrap(),
+            vec!["a:1".to_string()],
+            "sanity: the forged slot must be VALID, so the next store is what trips the guard"
+        );
+
+        let err = store_witnesses(&disk, &["b:2".to_string()])
+            .expect_err("advancing past u64::MAX must fail by name, not wrap");
+        assert_eq!(
+            err.to_string(),
+            "witness file generation counter is at u64::MAX and cannot advance — one witness \
+             set change per generation could not reach this, so a slot's generation field is \
+             corrupt despite a matching checksum. The safe repair is to delete BOTH \
+             \"witnesses.0\" and \"witnesses.1\" ONLY if you are certain no follower of this \
+             node was ever promoted, since an empty witness set lets this node resume as a \
+             primary unchecked"
+        );
+    }
+
+    /// The wrong-format error, rendered for `(no marker, absent sibling)` —
+    /// the combination the establishing arm would otherwise swallow.
+    fn foreign_with_absent_sibling() -> String {
+        "witness file was written in a different format (witnesses.0: no format marker; \
+         witnesses.1: absent) — every slot this build writes begins with the marker line \
+         \"charpente-witnesses-v1\", so a slot without it came from a different charpente \
+         version (or corruption destroyed the marker). Run the build that wrote this data dir, \
+         or delete BOTH \"witnesses.0\" and \"witnesses.1\" ONLY if you are certain no follower \
+         of this node was ever promoted, since an empty witness set lets this node resume as a \
+         primary unchecked"
+            .to_string()
+    }
+
+    // FIX ROUND 2, §2 (Noah decision C), evidence (a): an unknown marker is a
+    // named hard error EVEN WITH AN ABSENT SIBLING. That is the whole point —
+    // `(Torn, Empty)` is the one combination `open_witnesses` is entitled to
+    // read as empty, so a wrong-format slot that could fall into it would buy
+    // nothing. Asserted through `open_witnesses`, the startup path that owns
+    // the permissive arm, not just through the strict reader.
+    #[test]
+    fn an_unknown_format_marker_is_a_named_error_even_with_an_absent_sibling() {
+        let sim = Sim::with_faults(0x0DEE_001B, FaultConfig::none());
+        let disk = sim.disk();
+        // Well-formed in every OTHER respect: right trailer shape, right
+        // count, checksum valid over its own bytes. Only the marker differs.
+        let covered = "charpente-witnesses-v2\na:1\n0 1".to_string();
+        let forged = format!("{covered} {:08x}", covered_crc(&covered));
+        let file = disk.open(&witness_path(0)).unwrap();
+        file.write_at(0, forged.as_bytes()).unwrap();
+        file.set_len(forged.len() as u64).unwrap();
+        file.sync().unwrap();
+
+        let err = open_witnesses(&disk)
+            .expect_err("a slot from another format must never be read as an empty set");
+        assert_eq!(err.to_string(), foreign_with_absent_sibling());
+        assert_eq!(
+            load_witnesses(&disk).unwrap_err().to_string(),
+            foreign_with_absent_sibling(),
+            "the strict reader must answer identically — the marker check is not the \
+             establishing path's private business"
+        );
+        assert_eq!(
+            slot_bytes(&disk)[0].as_deref(),
+            Some(forged.as_bytes()),
+            "a refused slot must be left exactly as found, never repaired over"
+        );
+    }
+
+    // FIX ROUND 2, §2, evidence (b): the shape that made this worth doing.
+    // A data dir written by `056b9a7` — the immediately preceding format,
+    // with no marker line — with exactly one slot populated is the modal
+    // shape for a primary with one follower. Before the marker it read as
+    // `(Torn(crc mismatch), Empty)` and was SILENTLY re-initialized to empty,
+    // overwriting addresses that were still plainly readable in the file. Now
+    // it is the named error, and the bytes are untouched.
+    #[test]
+    fn a_pre_marker_format_file_is_named_not_silently_re_initialized() {
+        let sim = Sim::with_faults(0x0DEE_001C, FaultConfig::none());
+        let disk = sim.disk();
+        // `056b9a7`'s format, verbatim: "<addr>\n…\n<gen> <count> <crc>",
+        // the crc covering everything before itself.
+        let old_covered = "10.0.0.7:7001\n10.0.0.8:7001\n3 2".to_string();
+        let old_format = format!("{old_covered} {:08x}", covered_crc(&old_covered));
+        let file = disk.open(&witness_path(0)).unwrap();
+        file.write_at(0, old_format.as_bytes()).unwrap();
+        file.set_len(old_format.len() as u64).unwrap();
+        file.sync().unwrap();
+
+        let err = open_witnesses(&disk)
+            .expect_err("an older witness format must be named, never re-initialized to empty");
+        assert_eq!(err.to_string(), foreign_with_absent_sibling());
+        assert_eq!(
+            slot_bytes(&disk)[0].as_deref(),
+            Some(old_format.as_bytes()),
+            "the addresses were still readable — the repair must not have erased them"
+        );
+        assert!(
+            slot_bytes(&disk)[1].is_none(),
+            "and no slot may be established over a data dir this build refuses to read"
+        );
+    }
+
+    // FIX ROUND 2, M-5: `load_witnesses` has no production callers left, so
+    // the module's HEADLINE attack — "a torn write must never parse as a
+    // SHORTER set" — was pinned only through a reader the shipped startup
+    // path no longer uses, in a sibling-absent state that path can no longer
+    // reach. This is the same attack in the shape production can actually
+    // hit: both slots established, the LIVE slot truncated to bytes that
+    // naively parse as a shorter set, read back through `open_witnesses`.
+    #[test]
+    fn open_never_parses_a_truncated_live_slot_as_a_shorter_set() {
+        let sim = Sim::with_faults(0x0DEE_001D, FaultConfig::none());
+        let disk = sim.disk();
+        open_witnesses(&disk).unwrap(); // gen 0 -> slot 0, gen 1 -> slot 1
+        let older = vec!["10.0.0.1:7001".to_string(), "10.0.0.2:7001".to_string()];
+        let live = vec![
+            "10.0.0.1:7001".to_string(),
+            "10.0.0.2:7001".to_string(),
+            "10.0.0.3:7001".to_string(),
+        ];
+        store_witnesses(&disk, &older).unwrap(); // gen 2 -> slot 0
+        store_witnesses(&disk, &live).unwrap(); // gen 3 -> slot 1, the live one
+        assert_eq!(load_witnesses(&disk).unwrap(), live, "sanity");
+
+        // Cut the live slot after its FIRST address: the surviving bytes
+        // naively read as a complete one-element set.
+        let cut = (WITNESS_FORMAT_MARKER.len() + 1 + "10.0.0.1:7001\n".len()) as u64;
+        let file = disk.open(&witness_path(1)).unwrap();
+        file.set_len(cut).unwrap();
+        file.sync().unwrap();
+
+        let got = open_witnesses(&disk).unwrap();
+        assert_ne!(
+            got,
+            vec!["10.0.0.1:7001".to_string()],
+            "the truncated live slot must never be parsed as the shorter set it looks like"
+        );
+        assert_eq!(
+            got, older,
+            "the surviving valid sibling answers instead — one generation behind, never shorter \
+             than what was durable"
         );
     }
 }

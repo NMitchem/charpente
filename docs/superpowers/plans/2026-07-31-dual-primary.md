@@ -60,12 +60,15 @@ impossible to commit green on its own; (2) the integration tests reach `role` as
 
 **Format.** `<addr>\n<addr>\n…\n<n> <crc32 hex>` — addresses joined by `\n`, then a trailer line carrying the COUNT and the CRC of the joined body. The empty set stores as `"\n0 <crc of empty>"`, so "cleared" and "never written" are indistinguishable on read and both yield `vec![]`.
 
-> **SUPERSEDED TWICE — this section is the historical Task 1 format.** Task 1b (Noah-ruled
+> **SUPERSEDED THREE TIMES — this section is the historical Task 1 format.** Task 1b (Noah-ruled
 > 2026-07-31) split it into **two files** (`witnesses.0`/`witnesses.1`, so `WITNESS_FILE` is gone)
 > and added a **generation** to the trailer; Task 1b's fix round 1 (Noah-ruled 2026-08-01) brought
 > the generation and count **inside the CRC** and added `open_witnesses`, which establishes both
-> slots at `Repl::open` before any content is ever written. The shipped format is
-> `<addr>\n…\n<gen> <count> <crc32 hex>`, the CRC covering everything before itself.
+> slots at `Repl::open` before any content is ever written; fix round 2 (Noah decision C, same
+> day) added the leading **format marker line**, parsed before and independently of the CRC, so a
+> format bump is a named error rather than something indistinguishable from corruption. The
+> shipped format is `charpente-witnesses-v1\n<addr>\n…\n<gen> <count> <crc32 hex>`, the CRC
+> covering everything before itself.
 > **`crates/charpente/src/repl/witnesses.rs` is authoritative.**
 
 **AMENDED 2026-07-31 (Noah's ruling, after the Task 1 review).** The original format was

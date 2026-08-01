@@ -549,13 +549,32 @@ impl Client {
                     // forever with no future emit ever able to satisfy them.
                     // So prune down to the store's current head instead of
                     // just resetting the cursor.
-                    let head = db.next_event_id().map_err(|e| e.to_string())?;
-                    self.ledger.retain(|&id, _| id < head);
-                    self.pending.retain(|&(id, ..)| id < head);
-                    self.next_scan_id = self.next_scan_id.min(head);
-                    sim.cover("realtime:gap");
-                    self.cursor = None;
-                    self.need_subscribe = true;
+                    //
+                    // FIX ROUND 2, M-7: this is a live-`Db` read, so a
+                    // latched store makes it fail (M2 sub-project 0a) — the
+                    // second such read in this file, and the one the fix
+                    // round's census missed. Disposition matches §1's: retry,
+                    // never excuse. On fault fallout NOTHING here changes,
+                    // so `need_subscribe` stays true exactly as in the
+                    // fallout arm below, the client re-subscribes with the
+                    // same cursor, and the prune happens on the retry once
+                    // the node has recovered. No id is forgiven and no
+                    // verdict is skipped: a client that never manages the
+                    // prune never settles, and `unsettled_report` names it.
+                    match db.next_event_id() {
+                        Ok(head) => {
+                            self.ledger.retain(|&id, _| id < head);
+                            self.pending.retain(|&(id, ..)| id < head);
+                            self.next_scan_id = self.next_scan_id.min(head);
+                            sim.cover("realtime:gap");
+                            self.cursor = None;
+                            self.need_subscribe = true;
+                        }
+                        Err(e) if is_fault_fallout(&e.to_string()) => {}
+                        Err(e) => {
+                            return Err(format!("next_event_id read failed non-injected: {e}"));
+                        }
+                    }
                 }
                 _ if is_fault_fallout(&text) => {
                     // Not acked; need_subscribe stays true, retried next
@@ -1688,19 +1707,29 @@ fn drive_client_to_settled(
             let now = sim.now().as_nanos();
             let subscribe_info = {
                 let node = &mut *nodes[target];
-                let kernel = node
-                    .kernel
-                    .as_ref()
-                    .ok_or_else(|| format!("{INCONCLUSIVE}: target has no kernel"))?;
+                let Some(kernel) = node.kernel.as_ref() else {
+                    return Err(format!("{INCONCLUSIVE}: target has no kernel"));
+                };
                 // A latched store makes this read fail (M2 sub-project 0a).
-                // This property has no restore rig, so it takes the same
-                // disposition as "target has no kernel" two lines above:
-                // inconclusive, never a universe failure. Seed
-                // 0xdc154f8c66271f15 is the reproduction.
+                // FIX ROUND 2, I-1 (Noah decision B): RECOVER the node and
+                // keep the verdict. Returning an inconclusive here would
+                // propagate through this function's callers into
+                // `finish_rt_universe`, which converts it to `Ok(())` — so
+                // the phase-1 and phase-2 `client.settled()` checks would be
+                // skipped and a client that had already missed an event would
+                // be excused rather than reported. `kstep_rt_node` handles
+                // this same fault class the same way, and it genuinely
+                // recovers: a restart mints a fresh redb handle and a fresh
+                // latch flag. The attempt is spent, exactly as if the node
+                // had died mid-round. Seed 0xdc154f8c66271f15 is the
+                // reproduction of the fault itself.
                 match push_subscribe(sim, kernel, &mut node.source, path, client.cursor, now) {
                     Ok(info) => info,
                     Err(e) if is_fault_fallout(&e) => {
-                        return Err(format!("{INCONCLUSIVE}: subscribe read faulted: {e}"));
+                        recover_rt_node(sim, node)?;
+                        client.need_subscribe = true;
+                        client.current_handle = None;
+                        continue;
                     }
                     Err(e) => return Err(e),
                 }
