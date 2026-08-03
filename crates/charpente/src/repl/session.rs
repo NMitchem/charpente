@@ -514,6 +514,20 @@ enum Decision {
 pub(crate) const PEER_SECRET_REFUSAL: &str = "peer secret missing or mismatched — set \
      ReplConfig.peer_secret to match this node (or run the CLI verb with --secret)";
 
+/// The not-a-primary marker fragment (M2 sub-project 0b task 4, the witness
+/// probe client): shared by the refusal built below, the follower-side
+/// `HandingOff` resolver's check (`follower.rs`), and the probe's classifier
+/// (`probe.rs`) — one const, three readers, so producer and consumers cannot
+/// drift apart. Rewording the fragment this const carries deliberately
+/// reddens both consumers' classification; that coupling is the point, not
+/// an accident (see `probe.rs`'s module doc).
+pub(crate) const NOT_A_PRIMARY_MARKER: &str = "not a primary";
+
+/// The diverged-refusal label shared by `diverged_ahead`/`diverged_crc`/
+/// `diverged_behind` below and the witness probe's classifier (`probe.rs`,
+/// M2 sub-project 0b task 4) — same rationale as `NOT_A_PRIMARY_MARKER`.
+pub(crate) const DIVERGED_LABEL: &str = "diverged";
+
 /// The schema-digest refusal (migrations spec §5): pinned verbatim by tests.
 const SCHEMA_DIGEST_MISMATCH: &str = "replication schema mismatch: this node's #[table] schema digest does not match the \
      peer's — one side is running a binary compiled against a different table shape; rebuild \
@@ -625,10 +639,13 @@ fn decide_hello(
     match role {
         Role::Primary | Role::HandingOff { .. } => {}
         Role::Follower { primary } | Role::Backup { primary } => {
+            // Producer site for NOT_A_PRIMARY_MARKER (task 4): rewording this
+            // fragment deliberately reddens follower.rs's resolving check and
+            // probe.rs's classifier — both key on the const, not this prose.
             return Ok(Decision::Refuse(format!(
-                "this node is not a primary (it is a follower of {primary}) — replication Hellos \
-                 are served only by the primary, and a follower never feeds another follower \
-                 (no cascading); point the follower at {primary} instead"
+                "this node is {NOT_A_PRIMARY_MARKER} (it is a follower of {primary}) — \
+                 replication Hellos are served only by the primary, and a follower never feeds \
+                 another follower (no cascading); point the follower at {primary} instead"
             )));
         }
     }
@@ -674,13 +691,17 @@ fn decide_hello(
     }
 }
 
+// Producer site for DIVERGED_LABEL (task 4): all three functions below
+// deliberately lead with `{DIVERGED_LABEL}` rather than the literal word —
+// rewording it reddens the witness probe's classifier (`probe.rs`).
+
 fn diverged_ahead(pos_seq: u64, pos_crc: u32, last: Option<u64>) -> String {
     let ours = match last {
         Some(l) => format!("seq {l}"),
         None => "an empty log (no records at all)".to_string(),
     };
     format!(
-        "diverged: the follower is ahead at seq {pos_seq} (crc {pos_crc:#010x}) but this \
+        "{DIVERGED_LABEL}: the follower is ahead at seq {pos_seq} (crc {pos_crc:#010x}) but this \
          primary's last durable position is {ours} (crc n/a) — the follower holds records this \
          primary never had (or lost), a forked timeline that can never be merged; re-seed the \
          follower from a fresh data dir (stop it, delete its data dir, restart to snapshot-seed \
@@ -690,11 +711,11 @@ fn diverged_ahead(pos_seq: u64, pos_crc: u32, last: Option<u64>) -> String {
 
 fn diverged_crc(pos_seq: u64, pos_crc: u32, last: u64, ours: u32) -> String {
     format!(
-        "diverged: the follower's frame at seq {pos_seq} has crc {pos_crc:#010x} but this \
-         primary's frame at the same seq has crc {ours:#010x} (this primary is at seq {last}) — \
-         the logs share a seq but not its bytes, a forked timeline that can never be merged; \
-         re-seed the follower from a fresh data dir (stop it, delete its data dir, restart to \
-         snapshot-seed from this primary)"
+        "{DIVERGED_LABEL}: the follower's frame at seq {pos_seq} has crc {pos_crc:#010x} but \
+         this primary's frame at the same seq has crc {ours:#010x} (this primary is at seq \
+         {last}) — the logs share a seq but not its bytes, a forked timeline that can never be \
+         merged; re-seed the follower from a fresh data dir (stop it, delete its data dir, \
+         restart to snapshot-seed from this primary)"
     )
 }
 
@@ -706,14 +727,14 @@ fn diverged_crc(pos_seq: u64, pos_crc: u32, last: u64, ours: u32) -> String {
 /// re-seed a true laggard, or promote the follower if the primary forked behind.
 fn diverged_behind(pos_seq: u64, base: u64) -> String {
     format!(
-        "diverged: the follower holds a proven record at seq {pos_seq}, but this primary has \
-         GC'd every record below its retained base {base} — with no frame at or below seq \
-         {pos_seq} to compare, this primary cannot prove the follower's records are a prefix of \
-         its own timeline, and re-seeding here would silently overwrite whatever the follower \
-         holds; if the follower merely lagged past the retained window, re-seed it deliberately \
-         from a fresh data dir (stop it, delete its data dir, restart to snapshot-seed from this \
-         primary); if instead this primary forked below the follower (recovered past an \
-         above-horizon corruption cut and kept serving), promote the follower and re-seed this \
-         node from it"
+        "{DIVERGED_LABEL}: the follower holds a proven record at seq {pos_seq}, but this \
+         primary has GC'd every record below its retained base {base} — with no frame at or \
+         below seq {pos_seq} to compare, this primary cannot prove the follower's records are a \
+         prefix of its own timeline, and re-seeding here would silently overwrite whatever the \
+         follower holds; if the follower merely lagged past the retained window, re-seed it \
+         deliberately from a fresh data dir (stop it, delete its data dir, restart to \
+         snapshot-seed from this primary); if instead this primary forked below the follower \
+         (recovered past an above-horizon corruption cut and kept serving), promote the \
+         follower and re-seed this node from it"
     )
 }

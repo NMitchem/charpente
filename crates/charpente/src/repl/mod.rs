@@ -26,6 +26,7 @@ use crate::repl::session::{PendingCtrl, Session};
 use crate::repl::witnesses::{clear_witnesses, open_witnesses, store_witnesses};
 
 mod follower;
+pub mod probe;
 pub mod protocol;
 pub mod role;
 mod session;

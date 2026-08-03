@@ -18,6 +18,7 @@ use charpente_core::log::frame_crc;
 
 use crate::Db;
 use crate::repl::protocol::{Msg, decode, encode};
+use crate::repl::session::NOT_A_PRIMARY_MARKER;
 use crate::repl::{MAX_MESSAGE_BYTES, PROTO_VERSION, RECONNECT_NANOS};
 
 /// A latched `SnapshotStart`: `run_seed` finishes the re-seed against these.
@@ -222,7 +223,9 @@ impl Follower {
             match &msg {
                 // `to` isn't primary yet — nothing to resolve against; back off
                 // and retry (never a hard error, never a silent resume).
-                Msg::Refuse { message } if message.contains("not a primary") => {
+                // Keyed on the shared const (task 4): session.rs's producer
+                // and probe.rs's classifier read the same fragment.
+                Msg::Refuse { message } if message.contains(NOT_A_PRIMARY_MARKER) => {
                     self.disconnect(now);
                     return Ok(());
                 }
@@ -431,7 +434,11 @@ impl Follower {
 /// bitrot below `last_applied` on a follower). For a follower, the re-seed
 /// an empty position draws IS that corruption error's named fix — restore
 /// this node from a replica. Once a real frame lands, path (a) resumes.
-fn hello_position(db: &Db) -> io::Result<Option<(u64, u32)>> {
+///
+/// `pub(crate)` (task 4): the witness probe client (`probe.rs`) also builds
+/// its outbound Hello from this — carrying the real position, never `None`,
+/// is load-bearing there too (see `probe.rs`'s module doc).
+pub(crate) fn hello_position(db: &Db) -> io::Result<Option<(u64, u32)>> {
     let Some(last) = db.last_applied() else {
         return Ok(None); // genuinely empty — nothing applied, nothing seeded
     };
