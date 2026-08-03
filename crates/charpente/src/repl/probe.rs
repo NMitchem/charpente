@@ -179,6 +179,42 @@ impl WitnessProbe {
     }
 }
 
+/// The bound on a witness's `Refuse` message this probe retains (mirrors
+/// `session.rs`'s `ECHOED_LISTEN_ADDRESS_BYTES` — the same class of trust
+/// boundary, one hop further out): `Msg::Refuse.message` decodes off the
+/// wire bounded only by `MAX_MESSAGE_BYTES` (17 MiB), and Task 5 is
+/// specified to surface a witness's message in a loud operator notice, so a
+/// hostile or buggy witness could otherwise hand back up to ~17 MiB of
+/// arbitrary UTF-8 for this probe to retain and echo. Sized generously above
+/// every message the shipped refusal builders actually produce today (the
+/// longest, `diverged_behind`, is ~730 bytes; `invalid_listen_refusal`'s
+/// worst case with a maximally-long echoed address is ~470) — a bound that
+/// would truncate legitimate operator-facing prose defeats hard rule 5's
+/// "names the contract, the site, and the fix", so this is a hostile-input
+/// bound, not a tight one.
+const ECHOED_WITNESS_MESSAGE_BYTES: usize = 1024;
+
+/// Bounds and Debug-escapes a witness's `Refuse` message before this probe
+/// retains it (hard rule 4: never trust peer-supplied bytes into an
+/// operator-facing string unescaped and unbounded). Truncates on a UTF-8
+/// char boundary — never mid-character — appending a literal "..." marker
+/// before escaping, then Debug-formats the whole thing: this both escapes
+/// control characters/ANSI/CR-LF a hostile witness could plant and bounds
+/// the size, mirroring `invalid_listen_refusal`'s truncation shape
+/// (`session.rs`) exactly.
+fn bounded_witness_message(message: &str) -> String {
+    let mut cut = message.len().min(ECHOED_WITNESS_MESSAGE_BYTES);
+    while cut > 0 && !message.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let shown = if cut < message.len() {
+        format!("{}...", &message[..cut])
+    } else {
+        message.to_string()
+    };
+    format!("{shown:?}")
+}
+
 /// Classifies one response from a witness (see the module doc for the
 /// ladder rationale — this ladder mirrors `decide_hello`'s check ORDER, not
 /// its full logic). The default arm — any `Refuse` not carrying one of the
@@ -191,11 +227,14 @@ fn classify(msg: &Msg) -> WitnessVerdict {
             WitnessVerdict::NotPrimary
         }
         Msg::Refuse { message } if message.contains(DIVERGED_LABEL) => {
-            WitnessVerdict::IsPrimary(message.clone())
+            WitnessVerdict::IsPrimary(bounded_witness_message(message))
         }
-        Msg::Refuse { message } => WitnessVerdict::Inconclusive(message.clone()),
+        Msg::Refuse { message } => WitnessVerdict::Inconclusive(bounded_witness_message(message)),
         // Only a witness that passed the role match ever sends a non-Refuse
-        // message — HandingOff included (module doc).
+        // message — HandingOff included (module doc). `other.name()` is a
+        // fixed message-KIND label off `Msg`'s own enum (protocol.rs), never
+        // peer-controlled bytes, so this string needs no bounding/escaping —
+        // unlike the two arms above, nothing here reads off the wire.
         other => WitnessVerdict::IsPrimary(format!(
             "witness answered {} — only a node past the role match (primary, or handing off) \
              ever sends one",
@@ -380,7 +419,16 @@ mod tests {
         probe.step(&net, &db, 0).expect("connect + send Hello");
         probe.step(&net, &db, 0).expect("recv + classify");
         match probe.verdict() {
-            WitnessVerdict::IsPrimary(_) => {}
+            // Fix round 1, I-2: pinned byte-exact — this is the one
+            // operator-facing string `classify`'s default (non-Refuse) arm
+            // authors itself, with no other occurrence in the tree to pin
+            // it. "Frames" is `Msg::name()`'s fixed message-KIND label, not
+            // peer-controlled bytes, so it needs no bounding/escaping.
+            WitnessVerdict::IsPrimary(message) => assert_eq!(
+                message,
+                "witness answered Frames — only a node past the role match (primary, or \
+                 handing off) ever sends one"
+            ),
             other => panic!("expected IsPrimary, got {other:?}"),
         }
         assert_eq!(
@@ -397,7 +445,13 @@ mod tests {
         };
         let (probe, _db) = probe_scripted(0x0DEB_0404, &refusal);
         match probe.verdict() {
-            WitnessVerdict::Inconclusive(message) => assert_eq!(message, PEER_SECRET_REFUSAL),
+            // Bounded/Debug-escaped (fix round 1, I-1): PEER_SECRET_REFUSAL is
+            // well under ECHOED_WITNESS_MESSAGE_BYTES and carries nothing
+            // Debug needs to escape, so the stored form is exactly the
+            // quoted original — `format!("{:?}", ...)`, not raw equality.
+            WitnessVerdict::Inconclusive(message) => {
+                assert_eq!(message, &format!("{PEER_SECRET_REFUSAL:?}"))
+            }
             other => panic!("expected Inconclusive, got {other:?}"),
         }
     }
