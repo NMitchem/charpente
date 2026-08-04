@@ -548,7 +548,10 @@ fn tx_error_response(err: TxError<ApiError>) -> Response {
 /// name a primary, unlike `NotPrimary`, because it does not know whether one
 /// exists elsewhere — it may still be the legitimate one. Pluralises
 /// "follower"/"node"/"it" when more than one witness is still unreached
-/// (hard rule 5: both renderings are pinned byte-exact, `http.rs`).
+/// (hard rule 5: all three renderings are pinned byte-exact, `http.rs`).
+/// The list itself is bounded (`render_witness_list`, task 5's O-6): the
+/// witness set grows without bound under a peer that reconnects from
+/// changing ephemeral ports, and every address in it lands in this body.
 fn verifying_message(unreached: &[String]) -> String {
     assert!(
         !unreached.is_empty(),
@@ -556,7 +559,7 @@ fn verifying_message(unreached: &[String]) -> String {
          refuses to construct TxError::Verifying with one, so this is a caller bug, not a \
          renderable state"
     );
-    let list = unreached.join(", ");
+    let list = crate::repl::witnesses::render_witness_list(unreached);
     if unreached.len() > 1 {
         format!(
             "this node is not accepting writes yet: it was a primary before restarting and has \

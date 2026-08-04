@@ -334,6 +334,40 @@ fn a_verifying_node_pluralizes_the_503_body_for_multiple_unreached_witnesses() {
     );
 }
 
+/// The bounded rendering (M2 sub-project 0b task 5, O-6). The witness SET is
+/// unbounded by design — spec §5 rules out automatic eviction, because a
+/// witness that could have been promoted must never be silently dropped — and
+/// a peer that reconnects from changing ephemeral ports (exactly the edge
+/// harness's shape) grows it without limit. Every address in it otherwise
+/// lands in this body at up to 300 bytes each, on every refused write. The
+/// list is bounded here rather than at record time: truncating the SET would
+/// cost safety (an unlisted witness is an unprobed one), truncating the
+/// SENTENCE costs nothing — the gate still waits for every witness, and the
+/// boot gate's deadline notice still names the unresolved ones with reasons.
+#[test]
+fn a_verifying_node_bounds_the_witness_list_it_renders_in_the_503_body() {
+    const SEED: u64 = 0x9012_0009;
+    let (_sim, mut app) = quiet_app(SEED);
+
+    let witnesses: Vec<String> = (1..=13).map(|i| format!("10.0.0.{i}:7001")).collect();
+    app.db_for_tests().verify_writes(witnesses);
+
+    let resp = app.handle(Request::new(Method::Post, "/notes").json(&CreateNote {
+        id: 1,
+        text: "hi".into(),
+    }));
+    assert_eq!(resp.status, 503, "{}", body_text(&resp));
+    assert_eq!(
+        error_text(&resp),
+        "this node is not accepting writes yet: it was a primary before restarting and has \
+         not confirmed that its followers 10.0.0.1:7001, 10.0.0.2:7001, 10.0.0.3:7001, \
+         10.0.0.4:7001, 10.0.0.5:7001, 10.0.0.6:7001, 10.0.0.7:7001, 10.0.0.8:7001, \
+         10.0.0.9:7001, 10.0.0.10:7001, and 3 more were never promoted — reads are being \
+         served normally, and writes resume automatically once those nodes answer; if they \
+         are gone for good, see GUIDE §10's witness-set remedy"
+    );
+}
+
 #[test]
 fn sessions_login_auth_logout() {
     let (_sim, mut app) = quiet_app(0x47C);

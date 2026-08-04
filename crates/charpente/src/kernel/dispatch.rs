@@ -205,23 +205,20 @@ impl Dispatcher {
                 ))
             }
             Err(TxError::Verifying { .. }) => {
-                // Same shape as the NotPrimary arm above: unreachable today
-                // because nothing sets Verifying yet. When it does, the fix
-                // is a gate check at the call site — mirror Kernel::run's
-                // writes_allowed() guard on migrate_schema at Kernel::build's
-                // was_primary-gated cron.upsert and the Ready::Job/Ready::Cron
-                // pushes — not a probe-first sequence: a witness may stay
-                // unreached indefinitely, so the probe can never finish
-                // before dispatch would run.
+                // Same shape as the NotPrimary arm above: unreachable because
+                // the Ready::Job push is gated on writes_allowed(), which a
+                // verifying node fails.
                 self.due.insert((due_at, id));
                 Err(io::Error::other(
                     "BUG: a job/cron transaction hit Verifying — the kernel must not run \
-                     dispatch or cron on a write-gated node (M2 sub-project 0b: the fix is \
-                     a gate check at the call site, not a probe-first sequence — a witness \
-                     may stay unreached indefinitely, so the probe can never finish first; \
-                     mirror Kernel::run's writes_allowed() guard on migrate_schema at \
-                     Kernel::build's was_primary-gated cron.upsert and the \
-                     Ready::Job/Ready::Cron pushes)",
+                     dispatch or cron on a node whose witness gate is still shut (M2 \
+                     sub-project 0b). The guard that makes this unreachable is \
+                     writes_allowed(): Kernel::build's cron.upsert, the \
+                     Ready::Job/Ready::Cron pushes, and Kernel::run's migrate_schema all \
+                     check it, and after_repl_step re-runs the skipped work when the gate \
+                     opens. Reaching here means one of those checks was weakened back to a \
+                     role test — a verifying node is a Role::Primary, so is_primary() does \
+                     not cover it",
                 ))
             }
             Err(TxError::App(JobError::App(err))) => {
@@ -272,13 +269,14 @@ impl Dispatcher {
                         ),
                         TxError::Verifying { .. } => io::Error::other(
                             "BUG: a job/cron transaction hit Verifying — the kernel must not \
-                             run dispatch or cron on a write-gated node (M2 sub-project 0b: \
-                             the fix is a gate check at the call site, not a probe-first \
-                             sequence — a witness may stay unreached indefinitely, so the \
-                             probe can never finish first; mirror Kernel::run's \
-                             writes_allowed() guard on migrate_schema at Kernel::build's \
-                             was_primary-gated cron.upsert and the Ready::Job/Ready::Cron \
-                             pushes)",
+                             run dispatch or cron on a node whose witness gate is still shut \
+                             (M2 sub-project 0b). The guard that makes this unreachable is \
+                             writes_allowed(): Kernel::build's cron.upsert, the \
+                             Ready::Job/Ready::Cron pushes, and Kernel::run's migrate_schema \
+                             all check it, and after_repl_step re-runs the skipped work when \
+                             the gate opens. Reaching here means one of those checks was \
+                             weakened back to a role test — a verifying node is a \
+                             Role::Primary, so is_primary() does not cover it",
                         ),
                     })
                 };

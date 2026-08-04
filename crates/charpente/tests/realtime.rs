@@ -1594,6 +1594,17 @@ fn rt_kernel_round(sim: &Sim, nodes: &mut [&mut RNode]) -> Result<bool, String> 
     }
 }
 
+/// The witness boot gate's 503 (M2 sub-project 0b task 5): this workload
+/// restarts its primary under fault injection, and a primary that comes back
+/// with a recorded witness serves reads but withholds writes until that
+/// witness answers. An emit refused there did not happen — no event id was
+/// minted and nothing was acked — so it is the same "no write, no bug"
+/// outcome the fault-fallout arms already tolerate. Keyed on the 503 body's
+/// own leading phrase (`http/app.rs`, pinned byte-exact in `http.rs`).
+fn rt_witness_gated(body: &[u8]) -> bool {
+    String::from_utf8_lossy(body).contains("this node is not accepting writes yet")
+}
+
 /// Push a request onto `target`'s source and drive the whole node set until
 /// it is answered — mirrors replication.rs's `drive_request`.
 fn rt_drive_request(
@@ -1820,7 +1831,10 @@ fn multi_node_realtime_universe(sim: &mut Sim) -> Result<(), String> {
             Request::new(Method::Post, route).json(&body),
             RT_STEP_BUDGET,
         )?;
-        if status != 200 && !is_fault_fallout(&String::from_utf8_lossy(&resp_body)) {
+        if status != 200
+            && !is_fault_fallout(&String::from_utf8_lossy(&resp_body))
+            && !rt_witness_gated(&resp_body)
+        {
             return Err(format!(
                 "unexpected emit status {status} on p: {resp_body:?}"
             ));
@@ -1872,7 +1886,9 @@ fn multi_node_realtime_universe(sim: &mut Sim) -> Result<(), String> {
                     });
                 }
             }
-        } else if !is_fault_fallout(&String::from_utf8_lossy(&resp_body)) {
+        } else if !is_fault_fallout(&String::from_utf8_lossy(&resp_body))
+            && !rt_witness_gated(&resp_body)
+        {
             return Err(format!(
                 "unexpected emit status {status} on p during the partition window: {resp_body:?}"
             ));

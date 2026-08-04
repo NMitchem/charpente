@@ -108,11 +108,19 @@ pub struct Kernel {
     /// The replication engine when this kernel runs replicated (`None` for a
     /// plain single node — the ready set then never gates and never ticks).
     repl: Option<Repl>,
-    /// Whether the last iteration saw this node as a live primary. A
-    /// follower→primary flip (promote or a switchover hand-off, both inside
-    /// `Repl::step`) rebuilds the due-heap and cron from the replicated store
-    /// — the only truth for a promoted node.
-    was_primary: bool,
+    /// Whether the last iteration saw this node accepting writes. Every way
+    /// a node becomes writable mid-run — a promote, a switchover hand-off
+    /// (both inside `Repl::step`), or the witness boot gate resolving —
+    /// rebuilds the due-heap and cron from the replicated store and runs the
+    /// schema gate, because those are exactly the pieces of startup a
+    /// non-writable node had to skip.
+    ///
+    /// Keyed on the write gate rather than the ROLE (M2 sub-project 0b): a
+    /// witness-gated node is a `Role::Primary` the whole time, so a
+    /// role-keyed edge never fires for it. `writes_allowed()` is a strict
+    /// refinement of `Repl::is_primary()` — it agrees in every state that
+    /// existed before, and additionally covers `Verifying`.
+    was_writable: bool,
     /// Live SSE subscriptions (realtime T5). A tail joins the ready set only
     /// while it is behind (`next_id < next_event_id`); dead tails (below
     /// retention, or a sink that reported `Full`/`Closed`) are removed right
@@ -143,12 +151,20 @@ impl Kernel {
         let mut dispatcher = Dispatcher::new(app.take_job_defs());
         let mut cron = CronScheduler::new(app.take_cron_entries());
         let now = clock.now().as_nanos();
-        let was_primary = repl.as_ref().is_none_or(Repl::is_primary);
-        // `cron.upsert` writes the schedule rows — skip it on a follower (its
-        // `Db` is write-stopped, and the rows arrive by replication anyway); a
-        // promotion re-runs it in `after_repl_step`. `dispatcher.rebuild` is a
-        // read, always safe.
-        if was_primary {
+        let was_writable = app.db_mut().writes_allowed();
+        // `cron.upsert` writes the schedule rows — skip it whenever the write
+        // gate is shut (its transaction would be refused, and on a follower
+        // the rows arrive by replication anyway); `after_repl_step` re-runs it
+        // the moment the gate opens. `dispatcher.rebuild` is a read, always
+        // safe.
+        //
+        // The guard is the WRITE GATE, not the role: a witness-verifying node
+        // is a `Role::Primary`, so a role guard here would let the upsert
+        // transact, hit `TxError::Verifying`, and `?`-propagate out of the
+        // CONSTRUCTOR — a node that never enters `run` and cannot serve one
+        // read, silently implementing strict-refuse instead of spec §2's
+        // ruled "serve reads, withhold writes".
+        if was_writable {
             cron.upsert(app.db_mut(), now)?;
         }
         dispatcher.rebuild(&app.db_mut().snapshot()?)?;
@@ -166,7 +182,7 @@ impl Kernel {
             pending: None,
             stats: KernelStats::default(),
             repl,
-            was_primary,
+            was_writable,
             tails: Vec::new(),
             tail_cursor: 0,
         })
@@ -218,18 +234,20 @@ impl Kernel {
         if let Some(repl) = &mut self.repl {
             repl.pump_io(now);
         }
-        // A follower (or a draining primary — `is_primary` is false while
-        // handing off) serves reads and ships, but never runs jobs or cron:
-        // those transactions would hit `TxError::NotPrimary` (DESIGN §5).
-        let primary = self.repl.as_ref().is_none_or(Repl::is_primary);
+        // A follower (or a draining primary, or a primary still verifying its
+        // witnesses) serves reads and ships, but never runs jobs or cron:
+        // those transactions would hit `TxError::NotPrimary`/`Verifying`
+        // (DESIGN §5). The guard is the write gate, not the role — see
+        // `was_writable`.
+        let writable = self.app.db().writes_allowed();
         let mut ready = Vec::with_capacity(4);
         if self.pending.is_some() {
             ready.push(Ready::Request);
         }
-        if primary && self.dispatcher.has_due(now) {
+        if writable && self.dispatcher.has_due(now) {
             ready.push(Ready::Job);
         }
-        if primary && self.cron.has_due(now) {
+        if writable && self.cron.has_due(now) {
             ready.push(Ready::Cron);
         }
         if self
@@ -252,12 +270,12 @@ impl Kernel {
             }
         }
         if ready.is_empty() {
-            // Gate the job/cron deadlines on `primary` too: a follower with a
+            // Gate the job/cron deadlines on `writable` too: a node with a
             // due-but-gated job must not busy-spin on a deadline already in the
             // past — the park tick (below) is what wakes it to re-check.
             let mut deadline = [
-                primary.then(|| self.dispatcher.next_deadline()).flatten(),
-                primary.then(|| self.cron.next_deadline()).flatten(),
+                writable.then(|| self.dispatcher.next_deadline()).flatten(),
+                writable.then(|| self.cron.next_deadline()).flatten(),
                 self.repl.as_ref().and_then(|r| r.next_deadline(now)),
             ]
             .into_iter()
@@ -371,29 +389,44 @@ impl Kernel {
         // Any serviced source may have enqueued (handlers can enqueue too), so
         // this runs after every branch above. A follower's shipped applies also
         // fill the buffer, but a follower never runs jobs — drain it either way
-        // to keep it bounded and feed the heap only while primary (a promotion
-        // rebuilds the heap from the store in `after_repl_step`).
+        // to keep it bounded and feed the heap only while writable (becoming
+        // writable rebuilds the heap from the store in `after_repl_step`).
         let enqueued = self.app.db_mut().drain_enqueued();
-        if primary {
+        if writable {
             self.dispatcher.note_enqueued(enqueued);
         }
         Ok(Step::Worked)
     }
 
-    /// After a `Repl::step`, catch a follower→primary flip (promote, or a
-    /// switchover hand-off): rebuild the due-heap and cron from the replicated
-    /// store — the store's Pending rows are the only truth, and `rebuild` only
-    /// enqueues Pending ones, so a job the old primary already marked Done is
-    /// never resurrected onto the heap.
+    /// After a `Repl::step`, catch this node BECOMING WRITABLE — a promote, a
+    /// switchover hand-off, or the witness boot gate resolving — and run the
+    /// three pieces of startup a non-writable node had to skip:
+    ///
+    /// - the schema gate (`Kernel::run` guards it on `writes_allowed()` and
+    ///   never retries it),
+    /// - `cron.upsert` (`Kernel::build` guards it the same way, and a first
+    ///   `Ready::Cron` without it panics on the missing row),
+    /// - the due-heap rebuild from the replicated store — the store's Pending
+    ///   rows are the only truth, and `rebuild` only enqueues Pending ones, so
+    ///   a job the old primary already marked Done is never resurrected.
+    ///
+    /// Keyed on the write gate, not the role: a witness-gated node's role is
+    /// `Primary` from open, so the role edge this used to watch never fires
+    /// for it and all three would be skipped forever — silently, in the
+    /// migration's case. `do_promote` also runs the schema gate itself before
+    /// acking the control verb; running it a second time here is a no-op walk
+    /// over an already-current schema, and keeping both means neither call
+    /// site has to know about the other.
     fn after_repl_step(&mut self) -> io::Result<()> {
-        let primary = self.repl.as_ref().is_none_or(Repl::is_primary);
-        if primary && !self.was_primary {
+        let writable = self.app.db().writes_allowed();
+        if writable && !self.was_writable {
+            self.app.db_mut().migrate_schema()?;
             let now = self.clock.now().as_nanos();
             self.cron.upsert(self.app.db_mut(), now)?;
             let snap = self.app.db_mut().snapshot()?;
             self.dispatcher.rebuild(&snap)?;
         }
-        self.was_primary = primary;
+        self.was_writable = writable;
         Ok(())
     }
 

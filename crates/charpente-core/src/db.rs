@@ -1788,8 +1788,12 @@ impl Db {
     pub fn migrate_schema(&mut self) -> io::Result<()> {
         assert!(
             self.writes_allowed(),
-            "migrate_schema on a write-forbidden node — the gate is role-aware (spec §2): \
-             call it only on single-node/primary at startup, or at promote"
+            "migrate_schema on a write-forbidden node — this is the WRITE gate, not a role \
+             check (M2 sub-project 0b task 5): a durable primary that restarted with recorded \
+             witnesses is write-stopped until every witness answers, so a node can be \
+             `Role::Primary` and still forbid this. Call it only where writes are already \
+             allowed — the kernel's startup and `do_promote` both guard on \
+             `writes_allowed()`; a direct caller must do the same, or wait for the gate to open"
         );
         self.reload_adopted()?;
         let tables: Vec<&'static str> = self.engine.machine().schema.table_names();

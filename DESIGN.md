@@ -657,17 +657,35 @@ answered as a primary demotes it to `Follower(to)` (a diverged refusal is the op
 re-seed signal, surfaced as the step error); `to` unreachable or not-yet-primary keeps it
 `HandingOff` on a reconnect cadence — a node in durable `HandingOff` never silently
 resumes `Primary`, so no *switchover* interleaving yields two writable primaries. **The
-promote path does not carry that property, and that is a known gap** (M1 sub-project 6,
-T12): a node promoted *away from* — killed while `Primary`, its follower promoted
-underneath it — still has `Primary` in its own durable role file, and the durable role
-always wins, so restarting it with its original config resumes it as a second writable
-primary with no notice at all (neither node dials the other, so neither can observe the
-conflict). Two live, mutually invisible, diverged timelines; the mandated fresh-data-dir
-re-seed then destroys every write the resurrected node acked. Characterized, not fixed, by
-`crates/edge-harness/tests/failover.rs`'s
-`failover_known_gap_silent_dual_primary_resurrection` (`#[ignore]`, so its tripwire fires
-only under `scripts/edge-harness.sh`); the fix proposal — a durable witness set probed
-before any `Primary` resume — is M2 backlog (CLAUDE.md's follow-up entry).
+promote path did not carry that property** (the M1 sub-project 6 / T12 gap): a node
+promoted *away from* — killed while `Primary`, its follower promoted underneath it — still
+has `Primary` in its own durable role file, and the durable role always wins, so restarting
+it with its original config used to resume it as a second writable primary with no notice
+at all (neither node dials the other, so neither could observe the conflict). Two live,
+mutually invisible, diverged timelines; the mandated fresh-data-dir re-seed then destroys
+every write the resurrected node acked.
+
+**The boot gate** (M2 sub-project 0b, spec `docs/superpowers/specs/2026-07-31-dual-primary-
+design.md`) closes that for the case the node can see. A **witness** is a node this primary
+agreed to ship to; the listen addresses are recorded durably (two CRC'd generation-stamped
+slots, so a torn write can never parse as a shorter — and therefore weaker — set) as each
+shipping session is established, and cleared on every durable flip *toward* `Primary`,
+before the flip itself, so an interrupted promote is merely incomplete rather than a
+primary carrying a stale set nothing will re-clear. At open, a durable `Primary` with a
+non-empty set does not `allow_writes`: it enters the third write-gate state
+(`TxError::Verifying` → 503, §2a of the spec) and probes every witness with one
+classify-and-disconnect `Hello` — never `Follower::new_resolving`, which would fall through
+to *adopt* the winner's timeline, the move the 2026-07-16 diverged-BEHIND ruling rejected.
+Every witness answering "not a primary" opens the gate; one answering as a primary refuses
+this node by name, naming both remedies and demoting nothing; unreachable or inconclusive
+witnesses keep the gate shut, serve reads throughout, and produce one operator notice after
+`WITNESS_DEADLINE_NANOS` (Noah's ruled option (c) — the availability cost is deliberate,
+because the alternative is silent acked-write loss). **The bound, stated so it is not read
+wider: a probe answers "is THIS witness a primary", never "does another primary exist".**
+A node promoted after a switchover chain, never in this node's witness set, is invisible to
+the check — the witness set is the bound on the whole defence, and the M2 backlog's Design C
+(a durable timeline epoch carried on `Hello`) would sharpen the refusal rather than replace
+the probe.
 
 **Surfaces (v1, implemented).** The kernel wires the data + control plane in (M1
 replication T8): `Kernel::with_replication(app, clock, repl)` runs the `Repl` engine as the

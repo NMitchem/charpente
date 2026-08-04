@@ -2576,12 +2576,6 @@ routes work everywhere.
 
 ### What a restarting primary does
 
-> **Not armed yet.** This section describes the error surface the witness-set
-> probe uses; nothing in the platform enters this state today, so the promote
-> warning below still applies in full — a restarted old primary currently comes
-> up writable with no notice. Read the two together, and the warning wins until
-> the probe lands.
-
 A node that was a durable primary before it restarted, and has not yet
 confirmed that none of the followers it shipped to (its "witnesses") were
 promoted while it was down, also refuses writes — but it cannot name a
@@ -2604,6 +2598,44 @@ transient: writes resume automatically the moment every witness confirms it
 was never promoted, with no operator action needed for a witness that
 answers.
 
+**Where the witness set comes from, and what the check can prove.** A witness
+is a node this primary agreed to *ship* to; the addresses are recorded durably
+as each shipping session is established, so a single-node primary and one that
+never shipped have an empty set and are untouched by any of this — they resume
+writable immediately and silently. On a restart with a non-empty set the node
+asks each witness one question, "are you a primary now?", and:
+
+- every witness answers *not a primary* → the gate opens and writes resume;
+- a witness answers *as a primary* → it was promoted or handed off to while
+  this node was down, so this node **refuses to serve at all** and says so,
+  naming both remedies (re-seed this node from a fresh data dir if the other
+  timeline is the one to keep; or stop the other node, clear this node's
+  witness set, and restart it if these records are). It never demotes itself:
+  it cannot know which timeline you want, and the writes it acked are not the
+  platform's to discard;
+- a witness cannot be reached, or answers something that says nothing about
+  its role (a mismatched peer secret, protocol version, or schema digest) →
+  reads keep flowing, writes keep being refused, and after 30 seconds
+  (`WITNESS_DEADLINE_NANOS`) the node prints one notice on stderr naming what
+  is still unresolved and why. It keeps probing; an unreachable witness that
+  comes back resolves the gate on its own.
+
+The bound is worth stating plainly: this proves *none of the nodes I shipped
+to is a primary now*, not *no other primary exists*. If the follower you
+promoted was never in this node's witness set — it was promoted after a
+switchover chain, say — this node resumes, and you are back to the hazard the
+promote warning below describes.
+
+**The escape hatch, and its cost.** A follower that is permanently
+decommissioned stays in the witness set forever, and a primary whose only
+witness is gone for good will not accept writes until you intervene. Retention
+is deliberately conservative — a decommissioned node *could* have been promoted
+before it was decommissioned — so the exit is manual: stop the node and delete
+both `witnesses.0` and `witnesses.1` from its data directory. Do that **only**
+when you are certain no follower of this node was ever promoted: an empty
+witness set lets it resume as a primary unchecked, which is exactly the gap the
+set exists to close.
+
 ### Promotion and switchover
 
 Two operator moves change which node is primary, both crash-safe on the durable
@@ -2622,15 +2654,21 @@ role file:
 **After a `promote`, the old primary must be wiped before it is ever started
 again.** Its durable role file still says `Primary`, and the durable role always
 wins over config, so restarting it as it was configured brings up a *second*
-writable primary on a diverged timeline — and nothing warns you: neither node
-dials the other, so neither can notice, and the resurrected node will accept and
-ack new writes. Those writes are then destroyed by the only remedy available
-(the fresh-data-dir re-seed below). So: promote the follower, then treat the old
-box as a *new* node — stop it, clear its data directory, and let it re-seed as a
-follower of the new primary. A switchover does not have this hazard (the
-handed-off primary demotes itself durably); this is specific to promote, and it
-is a known gap the platform does not currently detect for you (DESIGN §5,
-characterized by `crates/edge-harness/tests/failover.rs`).
+primary again, on a timeline that has already diverged from the one you
+promoted.
+
+In the ordinary case the witness gate above catches exactly this — the promoted
+node is one the old primary had shipped to, so it is in the witness set, and the
+restarted box asks it, hears "I am a primary", and refuses to serve rather than
+acking writes nobody will ever see again. **Do not lean on that instead of the
+wipe.** The check is bounded by the witness set, so a node promoted after a
+switchover chain (one this primary never shipped to) is invisible to it; the
+verdict is a refusal to run, not a repair; and any write the resurrected box
+acked before you noticed is still destroyed by the only remedy there is. So:
+promote the follower, then treat the old box as a *new* node — stop it, clear
+its data directory, and let it re-seed as a follower of the new primary. A
+switchover does not have this hazard at all (the handed-off primary demotes
+itself durably); it is specific to promote (DESIGN §5).
 
 Both travel as control messages over the replication port, issued with the
 `charpente` CLI:

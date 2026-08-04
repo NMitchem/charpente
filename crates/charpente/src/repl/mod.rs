@@ -20,13 +20,16 @@ use charpente_core::io::{Clock, Disk, Listener, Net};
 
 use crate::Db;
 use crate::repl::follower::Follower;
+use crate::repl::probe::{WitnessProbe, WitnessVerdict};
 use crate::repl::protocol::Msg;
 use crate::repl::role::{Role, load_role, store_role};
 use crate::repl::session::{PendingCtrl, Session};
-use crate::repl::witnesses::{clear_witnesses, open_witnesses, store_witnesses};
+use crate::repl::witnesses::{
+    clear_witnesses, open_witnesses, render_witness_list, store_witnesses,
+};
 
 mod follower;
-pub mod probe;
+pub(crate) mod probe;
 pub mod protocol;
 pub mod role;
 mod session;
@@ -71,6 +74,15 @@ pub const REPL_TICK_NANOS: u64 = 5_000_000;
 /// `switchover`'s drain deadline before aborting back to `Primary` (spec
 /// §2; Global Constraints): 30s.
 pub const SWITCHOVER_DEADLINE_NANOS: u64 = 30_000_000_000;
+
+/// How long a resurrected primary probes quietly before it says out loud that
+/// it is withholding writes (spec §2's ruled option (c)): 30s. The deadline
+/// moves NOTHING — the gate stays shut and the probes keep running; it only
+/// decides when the operator is told why writes are refused. Sized well above
+/// `HEARTBEAT_NANOS`: a primary witness with nothing to ship answers only on
+/// its next heartbeat, up to 1s away, and reading a quiet primary as
+/// "unreachable" is the availability-costing false negative.
+pub const WITNESS_DEADLINE_NANOS: u64 = 30_000_000_000;
 
 // ---------------------------------------------------------------- Repl
 
@@ -161,6 +173,23 @@ pub struct Repl {
     /// timeline, and a stale witness would block writes after a future
     /// legitimate promotion. Task 5 gates boot on probing this set.
     witnesses: Vec<String>,
+    /// The boot gate (M2 sub-project 0b task 5, spec §2): one probe per
+    /// recorded witness, live only while this node is a durable `Primary`
+    /// that has not yet confirmed none of them was promoted while it was
+    /// down. Empty in every other state — including after the gate resolves,
+    /// which is what makes "the gate is set once per resolution, never per
+    /// tick" structural rather than a convention.
+    probes: Vec<WitnessProbe>,
+    /// When to say out loud that writes are being withheld — anchored at the
+    /// first step, since `Repl::open` has no clock; `None` when nothing is
+    /// being verified. Reaching it changes NO state: the gate stays shut and
+    /// the probes keep running.
+    witness_deadline: Option<u64>,
+    /// Latches once the deadline notice has been produced, so it is produced
+    /// exactly once per process rather than once per step past the deadline.
+    witness_notice_sent: bool,
+    /// The produced notice, waiting for a driver to take it.
+    witness_notice: Option<String>,
 }
 
 impl Repl {
@@ -203,8 +232,35 @@ impl Repl {
             move || *floor.lock().expect("uncontended")
         }));
 
+        // THE BOOT GATE (M2 sub-project 0b task 5, spec §2's ruled option
+        // (c)). This is a constraint on where the gate lives, not just on
+        // what it decides: `db.allow_writes()` used to be unconditional here,
+        // and the probe client below is not even constructed until further
+        // down — so writes were enabled strictly before any probe could
+        // possibly run, and a check bolted on afterwards would not be a fix.
+        //
+        // What the probes can and cannot prove (write this into the operator
+        // docs as it stands, not wider): a probe answers "is THIS witness a
+        // primary", never "does another primary exist". After a switchover
+        // W -> X where X was never in this node's witness set, W ends up a
+        // follower of X and correctly answers "not a primary", so this node
+        // resumes — dual-primary, undetected. The witness set is the bound on
+        // the whole defence.
+        let mut probes = Vec::new();
         match &role {
-            Role::Primary => db.allow_writes(),
+            Role::Primary if witnesses.is_empty() => db.allow_writes(),
+            Role::Primary => {
+                // Every witness is probed with NO listen address of its own,
+                // deliberately: this node is asking a question, not offering
+                // to follow. A witness that agreed to ship would otherwise
+                // durably record the prober as a witness of its own and gate
+                // ITS next restart on a node that may never come back.
+                probes = witnesses
+                    .iter()
+                    .map(|addr| WitnessProbe::new(addr.clone(), None, cfg.peer_secret.clone()))
+                    .collect();
+                db.verify_writes(witnesses.clone());
+            }
             Role::Follower { primary } | Role::Backup { primary } => {
                 db.forbid_writes(primary.clone())
             }
@@ -250,6 +306,10 @@ impl Repl {
                 pin_floor,
                 stats: ReplStats::default(),
                 witnesses,
+                probes,
+                witness_deadline: None,
+                witness_notice_sent: false,
+                witness_notice: None,
             },
             notice,
         ))
@@ -275,6 +335,24 @@ impl Repl {
         self.switchover.as_ref().map(|s| s.phase)
     }
 
+    /// How many witnesses this node is still probing (test hook — the
+    /// empty-set regression asserts a silent resume by proving ZERO probes
+    /// exist, which no gate observation can show).
+    #[doc(hidden)]
+    pub fn verifying_witnesses(&self) -> usize {
+        self.probes.len()
+    }
+
+    /// The one loud operator notice the witness gate emits when its deadline
+    /// passes with witnesses still unresolved (spec §2). Produced at most once
+    /// per process — `witness_notice_sent` latches — so a driver that polls
+    /// this sees `Some` exactly once and `None` forever after. The notice is
+    /// not a substitute for the gate; it is how an operator with no client
+    /// traffic learns why writes are being refused.
+    pub fn take_witness_notice(&mut self) -> Option<String> {
+        self.witness_notice.take()
+    }
+
     /// Non-destructive IO movement, called unconditionally each iteration like
     /// `source.poll()`: accept pending conns, drain readable messages into
     /// internal queues, note reconnect timers. No `Db` access.
@@ -294,6 +372,12 @@ impl Repl {
         }
         if let Some(f) = &mut self.follower {
             f.drain(now_nanos);
+        }
+        // The boot gate's witnesses answer on their own schedule: pumping
+        // here is what lets `has_work` stay honest about an open probe conn
+        // (see `WitnessProbe::drain`).
+        for p in &mut self.probes {
+            p.drain(now_nanos);
         }
     }
 
@@ -315,6 +399,17 @@ impl Repl {
         {
             return true;
         }
+        // The boot gate, both of its states (a drained reply to classify, a
+        // due reconnect) plus the deadline notice. Missing either probe state
+        // silently breaks the gate — an unclassified reply leaves a resolved
+        // witness looking unreached forever, and a probe whose backoff comes
+        // due and is never stepped never reconnects at all.
+        if self.probes.iter().any(|p| p.has_work(now_nanos)) {
+            return true;
+        }
+        if self.witness_notice_due(now_nanos) {
+            return true;
+        }
         if self.sessions.iter().any(|s| s.dead) {
             return true;
         }
@@ -324,6 +419,15 @@ impl Repl {
         self.follower
             .as_ref()
             .is_some_and(|f| f.has_work(now_nanos))
+    }
+
+    /// True when the witness deadline has passed with the gate unresolved and
+    /// the notice not yet produced. An unanchored deadline (`None` with live
+    /// probes) is not due — the first step anchors it.
+    fn witness_notice_due(&self, now_nanos: u64) -> bool {
+        !self.probes.is_empty()
+            && !self.witness_notice_sent
+            && self.witness_deadline.is_some_and(|d| now_nanos >= d)
     }
 
     /// The earliest future timer (heartbeat or reconnect) this node wants to
@@ -350,6 +454,20 @@ impl Repl {
         // virtual time to it so the abort/stall fires when nothing else runs.
         if let Some(sw) = &self.switchover {
             fold(sw.deadline);
+        }
+        // The boot gate's reconnect backoffs, and its notice deadline — the
+        // scheduler must advance to both, or a node whose only pending work
+        // is a retry looks quiescent and never says why it is refusing writes.
+        for p in &self.probes {
+            if let Some(d) = p.next_deadline() {
+                fold(d);
+            }
+        }
+        if !self.probes.is_empty()
+            && !self.witness_notice_sent
+            && let Some(d) = self.witness_deadline
+        {
+            fold(d);
         }
         best
     }
@@ -380,6 +498,26 @@ impl Repl {
         // target up.
         if self.switchover.is_some() && self.drive_switchover(db, now)? {
             return Ok(());
+        }
+
+        // The boot gate. Runs before the round-robin: a node that does not
+        // yet know whether it is still the primary has nothing more urgent to
+        // decide. It never starves the rest of the step for long — a probe
+        // reports work only for a drained reply or a due reconnect.
+        if !self.probes.is_empty() {
+            let deadline = *self
+                .witness_deadline
+                .get_or_insert(now + WITNESS_DEADLINE_NANOS);
+            if self.probes.iter().any(|p| p.has_work(now)) {
+                for p in &mut self.probes {
+                    p.step(&*self.net, db, now)?;
+                }
+                return self.resolve_witness_gate(db);
+            }
+            if !self.witness_notice_sent && now >= deadline {
+                self.emit_witness_notice();
+                return Ok(());
+            }
         }
 
         let before = self.sessions.len();
@@ -446,6 +584,117 @@ impl Repl {
             self.resolve_to_follower(db, &to)?;
         }
         Ok(())
+    }
+
+    // --------------------------------------------------------- boot gate
+
+    /// The gate's one decision point, run after every probe step (spec §2).
+    /// Three outcomes and no fourth: a witness answering as a primary is
+    /// conclusive on its own and refuses this node by name; every witness
+    /// answering "not a primary" opens the gate; anything else keeps waiting
+    /// (an `Inconclusive` witness behaves exactly like an unreachable one —
+    /// it never opens the gate, and the deadline notice names its reason).
+    ///
+    /// **The gate is set once per resolution, never per tick**, and that is a
+    /// safety property, not an efficiency one. `Db::verify_writes` asserts it
+    /// is not layering over `forbid_writes`, so a shape that recomputed the
+    /// unreached list and re-called it each tick would panic the moment any
+    /// other path write-stopped this node — and which answer a witness gives
+    /// is peer-controlled, which would make that panic remotely triggerable.
+    /// Here `verify_writes` is called exactly once, in `open`; this function
+    /// only ever moves the gate to `Allowed`, and clearing `probes` on the
+    /// way makes the whole arm dead afterwards. The one operator verb that
+    /// could otherwise move the gate underneath a live probe (`switchover`,
+    /// whose abort arm calls `allow_writes`) is refused while verifying.
+    ///
+    /// The cost of setting it once: `TxError::Verifying` names the whole
+    /// witness set for the life of the gate instead of shrinking as witnesses
+    /// answer. Deliberate — the 503 says what class of thing is unresolved,
+    /// and the deadline notice, which needs no gate write at all, is where
+    /// the per-witness detail lives.
+    fn resolve_witness_gate(&mut self, db: &mut Db) -> io::Result<()> {
+        let conflict = self.probes.iter().find_map(|p| match p.verdict() {
+            WitnessVerdict::IsPrimary(detail) => Some((p.addr().to_string(), detail.clone())),
+            _ => None,
+        });
+        if let Some((addr, detail)) = conflict {
+            // Never demote automatically — the 2026-07-16 diverged-BEHIND
+            // ruling: this node cannot know it is the loser, and its acked
+            // writes are not ours to discard. `{detail}` is already
+            // Debug-escaped and length-bounded at capture (probe.rs), so it
+            // is interpolated plainly here rather than quoted a second time.
+            return Err(io::Error::other(format!(
+                "witness {addr} answers as a primary itself ({detail}): this node restarted as \
+                 a durable primary, but a follower it had shipped to has been promoted or \
+                 handed off to while it was down, so this node is not the primary any more. It \
+                 has NOT demoted itself — it cannot know which timeline you want to keep, and \
+                 the writes it acked are not the platform's to discard. If {addr} holds the \
+                 timeline to keep, re-seed this node from a fresh data dir (stop it, delete its \
+                 data dir, restart to snapshot-seed from {addr}); if instead this node's \
+                 records are the ones to keep, stop {addr}, then clear this node's witness set \
+                 (GUIDE §10) and restart it."
+            )));
+        }
+        if self
+            .probes
+            .iter()
+            .all(|p| matches!(p.verdict(), WitnessVerdict::NotPrimary))
+        {
+            db.allow_writes();
+            self.probes.clear();
+            self.witness_deadline = None;
+        }
+        Ok(())
+    }
+
+    /// The one loud notice (spec §2): the deadline passed and writes are
+    /// still being withheld. Changes nothing — the gate stays shut, the
+    /// probes keep running — it only tells an operator with no client traffic
+    /// what the 503 would have told a client.
+    fn emit_witness_notice(&mut self) {
+        let unresolved: Vec<String> = self
+            .probes
+            .iter()
+            .filter_map(|p| match p.verdict() {
+                WitnessVerdict::Pending => Some(format!("{} (no answer yet)", p.addr())),
+                // Already Debug-escaped and bounded at capture (probe.rs) —
+                // not quoted again here.
+                WitnessVerdict::Inconclusive(reason) => {
+                    Some(format!("{} (inconclusive: {reason})", p.addr()))
+                }
+                // A satisfied witness is not unresolved; `IsPrimary` never
+                // reaches here — it refused this node one arm earlier.
+                WitnessVerdict::NotPrimary | WitnessVerdict::IsPrimary(_) => None,
+            })
+            .collect();
+        assert!(
+            !unresolved.is_empty(),
+            "witness notice with nothing unresolved — an all-answered gate clears its probes, \
+             so this arm cannot be reached with every witness satisfied"
+        );
+        // Seconds, derived from the constant rather than spelled out, so the
+        // text cannot drift from the deadline it reports (hard rule 5: the
+        // message is product surface, and "30000000000ns" is not a duration
+        // an operator reads).
+        let deadline_secs = WITNESS_DEADLINE_NANOS / 1_000_000_000;
+        let notice = format!(
+            "witness verification has not resolved after {deadline_secs}s: this node \
+             was a primary before restarting and still cannot confirm that every follower it \
+             had shipped to was never promoted, so it is serving reads and refusing writes — \
+             writes resume automatically the moment every witness answers. Unresolved: {}. If a \
+             witness is gone for good, see GUIDE §10's witness-set remedy.",
+            render_witness_list(&unresolved)
+        );
+        // The one stderr write inside `repl`, and the reason it is here
+        // rather than at the `serve` edge with its siblings: this notice is
+        // produced mid-run, and no driver polls the kernel while it is
+        // looping. An operator watching logs with no client traffic would
+        // otherwise have nothing at all to read. It fires at most once per
+        // process (`witness_notice_sent`), and the same string is left on
+        // `witness_notice` for a driver that would rather route it itself.
+        eprintln!("charpente replication: {notice}");
+        self.witness_notice = Some(notice);
+        self.witness_notice_sent = true;
     }
 
     // ------------------------------------------------------ control plane
@@ -594,6 +843,7 @@ impl Repl {
             );
             return Ok(());
         }
+        self.clear_stale_witnesses()?;
         store_role(&*self.role_disk, &Role::Primary)?;
         self.role = Role::Primary;
         db.allow_writes();
@@ -654,6 +904,28 @@ impl Repl {
                 return Ok(());
             }
             Role::Primary => {}
+        }
+        // Refused while the boot gate is still verifying, for a safety reason
+        // and not only a sensible one: `begin_switchover` write-stops this
+        // node, and `abort_switchover` later calls `allow_writes` — which on
+        // an unverified node would silently resume exactly the second primary
+        // this gate exists to prevent. Refusing here keeps `Verifying` a
+        // state only `resolve_witness_gate` can leave.
+        if !self.probes.is_empty() {
+            let witnesses: Vec<String> = self.probes.iter().map(|p| p.addr().to_string()).collect();
+            self.reply_ctrl(
+                ctrl_id,
+                &Msg::CtrlErr {
+                    message: format!(
+                        "cannot switch over: this node is still verifying its witnesses ({}) — \
+                         it has not accepted a write since it restarted, so there is nothing to \
+                         drain; wait for verification to finish, or promote the target directly",
+                        render_witness_list(&witnesses)
+                    ),
+                },
+                now,
+            );
+            return Ok(());
         }
         let found = self
             .sessions
@@ -718,6 +990,7 @@ impl Repl {
             }
             return Err(io::Error::other(msg));
         }
+        self.clear_stale_witnesses()?;
         store_role(&*self.role_disk, &Role::Primary)?;
         self.role = Role::Primary;
         db.allow_writes();
@@ -948,6 +1221,42 @@ impl Repl {
         next.extend(fresh);
         store_witnesses(&*self.role_disk, &next)?;
         self.witnesses = next;
+        Ok(())
+    }
+
+    /// Clears a stale witness set on the way UP to `Primary` — before the
+    /// durable role flip, at every site that performs one (`do_promote`,
+    /// `accept_handoff`). Noah ruling 2 (task 1b): `clear_witnesses` on the
+    /// two demote paths is a plain durable write, and a crash can tear it —
+    /// after which nothing ever re-attempts it, so the node carries a stale
+    /// set into a life where the set is load-bearing again and (under ruled
+    /// option (c)) withholds writes forever waiting on a witness from a
+    /// timeline it has left. There is no local write-ordering or durability
+    /// fix — from the bytes a torn clear and a torn update are
+    /// indistinguishable, and `open_witnesses` repairs a torn slot with the
+    /// resolved (stale) set, so by the next boot there is nothing left to
+    /// detect. Ordering is the only route, and BEFORE the flip specifically:
+    /// clear-then-`store_role` makes an interrupted promote merely incomplete
+    /// (still a follower, stale set inert, `charpente promote` retries),
+    /// while flip-then-clear reproduces the identical non-retryable window
+    /// one step over.
+    ///
+    /// Guarded on a non-empty set so the ordinary promote costs no disk op at
+    /// all — and sound, because the in-memory mirror and the durable set
+    /// cannot disagree within a process: `store_witnesses` syncs before it
+    /// returns, so a torn write means the process died mid-call, and the next
+    /// `Repl::open` reloads the set from disk.
+    ///
+    /// Deliberately NOT applied to `abort_switchover`'s flip back to
+    /// `Primary`: that node has been the primary throughout and its witnesses
+    /// are its real, current followers — clearing them there would reopen
+    /// this whole gap on the next restart.
+    fn clear_stale_witnesses(&mut self) -> io::Result<()> {
+        if self.witnesses.is_empty() {
+            return Ok(());
+        }
+        clear_witnesses(&*self.role_disk)?;
+        self.witnesses.clear();
         Ok(())
     }
 

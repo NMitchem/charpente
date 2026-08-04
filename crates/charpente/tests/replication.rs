@@ -17,8 +17,8 @@ use std::time::Duration;
 use charpente::repl::Repl;
 use charpente::repl::protocol::{Msg, decode, encode};
 use charpente::repl::role::Role;
-use charpente::repl::witnesses::load_witnesses;
-use charpente::repl::{MAX_MESSAGE_BYTES, PROTO_VERSION, ReplConfig};
+use charpente::repl::witnesses::{load_witnesses, store_witnesses};
+use charpente::repl::{MAX_MESSAGE_BYTES, PROTO_VERSION, ReplConfig, WITNESS_DEADLINE_NANOS};
 use charpente::{Db, DbConfig, Id, Job, Schema, TxError, table};
 use charpente_core::io::{Clock, Conn, Disk, File, Net};
 use charpente_core::log::{Wal, WalConfig};
@@ -540,11 +540,16 @@ fn commit_widget(sim: &Sim, node: &mut Node, i: u64) -> Result<(), String> {
             Err(format!("commit refused: not primary of {primary}"))
         }
         Err(TxError::Verifying { unreached }) => {
-            // This suite never calls verify_writes (M2 sub-project 0b's
-            // boot-time probe is Task 5, not yet wired into the kernel).
-            Err(format!(
-                "commit refused: impossible Verifying rejection (unreached {unreached:?})"
-            ))
+            // Legitimate since the boot gate landed (M2 sub-project 0b task
+            // 5): a primary that restarted with a non-empty witness set
+            // serves reads and withholds writes until every witness answers,
+            // so a commit offered in that window is refused and simply did
+            // not happen — the same "no write, no bug" outcome the fault arm
+            // above returns `Ok` for. Covered rather than silent, so the
+            // universes that exercise the gate stay visible in the report.
+            let _ = unreached;
+            sim.cover("repl:witness-gated-write");
+            Ok(())
         }
     }
 }
@@ -1534,6 +1539,21 @@ fn a_converged_follower_below_a_forked_primarys_base_is_refused_not_rewound() {
     p.host.crash_now();
     p.db = None;
     p.host.restart();
+    // The GUIDE §10 operator escape hatch, and the reason this test needs it
+    // is itself the finding: since the witness boot gate landed (M2
+    // sub-project 0b task 5), p cannot reach this fork on its own. It shipped
+    // to f above, so f is a durable witness; p restarts write-stopped and the
+    // partition means f can never answer, so the re-advance below would be
+    // refused outright and p would sit at the cut forever.
+    //
+    // That is the gate working — it makes THIS divergence much harder to
+    // reach, which is the whole point of 0b. But diverged-behind stays
+    // reachable exactly as spec §4 warns: an operator who clears the witness
+    // file to get a stuck primary writable again re-opens the gap. So the
+    // clear is not a workaround for the test, it is the scenario — the
+    // supported operator action whose cost §4 states out loud, and this test
+    // is what proves the refusal still holds after someone takes it.
+    charpente::repl::witnesses::clear_witnesses(&p.host.disk()).unwrap();
     reopen(&sim, &mut p).expect("an above-horizon cut recovers cleanly, not RESTORE_NEEDED");
     let p_after_cut = p.db.as_ref().unwrap().last_applied().expect("p recovered");
     assert!(
@@ -2482,19 +2502,36 @@ fn converged_v1_follower_catches_up_via_shipped_migrateputs() {
     p.db.as_mut().unwrap().checkpoint().unwrap();
     p.db = None;
 
+    // Followers first, then the primary. The order is load-bearing since the
+    // witness boot gate landed (M2 sub-project 0b task 5): p shipped to f
+    // above, so f is a durable witness of p, and a restarted p withholds
+    // writes — including `migrate_schema`, which O-1 moved onto the write
+    // gate — until f answers "not a primary". Starting p first here is what
+    // the pre-gate version of this test did, and it now deadlocks at the
+    // migrate below. This is the same followers-first rollout order the
+    // peer-secret work (M1 sub-project 4, T7) already established, and the
+    // gate generalizes it: the receiver must be up for the dialer to proceed.
+    //
+    // The follower's own gate is read-only: the store still holds v1 bytes,
+    // admitted because the clean checkpoint above left nothing below-version
+    // to replay; it catches up via shipped MigratePuts once reconnected,
+    // never running migrate_schema itself.
+    f.schema = make_schema_v2();
+    f.host.restart();
+    reopen(&sim, &mut f).unwrap();
+
     // Restart the primary on v2 — its startup path migrates.
     p.schema = make_schema_v2();
     p.host.restart();
     reopen(&sim, &mut p).unwrap();
+    run_until(
+        &sim,
+        &mut [&mut p, &mut f],
+        |ns: &[&mut Node]| ns[0].db.as_ref().is_some_and(Db::writes_allowed),
+        CONVERGE_BUDGET,
+    )
+    .expect("p's witness gate must open once f answers that it is not a primary");
     p.db.as_mut().unwrap().migrate_schema().unwrap();
-
-    // Restart the follower on v2 — its gate is read-only: the store still
-    // holds v1 bytes, admitted because the clean checkpoint above left
-    // nothing below-version to replay; it catches up via shipped
-    // MigratePuts once reconnected, never running migrate_schema itself.
-    f.schema = make_schema_v2();
-    f.host.restart();
-    reopen(&sim, &mut f).unwrap();
 
     run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
     assert_converged(&sim, &mut p, &mut f).unwrap();
@@ -2781,6 +2818,12 @@ fn promote_mid_migration_resumes_from_the_shipped_watermark() {
 enum WriteOutcome {
     Acked,
     NotPrimary,
+    /// The witness boot gate is still shut (M2 sub-project 0b task 5): this
+    /// node restarted as a primary with recorded witnesses and has not heard
+    /// back yet. Deliberately NOT folded into `NotPrimary` — that one means
+    /// "the switchover's write-stop landed", which is what the drain oracle
+    /// is watching for, and a witness-gated refusal is not that.
+    WitnessGated,
     Fallout,
 }
 
@@ -2809,11 +2852,9 @@ fn write_once(sim: &Sim, node: &mut Node, i: u64) -> Result<WriteOutcome, String
         Err(TxError::Io(e)) => Err(format!("commit io: {e}")),
         Err(TxError::App(e)) => Err(format!("commit app: {e}")),
         Err(TxError::Verifying { unreached }) => {
-            // This suite never calls verify_writes (M2 sub-project 0b's
-            // boot-time probe is Task 5, not yet wired into the kernel).
-            Err(format!(
-                "commit refused: impossible Verifying rejection (unreached {unreached:?})"
-            ))
+            let _ = unreached;
+            sim.cover("repl:witness-gated-write");
+            Ok(WriteOutcome::WitnessGated)
         }
     }
 }
@@ -2935,6 +2976,20 @@ enum DrainResult {
     /// The target follower was momentarily disconnected (conn_drop mid-
     /// reconnect) when the verb was processed — retry.
     NoSession,
+    /// The primary crashed mid-universe and came back with a recorded witness
+    /// it had not yet heard from, so it refused to hand off primacy it could
+    /// not confirm it still held (M2 sub-project 0b task 5) — retry.
+    ///
+    /// This is a RETRY, not a skip, and the distinction is the whole reason
+    /// this arm does not weaken spec §4 property 2 (PLAN's M1 exit criterion,
+    /// verbatim). The witness here IS `f`, which is live in this rig, so the
+    /// gate is transient and self-resolving: the probe reaches it within a
+    /// few rounds, the gate opens, and the very next attempt drains a real
+    /// switchover that the oracle then adjudicates in full. Tolerating the
+    /// refusal as a non-event instead — the tempting one-line fix — would
+    /// silently retire the property in exactly the universes where a crash
+    /// made it most interesting.
+    Verifying,
     /// The control conn was lost or the primary recovered — inconclusive.
     Lost,
 }
@@ -2966,7 +3021,8 @@ fn run_switchover_drain(
             match write_once(sim, p, *next)? {
                 WriteOutcome::Acked => acked.push(*next),
                 WriteOutcome::NotPrimary => stopped = true,
-                WriteOutcome::Fallout => {}
+                // Neither acked nor the stop landing: offer another.
+                WriteOutcome::WitnessGated | WriteOutcome::Fallout => {}
             }
             *next += 1;
         }
@@ -2980,6 +3036,11 @@ fn run_switchover_drain(
         match cli.poll() {
             Ok(Some(Msg::CtrlErr { message })) if message.contains("no replication session") => {
                 return Ok(DrainResult::NoSession);
+            }
+            Ok(Some(Msg::CtrlErr { message }))
+                if message.contains("still verifying its witnesses") =>
+            {
+                return Ok(DrainResult::Verifying);
             }
             Ok(Some(m)) => return Ok(DrainResult::Reply(m)),
             Ok(None) => {}
@@ -3055,6 +3116,11 @@ fn switchover_universe(sim: &mut Sim) -> Result<(), String> {
                 break;
             }
             DrainResult::NoSession => {
+                drive_rounds(sim, &mut [&mut p, &mut f], 20)?;
+                continue;
+            }
+            DrainResult::Verifying => {
+                sim.cover("repl:switchover-witness-gated");
                 drive_rounds(sim, &mut [&mut p, &mut f], 20)?;
                 continue;
             }
@@ -3530,6 +3596,24 @@ fn kernel_schema() -> Schema {
     Schema::new().table::<Widget>().table::<Tally>()
 }
 
+/// `kernel_schema()` plus the versioned `WidgetV2` table and its migration —
+/// the boot-gate test needs a kernel with something for `migrate_schema` to
+/// do, and `kernel_schema()` has no versioned table at all.
+fn kernel_schema_v2() -> Schema {
+    kernel_schema()
+        .table::<WidgetV2>()
+        .migration::<WidgetV2>("WidgetV2")
+}
+
+/// What a raw `Db::open` needs to write v1 rows into a data dir a kernel App
+/// will later mount at v2 (`full_schema()`'s v1 counterpart).
+fn kernel_full_schema_v1() -> Schema {
+    kernel_schema()
+        .table::<WidgetV1>()
+        .table::<Session>()
+        .table::<CronRow>()
+}
+
 /// The schema a raw `Db::open` needs to match a kernel `App`'s: `App::open`
 /// adds `Session` + `CronRow`, `Db::open` adds `JobRow` itself.
 fn full_schema() -> Schema {
@@ -3556,6 +3640,8 @@ struct KNode {
     name: String,
     repl_cfg: ReplConfig,
     db_cfg: DbConfig,
+    /// The schema this node opens/reopens under (`Node.schema`'s counterpart).
+    schema: Schema,
     recoveries: u32,
     flipped: bool,
     /// A designated survivor (the property's clean follower) is never
@@ -3565,17 +3651,21 @@ struct KNode {
 }
 
 /// Build the App + Repl + Kernel for one host, with the same torn-role
-/// first-boot re-init the Db-level `open_node` uses.
+/// first-boot re-init the Db-level `open_node` uses. Parameterized on the
+/// schema for exactly the reason `spawn_node_with_schema` is (migrations T10):
+/// the witness-gate test needs a kernel mounted over a versioned table, and
+/// `kernel_schema()` has none.
 fn open_kernel(
     sim: &Sim,
     h: &SimHost,
     cfg: &ReplConfig,
     db_cfg: &DbConfig,
     flipped: bool,
+    schema: &Schema,
 ) -> Result<Kernel, String> {
     let mut app = App::open(
         Box::new(h.disk()),
-        kernel_schema(),
+        schema.clone(),
         Box::new(h.entropy()),
         AppConfig {
             body_cap: 1 << 20,
@@ -3664,9 +3754,29 @@ fn spawn_kernel_node(
     horizon: u64,
     recoverable: bool,
 ) -> Result<KNode, String> {
+    spawn_kernel_node_with_schema(
+        sim,
+        host,
+        cfg,
+        db_cfg,
+        horizon,
+        recoverable,
+        kernel_schema(),
+    )
+}
+
+fn spawn_kernel_node_with_schema(
+    sim: &Sim,
+    host: &str,
+    cfg: ReplConfig,
+    db_cfg: DbConfig,
+    horizon: u64,
+    recoverable: bool,
+    schema: Schema,
+) -> Result<KNode, String> {
     let h = sim.host(host);
     for _ in 0..RECOVER_ATTEMPTS {
-        match open_kernel(sim, &h, &cfg, &db_cfg, false) {
+        match open_kernel(sim, &h, &cfg, &db_cfg, false, &schema) {
             Ok(kernel) => {
                 let source = SimSource::new(Box::new(sim.clock()), horizon);
                 let responses = source.responses();
@@ -3678,6 +3788,7 @@ fn spawn_kernel_node(
                     name: host.to_string(),
                     repl_cfg: cfg,
                     db_cfg,
+                    schema,
                     recoveries: 0,
                     flipped: false,
                     recoverable,
@@ -3708,7 +3819,14 @@ fn recover_kernel_node(sim: &Sim, node: &mut KNode) -> Result<(), String> {
     let mut last = String::new();
     for _ in 0..RECOVER_ATTEMPTS {
         node.host.restart();
-        match open_kernel(sim, &node.host, &node.repl_cfg, &node.db_cfg, node.flipped) {
+        match open_kernel(
+            sim,
+            &node.host,
+            &node.repl_cfg,
+            &node.db_cfg,
+            node.flipped,
+            &node.schema,
+        ) {
             Ok(kernel) => {
                 node.kernel = Some(kernel);
                 return Ok(());
@@ -4093,7 +4211,7 @@ fn backup_node_dir_opens_and_promotes_fingerprint_identical() {
     // promote it: it accepts writes from its acked position.
     b.flipped = true;
     b.host.restart();
-    b.kernel = Some(open_kernel(&sim, &b.host, &b.repl_cfg, &b.db_cfg, false).unwrap());
+    b.kernel = Some(open_kernel(&sim, &b.host, &b.repl_cfg, &b.db_cfg, false, &b.schema).unwrap());
 
     let mut cli = CtrlConn::open(&sim, "b:1", &Msg::CtrlPromote { secret: None }).unwrap();
     let reply = drive_ctrl_kernel(&sim, &mut [&mut b], &mut cli, CONVERGE_BUDGET).unwrap();
@@ -4260,7 +4378,7 @@ fn restore_p_from_survivor(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<()
     p.flipped = true;
     p.recoveries += 1;
     p.kernel = Some(
-        open_kernel(sim, &p.host, &p.repl_cfg, &p.db_cfg, true).map_err(|e| {
+        open_kernel(sim, &p.host, &p.repl_cfg, &p.db_cfg, true, &p.schema).map_err(|e| {
             if e.contains(INCONCLUSIVE) {
                 e
             } else {
@@ -5102,4 +5220,572 @@ fn a_graceful_switchover_clears_the_outgoing_primarys_witnesses() {
         "complete_switchover must clear p's witnesses on the durable flip to Follower — a \
          stale witness would block writes after a future legitimate promotion"
     );
+}
+
+// =================================================== the boot gate (task 5)
+//
+// The task that arms everything tasks 1-4 built (spec §2's ruled option (c)):
+// a node resuming as a durable `Primary` with a non-empty witness set serves
+// reads but withholds writes until every witness has answered "not a primary".
+// The gap being closed: a primary dies, an operator promotes the follower,
+// the old box is restarted EXACTLY as it was configured and — before this
+// task — resumed as a second writable primary in total silence.
+
+const RESURRECTION_SEED: u64 = 0x2EB1_0107;
+const RESURRECTION_REFUSAL_SEED: u64 = 0x2EB1_0108;
+const EMPTY_WITNESS_SEED: u64 = 0x2EB1_0109;
+const UNREACHABLE_WITNESS_SEED: u64 = 0x2EB1_010A;
+const SWITCHOVER_WHILE_VERIFYING_SEED: u64 = 0x2EB1_010B;
+const PROMOTE_CLEARS_WITNESSES_SEED: u64 = 0x2EB1_010C;
+const GATE_OPENS_KERNEL_SEED: u64 = 0x2EB1_010D;
+
+/// p ships to f until the two converge — so p durably records `f:1` as a
+/// witness — then p's host crashes with no drain (a real failover). f is left
+/// running and untouched; the caller decides what f becomes before p is
+/// restarted with its ORIGINAL config.
+fn ship_then_crash_the_primary(sim: &Sim, p: &mut Node, f: &mut Node) {
+    for i in 0..10u64 {
+        commit_widget(sim, p, i).unwrap();
+        drive_rounds(sim, &mut [&mut *p, &mut *f], 3).unwrap();
+    }
+    run_until(sim, &mut [&mut *p, &mut *f], converged, CONVERGE_BUDGET).unwrap();
+    assert_eq!(
+        load_witnesses(&p.host.disk()).unwrap(),
+        vec!["f:1".to_string()],
+        "sanity: p must have durably recorded f as a witness before it dies"
+    );
+    p.host.crash_now();
+}
+
+/// Promotes `f` through the real control verb, exactly as `charpente promote`
+/// does — never by writing its role file.
+fn promote(sim: &Sim, f: &mut Node) {
+    f.flipped = true;
+    let mut cli = CtrlConn::open(sim, "f:1", &Msg::CtrlPromote { secret: None }).unwrap();
+    let reply = drive_ctrl(sim, &mut [&mut *f], &mut cli, CONVERGE_BUDGET).unwrap();
+    assert!(
+        matches!(reply, Msg::CtrlOk { .. }),
+        "the promote must succeed: {reply:?}"
+    );
+}
+
+/// An effect-free transaction: reads are served throughout, whatever the gate
+/// says (spec §2 — this is what "serves reads and withholds writes" means).
+fn read_widget_count(node: &mut Node) -> usize {
+    node.db
+        .as_mut()
+        .expect("node is live")
+        .transact(|tx| Ok::<usize, io::Error>(tx.scan::<Widget>()?.len()))
+        .expect("an effect-free transaction is never gated")
+}
+
+/// One effectful transaction, returning whatever the gate had to say.
+fn try_write(node: &mut Node, i: u64) -> Result<(), TxError<io::Error>> {
+    node.db.as_mut().expect("node is live").transact(|tx| {
+        tx.put(&Widget {
+            id: Id::from_raw(i),
+            kind: 0,
+            weight: i as i64,
+        });
+        Ok::<(), io::Error>(())
+    })
+}
+
+/// THE HEADLINE (spec §6): a shipped-to follower is promoted, the old primary
+/// restarts with its original config — and must not reach `allow_writes`.
+/// Asserted on the GATE, never on a message: a notice an operator may or may
+/// not read is not what keeps the second primary from acking writes.
+#[test]
+fn a_resurrected_primary_does_not_accept_writes_until_its_witness_answers() {
+    let sim = Sim::with_faults(RESURRECTION_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    ship_then_crash_the_primary(&sim, &mut p, &mut f);
+    promote(&sim, &mut f);
+
+    // The old box comes back EXACTLY as it was configured: same --role
+    // primary, same data dir. Its durable role file says Primary and the
+    // durable role always wins, so nothing in its config hints at the truth.
+    recover_node(&sim, &mut p).unwrap();
+    assert!(
+        matches!(p.repl.role(), Role::Primary),
+        "the resurrected node must still be a durable Primary — that is the whole gap"
+    );
+
+    assert!(
+        !p.db.as_ref().unwrap().writes_allowed(),
+        "a durable primary that resumes with a non-empty witness set must NOT accept writes \
+         before its witnesses answer"
+    );
+    assert_eq!(
+        p.repl.verifying_witnesses(),
+        1,
+        "it must be probing the one follower it had shipped to"
+    );
+    assert_eq!(
+        read_widget_count(&mut p),
+        10,
+        "reads are served throughout (spec §2's ruled option (c))"
+    );
+    match try_write(&mut p, 100) {
+        Err(TxError::Verifying { unreached }) => assert_eq!(
+            unreached,
+            vec!["f:1".to_string()],
+            "the refusal must name the witness it is waiting on"
+        ),
+        other => panic!("expected a Verifying rejection, got {other:?}"),
+    }
+
+    // Driving it against the PROMOTED witness never opens the gate. (The
+    // refusal it eventually raises is pinned by name in the next test; here
+    // the assertion is only that `allow_writes` is never reached.)
+    let _ = run_until(&sim, &mut [&mut p, &mut f], |_| false, 100_000);
+    assert!(
+        !p.db.as_ref().unwrap().writes_allowed(),
+        "a witness that answers AS A PRIMARY must never open this node's gate"
+    );
+}
+
+/// The refusal, byte-exact (hard rule 5). Follows `decide_hello`'s
+/// `diverged_behind` shape: name both nodes and both remedies, and never
+/// demote automatically — this node cannot know which timeline the operator
+/// wants to keep, and its acked writes are not the platform's to discard.
+#[test]
+fn a_resurrected_primary_refuses_by_name_when_its_witness_answers_as_a_primary() {
+    let sim = Sim::with_faults(RESURRECTION_REFUSAL_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    ship_then_crash_the_primary(&sim, &mut p, &mut f);
+    promote(&sim, &mut f);
+    recover_node(&sim, &mut p).unwrap();
+
+    let err = run_until(&sim, &mut [&mut p, &mut f], |_| false, 100_000)
+        .expect_err("a witness answering as a primary must refuse, not resume");
+    let message = err
+        .strip_prefix("p step: ")
+        .unwrap_or_else(|| panic!("expected p's own step to refuse, got: {err}"));
+    assert_eq!(
+        message,
+        "witness f:1 answers as a primary itself (witness answered Heartbeat — only a node past \
+         the role match (primary, or handing off) ever sends one): this node restarted as a \
+         durable primary, but a follower it had shipped to has been promoted or handed off to \
+         while it was down, so this node is not the primary any more. It has NOT demoted itself \
+         — it cannot know which timeline you want to keep, and the writes it acked are not the \
+         platform's to discard. If f:1 holds the timeline to keep, re-seed this node from a \
+         fresh data dir (stop it, delete its data dir, restart to snapshot-seed from f:1); if \
+         instead this node's records are the ones to keep, stop f:1, then clear this node's \
+         witness set (GUIDE §10) and restart it."
+    );
+
+    // The probe must not make its target record it (the probe Hellos with no
+    // listen address of its own, deliberately): a witness that agreed to ship
+    // would otherwise durably record the prober and gate ITS OWN future
+    // restarts on a node that exists only to ask a question.
+    assert_eq!(
+        load_witnesses(&f.host.disk()).unwrap(),
+        Vec::<String>::new(),
+        "the questioned node must not record the prober as a witness"
+    );
+    assert!(
+        !p.db.as_ref().unwrap().writes_allowed(),
+        "the refused node never accepts writes"
+    );
+}
+
+/// The single-node regression (spec §2): "empty witness set → `allow_writes()`
+/// immediately, silently. Single-node primaries and never-shipped primaries
+/// are completely untouched. This is the common case and it must stay free."
+/// An absence-asserting guard — it passes on unfixed code by construction, so
+/// its teeth are the mutation proof recorded in the task report, not a RED run.
+#[test]
+fn an_empty_witness_set_resumes_immediately_and_silently() {
+    let sim = Sim::with_faults(EMPTY_WITNESS_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+
+    assert!(
+        p.db.as_ref().unwrap().writes_allowed(),
+        "a primary that has never shipped to anyone resumes writable, straight out of open"
+    );
+    assert_eq!(
+        p.repl.verifying_witnesses(),
+        0,
+        "no probe is started when there is nothing to verify"
+    );
+    assert!(
+        p.repl.take_witness_notice().is_none(),
+        "and nothing is said about it"
+    );
+    try_write(&mut p, 1).expect("writes flow immediately");
+
+    // Still silent across a restart — the empty set is durable, not a
+    // first-boot accident.
+    recover_node(&sim, &mut p).unwrap();
+    assert!(p.db.as_ref().unwrap().writes_allowed(), "still writable");
+    assert_eq!(p.repl.verifying_witnesses(), 0, "still no probe");
+    assert_eq!(
+        load_witnesses(&p.host.disk()).unwrap(),
+        Vec::<String>::new(),
+        "sanity: the set really is empty (both slots established, no addresses)"
+    );
+    try_write(&mut p, 2).expect("writes still flow");
+    assert!(p.repl.take_witness_notice().is_none(), "still nothing said");
+}
+
+/// The ruled option (c) in full (spec §2): with a witness that is simply gone,
+/// this node serves reads, refuses writes by name, says so ONCE, and keeps
+/// probing — it never resumes on its own and never gives up.
+#[test]
+fn an_unreachable_witness_serves_reads_and_withholds_writes() {
+    let sim = Sim::with_faults(UNREACHABLE_WITNESS_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    ship_then_crash_the_primary(&sim, &mut p, &mut f);
+    // And now the witness is gone for good — not promoted, not reachable.
+    f.host.crash_now();
+    recover_node(&sim, &mut p).unwrap();
+    assert!(!p.db.as_ref().unwrap().writes_allowed(), "gated at open");
+
+    // Nothing is said before the deadline: a witness that answers in 200ms
+    // must not produce an operator notice at all.
+    let start = sim.now().as_nanos();
+    run_until(
+        &sim,
+        &mut [&mut p],
+        |_| sim.now().as_nanos() >= start + WITNESS_DEADLINE_NANOS / 2,
+        100_000,
+    )
+    .unwrap();
+    assert!(
+        p.repl.take_witness_notice().is_none(),
+        "the notice must not fire before the deadline"
+    );
+
+    run_until(
+        &sim,
+        &mut [&mut p],
+        |_| sim.now().as_nanos() > start + WITNESS_DEADLINE_NANOS,
+        100_000,
+    )
+    .unwrap();
+
+    assert_eq!(
+        read_widget_count(&mut p),
+        10,
+        "reads are served throughout — that is the whole point of option (c)"
+    );
+    match try_write(&mut p, 100) {
+        Err(TxError::Verifying { unreached }) => assert_eq!(unreached, vec!["f:1".to_string()]),
+        other => panic!("expected a Verifying rejection, got {other:?}"),
+    }
+    let notice = p
+        .repl
+        .take_witness_notice()
+        .expect("the deadline must produce one loud operator notice");
+    assert_eq!(
+        notice,
+        "witness verification has not resolved after 30s: this node was a primary \
+         before restarting and still cannot confirm that every follower it had shipped to was \
+         never promoted, so it is serving reads and refusing writes — writes resume \
+         automatically the moment every witness answers. Unresolved: f:1 (no answer yet). If a \
+         witness is gone for good, see GUIDE §10's witness-set remedy."
+    );
+
+    // Exactly once: driving through several more deadlines' worth of virtual
+    // time produces no second notice.
+    let then = sim.now().as_nanos();
+    run_until(
+        &sim,
+        &mut [&mut p],
+        |_| sim.now().as_nanos() > then + 3 * WITNESS_DEADLINE_NANOS,
+        1_000_000,
+    )
+    .unwrap();
+    assert!(
+        p.repl.take_witness_notice().is_none(),
+        "the notice fires exactly once, not once per deadline"
+    );
+    assert!(
+        !p.db.as_ref().unwrap().writes_allowed(),
+        "and the gate never opens on its own"
+    );
+    assert_eq!(
+        p.repl.verifying_witnesses(),
+        1,
+        "it keeps probing — the node resolves itself the moment the witness returns"
+    );
+}
+
+/// O-4's other half: `Allowed -> Verifying` is unconstrained by construction
+/// (`Db` has no boot/running distinction), so the invariant that the gate is
+/// only ever set at boot lives at the call site — and the one operator verb
+/// that could otherwise move a verifying node's gate underneath the probes
+/// (`switchover`, whose abort arm calls `allow_writes` on a node that never
+/// verified) is refused by name instead.
+#[test]
+fn a_switchover_is_refused_while_the_witness_gate_is_still_verifying() {
+    let sim = Sim::with_faults(SWITCHOVER_WHILE_VERIFYING_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    ship_then_crash_the_primary(&sim, &mut p, &mut f);
+    f.host.crash_now(); // the witness is unreachable: p stays verifying
+    recover_node(&sim, &mut p).unwrap();
+    assert!(!p.db.as_ref().unwrap().writes_allowed(), "gated at open");
+
+    let mut cli = CtrlConn::open(
+        &sim,
+        "p:1",
+        &Msg::CtrlSwitchover {
+            to: "f:1".to_string(),
+            secret: None,
+        },
+    )
+    .unwrap();
+    let reply = drive_ctrl(&sim, &mut [&mut p], &mut cli, 100_000).unwrap();
+    match reply {
+        Msg::CtrlErr { message } => assert_eq!(
+            message,
+            "cannot switch over: this node is still verifying its witnesses (f:1) — it has not \
+             accepted a write since it restarted, so there is nothing to drain; wait for \
+             verification to finish, or promote the target directly"
+        ),
+        other => panic!("expected a named refusal, got {other:?}"),
+    }
+    assert!(
+        matches!(p.repl.role(), Role::Primary),
+        "the refused switchover must not have flipped the durable role"
+    );
+    assert!(
+        !p.db.as_ref().unwrap().writes_allowed(),
+        "and must not have moved the gate"
+    );
+}
+
+/// O-5 (Noah ruling 2, task 1b): a torn `clear_witnesses` on a demote path is
+/// never re-attempted, so the authoritative clear belongs on the PROMOTE path
+/// — and BEFORE the durable role flip, so an interrupted promote is merely
+/// incomplete (still a follower, stale set inert, `charpente promote` retries)
+/// rather than a primary carrying a stale set it will never clear.
+#[test]
+fn a_promote_clears_a_stale_witness_set_before_the_durable_role_flip() {
+    let sim = Sim::with_faults(PROMOTE_CLEARS_WITNESSES_SEED, FaultConfig::none());
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+
+    // The state a torn clear leaves behind by the next boot: a durable
+    // FOLLOWER carrying a stale witness set. (`open_witnesses` repairs a torn
+    // slot with the resolved — stale, non-empty — set, so there is nothing
+    // left in the bytes to detect; this is that end state, staged directly.)
+    store_witnesses(&f.host.disk(), &["ghost:1".to_string()]).unwrap();
+    recover_node(&sim, &mut f).unwrap();
+    assert_eq!(
+        load_witnesses(&f.host.disk()).unwrap(),
+        vec!["ghost:1".to_string()],
+        "sanity: the stale set survives into the follower's next boot"
+    );
+    assert!(
+        !f.db.as_ref().unwrap().writes_allowed(),
+        "sanity: a follower is write-stopped for its own reason (NotPrimary), not the gate"
+    );
+    assert_eq!(
+        f.repl.verifying_witnesses(),
+        0,
+        "sanity: a follower does not probe — the gate is a durable-Primary state"
+    );
+
+    promote(&sim, &mut f);
+
+    assert_eq!(
+        load_witnesses(&f.host.disk()).unwrap(),
+        Vec::<String>::new(),
+        "the promote must clear the stale set — otherwise this node withholds writes forever \
+         after its next restart, waiting on a witness from a timeline it has left"
+    );
+    assert!(
+        f.db.as_ref().unwrap().writes_allowed(),
+        "the promoted node accepts writes"
+    );
+    // And the proof that the clear is not merely cosmetic: the next restart
+    // resumes silently rather than gating on the ghost.
+    recover_node(&sim, &mut f).unwrap();
+    assert!(
+        f.db.as_ref().unwrap().writes_allowed(),
+        "a promoted node's next restart must not gate on a witness it has cleared"
+    );
+    assert_eq!(f.repl.verifying_witnesses(), 0, "and must not probe it");
+}
+
+/// O-2: the startup work a gated node SKIPS must run when the gate opens.
+/// `Kernel::run`'s schema gate and `Kernel::build`'s `cron.upsert` are both
+/// guarded on the write gate and neither is retried, and `after_repl_step`'s
+/// re-run fires on a follower->primary ROLE flip that never happens to a node
+/// whose role was `Primary` throughout — so without a re-run path a
+/// witness-gated node would silently skip its schema migration forever and
+/// panic on its first cron tick ("cron invariant: schedule has no row").
+///
+/// Also the end-to-end 503 (task 3's surface) and the liveness the 503 body
+/// promises: "writes resume automatically once that node answers".
+#[test]
+fn the_kernel_completes_its_skipped_startup_work_when_the_witness_gate_opens() {
+    let sim = Sim::with_faults(GATE_OPENS_KERNEL_SEED, FaultConfig::none());
+    let horizon = 100 * 1_000_000_000;
+    let ph = sim.host("p");
+
+    // p's data dir as a v1 primary that has shipped to w:1 — and on which no
+    // kernel has ever run, which is what makes the `cron.upsert` half of this
+    // test discriminating (a first kernel life would have written the row).
+    {
+        let mut db = Db::open(
+            Box::new(ph.disk()),
+            DbConfig::default(),
+            kernel_full_schema_v1(),
+        )
+        .unwrap();
+        db.transact(|tx| {
+            tx.put(&WidgetV1 {
+                id: Id::from_raw(1),
+                count: 7,
+            });
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+        db.checkpoint().unwrap();
+    }
+    store_witnesses(&ph.disk(), &["w:1".to_string()]).unwrap();
+
+    // The resurrected node, mounted at v2 — its witness is not up yet.
+    let mut p = spawn_kernel_node_with_schema(
+        &sim,
+        "p",
+        primary_cfg("p:1"),
+        DbConfig::default(),
+        horizon,
+        true,
+        kernel_schema_v2(),
+    )
+    .unwrap();
+    assert!(
+        !p.kernel.as_ref().unwrap().app().db().writes_allowed(),
+        "the kernel must open gated"
+    );
+
+    // O-1: the kernel CONSTRUCTED at all (a gated `cron.upsert` would have
+    // `?`-propagated out of `Kernel::build`, silently implementing
+    // strict-refuse), and it serves a read.
+    let (status, body) = drive_request(
+        &sim,
+        &mut [&mut p],
+        0,
+        Request::new(Method::Get, "/widget/1"),
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    assert_eq!(status, 404, "the gated node serves reads: {body:?}");
+
+    // A write gets task 3's 503, byte-exact, end to end.
+    let (status, body) = drive_request(
+        &sim,
+        &mut [&mut p],
+        0,
+        Request::new(Method::Post, "/widget/9"),
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    assert_eq!(status, 503, "the gated node refuses writes");
+    let decoded: serde_json::Value = serde_json::from_slice(&body).expect("503 body is JSON");
+    assert_eq!(
+        decoded["error"],
+        "this node is not accepting writes yet: it was a primary before restarting and has not \
+         confirmed that its follower w:1 was never promoted — reads are being served normally, \
+         and writes resume automatically once that node answers; if it is gone for good, see \
+         GUIDE §10's witness-set remedy"
+    );
+
+    // Nothing that needs a write has run.
+    {
+        let snap = p.kernel.as_ref().unwrap().app().db().snapshot().unwrap();
+        assert!(
+            CronRow::by_name(&snap, &"tick".to_string())
+                .unwrap()
+                .is_empty(),
+            "a gated node must not have written its cron rows"
+        );
+        let version: Option<SchemaVersion> = snap.get(schema_version_id("WidgetV2")).unwrap();
+        assert_eq!(
+            version.map(|v| v.version),
+            Some(1),
+            "and must not have migrated its schema"
+        );
+    }
+
+    // The witness comes back — as the follower it always was.
+    let mut w = spawn_kernel_node_with_schema(
+        &sim,
+        "w",
+        follower_cfg("w:1", "p:1"),
+        DbConfig::default(),
+        horizon,
+        true,
+        kernel_schema_v2(),
+    )
+    .unwrap();
+    krun_until(
+        &sim,
+        &mut [&mut p, &mut w],
+        |ns| {
+            ns[0]
+                .kernel
+                .as_ref()
+                .is_some_and(|k| k.app().db().writes_allowed())
+        },
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+
+    // The gate opened, and everything the gated node skipped has now run.
+    {
+        let db = p.kernel.as_ref().unwrap().app().db();
+        let snap = db.snapshot().unwrap();
+        let version: Option<SchemaVersion> = snap.get(schema_version_id("WidgetV2")).unwrap();
+        assert_eq!(
+            version.map(|v| v.version),
+            Some(2),
+            "migrate_schema must run once the gate opens"
+        );
+        assert_eq!(
+            count_index_snapshot(db, 7),
+            vec![(1, 7, "v2".to_string())],
+            "and must actually have rewritten the row (index rebuilt too)"
+        );
+        assert!(
+            !CronRow::by_name(&snap, &"tick".to_string())
+                .unwrap()
+                .is_empty(),
+            "cron.upsert must run once the gate opens"
+        );
+    }
+
+    // Liveness, as the 503 body promises: writes resume automatically.
+    let (status, _) = drive_request(
+        &sim,
+        &mut [&mut p, &mut w],
+        0,
+        Request::new(Method::Post, "/widget/9"),
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    assert_eq!(status, 200, "writes resume once the witness answers");
+
+    // And the cron rows are real: the node ticks without tripping the "cron
+    // invariant: schedule has no row" panic a missed upsert would cause.
+    krun_until(
+        &sim,
+        &mut [&mut p, &mut w],
+        |ns| {
+            ns[0]
+                .kernel
+                .as_ref()
+                .is_some_and(|k| k.stats().cron_ticks >= 2)
+        },
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
 }

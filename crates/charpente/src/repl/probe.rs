@@ -64,7 +64,7 @@ use crate::repl::{MAX_MESSAGE_BYTES, PROTO_VERSION, RECONNECT_NANOS};
 /// response. See the module doc for why the four-state shape exists —
 /// `IsPrimary` and `NotPrimary` are the only two conclusive outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WitnessVerdict {
+pub(crate) enum WitnessVerdict {
     /// No response yet: still connecting (or reconnecting), or connected and
     /// awaiting the first message.
     Pending,
@@ -82,12 +82,15 @@ pub enum WitnessVerdict {
 
 /// Connects to one witness, sends one `Hello`, classifies the first
 /// response, and disconnects. See the module doc.
-pub struct WitnessProbe {
+pub(crate) struct WitnessProbe {
     addr: String,
     my_listen: Option<String>,
     secret: Option<String>,
     conn: Option<Box<dyn Conn>>,
     recv_buf: Option<Vec<u8>>,
+    /// The witness's first response, moved off the wire by `drain` and
+    /// waiting for `step` to classify it.
+    pending: Option<Vec<u8>>,
     /// Reconnect backoff after a failed connect/send, mirroring `Follower`'s
     /// pacing (`RECONNECT_NANOS`) rather than busy-looping the caller.
     reconnect_at: Option<u64>,
@@ -95,36 +98,53 @@ pub struct WitnessProbe {
 }
 
 impl WitnessProbe {
-    pub fn new(addr: String, my_listen: Option<String>, secret: Option<String>) -> WitnessProbe {
+    pub(crate) fn new(
+        addr: String,
+        my_listen: Option<String>,
+        secret: Option<String>,
+    ) -> WitnessProbe {
         WitnessProbe {
             addr,
             my_listen,
             secret,
             conn: None,
             recv_buf: None,
+            pending: None,
             reconnect_at: None,
             verdict: WitnessVerdict::Pending,
         }
     }
 
-    pub fn verdict(&self) -> &WitnessVerdict {
+    pub(crate) fn verdict(&self) -> &WitnessVerdict {
         &self.verdict
     }
 
-    /// One unit of work: connect + `Hello` when disconnected and due, else
-    /// read one message and classify it. A verdict other than `Pending` is
-    /// terminal (the conn is already dropped) — later calls are a no-op, so
-    /// the caller can keep stepping every probe uniformly without tracking
-    /// which ones are already decided.
-    pub fn step(&mut self, net: &dyn Net, db: &Db, now: u64) -> io::Result<()> {
-        if !matches!(self.verdict, WitnessVerdict::Pending) {
-            return Ok(());
+    /// The witness this probe is questioning — the caller names it in both
+    /// the refusal and the deadline notice.
+    pub(crate) fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    /// Non-destructive IO movement (`Repl::pump_io`), the same split
+    /// `Follower::drain`/`Session::drain` use: move the witness's first
+    /// response off the wire into `pending`; an EOF or recv error drops the
+    /// conn and schedules a reconnect. No `Db` access, so `pump_io` — which
+    /// has none — can call it.
+    ///
+    /// The split is load-bearing, not tidiness. A probe holds its conn open
+    /// while the witness thinks (`recv` → `Ok(None)`), and the only way for a
+    /// `has_work`-driven caller to notice a reply that arrives later would be
+    /// to report work for an idle open conn — a kernel that never parks, and
+    /// under the simulator's scheduler a universe whose virtual time never
+    /// advances, so the reply it is spinning for can never be delivered.
+    /// Polling here instead keeps `has_work` honest: work means a message to
+    /// classify or a backoff that has come due, never "still waiting".
+    pub(crate) fn drain(&mut self, now: u64) {
+        if self.conn.is_none() || self.pending.is_some() {
+            return;
         }
-        if self.conn.is_none() {
-            if self.reconnect_at.is_some_and(|t| now < t) {
-                return Ok(());
-            }
-            return self.connect_and_hello(net, db, now);
+        if !matches!(self.verdict, WitnessVerdict::Pending) {
+            return;
         }
         let WitnessProbe { conn, recv_buf, .. } = self;
         let buf = recv_buf.get_or_insert_with(|| vec![0u8; MAX_MESSAGE_BYTES]);
@@ -135,18 +155,57 @@ impl WitnessProbe {
                 // caller retry, mirroring Follower's reconnect pacing.
                 self.conn = None;
                 self.reconnect_at = Some(now + RECONNECT_NANOS);
-                Ok(())
             }
-            Ok(None) => Ok(()), // nothing yet — stays Pending
-            Ok(Some(n)) => {
-                let msg = decode(&buf[..n])?;
-                self.verdict = classify(&msg);
-                // Classify and disconnect: never fall through to apply
-                // anything (the module doc's "never adopts").
-                self.conn = None;
-                Ok(())
-            }
+            Ok(None) => {} // nothing yet — stays Pending, conn stays open
+            Ok(Some(n)) => self.pending = Some(buf[..n].to_vec()),
         }
+    }
+
+    /// True when `step` has something to do: a drained response to classify,
+    /// or a due (re)connect. A decided probe and a probe waiting on an open
+    /// conn both report `false` — see `drain`.
+    pub(crate) fn has_work(&self, now: u64) -> bool {
+        if !matches!(self.verdict, WitnessVerdict::Pending) {
+            return false;
+        }
+        if self.pending.is_some() {
+            return true;
+        }
+        self.conn.is_none() && self.reconnect_at.is_none_or(|t| now >= t)
+    }
+
+    /// The reconnect backoff this probe wants to wake for, so a caller's
+    /// scheduler advances to it instead of stalling (`Follower::next_deadline`
+    /// one for one).
+    pub(crate) fn next_deadline(&self) -> Option<u64> {
+        if matches!(self.verdict, WitnessVerdict::Pending) && self.conn.is_none() {
+            self.reconnect_at
+        } else {
+            None
+        }
+    }
+
+    /// One unit of work: classify the drained response, else connect +
+    /// `Hello` when disconnected and due. A verdict other than `Pending` is
+    /// terminal (the conn is already dropped) — later calls are a no-op, so
+    /// the caller can keep stepping every probe uniformly without tracking
+    /// which ones are already decided.
+    pub(crate) fn step(&mut self, net: &dyn Net, db: &Db, now: u64) -> io::Result<()> {
+        if !matches!(self.verdict, WitnessVerdict::Pending) {
+            return Ok(());
+        }
+        let Some(raw) = self.pending.take() else {
+            if self.conn.is_none() && self.reconnect_at.is_none_or(|t| now >= t) {
+                return self.connect_and_hello(net, db, now);
+            }
+            return Ok(()); // backoff not yet due, or connected and waiting
+        };
+        let msg = decode(&raw)?;
+        self.verdict = classify(&msg);
+        // Classify and disconnect: never fall through to apply anything (the
+        // module doc's "never adopts").
+        self.conn = None;
+        Ok(())
     }
 
     fn connect_and_hello(&mut self, net: &dyn Net, db: &Db, now: u64) -> io::Result<()> {
@@ -354,13 +413,15 @@ mod tests {
     }
 
     /// Drives a `WitnessProbe` against one scripted response: connects (step
-    /// 1), then reads and classifies it (step 2).
+    /// 1), pumps the reply off the wire (`drain`, `Repl::pump_io`'s half),
+    /// then classifies it (step 2).
     fn probe_scripted(seed: u64, response: &Msg) -> (WitnessProbe, Db) {
         let db = fresh_db(seed);
         let net = OneShotNet::new(Box::new(ScriptedConn::new(response)));
         let mut probe = WitnessProbe::new("w:1".to_string(), None, None);
         probe.step(&net, &db, 0).expect("connect + send Hello");
-        probe.step(&net, &db, 0).expect("recv + classify");
+        probe.drain(0);
+        probe.step(&net, &db, 0).expect("classify");
         (probe, db)
     }
 
@@ -417,7 +478,8 @@ mod tests {
         let net = OneShotNet::new(Box::new(ScriptedConn::new(&frames)));
         let mut probe = WitnessProbe::new("w:1".to_string(), None, None);
         probe.step(&net, &db, 0).expect("connect + send Hello");
-        probe.step(&net, &db, 0).expect("recv + classify");
+        probe.drain(0);
+        probe.step(&net, &db, 0).expect("classify");
         match probe.verdict() {
             // Fix round 1, I-2: pinned byte-exact — this is the one
             // operator-facing string `classify`'s default (non-Refuse) arm
@@ -475,6 +537,47 @@ mod tests {
             WitnessVerdict::Inconclusive(_) => {}
             other => panic!("expected Inconclusive, got {other:?}"),
         }
+    }
+
+    /// The busy-spin guard (task 5, C-1). A probe that has connected and is
+    /// waiting for its witness to answer must report NO work: reporting work
+    /// there would make a `has_work`-driven caller step it forever without
+    /// parking, and under the simulator's scheduler — which advances virtual
+    /// time only when nothing is runnable — the very reply it spins for could
+    /// never be delivered. Work appears when `drain` has something, and
+    /// disappears for good once the verdict is in.
+    #[test]
+    fn work_appears_only_for_a_drained_reply_or_a_due_reconnect() {
+        let db = fresh_db(0x0DEB_0409);
+        let conn = RecordingConn::new();
+        let net = OneShotNet::new(Box::new(RecordingHandle(conn.clone())));
+        let mut probe = WitnessProbe::new("w:1".to_string(), None, None);
+
+        assert!(probe.has_work(0), "a fresh probe must connect");
+        probe.step(&net, &db, 0).expect("connect + send Hello");
+        probe.drain(0);
+        assert!(
+            !probe.has_work(0),
+            "a connected probe still awaiting its witness's reply must report no work"
+        );
+        assert_eq!(
+            probe.next_deadline(),
+            None,
+            "and has no timer to wake for — the reply is the network's to deliver"
+        );
+
+        // The witness answers.
+        conn.inbound.borrow_mut().push_back(encode(&Msg::Refuse {
+            message: format!("this node is {NOT_A_PRIMARY_MARKER} (it is a follower of p:1)"),
+        }));
+        probe.drain(0);
+        assert!(probe.has_work(0), "a drained reply is work");
+        probe.step(&net, &db, 0).expect("classify");
+        assert_eq!(*probe.verdict(), WitnessVerdict::NotPrimary);
+        assert!(
+            !probe.has_work(0) && probe.next_deadline().is_none(),
+            "a decided probe is inert — the caller may keep stepping every probe uniformly"
+        );
     }
 
     fn refusal_message(msg: &Msg) -> &str {

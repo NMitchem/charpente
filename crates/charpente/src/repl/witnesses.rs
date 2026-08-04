@@ -174,6 +174,36 @@ pub(crate) fn valid_witness_address(addr: &str) -> bool {
         && !addr.bytes().any(|b| b.is_ascii_whitespace())
 }
 
+/// How many witnesses an operator-facing string spells out before it stops
+/// counting (task 5, O-6 / task 2 minor #8). The SET is unbounded by design —
+/// spec §5 rules out automatic eviction, since a witness that could have been
+/// promoted must never be silently dropped — and a peer that reconnects from
+/// changing ephemeral ports (exactly the edge harness's shape) grows it
+/// without limit. Every one of those addresses is then joined into every
+/// `TxError::Verifying` 503 body and into the deadline notice, at up to
+/// `MAX_WITNESS_ADDRESS_BYTES` each. Bounding the RENDERING is the safe half
+/// of the fix: it costs nothing in safety — the gate still requires every
+/// witness to answer, and the deadline notice still names the reasons — while
+/// the set itself stays whole. Ten is well past what an operator reads and
+/// well short of a body worth truncating a log line over (~3 KB worst case).
+const MAX_RENDERED_WITNESSES: usize = 10;
+
+/// Renders a witness list for an operator-facing string, bounded per
+/// `MAX_RENDERED_WITNESSES`. Shared by the 503 body (`http::app`) and the
+/// boot gate's deadline notice (`repl::mod`) for the same reason
+/// `valid_witness_address` is shared with `session.rs`: the two renderings
+/// must not drift apart.
+pub(crate) fn render_witness_list(addrs: &[String]) -> String {
+    if addrs.len() <= MAX_RENDERED_WITNESSES {
+        return addrs.join(", ");
+    }
+    format!(
+        "{}, and {} more",
+        addrs[..MAX_RENDERED_WITNESSES].join(", "),
+        addrs.len() - MAX_RENDERED_WITNESSES
+    )
+}
+
 /// I-2 (2026-07-31 review): named rejection, never `assert!()` — an address
 /// arrives peer-supplied off the wire (`Hello.listen`), unvalidated. Rejects
 /// exactly the shapes `valid_witness_address` above rejects.

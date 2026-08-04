@@ -253,6 +253,18 @@ fn needs_restore(text: &str) -> bool {
         || text.contains("re-seed the follower")
 }
 
+/// The witness boot gate's 503 (M2 sub-project 0b task 5): this workload
+/// restarts its primary under fault injection, and a primary that comes back
+/// with a recorded witness serves reads but withholds writes until that
+/// witness answers. A request refused there simply did not happen — the same
+/// "no write, no credential, no bug" outcome the fault-fallout arms already
+/// tolerate, and the scan below cares only about credentials that WERE acked.
+/// Keyed on the 503 body's own leading phrase (`http/app.rs`, pinned
+/// byte-exact in `http.rs`).
+fn is_witness_gated(body: &[u8]) -> bool {
+    String::from_utf8_lossy(body).contains("this node is not accepting writes yet")
+}
+
 /// Restart-and-recover a node in place — folds local-corruption-shaped hard
 /// errors into an inconclusive skip (no restore rig in this property, exactly
 /// as realtime.rs's `recover_rt_node` does).
@@ -529,7 +541,7 @@ fn raw_credentials_universe(sim: &mut Sim) -> Result<(u64, u64, Vec<String>), St
             acked_hashes.push(hash_token(&raw));
             raws.push(raw.clone());
             session = Some((raw, subject));
-        } else if !is_fault_fallout(&String::from_utf8_lossy(&body)) {
+        } else if !is_fault_fallout(&String::from_utf8_lossy(&body)) && !is_witness_gated(&body) {
             return Err(format!(
                 "unexpected /login status {status}: {}",
                 String::from_utf8_lossy(&body)
@@ -572,7 +584,10 @@ fn raw_credentials_universe(sim: &mut Sim) -> Result<(u64, u64, Vec<String>), St
                 sim.cover("auth:key-mint");
                 acked_hashes.push(hash_token(&raw));
                 raws.push(raw);
-            } else if status != 401 && !is_fault_fallout(&String::from_utf8_lossy(&body)) {
+            } else if status != 401
+                && !is_fault_fallout(&String::from_utf8_lossy(&body))
+                && !is_witness_gated(&body)
+            {
                 return Err(format!(
                     "unexpected /keys status {status}: {}",
                     String::from_utf8_lossy(&body)
