@@ -752,6 +752,7 @@ fn primary_cfg(addr: &str) -> ReplConfig {
         listen: Some(addr.to_string()),
         initial_role: Role::Primary,
         peer_secret: None,
+        strict_witnesses: false,
     }
 }
 
@@ -762,6 +763,7 @@ fn follower_cfg(listen: &str, primary: &str) -> ReplConfig {
             primary: primary.to_string(),
         },
         peer_secret: None,
+        strict_witnesses: false,
     }
 }
 
@@ -1824,6 +1826,7 @@ fn peer_secret_refuses_mismatch_and_admits_match() {
     let db_cfg = seeding_db_cfg(); // small segments/checkpoint cadence: GC is observable
     let p_cfg = ReplConfig {
         peer_secret: Some("s3cret".to_string()),
+        strict_witnesses: false,
         ..primary_cfg("p:1")
     };
     let mut p = spawn_node(&sim, "p", p_cfg, db_cfg.clone()).unwrap();
@@ -1882,6 +1885,7 @@ fn peer_secret_refuses_mismatch_and_admits_match() {
     // (Follower attaches its configured secret automatically, outbound).
     let f_cfg = ReplConfig {
         peer_secret: Some("s3cret".to_string()),
+        strict_witnesses: false,
         ..follower_cfg("f:1", "p:1")
     };
     let mut f = spawn_node(&sim, "f", f_cfg, db_cfg).unwrap();
@@ -1964,6 +1968,7 @@ fn peer_secret_unconfigured_node_accepts_a_followers_unrequired_proof() {
     let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
     let f_cfg = ReplConfig {
         peer_secret: Some("s3cret".to_string()),
+        strict_witnesses: false,
         ..follower_cfg("f:1", "p:1")
     };
     let mut f = spawn_node(&sim, "f", f_cfg, DbConfig::default()).unwrap();
@@ -3120,28 +3125,41 @@ fn switchover_universe(sim: &mut Sim) -> Result<(), String> {
                 continue;
             }
             DrainResult::Verifying => {
-                // MEASURED, not assumed: a gated universe is ALREADY bound for
-                // the inconclusive path below, for a reason that predates the
-                // witness gate. The boot gate engages only at `Repl::open`,
-                // which in this rig is only reached through `recover_node`, so
-                // reaching this arm implies `p.recoveries > base_p_recoveries`
-                // — and that is the loop's own break at the top, evaluated
-                // before the verb is ever re-issued. So there is nothing to
-                // retry toward: any `continue` here lands on that break.
+                // What is MEASURED here, and — deliberately — what is not.
+                // An earlier version of this comment asserted a structural
+                // mechanism ("reaching this arm implies p recovered inside the
+                // switchover loop, so a `continue` lands on the top-of-loop
+                // break"). Instrumented cover keys at this base seed say that
+                // is FALSE 10 out of 10: every gated universe reaches here with
+                // `p.recoveries == base_p_recoveries`. The path that comment
+                // missed is that `base_p_recoveries` is captured AFTER the
+                // 12-iteration warm-up, and a p that recovers during warm-up is
+                // still gated when the baseline is taken — the warm-up's
+                // `drive_rounds(3)` bursts cannot span a 500 ms
+                // `RECONNECT_NANOS` probe cycle under a virtual clock that only
+                // advances when nothing is runnable.
                 //
-                // An earlier version of this arm waited for the gate to reopen
-                // and retried on a separate budget. It was inert — 127
-                // inconclusive universes with it and 127 without, byte for
-                // byte — and a retry that cannot reach its target reads like
-                // coverage that does not exist. The honest shape is to name
-                // the case and let it fall through, which still runs
-                // `assert_one_writable`.
+                // MEASURED, at base seed 0x2EB1_0009 over 256 universes:
+                //   - 10 universes reach this arm (~3.9%);
+                //   - none of them had recovered inside the loop;
+                //   - given real headroom the gate DOES open in all 10, so the
+                //     earlier `drive_rounds(20)` retry was inert because 20
+                //     rounds is ~2 orders of magnitude short of a probe cycle,
+                //     NOT because retrying was structurally pointless;
+                //   - and even with an unbounded gate wait, 0 of 10 reach
+                //     `CtrlOk`. THAT is why `break` is the right shape.
+                //
+                // NOT measured, and left undiagnosed on purpose rather than
+                // guessed at: WHY a gated universe never reaches `CtrlOk` even
+                // with headroom, and whether the 10/256 rate holds at other
+                // base seeds.
                 //
                 // The consequence is stated rather than hidden: the zero-loss
-                // oracle does not adjudicate a universe whose primary restarted
-                // into the gate. That is a loss of REACH, not of teeth — a
-                // universe that does reach `CtrlOk` runs the full oracle with
-                // nothing softened.
+                // oracle does not adjudicate those ~3.9% of universes. That is
+                // a loss of REACH, not of teeth — a universe that does reach
+                // `CtrlOk` runs the full oracle with nothing softened, and
+                // `assert_one_writable` still runs on every universe that ends
+                // here via the `reply.is_none()` path below.
                 sim.cover("repl:switchover-witness-gated");
                 break;
             }
@@ -3648,6 +3666,7 @@ fn backup_cfg(listen: &str, primary: &str) -> ReplConfig {
             primary: primary.to_string(),
         },
         peer_secret: None,
+        strict_witnesses: false,
     }
 }
 
@@ -5190,7 +5209,7 @@ fn a_hello_with_an_overlong_but_well_formed_listen_address_is_refused() {
 
 // ------------------------------------------- clear-on-flip (Correction 1)
 
-const SWITCHOVER_CLEARS_WITNESSES_SEED: u64 = 0x2EB1_0106;
+const SWITCHOVER_CLEARS_WITNESSES_SEED: u64 = 0x2EB1_0110;
 
 /// Clear-on-flip, site 1: `complete_switchover` (mod.rs — the graceful
 /// HandOffDone completion) must clear the outgoing primary's witness set on
@@ -5252,13 +5271,14 @@ fn a_graceful_switchover_clears_the_outgoing_primarys_witnesses() {
 // the old box is restarted EXACTLY as it was configured and — before this
 // task — resumed as a second writable primary in total silence.
 
-const RESURRECTION_SEED: u64 = 0x2EB1_0107;
-const RESURRECTION_REFUSAL_SEED: u64 = 0x2EB1_0108;
-const EMPTY_WITNESS_SEED: u64 = 0x2EB1_0109;
-const UNREACHABLE_WITNESS_SEED: u64 = 0x2EB1_010A;
-const SWITCHOVER_WHILE_VERIFYING_SEED: u64 = 0x2EB1_010B;
-const PROMOTE_CLEARS_WITNESSES_SEED: u64 = 0x2EB1_010C;
-const GATE_OPENS_KERNEL_SEED: u64 = 0x2EB1_010D;
+const RESURRECTION_SEED: u64 = 0x2EB1_0111;
+const RESURRECTION_REFUSAL_SEED: u64 = 0x2EB1_0112;
+const EMPTY_WITNESS_SEED: u64 = 0x2EB1_0113;
+const UNREACHABLE_WITNESS_SEED: u64 = 0x2EB1_0114;
+const STRICT_WITNESS_SEED: u64 = 0x2EB1_0115;
+const SWITCHOVER_WHILE_VERIFYING_SEED: u64 = 0x2EB1_0116;
+const PROMOTE_CLEARS_WITNESSES_SEED: u64 = 0x2EB1_0117;
+const GATE_OPENS_KERNEL_SEED: u64 = 0x2EB1_0118;
 
 /// p ships to f until the two converge — so p durably records `f:1` as a
 /// witness — then p's host crashes with no drain (a real failover). f is left
@@ -5533,6 +5553,69 @@ fn an_unreachable_witness_serves_reads_and_withholds_writes() {
         p.repl.verifying_witnesses(),
         1,
         "it keeps probing — the node resolves itself the moment the witness returns"
+    );
+}
+
+/// `ReplConfig::strict_witnesses` (task 6, spec §2): the opt-in for operators
+/// who would rather a node fail loudly than serve reads it cannot write to.
+///
+/// The shape is deliberately NOT the spec's "refusal to start at all", and the
+/// difference is operator-visible: whether a witness is unreachable is
+/// unknowable at open — only probing establishes it — so a strict node starts,
+/// serves reads for the deadline window, and only then stops, by returning an
+/// error out of `Repl::step` that bubbles through `Kernel::run` (DESIGN §5's
+/// restart-and-recover exit).
+#[test]
+fn strict_witnesses_stops_the_node_instead_of_serving_reads_it_cannot_write_to() {
+    let sim = Sim::with_faults(STRICT_WITNESS_SEED, FaultConfig::none());
+    let mut cfg = primary_cfg("p:1");
+    cfg.strict_witnesses = true;
+    let mut p = spawn_node(&sim, "p", cfg, DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    ship_then_crash_the_primary(&sim, &mut p, &mut f);
+    f.host.crash_now();
+    recover_node(&sim, &mut p).unwrap();
+    assert!(!p.db.as_ref().unwrap().writes_allowed(), "gated at open");
+
+    // Before the deadline a strict node is indistinguishable from a default
+    // one: it serves reads and says nothing. Strictness is a choice about what
+    // to do when verification TIMES OUT, not about refusing to run.
+    let start = sim.now().as_nanos();
+    run_until(
+        &sim,
+        &mut [&mut p],
+        |_| sim.now().as_nanos() >= start + WITNESS_DEADLINE_NANOS / 2,
+        100_000,
+    )
+    .expect("a strict node runs normally until the deadline");
+    assert_eq!(
+        read_widget_count(&mut p),
+        10,
+        "reads are served right up to the deadline"
+    );
+
+    let err = run_until(
+        &sim,
+        &mut [&mut p],
+        |_| sim.now().as_nanos() > start + WITNESS_DEADLINE_NANOS,
+        100_000,
+    )
+    .expect_err("past the deadline a strict node must stop, not settle into read-only service");
+    assert_eq!(
+        err,
+        "p step: witness verification did not resolve within 30s and \
+         ReplConfig.strict_witnesses is set, so this node is stopping instead of serving reads \
+         it cannot write to: it was a primary before restarting and still cannot confirm that \
+         every follower it had shipped to was never promoted. Unresolved: f:1 (no answer yet). \
+         Start the unreached witnesses and restart this node; clear strict_witnesses to serve \
+         reads while it waits instead; or, if a witness is gone for good, see GUIDE §10's \
+         witness-set remedy."
+    );
+    // The gate never opened on the way out — stopping is not a backdoor to
+    // writability.
+    assert!(
+        !p.db.as_ref().unwrap().writes_allowed(),
+        "a strict stop must never leave the node writable"
     );
 }
 

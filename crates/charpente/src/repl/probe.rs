@@ -143,7 +143,13 @@ impl WitnessProbe {
         if self.conn.is_none() || self.pending.is_some() {
             return;
         }
-        if !matches!(self.verdict, WitnessVerdict::Pending) {
+        // `decided`, not `!Pending` — and this one is the load-bearing copy.
+        // `drain` is the ONLY writer of `self.pending`, which is the only
+        // thing `step` classifies from, so gating it on `Pending` strands an
+        // `Inconclusive` probe one step further along than gating the others
+        // would: it reconnects, then never reads the answer, and holds an
+        // open conn nobody will ever drain or close.
+        if self.decided() {
             return;
         }
         let WitnessProbe { conn, recv_buf, .. } = self;
@@ -170,6 +176,14 @@ impl WitnessProbe {
     /// Treating it as decided strands the gate shut forever on an ordinary
     /// rolling-upgrade skew, and makes the notice's and the 503's promise
     /// that "writes resume the moment every witness answers" a lie.
+    ///
+    /// One consequence of keeping the verdict across retries rather than
+    /// resetting it to `Pending`: the reason an operator sees is the last one
+    /// **received**, not necessarily the current truth. A witness that answers
+    /// `Inconclusive` and then goes down keeps reporting that answer, because
+    /// a failed reconnect has nothing to overwrite it with. A retry that
+    /// reaches the witness always overwrites, including with a different
+    /// inconclusive reason.
     fn decided(&self) -> bool {
         matches!(
             self.verdict,
@@ -436,6 +450,26 @@ mod tests {
         }
     }
 
+    /// A `Net` handing out a scripted sequence of conns, one per `connect` —
+    /// needed to drive a probe across a RETRY, which `OneShotNet` cannot do.
+    struct SequencedNet(RefCell<VecDeque<Box<dyn Conn>>>);
+    impl SequencedNet {
+        fn new(conns: Vec<Box<dyn Conn>>) -> SequencedNet {
+            SequencedNet(RefCell::new(conns.into()))
+        }
+    }
+    impl Net for SequencedNet {
+        fn listen(&self, _addr: &str) -> io::Result<Box<dyn Listener>> {
+            unreachable!("WitnessProbe never listens")
+        }
+        fn connect(&self, _addr: &str) -> io::Result<Box<dyn Conn>> {
+            self.0
+                .borrow_mut()
+                .pop_front()
+                .ok_or_else(|| io::Error::other("SequencedNet: connect beyond the script"))
+        }
+    }
+
     /// Drives a `WitnessProbe` against one scripted response: connects (step
     /// 1), pumps the reply off the wire (`drain`, `Repl::pump_io`'s half),
     /// then classifies it (step 2).
@@ -557,16 +591,26 @@ mod tests {
     /// (followers first) is what walks an operator into it.
     #[test]
     fn an_inconclusive_witness_is_retried_not_stranded() {
-        let refusal = Msg::Refuse {
-            message: PEER_SECRET_REFUSAL.to_string(),
-        };
-        let (probe, _db) = probe_scripted(0x0DEB_0405, &refusal);
+        let db = fresh_db(0x0DEB_0405);
+        // Round 1 answers with a misconfiguration (peer-secret refusal);
+        // round 2 is the same witness after an operator fixed it.
+        let net = SequencedNet::new(vec![
+            Box::new(ScriptedConn::new(&Msg::Refuse {
+                message: PEER_SECRET_REFUSAL.to_string(),
+            })),
+            Box::new(ScriptedConn::new(&Msg::Refuse {
+                message: format!("this node is {NOT_A_PRIMARY_MARKER} (it is a follower of p:1)"),
+            })),
+        ]);
+        let mut probe = WitnessProbe::new("w:1".to_string(), None, None);
+
+        probe.step(&net, &db, 0).expect("connect + send Hello");
+        probe.drain(0);
+        probe.step(&net, &db, 0).expect("classify");
         assert!(
             matches!(probe.verdict(), WitnessVerdict::Inconclusive(_)),
             "precondition: this refusal classifies Inconclusive"
         );
-        // The conn is dropped and a backoff is armed, exactly as a failed
-        // connect arms one — so the probe asks again rather than giving up.
         assert!(
             probe.next_deadline().is_some(),
             "an inconclusive probe must schedule a retry, or the caller's scheduler parks \
@@ -578,8 +622,32 @@ mod tests {
         );
         assert!(
             probe.has_work(RECONNECT_NANOS),
-            "once the backoff comes due the probe must report work — this is the assertion \
-             that fails when Inconclusive is treated as a terminal verdict"
+            "once the backoff comes due the probe must report work"
+        );
+
+        // THE PART THAT MATTERS, and the part an earlier version of this test
+        // stopped one call short of: the retry must COMPLETE. A probe that
+        // reconnects but never drains the answer is stranded just as
+        // thoroughly as one that never reconnects — worse, actually, since it
+        // also holds an undrained conn open forever. Gating `drain` on
+        // `Pending` rather than `decided` produced exactly that, and every
+        // assertion above stayed green while it did.
+        let t = RECONNECT_NANOS;
+        probe.step(&net, &db, t).expect("reconnect + send Hello");
+        probe.drain(t);
+        assert!(
+            probe.has_work(t),
+            "STRANDED: the second answer was never moved off the wire, so the probe reports no \
+             work and no deadline and the gate can never reopen"
+        );
+        probe
+            .step(&net, &db, t)
+            .expect("classify the second answer");
+        assert_eq!(
+            *probe.verdict(),
+            WitnessVerdict::NotPrimary,
+            "the retry must reach a real verdict — this is what makes the notice's and the \
+             503's promise that writes resume once every witness answers actually true"
         );
     }
 

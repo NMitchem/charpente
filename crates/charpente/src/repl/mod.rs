@@ -103,6 +103,20 @@ pub struct ReplConfig {
     /// side's inbound is guarded, the other's is open). The wire is plaintext
     /// TCP: this authenticates peers, it does not encrypt the link.
     pub peer_secret: Option<String>,
+    /// Fail loudly rather than serve reads this node cannot write to, when a
+    /// restarted primary's witnesses stay unreached past
+    /// `WITNESS_DEADLINE_NANOS` (spec §2). Default `false` — the ruled option
+    /// (c), which serves reads and withholds writes.
+    ///
+    /// **This is not "refuse to start", despite the spec's shorthand, and the
+    /// difference is operator-visible.** Whether a witness is unreachable is
+    /// unknowable at open — it is only established by probing, which takes up
+    /// to the deadline. So a strict node starts, serves reads for that window,
+    /// and only then stops, by returning an error out of `Repl::step` that
+    /// bubbles through `Kernel::run` (DESIGN §5's restart-and-recover exit).
+    /// A supervisor that restarts it will loop until a witness answers, which
+    /// is the intended shape: loud and repeating, not silent and degraded.
+    pub strict_witnesses: bool,
 }
 
 /// Sim-agnostic counters a workload can assert on without reaching into the
@@ -154,6 +168,8 @@ pub struct Repl {
     /// attaches nothing outbound. Threaded to `Session::service` (inbound
     /// enforcement) and to every `Follower` this node builds (outbound proof).
     peer_secret: Option<String>,
+    /// `ReplConfig::strict_witnesses`, consulted only at the witness deadline.
+    strict_witnesses: bool,
     listener: Option<Box<dyn Listener>>,
     sessions: Vec<Session>,
     rr_cursor: usize,
@@ -297,6 +313,7 @@ impl Repl {
                 role_disk,
                 my_listen: cfg.listen.clone(),
                 peer_secret: cfg.peer_secret.clone(),
+                strict_witnesses: cfg.strict_witnesses,
                 listener,
                 sessions: Vec::new(),
                 rr_cursor: 0,
@@ -514,9 +531,19 @@ impl Repl {
                 }
                 return self.resolve_witness_gate(db);
             }
-            if !self.witness_notice_sent && now >= deadline {
-                self.emit_witness_notice();
-                return Ok(());
+            if now >= deadline {
+                // Strict: stop the node instead of serving reads it cannot
+                // write to. This error bubbles out of `Kernel::run` (DESIGN
+                // §5's restart-and-recover exit), so a supervised node loops
+                // loudly until a witness answers rather than sitting in a
+                // degraded state nobody is watching.
+                if self.strict_witnesses {
+                    return Err(io::Error::other(self.strict_witness_refusal()));
+                }
+                if !self.witness_notice_sent {
+                    self.emit_witness_notice();
+                    return Ok(());
+                }
             }
         }
 
@@ -647,13 +674,27 @@ impl Repl {
         Ok(())
     }
 
-    /// The one loud notice (spec §2): the deadline passed and writes are
-    /// still being withheld. Changes nothing — the gate stays shut, the
-    /// probes keep running — it only tells an operator with no client traffic
-    /// what the 503 would have told a client.
-    fn emit_witness_notice(&mut self) {
-        let unresolved: Vec<String> = self
-            .probes
+    /// The strict-mode refusal (`ReplConfig::strict_witnesses`). Shares
+    /// `unresolved_witnesses` with the notice so the two can never disagree
+    /// about which witnesses are outstanding.
+    fn strict_witness_refusal(&self) -> String {
+        format!(
+            "witness verification did not resolve within {}s and ReplConfig.strict_witnesses \
+             is set, so this node is stopping instead of serving reads it cannot write to: it \
+             was a primary before restarting and still cannot confirm that every follower it \
+             had shipped to was never promoted. Unresolved: {}. Start the unreached witnesses \
+             and restart this node; clear strict_witnesses to serve reads while it waits \
+             instead; or, if a witness is gone for good, see GUIDE §10's witness-set remedy.",
+            WITNESS_DEADLINE_NANOS / 1_000_000_000,
+            render_witness_list(&self.unresolved_witnesses())
+        )
+    }
+
+    /// The witnesses that have not yet answered in a way that opens the gate,
+    /// rendered one per entry with why. `IsPrimary` never appears: it refused
+    /// this node one arm earlier.
+    fn unresolved_witnesses(&self) -> Vec<String> {
+        self.probes
             .iter()
             .filter_map(|p| match p.verdict() {
                 WitnessVerdict::Pending => Some(format!("{} (no answer yet)", p.addr())),
@@ -666,7 +707,15 @@ impl Repl {
                 // reaches here — it refused this node one arm earlier.
                 WitnessVerdict::NotPrimary | WitnessVerdict::IsPrimary(_) => None,
             })
-            .collect();
+            .collect()
+    }
+
+    /// The one loud notice (spec §2): the deadline passed and writes are
+    /// still being withheld. Changes nothing — the gate stays shut, the
+    /// probes keep running — it only tells an operator with no client traffic
+    /// what the 503 would have told a client.
+    fn emit_witness_notice(&mut self) {
+        let unresolved = self.unresolved_witnesses();
         assert!(
             !unresolved.is_empty(),
             "witness notice with nothing unresolved — an all-answered gate clears its probes, \

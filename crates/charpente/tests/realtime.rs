@@ -1331,6 +1331,7 @@ fn rt_primary_cfg(addr: &str) -> ReplConfig {
         listen: Some(addr.to_string()),
         initial_role: Role::Primary,
         peer_secret: None,
+        strict_witnesses: false,
     }
 }
 
@@ -1341,6 +1342,7 @@ fn rt_follower_cfg(listen: &str, primary: &str) -> ReplConfig {
             primary: primary.to_string(),
         },
         peer_secret: None,
+        strict_witnesses: false,
     }
 }
 

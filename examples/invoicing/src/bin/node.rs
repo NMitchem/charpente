@@ -166,6 +166,7 @@ fn main() -> std::io::Result<()> {
                 listen: Some(repl.listen.clone()),
                 initial_role,
                 peer_secret: repl.secret.clone(),
+                strict_witnesses: false,
             };
             if repl.role == RoleKind::Backup {
                 let app = build(&parsed.data_dir)?;

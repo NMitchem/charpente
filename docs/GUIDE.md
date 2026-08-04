@@ -2525,6 +2525,7 @@ fn run_primary(app: App) -> std::io::Result<()> {
         listen: Some("0.0.0.0:9090".to_string()),
         initial_role: Role::Primary,
         peer_secret: Some("shared-with-every-follower".to_string()),
+        strict_witnesses: false,
     };
     // HTTP on 8080, replication on 9090. Returns once both are up.
     serve::serve_replicated("0.0.0.0:8080", app, Box::new(ProdDisk::new("./data")?), cfg)?;
@@ -2538,6 +2539,7 @@ fn run_follower(app: App) -> std::io::Result<()> {
             primary: "primary-host:9090".to_string(),
         },
         peer_secret: Some("shared-with-every-follower".to_string()),
+        strict_witnesses: false,
     };
     serve::serve_replicated("0.0.0.0:8080", app, Box::new(ProdDisk::new("./data")?), cfg)?;
     Ok(())
@@ -2550,6 +2552,7 @@ fn run_backup(app: App) -> std::io::Result<()> {
             primary: "primary-host:9090".to_string(),
         },
         peer_secret: Some("shared-with-every-follower".to_string()),
+        strict_witnesses: false,
     };
     // A backup blocks on the current thread — no HTTP edge, no requests.
     serve::backup(app, Box::new(ProdDisk::new("./backup-data")?), cfg)

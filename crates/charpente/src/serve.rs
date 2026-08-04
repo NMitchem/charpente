@@ -672,6 +672,7 @@ mod tests {
                 listen: Some(repl_p.clone()),
                 initial_role: Role::Primary,
                 peer_secret: None,
+                strict_witnesses: false,
             },
         )
         .unwrap();
@@ -685,6 +686,7 @@ mod tests {
                     primary: repl_p.clone(),
                 },
                 peer_secret: None,
+                strict_witnesses: false,
             },
         )
         .unwrap();
