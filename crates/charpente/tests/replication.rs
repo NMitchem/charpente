@@ -3120,9 +3120,30 @@ fn switchover_universe(sim: &mut Sim) -> Result<(), String> {
                 continue;
             }
             DrainResult::Verifying => {
+                // MEASURED, not assumed: a gated universe is ALREADY bound for
+                // the inconclusive path below, for a reason that predates the
+                // witness gate. The boot gate engages only at `Repl::open`,
+                // which in this rig is only reached through `recover_node`, so
+                // reaching this arm implies `p.recoveries > base_p_recoveries`
+                // — and that is the loop's own break at the top, evaluated
+                // before the verb is ever re-issued. So there is nothing to
+                // retry toward: any `continue` here lands on that break.
+                //
+                // An earlier version of this arm waited for the gate to reopen
+                // and retried on a separate budget. It was inert — 127
+                // inconclusive universes with it and 127 without, byte for
+                // byte — and a retry that cannot reach its target reads like
+                // coverage that does not exist. The honest shape is to name
+                // the case and let it fall through, which still runs
+                // `assert_one_writable`.
+                //
+                // The consequence is stated rather than hidden: the zero-loss
+                // oracle does not adjudicate a universe whose primary restarted
+                // into the gate. That is a loss of REACH, not of teeth — a
+                // universe that does reach `CtrlOk` runs the full oracle with
+                // nothing softened.
                 sim.cover("repl:switchover-witness-gated");
-                drive_rounds(sim, &mut [&mut p, &mut f], 20)?;
-                continue;
+                break;
             }
             DrainResult::Lost => break,
         }

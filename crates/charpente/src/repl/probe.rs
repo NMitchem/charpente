@@ -161,11 +161,27 @@ impl WitnessProbe {
         }
     }
 
+    /// True when this probe has learned something the gate can act on, and so
+    /// will never speak again. **`Inconclusive` is deliberately NOT decided**:
+    /// it is the verdict meaning "I learned nothing", absorbing
+    /// `decide_hello`'s whole prefix ladder (peer secret, protocol version,
+    /// schema digest, invalid listen), and spec §2's trichotomy files
+    /// "unknown" with unreachable — stay write-stopped, back off, retry.
+    /// Treating it as decided strands the gate shut forever on an ordinary
+    /// rolling-upgrade skew, and makes the notice's and the 503's promise
+    /// that "writes resume the moment every witness answers" a lie.
+    fn decided(&self) -> bool {
+        matches!(
+            self.verdict,
+            WitnessVerdict::NotPrimary | WitnessVerdict::IsPrimary(_)
+        )
+    }
+
     /// True when `step` has something to do: a drained response to classify,
     /// or a due (re)connect. A decided probe and a probe waiting on an open
     /// conn both report `false` — see `drain`.
     pub(crate) fn has_work(&self, now: u64) -> bool {
-        if !matches!(self.verdict, WitnessVerdict::Pending) {
+        if self.decided() {
             return false;
         }
         if self.pending.is_some() {
@@ -178,7 +194,7 @@ impl WitnessProbe {
     /// scheduler advances to it instead of stalling (`Follower::next_deadline`
     /// one for one).
     pub(crate) fn next_deadline(&self) -> Option<u64> {
-        if matches!(self.verdict, WitnessVerdict::Pending) && self.conn.is_none() {
+        if !self.decided() && self.conn.is_none() {
             self.reconnect_at
         } else {
             None
@@ -186,12 +202,12 @@ impl WitnessProbe {
     }
 
     /// One unit of work: classify the drained response, else connect +
-    /// `Hello` when disconnected and due. A verdict other than `Pending` is
-    /// terminal (the conn is already dropped) — later calls are a no-op, so
-    /// the caller can keep stepping every probe uniformly without tracking
-    /// which ones are already decided.
+    /// `Hello` when disconnected and due. A *decided* verdict is terminal
+    /// (the conn is already dropped) — later calls are a no-op, so the caller
+    /// can keep stepping every probe uniformly without tracking which ones
+    /// are already decided. `Inconclusive` is not decided; see `decided`.
     pub(crate) fn step(&mut self, net: &dyn Net, db: &Db, now: u64) -> io::Result<()> {
-        if !matches!(self.verdict, WitnessVerdict::Pending) {
+        if self.decided() {
             return Ok(());
         }
         let Some(raw) = self.pending.take() else {
@@ -205,6 +221,14 @@ impl WitnessProbe {
         // Classify and disconnect: never fall through to apply anything (the
         // module doc's "never adopts").
         self.conn = None;
+        // An undecided verdict re-arms the backoff, so the witness is asked
+        // again on the same pacing a failed connect uses. The verdict is kept
+        // rather than reset to `Pending` so the operator notice can say WHY
+        // this witness is still unresolved; `decided` is what makes it
+        // retryable, not the variant itself.
+        if !self.decided() {
+            self.reconnect_at = Some(now + RECONNECT_NANOS);
+        }
         Ok(())
     }
 
@@ -516,6 +540,47 @@ mod tests {
             }
             other => panic!("expected Inconclusive, got {other:?}"),
         }
+    }
+
+    /// An `Inconclusive` verdict must NOT strand the gate. It is the verdict
+    /// that means "I learned nothing" — it absorbs `decide_hello`'s whole
+    /// prefix ladder (peer secret, protocol version, **schema digest**,
+    /// invalid listen), every entry of which is a transient misconfiguration
+    /// an operator fixes. Spec §2's trichotomy files "unknown" with
+    /// unreachable: *stay write-stopped, back off, retry*.
+    ///
+    /// Making it terminal stranded a restarted primary permanently and
+    /// silently — the gate could never reopen even after the operator fixed
+    /// the skew — while three shipped strings promised writes resume the
+    /// moment the witness answers. Schema-digest skew is the ordinary
+    /// rolling-upgrade window, and this sub-project's own restart-order rule
+    /// (followers first) is what walks an operator into it.
+    #[test]
+    fn an_inconclusive_witness_is_retried_not_stranded() {
+        let refusal = Msg::Refuse {
+            message: PEER_SECRET_REFUSAL.to_string(),
+        };
+        let (probe, _db) = probe_scripted(0x0DEB_0405, &refusal);
+        assert!(
+            matches!(probe.verdict(), WitnessVerdict::Inconclusive(_)),
+            "precondition: this refusal classifies Inconclusive"
+        );
+        // The conn is dropped and a backoff is armed, exactly as a failed
+        // connect arms one — so the probe asks again rather than giving up.
+        assert!(
+            probe.next_deadline().is_some(),
+            "an inconclusive probe must schedule a retry, or the caller's scheduler parks \
+             forever and the gate never reopens"
+        );
+        assert!(
+            !probe.has_work(0),
+            "the backoff is not yet due at the instant it was armed"
+        );
+        assert!(
+            probe.has_work(RECONNECT_NANOS),
+            "once the backoff comes due the probe must report work — this is the assertion \
+             that fails when Inconclusive is treated as a terminal verdict"
+        );
     }
 
     #[test]
