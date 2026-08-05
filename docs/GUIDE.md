@@ -2618,16 +2618,36 @@ asks each witness one question, "are you a primary now?", and:
   platform's to discard;
 - a witness cannot be reached, or answers something that says nothing about
   its role (a mismatched peer secret, protocol version, or schema digest) →
-  reads keep flowing, writes keep being refused, and after 30 seconds
-  (`WITNESS_DEADLINE_NANOS`) the node prints one notice on stderr naming what
-  is still unresolved and why. It keeps probing; an unreachable witness that
-  comes back resolves the gate on its own.
+  by default reads keep flowing, writes keep being refused, and after 30
+  seconds (`WITNESS_DEADLINE_NANOS`) the node prints one notice on stderr
+  naming what is still unresolved and why. It keeps probing; an unreachable
+  witness that comes back resolves the gate on its own. Set
+  `ReplConfig::strict_witnesses` to stop instead — see below.
 
 The bound is worth stating plainly: this proves *none of the nodes I shipped
 to is a primary now*, not *no other primary exists*. If the follower you
 promoted was never in this node's witness set — it was promoted after a
 switchover chain, say — this node resumes, and you are back to the hazard the
 promote warning below describes.
+
+**Stopping instead of serving reads.** `ReplConfig::strict_witnesses` (default
+`false`) changes the third outcome only. With it set, a node whose witnesses
+are still unreached at the 30-second deadline stops rather than serving reads
+it cannot write to. The other two outcomes are unaffected: every witness
+answering *not a primary* still opens the gate, and one answering *as a
+primary* still refuses regardless of this flag.
+
+Two things about it are easy to get wrong. It is **not** "refuse to start":
+whether a witness is unreachable is only established by probing, so a strict
+node starts, serves reads for the whole 30-second window, and only then stops.
+And **the stop reaches a supervisor under `serve::backup` only** — there the
+error exits the process with a non-zero status, so a supervisor restarts it and
+keeps restarting until a witness answers. Under `serve::serve_replicated` the
+kernel runs on a spawned thread: it prints the error and the thread ends, but
+the HTTP edge stays up and the process does not exit, so every subsequent
+request gets `500 the kernel thread is gone` and nothing external notices.
+Writes are fail-stopped either way; only the backup shape is loud. On an HTTP
+node, set this flag only if something is watching for those 500s.
 
 **The escape hatch, and its cost.** A follower that is permanently
 decommissioned stays in the witness set forever, and a primary whose only

@@ -680,7 +680,13 @@ Every witness answering "not a primary" opens the gate; one answering as a prima
 this node by name, naming both remedies and demoting nothing; unreachable or inconclusive
 witnesses keep the gate shut, serve reads throughout, and produce one operator notice after
 `WITNESS_DEADLINE_NANOS` (Noah's ruled option (c) — the availability cost is deliberate,
-because the alternative is silent acked-write loss). **The bound, stated so it is not read
+because the alternative is silent acked-write loss). `ReplConfig::strict_witnesses` (default
+`false`) overrides that last arm alone: past the same deadline the node stops instead of
+serving reads it cannot write to. It is not "refuse to start" — unreachability is only
+established by probing, so a strict node starts, serves reads for the deadline window, and
+only then stops; and the stop reaches a supervisor only under `serve::backup`, where it
+exits the process, not under `serve::serve_replicated`, where the kernel thread ends and the
+HTTP edge stays up returning 500s. **The bound, stated so it is not read
 wider: a probe answers "is THIS witness a primary", never "does another primary exist".**
 A node promoted after a switchover chain, never in this node's witness set, is invisible to
 the check — the witness set is the bound on the whole defence, and the M2 backlog's Design C

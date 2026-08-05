@@ -114,8 +114,17 @@ pub struct ReplConfig {
     /// to the deadline. So a strict node starts, serves reads for that window,
     /// and only then stops, by returning an error out of `Repl::step` that
     /// bubbles through `Kernel::run` (DESIGN §5's restart-and-recover exit).
-    /// A supervisor that restarts it will loop until a witness answers, which
-    /// is the intended shape: loud and repeating, not silent and degraded.
+    ///
+    /// **What that stop looks like depends on the entry point, and only one of
+    /// the two reaches a supervisor.** Under `serve::backup` the error is the
+    /// tail expression of an `io::Result<()>`, so it leaves the process with a
+    /// non-zero status and a supervisor restarts it — loud and repeating, the
+    /// intended shape. Under `serve::serve_replicated` the kernel runs on a
+    /// spawned thread: the error is printed and the thread ends while the HTTP
+    /// edge stays up, so the process does NOT exit, nothing restarts it, and
+    /// every later request gets `500 "the kernel thread is gone"`. That is
+    /// still fail-stop for writes, but it is silent to a supervisor — set this
+    /// flag on an HTTP node only if something watches the 500s.
     pub strict_witnesses: bool,
 }
 
