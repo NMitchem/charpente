@@ -166,9 +166,12 @@ Expected: the new test PASSES; the replication suite is fully green (it is slow 
 
 ```bash
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace 2>&1 | tee /tmp/t1-workspace.log
 git add crates/charpente/src/repl/session.rs crates/charpente/tests/replication.rs
 git commit -m "repl: a dead session must not hold the retention pin"
 ```
+
+`cargo test --workspace` is required before the commit by Global Constraints — `pin_floor` is shared by every session, so the blast radius is not just the replication suite. It subsumes Step 4's targeted run; Step 4 exists to get a fast signal first.
 
 ---
 
