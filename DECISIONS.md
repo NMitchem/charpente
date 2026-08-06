@@ -73,6 +73,24 @@ is the safety equipment, and it doesn't exist yet. redb behind the `Disk` trait 
 shipped and *still* exercises crash/torn-write recovery of our WAL + snapshot layer.
 Reopen (on schedule): M2.
 
+**Reopened on schedule 2026-08-06; re-closed: deferred behind measurement** (Noah-ruled,
+premise re-examination at M2 start). The harness precondition is met, but the urgency
+case is gone: redb coupling is confined to `table.rs` (one file, ~30 call sites — deferral
+does not compound the swap cost); redb is healthy and its known gaps are fenced and pinned
+(the open-time panic fence, both mode-skew profile overrides, the 0a latch); and the moat
+NEIGHBORS defines — determinism + the compile-time oracle — already exists, while the
+engine is invisible to the adopters the wager needs. Building a performance-shaped engine
+with no benchmark showing redb as a bottleneck fails §6's measure-first discipline — and
+no benchmark exists at all, which is also PLAN's own unfulfilled "publish honest
+benchmarks early" mitigation. Build triggers, any one sufficient: (a) benchmarks show redb
+limiting the headline throughput claim; (b) a redb upgrade makes the fence-maintenance
+burden real (the latch's five-site census review); (c) post-launch adoption justifies
+moat-deepening. The engine trait boundary is deliberately not cut in the meantime: with
+one implementation it is speculative abstraction, and containment already holds by
+convention; the second engine's arrival is the moment to cut it. Page checksums stay "M2
+engine owns" (wal-segment spec ruling) — that IOU now hangs off the triggers rather than
+a scheduled start.
+
 ## 8. Name
 
 `charpente` (French: the load-bearing timber frame of a building). Chosen by Noah after

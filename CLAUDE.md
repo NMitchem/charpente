@@ -994,7 +994,12 @@ do not reorder a milestone's dependency sequence.
   way (`run_oracle`'s restart-then-relogin flow has no tolerance for the witness gate's async
   resolution window, regardless of which commit widened it, if any), not fixed here — Task 4
   is docs-and-evidence, not product or test code.
-- Next: **M2 per PLAN.** The backlog below holds **no open ruled follow-ups** — both entries
+- Next: **M2 per PLAN.** Ruled 2026-08-06 (premise re-examination at M2 start): the own-LSM
+  engine is **deferred behind measurement** — DECISIONS §7's scheduled reopen, re-closed with
+  three named build triggers — and the **benchmark harness** (PLAN's unfulfilled "publish
+  honest benchmarks early" mitigation) is the next sub-project; its spec is in brainstorming.
+  Do not start the LSM engine from this file alone; the triggers live in DECISIONS §7.
+  The backlog below holds **no open ruled follow-ups** — both entries
   in it are record. Still-open work, none of it ruled or blocking: `TcpProxy::stop`'s
   registration window ("fix in M2"); the follower-decode asymmetry above; the edge-harness
   restart-then-relogin race noted in the verifying-peer-policy entry just above (mechanism
