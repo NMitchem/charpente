@@ -702,57 +702,134 @@ do not reorder a milestone's dependency sequence.
   replication behavior. Note for whoever runs the next sweep: pipe cargo through `tee`, not
   `tail`. `tail` eats the aggregate counts *and* replaces cargo's exit status with its own,
   which is how the T1 sweep lost its counts and how this one nearly did.
+- **M2 sub-project 0b done — the dual-primary gap CLOSED (2026-08-05, spec
+  docs/superpowers/specs/2026-07-31-dual-primary-design.md (`cf80011`), 6-task plan
+  docs/superpowers/plans/2026-07-31-dual-primary.md (`59746d1`) + two amendments
+  (`2627fa7` the witness format's count trailer + address validation, `3da95b5` marking
+  Task 1's pre-amendment code blocks historical), ledger
+  `.superpowers/sdd/2026-07-31-dual-primary/progress.md`, commits `cf80011`..this commit).**
+  The last *ruled follow-up* carried out of M1, now retired from the backlog below.
+  **The gap:** a primary dies, an operator promotes the follower, and later the old box is
+  restarted **exactly as it was configured** — same `--role primary`, same data dir. The
+  durable role file says `Primary` and always wins over config, and `role.rs` emits a notice
+  only when config *contradicts* the file, so it resumes as a primary in total silence.
+  Neither node dials the other (a durable `Primary` has no follower client), so nothing on
+  either side could observe the conflict: two live, writable, mutually invisible primaries on
+  diverged timelines, the resurrected one serving stale reads **and acking new writes** whose
+  mandated remedy (fresh data dir + re-seed) then destroys them. Acked-write loss reached
+  through an ordinary "restart the old box the way it was" action.
+  **Mechanism — the witness set.** A **witness** is a node this primary has shipped to, and
+  the check is conclusive on its own: *if any node I shipped to now answers as a primary, I am
+  not the primary any more*. No wire change, no new protocol field, no proto bump — `Hello`
+  already carries the sender's listen address and the primary already holds it per session;
+  this persists what was already in memory. Durable form is a two-slot CRC'd `witnesses` file
+  in the data dir, sibling to `role`, written with `role.rs`'s exact discipline (`write_at` +
+  `set_len` + `sync` + `sync_dir`) with generation, count and a format marker inside the CRC,
+  so a torn write can neither brick startup nor parse as a shorter — and therefore *less
+  safe* — set. Written when a ship session's peer `listen` becomes known, append-if-new: one
+  durable write per **new** peer, so steady-state cost is zero. Cleared on any durable role
+  flip away from `Primary`, and `promote` clears the stale set **before** the durable flip.
+  **The gate moved, and that is the fix.** `mod.rs` called `db.allow_writes()` inside the
+  `match &role` block, before the follower client was even constructed — writes were enabled
+  strictly before any probe could run, so a check bolted on afterwards would not have been a
+  fix. A durable `Primary` with a non-empty witness set now starts at `forbid_writes` and is
+  promoted to `allow_writes` only when *every* witness has answered "not a primary". An empty
+  witness set still resumes immediately and silently: single-node and never-shipped primaries
+  are completely untouched, and that path is pinned.
+  **A third write-gate state.** `Db` modelled the gate as `not_primary: Option<String>` →
+  `TxError::NotPrimary { primary }` → 421 naming where to go instead. A witness-gated node has
+  **no primary to name** — it does not know whether one exists and may itself still be the
+  legitimate primary — so 421 with any address would be a lie and with its own would be a
+  loop. The gate became three-valued (`Allowed`/`NotPrimary(addr)`/`Verifying`) with
+  `TxError::Verifying { unreached }` rendering as **503**, the honest status for a transient
+  state the node expects to leave on its own. A pre-release breaking addition to the public
+  `TxError`, in the same class as realtime's `emit` format change; the existing
+  `NotPrimary` → 421 pin is byte-unchanged.
+  **The probe is a purpose-built classify-and-disconnect client, deliberately NOT
+  `Follower::new_resolving`** — worth stating so it is not "simplified" back later. `Follower::
+  step` classifies the first response and then *falls through to the normal handlers*:
+  `Msg::Frames` reaches `apply_and_ack`, `SnapshotStart` opens a seed. For a resurrected
+  primary that would silently auto-heal a forked node by adopting the winner's timeline, which
+  is exactly what the 2026-07-16 diverged-BEHIND interlude ruled against. The probe sends
+  `Hello`, classifies the first response, tears the connection down, and never applies a frame
+  or opens a seed.
+  **Ruling (Noah, 2026-07-31): option (c)** — after `WITNESS_DEADLINE_NANOS` with witnesses
+  still unreachable, serve reads, withhold writes, keep probing, and emit one loud notice
+  naming the unreached witnesses and the remedy. The notice is not a substitute for the gate;
+  it is how the operator learns why writes are refused. `ReplConfig::strict_witnesses`
+  (default `false`, shipped in `5af32f5`, documented in `bb91ff4`) is the opt-in alternative
+  for operators who prefer a node that fails to start over one serving reads it cannot write
+  to. **The honest cost, stated in GUIDE §10 rather than hidden:** a primary whose only
+  follower is permanently decommissioned will not accept writes until an operator edits or
+  deletes the `witnesses` file — reads stay up — and the guide carries the explicit warning
+  that clearing that file re-opens exactly this gap. Retention is conservative on purpose: a
+  decommissioned node *could still have been promoted* before it was decommissioned.
+  **What the reviews caught** (every task opus-reviewed; each closed its fix round at 0
+  Critical / 0 Important): Task 5's I-1 was a **real product defect** — every non-`Pending`
+  verdict was terminal, but `Inconclusive` is precisely the verdict meaning "I learned
+  nothing" and absorbs `decide_hello`'s whole prefix ladder including the schema digest, so
+  one inconclusive answer stranded the gate shut **permanently and silently** while three
+  shipped strings promised it would resolve itself (fixed in `87cd734`: an inconclusive
+  witness is asked again). Task 5's I-2 is the counter-example worth keeping: the review's
+  recommended fix was implemented, **measured, and reverted** — the new cover key fired in 0
+  of 256 universes and inconclusive was 127 with the machinery and 127 without, byte for
+  byte. The machinery was inert; measurement disproved the model behind it.
+  **Known, documented, and deliberately not fixed:** a `Verifying` node is still a live
+  replication peer — it accepts Hellos, ships, and seeds new followers while withholding its
+  own writes. Task 6's interlude built the refusal (`Db::verifying()` + a `Session::handle`
+  arm), measured it, and **reverted it** on the re-review's C-1; GUIDE §10 states the
+  behaviour instead.
+  **Tests** (seeds `0x2EB1_0102`..`0x2EB1_0118` in `crates/charpente/tests/replication.rs`,
+  RED-first per hard rule 3): the headline `0x2EB1_0111` asserts **on the gate, never on a
+  message** — a notice an operator may or may not read is not what keeps a second primary from
+  acking writes — plus refusal-by-name when a witness answers as a primary (`0x2EB1_0112`),
+  the silent empty-set path (`0x2EB1_0113`), unreachable-serves-reads-withholds-writes
+  (`0x2EB1_0114`), `strict_witnesses` (`0x2EB1_0115`), promote-clears-before-the-flip
+  (`0x2EB1_0117`), and the kernel completing its skipped startup work when the gate opens
+  (`0x2EB1_0118`). The edge tripwire was **updated and renamed, never deleted**:
+  `failover_known_gap_silent_dual_primary_resurrection` →
+  `failover_resurrected_primary_does_not_accept_writes`, flipping from characterizing the gap
+  to proving the fix (Phase A: witness unreachable → reads 200, writes 503 by name; Phase B:
+  witness answers as a primary → refuse by name and stop the kernel). It is `#[ignore]`, so
+  its red appears only under `scripts/edge-harness.sh`, never in `cargo test --workspace`.
+  **Evidence** — 11-stage sweep, every stage green (logs in the session scratchpad; `tee`,
+  never `tail`): `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets --
+  -D warnings` clean; `cargo build -p guide-examples` (the GUIDE compile gate) clean; `cargo
+  test --workspace` **twice**, identical both times — 49 test binaries, **570 passed / 0
+  failed / 31 ignored** (354s, 353s). The 569→570 delta against the ledger's `87cd734`
+  baseline is reconciled: `5af32f5` added exactly one test. Pinned debug replays
+  `CHARPENTE_SEED=0x8bee1752811ae873` (charpente-sim crash_recovery, 4/4) and
+  `0x348270b38f166529` (charpente kernel, 26/26); both release mode-skew tripwires exactly as
+  `ci.yml` runs them (`0x8bee1752811ae873` release crash_recovery 4/4,
+  `0xff159ed76d2806e4` release `late_follower_seeds_below_the_gcd_base_and_converges` 1/1); a
+  fresh invoicing 1024-universe batch, **all green, master seed `0x4e5f579b23852b2f`**; and
+  the edge matrix `scripts/edge-harness.sh`, **31/31 `#[ignore]` scenarios green in 47s**,
+  including the renamed tripwire. Note for the next sweep: the edge crate's ignored tests live
+  in `src/` as well as `tests/` — grepping only `tests/` undercounts them by more than half.
 - Next: **push** — one metered CI run, deliberately deferred through M1's whole final
-  sub-project and this one (local-first verification is the sweep above; Noah confirms).
-  Then M2 per PLAN, with the one remaining ruled follow-up below (the dual-primary gap)
-  re-decided at its policy fork before it is implemented.
+  sub-project and both M2 sub-projects so far (local-first verification is the sweep above;
+  Noah confirms). Then M2 per PLAN. The backlog below now holds **no open ruled follow-ups**:
+  both entries in it are record, and the only item still marked as work is `TcpProxy::stop`'s
+  registration window ("fix in M2") in the triage entry.
 
 ## M2 follow-up backlog (carried from M1, ruled — written to be read cold)
 
-- **The dual-primary gap: silent primary resurrection after a promote.** A primary dies; an
-  operator promotes the follower; later the old box comes back and is restarted **exactly
-  as it was configured** — same `--role primary`, same data dir. Its durable role file says
-  `Primary` and the durable role always wins over config, so it resumes as a primary with
-  **no notice at all**: `role.rs`'s notice fires only when the restart config *contradicts*
-  the role file, so it is a config-mismatch message, not a safety net. Neither node dials
-  the other (each node's follower client is `None` once it is durably `Primary`), so nothing
-  on either side can observe the conflict. Result: two live, writable, mutually invisible
-  primaries on diverged timelines — the resurrected node serves stale reads *and accepts new
-  writes, acking them* — and the mandated remedy for a demoted primary is a fresh data dir
-  plus a re-seed, which **destroys every write it acked in the meantime**. Acked-write loss
-  reached through an ordinary "restart the old box the way it was" action. **Recommended
-  fix:** extend to the `Primary`-resume path the probe-on-restart discipline `HandingOff`
-  resume already has, via one piece of new durable state — a **witness set**, the listen
-  addresses of the followers this node has shipped to, written alongside the role file
-  whenever a ship session is established. A node starting in durable `Primary` with a
-  non-empty witness set probes each witness with the existing `Hello` machinery *before*
-  allowing writes; a witness that answers **as a primary** is conclusive on its own (the
-  only way a node this one shipped to is now a primary is that it was promoted or handed
-  off to), and the resurrected node then refuses by name with the fresh-data-dir remedy, in
-  the shape `decide_hello`'s `diverged_behind` arm already uses. An empty witness set always
-  resumes silently, so single-node primaries are untouched. This is deliberately smaller
-  than the ledgered **Design C** (a durable timeline epoch at fork points, carried on
-  `Hello`) and **compatible with it**: no protocol field is needed, because "the peer
-  answers as a primary" is already distinguishable on today's wire, and an epoch would
-  *sharpen* the refusal rather than replace the probe. **The policy fork is the deliverable
-  and was deliberately NOT ruled:** what does a node do when its witnesses are
-  **unreachable**? Refusing is safe but breaks every ordinary restart of a primary whose
-  follower merely happens to be down (a single-node-plus-dead-follower deployment would
-  never start); resuming keeps availability but leaves the gap open in exactly the scenario
-  where it bites. T13 recommended resuming with a loud notice naming the unreached witnesses
-  and the risk — mirroring how `HandingOff` resume treats an unreachable `to` as "keep
-  trying" — with strict-refuse available as an opt-in `ReplConfig` flag; **re-decide it with
-  M2's context.** Costs: durable state that must survive crashes and stay accurate as
-  followers come and go, plus network IO on the startup path (a probe timeout added to every
-  primary's start). **Tripwire:** `crates/edge-harness/tests/failover.rs`'s
-  `failover_known_gap_silent_dual_primary_resurrection`, which proves the two primaries
-  genuinely cannot see each other rather than assuming it, and goes red on any fix that
-  makes the resurrected node refuse, demote, or warn. **Note the asymmetry with the gap
-  above:** this test is `#[ignore]`, so its red appears only under
-  `scripts/edge-harness.sh`, never in `cargo test --workspace`. That follows from plan
-  ruling 4 and is not a defect, but an M2 reader must know it. DESIGN §5's promote paragraph
-  now names this gap; GUIDE §10 carries the operator warning. Full write-up: proposal 2 of
-  the same report.
+- **The dual-primary gap — RETIRED 2026-08-05, closed by M2 sub-project 0b** (close-out in
+  "Current state" above). It was the last *ruled follow-up* carried out of M1; what remains
+  in this section is record, not open work, with one exception named in the triage entry
+  below (`TcpProxy::stop`'s registration window, marked "fix in M2"). The policy fork the
+  entry existed to hold open — what a node does when its witnesses are **unreachable** — was
+  re-decided at implementation time as ruled option (c): serve reads, withhold writes, keep
+  probing, and emit one notice at the deadline, with the strict-refuse alternative shipped as
+  the opt-in `ReplConfig::strict_witnesses`. The recommended fix in the retired entry is what
+  shipped, essentially unchanged (durable witness set, probe before writes, refuse by name,
+  never demote); the two things it did not anticipate are that the write gate needed a
+  **third** state rather than reusing `NotPrimary` (a verifying node has no primary to name,
+  so 421 would have been a lie — hence `TxError::Verifying` → 503), and that the probe had to
+  be a purpose-built classify-and-disconnect client rather than `Follower::new_resolving`,
+  which would have silently adopted the winner's timeline. Design C (a durable timeline epoch
+  on `Hello`) stays ledgered and stays compatible — it would sharpen the refusal, not replace
+  the probe.
 - **Retired follow-up wording.** The migrations close-out's follow-up "`Db::poisoned()`
   reflects only apply-side poison, not redb **read-side** poison" is retired as imprecise:
   the reachable-anywhere mechanism is the **checkpoint fsync**, and the read mechanism is

@@ -1810,9 +1810,14 @@ fn verify_writes_over_an_honest_not_primary_panics() {
 }
 
 /// `Verifying -> Verifying` must stay legal (fix round 1 M-3's own
-/// clarification): the witness list only ever shrinks as witnesses answer,
-/// so re-calling `verify_writes` with a smaller list is the normal, expected
-/// resolution path, not a caller bug.
+/// clarification): re-gating with a smaller list is supported, not a caller
+/// bug. This is a CAPABILITY test, not a description of the shipped path.
+/// `Repl` calls `verify_writes` exactly once, at `open`, and deliberately
+/// never re-gates — `resolve_witness_gate`'s rustdoc carries the reason
+/// (which answer a witness gives is peer-controlled, so a per-tick re-gate
+/// would make `verify_writes`'s own assert remotely triggerable). So the 503
+/// a client actually sees names the whole witness set for the life of the
+/// gate; only the deadline notice tracks who is still outstanding.
 #[test]
 fn verify_writes_can_shrink_the_witness_list() {
     let (_sim, mut db) = quiet_db(0x9012_000C);

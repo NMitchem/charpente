@@ -517,9 +517,11 @@ it either. It means this node was a durable primary before it restarted and
 has not yet confirmed that none of its followers (its "witnesses") were
 promoted while it was down (`Db::verify_writes`). Unlike `NotPrimary`, there
 is no primary address to name: this node does not know whether one exists
-elsewhere, and it may still be the legitimate primary itself. `unreached`
-lists the witnesses that have not yet answered; the HTTP layer maps it to
-503, naming them. The state is transient — writes resume automatically
+elsewhere, and it may still be the legitimate primary itself. `unreached` is
+the witness set this node is verifying, fixed at the moment the gate closed;
+the HTTP layer maps it to 503, naming them. It does not shrink as individual
+witnesses answer — the stderr notice described in §10 is where the live
+per-witness detail lives. The state is transient — writes resume automatically
 (`Db::allow_writes`) the moment every witness confirms it was never
 promoted, with no caller action needed.
 
@@ -2585,7 +2587,7 @@ promoted while it was down, also refuses writes — but it cannot name a
 primary the way a follower does, because it does not know whether one
 exists elsewhere; it may still be the legitimate one. An effectful
 transaction is refused with `TxError::Verifying`, which the HTTP layer maps
-to **503** naming the witnesses still unreached:
+to **503** naming the witness set it is verifying:
 
 ```text
 HTTP/1.1 503 Service Unavailable
@@ -2629,6 +2631,13 @@ to is a primary now*, not *no other primary exists*. If the follower you
 promoted was never in this node's witness set — it was promoted after a
 switchover chain, say — this node resumes, and you are back to the hazard the
 promote warning below describes.
+
+A gated node is also still a replication peer: withholding writes does not
+take it off the wire. It keeps accepting `Hello`s, keeps shipping records it
+already holds, and will still seed a brand-new follower. A follower that first
+connects during this window is recorded as a witness like any other — but it
+joins neither the probe set nor the 503's list, both of which were fixed when
+the gate closed, so it constrains the *next* restart rather than this one.
 
 **Stopping instead of serving reads.** `ReplConfig::strict_witnesses` (default
 `false`) changes the third outcome only. With it set, a node whose witnesses

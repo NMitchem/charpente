@@ -102,10 +102,14 @@ pub enum TxError<E> {
     /// "witnesses") were promoted in its absence (`Db::verify_writes`).
     /// Unlike `NotPrimary`, this node does not know whether a primary exists
     /// elsewhere — it may still be the legitimate one — so there is nothing
-    /// honest to name as "the" primary. `unreached` lists the witnesses that
-    /// have not yet answered; the gate resolves automatically (to `Allowed`
-    /// or a demotion) once every witness has. Reads and effect-free
-    /// transactions never see this, same as `NotPrimary`.
+    /// honest to name as "the" primary. `unreached` is the witness set this
+    /// node is verifying, captured when the gate closed: the replication
+    /// caller sets it once and never rewrites it, so it does NOT shrink as
+    /// individual witnesses answer (`Repl::resolve_witness_gate` carries the
+    /// reason a per-tick re-gate would be unsafe). The gate resolves
+    /// automatically (to `Allowed` or a demotion) once every witness has
+    /// answered. Reads and effect-free transactions never see this, same as
+    /// `NotPrimary`.
     Verifying {
         unreached: Vec<String>,
     },
@@ -1585,12 +1589,13 @@ impl Db {
     /// a durable primary that just restarted with a non-empty witness set,
     /// unsure whether one of its followers was promoted while it was down.
     /// Every further effectful `transact` returns `TxError::Verifying {
-    /// unreached }` naming the witnesses that have not yet confirmed they
-    /// were never promoted — never a primary address, since this node may
-    /// still be the legitimate one. Reads and effect-free transactions are
-    /// unaffected, same as `forbid_writes`. The caller (Task 5's boot probe)
-    /// resolves the gate by calling `allow_writes` once every witness
-    /// answers "not a primary", or `forbid_writes` if one answers "primary".
+    /// unreached }` naming the witness set passed here — never a primary
+    /// address, since this node may still be the legitimate one. Reads and
+    /// effect-free transactions are unaffected, same as `forbid_writes`. The
+    /// caller (Task 5's boot probe) resolves the gate by calling
+    /// `allow_writes` once every witness answers "not a primary", or
+    /// `forbid_writes` if one answers "primary"; it calls this exactly once,
+    /// so the rendered list does not shrink as individual witnesses answer.
     pub fn verify_writes(&mut self, unreached: Vec<String>) {
         assert!(
             !unreached.is_empty(),
@@ -1602,8 +1607,8 @@ impl Db {
             "Db::verify_writes called while forbid_writes was already in effect — this would \
              replace an honest \"go to X\" 421 with an \"I might still be the primary\" 503; \
              call forbid_writes (or allow_writes) instead of layering verify_writes on top of \
-             NotPrimary. Verifying -> Verifying stays legal — the witness list shrinks as \
-             witnesses answer."
+             NotPrimary. Verifying -> Verifying stays legal, so re-gating with a smaller list \
+             is supported — though the shipped replication caller gates exactly once."
         );
         self.gate = WriteGate::Verifying(unreached);
     }

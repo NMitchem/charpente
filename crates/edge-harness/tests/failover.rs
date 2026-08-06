@@ -21,18 +21,20 @@
 //! observed-converged tail is reported in the scenario, never silently
 //! dropped, and checked too, but its loss (if any) is not a failure.
 //!
-//! **KNOWN GAP (ruled 2026-07-26, characterize-now/fix-deferred to T13/
-//! T14):** `run_oracle`'s negative arm and the separate
-//! `failover_known_gap_silent_dual_primary_resurrection` test below
-//! together characterize a real product gap found while writing this task:
-//! restarting an old primary after a `promote` with a config that
-//! CONTRADICTS the durable role file (an attempted demote) prints the
-//! `role.rs` notice to stderr but does not stop the node from serving as a
-//! live second primary; restarting it with its ORIGINAL, unchanged config
-//! (no attempted demote) produces no notice at all — a silent second
-//! writable primary. See `failover_known_gap_silent_dual_primary_resurrection`
-//! for the full characterization and `DESIGN.md:612-613`, which the
-//! promote/failover path does not currently uphold.
+//! **The resurrection guard (M2 sub-project 0b, closed 2026-07-31):**
+//! `run_oracle`'s negative arm and the separate
+//! `failover_resurrected_primary_does_not_accept_writes` test below cover the
+//! two restart shapes an operator can reach after a `promote`. Restarting an
+//! old primary with a config that CONTRADICTS the durable role file (an
+//! attempted demote) prints the `role.rs` notice to stderr; that notice is
+//! the operator's cue to intervene, never a self-enforced refusal, and the
+//! node keeps serving. Restarting it with its ORIGINAL, unchanged config
+//! produces no notice at all — which is why, before the witness boot gate,
+//! that path produced a silent second writable primary. It no longer does:
+//! such a node now withholds writes until it has confirmed that no follower
+//! it had shipped to has since been promoted. See
+//! `failover_resurrected_primary_does_not_accept_writes` for the wire oracle,
+//! and DESIGN §5's boot-gate paragraph for the mechanism.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::collections::HashSet;
@@ -128,6 +130,13 @@ const KILL_ROUNDS_COUNT: u64 = 3;
 /// must be OBSERVED converged (read back from the follower) before promote,
 /// or the zero-loss assertion below would be checking an empty/tiny set.
 const MIN_CONVERGED: usize = 40;
+/// How long `run_resurrection_oracle`'s Phase B waits for the conclusive
+/// witness refusal to reach the old primary's stderr once the witness is
+/// back: the probe's reconnect backoff (`RECONNECT_NANOS`, 500 ms) plus the
+/// witness's heartbeat interval (`HEARTBEAT_NANOS`, 1 s — what a witness with
+/// nothing to ship answers with), plus a wide margin for process start. Not a
+/// tuning knob: needing to raise it means the probe's pacing regressed.
+const RESURRECTION_REFUSAL_TIMEOUT: Duration = Duration::from_secs(20);
 /// Per-round bound on how long the ship-ack barrier waits for the follower
 /// to catch up before giving up on THAT round (not a failure — it just
 /// leaves the id in the acked-but-not-converged tail).
@@ -684,9 +693,10 @@ fn run_oracle(
         //
         // This restart used a config that CONTRADICTS the role file
         // (`--role follower`), which is what produces the notice at all —
-        // see `failover_known_gap_silent_dual_primary_resurrection` below
-        // for the weaker, silent variant (an operator restart with the
-        // ORIGINAL `--role primary` config produces no notice whatsoever).
+        // see `failover_resurrected_primary_does_not_accept_writes` below
+        // for the silent variant (an operator restart with the ORIGINAL
+        // `--role primary` config produces no notice whatsoever, and is
+        // stopped by the witness boot gate rather than by a notice).
 
         Ok(RunStats {
             converged_len: converged.len(),
@@ -713,11 +723,11 @@ fn run_oracle(
 /// ONLY on success — `acked_durable.rs`'s `finish`, same rationale (crate
 /// honesty contract: a real finding's evidence must still exist afterward),
 /// adapted for TWO data directories (primary + follower). Generic over `T`
-/// (`RunStats` for `run_oracle`, `()` for `run_known_gap_oracle`) so a
+/// (`RunStats` for `run_oracle`, `()` for `run_resurrection_oracle`) so a
 /// caller that needs the run's observed stats — not just pass/fail — can
 /// get them back on success without re-deriving them from the scenario log.
 /// `tag` names which caller is reporting (review Minor 8 — this used to
-/// hardcode "failover", so a `run_known_gap_oracle` failure printed under
+/// hardcode "failover", so a `run_resurrection_oracle` failure printed under
 /// the wire oracle's name; `realtime_resume.rs`'s `finish` already took a
 /// `tag` for exactly this reason).
 fn finish<T>(
@@ -854,49 +864,56 @@ fn failover_non_converged_tail_is_exercised_and_bounded() {
     );
 }
 
-// ------------------------------------------------ KNOWN GAP characterization
+// ------------------------------------------------- the resurrection guard
 //
-// Ruled by Noah, 2026-07-26 (task-12-report.md carries the full finding):
-// characterize the shipped behavior now, decide the fix at T13/T14 (T13's
-// HALT-for-ruling slot, alongside Hunt 1's read-side-poison
-// characterization). This is deliberately its OWN test, visibly separate
-// from `failover_wire_oracle`'s guarantee assertions above — it does not
-// assert a guarantee; it records a fact about the stock build so a future
-// fix has something to turn red against. DO NOT weaken, delete, or fold
-// this into a passing assertion to "fix" a red run here — if the product
-// changes this behavior, UPDATE this test to assert the new, safer
-// behavior; a red run here after a product change is this test doing its
-// job, not a regression to work around.
+// M2 sub-project 0b (spec docs/superpowers/specs/2026-07-31-dual-primary-
+// design.md). This was `failover_known_gap_silent_dual_primary_resurrection`,
+// which characterized the gap by proving the two primaries could not see each
+// other. The gap is closed, so — exactly as that version's own instructions
+// demanded — this test is UPDATED to assert the new, safer behavior, never
+// deleted.
 //
-// DESIGN.md:612-613 states, of the `HandingOff`/switchover path only: "it
-// never silently resumes `Primary`, so no interleaving yields two writable
-// primaries." That claim does not hold for the `promote`/failover path:
-// restarting an old primary with its ORIGINAL, unchanged `--role primary`
-// config (no attempted demote — the operator just restarts the node as it
-// was configured before) produces NO stderr notice at all (contrast
-// `run_oracle`'s negative arm above, which restarts with a CONTRADICTING
-// `--role follower` config and DOES get the notice — the notice is not a
-// general safety net, it only fires when the restart config happens to
-// disagree with the durable role file). The resurrected old primary comes
-// up fully writable, answers reads for its own (stale, possibly-diverged)
-// data, and accepts new writes — a second live primary with no operator
-// warning whatsoever. Because a demoted-but-resurrected primary's log may
-// have diverged from the new primary's, the mandated remedy (wipe and
-// re-seed) DESTROYS whatever the resurrected node accepted in the
-// meantime — this is acked-write loss, the exact guarantee this whole
-// harness exists to defend, reachable purely through an ordinary "restart
-// the old box the same way it was configured before" operator action.
+// What it proves at the wire: an old primary restarted with its ORIGINAL,
+// unchanged `--role primary` config after its follower was promoted does not
+// accept writes, and says why. It runs in two phases, because the two halves
+// fail in different directions and only one of them is attributable to the
+// gate:
 //
-// Also characterized here: neither node is aware of the other. Each's
-// `follower` client is `None` once durably `Primary` (`repl/mod.rs`'s
-// `Repl::open`), so there is no wire-level signal either side could use to
-// notice the conflict — confirmed below by writing through EACH "primary"
-// and showing the write never appears on the other.
-fn run_known_gap_oracle(
+//   **Phase A (witness unreachable) is the anti-vacuity core.** The promoted
+//   node is killed BEFORE the old primary restarts, so its probe cannot reach
+//   it, the gate stays shut, and the write refusal is a 503 whose body names
+//   the unreached witness. Only `TxError::Verifying` — the witness gate
+//   itself — produces that status and that body, so a green Phase A cannot be
+//   explained away by a node that merely died on startup for some unrelated
+//   reason. Reads are asserted in the same phase, against the same live node:
+//   serving reads WHILE withholding writes is the ruled behaviour (spec §2,
+//   option (c)), not an incidental side effect.
+//
+//   **Phase B (witness reachable) proves the conclusive path.** The promoted
+//   node comes back, the probe reaches it, it answers as a primary, and the
+//   old primary refuses BY NAME with both remedies. That refusal bubbles out
+//   of `Kernel::run`, so the node stops serving entirely and every later
+//   request is `serve.rs`'s 500 "the kernel thread is gone". A 500 on its own
+//   would prove nothing — any crash produces one — which is exactly why the
+//   write refusal is asserted in Phase A rather than here.
+//
+// Scope, stated honestly (crate honesty contract, DESIGN §7's §4.4): this is
+// a wire test against stock binaries with no seed promise. It proves the
+// refusal is reachable and correctly worded through real HTTP and TCP. What
+// proves it under the fault matrix is the in-sim property
+// `a_resurrected_primary_refuses_by_name_when_its_witness_answers_as_a_primary`
+// (`crates/charpente/tests/replication.rs`), which pins the same refusal
+// byte-exact; the assertion below deliberately reuses that string's shape so
+// the two cannot drift apart silently.
+//
+// DO NOT weaken or delete these assertions to make a red run green. If the
+// product changes this behavior, UPDATE them to assert the new behavior — the
+// same instruction the known-gap version carried, for the same reason.
+fn run_resurrection_oracle(
     node_bin: &std::path::Path,
     charpente_bin: &std::path::Path,
 ) -> Result<(), String> {
-    let tag = "failover_known_gap";
+    let tag = "failover_resurrection";
     let scenario_root = temp_dir(&format!("{tag}-scenario-root"));
     std::fs::create_dir_all(&scenario_root).map_err(|e| e.to_string())?;
     let mut scenario = Scenario::new(&scenario_root, tag).map_err(|e| e.to_string())?;
@@ -933,9 +950,11 @@ fn run_known_gap_oracle(
         let proxy_addr = proxy.addr();
         repl_proxy = Some(proxy);
 
-        // Kept alive (unread) purely so its `Drop` doesn't kill the
-        // follower process partway through the scenario.
-        let _follower = ChildNode::spawn(
+        // The witness: the node this primary ships to, and therefore the
+        // address that lands in the primary's durable witness set. Held
+        // mutably (not `let _`) because both phases drive it — Phase A kills
+        // it to make the probe's target unreachable, Phase B brings it back.
+        let mut witness = ChildNode::spawn(
             node_bin,
             &[
                 "--addr".to_string(),
@@ -994,6 +1013,15 @@ fn run_known_gap_oracle(
         }
         scenario.record("follower promoted to primary");
 
+        // ================== PHASE A: the witness is DOWN ==================
+        // Killing the promoted node BEFORE the old primary restarts is what
+        // makes Phase A's write refusal attributable to the gate rather than
+        // to a dead node: the probe can never resolve, so the old primary
+        // stays up, serves reads, and refuses writes with the one 503 only
+        // `TxError::Verifying` produces.
+        witness.kill9(&mut scenario);
+        scenario.record("witness (the promoted node) killed — the probe's target is unreachable");
+
         // ---- resurrect the old primary with its ORIGINAL, unchanged ----
         // ---- config — no attempted demote, unlike run_oracle's negative --
         // ---- arm. Fresh ports (same rationale as run_oracle: avoid a ----
@@ -1022,62 +1050,185 @@ fn run_known_gap_oracle(
         let stderr_path = old_primary.stderr_log().to_path_buf();
         old_primary_restart = Some(old_primary);
 
-        // Give `Repl::open` a fair window to print anything it's going to
-        // print — `run_oracle`'s negative arm observes the (contradicting-
-        // config) notice appearing within tens of ms, so 2s is generous
-        // margin; here we're waiting to confirm the ABSENCE of one, so a
-        // fixed sleep — not a poll-until-found loop — is the honest check.
-        std::thread::sleep(Duration::from_secs(2));
-        let stderr_contents = std::fs::read_to_string(&stderr_path).unwrap_or_default();
-        if stderr_contents.contains("charpente replication:") {
-            return Err(format!(
-                "KNOWN GAP CHARACTERIZATION MISMATCH: expected NO \"charpente replication:\" \
-                 notice when the old primary restarts with its ORIGINAL, unchanged config (no \
-                 attempted demote) — got {stderr_contents:?}. If this is because a fix landed, \
-                 UPDATE this test to assert the new (safer) behavior; do not just delete this \
-                 check."
-            ));
-        }
-        scenario.record(
-            "confirmed: restarting the old primary with its ORIGINAL config prints NO stderr \
-             notice at all (contrast run_oracle's negative arm, which DOES get a notice from a \
-             contradicting config)",
-        );
-
         let mut old_http = Http::new(&old_addr);
         // Sessions are durable and replicate like any other table row (auth
         // T2) — the token minted through the original primary before it
         // died is still valid against the resurrected old primary, which
         // opened the SAME data dir.
-        old_http.set_session(token);
-        let old_resp = old_http
+        old_http.set_session(token.clone());
+
+        // Reads are served the whole time the gate is shut. That is the ruled
+        // behaviour (spec §2, option (c)) and it is asserted against the same
+        // live node as the write refusal below, so "refuses writes" can never
+        // be satisfied by a node that is simply down.
+        let read = old_http
             .get("/customers/1")
-            .map_err(|e| format!("GET on the silently-resurrected old primary failed: {e}"))?;
-        if old_resp.status != 200 {
+            .map_err(|e| format!("GET on the write-gated old primary failed: {e}"))?;
+        if read.status != 200 {
             return Err(format!(
-                "KNOWN GAP CHARACTERIZATION MISMATCH: expected the resurrected old primary to \
-                 silently serve its own stale data (status 200), got {}",
-                old_resp.status
+                "a witness-gated node must keep serving reads (spec §2's ruled option (c)): \
+                 expected 200 from GET /customers/1 on the resurrected old primary, got {} body \
+                 {:?}",
+                read.status,
+                String::from_utf8_lossy(&read.body)
             ));
         }
-        let write_resp = old_http
+        scenario.record("phase A: the resurrected old primary serves reads (200) while gated");
+
+        // Pinned byte-exact (hard rule 5), and it is the single-witness
+        // rendering — `verifying_message` (http/app.rs) pluralises, so a
+        // regression that lost the singular form fails here by text.
+        let expected_503 = format!(
+            "this node is not accepting writes yet: it was a primary before restarting and has \
+             not confirmed that its follower {follower_repl_addr} was never promoted — reads \
+             are being served normally, and writes resume automatically once that node answers; \
+             if it is gone for good, see GUIDE §10's witness-set remedy"
+        );
+        let gated = old_http
             .post("/customers/99", r#"{"name":"Z","email":"z@example.com"}"#)
-            .map_err(|e| format!("POST on the silently-resurrected old primary failed: {e}"))?;
-        if write_resp.status != 200 {
+            .map_err(|e| format!("POST on the write-gated old primary failed: {e}"))?;
+        if gated.status != 503 {
             return Err(format!(
-                "KNOWN GAP CHARACTERIZATION MISMATCH: expected the resurrected old primary to \
-                 silently accept a new write (status 200), got {}",
-                write_resp.status
+                "THE WITNESS GATE DID NOT HOLD: the resurrected old primary answered a write \
+                 with status {} instead of the witness-gate 503. A 200 here IS the dual-primary \
+                 gap — a second live writable primary reached through an ordinary \"restart the \
+                 old box the way it was configured\" action, whose mandated remedy (fresh data \
+                 dir + re-seed) then destroys every write it acked. Body: {:?}",
+                gated.status,
+                String::from_utf8_lossy(&gated.body)
+            ));
+        }
+        let gated_body = String::from_utf8_lossy(&gated.body).to_string();
+        if !gated_body.contains(&expected_503) {
+            return Err(format!(
+                "the write was refused 503, but NOT by the witness gate — some other 503 would \
+                 satisfy the status check alone, so the body is what makes this attributable. \
+                 Expected it to contain {expected_503:?}, got {gated_body:?}"
             ));
         }
         scenario.record(
-            "confirmed: the resurrected old primary is a fully live, silently writable second \
-             primary — serves reads (200) and accepts new writes (200), no warning anywhere",
+            "phase A: the write is refused 503 BY THE WITNESS GATE, naming the unreached \
+             witness (only TxError::Verifying renders this body)",
         );
 
-        // ---- mutual non-awareness: a write through EACH "primary" must ---
-        // ---- never appear on the other — neither dials the other once ---
-        // ---- both are durably Primary (repl/mod.rs's Repl::open).      ---
+        // An unreachable witness is "unknown", never "is a primary" (spec
+        // §2's trichotomy). If the conclusive refusal has already fired here,
+        // the probe is manufacturing a verdict it cannot have — the false
+        // positive `repl/probe.rs`'s module doc says it must never produce.
+        let refusal_marker = format!("witness {follower_repl_addr} answers as a primary itself");
+        let stderr_so_far = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        if stderr_so_far.contains(&refusal_marker) {
+            return Err(format!(
+                "the conclusive witness refusal fired while the witness was DOWN — an \
+                 unreachable witness must classify as unknown (back off and retry), never as a \
+                 primary; stderr: {stderr_so_far:?}"
+            ));
+        }
+
+        // ================ PHASE B: the witness comes back =================
+        // Restarted with its ORIGINAL follower config; its durable role file
+        // says Primary (it was promoted) and the durable role always wins, so
+        // it answers past the role match — conclusive proof this node is not
+        // the primary any more.
+        witness
+            .restart(&mut scenario)
+            .map_err(|e| format!("restarting the witness (the promoted node) failed: {e}"))?;
+        scenario.record("phase B: the witness is back, as the primary it was promoted to be");
+
+        let detail_for = |kind: &str| {
+            format!(
+                "witness answered {kind} — only a node past the role match (primary, or handing \
+                 off) ever sends one"
+            )
+        };
+        let refusal_for = |detail: &str| {
+            format!(
+                "witness {follower_repl_addr} answers as a primary itself ({detail}): this node \
+                 restarted as a durable primary, but a follower it had shipped to has been \
+                 promoted or handed off to while it was down, so this node is not the primary \
+                 any more. It has NOT demoted itself — it cannot know which timeline you want \
+                 to keep, and the writes it acked are not the platform's to discard. If \
+                 {follower_repl_addr} holds the timeline to keep, re-seed this node from a \
+                 fresh data dir (stop it, delete its data dir, restart to snapshot-seed from \
+                 {follower_repl_addr}); if instead this node's records are the ones to keep, \
+                 stop {follower_repl_addr}, then clear this node's witness set (GUIDE §10) and \
+                 restart it."
+            )
+        };
+        // The parenthetical is the witness's message KIND, and which one it is
+        // depends on whether the promoted node had anything to ship when the
+        // probe's Hello arrived: `Heartbeat` when the two logs are level (the
+        // ordinary case here — nothing is written through the promoted node
+        // before this point), `Frames` if it had pulled ahead. Both are
+        // equally conclusive (`classify`, repl/probe.rs: only a node past the
+        // role match sends either), so this accepts either FULL string and
+        // nothing else. Deliberately not a loose substring match: the whole
+        // point of the assertion is that the operator prose — both remedies,
+        // and the refusal to demote — cannot drift silently.
+        let expected_refusals = [
+            refusal_for(&detail_for("Heartbeat")),
+            refusal_for(&detail_for("Frames")),
+        ];
+        let deadline = Instant::now() + RESURRECTION_REFUSAL_TIMEOUT;
+        let stderr_contents = loop {
+            let contents = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+            if contents.contains(&refusal_marker) || Instant::now() >= deadline {
+                break contents;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let Some(matched) = expected_refusals
+            .iter()
+            .find(|r| stderr_contents.contains(r.as_str()))
+        else {
+            return Err(format!(
+                "the resurrected old primary never printed the witness refusal in full within \
+                 {RESURRECTION_REFUSAL_TIMEOUT:?}. Expected one of {expected_refusals:?}; got \
+                 {stderr_contents:?} (file: {})",
+                stderr_path.display()
+            ));
+        };
+        // Prefixed by `serve.rs`'s kernel-stopped line: the refusal bubbles
+        // out of `Kernel::run`, it is not an in-process notice.
+        if !stderr_contents.contains(&format!(
+            "charpente kernel stopped on a platform IO failure — restart to recover: {matched}"
+        )) {
+            return Err(format!(
+                "the witness refusal was present but not on the \"charpente kernel stopped on a \
+                 platform IO failure\" line it must bubble out of `Kernel::run` on: \
+                 {stderr_contents:?}"
+            ));
+        }
+        scenario.record(
+            "phase B: the resurrected old primary refuses BY NAME — names the witness, refuses \
+             to demote itself, and gives both remedies",
+        );
+
+        // The refusal stopped the kernel, so the node no longer serves at
+        // all. Asserting this alone would prove nothing (any crash produces a
+        // 500) — it is Phase A that proves the gate; this pins what an
+        // operator actually sees afterwards.
+        let after = old_http
+            .post("/customers/99", r#"{"name":"Z","email":"z@example.com"}"#)
+            .map_err(|e| format!("POST after the witness refusal failed at the transport: {e}"))?;
+        let after_body = String::from_utf8_lossy(&after.body).to_string();
+        let kernel_gone = after_body.contains("the kernel thread is gone")
+            || after_body.contains("the kernel dropped the request");
+        if after.status != 500 || !kernel_gone {
+            return Err(format!(
+                "after refusing by name the node must stop serving: expected 500 naming a gone \
+                 kernel (\"the kernel thread is gone\", or \"the kernel dropped the request\" \
+                 for a request that raced the thread's teardown), got {} body {after_body:?}",
+                after.status
+            ));
+        }
+        scenario.record(
+            "phase B: the refused node stops serving — writes get 500, the kernel thread is gone",
+        );
+
+        // ---- the legitimate primary is untouched: its own witness set ----
+        // ---- was cleared on the flip toward Primary, so it resumes ----
+        // ---- immediately and silently (spec §2's empty-set fast path). ----
         let new_write = follower_http
             .post(
                 "/customers/200",
@@ -1086,43 +1237,29 @@ fn run_known_gap_oracle(
             .map_err(|e| format!("write through the promoted (new) primary failed: {e}"))?;
         if new_write.status != 200 {
             return Err(format!(
-                "write through the promoted primary: expected 200, got {}",
-                new_write.status
+                "the promoted primary must still accept writes — the gate closes on a \
+                 RESURRECTED primary, never on the legitimate one (its witness set was cleared \
+                 at promote): expected 200, got {} body {:?}",
+                new_write.status,
+                String::from_utf8_lossy(&new_write.body)
             ));
         }
-        // id 99 was written through the OLD primary above, never through
-        // the new one — if the new primary can see it, they are NOT
-        // isolated from each other (a materially different, worse finding
-        // than the one this test otherwise characterizes).
-        let cross_check_a = follower_http
+        // id 99 was refused on the old primary twice and written nowhere
+        // else, so it must exist nowhere. This is the acked-write-loss claim
+        // in its observable form: nothing was accepted that a later
+        // fresh-data-dir re-seed would then destroy.
+        let leaked = follower_http
             .get("/customers/99")
             .map_err(|e| format!("cross-check GET on the promoted primary failed: {e}"))?;
-        if cross_check_a.status != 404 {
+        if leaked.status != 404 {
             return Err(format!(
-                "MUTUAL-AWARENESS CHECK FAILED: id 99 was written ONLY through the resurrected \
-                 old primary, but the promoted (new) primary answered its GET with status {} \
-                 (expected 404) — the two primaries are NOT isolated from each other, which is \
-                 a materially different and worse finding than the one documented above",
-                cross_check_a.status
-            ));
-        }
-        // Symmetric direction: id 200 was written only through the new
-        // primary, above — the old (resurrected) primary must not see it.
-        let cross_check_b = old_http
-            .get("/customers/200")
-            .map_err(|e| format!("cross-check GET on the resurrected old primary failed: {e}"))?;
-        if cross_check_b.status != 404 {
-            return Err(format!(
-                "MUTUAL-AWARENESS CHECK FAILED: id 200 was written ONLY through the promoted \
-                 (new) primary, but the resurrected old primary answered its GET with status {} \
-                 (expected 404) — the two primaries are NOT isolated from each other, which is \
-                 a materially different and worse finding than the one documented above",
-                cross_check_b.status
+                "id 99 was REFUSED on the resurrected old primary and written nowhere else, but \
+                 the promoted primary answered its GET with status {} (expected 404)",
+                leaked.status
             ));
         }
         scenario.record(
-            "confirmed: the two primaries are mutually unaware — a write through either never \
-             appears on the other (each's follower client is None once durably Primary)",
+            "confirmed: the promoted primary still writes, and the refused id exists nowhere",
         );
 
         Ok(())
@@ -1144,12 +1281,13 @@ fn run_known_gap_oracle(
 
 #[test]
 #[ignore]
-fn failover_known_gap_silent_dual_primary_resurrection() {
+fn failover_resurrected_primary_does_not_accept_writes() {
     let bins = build_bins().expect("build_bins");
-    run_known_gap_oracle(&bins.node, &bins.charpente).expect(
-        "KNOWN GAP characterization mismatch — see stderr above for the scenario script; if a \
-         product fix landed, update this test's assertions rather than deleting them (module \
-         doc comment and comment block above `run_known_gap_oracle` carry the full context)",
+    run_resurrection_oracle(&bins.node, &bins.charpente).expect(
+        "a primary restarted after its follower was promoted must refuse writes and name why — \
+         see stderr above for the scenario script; if the product changed this behavior, update \
+         these assertions rather than deleting them (the comment block above \
+         `run_resurrection_oracle` carries the full context)",
     );
 }
 

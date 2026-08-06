@@ -1049,8 +1049,10 @@ fn hunt3_switchover_refuses_a_wrong_secret_then_hands_off_with_the_right_one() {
 
         // ---- the write gate flipped, both ways -----------------------------
         // The OLD primary is now a follower of the new one and must answer a
-        // write with 421 naming it. This is the contrast with the promote
-        // path (failover.rs's known gap): switchover demotes correctly.
+        // write with 421 naming it. Switchover demotes, so it knows where to
+        // send the client; the promote path cannot name a primary and refuses
+        // with the witness-gate 503 instead (failover.rs's
+        // `failover_resurrected_primary_does_not_accept_writes`).
         let refused = primary_http
             .post(
                 "/customers/3",
