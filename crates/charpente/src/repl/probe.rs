@@ -377,7 +377,7 @@ mod tests {
 
     use super::*;
     use crate::repl::role::Role;
-    use crate::repl::session::{PEER_SECRET_REFUSAL, Session};
+    use crate::repl::session::{PEER_SECRET_REFUSAL, SEED_WHILE_VERIFYING_REFUSAL, Session};
     use crate::{DbConfig, Job, Schema};
     use charpente_sim::{FaultConfig, Sim};
 
@@ -864,6 +864,21 @@ mod tests {
             schema_digest: other_db.schema_digest(),
         };
         let reply = real_reply(&other_db, &Role::Primary, &hello);
+        match classify(&reply) {
+            WitnessVerdict::Inconclusive(_) => {}
+            other => panic!("expected Inconclusive, got {other:?}"),
+        }
+
+        // The seed-while-verifying refusal (M2 interlude) must land on
+        // classify's default arm. Load-bearing in BOTH directions: reading it
+        // as NotPrimary would let a probe treat "I am also unsure" as "I am
+        // satisfied" and open its gate on no evidence; IsPrimary would refuse
+        // a healthy node over a phantom split-brain. No production change is
+        // needed for this — the default arm already does it — so this test IS
+        // the contract.
+        let reply = Msg::Refuse {
+            message: SEED_WHILE_VERIFYING_REFUSAL.to_string(),
+        };
         match classify(&reply) {
             WitnessVerdict::Inconclusive(_) => {}
             other => panic!("expected Inconclusive, got {other:?}"),

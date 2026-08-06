@@ -18,7 +18,7 @@ use charpente_core::log::frame_crc;
 
 use crate::Db;
 use crate::repl::protocol::{Msg, decode, encode};
-use crate::repl::session::NOT_A_PRIMARY_MARKER;
+use crate::repl::session::{NOT_A_PRIMARY_MARKER, VERIFYING_WITNESSES_MARKER};
 use crate::repl::{MAX_MESSAGE_BYTES, PROTO_VERSION, RECONNECT_NANOS};
 
 /// A latched `SnapshotStart`: `run_seed` finishes the re-seed against these.
@@ -229,6 +229,14 @@ impl Follower {
                     self.disconnect(now);
                     return Ok(());
                 }
+                // `to` is a primary but has not finished its own witness boot
+                // gate (M2 interlude): it cannot seed us yet, and it says so
+                // in a form that resolves on its own. Back off and retry —
+                // node-fatal here would kill a follower for asking too early.
+                Msg::Refuse { message } if message.contains(VERIFYING_WITNESSES_MARKER) => {
+                    self.disconnect(now);
+                    return Ok(());
+                }
                 // A diverged/other refusal is the operator's re-seed signal.
                 Msg::Refuse { message } => return Err(io::Error::other(message.clone())),
                 // Any ship message proves `to` is a primary: Repl demotes this
@@ -290,6 +298,13 @@ impl Follower {
             // Repl, which owns the durable Primary flip and the HandOffDone.
             Msg::HandOff { at_seq } => {
                 self.handoff = Some(at_seq);
+                Ok(())
+            }
+            // The primary's witness boot gate is unresolved (M2 interlude):
+            // retryable, not fatal — same fragment, same reasoning as the
+            // resolving arm above.
+            Msg::Refuse { message } if message.contains(VERIFYING_WITNESSES_MARKER) => {
+                self.disconnect(now);
                 Ok(())
             }
             Msg::Refuse { message } => Err(io::Error::other(message)),
@@ -480,5 +495,94 @@ pub(crate) fn hello_position(db: &Db) -> io::Result<Option<(u64, u32)>> {
             Ok(None) // (c) cannot prove a position — the primary re-seeds us
         }
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repl::session::{SEED_WHILE_VERIFYING_REFUSAL, VERIFYING_WITNESSES_MARKER};
+    use crate::{DbConfig, Schema};
+    use charpente_sim::{FaultConfig, Sim};
+
+    fn fresh_db(seed: u64) -> Db {
+        let sim = Sim::with_faults(seed, FaultConfig::none());
+        Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new())
+            .expect("Db::open on a fresh sim disk")
+    }
+
+    /// The marker must actually be in the string it keys. Both consumers
+    /// match on the fragment, so a reworded refusal that dropped it would
+    /// become node-fatal again in silence.
+    #[test]
+    fn the_refusal_carries_its_marker() {
+        assert!(SEED_WHILE_VERIFYING_REFUSAL.contains(VERIFYING_WITNESSES_MARKER));
+    }
+
+    /// Negative space (hard rule 4): carrying either OTHER marker would
+    /// mis-route this refusal at a witness probe — `NotPrimary` opens a gate
+    /// on no evidence, `IsPrimary` invents a split-brain.
+    #[test]
+    fn the_refusal_carries_neither_other_marker() {
+        use crate::repl::session::{DIVERGED_LABEL, NOT_A_PRIMARY_MARKER};
+        assert!(!SEED_WHILE_VERIFYING_REFUSAL.contains(NOT_A_PRIMARY_MARKER));
+        assert!(!SEED_WHILE_VERIFYING_REFUSAL.contains(DIVERGED_LABEL));
+    }
+
+    /// The ordinary ship arm (`follower.rs:306`): a retryable refusal backs
+    /// off, it does not kill the node.
+    #[test]
+    fn a_retryable_refusal_backs_off_on_the_ship_arm() {
+        let sim = Sim::with_faults(0x2EB1_011C, FaultConfig::none());
+        let mut db = fresh_db(0x2EB1_011C);
+        let net = sim.host("f").net();
+        let mut f = Follower::new("p:1".to_string(), Some("f:1".to_string()), None);
+        f.inbox.push_back(encode(&Msg::Refuse {
+            message: SEED_WHILE_VERIFYING_REFUSAL.to_string(),
+        }));
+        f.step(&net, &mut db, 0)
+            .expect("a retryable refusal must not be a node-fatal error");
+        assert!(
+            f.reconnect_at.is_some(),
+            "it must have backed off for a retry"
+        );
+    }
+
+    /// The resolving arm (`follower.rs:236`) is separately fatal — the parked
+    /// attempt's probe patched only one of the two sites.
+    #[test]
+    fn a_retryable_refusal_backs_off_on_the_resolving_arm() {
+        let sim = Sim::with_faults(0x2EB1_011C, FaultConfig::none());
+        let mut db = fresh_db(0x2EB1_011C);
+        let net = sim.host("f").net();
+        let mut f = Follower::new_resolving("p:1".to_string(), Some("f:1".to_string()), None);
+        f.inbox.push_back(encode(&Msg::Refuse {
+            message: SEED_WHILE_VERIFYING_REFUSAL.to_string(),
+        }));
+        f.step(&net, &mut db, 0)
+            .expect("a retryable refusal must not be a node-fatal error");
+        assert!(f.reconnect_at.is_some(), "it must have backed off");
+        assert!(!f.resolved, "and must NOT have resolved the handoff");
+    }
+
+    /// Negative control, both arms: an unmarked refusal stays fatal. Without
+    /// this the marker check could be widened to all refusals and still pass.
+    #[test]
+    fn an_unmarked_refusal_is_still_fatal() {
+        let sim = Sim::with_faults(0x2EB1_011C, FaultConfig::none());
+        let net = sim.host("f").net();
+        for resolving in [false, true] {
+            let mut db = fresh_db(0x2EB1_011C);
+            let mut f = if resolving {
+                Follower::new_resolving("p:1".to_string(), None, None)
+            } else {
+                Follower::new("p:1".to_string(), None, None)
+            };
+            f.inbox.push_back(encode(&Msg::Refuse {
+                message: "some other refusal".to_string(),
+            }));
+            f.step(&net, &mut db, 0)
+                .expect_err("an unmarked refusal must remain node-fatal");
+        }
     }
 }

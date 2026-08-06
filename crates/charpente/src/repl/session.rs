@@ -540,6 +540,41 @@ pub(crate) const PEER_SECRET_REFUSAL: &str = "peer secret missing or mismatched 
 /// an accident (see `probe.rs`'s module doc).
 pub(crate) const NOT_A_PRIMARY_MARKER: &str = "not a primary";
 
+/// The keyed fragment of the seed-while-verifying refusal (M2 interlude,
+/// spec §3) — same producer/consumer discipline as `NOT_A_PRIMARY_MARKER`.
+/// Consumers: `follower.rs`'s BOTH refuse arms (back off and retry rather
+/// than dying) and, by omission, `probe.rs::classify`, whose default arm
+/// files any refusal carrying neither marker as `Inconclusive`. Rewording
+/// this fragment deliberately reddens those consumers' tests.
+pub(crate) const VERIFYING_WITNESSES_MARKER: &str = "still verifying its witnesses";
+
+/// Refusing to seed a brand-new follower while the witness boot gate is
+/// unresolved (M2 interlude, spec §1). Task 3 lands the production emitter
+/// and pins this byte-exact from a real refusal
+/// (`a_verifying_node_refuses_to_seed_a_brand_new_follower`); this task
+/// (2) only defines the string and teaches the receiver to treat it as
+/// retryable, so nothing in the repo emits it yet.
+///
+/// Deliberately carries NEITHER `NOT_A_PRIMARY_MARKER` nor `DIVERGED_LABEL`.
+/// A witness probe reading this as `NotPrimary` would treat "I am also
+/// unsure" as "I am satisfied" and open its own gate on no evidence; reading
+/// it as `IsPrimary` would refuse a healthy node over a phantom split-brain.
+/// `probe.rs::classify`'s default arm gives the correct `Inconclusive` for
+/// free — the absence of both markers is what earns it, so it is asserted.
+///
+/// `#[allow(dead_code)]`: a mechanical fix for `-D warnings`, not a design
+/// change. Until Task 3 lands the emitter, the only readers are the
+/// `#[cfg(test)]` modules in this file, `follower.rs`, and `probe.rs` — none
+/// visible to the plain (non-test) lib compilation clippy also checks.
+#[allow(dead_code)]
+pub(crate) const SEED_WHILE_VERIFYING_REFUSAL: &str = "cannot seed a new follower yet: this \
+     node restarted as a primary and is still verifying its witnesses — it has not confirmed \
+     that none of the followers it had shipped to was promoted while it was down, so seeding \
+     would copy a timeline it does not yet know it owns. This clears on its own once every \
+     witness answers, and an existing follower's catch-up is unaffected meanwhile. If the \
+     witnesses are permanently gone, see GUIDE §10 — note that clearing the witness file \
+     re-opens the dual-primary gap it exists to close.";
+
 /// The diverged-refusal label shared by `diverged_ahead`/`diverged_crc`/
 /// `diverged_behind` below and the witness probe's classifier (`probe.rs`,
 /// M2 sub-project 0b task 4) — same rationale as `NOT_A_PRIMARY_MARKER`.
