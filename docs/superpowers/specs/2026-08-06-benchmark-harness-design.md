@@ -105,9 +105,11 @@ Two write metrics, always reported together:
   job's completion commits another, so ≈2× acked writes at steady state. Stating
   both forecloses flattering double-counting in either direction.
 
-**Snapshot reads/sec** (secondary, core + wire): typed get and short scan
-against a populated store. Reads never touch the log; this number exists to show
-where the write ceiling does *not* apply.
+**Snapshot reads/sec** (secondary, core layer only — *amended at plan-writing,
+2026-08-06: a wire-level read sweep mostly re-measures HTTP overhead the write
+sweep already shows; deferred unless the read story needs wire evidence*):
+typed gets against a populated store. Reads never touch the log; this number
+exists to show where the write ceiling does *not* apply.
 
 **Invoicing** (tertiary, wire only): `examples/invoicing`'s node binary driven
 on one write route (the plan pins which), labeled "realistic app" — its handler
@@ -139,10 +141,15 @@ duration (default 30 s per point), and the device-ceiling ratio
 
 Run-validity rules, mechanical:
 
-- **CPU-vs-wall cross-check** (the measurement-method rule: laptops sleep
-  mid-run and wall clocks cannot tell). Harness process CPU time and wall time
-  are both recorded; per-thread expected-busy divergence beyond a pinned
-  threshold marks the run INVALID in the artifact itself, not in a footnote.
+- **Suspension guard** (the measurement-method rule: laptops sleep mid-run and
+  wall clocks cannot tell). *Amended at plan-writing (2026-08-06): the original
+  CPU-vs-wall divergence check is wrong for fsync-bound loops, where CPU is
+  legitimately tiny against wall.* The shipped mechanism is a heartbeat thread
+  ticking on a fixed interval: a suspended process misses ticks while wall time
+  inflates, independent of how blocked the measured loop is. Observed ticks
+  below half of expected marks the run INVALID in the artifact itself, not in a
+  footnote. Process CPU time is still recorded — it drives the client-saturation
+  check.
 - **Totals two ways**: every throughput number is computed both as
   requests ÷ duration and as a sum over per-thread counters; disagreement beyond
   rounding is a harness bug and fails the run.
