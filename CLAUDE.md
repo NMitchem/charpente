@@ -982,22 +982,25 @@ do not reorder a milestone's dependency sequence.
   cannot discriminate a load-sensitive race, since neither run carries the full suite's ~74s
   of prior CPU load. **The discriminating experiment: the full suite, 3 times, at the base
   commit** (`66cddde`, worktree-isolated) — **31/31 green all three times, 93/93 aggregate,
-  zero failures.** Against HEAD's 1-failure-in-2-attempts, this is *weak* evidence the
-  interlude widened an already-present race window rather than the race being independent of
-  it — not proof, given 3 vs. 2 samples of an inherently timing-sensitive failure, but not
-  nothing either. A concrete mechanism exists for a real perturbation: Task 1's `pin_floor`
-  fix makes checkpoint GC proceed where it previously stalled behind a dead session's pin,
-  which shifts work and scheduling — the same shape as M1 sub-project 4's T6 platform cron
-  "shifting the fault stream" and exposing a latent bug elsewhere. Ledgered as a candidate M2
-  item either way (`run_oracle`'s restart-then-relogin flow has no tolerance for the witness
-  gate's async resolution window, whichever commit widened it), not fixed here — Task 4 is
-  docs-and-evidence, not product or test code.
+  zero failures.** Stated as what is actually known, not overclaimed in either direction: the
+  failure was observed once at HEAD and was not reproduced at the base commit across 3 runs.
+  That does not establish this interlude widened the race — 3 green runs at base do not prove
+  the interlude is uninvolved either, given how few samples either side has. The mechanism
+  (sub-project 0b's witness gate racing `ChildNode::restart`'s TCP-only readiness check)
+  predates this interlude, but a timing contribution is not excluded: Task 1's `pin_floor` fix
+  makes checkpoint GC proceed where it previously stalled behind a dead session's pin, which
+  shifts work and scheduling — the same shape as M1 sub-project 4's T6 platform cron "shifting
+  the fault stream" and exposing a latent bug elsewhere. Ledgered as a candidate M2 item either
+  way (`run_oracle`'s restart-then-relogin flow has no tolerance for the witness gate's async
+  resolution window, regardless of which commit widened it, if any), not fixed here — Task 4
+  is docs-and-evidence, not product or test code.
 - Next: **M2 per PLAN.** The backlog below holds **no open ruled follow-ups** — both entries
   in it are record. Still-open work, none of it ruled or blocking: `TcpProxy::stop`'s
   registration window ("fix in M2"); the follower-decode asymmetry above; the edge-harness
-  restart-then-relogin race noted in the verifying-peer-policy entry just above (load-sensitive,
-  present since sub-project 0b at the latest — weak evidence, not yet confirmed, that this
-  interlude widened it via the GC-pin fix's timing shift); and 0b's remaining accepted minors
+  restart-then-relogin race noted in the verifying-peer-policy entry just above (mechanism
+  present since sub-project 0b at the latest, observed once at this interlude's tip, not
+  reproduced at its base in 3 runs — neither established nor ruled out as this interlude
+  widening it); and 0b's remaining accepted minors
   (the `eprintln!` inside the `repl` boundary with `take_witness_notice()` having no
   production caller, self-witnessing unguarded, the two gated-503 test sites with no cover
   key, `tx_err_to_io`'s unbounded `{unreached:?}`, the 17 MiB recv buffer per connected probe,
