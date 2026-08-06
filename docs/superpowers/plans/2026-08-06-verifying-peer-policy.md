@@ -851,9 +851,21 @@ git commit -m "repl: a verifying node refuses to seed a newcomer"
 
 State the policy (spec §1) and the keying (spec §2) — what a `Verifying` node may do as a peer, and why catch-up and seeding differ. Include spec §5's note that recording witnesses while verifying is unchanged and safety-monotone (`probes` is built once at `Repl::open`, so it can only make the *next* boot's gate stricter).
 
-- [ ] **Step 2: GUIDE §10**
+- [ ] **Step 2: GUIDE §10 — a CORRECTION, not just an addition**
 
-Add the newcomer case beside the three existing probe outcomes: while a node is verifying, an existing follower catches up normally and a returning recorded witness re-seeds normally, but a brand-new follower is refused until verification finishes. Under a permanently dead witness that means the existing escape hatch — editing or deleting the `witnesses` file, with its stated gap-reopening warning — is the only way forward. Quote the refusal from its pinning test, never retyped.
+**There is an existing paragraph that Task 3 made false, and it must be rewritten, not appended to.** `docs/GUIDE.md:2637-2642` currently reads:
+
+> A gated node is also still a replication peer: withholding writes does not take it off the wire. It keeps accepting `Hello`s, keeps shipping records it already holds, **and will still seed a brand-new follower. A follower that first connects during this window is recorded as a witness like any other** — but it joins neither the probe set nor the 503's list …
+
+Both bolded claims are now the opposite of the shipped behaviour: the seed is refused, and the refused newcomer is never recorded as a witness (the `Refuse` arm never assigns `listen`, so `record_witnesses` never sees it). The branch is currently shipping documentation its own tests disprove; **the interlude cannot close until this is fixed.** Verify the line numbers before editing — Task 3's fix round may have shifted them.
+
+The replacement must say: a gated node remains a live replication peer — it accepts `Hello`s, ships catch-up to peers that already hold a prefix of this timeline, and re-seeds a **recorded witness** returning with an empty data dir (which is GUIDE §10's own prescribed remedy and is what lets the gate resolve) — but it **refuses to seed a brand-new follower** until verification finishes, and a refused newcomer is not recorded as a witness. Keep the surviving true clause about the probe set and the 503's list both being fixed when the gate closed.
+
+Then state the operator consequence honestly: under a permanently dead witness a newcomer cannot join at all until the operator intervenes, and the existing escape hatch — editing or deleting the `witnesses` file, with its stated gap-reopening warning — is the only way forward. Note this costs little in practice, since a gated node refuses writes anyway and the only use for a newly-seeded follower would be promotion, which is precisely the harm the gate exists to prevent.
+
+Quote the refusal from its pinning test (`the_seed_while_verifying_refusal_is_pinned`), never retyped.
+
+**DESIGN §5 (`:668-695`) needs an ADDITION, not a correction** — verified: it makes no seed claim today, so nothing there is currently false.
 
 - [ ] **Step 3: Verify the guide gate**
 
