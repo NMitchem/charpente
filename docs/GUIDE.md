@@ -2635,11 +2635,35 @@ switchover chain, say — this node resumes, and you are back to the hazard the
 promote warning below describes.
 
 A gated node is also still a replication peer: withholding writes does not
-take it off the wire. It keeps accepting `Hello`s, keeps shipping records it
-already holds, and will still seed a brand-new follower. A follower that first
-connects during this window is recorded as a witness like any other — but it
-joins neither the probe set nor the 503's list, both of which were fixed when
-the gate closed, so it constrains the *next* restart rather than this one.
+take it off the wire. It keeps accepting `Hello`s, keeps shipping catch-up to
+peers that already hold a prefix of this timeline, and re-seeds a **recorded
+witness** that returns with an empty data dir — the fresh-data-dir remedy this
+section prescribes below, and precisely what lets the gate resolve. But it
+**refuses to seed a brand-new follower** until verification finishes, and a
+refused newcomer is not recorded as a witness (the refuse arm never assigns
+`listen`, so `record_witnesses` never sees it):
+
+```text
+cannot seed a new follower yet: this node restarted as a primary and is still
+verifying its witnesses — it has not confirmed that none of the followers it
+had shipped to was promoted while it was down, so seeding would copy a
+timeline it does not yet know it owns. This clears on its own once every
+witness answers, and an existing follower's catch-up is unaffected meanwhile.
+If the witnesses are permanently gone, see GUIDE §10 — note that clearing the
+witness file re-opens the dual-primary gap it exists to close.
+```
+
+A positioned follower this node had not yet recorded, catching up normally,
+can still be newly recorded as a witness while verifying — but it joins
+neither the probe set nor the 503's list, both of which were fixed when the
+gate closed, so it constrains only the *next* restart, not this one.
+
+Under a witness that is gone for good, this means a brand-new follower cannot
+join at all until you intervene — the escape hatch below (editing or deleting
+the `witnesses` file, and the gap it re-opens) is the only way forward. This
+costs little in practice: a gated node already refuses writes, so the only use
+for a newly-seeded follower would be promotion, which is exactly the harm the
+gate exists to prevent.
 
 **Stopping instead of serving reads.** `ReplConfig::strict_witnesses` (default
 `false`) changes the third outcome only. With it set, a node whose witnesses

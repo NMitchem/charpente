@@ -774,11 +774,14 @@ do not reorder a milestone's dependency sequence.
   recommended fix was implemented, **measured, and reverted** — the new cover key fired in 0
   of 256 universes and inconclusive was 127 with the machinery and 127 without, byte for
   byte. The machinery was inert; measurement disproved the model behind it.
-  **Known, documented, and deliberately not fixed:** a `Verifying` node is still a live
-  replication peer — it accepts Hellos, ships, and seeds new followers while withholding its
-  own writes. Task 6's interlude built the refusal (`Db::verifying()` + a `Session::handle`
-  arm), measured it, and **reverted it** on the re-review's C-1; GUIDE §10 states the
-  behaviour instead.
+  **Known, documented at the time, closed 2026-08-06:** a `Verifying` node was still a live
+  replication peer that could seed brand-new followers while withholding its own writes —
+  manufacturing a durable replica of a timeline it had not confirmed it owned. Task 6's
+  interlude built a first attempt at the refusal (`Db::verifying()` + a `Session::handle`
+  arm), measured it, and **reverted it** on the re-review's C-1 below (Minor 5, judged new
+  policy needing a ruling, not a Minor closure). The "M2 interlude — a verifying node's peer
+  policy" entry later in this file is that ruling, landed for real: seeding a newcomer is now
+  refused while catch-up to an already-positioned peer is not.
   **Tests** (seeds `0x2EB1_0102`..`0x2EB1_0118` in `crates/charpente/tests/replication.rs`,
   RED-first per hard rule 3): the headline `0x2EB1_0111` asserts **on the gate, never on a
   message** — a notice an operator may or may not read is not what keeps a second primary from
@@ -848,14 +851,142 @@ do not reorder a milestone's dependency sequence.
   as `ci.yml` runs them (4/4, 1/1); a fresh invoicing 1024-universe batch, all green, master
   seed `0x20f0591d1069879b`; and `scripts/edge-harness.sh` **31/31**, run because this
   touches replication behavior.
+- **M2 interlude — a verifying node's peer policy, CLOSED (2026-08-06, spec
+  docs/superpowers/specs/2026-08-06-verifying-peer-policy-design.md, 4-task plan
+  docs/superpowers/plans/2026-08-06-verifying-peer-policy.md, ledger
+  .superpowers/sdd/2026-08-06-verifying-peer-policy/progress.md, commits `60be3f6`..this
+  commit).** Closes Minor 5 from sub-project 0b's Task 5 review (recorded just above): that
+  review judged the gap real but accepted it as unfixed pending a ruling, and a first attempt
+  (Task 6's interlude) was built, measured, and reverted rather than shipped without one.
+  **The gap:** `begin_seeding` is read-only, so 0b's write gate never saw it — a `Verifying`
+  node remained a full replication peer that would **seed a brand-new follower** on request.
+  Manufacturing a fresh durable replica of a timeline this node has not confirmed it owns is
+  acting as the primary in the most consequential way short of acking a write, and unlike a
+  write that replica **outlives this node's own fail-stop** once a witness finally answers
+  "primary" — a gated `P` could seed newcomer `G`, then have its probe reach the real primary
+  and refuse-and-stop, leaving `G` holding a durable replica of a dead fork with nothing alive
+  left to say so.
+  **The policy (spec §1):** a `Verifying` node may not render a seed to a peer that holds
+  nothing and is not one of its recorded witnesses; everything else it does as a peer —
+  reads, catch-up, control verbs — is unchanged. **The keying (spec §2, Task 3, `ee17b8c`):**
+  `db.verifying() && position.is_none() && !witnesses.contains(listen)`, checked inside
+  `decide_hello`'s shared `None`-position arm rather than on the `Decision::Snapshot`
+  variant — the parked attempt from 0b keyed on the variant and was silently inert on a young
+  primary that answers `Frames { from: 0 }` instead. Both conjuncts are load-bearing:
+  `position.is_none()` alone is not "brand-new peer" (a **recorded witness** re-seeding from
+  an empty data dir — GUIDE §10's own remedy, and what resolves the gate — also Hellos with no
+  position), and membership alone would refuse ordinary catch-up to a positioned follower not
+  yet recorded. **Retryability (spec §3, Task 2, `b126beb`):** a new marker,
+  `VERIFYING_WITNESSES_MARKER`, recognized at both `follower.rs` refuse sites (the resolving
+  arm and the ordinary ship arm — separately fatal before this, since the parked attempt's
+  probe patched only one), mapping to back off and retry rather than dying;
+  `probe.rs::classify`'s existing default arm already files it `Inconclusive` for free (no
+  production change needed there — Task 2's tests are what hold that contract, since the
+  behaviour is inherited). **The GC pin (spec §4, Task 1, `60be3f6`):** `Session::pin_floor()`
+  now returns `u64::MAX` for a dead session, mirroring the `control` short-circuit beside it —
+  **this is an efficiency fix, not a correctness one.** An earlier spec draft called a
+  retrying peer's pin window "permanent"; the implementer's diagnostic trace disproved it
+  (`0 → 0 → 0 → MAX → MAX`, ended by `Repl::step`'s pre-existing top-of-step reap every
+  round) and the spec was corrected in place before landing: delayed GC, never wrong GC, at
+  most one checkpoint's GC per occurrence. **Ruling (Noah, 2026-08-06):** the seed refusal
+  **never lapses** while the witness gate is shut — not at `WITNESS_DEADLINE_NANOS`, not on a
+  timer, chosen over lapse-at-deadline and seed-but-propagate-the-gate (the latter needs a
+  wire field and new durable state on the newcomer; ledgered, not built).
+  **What the reviews caught** (every task opus-reviewed, every fix round closed 0 Critical):
+  Task 1's one Important was the controller's own comment, not the implementer's — "any fixed
+  round count either has not refused yet or has already been reaped" was false for a count of
+  1; four Minors were comment-precision (M-1: "until the next round's reap" understates —
+  `Repl::step` has four early returns above the reap, including the boot gate; M-2: the guard
+  covers any dead session, not only a refused one). Task 2's sharpest finding (I-2) was a doc
+  citing the WRONG Task-3 test as this refusal's byte-exact pin — the real one is
+  `the_seed_while_verifying_refusal_is_pinned` (`0x2EB1_0121`); three more Importants and
+  four Minors, all comment accuracy. Task 3's review caught **a third vacuous assertion**
+  (I-1): `assert_eq!(total_seeds(&g), 0, …)` in the retry test could never fail (this rig
+  never checkpoints, so a successful seed would also leave `total_seeds` at 0), fixed with
+  `last_applied() == None`, RED-first proof independently reproduced by the re-reviewer; I-2
+  was the GUIDE contradiction Task 4 closes below; 10 Minors, all hygiene.
+  **The headline process finding, caught by hard rule 3 rather than a reviewer:** the
+  implementer's own `a_verifying_node_still_ships_catch_up_to_a_positioned_peer` passed under
+  a mutation that should have reddened it — **in this simulator, not driving a node does not
+  isolate it.** `crash_now`'s `teardown_host` tears down only the crashed side, so the
+  survivor's inbound queue stays intact and a peer never polled still "converges" by draining
+  stale pre-crash frames without ever negotiating a fresh `Hello`. Fixed with `recover_node`
+  to force a real reconnect; mutation then produced a genuine RED (779s to budget exhaustion)
+  and GREEN under the real fix (0.03s). The ledger counts this as the interlude's **second**
+  controller-authored vacuity — the first was Task 1's test that could not go RED, caught
+  before it was ever committed — and Task 3's own review then caught a **third**, reviewer-
+  side this time (I-1): `assert_eq!(total_seeds(&g), 0, …)` in the retry test could never
+  fail either way, since this rig never checkpoints and so a refused seed and a successful
+  one both leave `total_seeds` at 0; fixed with `last_applied() == None`. All three were
+  caught by RED-first being enforced, none by a test "obviously" passing being taken on
+  faith.
+  **The corollary, confirmed on all five rigs (Task 3's acceptance gate — the five property
+  tests the 0b parked attempt broke):** `SEED_WHILE_VERIFYING_REFUSAL` is emitted in **none**
+  of `convergence_universe`, `failover_universe`, `switchover_universe`, auth's
+  `raw_credentials_universe`, or the kernel gate-opens test — every topology in them is either
+  a strict two-node pair or admits its newcomer through the membership conjunct alone. **So
+  the parked attempt's blast radius was entirely mis-keying, not receiver-fatality.** Stated
+  honestly, not wider: those five prove the conjunct does not fire *spuriously*; they do not
+  exercise retryability, which is covered separately by Task 2's five unit tests plus Task 3's
+  two new property tests (`a_verifying_node_still_seeds_a_recorded_witness`,
+  `a_refused_newcomer_retries_and_converges_once_the_gate_opens`).
+  **Task 4 (this commit) — docs, and a correction the branch owed its own tests.**
+  DESIGN §5 gained the policy/keying/retryability/safety-monotone-recording paragraph (a pure
+  addition — DESIGN made no seed claim before this). `docs/GUIDE.md`'s "gated node is also
+  still a replication peer" paragraph was rewritten, not appended to: it had shipped claiming
+  a gated node "will still seed a brand-new follower" and records the newcomer "as a witness
+  like any other" — both now the **opposite** of shipped behaviour (Task 3's own review,
+  I-2). The branch was shipping documentation its own tests disproved; the corrected
+  paragraph states the refusal (quoted byte-exact from `the_seed_while_verifying_refusal_is_
+  pinned`), that a refused newcomer is never recorded (`listen` is assigned only on the two
+  shipping arms), and the operator consequence — a permanently dead witness blocks new
+  followers until the existing escape hatch (edit or delete the `witnesses` file) is used,
+  which costs little since the only use for a freshly-seeded follower would be promotion,
+  exactly the harm the gate exists to prevent.
+  **Tests** (seeds `0x2EB1_011B`..`0x2EB1_0121` in `crates/charpente/tests/replication.rs`,
+  RED-first per hard rule 3): the GC pin (`a_refused_session_does_not_pin_gc`, `0x2EB1_011B`);
+  three `follower.rs` retry tests at `0x2EB1_011C` (both refuse sites, plus the negative
+  control that an unmarked refusal stays fatal); the headline
+  `a_verifying_node_refuses_to_seed_a_brand_new_follower` (`0x2EB1_011D`, rigged so
+  `log_base() == 0` to land on the arm a variant-keyed refusal would miss), the two
+  keying-correctness tests above (`0x2EB1_011E`/`0x2EB1_011F`), the negative-space
+  `a_verifying_node_still_ships_catch_up_to_a_positioned_peer` (`0x2EB1_0120`), and the
+  byte-exact pin (`0x2EB1_0121`). Plus `probe.rs`'s classifier case, now routed through a real
+  `decide_hello` emission (`real_reply`) like its siblings rather than hand-constructed, per
+  Task 2's review M-4.
+  **Evidence** — 11-stage sweep (spec §9), every stage green: `cargo fmt --all --check`
+  clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo build -p
+  guide-examples` (the GUIDE compile gate) clean; `cargo test --workspace` **twice**,
+  identical both times — 49 test binaries, **583 passed / 0 failed / 31 ignored** (the
+  572→583 delta against the hard-rule-5 baseline reconciles exactly: Task 1 +1, Task 2 +5,
+  Task 3 +5); pinned debug replays `CHARPENTE_SEED=0x8bee1752811ae873` (charpente-sim
+  crash_recovery, 4/4) and `0x348270b38f166529` (charpente kernel, 26/26); both release
+  mode-skew tripwires exactly as `ci.yml` runs them (`0x8bee1752811ae873` release
+  crash_recovery 4/4, `0xff159ed76d2806e4` release
+  `late_follower_seeds_below_the_gcd_base_and_converges` 1/1); a fresh invoicing
+  1024-universe batch, **all green, master seed `0xc53bdfb3f3a7f1a4`**; and
+  `scripts/edge-harness.sh`, run because replication, auth and realtime are all in the
+  measured blast radius. **Note for the next sweep:** the first edge-harness run hit two
+  transient failures (`failover_wire_oracle`, `failover_non_converged_tail_is_exercised_and_
+  bounded`) — a `login()` POST fired within ~3ms of a mid-run primary restart raced 0b's
+  witness-gate resolution (the HTTP port binds before the kernel thread finishes `Repl::open`,
+  by design) and lost. Bisected before treating it as this interlude's problem: 5/5 green in
+  isolation at this interlude's base commit (`66cddde`) and 5/5 at its tip, both outside the
+  full-suite run; a second full `scripts/edge-harness.sh` run was **31/31 green**. Pre-existing
+  since sub-project 0b shipped the gate (2026-07-31), load-sensitive (only reproduced after
+  ~74s of prior tests), not caused by this interlude's code — ledgered as a candidate M2 item
+  (`run_oracle`'s restart-then-relogin flow has no tolerance for the gate's async resolution
+  window) rather than fixed here, since Task 4 is docs-and-evidence, not product code.
 - Next: **M2 per PLAN.** The backlog below holds **no open ruled follow-ups** — both entries
   in it are record. Still-open work, none of it ruled or blocking: `TcpProxy::stop`'s
-  registration window ("fix in M2"); the follower-decode asymmetry above; and 0b's remaining
-  accepted minors (the `eprintln!` inside the `repl` boundary with `take_witness_notice()`
-  having no production caller, self-witnessing unguarded, the two gated-503 test sites with
-  no cover key, `tx_err_to_io`'s unbounded `{unreached:?}`, the 17 MiB recv buffer per
-  connected probe, and `probe.rs::connect_and_hello`'s near-verbatim copy of
-  `follower.rs` — a THIRD copy is the moment to consolidate).
+  registration window ("fix in M2"); the follower-decode asymmetry above; the edge-harness
+  restart-then-relogin race noted in the verifying-peer-policy entry just above (pre-existing
+  since sub-project 0b, load-sensitive, observed once); and 0b's remaining accepted minors
+  (the `eprintln!` inside the `repl` boundary with `take_witness_notice()` having no
+  production caller, self-witnessing unguarded, the two gated-503 test sites with no cover
+  key, `tx_err_to_io`'s unbounded `{unreached:?}`, the 17 MiB recv buffer per connected probe,
+  and `probe.rs::connect_and_hello`'s near-verbatim copy of `follower.rs` — a THIRD copy is
+  the moment to consolidate).
 
 ## M2 follow-up backlog (carried from M1, ruled — written to be read cold)
 
