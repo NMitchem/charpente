@@ -129,11 +129,29 @@ reaped next step, so it must never hold GC.
 
 `Repl::step` reaps at the top of the step but calls `recompute_pin()` immediately after
 `service` (`mod.rs:601`), so a session refused during that step is still present with
-`cursor = 0, acked = None` → `pin_floor() == 0`. This is **pre-existing on every refusal
-path** (peer-secret, schema-digest, invalid-listen, the diverged family) and is not
-introduced here; §2 makes it reachable in a new shape that repeats every `RECONNECT_NANOS`
-for as long as the gate stays shut. Same class as seed `0x2EB1_0010`, the `AwaitHello`
-session that pinned GC at 0 forever.
+`cursor = 0, acked = None` → `pin_floor() == 0`. `pump_io`'s own unconditional
+`recompute_pin()` (`mod.rs:394`) recomputes over the dead session too, so the window is not
+an artifact of one call site. This is **pre-existing on every refusal path** (peer-secret,
+schema-digest, invalid-listen, the diverged family) and is not introduced here; §2 makes it
+recur every `RECONNECT_NANOS` for as long as the gate stays shut.
+
+**Measured correction (2026-08-06, Task 1).** An earlier draft of this section called the
+window "permanent" under a retrying peer and filed it as the same class as seed
+`0x2EB1_0010`. Both claims are wrong, and the implementer's diagnostic trace is what
+disproved them. `Repl::step`'s pre-existing top-of-step `sessions.retain(|s| !s.dead)`
+reaps the refused session and restores the pin on the very next round, by machinery that
+has nothing to do with `pin_floor`. The observed sequence across three rounds was
+`0 → 0 → 0 → MAX → MAX`. So the window is **one step, recurring** — not forever — and each
+occurrence costs at most **one checkpoint's GC**, and only when a checkpoint happens to land
+inside it. `0x2EB1_0010` was genuinely unbounded (a silent `AwaitHello` session nothing
+reaped until its deadline); this is not that.
+
+The fix is still worth taking: it is three lines in the function the hazard lives in, and
+the impact is real on a **healthy** primary, where any misconfigured peer retrying every
+`RECONNECT_NANOS` (wrong secret, schema mismatch, a diverged follower) can skip checkpoint
+GC repeatedly. On a gated node the practical impact is nil — it accepts no writes, so its
+log is not growing. Severity: delayed GC, never wrong GC. This is an efficiency fix, not a
+correctness one, and it should not be described as closing a correctness gap.
 
 Fixing it here rather than ledgering it is deliberate: this interlude is what makes it
 repeat indefinitely, and the fix is three lines in the function the hazard lives in.

@@ -48,9 +48,11 @@
 - Consumes: nothing — this task is independent of the rest of the plan.
 - Produces: no new API. `Session::pin_floor(&self) -> u64` keeps its signature.
 
-**Why first:** this is a **pre-existing** bug on every refusal path (peer-secret, schema-digest, invalid-listen, the diverged family), not one this plan introduces. Task 3 makes it repeat every `RECONNECT_NANOS` for as long as the gate stays shut, so it must be closed before that lands.
+**Why first:** this is a **pre-existing** bug on every refusal path (peer-secret, schema-digest, invalid-listen, the diverged family), not one this plan introduces. Task 3 makes it recur every `RECONNECT_NANOS` for as long as the gate stays shut, so it is cleanest to close before that lands.
 
-**The mechanism:** `Repl::step` reaps dead sessions at the *top* of the step (`mod.rs:560`) but calls `recompute_pin()` immediately after `service` (`mod.rs:601-602`). A session refused during this step is therefore still in `self.sessions` with `cursor = 0, acked = None`, so `pin_floor()` returns 0 and pins GC at the log base.
+**The mechanism:** `Repl::step` reaps dead sessions at the *top* of the step (`mod.rs:560`) but calls `recompute_pin()` immediately after `service` (`mod.rs:601-602`); `pump_io` (`mod.rs:394`) recomputes over the dead session too. A session refused during this step is therefore still in `self.sessions` with `cursor = 0, acked = None`, so `pin_floor()` returns 0 and pins GC at the log base until the next round's reap.
+
+**Severity, stated honestly (measured in the first Task 1 attempt).** The window is **one step, recurring** — not permanent. The pre-existing top-of-step reap ends it on the very next round (observed `0 → 0 → 0 → MAX → MAX`), so each occurrence costs at most one checkpoint's GC, and only when a checkpoint lands inside the window. This is an **efficiency** fix — delayed GC, never wrong GC — and must not be written up as closing a correctness gap. It is worth taking because it is three lines in the function the hazard lives in, and because on a healthy primary any misconfigured peer retrying can skip checkpoint GC repeatedly.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -104,10 +106,33 @@ fn a_refused_session_does_not_pin_gc() {
         schema_digest,
     }))
     .unwrap();
-    drive_rounds(&sim, &mut [&mut p], 4).unwrap();
 
-    // GC is a function of commits-since-checkpoint, not of stepping, so no
-    // further driving is needed to prove the pin holds (or does not).
+    // Drive ONE round at a time and stop the instant the refusal reaches the
+    // client. At that moment the session was marked dead inside this step's
+    // `service` and `recompute_pin` has just run with it still present — that
+    // IS the window. Driving further lets `Repl::step`'s pre-existing
+    // top-of-step `sessions.retain(|s| !s.dead)` reap it and restore the pin,
+    // which is why NO fixed round count can observe this.
+    let mut buf = vec![0u8; MAX_MESSAGE_BYTES];
+    let mut refused = false;
+    for _ in 0..64 {
+        drive_rounds(&sim, &mut [&mut p], 1).unwrap();
+        if let Ok(Some(n)) = conn.recv(&mut buf) {
+            assert!(
+                matches!(decode(&buf[..n]).unwrap(), Msg::Refuse { .. }),
+                "expected the peer-secret refusal"
+            );
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "precondition: the peer must have been refused");
+
+    // Commit past several checkpoint boundaries WITHOUT driving the replicator
+    // again. GC is a function of commits-since-checkpoint and `commit_widget`
+    // calls `db.transact` directly (replication.rs:515-519) without stepping
+    // the scheduler, so this checkpoints while the dead session is still
+    // present and still holding the pin.
     for i in 0..16u64 {
         commit_widget(&sim, &mut p, i).unwrap();
     }
@@ -140,12 +165,14 @@ In `crates/charpente/src/repl/session.rs`, replace the body of `pin_floor`:
             return u64::MAX;
         }
         // Nor does a dead one. `Repl::step` reaps at the top of the step but
-        // calls `recompute_pin` right after `service`, so a session refused
-        // during THIS step is still in `self.sessions` with `cursor = 0,
-        // acked = None`. Unguarded that pins GC at 0 for the step — once per
-        // refusal on every refusal path, and permanently against a peer that
-        // keeps retrying (0b re-review M-2; same class as seed 0x2EB1_0010's
-        // silent AwaitHello session).
+        // calls `recompute_pin` right after `service` (and `pump_io` does its
+        // own), so a session refused during THIS step is still in
+        // `self.sessions` with `cursor = 0, acked = None`. Unguarded that pins
+        // GC at 0 until the next round's reap — costing that window's
+        // checkpoint its GC, once per refusal on every refusal path, and
+        // recurring against a peer that keeps retrying (0b re-review M-2).
+        // Bounded, not permanent: the reap is what ends it, measured
+        // 0 -> 0 -> 0 -> MAX. Delayed GC, never wrong GC.
         if self.dead {
             return u64::MAX;
         }
