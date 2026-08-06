@@ -205,12 +205,16 @@ impl Session {
     /// primary serves the ladder, a follower/backup refuses (no cascading).
     /// `peer_secret` (spec §5, auth T7) gates every inbound Hello/Ctrl on a
     /// matching proof when configured (`Some`); `None` accepts all.
+    /// `witnesses` is this node's durable witness set (M2 interlude, spec
+    /// §1/§2) — `decide_hello` refuses to seed a peer absent from it while
+    /// `db.verifying()` is true.
     pub(crate) fn service(
         &mut self,
         db: &Db,
         now: u64,
         role: &Role,
         peer_secret: &Option<String>,
+        witnesses: &[String],
     ) -> io::Result<()> {
         // A control connection is driven by `Repl` (which owns the durable role
         // and pin); the round-robin never ships on it.
@@ -233,7 +237,7 @@ impl Session {
                     return Ok(());
                 }
             };
-            return self.handle(msg, db, now, role, peer_secret);
+            return self.handle(msg, db, now, role, peer_secret, witnesses);
         }
         match &mut self.phase {
             Phase::Seeding { pending } => {
@@ -280,6 +284,7 @@ impl Session {
         now: u64,
         role: &Role,
         peer_secret: &Option<String>,
+        witnesses: &[String],
     ) -> io::Result<()> {
         match msg {
             Msg::Hello {
@@ -298,6 +303,7 @@ impl Session {
                     peer_secret,
                     &secret,
                     schema_digest,
+                    witnesses,
                 )? {
                     Decision::Refuse(message) => {
                         self.send(&Msg::Refuse { message }, now);
@@ -553,14 +559,13 @@ pub(crate) const NOT_A_PRIMARY_MARKER: &str = "not a primary";
 pub(crate) const VERIFYING_WITNESSES_MARKER: &str = "still verifying its witnesses";
 
 /// Refusing to seed a brand-new follower while the witness boot gate is
-/// unresolved (M2 interlude, spec §1). Task 3 lands the production emitter;
-/// its `the_seed_while_verifying_refusal_is_pinned` (seed `0x2EB1_0121`)
-/// pins this byte-exact from a real refusal. (Task 3's
-/// `a_verifying_node_refuses_to_seed_a_brand_new_follower` is a different,
+/// unresolved (M2 interlude, spec §1). `decide_hello`'s None-position arm
+/// emits this byte-exact when `db.verifying()` is true and the peer is not a
+/// recorded witness; `the_seed_while_verifying_refusal_is_pinned` (seed
+/// `0x2EB1_0121`) pins it from a real refusal.
+/// (`a_verifying_node_refuses_to_seed_a_brand_new_follower` is a different,
 /// gate-outcome property test — it asserts on `total_seeds`/`last_applied`/
-/// `load_witnesses`, deliberately not on this string.) This task (2) only
-/// defines the string and teaches the receiver to treat it as retryable, so
-/// nothing in the repo emits it yet.
+/// `load_witnesses`, deliberately not on this string.)
 ///
 /// Deliberately carries NEITHER `NOT_A_PRIMARY_MARKER` nor `DIVERGED_LABEL`.
 /// A witness probe reading this as `NotPrimary` would treat "I am also
@@ -576,12 +581,6 @@ pub(crate) const VERIFYING_WITNESSES_MARKER: &str = "still verifying its witness
 /// cannot `format!`. `the_refusal_carries_its_marker` (`follower.rs`) is
 /// what holds the two in sync; nothing here catches them drifting apart at
 /// compile time the way interpolation would.
-///
-/// `#[allow(dead_code)]`: a mechanical fix for `-D warnings`, not a design
-/// change. Until Task 3 lands the emitter, the only readers are the
-/// `#[cfg(test)]` modules in `follower.rs` and `probe.rs` — neither visible
-/// to the plain (non-test) lib compilation clippy also checks.
-#[allow(dead_code)]
 pub(crate) const SEED_WHILE_VERIFYING_REFUSAL: &str = "cannot seed a new follower yet: this \
      node restarted as a primary and is still verifying its witnesses — it has not confirmed \
      that none of the followers it had shipped to was promoted while it was down, so seeding \
@@ -672,8 +671,11 @@ fn secret_matches(peer_secret: &Option<String>, presented: &Option<String>) -> b
 /// not-a-primary → refuse; follower ahead → refuse (diverged); a positioned
 /// follower below the retained base → refuse (diverged behind — the primary
 /// GC'd its witness, Design B); position retained → verify the frame CRC
-/// (mismatch → diverged, match → resume); empty position → snapshot when the
-/// log has been compacted, else frames from 0.
+/// (mismatch → diverged, match → resume); empty position → refuse if this
+/// node's witness boot gate is unresolved and the peer is not a recorded
+/// witness (M2 interlude, spec §1 — a seed must not manufacture a durable
+/// replica of a timeline this node has not confirmed it owns); otherwise
+/// snapshot when the log has been compacted, else frames from 0.
 #[allow(clippy::too_many_arguments)] // one more ladder check (M2 0b task 2), each an independent field
 fn decide_hello(
     role: &Role,
@@ -684,6 +686,7 @@ fn decide_hello(
     peer_secret: &Option<String>,
     presented_secret: &Option<String>,
     schema_digest: u64,
+    witnesses: &[String],
 ) -> io::Result<Decision> {
     if !secret_matches(peer_secret, presented_secret) {
         return Ok(Decision::Refuse(PEER_SECRET_REFUSAL.to_string()));
@@ -718,6 +721,31 @@ fn decide_hello(
     }
     let last = db.last_applied();
     let Some((pos_seq, pos_crc)) = position else {
+        // The peer holds NOTHING and is asking for a whole copy. If this
+        // node's witness boot gate is unresolved and the peer is not one of
+        // the witnesses we recorded, refuse (M2 interlude, spec §1): a seed
+        // manufactures a fresh durable replica of a timeline we have not
+        // confirmed we own, and it outlives our own fail-stop.
+        //
+        // Both conjuncts are load-bearing. `position.is_none()` alone is NOT
+        // "brand-new node" — `hello_position` returns None for any empty-log
+        // node, including a RECORDED WITNESS returning with a rebuilt store,
+        // which is GUIDE §10's own prescribed remedy and what resolves this
+        // gate. Membership alone is not enough either: a positioned peer
+        // absent from the set is a genuine follower on this timeline, and
+        // catch-up must still ship to it.
+        //
+        // Sited here, inside the None-position arm, so it covers BOTH the
+        // `Frames { from: 0 }` and `Snapshot` answers below. Keying on the
+        // `Decision::Snapshot` variant instead would be silently inert on
+        // exactly a young primary that has not GC'd anything yet.
+        if db.verifying()
+            && !listen
+                .as_deref()
+                .is_some_and(|a| witnesses.iter().any(|w| w == a))
+        {
+            return Ok(Decision::Refuse(SEED_WHILE_VERIFYING_REFUSAL.to_string()));
+        }
         return Ok(if db.log_base() == 0 {
             Decision::Frames { from: 0 }
         } else {

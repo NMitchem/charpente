@@ -791,15 +791,16 @@ mod tests {
     /// Drives ONE real `Session::service` call against `db`/`role` with
     /// `hello` as the inbound message, and returns whatever the session
     /// actually sent back — the real `decide_hello` output, not a copy of
-    /// its prose.
-    fn real_reply(db: &Db, role: &Role, hello: &Msg) -> Msg {
+    /// its prose. `witnesses` is this node's recorded witness set — `&[]` for
+    /// every case here that does not care about it.
+    fn real_reply(db: &Db, role: &Role, hello: &Msg, witnesses: &[String]) -> Msg {
         let conn = RecordingConn::new();
         conn.inbound.borrow_mut().push_back(encode(hello));
         let handle = RecordingHandle(conn.clone());
         let mut session = Session::new(Box::new(handle), 0, 0);
         session.drain();
         session
-            .service(db, 0, role, &None)
+            .service(db, 0, role, &None, witnesses)
             .expect("service must not IO-error against an in-memory conn");
         let sent = conn
             .sent
@@ -830,7 +831,7 @@ mod tests {
         let role = Role::Follower {
             primary: "p:1".to_string(),
         };
-        let reply = real_reply(&follower_db, &role, &hello);
+        let reply = real_reply(&follower_db, &role, &hello, &[]);
         assert_eq!(classify(&reply), WitnessVerdict::NotPrimary);
 
         // Diverged (ahead): a real Primary-role Db with one committed
@@ -846,7 +847,7 @@ mod tests {
             secret: None,
             schema_digest: primary_db.schema_digest(),
         };
-        let reply = real_reply(&primary_db, &Role::Primary, &hello);
+        let reply = real_reply(&primary_db, &Role::Primary, &hello, &[]);
         match classify(&reply) {
             WitnessVerdict::IsPrimary(message) => assert!(message.contains(DIVERGED_LABEL)),
             other => panic!("expected IsPrimary, got {other:?}"),
@@ -863,7 +864,7 @@ mod tests {
             secret: None,
             schema_digest: other_db.schema_digest(),
         };
-        let reply = real_reply(&other_db, &Role::Primary, &hello);
+        let reply = real_reply(&other_db, &Role::Primary, &hello, &[]);
         match classify(&reply) {
             WitnessVerdict::Inconclusive(_) => {}
             other => panic!("expected Inconclusive, got {other:?}"),
@@ -873,12 +874,27 @@ mod tests {
         // classify's default arm. Load-bearing in BOTH directions: reading it
         // as NotPrimary would let a probe treat "I am also unsure" as "I am
         // satisfied" and open its gate on no evidence; IsPrimary would refuse
-        // a healthy node over a phantom split-brain. No production change is
-        // needed for this — the default arm already does it — so this test IS
-        // the contract.
-        let reply = Msg::Refuse {
-            message: SEED_WHILE_VERIFYING_REFUSAL.to_string(),
+        // a healthy node over a phantom split-brain. Driven through a real
+        // `decide_hello` call, like its three siblings above, now that Task 3
+        // wires a production emitter: a verifying `Db`, Hello'd with an
+        // address the (empty) witness set does not contain.
+        let mut verifying_db = fresh_db(0x0DEB_040C);
+        verifying_db.verify_writes(vec!["f:1".to_string()]);
+        let hello = Msg::Hello {
+            proto: PROTO_VERSION,
+            listen: Some("g:1".to_string()),
+            position: None,
+            secret: None,
+            schema_digest: verifying_db.schema_digest(),
         };
+        let reply = real_reply(&verifying_db, &Role::Primary, &hello, &[]);
+        assert_eq!(
+            reply,
+            Msg::Refuse {
+                message: SEED_WHILE_VERIFYING_REFUSAL.to_string(),
+            },
+            "must be the real shipped refusal, byte-exact"
+        );
         match classify(&reply) {
             WitnessVerdict::Inconclusive(_) => {}
             other => panic!("expected Inconclusive, got {other:?}"),

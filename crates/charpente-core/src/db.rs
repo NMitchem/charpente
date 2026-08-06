@@ -1617,6 +1617,18 @@ impl Db {
         matches!(self.gate, WriteGate::Allowed)
     }
 
+    /// True while the witness boot gate is unresolved (M2 sub-project 0b):
+    /// this node believes it is the primary but has not confirmed that none
+    /// of the followers it shipped to was promoted while it was down.
+    ///
+    /// Distinct from `!writes_allowed()`, which is also true on an ordinary
+    /// follower. Callers need the distinction when the question is "may I act
+    /// on a timeline I have not confirmed I own" rather than "may I write" —
+    /// `decide_hello` refuses to seed a newcomer in this state.
+    pub fn verifying(&self) -> bool {
+        matches!(self.gate, WriteGate::Verifying(_))
+    }
+
     /// Applies frames shipped from the primary: the follower's only write
     /// path (DESIGN §5). Runs the checkpoint cadence like transact — a
     /// follower checkpoints and GCs its own log on the same schedule.

@@ -1112,7 +1112,7 @@ fn a_silent_await_hello_session_stops_pinning_gc_after_its_deadline() {
 /// of the step but recomputes the pin right after `service` (and `pump_io`
 /// recomputes over the dead session too), so a session REFUSED during this
 /// step is still present with `cursor = 0, acked = None` and pins GC at 0
-/// until the next round's reap. Pre-existing on every refusal path; task 3's
+/// until a step reaches the reap. Pre-existing on every refusal path; task 3's
 /// seed-while-verifying refusal is the first a peer retries indefinitely.
 ///
 /// Bounded, not permanent — the reap ends it, measured `0 -> 0 -> 0 -> MAX`.
@@ -5375,6 +5375,11 @@ const PROMOTE_CLEARS_WITNESSES_SEED: u64 = 0x2EB1_0117;
 const GATE_OPENS_KERNEL_SEED: u64 = 0x2EB1_0118;
 const UNDECODABLE_WITNESS_SEED: u64 = 0x2EB1_0119;
 const INCONCLUSIVE_NOTICE_SEED: u64 = 0x2EB1_011A;
+const SEED_WHILE_VERIFYING_SEED: u64 = 0x2EB1_011D;
+const WITNESS_RESEED_SEED: u64 = 0x2EB1_011E;
+const NEWCOMER_RETRIES_SEED: u64 = 0x2EB1_011F;
+const POSITIONED_PEER_SEED: u64 = 0x2EB1_0120;
+const REFUSAL_PIN_SEED: u64 = 0x2EB1_0121;
 
 /// p ships to f until the two converge — so p durably records `f:1` as a
 /// witness — then p's host crashes with no drain (a real failover). f is left
@@ -5799,6 +5804,282 @@ fn the_deadline_notice_names_an_inconclusive_witness_and_its_reason() {
          automatically the moment every witness answers. Unresolved: f:1 (inconclusive: \
          \"schema digest mismatch\"). If a witness is gone for good, see GUIDE §10's \
          witness-set remedy."
+    );
+}
+
+/// M2 interlude, spec §1: a gated node must not SEED a brand-new follower.
+/// `begin_seeding` is read-only so the write gate does not stop it, but a
+/// seed manufactures a durable converged replica of a timeline this node has
+/// not confirmed it owns — and that replica OUTLIVES this node's own
+/// fail-stop when a witness finally answers "primary".
+///
+/// Rigged so `log_base() == 0`, which makes `decide_hello` answer
+/// `Frames { from: 0 }` — a full replay that is functionally a seed. A
+/// refusal keyed on the `Decision::Snapshot` VARIANT is green here and seeds
+/// anyway; keying on `position.is_none()` inside the None-position arm is
+/// what makes both sub-arms impossible to miss (spec §2).
+#[test]
+fn a_verifying_node_refuses_to_seed_a_brand_new_follower() {
+    let sim = Sim::with_faults(SEED_WHILE_VERIFYING_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    ship_then_crash_the_primary(&sim, &mut p, &mut f);
+    f.host.crash_now(); // the witness is gone, so the gate cannot resolve
+    recover_node(&sim, &mut p).unwrap();
+    assert!(
+        p.db.as_ref().unwrap().verifying(),
+        "precondition: p restarted gated on its recorded witness"
+    );
+    assert_eq!(
+        p.db.as_ref().unwrap().log_base(),
+        0,
+        "precondition: nothing GC'd, so a None-position peer takes the Frames{{from:0}} arm"
+    );
+
+    // A brand-new node, holding nothing, asks to join.
+    let mut g = spawn_node(&sim, "g", follower_cfg("g:1", "p:1"), DbConfig::default()).unwrap();
+    drive_rounds(&sim, &mut [&mut p, &mut g], 200).unwrap();
+
+    // Assert on the GATE OUTCOME, not on an error shape: the newcomer holds
+    // nothing and no seed happened. (The parked attempt asserted a shape the
+    // correct fix removes, and took 771s to reach its budget wall.)
+    assert_eq!(total_seeds(&g), 0, "no seed may have happened");
+    assert_eq!(
+        g.db.as_ref().unwrap().last_applied(),
+        None,
+        "the newcomer must hold nothing — a Frames{{from:0}} replay would have filled it"
+    );
+    // The bound this buys: a refused newcomer never enters the witness set,
+    // because `listen` is assigned only on the two shipping arms.
+    assert_eq!(
+        load_witnesses(&p.host.disk()).unwrap(),
+        vec!["f:1".to_string()],
+        "a refused newcomer must not be recorded as a witness"
+    );
+    // And it is still alive to retry (task 2) rather than dead.
+    assert!(
+        g.db.is_some(),
+        "the refused newcomer must have backed off, not died"
+    );
+}
+
+/// The other half of the keying (spec §2): a RECORDED WITNESS returning with
+/// a rebuilt store Hellos with `position: None` — indistinguishable from a
+/// newcomer on position alone. It must still be seeded: that is GUIDE §10's
+/// prescribed remedy, and it is what resolves this node's own gate. This is
+/// the case the parked attempt broke.
+///
+/// Construction: `store_witnesses` hand-writes `w:1` into p's witness set
+/// (the same technique `a_promote_clears_a_stale_witness_set_before_the_
+/// durable_role_flip` above uses on its own node before `recover_node`),
+/// then a THIRD node `w` — never before seen, empty data dir — spawns at
+/// that address. `w` stands in for a recorded witness whose store was
+/// rebuilt: p cannot tell the two apart from `position: None` alone, which
+/// is exactly the case this test is for.
+#[test]
+fn a_verifying_node_still_seeds_a_recorded_witness() {
+    let sim = Sim::with_faults(WITNESS_RESEED_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    ship_then_crash_the_primary(&sim, &mut p, &mut f);
+    // `ship_then_crash_the_primary` leaves p's disk crashed (erroring on every
+    // op); `restart()` un-crashes it before this direct write — under
+    // `FaultConfig::none()` restart's crash-collapse model is a no-op on
+    // already-durable bytes, and `recover_node` below restarts again
+    // (idempotent) before reopening.
+    p.host.restart();
+    // Record a SECOND witness that has never held data, then bring p back.
+    store_witnesses(&p.host.disk(), &["f:1".to_string(), "w:1".to_string()]).unwrap();
+    recover_node(&sim, &mut p).unwrap();
+    assert!(p.db.as_ref().unwrap().verifying(), "precondition: gated");
+
+    // w is a recorded witness with an empty data dir: position None, and it
+    // must be seeded anyway.
+    let mut w = spawn_node(&sim, "w", follower_cfg("w:1", "p:1"), DbConfig::default()).unwrap();
+    run_until(&sim, &mut [&mut p, &mut w], converged, CONVERGE_BUDGET)
+        .expect("a recorded witness must still be seeded while the gate is unresolved");
+    // NOT `total_seeds(&w) >= 1`: `ship_then_crash_the_primary` never
+    // checkpoints, so `log_base()` stays 0 and w's None-position Hello takes
+    // the `Frames { from: 0 }` arm (a full replay), not `Decision::Snapshot`
+    // — `total_seeds` would stay 0 even on success. `converged` above already
+    // proves `last_applied` equality; this proves it actually holds p's data
+    // rather than a trivial both-None equality.
+    assert_eq!(
+        read_widget_count(&mut w),
+        10,
+        "it must actually hold p's data, not merely be idle-equal"
+    );
+}
+
+/// Task 2's retryability, end to end: the refused newcomer does not die, and
+/// converges once the gate opens. `recover_node` is correct here — f comes
+/// back on its OWN data dir as the positioned follower it always was, which
+/// is what answers the probe and opens the gate.
+#[test]
+fn a_refused_newcomer_retries_and_converges_once_the_gate_opens() {
+    let sim = Sim::with_faults(NEWCOMER_RETRIES_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    ship_then_crash_the_primary(&sim, &mut p, &mut f);
+    recover_node(&sim, &mut p).unwrap();
+
+    let mut g = spawn_node(&sim, "g", follower_cfg("g:1", "p:1"), DbConfig::default()).unwrap();
+    drive_rounds(&sim, &mut [&mut p, &mut g], 200).unwrap();
+    assert_eq!(total_seeds(&g), 0, "refused while the gate is shut");
+
+    // f answers the probe, opening the gate. `converged` is the wrong
+    // predicate here: p and f are ALREADY at the same `last_applied` right
+    // after `ship_then_crash_the_primary` + `recover_node` (a crash under
+    // `FaultConfig::none()` loses no durable data), so it would be true
+    // before a single round drives the probe to f and back.
+    run_until(
+        &sim,
+        &mut [&mut p, &mut f],
+        |ns| ns[0].db.as_ref().is_some_and(|d| d.writes_allowed()),
+        CONVERGE_BUDGET,
+    )
+    .expect("the witness's probe answer must open the gate");
+    assert!(
+        p.db.as_ref().unwrap().writes_allowed(),
+        "the gate must have opened once the witness answered"
+    );
+    run_until(&sim, &mut [&mut p, &mut g], converged, CONVERGE_BUDGET)
+        .expect("the newcomer must converge once the gate is open");
+    // NOT `total_seeds(&g) >= 1`: `ship_then_crash_the_primary` never
+    // checkpoints, so `log_base()` stays 0 and the retry's None-position
+    // Hello takes the `Frames { from: 0 }` arm (a full replay), not
+    // `Decision::Snapshot` — `total_seeds` would stay 0 even on success.
+    // `converged` above already proves `last_applied` equality; this proves
+    // it is not a trivial both-None equality (p has real commits).
+    assert_eq!(
+        read_widget_count(&mut g),
+        10,
+        "and must actually hold p's data on the retry, not merely be idle-equal"
+    );
+}
+
+/// Negative space (hard rule 4): a POSITIONED peer is unaffected while
+/// verifying. Catch-up ships a timeline the peer already holds a prefix of;
+/// only a seed creates a new copy. Without this, the refusal could be widened
+/// to all peers and every other test here would still pass.
+///
+/// Two followers on purpose. With one, that follower's own probe answer opens
+/// the gate, so the catch-up would ship AFTER verification and prove nothing.
+/// Here `f` is permanently gone (gate can never resolve) while `h` is behind
+/// and positioned — so any frame `h` receives was shipped while verifying.
+/// Does NOT reuse `ship_then_crash_the_primary`, which hard-asserts a single
+/// witness.
+#[test]
+fn a_verifying_node_still_ships_catch_up_to_a_positioned_peer() {
+    let sim = Sim::with_faults(POSITIONED_PEER_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    let mut h = spawn_node(&sim, "h", follower_cfg("h:1", "p:1"), DbConfig::default()).unwrap();
+
+    // h converges on the first five records, then stops being driven.
+    for i in 0..5u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+        drive_rounds(&sim, &mut [&mut p, &mut f, &mut h], 3).unwrap();
+    }
+    run_until(&sim, &mut [&mut p, &mut h], converged, CONVERGE_BUDGET).unwrap();
+    let h_before = h.db.as_ref().unwrap().last_applied();
+    // Sever h's session before the next commits, not merely stop driving h:
+    // p keeps servicing h's OLD session (round-robin ships to every live
+    // session regardless of which nodes THIS TEST happens to drive), so the
+    // "five more" commits below would otherwise queue their frames on the
+    // wire to a peer nobody is draining — h would then absorb them as
+    // pre-crash backlog on its first later poll, catching up WITHOUT ever
+    // negotiating a fresh Hello, and this test would prove nothing about
+    // `decide_hello`. `recover_node` tears h's connection AND reopens it
+    // (h's own data survives intact — no faults, no data loss) so the catch
+    // up below can only happen through a real reconnect.
+    recover_node(&sim, &mut h).unwrap();
+
+    // Five more that only f sees, so h is genuinely behind.
+    for i in 5..10u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+        drive_rounds(&sim, &mut [&mut p, &mut f], 3).unwrap();
+    }
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    assert_eq!(
+        load_witnesses(&p.host.disk()).unwrap(),
+        vec!["f:1".to_string(), "h:1".to_string()],
+        "sanity: both followers are recorded witnesses"
+    );
+    p.host.crash_now();
+    f.host.crash_now(); // permanently gone: the gate can never resolve
+    recover_node(&sim, &mut p).unwrap();
+    assert!(
+        p.db.as_ref().unwrap().verifying(),
+        "precondition: gated on f:1"
+    );
+
+    run_until(&sim, &mut [&mut p, &mut h], converged, CONVERGE_BUDGET)
+        .expect("a positioned peer must still catch up while the gate is unresolved");
+    assert!(
+        h.db.as_ref().unwrap().last_applied() > h_before,
+        "h must have actually advanced, not merely been already-converged"
+    );
+    assert!(
+        p.db.as_ref().unwrap().verifying(),
+        "and the gate must still be shut — proving the ship happened WHILE verifying"
+    );
+}
+
+/// Hard rule 5: the refusal an operator actually reads, pinned byte-exact.
+/// The property tests above assert on the gate, which is the right oracle for
+/// the guarantee but would stay green through any reword of this string.
+#[test]
+fn the_seed_while_verifying_refusal_is_pinned() {
+    let sim = Sim::with_faults(REFUSAL_PIN_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    ship_then_crash_the_primary(&sim, &mut p, &mut f);
+    f.host.crash_now();
+    recover_node(&sim, &mut p).unwrap();
+    assert!(p.db.as_ref().unwrap().verifying(), "precondition: gated");
+
+    let schema_digest = p.db.as_ref().unwrap().schema_digest();
+    let conn = sim
+        .host("g")
+        .net()
+        .connect("p:1")
+        .expect("connect to the primary's listener");
+    conn.send(&encode(&Msg::Hello {
+        proto: PROTO_VERSION,
+        listen: Some("g:1".to_string()),
+        position: None,
+        secret: None,
+        schema_digest,
+    }))
+    .unwrap();
+
+    let mut buf = vec![0u8; MAX_MESSAGE_BYTES];
+    let mut reply = None;
+    for _ in 0..64 {
+        drive_rounds(&sim, &mut [&mut p], 1).unwrap();
+        match conn.recv(&mut buf) {
+            Ok(Some(n)) => {
+                reply = Some(decode(&buf[..n]).unwrap());
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => panic!("conn recv failed: {e}"),
+        }
+    }
+    let Some(Msg::Refuse { message }) = reply else {
+        panic!("expected a Refuse reply, got {reply:?}");
+    };
+    assert_eq!(
+        message,
+        "cannot seed a new follower yet: this node restarted as a primary and is still \
+         verifying its witnesses — it has not confirmed that none of the followers it had \
+         shipped to was promoted while it was down, so seeding would copy a timeline it does \
+         not yet know it owns. This clears on its own once every witness answers, and an \
+         existing follower's catch-up is unaffected meanwhile. If the witnesses are \
+         permanently gone, see GUIDE §10 — note that clearing the witness file re-opens the \
+         dual-primary gap it exists to close.",
+        "the refusal's exact shape is product surface (hard rule 5)"
     );
 }
 

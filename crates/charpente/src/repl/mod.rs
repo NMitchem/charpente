@@ -577,7 +577,7 @@ impl Repl {
             if self.sessions[idx].has_work(db, now) {
                 self.rr_cursor = (idx + 1) % n;
                 let role = self.role.clone();
-                self.sessions[idx].service(db, now, &role, &self.peer_secret)?;
+                self.sessions[idx].service(db, now, &role, &self.peer_secret, &self.witnesses)?;
                 // `Session::service` returns immediately after handling an
                 // inbound message (`return self.handle(...)`, session.rs:218),
                 // so the Hello that sets `listen` and that session's first
