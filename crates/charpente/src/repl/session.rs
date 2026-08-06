@@ -676,7 +676,7 @@ fn secret_matches(peer_secret: &Option<String>, presented: &Option<String>) -> b
 /// witness (M2 interlude, spec §1 — a seed must not manufacture a durable
 /// replica of a timeline this node has not confirmed it owns); otherwise
 /// snapshot when the log has been compacted, else frames from 0.
-#[allow(clippy::too_many_arguments)] // one more ladder check (M2 0b task 2), each an independent field
+#[allow(clippy::too_many_arguments)] // two more ladder checks since the base shape (M2 0b task 2's listen-address check, the M2 interlude's witness check), each an independent field
 fn decide_hello(
     role: &Role,
     db: &Db,
@@ -729,7 +729,9 @@ fn decide_hello(
         //
         // Both conjuncts are load-bearing. `position.is_none()` alone is NOT
         // "brand-new node" — `hello_position` returns None for any empty-log
-        // node, including a RECORDED WITNESS returning with a rebuilt store,
+        // node, including a RECORDED WITNESS whose data dir is empty (a
+        // fresh-data-dir re-seed, not a discard-and-rebuild — that replays
+        // the WAL and leaves `last_applied` intact, so it Hellos positioned),
         // which is GUIDE §10's own prescribed remedy and what resolves this
         // gate. Membership alone is not enough either: a positioned peer
         // absent from the set is a genuine follower on this timeline, and

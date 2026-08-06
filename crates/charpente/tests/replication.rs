@@ -5841,9 +5841,13 @@ fn a_verifying_node_refuses_to_seed_a_brand_new_follower() {
     drive_rounds(&sim, &mut [&mut p, &mut g], 200).unwrap();
 
     // Assert on the GATE OUTCOME, not on an error shape: the newcomer holds
-    // nothing and no seed happened. (The parked attempt asserted a shape the
-    // correct fix removes, and took 771s to reach its budget wall.)
-    assert_eq!(total_seeds(&g), 0, "no seed may have happened");
+    // nothing. (The parked attempt asserted a shape the correct fix removes,
+    // and took 771s to reach its budget wall.) NOT `total_seeds(&g) == 0`:
+    // this rig never checkpoints (see the doc comment above), so a SUCCESSFUL
+    // seed would ALSO take the `Frames { from: 0 }` arm and leave
+    // `total_seeds` at 0 — that assertion cannot fail either way and would
+    // silently pass if the refusal were deleted. `last_applied` is the
+    // discriminating check.
     assert_eq!(
         g.db.as_ref().unwrap().last_applied(),
         None,
@@ -5856,26 +5860,28 @@ fn a_verifying_node_refuses_to_seed_a_brand_new_follower() {
         vec!["f:1".to_string()],
         "a refused newcomer must not be recorded as a witness"
     );
-    // And it is still alive to retry (task 2) rather than dead.
-    assert!(
-        g.db.is_some(),
-        "the refused newcomer must have backed off, not died"
-    );
+    // Retryability (task 2) itself is proven by the `.unwrap()` on
+    // `drive_rounds` above surviving: a fatal follower error propagates out
+    // of `step_node` through `drive_rounds`'s `?` and would have panicked
+    // there. This is a sanity check that g is still the live node that
+    // `.unwrap()` implies, not a second proof of retryability.
+    assert!(g.db.is_some(), "sanity: g is still present");
 }
 
-/// The other half of the keying (spec §2): a RECORDED WITNESS returning with
-/// a rebuilt store Hellos with `position: None` — indistinguishable from a
-/// newcomer on position alone. It must still be seeded: that is GUIDE §10's
-/// prescribed remedy, and it is what resolves this node's own gate. This is
-/// the case the parked attempt broke.
+/// The other half of the keying (spec §2): a RECORDED WITNESS whose data dir
+/// is empty (GUIDE §10's fresh-data-dir re-seed remedy — not a
+/// discard-and-rebuild, which replays the WAL and leaves `last_applied`
+/// intact) Hellos with `position: None` — indistinguishable from a newcomer
+/// on position alone. It must still be seeded: that is what resolves this
+/// node's own gate. This is the case the parked attempt broke.
 ///
 /// Construction: `store_witnesses` hand-writes `w:1` into p's witness set
 /// (the same technique `a_promote_clears_a_stale_witness_set_before_the_
-/// durable_role_flip` above uses on its own node before `recover_node`),
+/// durable_role_flip` below uses on its own node before `recover_node`),
 /// then a THIRD node `w` — never before seen, empty data dir — spawns at
-/// that address. `w` stands in for a recorded witness whose store was
-/// rebuilt: p cannot tell the two apart from `position: None` alone, which
-/// is exactly the case this test is for.
+/// that address. `w` stands in for that recorded witness with an empty data
+/// dir: p cannot tell the two apart from `position: None` alone, which is
+/// exactly the case this test is for.
 #[test]
 fn a_verifying_node_still_seeds_a_recorded_witness() {
     let sim = Sim::with_faults(WITNESS_RESEED_SEED, FaultConfig::none());
@@ -5909,6 +5915,16 @@ fn a_verifying_node_still_seeds_a_recorded_witness() {
         10,
         "it must actually hold p's data, not merely be idle-equal"
     );
+    // The test's whole claim is "seeded WHILE the gate is unresolved" — f is
+    // left running by `ship_then_crash_the_primary` but is never included in
+    // a driven node list again in this test, so its own probe-answering
+    // logic never runs and p's gate can never open; this must still be true,
+    // or the seed above proves nothing about the timing this test is named
+    // for.
+    assert!(
+        p.db.as_ref().unwrap().verifying(),
+        "the gate must still be shut — proving the seed happened WHILE verifying"
+    );
 }
 
 /// Task 2's retryability, end to end: the refused newcomer does not die, and
@@ -5925,7 +5941,15 @@ fn a_refused_newcomer_retries_and_converges_once_the_gate_opens() {
 
     let mut g = spawn_node(&sim, "g", follower_cfg("g:1", "p:1"), DbConfig::default()).unwrap();
     drive_rounds(&sim, &mut [&mut p, &mut g], 200).unwrap();
-    assert_eq!(total_seeds(&g), 0, "refused while the gate is shut");
+    // NOT `total_seeds(&g) == 0` (review I-1, same defect as M-2 above): this
+    // rig never checkpoints, so a SUCCESSFUL seed would ALSO take the
+    // `Frames { from: 0 }` arm and leave `total_seeds` at 0 — the assertion
+    // cannot fail either way. `last_applied` is the discriminating check.
+    assert_eq!(
+        g.db.as_ref().unwrap().last_applied(),
+        None,
+        "refused while the gate is shut"
+    );
 
     // f answers the probe, opening the gate. `converged` is the wrong
     // predicate here: p and f are ALREADY at the same `last_applied` right
@@ -5960,8 +5984,13 @@ fn a_refused_newcomer_retries_and_converges_once_the_gate_opens() {
 
 /// Negative space (hard rule 4): a POSITIONED peer is unaffected while
 /// verifying. Catch-up ships a timeline the peer already holds a prefix of;
-/// only a seed creates a new copy. Without this, the refusal could be widened
-/// to all peers and every other test here would still pass.
+/// only a seed creates a new copy. This catches a MEMBERSHIP-AGNOSTIC
+/// widening of the refusal — one that drops or bypasses the witness-set
+/// check entirely and refuses every Hello outright while verifying — under
+/// which every other test here would stay green. It does NOT catch a
+/// membership-PRESERVING widening that merely hoists the same check above
+/// the position match: `h` is itself a recorded witness (below), so that
+/// narrower mistake would still ship to it.
 ///
 /// Two followers on purpose. With one, that follower's own probe answer opens
 /// the gate, so the catch-up would ship AFTER verification and prove nothing.
@@ -6011,7 +6040,7 @@ fn a_verifying_node_still_ships_catch_up_to_a_positioned_peer() {
     recover_node(&sim, &mut p).unwrap();
     assert!(
         p.db.as_ref().unwrap().verifying(),
-        "precondition: gated on f:1"
+        "precondition: gated on both f:1 and h:1 — f:1 is the one that never resolves"
     );
 
     run_until(&sim, &mut [&mut p, &mut h], converged, CONVERGE_BUDGET)

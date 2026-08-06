@@ -791,8 +791,11 @@ mod tests {
     /// Drives ONE real `Session::service` call against `db`/`role` with
     /// `hello` as the inbound message, and returns whatever the session
     /// actually sent back — the real `decide_hello` output, not a copy of
-    /// its prose. `witnesses` is this node's recorded witness set — `&[]` for
-    /// every case here that does not care about it.
+    /// its prose. `witnesses` is this node's recorded witness set: `&[]` for
+    /// cases that don't touch the witness-gate ladder at all, and `&[]`
+    /// deliberately (not merely incidentally) for the seed-while-verifying
+    /// case below, whose whole point is that the Hello's `listen` is absent
+    /// from it.
     fn real_reply(db: &Db, role: &Role, hello: &Msg, witnesses: &[String]) -> Msg {
         let conn = RecordingConn::new();
         conn.inbound.borrow_mut().push_back(encode(hello));
@@ -813,10 +816,12 @@ mod tests {
     // Structural keying (task 4 brief): the classifier keys on
     // NOT_A_PRIMARY_MARKER/DIVERGED_LABEL, the SAME consts `decide_hello`
     // builds its refusals from. This test proves the coupling end-to-end —
-    // driving the real producer, not a hand-copied string — for the
-    // not-a-primary refusal, a real diverged (ahead) refusal, and a real
-    // prefix refusal (version mismatch) that must fall through to the
-    // default arm rather than accidentally matching either marker.
+    // driving the real producer, not a hand-copied string — for every shape
+    // `classify` must distinguish: a refusal carrying NOT_A_PRIMARY_MARKER,
+    // one carrying DIVERGED_LABEL, and refusals carrying NEITHER (a prefix
+    // refusal like version mismatch, and the seed-while-verifying refusal),
+    // which must all fall through to the default `Inconclusive` arm rather
+    // than accidentally matching either marker.
     #[test]
     fn classifier_recognizes_the_real_shipped_refusal_strings() {
         // Not-a-primary: a real Follower-role Db + Session.
