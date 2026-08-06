@@ -548,8 +548,9 @@ mod tests {
         );
     }
 
-    /// The resolving arm (`follower.rs:236`) is separately fatal — the parked
-    /// attempt's probe patched only one of the two sites.
+    /// The resolving arm (`follower.rs:236`) was separately fatal before this
+    /// arm was added — the parked attempt's probe patched only one of the
+    /// two sites.
     #[test]
     fn a_retryable_refusal_backs_off_on_the_resolving_arm() {
         let sim = Sim::with_faults(0x2EB1_011C, FaultConfig::none());

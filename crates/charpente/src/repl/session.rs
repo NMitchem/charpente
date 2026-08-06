@@ -541,19 +541,26 @@ pub(crate) const PEER_SECRET_REFUSAL: &str = "peer secret missing or mismatched 
 pub(crate) const NOT_A_PRIMARY_MARKER: &str = "not a primary";
 
 /// The keyed fragment of the seed-while-verifying refusal (M2 interlude,
-/// spec §3) — same producer/consumer discipline as `NOT_A_PRIMARY_MARKER`.
-/// Consumers: `follower.rs`'s BOTH refuse arms (back off and retry rather
-/// than dying) and, by omission, `probe.rs::classify`, whose default arm
-/// files any refusal carrying neither marker as `Inconclusive`. Rewording
-/// this fragment deliberately reddens those consumers' tests.
+/// spec §3) — same CONSUMER discipline as `NOT_A_PRIMARY_MARKER`: `follower.rs`'s
+/// BOTH refuse arms match on this fragment (back off and retry rather than
+/// dying), and, by omission, `probe.rs::classify`'s default arm files any
+/// refusal carrying neither marker as `Inconclusive`. The PRODUCER discipline
+/// differs — see `SEED_WHILE_VERIFYING_REFUSAL`'s doc. Rewording this
+/// fragment deliberately reddens `follower.rs`'s tests (`probe.rs`'s test
+/// asserts on the full string below, not on this fragment, so it does not
+/// key off this const the way `probe.rs::classify` itself does for the other
+/// two markers).
 pub(crate) const VERIFYING_WITNESSES_MARKER: &str = "still verifying its witnesses";
 
 /// Refusing to seed a brand-new follower while the witness boot gate is
-/// unresolved (M2 interlude, spec §1). Task 3 lands the production emitter
-/// and pins this byte-exact from a real refusal
-/// (`a_verifying_node_refuses_to_seed_a_brand_new_follower`); this task
-/// (2) only defines the string and teaches the receiver to treat it as
-/// retryable, so nothing in the repo emits it yet.
+/// unresolved (M2 interlude, spec §1). Task 3 lands the production emitter;
+/// its `the_seed_while_verifying_refusal_is_pinned` (seed `0x2EB1_0121`)
+/// pins this byte-exact from a real refusal. (Task 3's
+/// `a_verifying_node_refuses_to_seed_a_brand_new_follower` is a different,
+/// gate-outcome property test — it asserts on `total_seeds`/`last_applied`/
+/// `load_witnesses`, deliberately not on this string.) This task (2) only
+/// defines the string and teaches the receiver to treat it as retryable, so
+/// nothing in the repo emits it yet.
 ///
 /// Deliberately carries NEITHER `NOT_A_PRIMARY_MARKER` nor `DIVERGED_LABEL`.
 /// A witness probe reading this as `NotPrimary` would treat "I am also
@@ -562,10 +569,18 @@ pub(crate) const VERIFYING_WITNESSES_MARKER: &str = "still verifying its witness
 /// `probe.rs::classify`'s default arm gives the correct `Inconclusive` for
 /// free — the absence of both markers is what earns it, so it is asserted.
 ///
+/// Unlike `NOT_A_PRIMARY_MARKER`/`DIVERGED_LABEL`, which are `format!`-
+/// interpolated into their refusals (`decide_hello` below, and
+/// `diverged_ahead`/`diverged_crc`/`diverged_behind`), this string is a
+/// literal duplicating `VERIFYING_WITNESSES_MARKER`'s text — a `const`
+/// cannot `format!`. `the_refusal_carries_its_marker` (`follower.rs`) is
+/// what holds the two in sync; nothing here catches them drifting apart at
+/// compile time the way interpolation would.
+///
 /// `#[allow(dead_code)]`: a mechanical fix for `-D warnings`, not a design
 /// change. Until Task 3 lands the emitter, the only readers are the
-/// `#[cfg(test)]` modules in this file, `follower.rs`, and `probe.rs` — none
-/// visible to the plain (non-test) lib compilation clippy also checks.
+/// `#[cfg(test)]` modules in `follower.rs` and `probe.rs` — neither visible
+/// to the plain (non-test) lib compilation clippy also checks.
 #[allow(dead_code)]
 pub(crate) const SEED_WHILE_VERIFYING_REFUSAL: &str = "cannot seed a new follower yet: this \
      node restarted as a primary and is still verifying its witnesses — it has not confirmed \
