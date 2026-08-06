@@ -1108,6 +1108,95 @@ fn a_silent_await_hello_session_stops_pinning_gc_after_its_deadline() {
     );
 }
 
+/// Regression (0b re-review M-2): `Repl::step` reaps dead sessions at the top
+/// of the step but recomputes the pin right after `service` (and `pump_io`
+/// recomputes over the dead session too), so a session REFUSED during this
+/// step is still present with `cursor = 0, acked = None` and pins GC at 0
+/// until the next round's reap. Pre-existing on every refusal path; task 3's
+/// seed-while-verifying refusal is the first a peer retries indefinitely.
+///
+/// Bounded, not permanent — the reap ends it, measured `0 -> 0 -> 0 -> MAX`.
+/// Each occurrence costs one checkpoint's GC. Delayed GC, never wrong GC.
+///
+/// Uses the peer-secret refusal because it needs no new code — the point is
+/// the pin, not which refusal caused it. Drives ONE round at a time and stops
+/// the instant the refusal lands, because that is the only moment the window
+/// is observable: any fixed round count either has not refused yet or has
+/// already been reaped. The commit loop then checkpoints WITHOUT stepping the
+/// replicator, so GC runs while the dead session is still holding the pin.
+#[test]
+fn a_refused_session_does_not_pin_gc() {
+    let sim = Sim::with_faults(0x2EB1_011B, FaultConfig::none());
+    let db_cfg = DbConfig {
+        wal: WalConfig {
+            dir: "wal".to_string(),
+            segment_bytes: 128,
+        },
+        store_path: "tables.redb".to_string(),
+        retain_segments: 1,
+        checkpoint_every: 4,
+        event_retention: 65_536,
+        migration_batch_size: 1000,
+    };
+    let mut cfg = primary_cfg("p:1");
+    cfg.peer_secret = Some("right".to_string());
+    let mut p = spawn_node(&sim, "p", cfg, db_cfg).unwrap();
+
+    // A peer that presents the wrong secret: refused, session marked dead,
+    // still present when this step recomputes the pin. Raw-conn shape copied
+    // from `a_long_invalid_listen_address_is_truncated_in_the_refusal`
+    // (replication.rs ~:4990), the file's idiom for driving a Hello by hand.
+    let schema_digest = p.db.as_ref().unwrap().schema_digest();
+    let conn = sim
+        .host("wrong")
+        .net()
+        .connect("p:1")
+        .expect("connect to the primary's listener");
+    conn.send(&encode(&Msg::Hello {
+        proto: PROTO_VERSION,
+        listen: Some("wrong:1".to_string()),
+        position: None,
+        secret: Some("wrong".to_string()),
+        schema_digest,
+    }))
+    .unwrap();
+
+    // Drive ONE round at a time and stop the instant the refusal reaches the
+    // client. At that moment the session was marked dead inside this step's
+    // `service` and `recompute_pin` has just run with it still present — that
+    // IS the window. Driving further lets `Repl::step`'s pre-existing
+    // top-of-step `sessions.retain(|s| !s.dead)` reap it and restore the pin,
+    // which is why NO fixed round count can observe this.
+    let mut buf = vec![0u8; MAX_MESSAGE_BYTES];
+    let mut refused = false;
+    for _ in 0..64 {
+        drive_rounds(&sim, &mut [&mut p], 1).unwrap();
+        if let Ok(Some(n)) = conn.recv(&mut buf) {
+            assert!(
+                matches!(decode(&buf[..n]).unwrap(), Msg::Refuse { .. }),
+                "expected the peer-secret refusal"
+            );
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "precondition: the peer must have been refused");
+
+    // Commit past several checkpoint boundaries WITHOUT driving the replicator
+    // again. GC is a function of commits-since-checkpoint and `commit_widget`
+    // calls `db.transact` directly (replication.rs:515-519) without stepping
+    // the scheduler, so this checkpoints while the dead session is still
+    // present and still holding the pin.
+    for i in 0..16u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    assert!(
+        p.db.as_ref().unwrap().log_base() > 0,
+        "a refused (dead) session must not hold the retention pin; base stuck at {}",
+        p.db.as_ref().unwrap().log_base()
+    );
+}
+
 // -------------------------------------------------- property: divergence
 
 #[test]
