@@ -71,10 +71,11 @@ Add to `crates/charpente/tests/replication.rs`, near `a_silent_await_hello_sessi
 ///
 /// Uses the peer-secret refusal because it needs no new code — the point is
 /// the pin, not which refusal caused it. Drives ONE round at a time and stops
-/// the instant the refusal lands, because that is the only moment the window
-/// is observable: any fixed round count either has not refused yet or has
-/// already been reaped. The commit loop then checkpoints WITHOUT stepping the
-/// replicator, so GC runs while the dead session is still holding the pin.
+/// the instant the refusal lands, because a *larger* fixed round count has
+/// already been reaped by the time it checks, and a bare count of 1 would
+/// assume the refusal happened rather than prove it. The commit loop then
+/// checkpoints WITHOUT stepping the replicator, so GC runs while the dead
+/// session is still present.
 #[test]
 fn a_refused_session_does_not_pin_gc() {
     let sim = Sim::with_faults(0x2EB1_011B, FaultConfig::none());
@@ -169,15 +170,23 @@ In `crates/charpente/src/repl/session.rs`, replace the body of `pin_floor`:
         if self.control {
             return u64::MAX;
         }
-        // Nor does a dead one. `Repl::step` reaps at the top of the step but
-        // calls `recompute_pin` right after `service` (and `pump_io` does its
-        // own), so a session refused during THIS step is still in
-        // `self.sessions` with `cursor = 0, acked = None`. Unguarded that pins
-        // GC at 0 until the next round's reap — costing that window's
-        // checkpoint its GC, once per refusal on every refusal path, and
-        // recurring against a peer that keeps retrying (0b re-review M-2).
-        // Bounded, not permanent: the reap is what ends it, measured
-        // 0 -> 0 -> 0 -> MAX. Delayed GC, never wrong GC.
+        // Nor does ANY dead one — not only a refused session. `dead` is also
+        // set by `send`'s wire failure and `drain`'s recv-error/EOF, which can
+        // kill a *shipping* session carrying a real cursor/acked; the guard
+        // releases those a round earlier than the reap would have, which is
+        // safe because the reap released them anyway and RECONNECT_NANOS is
+        // three orders of magnitude wider than the window.
+        //
+        // `Repl::step` reaps at the top of the step but calls `recompute_pin`
+        // right after `service` (and `pump_io` does its own), so a session
+        // refused during THIS step is still in `self.sessions` with
+        // `cursor = 0, acked = None`. Unguarded that pins GC at 0 until a step
+        // reaches the reap — `Repl::step` has four early returns above it, so
+        // that is not always the next round — costing those checkpoints their
+        // GC, once per refusal on every refusal path, and recurring against a
+        // peer that keeps retrying (0b re-review M-2). Bounded, not permanent:
+        // the reap is what ends it, measured 0 -> 0 -> 0 -> MAX. Delayed GC,
+        // never wrong GC.
         if self.dead {
             return u64::MAX;
         }
