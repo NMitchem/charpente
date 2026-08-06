@@ -806,11 +806,56 @@ do not reorder a milestone's dependency sequence.
   the edge matrix `scripts/edge-harness.sh`, **31/31 `#[ignore]` scenarios green in 47s**,
   including the renamed tripwire. Note for the next sweep: the edge crate's ignored tests live
   in `src/` as well as `tests/` — grepping only `tests/` undercounts them by more than half.
-- Next: **push** — one metered CI run, deliberately deferred through M1's whole final
-  sub-project and both M2 sub-projects so far (local-first verification is the sweep above;
-  Noah confirms). Then M2 per PLAN. The backlog below now holds **no open ruled follow-ups**:
-  both entries in it are record, and the only item still marked as work is `TcpProxy::stop`'s
-  registration window ("fix in M2") in the triage entry.
+- **Pushed, and CI is green (2026-08-06).** `e5c7c0c..98c541f`, 29 commits — the metered run
+  deferred through M1's final sub-project and both M2 sub-projects. GHA `ci` succeeded in
+  22m01s on the first attempt, so the local-first policy held: nothing reached the remote
+  that the local sweeps had not already caught.
+- **Hard-rule-5 interlude done (2026-08-06, this commit)** — the two rule-5 items accepted
+  but not fixed by sub-project 0b's Task 5 review, closed together because both live on the
+  same operator-facing surface.
+  **(1) An undecodable witness response no longer kills the node.** `WitnessProbe::step`
+  took a bare `?` on `decode`, so a reply this node could not parse became an `io::Error`
+  that propagated through `Repl::step` and out of `Kernel::run` — anything holding a
+  witness's address (a half-open port, a wrong-protocol service, a corrupted reply) could
+  take a resurrected primary down with eight bytes of garbage, reported as a decode fault
+  rather than as the thing an operator must act on. **Noah-ruled 2026-08-06:** classify it
+  `Inconclusive` rather than name-and-stay-fatal. Undecodable is not a verdict, it is the
+  absence of one, and spec §2's trichotomy files "unknown" with unreachable — back off and
+  ask again. This extends ruling (c) to an epistemically identical case rather than
+  inventing a policy, and it makes the hard-rule-5 gap moot instead of papering over it: the
+  reason now reaches the operator through the deadline notice. Payload bounded and escaped
+  via `bounded_witness_message`, like every other peer-derived string in the module.
+  **(2) The notice's `(inconclusive: …)` variant is pinned.** Its `(no answer yet)` sibling
+  was pinned byte-exact from the start; the variant carrying the *reason* — the one an
+  operator actually acts on — was pinned nowhere.
+  **Deliberate asymmetry, recorded so it is not "fixed" later:** `Follower::step`
+  (`follower.rs:219`) still takes the bare `?`. A follower's primary is its source of truth
+  and a dead follower is not a dead primary; a probe's witness is only being asked a
+  question. Whether the follower should get the same treatment is a **new follow-up**, not
+  part of this ruling.
+  Tests: `0x2EB1_0119` (survival + gate stays shut + keeps asking + the notice text) and
+  `0x2EB1_011A` (the inconclusive variant against a `Refuse` on `classify`'s default arm).
+  RED-first per hard rule 3 — (1) failed for exactly the right reason before the fix
+  (`"p step: repl message decode: unknown tag 255 …"`, the node dying). (2) pins shipped
+  output and so passed on arrival, **so its teeth were proven by mutation instead**:
+  perturbing `unresolved_witnesses`'s inconclusive arm turns BOTH pins red, and `mod.rs` was
+  restored byte-exact afterwards. GUIDE §10's third probe outcome and `probe.rs`'s module
+  doc both name the undecodable case (hard rule 6).
+  Evidence — the same 11-stage sweep, every stage green: fmt, clippy `-D warnings`, guide
+  gate; `cargo test --workspace` **twice**, 49 binaries, **572 passed / 0 failed / 31
+  ignored** both times (570 + these two tests); both pinned debug replays
+  (`0x8bee1752811ae873` 4/4, `0x348270b38f166529` 26/26); both release mode-skew tripwires
+  as `ci.yml` runs them (4/4, 1/1); a fresh invoicing 1024-universe batch, all green, master
+  seed `0x20f0591d1069879b`; and `scripts/edge-harness.sh` **31/31**, run because this
+  touches replication behavior.
+- Next: **M2 per PLAN.** The backlog below holds **no open ruled follow-ups** — both entries
+  in it are record. Still-open work, none of it ruled or blocking: `TcpProxy::stop`'s
+  registration window ("fix in M2"); the follower-decode asymmetry above; and 0b's remaining
+  accepted minors (the `eprintln!` inside the `repl` boundary with `take_witness_notice()`
+  having no production caller, self-witnessing unguarded, the two gated-503 test sites with
+  no cover key, `tx_err_to_io`'s unbounded `{unreached:?}`, the 17 MiB recv buffer per
+  connected probe, and `probe.rs::connect_and_hello`'s near-verbatim copy of
+  `follower.rs` — a THIRD copy is the moment to consolidate).
 
 ## M2 follow-up backlog (carried from M1, ruled — written to be read cold)
 

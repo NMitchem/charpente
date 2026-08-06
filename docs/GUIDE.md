@@ -2619,7 +2619,9 @@ asks each witness one question, "are you a primary now?", and:
   it cannot know which timeline you want, and the writes it acked are not the
   platform's to discard;
 - a witness cannot be reached, or answers something that says nothing about
-  its role (a mismatched peer secret, protocol version, or schema digest) →
+  its role (a mismatched peer secret, protocol version, or schema digest — or
+  bytes this node cannot decode at all, which is what you get when something
+  other than a charpente node has taken over the address) →
   by default reads keep flowing, writes keep being refused, and after 30
   seconds (`WITNESS_DEADLINE_NANOS`) the node prints one notice on stderr
   naming what is still unresolved and why. It keeps probing; an unreachable

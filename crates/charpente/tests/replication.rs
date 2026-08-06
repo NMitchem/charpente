@@ -18,7 +18,9 @@ use charpente::repl::Repl;
 use charpente::repl::protocol::{Msg, decode, encode};
 use charpente::repl::role::Role;
 use charpente::repl::witnesses::{load_witnesses, store_witnesses};
-use charpente::repl::{MAX_MESSAGE_BYTES, PROTO_VERSION, ReplConfig, WITNESS_DEADLINE_NANOS};
+use charpente::repl::{
+    MAX_MESSAGE_BYTES, PROTO_VERSION, RECONNECT_NANOS, ReplConfig, WITNESS_DEADLINE_NANOS,
+};
 use charpente::{Db, DbConfig, Id, Job, Schema, TxError, table};
 use charpente_core::io::{Clock, Conn, Disk, File, Net};
 use charpente_core::log::{Wal, WalConfig};
@@ -5279,6 +5281,8 @@ const STRICT_WITNESS_SEED: u64 = 0x2EB1_0115;
 const SWITCHOVER_WHILE_VERIFYING_SEED: u64 = 0x2EB1_0116;
 const PROMOTE_CLEARS_WITNESSES_SEED: u64 = 0x2EB1_0117;
 const GATE_OPENS_KERNEL_SEED: u64 = 0x2EB1_0118;
+const UNDECODABLE_WITNESS_SEED: u64 = 0x2EB1_0119;
+const INCONCLUSIVE_NOTICE_SEED: u64 = 0x2EB1_011A;
 
 /// p ships to f until the two converge — so p durably records `f:1` as a
 /// witness — then p's host crashes with no drain (a real failover). f is left
@@ -5553,6 +5557,156 @@ fn an_unreachable_witness_serves_reads_and_withholds_writes() {
         p.repl.verifying_witnesses(),
         1,
         "it keeps probing — the node resolves itself the moment the witness returns"
+    );
+}
+
+/// Stands a raw listener on a departed witness's address and hands the probe
+/// one chosen reply, then vanishes.
+///
+/// The vanishing is load-bearing, not cleanup. A probe that has answered
+/// inconclusively reconnects, and a reconnect that *succeeds* leaves an open
+/// conn nobody will ever answer — which reports no work and no deadline, so
+/// the scheduler stalls instead of advancing virtual time to the notice
+/// deadline. With the listener gone the reconnects fail and the backoff
+/// drives the clock, exactly as an unreachable witness does.
+fn answer_the_probe_once(sim: &Sim, p: &mut Node, reply: &[u8]) {
+    let listener = sim.host("f").net().listen("f:1").expect("listen on f:1");
+    p.repl.pump_io(sim.now().as_nanos());
+    step_node(sim, p).expect("a freshly recovered probe's first step is connect_and_hello");
+    let conn = listener
+        .accept()
+        .expect("accept")
+        .expect("the probe must have dialed its witness");
+    let mut buf = vec![0u8; MAX_MESSAGE_BYTES];
+    let n = conn
+        .recv(&mut buf)
+        .expect("recv")
+        .expect("the probe's Hello must have arrived (zero simulated net latency)");
+    assert!(
+        matches!(decode(&buf[..n]).unwrap(), Msg::Hello { .. }),
+        "a probe opens with a Hello"
+    );
+    conn.send(reply).expect("send the chosen reply");
+    // Move the reply off the wire before the socket goes away.
+    p.repl.pump_io(sim.now().as_nanos());
+    drop(conn);
+    drop(listener);
+}
+
+/// Hard rule 5, and spec §2's trichotomy: a witness that answers with bytes
+/// this node cannot decode has told it **nothing**, and "nothing" files with
+/// unreachable — stay write-stopped, back off, ask again.
+///
+/// Before the fix, `WitnessProbe::step` took a bare `?` on `decode`, so an
+/// undecodable reply became an unnamed `io::Error` that propagated through
+/// `Repl::step` and out of `Kernel::run`: anything holding a witness's
+/// address — a half-open port, a wrong-protocol service, a corrupted reply —
+/// could kill a resurrected primary with eight bytes of garbage, and the
+/// operator got no name for the contract, the site, or the fix.
+#[test]
+fn a_witness_that_answers_with_undecodable_bytes_does_not_kill_the_node() {
+    let sim = Sim::with_faults(UNDECODABLE_WITNESS_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    ship_then_crash_the_primary(&sim, &mut p, &mut f);
+    f.host.crash_now();
+    recover_node(&sim, &mut p).unwrap();
+    assert!(!p.db.as_ref().unwrap().writes_allowed(), "gated at open");
+
+    answer_the_probe_once(&sim, &mut p, &[0xff; 8]);
+
+    let start = sim.now().as_nanos();
+    run_until(
+        &sim,
+        &mut [&mut p],
+        |_| sim.now().as_nanos() > start + 4 * RECONNECT_NANOS,
+        100_000,
+    )
+    .expect("an undecodable witness answer must not kill this node");
+
+    assert!(
+        !p.db.as_ref().unwrap().writes_allowed(),
+        "and the gate stays shut — an answer this node cannot read is not permission to write"
+    );
+    assert_eq!(
+        p.repl.verifying_witnesses(),
+        1,
+        "it keeps asking: undecodable is retryable, not decided"
+    );
+
+    // And the operator is told which witness and why (hard rule 5): the
+    // reason reaches them through the notice, which is the whole basis for
+    // routing this to a verdict instead of an error.
+    run_until(
+        &sim,
+        &mut [&mut p],
+        |_| sim.now().as_nanos() > start + WITNESS_DEADLINE_NANOS,
+        1_000_000,
+    )
+    .unwrap();
+    let notice = p
+        .repl
+        .take_witness_notice()
+        .expect("the deadline must produce one loud operator notice");
+    assert_eq!(
+        notice,
+        "witness verification has not resolved after 30s: this node was a primary \
+         before restarting and still cannot confirm that every follower it had shipped to was \
+         never promoted, so it is serving reads and refusing writes — writes resume \
+         automatically the moment every witness answers. Unresolved: f:1 (inconclusive: \
+         \"undecodable response: repl message decode: unknown tag 255 — this peer speaks a \
+         newer protocol version; upgrade this binary or downgrade the peer\"). If a witness is \
+         gone for good, see GUIDE §10's witness-set remedy."
+    );
+}
+
+/// Hard rule 5 says error output is pinned by tests. The notice's
+/// `(no answer yet)` variant was pinned byte-exact from the start; its
+/// `(inconclusive: …)` sibling — the one that carries the *reason* a witness
+/// is unresolved, and so the one an operator actually acts on — was not
+/// pinned anywhere. This pins it, including the `{:?}` quoting that bounding
+/// the peer-controlled message applies.
+#[test]
+fn the_deadline_notice_names_an_inconclusive_witness_and_its_reason() {
+    let sim = Sim::with_faults(INCONCLUSIVE_NOTICE_SEED, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    ship_then_crash_the_primary(&sim, &mut p, &mut f);
+    f.host.crash_now();
+    recover_node(&sim, &mut p).unwrap();
+
+    // A refusal carrying neither marker lands on `classify`'s default arm,
+    // the one absorbing every prefix refusal (secret, version, schema,
+    // listen) and any added later.
+    answer_the_probe_once(
+        &sim,
+        &mut p,
+        &encode(&Msg::Refuse {
+            message: "schema digest mismatch".to_string(),
+        }),
+    );
+
+    let start = sim.now().as_nanos();
+    run_until(
+        &sim,
+        &mut [&mut p],
+        |_| sim.now().as_nanos() > start + WITNESS_DEADLINE_NANOS,
+        1_000_000,
+    )
+    .unwrap();
+
+    let notice = p
+        .repl
+        .take_witness_notice()
+        .expect("the deadline must produce one loud operator notice");
+    assert_eq!(
+        notice,
+        "witness verification has not resolved after 30s: this node was a primary \
+         before restarting and still cannot confirm that every follower it had shipped to was \
+         never promoted, so it is serving reads and refusing writes — writes resume \
+         automatically the moment every witness answers. Unresolved: f:1 (inconclusive: \
+         \"schema digest mismatch\"). If a witness is gone for good, see GUIDE §10's \
+         witness-set remedy."
     );
 }
 

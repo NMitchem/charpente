@@ -23,6 +23,13 @@
 //! in the direction that costs availability, which this probe must never
 //! manufacture.
 //!
+//! A response this node cannot decode at all takes the same `Inconclusive`
+//! route, one step earlier — it never reaches `classify`. It is the absence
+//! of an answer, not an answer, so it files with unreachable exactly as spec
+//! §2's trichotomy says: back off and ask again. Making it an error instead
+//! would hand anything squatting on a witness's address a way to take a
+//! resurrected primary down.
+//!
 //! **`Role::HandingOff` classifies `IsPrimary`, and that is correct — not a
 //! bug to "fix".** It passes the role match exactly like `Role::Primary`
 //! (`session.rs`), so a `HandingOff` witness answers a ship message, never
@@ -230,7 +237,26 @@ impl WitnessProbe {
             }
             return Ok(()); // backoff not yet due, or connected and waiting
         };
-        let msg = decode(&raw)?;
+        // Undecodable is not a verdict — it is the absence of one, and spec
+        // §2's trichotomy files "unknown" with unreachable: back off and ask
+        // again. Propagating it instead (the bare `?` this replaced) let
+        // anything holding a witness's address take a resurrected primary
+        // down with a few bytes of garbage, and reported it as a decode
+        // fault rather than as what the operator needs to act on — which
+        // witness, and that the gate is still shut because of it. Bounded
+        // and escaped like every other peer-derived payload here: the text
+        // quotes the wire's own tag back.
+        let msg = match decode(&raw) {
+            Ok(msg) => msg,
+            Err(e) => {
+                self.verdict = WitnessVerdict::Inconclusive(bounded_witness_message(&format!(
+                    "undecodable response: {e}"
+                )));
+                self.conn = None;
+                self.reconnect_at = Some(now + RECONNECT_NANOS);
+                return Ok(());
+            }
+        };
         self.verdict = classify(&msg);
         // Classify and disconnect: never fall through to apply anything (the
         // module doc's "never adopts").
