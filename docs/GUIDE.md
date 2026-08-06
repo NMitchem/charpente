@@ -2597,6 +2597,15 @@ served normally, and writes resume automatically once that node answers; if it i
 gone for good, see GUIDE §10's witness-set remedy
 ```
 
+**This is not specific to a failover or an incident.** Every restart of a
+primary with a non-empty witness set starts this same window — an ordinary
+deploy or bounce with nothing wrong included — because the node cannot tell
+"I just restarted" from "I restarted after being promoted away from" until
+its witnesses answer. If your deploy process writes immediately after
+restarting a node, expect this 503 rather than treat it as a bug: in the
+common case a witness is alive and reachable, so the window is a round trip
+or two, not a stall.
+
 Same as the 421, this is a read-side no-op — a read-only transaction (no
 effects) still commits normally, the gate never touches reads — and it is
 transient: writes resume automatically the moment every witness confirms it

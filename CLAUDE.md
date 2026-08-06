@@ -942,7 +942,13 @@ do not reorder a milestone's dependency sequence.
   shipping arms), and the operator consequence — a permanently dead witness blocks new
   followers until the existing escape hatch (edit or delete the `witnesses` file) is used,
   which costs little since the only use for a freshly-seeded follower would be promotion,
-  exactly the harm the gate exists to prevent.
+  exactly the harm the gate exists to prevent. The evidence sweep below surfaced a second,
+  unplanned doc gap in the same section: `TxError::Verifying`'s 503 is not incident-specific
+  — it fires on *every* restart of a primary with a non-empty witness set, ordinary deploys
+  included, since the node cannot yet distinguish "just restarted" from "restarted after
+  being promoted away from." GUIDE §10 now says so explicitly, up front, so an operator whose
+  deploy writes immediately after a restart recognizes the 503 rather than filing it as a
+  bug.
   **Tests** (seeds `0x2EB1_011B`..`0x2EB1_0121` in `crates/charpente/tests/replication.rs`,
   RED-first per hard rule 3): the GC pin (`a_refused_session_does_not_pin_gc`, `0x2EB1_011B`);
   three `follower.rs` retry tests at `0x2EB1_011C` (both refuse sites, plus the negative
@@ -966,22 +972,32 @@ do not reorder a milestone's dependency sequence.
   `late_follower_seeds_below_the_gcd_base_and_converges` 1/1); a fresh invoicing
   1024-universe batch, **all green, master seed `0xc53bdfb3f3a7f1a4`**; and
   `scripts/edge-harness.sh`, run because replication, auth and realtime are all in the
-  measured blast radius. **Note for the next sweep:** the first edge-harness run hit two
-  transient failures (`failover_wire_oracle`, `failover_non_converged_tail_is_exercised_and_
-  bounded`) — a `login()` POST fired within ~3ms of a mid-run primary restart raced 0b's
-  witness-gate resolution (the HTTP port binds before the kernel thread finishes `Repl::open`,
-  by design) and lost. Bisected before treating it as this interlude's problem: 5/5 green in
-  isolation at this interlude's base commit (`66cddde`) and 5/5 at its tip, both outside the
-  full-suite run; a second full `scripts/edge-harness.sh` run was **31/31 green**. Pre-existing
-  since sub-project 0b shipped the gate (2026-07-31), load-sensitive (only reproduced after
-  ~74s of prior tests), not caused by this interlude's code — ledgered as a candidate M2 item
-  (`run_oracle`'s restart-then-relogin flow has no tolerance for the gate's async resolution
-  window) rather than fixed here, since Task 4 is docs-and-evidence, not product code.
+  measured blast radius, reported here honestly rather than as only its clean attempt.
+  **Run 1: two transient failures** (`failover_wire_oracle`,
+  `failover_non_converged_tail_is_exercised_and_bounded`) — a `login()` POST fired within
+  ~3ms of a mid-run primary restart raced sub-project 0b's witness-gate resolution (the HTTP
+  port binds before the kernel thread finishes `Repl::open`, by design) and lost. **Run 2 at
+  the same commit: 31/31 green.** Isolated re-runs of the two failing tests alone were 5/5
+  green both at this interlude's base commit (`66cddde`) and at its tip — but isolation
+  cannot discriminate a load-sensitive race, since neither run carries the full suite's ~74s
+  of prior CPU load. **The discriminating experiment: the full suite, 3 times, at the base
+  commit** (`66cddde`, worktree-isolated) — **31/31 green all three times, 93/93 aggregate,
+  zero failures.** Against HEAD's 1-failure-in-2-attempts, this is *weak* evidence the
+  interlude widened an already-present race window rather than the race being independent of
+  it — not proof, given 3 vs. 2 samples of an inherently timing-sensitive failure, but not
+  nothing either. A concrete mechanism exists for a real perturbation: Task 1's `pin_floor`
+  fix makes checkpoint GC proceed where it previously stalled behind a dead session's pin,
+  which shifts work and scheduling — the same shape as M1 sub-project 4's T6 platform cron
+  "shifting the fault stream" and exposing a latent bug elsewhere. Ledgered as a candidate M2
+  item either way (`run_oracle`'s restart-then-relogin flow has no tolerance for the witness
+  gate's async resolution window, whichever commit widened it), not fixed here — Task 4 is
+  docs-and-evidence, not product or test code.
 - Next: **M2 per PLAN.** The backlog below holds **no open ruled follow-ups** — both entries
   in it are record. Still-open work, none of it ruled or blocking: `TcpProxy::stop`'s
   registration window ("fix in M2"); the follower-decode asymmetry above; the edge-harness
-  restart-then-relogin race noted in the verifying-peer-policy entry just above (pre-existing
-  since sub-project 0b, load-sensitive, observed once); and 0b's remaining accepted minors
+  restart-then-relogin race noted in the verifying-peer-policy entry just above (load-sensitive,
+  present since sub-project 0b at the latest — weak evidence, not yet confirmed, that this
+  interlude widened it via the GC-pin fix's timing shift); and 0b's remaining accepted minors
   (the `eprintln!` inside the `repl` boundary with `take_witness_notice()` having no
   production caller, self-witnessing unguarded, the two gated-503 test sites with no cover
   key, `tx_err_to_io`'s unbounded `{unreached:?}`, the 17 MiB recv buffer per connected probe,
