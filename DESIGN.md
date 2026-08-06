@@ -702,35 +702,40 @@ it owns is acting as the primary in the most consequential way short of acking a
 unlike a write that replica **outlives this node's own fail-stop** once a witness finally
 answers "primary". The policy: a `Verifying` node may not render a seed to a peer that holds
 nothing and is not one of its recorded witnesses; everything else it does as a peer — serving
-reads, refusing writes, accepting Hellos, shipping catch-up, answering control verbs — is
-unchanged. The line drawn: *catch-up ships a timeline the peer already holds a prefix of; a
-seed creates a fresh copy of an unverified one.*
+reads, refusing writes, accepting Hellos, shipping catch-up — is unchanged, with one named
+carve-out already in force before this interlude: `switchover` is refused while verifying
+(`mod.rs:966-987`), since `abort_switchover`'s `allow_writes` would open the gate by a path
+`resolve_witness_gate` never sanctioned. The line drawn: *catch-up ships a timeline the peer
+already holds a prefix of; a seed creates a fresh copy of an unverified one.*
 The keying is `db.verifying() && position.is_none() && !witnesses.contains(listen)`, with an
 absent `listen` counting as not a witness (conservative — an unidentifiable peer is treated
 as a newcomer), checked inside `decide_hello`'s shared `None`-position arm rather than on the
 `Decision::Snapshot` variant. Both conjuncts are load-bearing and neither alone is correct:
 `position.is_none()` does not mean "brand-new peer" — `hello_position` returns `None` for any
-node with `last_applied() == None`, including a **recorded witness** returning with a rebuilt
-store (GUIDE §10's own re-seed remedy, and precisely what resolves this node's gate), so that
-peer must still be seeded; and membership alone is not enough either, since a positioned peer
-absent from the set is a genuine follower on this timeline and must still catch up. Keying on
-the `Decision::Snapshot` variant instead would be silently inert on exactly a young primary
-that has not GC'd anything yet — its `None`-position arm answers `Frames { from: 0 }` (a full
-replay that is functionally a seed) rather than `Decision::Snapshot`.
+node with `last_applied() == None`, including a **recorded witness** returning with an empty
+data dir (a fresh-data-dir re-seed, not a discard-and-rebuild — that replays the WAL and
+leaves `last_applied` intact, so it Hellos positioned instead; GUIDE §10's own re-seed remedy,
+and precisely what resolves this node's gate), so that peer must still be seeded; and
+membership alone is not enough either, since a positioned peer absent from the set is a
+genuine follower on this timeline and must still catch up. Keying on the `Decision::Snapshot`
+variant instead would be silently inert on exactly a young primary that has not GC'd anything
+yet — its `None`-position arm answers `Frames { from: 0 }` (a full replay that is
+functionally a seed) rather than `Decision::Snapshot`.
 The refusal is retryable, not node-fatal, at both places it can land. A newcomer's own
 `follower.rs` client recognizes the marker at both its refuse-handling sites (the resolving
 arm and the ordinary ship arm, separately fatal before this) and backs off to retry rather
-than treating it as fatal. Separately, the witness probe's `classify` — which never actually
-sends this refusal to itself, since a probe always Hellos with its own real position, never
-`None` — still must resolve it correctly should it ever land there: it carries neither
-`NOT_A_PRIMARY_MARKER` nor `DIVERGED_LABEL`, so `classify`'s existing default arm files it
-`Inconclusive` for free. Either misclassification would be wrong: reading it as `NotPrimary`
-would let a probing peer open its own gate on no evidence, and as `IsPrimary` would refuse a
-healthy node over a phantom split-brain. Per Noah's ruling (2026-08-06), the refusal **never
-lapses** while the gate is shut — admitting a newcomer on a timer would make the guarantee
-time-dependent instead of evidence-dependent, and the availability cost is near-zero
-regardless: a gated node already refuses writes, so the only use for a newly-seeded follower
-would be promotion, which is exactly the harm the gate exists to prevent.
+than treating it as fatal. Separately, the witness probe's `classify` must resolve the
+refusal correctly should it ever land there — it carries neither `NOT_A_PRIMARY_MARKER` nor
+`DIVERGED_LABEL`, so `classify`'s existing default arm files it `Inconclusive` for free, with
+either misclassification wrong: `NotPrimary` would let a probing peer open its own gate on no
+evidence, and `IsPrimary` would refuse a healthy node over a phantom split-brain. In practice
+a probe rarely reaches this: it Hellos with its own real position rather than a synthetic
+`None`, so on any node that has ever applied a record it lands in the positioned ladder
+instead, never this arm. Per Noah's ruling (2026-08-06), the refusal **never lapses** while
+the gate is shut — admitting a newcomer on a timer would make the guarantee time-dependent
+instead of evidence-dependent, and the availability cost is near-zero regardless: a gated
+node already refuses writes, so the only use for a newly-seeded follower would be promotion,
+which is exactly the harm the gate exists to prevent.
 Recording witnesses while verifying is unchanged and safety-monotone: `probes` is built once
 at `Repl::open` from the witness set on disk at that moment, so a witness recorded mid-
 verification cannot affect the gate currently open — it can only make the *next* boot's gate

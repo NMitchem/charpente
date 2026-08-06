@@ -949,19 +949,25 @@ do not reorder a milestone's dependency sequence.
   being promoted away from." GUIDE §10 now says so explicitly, up front, so an operator whose
   deploy writes immediately after a restart recognizes the 503 rather than filing it as a
   bug.
-  **Tests** (seeds `0x2EB1_011B`..`0x2EB1_0121` in `crates/charpente/tests/replication.rs`,
-  RED-first per hard rule 3): the GC pin (`a_refused_session_does_not_pin_gc`, `0x2EB1_011B`);
-  three `follower.rs` retry tests at `0x2EB1_011C` (both refuse sites, plus the negative
-  control that an unmarked refusal stays fatal); the headline
+  **Tests** (RED-first per hard rule 3): the GC pin
+  (`a_refused_session_does_not_pin_gc`, `0x2EB1_011B`, `replication.rs`); five `follower.rs`
+  tests seeded `0x2EB1_011C` (two marker-content assertions with no sim,
+  `the_refusal_carries_its_marker` and `the_refusal_carries_neither_other_marker`, plus three
+  seeded retry tests — both refuse sites backing off, and the negative control that an
+  unmarked refusal stays fatal); in `replication.rs`, the headline
   `a_verifying_node_refuses_to_seed_a_brand_new_follower` (`0x2EB1_011D`, rigged so
-  `log_base() == 0` to land on the arm a variant-keyed refusal would miss), the two
-  keying-correctness tests above (`0x2EB1_011E`/`0x2EB1_011F`), the negative-space
+  `log_base() == 0` to land on the arm a variant-keyed refusal would miss), the keying
+  positive case `a_verifying_node_still_seeds_a_recorded_witness` (`0x2EB1_011E`), the
+  retryability test `a_refused_newcomer_retries_and_converges_once_the_gate_opens`
+  (`0x2EB1_011F`), the negative-space
   `a_verifying_node_still_ships_catch_up_to_a_positioned_peer` (`0x2EB1_0120`), and the
-  byte-exact pin (`0x2EB1_0121`). Plus `probe.rs`'s classifier case, now routed through a real
+  byte-exact pin `the_seed_while_verifying_refusal_is_pinned` (`0x2EB1_0121`). Plus
+  `probe.rs`'s classifier case (`fresh_db(0x0DEB_040C)`), now routed through a real
   `decide_hello` emission (`real_reply`) like its siblings rather than hand-constructed, per
   Task 2's review M-4.
-  **Evidence** — 11-stage sweep (spec §9), every stage green: `cargo fmt --all --check`
-  clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo build -p
+  **Evidence** — 11-stage sweep (spec §9), 10 of 11 stages green on the first attempt; the
+  edge matrix required a second run (see below) — `cargo fmt --all --check` clean;
+  `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo build -p
   guide-examples` (the GUIDE compile gate) clean; `cargo test --workspace` **twice**,
   identical both times — 49 test binaries, **583 passed / 0 failed / 31 ignored** (the
   572→583 delta against the hard-rule-5 baseline reconciles exactly: Task 1 +1, Task 2 +5,
@@ -980,20 +986,26 @@ do not reorder a milestone's dependency sequence.
   the same commit: 31/31 green.** Isolated re-runs of the two failing tests alone were 5/5
   green both at this interlude's base commit (`66cddde`) and at its tip — but isolation
   cannot discriminate a load-sensitive race, since neither run carries the full suite's ~74s
-  of prior CPU load. **The discriminating experiment: the full suite, 3 times, at the base
-  commit** (`66cddde`, worktree-isolated) — **31/31 green all three times, 93/93 aggregate,
-  zero failures.** Stated as what is actually known, not overclaimed in either direction: the
-  failure was observed once at HEAD and was not reproduced at the base commit across 3 runs.
-  That does not establish this interlude widened the race — 3 green runs at base do not prove
-  the interlude is uninvolved either, given how few samples either side has. The mechanism
-  (sub-project 0b's witness gate racing `ChildNode::restart`'s TCP-only readiness check)
-  predates this interlude, but a timing contribution is not excluded: Task 1's `pin_floor` fix
-  makes checkpoint GC proceed where it previously stalled behind a dead session's pin, which
-  shifts work and scheduling — the same shape as M1 sub-project 4's T6 platform cron "shifting
-  the fault stream" and exposing a latent bug elsewhere. Ledgered as a candidate M2 item either
-  way (`run_oracle`'s restart-then-relogin flow has no tolerance for the witness gate's async
-  resolution window, regardless of which commit widened it, if any), not fixed here — Task 4
-  is docs-and-evidence, not product or test code.
+  of prior CPU load. **The base-commit comparison** (the experiment that could have settled
+  it: the full suite, 3 times, at the base commit `66cddde`, worktree-isolated) —
+  **31/31 green all three times, 93/93 aggregate, zero failures.** Stated as what is actually
+  known, not overclaimed in either direction: the failure was observed once at HEAD and was
+  not reproduced at the base commit across 3 runs. That does not establish this interlude
+  widened the race — 3 green runs at base do not prove the interlude is uninvolved either,
+  given how few samples either side has (1 failure in 2 against 0 in 3 is p ≈ 0.4 by Fisher's
+  exact test — refusing a direction is the statistically correct call here, not excess
+  caution). The mechanism (sub-project 0b's witness gate racing `ChildNode::restart`'s
+  TCP-only readiness check) predates this interlude, but a timing contribution is not
+  excluded: Task 1's `pin_floor` fix makes checkpoint GC proceed where it previously stalled
+  behind a dead session's pin, which shifts work and scheduling — the same shape as M1
+  sub-project 4's T6 platform cron "shifting the fault stream" and exposing a latent bug
+  elsewhere. What would actually settle the causal question, cheaper than the n ≫ 3 runs at
+  both commits the statistical route would need: fix `run_oracle`'s readiness check so it
+  waits on the gate rather than the TCP port, which makes the race moot regardless of cause.
+  Ledgered as a candidate M2 item either way (`run_oracle`'s restart-then-relogin flow has no
+  tolerance for the witness gate's async resolution window, regardless of which commit
+  widened it, if any), not fixed here — Task 4 is docs-and-evidence, not product or test
+  code.
 - Next: **M2 per PLAN.** Ruled 2026-08-06 (premise re-examination at M2 start): the own-LSM
   engine is **deferred behind measurement** — DECISIONS §7's scheduled reopen, re-closed with
   three named build triggers — and the **benchmark harness** (PLAN's unfulfilled "publish
@@ -1061,3 +1073,16 @@ do not reorder a milestone's dependency sequence.
   **is** pinned byte-exact by `require_full_ack_names_a_vacuous_run`
   (`acked_durable.rs:1096`); the waiver covers only reaching it end-to-end at the wire,
   which needs a non-acking build.
+- **The verifying-peer-policy interlude's uncovered `Decision::Snapshot` producer** (found by
+  its final review, I-1): `decide_hello` has a *third* seed-shaped answer besides the two
+  guarded `None`-position arms — `session.rs`'s positioned-peer ladder answers
+  `Decision::Snapshot` when this node cannot read back the peer's frame at `pos_seq`. A
+  verifying node reaching it would render a full snapshot over a peer's *existing* store,
+  worse than the newcomer case. The shipped policy is correctly scoped to "a peer that holds
+  nothing" (spec §1), so this is not a behaviour change, and the review could not construct a
+  reachable case (it needs a hole in the log below `last_applied`, which recovery's cut, the
+  gaplessness triple-guard, and the `pos_seq < base` → `diverged_behind` arm above jointly
+  exclude) — but it was neither proven unreachable nor recorded anywhere before the review
+  found it. A rationale comment now sits at the site. Extending the verifying guard to cover
+  it (refuse, or assert unreachable) is a policy change outside spec §1's scope — a positioned
+  peer, not a newcomer — and needs a ruling before it is anything but a comment.

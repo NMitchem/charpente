@@ -564,8 +564,8 @@ pub(crate) const VERIFYING_WITNESSES_MARKER: &str = "still verifying its witness
 /// recorded witness; `the_seed_while_verifying_refusal_is_pinned` (seed
 /// `0x2EB1_0121`) pins it from a real refusal.
 /// (`a_verifying_node_refuses_to_seed_a_brand_new_follower` is a different,
-/// gate-outcome property test — it asserts on `total_seeds`/`last_applied`/
-/// `load_witnesses`, deliberately not on this string.)
+/// gate-outcome property test — it asserts on `last_applied`/`load_witnesses`,
+/// deliberately not on this string.)
 ///
 /// Deliberately carries NEITHER `NOT_A_PRIMARY_MARKER` nor `DIVERGED_LABEL`.
 /// A witness probe reading this as `NotPrimary` would treat "I am also
@@ -782,6 +782,21 @@ fn decide_hello(
             Ok(match ours {
                 Some(crc) if crc == pos_crc => Decision::Frames { from: pos_seq + 1 },
                 Some(crc) => Decision::Refuse(diverged_crc(pos_seq, pos_crc, last, crc)),
+                // A THIRD `Decision::Snapshot` producer (final review, M2 interlude,
+                // 2026-08-06 I-1). The verifying guard above covers only the
+                // `None`-position arm's two producers; it deliberately does not extend to
+                // this one, since reaching it requires a POSITIONED peer (`pos_seq >=
+                // base`), which the guard's own reasoning already treats as on this
+                // timeline. Believed unreachable: this arm needs a hole in the
+                // log at `pos_seq` with `base <= pos_seq <= last` — `read_from` (log.rs)
+                // returns empty only via `Frame::CleanEnd` below `from_seq`, and a hole
+                // below `last_applied` is exactly what recovery's cut, the gaplessness
+                // triple-guard (sub-project 1), and the `pos_seq < base` arm above
+                // (`diverged_behind`) jointly exclude. Not proven, only argued — the
+                // review could not construct a reachable case either. Extending the
+                // verifying guard to this arm (refuse, or assert unreachable) is a
+                // policy change outside spec §1's scope (a POSITIONED peer, not a
+                // newcomer) and needs a ruling, not a close-out edit.
                 None => Decision::Snapshot,
             })
         }
