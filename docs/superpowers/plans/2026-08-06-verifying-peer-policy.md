@@ -60,16 +60,21 @@ Add to `crates/charpente/tests/replication.rs`, near `a_silent_await_hello_sessi
 
 ```rust
 /// Regression (0b re-review M-2): `Repl::step` reaps dead sessions at the top
-/// of the step but recomputes the pin right after `service`, so a session
-/// REFUSED during this step is still present with `cursor = 0, acked = None`
-/// and pins GC at 0. Pre-existing on every refusal path; the seed-while-
-/// verifying refusal (task 3) is the first that a peer retries forever,
-/// turning a one-step window into a permanent one.
+/// of the step but recomputes the pin right after `service` (and `pump_io`
+/// recomputes over the dead session too), so a session REFUSED during this
+/// step is still present with `cursor = 0, acked = None` and pins GC at 0
+/// until the next round's reap. Pre-existing on every refusal path; task 3's
+/// seed-while-verifying refusal is the first a peer retries indefinitely.
+///
+/// Bounded, not permanent — the reap ends it, measured `0 -> 0 -> 0 -> MAX`.
+/// Each occurrence costs one checkpoint's GC. Delayed GC, never wrong GC.
 ///
 /// Uses the peer-secret refusal because it needs no new code — the point is
-/// the pin, not which refusal caused it. Deliberately does NOT drive the
-/// scheduler after the refusal: that isolates the single-step window, which
-/// is exactly what a retrying peer re-creates every RECONNECT_NANOS.
+/// the pin, not which refusal caused it. Drives ONE round at a time and stops
+/// the instant the refusal lands, because that is the only moment the window
+/// is observable: any fixed round count either has not refused yet or has
+/// already been reaped. The commit loop then checkpoints WITHOUT stepping the
+/// replicator, so GC runs while the dead session is still holding the pin.
 #[test]
 fn a_refused_session_does_not_pin_gc() {
     let sim = Sim::with_faults(0x2EB1_011B, FaultConfig::none());
