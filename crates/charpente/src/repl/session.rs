@@ -114,15 +114,20 @@ impl Session {
         if self.control {
             return u64::MAX;
         }
-        // Nor does a dead one. `Repl::step` reaps at the top of the step but
-        // calls `recompute_pin` right after `service` (and `pump_io` does its
-        // own), so a session refused during THIS step is still in
-        // `self.sessions` with `cursor = 0, acked = None`. Unguarded that pins
-        // GC at 0 until the next round's reap — costing that window's
-        // checkpoint its GC, once per refusal on every refusal path, and
-        // recurring against a peer that keeps retrying (0b re-review M-2).
-        // Bounded, not permanent: the reap is what ends it, measured
-        // 0 -> 0 -> 0 -> MAX. Delayed GC, never wrong GC.
+        // Nor does a dead one — and `dead` is set at every wire-failure site
+        // too (send/drain error, EOF), not only on refusal, so this guards
+        // ANY dead session, including one mid-shipping with a real
+        // `cursor`/`acked`: it releases that pin here rather than waiting for
+        // the reap to drop the session. `Repl::step` reaps at the top of the
+        // step but calls `recompute_pin` right after `service` (and
+        // `pump_io` does its own), so a session that died THIS step is still
+        // in `self.sessions` when the pin is recomputed — for the refused
+        // case (`cursor = 0, acked = None`) that pins GC at 0 until a step
+        // reaches the reap, costing that window's checkpoint its GC, once
+        // per refusal on every refusal path, and recurring against a peer
+        // that keeps retrying (0b re-review M-2). Bounded, not permanent:
+        // the reap is what ends it, measured 0 -> 0 -> 0 -> MAX. Delayed GC,
+        // never wrong GC.
         if self.dead {
             return u64::MAX;
         }

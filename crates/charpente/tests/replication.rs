@@ -1120,10 +1120,11 @@ fn a_silent_await_hello_session_stops_pinning_gc_after_its_deadline() {
 ///
 /// Uses the peer-secret refusal because it needs no new code — the point is
 /// the pin, not which refusal caused it. Drives ONE round at a time and stops
-/// the instant the refusal lands, because that is the only moment the window
-/// is observable: any fixed round count either has not refused yet or has
-/// already been reaped. The commit loop then checkpoints WITHOUT stepping the
-/// replicator, so GC runs while the dead session is still holding the pin.
+/// the instant the refusal lands, because a *larger* fixed round count has
+/// already been reaped by the time it checks, and a bare count of 1 would
+/// assume the refusal happened rather than prove it. The commit loop then
+/// checkpoints WITHOUT stepping the replicator, so GC runs while the dead
+/// session is still present.
 #[test]
 fn a_refused_session_does_not_pin_gc() {
     let sim = Sim::with_faults(0x2EB1_011B, FaultConfig::none());
@@ -1145,7 +1146,7 @@ fn a_refused_session_does_not_pin_gc() {
     // A peer that presents the wrong secret: refused, session marked dead,
     // still present when this step recomputes the pin. Raw-conn shape copied
     // from `a_long_invalid_listen_address_is_truncated_in_the_refusal`
-    // (replication.rs ~:4990), the file's idiom for driving a Hello by hand.
+    // (replication.rs ~:5076), the file's idiom for driving a Hello by hand.
     let schema_digest = p.db.as_ref().unwrap().schema_digest();
     let conn = sim
         .host("wrong")
@@ -1165,8 +1166,10 @@ fn a_refused_session_does_not_pin_gc() {
     // client. At that moment the session was marked dead inside this step's
     // `service` and `recompute_pin` has just run with it still present — that
     // IS the window. Driving further lets `Repl::step`'s pre-existing
-    // top-of-step `sessions.retain(|s| !s.dead)` reap it and restore the pin,
-    // which is why NO fixed round count can observe this.
+    // top-of-step `sessions.retain(|s| !s.dead)` reap it and restore the pin —
+    // a *larger* fixed round count would already have missed the window, and
+    // a bare count of 1 would assume it landed there rather than prove it
+    // (see the `refused` assert below).
     let mut buf = vec![0u8; MAX_MESSAGE_BYTES];
     let mut refused = false;
     for _ in 0..64 {
@@ -1186,7 +1189,7 @@ fn a_refused_session_does_not_pin_gc() {
     // again. GC is a function of commits-since-checkpoint and `commit_widget`
     // calls `db.transact` directly (replication.rs:515-519) without stepping
     // the scheduler, so this checkpoints while the dead session is still
-    // present and still holding the pin.
+    // present.
     for i in 0..16u64 {
         commit_widget(&sim, &mut p, i).unwrap();
     }
