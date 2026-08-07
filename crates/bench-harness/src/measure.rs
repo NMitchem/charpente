@@ -44,6 +44,22 @@ unsafe extern "C" {
     fn getrusage(who: i32, usage: *mut Rusage) -> i32;
 }
 
+/// Widens `tv_usec` to `i64` for summing. Cfg'd the same way as the
+/// `Timeval` field itself: on macOS this is a genuine widening conversion
+/// (`i32 -> i64`); on non-macOS `tv_usec` is already `i64`, so the function
+/// is the identity — written this way (not a bare `as i64`) because a plain
+/// `as i64` cast is a no-op there and `clippy::unnecessary_cast` denies it
+/// under `-D warnings`, while `i64::from` would trip `clippy::useless_conversion`
+/// on the very same platform.
+#[cfg(target_os = "macos")]
+fn usec_to_i64(u: i32) -> i64 {
+    i64::from(u)
+}
+#[cfg(not(target_os = "macos"))]
+fn usec_to_i64(u: i64) -> i64 {
+    u
+}
+
 /// User + system CPU time consumed by this process so far.
 pub fn process_cpu() -> Duration {
     let mut ru = Rusage {
@@ -72,11 +88,7 @@ pub fn process_cpu() -> Duration {
         rc, 0,
         "getrusage(RUSAGE_SELF) cannot fail with valid arguments"
     );
-    // Explicit widening: tv_usec is i32 on macOS, i64 elsewhere (Timeval's
-    // doc comment above states why); `as i64` on each side is a lossless
-    // widen on macOS and a no-op identity cast on Linux, so this line
-    // compiles correctly against either layout.
-    let usec = ru.ru_utime.tv_usec as i64 + ru.ru_stime.tv_usec as i64;
+    let usec = usec_to_i64(ru.ru_utime.tv_usec) + usec_to_i64(ru.ru_stime.tv_usec);
     Duration::from_secs((ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) as u64)
         + Duration::from_micros(usec as u64)
 }
