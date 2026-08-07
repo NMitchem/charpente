@@ -188,7 +188,7 @@ Expected: PASS (1 test).
 
 - [ ] **Step 6: Create the ledger and commit**
 
-Create `.superpowers/sdd/2026-08-06-benchmark-harness/progress.md` with a dated Task 1 entry (crate scaffolded, sim proof green, seed 0xBE9C_0001). Then:
+Create `.superpowers/sdd/2026-08-06-benchmark-harness/progress.md` with a dated Task 1 entry (crate scaffolded, sim proof green, seed 0xBE9C_0001). Then — first run `git diff Cargo.toml` and confirm the diff contains ONLY the one members line; anything else is another session's uncommitted work (this tree is shared — CLAUDE.md workflow): stop and ask, never stage it blindly. Then:
 
 ```bash
 git add Cargo.toml crates/bench-harness
@@ -416,7 +416,9 @@ Add `pub mod measure;` to `lib.rs`.
 Run: `cargo test -p bench-harness measure`
 Expected: PASS (6 tests).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Ledger + commit**
+
+Append the Task 2 entry to the ledger, then:
 
 ```bash
 git add crates/bench-harness
@@ -439,6 +441,7 @@ git commit -m "bench: measurement discipline — cpu time, heartbeat sleep-guard
 pub struct Report {
     pub hardware: String,
     pub os: String,
+    pub filesystem: String,
     pub cores: usize,
     pub sync_semantics: &'static str,
     pub warmup_secs: f64,
@@ -466,6 +469,7 @@ pub struct WireReport { pub target: String, pub points: Vec<SweepPoint> }
 pub struct SweepPoint {
     pub connections: usize,
     pub throughput_per_sec: f64,
+    pub log_records_per_sec: f64,
     pub p50_us: u64,
     pub p99_us: u64,
     pub p999_us: u64,
@@ -488,6 +492,7 @@ mod tests {
         Report {
             hardware: "Test \"Box\" 1".to_string(),
             os: "TestOS 1.0 arm64".to_string(),
+            filesystem: "TestFS".to_string(),
             cores: 8,
             sync_semantics: "F_FULLFSYNC via sync_all",
             warmup_secs: 5.0,
@@ -510,6 +515,7 @@ mod tests {
                 points: vec![SweepPoint {
                     connections: 4,
                     throughput_per_sec: 1200.0,
+                    log_records_per_sec: 2400.0,
                     p50_us: 800,
                     p99_us: 2100,
                     p999_us: 5000,
@@ -527,14 +533,16 @@ mod tests {
         assert_eq!(
             json,
             "{\"bench\":{\"hardware\":\"Test \\\"Box\\\" 1\",\"os\":\"TestOS 1.0 arm64\",\
-             \"cores\":8,\"sync_semantics\":\"F_FULLFSYNC via sync_all\",\"warmup_secs\":5.00,\
+             \"filesystem\":\"TestFS\",\"cores\":8,\
+             \"sync_semantics\":\"F_FULLFSYNC via sync_all\",\"warmup_secs\":5.00,\
              \"duration_secs\":30.00,\"device\":{\"syncs_per_sec\":1500.25,\
              \"appends_per_sec\":1400.50},\"core\":{\"acked_writes_per_sec\":1450.00,\
              \"log_records_per_sec\":1450.00,\"reads_per_sec\":800000.00,\
              \"device_ratio\":0.970},\"kernel\":{\"acked_writes_per_sec\":1300.00,\
              \"log_records_per_sec\":2600.00,\"requests_total\":50000,\"jobs_done\":50000},\
              \"wire\":[{\"target\":\"bench-app\",\"points\":[{\"connections\":4,\
-             \"throughput_per_sec\":1200.00,\"p50_us\":800,\"p99_us\":2100,\"p999_us\":5000,\
+             \"throughput_per_sec\":1200.00,\"log_records_per_sec\":2400.00,\
+             \"p50_us\":800,\"p99_us\":2100,\"p999_us\":5000,\
              \"client_busy_fraction\":0.120,\"saturated\":false}]}],\"invalid\":[]}}"
         );
     }
@@ -602,9 +610,9 @@ pub fn render_json(r: &Report) -> Result<String, String> {
     }
     let mut s = String::new();
     s.push_str(&format!(
-        "{{\"bench\":{{\"hardware\":\"{}\",\"os\":\"{}\",\"cores\":{},\
+        "{{\"bench\":{{\"hardware\":\"{}\",\"os\":\"{}\",\"filesystem\":\"{}\",\"cores\":{},\
          \"sync_semantics\":\"{}\",\"warmup_secs\":{:.2},\"duration_secs\":{:.2}",
-        esc(&r.hardware), esc(&r.os), r.cores, esc(r.sync_semantics),
+        esc(&r.hardware), esc(&r.os), esc(&r.filesystem), r.cores, esc(r.sync_semantics),
         r.warmup_secs, r.duration_secs
     ));
     if let Some(d) = &r.device {
@@ -635,10 +643,12 @@ pub fn render_json(r: &Report) -> Result<String, String> {
             for (pi, p) in w.points.iter().enumerate() {
                 if pi > 0 { s.push(','); }
                 s.push_str(&format!(
-                    "{{\"connections\":{},\"throughput_per_sec\":{:.2},\"p50_us\":{},\
+                    "{{\"connections\":{},\"throughput_per_sec\":{:.2},\
+                     \"log_records_per_sec\":{:.2},\"p50_us\":{},\
                      \"p99_us\":{},\"p999_us\":{},\"client_busy_fraction\":{:.3},\
                      \"saturated\":{}}}",
-                    p.connections, p.throughput_per_sec, p.p50_us, p.p99_us, p.p999_us,
+                    p.connections, p.throughput_per_sec, p.log_records_per_sec,
+                    p.p50_us, p.p99_us, p.p999_us,
                     p.client_busy_fraction, p.saturated
                 ));
             }
@@ -658,8 +668,9 @@ pub fn render_json(r: &Report) -> Result<String, String> {
 pub fn render_human(r: &Report) -> String {
     let mut s = String::new();
     s.push_str(&format!(
-        "bench: {} | {} | {} cores | sync: {} | warmup {:.0}s, measure {:.0}s\n",
-        r.hardware, r.os, r.cores, r.sync_semantics, r.warmup_secs, r.duration_secs
+        "bench: {} | {} | {} | {} cores | sync: {} | warmup {:.0}s, measure {:.0}s\n",
+        r.hardware, r.os, r.filesystem, r.cores, r.sync_semantics, r.warmup_secs,
+        r.duration_secs
     ));
     if let Some(d) = &r.device {
         s.push_str(&format!(
@@ -683,9 +694,10 @@ pub fn render_human(r: &Report) -> String {
         s.push_str(&format!("  wire [{}]:\n", w.target));
         for p in &w.points {
             s.push_str(&format!(
-                "    {:>4} conns: {:>8.0} req/s  p50 {:>6}us  p99 {:>6}us  p99.9 {:>6}us  \
-                 client busy {:.0}%{}\n",
-                p.connections, p.throughput_per_sec, p.p50_us, p.p99_us, p.p999_us,
+                "    {:>4} conns: {:>8.0} req/s  {:>8.0} rec/s  p50 {:>6}us  p99 {:>6}us  \
+                 p99.9 {:>6}us  client busy {:.0}%{}\n",
+                p.connections, p.throughput_per_sec, p.log_records_per_sec, p.p50_us,
+                p.p99_us, p.p999_us,
                 p.client_busy_fraction * 100.0,
                 if p.saturated { "  CLIENT-SATURATED (point invalid)" } else { "" }
             ));
@@ -705,7 +717,9 @@ Add `pub mod report;` to `lib.rs`.
 Run: `cargo test -p bench-harness report`
 Expected: PASS (3 tests). If the shape-pin string disagrees on float formatting, fix the *implementation* to match the pin (the pin is the spec's shape), never loosen the pin to `contains`.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Ledger + commit**
+
+Append the Task 3 entry to the ledger, then:
 
 ```bash
 git add crates/bench-harness
@@ -724,7 +738,7 @@ git commit -m "bench: report model, pinned JSON shape, the ceiling refusal (T3)"
 
 **Interfaces:**
 - Consumes: `charpente::prod::ProdDisk`; `measure::Heartbeat`; `report::*`.
-- Produces: `device::run(dir: &str, warmup: Duration, duration: Duration) -> io::Result<DeviceReport>`; the `bench` binary with `device` subcommand, `--json`, `--duration S`, `--warmup S` flags; `bin/bench.rs` helper fns later subcommands extend: `fn temp_dir(tag: &str) -> String`, `fn hardware() -> String`, `fn os() -> String`, `fn sync_semantics() -> &'static str`, `fn base_report(warmup: f64, duration: f64) -> Report`.
+- Produces: `device::run(dir: &str, warmup: Duration, duration: Duration) -> io::Result<DeviceReport>`; the `bench` binary with `device` subcommand, `--json`, `--duration S`, `--warmup S` flags; `bin/bench.rs` helper fns later subcommands extend: `fn temp_dir(tag: &str) -> String`, `fn hardware() -> String`, `fn os() -> String`, `fn filesystem() -> String`, `fn sync_semantics() -> &'static str`, `fn base_report(warmup: f64, duration: f64) -> Report`.
 
 - [ ] **Step 1: Implement `device.rs`**
 
@@ -781,6 +795,8 @@ pub fn run(dir: &str, warmup: Duration, duration: Duration) -> io::Result<Device
     Ok(DeviceReport { syncs_per_sec, appends_per_sec })
 }
 ```
+
+Add `pub mod device;` to `lib.rs`.
 
 - [ ] **Step 2: Implement the binary skeleton**
 
@@ -892,6 +908,33 @@ fn os() -> String {
     sh("uname", &["-srm"]).unwrap_or_else(|| std::env::consts::OS.to_string())
 }
 
+/// The filesystem under the bench scratch dirs (spec §5 names it: sync
+/// semantics are an OS/filesystem pair — F_FULLFSYNC's cost is APFS-on-macOS
+/// truth, not a portable constant). Both bench dirs live under temp_dir(),
+/// which sits on the root volume group on macOS.
+fn filesystem() -> String {
+    if cfg!(target_os = "macos") {
+        // `mount` line for /: "/dev/disk3s1s1 on / (apfs, sealed, ...)".
+        sh("mount", &[]).and_then(|out| {
+            out.lines()
+                .find(|l| l.contains(" on / ("))
+                .and_then(|l| l.split('(').nth(1))
+                .and_then(|rest| rest.split([',', ')']).next())
+                .map(|t| t.trim().to_string())
+        })
+    } else {
+        // POSIX df has no -T on macOS (there it filters by type); on Linux
+        // `df -PT` prints "Filesystem Type ..." with the type in column 2.
+        sh("df", &["-PT", "/tmp"]).and_then(|out| {
+            out.lines()
+                .nth(1)
+                .and_then(|l| l.split_whitespace().nth(1))
+                .map(|s| s.to_string())
+        })
+    }
+    .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn sync_semantics() -> &'static str {
     if cfg!(target_os = "macos") {
         "F_FULLFSYNC via sync_all"
@@ -904,6 +947,7 @@ fn base_report(warmup: f64, duration: f64) -> Report {
     Report {
         hardware: hardware(),
         os: os(),
+        filesystem: filesystem(),
         cores: std::thread::available_parallelism().map_or(0, |n| n.get()),
         sync_semantics: sync_semantics(),
         warmup_secs: warmup,
@@ -1006,7 +1050,9 @@ Run: `cargo test -p bench-harness --test harness -- --ignored` → PASS (1 test)
 Run: `cargo run -p bench-harness --bin bench -- device --duration 1 --warmup 0.2 --json` → human summary on stderr, one-line JSON on stdout, exit 0.
 Run: `cargo run -p bench-harness --bin bench -- bogus` → usage on stderr, exit 2.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Ledger + commit**
+
+Append the Task 4 entry to the ledger, then:
 
 ```bash
 git add crates/bench-harness
@@ -1092,6 +1138,11 @@ pub fn run(
         invalid.push(reason);
     }
     // Totals two ways (spec §5): the loop counter delta vs the grand counter.
+    // Structurally vacuous today — both increment in the same statement of
+    // the same single-threaded loop — kept so every layer's throughput has a
+    // uniform cross-check shape; it becomes a real check only if this loop
+    // ever gains concurrency (the wire/kernel layers' cross-checks are the
+    // genuinely independent ones).
     match crosscheck(&[i - measured_from], grand) {
         Ok(_) => {}
         Err(reason) => invalid.push(reason),
@@ -1099,16 +1150,19 @@ pub fn run(
     let acked = grand as f64 / elapsed.as_secs_f64();
 
     // Reads: one snapshot, typed gets. No log involvement — this number shows
-    // where the write ceiling does NOT apply (spec §3).
+    // where the write ceiling does NOT apply (spec §3). Measured under the
+    // SAME warmup/duration the caller passed: the Report's warmup_secs/
+    // duration_secs fields are global, and a silently different read window
+    // would belie them (spec §5 — fields, not caveats buried in code).
     let snap = db.snapshot()?;
-    let read_warm_end = Instant::now() + Duration::from_millis(500);
+    let read_warm_end = Instant::now() + warmup;
     let mut r = 0u64;
     while Instant::now() < read_warm_end {
         let _ = snap.get(Id::<Slot>::from_raw(r % SLOTS))?;
         r += 1;
     }
     let read_start = Instant::now();
-    let read_end = read_start + duration.min(Duration::from_secs(5));
+    let read_end = read_start + duration;
     let mut reads = 0u64;
     while Instant::now() < read_end {
         let _ = snap.get(Id::<Slot>::from_raw(reads % SLOTS))?;
@@ -1130,6 +1184,8 @@ pub fn run(
     ))
 }
 ```
+
+Add `pub mod core_bench;` to `lib.rs`.
 
 - [ ] **Step 2: Wire the subcommand arm**
 
@@ -1173,7 +1229,9 @@ fn core_layer_commits_and_reports_a_ratio() {
 Run: `cargo test -p bench-harness --test harness -- --ignored` → PASS (2 tests).
 Run: `cargo run -p bench-harness --bin bench -- core --duration 2 --warmup 0.5 --json` → JSON contains `"core":{...,"device_ratio":...}`, exit 0.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Ledger + commit**
+
+Append the Task 5 entry to the ledger, then:
 
 ```bash
 git add crates/bench-harness
@@ -1212,7 +1270,9 @@ use charpente::http::{Method, Request};
 use charpente::kernel::{Kernel, SimSource};
 use charpente::prod::{ProdClock, ProdDisk, ProdEntropy};
 use std::io;
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> {
     let app = build(Box::new(ProdDisk::new(dir)?), Box::new(ProdEntropy::new()?))?;
@@ -1225,9 +1285,40 @@ pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> 
 
     let mut invalid = Vec::new();
     let hb = Heartbeat::start();
+    // Kernel::run is one blocking call over the whole batch — a watcher
+    // thread reports drain progress on stderr so a slow (fsync-bound) run is
+    // distinguishable from a hung one. It reads the shared response vec the
+    // source already exposes: one uncontended lock every 5 s.
+    let stop_progress = Arc::new(AtomicBool::new(false));
+    let progress = {
+        let (responses, stop) = (responses.clone(), stop_progress.clone());
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            // 100 ms stop-poll so the post-run join returns promptly; one
+            // progress line every 50th tick (~5 s).
+            let mut ticks = 0u32;
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                ticks += 1;
+                if ticks % 50 == 0 {
+                    let done = responses.lock().expect("responses lock").len();
+                    eprintln!(
+                        "bench: kernel {done}/{requests} requests ({:.0}/s so far)",
+                        done as f64 / started.elapsed().as_secs_f64()
+                    );
+                }
+            }
+        })
+    };
     let start = Instant::now();
-    kernel.run(&mut source)?;
+    let run_outcome = kernel.run(&mut source);
     let elapsed = start.elapsed();
+    stop_progress.store(true, Ordering::Relaxed);
+    run_outcome?;
+    let _ = progress.join();
     if let Some(reason) = hb.finish() {
         invalid.push(reason);
     }
@@ -1265,6 +1356,8 @@ pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> 
 }
 ```
 
+Add `pub mod kernel_bench;` to `lib.rs`.
+
 - [ ] **Step 2: Wire the subcommand arm** (in `run_layers`)
 
 ```rust
@@ -1298,7 +1391,9 @@ fn kernel_layer_drains_the_batch_with_every_job_done() {
 Run: `cargo test -p bench-harness --test harness -- --ignored` → PASS (3 tests).
 Run: `cargo run -p bench-harness --bin bench -- kernel --requests 2000 --json` → JSON has `"kernel":{...}`, exit 0. If `Kernel::run` fails to terminate (the `SimSource`+`ProdClock` contingency), STOP AND ASK — do not patch `charpente` (Global Constraints).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Ledger + commit**
+
+Append the Task 6 entry to the ledger, then:
 
 ```bash
 git add crates/bench-harness
@@ -1318,13 +1413,13 @@ git commit -m "bench: kernel layer — batch model through RequestSource (T6)"
 - Modify: `crates/bench-harness/tests/harness.rs` (add smoke)
 
 **Interfaces:**
-- Consumes: `measure::{process_cpu, crosscheck, percentile, Heartbeat}`; `report::{WireReport, SweepPoint}`; `charpente::launch`.
+- Consumes: `measure::{process_cpu, crosscheck, percentile, Heartbeat}`; `report::{WireReport, SweepPoint}`; `charpente::serve::serve` (NOT `charpente::launch` — see Step 5).
 - Produces:
   - `client::Conn` — `connect(addr: &str) -> io::Result<Conn>`, `request(&mut self, method: &str, path: &str, headers: &[(String, String)], body: &[u8]) -> io::Result<(u16, Vec<u8>)>`; `client::read_response(r: &mut impl BufRead) -> io::Result<(u16, Vec<u8>)>` (pure-parsable, unit-tested un-ignored).
-  - `wire::Target` enum (`BenchApp`, `Invoicing`) with `fn request_for(&self, conn: &mut Conn, ids: &AtomicU64) -> io::Result<(u16, Vec<u8>)>` and `fn session_setup(&self, conn: &mut Conn) -> io::Result<Vec<(String, String)>>` (Task 8 fills the `Invoicing` arms; this task ships them as `unreachable!("wired in T8")`).
+  - `wire::Target` enum (`BenchApp`, `Invoicing`) with `fn one_request(&self, conn: &mut Conn, headers: &[(String, String)], ids: &AtomicU64) -> io::Result<(u16, Vec<u8>)>` and `fn session_setup(&self, conn: &mut Conn) -> io::Result<Vec<(String, String)>>` (Task 8 fills the `Invoicing` arms; this task ships them as `unreachable!("wired in T8")`).
   - `wire::build_bin(package: &str, bin: &str) -> io::Result<PathBuf>` (cargo `--message-format=json` string-scan, the `edge-harness/src/child.rs:302-330` shape).
   - `wire::sweep(bin: &Path, target: Target, connections: &[usize], warmup: Duration, duration: Duration) -> io::Result<(WireReport, Vec<String>)>`.
-  - `bench-app` binary: `--addr A --data-dir D` (usage → stderr, exit 2), body = `charpente::launch(&addr, &dir, bench_harness::build)`.
+  - `bench-app` binary: `--addr A --data-dir D` (usage → stderr, exit 2); parses its own flags, builds the app, calls `charpente::serve::serve`, parks. NOT `charpente::launch`: `launch()` re-reads the live process argv (`launch.rs:31`) and serves only on ZERO argv — a child spawned with `--addr`/`--data-dir` would exit 2 as an unknown verb and never bind a port. `examples/invoicing/src/bin/node.rs` is the committed vehicle precedent and its module doc records this exact trap.
 
 - [ ] **Step 1: Write the failing parse test** (in `client.rs`'s `#[cfg(test)] mod tests` — pure, un-ignored)
 
@@ -1451,10 +1546,15 @@ pub fn read_response(r: &mut impl BufRead) -> io::Result<(u16, Vec<u8>)> {
 - [ ] **Step 5: Implement `bin/bench-app.rs`**
 
 ```rust
-//! The wire-layer vehicle (spec §1): the standard charpente app fn main.
+//! The wire-layer vehicle (spec §1, as amended at the plan fix-wave): the
+//! node.rs precedent — parse flags, build, serve::serve, park. Deliberately
+//! NOT `charpente::launch`: launch() re-reads the live process argv
+//! (launch.rs:31) and serves only on ZERO argv, so a child spawned with
+//! `--addr`/`--data-dir` would exit 2 as an unknown verb and never bind.
 //! Edge tooling outside the deterministic core (DESIGN §1).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
+use charpente::prod::{ProdDisk, ProdEntropy};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -1466,16 +1566,30 @@ fn main() -> ExitCode {
         match flag.as_str() {
             "--addr" => addr = it.next().cloned(),
             "--data-dir" => dir = it.next().cloned(),
-            // Unknown flags fall through untouched: launch() argv-dispatches
-            // verbs like `describe` itself.
-            _ => {}
+            other => {
+                eprintln!("bench-app: unknown flag {other:?}");
+                eprintln!("usage: bench-app --addr HOST:PORT --data-dir DIR");
+                return ExitCode::from(2);
+            }
         }
     }
     let (Some(addr), Some(dir)) = (addr, dir) else {
         eprintln!("usage: bench-app --addr HOST:PORT --data-dir DIR");
         return ExitCode::from(2);
     };
-    match charpente::launch(&addr, &dir, |disk, entropy| bench_harness::build(disk, entropy)) {
+    let serve = || -> std::io::Result<()> {
+        let disk = ProdDisk::new(&dir)?;
+        let entropy = ProdEntropy::new()?;
+        let app = bench_harness::build(Box::new(disk), Box::new(entropy))?;
+        // serve returns a handle; dropping it does not stop serving (launch's
+        // own serve arm drops it the same way) — the park loop keeps the
+        // process alive until the harness kills it.
+        charpente::serve::serve(&addr, app)?;
+        loop {
+            std::thread::park();
+        }
+    };
+    match serve() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("bench-app: {e}");
@@ -1519,6 +1633,21 @@ impl Target {
         match self {
             Target::BenchApp => "bench-app",
             Target::Invoicing => "invoicing",
+        }
+    }
+
+    /// Log records committed per acked request, by construction — the wire
+    /// layer's records/sec is DERIVED from this, not separately counted (the
+    /// client cannot see the server's log from outside the process; BENCH.md
+    /// states the derivation). bench-app's canonical txn commits one effects
+    /// record and its Bump's Done-mark commits another (jobs ≡ acked
+    /// requests is the platform's property-tested dual-write invariant), so
+    /// 2.0 at steady state; invoicing's create_customer is get + put only —
+    /// one effects record, no job (routes.rs:53-71, verified).
+    fn records_per_request(&self) -> f64 {
+        match self {
+            Target::BenchApp => 2.0,
+            Target::Invoicing => 1.0,
         }
     }
 
@@ -1608,10 +1737,19 @@ impl Drop for BenchChild {
 }
 
 fn spawn_target(bin: &Path, addr: &str, dir: &str) -> io::Result<BenchChild> {
+    // Child stdio tees to sibling files of the data dir (never inside it —
+    // the data dir is charpente's), the edge-harness ChildNode::spawn
+    // discipline: a spawn failure must be self-diagnosing. Stdio::null()
+    // here once hid an argv-contract exit 2 behind an opaque "exited during
+    // spawn" (plan-review C-1). Siblings are cleaned on point success and
+    // deliberately left behind on failure.
+    let out = std::fs::File::create(format!("{dir}.child.out"))?;
+    let err_path = format!("{dir}.child.err");
+    let err = std::fs::File::create(&err_path)?;
     let child = Command::new(bin)
         .args(["--addr", addr, "--data-dir", dir])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err))
         .spawn()?;
     let mut node = BenchChild { child };
     let deadline = Instant::now() + SPAWN_TIMEOUT;
@@ -1620,7 +1758,10 @@ fn spawn_target(bin: &Path, addr: &str, dir: &str) -> io::Result<BenchChild> {
             return Ok(node);
         }
         if let Some(status) = node.child.try_wait()? {
-            return Err(io::Error::other(format!("target exited during spawn: {status}")));
+            let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+            return Err(io::Error::other(format!(
+                "target exited during spawn: {status}\nchild stderr ({err_path}):\n{stderr}"
+            )));
         }
         if Instant::now() > deadline {
             return Err(io::Error::other(format!("target never answered on {addr}")));
@@ -1640,91 +1781,129 @@ pub fn sweep(
     let mut points = Vec::new();
     let mut invalid = Vec::new();
     for &n in connections {
-        // A fresh child + data dir per point: store growth from one point
-        // must not confound the next.
-        let dir = crate::wire::point_dir(target.name(), n);
-        let addr = free_addr();
-        let node = spawn_target(bin, &addr, &dir)?;
-
-        let measuring = Arc::new(AtomicBool::new(false));
-        let stop = Arc::new(AtomicBool::new(false));
-        let grand = Arc::new(AtomicU64::new(0));
-        let ids = Arc::new(AtomicU64::new(0));
-        let mut workers = Vec::new();
-        for _ in 0..n {
-            let (addr, target) = (addr.clone(), target.clone());
-            let (measuring, stop, grand, ids) =
-                (measuring.clone(), stop.clone(), grand.clone(), ids.clone());
-            workers.push(std::thread::spawn(move || -> io::Result<(u64, Vec<u64>)> {
-                let mut conn = Conn::connect(&addr)?;
-                let headers = target.session_setup(&mut conn)?;
-                let mut count = 0u64;
-                let mut lat = Vec::new();
-                while !stop.load(Ordering::Relaxed) {
-                    let t0 = Instant::now();
-                    let (status, body) = target.one_request(&mut conn, &headers, &ids)?;
-                    if status != 200 {
-                        return Err(io::Error::other(format!(
-                            "request failed with {status}: {}",
-                            String::from_utf8_lossy(&body)
-                        )));
-                    }
-                    if measuring.load(Ordering::Relaxed) {
-                        lat.push(t0.elapsed().as_micros() as u64);
-                        count += 1;
-                        grand.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                Ok((count, lat))
-            }));
-        }
-
-        std::thread::sleep(warmup);
-        let hb = Heartbeat::start();
-        let cpu0 = process_cpu();
-        let start = Instant::now();
-        measuring.store(true, Ordering::Relaxed);
-        std::thread::sleep(duration);
-        measuring.store(false, Ordering::Relaxed);
-        let elapsed = start.elapsed();
-        let cpu = process_cpu() - cpu0;
-        stop.store(true, Ordering::Relaxed);
-        if let Some(reason) = hb.finish() {
-            invalid.push(format!("[{} conns] {reason}", n));
-        }
-
-        let mut per_thread = Vec::new();
-        let mut latencies = Vec::new();
-        for w in workers {
-            let (count, lat) = w
-                .join()
-                .map_err(|_| io::Error::other("a client thread panicked"))??;
-            per_thread.push(count);
-            latencies.extend(lat);
-        }
-        drop(node);
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let total = match crosscheck(&per_thread, grand.load(Ordering::Relaxed)) {
-            Ok(t) => t,
-            Err(reason) => {
-                invalid.push(format!("[{} conns] {reason}", n));
-                grand.load(Ordering::Relaxed)
+        match sweep_point(bin, &target, n, warmup, duration) {
+            Ok((point, mut point_invalid)) => {
+                invalid.append(&mut point_invalid);
+                points.push(point);
             }
-        };
-        latencies.sort_unstable();
-        let client_busy_fraction = cpu.as_secs_f64() / (n as f64 * elapsed.as_secs_f64());
-        points.push(SweepPoint {
+            // Fail-soft (plan-review I-4, the spec §5 posture): one lost
+            // point — a spawn hiccup, a timeout at 256 conns, a non-200 —
+            // must not discard the points already measured. The report keeps
+            // what was measured and names what was lost; a non-empty
+            // `invalid` still exits 1, so a lost point can never pass silently.
+            Err(e) => invalid.push(format!("[{n} conns] point lost: {e}")),
+        }
+    }
+    Ok((WireReport { target: target.name().to_string(), points }, invalid))
+}
+
+fn sweep_point(
+    bin: &Path,
+    target: &Arc<Target>,
+    n: usize,
+    warmup: Duration,
+    duration: Duration,
+) -> io::Result<(SweepPoint, Vec<String>)> {
+    // A fresh child + data dir per point: store growth from one point
+    // must not confound the next.
+    let dir = point_dir(target.name(), n);
+    let addr = free_addr();
+    let node = spawn_target(bin, &addr, &dir)?;
+    let mut invalid = Vec::new();
+
+    let measuring = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let grand = Arc::new(AtomicU64::new(0));
+    let ids = Arc::new(AtomicU64::new(0));
+    let mut workers = Vec::new();
+    for _ in 0..n {
+        let (addr, target) = (addr.clone(), target.clone());
+        let (measuring, stop, grand, ids) =
+            (measuring.clone(), stop.clone(), grand.clone(), ids.clone());
+        workers.push(std::thread::spawn(move || -> io::Result<(u64, Vec<u64>)> {
+            let mut conn = Conn::connect(&addr)?;
+            let headers = target.session_setup(&mut conn)?;
+            let mut count = 0u64;
+            let mut lat = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                let t0 = Instant::now();
+                let (status, body) = target.one_request(&mut conn, &headers, &ids)?;
+                if status != 200 {
+                    return Err(io::Error::other(format!(
+                        "request failed with {status}: {}",
+                        String::from_utf8_lossy(&body)
+                    )));
+                }
+                if measuring.load(Ordering::Relaxed) {
+                    lat.push(t0.elapsed().as_micros() as u64);
+                    count += 1;
+                    grand.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Ok((count, lat))
+        }));
+    }
+
+    std::thread::sleep(warmup);
+    let hb = Heartbeat::start();
+    let cpu0 = process_cpu();
+    let start = Instant::now();
+    measuring.store(true, Ordering::Relaxed);
+    std::thread::sleep(duration);
+    measuring.store(false, Ordering::Relaxed);
+    let elapsed = start.elapsed();
+    let cpu = process_cpu() - cpu0;
+    stop.store(true, Ordering::Relaxed);
+    if let Some(reason) = hb.finish() {
+        invalid.push(format!("[{n} conns] {reason}"));
+    }
+
+    let mut per_thread = Vec::new();
+    let mut latencies = Vec::new();
+    for w in workers {
+        let (count, lat) = w
+            .join()
+            .map_err(|_| io::Error::other("a client thread panicked"))??;
+        per_thread.push(count);
+        latencies.extend(lat);
+    }
+    drop(node);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(format!("{dir}.child.out"));
+    let _ = std::fs::remove_file(format!("{dir}.child.err"));
+
+    // percentile() rightly asserts non-empty; a window in which nothing
+    // completed is a lost point, not a panic of the whole sweep.
+    if latencies.is_empty() {
+        return Err(io::Error::other(
+            "no requests completed inside the measuring window",
+        ));
+    }
+    let total = match crosscheck(&per_thread, grand.load(Ordering::Relaxed)) {
+        Ok(t) => t,
+        Err(reason) => {
+            invalid.push(format!("[{n} conns] {reason}"));
+            grand.load(Ordering::Relaxed)
+        }
+    };
+    latencies.sort_unstable();
+    let throughput = total as f64 / elapsed.as_secs_f64();
+    let client_busy_fraction = cpu.as_secs_f64() / (n as f64 * elapsed.as_secs_f64());
+    Ok((
+        SweepPoint {
             connections: n,
-            throughput_per_sec: total as f64 / elapsed.as_secs_f64(),
+            throughput_per_sec: throughput,
+            // Spec §3's pairing at this layer; see records_per_request's doc
+            // for why this is a per-target derivation, not a count.
+            log_records_per_sec: target.records_per_request() * throughput,
             p50_us: percentile(&latencies, 50.0),
             p99_us: percentile(&latencies, 99.0),
             p999_us: percentile(&latencies, 99.9),
             client_busy_fraction,
             saturated: client_busy_fraction > SATURATION_FRACTION,
-        });
-    }
-    Ok((WireReport { target: target.name().to_string(), points }, invalid))
+        },
+        invalid,
+    ))
 }
 
 pub fn point_dir(target: &str, conns: usize) -> String {
@@ -1740,6 +1919,8 @@ pub fn point_dir(target: &str, conns: usize) -> String {
     dir.to_string_lossy().into_owned()
 }
 ```
+
+Add `pub mod client;` and `pub mod wire;` to `lib.rs`.
 
 - [ ] **Step 7: Wire the subcommand arm** (in `run_layers`)
 
@@ -1793,7 +1974,9 @@ Run: `cargo test -p bench-harness client` → PASS.
 Run: `cargo test -p bench-harness --test harness -- --ignored --test-threads=1` → PASS (4 tests).
 Run: `cargo run -p bench-harness --bin bench -- wire --connections 1,4 --duration 2 --warmup 0.5 --json` → JSON has `"wire":[{"target":"bench-app",...}]`, exit 0.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 10: Ledger + commit**
+
+Append the Task 7 entry to the ledger, then:
 
 ```bash
 git add crates/bench-harness
@@ -1888,7 +2071,9 @@ fn wire_layer_drives_invoicing_through_login() {
 Run: `cargo test -p bench-harness --test harness -- --ignored --test-threads=1` → PASS (5 tests).
 Run: `cargo run -p bench-harness --bin bench -- wire --target invoicing --connections 1,4 --duration 2 --warmup 0.5` → human summary shows `wire [invoicing]`, exit 0.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Ledger + commit**
+
+Append the Task 8 entry to the ledger, then:
 
 ```bash
 git add crates/bench-harness
@@ -1901,12 +2086,17 @@ git commit -m "bench: invoicing wire target — login flow + create_customer loa
 
 **Files:**
 - Modify: `crates/bench-harness/src/bin/bench.rs` (add `all` + `smoke` arms)
-- Modify: `crates/bench-harness/tests/harness.rs` (forced-arm tests)
+- Modify: `crates/bench-harness/src/wire.rs` (make `SATURATION_FRACTION` `pub`)
+- Modify: `crates/bench-harness/tests/harness.rs` (forced-arm tests + binary-driving smokes)
 - Create: `scripts/bench.sh` (mode `+x`)
 
 **Interfaces:**
 - Consumes: everything from T4–T8.
 - Produces: `bench all` (device + core + kernel + wire×2, one assembled report), `bench smoke` (= `all` at 1 s durations, 2000 requests, connections 1,4), `scripts/bench.sh` / `scripts/bench.sh --smoke`.
+
+Note: `all` is a sixth subcommand beyond spec §1's original five, now recorded there by
+amendment — assembly lives in Rust because JSON is hand-rolled in this crate; merging JSON
+fragments in bash without a JSON library would be worse.
 
 - [ ] **Step 1: Add the forced INVALID-arm tests** (spec §7: each arm proven by construction, not luck)
 
@@ -1934,6 +2124,7 @@ fn a_saturated_client_is_flagged_on_the_point() {
     let p = bench_harness::report::SweepPoint {
         connections: 1,
         throughput_per_sec: 1.0,
+        log_records_per_sec: 2.0,
         p50_us: 1,
         p99_us: 1,
         p999_us: 1,
@@ -1955,12 +2146,129 @@ fn a_saturated_client_is_flagged_on_the_point() {
 
 Make `SATURATION_FRACTION` `pub` in `wire.rs` (it is consumed here and documented in BENCH.md).
 
-- [ ] **Step 2: Run them** — `cargo test -p bench-harness --test harness` → the two new tests PASS un-ignored (the rest stay ignored).
-
-- [ ] **Step 3: Add the `all` and `smoke` arms** (in `run_layers`, replacing the per-arm dispatch with a shared list)
+Also add three `#[ignore]`d tests to `tests/harness.rs` (they spawn processes, so they run
+only via `scripts/bench.sh --smoke`). The first two close spec §7 bullet 1's real gap: every
+other smoke calls library fns — nothing else drives the `bench` binary's parse/dispatch/
+exit-code contract, so a regression there would otherwise be invisible (plan-review C-2).
+The third forces the saturation INVALID arm through `wire::sweep`'s REAL CPU arithmetic, not
+a hand-built literal (plan-review I-4) — the unit test above proves rendering; this one
+proves the classification:
 
 ```rust
+#[test]
+#[ignore]
+fn the_bench_binary_smokes_end_to_end() {
+    // Spec §7 bullet 1: drive the real `bench` binary — argv parse, dispatch,
+    // exit-code contract, JSON emission. build_bin builds all of the
+    // package's bins, `bench` included.
+    let bin = bench_harness::wire::build_bin("bench-harness", "bench").expect("bench builds");
+    let out = std::process::Command::new(&bin)
+        .args(["smoke", "--json"])
+        .output()
+        .expect("bench smoke runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "bench smoke must exit 0 on a healthy box\nstderr:\n{stderr}\nstdout:\n{stdout}"
+    );
+    for key in ["\"bench\":{", "\"device\":{", "\"core\":{", "\"kernel\":{", "\"wire\":["] {
+        assert!(stdout.contains(key), "smoke JSON missing {key}: {stdout}");
+    }
+    assert!(
+        stdout.contains("\"duration_secs\":1.00"),
+        "smoke's forced 1 s duration must reach the report: {stdout}"
+    );
+}
+
+#[test]
+#[ignore]
+fn a_bogus_subcommand_is_a_usage_error() {
+    let bin = bench_harness::wire::build_bin("bench-harness", "bench").expect("bench builds");
+    let out = std::process::Command::new(&bin)
+        .arg("bogus")
+        .output()
+        .expect("bench bogus runs");
+    assert_eq!(out.status.code(), Some(2), "usage errors exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("usage: bench"), "got: {stderr}");
+}
+
+#[test]
+#[ignore]
+fn a_saturated_client_is_flagged_through_the_real_sweep() {
+    // Force client_busy_fraction through wire::sweep's real formula
+    // (cpu / (n * elapsed)): two spinner threads burn this process's CPU
+    // during a 1-conn sweep, driving the measured fraction to ~2 > 0.9.
+    let bin = bench_harness::wire::build_bin("bench-harness", "bench-app").expect("bin builds");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let spinners: Vec<_> = (0..2)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut x = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                }
+                std::hint::black_box(x);
+            })
+        })
+        .collect();
+    let result = bench_harness::wire::sweep(
+        &bin,
+        bench_harness::wire::Target::BenchApp,
+        &[1],
+        Duration::from_millis(200),
+        Duration::from_secs(1),
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for s in spinners {
+        let _ = s.join();
+    }
+    let (wire, _invalid) = result.expect("sweep runs");
+    assert!(
+        wire.points[0].saturated,
+        "2 spinner threads over a 1-conn sweep must saturate the client: busy fraction {}",
+        wire.points[0].client_busy_fraction
+    );
+}
+```
+
+- [ ] **Step 2: Run them** — `cargo test -p bench-harness --test harness` → the two new forced-arm tests PASS un-ignored (the rest stay ignored; the three new ignored tests run in Step 5's smoke).
+
+- [ ] **Step 3: Add the `all` and `smoke` arms** — replace the ENTIRE existing `run_layers`
+function (the per-arm dispatch T5–T8 accumulated, including its standalone `"wire"` arm —
+delete those arms wholesale, leave no dead code behind) with this literal function. Two
+things are deliberate: the smoke-parameter selection happens BEFORE the device run, so
+`bench smoke`'s ceiling loops are 1 s too (spec §7 says ~1 s durations; selecting after the
+device run would silently leave it at the 5 s + 30 s defaults — over a minute of device
+loops in a "smoke"), and the report's `warmup_secs`/`duration_secs` are overwritten with
+the selected values so the artifact states what actually ran:
+
+```rust
+fn run_layers(args: &Args, report: &mut Report) -> std::io::Result<()> {
+    // smoke = the full matrix at forced-short parameters (spec §7). Selected
+    // BEFORE the device run so the ceiling loops are short too.
+    let (warmup, duration, requests, connections) = if args.cmd == "smoke" {
+        (Duration::from_millis(200), Duration::from_secs(1), 2000, vec![1usize, 4])
+    } else {
+        (args.warmup, args.duration, args.requests, args.connections.clone())
+    };
+    report.warmup_secs = warmup.as_secs_f64();
+    report.duration_secs = duration.as_secs_f64();
+
+    // Every subcommand carries the ceiling (spec §5): device runs first
+    // unconditionally, so no layer can render without it.
+    let hb = Heartbeat::start();
+    let dir = temp_dir("device");
+    report.device = Some(device::run(&dir, warmup, duration)?);
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Some(reason) = hb.finish() {
+        report.invalid.push(reason);
+    }
+
     let cmds: Vec<&str> = match args.cmd.as_str() {
+        "device" => vec![],
         "all" | "smoke" => vec!["core", "kernel", "wire-bench-app", "wire-invoicing"],
         "wire" => vec![match args.target.as_str() {
             "bench-app" => "wire-bench-app",
@@ -1969,24 +2277,42 @@ Make `SATURATION_FRACTION` `pub` in `wire.rs` (it is consumed here and documente
         }],
         single => vec![single],
     };
-    let (warmup, duration, requests, connections) = if args.cmd == "smoke" {
-        (Duration::from_millis(200), Duration::from_secs(1), 2000, vec![1usize, 4])
-    } else {
-        (args.warmup, args.duration, args.requests, args.connections.clone())
-    };
     for cmd in cmds {
         match cmd {
-            "device" => {} // already ran above
-            "core" => { /* the T5 arm, using `warmup`/`duration` */ }
-            "kernel" => { /* the T6 arm, using `requests` */ }
-            "wire-bench-app" => { /* the T7 arm with Target::BenchApp, `connections` */ }
-            "wire-invoicing" => { /* the T8 arm with Target::Invoicing, `connections` */ }
+            "core" => {
+                let dir = temp_dir("core");
+                let ceiling = report.device.as_ref().expect("device ran first").syncs_per_sec;
+                let (core, invalid) =
+                    bench_harness::core_bench::run(&dir, warmup, duration, ceiling)?;
+                let _ = std::fs::remove_dir_all(&dir);
+                report.core = Some(core);
+                report.invalid.extend(invalid);
+            }
+            "kernel" => {
+                let dir = temp_dir("kernel");
+                let (kernel, invalid) = bench_harness::kernel_bench::run(&dir, requests)?;
+                let _ = std::fs::remove_dir_all(&dir);
+                report.kernel = Some(kernel);
+                report.invalid.extend(invalid);
+            }
+            "wire-bench-app" | "wire-invoicing" => {
+                let (package, bin, target) = if cmd == "wire-bench-app" {
+                    ("bench-harness", "bench-app", bench_harness::wire::Target::BenchApp)
+                } else {
+                    ("invoicing", "node", bench_harness::wire::Target::Invoicing)
+                };
+                let bin = bench_harness::wire::build_bin(package, bin)?;
+                let (wire, invalid) =
+                    bench_harness::wire::sweep(&bin, target, &connections, warmup, duration)?;
+                report.wire.push(wire);
+                report.invalid.extend(invalid);
+            }
             other => unreachable!("unmapped subcommand {other}"),
         }
     }
+    Ok(())
+}
 ```
-
-(Restructure the existing arms into this dispatch — same bodies, parameterized by the chosen `warmup`/`duration`/`requests`/`connections`. `device` still runs first unconditionally.)
 
 - [ ] **Step 4: Create `scripts/bench.sh`**
 
@@ -2012,9 +2338,11 @@ echo "JSON report: target/bench/report.json" >&2
 - [ ] **Step 5: Verify**
 
 Run: `scripts/bench.sh --smoke` → all bench-harness tests pass (ignored + un-ignored).
-Run: `cargo run -p bench-harness --bin bench -- smoke --json` → one assembled report with device+core+kernel+both wire targets, exit 0.
+Run: `cargo run -p bench-harness --bin bench -- smoke --json` → one assembled report with device+core+kernel+both wire targets, exit 0, JSON carries `"duration_secs":1.00` (the smoke override reached the report), and the whole run completes in well under 2 minutes wall — if a wire sweep alone takes 30 s+ per point, the shortened smoke parameters did not reach it: that is a bug in the Step 3 restructure, not a slow machine.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Ledger + commit**
+
+Append the Task 9 entry to the ledger, then:
 
 ```bash
 git add crates/bench-harness scripts/bench.sh
@@ -2035,7 +2363,7 @@ git commit -m "bench: all/smoke assembly, forced INVALID arms, scripts/bench.sh 
 
 - [ ] **Step 1: Run the full matrix**
 
-Run: `scripts/bench.sh` (expect ~10 minutes: 2 device loops + core + kernel + 2 wire sweeps × 5 points, each 5 s warmup + 30 s measure). Keep `target/bench/report.json`. If any INVALID appears, fix the environment (not the thresholds) and re-run.
+Run: `scripts/bench.sh` (expect ~10 minutes: 2 device loops + core + kernel + 2 wire sweeps × 5 points, each 5 s warmup + 30 s measure). Keep `target/bench/report.json`. If any INVALID appears — including a `point lost:` entry from the wire layer's fail-soft path (a lost point keeps the other points' data but still invalidates the run) — fix the environment (not the thresholds) and re-run. The kernel layer prints progress every ~5 s; if it goes quiet for ~2 minutes with no progress lines, Ctrl-C and sanity-check with `cargo run --release -p bench-harness --bin bench -- kernel --requests 5000` before committing to the full run.
 
 - [ ] **Step 2: Write `docs/BENCH.md`**
 
@@ -2053,10 +2381,14 @@ disclosure and the client-saturation rule (>90% client busy invalidates a
 point) from spec §4. The run-validity rules (heartbeat sleep-guard,
 totals-two-ways) from spec §5. The canonical transaction defined (README's
 get + put + enqueue + emit shape) and the two write metrics explained —
-acked writes/sec vs log records/sec (≈2x at kernel/wire: the job Done-mark).]
+acked writes/sec vs log records/sec (≈2x at kernel/wire for the canonical
+txn: the job Done-mark). State plainly that the wire layer's records/sec is
+DERIVED per target (2x for bench-app via the dual-write invariant, 1x for
+invoicing's get+put route), not separately counted — the client cannot see
+the server's log.]
 
 ## Numbers of record — dev hardware (NOT the launch claim)
-Hardware: [report.hardware, report.os, report.cores cores]
+Hardware: [report.hardware, report.os, report.filesystem, report.cores cores]
 Sync semantics: [report.sync_semantics] — on macOS every measured write is
 F_FULLFSYNC-durable, which is drastically slower than Linux-server fsync;
 these numbers UNDERSELL a server deliberately rather than oversell it.
@@ -2073,8 +2405,15 @@ layer's own one-command line, e.g.
 at the device ceiling; the gap to MANIFESTO §7's headline number is a
 group-commit question (engine.rs:137-162's follower batch path already
 proves the shape) — record the sized gap as the follow-up's opening
-evidence. If not ≈1x: state what the layers show instead — where the time
-went, per the layer deltas. Either way: DECISIONS §7 trigger (a) reads THIS
+evidence. If not ≈1x: state what the layers show instead — and be explicit
+that this instrument does not isolate redb's own contribution (the core
+layer bundles WAL append + sync + apply + store materialization as one
+number). Attempt a rough attribution from what exists: core's number against
+device's append-shaped loop isolates WAL-shaped device cost from the rest of
+core's bundle. If the attribution stays ambiguous, say plainly that
+DECISIONS §7 trigger (a) remains OPEN pending finer profiling — the refuted
+branch does not close it the way the confirmed branch does, and this section
+must not imply otherwise. Either way: DECISIONS §7 trigger (a) reads THIS
 section.]
 
 ## What these numbers are not
@@ -2086,7 +2425,7 @@ omission, disclosed above).
 
 - [ ] **Step 3: Correct README's platform-surface line**
 
-The audit found README line 8 overclaims ("...auth, and the blob store" — no blob store exists). While touching the docs surface, fix just that clause: change "auth, and the blob store" to "and auth" (the blob store stays in DESIGN §4's future Snapshots-&-reads sketch). One-line diff, named in the commit.
+The audit found README line 8 overclaims ("...auth, and the blob store" — no blob store exists). While touching the docs surface, fix just that clause: change "auth, and the blob store" to "and auth" (the blob store stays in DESIGN §4's future Snapshots-&-reads sketch). One-line diff. This is out of the benchmark spec's scope — a pre-existing docs inaccuracy fixed opportunistically — so the Step 6 commit message must name it as an incidental, spec-unrelated correction.
 
 - [ ] **Step 4: CLAUDE.md close-out entry**
 
@@ -2100,18 +2439,37 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace          # twice; bench-harness adds its un-ignored tests
 cargo build -p guide-examples   # untouched, must stay green
 scripts/bench.sh --smoke
-git diff --name-only $(git merge-base HEAD main)..HEAD -- crates/charpente-core crates/charpente
-# ^ MUST print nothing (spec §9.4). If it prints anything, STOP — the
-#   constraint was violated somewhere; find and revert before closing.
+git log --format='%h %s' --grep='^bench:' -- crates/charpente-core crates/charpente
+# ^ MUST print nothing (spec §9.4): no commit of THIS sub-project (the
+#   `bench:` prefix) touched the deterministic boundary. Filtering by the
+#   prefix, not a ref range, is deliberate: this plan commits directly to
+#   main, so `git merge-base HEAD main` is HEAD itself and a HEAD..HEAD
+#   diff is vacuously empty — it could never fail (plan-review C-1) — while
+#   a start-SHA range would false-positive on another session's interleaved
+#   core commits. If anything prints, STOP — find and revert before closing.
+git log --oneline --grep='^bench:' | head -3
+# ^ positive control: MUST print this sub-project's commits (verified empty
+#   before T1 — no historical commit matches '^bench:'). Proves the prefix
+#   convention held, so the empty pathspec-filtered list above is meaningful
+#   rather than an artifact of no bench: commits existing at all.
 ```
 
-All green + the empty diff is the exit evidence. Record each stage's outcome in the ledger (tee, never tail).
+All green + the empty pathspec-filtered list + the non-empty positive control is the exit evidence. Record each stage's outcome in the ledger (tee, never tail).
 
 - [ ] **Step 6: Commit**
 
+First run `git diff CLAUDE.md README.md` and confirm the diff contains ONLY this task's own
+edits (the Current-state entry, the Next bullet, the one README clause). CLAUDE.md is the
+most contested file in this shared tree — `git add` stages the whole file, so another
+session's half-written uncommitted edit would be silently absorbed into this commit. If
+anything else appears, stop and ask; never stage it blindly. Then:
+
 ```bash
 git add docs/BENCH.md CLAUDE.md README.md
-git commit -m "bench: BENCH.md first numbers of record + prediction verdict; close out M2 sub-project 1"
+git commit -m "bench: BENCH.md first numbers of record + prediction verdict; close out M2 sub-project 1
+
+The README platform-surface line is an incidental docs correction (no blob
+store exists), not benchmark scope."
 ```
 
 ---
@@ -2121,3 +2479,53 @@ git commit -m "bench: BENCH.md first numbers of record + prediction verdict; clo
 - Spec coverage: §1 (T1, T4 binary, T7 vehicle), §2 (T4/T5/T6/T7), §3 (T1 app + T5/T6 metrics + T8 invoicing), §4 (T7 client/sweep), §5 (T2 validity + T3 fields + T4 embedding), §6 (T3 JSON pin + T10 BENCH.md), §7 (T4–T8 smokes + T9 forced arms + T3 shape pin), §8 (nothing in any task implements a non-goal), §9 (T9 bench.sh, T10 exit criteria).
 - The `#[job]`/`#[route]`/`#[event]` visibility (`pub` items) must match what the macros require; if a macro rejects `pub` or requires it, follow the compiler — the sim proof in T1 gates every later task on the app actually working.
 - `SATURATION_FRACTION` is defined in T7, made `pub` in T9, consumed by name in T9's test and BENCH.md's method prose — keep the name.
+
+---
+
+## Plan-review fix wave (2026-08-07)
+
+Two adversarial reviews (`.superpowers/sdd/2026-08-06-benchmark-harness/plan-review-spec-fidelity.md`
+and `plan-review-execution.md`, both APPROVE-WITH-FIXES) were applied to this plan before
+execution. Every Critical/Important finding was source-verified before its fix landed:
+
+- **Execution C-1** (source-verified at `launch.rs:31` + `serve.rs:38`): `bench-app` cannot
+  use `charpente::launch` — it re-reads live process argv and exits 2 on `--addr`. T7
+  rewritten to the `node.rs` precedent (`serve::serve` + park); spec §1 amended with a dated
+  note. `spawn_target` now tees child stdio to sibling files and embeds the child's stderr
+  in the exited-during-spawn error, so this class of failure is self-diagnosing.
+- **Fidelity C-1**: T10's zero-core-diff check was `merge-base HEAD main`..HEAD on main —
+  vacuously empty, could never fail. Replaced with the `^bench:`-prefix pathspec grep plus a
+  positive control (verified: no historical commit matches `^bench:`).
+- **Fidelity C-2**: nothing drove the `bench` binary itself. T9 gains two `#[ignore]`d
+  binary-driving smokes (end-to-end `smoke --json` with exit/shape asserts; `bogus` → exit 2).
+- **Fidelity I-1**: `Report` gains `filesystem` (spec §5 names it); helper, JSON pin, both
+  renderers, and BENCH.md template updated.
+- **Fidelity I-2**: `SweepPoint` gains `log_records_per_sec`, derived per target
+  (`records_per_request`: bench-app 2.0 via the dual-write invariant; invoicing 1.0 —
+  `create_customer` is get+put only, verified at `routes.rs:53-71`). The derivation is
+  disclosed in code and BENCH.md, never presented as a count.
+- **Fidelity I-3**: core's read loop now uses the caller's warmup/duration (the hardcoded
+  500 ms/5 s window silently contradicted the report's own fields).
+- **Fidelity I-4**: T9 gains an `#[ignore]`d test forcing saturation through `wire::sweep`'s
+  REAL CPU arithmetic (spinner threads), complementing the render-only unit test.
+- **Fidelity I-5**: BENCH.md's refuted-prediction branch now explicitly states that this
+  instrument does not isolate redb, instructs the core-vs-device-append attribution attempt,
+  and forbids implying trigger (a) closes in that branch.
+- **Execution I-1**: the explicit `pub mod X;` lib.rs line added to T4/T5/T6/T7 (was present
+  only in T2/T3).
+- **Execution I-2** (+ a defect both reviews missed, found while fixing): T9 Step 3 is now
+  the full literal `run_layers`, not comment placeholders — and the smoke-parameter
+  selection moved BEFORE the device run (as placed, `bench smoke` would have run the device
+  loops at the 5 s + 30 s defaults: a minute-plus "1 s smoke").
+- **Execution I-3**: shared-file staging guards (diff-then-add) added to T1 (Cargo.toml) and
+  T10 (CLAUDE.md/README.md).
+- **Execution I-4**: `wire::sweep` restructured fail-soft — a lost point is reported in
+  `invalid` (still exits 1) instead of discarding the whole sweep; plus an empty-latency
+  guard so `percentile`'s non-empty assert cannot panic the run.
+- **Execution I-5**: kernel layer gains a progress watcher thread (5 s cadence, 100 ms
+  stop-poll) + T10 stall guidance.
+- **Minors**: fidelity M-1 (README fix named incidental in the commit), M-2 (ledger step per
+  task), M-3 (vacuous-crosscheck comment), M-4/exec M-2 (Interfaces `one_request` drift),
+  M-5 (`all` sixth-subcommand deviation recorded in spec §1 + T9); exec M-1 (T9 Files list
+  gains wire.rs). Exec M-3 (CLIENT_TIMEOUT) is de-risked by the I-4 fail-soft change and
+  otherwise accepted as-is.

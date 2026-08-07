@@ -60,10 +60,20 @@ Contents:
 - **lib** — the canonical bench app: minimal `#[table]`/`#[route]`/`#[job]`/
   `#[event]` surface plus its `build()` fn, exported so every bin below shares
   one app definition.
-- **bin `bench`** — subcommands `device`, `core`, `kernel`, `wire`, `smoke`;
-  human and JSON output.
-- **bin `bench-app`** — the wire-layer vehicle: `charpente::launch(addr,
-  data_dir, build)`, exactly the standard app `fn main`.
+- **bin `bench`** — subcommands `device`, `core`, `kernel`, `wire`, `smoke`,
+  plus `all` (*amended at plan fix-wave, 2026-08-07: report assembly lives in
+  Rust as a sixth subcommand because JSON is hand-rolled here — merging JSON
+  fragments in bash without a JSON library would be worse; `scripts/bench.sh`
+  delegates to it*); human and JSON output.
+- **bin `bench-app`** — the wire-layer vehicle. *Amended at plan fix-wave
+  (2026-08-07): originally "`charpente::launch(addr, data_dir, build)`, exactly
+  the standard app `fn main`" — impossible as stated. `launch()` re-reads the
+  live process argv (`launch.rs:31`) and its `dispatch` serves only on ZERO
+  argv (or `describe`); a child spawned with `--addr`/`--data-dir` flags exits
+  2 as an unknown verb and never binds a port. `bench-app` therefore follows
+  the committed vehicle precedent (`examples/invoicing/src/bin/node.rs`, whose
+  module doc records this exact trap): parse its own flags, call
+  `charpente::serve::serve`, park.*
 - **`scripts/bench.sh`** — runs the full matrix and assembles one report.
 
 ## §2 The four measurement points
