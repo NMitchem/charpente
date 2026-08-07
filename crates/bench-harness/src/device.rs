@@ -46,6 +46,13 @@ fn timed_loop(
 /// would make a trivial frame's append cheaper than a real one's. Generated
 /// deterministically (splitmix64, a fixed seed) — reproducible, not
 /// cryptographic, just non-trivial.
+///
+/// High entropy inside one frame defeats zero-elision, but writing the SAME
+/// 256 bytes at every offset would still leave the file one block repeated,
+/// which an LZ-family compressor (ZFS `lz4`, btrfs `zstd`) squeezes nearly as
+/// hard as zeros (T4 re-review, M-F). The caller therefore stamps each frame
+/// with its own offset before writing, exactly as a real WAL frame carries a
+/// distinct header — so no two blocks are identical.
 fn frame_pattern() -> [u8; 256] {
     let mut state: u64 = 0x9E3779B97F4A7C15;
     let mut out = [0u8; 256];
@@ -71,14 +78,16 @@ pub fn run(dir: &str, warmup: Duration, duration: Duration) -> io::Result<Device
         file.sync()
     })?;
     // Append-shaped: write_at the tail + sync, the WAL's op shape. The frame
-    // is a fixed non-compressible pattern (T4 review, M-3), not all-zero: a
-    // zero-eliding or compressing filesystem (ZFS/btrfs) would make an
-    // all-zero payload's append cheaper than a real WAL frame's, silently
-    // no longer measuring what the doc comment claims.
+    // is a high-entropy pattern (T4 review, M-3) stamped with its own offset
+    // (T4 re-review, M-F), not all-zero and not one block repeated: a
+    // zero-eliding or compressing filesystem (ZFS/btrfs) would otherwise make
+    // this payload's append cheaper than a real WAL frame's, silently no
+    // longer measuring what the doc comment claims.
     let file = disk.open("bench-append.dat")?;
     let mut off = 0u64;
-    let frame = frame_pattern();
+    let mut frame = frame_pattern();
     let appends_per_sec = timed_loop("append", warmup, duration, || {
+        frame[..8].copy_from_slice(&off.to_le_bytes());
         file.write_at(off, &frame)?;
         off += frame.len() as u64;
         file.sync()
@@ -104,8 +113,27 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("INVALID"), "got: {msg}");
         assert!(msg.contains("0 ops"), "got: {msg}");
-        assert!(msg.contains("sync"), "must name which loop: {msg}");
+        // T4 re-review, M-C: `contains("sync")` could NOT fail — the message's
+        // own tail carries the literal words "durable sync", so it passed with
+        // `{name}` deleted from the format string entirely (proven by
+        // mutation). Assert the interpolated phrase, and assert the append
+        // loop separately, or neither loop is actually named.
+        assert!(
+            msg.contains("the device sync loop"),
+            "must name which loop: {msg}"
+        );
         assert!(msg.contains("--duration"), "must name the fix: {msg}");
+    }
+
+    #[test]
+    fn a_zero_op_window_names_the_append_loop_too() {
+        let err = timed_loop("append", Duration::ZERO, Duration::ZERO, || Ok(())).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("the device append loop"),
+            "the discriminating case — a message naming only 'sync' would pass \
+             the test above for the wrong reason: {msg}"
+        );
     }
 
     // T4 review, M-3: the frame must not be all-zero or otherwise trivially

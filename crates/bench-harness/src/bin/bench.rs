@@ -1,6 +1,8 @@
 //! The bench binary (spec §1): device/core/kernel/wire/all/smoke subcommands.
 //! Human render → stderr (always); pinned JSON → stdout (with --json).
-//! Exit 0 = valid run; 1 = INVALID (or a layer error); 2 = usage.
+//! Exit 0 = valid run; 1 = INVALID (or a layer error); 2 = usage, which also
+//! covers a subcommand that is not implemented yet (T4 review, M-7) and a
+//! `--dir` that does not exist (T4 re-review, M-A/M-I).
 //! Edge tooling outside the deterministic core (DESIGN §1).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
@@ -90,23 +92,44 @@ fn parse(argv: &[String]) -> Result<Args, String> {
 }
 
 /// `base` overrides `std::env::temp_dir()` (T4 review, I-1: `--dir` points
-/// the ceiling at the server's real data volume). Interface note for T5-T9:
-/// this is a signature change from the brief's documented
-/// `fn temp_dir(tag: &str) -> String` — pass `None` for the prior behavior.
-fn temp_dir(tag: &str, base: Option<&str>) -> String {
+/// the ceiling at the server's real data volume).
+///
+/// Returns `Err` instead of panicking (T4 re-review, M-A): the path is
+/// operator input, and this file's contract routes bad operator input to
+/// exit 2, not to a 101 abort — the same defect class M-9 just fixed for
+/// `--duration`. An explicit `base` must ALREADY exist (T4 re-review, M-I):
+/// creating it turns a typo into a healthy-looking run against a brand-new
+/// empty tree, potentially on a different filesystem than the one intended.
+/// The `None` fallback is deliberately exempt — there is no operator input
+/// to mistype, and the system temp dir is expected to exist.
+///
+/// Interface note for T5-T9: two changes from the brief's documented
+/// `fn temp_dir(tag: &str) -> String` — the `base` parameter and the `Result`.
+fn temp_dir(tag: &str, base: Option<&str>) -> Result<String, String> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock after 1970")
         .as_nanos();
-    let root = base
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+    let root = match base {
+        Some(b) => {
+            let p = std::path::PathBuf::from(b);
+            if !p.is_dir() {
+                return Err(format!(
+                    "--dir {b:?} is not an existing directory — it must name the target \
+                     data directory's own volume, which the harness measures rather than \
+                     creates (spec §2)\n{USAGE}"
+                ));
+            }
+            p
+        }
+        None => std::env::temp_dir(),
+    };
     let dir = root.join(format!(
         "bench-harness-{tag}-{}-{nanos}",
         std::process::id()
     ));
-    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("scratch dir {dir:?} creates: {e}"));
-    dir.to_string_lossy().into_owned()
+    std::fs::create_dir_all(&dir).map_err(|e| format!("scratch dir {dir:?} creates: {e}"))?;
+    Ok(dir.to_string_lossy().into_owned())
 }
 
 fn sh(cmd: &str, args: &[&str]) -> Option<String> {
@@ -201,6 +224,25 @@ fn ram_backed_reason(dir: &str, fs: &str) -> Option<String> {
     })
 }
 
+/// spec §5's RAM-backed guard has a precondition: it can only classify a
+/// filesystem it could identify. `filesystem()` degrades to `"unknown"` on any
+/// probe failure (a `df` that rejects its flags, a device name containing
+/// spaces, a directory that vanished mid-run), and `is_ram_backed("unknown")`
+/// is false — so a degraded probe published an unguarded run at exit 0, which
+/// is I-1's failure mode surviving in a narrower case (T4 re-review, M-B).
+/// Noah ruling 2026-08-07: mark INVALID by name, still render — an
+/// unverifiable substrate cannot back a hardware-ceiling claim.
+fn unknown_filesystem_reason(dir: &str, fs: &str) -> Option<String> {
+    (fs == "unknown").then(|| {
+        format!(
+            "INVALID: could not determine the filesystem backing {dir:?}, so spec §5's \
+             RAM-backed guard did not run — this ceiling is unverified, and a tmpfs/ramfs \
+             measurement would look exactly like a healthy one. Check that `df` is on PATH \
+             and that --dir names a readable directory"
+        )
+    })
+}
+
 fn sync_semantics() -> &'static str {
     if cfg!(target_os = "macos") {
         "F_FULLFSYNC via sync_all"
@@ -253,7 +295,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let dir = temp_dir("device", args.dir.as_deref());
+    let dir = match temp_dir("device", args.dir.as_deref()) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
     let mut report = base_report(args.warmup.as_secs_f64(), args.duration.as_secs_f64(), &dir);
     // T4 review, M-2: a real system never reports 0 cores, so this is the
     // one value that unambiguously means "the probe failed" — flag it
@@ -266,6 +314,9 @@ fn main() -> ExitCode {
         );
     }
     if let Some(reason) = ram_backed_reason(&dir, &report.filesystem) {
+        report.invalid.push(reason);
+    }
+    if let Some(reason) = unknown_filesystem_reason(&dir, &report.filesystem) {
         report.invalid.push(reason);
     }
     let implemented = match run_layers(&args, &dir, &mut report) {
@@ -432,6 +483,62 @@ mod tests {
         assert!(r.contains("tmpfs"), "got: {r}");
         assert!(r.contains("--dir"), "must name the fix: {r}");
         assert!(ram_backed_reason("/data/x", "apfs").is_none());
+    }
+
+    // T4 re-review, M-B (Noah ruling 2026-08-07: mark INVALID by name, still
+    // render). `filesystem()` degrades to "unknown" on any probe failure and
+    // `is_ram_backed("unknown")` is false, so a degraded probe published an
+    // unguarded run at exit 0 — I-1's failure mode surviving in a narrower
+    // case. The guard must announce when it did not run.
+    #[test]
+    fn an_undeterminable_filesystem_is_named_invalid() {
+        let r = unknown_filesystem_reason("/x/y", "unknown").expect("flagged");
+        assert!(r.contains("INVALID"), "got: {r}");
+        assert!(r.contains("/x/y"), "must name the site: {r}");
+        assert!(
+            r.contains("did not run"),
+            "must say the guard did not run, not merely that the label is unknown: {r}"
+        );
+        assert!(
+            unknown_filesystem_reason("/x/y", "apfs").is_none(),
+            "a probed filesystem must not be flagged"
+        );
+        assert!(
+            unknown_filesystem_reason("/x/y", "tmpfs").is_none(),
+            "tmpfs is ram_backed_reason's job — two reasons for one fact would double-report"
+        );
+    }
+
+    // T4 re-review, M-A + M-I: `--dir` is operator input. A path that does
+    // not exist must be a usage error (exit 2), not a panic (101) and not a
+    // silent `mkdir -p` that turns a typo into a healthy-looking run against
+    // a brand-new empty tree on some other filesystem.
+    #[test]
+    fn an_explicit_dir_that_does_not_exist_is_a_named_usage_error() {
+        // A writable-but-absent path, so the old behavior genuinely SUCCEEDS
+        // at creating it — that is the defect, and it is what makes this a
+        // behavioral RED rather than a permission accident.
+        let root = std::env::temp_dir().join(format!("bench-absent-{}", std::process::id()));
+        let typo = root.join("deep/er");
+        let _ = std::fs::remove_dir_all(&root);
+        let err = temp_dir("device", Some(&typo.to_string_lossy())).unwrap_err();
+        assert!(err.contains("--dir"), "must name the flag: {err}");
+        assert!(
+            err.contains(&*typo.to_string_lossy()),
+            "must name the path: {err}"
+        );
+        assert!(
+            !root.exists(),
+            "must NOT have created the tree it rejected: {root:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_fallback_temp_dir_still_works_without_an_explicit_dir() {
+        let dir = temp_dir("device", None).expect("the fallback temp dir is not operator input");
+        assert!(std::path::Path::new(&dir).is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn minimal_report() -> Report {

@@ -201,6 +201,13 @@ git commit -m "bench: scaffold bench-harness with the canonical app + sim proof 
 
 ### Task 2: `measure.rs` — CPU time, heartbeat sleep-guard, percentiles, totals cross-check
 
+> **HISTORICAL — this task is shipped, and its code blocks below are the pre-review
+> versions. The committed source is authoritative.** Task 4's review (I-5) reopened this
+> file: the sleep-guard is now two arms, `suspension_verdict` and `heartbeat_verdict`,
+> composed by `verdict` (T4 re-review, M-D). In particular the test block below asserts
+> `contains("suspended")` on a *starved* heartbeat — that reason string now reads
+> "starved", and the shipped test asserts accordingly.
+
 **Files:**
 - Create: `crates/bench-harness/src/measure.rs`
 - Modify: `crates/bench-harness/src/lib.rs` (add `pub mod measure;`)
@@ -730,6 +737,14 @@ git commit -m "bench: report model, pinned JSON shape, the ceiling refusal (T3)"
 
 ### Task 4: `device.rs` + the `bench` binary skeleton
 
+> **HISTORICAL — this task is shipped, and its code blocks below are the pre-review
+> versions. The committed source is authoritative.** Two review rounds changed it
+> substantially: `--dir` plus the RAM-backed and undeterminable-filesystem guards, the
+> zero-op refusal, `invalid_reasons` as the single exit gate, the split suspension/
+> starvation arms, and the `temp_dir`/`filesystem`/`base_report`/`run_layers` signature
+> changes recorded under **Interfaces** above. Do not copy `filesystem()`, `base_report`,
+> `temp_dir` or `run_layers` from the blocks below.
+
 **Files:**
 - Create: `crates/bench-harness/src/device.rs`
 - Create: `crates/bench-harness/src/bin/bench.rs`
@@ -739,6 +754,19 @@ git commit -m "bench: report model, pinned JSON shape, the ceiling refusal (T3)"
 **Interfaces:**
 - Consumes: `charpente::prod::ProdDisk`; `measure::Heartbeat`; `report::*`.
 - Produces: `device::run(dir: &str, warmup: Duration, duration: Duration) -> io::Result<DeviceReport>`; the `bench` binary with `device` subcommand, `--json`, `--duration S`, `--warmup S` flags; `bin/bench.rs` helper fns later subcommands extend: `fn temp_dir(tag: &str) -> String`, `fn hardware() -> String`, `fn os() -> String`, `fn filesystem() -> String`, `fn sync_semantics() -> &'static str`, `fn base_report(warmup: f64, duration: f64) -> Report`.
+
+> **AMENDED at Task 4's review and re-review (2026-08-07) — three of those
+> signatures are stale as written above; the shipped ones are authoritative
+> (re-review finding I-A).** `fn temp_dir(tag: &str, base: Option<&str>) ->
+> Result<String, String>`, `fn filesystem(dir: &str) -> String`, and
+> `fn base_report(warmup: f64, duration: f64, dir: &str) -> Report`. All three
+> follow from I-1: the ceiling must be measured on — and labelled with — the
+> directory the operator actually named, so the measured dir has to reach the
+> probe and the report; `temp_dir`'s `Result` is M-A/M-I (a bad `--dir` is a
+> usage error, not a panic, and is never created). `run_layers` also changed:
+> `(args, report) -> io::Result<()>` became `(args, dir, report) ->
+> io::Result<bool>`. Call sites in later tasks must be adapted, not reverted —
+> see the warning in Task 9 Step 3.
 
 - [ ] **Step 1: Implement `device.rs`**
 
@@ -1189,21 +1217,34 @@ Add `pub mod core_bench;` to `lib.rs`.
 
 - [ ] **Step 2: Wire the subcommand arm**
 
-In `bin/bench.rs`'s `run_layers`, replace the placeholder match with:
+In `bin/bench.rs`'s `run_layers`, replace the placeholder match with the block below.
+
+> **AMENDED at Task 4's re-review (2026-08-07, finding I-A).** `temp_dir` shipped as
+> `fn temp_dir(tag: &str, base: Option<&str>) -> Result<String, String>` — the `base`
+> parameter keeps every layer on the operator's `--dir` filesystem rather than silently
+> falling back to `$TMPDIR` (T4 I-1), and the `Result` makes a bad `--dir` a usage error
+> instead of a panic (M-A/M-I). The match arm must also keep returning the `implemented`
+> flag (M-7); the `other =>` arm below sets it to `false` rather than printing and
+> falling through to a success exit.
 
 ```rust
-    match args.cmd.as_str() {
-        "device" => {}
+    let implemented = match args.cmd.as_str() {
+        "device" => true,
         "core" => {
-            let dir = temp_dir("core");
+            let dir = temp_dir("core", args.dir.as_deref()).map_err(std::io::Error::other)?;
             let ceiling = report.device.as_ref().expect("device ran first").syncs_per_sec;
             let (core, invalid) = bench_harness::core_bench::run(&dir, args.warmup, args.duration, ceiling)?;
             let _ = std::fs::remove_dir_all(&dir);
             report.core = Some(core);
             report.invalid.extend(invalid);
+            true
         }
-        other => eprintln!("bench: subcommand {other:?} not implemented yet"),
-    }
+        other => {
+            eprintln!("bench: subcommand {other:?} not implemented yet");
+            false
+        }
+    };
+    Ok(implemented)
 ```
 
 - [ ] **Step 3: Add the ignored smoke** (in `tests/harness.rs`)
@@ -1360,13 +1401,17 @@ Add `pub mod kernel_bench;` to `lib.rs`.
 
 - [ ] **Step 2: Wire the subcommand arm** (in `run_layers`)
 
+Same two amendments as Task 5's arm (T4 re-review, I-A): `temp_dir` takes the `--dir`
+base and returns a `Result`, and the arm evaluates to `true` for the `implemented` flag.
+
 ```rust
         "kernel" => {
-            let dir = temp_dir("kernel");
+            let dir = temp_dir("kernel", args.dir.as_deref()).map_err(std::io::Error::other)?;
             let (kernel, invalid) = bench_harness::kernel_bench::run(&dir, args.requests)?;
             let _ = std::fs::remove_dir_all(&dir);
             report.kernel = Some(kernel);
             report.invalid.extend(invalid);
+            true
         }
 ```
 
@@ -2114,7 +2159,12 @@ fn a_starved_heartbeat_flags_invalid_through_its_real_path() {
     drop(held);
     let verdict = hb.finish().expect("a starved heartbeat must flag the run");
     assert!(verdict.contains("INVALID"), "got: {verdict}");
-    assert!(verdict.contains("suspended"), "got: {verdict}");
+    // AMENDED at Task 4's re-review (2026-08-07, finding I-A): this rig
+    // starves the heartbeat thread while the process stays AWAKE, which is
+    // the STARVATION arm, not the suspension arm. T4's I-5 fix split the two
+    // and reworded this reason accordingly, so asserting "suspended" here
+    // now fails. Assert the arm this test actually exercises.
+    assert!(verdict.contains("starved"), "got: {verdict}");
 }
 
 #[test]
@@ -2245,8 +2295,20 @@ device run would silently leave it at the 5 s + 30 s defaults — over a minute 
 loops in a "smoke"), and the report's `warmup_secs`/`duration_secs` are overwritten with
 the selected values so the artifact states what actually ran:
 
+> **AMENDED at Task 4's re-review (2026-08-07, finding I-A). The literal below was
+> rewritten; the version this plan originally carried is pre-Task-4 and pasting it would
+> silently revert four shipped fixes in one action** — I-1's dir coupling (its own
+> `temp_dir("device")` re-created the measurement dir *inside* `run_layers`, so the loops
+> and `main`'s `filesystem()` label diverged again, which is the second half of the very
+> defect I-1 was raised for — and that one is **not a compile error**), M-5 (cleanup ran
+> after `?`, so an erroring device run leaked its scratch dir), M-7 (returning `()` loses
+> the `implemented` signal that keeps an unimplemented subcommand off exit 0), and I-4's
+> per-arm heartbeat comment. The compiler catches the arity change but does **not**
+> constrain the direction of the repair. Adapt the accumulated arms into this shape; do
+> not restore the old signature.
+
 ```rust
-fn run_layers(args: &Args, report: &mut Report) -> std::io::Result<()> {
+fn run_layers(args: &Args, dir: &str, report: &mut Report) -> std::io::Result<bool> {
     // smoke = the full matrix at forced-short parameters (spec §7). Selected
     // BEFORE the device run so the ceiling loops are short too.
     let (warmup, duration, requests, connections) = if args.cmd == "smoke" {
@@ -2258,11 +2320,18 @@ fn run_layers(args: &Args, report: &mut Report) -> std::io::Result<()> {
     report.duration_secs = duration.as_secs_f64();
 
     // Every subcommand carries the ceiling (spec §5): device runs first
-    // unconditionally, so no layer can render without it.
+    // unconditionally, so no layer can render without it. `dir` is created and
+    // probed by `main` (T4 review, I-1) — the directory measured here and the
+    // one `filesystem()` labelled the report with MUST be the same one, so it
+    // is passed in, never re-created here. This Heartbeat covers ONLY the
+    // device measurement; each later layer starts and finishes its own around
+    // its own measured window (T4 review, I-4), which is why there is no
+    // single heartbeat spanning the whole process — under one, `bench all`'s
+    // guard would span `wire::build_bin`'s cargo build and fire spuriously.
     let hb = Heartbeat::start();
-    let dir = temp_dir("device");
-    report.device = Some(device::run(&dir, warmup, duration)?);
-    let _ = std::fs::remove_dir_all(&dir);
+    let result = device::run(dir, warmup, duration);
+    let _ = std::fs::remove_dir_all(dir); // T4 review, M-5: clean up on Err too.
+    report.device = Some(result?);
     if let Some(reason) = hb.finish() {
         report.invalid.push(reason);
     }
@@ -2280,7 +2349,7 @@ fn run_layers(args: &Args, report: &mut Report) -> std::io::Result<()> {
     for cmd in cmds {
         match cmd {
             "core" => {
-                let dir = temp_dir("core");
+                let dir = temp_dir("core", args.dir.as_deref()).map_err(std::io::Error::other)?;
                 let ceiling = report.device.as_ref().expect("device ran first").syncs_per_sec;
                 let (core, invalid) =
                     bench_harness::core_bench::run(&dir, warmup, duration, ceiling)?;
@@ -2289,7 +2358,7 @@ fn run_layers(args: &Args, report: &mut Report) -> std::io::Result<()> {
                 report.invalid.extend(invalid);
             }
             "kernel" => {
-                let dir = temp_dir("kernel");
+                let dir = temp_dir("kernel", args.dir.as_deref()).map_err(std::io::Error::other)?;
                 let (kernel, invalid) = bench_harness::kernel_bench::run(&dir, requests)?;
                 let _ = std::fs::remove_dir_all(&dir);
                 report.kernel = Some(kernel);
@@ -2310,7 +2379,10 @@ fn run_layers(args: &Args, report: &mut Report) -> std::io::Result<()> {
             other => unreachable!("unmapped subcommand {other}"),
         }
     }
-    Ok(())
+    // T4 review, M-7: `main` gates the exit code on this. By T9 every
+    // subcommand has an arm, so this is `true` — the plumbing stays as the
+    // structural guarantee that a future unmapped subcommand cannot exit 0.
+    Ok(true)
 }
 ```
 

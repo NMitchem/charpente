@@ -96,8 +96,13 @@ pub fn process_cpu() -> Duration {
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(10);
 
 /// How far a suspend-inclusive clock may run ahead of a monotonic one before
-/// `suspension_verdict` calls it a suspend rather than ordinary clock jitter
-/// or an NTP step. Suspends are seconds-to-hours; steps are milliseconds.
+/// `verdict` rejects the run. Ordinary NTP *slew* stays far below this — the
+/// discipline is capped at 500 ppm, i.e. ~15 ms across a 30 s window, three
+/// orders of magnitude under the slack. A `makestep` correction is a
+/// different thing: it can be arbitrarily large (hours), and it is reported
+/// here as a suspend. That is deliberate, not a false positive — the reason
+/// string names both causes, because either one means the measured window
+/// was not one continuous run on a settled machine (T4 re-review, M-E).
 const SUSPENSION_SLACK: Duration = Duration::from_secs(2);
 
 /// A ticking thread plus a suspend-inclusive wall-clock snapshot. `finish`
@@ -156,14 +161,23 @@ impl Heartbeat {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
-        suspension_verdict(monotonic, wall_clock).or_else(|| {
-            heartbeat_verdict(
-                monotonic,
-                HEARTBEAT_INTERVAL,
-                self.ticks.load(Ordering::Relaxed),
-            )
-        })
+        verdict(monotonic, wall_clock, self.ticks.load(Ordering::Relaxed))
     }
+}
+
+/// The composed run verdict: suspension first, starvation second. Extracted
+/// from `Heartbeat::finish` so the composition is assertable (T4 re-review,
+/// M-D) — before this, transposing the two `Duration` arguments or deleting
+/// the suspension arm outright left the whole suite green, because every
+/// test called the two arms directly and none exercised the wiring between
+/// them.
+///
+/// Residual, stated rather than hidden: this makes the *composition* testable,
+/// not `finish`'s mapping of its own two fields onto it. Proving that last hop
+/// would take an actual suspend, which is not constructible in a unit test.
+pub fn verdict(monotonic: Duration, wall_clock: Duration, ticks: u64) -> Option<String> {
+    suspension_verdict(monotonic, wall_clock)
+        .or_else(|| heartbeat_verdict(monotonic, HEARTBEAT_INTERVAL, ticks))
 }
 
 /// Detects an actual suspend: `Instant` (`CLOCK_UPTIME_RAW` on Apple,
@@ -172,11 +186,21 @@ impl Heartbeat {
 /// which `SUSPENSION_SLACK` absorbs.
 pub fn suspension_verdict(monotonic: Duration, wall_clock: Duration) -> Option<String> {
     if wall_clock.saturating_sub(monotonic) > SUSPENSION_SLACK {
+        // T4 re-review, M-E: this must NOT claim the rates are arithmetically
+        // corrupted. Every layer divides by an `Instant`, which excludes
+        // suspended time — so a suspend pauses the measurement rather than
+        // inflating its denominator. The run is rejected for a different and
+        // true reason: the window is no longer one continuous run on a settled
+        // machine. Naming the false reason here would be the same
+        // product-surface defect I-5 was reopened to fix.
         Some(format!(
-            "INVALID: wall-clock time ({wall_clock:?}) exceeds monotonic elapsed \
-             ({monotonic:?}) by more than {SUSPENSION_SLACK:?} — the process was \
-             suspended mid-run (laptop sleep?); wall-clock rates from this run are \
-             meaningless"
+            "INVALID: the suspend-inclusive clock advanced {wall_clock:?} while monotonic \
+             elapsed was only {monotonic:?} — more than {SUSPENSION_SLACK:?} apart. Either \
+             the process was suspended mid-run (laptop sleep) or the system clock stepped \
+             forward (an NTP makestep, a resuming VM). Rates divide by the monotonic clock, \
+             so they are not arithmetically wrong; the run is rejected because the measured \
+             window was not one continuous run on a settled machine (cold caches, disturbed \
+             thermal and scheduler state) — re-run it undisturbed"
         ))
     } else {
         None
@@ -291,6 +315,52 @@ mod tests {
             .expect("suspended");
         assert!(v.contains("INVALID"), "got: {v}");
         assert!(v.contains("suspended"), "got: {v}");
+        // T4 re-review, M-E: the reason must not claim an arithmetic
+        // corruption that does not happen — every layer divides by `Instant`,
+        // which excludes suspended time.
+        assert!(
+            !v.contains("meaningless"),
+            "must not claim the rates are corrupted; they divide by a monotonic clock: {v}"
+        );
+        assert!(
+            v.contains("clock stepped forward"),
+            "must name the second cause that fires this arm: {v}"
+        );
+    }
+
+    // T4 re-review, M-D: `Heartbeat::finish` composes the two arms, and that
+    // composition was previously unreachable from any test — transposing the
+    // arguments or deleting the suspension arm left the suite green. These
+    // two tests are the teeth for the wiring itself, not for either arm.
+    #[test]
+    fn verdict_puts_suspension_ahead_of_starvation() {
+        // Both arms fire: a 9s clock divergence AND zero observed ticks.
+        let v = verdict(Duration::from_secs(1), Duration::from_secs(10), 0)
+            .expect("both arms fire, so a reason must come back");
+        assert!(v.contains("suspended"), "suspension must win: {v}");
+        assert!(
+            !v.contains("starved"),
+            "starvation must not be the reported reason when both fire: {v}"
+        );
+    }
+
+    #[test]
+    fn verdict_reads_monotonic_first_and_wall_clock_second() {
+        // A healthy tick count, so `heartbeat_verdict` cannot fire either way
+        // and the only thing under test is the argument order.
+        let healthy = (Duration::from_secs(10).as_nanos() / HEARTBEAT_INTERVAL.as_nanos()) as u64;
+        assert!(
+            verdict(Duration::from_secs(1), Duration::from_secs(10), healthy).is_some(),
+            "monotonic 1s vs wall 10s is a suspend"
+        );
+        // The transposition is a wall clock BEHIND monotonic — not a suspend,
+        // and with healthy ticks not starvation either. So a swapped wiring
+        // turns a real suspend into a silent pass, and this asymmetry is what
+        // makes the swap detectable.
+        assert!(
+            verdict(Duration::from_secs(10), Duration::from_secs(1), healthy).is_none(),
+            "transposed arguments must NOT also return a reason, or the order is unpinned"
+        );
     }
 
     #[test]

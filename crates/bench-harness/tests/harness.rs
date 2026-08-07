@@ -29,6 +29,23 @@ fn device_layer_produces_nonzero_rates() {
     let dir = scratch("device");
     let d = bench_harness::device::run(&dir, Duration::from_millis(200), Duration::from_secs(1))
         .expect("device layer runs");
+    // T4 re-review, M-F: each append frame is stamped with its own offset, so
+    // no two blocks are byte-identical. High entropy inside one frame defeats
+    // zero-elision; only distinct blocks also defeat an LZ-family compressor
+    // (ZFS lz4, btrfs zstd) making this payload's append cheaper than a real
+    // WAL frame's. Read back before the cleanup below.
+    let appended = std::fs::read(std::path::Path::new(&dir).join("bench-append.dat"))
+        .expect("the append loop's file exists");
+    assert!(
+        appended.len() >= 512,
+        "expected at least two 256-byte frames, got {} bytes",
+        appended.len()
+    );
+    assert_ne!(
+        &appended[..256],
+        &appended[256..512],
+        "consecutive frames must not be byte-identical, or the file is one block repeated"
+    );
     let _ = std::fs::remove_dir_all(&dir);
     assert!(d.syncs_per_sec > 0.0, "syncs_per_sec: {}", d.syncs_per_sec);
     assert!(

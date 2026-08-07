@@ -167,7 +167,16 @@ Run-validity rules, mechanical:
   **suspension** arm compares a suspend-inclusive clock (`SystemTime`)
   against the monotonic `Instant`: the two diverge only across a real
   suspend (small NTP steps aside, absorbed by a slack threshold), and a
-  divergence beyond it marks the run INVALID by name. A **starvation** arm
+  divergence beyond it marks the run INVALID by name. *Amended at Task 4's
+  re-review (2026-08-07): the reason string states why such a run is rejected
+  honestly. Rates are NOT arithmetically corrupted by a suspend — every layer
+  divides by the monotonic `Instant`, which excludes suspended time, so the
+  measurement pauses rather than inflating its denominator. The run is
+  rejected because the window was not one continuous run on a settled machine
+  (cold caches, disturbed thermal and scheduler state). The same arm also
+  fires on a large forward clock step (an NTP `makestep`, a resuming VM),
+  which the reason names as a second cause rather than asserting a laptop
+  sleep that may not have happened.* A **starvation** arm
   keeps the original heartbeat thread ticking on a fixed interval, observed
   ticks below half of expected: this never fires during a genuine suspend
   (the tick thread's own sleeps exclude suspended time exactly like
@@ -183,7 +192,22 @@ Run-validity rules, mechanical:
   name and probed against the directory actually measured, not a hardcoded
   path; the run is marked INVALID in the artifact and still rendered (same
   pattern as a non-finite float, not a refusal — an invalid run's own
-  artifact is where its explanation lives).
+  artifact is where its explanation lives). *Amended at Task 4's re-review
+  (2026-08-07, Noah ruling): this guard has a precondition — it can only
+  classify a filesystem it could identify. When the probe degrades (a `df`
+  that rejects its flags, a device name containing spaces, an unreadable
+  directory) the label falls back to `unknown`, which is not RAM-backed and
+  so would previously have published an unguarded run at exit 0 — the same
+  failure mode in a narrower case. An undeterminable filesystem is therefore
+  itself INVALID by name, stating that the guard did not run: an unverifiable
+  substrate cannot back a hardware-ceiling claim.*
+- **A degenerate measured window is refused, not published** (added at Task
+  4's review, 2026-08-07): a window completing zero ops divides into a
+  *finite* `0.0` rate, which the non-finite check cannot catch, so each
+  measurement loop refuses by name instead — this one is an error rather than
+  an INVALID artifact, because there is no measurement to render. Likewise a
+  core-count probe reporting `0` (the one value no real system reports) marks
+  the run INVALID rather than publishing a lie-shaped number silently.
 - **Totals two ways**: every throughput number is computed both as
   requests ÷ duration and as a sum over per-thread counters; disagreement beyond
   rounding is a harness bug and fails the run.
