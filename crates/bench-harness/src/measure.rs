@@ -8,14 +8,31 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// `struct timeval`'s layout differs by platform, and that difference is
+/// stated here rather than assumed. On 64-bit Linux, `suseconds_t` really is
+/// an 8-byte `long`, so `tv_usec: i64` alone matches the ABI. On macOS/
+/// Darwin, `__darwin_suseconds_t` is a 4-byte `int32_t`, and the real struct
+/// is `{tv_sec: i64, tv_usec: i32, <4 bytes compiler padding>}` to keep the
+/// enclosing struct 8-byte aligned — 16 bytes total either way. A bare
+/// `tv_usec: i64` on macOS would only read the correct value because the
+/// kernel happens to zero that padding; cfg'ing the field to its real
+/// platform width plus an explicit `_pad` field makes the reliance visible
+/// in the type instead of leaving it as an unstated assumption.
 #[repr(C)]
 struct Timeval {
     tv_sec: i64,
+    #[cfg(target_os = "macos")]
+    tv_usec: i32,
+    #[cfg(target_os = "macos")]
+    _pad: i32,
+    #[cfg(not(target_os = "macos"))]
     tv_usec: i64,
 }
 
-/// ru_utime + ru_stime lead on both macOS and 64-bit Linux; the 14 trailing
-/// c_longs differ in meaning but not layout. RUSAGE_SELF is 0 on both.
+/// ru_utime + ru_stime lead on both macOS and 64-bit Linux — Timeval's own
+/// doc comment above carries the per-platform tv_usec width/padding split.
+/// The 14 trailing c_longs differ in meaning but not layout across both.
+/// RUSAGE_SELF is 0 on both.
 #[repr(C)]
 struct Rusage {
     ru_utime: Timeval,
@@ -32,10 +49,20 @@ pub fn process_cpu() -> Duration {
     let mut ru = Rusage {
         ru_utime: Timeval {
             tv_sec: 0,
+            #[cfg(target_os = "macos")]
+            tv_usec: 0,
+            #[cfg(target_os = "macos")]
+            _pad: 0,
+            #[cfg(not(target_os = "macos"))]
             tv_usec: 0,
         },
         ru_stime: Timeval {
             tv_sec: 0,
+            #[cfg(target_os = "macos")]
+            tv_usec: 0,
+            #[cfg(target_os = "macos")]
+            _pad: 0,
+            #[cfg(not(target_os = "macos"))]
             tv_usec: 0,
         },
         pad: [0; 14],
@@ -45,8 +72,13 @@ pub fn process_cpu() -> Duration {
         rc, 0,
         "getrusage(RUSAGE_SELF) cannot fail with valid arguments"
     );
+    // Explicit widening: tv_usec is i32 on macOS, i64 elsewhere (Timeval's
+    // doc comment above states why); `as i64` on each side is a lossless
+    // widen on macOS and a no-op identity cast on Linux, so this line
+    // compiles correctly against either layout.
+    let usec = ru.ru_utime.tv_usec as i64 + ru.ru_stime.tv_usec as i64;
     Duration::from_secs((ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) as u64)
-        + Duration::from_micros((ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) as u64)
+        + Duration::from_micros(usec as u64)
 }
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(10);
@@ -113,7 +145,11 @@ pub fn heartbeat_verdict(wall: Duration, interval: Duration, observed: u64) -> O
     }
 }
 
-/// Nearest-rank percentile over an already-sorted slice (latency micros).
+/// Nearest-rank percentile over an already-sorted slice (latency micros):
+/// ordinal rank = `ceil(p/100 * n)`, 1-indexed, clamped into range. This is
+/// the true nearest-rank convention — it rounds to the closest order
+/// statistic rather than always flooring, so it cannot systematically
+/// under-report a tail.
 pub fn percentile(sorted: &[u64], p: f64) -> u64 {
     assert!(
         !sorted.is_empty(),
@@ -124,8 +160,9 @@ pub fn percentile(sorted: &[u64], p: f64) -> u64 {
         sorted.windows(2).all(|w| w[0] <= w[1]),
         "percentile input must be sorted"
     );
-    let rank = ((p / 100.0) * (sorted.len() - 1) as f64) as usize;
-    sorted[rank]
+    let rank = ((p / 100.0) * sorted.len() as f64).ceil() as usize;
+    let index = rank.saturating_sub(1).min(sorted.len() - 1);
+    sorted[index]
 }
 
 /// Totals-two-ways (spec §5): per-thread counters vs the grand counter.
