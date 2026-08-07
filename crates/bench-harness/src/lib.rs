@@ -13,6 +13,7 @@ use charpente::{Id, Schema, Tx, View};
 use charpente::{event, job, jobs, route, routes, table};
 
 pub mod measure;
+pub mod report;
 
 /// Row-id space for the canonical workload: bounded so the store's working
 /// set stays cache-resident (the spec measures the commit path, not paging).
