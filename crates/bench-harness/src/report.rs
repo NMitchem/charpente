@@ -3,6 +3,7 @@
 //! shape is pinned byte-exact by test, the sim-harness discipline.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
+#[derive(Debug, Clone)]
 pub struct Report {
     pub hardware: String,
     pub os: String,
@@ -17,26 +18,31 @@ pub struct Report {
     pub wire: Vec<WireReport>,
     pub invalid: Vec<String>,
 }
+#[derive(Debug, Clone)]
 pub struct DeviceReport {
     pub syncs_per_sec: f64,
     pub appends_per_sec: f64,
 }
+#[derive(Debug, Clone)]
 pub struct CoreReport {
     pub acked_writes_per_sec: f64,
     pub log_records_per_sec: f64,
     pub reads_per_sec: f64,
     pub device_ratio: f64,
 }
+#[derive(Debug, Clone)]
 pub struct KernelReport {
     pub acked_writes_per_sec: f64,
     pub log_records_per_sec: f64,
     pub requests_total: u64,
     pub jobs_done: u64,
 }
+#[derive(Debug, Clone)]
 pub struct WireReport {
     pub target: String,
     pub points: Vec<SweepPoint>,
 }
+#[derive(Debug, Clone)]
 pub struct SweepPoint {
     pub connections: usize,
     pub throughput_per_sec: f64,
@@ -65,41 +71,141 @@ fn esc(s: &str) -> String {
     out
 }
 
+/// NaN/Infinity are not JSON numbers (fix round 1, review I-1): a single non-finite
+/// field would otherwise make the entire artifact unparseable, silently, with
+/// `render_json` still returning `Ok`. Ruled (Noah, 2026-08-07): render the field as
+/// `null` and name the reason in `invalid`, rather than refuse — a non-finite number
+/// usually co-occurs with an already-INVALID run, and refusing would destroy the very
+/// artifact carrying the explanation (spec §5).
+fn non_finite_reason(field: &str, v: f64) -> String {
+    format!(
+        "{field} is not finite ({v}): NaN/Infinity is not a JSON number (typically a rate \
+         divided by a zero-length interval) — recorded as null and this run is marked \
+         INVALID (spec §5)"
+    )
+}
+
+fn push_if_non_finite(out: &mut Vec<String>, field: &str, v: f64) {
+    if !v.is_finite() {
+        out.push(non_finite_reason(field, v));
+    }
+}
+
+/// Scans every float field for non-finite values, in a fixed field order. Both
+/// renderers call this so `render_json`'s `invalid` array and `render_human`'s `!!`
+/// lines always agree about what is wrong with a run.
+fn collect_non_finite(r: &Report) -> Vec<String> {
+    let mut out = Vec::new();
+    push_if_non_finite(&mut out, "warmup_secs", r.warmup_secs);
+    push_if_non_finite(&mut out, "duration_secs", r.duration_secs);
+    if let Some(d) = &r.device {
+        push_if_non_finite(&mut out, "device.syncs_per_sec", d.syncs_per_sec);
+        push_if_non_finite(&mut out, "device.appends_per_sec", d.appends_per_sec);
+    }
+    if let Some(c) = &r.core {
+        push_if_non_finite(
+            &mut out,
+            "core.acked_writes_per_sec",
+            c.acked_writes_per_sec,
+        );
+        push_if_non_finite(&mut out, "core.log_records_per_sec", c.log_records_per_sec);
+        push_if_non_finite(&mut out, "core.reads_per_sec", c.reads_per_sec);
+        push_if_non_finite(&mut out, "core.device_ratio", c.device_ratio);
+    }
+    if let Some(k) = &r.kernel {
+        push_if_non_finite(
+            &mut out,
+            "kernel.acked_writes_per_sec",
+            k.acked_writes_per_sec,
+        );
+        push_if_non_finite(
+            &mut out,
+            "kernel.log_records_per_sec",
+            k.log_records_per_sec,
+        );
+    }
+    for w in &r.wire {
+        for (pi, p) in w.points.iter().enumerate() {
+            let prefix = format!("wire[{}].points[{pi}]", w.target);
+            push_if_non_finite(
+                &mut out,
+                &format!("{prefix}.throughput_per_sec"),
+                p.throughput_per_sec,
+            );
+            push_if_non_finite(
+                &mut out,
+                &format!("{prefix}.log_records_per_sec"),
+                p.log_records_per_sec,
+            );
+            push_if_non_finite(
+                &mut out,
+                &format!("{prefix}.client_busy_fraction"),
+                p.client_busy_fraction,
+            );
+        }
+    }
+    out
+}
+
+fn num2(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v:.2}")
+    } else {
+        "null".to_string()
+    }
+}
+
+fn num3(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v:.3}")
+    } else {
+        "null".to_string()
+    }
+}
+
 pub fn render_json(r: &Report) -> Result<String, String> {
     let has_layers = r.core.is_some() || r.kernel.is_some() || !r.wire.is_empty();
     if has_layers && r.device.is_none() {
         return Err(CEILING_REFUSAL.to_string());
     }
+    let non_finite = collect_non_finite(r);
     let mut s = String::new();
     s.push_str(&format!(
         "{{\"bench\":{{\"hardware\":\"{}\",\"os\":\"{}\",\"filesystem\":\"{}\",\"cores\":{},\
-         \"sync_semantics\":\"{}\",\"warmup_secs\":{:.2},\"duration_secs\":{:.2}",
+         \"sync_semantics\":\"{}\",\"warmup_secs\":{},\"duration_secs\":{}",
         esc(&r.hardware),
         esc(&r.os),
         esc(&r.filesystem),
         r.cores,
         esc(r.sync_semantics),
-        r.warmup_secs,
-        r.duration_secs
+        num2(r.warmup_secs),
+        num2(r.duration_secs)
     ));
     if let Some(d) = &r.device {
         s.push_str(&format!(
-            ",\"device\":{{\"syncs_per_sec\":{:.2},\"appends_per_sec\":{:.2}}}",
-            d.syncs_per_sec, d.appends_per_sec
+            ",\"device\":{{\"syncs_per_sec\":{},\"appends_per_sec\":{}}}",
+            num2(d.syncs_per_sec),
+            num2(d.appends_per_sec)
         ));
     }
     if let Some(c) = &r.core {
         s.push_str(&format!(
-            ",\"core\":{{\"acked_writes_per_sec\":{:.2},\"log_records_per_sec\":{:.2},\
-             \"reads_per_sec\":{:.2},\"device_ratio\":{:.3}}}",
-            c.acked_writes_per_sec, c.log_records_per_sec, c.reads_per_sec, c.device_ratio
+            ",\"core\":{{\"acked_writes_per_sec\":{},\"log_records_per_sec\":{},\
+             \"reads_per_sec\":{},\"device_ratio\":{}}}",
+            num2(c.acked_writes_per_sec),
+            num2(c.log_records_per_sec),
+            num2(c.reads_per_sec),
+            num3(c.device_ratio)
         ));
     }
     if let Some(k) = &r.kernel {
         s.push_str(&format!(
-            ",\"kernel\":{{\"acked_writes_per_sec\":{:.2},\"log_records_per_sec\":{:.2},\
+            ",\"kernel\":{{\"acked_writes_per_sec\":{},\"log_records_per_sec\":{},\
              \"requests_total\":{},\"jobs_done\":{}}}",
-            k.acked_writes_per_sec, k.log_records_per_sec, k.requests_total, k.jobs_done
+            num2(k.acked_writes_per_sec),
+            num2(k.log_records_per_sec),
+            k.requests_total,
+            k.jobs_done
         ));
     }
     if !r.wire.is_empty() {
@@ -114,17 +220,17 @@ pub fn render_json(r: &Report) -> Result<String, String> {
                     s.push(',');
                 }
                 s.push_str(&format!(
-                    "{{\"connections\":{},\"throughput_per_sec\":{:.2},\
-                     \"log_records_per_sec\":{:.2},\"p50_us\":{},\
-                     \"p99_us\":{},\"p999_us\":{},\"client_busy_fraction\":{:.3},\
+                    "{{\"connections\":{},\"throughput_per_sec\":{},\
+                     \"log_records_per_sec\":{},\"p50_us\":{},\
+                     \"p99_us\":{},\"p999_us\":{},\"client_busy_fraction\":{},\
                      \"saturated\":{}}}",
                     p.connections,
-                    p.throughput_per_sec,
-                    p.log_records_per_sec,
+                    num2(p.throughput_per_sec),
+                    num2(p.log_records_per_sec),
                     p.p50_us,
                     p.p99_us,
                     p.p999_us,
-                    p.client_busy_fraction,
+                    num3(p.client_busy_fraction),
                     p.saturated
                 ));
             }
@@ -133,7 +239,13 @@ pub fn render_json(r: &Report) -> Result<String, String> {
         s.push(']');
     }
     s.push_str(",\"invalid\":[");
-    for (i, reason) in r.invalid.iter().enumerate() {
+    let all_invalid: Vec<&str> = r
+        .invalid
+        .iter()
+        .map(String::as_str)
+        .chain(non_finite.iter().map(String::as_str))
+        .collect();
+    for (i, reason) in all_invalid.iter().enumerate() {
         if i > 0 {
             s.push(',');
         }
@@ -188,7 +300,8 @@ pub fn render_human(r: &Report) -> String {
             ));
         }
     }
-    for reason in &r.invalid {
+    let non_finite = collect_non_finite(r);
+    for reason in r.invalid.iter().chain(non_finite.iter()) {
         s.push_str(&format!("  !! {reason}\n"));
     }
     s
@@ -283,9 +396,70 @@ mod tests {
         let json = render_json(&r).expect("renders");
         assert!(json.contains("\"invalid\":[\"INVALID: heartbeat observed 1 ticks\"]"));
         let human = render_human(&r);
+        // fix round 1 (review M-1): assert on render_human's own "!! " marker plus
+        // the exact reason, not merely `.contains("INVALID")` — that passed only
+        // because the fixture's own string happens to start with "INVALID: ", and
+        // would keep passing even if the `!!` marker were deleted entirely.
         assert!(
-            human.contains("INVALID"),
-            "human render must shout invalidity"
+            human.contains("  !! INVALID: heartbeat observed 1 ticks\n"),
+            "human render must shout invalidity with its own !! marker, not merely \
+             echo text the fixture happened to supply; got: {human}"
         );
+    }
+
+    // fix round 1 (review I-1, Noah-ruled 2026-08-07): a non-finite float must not
+    // silently produce an unparseable artifact. It renders as JSON `null` and the
+    // reason is named in `invalid`, in both renderers, without making render_json
+    // refuse (CEILING_REFUSAL stays the only Err arm).
+    #[test]
+    fn a_non_finite_float_renders_as_null_and_marks_the_run_invalid() {
+        let mut r = fixed_report();
+        r.core.as_mut().unwrap().device_ratio = f64::NAN;
+        r.wire[0].points[0].client_busy_fraction = f64::INFINITY;
+
+        let json = render_json(&r).expect("non-finite floats are recorded, not refused");
+        assert!(
+            json.contains("\"device_ratio\":null"),
+            "non-finite core.device_ratio must render as JSON null, got: {json}"
+        );
+        assert!(
+            json.contains("\"client_busy_fraction\":null"),
+            "non-finite client_busy_fraction must render as JSON null, got: {json}"
+        );
+        assert!(
+            json.contains("core.device_ratio is not finite (NaN)"),
+            "the invalid array must name the field and the offending value, got: {json}"
+        );
+        assert!(
+            json.contains("wire[bench-app].points[0].client_busy_fraction is not finite (inf)"),
+            "the invalid array must name the wire site, got: {json}"
+        );
+
+        let human = render_human(&r);
+        assert!(
+            human.contains("!! core.device_ratio is not finite (NaN)"),
+            "render_human must surface the same reason, got: {human}"
+        );
+        assert!(
+            human.contains("!! wire[bench-app].points[0].client_busy_fraction is not finite (inf)"),
+            "render_human must surface the wire reason too, got: {human}"
+        );
+
+        // every other float is still finite: only the two perturbed fields are null.
+        assert!(json.contains("\"acked_writes_per_sec\":1450.00"));
+        assert!(json.contains("\"throughput_per_sec\":1200.00"));
+    }
+
+    // fix round 1 (review I-2): esc's `\\`, `\n`, and `<0x20` arms were exercised by
+    // no test — `fixed_report()`'s only escape-triggering value hits the `"` arm.
+    #[test]
+    fn esc_escapes_every_control_character_arm() {
+        assert_eq!(esc("plain"), "plain");
+        assert_eq!(esc("a\"b"), "a\\\"b");
+        assert_eq!(esc("a\\b"), "a\\\\b");
+        assert_eq!(esc("a\nb"), "a\\nb");
+        assert_eq!(esc("a\tb"), "a\\u0009b");
+        assert_eq!(esc("a\rb"), "a\\u000db");
+        assert_eq!(esc("a\u{0}b"), "a\\u0000b");
     }
 }
