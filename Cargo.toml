@@ -9,6 +9,7 @@ members = [
     "crates/sim-fixture",
     "crates/guide-examples",
     "crates/edge-harness",
+    "crates/bench-harness",
     "examples/invoicing",
 ]
 

@@ -1,0 +1,16 @@
+[package]
+name = "bench-harness"
+description = "M2 sub-project 1: the honest-benchmarks instrument — four measurement layers (device/core/kernel/wire) against the prod IO stack and real binaries."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+charpente = { path = "../charpente" }
+
+[dev-dependencies]
+charpente-sim = { path = "../charpente-sim" }
