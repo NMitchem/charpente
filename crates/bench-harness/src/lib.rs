@@ -12,6 +12,8 @@ use charpente::kernel::JobError;
 use charpente::{Id, Schema, Tx, View};
 use charpente::{event, job, jobs, route, routes, table};
 
+pub mod measure;
+
 /// Row-id space for the canonical workload: bounded so the store's working
 /// set stays cache-resident (the spec measures the commit path, not paging).
 pub const SLOTS: u64 = 1024;
