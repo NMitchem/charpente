@@ -85,7 +85,11 @@ without the layer beneath it.
   data directory's filesystem, through the production `Disk` impl: sync-only
   (repeated `sync` on a dirty file) and append-shaped (`write_at` + `sync` per
   iteration, the WAL's op shape). Reports durable syncs/sec. Every other number
-  is published as a ratio against this one.
+  is published as a ratio against this one. *Amended at Task 4's review
+  (2026-08-07): "the target data directory's filesystem" is an operator input,
+  not a default — the `--dir` flag names it, defaulting to a throwaway temp
+  dir when omitted (fine on a real disk, silently wrong on `tmpfs`; see §5's
+  RAM-backed filesystem guard).*
 - **`core`** — `Db::transact` in a closed loop against the prod `Disk` on a
   throwaway data dir: the commit path alone (WAL append + sync + apply + store
   materialization), no kernel, no HTTP. The prediction in Context is about this
@@ -154,12 +158,32 @@ Run-validity rules, mechanical:
 - **Suspension guard** (the measurement-method rule: laptops sleep mid-run and
   wall clocks cannot tell). *Amended at plan-writing (2026-08-06): the original
   CPU-vs-wall divergence check is wrong for fsync-bound loops, where CPU is
-  legitimately tiny against wall.* The shipped mechanism is a heartbeat thread
-  ticking on a fixed interval: a suspended process misses ticks while wall time
-  inflates, independent of how blocked the measured loop is. Observed ticks
-  below half of expected marks the run INVALID in the artifact itself, not in a
-  footnote. Process CPU time is still recorded — it drives the client-saturation
-  check.
+  legitimately tiny against wall.* *Amended at Task 4's review (2026-08-07): a
+  heartbeat thread alone cannot detect a suspend — its tick interval and the
+  wall clock it was compared against (`Instant`) both exclude suspended time
+  on Apple and Linux alike, so a genuine sleep left the original ratio
+  untouched and the shipped reason string named a cause that could not have
+  occurred.* The shipped mechanism is now two independent arms. A
+  **suspension** arm compares a suspend-inclusive clock (`SystemTime`)
+  against the monotonic `Instant`: the two diverge only across a real
+  suspend (small NTP steps aside, absorbed by a slack threshold), and a
+  divergence beyond it marks the run INVALID by name. A **starvation** arm
+  keeps the original heartbeat thread ticking on a fixed interval, observed
+  ticks below half of expected: this never fires during a genuine suspend
+  (the tick thread's own sleeps exclude suspended time exactly like
+  `Instant` does), but does catch the process staying awake while starved —
+  `SIGSTOP`, App Nap, severe CPU oversubscription. Either arm marks the run
+  INVALID in the artifact itself, not in a footnote. Process CPU time is
+  still recorded — it drives the client-saturation check.
+- **RAM-backed filesystem guard** (added at Task 4's review, 2026-08-07): the
+  device ceiling must be measured on the target data directory's real
+  filesystem (`--dir`, defaulting to a throwaway temp dir) — a `tmpfs`/
+  `ramfs` mount makes `fsync` close to free, so every ratio computed against
+  it would be a plausible-looking number that means nothing. Detected by
+  name and probed against the directory actually measured, not a hardcoded
+  path; the run is marked INVALID in the artifact and still rendered (same
+  pattern as a non-finite float, not a refusal — an invalid run's own
+  artifact is where its explanation lives).
 - **Totals two ways**: every throughput number is computed both as
   requests ÷ duration and as a sum over per-thread counters; disagreement beyond
   rounding is a harness bug and fails the run.

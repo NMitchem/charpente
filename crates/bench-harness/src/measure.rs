@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// `struct timeval`'s layout differs by platform, and that difference is
 /// stated here rather than assumed. On 64-bit Linux, `suseconds_t` really is
@@ -95,15 +95,26 @@ pub fn process_cpu() -> Duration {
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(10);
 
-/// A ticking thread: if the process is suspended (laptop sleep), ticks stop
-/// while wall time inflates — `finish` then marks the run INVALID. The tick
-/// thread takes `gate` on every tick; holding it is the test seam that
-/// starves the heartbeat through its real path.
+/// How far a suspend-inclusive clock may run ahead of a monotonic one before
+/// `suspension_verdict` calls it a suspend rather than ordinary clock jitter
+/// or an NTP step. Suspends are seconds-to-hours; steps are milliseconds.
+const SUSPENSION_SLACK: Duration = Duration::from_secs(2);
+
+/// A ticking thread plus a suspend-inclusive wall-clock snapshot. `finish`
+/// runs two independent checks (T4 review, I-5): `suspension_verdict`
+/// (`Instant` vs `SystemTime` divergence — the only signal that survives a
+/// real suspend, since a suspended `Instant`-based tick count is internally
+/// consistent with a suspended `Instant`-based wall reading) and
+/// `heartbeat_verdict` (missed ticks while the system stays awake — thread
+/// starvation, not suspension). The tick thread takes `gate` on every tick;
+/// holding it is the test seam that starves the heartbeat through its real
+/// path.
 pub struct Heartbeat {
     ticks: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     gate: Arc<Mutex<()>>,
     started: Instant,
+    started_wall: SystemTime,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -125,6 +136,7 @@ impl Heartbeat {
             stop,
             gate,
             started: Instant::now(),
+            started_wall: SystemTime::now(),
             thread: Some(thread),
         }
     }
@@ -136,21 +148,54 @@ impl Heartbeat {
     /// None = run valid; Some(reason) = INVALID.
     pub fn finish(mut self) -> Option<String> {
         self.stop.store(true, Ordering::Relaxed);
-        let wall = self.started.elapsed();
+        let monotonic = self.started.elapsed();
+        // Falls back to the monotonic reading (never flags) if the system
+        // clock ran backwards — that is a clock-step case for an operator to
+        // investigate separately, not this guard's job.
+        let wall_clock = self.started_wall.elapsed().unwrap_or(monotonic);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
-        heartbeat_verdict(wall, HEARTBEAT_INTERVAL, self.ticks.load(Ordering::Relaxed))
+        suspension_verdict(monotonic, wall_clock).or_else(|| {
+            heartbeat_verdict(
+                monotonic,
+                HEARTBEAT_INTERVAL,
+                self.ticks.load(Ordering::Relaxed),
+            )
+        })
     }
 }
 
+/// Detects an actual suspend: `Instant` (`CLOCK_UPTIME_RAW` on Apple,
+/// `CLOCK_MONOTONIC` on Linux) excludes suspended time; `SystemTime` does
+/// not. The two diverge only across a real suspend — small NTP steps aside,
+/// which `SUSPENSION_SLACK` absorbs.
+pub fn suspension_verdict(monotonic: Duration, wall_clock: Duration) -> Option<String> {
+    if wall_clock.saturating_sub(monotonic) > SUSPENSION_SLACK {
+        Some(format!(
+            "INVALID: wall-clock time ({wall_clock:?}) exceeds monotonic elapsed \
+             ({monotonic:?}) by more than {SUSPENSION_SLACK:?} — the process was \
+             suspended mid-run (laptop sleep?); wall-clock rates from this run are \
+             meaningless"
+        ))
+    } else {
+        None
+    }
+}
+
+/// Catches the process staying AWAKE while its heartbeat thread is starved
+/// (`SIGSTOP`, App Nap, severe CPU oversubscription) — NOT suspension, which
+/// this ratio cannot detect (a real suspend leaves it untouched: the tick
+/// thread's own sleeps exclude suspended time exactly like `Instant` does,
+/// so `wall` here does not grow across a suspend either).
 pub fn heartbeat_verdict(wall: Duration, interval: Duration, observed: u64) -> Option<String> {
     let expected = (wall.as_nanos() / interval.as_nanos()).max(1) as u64;
     if observed * 2 < expected {
         Some(format!(
             "INVALID: heartbeat observed {observed} ticks of ~{expected} expected over \
-             {wall:?} — the process was suspended mid-run (laptop sleep?); \
-             wall-clock rates from this run are meaningless"
+             {wall:?} — the heartbeat thread was starved (SIGSTOP, App Nap, or severe CPU \
+             oversubscription) while the process stayed awake; rates from this run are \
+             meaningless"
         ))
     } else {
         None
@@ -222,9 +267,28 @@ mod tests {
 
     #[test]
     fn heartbeat_verdict_flags_a_starved_run_and_passes_a_healthy_one() {
+        // T4 review, I-5: this arm catches the process staying AWAKE while its
+        // heartbeat thread is starved (SIGSTOP, App Nap, CPU oversubstription) —
+        // not suspension, which `suspension_verdict` below detects instead (a
+        // genuine sleep leaves this ratio untouched, since the tick thread's own
+        // sleeps exclude suspended time exactly like `Instant` does).
         let interval = Duration::from_millis(10);
         assert!(heartbeat_verdict(Duration::from_secs(30), interval, 2900).is_none());
         let v = heartbeat_verdict(Duration::from_secs(30), interval, 100).expect("starved");
+        assert!(v.contains("INVALID"), "got: {v}");
+        assert!(v.contains("starved"), "got: {v}");
+    }
+
+    #[test]
+    fn suspension_verdict_flags_a_wall_clock_divergence_and_passes_a_healthy_one() {
+        // No divergence: healthy run, both clocks agree.
+        assert!(suspension_verdict(Duration::from_secs(30), Duration::from_secs(30)).is_none());
+        // Small divergence (NTP step, clock jitter) within slack: still healthy.
+        assert!(suspension_verdict(Duration::from_secs(30), Duration::from_secs(31)).is_none());
+        // A real suspend: monotonic time barely advances, wall clock advances
+        // through the whole sleep — exactly what a laptop-sleep run looks like.
+        let v = suspension_verdict(Duration::from_secs(2), Duration::from_secs(602))
+            .expect("suspended");
         assert!(v.contains("INVALID"), "got: {v}");
         assert!(v.contains("suspended"), "got: {v}");
     }

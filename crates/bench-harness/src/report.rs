@@ -147,6 +147,21 @@ fn collect_non_finite(r: &Report) -> Vec<String> {
     out
 }
 
+/// Every reason this run is INVALID: `r.invalid` (accumulated by the
+/// measurement layers as they ran) plus `collect_non_finite`'s rendering-time
+/// findings, in that order. This is the ONE place "is this run publishable"
+/// should be answered from (T4 review, I-3) — gating on `r.invalid` alone, as
+/// `main`'s exit code did before this fix, misses a non-finite value that is
+/// discovered only at render time (Task 3's ruling forbids a renderer
+/// mutating the caller's `Report`, so it can never land in `r.invalid`
+/// itself) and can report a run valid when its own rendered artifact already
+/// says INVALID.
+pub fn invalid_reasons(r: &Report) -> Vec<String> {
+    let mut reasons = r.invalid.clone();
+    reasons.extend(collect_non_finite(r));
+    reasons
+}
+
 fn num2(v: f64) -> String {
     if v.is_finite() {
         format!("{v:.2}")
@@ -168,7 +183,7 @@ pub fn render_json(r: &Report) -> Result<String, String> {
     if has_layers && r.device.is_none() {
         return Err(CEILING_REFUSAL.to_string());
     }
-    let non_finite = collect_non_finite(r);
+    let all_invalid = invalid_reasons(r);
     let mut s = String::new();
     s.push_str(&format!(
         "{{\"bench\":{{\"hardware\":\"{}\",\"os\":\"{}\",\"filesystem\":\"{}\",\"cores\":{},\
@@ -239,12 +254,6 @@ pub fn render_json(r: &Report) -> Result<String, String> {
         s.push(']');
     }
     s.push_str(",\"invalid\":[");
-    let all_invalid: Vec<&str> = r
-        .invalid
-        .iter()
-        .map(String::as_str)
-        .chain(non_finite.iter().map(String::as_str))
-        .collect();
     for (i, reason) in all_invalid.iter().enumerate() {
         if i > 0 {
             s.push(',');
@@ -300,8 +309,7 @@ pub fn render_human(r: &Report) -> String {
             ));
         }
     }
-    let non_finite = collect_non_finite(r);
-    for reason in r.invalid.iter().chain(non_finite.iter()) {
+    for reason in invalid_reasons(r) {
         s.push_str(&format!("  !! {reason}\n"));
     }
     s
@@ -461,5 +469,40 @@ mod tests {
         assert_eq!(esc("a\tb"), "a\\u0009b");
         assert_eq!(esc("a\rb"), "a\\u000db");
         assert_eq!(esc("a\u{0}b"), "a\\u0000b");
+    }
+
+    // fix round 1 (T4 review, I-3): `main`'s exit-code gate must see
+    // rendering-time non-finite reasons too, not just `Report.invalid` — this
+    // is the ONE function that answers "is this run publishable", so its
+    // result must include what `collect_non_finite` finds even though that
+    // never touches the caller's struct (Task 3's ruling forbids the
+    // renderer mutating the caller's `Report`).
+    #[test]
+    fn invalid_reasons_includes_rendering_time_non_finite_reasons() {
+        let mut r = fixed_report();
+        r.core.as_mut().unwrap().device_ratio = f64::NAN;
+        assert!(
+            r.invalid.is_empty(),
+            "the struct field alone must still be empty — this is exactly the gap"
+        );
+        let reasons = invalid_reasons(&r);
+        assert!(
+            !reasons.is_empty(),
+            "invalid_reasons must see the rendering-time non-finite reason"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|s| s.contains("core.device_ratio is not finite")),
+            "got: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_reasons_carries_pre_existing_reasons_too() {
+        let mut r = fixed_report();
+        r.invalid.push("INVALID: something else".to_string());
+        let reasons = invalid_reasons(&r);
+        assert_eq!(reasons, vec!["INVALID: something else".to_string()]);
     }
 }
