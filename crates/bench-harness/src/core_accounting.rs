@@ -4,10 +4,15 @@
 //! pure functions over observations that were already taken.
 //!
 //! Nothing here reads a clock, touches a database, a disk or a thread, or
-//! performs any IO — that is the point, and it is enforced rather than
-//! promised: unlike every other module in this crate, this one carries no
-//! blanket `#![allow(clippy::disallowed_methods, clippy::disallowed_types)]`,
-//! so hard rule 1's workspace deny-list is what holds spec §9.1.
+//! performs any IO — that is the point. Unlike every other module in this
+//! crate, this one carries no blanket
+//! `#![allow(clippy::disallowed_methods, clippy::disallowed_types)]`, so hard
+//! rule 1's workspace deny-list is what holds the no-clock/no-IO half of spec
+//! §9.1 mechanically — `Instant::now`, `std::fs`, `std::thread` and
+//! `std::net` all redden `-D warnings` here. The no-`Db`/no-`Disk` half is
+//! not on the deny-list (those are charpente types) and is held by review
+//! instead: adding a `Db` or `Disk` parameter to anything in this module
+//! defeats the seam even though CI stays green.
 //!
 //! A benchmark measures wall-clock performance on real hardware and is
 //! definitionally outside the deterministic core (DESIGN §1), so the simulator
@@ -255,9 +260,12 @@ pub fn read_accounting(duration: Duration, r: &ReadObs) -> Result<ReadAccounting
     // under ~4.5us to trip this floor) while writes run on the order of 250/s
     // (tripping the write arm above under ~20ms), three to four orders of
     // magnitude earlier, so any duration small enough to reach here would
-    // already have returned Err from the write arm. It was the fifth
-    // assertion this sub-project found that could not fail through the path
-    // that reaches it. Extracting the accounting is what gives it teeth:
+    // already have returned Err from the write arm. Kept for parity with
+    // `device::timed_loop`'s shared floor — Noah ruling #2 asked for BOTH
+    // core loops to carry it, so this arm is not removable on unreachability
+    // grounds. It was the fifth assertion this sub-project found that could
+    // not fail through the path that reaches it. Extracting the accounting is
+    // what gives it teeth:
     // `a_below_floor_read_window_refuses_and_an_at_floor_one_does_not` calls
     // this function directly, so the arm is now reachable without `run`
     // needing separate read/write durations.
@@ -269,7 +277,9 @@ pub fn read_accounting(duration: Duration, r: &ReadObs) -> Result<ReadAccounting
     // loop every read is a hit. The mutation the review demonstrated (a loop
     // body reduced to `reads += 1;` with no `get` call, publishing 42M
     // "reads/sec" from a loop touching the store zero times) leaves `hits` at
-    // 0 while `reads` climbs into the millions.
+    // 0 while `reads` climbs into the millions — caught here, on run's own
+    // path, not by a test-side bound that a portable rate check could not
+    // substitute for.
     if r.hits != r.reads {
         let (reads, hits) = (r.reads, r.hits);
         return Err(format!(
