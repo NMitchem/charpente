@@ -10,6 +10,13 @@ pub struct Report {
     pub filesystem: String,
     pub cores: usize,
     pub sync_semantics: &'static str,
+    // T5 review, M-7 / Noah ruling #3: every number in the review, the
+    // implementer's report and the ledger came from an unoptimized dev
+    // build (`cargo run`/`cargo test`, no `--release`) — this barely
+    // matters for the fsync-bound write path and matters a great deal for
+    // `reads_per_sec` and the kernel/wire layers. "dev" or "release" from
+    // `cfg!(debug_assertions)` (spec §5).
+    pub build_profile: &'static str,
     pub warmup_secs: f64,
     pub duration_secs: f64,
     pub device: Option<DeviceReport>,
@@ -29,6 +36,17 @@ pub struct CoreReport {
     pub log_records_per_sec: f64,
     pub reads_per_sec: f64,
     pub device_ratio: f64,
+    // T5 review, C-1 / Noah ruling #1: state in the artifact itself which
+    // device operand the ratio divides by, rather than leaving it implicit
+    // in spec §5's prose.
+    pub device_ratio_denominator: &'static str,
+    // T5 review, C-1 / Noah ruling #1: independent device-sync samples
+    // bracketing the measured write window (before and after), so the
+    // ratio's error bar is visible in the artifact instead of invisible —
+    // a single sample per operand cannot distinguish a real >1x reading
+    // from cross-window noise.
+    pub device_syncs_per_sec_before: f64,
+    pub device_syncs_per_sec_after: f64,
 }
 #[derive(Debug, Clone)]
 pub struct KernelReport {
@@ -111,6 +129,16 @@ fn collect_non_finite(r: &Report) -> Vec<String> {
         push_if_non_finite(&mut out, "core.log_records_per_sec", c.log_records_per_sec);
         push_if_non_finite(&mut out, "core.reads_per_sec", c.reads_per_sec);
         push_if_non_finite(&mut out, "core.device_ratio", c.device_ratio);
+        push_if_non_finite(
+            &mut out,
+            "core.device_syncs_per_sec_before",
+            c.device_syncs_per_sec_before,
+        );
+        push_if_non_finite(
+            &mut out,
+            "core.device_syncs_per_sec_after",
+            c.device_syncs_per_sec_after,
+        );
     }
     if let Some(k) = &r.kernel {
         push_if_non_finite(
@@ -187,12 +215,14 @@ pub fn render_json(r: &Report) -> Result<String, String> {
     let mut s = String::new();
     s.push_str(&format!(
         "{{\"bench\":{{\"hardware\":\"{}\",\"os\":\"{}\",\"filesystem\":\"{}\",\"cores\":{},\
-         \"sync_semantics\":\"{}\",\"warmup_secs\":{},\"duration_secs\":{}",
+         \"sync_semantics\":\"{}\",\"build_profile\":\"{}\",\"warmup_secs\":{},\
+         \"duration_secs\":{}",
         esc(&r.hardware),
         esc(&r.os),
         esc(&r.filesystem),
         r.cores,
         esc(r.sync_semantics),
+        esc(r.build_profile),
         num2(r.warmup_secs),
         num2(r.duration_secs)
     ));
@@ -206,11 +236,15 @@ pub fn render_json(r: &Report) -> Result<String, String> {
     if let Some(c) = &r.core {
         s.push_str(&format!(
             ",\"core\":{{\"acked_writes_per_sec\":{},\"log_records_per_sec\":{},\
-             \"reads_per_sec\":{},\"device_ratio\":{}}}",
+             \"reads_per_sec\":{},\"device_ratio\":{},\"device_ratio_denominator\":\"{}\",\
+             \"device_syncs_per_sec_before\":{},\"device_syncs_per_sec_after\":{}}}",
             num2(c.acked_writes_per_sec),
             num2(c.log_records_per_sec),
             num2(c.reads_per_sec),
-            num3(c.device_ratio)
+            num3(c.device_ratio),
+            esc(c.device_ratio_denominator),
+            num2(c.device_syncs_per_sec_before),
+            num2(c.device_syncs_per_sec_after)
         ));
     }
     if let Some(k) = &r.kernel {
@@ -266,9 +300,24 @@ pub fn render_json(r: &Report) -> Result<String, String> {
 
 pub fn render_human(r: &Report) -> String {
     let mut s = String::new();
+    // T5 review, I-4: the bare `{:.0}` printed "warmup 0s" for a real 0.5s
+    // warmup (round-half-to-even) and "measure 0s" for a real 0.4s window —
+    // false values for the two most load-bearing methodological fields in a
+    // benchmark artifact. `num2` matches the JSON renderer's precision and
+    // non-finite handling. T5 review, M-1: "(per window)" states that a
+    // layer running multiple measured windows (core: write, then read) uses
+    // this SAME pair for each one, not once for the whole invocation.
     s.push_str(&format!(
-        "bench: {} | {} | {} | {} cores | sync: {} | warmup {:.0}s, measure {:.0}s\n",
-        r.hardware, r.os, r.filesystem, r.cores, r.sync_semantics, r.warmup_secs, r.duration_secs
+        "bench: {} | {} | {} | {} cores | {} build | sync: {} | warmup {}s, measure {}s \
+         (per window)\n",
+        r.hardware,
+        r.os,
+        r.filesystem,
+        r.cores,
+        r.build_profile,
+        r.sync_semantics,
+        num2(r.warmup_secs),
+        num2(r.duration_secs)
     ));
     if let Some(d) = &r.device {
         s.push_str(&format!(
@@ -278,8 +327,15 @@ pub fn render_human(r: &Report) -> String {
     }
     if let Some(c) = &r.core {
         s.push_str(&format!(
-            "  core:   {:.0} acked writes/s ({:.2}x device), {:.0} log records/s, {:.0} reads/s\n",
-            c.acked_writes_per_sec, c.device_ratio, c.log_records_per_sec, c.reads_per_sec
+            "  core:   {:.0} acked writes/s ({:.2}x {}, bracket {:.0}/{:.0} syncs/s \
+             before/after), {:.0} log records/s, {:.0} reads/s\n",
+            c.acked_writes_per_sec,
+            c.device_ratio,
+            c.device_ratio_denominator,
+            c.device_syncs_per_sec_before,
+            c.device_syncs_per_sec_after,
+            c.log_records_per_sec,
+            c.reads_per_sec
         ));
     }
     if let Some(k) = &r.kernel {
@@ -326,6 +382,7 @@ mod tests {
             filesystem: "TestFS".to_string(),
             cores: 8,
             sync_semantics: "F_FULLFSYNC via sync_all",
+            build_profile: "dev",
             warmup_secs: 5.0,
             duration_secs: 30.0,
             device: Some(DeviceReport {
@@ -337,6 +394,9 @@ mod tests {
                 log_records_per_sec: 1450.0,
                 reads_per_sec: 800000.0,
                 device_ratio: 0.97,
+                device_ratio_denominator: "device.syncs_per_sec",
+                device_syncs_per_sec_before: 1490.0,
+                device_syncs_per_sec_after: 1510.0,
             }),
             kernel: Some(KernelReport {
                 acked_writes_per_sec: 1300.0,
@@ -368,11 +428,14 @@ mod tests {
             json,
             "{\"bench\":{\"hardware\":\"Test \\\"Box\\\" 1\",\"os\":\"TestOS 1.0 arm64\",\
              \"filesystem\":\"TestFS\",\"cores\":8,\
-             \"sync_semantics\":\"F_FULLFSYNC via sync_all\",\"warmup_secs\":5.00,\
+             \"sync_semantics\":\"F_FULLFSYNC via sync_all\",\"build_profile\":\"dev\",\
+             \"warmup_secs\":5.00,\
              \"duration_secs\":30.00,\"device\":{\"syncs_per_sec\":1500.25,\
              \"appends_per_sec\":1400.50},\"core\":{\"acked_writes_per_sec\":1450.00,\
              \"log_records_per_sec\":1450.00,\"reads_per_sec\":800000.00,\
-             \"device_ratio\":0.970},\"kernel\":{\"acked_writes_per_sec\":1300.00,\
+             \"device_ratio\":0.970,\"device_ratio_denominator\":\"device.syncs_per_sec\",\
+             \"device_syncs_per_sec_before\":1490.00,\"device_syncs_per_sec_after\":1510.00},\
+             \"kernel\":{\"acked_writes_per_sec\":1300.00,\
              \"log_records_per_sec\":2600.00,\"requests_total\":50000,\"jobs_done\":50000},\
              \"wire\":[{\"target\":\"bench-app\",\"points\":[{\"connections\":4,\
              \"throughput_per_sec\":1200.00,\"log_records_per_sec\":2400.00,\
@@ -456,6 +519,34 @@ mod tests {
         // every other float is still finite: only the two perturbed fields are null.
         assert!(json.contains("\"acked_writes_per_sec\":1450.00"));
         assert!(json.contains("\"throughput_per_sec\":1200.00"));
+    }
+
+    // T5 review, C-1 / Noah ruling #1: the two new bracket-sample fields
+    // must be scanned by the SAME central non-finite path as every other
+    // float — do not hand-roll a separate check for them (Task 3's
+    // standing note to T4-T8).
+    #[test]
+    fn the_bracket_sample_fields_are_scanned_for_non_finite() {
+        let mut r = fixed_report();
+        r.core.as_mut().unwrap().device_syncs_per_sec_before = f64::NAN;
+        r.core.as_mut().unwrap().device_syncs_per_sec_after = f64::INFINITY;
+        let json = render_json(&r).expect("non-finite floats are recorded, not refused");
+        assert!(
+            json.contains("\"device_syncs_per_sec_before\":null"),
+            "got: {json}"
+        );
+        assert!(
+            json.contains("\"device_syncs_per_sec_after\":null"),
+            "got: {json}"
+        );
+        assert!(
+            json.contains("core.device_syncs_per_sec_before is not finite (NaN)"),
+            "got: {json}"
+        );
+        assert!(
+            json.contains("core.device_syncs_per_sec_after is not finite (inf)"),
+            "got: {json}"
+        );
     }
 
     // fix round 1 (review I-2): esc's `\\`, `\n`, and `<0x20` arms were exercised by

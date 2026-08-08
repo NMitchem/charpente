@@ -149,9 +149,17 @@ point, detected by comparing client-side busy time against wall time).
 
 Every report — JSON and human — embeds, not as prose elsewhere but as fields in
 the artifact: hardware model and core count, OS and filesystem, sync semantics
-(`F_FULLFSYNC` named on macOS), warmup discarded (default 5 s), measured
+(`F_FULLFSYNC` named on macOS), the build profile (`dev`/`release`, from
+`cfg!(debug_assertions)` — *added at Task 5's review, 2026-08-08, Noah ruling
+#3: every number in that review, the implementer's report and the ledger came
+from an unoptimized dev build; this barely matters for the fsync-bound write
+path and matters a great deal for `reads_per_sec` and the kernel/wire layers.
+`scripts/bench.sh`, not yet created as of this amendment, must force
+`--release` when it lands.*), warmup discarded (default 5 s), measured
 duration (default 30 s per point), and the device-ceiling ratio
-(core acked-writes/sec ÷ device syncs/sec).
+(core acked-writes/sec ÷ device syncs/sec — *amended at Task 5's review,
+2026-08-08: the artifact also states, as its own field, which device operand
+the ratio divides by (`device.syncs_per_sec`).*).
 
 Run-validity rules, mechanical:
 
@@ -208,6 +216,39 @@ Run-validity rules, mechanical:
   an INVALID artifact, because there is no measurement to render. Likewise a
   core-count probe reporting `0` (the one value no real system reports) marks
   the run INVALID rather than publishing a lie-shaped number silently.
+  *Amended at Task 5's review (2026-08-08, C-3 / Noah ruling #2): "zero ops"
+  was not a strict enough floor. A window completing exactly one op is the
+  same defect one step later — a rate that is really just that one
+  operation's own latency inverted (reproduced through the shipped CLI at
+  `--duration 0.004`, ratios up to 1.543). The real floor a measurement loop
+  must clear is that it actually ran its full requested duration AND
+  completed a minimum op count. Every measurement loop in this crate is
+  shaped `while Instant::now() < end { op() }`, which can only exit once
+  `Instant::now() >= end` — so `elapsed >= duration` holds unconditionally
+  the moment such a loop returns, and the "ran its full duration" half of the
+  floor is structurally guaranteed by the loop shape itself. The floor
+  therefore collapses to a minimum op count
+  (`measure::MIN_MEASURED_OPS`, currently 5), applied uniformly by
+  `measure::degenerate_window_reason` to `device::timed_loop` and to both of
+  `core_bench::run`'s write and read loops.*
+- **The device-ceiling ratio must be physically plausible** (added at Task
+  5's review, 2026-08-08, C-1 / Noah ruling #1): `Engine::submit` performs
+  exactly one `wal.sync()` per transaction with no group commit, so the
+  commit path cannot durably ack faster than the device's own sync rate in
+  fact — a measured `device_ratio` above `1.0` (plus a small slack covering
+  floating-point/timer-resolution noise) is a measurement artifact, not a
+  real durability finding, and is marked INVALID by name. The reason names
+  both candidate causes rather than asserting one: cross-window variance
+  (the device ceiling and the core write window are measured in disjoint
+  windows, and single-sample noise on the denominator alone was measured at
+  220–310 syncs/s across otherwise-identical runs — comparable to the whole
+  signal the ratio is about) and non-comparable op shapes (the ratio's
+  denominator is the one-byte-overwrite sync loop, not the append-shaped
+  loop that reproduces the WAL's own op shape). The core write window is
+  additionally bracketed by an independent, short device-sync sample on
+  either side (before and after), reported in the artifact as
+  `device_syncs_per_sec_before`/`_after` — visible dispersion in place of a
+  single distant sample from a separate `bench device` invocation.
 - **Totals two ways**: every throughput number is computed both as
   requests ÷ duration and as a sum over per-thread counters; disagreement beyond
   rounding is a harness bug and fails the run.

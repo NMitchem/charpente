@@ -246,6 +246,37 @@ pub fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[index]
 }
 
+/// The minimum op count a measured window must complete to publish a rate
+/// (spec §5's degenerate-window floor, amended T5 review C-3). `ops == 0`
+/// divides into a *finite* `0.0` rate that `report::collect_non_finite`
+/// cannot catch (T4 review, I-2); an op count of `1` is the same defect one
+/// step later — a rate that is really just one operation's own latency
+/// inverted (T5 review, C-3, reproduced through the shipped CLI at
+/// `--duration 0.004` with ratios up to 1.543). Kept low enough (not, say,
+/// 1000) that it does not itself break the short `--duration`/`--warmup`
+/// values this crate's own smoke tests and manual repros already use.
+pub const MIN_MEASURED_OPS: u64 = 5;
+
+/// `None` = the window is a real measurement; `Some(reason)` = refuse it,
+/// don't publish it. Spec §5 also asks whether the loop "actually ran its
+/// full duration" — every measurement loop in this crate is shaped
+/// `while Instant::now() < end { op() }`, which can only exit once
+/// `Instant::now() >= end`, so `start.elapsed() >= duration` holds
+/// unconditionally the moment such a loop returns. That half of the floor is
+/// therefore structurally guaranteed by the loop shape itself, not something
+/// this function needs to check — the floor collapses to a minimum op count.
+pub fn degenerate_window_reason(name: &str, ops: u64, duration: Duration) -> Option<String> {
+    if ops < MIN_MEASURED_OPS {
+        Some(format!(
+            "INVALID: the {name} loop completed only {ops} ops in a {duration:?} window \
+             (need at least {MIN_MEASURED_OPS}) — raise --duration; a window this short \
+             cannot produce a rate, only one (or a few) operation's own latency inverted"
+        ))
+    } else {
+        None
+    }
+}
+
 /// Totals-two-ways (spec §5): per-thread counters vs the grand counter.
 /// Disagreement is a harness bug, and the run that produced it is INVALID.
 pub fn crosscheck(per_thread: &[u64], grand: u64) -> Result<u64, String> {
@@ -287,6 +318,43 @@ mod tests {
         let err = crosscheck(&[2, 2], 5).unwrap_err();
         assert!(err.contains("totals disagree"), "got: {err}");
         assert!(err.contains("INVALID"), "got: {err}");
+    }
+
+    // T5 review C-3 (Noah ruling #2): the shared floor a zero-op window AND
+    // a below-floor-but-nonzero window must both hit — "1 op" is the same
+    // defect as "0 ops" one step later, a rate that is really just one
+    // operation's own latency inverted.
+    #[test]
+    fn a_zero_op_window_is_below_the_floor() {
+        let r = degenerate_window_reason("test", 0, Duration::from_millis(4))
+            .expect("0 ops must be refused");
+        assert!(r.contains("INVALID"), "got: {r}");
+        assert!(r.contains("0 ops"), "got: {r}");
+        assert!(r.contains("test"), "must name which loop: {r}");
+        assert!(r.contains("--duration"), "must name the fix: {r}");
+    }
+
+    #[test]
+    fn a_below_floor_nonzero_op_window_is_also_refused() {
+        // The discriminating case the review reproduced through the shipped
+        // CLI: nonzero but degenerate. A naive "ops == 0" check would pass
+        // this silently.
+        for ops in 1..MIN_MEASURED_OPS {
+            let r = degenerate_window_reason("test", ops, Duration::from_millis(4))
+                .unwrap_or_else(|| panic!("{ops} ops must still be below the floor"));
+            assert!(r.contains(&format!("{ops} ops")), "got: {r}");
+        }
+    }
+
+    #[test]
+    fn a_window_at_or_above_the_floor_is_not_flagged() {
+        assert!(
+            degenerate_window_reason("test", MIN_MEASURED_OPS, Duration::from_secs(1)).is_none()
+        );
+        assert!(
+            degenerate_window_reason("test", MIN_MEASURED_OPS * 100, Duration::from_secs(1))
+                .is_none()
+        );
     }
 
     #[test]

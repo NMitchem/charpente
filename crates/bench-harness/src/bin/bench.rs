@@ -251,6 +251,20 @@ fn sync_semantics() -> &'static str {
     }
 }
 
+/// T5 review, M-7 / Noah ruling #3: every number in the T5 review, the
+/// implementer's report and the ledger came from an unoptimized dev build
+/// (`cargo run`/`cargo test`, no `--release`). Barely matters for the
+/// fsync-bound write path; matters a great deal for `reads_per_sec` and the
+/// kernel/wire layers. Stated in the artifact so a reader never has to
+/// guess which build produced a number.
+fn build_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "dev"
+    } else {
+        "release"
+    }
+}
+
 fn base_report(warmup: f64, duration: f64, dir: &str) -> Report {
     Report {
         hardware: hardware(),
@@ -258,6 +272,7 @@ fn base_report(warmup: f64, duration: f64, dir: &str) -> Report {
         filesystem: filesystem(dir),
         cores: std::thread::available_parallelism().map_or(0, |n| n.get()),
         sync_semantics: sync_semantics(),
+        build_profile: build_profile(),
         warmup_secs: warmup,
         duration_secs: duration,
         device: None,
@@ -367,9 +382,9 @@ fn run_layers(args: &Args, dir: &str, report: &mut Report) -> std::io::Result<bo
                 .as_ref()
                 .expect("device ran first")
                 .syncs_per_sec;
-            let (core, invalid) =
-                bench_harness::core_bench::run(&dir, args.warmup, args.duration, ceiling)?;
-            let _ = std::fs::remove_dir_all(&dir);
+            let result = bench_harness::core_bench::run(&dir, args.warmup, args.duration, ceiling);
+            let _ = std::fs::remove_dir_all(&dir); // T5 review, M-3: clean up on Err too (mirrors the device arm's M-5 fix).
+            let (core, invalid) = result?;
             report.core = Some(core);
             report.invalid.extend(invalid);
             true
@@ -562,6 +577,7 @@ mod tests {
             filesystem: String::new(),
             cores: 1,
             sync_semantics: "test",
+            build_profile: "test",
             warmup_secs: 0.0,
             duration_secs: 0.0,
             device: None,
@@ -584,6 +600,9 @@ mod tests {
             log_records_per_sec: 1.0,
             reads_per_sec: 1.0,
             device_ratio: f64::NAN,
+            device_ratio_denominator: "device.syncs_per_sec",
+            device_syncs_per_sec_before: 1.0,
+            device_syncs_per_sec_after: 1.0,
         });
         assert!(
             r.invalid.is_empty(),

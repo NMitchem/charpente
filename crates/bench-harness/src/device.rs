@@ -10,7 +10,10 @@ use charpente::prod::ProdDisk;
 use std::io;
 use std::time::{Duration, Instant};
 
-fn timed_loop(
+// T5 review, C-1 / Noah ruling #1: exposed to `core_bench` so its device-
+// ceiling bracket samples reuse this loop rather than hand-rolling a second
+// one.
+pub(crate) fn timed_loop(
     name: &str,
     warmup: Duration,
     duration: Duration,
@@ -27,15 +30,18 @@ fn timed_loop(
         op()?;
         ops += 1;
     }
-    // T4 review, I-2: `ops == 0` divides into a FINITE `0.0`, not NaN/Infinity
-    // — `report::collect_non_finite` cannot catch it, so a window shorter
-    // than one durable op must refuse by name instead of publishing a
-    // plausible-looking zero.
-    if ops == 0 {
-        return Err(io::Error::other(format!(
-            "INVALID: the device {name} loop completed 0 ops in a {duration:?} window — \
-             raise --duration; a window shorter than one durable sync cannot produce a rate"
-        )));
+    // T4 review, I-2 (the zero-op case) + T5 review C-3 / Noah ruling #2 (the
+    // general floor, spec §5 amended in the same commit): `ops == 0` divides
+    // into a FINITE `0.0`, not NaN/Infinity — `report::collect_non_finite`
+    // cannot catch it — and a small nonzero count is the same defect one
+    // step later (a rate that is really just one operation's own latency
+    // inverted). Shared with core_bench.rs's write/read loops via
+    // `crate::measure::degenerate_window_reason`/`MIN_MEASURED_OPS` so both
+    // layers refuse by the same rule.
+    if let Some(reason) =
+        crate::measure::degenerate_window_reason(&format!("device {name}"), ops, duration)
+    {
+        return Err(io::Error::other(reason));
     }
     Ok(ops as f64 / start.elapsed().as_secs_f64())
 }
@@ -134,6 +140,28 @@ mod tests {
             "the discriminating case — a message naming only 'sync' would pass \
              the test above for the wrong reason: {msg}"
         );
+    }
+
+    // T5 review, C-3 / Noah ruling #2: a window that completed a SMALL
+    // NONZERO op count is the same defect as zero ops, one step later — the
+    // review reproduced this through the shipped CLI (`--duration 0.004`,
+    // one op, ratios up to 1.543). Force a small nonzero count deterministically
+    // via a slow op (not a mock of the floor itself) — a naive `ops == 0`
+    // check, which is what shipped before this round, would let this pass.
+    #[test]
+    fn a_below_floor_nonzero_op_window_is_still_refused() {
+        let err = timed_loop("sync", Duration::ZERO, Duration::from_millis(45), || {
+            std::thread::sleep(Duration::from_millis(15));
+            Ok(())
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("INVALID"), "got: {msg}");
+        assert!(
+            !msg.contains("only 0 ops"),
+            "must be the nonzero-but-below-floor case, not the zero-op case: {msg}"
+        );
+        assert!(msg.contains("the device sync loop"), "got: {msg}");
     }
 
     // T4 review, M-3: the frame must not be all-zero or otherwise trivially

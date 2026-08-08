@@ -69,23 +69,173 @@ fn device_layer_produces_nonzero_rates() {
 #[test]
 #[ignore]
 fn core_layer_commits_and_reports_a_ratio() {
-    let dir = scratch("core");
-    let (core, invalid) = bench_harness::core_bench::run(
-        &dir,
+    // T5 review, C-2 / M-6: a fabricated 1000.0 ceiling let the ratio
+    // assertion degenerate into checking arithmetic against a made-up
+    // number, and meant the layer's ratio math was never grounded in a real
+    // device measurement. Run a REAL (short) device probe first, on its own
+    // subdirectory of the same scratch tree — mirroring bin/bench.rs's own
+    // shape (device runs in its own dir, core in its own, same base
+    // filesystem) without needing the full binary (that's the separate
+    // subprocess test below, which closes the rest of M-6: the binary's OWN
+    // `report.device.as_ref().expect(...)` handoff line).
+    let base = scratch("core");
+    let device_dir = format!("{base}/device");
+    let core_dir = format!("{base}/core");
+    std::fs::create_dir_all(&device_dir).expect("device subdir");
+    std::fs::create_dir_all(&core_dir).expect("core subdir");
+    let device = bench_harness::device::run(
+        &device_dir,
         Duration::from_millis(200),
         Duration::from_secs(1),
-        1000.0,
+    )
+    .expect("device layer runs");
+    let ceiling = device.syncs_per_sec;
+    let (core, invalid) = bench_harness::core_bench::run(
+        &core_dir,
+        Duration::from_millis(200),
+        Duration::from_secs(1),
+        ceiling,
     )
     .expect("core layer runs");
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        invalid.is_empty(),
-        "short healthy run must be valid: {invalid:?}"
-    );
+    let _ = std::fs::remove_dir_all(&base);
+    // NOT `invalid.is_empty()` (M-2 kept that assertion for the pre-existing
+    // heartbeat arms, which need the machine to be genuinely broken to fire —
+    // this is a DIFFERENT source). C-1's ratio gate is designed to fire on
+    // short/noisy windows — the review measured it 2-in-7 even on a "quiet"
+    // machine with fully separate runs, and this smoke's 1s windows plus
+    // real parallel-test contention make it MORE likely, not less. A gate
+    // that never fires on a short window would be the bug (that is C-1
+    // itself). Tolerate only that one, named, reason; any OTHER invalid
+    // reason on a healthy short run means something really regressed.
+    for reason in &invalid {
+        assert!(
+            reason.contains("device_ratio") && reason.contains("exceeds 1.0"),
+            "C-1's ratio gate legitimately fires on some short/noisy windows (that's the \
+             fix working) — but any OTHER invalid reason here means something regressed: \
+             {reason}"
+        );
+    }
     assert!(core.acked_writes_per_sec > 0.0);
+    // T5 review, C-2 (recommended fix 2): the implausibility upper bound the
+    // device smoke already has (IMPLAUSIBLY_DURABLE_PER_SEC's own rationale
+    // above applies verbatim — no fsync-backed commit path reaches this).
+    assert!(
+        core.acked_writes_per_sec < IMPLAUSIBLY_DURABLE_PER_SEC,
+        "acked_writes_per_sec implausibly high for an fsync-bound commit path: {} \
+         (measured on a RAM-backed filesystem?)",
+        core.acked_writes_per_sec
+    );
     assert!(
         core.reads_per_sec > core.acked_writes_per_sec,
-        "reads never fsync"
+        "reads never fsync — this is a weak sanity bound (large margin); the real \
+         protection against a read loop touching nothing is core_bench::run's own \
+         hits == reads invariant (T5 review, C-2 recommended fix 3), not this assertion"
     );
-    assert!(core.device_ratio > 0.0);
+    // T5 review, C-2 (recommended fix 1): `device_ratio > 0.0` was strictly
+    // implied by the `acked_writes_per_sec > 0.0` assertion above — no input
+    // to `run` could make one fail and not the other. Assert the field's
+    // DERIVATION instead, which can actually fail (e.g. a wrong multiplier
+    // or a swapped operand, both proven by mutation in the fix-round report).
+    assert!(
+        (core.device_ratio - core.acked_writes_per_sec / ceiling).abs() < 1e-9,
+        "device_ratio must equal acked_writes_per_sec / device.syncs_per_sec: {} vs {}",
+        core.device_ratio,
+        core.acked_writes_per_sec / ceiling
+    );
+}
+
+// T5 review, M-6: the smoke above measures a real device ceiling, but never
+// drives `bin/bench.rs`'s OWN device->core handoff
+// (`report.device.as_ref().expect("device ran first").syncs_per_sec`) — only
+// manual CLI runs did. Spawn the real binary end to end.
+#[test]
+#[ignore]
+fn the_binarys_device_to_core_handoff_is_exercised() {
+    let dir = scratch("handoff");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bench"))
+        .args([
+            "core",
+            "--duration",
+            "1",
+            "--warmup",
+            "0.2",
+            "--dir",
+            &dir,
+            "--json",
+        ])
+        .output()
+        .expect("bench binary runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let code = out.status.code();
+    // Not necessarily 0: C-1's ratio gate can legitimately mark a short run
+    // INVALID (exit 1) on a noisy machine — this test proves the handoff
+    // itself works, not that every run is valid.
+    assert!(
+        code == Some(0) || code == Some(1),
+        "bench core must exit 0 (valid) or 1 (INVALID) through the real device->core \
+         handoff, got {code:?}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("\"core\":{"),
+        "the real device->core handoff must produce a core report: {stdout}"
+    );
+    assert!(stdout.contains("\"device_ratio\""), "got: {stdout}");
+}
+
+// T5 review, C-3 / Noah ruling #2: a genuinely degenerate CLI window (the
+// review's own repro, `--duration 0.004`) must be refused, not published as
+// a self-contradicting "duration_secs: 0.00" artifact with four rates
+// derived from it.
+#[test]
+#[ignore]
+fn a_degenerate_cli_duration_is_refused_not_published() {
+    let dir = scratch("degenerate");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bench"))
+        .args([
+            "core",
+            "--duration",
+            "0.004",
+            "--warmup",
+            "0",
+            "--dir",
+            &dir,
+            "--json",
+        ])
+        .output()
+        .expect("bench binary runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a degenerate window must be refused (layer failure, exit 1), not published at \
+         exit 0\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("layer failed") && stderr.contains("INVALID"),
+        "got: {stderr}"
+    );
+}
+
+// T5 review, C-3 / Noah ruling #2: proves the WIRING inside core_bench::run
+// itself, not just measure::degenerate_window_reason in isolation (unit-
+// tested in core_bench.rs's own #[cfg(test)] module) or device.rs's parallel
+// wiring. `canonical` performs a real fsync per op (~3-5ms on this class of
+// hardware per the review's own measurements), so a tiny nonzero duration
+// reliably lands a SMALL NONZERO op count — the discriminating case a naive
+// `ops == 0` check (what shipped before this round) would have let through.
+#[test]
+#[ignore]
+fn a_below_floor_core_write_window_is_refused() {
+    let dir = scratch("core-below-floor");
+    let err =
+        bench_harness::core_bench::run(&dir, Duration::ZERO, Duration::from_millis(10), 250.0)
+            .expect_err("a handful of ops in 10ms must be refused, not published");
+    let _ = std::fs::remove_dir_all(&dir);
+    let msg = err.to_string();
+    assert!(msg.contains("INVALID"), "got: {msg}");
+    assert!(msg.contains("core write"), "must name which loop: {msg}");
+    assert!(msg.contains("--duration"), "must name the fix: {msg}");
 }
