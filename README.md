@@ -5,8 +5,8 @@
 *Une charpente* is the timber frame of a building — the one structure everything else hangs
 off. Charpente is a Rust platform where one statically-linked binary *is* the entire
 backend: the HTTP server, the database, the job queue, the cron scheduler, the realtime
-event feed, auth, and the blob store. An application is a Rust crate that links against the
-platform and compiles into it. Deployment is one binary and one data directory.
+event feed, and auth. An application is a Rust crate that links against the platform and
+compiles into it. Deployment is one binary and one data directory.
 
 There is no Postgres to provision. No Redis to babysit. No queue service, no outbox table,
 no sidecar collector, no serialization boundary between "services." One process, one commit
@@ -80,7 +80,7 @@ otherwise is how platforms die building a worse Spanner instead of a better SQLi
 
 ## Status
 
-**M0 shipped (2026-07-07).** The sim-first core is built: a segmented
+**M1 shipped (2026-07-27).** M0 built the sim-first core: a segmented
 checksummed WAL, typed tables on redb, transactions with one commit point
 across state/queue/events, the HTTP kernel, queue + cron, and `charpente
 test --sim` — the deterministic simulator with seeded fault injection this
@@ -91,6 +91,19 @@ fault-injection universes (master seed `0x483e230baed4922b`). The
 dual-write bug class the second guarantee above claims to delete
 structurally is demonstrated, caught, and reverted at
 [examples/invoicing/DEMO.md](examples/invoicing/DEMO.md).
+
+M1 made it a platform: replication with promotable followers and manual
+failover, realtime SSE with exact `Last-Event-ID` resume, auth (sessions,
+API keys, static-JWKS OIDC), schema migrations as log records, `charpente
+describe`, and a black-box edge harness that drives stock binaries over
+real TCP with `kill -9` and TCP-proxy fault injection.
+
+**M2 is in progress**, starting with an honest benchmark harness. What is
+*not* built, so you don't have to go looking: there are no published
+performance numbers yet (the scaling paragraph above is an argument, not a
+measurement), no blob store, no object-storage backup (`serve::backup` is
+a promotable hot standby, not a snapshot shipper), no WebSockets, no TS
+client codegen, and no tenant scoping as typed key prefixes.
 
 | Doc | What it is |
 |---|---|

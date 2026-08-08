@@ -516,9 +516,12 @@ measurement: no store over the 1 GiB bound was built to prove the symptom, by
 design.
 
 **Snapshots & reads.** MVCC snapshots at log positions; read-only queries (and follower
-reads) run against snapshots without touching the write path. Blob columns over a
-configurable size spill to a content-addressed blob store (same log-commit discipline for
-the metadata, direct streaming for the bytes).
+reads) run against snapshots without touching the write path.
+
+**Blobs (M2, not built).** Blob columns over a configurable size are *to* spill to a
+content-addressed blob store (same log-commit discipline for the metadata, direct
+streaming for the bytes). Nothing in this paragraph exists today — there is no blob type,
+no spill threshold, and no streaming path; a large value is simply bytes in a row.
 
 **Logical export (v1, implemented).** A `Snapshot` also exposes the seed path's read
 surface (M1 replication T4): `applied_seq`/`next_job_id` read META off the snapshot's own
@@ -538,8 +541,12 @@ after every table has landed.
   later *without* changing the data plane, because the log format is the contract).
 - **Stance (fixed):** one primary, no sharding, no multi-master. See MANIFESTO §7.
 - **Deploy:** one binary + one data directory. Upgrades: new binary replays/attaches to the
-  same log (schema versions in-log make this well-defined). Backup: log segments + periodic
-  snapshot to object storage, Litestream-style, built in — not an add-on.
+  same log (schema versions in-log make this well-defined).
+- **Backup (M2, not built):** log segments + periodic snapshot to object storage,
+  Litestream-style, built in — not an add-on. What exists today is `serve::backup`
+  (`crates/charpente/src/serve.rs`): a replication-only node with no HTTP edge that keeps
+  its own durable copy and can be promoted. That is a hot standby, not an off-site
+  snapshot shipper — there is no object-storage code path anywhere in the tree.
 
 **Seeding (v1, implemented).** `Db::into_seeder`/`Seeder` builds a follower's (or a fresh
 backup's) entire state from a primary's logical snapshot stream, no log replay involved

@@ -3,7 +3,7 @@
 Bias: end-to-end working system as fast as possible, then refine. Every milestone ends in
 something that runs and demonstrates a guarantee no incumbent stack offers.
 
-## M0 — The demo that sells the thesis
+## M0 — The demo that sells the thesis [shipped 2026-07-07]
 
 **Goal:** an agent builds a small SaaS on charpente in one session, and `--sim` catches an
 injected durability bug that would silently eat data on a conventional stack.
@@ -34,28 +34,44 @@ Scope, in dependency order:
 at any point during commit never loses an acknowledged write; the agent-authored app
 required zero framework patches.
 
-## M1 — The platform becomes real
+## M1 — The platform becomes real [shipped 2026-07-27; four bullets deferred, marked below]
 
-- **Replication:** async log shipping, follower reads, manual/arbiter failover; backup =
-  log segments + snapshots to object storage, built in.
-- **Realtime:** SSE/WebSocket subscription surface over `#[event]` with exact
-  resume-from-cursor; TS client codegen for events and routes.
-- **Auth, properly:** OIDC, API keys, tenant scoping as typed key prefixes.
+- **Replication:** async log shipping, follower reads, manual/arbiter failover. *Shipped.*
+  Backup = log segments + snapshots to object storage: **deferred to M2, not built** —
+  `serve::backup` is a promotable hot standby, not a snapshot shipper.
+- **Realtime:** SSE subscription surface over `#[event]` with exact resume-from-cursor.
+  *Shipped.* WebSockets and TS client codegen for events and routes: **deferred to M2**
+  (both were declared non-goals of the realtime spec).
+- **Auth, properly:** OIDC (static-JWKS RS256), API keys, sessions. *Shipped.* Tenant
+  scoping as typed key prefixes: **deferred to M2** — multi-tenancy is a convention today,
+  not compiler-enforced (DESIGN §9 carries it as its own future design).
 - **Migrations:** schema versions as log records; compile-time incompatibility detection.
+  *Shipped.*
 - **Error/introspection polish:** `charpente describe`, structured sim-failure reports —
-  the agent-interface quality bar (DESIGN §7) gets its own test suite.
+  the agent-interface quality bar (DESIGN §7) gets its own test suite. *Shipped.*
 - **Edge harness:** Vörtex-style black-box rig for the hyper edge — stock binary,
   TCP-proxy fault injection, process kill/pause. The sim proves the kernel; this covers
-  the wire (`serve`).
+  the wire (`serve`). *Shipped.*
 
 **Exit criteria:** a follower promoted mid-write-load loses nothing and serves reads
-throughout; a reconnecting realtime client provably misses no events.
+throughout; a reconnecting realtime client provably misses no events. **Both discharged
+2026-07-27**, each with an oracle at two layers (an in-sim property plus a wire oracle in
+the edge harness). None of the four deferred bullets above gates either criterion — which
+is why the milestone closed with them outstanding rather than silently absorbing them.
 
-## M2 — The moat deepens
+## M2 — The moat deepens [in progress]
 
+- **Honest benchmark harness** — the "publish honest benchmarks early" mitigation below,
+  and the instrument DECISIONS §7's LSM build triggers are read against. *In progress.*
 - **Own LSM storage engine**, proven under the (by now battle-hardened) sim harness before
-  it replaces redb. The harness is what makes this safe to attempt.
+  it replaces redb. The harness is what makes this safe to attempt. **Deferred behind
+  measurement** (ruled 2026-08-06): the build triggers live in DECISIONS §7, and the
+  benchmark harness above is what reads them.
 - **Blob store** (content-addressed, spill-over columns, direct streaming).
+- **Object-storage backup** (deferred from M1): log segments + periodic snapshots
+  off-site, Litestream-style.
+- **WebSockets + TS client codegen** (deferred from M1).
+- **Tenant scoping as typed key prefixes** (deferred from M1; DESIGN §9).
 - **Typed telemetry with change-time checks** — the observability contract as a lockfile;
   instrumentation that cannot silently rot.
 - **Read-only Postgres-wire endpoint** for BI tools.
