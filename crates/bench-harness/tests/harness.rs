@@ -188,6 +188,13 @@ fn the_binarys_device_to_core_handoff_is_exercised() {
 // review's own repro, `--duration 0.004`) must be refused, not published as
 // a self-contradicting "duration_secs: 0.00" artifact with four rates
 // derived from it.
+//
+// T5 re-review, N-7 (Minor): at this duration the DEVICE layer's own floor
+// (device::timed_loop, which runs first per bin/bench.rs's handoff) is what
+// actually refuses — `core_bench::run` is never reached, so this test proves
+// ruling #2's end-to-end regression through the CLI, not the core loops'
+// OWN wiring to the shared floor. `a_below_floor_core_write_window_is_refused`
+// below is what proves that.
 #[test]
 #[ignore]
 fn a_degenerate_cli_duration_is_refused_not_published() {
@@ -216,6 +223,41 @@ fn a_degenerate_cli_duration_is_refused_not_published() {
     assert!(
         stderr.contains("layer failed") && stderr.contains("INVALID"),
         "got: {stderr}"
+    );
+}
+
+// T5 re-review, N-1 (Critical): WAL seqs are 0-based (log.rs's next_seq
+// starts at 0), so on a fresh Db with warmup == 0, `last_applied()` returns
+// None before ANY record is applied and Some(0) after the first. The
+// original I-3 fix's `unwrap_or(0)` read "no records applied" as "record 0
+// applied", so the applied-seq delta came out one low on every such run —
+// publishing a wrong log_records_per_sec AND raising a named INVALID
+// accusing charpente's commit path of breaking the one-record-per-transact
+// contract it did not break. `--warmup 0` is exactly what C-3's own repro
+// used, so this is a flag value the sub-project has already exercised.
+#[test]
+#[ignore]
+fn a_warmup_zero_core_write_window_reports_the_correct_log_record_count() {
+    let dir = scratch("warmup-zero");
+    let (core, invalid) =
+        bench_harness::core_bench::run(&dir, Duration::ZERO, Duration::from_secs(1), 250.0)
+            .expect("core layer runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    for reason in &invalid {
+        assert!(
+            reason.contains("device_ratio") && reason.contains("exceeds 1.0"),
+            "a warmup==0 run must not raise a FALSE log_records_per_sec mismatch (N-1) — \
+             any invalid reason here besides the ratio gate is a regression: {reason}"
+        );
+    }
+    assert!(
+        (core.log_records_per_sec - core.acked_writes_per_sec).abs() < 1e-6,
+        "core_bench's canonical transaction commits exactly one effects record per \
+         transact (no dispatcher runs at this layer to double it with a job Done-mark), \
+         so log_records_per_sec must equal acked_writes_per_sec even when warmup == 0: \
+         {} vs {}",
+        core.log_records_per_sec,
+        core.acked_writes_per_sec
     );
 }
 

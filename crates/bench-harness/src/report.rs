@@ -444,6 +444,24 @@ mod tests {
         );
     }
 
+    // T5 re-review, N-5 / Noah ruling #5: build_profile's release-mode value
+    // now names the workspace's deliberate redb debug-assertions override
+    // (bin/bench.rs's build_profile()) — pin that the renderer emits it
+    // byte-exact, parens and comma included, through the ordinary `esc` path
+    // (neither character needs escaping, and nothing bypasses that path).
+    #[test]
+    fn json_pin_covers_the_release_build_profile_label() {
+        let mut r = fixed_report();
+        r.build_profile = "release (redb debug-assertions on, workspace override)";
+        let json = render_json(&r).expect("renders");
+        assert!(
+            json.contains(
+                "\"build_profile\":\"release (redb debug-assertions on, workspace override)\""
+            ),
+            "got: {json}"
+        );
+    }
+
     #[test]
     fn a_layer_without_the_device_ceiling_refuses_to_render() {
         let mut r = fixed_report();
@@ -546,6 +564,30 @@ mod tests {
         assert!(
             json.contains("core.device_syncs_per_sec_after is not finite (inf)"),
             "got: {json}"
+        );
+    }
+
+    // T5 re-review, N-3: I-4's routing explicitly asked for a byte-exact pin
+    // on render_human's header and `core:` lines so the format string cannot
+    // regress silently — fix round 1 shipped, then hand-caught, a doubled
+    // "device.device.syncs_per_sec" prefix bug in precisely this unpinned
+    // line, found only by eyeballing a manual run. This pin would have
+    // reddened it in CI.
+    #[test]
+    fn render_human_header_and_core_line_are_pinned() {
+        let human = render_human(&fixed_report());
+        let lines: Vec<&str> = human.lines().collect();
+        assert_eq!(
+            lines[0],
+            "bench: Test \"Box\" 1 | TestOS 1.0 arm64 | TestFS | 8 cores | dev build | \
+             sync: F_FULLFSYNC via sync_all | warmup 5.00s, measure 30.00s (per window)",
+            "got: {human}"
+        );
+        assert_eq!(
+            lines[2],
+            "  core:   1450 acked writes/s (0.97x device.syncs_per_sec, bracket 1490/1510 \
+             syncs/s before/after), 1450 log records/s, 800000 reads/s",
+            "got: {human}"
         );
     }
 

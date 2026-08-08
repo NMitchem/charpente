@@ -46,10 +46,25 @@ fn canonical(db: &mut Db, i: u64) -> io::Result<u64> {
 /// review, C-1 / Noah ruling #1). `Engine::submit` performs exactly one
 /// `wal.sync()` per transaction with no group commit, so the commit path
 /// cannot durably ack faster than the device's own sync rate in fact — a
-/// measured ratio above 1.0 is a measurement artifact, not a real durability
-/// finding. 1% covers floating-point/timer-resolution slop without hiding a
-/// genuine violation of the one-sync-per-transaction invariant.
-const DEVICE_RATIO_SLACK: f64 = 0.01;
+/// ratio above 1.0 is IMPOSSIBLE, not merely unlikely, so anything above it
+/// is a measurement artifact worth flagging, not a real durability finding.
+///
+/// T5 re-review, N-4 / Noah ruling #4 (fixed here): the original 1e-2 was
+/// justified as covering "floating-point/timer-resolution noise" — that
+/// justification was wrong by roughly seven orders of magnitude. Over a
+/// 1s `Instant`-measured window, timer resolution contributes ~1e-9 relative
+/// error and f64 arithmetic ~1e-16; 1e-2 instead absorbed a band of
+/// cross-window SAMPLING noise (single-sample dispersion of 220-310 syncs/s
+/// was measured across otherwise-identical runs), which is precisely the
+/// phenomenon this gate exists to detect. A ratio anywhere in `(1.0, 1.01]`
+/// published unflagged at exit 0 was C-1's exact defect, one order of
+/// magnitude smaller, still shipped. Tightened to 1e-6 — still generous for
+/// genuine float/timer slop, the only cause this constant is meant to
+/// excuse. The accepted cost: more short/noisy runs now exit 1; those runs
+/// ARE genuinely invalid measurements, and the bracket samples
+/// (device_syncs_per_sec_before/_after) are what tell the reader why, not a
+/// wider slack that hides the same fact.
+const DEVICE_RATIO_SLACK: f64 = 1e-6;
 
 /// `None` = plausible; `Some(reason)` = INVALID, naming BOTH candidate
 /// causes rather than asserting one (the review measured 220-310 syncs/s
@@ -88,7 +103,11 @@ const BRACKET_DURATION: Duration = Duration::from_secs(1);
 fn device_bracket_sample(dir: &str) -> io::Result<f64> {
     let disk = ProdDisk::new(dir)?;
     let file = disk.open("bench-core-bracket.dat")?;
-    timed_loop("core bracket", BRACKET_WARMUP, BRACKET_DURATION, || {
+    // T5 re-review, N-11 (Minor, fixed here): `timed_loop` formats its
+    // degenerate-window message as "device {name}", so passing "core
+    // bracket" here rendered "the device core bracket loop" — a doubled
+    // "device" reading. "bracket" alone reads as "the device bracket loop".
+    timed_loop("bracket", BRACKET_WARMUP, BRACKET_DURATION, || {
         file.write_at(0, &[1u8])?;
         file.sync()
     })
@@ -112,9 +131,19 @@ pub fn run(
 
     // T5 review, C-1 / Noah ruling #1: bracket the measured write window
     // with an independent device-sync sample on either side.
+    //
+    // T5 re-review, N-2 (Important, fixed here): the bracket samples are
+    // PUBLISHED artifact fields (device_syncs_per_sec_before/_after) — I-1's
+    // whole point was that a measured, published window needs a suspension/
+    // starvation guard, and the original fix covered only the write loop
+    // itself, leaving these two new sibling windows uncovered in the same
+    // commit that added them. `hb` now starts before the first bracket
+    // sample and finishes after the second, so a suspend or starvation
+    // episode during either bracket is caught exactly like one during the
+    // write loop.
+    let hb = Heartbeat::start();
     let device_before = device_bracket_sample(dir)?;
 
-    let hb = Heartbeat::start();
     let start = Instant::now();
     let end = start + duration;
     let measured_from = i;
@@ -130,6 +159,7 @@ pub fn run(
     }
     let elapsed = start.elapsed();
     let applied_after = db.last_applied();
+    let device_after = device_bracket_sample(dir)?;
     if let Some(reason) = hb.finish() {
         invalid.push(reason);
     }
@@ -154,12 +184,24 @@ pub fn run(
 
     // I-3's cross-check: the canonical transaction is documented (below) to
     // commit exactly one effects record per transact, so the applied-seq
-    // delta must equal the acked-write count. `unwrap_or(0)` treats "no
-    // records applied yet" (a fresh Db, warmup == 0) as zero, not a missing
-    // measurement — the delta is still exact either way.
-    let applied_delta = applied_after
-        .unwrap_or(0)
-        .saturating_sub(applied_before.unwrap_or(0));
+    // delta must equal the acked-write count.
+    //
+    // T5 re-review, N-1 (Critical, fixed here): WAL seqs are 0-based
+    // (log.rs's next_seq starts at 0), so `Db::last_applied()` returning
+    // `None` means "zero records applied" while `Some(0)` means "one record
+    // applied" (seq 0 itself). The prior `unwrap_or(0)` treated both the
+    // same — reading "no records applied yet" (a fresh Db, warmup == 0) as
+    // "record 0 already applied" — which undercounted the delta by exactly
+    // one on every such run and published a wrong log_records_per_sec plus a
+    // false "contract broke" INVALID below. Matched explicitly instead: a
+    // `None` before must become `Some(a) + 1`, not `unwrap_or(0)`'s implicit
+    // "start counting from the record that doesn't exist".
+    let applied_delta = match (applied_before, applied_after) {
+        (Some(b), Some(a)) => a - b,
+        (None, Some(a)) => a + 1,
+        (None, None) => 0,
+        (Some(_), None) => unreachable!("last_applied cannot go backwards to None"),
+    };
     if applied_delta != grand {
         invalid.push(format!(
             "INVALID: log_records_per_sec measured {applied_delta} applied records against \
@@ -171,7 +213,6 @@ pub fn run(
     }
     let log_records_per_sec = applied_delta as f64 / elapsed.as_secs_f64();
 
-    let device_after = device_bracket_sample(dir)?;
     let device_ratio = acked / device_syncs_per_sec;
     if let Some(reason) = device_ratio_reason(
         device_ratio,
@@ -194,6 +235,14 @@ pub fn run(
     // run, since a miss is cheaper than a hit over a smaller tree). Populate
     // every key in 0..SLOTS here, OUTSIDE any measured window and outside
     // `grand`/`acked` — this is setup, not a measurement.
+    //
+    // T5 re-review, N-2 (Important, fixed here): `read_hb` now starts BEFORE
+    // this population loop rather than after it. Population can run for
+    // several seconds of real fsyncs (I-2's own cost account), and a sleep
+    // or starvation episode there would disturb the machine for the read
+    // window that follows with nothing able to see it — the same gap I-1
+    // was reopened to close, one loop earlier.
+    let read_hb = Heartbeat::start();
     for slot in 0..SLOTS {
         db.transact(|tx| -> Result<(), io::Error> {
             let slot_id = Id::<Slot>::from_raw(slot);
@@ -213,11 +262,10 @@ pub fn run(
     }
 
     let snap = db.snapshot()?;
-    // T5 review, I-1: a second Heartbeat covering the read warmup + read
-    // window — 35 of the layer's 70 seconds at default settings previously
-    // ran with no suspension/starvation guard at all, symmetric with the
-    // write window's own `hb` above.
-    let read_hb = Heartbeat::start();
+    // T5 review, I-1: `read_hb` (started above, before the population loop)
+    // covers the read warmup and the read window too — symmetric with the
+    // write window's own `hb`, and now spanning everything measured or
+    // published in this half of the layer, per N-2 above.
     let read_warm_end = Instant::now() + warmup;
     let mut r = 0u64;
     while Instant::now() < read_warm_end {
@@ -245,6 +293,18 @@ pub fn run(
     if let Some(reason) = read_hb.finish() {
         invalid.push(reason);
     }
+    // T5 re-review, N-6 (Minor): this arm is UNREACHABLE through `run`'s
+    // public signature, not merely unproven by real timing — `run` drives
+    // both windows from the same `duration`, reads run on the order of
+    // 1.1M/s (needing a window under ~4.5us to trip this floor) while
+    // writes run on the order of 250/s (tripping the write arm above under
+    // ~20ms), three to four orders of magnitude earlier. Any duration small
+    // enough to reach here would already have returned Err from the write
+    // arm. Kept for parity with `device::timed_loop`'s shared floor (Noah
+    // ruling #2 asked for BOTH core loops to carry it) and because it is
+    // harmless — but it is the fifth assertion this sub-project has found
+    // that cannot fail through the path that reaches it; it would only
+    // become live if `run` grew separate read/write durations.
     if let Some(reason) = degenerate_window_reason("core read", reads, duration) {
         return Err(io::Error::other(reason));
     }

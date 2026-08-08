@@ -155,7 +155,16 @@ the artifact: hardware model and core count, OS and filesystem, sync semantics
 from an unoptimized dev build; this barely matters for the fsync-bound write
 path and matters a great deal for `reads_per_sec` and the kernel/wire layers.
 `scripts/bench.sh`, not yet created as of this amendment, must force
-`--release` when it lands.*), warmup discarded (default 5 s), measured
+`--release` when it lands.* *Amended at Task 5 fix round 2's re-review
+(2026-08-08, N-5 / Noah ruling #5): `cfg!(debug_assertions)` names the right
+mechanism but was silent about a workspace-specific fact —
+`[profile.release.package.redb] debug-assertions = true` (the 2026-07-15
+mode-skew fix, kept deliberately for the CI replay guarantee it holds) means
+a `--release` bench run still measures a redb compiled with its OWN debug
+assertions live, on exactly the path every core write lands on and all
+~1.1M reads/sec come from. The field's release-mode value now states this:
+`"release (redb debug-assertions on, workspace override)"`.*), warmup
+discarded (default 5 s), measured
 duration (default 30 s per point), and the device-ceiling ratio
 (core acked-writes/sec ÷ device syncs/sec — *amended at Task 5's review,
 2026-08-08: the artifact also states, as its own field, which device operand
@@ -249,6 +258,56 @@ Run-validity rules, mechanical:
   either side (before and after), reported in the artifact as
   `device_syncs_per_sec_before`/`_after` — visible dispersion in place of a
   single distant sample from a separate `bench device` invocation.
+  *Amended at Task 5 fix round 2's re-review (2026-08-08, N-4 / Noah ruling
+  #4): the shipped slack's stated justification — "floating-point/timer-
+  resolution noise" — was wrong by roughly seven orders of magnitude. Over a
+  1 s `Instant`-measured window, timer resolution contributes ~1e-9 relative
+  error; the shipped 1e-2 instead absorbed a band of cross-window SAMPLING
+  noise (the same 220–310 syncs/s dispersion cited above), which is exactly
+  the phenomenon this rule exists to detect — a ratio anywhere in
+  `(1.0, 1.01]` published unflagged at exit 0 was this rule's own defect, one
+  order of magnitude smaller, still shipped. Tightened to `1e-6`
+  (`core_bench::DEVICE_RATIO_SLACK`), still generous for genuine float/timer
+  slop, the only cause the constant is meant to excuse. Accepted cost: more
+  short/noisy runs now correctly exit 1; the bracket samples above are what
+  tell the reader why, not a wider slack that hides the same fact.*
+- **The read window's hit count must match its op count** (added at Task 5's
+  review, 2026-08-08, C-2, no spec bullet at the time — added retroactively
+  at Task 5 fix round 2's re-review, 2026-08-08, N-9, hard rule 6): every key
+  in the read window's key space is populated before the window opens (this
+  section's read-population rule below), so under a working read loop every
+  `get` is a hit. `core_bench::run`'s read loop counts hits separately from
+  attempts and refuses (an error, not an INVALID artifact — there is no
+  measurement to render) a window whose hit count diverges from its read
+  count. This is the layer's strongest run-validity check: the review's own
+  mutation — a read loop reduced to counting attempts with no `get` call —
+  published tens of millions of "reads/sec" from a loop touching the store
+  zero times, and no portable rate bound can substitute for catching that
+  from inside the loop itself.
+- **The read window is measured against a populated store** (added at Task
+  5's review, 2026-08-08, I-2): population was previously an accident of how
+  many writes the preceding write window happened to complete — a miss is
+  cheaper than a hit over a smaller tree, so `reads_per_sec` varied with
+  `--duration` by as much as 73% on short runs. Every key in the read key
+  space is now written OUTSIDE any measured window before the read window
+  opens, making the read number duration-independent — the property a
+  one-command repro needs.
+- **`log_records_per_sec` is checked against acked writes** (added at Task
+  5's review, 2026-08-08, I-3, no spec bullet at the time — added
+  retroactively at Task 5 fix round 2's re-review, 2026-08-08, N-9, hard
+  rule 6): the canonical transaction commits exactly one effects record per
+  `transact` (§3 — no dispatcher runs at this layer to double it with a job
+  Done-mark), so the WAL's applied-seq delta over the measured write window
+  must equal the count of acked writes; a mismatch is marked INVALID by name
+  rather than silently publishing a wrong `log_records_per_sec`. *Amended at
+  Task 5 fix round 2's re-review (2026-08-08, N-1 / Critical): the first
+  shipped version of this check computed the delta with
+  `applied_after.unwrap_or(0) - applied_before.unwrap_or(0)`. WAL seqs are
+  0-based, so `Db::last_applied() == None` means zero records applied while
+  `Some(0)` means one — `unwrap_or(0)` conflated the two, undercounting the
+  delta by exactly one on every `--warmup 0` run and firing this very rule's
+  INVALID reason falsely. Fixed by matching `(applied_before, applied_after)`
+  explicitly instead of collapsing `None` into the same number as `Some(0)`.*
 - **Totals two ways**: every throughput number is computed both as
   requests ÷ duration and as a sum over per-thread counters; disagreement beyond
   rounding is a harness bug and fails the run.

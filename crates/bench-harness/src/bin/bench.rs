@@ -257,11 +257,20 @@ fn sync_semantics() -> &'static str {
 /// fsync-bound write path; matters a great deal for `reads_per_sec` and the
 /// kernel/wire layers. Stated in the artifact so a reader never has to
 /// guess which build produced a number.
+///
+/// T5 re-review, N-5 / Noah ruling #5: `cfg!(debug_assertions)` alone names
+/// the right MECHANISM but is silent about a workspace-specific fact —
+/// `[profile.release.package.redb] debug-assertions = true`
+/// (Cargo.toml:38-39, kept deliberately for the debug/release replay
+/// guarantee the CI mode-skew tripwires depend on) means a --release bench
+/// run still measures a redb compiled with ITS OWN debug assertions live, on
+/// exactly the path every core write lands on and all ~1.1M reads/s come
+/// from. Keep the override; only the artifact's honesty about it changes.
 fn build_profile() -> &'static str {
     if cfg!(debug_assertions) {
         "dev"
     } else {
-        "release"
+        "release (redb debug-assertions on, workspace override)"
     }
 }
 
@@ -404,6 +413,28 @@ mod tests {
 
     fn s(v: &str) -> String {
         v.to_string()
+    }
+
+    // T5 re-review, N-5 / Noah ruling #5: this workspace carries
+    // `[profile.release.package.redb] debug-assertions = true`
+    // (Cargo.toml:38-39, the 2026-07-15 mode-skew fix), so a --release bench
+    // run measures a redb compiled with its debug assertions LIVE — exactly
+    // the path every core write lands on and all ~1.1M reads/s come from.
+    // `cfg!(debug_assertions)` alone is the right MECHANISM but leaves this
+    // silent. Runs under both build modes: the dev half of the assertion is
+    // exercised by ordinary `cargo test`, the release half only by
+    // `cargo test --release` (the mode-skew CI tripwire's own invocation
+    // shape) — this is the pin the byte-exact JSON output moves for.
+    #[test]
+    fn build_profile_names_the_workspace_redb_override_in_release() {
+        if cfg!(debug_assertions) {
+            assert_eq!(build_profile(), "dev");
+        } else {
+            assert_eq!(
+                build_profile(),
+                "release (redb debug-assertions on, workspace override)"
+            );
+        }
     }
 
     #[test]
