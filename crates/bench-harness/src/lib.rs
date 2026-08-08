@@ -12,6 +12,7 @@ use charpente::kernel::JobError;
 use charpente::{Id, Schema, Tx, View};
 use charpente::{event, job, jobs, route, routes, table};
 
+pub mod core_accounting;
 pub mod core_bench;
 pub mod device;
 pub mod measure;

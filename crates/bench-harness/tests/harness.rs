@@ -263,7 +263,7 @@ fn a_warmup_zero_core_write_window_reports_the_correct_log_record_count() {
 
 // T5 review, C-3 / Noah ruling #2: proves the WIRING inside core_bench::run
 // itself, not just measure::degenerate_window_reason in isolation (unit-
-// tested in core_bench.rs's own #[cfg(test)] module) or device.rs's parallel
+// tested in measure.rs's own #[cfg(test)] module) or device.rs's parallel
 // wiring. `canonical` performs a real fsync per op (~3-5ms on this class of
 // hardware per the review's own measurements), so a tiny nonzero duration
 // reliably lands a SMALL NONZERO op count — the discriminating case a naive
