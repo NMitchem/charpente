@@ -1098,10 +1098,21 @@ git commit -m "bench: device layer (the ceiling) + the bench binary skeleton (T4
 - Modify: `crates/bench-harness/tests/harness.rs` (add smoke)
 
 **Interfaces:**
-- Consumes: `bench_harness::{schema, Slot, Bump, SlotBumped, SLOTS}`; `charpente::core::{Db, DbConfig, TxError, View}` (fix paths per rustc); `charpente::prod::ProdDisk`; `measure::{Heartbeat, crosscheck}`; `report::CoreReport`.
+- Consumes: `bench_harness::{schema, Slot, Bump, SlotBumped, SLOTS}`; `charpente::{Db, DbConfig, Id, TxError, View}` (**corrected at implementation, 2026-08-08** — these four are TOP-LEVEL re-exports; the original `charpente::core::{...}` does not compile, see the Step 1 note); `charpente::prod::ProdDisk`; `measure::{Heartbeat, crosscheck}`; `report::CoreReport`.
 - Produces: `core_bench::run(dir: &str, warmup: Duration, duration: Duration, device_syncs_per_sec: f64) -> io::Result<(CoreReport, Vec<String>)>` — the `Vec<String>` is invalidity reasons for `report.invalid`.
 
 - [ ] **Step 1: Implement**
+
+> **CORRECTED at implementation (2026-08-08).** The import block below originally read
+> `use charpente::core::{Db, DbConfig, TxError, View};`, which does not compile. `Db`,
+> `DbConfig`, `TxError`, `Id`, `Snapshot` and `View` are re-exported at the **top level**
+> of the `charpente` crate (`crates/charpente/src/lib.rs:9-11`); `charpente_core` declares
+> `pub mod db;`/`pub mod table;` with no crate-root re-exports of its own, so
+> `charpente::core::Db` would require `charpente_core::Db`, which does not exist.
+> `charpente::core::` **is** the right prefix for `Disk`/`Entropy`/`migration`/
+> `table::Codec` — which is presumably why the original block generalized it. Every
+> existing committed caller (the charpente test suites, `examples/invoicing`) imports
+> these as `charpente::{...}`. The block below is the corrected, as-shipped form.
 
 ```rust
 //! Layer 2 (spec §2): Db::transact in a closed loop against the prod Disk —
@@ -1113,9 +1124,8 @@ git commit -m "bench: device layer (the ceiling) + the bench binary skeleton (T4
 use crate::measure::{crosscheck, Heartbeat};
 use crate::report::CoreReport;
 use crate::{schema, Bump, Slot, SlotBumped, SLOTS};
-use charpente::core::{Db, DbConfig, TxError, View};
 use charpente::prod::ProdDisk;
-use charpente::Id;
+use charpente::{Db, DbConfig, Id, TxError, View};
 use std::io;
 use std::time::{Duration, Instant};
 

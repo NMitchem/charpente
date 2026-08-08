@@ -360,6 +360,20 @@ fn run_layers(args: &Args, dir: &str, report: &mut Report) -> std::io::Result<bo
     // unimplemented subcommand must not exit 0.
     let implemented = match args.cmd.as_str() {
         "device" => true,
+        "core" => {
+            let dir = temp_dir("core", args.dir.as_deref()).map_err(std::io::Error::other)?;
+            let ceiling = report
+                .device
+                .as_ref()
+                .expect("device ran first")
+                .syncs_per_sec;
+            let (core, invalid) =
+                bench_harness::core_bench::run(&dir, args.warmup, args.duration, ceiling)?;
+            let _ = std::fs::remove_dir_all(&dir);
+            report.core = Some(core);
+            report.invalid.extend(invalid);
+            true
+        }
         other => {
             eprintln!("bench: subcommand {other:?} not implemented yet");
             false

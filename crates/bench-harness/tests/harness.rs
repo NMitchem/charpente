@@ -65,3 +65,27 @@ fn device_layer_produces_nonzero_rates() {
         d.appends_per_sec
     );
 }
+
+#[test]
+#[ignore]
+fn core_layer_commits_and_reports_a_ratio() {
+    let dir = scratch("core");
+    let (core, invalid) = bench_harness::core_bench::run(
+        &dir,
+        Duration::from_millis(200),
+        Duration::from_secs(1),
+        1000.0,
+    )
+    .expect("core layer runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        invalid.is_empty(),
+        "short healthy run must be valid: {invalid:?}"
+    );
+    assert!(core.acked_writes_per_sec > 0.0);
+    assert!(
+        core.reads_per_sec > core.acked_writes_per_sec,
+        "reads never fsync"
+    );
+    assert!(core.device_ratio > 0.0);
+}
