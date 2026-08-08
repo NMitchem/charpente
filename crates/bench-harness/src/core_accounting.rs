@@ -299,6 +299,7 @@ pub fn read_accounting(duration: Duration, r: &ReadObs) -> Result<ReadAccounting
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::measure::MIN_MEASURED_OPS;
 
     // T5 review, C-1 / Noah ruling #1: a physically-impossible ratio must be
     // named, not silently published. Pure function — no hardware timing
@@ -341,5 +342,276 @@ mod tests {
         assert!(
             device_ratio_reason(1.0 + DEVICE_RATIO_SLACK + 0.001, 250.0, 245.0, 255.0).is_some()
         );
+    }
+
+    /// A plausible healthy run on this class of hardware: 7,500 acked writes
+    /// over 30s (250/s against a 300/s device ceiling — a ratio of 0.833,
+    /// comfortably below the gate), 33M reads over 30s. Every derived quantity
+    /// is exact in f64, so the assertions can be equalities rather than
+    /// tolerances. This fixture is also spec §4 bullet 4's ABOVE-the-boundary
+    /// case for both windows: 7,500 and 33,000,000 are both far above
+    /// `MIN_MEASURED_OPS`, and the two `a_healthy_*` tests assert neither
+    /// window is flagged. The two boundary tests below cover at and under.
+    fn healthy() -> CoreObservations {
+        CoreObservations {
+            duration: Duration::from_secs(30),
+            write: WriteObs {
+                ops: 7_500,
+                loop_delta: 7_500,
+                elapsed: Duration::from_secs(30),
+                applied_before: Some(99),
+                applied_after: Some(7_599),
+                heartbeat: None,
+                device_ceiling: 300.0,
+                device_before: 295.0,
+                device_after: 305.0,
+            },
+            read: ReadObs {
+                reads: 33_000_000,
+                hits: 33_000_000,
+                elapsed: Duration::from_secs(30),
+                heartbeat: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_healthy_write_half_publishes_and_flags_nothing() {
+        let o = healthy();
+        let a = write_accounting(o.duration, &o.write).expect("a healthy window publishes");
+        assert!(a.invalid.is_empty(), "got: {:?}", a.invalid);
+        assert_eq!(a.acked_writes_per_sec, 250.0);
+        assert_eq!(
+            a.log_records_per_sec, 250.0,
+            "an applied delta that agrees with the ack count publishes the same rate"
+        );
+        assert!((a.device_ratio - 250.0 / 300.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_healthy_read_half_publishes_and_flags_nothing() {
+        let o = healthy();
+        let a = read_accounting(o.duration, &o.read).expect("a healthy window publishes");
+        assert!(a.invalid.is_empty(), "got: {:?}", a.invalid);
+        assert_eq!(a.reads_per_sec, 1_100_000.0);
+    }
+
+    // Interlude spec §4, first bullet. N-1 (Critical, T5 re-review) was a
+    // two-line total function over a pair of `Option<u64>` that needed real
+    // hardware and `--warmup 0` to surface, because it was welded to a
+    // measurement loop. All four shapes, including the one asserted
+    // unreachable.
+    #[test]
+    fn applied_delta_is_total_over_every_option_pair() {
+        assert_eq!(applied_delta(Some(99), Some(7_599)), 7_500);
+        assert_eq!(
+            applied_delta(None, Some(0)),
+            1,
+            "seq 0 is a real record: Some(0) means ONE record applied, not zero"
+        );
+        assert_eq!(applied_delta(None, Some(9)), 10);
+        assert_eq!(applied_delta(None, None), 0);
+        assert_eq!(
+            applied_delta(Some(7), Some(7)),
+            0,
+            "a window that applied nothing"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "last_applied cannot go backwards to None")]
+    fn applied_delta_refuses_a_backwards_last_applied() {
+        applied_delta(Some(1), None);
+    }
+
+    // The pure twin of tests/harness.rs's #[ignore]d disk regression
+    // `a_warmup_zero_core_write_window_reports_the_correct_log_record_count`.
+    // Both are kept deliberately (spec §7): this one proves the arithmetic,
+    // the disk one proves the wiring that hands it the arithmetic's inputs.
+    #[test]
+    fn a_warmup_zero_window_does_not_raise_a_false_contract_break() {
+        // Exactly the shape of a fresh Db with `--warmup 0`: nothing applied
+        // before the window, and `Some(ops - 1)` after it, because seq 0 is
+        // the first record rather than the absence of one.
+        let mut o = healthy();
+        o.write.applied_before = None;
+        o.write.applied_after = Some(o.write.ops - 1);
+        let a = write_accounting(o.duration, &o.write).expect("publishes");
+        assert!(
+            a.invalid.is_empty(),
+            "a warmup==0 run must not accuse charpente's commit path of breaking a \
+             contract that did not break (hard rule 5): {:?}",
+            a.invalid
+        );
+        assert_eq!(a.log_records_per_sec, a.acked_writes_per_sec);
+    }
+
+    // Interlude spec §4, second bullet — and the negative half is
+    // `a_healthy_write_half_publishes_and_flags_nothing` above.
+    #[test]
+    fn an_applied_delta_that_disagrees_with_the_ack_count_is_named_invalid() {
+        let mut o = healthy();
+        o.write.applied_after = Some(7_600); // one record more than the acks
+        let a = write_accounting(o.duration, &o.write).expect("a mismatch is named, not refused");
+        assert_eq!(a.invalid.len(), 1, "got: {:?}", a.invalid);
+        let r = &a.invalid[0];
+        assert!(r.contains("INVALID"), "got: {r}");
+        assert!(
+            r.contains("7501 applied records"),
+            "must name the measured delta: {r}"
+        );
+        assert!(
+            r.contains("7500 acked writes"),
+            "must name the ack count it disagrees with: {r}"
+        );
+        assert!(
+            r.contains("exactly one effects record per transact"),
+            "must name the contract that broke: {r}"
+        );
+    }
+
+    // Interlude spec §4, fourth bullet — under and at the boundary for the
+    // write window; `healthy()` is the above-boundary case.
+    #[test]
+    fn a_below_floor_write_window_refuses_and_an_at_floor_one_does_not() {
+        let mut o = healthy();
+        o.write.ops = MIN_MEASURED_OPS - 1;
+        o.write.loop_delta = MIN_MEASURED_OPS - 1;
+        let err = write_accounting(o.duration, &o.write).expect_err("below the floor refuses");
+        assert!(err.contains("INVALID"), "got: {err}");
+        assert!(err.contains("core write"), "must name which loop: {err}");
+        assert!(err.contains("--duration"), "must name the fix: {err}");
+
+        o.write.ops = MIN_MEASURED_OPS;
+        o.write.loop_delta = MIN_MEASURED_OPS;
+        o.write.applied_before = None;
+        o.write.applied_after = Some(MIN_MEASURED_OPS - 1);
+        let a = write_accounting(o.duration, &o.write).expect("the floor itself publishes");
+        assert!(a.invalid.is_empty(), "got: {:?}", a.invalid);
+    }
+
+    // Interlude spec §4, fourth bullet — under and at the boundary for the
+    // read window; `healthy()` is the above-boundary case. N-6 recorded this
+    // arm as UNREACHABLE through `run` (both windows share one duration, and
+    // the write floor trips three to four orders of magnitude earlier), which
+    // made it the fifth assertion this sub-project found that could not fail.
+    // Calling the accounting directly is what gives it teeth.
+    #[test]
+    fn a_below_floor_read_window_refuses_and_an_at_floor_one_does_not() {
+        let mut o = healthy();
+        o.read.reads = MIN_MEASURED_OPS - 1;
+        o.read.hits = MIN_MEASURED_OPS - 1;
+        let err = read_accounting(o.duration, &o.read).expect_err("below the floor refuses");
+        assert!(err.contains("INVALID"), "got: {err}");
+        assert!(err.contains("core read"), "must name which loop: {err}");
+        assert!(err.contains("--duration"), "must name the fix: {err}");
+
+        o.read.reads = MIN_MEASURED_OPS;
+        o.read.hits = MIN_MEASURED_OPS;
+        read_accounting(o.duration, &o.read).expect("the floor itself publishes");
+    }
+
+    // Interlude spec §4, fifth bullet. The defect this catches is C-2's own
+    // demonstrated mutation: a read loop reduced to `reads += 1;` with no
+    // `get` call, publishing 42M "reads/sec" from a loop that touched the
+    // store zero times.
+    #[test]
+    fn a_read_loop_that_stopped_hitting_the_store_refuses_by_name() {
+        let mut o = healthy();
+        o.read.hits = o.read.reads - 1;
+        let err =
+            read_accounting(o.duration, &o.read).expect_err("a miss against a populated store");
+        assert!(err.contains("INVALID"), "got: {err}");
+        assert!(
+            err.contains("33000000 reads"),
+            "must name the read count: {err}"
+        );
+        assert!(
+            err.contains("32999999 were hits"),
+            "must name the hit count: {err}"
+        );
+        assert!(
+            err.contains(&format!("0..{SLOTS}")),
+            "must name the key range that was populated: {err}"
+        );
+
+        o.read.hits = o.read.reads;
+        read_accounting(o.duration, &o.read).expect("hits == reads publishes");
+    }
+
+    // Interlude spec §4, last bullet, and Task 3's standing note to T4-T8:
+    // naming a non-finite float is `report::collect_non_finite`'s single job.
+    // The accounting must not grow a local copy — two places deciding the same
+    // thing is how the two renderers drift apart.
+    #[test]
+    fn a_zero_device_ceiling_yields_a_non_finite_ratio_left_for_the_renderer() {
+        let mut o = healthy();
+        o.write.device_ceiling = 0.0;
+        let a = write_accounting(o.duration, &o.write).expect("a non-finite ratio is no refusal");
+        assert!(a.device_ratio.is_infinite(), "got: {}", a.device_ratio);
+        // The ratio gate fires — infinity is certainly above 1.0 + slack —
+        // exactly as it does today. Preserved, not new.
+        assert_eq!(a.invalid.len(), 1, "got: {:?}", a.invalid);
+        assert!(
+            a.invalid[0].contains("device_ratio"),
+            "got: {:?}",
+            a.invalid
+        );
+        assert!(
+            !a.invalid.iter().any(|r| r.contains("not finite")),
+            "the accounting must NOT name the non-finite value itself — that is \
+             report::collect_non_finite's job, and a local copy here would double-report \
+             it in the artifact: {:?}",
+            a.invalid
+        );
+    }
+
+    // Interlude spec §3.3: reasons are pushed in a fixed order and both
+    // renderers derive from the same list, so a reordering would be invisible
+    // to every other assertion in this file and visible in the published
+    // artifact. Force all four non-fatal write-half reasons at once and pin
+    // the sequence. (The cross-half order — every write reason before the read
+    // heartbeat reason — is guaranteed by `run`'s statement order and is not
+    // pinned here; forcing both heartbeats to fire needs a starved machine.)
+    #[test]
+    fn the_write_half_pushes_its_reasons_in_a_fixed_order() {
+        let mut o = healthy();
+        o.write.heartbeat = Some("INVALID: heartbeat starved".to_string());
+        o.write.loop_delta = o.write.ops - 1; // totals disagree
+        o.write.applied_after = Some(7_600); // applied delta disagrees
+        o.write.device_ceiling = 1.0; // ratio far above 1.0
+        let a = write_accounting(o.duration, &o.write).expect("all four of these are non-fatal");
+        let shape: Vec<&str> = a
+            .invalid
+            .iter()
+            .map(|r| {
+                if r.contains("heartbeat starved") {
+                    "heartbeat"
+                } else if r.contains("totals disagree") {
+                    "crosscheck"
+                } else if r.contains("log_records_per_sec measured") {
+                    "applied"
+                } else if r.contains("device_ratio") {
+                    "ratio"
+                } else {
+                    "UNKNOWN"
+                }
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec!["heartbeat", "crosscheck", "applied", "ratio"],
+            "got: {:?}",
+            a.invalid
+        );
+    }
+
+    #[test]
+    fn the_read_half_carries_its_heartbeat_reason_through() {
+        let mut o = healthy();
+        o.read.heartbeat = Some("INVALID: heartbeat starved".to_string());
+        let a = read_accounting(o.duration, &o.read).expect("a starved heartbeat is no refusal");
+        assert_eq!(a.invalid, vec!["INVALID: heartbeat starved".to_string()]);
+        assert_eq!(a.reads_per_sec, 1_100_000.0);
     }
 }
