@@ -1873,24 +1873,106 @@ git commit -m "bench: kernel layer — batch model through RequestSource (T6)"
 
 ### Task 7: keep-alive client + `bench-app` vehicle + the wire layer
 
+**Rev. 2 (2026-08-09, T7 pre-flight; rev. 1 replaced, not retained).** Rev. 1 predated the
+accounting/measuring interlude and, exactly like Task 6's rev. 1, put every accounting
+decision inline in the measuring function: the crosscheck, the throughput and `client_busy_fraction` divisions,
+the saturation threshold, the `records_per_request` multiply and the empty-latency refusal
+all lived in `sweep_point`, fused to a spawned child process and a thread pool. Interlude
+spec §5 names T7 alongside T6 as adopting the seam *from inception* — "so they inherit a
+tested pure function instead of copying an untested pattern." Restructured into
+`wire_accounting.rs` (pure, no blanket clippy allow, so the deny-list enforces the
+no-clock/no-socket property) plus `wire.rs` (child process, threads, `Heartbeat`, no
+arithmetic decision of its own).
+
+Four changes beyond relocation:
+
+1. **The device-ceiling gate reaches the headline layer (Noah ruling, 2026-08-09).**
+   Rev. 1 had no ceiling and no gate — the wire layer, whose number *is* what the README
+   claim is about, was the only one of the three with no implausibility check. The
+   commit path takes one `sync()` per transaction with no group commit anywhere
+   (`log.rs:289`), so `bench-app`'s two records per acked request are bounded by the
+   device ceiling one-for-one, the same physics layer 3 established. `sweep` now takes
+   `device_ceiling: f64` the way `core_bench::run` and `kernel_bench::run` already do,
+   and `SweepPoint` gains a published `device_ratio` — the ruling matching T6's I-4,
+   which added `window_secs`/`device_ratio` to `KernelReport` for the same reason. This
+   moves the byte-exact literal in `report::json_shape_is_pinned`; that is the pin doing
+   its job, and Step 1 is the only place in this task permitted to move it.
+   **The prose differs from layer 3's and that is deliberate.** This layer cannot see
+   the server's log from outside the process, so its record rate is DERIVED
+   (`records_per_request * throughput`) where layer 3 OBSERVES `KernelStats::jobs_done`.
+   A ratio above 1.0 therefore has two possible causes here, and the reason names both.
+
+2. **A window floor, not just an op floor.** Rev. 1 had neither. The op floor alone is
+   not enough at this layer: five ops across 256 connections can clear
+   `MIN_MEASURED_OPS` inside a 4 ms `--duration`, and the rate published from that
+   window is the exact shape of the T6 review's C-1 (83 acked writes/s from a 46 ms
+   window, exit 0, `invalid: []`). The op floor is `degenerate_window_reason`'s fourth
+   CONSUMER — sharing, not the third COPY spec §5 warns about. The window floor compares
+   against the same `measure::MIN_MEASURED_WINDOW` layer 3 uses and carries its own
+   prose, on the T6 ruling's principle that the RULE is shared and the PROSE is not:
+   this layer's window IS `--duration`, so its remedy is "raise --duration", where layer
+   3's batch-determined window says "raise --requests".
+
+3. **The crosscheck's honesty, carried over from the T6 review's I-2.** `per_thread`,
+   `grand` and the latency vector are all bumped in one unbranched block inside the
+   worker loop, so as a check on the MEASURED PATH they are one check, not three. They
+   stay genuinely independent as a check on this harness's own collection plumbing — a
+   dropped `join`, a mis-accumulated sum. The observations struct says so at the field,
+   rather than letting a future reader read three sources as three witnesses.
+
+4. **`--target invoicing` refuses by name instead of panicking.** Rev. 1's `unreachable!
+   ("wired in T8")` sits behind a flag value the shipped usage string advertises, so
+   `bench wire --target invoicing` would abort the binary with a panic — a contract
+   violation with no named remedy (hard rule 5). The CLI arm refuses it by name until
+   T8 lands; the `unreachable!`s stay as the internal assertion they are.
+
+Verification counts, measured at `b3cb252` and stated as a delta: lib 59, bin 15, app 1,
+harness 7 ignored, workspace 658 passed / 38 ignored.
+
 **Files:**
 - Create: `crates/bench-harness/src/client.rs`
+- Create: `crates/bench-harness/src/wire_accounting.rs`
 - Create: `crates/bench-harness/src/wire.rs`
 - Create: `crates/bench-harness/src/bin/bench-app.rs`
-- Modify: `crates/bench-harness/src/lib.rs` (add `pub mod client; pub mod wire;`)
-- Modify: `crates/bench-harness/src/bin/bench.rs` (add the `wire` arm)
+- Modify: `crates/bench-harness/src/lib.rs` (add `pub mod client; pub mod wire; pub mod wire_accounting;`)
+- Modify: `crates/bench-harness/src/report.rs` (`SweepPoint::device_ratio` and every site that already handles a sweep-point field)
+- Modify: `crates/bench-harness/src/bin/bench.rs` (the `wire` arm)
 - Modify: `crates/bench-harness/tests/harness.rs` (add smoke)
 
 **Interfaces:**
-- Consumes: `measure::{process_cpu, crosscheck, percentile, Heartbeat}`; `report::{WireReport, SweepPoint}`; `charpente::serve::serve` (NOT `charpente::launch` — see Step 5).
+- Consumes: `measure::{process_cpu, crosscheck, percentile, Heartbeat, degenerate_window_reason, implausible_ratio, MIN_MEASURED_WINDOW}`; `report::{WireReport, SweepPoint}`; `charpente::serve::serve` (NOT `charpente::launch` — see Step 6).
 - Produces:
   - `client::Conn` — `connect(addr: &str) -> io::Result<Conn>`, `request(&mut self, method: &str, path: &str, headers: &[(String, String)], body: &[u8]) -> io::Result<(u16, Vec<u8>)>`; `client::read_response(r: &mut impl BufRead) -> io::Result<(u16, Vec<u8>)>` (pure-parsable, unit-tested un-ignored).
-  - `wire::Target` enum (`BenchApp`, `Invoicing`) with `fn one_request(&self, conn: &mut Conn, headers: &[(String, String)], ids: &AtomicU64) -> io::Result<(u16, Vec<u8>)>` and `fn session_setup(&self, conn: &mut Conn) -> io::Result<Vec<(String, String)>>` (Task 8 fills the `Invoicing` arms; this task ships them as `unreachable!("wired in T8")`).
+  - `wire_accounting::{WireObs, WireAccounting, point_accounting, SATURATION_FRACTION}` — pure.
+  - `wire::Target` enum (`BenchApp`, `Invoicing`) with `records_per_request`, `session_setup`, `one_request` (Task 8 fills the `Invoicing` arms; this task ships them as `unreachable!("wired in T8")`, reachable only through a CLI arm that refuses first).
   - `wire::build_bin(package: &str, bin: &str) -> io::Result<PathBuf>` (cargo `--message-format=json` string-scan, the `edge-harness/src/child.rs:302-330` shape).
-  - `wire::sweep(bin: &Path, target: Target, connections: &[usize], warmup: Duration, duration: Duration) -> io::Result<(WireReport, Vec<String>)>`.
-  - `bench-app` binary: `--addr A --data-dir D` (usage → stderr, exit 2); parses its own flags, builds the app, calls `charpente::serve::serve`, parks. NOT `charpente::launch`: `launch()` re-reads the live process argv (`launch.rs:31`) and serves only on ZERO argv — a child spawned with `--addr`/`--data-dir` would exit 2 as an unknown verb and never bind a port. `examples/invoicing/src/bin/node.rs` is the committed vehicle precedent and its module doc records this exact trap.
+  - `wire::sweep(bin: &Path, target: Target, connections: &[usize], warmup: Duration, duration: Duration, device_ceiling: f64) -> io::Result<(WireReport, Vec<String>)>`.
+  - `bench-app` binary: `--addr A --data-dir D` (usage → stderr, exit 2).
 
-- [ ] **Step 1: Write the failing parse test** (in `client.rs`'s `#[cfg(test)] mod tests` — pure, un-ignored)
+- [ ] **Step 1: `SweepPoint` gains `device_ratio`, and the pin moves once**
+
+Add `pub device_ratio: f64` to `SweepPoint` immediately after `log_records_per_sec`,
+mirroring `KernelReport`'s field order. Then update **every** site in `report.rs` that
+already handles a sweep-point field, in that file's existing style:
+
+- `render_json`'s per-point object,
+- `render_human`'s per-point line,
+- `collect_non_finite`'s wire walk (`wire[i].points[j].device_ratio` — a zero device
+  ceiling must reach the central non-finite collector here exactly as it does at layers
+  2 and 3; interlude §4's standing rule is that the accounting must not grow its own
+  non-finite check),
+- the `fixed_report()` test fixture,
+- the byte-exact literal in `json_shape_is_pinned`, and `render_human`'s pin if it
+  covers a sweep line.
+
+Add one test that a non-finite wire `device_ratio` is collected by name, beside the
+existing non-finite tests.
+
+**This is the only step in Task 7 permitted to edit a pinned literal.** The report must
+show the pin's before/after diff explicitly. If any *other* pinned string moves during
+this task, something changed behaviour that was not supposed to.
+
+- [ ] **Step 2: Write the failing parse test** (in `client.rs`'s `#[cfg(test)] mod tests` — pure, un-ignored)
 
 ```rust
 #[cfg(test)]
@@ -1916,9 +1998,9 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run it, verify it fails** — `cargo test -p bench-harness client` → compile FAIL.
+- [ ] **Step 3: Run it, verify it fails** — `cargo test -p bench-harness client` → compile FAIL.
 
-- [ ] **Step 3: Implement `client.rs`**
+- [ ] **Step 4: Implement `client.rs`**
 
 ```rust
 //! Hand-rolled keep-alive HTTP/1.1 client (spec §4). The edge-harness client
@@ -2010,9 +2092,9 @@ pub fn read_response(r: &mut impl BufRead) -> io::Result<(u16, Vec<u8>)> {
 }
 ```
 
-- [ ] **Step 4: Run the parse tests, verify they pass** — `cargo test -p bench-harness client` → PASS (2 tests).
+- [ ] **Step 5: Run the parse tests, verify they pass** — `cargo test -p bench-harness client` → PASS (2 tests).
 
-- [ ] **Step 5: Implement `bin/bench-app.rs`**
+- [ ] **Step 6: Implement `bin/bench-app.rs`**
 
 ```rust
 //! The wire-layer vehicle (spec §1, as amended at the plan fix-wave): the
@@ -2068,18 +2150,258 @@ fn main() -> ExitCode {
 }
 ```
 
-- [ ] **Step 6: Implement `wire.rs`**
+- [ ] **Step 7: Implement `wire_accounting.rs`**
+
+```rust
+//! The accounting half of layer 4. Interlude spec
+//! docs/superpowers/specs/2026-08-08-bench-accounting-split-design.md §5 rules
+//! that this layer adopts the observations seam from inception rather than
+//! having it retrofitted: every floor, crosscheck, rate division and INVALID
+//! decision the wire layer makes is a pure function over observations already
+//! taken.
+//!
+//! Nothing here reads a clock, spawns a process, opens a socket or touches a
+//! file. As in `kernel_accounting`, that half is enforced rather than
+//! promised: this module carries no blanket
+//! `#![allow(clippy::disallowed_methods, clippy::disallowed_types)]`, so hard
+//! rule 1's workspace deny-list is what holds it. The no-`Conn`/no-`Child`
+//! half is NOT on the deny-list and is held by review instead — adding either
+//! to anything in this module defeats the seam with CI still green.
+//!
+//! **What this layer's `log_records_per_sec` is, stated here because this is
+//! the one place a reader can check it.** Layer 3 OBSERVES
+//! `KernelStats::jobs_done`. This layer cannot see the server's log from
+//! outside the process, so its record rate is DERIVED —
+//! `records_per_request * throughput` — and that derivation assumes the job
+//! queue is at steady state inside the window. A `device_ratio` above 1.0
+//! therefore has two possible causes here where layer 3 has one, and the
+//! reason names both.
+
+use crate::measure::{
+    crosscheck, degenerate_window_reason, implausible_ratio, percentile, MIN_MEASURED_WINDOW,
+};
+use crate::report::SweepPoint;
+use std::time::Duration;
+
+/// Above this, the client's own CPU — not the server — is what the number
+/// measures. Published per point rather than used as a refusal: a saturated
+/// point is a real observation about this client, and the sweep's shape is
+/// what makes it readable.
+pub const SATURATION_FRACTION: f64 = 0.9;
+
+#[derive(Debug, Clone, Default)]
+pub struct WireObs {
+    /// This point's connection count — an INPUT, and the label every reason
+    /// this point raises is prefixed with.
+    pub connections: usize,
+    /// Per-worker measured request counts, collected through `join`.
+    pub per_thread: Vec<u64>,
+    /// The shared atomic every worker also bumped. Note what this pair does
+    /// and does not prove: `per_thread`, `grand` and `latencies_us` are all
+    /// bumped in ONE unbranched block in the worker loop, so as a check on
+    /// the MEASURED PATH they are one check, not three (the T6 review's I-2
+    /// finding, which applies here verbatim). They stay genuinely independent
+    /// as a check on this harness's own collection plumbing — a dropped
+    /// `join`, a mis-accumulated sum — which is the only thing the crosscheck
+    /// is claimed to catch.
+    pub grand: u64,
+    /// Per-request latencies in microseconds, measured window only, in
+    /// completion order. `point_accounting` sorts its own copy: the driver
+    /// hands these over UNSORTED so that `percentile`'s sorted-input
+    /// precondition is held by a function a unit test can reach.
+    pub latencies_us: Vec<u64>,
+    /// The measured window — `Instant::elapsed` across the `--duration`
+    /// sleep, warmup excluded.
+    pub elapsed: Duration,
+    /// This process's user+system CPU across the window. The server is a
+    /// separate process, so this is the CLIENT's cost and nothing else.
+    pub client_cpu: Duration,
+    /// `device.syncs_per_sec`, measured by layer 1 in this process and
+    /// threaded in — an INPUT, not an observation of this layer.
+    pub device_ceiling: f64,
+    /// Log records committed per acked request for this target — an INPUT,
+    /// the per-target constant from `Target::records_per_request` (spec §3).
+    pub records_per_request: f64,
+    /// `Heartbeat::finish()` over the measured window.
+    pub heartbeat: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WireAccounting {
+    pub point: SweepPoint,
+    pub invalid: Vec<String>,
+}
+
+/// The whole of this layer's arithmetic, and every decision it makes.
+///
+/// `Err` means this point is not a measurement at all, and the sweep drops it
+/// fail-soft (spec §5): the points already measured are kept and the loss is
+/// named. `Ok` carries the point plus any reasons that make the RUN
+/// unpublishable — a non-empty `invalid` still exits 1.
+pub fn point_accounting(w: &WireObs) -> Result<WireAccounting, String> {
+    let n = w.connections;
+    let at = |reason: String| format!("[{n} conns] {reason}");
+    let ops = w.latencies_us.len() as u64;
+
+    // Two floors, in this order, both refusing.
+    //
+    // The op floor is `degenerate_window_reason`'s fourth CONSUMER (device,
+    // core's two windows, and this one) — sharing, not the third COPY
+    // interlude spec §5 warns about. It also protects `percentile`'s
+    // non-empty assert structurally: MIN_MEASURED_OPS > 0, so nothing below
+    // reaches a percentile of an empty slice, and rev. 1's separate
+    // empty-latency check is subsumed rather than dropped.
+    //
+    // The window floor compares against the same `MIN_MEASURED_WINDOW` layer
+    // 3 uses but carries its own prose, on the T6 ruling's principle that the
+    // RULE is shared and the PROSE is not: this layer's window IS
+    // `--duration`. Without it, five ops across 256 connections can clear the
+    // op floor inside a 4 ms window and publish a rate from it — the exact
+    // shape of the T6 review's C-1. It is also what keeps `secs` off zero on
+    // every published path, so no `inf` rate reaches `collect_non_finite`
+    // through this layer's throughput division.
+    if let Some(reason) = degenerate_window_reason("wire", ops, w.elapsed) {
+        return Err(at(reason));
+    }
+    if w.elapsed < MIN_MEASURED_WINDOW {
+        return Err(at(format!(
+            "INVALID: the wire measured window was {:?}, under the \
+             {MIN_MEASURED_WINDOW:?} minimum — raise --duration; a window this \
+             short is dominated by connection ramp-up and scheduler noise \
+             rather than by the path being measured",
+            w.elapsed
+        )));
+    }
+
+    // Fixed push order, pinned by a test: heartbeat, then the crosscheck,
+    // then the ratio gate. Both renderers derive from this list, so a
+    // reordering would be invisible to most assertions and visible in the
+    // artifact (interlude §3.3).
+    let mut invalid = Vec::new();
+    if let Some(reason) = w.heartbeat.clone() {
+        invalid.push(at(reason));
+    }
+    let total = match crosscheck(&w.per_thread, w.grand) {
+        Ok(t) => t,
+        Err(reason) => {
+            invalid.push(at(reason));
+            w.grand
+        }
+    };
+
+    let secs = w.elapsed.as_secs_f64();
+    let throughput = total as f64 / secs;
+    let log_records_per_sec = w.records_per_request * throughput;
+    let device_ratio = log_records_per_sec / w.device_ceiling;
+    if implausible_ratio(device_ratio) {
+        invalid.push(at(format!(
+            "INVALID: log_records_per_sec {log_records_per_sec:.0} is \
+             {device_ratio:.2}x the measured device ceiling of {:.0} durable \
+             syncs/s — unlike layer 3 this rate is DERIVED as {} records per \
+             acked request rather than observed, so either the measurement is \
+             impossible or the job queue was not at steady state inside the \
+             window",
+            w.device_ceiling, w.records_per_request
+        )));
+    }
+
+    let mut sorted = w.latencies_us.clone();
+    sorted.sort_unstable();
+    let client_busy_fraction = w.client_cpu.as_secs_f64() / (n as f64 * secs);
+    Ok(WireAccounting {
+        point: SweepPoint {
+            connections: n,
+            throughput_per_sec: throughput,
+            // Spec §3's pairing at this layer; see the module doc for why this
+            // is a per-target derivation and not a count.
+            log_records_per_sec,
+            device_ratio,
+            p50_us: percentile(&sorted, 50.0),
+            p99_us: percentile(&sorted, 99.0),
+            p999_us: percentile(&sorted, 99.9),
+            client_busy_fraction,
+            saturated: client_busy_fraction > SATURATION_FRACTION,
+        },
+        invalid,
+    })
+}
+```
+
+- [ ] **Step 7b: The accounting unit tests**
+
+Twelve `#[test]`s in `wire_accounting.rs`'s `mod tests`, sharing a `healthy()` fixture
+builder that every test mutates from — the `kernel_accounting` convention, full-sentence
+test names:
+
+1. `a_healthy_point_publishes_and_flags_nothing`
+2. `the_record_rate_is_the_per_target_multiple_of_throughput` (2.0 and 1.0 both)
+3. `a_below_floor_point_refuses_and_an_at_floor_one_does_not` (`MIN_MEASURED_OPS` both sides)
+4. `a_short_window_refuses_even_when_the_op_floor_is_cleared` (the C-1 shape: ops well above the floor, window under `MIN_MEASURED_WINDOW`)
+5. `the_window_floor_admits_a_window_exactly_at_the_minimum` (boundary, other side)
+6. `the_op_floor_refuses_before_the_window_floor` (both violated → op-floor prose, matching `degenerate_batch_reason`'s own internal precedence)
+7. `a_disagreeing_crosscheck_is_named_and_falls_back_to_the_grand_counter`
+8. `a_rate_above_the_device_ceiling_is_flagged_and_at_the_ceiling_is_not` (both sides of `DEVICE_RATIO_SLACK`)
+9. `the_ceiling_refusal_names_the_derivation_as_a_possible_cause` (the layer-3/layer-4 difference is in the prose, not only in this plan)
+10. `saturation_is_flagged_above_the_fraction_and_not_at_it`
+11. `every_reason_carries_its_connection_count` (the `[{n} conns]` prefix, on all three `invalid` arms and both refusals)
+12. `a_zero_device_ceiling_leaves_a_non_finite_ratio_for_the_central_collector` (interlude §4's standing rule: no local non-finite check)
+
+Plus one that earns its keep by construction rather than by boundary:
+13. `percentiles_come_from_a_sorted_copy_of_unsorted_observations` — hand the fixture
+    latencies in a deliberately unsorted order and assert p50/p99/p999 are the sorted
+    answers. This is what makes the "driver hands them over unsorted" contract real; if
+    a future driver sorts first, this test still passes, and if the accounting stops
+    sorting, it goes red.
+
+**On the interlude's protocol:** these pin behaviour this task is itself introducing, so
+unlike the interlude's own tests they arrive RED, not passing. Steps 7 and 7b are
+therefore ordinary TDD — write the tests, watch them fail to compile, implement, watch
+them pass. The mutation table below is still required, because a test that passes for
+the wrong reason is the failure mode this sub-project has now hit five times.
+
+- [ ] **Step 7c: The mutation table** (whole module per round, pristine copy taken first, `shasum -a 256` both sides, never `git checkout --`)
+
+| # | Mutation | Predicted RED |
+|---|---|---|
+| 1 | Delete the window-floor check entirely | 4, 5 |
+| 2 | Change the window floor to `<=` | 5 |
+| 3 | Swap the two floors' order | 6 |
+| 4 | Drop the `at()` prefix from the ratio reason | 11 |
+| 5 | Use `per_thread.iter().sum()` instead of the crosscheck's fallback on disagreement | 7 |
+| 6 | Replace `records_per_request * throughput` with a hardcoded `2.0 * throughput` | 2 (the invoicing arm) |
+| 7 | Change `saturated` to `>=` | 10 |
+| 8 | Add a local `if !device_ratio.is_finite() { return ... }` guard | 12 |
+| 9 | Sort `w.latencies_us` in place via a `&mut` parameter, or drop the sort | 13 |
+| 10 | Push the ratio reason before the heartbeat reason | the fixed-order assertion in 11 |
+| 11 | Drop "steady state" from the ceiling prose | 9 |
+
+A compile error is not a RED for an assertion (the T5 finding: novelty is not teeth).
+Row 9's "drop the sort" half is the one to run if the `&mut` half will not compile.
+
+- [ ] **Step 8: Implement `wire.rs`** — the driver, which makes no arithmetic decision of its own
 
 ```rust
 //! Layer 4 (spec §2, §4): real HTTP/1.1 keep-alive load against a spawned
 //! child binary — the number the README claim is about. Closed-loop, with
 //! coordinated-omission and client-saturation disclosed in the artifact.
 //! Edge tooling outside the deterministic core (DESIGN §1).
+//!
+//! This module keeps the child process, the thread pool, the Heartbeat and
+//! the two clocks, fills a `WireObs` per point, and makes no published
+//! arithmetic decision of its own — every one of those lives in
+//! `wire_accounting` (interlude spec §5).
+//!
+//! **This layer's window**: `--warmup` then `--duration`, both read, unlike
+//! layer 3 which reads neither. Each point gets a fresh child and a fresh
+//! data dir, so store growth under one connection count cannot confound the
+//! next; the child's own startup costs sit before the warmup and are excluded
+//! from the measured window by construction.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use crate::client::Conn;
-use crate::measure::{crosscheck, percentile, process_cpu, Heartbeat};
-use crate::report::{SweepPoint, WireReport};
+use crate::measure::{process_cpu, Heartbeat};
+use crate::report::WireReport;
+use crate::wire_accounting::{point_accounting, WireObs};
 use crate::SLOTS;
 use std::io;
 use std::net::TcpStream;
@@ -2089,7 +2411,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const SATURATION_FRACTION: f64 = 0.9;
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub enum Target {
@@ -2105,11 +2426,10 @@ impl Target {
         }
     }
 
-    /// Log records committed per acked request, by construction — the wire
-    /// layer's records/sec is DERIVED from this, not separately counted (the
-    /// client cannot see the server's log from outside the process; BENCH.md
-    /// states the derivation). bench-app's canonical txn commits one effects
-    /// record and its Bump's Done-mark commits another (jobs ≡ acked
+    /// Log records committed per acked request, by construction — see
+    /// `wire_accounting`'s module doc for why this layer derives its record
+    /// rate instead of counting it. bench-app's canonical txn commits one
+    /// effects record and its Bump's Done-mark commits another (jobs ≡ acked
     /// requests is the platform's property-tested dual-write invariant), so
     /// 2.0 at steady state; invoicing's create_customer is get + put only —
     /// one effects record, no job (routes.rs:53-71, verified).
@@ -2120,8 +2440,9 @@ impl Target {
         }
     }
 
-    /// Per-thread setup returning the headers every request carries.
-    fn session_setup(&self, conn: &mut Conn) -> io::Result<Vec<(String, String)>> {
+    /// Per-thread setup returning the headers every request carries. `_conn`
+    /// is unused only until T8's Invoicing arm logs in through it.
+    fn session_setup(&self, _conn: &mut Conn) -> io::Result<Vec<(String, String)>> {
         match self {
             Target::BenchApp => Ok(Vec::new()),
             Target::Invoicing => unreachable!("wired in T8"),
@@ -2245,21 +2566,23 @@ pub fn sweep(
     connections: &[usize],
     warmup: Duration,
     duration: Duration,
+    device_ceiling: f64,
 ) -> io::Result<(WireReport, Vec<String>)> {
     let target = Arc::new(target);
     let mut points = Vec::new();
     let mut invalid = Vec::new();
     for &n in connections {
-        match sweep_point(bin, &target, n, warmup, duration) {
+        match sweep_point(bin, &target, n, warmup, duration, device_ceiling) {
             Ok((point, mut point_invalid)) => {
                 invalid.append(&mut point_invalid);
                 points.push(point);
             }
             // Fail-soft (plan-review I-4, the spec §5 posture): one lost
-            // point — a spawn hiccup, a timeout at 256 conns, a non-200 —
-            // must not discard the points already measured. The report keeps
-            // what was measured and names what was lost; a non-empty
-            // `invalid` still exits 1, so a lost point can never pass silently.
+            // point — a spawn hiccup, a timeout at 256 conns, a non-200, a
+            // window the accounting refused — must not discard the points
+            // already measured. The report keeps what was measured and names
+            // what was lost; a non-empty `invalid` still exits 1, so a lost
+            // point can never pass silently.
             Err(e) => invalid.push(format!("[{n} conns] point lost: {e}")),
         }
     }
@@ -2272,13 +2595,13 @@ fn sweep_point(
     n: usize,
     warmup: Duration,
     duration: Duration,
-) -> io::Result<(SweepPoint, Vec<String>)> {
+    device_ceiling: f64,
+) -> io::Result<(crate::report::SweepPoint, Vec<String>)> {
     // A fresh child + data dir per point: store growth from one point
     // must not confound the next.
     let dir = point_dir(target.name(), n);
     let addr = free_addr();
     let node = spawn_target(bin, &addr, &dir)?;
-    let mut invalid = Vec::new();
 
     let measuring = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
@@ -2298,9 +2621,9 @@ fn sweep_point(
                 let t0 = Instant::now();
                 let (status, body) = target.one_request(&mut conn, &headers, &ids)?;
                 if status != 200 {
+                    let shown: String = String::from_utf8_lossy(&body).chars().take(256).collect();
                     return Err(io::Error::other(format!(
-                        "request failed with {status}: {}",
-                        String::from_utf8_lossy(&body)
+                        "request failed with HTTP {status}: {shown}"
                     )));
                 }
                 if measuring.load(Ordering::Relaxed) {
@@ -2321,58 +2644,50 @@ fn sweep_point(
     std::thread::sleep(duration);
     measuring.store(false, Ordering::Relaxed);
     let elapsed = start.elapsed();
-    let cpu = process_cpu() - cpu0;
+    let client_cpu = process_cpu() - cpu0;
     stop.store(true, Ordering::Relaxed);
-    if let Some(reason) = hb.finish() {
-        invalid.push(format!("[{n} conns] {reason}"));
-    }
+    // `Heartbeat` has no `Drop`; finish it before any `?` below can return
+    // early, or a 10 ms tick thread leaks for the life of the process
+    // (T6 review, M-3).
+    let heartbeat = hb.finish();
 
     let mut per_thread = Vec::new();
-    let mut latencies = Vec::new();
+    let mut latencies_us = Vec::new();
+    let mut joined = Ok(());
     for w in workers {
-        let (count, lat) = w
-            .join()
-            .map_err(|_| io::Error::other("a client thread panicked"))??;
-        per_thread.push(count);
-        latencies.extend(lat);
+        match w.join().map_err(|_| io::Error::other("a client thread panicked")) {
+            Ok(Ok((count, lat))) => {
+                per_thread.push(count);
+                latencies_us.extend(lat);
+            }
+            // Join every worker before propagating: an early `?` here leaves
+            // the rest of the pool detached and racing the child's kill.
+            Ok(Err(e)) | Err(e) => {
+                if joined.is_ok() {
+                    joined = Err(e);
+                }
+            }
+        }
     }
     drop(node);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_file(format!("{dir}.child.out"));
     let _ = std::fs::remove_file(format!("{dir}.child.err"));
+    joined?;
 
-    // percentile() rightly asserts non-empty; a window in which nothing
-    // completed is a lost point, not a panic of the whole sweep.
-    if latencies.is_empty() {
-        return Err(io::Error::other(
-            "no requests completed inside the measuring window",
-        ));
-    }
-    let total = match crosscheck(&per_thread, grand.load(Ordering::Relaxed)) {
-        Ok(t) => t,
-        Err(reason) => {
-            invalid.push(format!("[{n} conns] {reason}"));
-            grand.load(Ordering::Relaxed)
-        }
+    let obs = WireObs {
+        connections: n,
+        per_thread,
+        grand: grand.load(Ordering::Relaxed),
+        latencies_us,
+        elapsed,
+        client_cpu,
+        device_ceiling,
+        records_per_request: target.records_per_request(),
+        heartbeat,
     };
-    latencies.sort_unstable();
-    let throughput = total as f64 / elapsed.as_secs_f64();
-    let client_busy_fraction = cpu.as_secs_f64() / (n as f64 * elapsed.as_secs_f64());
-    Ok((
-        SweepPoint {
-            connections: n,
-            throughput_per_sec: throughput,
-            // Spec §3's pairing at this layer; see records_per_request's doc
-            // for why this is a per-target derivation, not a count.
-            log_records_per_sec: target.records_per_request() * throughput,
-            p50_us: percentile(&latencies, 50.0),
-            p99_us: percentile(&latencies, 99.0),
-            p999_us: percentile(&latencies, 99.9),
-            client_busy_fraction,
-            saturated: client_busy_fraction > SATURATION_FRACTION,
-        },
-        invalid,
-    ))
+    let a = point_accounting(&obs).map_err(io::Error::other)?;
+    Ok((a.point, a.invalid))
 }
 
 pub fn point_dir(target: &str, conns: usize) -> String {
@@ -2389,66 +2704,123 @@ pub fn point_dir(target: &str, conns: usize) -> String {
 }
 ```
 
-Add `pub mod client;` and `pub mod wire;` to `lib.rs`.
+Add `pub mod client;`, `pub mod wire;` and `pub mod wire_accounting;` to `lib.rs`.
 
-- [ ] **Step 7: Wire the subcommand arm** (in `run_layers`)
+Two things in the above are corrections to rev. 1's driver, not relocation, and the
+report should say so:
+
+- **`records_per_request` is now the target's own method feeding an observation field**,
+  not a multiply performed in the driver. The driver reads the constant; the accounting
+  does the arithmetic.
+- **Workers are all joined before any error propagates.** Rev. 1's `w.join()...??` inside
+  the loop returned on the first failing worker, leaving the rest of the pool detached and
+  racing `drop(node)`'s `kill`. The first error is still the one reported.
+
+- [ ] **Step 9: Wire the subcommand arm** (in `run_layers`)
 
 ```rust
         "wire" => {
             let target = match args.target.as_str() {
                 "bench-app" => bench_harness::wire::Target::BenchApp,
-                "invoicing" => bench_harness::wire::Target::Invoicing,
+                // T8 fills the Invoicing arms. Until then this refuses by
+                // name: `--target invoicing` is advertised in the usage
+                // string, so reaching the internal `unreachable!` through a
+                // documented flag value would be a panic where a named
+                // remedy belongs (hard rule 5).
+                "invoicing" => {
+                    return Err(std::io::Error::other(
+                        "--target invoicing is not wired yet (bench-harness Task 8) — \
+                         use --target bench-app",
+                    ))
+                }
                 other => return Err(std::io::Error::other(format!("unknown --target {other:?}"))),
             };
             let (package, bin) = match &target {
                 bench_harness::wire::Target::BenchApp => ("bench-harness", "bench-app"),
                 bench_harness::wire::Target::Invoicing => ("invoicing", "node"),
             };
+            let ceiling = report.device.as_ref().expect("device ran first").syncs_per_sec;
             let bin = bench_harness::wire::build_bin(package, bin)?;
             let (wire, invalid) = bench_harness::wire::sweep(
-                &bin, target, &args.connections, args.warmup, args.duration,
+                &bin, target, &args.connections, args.warmup, args.duration, ceiling,
             )?;
             report.wire.push(wire);
             report.invalid.extend(invalid);
+            true
         }
 ```
 
-- [ ] **Step 8: Add the ignored smoke** (in `tests/harness.rs`)
+- [ ] **Step 10: Add the ignored smoke** (in `tests/harness.rs`)
+
+Measure a real device ceiling first — the T6 review's I-5 ruled out a smoke that hands a
+layer a made-up ceiling, because the ratio assertion then compares a number with itself.
 
 ```rust
 #[test]
 #[ignore]
 fn wire_layer_sweeps_the_bench_app() {
+    let dir = temp_dir("wire-device");
+    let device = bench_harness::device::run(&dir, Duration::from_millis(200), Duration::from_secs(1))
+        .expect("device probe runs");
+    let _ = std::fs::remove_dir_all(&dir);
+
     let bin = bench_harness::wire::build_bin("bench-harness", "bench-app").expect("bin builds");
     let (wire, invalid) = bench_harness::wire::sweep(
         &bin,
         bench_harness::wire::Target::BenchApp,
         &[1, 4],
         Duration::from_millis(300),
-        Duration::from_secs(1),
+        Duration::from_secs(2),
+        device.syncs_per_sec,
     )
     .expect("sweep runs");
     assert!(invalid.is_empty(), "short healthy run must be valid: {invalid:?}");
     assert_eq!(wire.points.len(), 2);
     for p in &wire.points {
         assert!(p.throughput_per_sec > 0.0);
+        // The derivation, asserted rather than assumed (T6 review, I-5: a
+        // `> 0.0` on a number the caller supplied is not an assertion).
+        assert_eq!(p.log_records_per_sec, 2.0 * p.throughput_per_sec);
+        assert_eq!(p.device_ratio, p.log_records_per_sec / device.syncs_per_sec);
         assert!(p.p50_us <= p.p99_us && p.p99_us <= p.p999_us, "percentile ordering");
     }
 }
 ```
 
-- [ ] **Step 9: Verify**
+The `--duration` is 2s, not rev. 1's 1s: `MIN_MEASURED_WINDOW` is 1s and a smoke that
+sits exactly on a refusal boundary is a flake waiting for a slow CI box.
 
-Run: `cargo test -p bench-harness client` → PASS.
-Run: `cargo test -p bench-harness --test harness -- --ignored --test-threads=1` → PASS (4 tests).
-Run: `cargo run -p bench-harness --bin bench -- wire --connections 1,4 --duration 2 --warmup 0.5 --json` → JSON has `"wire":[{"target":"bench-app",...}]`, exit 0.
+Note for the implementer: this smoke runs `cargo build` for `bench-harness`'s own bins
+from inside a `bench-harness` test. The outer cargo has released the target-dir lock by
+the time tests run, and the edge-harness precedent does the same across packages — but
+if it blocks, that is the known cargo target-dir lock and not a harness bug. The test is
+`#[ignore]`, so it only runs under `scripts/bench.sh`.
 
-- [ ] **Step 10: Ledger + commit**
+- [ ] **Step 11: Verify**
+
+Run: `cargo test -p bench-harness client` → PASS (2 tests).
+Run: `cargo test -p bench-harness --lib wire_accounting` → PASS (13 tests).
+Run: `cargo test -p bench-harness` → lib 59 → 74, bin 15, app 1, 8 ignored, 0 failed.
+Run: `cargo test -p bench-harness --test harness -- --ignored --test-threads=1` → 8/8.
+Run: `cargo test --workspace` twice → 658 → 673 passed, 38 → 39 ignored; reconcile the
+delta exactly (2 client + 13 accounting + 1 report non-finite = 16 lib; if the arithmetic
+does not close, say so rather than restating the prediction).
+Run: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`;
+`cargo clippy -p bench-harness --all-targets --target x86_64-unknown-linux-gnu -- -D warnings`;
+`cargo build -p guide-examples`.
+Run: `git diff --stat -- crates/charpente-core crates/charpente` → **empty** (Global Constraint).
+Run: `cargo run -p bench-harness --bin bench -- wire --connections 1,4 --duration 2 --warmup 0.5 --json`
+→ JSON has `"wire":[{"target":"bench-app",...,"device_ratio":...}]`, exit 0.
+Run: `cargo run -p bench-harness --bin bench -- wire --target invoicing` → exit 1, the named refusal.
+Run: `cargo run -p bench-harness --bin bench -- wire --connections 1 --duration 0.1 --warmup 0`
+→ exit 1, refused by a floor rather than published.
+
+- [ ] **Step 12: Ledger + commit**
 
 Append the Task 7 entry to the ledger, then:
 
 ```bash
-git add crates/bench-harness
+git add crates/bench-harness docs/superpowers/plans/2026-08-06-benchmark-harness.md
 git commit -m "bench: wire layer — keep-alive client, bench-app vehicle, connection sweep (T7)"
 ```
 
@@ -2456,8 +2828,21 @@ git commit -m "bench: wire layer — keep-alive client, bench-app vehicle, conne
 
 ### Task 8: the invoicing wire target
 
+**Handoff from T7 rev. 2 — do not miss this.** T7 ships a named CLI refusal for
+`--target invoicing` in `bin/bench.rs`'s `wire` arm (its Step 9), because reaching the
+internal `unreachable!("wired in T8")` through a flag the usage string advertises would be
+a panic where a named remedy belongs. **T8 must delete that refusal arm** and let
+`"invoicing"` construct `Target::Invoicing` — otherwise this task's own smoke passes
+in-process while the shipped binary still refuses the target it just wired. T7's Step 11
+pins the refusal, so that test is the one that must be updated here, and its update is the
+evidence the handoff was taken.
+
+Also note `session_setup`'s parameter is named `_conn` as T7 ships it (the `BenchApp` arm
+does not use it); Step 1 below renames it to `conn`.
+
 **Files:**
 - Modify: `crates/bench-harness/src/wire.rs` (fill the two `Invoicing` arms)
+- Modify: `crates/bench-harness/src/bin/bench.rs` (delete T7's `--target invoicing` refusal)
 - Modify: `crates/bench-harness/tests/harness.rs` (add smoke)
 
 **Interfaces:**
