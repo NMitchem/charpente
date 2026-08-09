@@ -1929,6 +1929,87 @@ Four changes beyond relocation:
 Verification counts, measured at `b3cb252` and stated as a delta: lib 59, bin 15, app 1,
 harness 7 ignored, workspace 658 passed / 38 ignored.
 
+**Rev. 3 (2026-08-09, after the first implementation attempt). The ratio gate is bracketed,
+because rev. 2's shipped as a false-alarm generator.** Rev. 2's gate divided by the
+CLI-threaded layer-1 ceiling and flagged above `1.0 + DEVICE_RATIO_SLACK` (1e-6). Run
+against real hardware it fired on healthy runs, twice, at large margins:
+
+| run | layer-1 ceiling | 1 conn | 4 conns | outcome |
+|---|---|---|---|---|
+| harness smoke | 198 syncs/s | 236 rec/s → **1.19x** | 245 rec/s → **1.24x** | smoke FAILED |
+| same smoke, re-run | (higher) | — | — | 8/8 passed |
+| `bench wire --json` | 243 syncs/s | 228 rec/s → 0.94x | 253 rec/s → **1.04x** | exit 1 |
+
+**The derivation is not wrong and the measurement is not wrong.** At 1 connection p50 was
+8189 µs; a 243 syncs/s ceiling is 4.1 ms per sync and two syncs is 8.2 ms. charpente is
+running at the device ceiling, which is the CORRECT result for an ack-after-durable design.
+The wire number was stable (228–253 rec/s) while the layer-1 ceiling swung 198 → 243 — the
+denominator is the noisy term, and the ledger already records a 220–310 syncs/s cross-window
+dispersion, with the T6 review noting the kernel layer sits at 0.99x, "well inside the band
+where the dispersion would carry it past 1.0 unnoticed."
+
+So a layer that is *supposed* to sit at 1.0 cannot be gated at `1.0 + 1e-6` against a
+ceiling measured in a different window. This is the class interlude §6 named as unreachable
+by pure-function testing and findable only by running the binary; it was found by running
+the binary.
+
+**Noah ruling (2026-08-09): bracket the ceiling.** Each sweep point takes its own device
+sample before spawning its child and after killing it, and the gate divides by
+`max(before, after)`. Both samples are published so the ratio carries a visible error bar.
+
+**Three deliberate divergences from the core layer's bracket shape, recorded so they are not
+"consistency"-fixed later:**
+
+1. **The core layer publishes brackets but does NOT divide by them** — `core_accounting`
+   gates on the threaded `device_ceiling` and cites the brackets only as prose evidence
+   (`device_ratio_reason`'s signature takes `before`/`after` for the message alone). The
+   wire layer divides by the bracket max. The reason is the 0.99x-vs-0.75x difference above:
+   the core layer sits well below its ceiling, so a noisy denominator rarely crosses 1.0
+   there, and it crosses constantly here.
+2. **Consequently `SweepPoint::device_ratio` is not comparable to `CoreReport::device_ratio`
+   or `KernelReport::device_ratio`** — different denominators. `docs/BENCH.md` (T10) must
+   say so; do not present the three side by side as one column.
+3. **Brackets are per POINT, not per sweep.** A bracket sample is
+   `BRACKET_WARMUP + BRACKET_DURATION` = 1.1s against a spec-default 35s point (~6%), and
+   per-sweep brackets on a five-point sweep would sit minutes from the middle points, which
+   is the locality problem this ruling exists to fix.
+
+**Superseding rev. 2 in the blocks below** (the blocks are otherwise unchanged; where they
+disagree with this list, this list wins):
+
+- `WireObs::device_ceiling: f64` becomes **`device_before: f64` and `device_after: f64`**.
+- `point_accounting` computes `let ceiling = w.device_before.max(w.device_after);` and
+  `device_ratio = log_records_per_sec / ceiling`. `implausible_ratio` is unchanged and still
+  the shared predicate.
+- The ceiling reason cites **both** samples, the `core_accounting::device_ratio_reason`
+  precedent: `"… the bracket samples either side of this point ({before:.2} before / {after:.2} after) …"`.
+- `SweepPoint` gains **`device_syncs_per_sec_before: f64` and `device_syncs_per_sec_after:
+  f64`** beside `device_ratio`, named exactly as `CoreReport`'s equivalents. All three go
+  into `render_json`, `render_human`, `collect_non_finite`, `fixed_report()` and the pin.
+- `wire::sweep` **drops its `device_ceiling: f64` parameter** — the layer measures its own —
+  and `bin/bench.rs`'s `wire` arm no longer reads `report.device`. Layer 1 still runs first
+  and still publishes the `device:` line; the wire layer simply no longer divides by it.
+- `sweep_point` calls `device_bracket_sample` **before `spawn_target` and after `drop(node)`**.
+  Sampling while the child is live would contend with it for the device and under-measure the
+  ceiling, which is the failure this ruling fixes, not a variant of it. Use a sibling
+  directory of the point dir, never the child's own data dir.
+- `core_bench::device_bracket_sample` is currently private. **Promote it to
+  `pub(crate)` and reuse it** — do not hand-roll a second sync loop (it already reuses
+  `device::timed_loop`, and its `"bracket"` name string was fixed in T5's re-review N-11 to
+  avoid a doubled "device device" rendering). Moving it to `device.rs` beside `timed_loop`
+  is acceptable and probably better; copying it is not.
+
+**Added tests** (on top of Step 7b's thirteen): the gate divides by the bracket MAX not the
+min and not `before`; an under-measured single sample does not by itself flag a healthy
+point; both bracket samples reach the published point; a non-finite bracket flows to
+`collect_non_finite`. **Added mutation rows**: `max` → `min`; `max` → `before`; drop either
+published bracket field from `render_json`.
+
+**The smoke changes shape.** `assert!(invalid.is_empty())` is what went flaky, and it stays —
+but it is now a real assertion rather than a coin flip, and the smoke must additionally
+assert `p.device_ratio == p.log_records_per_sec / p.device_syncs_per_sec_before.max(p.device_syncs_per_sec_after)`.
+If it flakes again, that is a finding to report, not a threshold to widen.
+
 **Files:**
 - Create: `crates/bench-harness/src/client.rs`
 - Create: `crates/bench-harness/src/wire_accounting.rs`
