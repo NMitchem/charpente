@@ -267,7 +267,7 @@ Run-validity rules, mechanical:
   the phenomenon this rule exists to detect — a ratio anywhere in
   `(1.0, 1.01]` published unflagged at exit 0 was this rule's own defect, one
   order of magnitude smaller, still shipped. Tightened to `1e-6`
-  (`core_bench::DEVICE_RATIO_SLACK`), still generous for genuine float/timer
+  (`core_accounting::DEVICE_RATIO_SLACK`), still generous for genuine float/timer
   slop, the only cause the constant is meant to excuse. Accepted cost: more
   short/noisy runs now correctly exit 1; the bracket samples above are what
   tell the reader why, not a wider slack that hides the same fact.*

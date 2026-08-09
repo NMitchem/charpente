@@ -1009,10 +1009,20 @@ do not reorder a milestone's dependency sequence.
 - Next: **M2 per PLAN.** Ruled 2026-08-06 (premise re-examination at M2 start): the own-LSM
   engine is **deferred behind measurement** — DECISIONS §7's scheduled reopen, re-closed with
   three named build triggers — and the **benchmark harness** (PLAN's unfulfilled "publish
-  honest benchmarks early" mitigation) is the next sub-project; its spec is in brainstorming.
+  honest benchmarks early" mitigation) is the next sub-project. **It is in progress, not
+  pending**: the spec (`docs/superpowers/specs/2026-08-06-benchmark-harness-design.md`,
+  `2b47556`) and its 10-task plan (`be9b05a`) landed 2026-08-06; Tasks 1-5 shipped
+  `crates/bench-harness` — the measurement discipline, the pinned report model, the device
+  layer and the `bench` binary, and the core layer against its device ceiling — and a
+  Noah-ruled mid-plan interlude (2026-08-08, spec `…/2026-08-08-bench-accounting-split-
+  design.md`) split the core layer's *accounting* from its *measuring* so every guard, delta
+  and INVALID decision is a deterministic unit test instead of something only a real benchmark
+  run can reach. **Tasks 6 (kernel layer) and 7 (wire layer) are next**, and per that
+  interlude's spec §5 they adopt its seam from inception — raw observations struct, pure
+  accounting, thin driver — rather than copying an untested pattern.
   Do not start the LSM engine from this file alone; the triggers live in DECISIONS §7.
-  The backlog below holds **no open ruled follow-ups** — both entries
-  in it are record. Still-open work, none of it ruled or blocking: `TcpProxy::stop`'s
+  The backlog below holds **one open ruled follow-up** — `applied_delta`'s release-mode wrap,
+  added 2026-08-08 and the only entry in it that is open work; every other entry is record. Still-open work, none of it ruled or blocking: `TcpProxy::stop`'s
   registration window ("fix in M2"); the follower-decode asymmetry above; the edge-harness
   restart-then-relogin race noted in the verifying-peer-policy entry just above (mechanism
   present since sub-project 0b at the latest, observed once at this interlude's tip, not
@@ -1026,6 +1036,30 @@ do not reorder a milestone's dependency sequence.
 
 ## M2 follow-up backlog (carried from M1, ruled — written to be read cold)
 
+- **OPEN, ruled 2026-08-08: `applied_delta`'s `(Some, Some)` arm wraps silently in release.**
+  The one piece of open work in this section. `crates/bench-harness/src/core_accounting.rs`'s
+  `applied_delta` computes the applied-record delta across a measured window, and its
+  `(Some(b), Some(a))` arm is a bare `a - b` while its sibling impossible-state arm
+  `(Some(_), None)` carries a named `unreachable!`. **The workspace sets no `overflow-checks`
+  override** — the only `[profile.*]` entries in the root `Cargo.toml` are the redb
+  `debug-assertions`/`opt-level` ones — so release inherits Rust's default
+  `overflow-checks = false` and that subtraction wraps instead of panicking. Verified
+  empirically twice, independently (the T2 controller and the fix-round re-reviewer): `rustc
+  -O` on `(Some(5), Some(3))` prints `18446744073709551614` and exits 0. Consequence in the
+  mode a real benchmark actually runs in: a backwards `last_applied` publishes
+  `log_records_per_sec` ≈ 1.8e19 / elapsed and the run **continues**, flagged only as a
+  non-fatal INVALID by the `delta != ops` crosscheck, rather than stopping and naming the
+  contract that broke. **Not reachable through `core_bench::run` today** — `Db::last_applied()`
+  is monotonic and the two samples are taken in window order — so this is negative-space
+  assertion work, exactly what hard rule 4's "assertions stay on in release builds" clause is
+  about, not a live bug. Recommended fix, one line:
+  `a.checked_sub(b).unwrap_or_else(|| panic!("last_applied went backwards: {b} -> {a}"))`.
+  **Why it is here and not already done** (Noah-ruled 2026-08-08): turning a release-mode wrap
+  into a panic *is* a behaviour change in release, and it was found inside an interlude whose
+  spec §3 opens "This is a refactor" and whose banner is zero behaviour change; under that
+  spec §7 it also owes a mutation-proven test of its own. Both the T2 review and the fix-round
+  re-review independently judged deferring correct rather than folding it into a test-only
+  round. It is small enough to be its own interlude whenever it is picked up.
 - **The dual-primary gap — RETIRED 2026-08-05, closed by M2 sub-project 0b** (close-out in
   "Current state" above). It was the last *ruled follow-up* carried out of M1; what remains
   in this section is record, not open work, with one exception named in the triage entry
