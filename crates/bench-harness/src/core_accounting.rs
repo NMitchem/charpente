@@ -385,7 +385,7 @@ mod tests {
             a.log_records_per_sec, 250.0,
             "an applied delta that agrees with the ack count publishes the same rate"
         );
-        assert!((a.device_ratio - 250.0 / 300.0).abs() < 1e-12);
+        assert_eq!(a.device_ratio, 250.0 / 300.0);
     }
 
     #[test]
@@ -508,7 +508,8 @@ mod tests {
 
         o.read.reads = MIN_MEASURED_OPS;
         o.read.hits = MIN_MEASURED_OPS;
-        read_accounting(o.duration, &o.read).expect("the floor itself publishes");
+        let a = read_accounting(o.duration, &o.read).expect("the floor itself publishes");
+        assert!(a.invalid.is_empty(), "got: {:?}", a.invalid);
     }
 
     // Interlude spec §4, fifth bullet. The defect this catches is C-2's own
@@ -549,19 +550,23 @@ mod tests {
         o.write.device_ceiling = 0.0;
         let a = write_accounting(o.duration, &o.write).expect("a non-finite ratio is no refusal");
         assert!(a.device_ratio.is_infinite(), "got: {}", a.device_ratio);
+        // Checked first (T2 fix round, I-1): this is the assertion this test's
+        // name and doc comment exist for, and it must not be shadowed by the
+        // length check below firing first on a mutation that adds a second,
+        // unrelated entry to `invalid`.
+        assert!(
+            !a.invalid.iter().any(|r| r.contains("not finite")),
+            "the accounting must NOT name the non-finite value itself — that is \
+             report::collect_non_finite's job, and a local copy here would double-report \
+             it in the artifact: {:?}",
+            a.invalid
+        );
         // The ratio gate fires — infinity is certainly above 1.0 + slack —
         // exactly as it does today. Preserved, not new.
         assert_eq!(a.invalid.len(), 1, "got: {:?}", a.invalid);
         assert!(
             a.invalid[0].contains("device_ratio"),
             "got: {:?}",
-            a.invalid
-        );
-        assert!(
-            !a.invalid.iter().any(|r| r.contains("not finite")),
-            "the accounting must NOT name the non-finite value itself — that is \
-             report::collect_non_finite's job, and a local copy here would double-report \
-             it in the artifact: {:?}",
             a.invalid
         );
     }
