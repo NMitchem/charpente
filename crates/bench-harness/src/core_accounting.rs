@@ -347,8 +347,13 @@ mod tests {
     /// A plausible healthy run on this class of hardware: 7,500 acked writes
     /// over 30s (250/s against a 300/s device ceiling — a ratio of 0.833,
     /// comfortably below the gate), 33M reads over 30s. Every derived quantity
-    /// is exact in f64, so the assertions can be equalities rather than
-    /// tolerances. This fixture is also spec §4 bullet 4's ABOVE-the-boundary
+    /// is exact in f64 — 250.0, 250.0 and 1_100_000.0 all are — EXCEPT
+    /// `device_ratio`: 5/6 is a repeating binary fraction
+    /// (`0x3feaaaaaaaaaaaab`). Its assertion is still an equality rather than a
+    /// tolerance, but it holds by bit-reproducibility, not exactness: both
+    /// sides are the identically-rounded result of the same division on the
+    /// same operands, since `7500.0/30.0` is exactly `250.0`. This fixture is
+    /// also spec §4 bullet 4's ABOVE-the-boundary
     /// case for both windows: 7,500 and 33,000,000 are both far above
     /// `MIN_MEASURED_OPS`, and the two `a_healthy_*` tests assert neither
     /// window is flagged. The two boundary tests below cover at and under.
