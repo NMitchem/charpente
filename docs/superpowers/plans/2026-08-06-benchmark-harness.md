@@ -2759,7 +2759,9 @@ layer a made-up ceiling, because the ratio assertion then compares a number with
 #[test]
 #[ignore]
 fn wire_layer_sweeps_the_bench_app() {
-    let dir = temp_dir("wire-device");
+    // `scratch(tag) -> String` is tests/harness.rs's own helper (harness.rs:7),
+    // not bin/bench.rs's two-argument `temp_dir`.
+    let dir = scratch("wire-device");
     let device = bench_harness::device::run(&dir, Duration::from_millis(200), Duration::from_secs(1))
         .expect("device probe runs");
     let _ = std::fs::remove_dir_all(&dir);
