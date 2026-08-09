@@ -400,8 +400,16 @@ fn run_layers(args: &Args, dir: &str, report: &mut Report) -> std::io::Result<bo
         }
         "kernel" => {
             let dir = temp_dir("kernel", args.dir.as_deref()).map_err(std::io::Error::other)?;
-            let (kernel, invalid) = bench_harness::kernel_bench::run(&dir, args.requests)?;
+            // T6 review, M-5 / Noah ruling: this layer gets the same ceiling
+            // the core arm does — the device layer above ran unconditionally.
+            let ceiling = report
+                .device
+                .as_ref()
+                .expect("device ran first")
+                .syncs_per_sec;
+            let result = bench_harness::kernel_bench::run(&dir, args.requests, ceiling);
             let _ = std::fs::remove_dir_all(&dir);
+            let (kernel, invalid) = result?;
             report.kernel = Some(kernel);
             report.invalid.extend(invalid);
             true

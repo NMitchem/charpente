@@ -240,6 +240,24 @@ Run-validity rules, mechanical:
   (`measure::MIN_MEASURED_OPS`, currently 5), applied uniformly by
   `measure::degenerate_window_reason` to `device::timed_loop` and to both of
   `core_bench::run`'s write and read loops.*
+  *Amended again at Task 6's review (2026-08-09, C-1 / Noah ruling): the
+  sentence "every measurement loop in this crate is shaped `while
+  Instant::now() < end { op() }`" was true when it was written and Task 6
+  made it false. The kernel layer is BATCH-shaped: the operator sets
+  `--requests` and the window is the observation, exactly inverting the two
+  roles the structural guarantee above depends on. Applying an op-count floor
+  there bounds the operator's input and leaves the measured window unbounded,
+  which is how `bench kernel --requests 5` published 83 acked writes/s at
+  exit 0 with `invalid: []` from a ~46 ms window while `--requests 4` — a
+  window of essentially the same length — refused. The floor is therefore
+  TWO functions, not one: `degenerate_window_reason` for duration-bounded
+  loops (the shape above, unchanged), and `measure::degenerate_batch_reason`
+  for batch-shaped ones, which keeps the op floor and adds a minimum measured
+  window (`measure::MIN_MEASURED_WINDOW`, currently 1s) and names
+  `--requests` as the remedy — the shipped message named `--duration`, a flag
+  the kernel layer never reads, so an operator who followed it got the
+  byte-identical refusal. Any future layer that is not `while now < end` uses
+  the batch floor or states why neither applies.*
 - **The device-ceiling ratio must be physically plausible** (added at Task
   5's review, 2026-08-08, C-1 / Noah ruling #1): `Engine::submit` performs
   exactly one `wal.sync()` per transaction with no group commit, so the
@@ -271,6 +289,22 @@ Run-validity rules, mechanical:
   slop, the only cause the constant is meant to excuse. Accepted cost: more
   short/noisy runs now correctly exit 1; the bracket samples above are what
   tell the reader why, not a wider slack that hides the same fact.*
+  *Amended at Task 6's review (2026-08-09, M-5 / Noah ruling): this rule was
+  scoped to the core layer and the kernel layer shipped without it, which the
+  interlude spec had already anticipated ("the ratio gate moves to
+  `measure.rs` the moment T6 becomes its second consumer"). It now has two
+  consumers, so the RULE — the threshold and the comparison — lives once in
+  `measure::DEVICE_RATIO_SLACK` / `measure::implausible_ratio`, while the
+  PROSE stays with each layer, because the physics and the available evidence
+  differ. At the kernel layer each request commits one effects record and its
+  Bump's Done-mark commits another, so the layer spends TWO durable syncs per
+  request and the rate the ceiling bounds one-for-one is
+  `log_records_per_sec`, not `acked_writes_per_sec` — equivalently
+  `acked_writes_per_sec <= syncs_per_sec / 2`. The kernel reason also does
+  not cite bracket samples, because that layer takes none. This is not slack:
+  a steady-state 2000-request run was measured at 0.99 of its ceiling, well
+  inside the band where the cross-window sampling noise cited above would
+  carry it past 1.0 unnoticed.*
 - **The read window's hit count must match its op count** (added at Task 5's
   review, 2026-08-08, C-2, no spec bullet at the time — added retroactively
   at Task 5 fix round 2's re-review, 2026-08-08, N-9, hard rule 6): every key

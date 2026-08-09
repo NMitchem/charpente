@@ -259,12 +259,22 @@ pub const MIN_MEASURED_OPS: u64 = 5;
 
 /// `None` = the window is a real measurement; `Some(reason)` = refuse it,
 /// don't publish it. Spec §5 also asks whether the loop "actually ran its
-/// full duration" — every measurement loop in this crate is shaped
-/// `while Instant::now() < end { op() }`, which can only exit once
+/// full duration" — every DURATION-BOUNDED measurement loop in this crate is
+/// shaped `while Instant::now() < end { op() }`, which can only exit once
 /// `Instant::now() >= end`, so `start.elapsed() >= duration` holds
 /// unconditionally the moment such a loop returns. That half of the floor is
 /// therefore structurally guaranteed by the loop shape itself, not something
 /// this function needs to check — the floor collapses to a minimum op count.
+///
+/// **That reasoning is load-bearing and it is scoped** (T6 review, C-1). It
+/// holds only where the operator sets the duration and the op count is the
+/// observation. The kernel layer inverts exactly those roles — `--requests`
+/// is the input and the window is what gets measured — so this function is
+/// the WRONG floor there and `degenerate_batch_reason` below is the right
+/// one. Applying this one to a batch bounds the input and leaves the window
+/// unbounded, which is precisely how a five-request batch published a rate at
+/// exit 0. Any future layer that is not `while now < end` must use the batch
+/// floor, or state why neither applies.
 pub fn degenerate_window_reason(name: &str, ops: u64, duration: Duration) -> Option<String> {
     if ops < MIN_MEASURED_OPS {
         Some(format!(
@@ -275,6 +285,84 @@ pub fn degenerate_window_reason(name: &str, ops: u64, duration: Duration) -> Opt
     } else {
         None
     }
+}
+
+/// The minimum window a BATCH-shaped loop must span to publish a rate (T6
+/// review, C-1 / Noah ruling).
+///
+/// `degenerate_window_reason` above collapses to an op-count floor because
+/// every duration-bounded loop in this crate is shaped
+/// `while Instant::now() < end { op() }`, so the window is the operator's
+/// input and the op count is the observation. A batch-shaped loop inverts
+/// exactly those two roles: the operator sets `--requests` and the window is
+/// what gets measured. Applying an op-count floor there bounds the INPUT and
+/// leaves the measured window unbounded, which is how `bench kernel
+/// --requests 5` published 83 acked writes/s at exit 0 with `invalid: []`
+/// from a ~46 ms window — while `--requests 4`, a window of essentially the
+/// same length, refused as too short to produce a rate. Same defect as T5's
+/// C-3, reproduced through the shipped CLI the same way.
+///
+/// One second is chosen the way `MIN_MEASURED_OPS` was: low enough not to
+/// break this crate's own smokes and manual repros (the kernel smoke's 500
+/// requests span several seconds on any device doing real `F_FULLFSYNC`s,
+/// since this layer costs two durable syncs per request), high enough that
+/// the fixed costs enclosed in the window — `Kernel::run`'s entry
+/// `migrate_schema()` and its shutdown `checkpoint()` — cannot dominate the
+/// rate they are divided into.
+pub const MIN_MEASURED_WINDOW: Duration = Duration::from_secs(1);
+
+/// The batch-shaped sibling of `degenerate_window_reason`: bounds the
+/// measured WINDOW, and names `--requests` because that is the only knob an
+/// operator has at a layer whose duration is an output (T6 review, I-1 — the
+/// shipped message named `--duration`, which does not reach the kernel layer
+/// at all, so an operator following it re-ran and got the byte-identical
+/// refusal). The op-count floor is kept as well: a batch below
+/// `MIN_MEASURED_OPS` is degenerate whatever window it spans.
+pub fn degenerate_batch_reason(name: &str, ops: u64, window: Duration) -> Option<String> {
+    if ops < MIN_MEASURED_OPS {
+        return Some(format!(
+            "INVALID: the {name} batch was only {ops} ops (need at least \
+             {MIN_MEASURED_OPS}) — raise --requests; a batch this small cannot produce a \
+             rate, only one (or a few) operation's own latency inverted"
+        ));
+    }
+    if window < MIN_MEASURED_WINDOW {
+        return Some(format!(
+            "INVALID: the {name} batch of {ops} ops drained in {window:?}, under the \
+             {MIN_MEASURED_WINDOW:?} minimum measured window — raise --requests; a window \
+             this short is dominated by the fixed costs enclosed in it (schema migration at \
+             entry, checkpoint at shutdown) rather than by the path being measured"
+        ));
+    }
+    None
+}
+
+/// How much play a device-ceiling ratio may have above 1.0 before it is
+/// flagged (T5 review, C-1 / Noah ruling #1; moved here from
+/// `core_accounting` at the T6 review's M-5 / Noah ruling, which is what the
+/// interlude spec anticipated — "the ratio gate moves to `measure.rs` the
+/// moment T6 becomes its second consumer").
+///
+/// T5 re-review, N-4 / Noah ruling #4: the original 1e-2 was justified as
+/// covering "floating-point/timer-resolution noise" — that justification was
+/// wrong by roughly seven orders of magnitude. Over a 1s `Instant`-measured
+/// window, timer resolution contributes ~1e-9 relative error and f64
+/// arithmetic ~1e-16; 1e-2 instead absorbed a band of cross-window SAMPLING
+/// noise (single-sample dispersion of 220-310 syncs/s was measured across
+/// otherwise-identical runs), which is precisely the phenomenon this gate
+/// exists to detect. A ratio anywhere in `(1.0, 1.01]` published unflagged at
+/// exit 0 was C-1's exact defect, one order of magnitude smaller, still
+/// shipped. Tightened to 1e-6 — still generous for genuine float/timer slop,
+/// the only cause this constant is meant to excuse.
+pub const DEVICE_RATIO_SLACK: f64 = 1e-6;
+
+/// The gate itself, shared by every layer that has a device ceiling. What
+/// differs per layer is the PHYSICS (how many durable syncs one op costs) and
+/// therefore the prose, so each layer builds its own reason and calls this for
+/// the decision — the rule lives here exactly once, the explanation lives
+/// where it is true.
+pub fn implausible_ratio(ratio: f64) -> bool {
+    ratio > 1.0 + DEVICE_RATIO_SLACK
 }
 
 /// Totals-two-ways (spec §5): per-thread counters vs the grand counter.
@@ -355,6 +443,70 @@ mod tests {
             degenerate_window_reason("test", MIN_MEASURED_OPS * 100, Duration::from_secs(1))
                 .is_none()
         );
+    }
+
+    /// T6 review, C-1. The batch floor's whole reason to exist: an op count
+    /// far above `MIN_MEASURED_OPS` does NOT excuse a window too short to
+    /// carry a rate. `degenerate_window_reason` returns `None` on exactly this
+    /// input, which is the shipped defect in one assertion.
+    #[test]
+    fn a_large_batch_in_a_tiny_window_is_refused_by_the_batch_floor_only() {
+        let ops = MIN_MEASURED_OPS * 1000;
+        let tiny = MIN_MEASURED_WINDOW - Duration::from_millis(1);
+        assert!(
+            degenerate_window_reason("test", ops, tiny).is_none(),
+            "the duration-bounded floor cannot see this — that is C-1"
+        );
+        let r = degenerate_batch_reason("test", ops, tiny).expect("the batch floor sees it");
+        assert!(r.contains("INVALID"), "got: {r}");
+        assert!(r.contains("--requests"), "must name the fix: {r}");
+        assert!(
+            !r.contains("--duration"),
+            "must not name a flag a batch layer never reads: {r}"
+        );
+        assert!(r.contains("drained in"), "must name the window: {r}");
+    }
+
+    #[test]
+    fn the_batch_floor_is_a_boundary_in_both_dimensions() {
+        // Exactly at both minimums: publishes.
+        assert!(
+            degenerate_batch_reason("test", MIN_MEASURED_OPS, MIN_MEASURED_WINDOW).is_none(),
+            "the boundary itself must publish"
+        );
+        // One below the op floor, with an ample window.
+        let r = degenerate_batch_reason("test", MIN_MEASURED_OPS - 1, Duration::from_secs(60))
+            .expect("below the op floor");
+        assert!(r.contains("was only"), "the op-count arm's wording: {r}");
+        assert!(r.contains("--requests"), "got: {r}");
+        // One below the window floor, with an ample op count.
+        let r = degenerate_batch_reason(
+            "test",
+            MIN_MEASURED_OPS * 1000,
+            MIN_MEASURED_WINDOW - Duration::from_nanos(1),
+        )
+        .expect("below the window floor");
+        assert!(r.contains("drained in"), "the window arm's wording: {r}");
+        // The two arms are distinguishable — an operator told "only 4 ops"
+        // and one told "drained in 999ms" have different things to fix.
+        assert!(!r.contains("was only"), "arms must not share wording: {r}");
+    }
+
+    #[test]
+    fn the_op_floor_is_checked_before_the_window_floor() {
+        // Both violated: the op count is the more basic defect and wins, so
+        // an operator fixes the batch size rather than chasing the window.
+        let r = degenerate_batch_reason("test", 1, Duration::from_millis(1)).expect("refuses");
+        assert!(r.contains("was only 1 ops"), "the op arm must win: {r}");
+        assert!(!r.contains("drained in"), "got: {r}");
+    }
+
+    #[test]
+    fn the_ratio_gate_is_a_boundary_at_one_plus_slack() {
+        assert!(!implausible_ratio(1.0), "1.0 is possible, not flagged");
+        assert!(!implausible_ratio(1.0 + DEVICE_RATIO_SLACK));
+        assert!(implausible_ratio(1.0 + DEVICE_RATIO_SLACK + 1e-9));
+        assert!(!implausible_ratio(0.5));
     }
 
     #[test]

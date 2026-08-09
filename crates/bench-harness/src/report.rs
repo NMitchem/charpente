@@ -52,6 +52,14 @@ pub struct CoreReport {
 pub struct KernelReport {
     pub acked_writes_per_sec: f64,
     pub log_records_per_sec: f64,
+    // T6 review, I-4 / Noah ruling: this layer reads neither --warmup nor
+    // --duration, so the artifact's methodology header describes a window it
+    // never used. Publish the one it did measure.
+    pub window_secs: f64,
+    // T6 review, M-5 / Noah ruling: log_records_per_sec / device.syncs_per_sec
+    // — two durable syncs per request, so the LOG rate is what the ceiling
+    // bounds one-for-one.
+    pub device_ratio: f64,
     pub requests_total: u64,
     pub jobs_done: u64,
 }
@@ -151,6 +159,8 @@ fn collect_non_finite(r: &Report) -> Vec<String> {
             "kernel.log_records_per_sec",
             k.log_records_per_sec,
         );
+        push_if_non_finite(&mut out, "kernel.window_secs", k.window_secs);
+        push_if_non_finite(&mut out, "kernel.device_ratio", k.device_ratio);
     }
     for w in &r.wire {
         for (pi, p) in w.points.iter().enumerate() {
@@ -250,9 +260,12 @@ pub fn render_json(r: &Report) -> Result<String, String> {
     if let Some(k) = &r.kernel {
         s.push_str(&format!(
             ",\"kernel\":{{\"acked_writes_per_sec\":{},\"log_records_per_sec\":{},\
+             \"window_secs\":{},\"device_ratio\":{},\
              \"requests_total\":{},\"jobs_done\":{}}}",
             num2(k.acked_writes_per_sec),
             num2(k.log_records_per_sec),
+            num2(k.window_secs),
+            num3(k.device_ratio),
             k.requests_total,
             k.jobs_done
         ));
@@ -340,8 +353,16 @@ pub fn render_human(r: &Report) -> String {
     }
     if let Some(k) = &r.kernel {
         s.push_str(&format!(
-            "  kernel: {:.0} acked writes/s, {:.0} log records/s ({} requests, {} jobs)\n",
-            k.acked_writes_per_sec, k.log_records_per_sec, k.requests_total, k.jobs_done
+            // T6 review, I-4: name this layer's OWN window here. The header
+            // above carries --warmup/--duration, which this layer never read.
+            "  kernel: {:.0} acked writes/s, {:.0} log records/s ({} requests, {} jobs; \
+             {:.2}s batch window, no warmup; device_ratio {:.3})\n",
+            k.acked_writes_per_sec,
+            k.log_records_per_sec,
+            k.requests_total,
+            k.jobs_done,
+            k.window_secs,
+            k.device_ratio
         ));
     }
     for w in &r.wire {
@@ -401,6 +422,8 @@ mod tests {
             kernel: Some(KernelReport {
                 acked_writes_per_sec: 1300.0,
                 log_records_per_sec: 2600.0,
+                window_secs: 38.46,
+                device_ratio: 0.867,
                 requests_total: 50000,
                 jobs_done: 50000,
             }),
@@ -436,7 +459,8 @@ mod tests {
              \"device_ratio\":0.970,\"device_ratio_denominator\":\"device.syncs_per_sec\",\
              \"device_syncs_per_sec_before\":1490.00,\"device_syncs_per_sec_after\":1510.00},\
              \"kernel\":{\"acked_writes_per_sec\":1300.00,\
-             \"log_records_per_sec\":2600.00,\"requests_total\":50000,\"jobs_done\":50000},\
+             \"log_records_per_sec\":2600.00,\"window_secs\":38.46,\
+             \"device_ratio\":0.867,\"requests_total\":50000,\"jobs_done\":50000},\
              \"wire\":[{\"target\":\"bench-app\",\"points\":[{\"connections\":4,\
              \"throughput_per_sec\":1200.00,\"log_records_per_sec\":2400.00,\
              \"p50_us\":800,\"p99_us\":2100,\"p999_us\":5000,\

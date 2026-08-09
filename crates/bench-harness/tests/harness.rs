@@ -285,14 +285,77 @@ fn a_below_floor_core_write_window_is_refused() {
 #[test]
 #[ignore]
 fn kernel_layer_drains_the_batch_with_every_job_done() {
-    let dir = scratch("kernel");
-    let (k, invalid) = bench_harness::kernel_bench::run(&dir, 500).expect("kernel layer runs");
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        invalid.is_empty(),
-        "short healthy run must be valid: {invalid:?}"
+    const REQUESTS: u64 = 500;
+    let base = scratch("kernel");
+    let device_dir = format!("{base}/device");
+    let kernel_dir = format!("{base}/kernel");
+    std::fs::create_dir_all(&device_dir).expect("device subdir");
+    std::fs::create_dir_all(&kernel_dir).expect("kernel subdir");
+    // T6 review, M-5 / Noah ruling: this layer now has a device ceiling, so
+    // the smoke measures a real one rather than inventing a number.
+    let device = bench_harness::device::run(
+        &device_dir,
+        Duration::from_millis(200),
+        Duration::from_secs(1),
+    )
+    .expect("device layer runs");
+    let ceiling = device.syncs_per_sec;
+    let (k, invalid) = bench_harness::kernel_bench::run(&kernel_dir, REQUESTS, ceiling).expect(
+        "kernel layer runs — a refusal here naming the minimum measured window means this \
+         batch drained in under a second, i.e. the store is not on a device doing real \
+         durable syncs (RAM-backed filesystem?), which is the C-1 floor working",
     );
-    assert_eq!(k.requests_total, 500);
-    assert_eq!(k.jobs_done, 500);
-    assert!(k.acked_writes_per_sec > 0.0);
+    let _ = std::fs::remove_dir_all(&base);
+    // Same shape as the core smoke above: the ratio gate is DESIGNED to fire
+    // on short/noisy windows, so tolerate that one named reason and nothing
+    // else.
+    for reason in &invalid {
+        assert!(
+            reason.contains("device_ratio") && reason.contains("exceeds 1.0"),
+            "the ratio gate legitimately fires on some short/noisy windows — but any OTHER \
+             invalid reason here means something regressed: {reason}"
+        );
+    }
+    // Genuinely measured: a kernel counter, not an echo of run()'s argument.
+    // This is also the only thing covering responses_recorded, via the sink
+    // crosscheck that would have pushed a reason above.
+    assert_eq!(
+        k.jobs_done, REQUESTS,
+        "every /hit/:id enqueues exactly one Bump, and the batch must drain them all"
+    );
+    // T6 review, I-5: the two assertions this replaces could not fail.
+    // `requests_total == 500` compares run()'s own argument with itself
+    // through two struct fields with no measurement in between, and
+    // `acked_writes_per_sec > 0.0` is the exact assertion T5's C-2 ruled out
+    // (it holds for every finite positive window, and for infinity too).
+    // Assert the upper implausibility bound and the DERIVATIONS instead —
+    // each of which a wrong operand, a swapped operand or a wrong multiplier
+    // would break.
+    assert!(
+        k.acked_writes_per_sec < IMPLAUSIBLY_DURABLE_PER_SEC,
+        "acked_writes_per_sec implausibly high for a path spending two durable syncs per \
+         request: {} (measured on a RAM-backed filesystem?)",
+        k.acked_writes_per_sec
+    );
+    assert!(
+        (k.acked_writes_per_sec - k.requests_total as f64 / k.window_secs).abs() < 1e-9,
+        "acked_writes_per_sec must be requests_total over the published window: {} vs {}",
+        k.acked_writes_per_sec,
+        k.requests_total as f64 / k.window_secs
+    );
+    assert!(
+        (k.log_records_per_sec - (k.requests_total + k.jobs_done) as f64 / k.window_secs).abs()
+            < 1e-9,
+        "log_records_per_sec must be (requests + jobs_done) over the SAME window — a wrong \
+         multiplier or a swapped operand breaks this: {} vs {}",
+        k.log_records_per_sec,
+        (k.requests_total + k.jobs_done) as f64 / k.window_secs
+    );
+    assert!(
+        (k.device_ratio - k.log_records_per_sec / ceiling).abs() < 1e-9,
+        "device_ratio must divide the LOG rate (two syncs per request), not the ack rate: \
+         {} vs {}",
+        k.device_ratio,
+        k.log_records_per_sec / ceiling
+    );
 }

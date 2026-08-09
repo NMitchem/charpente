@@ -25,7 +25,7 @@
 //! was violating it.
 
 use crate::SLOTS;
-use crate::measure::{crosscheck, degenerate_window_reason};
+use crate::measure::{DEVICE_RATIO_SLACK, crosscheck, degenerate_window_reason, implausible_ratio};
 use std::time::Duration;
 
 /// What the measured write window observed. Every field is a count, a duration
@@ -109,41 +109,27 @@ pub struct ReadAccounting {
     pub invalid: Vec<String>,
 }
 
-/// How much play `device_ratio` may have above 1.0 before it is flagged (T5
-/// review, C-1 / Noah ruling #1). `Engine::submit` performs exactly one
-/// `wal.sync()` per transaction with no group commit, so the commit path
-/// cannot durably ack faster than the device's own sync rate in fact — a
-/// ratio above 1.0 is IMPOSSIBLE, not merely unlikely, so anything above it
-/// is a measurement artifact worth flagging, not a real durability finding.
-///
-/// T5 re-review, N-4 / Noah ruling #4 (fixed here): the original 1e-2 was
-/// justified as covering "floating-point/timer-resolution noise" — that
-/// justification was wrong by roughly seven orders of magnitude. Over a
-/// 1s `Instant`-measured window, timer resolution contributes ~1e-9 relative
-/// error and f64 arithmetic ~1e-16; 1e-2 instead absorbed a band of
-/// cross-window SAMPLING noise (single-sample dispersion of 220-310 syncs/s
-/// was measured across otherwise-identical runs), which is precisely the
-/// phenomenon this gate exists to detect. A ratio anywhere in `(1.0, 1.01]`
-/// published unflagged at exit 0 was C-1's exact defect, one order of
-/// magnitude smaller, still shipped. Tightened to 1e-6 — still generous for
-/// genuine float/timer slop, the only cause this constant is meant to
-/// excuse. The accepted cost: more short/noisy runs now exit 1; those runs
-/// ARE genuinely invalid measurements, and the bracket samples
-/// (device_syncs_per_sec_before/_after) are what tell the reader why, not a
-/// wider slack that hides the same fact.
-pub const DEVICE_RATIO_SLACK: f64 = 1e-6;
-
 /// `None` = plausible; `Some(reason)` = INVALID, naming BOTH candidate
 /// causes rather than asserting one (the review measured 220-310 syncs/s
 /// spread across otherwise-identical runs — noise comparable to the whole
 /// signal the ratio is supposed to carry).
+///
+/// The threshold and the comparison moved to `measure::DEVICE_RATIO_SLACK` /
+/// `measure::implausible_ratio` at the T6 review's M-5 (Noah ruling), leaving
+/// the PROSE here where it is true: this layer's physics is one `wal.sync()`
+/// per transaction, and the bracket samples this message cites exist only
+/// around the core write window. The accepted cost of the 1e-6 slack, stated
+/// with the message that carries it: more short/noisy runs now exit 1; those
+/// runs ARE genuinely invalid measurements, and the bracket samples
+/// (device_syncs_per_sec_before/_after) are what tell the reader why, not a
+/// wider slack that hides the same fact.
 pub fn device_ratio_reason(
     ratio: f64,
     denominator: f64,
     before: f64,
     after: f64,
 ) -> Option<String> {
-    if ratio > 1.0 + DEVICE_RATIO_SLACK {
+    if implausible_ratio(ratio) {
         Some(format!(
             "INVALID: device_ratio {ratio:.3} exceeds 1.0 + {DEVICE_RATIO_SLACK} — \
              Engine::submit performs exactly one wal.sync() per transaction with no group \
