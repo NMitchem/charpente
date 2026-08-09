@@ -281,3 +281,18 @@ fn a_below_floor_core_write_window_is_refused() {
     assert!(msg.contains("core write"), "must name which loop: {msg}");
     assert!(msg.contains("--duration"), "must name the fix: {msg}");
 }
+
+#[test]
+#[ignore]
+fn kernel_layer_drains_the_batch_with_every_job_done() {
+    let dir = scratch("kernel");
+    let (k, invalid) = bench_harness::kernel_bench::run(&dir, 500).expect("kernel layer runs");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        invalid.is_empty(),
+        "short healthy run must be valid: {invalid:?}"
+    );
+    assert_eq!(k.requests_total, 500);
+    assert_eq!(k.jobs_done, 500);
+    assert!(k.acked_writes_per_sec > 0.0);
+}

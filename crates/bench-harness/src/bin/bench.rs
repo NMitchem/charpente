@@ -398,6 +398,14 @@ fn run_layers(args: &Args, dir: &str, report: &mut Report) -> std::io::Result<bo
             report.invalid.extend(invalid);
             true
         }
+        "kernel" => {
+            let dir = temp_dir("kernel", args.dir.as_deref()).map_err(std::io::Error::other)?;
+            let (kernel, invalid) = bench_harness::kernel_bench::run(&dir, args.requests)?;
+            let _ = std::fs::remove_dir_all(&dir);
+            report.kernel = Some(kernel);
+            report.invalid.extend(invalid);
+            true
+        }
         other => {
             eprintln!("bench: subcommand {other:?} not implemented yet");
             false

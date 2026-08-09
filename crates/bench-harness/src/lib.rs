@@ -15,6 +15,8 @@ use charpente::{event, job, jobs, route, routes, table};
 pub mod core_accounting;
 pub mod core_bench;
 pub mod device;
+pub mod kernel_accounting;
+pub mod kernel_bench;
 pub mod measure;
 pub mod report;
 
