@@ -359,3 +359,54 @@ fn kernel_layer_drains_the_batch_with_every_job_done() {
         k.log_records_per_sec / ceiling
     );
 }
+
+// T7 rev. 3: no separate device-ceiling probe here any more — this layer
+// brackets its own ceiling per point (device::device_bracket_sample, before
+// spawning the child and after killing it), rather than the one-shot
+// cross-window sample rev. 2 divided by.
+//
+// T7 rev. 4 is what makes `invalid.is_empty()` a real assertion rather than
+// a coin flip, and rev. 3 alone did not: with a bracket-stable ceiling this
+// smoke still failed 3 of 3, because the quantity being flagged was the
+// DERIVED record rate (records_per_request * throughput, which assumes a
+// steady-state job drain a 2s window has not reached). The gate now reads
+// the COUNTED acked-request rate, which cannot exceed the ceiling by
+// construction (ack-after-durable). See the plan's Task 7 rev. 4 block for
+// the readings. If this flakes, that is a finding to report, not a
+// threshold to widen.
+#[test]
+#[ignore]
+fn wire_layer_sweeps_the_bench_app() {
+    let bin = bench_harness::wire::build_bin("bench-harness", "bench-app").expect("bin builds");
+    let (wire, invalid) = bench_harness::wire::sweep(
+        &bin,
+        bench_harness::wire::Target::BenchApp,
+        &[1, 4],
+        Duration::from_millis(300),
+        Duration::from_secs(2),
+    )
+    .expect("sweep runs");
+    assert!(
+        invalid.is_empty(),
+        "short healthy run must be valid: {invalid:?}"
+    );
+    assert_eq!(wire.points.len(), 2);
+    for p in &wire.points {
+        assert!(p.throughput_per_sec > 0.0);
+        // The derivation, asserted rather than assumed (T6 review, I-5: a
+        // `> 0.0` on a number the caller supplied is not an assertion).
+        assert_eq!(p.log_records_per_sec, 2.0 * p.throughput_per_sec);
+        // T7 rev. 3: the published ratio divides by the bracket MAX, not
+        // either sample alone. Published, not gated — that is rev. 4.
+        assert_eq!(
+            p.device_ratio,
+            p.log_records_per_sec
+                / p.device_syncs_per_sec_before
+                    .max(p.device_syncs_per_sec_after)
+        );
+        assert!(
+            p.p50_us <= p.p99_us && p.p99_us <= p.p999_us,
+            "percentile ordering"
+        );
+    }
+}

@@ -73,6 +73,23 @@ pub struct SweepPoint {
     pub connections: usize,
     pub throughput_per_sec: f64,
     pub log_records_per_sec: f64,
+    // T7 rev. 4 (Noah ruling, 2026-08-09): published here but NOT gated on,
+    // unlike kernel.device_ratio. This layer's log rate is DERIVED
+    // (records_per_request * throughput) rather than observed, and a derived
+    // quantity cannot carry a gate — the gate at this layer is on the COUNTED
+    // acked-request rate instead. See wire_accounting's module doc.
+    pub device_ratio: f64,
+    // T7 rev. 3 (Noah ruling, 2026-08-09): each point brackets its own
+    // ceiling (before/after, child not running) and both ratios divide by the
+    // max — published here, named exactly as CoreReport's equivalents, so the
+    // ratio's error bar is visible in the artifact. Bracketing replaced a
+    // single cross-window device.syncs_per_sec sample and removed real drift;
+    // rev. 4 then measured a bracket-stable ceiling and found the false
+    // alarms came from the DERIVED numerator, not this denominator. NOT
+    // comparable to CoreReport::device_ratio or KernelReport::device_ratio —
+    // different denominators (see wire_accounting's module doc).
+    pub device_syncs_per_sec_before: f64,
+    pub device_syncs_per_sec_after: f64,
     pub p50_us: u64,
     pub p99_us: u64,
     pub p999_us: u64,
@@ -174,6 +191,17 @@ fn collect_non_finite(r: &Report) -> Vec<String> {
                 &mut out,
                 &format!("{prefix}.log_records_per_sec"),
                 p.log_records_per_sec,
+            );
+            push_if_non_finite(&mut out, &format!("{prefix}.device_ratio"), p.device_ratio);
+            push_if_non_finite(
+                &mut out,
+                &format!("{prefix}.device_syncs_per_sec_before"),
+                p.device_syncs_per_sec_before,
+            );
+            push_if_non_finite(
+                &mut out,
+                &format!("{prefix}.device_syncs_per_sec_after"),
+                p.device_syncs_per_sec_after,
             );
             push_if_non_finite(
                 &mut out,
@@ -283,12 +311,16 @@ pub fn render_json(r: &Report) -> Result<String, String> {
                 }
                 s.push_str(&format!(
                     "{{\"connections\":{},\"throughput_per_sec\":{},\
-                     \"log_records_per_sec\":{},\"p50_us\":{},\
-                     \"p99_us\":{},\"p999_us\":{},\"client_busy_fraction\":{},\
+                     \"log_records_per_sec\":{},\"device_ratio\":{},\
+                     \"device_syncs_per_sec_before\":{},\"device_syncs_per_sec_after\":{},\
+                     \"p50_us\":{},\"p99_us\":{},\"p999_us\":{},\"client_busy_fraction\":{},\
                      \"saturated\":{}}}",
                     p.connections,
                     num2(p.throughput_per_sec),
                     num2(p.log_records_per_sec),
+                    num3(p.device_ratio),
+                    num2(p.device_syncs_per_sec_before),
+                    num2(p.device_syncs_per_sec_after),
                     p.p50_us,
                     p.p99_us,
                     p.p999_us,
@@ -369,11 +401,15 @@ pub fn render_human(r: &Report) -> String {
         s.push_str(&format!("  wire [{}]:\n", w.target));
         for p in &w.points {
             s.push_str(&format!(
-                "    {:>4} conns: {:>8.0} req/s  {:>8.0} rec/s  p50 {:>6}us  p99 {:>6}us  \
-                 p99.9 {:>6}us  client busy {:.0}%{}\n",
+                "    {:>4} conns: {:>8.0} req/s  {:>8.0} rec/s  {:.3}x dev (bracket {:.0}/{:.0} \
+                 syncs/s before/after)  p50 {:>6}us  p99 {:>6}us  p99.9 {:>6}us  client busy \
+                 {:.0}%{}\n",
                 p.connections,
                 p.throughput_per_sec,
                 p.log_records_per_sec,
+                p.device_ratio,
+                p.device_syncs_per_sec_before,
+                p.device_syncs_per_sec_after,
                 p.p50_us,
                 p.p99_us,
                 p.p999_us,
@@ -433,6 +469,9 @@ mod tests {
                     connections: 4,
                     throughput_per_sec: 1200.0,
                     log_records_per_sec: 2400.0,
+                    device_ratio: 0.685,
+                    device_syncs_per_sec_before: 3500.0,
+                    device_syncs_per_sec_after: 3600.0,
                     p50_us: 800,
                     p99_us: 2100,
                     p999_us: 5000,
@@ -463,7 +502,9 @@ mod tests {
              \"device_ratio\":0.867,\"requests_total\":50000,\"jobs_done\":50000},\
              \"wire\":[{\"target\":\"bench-app\",\"points\":[{\"connections\":4,\
              \"throughput_per_sec\":1200.00,\"log_records_per_sec\":2400.00,\
-             \"p50_us\":800,\"p99_us\":2100,\"p999_us\":5000,\
+             \"device_ratio\":0.685,\"device_syncs_per_sec_before\":3500.00,\
+             \"device_syncs_per_sec_after\":3600.00,\"p50_us\":800,\"p99_us\":2100,\
+             \"p999_us\":5000,\
              \"client_busy_fraction\":0.120,\"saturated\":false}]}],\"invalid\":[]}}"
         );
     }
@@ -588,6 +629,76 @@ mod tests {
         assert!(
             json.contains("core.device_syncs_per_sec_after is not finite (inf)"),
             "got: {json}"
+        );
+    }
+
+    // T7, plan Step 1: `SweepPoint::device_ratio` must be scanned by the SAME
+    // central non-finite path as every other float — a zero device ceiling
+    // makes this ratio `inf` and wire_accounting must not grow its own
+    // non-finite guard (interlude spec §4's standing rule).
+    #[test]
+    fn a_non_finite_wire_device_ratio_is_collected_by_name() {
+        let mut r = fixed_report();
+        r.wire[0].points[0].device_ratio = f64::INFINITY;
+        let json = render_json(&r).expect("non-finite floats are recorded, not refused");
+        assert!(
+            json.contains(
+                "\"wire\":[{\"target\":\"bench-app\",\"points\":[{\"connections\":4,\
+             \"throughput_per_sec\":1200.00,\"log_records_per_sec\":2400.00,\
+             \"device_ratio\":null"
+            ),
+            "non-finite wire device_ratio must render as JSON null, got: {json}"
+        );
+        assert!(
+            json.contains("wire[bench-app].points[0].device_ratio is not finite (inf)"),
+            "the invalid array must name the wire site, got: {json}"
+        );
+        let human = render_human(&r);
+        assert!(
+            human.contains("!! wire[bench-app].points[0].device_ratio is not finite (inf)"),
+            "render_human must surface the same reason, got: {human}"
+        );
+    }
+
+    // T7 rev. 3: `SweepPoint::device_syncs_per_sec_before`/`_after` must be
+    // scanned by the SAME central non-finite path as every other float — the
+    // `CoreReport` twin above (`the_bracket_sample_fields_are_scanned_for_
+    // non_finite`) is the precedent this mirrors. `wire_accounting`'s own
+    // `a_non_finite_bracket_sample_is_not_locally_guarded_and_flows_through`
+    // proves the accounting layer does not catch it locally; this proves
+    // this layer does.
+    #[test]
+    fn the_wire_bracket_sample_fields_are_scanned_for_non_finite() {
+        let mut r = fixed_report();
+        r.wire[0].points[0].device_syncs_per_sec_before = f64::NAN;
+        r.wire[0].points[0].device_syncs_per_sec_after = f64::INFINITY;
+        let json = render_json(&r).expect("non-finite floats are recorded, not refused");
+        assert!(
+            json.contains("\"device_syncs_per_sec_before\":null"),
+            "got: {json}"
+        );
+        assert!(
+            json.contains("\"device_syncs_per_sec_after\":null"),
+            "got: {json}"
+        );
+        assert!(
+            json.contains(
+                "wire[bench-app].points[0].device_syncs_per_sec_before is not finite (NaN)"
+            ),
+            "got: {json}"
+        );
+        assert!(
+            json.contains(
+                "wire[bench-app].points[0].device_syncs_per_sec_after is not finite (inf)"
+            ),
+            "got: {json}"
+        );
+        let human = render_human(&r);
+        assert!(
+            human.contains(
+                "!! wire[bench-app].points[0].device_syncs_per_sec_before is not finite (NaN)"
+            ),
+            "render_human must surface the same reason, got: {human}"
         );
     }
 

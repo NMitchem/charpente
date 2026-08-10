@@ -104,6 +104,33 @@ pub fn run(dir: &str, warmup: Duration, duration: Duration) -> io::Result<Device
     })
 }
 
+// T5 review, C-1 / Noah ruling #1: a short, independent device-sync sample on
+// the caller's own directory, for bracketing a measured window elsewhere in
+// this crate. Reuses `timed_loop` rather than hand-rolling a second sync
+// loop. Fixed (not user-configurable) duration: this is a bracket around a
+// measured window, not a second `bench device` invocation, and a full
+// spec-default device run (5s warmup + 30s duration) on both sides would
+// roughly triple the caller's own wall time for a supporting measurement.
+const BRACKET_WARMUP: Duration = Duration::from_millis(100);
+const BRACKET_DURATION: Duration = Duration::from_secs(1);
+
+/// Promoted here from `core_bench.rs` at T7 rev. 3 so the wire layer's
+/// per-point brackets reuse the SAME function the core layer's write-window
+/// brackets do (plan: "moving it to device.rs beside timed_loop is
+/// acceptable and probably better; copying it is not").
+pub(crate) fn device_bracket_sample(dir: &str) -> io::Result<f64> {
+    let disk = ProdDisk::new(dir)?;
+    let file = disk.open("bench-bracket.dat")?;
+    // T5 re-review, N-11 (Minor, fixed here): `timed_loop` formats its
+    // degenerate-window message as "device {name}", so passing "core
+    // bracket" here rendered "the device core bracket loop" — a doubled
+    // "device" reading. "bracket" alone reads as "the device bracket loop".
+    timed_loop("bracket", BRACKET_WARMUP, BRACKET_DURATION, || {
+        file.write_at(0, &[1u8])?;
+        file.sync()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2010,6 +2010,69 @@ but it is now a real assertion rather than a coin flip, and the smoke must addit
 assert `p.device_ratio == p.log_records_per_sec / p.device_syncs_per_sec_before.max(p.device_syncs_per_sec_after)`.
 If it flakes again, that is a finding to report, not a threshold to widen.
 
+**Rev. 4 (2026-08-09). It flaked again — and rev. 3 disproved its own premise, so the gate
+moves to a quantity that is counted rather than derived.**
+
+Rev. 3's brackets worked exactly as designed, and what they measured refuted the model
+behind them. Taken either side of each point with the child stopped, the samples agree to
+within ~1%:
+
+| point | bracket before / after | derived rec/s | ratio |
+|---|---|---|---|
+| 1 conn | 241.80 / 244.48 | 250 | 1.02x |
+| 4 conns | 241.92 / 239.95 | 258 | 1.07x |
+| 1 conn (run 2) | 241.31 / 244.48 | 254 | 1.04x |
+| run 3 | — | 260, 270 | 1.05x, 1.10x |
+
+**The ceiling is not noisy when measured locally; rev. 2's diagnosis was wrong.** The
+198→243 swing it was built on was cross-window drift, which bracketing correctly removed.
+Yet the smoke failed **3 of 3** — reproducible, not flaky — because the *numerator* is the
+uncertain term. `log_records_per_sec` is `records_per_request * throughput`, and that
+assumes every enqueued `Bump` drains inside the window. On a 2s window the queue is still
+building a small backlog, so real records are fewer than 2x requests and the derivation
+overshoots by exactly the backlog fraction. 2–7% is what a modest backlog looks like. This
+is the second cause rev. 3's own refusal prose already named: it was right, and it was
+firing.
+
+**A derived quantity cannot be made gate-worthy by improving the quantity it is divided
+by.** That is the general lesson, and it is why rev. 3 was the wrong fix rather than an
+insufficient one.
+
+**Noah ruling (2026-08-09): gate on the acked-request rate; publish the record rate.**
+
+- The gate is `ack_ratio = throughput_per_sec / max(before, after)`. `throughput_per_sec`
+  is **counted**, and every acked request commits at least its own effects record and pays
+  at least one durable sync for it (ack-after-durable), so exceeding the ceiling is
+  impossible **by construction rather than by assumption**. Measured margin on this
+  hardware: 114–135 req/s against a ~242 ceiling, ≈0.5x. It has no false-alarm path.
+- `device_ratio` (the derived record rate over the same bracket max) and both bracket
+  samples stay **published and ungated**. Read it as "how close this run came to the
+  ceiling, if the 2-records-per-request derivation held." Above 1.0 on short windows is
+  expected and is not a defect.
+- **The gate is weaker on purpose.** It would not catch a 2x error in `records_per_request`.
+  That is the price of soundness, it is stated in `BENCH.md` (T10), and it is not to be
+  "strengthened" back onto `device_ratio` — mutation row 15 exists to redden precisely that
+  change.
+- Rev. 3's divergence #2 is **withdrawn**: with no record-level gate here, there is no
+  cross-layer gate comparison to mis-read. `device_ratio` remains non-comparable across
+  layers as a *number*, and `BENCH.md` still says so.
+
+**Test consequences** (all landed): `a_rate_above_the_device_ceiling_...` becomes
+`an_ack_rate_above_...`; `the_ceiling_refusal_names_the_derivation_as_a_possible_cause` is
+replaced by `the_ceiling_refusal_names_the_ack_after_durable_argument`; and the new
+`a_derived_record_rate_above_the_ceiling_does_not_flag_by_itself` is **the regression test
+for this whole finding**, fixturing the ceiling (800) between the counted ack rate (500)
+and the derived record rate (1000) — the exact shape the hardware produced.
+
+**Two tests went vacuous under the new gate and were re-tuned, which is worth recording
+because it is the trap this sub-project keeps hitting.** `the_ratio_gate_divides_by_the_
+bracket_max_not_the_min_or_before` and `an_under_measured_single_bracket_sample_...` used
+900/1200 brackets against a 500/s ack rate: under rev. 4 both `max` and `min` land far
+below 1.0, so neither could fail either way. Re-fixtured to 450/600, where `max` gives 0.83
+and clears while `min`/`before` gives 1.11 and would flag. A gate change silently converts
+its own boundary tests into assertions that cannot fail; re-check every fixture that
+straddled the old threshold.
+
 **Files:**
 - Create: `crates/bench-harness/src/client.rs`
 - Create: `crates/bench-harness/src/wire_accounting.rs`
@@ -2442,22 +2505,44 @@ the wrong reason is the failure mode this sub-project has now hit five times.
 
 - [ ] **Step 7c: The mutation table** (whole module per round, pristine copy taken first, `shasum -a 256` both sides, never `git checkout --`)
 
-| # | Mutation | Predicted RED |
-|---|---|---|
-| 1 | Delete the window-floor check entirely | 4, 5 |
-| 2 | Change the window floor to `<=` | 5 |
-| 3 | Swap the two floors' order | 6 |
-| 4 | Drop the `at()` prefix from the ratio reason | 11 |
-| 5 | Use `per_thread.iter().sum()` instead of the crosscheck's fallback on disagreement | 7 |
-| 6 | Replace `records_per_request * throughput` with a hardcoded `2.0 * throughput` | 2 (the invoicing arm) |
-| 7 | Change `saturated` to `>=` | 10 |
-| 8 | Add a local `if !device_ratio.is_finite() { return ... }` guard | 12 |
-| 9 | Sort `w.latencies_us` in place via a `&mut` parameter, or drop the sort | 13 |
-| 10 | Push the ratio reason before the heartbeat reason | the fixed-order assertion in 11 |
-| 11 | Drop "steady state" from the ceiling prose | 9 |
+**Amended at execution time (2026-08-10), because rev. 3 and rev. 4 both changed this table
+and neither wrote the change down.** Rev. 3 added three rows in prose only ("Added mutation
+rows: `max` → `min`; `max` → `before`; drop either published bracket field from
+`render_json`"), and rev. 4's ruling cites "mutation row 15" — a row that existed nowhere.
+The effective table is therefore fifteen rows, written out here so a future reader is not
+reconstructing it from three revision blocks. Row 11's mutation target also had to move:
+rev. 4 replaced the "steady state" ceiling prose it named, along with the test that pinned
+it. Rows are identified by test NAME where rev. 2's numbering no longer resolves.
+
+| # | Mutation | Predicted RED | Observed RED (2026-08-10) |
+|---|---|---|---|
+| 1 | Delete the window-floor check entirely | 4, 5 | 4; **11**, not 5 — see below |
+| 2 | Change the window floor to `<=` | 5 | 5, **+ 10** (`saturation_fixture`'s window is exactly `MIN_MEASURED_WINDOW`) |
+| 3 | Swap the two floors' order | 6 | 6 |
+| 4 | Drop the `at()` prefix from the ratio reason | 11 | 11 |
+| 5 | Use `per_thread.iter().sum()` instead of the crosscheck's fallback on disagreement | 7 | 7, **+ 11** (the three-reason arm drops to two) |
+| 6 | Replace `records_per_request * throughput` with a hardcoded `2.0 * throughput` | 2 (the invoicing arm) | 2 |
+| 7 | Change `saturated` to `>=` | 10 | 10 |
+| 8 | Add a local `if !device_ratio.is_finite() { return ... }` guard | 12 | 12, **+ `a_non_finite_bracket_sample_…`** |
+| 9 | Sort `w.latencies_us` in place via a `&mut` parameter, or drop the sort | 13 | 13 |
+| 10 | Push the ratio reason before the heartbeat reason | the fixed-order assertion in 11 | 11 |
+| 11 | **Rev. 4 adaptation:** drop the ack-after-durable clause from the ceiling prose (rev. 2's "steady state" wording no longer exists) | `the_ceiling_refusal_names_the_ack_after_durable_argument` | that test |
+| 12 | **Rev. 3 row:** bracket `max` → `min` | `the_ratio_gate_divides_by_the_bracket_max_not_the_min_or_before` | that test, **+ `an_under_measured_single_bracket_sample_…`** |
+| 13 | **Rev. 3 row:** bracket `max` → `before` alone | same | that test, **+ `a_non_finite_bracket_sample_…`** |
+| 14 | **Rev. 3 row:** drop a published bracket field from the wire arm of `render_json` (and its argument, so the round is not a compile error) | `json_shape_is_pinned` | that test, **+ `the_wire_bracket_sample_fields_are_scanned_for_non_finite`** |
+| 15 | **Rev. 4 row:** move the gate back onto `device_ratio` — the change rev. 4's ruling forbids | `a_derived_record_rate_above_the_ceiling_does_not_flag_by_itself` | that test, **+ 8, + 12's max-fixture, + `an_under_measured_…`** |
 
 A compile error is not a RED for an assertion (the T5 finding: novelty is not teeth).
 Row 9's "drop the sort" half is the one to run if the `&mut` half will not compile.
+
+**Row 1's predicted RED was wrong, and the row still has teeth.** Test 5
+(`the_window_floor_admits_a_window_exactly_at_the_minimum`) asserts that the boundary
+window **publishes**; deleting the floor makes it publish more readily, so that test cannot
+detect this mutation in principle. What actually reddens beside test 4 is
+`every_reason_carries_its_connection_count`'s own window-floor arm. Recorded rather than
+quietly corrected, because a predicted-RED cell that names a test which cannot fail is the
+same vacuity trap this sub-project keeps hitting — here it was the prediction that was
+vacuous, not the test.
 
 - [ ] **Step 8: Implement `wire.rs`** — the driver, which makes no arithmetic decision of its own
 
@@ -2881,13 +2966,23 @@ if it blocks, that is the known cargo target-dir lock and not a harness bug. The
 
 - [ ] **Step 11: Verify**
 
+**The counts below were written at rev. 2 and were never updated as rev. 3 and rev. 4 added
+tests; corrected at execution time (2026-08-10) with the derivation shown, per this step's
+own "say so rather than restating the prediction" instruction.** The rev.-2 line read
+"13 accounting tests", "lib 59 → 74" and "658 → 673 passed, 38 → 39 ignored". Rev. 3 added
+three accounting tests plus one report test, and one further accounting test
+(`a_non_finite_bracket_sample_…`); rev. 4 added the regression test
+`a_derived_record_rate_above_the_ceiling_does_not_flag_by_itself`. So the accounting module
+is 13 + 5 = **18**, and the lib delta is 2 client + 18 accounting + 2 report = **22**, not
+16. Note also that rev. 2's own arithmetic did not close: 59 + 16 is 75, and it predicted 74.
+
 Run: `cargo test -p bench-harness client` → PASS (2 tests).
-Run: `cargo test -p bench-harness --lib wire_accounting` → PASS (13 tests).
-Run: `cargo test -p bench-harness` → lib 59 → 74, bin 15, app 1, 8 ignored, 0 failed.
+Run: `cargo test -p bench-harness --lib wire_accounting` → PASS (18 tests).
+Run: `cargo test -p bench-harness` → lib 59 → 81, bin 15, app 1, 8 ignored, 0 failed.
 Run: `cargo test -p bench-harness --test harness -- --ignored --test-threads=1` → 8/8.
-Run: `cargo test --workspace` twice → 658 → 673 passed, 38 → 39 ignored; reconcile the
-delta exactly (2 client + 13 accounting + 1 report non-finite = 16 lib; if the arithmetic
-does not close, say so rather than restating the prediction).
+Run: `cargo test --workspace` twice → 658 → 680 passed, 38 → 39 ignored; reconcile the
+delta exactly (2 client + 18 accounting + 2 report = 22 lib; if the arithmetic does not
+close, say so rather than restating the prediction).
 Run: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`;
 `cargo clippy -p bench-harness --all-targets --target x86_64-unknown-linux-gnu -- -D warnings`;
 `cargo build -p guide-examples`.

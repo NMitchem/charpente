@@ -5,11 +5,10 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use crate::core_accounting::{self, CoreObservations};
-use crate::device::timed_loop;
+use crate::device::device_bracket_sample;
 use crate::measure::Heartbeat;
 use crate::report::CoreReport;
 use crate::{Bump, SLOTS, Slot, SlotBumped, schema};
-use charpente::core::io::Disk;
 use charpente::prod::ProdDisk;
 use charpente::{Db, DbConfig, Id, TxError, View};
 use std::io;
@@ -40,29 +39,6 @@ fn canonical(db: &mut Db, i: u64) -> io::Result<u64> {
         TxError::Io(io) => io,
         TxError::App(io) => io,
         other => io::Error::other(format!("unexpected transact refusal: {other:?}")),
-    })
-}
-
-/// A short, independent device-sync sample on the SAME directory the core
-/// write window measures (T5 review, C-1 / Noah ruling #1) — reuses
-/// `device::timed_loop` rather than hand-rolling a second sync loop. Fixed
-/// (not user-configurable) duration: this is a bracket around the write
-/// window, not a second `bench device` invocation, and a full spec-default
-/// device run (5s warmup + 30s duration) on both sides would roughly triple
-/// `bench core`'s wall time for a supporting measurement.
-const BRACKET_WARMUP: Duration = Duration::from_millis(100);
-const BRACKET_DURATION: Duration = Duration::from_secs(1);
-
-fn device_bracket_sample(dir: &str) -> io::Result<f64> {
-    let disk = ProdDisk::new(dir)?;
-    let file = disk.open("bench-core-bracket.dat")?;
-    // T5 re-review, N-11 (Minor, fixed here): `timed_loop` formats its
-    // degenerate-window message as "device {name}", so passing "core
-    // bracket" here rendered "the device core bracket loop" — a doubled
-    // "device" reading. "bracket" alone reads as "the device bracket loop".
-    timed_loop("bracket", BRACKET_WARMUP, BRACKET_DURATION, || {
-        file.write_at(0, &[1u8])?;
-        file.sync()
     })
 }
 

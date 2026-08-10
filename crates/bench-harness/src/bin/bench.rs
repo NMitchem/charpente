@@ -414,6 +414,43 @@ fn run_layers(args: &Args, dir: &str, report: &mut Report) -> std::io::Result<bo
             report.invalid.extend(invalid);
             true
         }
+        "wire" => {
+            let target = match args.target.as_str() {
+                "bench-app" => bench_harness::wire::Target::BenchApp,
+                // T8 fills the Invoicing arms. Until then this refuses by
+                // name: `--target invoicing` is advertised in the usage
+                // string, so reaching the internal `unreachable!` through a
+                // documented flag value would be a panic where a named
+                // remedy belongs (hard rule 5).
+                "invoicing" => {
+                    return Err(std::io::Error::other(
+                        "--target invoicing is not wired yet (bench-harness Task 8) — \
+                         use --target bench-app",
+                    ));
+                }
+                other => return Err(std::io::Error::other(format!("unknown --target {other:?}"))),
+            };
+            let (package, bin) = match &target {
+                bench_harness::wire::Target::BenchApp => ("bench-harness", "bench-app"),
+                bench_harness::wire::Target::Invoicing => ("invoicing", "node"),
+            };
+            // T7 rev. 3: this layer no longer divides by the CLI's one-shot
+            // device.syncs_per_sec — it brackets its own ceiling per point.
+            // The device layer above still ran unconditionally and still
+            // publishes the `device:` line; this arm simply no longer reads
+            // it.
+            let bin = bench_harness::wire::build_bin(package, bin)?;
+            let (wire, invalid) = bench_harness::wire::sweep(
+                &bin,
+                target,
+                &args.connections,
+                args.warmup,
+                args.duration,
+            )?;
+            report.wire.push(wire);
+            report.invalid.extend(invalid);
+            true
+        }
         other => {
             eprintln!("bench: subcommand {other:?} not implemented yet");
             false
