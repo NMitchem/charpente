@@ -20,6 +20,7 @@
 //! is what keeps those fixed costs from dominating the rate divided into it.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
+use crate::device::device_bracket_sample;
 use crate::kernel_accounting::{self, KernelObs};
 use crate::measure::Heartbeat;
 use crate::report::KernelReport;
@@ -32,11 +33,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-pub fn run(
-    dir: &str,
-    requests: u64,
-    device_ceiling: f64,
-) -> io::Result<(KernelReport, Vec<String>)> {
+/// Interlude spec §4.2 (Noah ruling, 2026-08-10): this no longer takes layer
+/// 1's `device.syncs_per_sec`. It brackets its own batch window instead, which
+/// is the gap the shipped refusal message named in so many words — "this layer
+/// takes no bracket samples of its own to show the spread".
+pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> {
     let app = build(Box::new(ProdDisk::new(dir)?), Box::new(ProdEntropy::new()?))?;
     let mut source = SimSource::new(Box::new(ProdClock::new()), 0);
     for i in 0..requests {
@@ -47,10 +48,14 @@ pub fn run(
 
     let mut obs = KernelObs {
         requests_planned: requests,
-        device_ceiling,
         ..Default::default()
     };
+    // The heartbeat starts BEFORE the first bracket sample and finishes after
+    // the window, exactly as `core_bench` does (T5 re-review, N-2): the
+    // brackets are published artifact fields, so a suspend or starvation
+    // episode during either one has to be catchable too.
     let hb = Heartbeat::start();
+    obs.device_before = device_bracket_sample(dir)?;
     // Kernel::run is one blocking call over the whole batch — a watcher
     // thread reports drain progress on stderr so a slow (fsync-bound) run is
     // distinguishable from a hung one. It reads the shared response vec the
@@ -87,6 +92,10 @@ pub fn run(
     let run_outcome = kernel.run(&mut source);
     obs.elapsed = start.elapsed();
     stop_progress.store(true, Ordering::Relaxed);
+    // Taken here, inside the heartbeat's span, but NOT unwrapped until after
+    // `run_outcome?` below: a bracket failure must not mask the kernel's own
+    // error, which is the more informative of the two.
+    let after = device_bracket_sample(dir);
     // T6 review, M-3: finish the Heartbeat BEFORE the `?`. `Heartbeat` has no
     // `Drop` impl and `stop` is set only by `finish`, which takes `self` — so
     // returning through the `?` first dropped it unstopped and left its tick
@@ -96,6 +105,7 @@ pub fn run(
     // heartbeat window to exclude the join below.
     obs.heartbeat = hb.finish();
     run_outcome?;
+    obs.device_after = after?;
     let _ = progress.join();
 
     {
@@ -136,6 +146,8 @@ pub fn run(
             log_records_per_sec: a.log_records_per_sec,
             window_secs: a.window_secs,
             device_ratio: a.device_ratio,
+            device_appends_per_sec_before: obs.device_before,
+            device_appends_per_sec_after: obs.device_after,
             requests_total: obs.requests_planned,
             jobs_done: obs.stats_jobs_done,
         },

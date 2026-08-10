@@ -59,9 +59,11 @@ pub(crate) fn timed_loop(
 /// hard as zeros (T4 re-review, M-F). The caller therefore stamps each frame
 /// with its own offset before writing, exactly as a real WAL frame carries a
 /// distinct header — so no two blocks are identical.
-fn frame_pattern() -> [u8; 256] {
+pub(crate) const FRAME_BYTES: usize = 256;
+
+fn frame_pattern() -> [u8; FRAME_BYTES] {
     let mut state: u64 = 0x9E3779B97F4A7C15;
-    let mut out = [0u8; 256];
+    let mut out = [0u8; FRAME_BYTES];
     for chunk in out.chunks_mut(8) {
         state = state.wrapping_add(0x9E3779B97F4A7C15);
         let mut z = state;
@@ -118,15 +120,36 @@ const BRACKET_DURATION: Duration = Duration::from_secs(1);
 /// per-point brackets reuse the SAME function the core layer's write-window
 /// brackets do (plan: "moving it to device.rs beside timed_loop is
 /// acceptable and probably better; copying it is not").
+/// Each sample gets its own file, so every one of them is an append to a
+/// GROWING file rather than a rewrite of the previous sample's extents — the
+/// WAL's shape, which is the whole point of the interlude's §4.1.
+static BRACKET_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn device_bracket_sample(dir: &str) -> io::Result<f64> {
     let disk = ProdDisk::new(dir)?;
-    let file = disk.open("bench-bracket.dat")?;
-    // T5 re-review, N-11 (Minor, fixed here): `timed_loop` formats its
-    // degenerate-window message as "device {name}", so passing "core
-    // bracket" here rendered "the device core bracket loop" — a doubled
-    // "device" reading. "bracket" alone reads as "the device bracket loop".
+    let n = BRACKET_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file = disk.open(&format!("bench-bracket-{n}.dat"))?;
+    // Interlude spec §4.1 / Noah ruling 2026-08-10: this is a sequential
+    // append + sync, NOT the `write_at(0, &[1u8])` rewrite it was through T8.
+    // The bracket's job is to bound a WAL append, and on apfs the two shapes
+    // do not cost the same: measured over 15 paired `bench device` runs the
+    // append shape is ~4.2% FASTER (mean paired ratio 1.0421, faster in 12 of
+    // 15), with loop order ruled out as the cause by an order-alternating
+    // probe (1.0433 sync-first vs 1.0411 append-first). A denominator ~4%
+    // below the path it bounds is not a ceiling, and this gate divides by it.
+    //
+    // This reinstates T8's Ruling 1, whose n=2 refutation could not have
+    // detected a 4% effect inside 10%+ noise (spec §7).
+    let mut off = 0u64;
+    let mut frame = frame_pattern();
+    // T5 re-review, N-11 (Minor): `timed_loop` formats its degenerate-window
+    // message as "device {name}", so passing "core bracket" here rendered
+    // "the device core bracket loop" — a doubled "device" reading. "bracket"
+    // alone reads as "the device bracket loop".
     timed_loop("bracket", BRACKET_WARMUP, BRACKET_DURATION, || {
-        file.write_at(0, &[1u8])?;
+        frame[..8].copy_from_slice(&off.to_le_bytes());
+        file.write_at(off, &frame)?;
+        off += frame.len() as u64;
         file.sync()
     })
 }
@@ -205,6 +228,51 @@ mod tests {
         assert!(
             frame.iter().collect::<std::collections::HashSet<_>>().len() > 1,
             "frame must not be a single repeated byte"
+        );
+    }
+
+    /// The interlude's §6.1 discriminating test. `device_bracket_sample` must
+    /// measure the op shape it BOUNDS — a sequential append, the WAL's shape —
+    /// not a rewrite of offset 0 of a one-byte file. Measured at n=15 paired
+    /// (order confound ruled out at n=14): the append shape runs ~4.2% faster
+    /// on apfs, so the rewrite shape is not an upper bound on the path it was
+    /// being divided into.
+    ///
+    /// Keyed on the artifact rather than the rate, because a rate assertion
+    /// here would be a machine-speed assertion. The old shape leaves a
+    /// ONE-BYTE file however fast the machine is; the new one leaves at least
+    /// `MIN_MEASURED_OPS` frames, because `timed_loop` refuses below that
+    /// floor. So this cannot pass for the wrong reason in either direction.
+    #[test]
+    fn a_bracket_sample_appends_rather_than_rewriting_one_block() {
+        let dir = std::env::temp_dir().join(format!(
+            "charpente-bracket-shape-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.to_str().expect("utf-8 scratch path");
+
+        let rate = device_bracket_sample(path).expect("bracket sample");
+        assert!(rate > 0.0, "rate: {rate}");
+
+        let biggest = std::fs::read_dir(&dir)
+            .expect("read scratch dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("bench-bracket"))
+            .map(|e| e.metadata().expect("metadata").len())
+            .max()
+            .expect("the bracket wrote a file");
+        std::fs::remove_dir_all(&dir).ok();
+
+        let floor = crate::measure::MIN_MEASURED_OPS * FRAME_BYTES as u64;
+        assert!(
+            biggest > floor,
+            "the bracket must APPEND: its file is {biggest} bytes, but a loop that \
+             completed at least MIN_MEASURED_OPS frames of {FRAME_BYTES} bytes must \
+             leave more than {floor}. A one-byte file means the bracket is still \
+             rewriting offset 0, which measures a shape ~4% slower than the WAL \
+             append it is used to bound"
         );
     }
 

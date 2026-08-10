@@ -42,11 +42,14 @@ fn canonical(db: &mut Db, i: u64) -> io::Result<u64> {
     })
 }
 
+/// Interlude spec §4.2 (Noah ruling, 2026-08-10): this no longer takes layer
+/// 1's `device.syncs_per_sec`. The gate divides by the brackets taken either
+/// side of this function's own write window, so a one-shot sample from a
+/// separate invocation is no longer an input to any decision here.
 pub fn run(
     dir: &str,
     warmup: Duration,
     duration: Duration,
-    device_syncs_per_sec: f64,
 ) -> io::Result<(CoreReport, Vec<String>)> {
     let mut db = Db::open(Box::new(ProdDisk::new(dir)?), DbConfig::default(), schema())?;
     let mut invalid = Vec::new();
@@ -61,8 +64,6 @@ pub fn run(
         duration,
         ..Default::default()
     };
-    obs.write.device_ceiling = device_syncs_per_sec;
-
     let warm_end = Instant::now() + warmup;
     while Instant::now() < warm_end {
         canonical(&mut db, i)?;
@@ -73,7 +74,7 @@ pub fn run(
     // with an independent device-sync sample on either side.
     //
     // T5 re-review, N-2 (Important): the bracket samples are PUBLISHED
-    // artifact fields (device_syncs_per_sec_before/_after) — I-1's whole
+    // artifact fields (device_appends_per_sec_before/_after) — I-1's whole
     // point was that a measured, published window needs a suspension/
     // starvation guard, and the original fix covered only the write loop
     // itself, leaving these two new sibling windows uncovered in the same
@@ -185,9 +186,9 @@ pub fn run(
             log_records_per_sec: write.log_records_per_sec,
             reads_per_sec: read.reads_per_sec,
             device_ratio: write.device_ratio,
-            device_ratio_denominator: "device.syncs_per_sec",
-            device_syncs_per_sec_before: obs.write.device_before,
-            device_syncs_per_sec_after: obs.write.device_after,
+            device_ratio_denominator: "the device bracket max",
+            device_appends_per_sec_before: obs.write.device_before,
+            device_appends_per_sec_after: obs.write.device_after,
         },
         invalid,
     ))

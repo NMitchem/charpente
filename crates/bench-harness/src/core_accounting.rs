@@ -25,7 +25,10 @@
 //! was violating it.
 
 use crate::SLOTS;
-use crate::measure::{DEVICE_RATIO_SLACK, crosscheck, degenerate_window_reason, implausible_ratio};
+use crate::measure::{
+    RATIO_TOLERANCE_FLOOR, crosscheck, degenerate_window_reason, implausible_bracketed_ratio,
+    ratio_tolerance,
+};
 use std::time::Duration;
 
 /// What the measured write window observed. Every field is a count, a duration
@@ -48,11 +51,14 @@ pub struct WriteObs {
     /// `Heartbeat::finish()` spanning both bracket samples and the write
     /// window. `None` = one continuous run on a settled machine.
     pub heartbeat: Option<String>,
-    /// The device ceiling this run divides by — `device.syncs_per_sec`, a
-    /// single sample from the device layer's own separate invocation.
-    pub device_ceiling: f64,
-    /// This run's own device-sync bracket samples, either side of the write
-    /// window, so the ratio's error bar is visible in the artifact.
+    /// This run's own device bracket samples, either side of the write window
+    /// — and, since the 2026-08-10 interlude, the ratio's DENOMINATOR rather
+    /// than merely its error bar. Layer 1's one-shot `device.syncs_per_sec` was
+    /// what this divided by through T8; it is a single sample from a separate
+    /// invocation, and run 2 of the interlude's evidence divided 206 acked
+    /// writes/s by 166 while these two read 218 and 215 (spec §3.2). The
+    /// accounting takes `max(before, after)` — the worse of the two, so the
+    /// ratio stays conservative rather than merely less noisy.
     pub device_before: f64,
     pub device_after: f64,
 }
@@ -118,30 +124,35 @@ pub struct ReadAccounting {
 /// `measure::implausible_ratio` at the T6 review's M-5 (Noah ruling), leaving
 /// the PROSE here where it is true: this layer's physics is one `wal.sync()`
 /// per transaction, and the bracket samples this message cites exist only
-/// around the core write window. The accepted cost of the 1e-6 slack, stated
-/// with the message that carries it: more short/noisy runs now exit 1; those
-/// runs ARE genuinely invalid measurements, and the bracket samples
-/// (device_syncs_per_sec_before/_after) are what tell the reader why, not a
-/// wider slack that hides the same fact.
-pub fn device_ratio_reason(
-    ratio: f64,
-    denominator: f64,
-    before: f64,
-    after: f64,
-) -> Option<String> {
-    if implausible_ratio(ratio) {
+/// around the core write window.
+///
+/// **2026-08-10 interlude (Noah ruling).** Both of the candidate causes the
+/// shipped message used to *offer the reader* have since been measured, and
+/// both were real, so neither is offered as a guess any more — they are fixed
+/// instead. Cause (2), the op-shape mismatch, is gone: `device_bracket_sample`
+/// now appends (spec §4.1). Cause (1), cross-window variance, is gone as a
+/// DENOMINATOR problem: this divides by the brackets either side of its own
+/// window rather than by a one-shot sample from another invocation. What
+/// remains is the irreducible error in the brackets themselves, and
+/// `implausible_bracketed_ratio` tolerates exactly that much and no more
+/// (spec §4.3). The `1e-6` slack this replaces did not buy detection — it
+/// bought a ~50% false-refusal rate at every layer whose true ratio is 1.0.
+pub fn device_ratio_reason(ratio: f64, before: f64, after: f64) -> Option<String> {
+    if implausible_bracketed_ratio(ratio, before, after) {
+        let tolerance = ratio_tolerance(before, after);
+        let ceiling = before.max(after);
         Some(format!(
-            "INVALID: device_ratio {ratio:.3} exceeds 1.0 + {DEVICE_RATIO_SLACK} — \
-             Engine::submit performs exactly one wal.sync() per transaction with no group \
-             commit, so the commit path cannot durably ack faster than the device's own sync \
-             rate; a ratio above 1.0 is a measurement artifact rather than a real durability \
-             finding. Two candidate causes, either or both: (1) cross-window variance — \
-             device.syncs_per_sec ({denominator:.2}) is a single sample from a separate \
-             invocation, and this run's own bracket samples ({before:.2} before / {after:.2} \
-             after the write window) show the spread that single sample cannot; (2) the \
-             ratio's denominator (device.syncs_per_sec, the one-byte-overwrite loop) is not \
-             the same op shape as the canonical commit's WAL append — device.appends_per_sec \
-             is closer and may be exceeded less, or not at all"
+            "INVALID: device_ratio {ratio:.3} exceeds 1.0 by more than this window's own \
+             measurement error ({:.1}%) — Engine::submit performs exactly one wal.sync() per \
+             transaction with no group commit, so the commit path cannot durably ack faster \
+             than the device's own sync rate. The denominator is this run's own bracket max \
+             ({ceiling:.2}) from the samples either side of the write window ({before:.2} \
+             before / {after:.2} after); the tolerance is the wider of those two disagreeing \
+             ({:.1}%) and the {:.1}% floor for drift a bracket cannot see. A ratio this far \
+             above 1.0 is not a measurement artifact the tolerance can absorb",
+            tolerance * 100.0,
+            crate::measure::bracket_spread(before, after) * 100.0,
+            RATIO_TOLERANCE_FLOOR * 100.0,
         ))
     } else {
         None
@@ -215,13 +226,11 @@ pub fn write_accounting(duration: Duration, w: &WriteObs) -> Result<WriteAccount
     }
     let log_records_per_sec = delta as f64 / w.elapsed.as_secs_f64();
 
-    let device_ratio = acked_writes_per_sec / w.device_ceiling;
-    if let Some(reason) = device_ratio_reason(
-        device_ratio,
-        w.device_ceiling,
-        w.device_before,
-        w.device_after,
-    ) {
+    // Interlude spec §4.2: divide by the WORSE (larger) of this window's own
+    // two bracket samples, exactly as the wire layer has since T7 rev. 3 — not
+    // by a one-shot `device.syncs_per_sec` from a separate invocation.
+    let device_ratio = acked_writes_per_sec / w.device_before.max(w.device_after);
+    if let Some(reason) = device_ratio_reason(device_ratio, w.device_before, w.device_after) {
         invalid.push(reason);
     }
 
@@ -292,53 +301,97 @@ mod tests {
     // dependency — so this asserts the gate itself, independent of whether
     // a real run happens to reproduce a >1.0 ratio (the review saw it 2 of
     // 7 runs on a quiet machine, not reliably reproducible on demand).
+    /// Interlude spec §6.3, the discriminating case. Real numbers from `bench
+    /// core` run 2: 206 acked writes/s over a 1 s window, with THIS run's own
+    /// brackets reading 218 and 215 — while layer 1's one-shot
+    /// `device.syncs_per_sec`, sampled in a separate invocation seconds
+    /// earlier, read 166. Dividing by the one-shot gives 1.239 and refuses a
+    /// healthy run; dividing by the brackets beside the window gives 0.945.
+    ///
+    /// This is T7 rev. 3's fix, finally applied at the layer it skipped.
     #[test]
-    fn a_ratio_above_one_plus_slack_is_named_invalid() {
-        let r = device_ratio_reason(1.05, 250.0, 245.0, 255.0).expect("must flag");
+    fn the_gate_divides_by_this_runs_own_brackets_not_a_one_shot_sample() {
+        let w = WriteObs {
+            ops: 206,
+            loop_delta: 206,
+            elapsed: Duration::from_secs(1),
+            applied_before: None,
+            applied_after: Some(205),
+            heartbeat: None,
+            device_before: 218.0,
+            device_after: 215.0,
+        };
+        let a = write_accounting(Duration::from_secs(1), &w).expect("a measurement");
+        assert!(
+            a.invalid.is_empty(),
+            "a healthy one-record-per-transact run was refused: {:?}",
+            a.invalid
+        );
+        assert!(
+            (a.device_ratio - 206.0 / 218.0).abs() < 1e-9,
+            "the denominator must be max(before, after) = 218, got ratio {}",
+            a.device_ratio
+        );
+    }
+
+    #[test]
+    fn a_ratio_beyond_this_windows_own_error_is_named_invalid() {
+        // Brackets agreeing to 3.9%, so the tolerance is the 10% floor and
+        // 1.15 is genuinely beyond it.
+        let r = device_ratio_reason(1.15, 245.0, 255.0).expect("must flag");
         assert!(r.contains("INVALID"), "got: {r}");
-        assert!(r.contains("1.050"), "must name the offending value: {r}");
+        assert!(r.contains("1.150"), "must name the offending value: {r}");
         assert!(
-            r.contains("cross-window variance"),
-            "must name candidate cause 1: {r}"
+            r.contains("one wal.sync() per transaction"),
+            "must name the physics the gate rests on: {r}"
         );
         assert!(
-            r.contains("not the same op shape"),
-            "must name candidate cause 2: {r}"
-        );
-        assert!(
-            r.contains("device.syncs_per_sec"),
-            "must name which operand the ratio divides by: {r}"
+            r.contains("255.00"),
+            "must name the denominator it actually divided by: {r}"
         );
         assert!(r.contains("245.00"), "must show the before sample: {r}");
-        assert!(r.contains("255.00"), "must show the after sample: {r}");
+        assert!(
+            r.contains("10.0%"),
+            "must show the tolerance the ratio had to clear: {r}"
+        );
     }
 
     #[test]
-    fn a_ratio_at_or_below_the_slack_boundary_is_not_flagged() {
-        assert!(device_ratio_reason(1.0, 250.0, 245.0, 255.0).is_none());
+    fn a_ratio_inside_this_windows_own_error_is_not_flagged() {
+        // The whole point of the interlude: a healthy one-record-per-op layer
+        // sits at exactly 1.0, so everything in this band is expected.
+        assert!(device_ratio_reason(1.0, 245.0, 255.0).is_none());
+        assert!(device_ratio_reason(1.05, 245.0, 255.0).is_none());
         assert!(
-            device_ratio_reason(1.0 + DEVICE_RATIO_SLACK, 250.0, 245.0, 255.0).is_none(),
+            device_ratio_reason(1.0 + RATIO_TOLERANCE_FLOOR, 245.0, 255.0).is_none(),
             "the boundary itself must not flag — only strictly above it"
         );
-        assert!(device_ratio_reason(0.79, 250.0, 245.0, 255.0).is_none());
+        assert!(device_ratio_reason(0.79, 245.0, 255.0).is_none());
     }
 
     #[test]
-    fn a_ratio_just_over_the_slack_boundary_is_flagged() {
-        assert!(
-            device_ratio_reason(1.0 + DEVICE_RATIO_SLACK + 0.001, 250.0, 245.0, 255.0).is_some()
-        );
+    fn a_ratio_just_over_the_tolerance_is_flagged() {
+        assert!(device_ratio_reason(1.0 + RATIO_TOLERANCE_FLOOR + 1e-9, 245.0, 255.0).is_some());
+    }
+
+    /// The spread term, at this layer: the SAME ratio that is refused beside
+    /// stable brackets passes beside brackets that disagree by 30%, because in
+    /// the second case the harness has measured that it cannot tell.
+    #[test]
+    fn a_wide_bracket_spread_widens_this_layers_tolerance_too() {
+        assert!(device_ratio_reason(1.15, 245.0, 255.0).is_some());
+        assert!(device_ratio_reason(1.15, 147.0, 215.0).is_none());
     }
 
     /// A plausible healthy run on this class of hardware: 7,500 acked writes
-    /// over 30s (250/s against a 300/s device ceiling — a ratio of 0.833,
+    /// over 30s (250/s against a 305/s bracket max — a ratio of 0.820,
     /// comfortably below the gate), 33M reads over 30s. Every derived quantity
     /// is exact in f64 — 250.0, 250.0 and 1_100_000.0 all are — EXCEPT
-    /// `device_ratio`: 5/6 is a repeating binary fraction
-    /// (`0x3feaaaaaaaaaaaab`). Its assertion is still an equality rather than a
-    /// tolerance, but it holds by bit-reproducibility, not exactness: both
-    /// sides are the identically-rounded result of the same division on the
-    /// same operands, since `7500.0/30.0` is exactly `250.0`. This fixture is
+    /// `device_ratio`: 50/61 is a repeating binary fraction. Its assertion is
+    /// still an equality rather than a tolerance, but it holds by
+    /// bit-reproducibility, not exactness: both sides are the
+    /// identically-rounded result of the same division on the same operands,
+    /// since `7500.0/30.0` is exactly `250.0`. This fixture is
     /// also spec §4 bullet 4's ABOVE-the-boundary
     /// case for both windows: 7,500 and 33,000,000 are both far above
     /// `MIN_MEASURED_OPS`, and the two `a_healthy_*` tests assert neither
@@ -353,7 +406,6 @@ mod tests {
                 applied_before: Some(99),
                 applied_after: Some(7_599),
                 heartbeat: None,
-                device_ceiling: 300.0,
                 device_before: 295.0,
                 device_after: 305.0,
             },
@@ -376,7 +428,11 @@ mod tests {
             a.log_records_per_sec, 250.0,
             "an applied delta that agrees with the ack count publishes the same rate"
         );
-        assert_eq!(a.device_ratio, 250.0 / 300.0);
+        assert_eq!(
+            a.device_ratio,
+            250.0 / 305.0,
+            "the denominator is max(before, after), this run's own worse bracket"
+        );
     }
 
     #[test]
@@ -538,7 +594,9 @@ mod tests {
     #[test]
     fn a_zero_device_ceiling_yields_a_non_finite_ratio_left_for_the_renderer() {
         let mut o = healthy();
-        o.write.device_ceiling = 0.0;
+        // Both brackets, since the denominator is now their max.
+        o.write.device_before = 0.0;
+        o.write.device_after = 0.0;
         let a = write_accounting(o.duration, &o.write).expect("a non-finite ratio is no refusal");
         assert!(a.device_ratio.is_infinite(), "got: {}", a.device_ratio);
         // Checked first (T2 fix round, I-1): this is the assertion this test's
@@ -575,7 +633,8 @@ mod tests {
         o.write.heartbeat = Some("INVALID: heartbeat starved".to_string());
         o.write.loop_delta = o.write.ops - 1; // totals disagree
         o.write.applied_after = Some(7_600); // applied delta disagrees
-        o.write.device_ceiling = 1.0; // ratio far above 1.0
+        o.write.device_before = 1.0; // ratio far above 1.0
+        o.write.device_after = 1.0;
         let a = write_accounting(o.duration, &o.write).expect("all four of these are non-fatal");
         let shape: Vec<&str> = a
             .invalid

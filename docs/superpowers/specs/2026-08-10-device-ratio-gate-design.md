@@ -215,6 +215,34 @@ the bug) and §8 records how often it actually fires.
 Untouched and still right. This interlude changes what the rate is divided by and
 how much tolerance the quotient gets, not which numerator is trustworthy.
 
+**Ruling #4 (T5 re-review, N-4) — the one this interlude is in real tension with,
+named rather than quietly overridden.** That ruling tightened `DEVICE_RATIO_SLACK`
+from `1e-2` to `1e-6`, on the ground that `1e-2` "absorbed a band of cross-window
+SAMPLING noise … which is precisely the phenomenon this gate exists to detect",
+and that "a ratio anywhere in `(1.0, 1.01]` published unflagged at exit 0 was C-1's
+exact defect". §4.3 re-introduces a tolerance an order of magnitude *larger* than
+the one that ruling rejected. Both of its premises have since changed:
+
+1. **The denominator was a single cross-window sample then.** It is now a bracket
+   taken either side of the window being judged, so the estimator's error is
+   directly observable per point instead of being a blanket unknown. §4.3 does not
+   absorb noise with a constant; it absorbs exactly the spread the harness measured,
+   and the constant floor covers only the residual the spread cannot see.
+2. **No layer had been measured at a true ratio of 1.0 then.** §1 establishes that
+   three of the four shipped configurations sit exactly there. That inverts the
+   meaning of the evidence: a ratio in `(1.0, 1.10]` is the *expected healthy
+   observation* for a one-record-per-op layer, not a signal. Ruling #4 read that
+   band as under-detection because, at the time, the only validated configuration
+   was the one with 2x margin.
+
+What ruling #4 got right and this interlude keeps: a gate must not be widened to
+make a run pass, and slack must be justified by the error it actually covers rather
+than by a plausible-sounding story. §4.3's floor is the measured drift and §8's
+acceptance is a re-measured distribution, precisely so that standard is met. What
+this interlude asserts against it: a gate cannot detect a violation smaller than
+its own measurement error, and pretending otherwise does not buy detection — it
+buys false refusals at ~50% and a CLI that cannot publish.
+
 ## 8. Evidence required
 
 - **The distribution, re-measured**, not one green run: ≥ 6 runs each of `bench

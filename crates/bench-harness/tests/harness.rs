@@ -69,32 +69,23 @@ fn device_layer_produces_nonzero_rates() {
 #[test]
 #[ignore]
 fn core_layer_commits_and_reports_a_ratio() {
-    // T5 review, C-2 / M-6: a fabricated 1000.0 ceiling let the ratio
-    // assertion degenerate into checking arithmetic against a made-up
-    // number, and meant the layer's ratio math was never grounded in a real
-    // device measurement. Run a REAL (short) device probe first, on its own
-    // subdirectory of the same scratch tree — mirroring bin/bench.rs's own
-    // shape (device runs in its own dir, core in its own, same base
-    // filesystem) without needing the full binary (that's the separate
-    // subprocess test below, which closes the rest of M-6: the binary's OWN
-    // `report.device.as_ref().expect(...)` handoff line).
+    // T5 review, C-2 / M-6 required a REAL device probe here, because a
+    // fabricated 1000.0 ceiling let the ratio assertion degenerate into
+    // checking arithmetic against a made-up number. The 2026-08-10 interlude
+    // (§4.2) satisfies that requirement a better way and the probe is gone:
+    // this layer brackets its OWN write window and divides by that, so its
+    // ratio math is grounded in a real device measurement taken either side of
+    // the very window being measured — strictly closer than a separate probe
+    // in a separate directory could be. Exactly the move T7 rev. 3 made for
+    // the wire smoke (see its comment below). M-6's other half — the binary's
+    // own device->core handoff — is still covered by the subprocess test.
     let base = scratch("core");
-    let device_dir = format!("{base}/device");
     let core_dir = format!("{base}/core");
-    std::fs::create_dir_all(&device_dir).expect("device subdir");
     std::fs::create_dir_all(&core_dir).expect("core subdir");
-    let device = bench_harness::device::run(
-        &device_dir,
-        Duration::from_millis(200),
-        Duration::from_secs(1),
-    )
-    .expect("device layer runs");
-    let ceiling = device.syncs_per_sec;
     let (core, invalid) = bench_harness::core_bench::run(
         &core_dir,
         Duration::from_millis(200),
         Duration::from_secs(1),
-        ceiling,
     )
     .expect("core layer runs");
     let _ = std::fs::remove_dir_all(&base);
@@ -136,11 +127,20 @@ fn core_layer_commits_and_reports_a_ratio() {
     // to `run` could make one fail and not the other. Assert the field's
     // DERIVATION instead, which can actually fail (e.g. a wrong multiplier
     // or a swapped operand, both proven by mutation in the fix-round report).
+    // 2026-08-10 interlude §4.2: the denominator is this run's OWN bracket
+    // max, not the one-shot `device.syncs_per_sec` measured in a separate
+    // window above. Asserting against the published bracket fields keeps this
+    // pin self-contained in the artifact — the reader can check it by hand
+    // from the JSON, which the old form (referencing a local binding) could
+    // not be.
+    let core_ceiling = core
+        .device_appends_per_sec_before
+        .max(core.device_appends_per_sec_after);
     assert!(
-        (core.device_ratio - core.acked_writes_per_sec / ceiling).abs() < 1e-9,
-        "device_ratio must equal acked_writes_per_sec / device.syncs_per_sec: {} vs {}",
+        (core.device_ratio - core.acked_writes_per_sec / core_ceiling).abs() < 1e-9,
+        "device_ratio must equal acked_writes_per_sec / max(bracket before, after): {} vs {}",
         core.device_ratio,
-        core.acked_writes_per_sec / ceiling
+        core.acked_writes_per_sec / core_ceiling
     );
 }
 
@@ -240,7 +240,7 @@ fn a_degenerate_cli_duration_is_refused_not_published() {
 fn a_warmup_zero_core_write_window_reports_the_correct_log_record_count() {
     let dir = scratch("warmup-zero");
     let (core, invalid) =
-        bench_harness::core_bench::run(&dir, Duration::ZERO, Duration::from_secs(1), 250.0)
+        bench_harness::core_bench::run(&dir, Duration::ZERO, Duration::from_secs(1))
             .expect("core layer runs");
     let _ = std::fs::remove_dir_all(&dir);
     for reason in &invalid {
@@ -272,9 +272,8 @@ fn a_warmup_zero_core_write_window_reports_the_correct_log_record_count() {
 #[ignore]
 fn a_below_floor_core_write_window_is_refused() {
     let dir = scratch("core-below-floor");
-    let err =
-        bench_harness::core_bench::run(&dir, Duration::ZERO, Duration::from_millis(10), 250.0)
-            .expect_err("a handful of ops in 10ms must be refused, not published");
+    let err = bench_harness::core_bench::run(&dir, Duration::ZERO, Duration::from_millis(10))
+        .expect_err("a handful of ops in 10ms must be refused, not published");
     let _ = std::fs::remove_dir_all(&dir);
     let msg = err.to_string();
     assert!(msg.contains("INVALID"), "got: {msg}");
@@ -287,20 +286,14 @@ fn a_below_floor_core_write_window_is_refused() {
 fn kernel_layer_drains_the_batch_with_every_job_done() {
     const REQUESTS: u64 = 500;
     let base = scratch("kernel");
-    let device_dir = format!("{base}/device");
     let kernel_dir = format!("{base}/kernel");
-    std::fs::create_dir_all(&device_dir).expect("device subdir");
     std::fs::create_dir_all(&kernel_dir).expect("kernel subdir");
-    // T6 review, M-5 / Noah ruling: this layer now has a device ceiling, so
-    // the smoke measures a real one rather than inventing a number.
-    let device = bench_harness::device::run(
-        &device_dir,
-        Duration::from_millis(200),
-        Duration::from_secs(1),
-    )
-    .expect("device layer runs");
-    let ceiling = device.syncs_per_sec;
-    let (k, invalid) = bench_harness::kernel_bench::run(&kernel_dir, REQUESTS, ceiling).expect(
+    // T6 review, M-5 / Noah ruling gave this layer a real device ceiling
+    // rather than an invented number. The 2026-08-10 interlude (§4.2) keeps
+    // that and improves it: the ceiling is now bracketed either side of this
+    // batch's own window, so the separate probe that used to stand in for it
+    // is gone.
+    let (k, invalid) = bench_harness::kernel_bench::run(&kernel_dir, REQUESTS).expect(
         "kernel layer runs — a refusal here naming the minimum measured window means this \
          batch drained in under a second, i.e. the store is not on a device doing real \
          durable syncs (RAM-backed filesystem?), which is the C-1 floor working",
@@ -351,12 +344,24 @@ fn kernel_layer_drains_the_batch_with_every_job_done() {
         k.log_records_per_sec,
         (k.requests_total + k.jobs_done) as f64 / k.window_secs
     );
+    // 2026-08-10 interlude §4.2: this layer now brackets its own batch window,
+    // so the denominator is its own bracket max rather than the one-shot
+    // sample measured above.
+    let k_ceiling = k
+        .device_appends_per_sec_before
+        .max(k.device_appends_per_sec_after);
     assert!(
-        (k.device_ratio - k.log_records_per_sec / ceiling).abs() < 1e-9,
+        (k.device_ratio - k.log_records_per_sec / k_ceiling).abs() < 1e-9,
         "device_ratio must divide the LOG rate (two syncs per request), not the ack rate: \
          {} vs {}",
         k.device_ratio,
-        k.log_records_per_sec / ceiling
+        k.log_records_per_sec / k_ceiling
+    );
+    assert!(
+        k.device_appends_per_sec_before > 0.0 && k.device_appends_per_sec_after > 0.0,
+        "this layer must take its own bracket samples — the interlude's whole §4.2: {}/{}",
+        k.device_appends_per_sec_before,
+        k.device_appends_per_sec_after
     );
 }
 
@@ -401,8 +406,8 @@ fn wire_layer_sweeps_the_bench_app() {
         assert_eq!(
             p.device_ratio,
             p.log_records_per_sec
-                / p.device_syncs_per_sec_before
-                    .max(p.device_syncs_per_sec_after)
+                / p.device_appends_per_sec_before
+                    .max(p.device_appends_per_sec_after)
         );
         assert!(
             p.p50_us <= p.p99_us && p.p99_us <= p.p999_us,

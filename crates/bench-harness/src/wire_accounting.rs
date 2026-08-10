@@ -35,10 +35,22 @@
 //! `device_before`/`device_after` bracket samples with the child NOT
 //! running, and `point_accounting` divides by `max(before, after)` — the
 //! worse of the two, so both ratios stay conservative rather than merely
-//! less noisy. Unlike the core layer (which publishes its own brackets as
-//! prose evidence but still gates on a threaded-in ceiling), this layer
-//! DIVIDES by the bracket max, because it runs much closer to the device
-//! ceiling and cross-window drift in a single sample is real.
+//! less noisy.
+//!
+//! **2026-08-10 interlude (Noah ruling).** This paragraph used to continue
+//! "unlike the core layer, which publishes its own brackets as prose evidence
+//! but still gates on a threaded-in ceiling". That is no longer true and the
+//! difference it described was itself the bug: core and kernel now bracket
+//! their own windows too, and all three layers divide by their own bracket
+//! max. Two further changes land here. The bracket measures a sequential
+//! APPEND rather than a one-byte rewrite (§4.1) — the shape it is bounding,
+//! and ~4.2% faster on apfs, so the old shape was not an upper bound at all.
+//! And the gate compares against this point's OWN measurement error rather
+//! than `1.0 + 1e-6` (§4.3): invoicing commits exactly one record per
+//! request, so its true ack ratio is exactly 1.0 and a zero-tolerance
+//! comparison was decided by noise, refusing healthy runs about half the
+//! time. bench-app hid this for the whole of T7 because 2.0
+//! records/request put its ack ratio near 0.5.
 //!
 //! **What rev. 3 did not fix, recorded so the bracket is not credited with
 //! it.** Bracketing removed the drift and thereby refuted its own premise:
@@ -50,7 +62,8 @@
 //! it is divided by.
 
 use crate::measure::{
-    MIN_MEASURED_WINDOW, crosscheck, degenerate_window_reason, implausible_ratio, percentile,
+    MIN_MEASURED_WINDOW, RATIO_TOLERANCE_FLOOR, bracket_spread, crosscheck,
+    degenerate_window_reason, implausible_bracketed_ratio, percentile, ratio_tolerance,
 };
 use crate::report::SweepPoint;
 use std::time::Duration;
@@ -197,16 +210,28 @@ pub fn point_accounting(w: &WireObs) -> Result<WireAccounting, String> {
     // sync at all is impossible by construction rather than by assumption.
     // Weaker than a record-level gate — it would not catch a 2x error in
     // `records_per_request` — and sound, which the record-level gate was not.
+    // 2026-08-10 interlude §4.3 (Noah ruling): the comparison is against this
+    // point's OWN measurement error, not `1.0 + 1e-6`. invoicing commits
+    // exactly one record per request, so its true ratio is exactly 1.0 and the
+    // sign of a zero-tolerance comparison was decided entirely by noise — the
+    // gate refused healthy runs about half the time (spec §1). bench-app never
+    // showed it because 2.0 records/request put its ack ratio near 0.5.
     let ack_ratio = throughput / ceiling;
-    if implausible_ratio(ack_ratio) {
+    if implausible_bracketed_ratio(ack_ratio, w.device_before, w.device_after) {
         invalid.push(at(format!(
             "INVALID: {throughput:.0} acked requests/s is {ack_ratio:.2}x the \
-             measured device ceiling of {ceiling:.0} durable syncs/s — the bracket \
-             samples either side of this point ({:.2} before / {:.2} after) show the \
-             spread a single sample cannot. Every acked request commits at least one \
-             log record and pays at least one durable sync for it, so this rate is \
-             not physically possible and the run is not a measurement",
-            w.device_before, w.device_after
+             measured device ceiling of {ceiling:.0} durable appends/s, beyond this \
+             point's own measurement error ({:.1}%) — the bracket samples either side \
+             of this point ({:.2} before / {:.2} after) disagree by {:.1}%, and the \
+             tolerance is the wider of that and the {:.1}% floor. Every acked request \
+             commits at least one log record and pays at least one durable sync for \
+             it, so this rate is not physically possible and the run is not a \
+             measurement",
+            ratio_tolerance(w.device_before, w.device_after) * 100.0,
+            w.device_before,
+            w.device_after,
+            bracket_spread(w.device_before, w.device_after) * 100.0,
+            RATIO_TOLERANCE_FLOOR * 100.0,
         )));
     }
 
@@ -221,8 +246,8 @@ pub fn point_accounting(w: &WireObs) -> Result<WireAccounting, String> {
             // is a per-target derivation and not a count.
             log_records_per_sec,
             device_ratio,
-            device_syncs_per_sec_before: w.device_before,
-            device_syncs_per_sec_after: w.device_after,
+            device_appends_per_sec_before: w.device_before,
+            device_appends_per_sec_after: w.device_after,
             p50_us: percentile(&sorted, 50.0),
             p99_us: percentile(&sorted, 99.0),
             p999_us: percentile(&sorted, 99.9),
@@ -236,7 +261,7 @@ pub fn point_accounting(w: &WireObs) -> Result<WireAccounting, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::measure::{DEVICE_RATIO_SLACK, MIN_MEASURED_OPS};
+    use crate::measure::MIN_MEASURED_OPS;
     use std::time::Duration;
 
     /// A plausible healthy point: 4 connections, 1000 requests measured over
@@ -382,8 +407,10 @@ mod tests {
         // single assertion is what goes red.
         assert_eq!(a.point.device_ratio, 2.0);
 
-        // Above it: impossible, so flagged by name.
-        o.device_before = 500.0 / (1.0 + 2.0 * DEVICE_RATIO_SLACK);
+        // Above it by more than the tolerance: flagged by name. The two
+        // samples AGREE here, so the tolerance is the floor and 1.2x is
+        // genuinely beyond it (2026-08-10 interlude §4.3).
+        o.device_before = 500.0 / 1.2;
         o.device_after = o.device_before;
         let a = point_accounting(&o).expect("implausible is named, not refused");
         assert_eq!(a.invalid.len(), 1, "got: {:?}", a.invalid);
@@ -393,6 +420,32 @@ mod tests {
             a.invalid
         );
         assert!(a.invalid[0].contains("INVALID"), "got: {:?}", a.invalid);
+    }
+
+    /// 2026-08-10 interlude, the DISCRIMINATING case for this layer's gate —
+    /// the same gap mutation found at the kernel layer. The 1.0 and 1.2x
+    /// probes above pass under BOTH the old `1.0 + 1e-6` gate and the new
+    /// bracketed one, so neither could detect a revert. This is the band where
+    /// they differ, and it is the band every observed invoicing point landed
+    /// in: 1.007, 1.010, 1.013, 1.036, 1.052, 1.086 (spec §1).
+    #[test]
+    fn an_ack_rate_just_over_one_is_inside_this_points_measurement_error() {
+        let mut o = healthy();
+        // 500 acked/s against agreeing brackets of ~490 => 1.02.
+        o.device_before = 500.0 / 1.02;
+        o.device_after = o.device_before;
+        let a = point_accounting(&o).expect("publishes");
+        assert!(
+            500.0 / o.device_before > 1.0 + crate::measure::DEVICE_RATIO_SLACK,
+            "premise: the OLD gate must have refused this, or this test proves \
+             nothing about the new one"
+        );
+        assert!(
+            a.invalid.is_empty(),
+            "a one-record-per-request target sits at exactly 1.0, so 1.02 is \
+             inside this point's own error and must publish: {:?}",
+            a.invalid
+        );
     }
 
     /// **The regression test for the finding that produced rev. 4.** On real
@@ -424,7 +477,10 @@ mod tests {
     #[test]
     fn the_ceiling_refusal_names_the_ack_after_durable_argument() {
         let mut o = healthy();
-        o.device_before = 500.0 / (1.0 + 2.0 * DEVICE_RATIO_SLACK);
+        // 1.2x, not 1.0 + 2*slack: the 2026-08-10 interlude gates against this
+        // point's own measurement error, and with the two samples equal that is
+        // the RATIO_TOLERANCE_FLOOR, so the ratio must clear the floor to fire.
+        o.device_before = 500.0 / 1.2;
         o.device_after = o.device_before;
         let a = point_accounting(&o).expect("implausible is named, not refused");
         assert!(
@@ -495,8 +551,8 @@ mod tests {
         o.device_before = 3500.0;
         o.device_after = 3600.0;
         let a = point_accounting(&o).expect("publishes");
-        assert_eq!(a.point.device_syncs_per_sec_before, 3500.0);
-        assert_eq!(a.point.device_syncs_per_sec_after, 3600.0);
+        assert_eq!(a.point.device_appends_per_sec_before, 3500.0);
+        assert_eq!(a.point.device_appends_per_sec_after, 3600.0);
     }
 
     /// A one-connection, one-second fixture so `client_busy_fraction` IS
@@ -562,7 +618,10 @@ mod tests {
         let mut o = healthy();
         // 500.0, not 1000.0: rev. 4 gates on the ACK rate (500/s), so a
         // ceiling just under the derived record rate no longer flags at all.
-        o.device_before = 500.0 / (1.0 + 2.0 * DEVICE_RATIO_SLACK);
+        // 1.2x, not 1.0 + 2*slack: the 2026-08-10 interlude gates against this
+        // point's own measurement error, and with the two samples equal that is
+        // the RATIO_TOLERANCE_FLOOR, so the ratio must clear the floor to fire.
+        o.device_before = 500.0 / 1.2;
         o.device_after = o.device_before;
         let a = point_accounting(&o).expect("non-fatal");
         assert!(a.invalid[0].starts_with(&prefix), "got: {:?}", a.invalid);
@@ -592,7 +651,10 @@ mod tests {
         o.per_thread = vec![250, 250, 250, 249];
         // 500.0, not 1000.0: rev. 4 gates on the ACK rate (500/s), so a
         // ceiling just under the derived record rate no longer flags at all.
-        o.device_before = 500.0 / (1.0 + 2.0 * DEVICE_RATIO_SLACK);
+        // 1.2x, not 1.0 + 2*slack: the 2026-08-10 interlude gates against this
+        // point's own measurement error, and with the two samples equal that is
+        // the RATIO_TOLERANCE_FLOOR, so the ratio must clear the floor to fire.
+        o.device_before = 500.0 / 1.2;
         o.device_after = o.device_before;
         let a = point_accounting(&o).expect("all three of these are non-fatal");
         assert_eq!(a.invalid.len(), 3, "got: {:?}", a.invalid);
@@ -642,7 +704,7 @@ mod tests {
     /// A non-finite BRACKET SAMPLE (not just a zero ceiling collapsing into
     /// one) is not locally guarded — the RAW sample flows through to the
     /// published point unmodified, so that `report::collect_non_finite`
-    /// (which scans the published `device_syncs_per_sec_before`/`_after`
+    /// (which scans the published `device_appends_per_sec_before`/`_after`
     /// fields directly, per T7 rev. 3) is what catches it, not a local check
     /// here.
     ///
@@ -658,7 +720,7 @@ mod tests {
         o.device_before = f64::NAN;
         let a = point_accounting(&o).expect("a non-finite bracket sample is not a local refusal");
         assert!(
-            a.point.device_syncs_per_sec_before.is_nan(),
+            a.point.device_appends_per_sec_before.is_nan(),
             "the raw sample must reach the published point unmodified"
         );
         assert!(

@@ -365,6 +365,62 @@ pub fn implausible_ratio(ratio: f64) -> bool {
     ratio > 1.0 + DEVICE_RATIO_SLACK
 }
 
+/// The residual error a bracket's own spread CANNOT see: both samples agreeing
+/// with each other while the true rate *during* the window differed from both.
+///
+/// Set from measurement, not from a story (the mistake ruling #4 correctly
+/// called out in the `1e-2` that preceded it): 15 `bench device` samples of the
+/// same quantity on the T8 machine spanned 197.98–234.76 syncs/s about a mean
+/// of 217.70, i.e. ±8.4%, rounded up. **A machine-measured value, not a
+/// universal constant** — on hardware with tighter fsync timing this is loose,
+/// and on noisier hardware `bracket_spread` is what carries the tolerance
+/// instead.
+pub const RATIO_TOLERANCE_FLOOR: f64 = 0.10;
+
+/// Structural non-vacuity. No bracket disagreement, however wild, excuses
+/// acking 50% faster than the ceiling — without this bound a sufficiently
+/// unstable device would tolerate anything, which is the failure mode ruling #4
+/// was right to fear. A real violation (ack-before-sync, a dropped fsync, a
+/// build that lies about durability) lands at 2x or beyond and is still caught
+/// at every spread this harness has ever observed.
+pub const RATIO_HARD_LIMIT: f64 = 1.5;
+
+/// How much the two bracket samples disagree, as a fraction of the larger.
+/// This is the estimator reporting its own precision for THIS window.
+///
+/// Non-finite or non-positive input yields `0.0` rather than a widened
+/// tolerance: a bracket that could not be measured must not be able to excuse
+/// a ratio. The `collect_non_finite` scan is what reports those separately.
+pub fn bracket_spread(before: f64, after: f64) -> f64 {
+    let hi = before.max(after);
+    if !hi.is_finite() || hi <= 0.0 {
+        return 0.0;
+    }
+    let delta = (before - after).abs();
+    if !delta.is_finite() {
+        return 0.0;
+    }
+    delta / hi
+}
+
+/// The tolerance this point has earned: never below the floor, and above it
+/// exactly as far as the harness measured itself to be imprecise here.
+pub fn ratio_tolerance(before: f64, after: f64) -> f64 {
+    RATIO_TOLERANCE_FLOOR.max(bracket_spread(before, after))
+}
+
+/// The bracketed gate (interlude spec §4.3), shared by every layer that
+/// brackets its own window — which, after this interlude, is all three.
+///
+/// Read it as: *is this ratio above 1.0 by more than the error in the two
+/// numbers that produced it?* A gate cannot detect a violation smaller than its
+/// own measurement error; the `1e-6` this replaces did not buy that detection,
+/// it bought ~50% false refusals on every layer whose true ratio is exactly 1.0
+/// (spec §1).
+pub fn implausible_bracketed_ratio(ratio: f64, before: f64, after: f64) -> bool {
+    ratio > RATIO_HARD_LIMIT || ratio > 1.0 + ratio_tolerance(before, after)
+}
+
 /// Totals-two-ways (spec §5): per-thread counters vs the grand counter.
 /// Disagreement is a harness bug, and the run that produced it is INVALID.
 pub fn crosscheck(per_thread: &[u64], grand: u64) -> Result<u64, String> {
@@ -507,6 +563,106 @@ mod tests {
         assert!(!implausible_ratio(1.0 + DEVICE_RATIO_SLACK));
         assert!(implausible_ratio(1.0 + DEVICE_RATIO_SLACK + 1e-9));
         assert!(!implausible_ratio(0.5));
+    }
+
+    #[test]
+    fn the_tolerance_is_the_floor_when_the_brackets_agree() {
+        // Real numbers, wire run 1 point 1: 213/216, agreeing to 1.4%.
+        let t = ratio_tolerance(213.0, 216.0);
+        assert_eq!(t, RATIO_TOLERANCE_FLOOR, "spread below the floor: {t}");
+    }
+
+    #[test]
+    fn the_tolerance_grows_to_the_measured_spread() {
+        // Real numbers, wire run 4 point 1: 147/215, a 31.6% disagreement. The
+        // harness measured that it cannot pin this window's denominator; the
+        // gate must not then adjudicate a 5% overshoot.
+        let t = ratio_tolerance(147.0, 215.0);
+        assert!(
+            t > RATIO_TOLERANCE_FLOOR,
+            "a 31.6% spread must exceed the floor: {t}"
+        );
+        assert!((t - (215.0 - 147.0) / 215.0).abs() < 1e-12, "got: {t}");
+    }
+
+    #[test]
+    fn the_spread_is_symmetric_in_its_arguments() {
+        // before/after order is an accident of when the sample was taken.
+        assert_eq!(bracket_spread(147.0, 215.0), bracket_spread(215.0, 147.0));
+    }
+
+    #[test]
+    fn the_hard_limit_binds_however_wide_the_spread() {
+        // The anti-vacuity case (spec §4.3). A device unstable enough to make
+        // `spread` enormous must not thereby excuse an impossible rate.
+        //
+        // The ratio here is chosen to DISCRIMINATE, and the first draft of this
+        // test did not: brackets of 1.0/1000.0 give a spread of 0.999, so the
+        // tolerance arm alone already refuses anything above 1.999 and a probe
+        // at 2.0 passed with RATIO_HARD_LIMIT deleted entirely (proven by
+        // mutation). 1.7 sits BELOW 1.0 + 0.999 and ABOVE the hard limit, so
+        // only the hard limit can refuse it.
+        assert!(ratio_tolerance(1.0, 1000.0) > 0.9, "premise of this test");
+        assert!(
+            1.7 < 1.0 + ratio_tolerance(1.0, 1000.0),
+            "premise: the tolerance arm must NOT fire here, or this test would \
+             pass without the hard limit doing anything"
+        );
+        assert!(
+            implausible_bracketed_ratio(1.7, 1.0, 1000.0),
+            "1.7x must refuse even at a 99.9% spread — this is what keeps the \
+             gate from being defeated by a noisy device"
+        );
+    }
+
+    #[test]
+    fn a_healthy_one_record_per_op_ratio_is_no_longer_refused() {
+        // Every ratio observed across the interlude's 12 healthy wire points
+        // plus the 4 core and 3 kernel runs (spec §1), against the brackets
+        // measured beside them. All must pass; under the 1e-6 slack this
+        // replaces, every one above 1.0 was refused.
+        for (ratio, before, after) in [
+            (1.086, 208.0, 198.0),
+            (1.010, 208.0, 220.0),
+            (1.036, 196.0, 218.0),
+            (1.053, 147.0, 215.0),
+            (1.072, 205.0, 211.0),
+            (1.049, 213.0, 246.0),
+        ] {
+            assert!(
+                !implausible_bracketed_ratio(ratio, before, after),
+                "healthy point refused: {ratio} with brackets {before}/{after}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unmeasurable_bracket_does_not_widen_the_tolerance() {
+        // A bracket that could not be measured must not be able to EXCUSE a
+        // ratio — the widest tolerance must come from a real disagreement, not
+        // from a missing number. `collect_non_finite` reports these separately.
+        for (b, a) in [
+            (f64::NAN, 210.0),
+            (210.0, f64::NAN),
+            (f64::NAN, f64::NAN),
+            (f64::INFINITY, 210.0),
+            (0.0, 0.0),
+            (-1.0, -2.0),
+        ] {
+            assert_eq!(
+                ratio_tolerance(b, a),
+                RATIO_TOLERANCE_FLOOR,
+                "brackets {b}/{a} must fall back to the floor"
+            );
+        }
+    }
+
+    #[test]
+    fn an_infinite_ratio_is_still_refused() {
+        // A zero ceiling divides into infinity. This was flagged before the
+        // interlude and must stay flagged: the hard limit is what catches it
+        // now, and three layers' tests assert the reason exists.
+        assert!(implausible_bracketed_ratio(f64::INFINITY, 0.0, 0.0));
     }
 
     #[test]

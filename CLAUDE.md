@@ -1017,9 +1017,69 @@ do not reorder a milestone's dependency sequence.
   Noah-ruled mid-plan interlude (2026-08-08, spec `…/2026-08-08-bench-accounting-split-
   design.md`) split the core layer's *accounting* from its *measuring* so every guard, delta
   and INVALID decision is a deterministic unit test instead of something only a real benchmark
-  run can reach. **Tasks 6 (kernel layer) and 7 (wire layer) are next**, and per that
-  interlude's spec §5 they adopt its seam from inception — raw observations struct, pure
-  accounting, thin driver — rather than copying an untested pattern.
+  run can reach. Tasks 6 (kernel layer), 7 (wire layer) and 8 (the invoicing wire target)
+  then shipped, each adopting that interlude's seam from inception per its spec §5 — raw
+  observations struct, pure accounting, thin driver — rather than copying an untested
+  pattern. **Task 9 (the `all`/`smoke` subcommands, forced-INVALID-arm tests and
+  `scripts/bench.sh`) is next**, then T10 (`docs/BENCH.md`, first numbers of record).
+- **Bench interlude — the device-ratio gate, done (2026-08-10, spec
+  docs/superpowers/specs/2026-08-10-device-ratio-gate-design.md, ledger
+  .superpowers/sdd/2026-08-10-device-ratio-gate/progress.md, commits `c10b8fa`..this
+  commit).** Opened by T8's §6 "What is NOT met" and widened by measurement: `bench` was
+  refusing HEALTHY runs at **all three** gating layers, not just invoicing's — core 4 of 4
+  red, kernel 2 of 3, wire-invoicing 3 of 6. **The premise was checked at the source and is
+  sound** (`Engine::submit` is unconditionally `append`→`sync`→`apply`, no group commit; the
+  follower's `submit_batch` is the only batching path and is explicitly "minus the client
+  ack"), so one acked request really does pay one durable sync. The defect was comparing a
+  *measured estimate* of the denominator against a `1e-6` tolerance: for any layer
+  committing one record per acked unit the true ratio is exactly **1.0**, so the
+  comparison's sign was decided entirely by measurement error. Three of the four shipped
+  configurations sit there; bench-app was the only one with margin (2.0 records/request →
+  ~0.5x), and the gate had been validated on it alone. Two error components measured: the
+  bracket used the **wrong op shape** (offset-0 rewrite of a one-byte file vs the sequential
+  WAL append it bounds — ~4.2% systematic, n=15 paired, sign test p≈0.035, with the loop-order
+  confound ruled out by an order-alternating probe at 1.0433 vs 1.0411), and the estimator's
+  own per-point spread ran 10–31%. **Three Noah rulings (2026-08-10):** shape fix + noise-aware
+  tolerance (over tolerance-only or a flat wider slack); land it as its own interlude; cut
+  across all three layers uniformly. Shipped: `device_bracket_sample` appends to a fresh
+  growing file; core and kernel divide by brackets around their own windows (finishing T7
+  rev. 3's fix at the two layers it skipped — `core_bench` already TOOK its brackets and
+  merely published them, `kernel_bench` took none, and its shipped refusal message named
+  that gap in so many words); and `measure::implausible_bracketed_ratio` gates on
+  `max(RATIO_TOLERANCE_FLOOR 0.10, bracket spread)` with a `RATIO_HARD_LIMIT` of 1.5 keeping
+  it structurally non-vacuous. `device_ceiling` left both observation structs, both `run`
+  signatures and `bench.rs`'s threading; `bench device` is now the artifact's methodology
+  header and no layer's gate input. Pre-release artifact change: the bracket fields are
+  `device_appends_per_sec_*` (a field named "syncs" holding an appends number is the record
+  inaccuracy this repo keeps paying for), and `KernelReport` gained its pair.
+  **Reopens two rulings, both argued rather than overridden** (spec §7): T8's Ruling 1
+  ("measure the ceiling on the same path") was refuted at **n=2**, which cannot see a 4.2%
+  effect inside 10%+ noise — reinstated on evidence that can carry it; and T5 re-review N-4 /
+  ruling #4, which tightened `1e-2`→`1e-6` precisely to stop absorbing sampling noise, is in
+  real tension with this and is named as such — both its premises changed (the denominator
+  was a one-shot sample then, and no layer had been measured at a true ratio of 1.0).
+  **Measured before → after:** core 0/4 → **6/6** exit 0, kernel 1/3 → **6/6**, wire-invoicing
+  3/6 → **6/6** (ratios 0.858–0.989, none above 1.0). Second-order effect worth knowing: the
+  append-shaped bracket is not merely ~4% higher but far more STABLE (spreads 0–7% vs up to
+  31.6%), so the shape fix did most of the work and the tolerance is margin — the option
+  analysis put to Noah predicted the reverse balance and was wrong in its mechanism, right in
+  its conclusion (the tolerance is still needed; core run 1 landed at 1.01 and kernel run 2 at
+  1.022, both of which the old gate refuses). **Teeth: an 8-mutation table, 8/8 RED, restores
+  sha256-identical — and it caught three of this interlude's OWN tests that could not fail for
+  the reason they claimed** (the hard-limit probe passed with the hard limit deleted, because
+  its 0.999 spread meant the tolerance arm already refused 2.0; and the kernel and wire gates
+  could both be reverted to `> 1.0 + 1e-6` with every test still green, since nothing probed
+  the band where the two gates differ). All three fixed, each now asserting its discriminating
+  premise. Also closed a renderer gap found by accident: the `device:` and `kernel:` human
+  lines were pinned nowhere, which is how edits to both passed a green suite. Evidence — 13
+  stages green: fmt, clippy `-D warnings`, guide gate, `cargo test --workspace` **twice**
+  identical (**693 passed / 0 failed / 40 ignored over 55 binaries**; the 680→693 delta is
+  reconciled exactly as 16 added minus 3 renamed), the 9/9 `--ignored` bench smokes, both
+  pinned debug replays (`0x8bee1752811ae873` 4/4, `0x348270b38f166529` 26/26), both release
+  mode-skew tripwires as `ci.yml` runs them (4/4, 1/1), a fresh invoicing 1024-universe batch
+  all green (master seed `0x4cf5a3839fb2f628`), and `git diff --stat` over `charpente-core`
+  and `charpente` **empty**. The edge matrix was deliberately not run — no replication, auth
+  or realtime behaviour is touched, which is spec §8's stated condition for skipping it.
   Do not start the LSM engine from this file alone; the triggers live in DECISIONS §7.
   The backlog below holds **one open ruled follow-up** — `applied_delta`'s release-mode wrap,
   added 2026-08-08 and the only entry in it that is open work; every other entry is record. Still-open work, none of it ruled or blocking: `TcpProxy::stop`'s

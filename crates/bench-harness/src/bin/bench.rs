@@ -386,12 +386,12 @@ fn run_layers(args: &Args, dir: &str, report: &mut Report) -> std::io::Result<bo
         "device" => true,
         "core" => {
             let dir = temp_dir("core", args.dir.as_deref()).map_err(std::io::Error::other)?;
-            let ceiling = report
-                .device
-                .as_ref()
-                .expect("device ran first")
-                .syncs_per_sec;
-            let result = bench_harness::core_bench::run(&dir, args.warmup, args.duration, ceiling);
+            // 2026-08-10 interlude §4.2: no ceiling is threaded in. This layer
+            // brackets its own write window and divides by that, exactly as
+            // the wire layer has since T7 rev. 3. `bench device` above still
+            // ran unconditionally and still publishes the `device:` line —
+            // it is the artifact's methodology header, not a gate input.
+            let result = bench_harness::core_bench::run(&dir, args.warmup, args.duration);
             let _ = std::fs::remove_dir_all(&dir); // T5 review, M-3: clean up on Err too (mirrors the device arm's M-5 fix).
             let (core, invalid) = result?;
             report.core = Some(core);
@@ -400,14 +400,12 @@ fn run_layers(args: &Args, dir: &str, report: &mut Report) -> std::io::Result<bo
         }
         "kernel" => {
             let dir = temp_dir("kernel", args.dir.as_deref()).map_err(std::io::Error::other)?;
-            // T6 review, M-5 / Noah ruling: this layer gets the same ceiling
-            // the core arm does — the device layer above ran unconditionally.
-            let ceiling = report
-                .device
-                .as_ref()
-                .expect("device ran first")
-                .syncs_per_sec;
-            let result = bench_harness::kernel_bench::run(&dir, args.requests, ceiling);
+            // 2026-08-10 interlude §4.2: like the core arm, this layer now
+            // brackets its own window rather than taking layer 1's one-shot
+            // sample. T6 review M-5's "the same ceiling the core arm does"
+            // still holds — it is just that both arms' ceiling is now their
+            // own bracket max.
+            let result = bench_harness::kernel_bench::run(&dir, args.requests);
             let _ = std::fs::remove_dir_all(&dir);
             let (kernel, invalid) = result?;
             report.kernel = Some(kernel);
@@ -680,8 +678,8 @@ mod tests {
             reads_per_sec: 1.0,
             device_ratio: f64::NAN,
             device_ratio_denominator: "device.syncs_per_sec",
-            device_syncs_per_sec_before: 1.0,
-            device_syncs_per_sec_after: 1.0,
+            device_appends_per_sec_before: 1.0,
+            device_appends_per_sec_after: 1.0,
         });
         assert!(
             r.invalid.is_empty(),

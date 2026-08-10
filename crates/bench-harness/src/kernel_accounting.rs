@@ -17,7 +17,10 @@
 //! mechanical (T6 review, I-3), and a module whose stated reason for existing
 //! is mechanical enforcement is the last place to overstate it.
 
-use crate::measure::{crosscheck, degenerate_batch_reason, implausible_ratio};
+use crate::measure::{
+    RATIO_TOLERANCE_FLOOR, bracket_spread, crosscheck, degenerate_batch_reason,
+    implausible_bracketed_ratio, ratio_tolerance,
+};
 use std::time::Duration;
 
 /// What one measured kernel batch observed. Every field is a count, a duration
@@ -34,10 +37,15 @@ pub struct KernelObs {
     /// `KernelStats::requests` — totals source 2, counted by the kernel's own
     /// dispatch rather than by the sink.
     pub stats_requests: u64,
-    /// `device.syncs_per_sec`, the ceiling this layer's log-record rate is
-    /// checked against (T6 review, M-5 / Noah ruling). The device layer runs
-    /// first unconditionally, so every `bench` subcommand has it.
-    pub device_ceiling: f64,
+    /// This layer's own device bracket samples, taken either side of the
+    /// `Kernel::run` batch window (interlude spec §4.2, Noah ruling
+    /// 2026-08-10). Through T8 this was `device_ceiling` — layer 1's one-shot
+    /// `device.syncs_per_sec` from a separate invocation — and the shipped
+    /// refusal message itself named the gap: "this layer takes no bracket
+    /// samples of its own to show the spread". It does now, and the accounting
+    /// divides by `max(before, after)`, the worse of the two.
+    pub device_before: f64,
+    pub device_after: f64,
     /// `KernelStats::jobs_done` — totals source 3. Every `/hit/:id` enqueues
     /// exactly one `Bump` (lib.rs's canonical route), so a drained batch must
     /// finish exactly as many jobs as it served requests.
@@ -64,8 +72,8 @@ pub struct KernelAccounting {
     /// carries — so without this field the header describes a window this
     /// layer never used.
     pub window_secs: f64,
-    /// `log_records_per_sec / device_ceiling`. See the gate in
-    /// `kernel_accounting` for why the LOG rate is the operand.
+    /// `log_records_per_sec / max(device_before, device_after)`. See the gate
+    /// in `kernel_accounting` for why the LOG rate is the operand.
     pub device_ratio: f64,
     pub invalid: Vec<String>,
 }
@@ -157,18 +165,24 @@ pub fn kernel_accounting(k: &KernelObs) -> Result<KernelAccounting, String> {
     // LOG RECORD rate, not the ack rate. Hence `log_records_per_sec /
     // syncs_per_sec`, equivalently `acked_writes_per_sec <= syncs_per_sec / 2`.
     // Measured headroom on this machine is about 1%, so this is not slack.
-    let device_ratio = log_records_per_sec / k.device_ceiling;
-    if implausible_ratio(device_ratio) {
+    let ceiling = k.device_before.max(k.device_after);
+    let device_ratio = log_records_per_sec / ceiling;
+    if implausible_bracketed_ratio(device_ratio, k.device_before, k.device_after) {
         invalid.push(format!(
-            "INVALID: device_ratio {device_ratio:.3} exceeds 1.0 — this layer spends two \
-             durable syncs per request (the request's own effects record and its Bump's \
-             Done-mark), and Engine::submit performs exactly one wal.sync() per transaction \
-             with no group commit, so {log_records_per_sec:.2} log records/s cannot exceed \
-             device.syncs_per_sec ({:.2}); a ratio above 1.0 is a measurement artifact \
-             rather than a real durability finding. The likeliest cause is cross-window \
-             variance — device.syncs_per_sec is a single sample from a separate measured \
-             window, and this layer takes no bracket samples of its own to show the spread",
-            k.device_ceiling
+            "INVALID: device_ratio {device_ratio:.3} exceeds 1.0 by more than this window's \
+             own measurement error ({:.1}%) — this layer spends two durable syncs per request \
+             (the request's own effects record and its Bump's Done-mark), and Engine::submit \
+             performs exactly one wal.sync() per transaction with no group commit, so \
+             {log_records_per_sec:.2} log records/s cannot exceed the device's own durable \
+             rate. The denominator is this batch's own bracket max ({ceiling:.2}) from the \
+             samples either side of the window ({:.2} before / {:.2} after); the tolerance is \
+             the wider of those two disagreeing ({:.1}%) and the {:.1}% floor for drift a \
+             bracket cannot see",
+            ratio_tolerance(k.device_before, k.device_after) * 100.0,
+            k.device_before,
+            k.device_after,
+            bracket_spread(k.device_before, k.device_after) * 100.0,
+            RATIO_TOLERANCE_FLOOR * 100.0,
         ));
     }
 
@@ -184,7 +198,7 @@ pub fn kernel_accounting(k: &KernelObs) -> Result<KernelAccounting, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::measure::{DEVICE_RATIO_SLACK, MIN_MEASURED_OPS, MIN_MEASURED_WINDOW};
+    use crate::measure::{MIN_MEASURED_OPS, MIN_MEASURED_WINDOW};
 
     /// A plausible healthy batch: 10,000 requests drained in 2s, all three
     /// totals agreeing, every response 200. Every derived quantity is exact in
@@ -203,7 +217,8 @@ mod tests {
             // 10_000 log records/s against a 20_000/s ceiling — ratio 0.5,
             // comfortably plausible, and an exact binary fraction so the
             // equality below is legitimate rather than lucky.
-            device_ceiling: 20_000.0,
+            device_before: 20_000.0,
+            device_after: 20_000.0,
         }
     }
 
@@ -344,7 +359,8 @@ mod tests {
         o.responses_recorded -= 1;
         o.stats_requests -= 2;
         o.stats_jobs_done -= 3;
-        o.device_ceiling = 1.0; // forces the ratio reason too
+        o.device_before = 1.0; // forces the ratio reason too
+        o.device_after = 1.0;
         let a = kernel_accounting(&o).expect("all five of these are non-fatal");
         let shape: Vec<&str> = a
             .invalid
@@ -428,7 +444,10 @@ mod tests {
     fn a_log_rate_above_the_device_ceiling_is_flagged_and_at_the_ceiling_is_not() {
         let mut o = healthy();
         // Exactly at the ceiling: 10_000 log records/s against 10_000 syncs/s.
-        o.device_ceiling = 10_000.0;
+        // This is where a healthy two-syncs-per-request batch actually sits,
+        // which is the whole reason the interlude widened the tolerance.
+        o.device_before = 10_000.0;
+        o.device_after = 10_000.0;
         let a = kernel_accounting(&o).expect("publishes");
         assert_eq!(a.device_ratio, 1.0);
         assert!(
@@ -437,8 +456,10 @@ mod tests {
             a.invalid
         );
 
-        // Above it: impossible, so flagged by name.
-        o.device_ceiling = 10_000.0 / (1.0 + 2.0 * DEVICE_RATIO_SLACK);
+        // Above the tolerance: flagged by name. The brackets AGREE here, so
+        // the tolerance is the floor and 1.2 is genuinely beyond it.
+        o.device_before = 10_000.0 / 1.2;
+        o.device_after = 10_000.0 / 1.2;
         let a = kernel_accounting(&o).expect("implausible is named, not refused");
         assert_eq!(a.invalid.len(), 1, "got: {:?}", a.invalid);
         assert!(
@@ -452,6 +473,36 @@ mod tests {
             a.invalid
         );
         assert!(a.invalid[0].contains("INVALID"), "got: {:?}", a.invalid);
+    }
+
+    /// 2026-08-10 interlude, the DISCRIMINATING case for this layer's gate.
+    ///
+    /// Found by mutation: with only the 1.0 and 1.2x probes above, swapping
+    /// `implausible_bracketed_ratio` back for the old `ratio > 1.0 + 1e-6`
+    /// left every kernel test green — 1.0 passes under both gates and 1.2x
+    /// fails under both, so nothing here could tell them apart. This is the
+    /// band where they differ, and it is not hypothetical: `bench kernel` run
+    /// 2 of the interlude's own evidence measured exactly 1.022, and the old
+    /// gate refused it.
+    #[test]
+    fn a_log_rate_just_over_one_is_inside_this_batchs_measurement_error() {
+        let mut o = healthy();
+        // 10_000 log records/s against agreeing brackets of 9_785 => 1.022.
+        o.device_before = 10_000.0 / 1.022;
+        o.device_after = o.device_before;
+        let a = kernel_accounting(&o).expect("publishes");
+        assert!(
+            a.device_ratio > 1.0 + crate::measure::DEVICE_RATIO_SLACK,
+            "premise: the OLD gate must have refused this, or the test proves \
+             nothing about the new one — ratio {}",
+            a.device_ratio
+        );
+        assert!(
+            a.invalid.is_empty(),
+            "a two-syncs-per-request batch sits at exactly 1.0, so 1.022 is \
+             inside this window's own error and must publish: {:?}",
+            a.invalid
+        );
     }
 
     /// The ceiling operand is the LOG rate, not the ack rate — getting this

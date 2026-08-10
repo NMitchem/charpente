@@ -45,8 +45,8 @@ pub struct CoreReport {
     // ratio's error bar is visible in the artifact instead of invisible —
     // a single sample per operand cannot distinguish a real >1x reading
     // from cross-window noise.
-    pub device_syncs_per_sec_before: f64,
-    pub device_syncs_per_sec_after: f64,
+    pub device_appends_per_sec_before: f64,
+    pub device_appends_per_sec_after: f64,
 }
 #[derive(Debug, Clone)]
 pub struct KernelReport {
@@ -56,10 +56,17 @@ pub struct KernelReport {
     // --duration, so the artifact's methodology header describes a window it
     // never used. Publish the one it did measure.
     pub window_secs: f64,
-    // T6 review, M-5 / Noah ruling: log_records_per_sec / device.syncs_per_sec
-    // — two durable syncs per request, so the LOG rate is what the ceiling
-    // bounds one-for-one.
+    // T6 review, M-5 / Noah ruling: two durable syncs per request, so the LOG
+    // rate is what the ceiling bounds one-for-one. 2026-08-10 interlude: the
+    // denominator is this batch's own bracket max, not layer 1's one-shot
+    // device.syncs_per_sec.
     pub device_ratio: f64,
+    // 2026-08-10 interlude §4.2: this layer brackets its own batch window, as
+    // core and wire already did. The shipped refusal message used to name the
+    // absence of exactly these two fields as the likeliest cause of its own
+    // firing.
+    pub device_appends_per_sec_before: f64,
+    pub device_appends_per_sec_after: f64,
     pub requests_total: u64,
     pub jobs_done: u64,
 }
@@ -88,8 +95,8 @@ pub struct SweepPoint {
     // alarms came from the DERIVED numerator, not this denominator. NOT
     // comparable to CoreReport::device_ratio or KernelReport::device_ratio —
     // different denominators (see wire_accounting's module doc).
-    pub device_syncs_per_sec_before: f64,
-    pub device_syncs_per_sec_after: f64,
+    pub device_appends_per_sec_before: f64,
+    pub device_appends_per_sec_after: f64,
     pub p50_us: u64,
     pub p99_us: u64,
     pub p999_us: u64,
@@ -156,13 +163,13 @@ fn collect_non_finite(r: &Report) -> Vec<String> {
         push_if_non_finite(&mut out, "core.device_ratio", c.device_ratio);
         push_if_non_finite(
             &mut out,
-            "core.device_syncs_per_sec_before",
-            c.device_syncs_per_sec_before,
+            "core.device_appends_per_sec_before",
+            c.device_appends_per_sec_before,
         );
         push_if_non_finite(
             &mut out,
-            "core.device_syncs_per_sec_after",
-            c.device_syncs_per_sec_after,
+            "core.device_appends_per_sec_after",
+            c.device_appends_per_sec_after,
         );
     }
     if let Some(k) = &r.kernel {
@@ -178,6 +185,19 @@ fn collect_non_finite(r: &Report) -> Vec<String> {
         );
         push_if_non_finite(&mut out, "kernel.window_secs", k.window_secs);
         push_if_non_finite(&mut out, "kernel.device_ratio", k.device_ratio);
+        // 2026-08-10 interlude: scanned by the SAME scan as core's and wire's
+        // equivalents — a published field this scan skips is exactly how the
+        // two renderers drift apart (T7's Step 1 finding, one layer over).
+        push_if_non_finite(
+            &mut out,
+            "kernel.device_appends_per_sec_before",
+            k.device_appends_per_sec_before,
+        );
+        push_if_non_finite(
+            &mut out,
+            "kernel.device_appends_per_sec_after",
+            k.device_appends_per_sec_after,
+        );
     }
     for w in &r.wire {
         for (pi, p) in w.points.iter().enumerate() {
@@ -195,13 +215,13 @@ fn collect_non_finite(r: &Report) -> Vec<String> {
             push_if_non_finite(&mut out, &format!("{prefix}.device_ratio"), p.device_ratio);
             push_if_non_finite(
                 &mut out,
-                &format!("{prefix}.device_syncs_per_sec_before"),
-                p.device_syncs_per_sec_before,
+                &format!("{prefix}.device_appends_per_sec_before"),
+                p.device_appends_per_sec_before,
             );
             push_if_non_finite(
                 &mut out,
-                &format!("{prefix}.device_syncs_per_sec_after"),
-                p.device_syncs_per_sec_after,
+                &format!("{prefix}.device_appends_per_sec_after"),
+                p.device_appends_per_sec_after,
             );
             push_if_non_finite(
                 &mut out,
@@ -275,25 +295,28 @@ pub fn render_json(r: &Report) -> Result<String, String> {
         s.push_str(&format!(
             ",\"core\":{{\"acked_writes_per_sec\":{},\"log_records_per_sec\":{},\
              \"reads_per_sec\":{},\"device_ratio\":{},\"device_ratio_denominator\":\"{}\",\
-             \"device_syncs_per_sec_before\":{},\"device_syncs_per_sec_after\":{}}}",
+             \"device_appends_per_sec_before\":{},\"device_appends_per_sec_after\":{}}}",
             num2(c.acked_writes_per_sec),
             num2(c.log_records_per_sec),
             num2(c.reads_per_sec),
             num3(c.device_ratio),
             esc(c.device_ratio_denominator),
-            num2(c.device_syncs_per_sec_before),
-            num2(c.device_syncs_per_sec_after)
+            num2(c.device_appends_per_sec_before),
+            num2(c.device_appends_per_sec_after)
         ));
     }
     if let Some(k) = &r.kernel {
         s.push_str(&format!(
             ",\"kernel\":{{\"acked_writes_per_sec\":{},\"log_records_per_sec\":{},\
              \"window_secs\":{},\"device_ratio\":{},\
+             \"device_appends_per_sec_before\":{},\"device_appends_per_sec_after\":{},\
              \"requests_total\":{},\"jobs_done\":{}}}",
             num2(k.acked_writes_per_sec),
             num2(k.log_records_per_sec),
             num2(k.window_secs),
             num3(k.device_ratio),
+            num2(k.device_appends_per_sec_before),
+            num2(k.device_appends_per_sec_after),
             k.requests_total,
             k.jobs_done
         ));
@@ -312,15 +335,15 @@ pub fn render_json(r: &Report) -> Result<String, String> {
                 s.push_str(&format!(
                     "{{\"connections\":{},\"throughput_per_sec\":{},\
                      \"log_records_per_sec\":{},\"device_ratio\":{},\
-                     \"device_syncs_per_sec_before\":{},\"device_syncs_per_sec_after\":{},\
+                     \"device_appends_per_sec_before\":{},\"device_appends_per_sec_after\":{},\
                      \"p50_us\":{},\"p99_us\":{},\"p999_us\":{},\"client_busy_fraction\":{},\
                      \"saturated\":{}}}",
                     p.connections,
                     num2(p.throughput_per_sec),
                     num2(p.log_records_per_sec),
                     num3(p.device_ratio),
-                    num2(p.device_syncs_per_sec_before),
-                    num2(p.device_syncs_per_sec_after),
+                    num2(p.device_appends_per_sec_before),
+                    num2(p.device_appends_per_sec_after),
                     p.p50_us,
                     p.p99_us,
                     p.p999_us,
@@ -366,19 +389,22 @@ pub fn render_human(r: &Report) -> String {
     ));
     if let Some(d) = &r.device {
         s.push_str(&format!(
-            "  device: {:.0} syncs/s, {:.0} appends/s (the ceiling)\n",
+            // 2026-08-10 interlude: no longer "(the ceiling)". Since §4.2 no
+            // layer divides by these; each brackets its own window. This line
+            // is the artifact's methodology header, not a gate input.
+            "  device: {:.0} syncs/s, {:.0} appends/s (reference; layers bracket their own)\n",
             d.syncs_per_sec, d.appends_per_sec
         ));
     }
     if let Some(c) = &r.core {
         s.push_str(&format!(
-            "  core:   {:.0} acked writes/s ({:.2}x {}, bracket {:.0}/{:.0} syncs/s \
+            "  core:   {:.0} acked writes/s ({:.2}x {}, bracket {:.0}/{:.0} appends/s \
              before/after), {:.0} log records/s, {:.0} reads/s\n",
             c.acked_writes_per_sec,
             c.device_ratio,
             c.device_ratio_denominator,
-            c.device_syncs_per_sec_before,
-            c.device_syncs_per_sec_after,
+            c.device_appends_per_sec_before,
+            c.device_appends_per_sec_after,
             c.log_records_per_sec,
             c.reads_per_sec
         ));
@@ -388,13 +414,16 @@ pub fn render_human(r: &Report) -> String {
             // T6 review, I-4: name this layer's OWN window here. The header
             // above carries --warmup/--duration, which this layer never read.
             "  kernel: {:.0} acked writes/s, {:.0} log records/s ({} requests, {} jobs; \
-             {:.2}s batch window, no warmup; device_ratio {:.3})\n",
+             {:.2}s batch window, no warmup; device_ratio {:.3}, bracket {:.0}/{:.0} \
+             appends/s before/after)\n",
             k.acked_writes_per_sec,
             k.log_records_per_sec,
             k.requests_total,
             k.jobs_done,
             k.window_secs,
-            k.device_ratio
+            k.device_ratio,
+            k.device_appends_per_sec_before,
+            k.device_appends_per_sec_after
         ));
     }
     for w in &r.wire {
@@ -402,14 +431,14 @@ pub fn render_human(r: &Report) -> String {
         for p in &w.points {
             s.push_str(&format!(
                 "    {:>4} conns: {:>8.0} req/s  {:>8.0} rec/s  {:.3}x dev (bracket {:.0}/{:.0} \
-                 syncs/s before/after)  p50 {:>6}us  p99 {:>6}us  p99.9 {:>6}us  client busy \
+                 appends/s before/after)  p50 {:>6}us  p99 {:>6}us  p99.9 {:>6}us  client busy \
                  {:.0}%{}\n",
                 p.connections,
                 p.throughput_per_sec,
                 p.log_records_per_sec,
                 p.device_ratio,
-                p.device_syncs_per_sec_before,
-                p.device_syncs_per_sec_after,
+                p.device_appends_per_sec_before,
+                p.device_appends_per_sec_after,
                 p.p50_us,
                 p.p99_us,
                 p.p999_us,
@@ -451,15 +480,17 @@ mod tests {
                 log_records_per_sec: 1450.0,
                 reads_per_sec: 800000.0,
                 device_ratio: 0.97,
-                device_ratio_denominator: "device.syncs_per_sec",
-                device_syncs_per_sec_before: 1490.0,
-                device_syncs_per_sec_after: 1510.0,
+                device_ratio_denominator: "the device bracket max",
+                device_appends_per_sec_before: 1490.0,
+                device_appends_per_sec_after: 1510.0,
             }),
             kernel: Some(KernelReport {
                 acked_writes_per_sec: 1300.0,
                 log_records_per_sec: 2600.0,
                 window_secs: 38.46,
                 device_ratio: 0.867,
+                device_appends_per_sec_before: 2980.0,
+                device_appends_per_sec_after: 3020.0,
                 requests_total: 50000,
                 jobs_done: 50000,
             }),
@@ -470,8 +501,8 @@ mod tests {
                     throughput_per_sec: 1200.0,
                     log_records_per_sec: 2400.0,
                     device_ratio: 0.685,
-                    device_syncs_per_sec_before: 3500.0,
-                    device_syncs_per_sec_after: 3600.0,
+                    device_appends_per_sec_before: 3500.0,
+                    device_appends_per_sec_after: 3600.0,
                     p50_us: 800,
                     p99_us: 2100,
                     p999_us: 5000,
@@ -495,15 +526,17 @@ mod tests {
              \"duration_secs\":30.00,\"device\":{\"syncs_per_sec\":1500.25,\
              \"appends_per_sec\":1400.50},\"core\":{\"acked_writes_per_sec\":1450.00,\
              \"log_records_per_sec\":1450.00,\"reads_per_sec\":800000.00,\
-             \"device_ratio\":0.970,\"device_ratio_denominator\":\"device.syncs_per_sec\",\
-             \"device_syncs_per_sec_before\":1490.00,\"device_syncs_per_sec_after\":1510.00},\
+             \"device_ratio\":0.970,\"device_ratio_denominator\":\"the device bracket max\",\
+             \"device_appends_per_sec_before\":1490.00,\"device_appends_per_sec_after\":1510.00},\
              \"kernel\":{\"acked_writes_per_sec\":1300.00,\
              \"log_records_per_sec\":2600.00,\"window_secs\":38.46,\
-             \"device_ratio\":0.867,\"requests_total\":50000,\"jobs_done\":50000},\
+             \"device_ratio\":0.867,\"device_appends_per_sec_before\":2980.00,\
+             \"device_appends_per_sec_after\":3020.00,\
+             \"requests_total\":50000,\"jobs_done\":50000},\
              \"wire\":[{\"target\":\"bench-app\",\"points\":[{\"connections\":4,\
              \"throughput_per_sec\":1200.00,\"log_records_per_sec\":2400.00,\
-             \"device_ratio\":0.685,\"device_syncs_per_sec_before\":3500.00,\
-             \"device_syncs_per_sec_after\":3600.00,\"p50_us\":800,\"p99_us\":2100,\
+             \"device_ratio\":0.685,\"device_appends_per_sec_before\":3500.00,\
+             \"device_appends_per_sec_after\":3600.00,\"p50_us\":800,\"p99_us\":2100,\
              \"p999_us\":5000,\
              \"client_busy_fraction\":0.120,\"saturated\":false}]}],\"invalid\":[]}}"
         );
@@ -611,23 +644,23 @@ mod tests {
     #[test]
     fn the_bracket_sample_fields_are_scanned_for_non_finite() {
         let mut r = fixed_report();
-        r.core.as_mut().unwrap().device_syncs_per_sec_before = f64::NAN;
-        r.core.as_mut().unwrap().device_syncs_per_sec_after = f64::INFINITY;
+        r.core.as_mut().unwrap().device_appends_per_sec_before = f64::NAN;
+        r.core.as_mut().unwrap().device_appends_per_sec_after = f64::INFINITY;
         let json = render_json(&r).expect("non-finite floats are recorded, not refused");
         assert!(
-            json.contains("\"device_syncs_per_sec_before\":null"),
+            json.contains("\"device_appends_per_sec_before\":null"),
             "got: {json}"
         );
         assert!(
-            json.contains("\"device_syncs_per_sec_after\":null"),
+            json.contains("\"device_appends_per_sec_after\":null"),
             "got: {json}"
         );
         assert!(
-            json.contains("core.device_syncs_per_sec_before is not finite (NaN)"),
+            json.contains("core.device_appends_per_sec_before is not finite (NaN)"),
             "got: {json}"
         );
         assert!(
-            json.contains("core.device_syncs_per_sec_after is not finite (inf)"),
+            json.contains("core.device_appends_per_sec_after is not finite (inf)"),
             "got: {json}"
         );
     }
@@ -660,7 +693,7 @@ mod tests {
         );
     }
 
-    // T7 rev. 3: `SweepPoint::device_syncs_per_sec_before`/`_after` must be
+    // T7 rev. 3: `SweepPoint::device_appends_per_sec_before`/`_after` must be
     // scanned by the SAME central non-finite path as every other float — the
     // `CoreReport` twin above (`the_bracket_sample_fields_are_scanned_for_
     // non_finite`) is the precedent this mirrors. `wire_accounting`'s own
@@ -670,33 +703,33 @@ mod tests {
     #[test]
     fn the_wire_bracket_sample_fields_are_scanned_for_non_finite() {
         let mut r = fixed_report();
-        r.wire[0].points[0].device_syncs_per_sec_before = f64::NAN;
-        r.wire[0].points[0].device_syncs_per_sec_after = f64::INFINITY;
+        r.wire[0].points[0].device_appends_per_sec_before = f64::NAN;
+        r.wire[0].points[0].device_appends_per_sec_after = f64::INFINITY;
         let json = render_json(&r).expect("non-finite floats are recorded, not refused");
         assert!(
-            json.contains("\"device_syncs_per_sec_before\":null"),
+            json.contains("\"device_appends_per_sec_before\":null"),
             "got: {json}"
         );
         assert!(
-            json.contains("\"device_syncs_per_sec_after\":null"),
+            json.contains("\"device_appends_per_sec_after\":null"),
             "got: {json}"
         );
         assert!(
             json.contains(
-                "wire[bench-app].points[0].device_syncs_per_sec_before is not finite (NaN)"
+                "wire[bench-app].points[0].device_appends_per_sec_before is not finite (NaN)"
             ),
             "got: {json}"
         );
         assert!(
             json.contains(
-                "wire[bench-app].points[0].device_syncs_per_sec_after is not finite (inf)"
+                "wire[bench-app].points[0].device_appends_per_sec_after is not finite (inf)"
             ),
             "got: {json}"
         );
         let human = render_human(&r);
         assert!(
             human.contains(
-                "!! wire[bench-app].points[0].device_syncs_per_sec_before is not finite (NaN)"
+                "!! wire[bench-app].points[0].device_appends_per_sec_before is not finite (NaN)"
             ),
             "render_human must surface the same reason, got: {human}"
         );
@@ -720,8 +753,33 @@ mod tests {
         );
         assert_eq!(
             lines[2],
-            "  core:   1450 acked writes/s (0.97x device.syncs_per_sec, bracket 1490/1510 \
-             syncs/s before/after), 1450 log records/s, 800000 reads/s",
+            "  core:   1450 acked writes/s (0.97x the device bracket max, bracket 1490/1510 \
+             appends/s before/after), 1450 log records/s, 800000 reads/s",
+            "got: {human}"
+        );
+    }
+
+    /// 2026-08-10 interlude, spec §6.6. Two human lines this file changed were
+    /// pinned NOWHERE, which is how an edit to both passed a full green suite:
+    /// the `device:` line (whose parenthetical stopped being true the moment
+    /// §4.2 stopped any layer dividing by it) and the `kernel:` line (which
+    /// gained the bracket pair). The N-3 pin above exists because exactly this
+    /// class of silent renderer regression shipped once already.
+    #[test]
+    fn render_human_device_and_kernel_lines_are_pinned() {
+        let human = render_human(&fixed_report());
+        let lines: Vec<&str> = human.lines().collect();
+        assert_eq!(
+            lines[1],
+            // 1400.50 renders as 1400, not 1401: `{:.0}` rounds half to even.
+            "  device: 1500 syncs/s, 1400 appends/s (reference; layers bracket their own)",
+            "got: {human}"
+        );
+        assert_eq!(
+            lines[3],
+            "  kernel: 1300 acked writes/s, 2600 log records/s (50000 requests, 50000 jobs; \
+             38.46s batch window, no warmup; device_ratio 0.867, bracket 2980/3020 \
+             appends/s before/after)",
             "got: {human}"
         );
     }
