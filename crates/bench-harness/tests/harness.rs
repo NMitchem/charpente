@@ -1,5 +1,13 @@
-//! Syscall-touching smokes for the bench harness — every test here is
-//! #[ignore] (edge-harness convention) and runs via `scripts/bench.sh --smoke`.
+//! Syscall-touching smokes for the bench harness — #[ignore] by the
+//! edge-harness convention, run via `scripts/bench.sh --smoke`.
+//!
+//! T9 exception, stated because the blanket claim used to be true and is not:
+//! the two forced-INVALID-arm tests at the bottom of this file are NOT
+//! ignored. They spawn no process, bind no port and touch no data directory —
+//! one holds a mutex, the other builds a struct and renders it — so the reason
+//! the convention exists does not apply to them, and they run in every
+//! `cargo test --workspace`. The criterion is "does it need a process, a port
+//! or a disk", not a count.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::time::Duration;
@@ -91,12 +99,17 @@ fn core_layer_commits_and_reports_a_ratio() {
     let _ = std::fs::remove_dir_all(&base);
     // NOT `invalid.is_empty()` (M-2 kept that assertion for the pre-existing
     // heartbeat arms, which need the machine to be genuinely broken to fire —
-    // this is a DIFFERENT source). C-1's ratio gate is designed to fire on
-    // short/noisy windows — the review measured it 2-in-7 even on a "quiet"
-    // machine with fully separate runs, and this smoke's 1s windows plus
-    // real parallel-test contention make it MORE likely, not less. A gate
-    // that never fires on a short window would be the bug (that is C-1
-    // itself). Tolerate only that one, named, reason; any OTHER invalid
+    // this is a DIFFERENT source). C-1's ratio gate fires on short/noisy
+    // windows — the review measured it 2-in-7 even on a "quiet" machine with
+    // fully separate runs, and this smoke's 1s windows plus real
+    // parallel-test contention made it MORE likely, not less.
+    //
+    // 2026-08-10 interlude: that frequency is now historical. This layer used
+    // to divide by layer 1's one-shot `device.syncs_per_sec` and went red 4 of
+    // 4 `bench core` runs; dividing by its own brackets, at its own measured
+    // error, it went 6 of 6 GREEN with ratios 0.91-1.01. The tolerance is kept
+    // because a gate that CANNOT fire would be vacuous — not because firing is
+    // still expected. Tolerate only that one, named, reason; any OTHER invalid
     // reason on a healthy short run means something really regressed.
     for reason in &invalid {
         assert!(
@@ -433,26 +446,35 @@ fn wire_layer_sweeps_the_bench_app() {
 // **Why this smoke does NOT assert `invalid.is_empty()` while its bench-app
 // twin above does (Noah ruling, 2026-08-10).** invoicing commits ONE log
 // record per request, so its acked-request rate and the device ceiling are
-// the same physical quantity, and T7 rev. 4's gate sits at exactly 1.0x.
-// Measured on an Apple M4 Pro / apfs: the raw fsync bracket reads 219-246/s,
-// a `Wal::append`+`Wal::sync` loop 224-231/s, a bare in-process `Db::transact`
-// loop 246/s (1.00x the ceiling, with no HTTP at all), and this target
-// 237-257/s. The commit path is entirely fsync-bound, so every one of those
-// measures the same thing to within its own +/-5% noise, and the gate fired on
-// roughly one healthy run in three. bench-app never shows it because its 2.0
-// records-per-request buys a 2x margin — rev. 4's "no false-alarm path" was
-// established only where the gate had headroom.
+// the same physical quantity, and the gate sits at exactly 1.0x. bench-app
+// never shows it because its 2.0 records-per-request buys a 2x margin — T7
+// rev. 4's "no false-alarm path" was established only where the gate had
+// headroom.
 //
-// Measuring the ceiling on the WAL path instead was tried first and is
-// refuted by the numbers above: there is no path meaningfully faster than the
-// thing being bounded. So the gate stays exactly as it is — unweakened, and
-// still catching a genuinely impossible number — and this smoke tolerates
-// that ONE named reason, which is precisely what
-// `core_layer_commits_and_reports_a_ratio` already does one layer down for
-// the same reason. Any OTHER reason still reddens: a 401 storm, a lost point,
-// a disagreeing crosscheck and a starved heartbeat all carry different
-// wording, and a LOST point additionally fails the `points.len()` assertion
-// below, since a lost point publishes nothing.
+// **UPDATED by the 2026-08-10 device-ratio-gate interlude, which disproved
+// part of what this comment used to say.** The shipped text claimed
+// "measuring the ceiling on the WAL path was tried first and is refuted …
+// there is no path meaningfully faster than the thing being bounded". That
+// refutation rested on n=2. Re-run at n=15 paired, with the loop-order
+// confound controlled at n=14, the append shape is ~4.2% FASTER than the
+// one-byte-rewrite shape the bracket used (mean paired ratio 1.0421, faster
+// in 12 of 15, sign test p~0.035) — so the bracket was ~4% BELOW the path it
+// was bounding, and was never an upper bound at all. The interlude's §4.1
+// reinstates that idea; §4.3 then gates against each point's own measurement
+// error rather than `1.0 + 1e-6`.
+//
+// The tolerance below therefore STAYS, but its expected frequency inverts:
+// before the interlude this gate fired on roughly one healthy run in three,
+// and after it, six consecutive `bench wire --target invoicing` runs produced
+// ratios of 0.858-0.989 with the gate never firing. It is kept because a gate
+// that CANNOT fire on a short window would be vacuous, not because firing is
+// still routine — if it starts firing again on healthy runs, that is a
+// finding, not the weather. `core_layer_commits_and_reports_a_ratio` carries
+// the same tolerance one layer down for the same reason. Any OTHER reason
+// still reddens: a 401 storm, a lost point, a disagreeing crosscheck and a
+// starved heartbeat all carry different wording, and a LOST point
+// additionally fails the `points.len()` assertion below, since a lost point
+// publishes nothing.
 #[test]
 #[ignore]
 fn wire_layer_drives_invoicing_through_login() {
@@ -484,5 +506,191 @@ fn wire_layer_drives_invoicing_through_login() {
     assert_eq!(
         wire.points[0].log_records_per_sec,
         wire.points[0].throughput_per_sec
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T9: the forced INVALID arms (spec §7 — each arm proven by construction, not
+// by waiting for a real run to happen to produce it).
+//
+// These two are deliberately NOT #[ignore]: neither spawns a process, binds a
+// port, or writes a data directory. See this file's module doc.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_starved_heartbeat_flags_invalid_through_its_real_path() {
+    // Threads only. Holding the gate starves the tick thread through the exact
+    // mutex it takes every tick — the real path, not a mocked verdict.
+    let hb = bench_harness::measure::Heartbeat::start();
+    let gate = hb.gate();
+    let held = gate.lock().expect("test holds the heartbeat gate");
+    std::thread::sleep(Duration::from_millis(300));
+    drop(held);
+    let verdict = hb.finish().expect("a starved heartbeat must flag the run");
+    assert!(verdict.contains("INVALID"), "got: {verdict}");
+    // AMENDED at Task 4's re-review (2026-08-07, finding I-A): this rig starves
+    // the heartbeat thread while the process stays AWAKE, which is the
+    // STARVATION arm, not the suspension arm. T4's I-5 fix split the two and
+    // reworded this reason accordingly, so asserting "suspended" here now
+    // fails. Assert the arm this test actually exercises.
+    assert!(verdict.contains("starved"), "got: {verdict}");
+}
+
+#[test]
+fn a_saturated_client_is_flagged_on_the_point() {
+    // The saturation rule is arithmetic on measured CPU (spec §4); force it by
+    // construction — busy_fraction 1.0 against the 0.9 threshold — and assert
+    // the RENDERING. `a_saturated_client_is_flagged_through_the_real_sweep`
+    // below is the sibling that proves the CLASSIFICATION through wire::sweep's
+    // own CPU arithmetic; this one would pass even if that formula were wrong,
+    // which is exactly why both exist (plan-review I-4).
+    let p = bench_harness::report::SweepPoint {
+        connections: 1,
+        throughput_per_sec: 1.0,
+        log_records_per_sec: 2.0,
+        device_ratio: 0.5,
+        device_appends_per_sec_before: 2.0,
+        device_appends_per_sec_after: 2.0,
+        p50_us: 1,
+        p99_us: 1,
+        p999_us: 1,
+        client_busy_fraction: 1.0,
+        saturated: 1.0 > bench_harness::wire_accounting::SATURATION_FRACTION,
+    };
+    assert!(
+        p.saturated,
+        "a fully-busy client must mark its point saturated"
+    );
+    let human = bench_harness::report::render_human(&bench_harness::report::Report {
+        hardware: "h".into(),
+        os: "o".into(),
+        filesystem: "f".into(),
+        cores: 1,
+        sync_semantics: "s",
+        build_profile: "dev",
+        warmup_secs: 0.0,
+        duration_secs: 0.0,
+        device: Some(bench_harness::report::DeviceReport {
+            syncs_per_sec: 1.0,
+            appends_per_sec: 1.0,
+        }),
+        core: None,
+        kernel: None,
+        wire: vec![bench_harness::report::WireReport {
+            target: "t".into(),
+            points: vec![p],
+        }],
+        invalid: vec![],
+    });
+    assert!(human.contains("CLIENT-SATURATED"), "got: {human}");
+}
+
+// ---------------------------------------------------------------------------
+// T9: the three that drive the `bench` BINARY. #[ignore] — they spawn
+// processes and build crates.
+//
+// The first two close spec §7 bullet 1's real gap: every other smoke in this
+// file calls library functions, so nothing else exercises the binary's own
+// argv-parse / dispatch / exit-code contract, and a regression there would be
+// invisible (plan-review C-2).
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn the_bench_binary_smokes_end_to_end() {
+    let bin = bench_harness::wire::build_bin("bench-harness", "bench").expect("bench builds");
+    let out = std::process::Command::new(&bin)
+        .args(["smoke", "--json"])
+        .output()
+        .expect("bench smoke runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "bench smoke must exit 0 on a healthy box\nstderr:\n{stderr}\nstdout:\n{stdout}"
+    );
+    // All four layers assembled into ONE report — this is what `all`/`smoke`
+    // add over the single-layer subcommands, and the only place it is checked.
+    for key in [
+        "\"bench\":{",
+        "\"device\":{",
+        "\"core\":{",
+        "\"kernel\":{",
+        "\"wire\":[",
+    ] {
+        assert!(stdout.contains(key), "smoke JSON missing {key}: {stdout}");
+    }
+    // Both wire targets ran, not just the default one.
+    assert!(
+        stdout.contains("\"target\":\"bench-app\"") && stdout.contains("\"target\":\"invoicing\""),
+        "smoke must sweep BOTH wire targets: {stdout}"
+    );
+    // The smoke override reached the artifact. Without this the run could
+    // silently use the 5 s + 30 s defaults and still pass everything above —
+    // which is the whole failure mode Step 3's "select before the device run"
+    // ordering exists to prevent.
+    assert!(
+        stdout.contains("\"duration_secs\":1.00"),
+        "smoke's forced 1 s duration must reach the report: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"warmup_secs\":0.20"),
+        "smoke's forced 0.2 s warmup must reach the report: {stdout}"
+    );
+}
+
+#[test]
+#[ignore]
+fn a_bogus_subcommand_is_a_usage_error() {
+    let bin = bench_harness::wire::build_bin("bench-harness", "bench").expect("bench builds");
+    let out = std::process::Command::new(&bin)
+        .arg("bogus")
+        .output()
+        .expect("bench bogus runs");
+    assert_eq!(out.status.code(), Some(2), "usage errors exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("usage: bench"), "got: {stderr}");
+}
+
+#[test]
+#[ignore]
+fn a_saturated_client_is_flagged_through_the_real_sweep() {
+    // Forces client_busy_fraction through wire::sweep's REAL formula
+    // (cpu / (n * elapsed)) rather than a hand-built literal: two spinner
+    // threads burn this process's CPU during a 1-conn sweep, driving the
+    // measured fraction well above 0.9. `a_saturated_client_is_flagged_on_the_point`
+    // proves the RENDERING; this proves the CLASSIFICATION (plan-review I-4).
+    let bin = bench_harness::wire::build_bin("bench-harness", "bench-app").expect("bin builds");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let spinners: Vec<_> = (0..2)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut x = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    x = x
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                }
+                std::hint::black_box(x);
+            })
+        })
+        .collect();
+    let result = bench_harness::wire::sweep(
+        &bin,
+        bench_harness::wire::Target::BenchApp,
+        &[1],
+        Duration::from_millis(200),
+        Duration::from_secs(1),
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for s in spinners {
+        let _ = s.join();
+    }
+    let (wire, _invalid) = result.expect("sweep runs");
+    assert!(
+        wire.points[0].saturated,
+        "2 spinner threads over a 1-conn sweep must saturate the client: busy fraction {}",
+        wire.points[0].client_busy_fraction
     );
 }

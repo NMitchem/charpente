@@ -364,6 +364,40 @@ fn main() -> ExitCode {
 }
 
 fn run_layers(args: &Args, dir: &str, report: &mut Report) -> std::io::Result<bool> {
+    // T9: `smoke` is the full matrix at forced-short parameters (spec §7).
+    // Selected BEFORE the device run on purpose — selecting after it would
+    // leave the ceiling loops at the 5 s + 30 s defaults, over a minute of
+    // device loops inside something called a "smoke".
+    //
+    // 1 s is safe here despite T7 rev. 2's ruling against a smoke sitting on a
+    // refusal boundary. That ruling was about `MIN_MEASURED_WINDOW`, and every
+    // measured window in this crate is structurally `>=` its requested
+    // duration: the device/core loops run `while Instant::now() < end` and the
+    // wire point sleeps `duration` before reading `elapsed`. The floor
+    // compares `elapsed < MIN_MEASURED_WINDOW`, so it cannot fire at
+    // `--duration 1` however slow the box is. The op floor needs 5 ops in that
+    // second, against ~200/s measured.
+    let (warmup, duration, requests, connections) = if args.cmd == "smoke" {
+        (
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+            2_000,
+            vec![1usize, 4],
+        )
+    } else {
+        (
+            args.warmup,
+            args.duration,
+            args.requests,
+            args.connections.clone(),
+        )
+    };
+    // The artifact must state what actually ran, not what was asked for
+    // (spec §5): `main` seeded these from the flags before `smoke` overrode
+    // them.
+    report.warmup_secs = warmup.as_secs_f64();
+    report.duration_secs = duration.as_secs_f64();
+
     // Every subcommand carries the ceiling (spec §5): device runs first
     // unconditionally, so no layer can render without it. This Heartbeat
     // covers ONLY the device measurement below — each later layer (core,
@@ -371,85 +405,91 @@ fn run_layers(args: &Args, dir: &str, report: &mut Report) -> std::io::Result<bo
     // measured window and pushes its own reason into report.invalid (see
     // Task 5's core_bench::run), exactly mirroring this arm. There is
     // deliberately no single heartbeat spanning the whole process (T4
-    // review, I-4) — Task 5's own layer already owns its own guard.
+    // review, I-4) — under one, `bench all`'s guard would span
+    // `wire::build_bin`'s cargo build and fire spuriously.
     let hb = Heartbeat::start();
-    let result = device::run(dir, args.warmup, args.duration);
+    let result = device::run(dir, warmup, duration);
     let _ = std::fs::remove_dir_all(dir); // T4 review, M-5: clean up on Err too.
     report.device = Some(result?);
     if let Some(reason) = hb.finish() {
         report.invalid.push(reason);
     }
-    // Later tasks extend this match with core/kernel/wire/all/smoke arms.
-    // Returns whether `args.cmd`'s own arm ran (T4 review, M-7): an
-    // unimplemented subcommand must not exit 0.
-    let implemented = match args.cmd.as_str() {
-        "device" => true,
-        "core" => {
-            let dir = temp_dir("core", args.dir.as_deref()).map_err(std::io::Error::other)?;
-            // 2026-08-10 interlude §4.2: no ceiling is threaded in. This layer
-            // brackets its own write window and divides by that, exactly as
-            // the wire layer has since T7 rev. 3. `bench device` above still
-            // ran unconditionally and still publishes the `device:` line —
-            // it is the artifact's methodology header, not a gate input.
-            let result = bench_harness::core_bench::run(&dir, args.warmup, args.duration);
-            let _ = std::fs::remove_dir_all(&dir); // T5 review, M-3: clean up on Err too (mirrors the device arm's M-5 fix).
-            let (core, invalid) = result?;
-            report.core = Some(core);
-            report.invalid.extend(invalid);
-            true
-        }
-        "kernel" => {
-            let dir = temp_dir("kernel", args.dir.as_deref()).map_err(std::io::Error::other)?;
-            // 2026-08-10 interlude §4.2: like the core arm, this layer now
-            // brackets its own window rather than taking layer 1's one-shot
-            // sample. T6 review M-5's "the same ceiling the core arm does"
-            // still holds — it is just that both arms' ceiling is now their
-            // own bracket max.
-            let result = bench_harness::kernel_bench::run(&dir, args.requests);
-            let _ = std::fs::remove_dir_all(&dir);
-            let (kernel, invalid) = result?;
-            report.kernel = Some(kernel);
-            report.invalid.extend(invalid);
-            true
-        }
-        "wire" => {
-            let target = match args.target.as_str() {
-                "bench-app" => bench_harness::wire::Target::BenchApp,
-                // T8 filled the Invoicing arms, so this is a real target now.
-                // T7's named refusal here is deliberately GONE, not disabled:
-                // it existed only so a documented flag value could not reach
-                // an internal `unreachable!` (hard rule 5), and both
-                // `unreachable!`s are gone with it.
-                "invoicing" => bench_harness::wire::Target::Invoicing,
-                other => return Err(std::io::Error::other(format!("unknown --target {other:?}"))),
-            };
-            let (package, bin) = match &target {
-                bench_harness::wire::Target::BenchApp => ("bench-harness", "bench-app"),
-                bench_harness::wire::Target::Invoicing => ("invoicing", "node"),
-            };
-            // T7 rev. 3: this layer no longer divides by the CLI's one-shot
-            // device.syncs_per_sec — it brackets its own ceiling per point.
-            // The device layer above still ran unconditionally and still
-            // publishes the `device:` line; this arm simply no longer reads
-            // it.
-            let bin = bench_harness::wire::build_bin(package, bin)?;
-            let (wire, invalid) = bench_harness::wire::sweep(
-                &bin,
-                target,
-                &args.connections,
-                args.warmup,
-                args.duration,
-            )?;
-            report.wire.push(wire);
-            report.invalid.extend(invalid);
-            true
-        }
-        other => {
-            eprintln!("bench: subcommand {other:?} not implemented yet");
-            false
-        }
+
+    // T9: one list, so `all`/`smoke` and the single-layer subcommands run the
+    // SAME arms rather than a parallel copy of each. `device` runs nothing
+    // further — it is already done above.
+    let layers: Vec<&str> = match args.cmd.as_str() {
+        "device" => vec![],
+        "all" | "smoke" => vec!["core", "kernel", "wire-bench-app", "wire-invoicing"],
+        "wire" => vec![match args.target.as_str() {
+            "bench-app" => "wire-bench-app",
+            // T8 filled the Invoicing arms, so this is a real target now.
+            // T7's named refusal here is deliberately GONE, not disabled: it
+            // existed only so a documented flag value could not reach an
+            // internal `unreachable!` (hard rule 5), and both `unreachable!`s
+            // are gone with it.
+            "invoicing" => "wire-invoicing",
+            other => return Err(std::io::Error::other(format!("unknown --target {other:?}"))),
+        }],
+        single => vec![single],
     };
-    Ok(implemented)
+    for layer in layers {
+        match layer {
+            "core" => {
+                let dir = temp_dir("core", args.dir.as_deref()).map_err(std::io::Error::other)?;
+                // 2026-08-10 interlude §4.2: no ceiling is threaded in. This
+                // layer brackets its own write window and divides by that,
+                // exactly as the wire layer has since T7 rev. 3. `bench
+                // device` above still ran unconditionally and still publishes
+                // the `device:` line — it is the artifact's methodology
+                // header, not a gate input.
+                let result = bench_harness::core_bench::run(&dir, warmup, duration);
+                let _ = std::fs::remove_dir_all(&dir); // T5 review, M-3: clean up on Err too (mirrors the device arm's M-5 fix).
+                let (core, invalid) = result?;
+                report.core = Some(core);
+                report.invalid.extend(invalid);
+            }
+            "kernel" => {
+                let dir = temp_dir("kernel", args.dir.as_deref()).map_err(std::io::Error::other)?;
+                // 2026-08-10 interlude §4.2: like the core arm, this layer now
+                // brackets its own window rather than taking layer 1's
+                // one-shot sample. T6 review M-5's "the same ceiling the core
+                // arm does" still holds — it is just that both arms' ceiling
+                // is now their own bracket max.
+                let result = bench_harness::kernel_bench::run(&dir, requests);
+                let _ = std::fs::remove_dir_all(&dir);
+                let (kernel, invalid) = result?;
+                report.kernel = Some(kernel);
+                report.invalid.extend(invalid);
+            }
+            "wire-bench-app" | "wire-invoicing" => {
+                let (package, bin, target) = if layer == "wire-bench-app" {
+                    (
+                        "bench-harness",
+                        "bench-app",
+                        bench_harness::wire::Target::BenchApp,
+                    )
+                } else {
+                    ("invoicing", "node", bench_harness::wire::Target::Invoicing)
+                };
+                // T7 rev. 3: this layer no longer divides by the CLI's
+                // one-shot device.syncs_per_sec — it brackets its own ceiling
+                // per point.
+                let bin = bench_harness::wire::build_bin(package, bin)?;
+                let (wire, invalid) =
+                    bench_harness::wire::sweep(&bin, target, &connections, warmup, duration)?;
+                report.wire.push(wire);
+                report.invalid.extend(invalid);
+            }
+            other => unreachable!("unmapped subcommand {other}"),
+        }
+    }
+    // T4 review, M-7: `main` gates the exit code on this. By T9 every
+    // subcommand has an arm, so this is `true` — the plumbing stays as the
+    // structural guarantee that a future unmapped subcommand cannot exit 0.
+    // The `parse` accept-list and `layers` above must be extended together;
+    // a name accepted by one and not the other reaches the `unreachable!`.
+    Ok(true)
 }
 
 #[cfg(test)]
