@@ -3018,6 +3018,37 @@ evidence the handoff was taken.
 Also note `session_setup`'s parameter is named `_conn` as T7 ships it (the `BenchApp` arm
 does not use it); Step 1 below renames it to `conn`.
 
+**Ruling (Noah, 2026-08-10) — T7 rev. 4's ack-rate gate has no margin for a
+one-record-per-request target, and the smoke tolerates it rather than the gate being
+weakened.** T8's first green run exposed what rev. 4 could not have seen with only one
+target: invoicing commits ONE log record per request, so its acked-request rate and the
+device ceiling are the same physical quantity, the gate sits at exactly 1.0x, and it fired
+on roughly one healthy run in three (0.95x, 0.99x, 1.03x, 1.05x across runs).
+
+**Measured on an Apple M4 Pro / apfs / `F_FULLFSYNC`, because the first ruling was to fix
+the denominator and the numbers refuted it:** the raw fsync bracket reads 219–246/s; a
+`Wal::append` + `Wal::sync` loop — the exact pair an acked request pays for, built and
+measured for this ruling — reads 224–231/s, i.e. **the same number or lower, not higher**;
+a bare in-process `Db::transact` loop reads 246/s, **1.00x the ceiling with no HTTP at
+all**; and this target reads 237–257/s. The commit path is entirely fsync-bound, so all
+four measure one physical quantity to within each one's own ±5%. **There is no measurement
+path meaningfully faster than the thing being bounded**, so relocating the ceiling cannot
+fix this; the WAL sampler was written, measured, and reverted.
+
+rev. 4's "it has no false-alarm path" was established at ≈0.5x on bench-app alone — the
+only target that existed then, and the one whose 2.0 records-per-request buys a 2x margin.
+That is the same shape of error rev. 4 itself diagnosed in rev. 3: validating a gate where
+it has headroom and generalizing to where it has none.
+
+**The resolution is the precedent this crate already set one layer down.**
+`core_layer_commits_and_reports_a_ratio` faced exactly this and deliberately does not
+assert `invalid.is_empty()`; it tolerates only the named ratio reason, on the rationale
+that "a gate that never fires on a short window would be the bug." T8's invoicing smoke
+does the same, pinned to the two substrings unique to the ack-gate reason. **The gate
+itself is unchanged and unweakened** — `implausible_ratio`, `DEVICE_RATIO_SLACK` and the
+refusal prose are all untouched, and it still catches a genuinely impossible number.
+bench-app's smoke keeps its strict `invalid.is_empty()`, because it has the margin.
+
 **Files:**
 - Modify: `crates/bench-harness/src/wire.rs` (fill the two `Invoicing` arms)
 - Modify: `crates/bench-harness/src/bin/bench.rs` (delete T7's `--target invoicing` refusal)
@@ -3100,8 +3131,16 @@ fn wire_layer_drives_invoicing_through_login() {
 
 - [ ] **Step 3: Verify**
 
-Run: `cargo test -p bench-harness --test harness -- --ignored --test-threads=1` → PASS (5 tests).
+Run: `cargo test -p bench-harness --test harness -- --ignored --test-threads=1` → PASS
+(**9** tests, not the 5 written here at rev. 1 — T4/T5/T6/T7 each added smokes; corrected at
+execution time, 2026-08-10, per the same "reconcile rather than restate" instruction Step 11
+of Task 7 carries).
 Run: `cargo run -p bench-harness --bin bench -- wire --target invoicing --connections 1,4 --duration 2 --warmup 0.5` → human summary shows `wire [invoicing]`, exit 0.
+
+Note on that second command's exit code, given the ruling above: on a 1-record-per-request
+target the ack-rate gate legitimately fires on some healthy runs, and a non-empty `invalid`
+exits 1 by design. Exit 0 is the common case, not a guarantee, and an exit 1 whose only
+reason is the named ack-rate one is not a regression. Any other reason is.
 
 - [ ] **Step 4: Ledger + commit**
 

@@ -417,17 +417,12 @@ fn run_layers(args: &Args, dir: &str, report: &mut Report) -> std::io::Result<bo
         "wire" => {
             let target = match args.target.as_str() {
                 "bench-app" => bench_harness::wire::Target::BenchApp,
-                // T8 fills the Invoicing arms. Until then this refuses by
-                // name: `--target invoicing` is advertised in the usage
-                // string, so reaching the internal `unreachable!` through a
-                // documented flag value would be a panic where a named
-                // remedy belongs (hard rule 5).
-                "invoicing" => {
-                    return Err(std::io::Error::other(
-                        "--target invoicing is not wired yet (bench-harness Task 8) — \
-                         use --target bench-app",
-                    ));
-                }
+                // T8 filled the Invoicing arms, so this is a real target now.
+                // T7's named refusal here is deliberately GONE, not disabled:
+                // it existed only so a documented flag value could not reach
+                // an internal `unreachable!` (hard rule 5), and both
+                // `unreachable!`s are gone with it.
+                "invoicing" => bench_harness::wire::Target::Invoicing,
                 other => return Err(std::io::Error::other(format!("unknown --target {other:?}"))),
             };
             let (package, bin) = match &target {

@@ -70,12 +70,30 @@ impl Target {
         }
     }
 
-    /// Per-thread setup returning the headers every request carries. `_conn`
-    /// is unused only until T8's Invoicing arm logs in through it.
-    fn session_setup(&self, _conn: &mut Conn) -> io::Result<Vec<(String, String)>> {
+    /// Per-thread setup returning the headers every request carries. Run once
+    /// per worker on its own connection, before the warmup, so no login
+    /// round-trip lands inside a measured window.
+    fn session_setup(&self, conn: &mut Conn) -> io::Result<Vec<(String, String)>> {
         match self {
+            // bench-app mounts no auth, so there is nothing to carry.
             Target::BenchApp => Ok(Vec::new()),
-            Target::Invoicing => unreachable!("wired in T8"),
+            Target::Invoicing => {
+                let (status, body) = conn.request("POST", "/login", &[], b"\"bench\"")?;
+                if status != 200 {
+                    return Err(io::Error::other(format!(
+                        "invoicing login failed with {status}: {}",
+                        String::from_utf8_lossy(&body)
+                    )));
+                }
+                // The response body is a bare JSON string: the raw session
+                // token. Sessions are hashed at rest (M1 sub-project 4), but
+                // the token the client presents is this raw value.
+                let token = String::from_utf8_lossy(&body).trim_matches('"').to_string();
+                Ok(vec![(
+                    "cookie".to_string(),
+                    format!("charpente_session={token}"),
+                )])
+            }
         }
     }
 
@@ -90,7 +108,20 @@ impl Target {
                 let id = ids.fetch_add(1, Ordering::Relaxed) % SLOTS;
                 conn.request("POST", &format!("/hit/{id}"), headers, b"")
             }
-            Target::Invoicing => unreachable!("wired in T8"),
+            Target::Invoicing => {
+                // create_customer refuses an existing id, so ids never wrap:
+                // every request creates a fresh row (the realistic-app shape —
+                // insert-heavy, spec §3). `ids` is shared across workers, so
+                // no two connections can collide on an id and turn a measured
+                // request into a 400.
+                let id = ids.fetch_add(1, Ordering::Relaxed) + 1;
+                conn.request(
+                    "POST",
+                    &format!("/customers/{id}"),
+                    headers,
+                    b"{\"name\":\"Bench Load\",\"email\":\"bench@example.com\"}",
+                )
+            }
         }
     }
 }
@@ -193,7 +224,23 @@ fn spawn_target(bin: &Path, addr: &str, dir: &str) -> io::Result<BenchChild> {
             )));
         }
         if Instant::now() > deadline {
-            return Err(io::Error::other(format!("target never answered on {addr}")));
+            // Carry the child's stderr here too, not only on the exited arm
+            // above. This arm shipped without it, and when T8 hit it once the
+            // failure was undiagnosable for exactly that reason — the same
+            // "spawn failure must be self-diagnosing" rule that plan-review
+            // C-1 already enforced on the sibling arm. The child is still
+            // alive on this path, so its stderr may be empty; say which case
+            // it is rather than printing a bare blank.
+            let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+            let tail = if stderr.trim().is_empty() {
+                "<empty — the child is still running but never bound>".to_string()
+            } else {
+                stderr
+            };
+            return Err(io::Error::other(format!(
+                "target never answered on {addr} within {SPAWN_TIMEOUT:?}\n\
+                 child stderr ({err_path}):\n{tail}"
+            )));
         }
         std::thread::sleep(Duration::from_millis(20));
     }

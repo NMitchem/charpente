@@ -410,3 +410,74 @@ fn wire_layer_sweeps_the_bench_app() {
         );
     }
 }
+
+// T8: the same sweep against a REAL app rather than the purpose-built
+// vehicle. What this smoke adds over its bench-app twin is the parts
+// bench-app has none of — a login round-trip whose token every subsequent
+// request must carry as a cookie, and a handler that reads before it writes.
+// A broken `session_setup` shows up here as a 401 storm rather than as a
+// plausible-looking number, because the driver counts non-200s as errors.
+//
+// `--duration` is 2s, not the plan's 1s. The plan's Task 8 Step 2 block
+// specifies 1s, but Task 7's own rev. 2 ruling rejected exactly that value
+// for exactly this shape: `MIN_MEASURED_WINDOW` is 1s, and "a smoke that
+// sits exactly on a refusal boundary is a flake waiting for a slow CI box."
+// The two instructions contradict; this follows the ruling, not the
+// transcribed literal.
+//
+// **Why this smoke does NOT assert `invalid.is_empty()` while its bench-app
+// twin above does (Noah ruling, 2026-08-10).** invoicing commits ONE log
+// record per request, so its acked-request rate and the device ceiling are
+// the same physical quantity, and T7 rev. 4's gate sits at exactly 1.0x.
+// Measured on an Apple M4 Pro / apfs: the raw fsync bracket reads 219-246/s,
+// a `Wal::append`+`Wal::sync` loop 224-231/s, a bare in-process `Db::transact`
+// loop 246/s (1.00x the ceiling, with no HTTP at all), and this target
+// 237-257/s. The commit path is entirely fsync-bound, so every one of those
+// measures the same thing to within its own +/-5% noise, and the gate fired on
+// roughly one healthy run in three. bench-app never shows it because its 2.0
+// records-per-request buys a 2x margin — rev. 4's "no false-alarm path" was
+// established only where the gate had headroom.
+//
+// Measuring the ceiling on the WAL path instead was tried first and is
+// refuted by the numbers above: there is no path meaningfully faster than the
+// thing being bounded. So the gate stays exactly as it is — unweakened, and
+// still catching a genuinely impossible number — and this smoke tolerates
+// that ONE named reason, which is precisely what
+// `core_layer_commits_and_reports_a_ratio` already does one layer down for
+// the same reason. Any OTHER reason still reddens: a 401 storm, a lost point,
+// a disagreeing crosscheck and a starved heartbeat all carry different
+// wording, and a LOST point additionally fails the `points.len()` assertion
+// below, since a lost point publishes nothing.
+#[test]
+#[ignore]
+fn wire_layer_drives_invoicing_through_login() {
+    let bin = bench_harness::wire::build_bin("invoicing", "node").expect("node builds");
+    let (wire, invalid) = bench_harness::wire::sweep(
+        &bin,
+        bench_harness::wire::Target::Invoicing,
+        &[2],
+        Duration::from_millis(300),
+        Duration::from_secs(2),
+    )
+    .expect("sweep runs");
+    for reason in &invalid {
+        assert!(
+            reason.contains("acked requests/s") && reason.contains("the measured device ceiling"),
+            "a 1-record-per-request target legitimately sits at 1.0x the ceiling, so the \
+             ack-rate gate fires on measurement noise here (that is the gate working, and \
+             the ruling is to tolerate it rather than weaken it) — but any OTHER invalid \
+             reason means something regressed: {reason}"
+        );
+    }
+    assert_eq!(wire.points.len(), 1);
+    assert!(wire.points[0].throughput_per_sec > 0.0);
+    // invoicing's create_customer is get + put with no enqueue, so its record
+    // rate is 1.0x throughput, not bench-app's 2.0x. Asserting the
+    // per-target multiple here is what makes `records_per_request` a
+    // measured contract rather than a constant nobody reads (the T7 smoke
+    // asserts the same relation at 2.0).
+    assert_eq!(
+        wire.points[0].log_records_per_sec,
+        wire.points[0].throughput_per_sec
+    );
+}
