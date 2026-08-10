@@ -127,16 +127,36 @@ the existing per-second record figures in the report; only the **gate input** ch
 - [ ] **Step 4: Add the equality assertion that makes today's behaviour provably unchanged**
 
 ```rust
-/// Pre-group-commit, one acked unit costs exactly one fsync, so the gate's new
-/// subject and its old one are the same number. This test is what proves T1
-/// changed no behaviour; it is EXPECTED to be deleted by the task that makes
-/// batching real, and its deletion is the signal that the gate's new framing
-/// started earning its keep.
+/// T1's no-behaviour-change claim, ASSERTED rather than implied. While one
+/// transaction costs one fsync, the gate's new subject and its old one are the
+/// same number, so the published ratio must equal the records-based ratio
+/// exactly — that equality is the claim, and a test that merely ran a healthy
+/// case without asserting it would pass no matter what T1 broke.
+///
+/// A later task makes syncs and records diverge. This test is then expected to
+/// be REPLACED by the divergence case, never silently deleted.
 #[test]
-fn syncs_equal_records_before_group_commit() {
-    let w = WriteObs { ops: 500, loop_delta: 500, syncs: 500, /* ..as above.. */ };
-    let a = write_accounting(Duration::from_secs(2), &w).unwrap();
-    assert!(a.invalid.is_empty());
+fn while_one_txn_costs_one_fsync_the_gate_input_is_unchanged() {
+    let ceiling = 250.0;
+    let w = WriteObs {
+        ops: 500,
+        loop_delta: 500,
+        syncs: 500, // one fsync per transaction — today's engine
+        elapsed: Duration::from_secs(2),
+        applied_before: Some(0),
+        applied_after: Some(500),
+        device_before: ceiling,
+        device_after: ceiling,
+        heartbeat: None,
+    };
+    let a = write_accounting(Duration::from_secs(2), &w).expect("healthy run");
+    let records_ratio = (w.ops as f64 / 2.0) / ceiling;
+    assert_eq!(
+        a.device_ratio, records_ratio,
+        "with syncs == records the new gate input must equal the old one exactly, \
+         or T1 changed behaviour it claimed not to"
+    );
+    assert!(a.invalid.is_empty(), "{:?}", a.invalid);
 }
 ```
 
@@ -528,29 +548,35 @@ tails in arrival order. Responses for every request in the batch are held and se
 after `commit` returns — sending a 200 before the sync would break ack-after-durable, which
 is the entire point.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing test — scoped to what T5 delivers**
+
+This task ends green. The ack-ordering property belongs to T6, which is the task that makes
+the kernel capable of violating it; asserting it here would leave a red test at task end.
 
 ```rust
+/// `stage_or_subscribe` runs the whole dispatch path but commits nothing —
+/// the record lands in the group, and the WAL is untouched until commit.
 #[test]
-fn no_response_is_sent_before_the_group_syncs() {
-    // A two-request batch against a Disk that records op order. Assert that
-    // every reply lands after the sync, not between the appends.
-    let trace = run_two_request_batch(0x60C0_0005);
-    let sync_at = trace.iter().position(|op| op == "sync").expect("a sync happened");
-    let first_reply = trace.iter().position(|op| op == "reply").expect("a reply happened");
-    assert!(
-        first_reply > sync_at,
-        "a reply was sent before the batch synced — ack-after-durable is broken: {trace:?}"
+fn stage_or_subscribe_produces_a_record_without_touching_the_wal() {
+    let (mut app, counts) = app_with_op_counter(0x60C0_0005);
+    let before = counts.appends() + counts.syncs();
+    let mut g = app.db_mut().begin_group().expect("group");
+    let handled = app.stage_or_subscribe(&mut g, post("/hit/1"), 0);
+    assert!(matches!(handled, Handled::Response(_)), "a write route responds");
+    assert_eq!(g.len(), 1, "the record is staged");
+    assert_eq!(
+        counts.appends() + counts.syncs() - before,
+        0,
+        "staging must not touch the WAL — that is what makes one fsync per batch possible"
     );
+    g.commit().expect("commit");
 }
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cargo test -p charpente --test group_commit no_response_is_sent_before`
-Expected: FAIL — the kernel still replies per request (this goes green in Task 6; keep it
-red here and say so in the commit, or land Steps 3–4 first if the reviewer prefers one
-green task — see Task 6 Step 1).
+Run: `cargo test -p charpente --test group_commit stage_or_subscribe_produces_a_record`
+Expected: FAIL — no method `stage_or_subscribe`.
 
 - [ ] **Step 3: Implement `stage_or_subscribe`**
 
@@ -563,11 +589,34 @@ one-transaction group, exactly as `transact` did in T4 — same reasoning, one c
 Run: `cargo test -p charpente --test http && cargo test -p charpente --test kernel`
 Expected: green.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Capture the pre-batching disk trace — this step exists HERE and nowhere else**
+
+T6 asserts that a never-contended universe traces byte-identically to the unbatched engine.
+That constant must be recorded while the kernel is **still unbatched**, which is true at this
+commit and false at every later one. Captured after T6, it would record whatever T6 produced
+and the assertion would be a tautology.
 
 ```bash
-git add crates/charpente/src/http crates/charpente/src/lib.rs
-git commit -m "http: stage_or_subscribe — dispatch into a group without committing"
+cargo test -p charpente --test group_commit -- --ignored capture_pre_batching_trace \
+  > .superpowers/sdd/2026-08-10-group-commit/pre-batching-trace.txt
+```
+
+Write an `#[ignore]`d `capture_pre_batching_trace` that runs the one-request-at-a-time
+universe at seed `0x60C0_0006` and prints its disk trace. Commit the captured file, and
+state in the commit message that it was captured pre-batching — that provenance is the only
+thing that makes T6's assertion meaningful.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/charpente/src/http crates/charpente/src/lib.rs \
+        crates/charpente/tests/group_commit.rs \
+        .superpowers/sdd/2026-08-10-group-commit/pre-batching-trace.txt
+git commit -m "http: stage_or_subscribe — dispatch into a group without committing
+
+Also captures the pre-batching disk trace for seed 0x60C00006 while the kernel
+is still unbatched. T6 asserts batch-of-1 traces identically against it;
+captured any later, that assertion would compare T6's output to itself."
 ```
 
 ---
@@ -589,12 +638,28 @@ batch.push(r), None => break } }`. Adding a `drain` method would give the two so
 chance to disagree; reusing `poll` keeps prod and sim on the same code, which is the
 same-shape rule.
 
-- [ ] **Step 1: Make Task 5 Step 1's test pass**
+- [ ] **Step 1: Write the ack-ordering test (RED)**
 
-Implement the drain, stage each request, `commit()`, then send replies. Run the T5 test:
-Expected: PASS.
+This is the property T6 makes it possible to violate, so it belongs here.
 
-- [ ] **Step 2: Write the batch-of-1 identity test (RED against a naive drain)**
+```rust
+/// Ack-after-durable, batch-wide: no reply may leave before the batch's sync.
+#[test]
+fn no_response_is_sent_before_the_group_syncs() {
+    let trace = run_two_request_batch(0x60C0_0005);
+    let sync_at = trace.iter().position(|op| op == "sync").expect("a sync happened");
+    let first_reply = trace.iter().position(|op| op == "reply").expect("a reply happened");
+    assert!(
+        first_reply > sync_at,
+        "a reply was sent before the batch synced — ack-after-durable is broken: {trace:?}"
+    );
+}
+```
+
+Run it: expected FAIL (the arm still replies per request). Then implement the drain — stage
+each request, `commit()`, then send every reply in arrival order — and re-run: PASS.
+
+- [ ] **Step 2: Write the batch-of-1 identity test against T5's captured trace**
 
 ```rust
 /// §7's structural guarantee under test: a universe that never queues two
@@ -602,14 +667,19 @@ Expected: PASS.
 /// engine. This is what lets the frozen pinned seeds survive.
 #[test]
 fn a_never_contended_universe_traces_identically() {
+    let expected = include_str!(
+        "../../../.superpowers/sdd/2026-08-10-group-commit/pre-batching-trace.txt"
+    );
     let batched = run_one_at_a_time_universe(0x60C0_0006);
-    assert_eq!(batched.disk_trace, PRE_BATCHING_TRACE_0x60C00006,
+    assert_eq!(batched.disk_trace_string(), expected.trim(),
         "batch-of-1 must be byte-identical to the unbatched path");
 }
 ```
 
-Capture `PRE_BATCHING_TRACE_*` by running the same workload at the T5 commit and pinning the
-bytes. Record in the ledger that the constant was captured pre-batching, or it proves nothing.
+The constant was captured at T5 Step 5, while the kernel was still unbatched. **Do not
+re-capture it here** — a constant regenerated after batching lands compares T6's output to
+itself and asserts nothing. If the file is missing, stop and report BLOCKED rather than
+regenerating it.
 
 - [ ] **Step 3: Handle the poison/stop path**
 
@@ -869,13 +939,22 @@ git commit -m "bench: group commit — close out M2 sub-project 2"
 §10 non-goals — no task implements one; §11 exit criteria → T8/T9/T10/T11.
 
 **Known soft spots, called out rather than hidden:**
-- T5 Step 1's test is written in T5 and goes green in T6. The alternative was a task boundary
-  that splits an untestable deliverable; the reviewer should accept T5 with a red test or ask
-  for T5+T6 to merge.
-- T6 Step 2's `PRE_BATCHING_TRACE_*` constant must be captured **before** batching lands, at
-  the T5 commit. If captured after, it proves nothing. Said at the step.
 - T9's scale is unknown until Step 1 enumerates the seeds. It is the task most likely to
   need splitting once its size is known.
+- From T6 onward the frozen pinned seeds may legitimately change. That is T9's subject, not
+  a regression to fix in place. Task 6 Step 4 says so explicitly, because an implementer who
+  "fixes" a drifted seed destroys the evidence T9 needs.
+
+**Resolved during pre-flight (2026-08-10), recorded so the reasoning is not re-litigated:**
+- T1's no-behaviour-change test originally ran a healthy case without asserting the
+  equality it claimed, so it would have passed no matter what T1 broke. It now asserts
+  `device_ratio == records_ratio` directly.
+- T5 originally ended with a test that stayed red until T6, which the review rubric treats
+  as a defect. T5 now ends green on a T5-scoped assertion (staging touches no WAL) and the
+  ack-ordering property moved to T6, the task that can actually violate it.
+- T6's pre-batching trace constant was originally captured in T6, where the kernel is
+  already batched — the assertion would have compared T6's output to itself. Capture moved
+  to T5 Step 5, with an explicit instruction never to regenerate it later.
 - Test helper names (`fresh_db`, `engine_with_sync_counter`, `run_universe_with_due_jobs`)
   follow existing suite conventions; implementers should reuse the real helpers in each file
   rather than create these if equivalents exist.
