@@ -1013,8 +1013,9 @@ do not reorder a milestone's dependency sequence.
   numbers: it **does not fire**, so the LSM stays deferred and is NOT the next sub-project.
   What the measurement opens instead is **primary-side group commit**, already sized by
   BENCH.md's own table — 215 durable records/sec is the number to beat — and it needs a spec
-  and a ruling before any code. Otherwise M2 per PLAN, plus the one genuinely open ruled item
-  in the backlog below (`applied_delta`'s release-mode wrap).
+  and a ruling before any code. Otherwise M2 per PLAN — the follow-up backlog below now holds
+  **no open work** (`applied_delta`'s release-mode wrap, its last open item, closed
+  2026-08-10).
 - **Bench interlude — the device-ratio gate, done (2026-08-10, spec
   docs/superpowers/specs/2026-08-10-device-ratio-gate-design.md, ledger
   .superpowers/sdd/2026-08-10-device-ratio-gate/progress.md, commits `c10b8fa`..this
@@ -1074,8 +1075,9 @@ do not reorder a milestone's dependency sequence.
   and `charpente` **empty**. The edge matrix was deliberately not run — no replication, auth
   or realtime behaviour is touched, which is spec §8's stated condition for skipping it.
   Do not start the LSM engine from this file alone; the triggers live in DECISIONS §7.
-  The backlog below holds **one open ruled follow-up** — `applied_delta`'s release-mode wrap,
-  added 2026-08-08 and the only entry in it that is open work; every other entry is record. Still-open work, none of it ruled or blocking: `TcpProxy::stop`'s
+  The backlog below held **one open ruled follow-up** when this entry was written —
+  `applied_delta`'s release-mode wrap, added 2026-08-08 — which was closed by its own interlude
+  on 2026-08-10, leaving that section all record. Still-open work, none of it ruled or blocking: `TcpProxy::stop`'s
   registration window ("fix in M2"); the follower-decode asymmetry above; the edge-harness
   restart-then-relogin race noted in the verifying-peer-policy entry just above (mechanism
   present since sub-project 0b at the latest, observed once at this interlude's tip, not
@@ -1166,10 +1168,21 @@ do not reorder a milestone's dependency sequence.
   clear — was at 28.7% CPU with ~85 MB free memory. The box was also carrying **five orphaned
   `node` processes, PPID 1, 4h11m old**, with edge-harness `tmp.XXXX` data dirs — leftovers
   from a matrix run killed mid-test, the hazard the M1 close-out already notes for `git
-  worktree`. Reaping them and re-running was the fix, per the plan's own Step 1 rule (*fix the
-  environment, not the thresholds*) — which is also why `SPAWN_TIMEOUT` was deliberately NOT
-  widened. Runtime corroborates the diagnosis: 128–151 s while degraded, 99.75 s clean against
-  T9's recorded 101.31 s baseline. **Two follow-ups, neither fixed here** (T10 is docs and
+  worktree`.
+  **The discriminating variable is recent heavy load, NOT the orphans — and that correction is
+  recorded because the first draft of this entry got it wrong.** Reaping the orphans was real
+  hygiene and was initially written up as "the fix"; a later run with **zero orphans present**
+  went red the same way, which rules them out as necessary. Across five runs the separation is
+  clean and one-variable across **six** runs: **red whenever the smoke ran immediately after a
+  full `cargo test --workspace`** (151 s / 128 s / 184 s, with 2, 3 and 1 failures), **green
+  whenever it ran on a settled box** (99.75 s / 106.16 s / 103.53 s, 12/12 every time),
+  against T9's recorded 101.31 s baseline — so the runtime tracks the verdict as tightly as
+  the pass/fail does, 3 for 3 in each direction. Consistent with the
+  mechanism: a just-finished 12-core cargo workload leaves `syspolicyd` and the page cache
+  saturated, and every child exec has to clear Gatekeeper before `main`. `SPAWN_TIMEOUT` was
+  deliberately NOT widened — the plan's Step 1 rule is *fix the environment, not the
+  thresholds* — so the operational consequence is simply that **`scripts/bench.sh --smoke`
+  must not be run back-to-back with `cargo test --workspace`**; give the box a moment first. **Two follow-ups, neither fixed here** (T10 is docs and
   evidence, not test code): the harness cannot distinguish "child never reached `main`" from
   "child failed to bind", which is why a macOS exec stall reads as a benchmark failure; and
   nothing reaps orphaned children when a run is killed mid-test.
@@ -1191,11 +1204,42 @@ do not reorder a milestone's dependency sequence.
   rather than an artifact of no such commits existing. The numbers of record are the
   13:29 full-matrix run with `invalid: []`, archived at `target/bench/report.json`; every
   figure in BENCH.md was re-checked against that artifact field by field while writing this.
+- **Bench interlude — `applied_delta`'s release-mode wrap, CLOSED (2026-08-10, this commit).**
+  The last open item in the follow-up backlog below, ruled 2026-08-08 and retired here; that
+  section is now entirely record.
+  **The defect:** `core_accounting::applied_delta`'s `(Some(b), Some(a))` arm was a bare
+  `a - b`, while its sibling impossible-state arm `(Some(_), None)` already carried a named
+  `unreachable!`. This workspace sets no `overflow-checks` override — the only `[profile.*]`
+  entries in the root `Cargo.toml` are redb's `debug-assertions`/`opt-level` ones — so release
+  inherits Rust's default `overflow-checks = false` and that subtraction **wrapped**. A
+  backwards `last_applied` would publish `log_records_per_sec` ≈ 1.8e19 / elapsed and let the
+  run **continue**, flagged only by the non-fatal `delta != ops` crosscheck rather than
+  stopping and naming the contract that broke — in exactly the build mode a real benchmark
+  runs in. Fixed with the ruled one-liner (`checked_sub` + a panic naming both values), plus a
+  rationale comment at the site recording why it cannot be a bare subtraction, so a future
+  "simplification" back to `a - b` has to argue with the reason.
+  **The headline is how the test had to be proven, and it is not what the backlog entry
+  predicted.** That entry said the fix owed "a mutation-proven test". It owed a **two-mode**
+  proof instead: under `cargo test` alone a `should_panic` test **passes against the unfixed
+  code for the wrong reason**, because debug traps the overflow — just with the generic
+  `"attempt to subtract with overflow"` rather than the named contract. So RED was proven in
+  both modes per hard rule 3: debug red on the message mismatch, and **release red on `"test
+  did not panic as expected"`, which is the bug itself**. Green in both after the fix. A test
+  of this shape that is only ever run in debug would be decorative, and the comment on it says
+  so.
+  **Scope, stated so it is not read wider:** still unreachable through `core_bench::run`
+  (`Db::last_applied()` is monotonic and the two samples are taken in window order), so this is
+  negative-space assertion work under hard rule 4's "assertions stay on in release" clause —
+  a silent-corruption path closed, not a live bug fixed. The `(None, Some(a)) => a + 1` arm can
+  also wrap in principle (at `a == u64::MAX`) and was deliberately left alone: outside the
+  ruling, and not a state any log can reach.
 
 ## M2 follow-up backlog (carried from M1, ruled — written to be read cold)
 
-- **OPEN, ruled 2026-08-08: `applied_delta`'s `(Some, Some)` arm wraps silently in release.**
-  The one piece of open work in this section. `crates/bench-harness/src/core_accounting.rs`'s
+- **`applied_delta`'s release-mode wrap — RETIRED 2026-08-10, closed by its own interlude**
+  (close-out in "Current state" above). Ruled 2026-08-08, fixed with exactly the one-liner
+  recommended below; the account is kept here as record, and this section now holds **no open
+  work**. `crates/bench-harness/src/core_accounting.rs`'s
   `applied_delta` computes the applied-record delta across a measured window, and its
   `(Some(b), Some(a))` arm is a bare `a - b` while its sibling impossible-state arm
   `(Some(_), None)` carries a named `unreachable!`. **The workspace sets no `overflow-checks`
@@ -1218,6 +1262,12 @@ do not reorder a milestone's dependency sequence.
   spec §7 it also owes a mutation-proven test of its own. Both the T2 review and the fix-round
   re-review independently judged deferring correct rather than folding it into a test-only
   round. It is small enough to be its own interlude whenever it is picked up.
+  **How it actually closed (2026-08-10):** the deferral was right for a reason the entry did
+  not anticipate. The owed "mutation-proven test" turned out to be a **two-mode** proof, not a
+  mutation: a `should_panic` test run under `cargo test` alone would have passed against the
+  unfixed code *for the wrong reason*, because debug traps the overflow — just with the generic
+  `"attempt to subtract with overflow"` message instead of the named contract. The teeth are in
+  release, where the unfixed code does not panic at all, and that is where RED was proven.
 - **The dual-primary gap — RETIRED 2026-08-05, closed by M2 sub-project 0b** (close-out in
   "Current state" above). It was the last *ruled follow-up* carried out of M1; what remains
   in this section is record, not open work, with one exception named in the triage entry

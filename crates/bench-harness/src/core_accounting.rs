@@ -175,7 +175,14 @@ pub fn device_ratio_reason(ratio: f64, before: f64, after: f64) -> Option<String
 /// interlude in one function.
 pub fn applied_delta(before: Option<u64>, after: Option<u64>) -> u64 {
     match (before, after) {
-        (Some(b), Some(a)) => a - b,
+        // `checked_sub`, not `a - b`: this workspace sets no `overflow-checks`
+        // override, so release inherits `false` and a bare subtraction would
+        // WRAP rather than trap — publishing ~1.8e19 records/sec and letting the
+        // run continue behind a non-fatal INVALID, in exactly the build mode a
+        // real benchmark uses. Hard rule 4: the assertion stays on in release.
+        (Some(b), Some(a)) => a
+            .checked_sub(b)
+            .unwrap_or_else(|| panic!("last_applied went backwards: {b} -> {a}")),
         (None, Some(a)) => a + 1,
         (None, None) => 0,
         (Some(_), None) => unreachable!("last_applied cannot go backwards to None"),
@@ -469,6 +476,30 @@ mod tests {
     #[should_panic(expected = "last_applied cannot go backwards to None")]
     fn applied_delta_refuses_a_backwards_last_applied() {
         applied_delta(Some(1), None);
+    }
+
+    /// The `(Some, Some)` sibling of the arm above, and the reason it needs an
+    /// explicit check rather than Rust's arithmetic trap.
+    ///
+    /// The workspace sets no `overflow-checks` override — the only `[profile.*]`
+    /// entries in the root `Cargo.toml` are redb's `debug-assertions`/`opt-level`
+    /// ones — so release inherits `overflow-checks = false` and a bare `a - b`
+    /// WRAPS there instead of panicking. Under `cargo test` alone this test would
+    /// pass against the unfixed code for the wrong reason (debug traps the
+    /// overflow, just with a different message), so **its teeth are in release**:
+    /// `cargo test -p bench-harness --release` is where the unfixed code does not
+    /// panic at all and this goes red. That is also the mode a real benchmark runs
+    /// in, where the wrap would publish ~1.8e19 records/sec and let the run
+    /// continue behind a non-fatal INVALID instead of stopping and naming the
+    /// contract that broke (hard rule 4: assertions stay on in release).
+    ///
+    /// Unreachable through `core_bench::run` today — `Db::last_applied()` is
+    /// monotonic and the two samples are taken in window order — so this is
+    /// negative-space assertion work, not a live bug.
+    #[test]
+    #[should_panic(expected = "last_applied went backwards: 5 -> 3")]
+    fn applied_delta_refuses_a_last_applied_that_decreased() {
+        applied_delta(Some(5), Some(3));
     }
 
     // The pure twin of tests/harness.rs's #[ignore]d disk regression
