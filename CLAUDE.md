@@ -1008,20 +1008,13 @@ do not reorder a milestone's dependency sequence.
   code.
 - Next: **M2 per PLAN.** Ruled 2026-08-06 (premise re-examination at M2 start): the own-LSM
   engine is **deferred behind measurement** — DECISIONS §7's scheduled reopen, re-closed with
-  three named build triggers — and the **benchmark harness** (PLAN's unfulfilled "publish
-  honest benchmarks early" mitigation) is the next sub-project. **It is in progress, not
-  pending**: the spec (`docs/superpowers/specs/2026-08-06-benchmark-harness-design.md`,
-  `2b47556`) and its 10-task plan (`be9b05a`) landed 2026-08-06; Tasks 1-5 shipped
-  `crates/bench-harness` — the measurement discipline, the pinned report model, the device
-  layer and the `bench` binary, and the core layer against its device ceiling — and a
-  Noah-ruled mid-plan interlude (2026-08-08, spec `…/2026-08-08-bench-accounting-split-
-  design.md`) split the core layer's *accounting* from its *measuring* so every guard, delta
-  and INVALID decision is a deterministic unit test instead of something only a real benchmark
-  run can reach. Tasks 6 (kernel layer), 7 (wire layer) and 8 (the invoicing wire target)
-  then shipped, each adopting that interlude's seam from inception per its spec §5 — raw
-  observations struct, pure accounting, thin driver — rather than copying an untested
-  pattern. **Task 9 (the `all`/`smoke` subcommands, forced-INVALID-arm tests and
-  `scripts/bench.sh`) is next**, then T10 (`docs/BENCH.md`, first numbers of record).
+  three named build triggers. The **benchmark harness** built to read those triggers is now
+  **done** (close-out entry below, 2026-08-10), and trigger (a) has been read against real
+  numbers: it **does not fire**, so the LSM stays deferred and is NOT the next sub-project.
+  What the measurement opens instead is **primary-side group commit**, already sized by
+  BENCH.md's own table — 215 durable records/sec is the number to beat — and it needs a spec
+  and a ruling before any code. Otherwise M2 per PLAN, plus the one genuinely open ruled item
+  in the backlog below (`applied_delta`'s release-mode wrap).
 - **Bench interlude — the device-ratio gate, done (2026-08-10, spec
   docs/superpowers/specs/2026-08-10-device-ratio-gate-design.md, ledger
   .superpowers/sdd/2026-08-10-device-ratio-gate/progress.md, commits `c10b8fa`..this
@@ -1093,6 +1086,111 @@ do not reorder a milestone's dependency sequence.
   key, `tx_err_to_io`'s unbounded `{unreached:?}`, the 17 MiB recv buffer per connected probe,
   and `probe.rs::connect_and_hello`'s near-verbatim copy of `follower.rs` — a THIRD copy is
   the moment to consolidate).
+- **M2 sub-project 1 done — the benchmark harness (2026-08-10, spec
+  docs/superpowers/specs/2026-08-06-benchmark-harness-design.md (`2b47556`), 10-task plan
+  docs/superpowers/plans/2026-08-06-benchmark-harness.md (`be9b05a`) + a pre-execution
+  two-review fix wave (`27338b2`), ledger
+  .superpowers/sdd/2026-08-06-benchmark-harness/progress.md, commits `2b47556`..this commit,
+  34 in all).** PLAN's unfulfilled "publish honest benchmarks early" mitigation, discharged,
+  and the instrument DECISIONS §7's LSM build triggers are read against.
+  **Shipped:** `crates/bench-harness` — four layers, each a ratio against the one beneath it
+  and none published without that one in the same invocation. **device**: two loops through
+  the production `Disk` on the target filesystem, sync-only and append-shaped (`write_at` at
+  the tail + `sync`, the WAL's own op shape). **core**: `Db::transact` in a closed loop, the
+  commit path alone. **kernel**: a `Kernel` fed through the same `RequestSource` seam
+  `SimSource` and `ProdSource` share, requests pre-built, no TCP. **wire**: the server as a
+  real child process over real HTTP/1.1 keep-alive, two targets — the purpose-built
+  `bench-app` and `examples/invoicing`, the latter labeled as measuring an app rather than
+  the platform's limit. Plus the `bench` binary (`device|core|kernel|wire|all|smoke`),
+  `scripts/bench.sh`, the pinned JSON report model, and the discipline that makes a number
+  *refusable*: a CPU-time heartbeat sleep-guard spanning every measured window, totals two
+  ways, client-saturation marking (`SATURATION_FRACTION` 0.9 — a point where the client is
+  >90% busy measures the client), window and op floors, and the device-ratio gate.
+  Two Noah-ruled mid-plan interludes: the **accounting/measuring split** (2026-08-08) making
+  every guard, delta and INVALID decision a deterministic unit test rather than something
+  only a real benchmark run can reach — adopted from inception by T6–T8 rather than copied as
+  an untested pattern; and the **device-ratio gate** (2026-08-10), which found `bench`
+  refusing HEALTHY runs at all three gating layers and fixed the bracket's op shape plus a
+  noise-aware tolerance.
+  **The prediction is CONFIRMED, and it is the headline.** The spec committed to testing one:
+  *the core write path measures at ≈1x the device's durable-sync rate — sync-bound, far below
+  the headline claim on any hardware.* Measured: core commits **215 log records/sec** against
+  an append ceiling of **215–258/sec** bracketed either side of its own window (`device_ratio`
+  0.833). The mechanism is not inferred — `Engine::submit` is unconditionally `append` →
+  `sync` → `apply`, one durable sync per transaction, no group commit.
+  **The most informative result is a column, not a row.** log-records/sec reads **215 / 215 /
+  217 / 198–225 / 170–202** down device / core / kernel / wire·bench-app / wire·invoicing.
+  Four different code paths — a bare fsync loop, an in-process commit loop, the full kernel
+  with job execution, and a real HTTP server driven over TCP — converge on the same number.
+  Adding the kernel halves the *request* rate (109 vs 215) precisely because each canonical
+  request then costs two durable records, and leaves the *record* rate untouched. The system
+  is fsync-bound end to end; at this workload everything above the log is free.
+  **The gap is named, not hidden:** MANIFESTO §7 and README claim "hundreds of thousands of
+  transactions per second"; this instrument measures 215/sec for the canonical transaction on
+  this laptop under `F_FULLFSYNC` — roughly three orders of magnitude. README now says so
+  directly above its own scaling paragraph, and BENCH.md's table is captioned NOT the launch
+  claim (bare-metal Linux is spec ruling 4 and does not exist yet).
+  **DECISIONS §7 trigger (a) does NOT fire; the LSM engine stays deferred** — recorded in §7
+  itself, whose "no benchmark exists at all" clause this sub-project retired. Core sits *at*
+  the device ceiling, so redb's materialization cannot be costing anything material at this
+  rate; reads agree from the other side at 2.65M/sec. **Scoped honestly:** the core layer
+  bundles WAL append + sync + apply + store materialization into ONE number, so this rules out
+  redb as *the binding constraint at this workload on this hardware* — it does not measure
+  redb in isolation. The follow-up this opens is **primary-side group commit**, now sized: the
+  engine already has the shape (the follower's `Engine::submit_batch` appends a whole shipped
+  batch and syncs once), and the primary deliberately does not use it because acking before
+  the batch's sync breaks ack-after-durable. The number to beat is 215.
+  **Three BENCH.md defects were found at close-out by checking the prose against the code, and
+  none by a reviewer** — the class this repo keeps paying for, a doc its own source disproves.
+  (1) The bracket-outlier note claimed the invoicing 1-connection point "would have passed
+  against either sample". False: `implausible_bracketed_ratio` is `ratio > RATIO_HARD_LIMIT ||
+  ratio > 1.0 + ratio_tolerance`, and against the smaller bracket (47.96) that point reads
+  **4.14**, which the 1.5 hard limit refuses outright. Divide-by-the-larger is what kept the
+  run valid, and because the 78% bracket spread widens the tolerance arm to 1.78, the *hard
+  limit* — not the tolerance — is what bounded that point at all. (2) The window row said "5 s
+  warmup, 30 s measure" for every layer; `kernel_bench::run(&dir, requests)` takes neither and
+  is count-driven — a fixed 50,000 requests, **460 s** in this run. (3) The
+  single-threaded-kernel disclosure cited a 256-connection p50 "over two seconds", true of
+  bench-app (2.27 s) and not of invoicing (1.34 s); it now names its target.
+  **The smoke stage failed three times before it passed, and the cause is worth recording
+  because it is not charpente's.** `scripts/bench.sh --smoke` went red 3 runs running (2, 3
+  and 1 failed tests), always the same shape: `point lost: target never answered on
+  127.0.0.1:PORT within 10s / <empty — the child is still running but never bound>`, on a
+  random target and connection count rather than a fixed one. Root-caused by sampling a
+  failing child live: its entire stack was `_dyld_start` at a **96K** physical footprint —
+  stalled in the dynamic loader, before `main`, so it had not run one line of charpente. The
+  control (a healthy sibling child sampled the same way) showed the full tokio serving stack
+  at 2384K. An isolated probe spawning the same binary 20 times bound in **46–66 ms every
+  time**, so the binary's own startup is not at fault; `syspolicyd` — Gatekeeper's
+  signature-validation daemon, which every exec of a freshly-built ad-hoc-signed binary must
+  clear — was at 28.7% CPU with ~85 MB free memory. The box was also carrying **five orphaned
+  `node` processes, PPID 1, 4h11m old**, with edge-harness `tmp.XXXX` data dirs — leftovers
+  from a matrix run killed mid-test, the hazard the M1 close-out already notes for `git
+  worktree`. Reaping them and re-running was the fix, per the plan's own Step 1 rule (*fix the
+  environment, not the thresholds*) — which is also why `SPAWN_TIMEOUT` was deliberately NOT
+  widened. Runtime corroborates the diagnosis: 128–151 s while degraded, 99.75 s clean against
+  T9's recorded 101.31 s baseline. **Two follow-ups, neither fixed here** (T10 is docs and
+  evidence, not test code): the harness cannot distinguish "child never reached `main`" from
+  "child failed to bind", which is why a macOS exec stall reads as a benchmark failure; and
+  nothing reaps orphaned children when a run is killed mid-test.
+  **Evidence** — the **scoped** sweep this sub-project owes, stated exactly rather than by
+  count: bench-harness touches no core code and this commit changes no code at all (its whole
+  diff is `docs/BENCH.md`, `CLAUDE.md`, `README.md`, `PLAN.md`, `DECISIONS.md`), so the
+  11-stage sweep is not owed and the edge matrix, the pinned seed replays and the release
+  mode-skew tripwires were deliberately not run — no replication, auth or realtime behaviour
+  is in the blast radius. What ran: `cargo fmt --all --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean; `cargo build -p guide-examples` (the GUIDE compile
+  gate) clean; `cargo test --workspace` **twice**, identical both times — 55 test binaries,
+  **695 passed / 0 failed / 43 ignored** (9m31s, 6m22s), and the 693/40 → 695/43 delta against
+  the device-ratio-gate baseline reconciles exactly as T9's two added forced-arm tests plus
+  its three binary-driving tests moving to ignored (9 → 12); `scripts/bench.sh --smoke`
+  **12/12 green twice** (99.75 s, 106.16 s) on the cleaned box, after the three red runs
+  root-caused above. Spec §9.4's two gates both held: the pathspec-filtered
+  `git log --grep='^bench:' -- crates/charpente-core crates/charpente` printed **nothing**,
+  and its positive control printed **24** `bench:` commits — so the empty list is meaningful
+  rather than an artifact of no such commits existing. The numbers of record are the
+  13:29 full-matrix run with `invalid: []`, archived at `target/bench/report.json`; every
+  figure in BENCH.md was re-checked against that artifact field by field while writing this.
 
 ## M2 follow-up backlog (carried from M1, ruled — written to be read cold)
 

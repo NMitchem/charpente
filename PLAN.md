@@ -62,7 +62,10 @@ is why the milestone closed with them outstanding rather than silently absorbing
 ## M2 — The moat deepens [in progress]
 
 - **Honest benchmark harness** — the "publish honest benchmarks early" mitigation below,
-  and the instrument DECISIONS §7's LSM build triggers are read against. *In progress.*
+  and the instrument DECISIONS §7's LSM build triggers are read against. *Shipped
+  2026-08-10*; numbers of record and method in [docs/BENCH.md](docs/BENCH.md). Trigger (a)
+  does not fire on them: the commit path is fsync-bound at ≈1x the device ceiling, so redb
+  is not the binding constraint at this workload.
 - **Own LSM storage engine**, proven under the (by now battle-hardened) sim harness before
   it replaces redb. The harness is what makes this safe to attempt. **Deferred behind
   measurement** (ruled 2026-08-06): the build triggers live in DECISIONS §7, and the

@@ -91,6 +91,21 @@ convention; the second engine's arrival is the moment to cut it. Page checksums 
 engine owns" (wal-segment spec ruling) — that IOU now hangs off the triggers rather than
 a scheduled start.
 
+**Trigger (a) read 2026-08-10; it does not fire, and the deferral stands.** The benchmark
+that did not exist when this entry was re-closed now does (M2 sub-project 1,
+[docs/BENCH.md](docs/BENCH.md), which is the section this trigger reads). It does not show
+redb limiting the headline claim — it shows the *fsync* limiting it. The core commit path
+measures 215 log records/sec against a device append ceiling of 215–258/sec bracketed
+around its own window, i.e. at the ceiling within measurement error; if redb's
+materialization cost anything material at this rate, core would sit well below it. Reads
+agree from the other side at 2.65M/sec, four orders of magnitude above the write path,
+because they never touch the log. **Scoped honestly:** the core layer bundles WAL append +
+sync + apply + store materialization into one number, so this rules out redb as *the
+binding constraint at this workload on this hardware* — it does not measure redb in
+isolation, and says nothing about a workload whose store cost is not swamped by an fsync. A
+finer attribution needs per-phase profiling the instrument does not do. The follow-up this
+opens is group commit, not an engine swap.
+
 ## 8. Name
 
 `charpente` (French: the load-bearing timber frame of a building). Chosen by Noah after

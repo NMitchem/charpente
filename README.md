@@ -78,6 +78,12 @@ thousands of transactions per second when there is no network hop between app an
 you will not outgrow this before you can afford to build something bespoke, and pretending
 otherwise is how platforms die building a worse Spanner instead of a better SQLite.
 
+That last sentence is the argument, not a measurement of what charpente does today.
+Measured, charpente commits one durable record per transaction with no group commit, which
+puts it at the device's fsync rate — 215/sec on a dev laptop under `F_FULLFSYNC`. See
+[docs/BENCH.md](docs/BENCH.md) for the method and the numbers, and for what closing that gap
+would take.
+
 ## Status
 
 **M1 shipped (2026-07-27).** M0 built the sim-first core: a segmented
@@ -98,10 +104,14 @@ API keys, static-JWKS OIDC), schema migrations as log records, `charpente
 describe`, and a black-box edge harness that drives stock binaries over
 real TCP with `kill -9` and TCP-proxy fault injection.
 
-**M2 is in progress**, starting with an honest benchmark harness. What is
-*not* built, so you don't have to go looking: there are no published
-performance numbers yet (the scaling paragraph above is an argument, not a
-measurement), no blob store, no object-storage backup (`serve::backup` is
+**M2 is in progress.** Its first sub-project, an honest benchmark harness, is
+done and its numbers are in [docs/BENCH.md](docs/BENCH.md) — measured on a dev
+laptop under `F_FULLFSYNC`, and explicitly not the launch claim. Read them
+before the scaling paragraph above: the commit path is fsync-bound at ~215
+durable records/sec on that hardware, roughly three orders of magnitude below
+the headline figure, and closing that gap is a named future sub-project
+(group commit), not a shipped property. What is *not* built, so you don't have
+to go looking: no blob store, no object-storage backup (`serve::backup` is
 a promotable hot standby, not a snapshot shipper), no WebSockets, no TS
 client codegen, and no tenant scoping as typed key prefixes.
 
@@ -111,6 +121,7 @@ client codegen, and no tenant scoping as typed key prefixes.
 | [DESIGN.md](DESIGN.md) | Architecture: the deterministic core, write model, typed surface, simulation |
 | [PLAN.md](PLAN.md) | Milestones (M0–M2), risks, non-goals |
 | [docs/GUIDE.md](docs/GUIDE.md) | How to build an app — agent-first, every runnable example compile-gated |
+| [docs/BENCH.md](docs/BENCH.md) | Measured numbers, method first — dev hardware, honestly labeled as not the launch claim |
 | [examples/invoicing](examples/invoicing) | The M0 demo: agent-built against the docs alone; DEMO.md + FINDINGS.md |
 
 ## Non-goals
