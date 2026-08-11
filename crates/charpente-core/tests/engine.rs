@@ -15,9 +15,11 @@
 //! two. Integration tests share the one normal build both crates see.
 
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use charpente_core::engine::{Engine, REHELLO_MARKER, StateMachine};
-use charpente_core::io::Disk;
+use charpente_core::io::{Disk, File};
 use charpente_core::log::{Wal, WalConfig};
 use charpente_sim::{FaultConfig, Sim};
 
@@ -30,6 +32,17 @@ impl StateMachine for Counter {
     fn apply(&mut self, seq: u64, payload: &[u8]) -> io::Result<()> {
         self.applied.push((seq, payload.to_vec()));
         Ok(())
+    }
+}
+
+/// Refuses every apply, so one `submit` poisons the engine. The record
+/// itself still appends and syncs — apply is the only thing that fails,
+/// which is exactly the state the poison flag exists to describe.
+struct AlwaysFails;
+
+impl StateMachine for AlwaysFails {
+    fn apply(&mut self, _seq: u64, _payload: &[u8]) -> io::Result<()> {
+        Err(io::Error::other("the test machine refuses every apply"))
     }
 }
 
@@ -145,5 +158,157 @@ fn submit_batch_out_of_order_seq_names_the_shared_rehello_marker() {
     assert!(
         msg.contains(REHELLO_MARKER),
         "the engine string must contain the exact marker follower.rs matches on: {msg}"
+    );
+}
+
+/// Group-commit T2: counts `File::sync` calls across every file a `Disk`
+/// opens, so a test can assert "N records, one fsync" without the sim
+/// exposing a sync counter of its own. Wraps `SimDisk` rather than
+/// replacing it — every fault-injection/latency behavior stays real, only
+/// the sync count is observed.
+#[derive(Clone)]
+struct SyncCounts(Arc<AtomicU64>);
+
+impl SyncCounts {
+    fn syncs(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+struct CountingDisk {
+    inner: charpente_sim::SimDisk,
+    syncs: Arc<AtomicU64>,
+}
+
+impl Disk for CountingDisk {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        let file = self.inner.open(path)?;
+        Ok(Box::new(CountingFile {
+            inner: file,
+            syncs: self.syncs.clone(),
+        }))
+    }
+
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+struct CountingFile {
+    inner: Box<dyn File>,
+    syncs: Arc<AtomicU64>,
+}
+
+impl File for CountingFile {
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.inner.read_at(offset, out)
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write_at(offset, data)
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.syncs.fetch_add(1, Ordering::SeqCst);
+        self.inner.sync()
+    }
+}
+
+fn engine_with_sync_counter(seed: u64) -> (Engine<Counter>, SyncCounts) {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let counts = SyncCounts(Arc::new(AtomicU64::new(0)));
+    let disk = CountingDisk {
+        inner: sim.disk(),
+        syncs: counts.0.clone(),
+    };
+    let engine = Engine::recover(Box::new(disk), wal_cfg(), Counter::default(), None).unwrap();
+    (engine, counts)
+}
+
+/// Group-commit T2 (spec §1), the whole feature in one assertion: three
+/// records staged as one batch must cost exactly one fsync, not three.
+#[test]
+fn submit_all_costs_one_sync_for_many_records() {
+    let (mut engine, counts) = engine_with_sync_counter(0x60C0_0001);
+    let before = counts.syncs();
+    // Three is not arbitrary: `wal_cfg`'s segment_bytes is 64 and each
+    // record frames to 16 + 1 = 17 bytes, so three fit in one segment. A
+    // FOURTH would rotate (68 > 64), and `Wal::rotate` syncs the old tail —
+    // a second sync for an entirely legitimate reason. The count below is a
+    // property of a batch inside one segment, not of any batch size.
+    let seqs = engine
+        .submit_all(&[b"a", b"b", b"c"])
+        .expect("three records commit");
+    assert_eq!(seqs, vec![0, 1, 2], "seqs are assigned in order");
+    assert_eq!(
+        counts.syncs() - before,
+        1,
+        "three records must cost exactly one fsync — that is the whole feature"
+    );
+}
+
+/// An arm with nothing ready must cost nothing: `submit_all(&[])` must not
+/// touch the WAL at all, not even a sync.
+#[test]
+fn submit_all_of_an_empty_slice_does_not_sync() {
+    let (mut engine, counts) = engine_with_sync_counter(0x60C0_0002);
+    let before = counts.syncs();
+    let seqs = engine.submit_all(&[]).expect("an empty batch is a no-op");
+    assert!(seqs.is_empty(), "no records means no seqs");
+    assert_eq!(
+        counts.syncs(),
+        before,
+        "an empty batch must not sync — an arm with nothing ready must cost nothing"
+    );
+}
+
+/// The poison check runs BEFORE the empty check, and that order is a policy
+/// choice rather than an accident: poison is a property of the engine, not
+/// of the argument, so an engine that cannot serve refuses every call — an
+/// empty batch included. Swapping the two guards is user-visible and
+/// reachable by construction from the request arm (a drain in which every
+/// staged handler returned an app `Err` stages zero payloads and calls
+/// `submit_all(&[])`, deciding whether those clients see their own errors or
+/// a blanket 500), and the T2 review proved that mutation leaves every other
+/// test in the workspace green.
+#[test]
+fn an_empty_batch_on_a_poisoned_engine_still_refuses() {
+    let sim = Sim::with_faults(0x60C0_0003, FaultConfig::none());
+    let mut engine = Engine::recover(Box::new(sim.disk()), wal_cfg(), AlwaysFails, None).unwrap();
+
+    engine
+        .submit(b"x")
+        .expect_err("the machine refuses every apply, which poisons the engine");
+    assert!(
+        engine.poisoned(),
+        "a durable record that failed to apply must poison the engine"
+    );
+
+    let err = engine
+        .submit_all(&[])
+        .expect_err("a poisoned engine must refuse even an empty batch");
+    assert_eq!(
+        err.to_string(),
+        "engine poisoned: a durable record failed to apply, so machine state no \
+         longer matches the log — restart and recover",
+        "the refusal must name the poison contract byte-exact — checks::classify \
+         matches on this string's prefix, so a reword reclassifies every poisoned \
+         universe in the sim suite"
     );
 }

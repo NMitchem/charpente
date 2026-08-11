@@ -919,6 +919,16 @@ size, so a faster server yields smaller batches. State the win as *"removes the
 one-fsync-per-transaction ceiling; on hardware whose fsync is slow enough to keep a queue
 deep it recovers Nx"* — never as *"charpente is Nx faster"*. Bare metal stays owed.
 
+  **Named site, carried from the T2 review (M-3), because this step's brief is about *new*
+  numbers and would otherwise not sweep it:** `docs/BENCH.md:181` reads "`Engine::submit` is
+  `wal.append` → `wal.sync()` → `apply`, one durable sync per transaction, no group commit."
+  That sentence was true when written and is *still* true at T2 (nothing batches yet, and the
+  length-1 path is byte-identical), but a reader following the citation already finds a
+  different shape at that name, and it becomes **outright false** the moment T6/T7 land. Rewrite
+  it against the shipped code — the one-sync-per-transaction claim is what the whole sub-project
+  removes, so leaving it standing would be the repo's recurring defect class (a doc its own
+  source disproves) sitting in the file that publishes the numbers.
+
 - [ ] **Step 2: DESIGN.md** — the staged commit path, the two-level overlay, `submit_all`,
 and the batch cap constant with its rationale.
 

@@ -107,31 +107,80 @@ impl<S: StateMachine> Engine<S> {
         })
     }
 
-    /// Append → sync → apply → acknowledge. On `Ok`, the record is durable
-    /// and applied; on `Err`, it is not acknowledged (it may still surface
-    /// after a crash, like any unacknowledged write). If apply fails after a
-    /// successful sync, machine state has diverged from durable truth and
-    /// the engine poisons itself — the only exit is restart-and-recover.
+    /// The length-1 case of `submit_all` — see its docs for the
+    /// append→sync→apply discipline this executes, and for what an `Err`
+    /// says about durable state.
     pub fn submit(&mut self, payload: &[u8]) -> io::Result<u64> {
+        // The payload goes straight into a length-1 slice-of-slices, so the
+        // single-request hot path pays no allocation for being routed
+        // through the batch core. Do NOT "simplify" this to a signature that
+        // copies (`&[Vec<u8>]` + `to_vec()`): that copy is O(payload), up to
+        // MAX_RECORD_BYTES, on the hottest path in the commit engine.
+        Ok(self.submit_all(&[payload])?[0])
+    }
+
+    /// Appends every record, syncs once for the batch, then applies each in
+    /// seq order — the append→sync→apply discipline of `submit`, N-wide.
+    /// Apply stays strictly after sync: a crash before the sync loses the
+    /// whole batch and never part of it, which is what keeps
+    /// ack-after-durable true for every record in it. (A batch large enough
+    /// to cross a segment boundary takes one more barrier than that:
+    /// `Wal::rotate` syncs the old tail before any frame lands in the new
+    /// segment. Batch atomicity is unaffected — that barrier falls between
+    /// frames, never between the batch's appends and its sync.)
+    ///
+    /// On `Ok`, every record is durable and applied. On `Err`, three cases
+    /// with different durable standing, which a caller must NOT conflate:
+    ///
+    /// - **append or sync failed**: nothing in the batch is acknowledged and
+    ///   the log is poisoned. Records already written may still surface
+    ///   after a crash, like any unacknowledged write.
+    /// - **apply failed at record `i`**: every record in the batch is
+    ///   ALREADY DURABLE. Records before `i` are applied and acknowledged;
+    ///   `i` and the tail are unacknowledged but WILL apply on restart — so
+    ///   their failure is a false negative, not a rejection. The engine
+    ///   poisons itself and restart-and-recover is the only exit.
+    ///
+    /// `last_applied()` is the caller's signal in every case, success
+    /// included: its delta across the call is exactly the number of records
+    /// acknowledged. `poisoned()` does not discriminate the cases above — it
+    /// ORs apply-poison with log-poison.
+    pub fn submit_all(&mut self, records: &[&[u8]]) -> io::Result<Vec<u64>> {
         if self.poisoned {
             return Err(io::Error::other(
                 "engine poisoned: a durable record failed to apply, so machine state no \
                  longer matches the log — restart and recover",
             ));
         }
-        let seq = self.wal.append(payload)?;
-        self.wal.sync()?;
-        assert_eq!(
-            seq,
-            self.last_applied.map_or(0, |l| l + 1),
-            "apply loop skipped a seq — append and apply have diverged"
-        );
-        if let Err(e) = self.machine.apply(seq, payload) {
-            self.poisoned = true;
-            return Err(e);
+        // An arm with nothing ready must cost nothing: no append, no sync.
+        // This check stays BELOW the poison check deliberately — poison is a
+        // property of the engine, not of the argument, so an engine that
+        // cannot serve refuses every call, this one included
+        // (`an_empty_batch_on_a_poisoned_engine_still_refuses` pins the
+        // order). `submit_batch` diverges here and does sync on an empty
+        // frame list; its empty case is guarded upstream at the peer
+        // boundary, so do not reconcile the two by making this arm sync.
+        if records.is_empty() {
+            return Ok(Vec::new());
         }
-        self.last_applied = Some(seq);
-        Ok(seq)
+        let mut seqs = Vec::with_capacity(records.len());
+        for payload in records {
+            seqs.push(self.wal.append(payload)?);
+        }
+        self.wal.sync()?;
+        for (seq, payload) in seqs.iter().zip(records) {
+            assert_eq!(
+                *seq,
+                self.last_applied.map_or(0, |l| l + 1),
+                "apply loop skipped a seq — append and apply have diverged"
+            );
+            if let Err(e) = self.machine.apply(*seq, payload) {
+                self.poisoned = true;
+                return Err(e);
+            }
+            self.last_applied = Some(*seq);
+        }
+        Ok(seqs)
     }
 
     /// The follower's apply path: append every frame, one sync, then apply
