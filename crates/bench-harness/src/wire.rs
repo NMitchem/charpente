@@ -70,6 +70,21 @@ impl Target {
         }
     }
 
+    /// Durable syncs paid per acked request, by construction (2026-08-10
+    /// group-commit interlude, T1 fix wave, C-1). Equal to
+    /// `records_per_request` ONLY while one commit costs one fsync —
+    /// `Engine::submit` today is unconditionally `append`→`sync`→`apply` with
+    /// no batching, so every committed record pays its own durable sync and
+    /// the two constants coincide. A future group-commit primary path is
+    /// where this stops holding: N records can share one fsync, and at that
+    /// point this needs a real server-reported sync count (a client outside
+    /// the process cannot count the server's `wal.sync()` calls any more than
+    /// it can count its log records) — see `wire_accounting`'s module doc for
+    /// what is owed and why this is not yet built.
+    fn syncs_per_request(&self) -> f64 {
+        self.records_per_request()
+    }
+
     /// Per-thread setup returning the headers every request carries. Run once
     /// per worker on its own connection, before the warmup, so no login
     /// round-trip lands inside a measured window.
@@ -393,16 +408,28 @@ fn sweep_point(
     joined?;
     let device_after = device_after?;
 
+    let acked = grand.load(Ordering::Relaxed);
     let obs = WireObs {
         connections: n,
         per_thread,
-        grand: grand.load(Ordering::Relaxed),
+        grand: acked,
         latencies_us,
         elapsed,
         client_cpu,
         device_before,
         device_after,
         records_per_request: target.records_per_request(),
+        // 2026-08-10 group-commit interlude, T1 fix wave, C-1: derived
+        // honestly via the per-target multiplier, not copied from `grand`.
+        // The review found the shipped form (`syncs: acked`) wrong by 2x for
+        // BenchApp — its canonical route commits TWO durable records per
+        // acked request (the request's own effects record and its Bump's
+        // Done-mark), so `records_per_request` (== `syncs_per_request` while
+        // one commit costs one fsync) is 2.0, not 1.0. Numerically unchanged
+        // for Invoicing (1.0). This remains a DERIVED input, not a counted
+        // one — see `Target::syncs_per_request`'s doc and
+        // `wire_accounting`'s module doc for what would make it counted.
+        syncs: (target.syncs_per_request() * acked as f64) as u64,
         heartbeat,
     };
     let a = point_accounting(&obs).map_err(io::Error::other)?;

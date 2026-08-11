@@ -420,6 +420,16 @@ the txn overlay into the group overlay and push the record.
 2. **Checkpoint cadence is per-batch.** `records_since_checkpoint += records.len()` once in
    `commit`, then the threshold check once — never inside the batch (§3).
 
+**A note for whoever implements this task (2026-08-10, T1's post-review fix wave, review
+finding 3).** Once staged commits make `syncs != ops` (core) and
+`syncs != requests_planned + stats_jobs_done` (kernel) for a real batched run,
+`core_accounting`'s `while_one_txn_costs_one_fsync_the_gate_input_is_unchanged` and
+`kernel_accounting`'s `while_one_commit_costs_one_fsync_the_gate_input_is_unchanged` will go
+RED. Both already carry a doc comment saying they are expected to be REPLACED by the
+divergence case, never silently deleted — this line exists because deleting them is the
+cheapest way to make this task's own test suite pass, and a doc comment alone does not stop
+that from happening.
+
 - [ ] **Step 1: Write the failing test — read-your-own-writes across the batch**
 
 ```rust
@@ -881,6 +891,18 @@ The comparison is `wire --target bench-app` at 64 and 256 connections against su
 subject — and confirm it stayed at or below the device ceiling, which is the evidence that
 the win came from amortization and not from skipping a sync.
 
+**Wire-layer note (T1's post-review fix wave, 2026-08-10, review finding C-1).** The wire
+layer's `syncs_per_sec` is DERIVED (`Target::syncs_per_request() * throughput`), not counted
+— a client outside the process cannot count the server's real `wal.sync()` calls. That
+derivation assumes one fsync per commit, which is exactly what batching breaks: once a
+group-commit primary path amortizes N commits over one fsync, the wire layer has no way to
+see the real count from outside the process, and `syncs_per_sec` will silently keep reporting
+the pre-batching (unbatched) rate. **Do not fudge the wire number to make it agree with
+core/kernel's real counts.** If the wire gate needs fixing at this point, land a
+server-reported sync counter (surfaced over HTTP or in the child's exit output) or re-scope
+the wire gate honestly and say so in BENCH.md — "we adjusted the check that would have caught
+it, in the commit that made the number" is exactly the outcome spec §5 exists to forbid.
+
 - [ ] **Step 3: Commit the artifact reference in the ledger** (no code commit).
 
 ---
@@ -958,3 +980,21 @@ git commit -m "bench: group commit — close out M2 sub-project 2"
 - Test helper names (`fresh_db`, `engine_with_sync_counter`, `run_universe_with_due_jobs`)
   follow existing suite conventions; implementers should reuse the real helpers in each file
   rather than create these if equivalents exist.
+
+**Resolved during T1's post-review fix wave (2026-08-10), recorded so the reasoning is not
+re-litigated:**
+- T1's Interfaces line above ("the gate input becomes `syncs as f64 /
+  elapsed.as_secs_f64()`") was written as if core, kernel and wire observe alike. They do
+  not: core and kernel observe the process they measure directly; wire is a separate process
+  and cannot count the server's syncs at all. This is a plan defect as much as an
+  implementation one (review finding C-1) — Step 3's "Apply the same shape in
+  `wire_accounting.rs`" is where it bit, and the shipped fix set `syncs: acked`, wrong by 2x
+  for `Target::BenchApp`. Fixed by giving `Target` a `syncs_per_request()` method and deriving
+  honestly (`Target::syncs_per_request() * throughput`) — still a DERIVED input, not a counted
+  one, and it stays that way until a server-reported sync counter lands (see Task 10's
+  wire-layer note above).
+- `syncs` is the first field in these three obs structs to break the accounting-split spec's
+  stated rule that "every field is a count, a duration or a verdict that was actually
+  observed; nothing here is derived" (`core_accounting.rs:34-36`). At core and kernel it is
+  sound (one commit, one fsync, no batching, so it really is what was observed); at wire it is
+  a deliberate, documented exception. Recorded here rather than left implicit.

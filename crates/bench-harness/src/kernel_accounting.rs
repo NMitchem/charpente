@@ -50,6 +50,13 @@ pub struct KernelObs {
     /// exactly one `Bump` (lib.rs's canonical route), so a drained batch must
     /// finish exactly as many jobs as it served requests.
     pub stats_jobs_done: u64,
+    /// Durable syncs this batch paid — the device-ratio gate's subject
+    /// (2026-08-10 group-commit interlude, T1). `Engine::submit` today is
+    /// unconditionally `append`→`sync`→`apply` with no batching, so this
+    /// equals the log record count (`requests_planned + stats_jobs_done`,
+    /// one commit each); a future group-commit primary path is what makes
+    /// the two diverge.
+    pub syncs: u64,
     /// The first non-200 response, already rendered, or `None` if every
     /// request succeeded. Rendering happens in the driver because it needs the
     /// body bytes; the DECISION about it happens here.
@@ -72,8 +79,17 @@ pub struct KernelAccounting {
     /// carries — so without this field the header describes a window this
     /// layer never used.
     pub window_secs: f64,
-    /// `log_records_per_sec / max(device_before, device_after)`. See the gate
-    /// in `kernel_accounting` for why the LOG rate is the operand.
+    /// The device-ratio gate's numerator (2026-08-10 group-commit interlude,
+    /// T1 fix wave, I-4) — published so `device_ratio` is reconstructable
+    /// from the artifact, mirroring the standing ruling behind
+    /// `CoreReport::device_ratio_denominator`. Today equals
+    /// `log_records_per_sec` exactly (one commit, one fsync, no batching).
+    pub syncs_per_sec: f64,
+    /// `syncs_per_sec / max(device_before, device_after)`. See the gate in
+    /// `kernel_accounting` for why syncs, not the log rate, is the operand
+    /// (2026-08-10 group-commit interlude, T1) — today the two are the same
+    /// number, one commit per sync, so this is unchanged in value from
+    /// before T1.
     pub device_ratio: f64,
     pub invalid: Vec<String>,
 }
@@ -165,19 +181,41 @@ pub fn kernel_accounting(k: &KernelObs) -> Result<KernelAccounting, String> {
     // LOG RECORD rate, not the ack rate. Hence `log_records_per_sec /
     // syncs_per_sec`, equivalently `acked_writes_per_sec <= syncs_per_sec / 2`.
     // Measured headroom on this machine is about 1%, so this is not slack.
+    //
+    // 2026-08-10 group-commit interlude, T1: the numerator is `k.syncs`, not
+    // `log_records_per_sec` — today they are the same number (one commit,
+    // one fsync, pinned by
+    // `while_one_commit_costs_one_fsync_the_gate_input_is_unchanged`), and a
+    // future group-commit primary path is where they stop being equal.
+    //
+    // T1 fix wave, C-2: mirrors core_accounting's guard. `syncs == 0` on a
+    // batch that already cleared the floor above is impossible under any
+    // engine, batched or not — a nonzero batch syncs at least once. Without
+    // this a producing site that leaves `KernelObs::syncs` at
+    // `KernelObs::default()`'s 0 makes `device_ratio` a silently-published
+    // 0.0, incapable of ever refusing anything.
+    if k.syncs == 0 {
+        return Err(format!(
+            "INVALID: the kernel batch drained {} requests but recorded 0 durable syncs — \
+             the device-ratio gate divides by this, and a zero numerator makes it incapable \
+             of refusing anything; kernel_bench::run must set KernelObs::syncs",
+            k.requests_planned
+        ));
+    }
     let ceiling = k.device_before.max(k.device_after);
-    let device_ratio = log_records_per_sec / ceiling;
+    let syncs_per_sec = k.syncs as f64 / secs;
+    let device_ratio = syncs_per_sec / ceiling;
     if implausible_bracketed_ratio(device_ratio, k.device_before, k.device_after) {
         invalid.push(format!(
             "INVALID: device_ratio {device_ratio:.3} exceeds 1.0 by more than this window's \
              own measurement error ({:.1}%) — this layer spends two durable syncs per request \
              (the request's own effects record and its Bump's Done-mark), and Engine::submit \
              performs exactly one wal.sync() per transaction with no group commit, so \
-             {log_records_per_sec:.2} log records/s cannot exceed the device's own durable \
-             rate. The denominator is this batch's own bracket max ({ceiling:.2}) from the \
-             samples either side of the window ({:.2} before / {:.2} after); the tolerance is \
-             the wider of those two disagreeing ({:.1}%) and the {:.1}% floor for drift a \
-             bracket cannot see",
+             {syncs_per_sec:.2} durable syncs/s ({log_records_per_sec:.2} log records/s) \
+             cannot exceed the device's own durable rate. The denominator is this batch's own \
+             bracket max ({ceiling:.2}) from the samples either side of the window ({:.2} \
+             before / {:.2} after); the tolerance is the wider of those two disagreeing \
+             ({:.1}%) and the {:.1}% floor for drift a bracket cannot see",
             ratio_tolerance(k.device_before, k.device_after) * 100.0,
             k.device_before,
             k.device_after,
@@ -189,6 +227,7 @@ pub fn kernel_accounting(k: &KernelObs) -> Result<KernelAccounting, String> {
     Ok(KernelAccounting {
         acked_writes_per_sec: k.requests_planned as f64 / secs,
         window_secs: secs,
+        syncs_per_sec,
         device_ratio,
         log_records_per_sec,
         invalid,
@@ -211,12 +250,16 @@ mod tests {
             responses_recorded: 10_000,
             stats_requests: 10_000,
             stats_jobs_done: 10_000,
+            // One fsync per commit — today's engine, so this equals the log
+            // record count (10_000 + 10_000).
+            syncs: 20_000,
             first_failure: None,
             elapsed: Duration::from_secs(2),
             heartbeat: None,
-            // 10_000 log records/s against a 20_000/s ceiling — ratio 0.5,
-            // comfortably plausible, and an exact binary fraction so the
-            // equality below is legitimate rather than lucky.
+            // 10_000 syncs/s (== 10_000 log records/s today) against a
+            // 20_000/s ceiling — ratio 0.5, comfortably plausible, and an
+            // exact binary fraction so the equality below is legitimate
+            // rather than lucky.
             device_before: 20_000.0,
             device_after: 20_000.0,
         }
@@ -436,6 +479,73 @@ mod tests {
             10_000.0,
             "the published window must be the one the published rate divides by"
         );
+    }
+
+    /// The gate's subject is SYNCS, not log records — mirroring
+    /// core_accounting's discriminating test. Today the two are equal at this
+    /// layer too (one commit, one fsync — the request's own effects record
+    /// and its Bump's Done-mark each pay their own sync), which is why
+    /// `while_one_commit_costs_one_fsync_the_gate_input_is_unchanged` below
+    /// passes trivially; after group commit they diverge and only the syncs
+    /// framing stays physically meaningful.
+    #[test]
+    fn the_gate_compares_syncs_to_the_device_ceiling_not_log_records() {
+        let mut o = healthy();
+        // healthy()'s 20,000 log records over 2s (10,000/s) against a
+        // 6,000/s ceiling would be refused under the OLD log-rate gate
+        // (ratio 1.667, past the 1.5 hard limit). Set syncs to a
+        // batched-looking 10,000 (5,000/s) — under the ceiling — to prove
+        // the gate now compares syncs, not the log record rate.
+        o.device_before = 6_000.0;
+        o.device_after = 6_000.0;
+        let old_log_rate_ratio = (o.requests_planned + o.stats_jobs_done) as f64
+            / o.elapsed.as_secs_f64()
+            / o.device_before.max(o.device_after);
+        assert!(
+            old_log_rate_ratio > crate::measure::RATIO_HARD_LIMIT,
+            "premise: the OLD log-rate gate must have refused this, or this \
+             test proves nothing about the new one — ratio {old_log_rate_ratio}"
+        );
+        o.syncs = 10_000;
+        let a = kernel_accounting(&o).expect("must not refuse");
+        assert!(
+            a.invalid.is_empty(),
+            "a batched batch under the sync ceiling must not be refused: {:?}",
+            a.invalid
+        );
+    }
+
+    /// C-2 fix (2026-08-10 group-commit interlude, T1 fix wave): mirrors
+    /// core_accounting's guard test. RED-first per hard rule 3: fails against
+    /// code without the guard (`kernel_accounting` returns `Ok` with
+    /// `device_ratio: 0.0` and an empty `invalid`).
+    #[test]
+    fn a_zero_sync_count_refuses_rather_than_silently_disabling_the_gate() {
+        let mut o = healthy();
+        o.syncs = 0;
+        let err = kernel_accounting(&o).expect_err("a zero-sync batch refuses");
+        assert!(err.contains("INVALID"), "got: {err}");
+        assert!(err.contains("0 durable syncs"), "got: {err}");
+        assert!(err.contains("KernelObs::syncs"), "must name the fix: {err}");
+    }
+
+    /// T1's no-behaviour-change claim, ASSERTED — mirrors core_accounting's
+    /// `while_one_txn_costs_one_fsync_the_gate_input_is_unchanged`. At this
+    /// layer one sync per commit means `syncs` equals the log record count
+    /// (`requests_planned + stats_jobs_done`), so the published ratio must
+    /// equal the old log-rate-based one exactly.
+    #[test]
+    fn while_one_commit_costs_one_fsync_the_gate_input_is_unchanged() {
+        let mut o = healthy();
+        o.syncs = o.requests_planned + o.stats_jobs_done; // one fsync per commit
+        let a = kernel_accounting(&o).expect("healthy batch");
+        let log_rate_ratio = a.log_records_per_sec / o.device_before.max(o.device_after);
+        assert_eq!(
+            a.device_ratio, log_rate_ratio,
+            "with syncs == log records the new gate input must equal the old one \
+             exactly, or T1 changed behaviour it claimed not to"
+        );
+        assert!(a.invalid.is_empty(), "{:?}", a.invalid);
     }
 
     /// T6 review, M-5 / Noah ruling: two durable syncs per request, so the

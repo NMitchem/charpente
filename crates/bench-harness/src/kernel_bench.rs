@@ -136,8 +136,29 @@ pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> 
                 });
     }
     let stats = kernel.stats();
-    obs.stats_requests = stats.requests;
-    obs.stats_jobs_done = stats.jobs_done;
+    // C-2 fix (2026-08-10 group-commit interlude, T1 fix wave): a FULL
+    // struct literal, not `obs.field = ...` trailing mutations — the shape
+    // that let `syncs` silently stay at `KernelObs::default()`'s 0 with the
+    // compiler saying nothing (review C-2). Every field of `KernelObs` is
+    // already known by this point; naming them all here means a future field
+    // added to the struct, or a future edit that drops `syncs`, breaks the
+    // build instead of silently disabling the gate.
+    obs = KernelObs {
+        requests_planned: obs.requests_planned,
+        responses_recorded: obs.responses_recorded,
+        stats_requests: stats.requests,
+        device_before: obs.device_before,
+        device_after: obs.device_after,
+        stats_jobs_done: stats.jobs_done,
+        // `Engine::submit` is one fsync per commit with no batching, so this
+        // equals the log record count (the request's own effects record plus
+        // its Bump's Done-mark). A future group-commit primary path is where
+        // this stops being a copy of that sum.
+        syncs: obs.requests_planned + stats.jobs_done,
+        first_failure: obs.first_failure.clone(),
+        elapsed: obs.elapsed,
+        heartbeat: obs.heartbeat.clone(),
+    };
 
     let a = kernel_accounting::kernel_accounting(&obs).map_err(io::Error::other)?;
     Ok((
@@ -145,6 +166,7 @@ pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> 
             acked_writes_per_sec: a.acked_writes_per_sec,
             log_records_per_sec: a.log_records_per_sec,
             window_secs: a.window_secs,
+            syncs_per_sec: a.syncs_per_sec,
             device_ratio: a.device_ratio,
             device_appends_per_sec_before: obs.device_before,
             device_appends_per_sec_after: obs.device_after,

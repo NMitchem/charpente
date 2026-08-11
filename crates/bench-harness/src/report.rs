@@ -35,6 +35,15 @@ pub struct CoreReport {
     pub acked_writes_per_sec: f64,
     pub log_records_per_sec: f64,
     pub reads_per_sec: f64,
+    // 2026-08-10 group-commit interlude, T1 fix wave, I-4: the device-ratio
+    // gate's NUMERATOR, published for the same reason
+    // `device_ratio_denominator` below was added for the denominator (T5
+    // review C-1 / Noah ruling #1) — so `device_ratio` is reconstructable
+    // from the artifact instead of implicit. Today equals
+    // `acked_writes_per_sec`/`log_records_per_sec` exactly (one transaction,
+    // one fsync, no batching); a group-commit primary path is where the two
+    // diverge.
+    pub syncs_per_sec: f64,
     pub device_ratio: f64,
     // T5 review, C-1 / Noah ruling #1: state in the artifact itself which
     // device operand the ratio divides by, rather than leaving it implicit
@@ -56,10 +65,20 @@ pub struct KernelReport {
     // --duration, so the artifact's methodology header describes a window it
     // never used. Publish the one it did measure.
     pub window_secs: f64,
-    // T6 review, M-5 / Noah ruling: two durable syncs per request, so the LOG
-    // rate is what the ceiling bounds one-for-one. 2026-08-10 interlude: the
-    // denominator is this batch's own bracket max, not layer 1's one-shot
-    // device.syncs_per_sec.
+    // 2026-08-10 group-commit interlude, T1 fix wave, I-4: the device-ratio
+    // gate's NUMERATOR, published so `device_ratio` is reconstructable from
+    // the artifact (mirrors `CoreReport::syncs_per_sec` — the same standing
+    // ruling applied symmetrically to the numerator). Today equals
+    // `log_records_per_sec` exactly (one commit, one fsync, no batching, two
+    // syncs per request); a group-commit primary path is where the two
+    // diverge.
+    pub syncs_per_sec: f64,
+    // `syncs_per_sec / max(device_before, device_after)` (2026-08-10
+    // group-commit interlude, T1) — the numerator is SYNCS, not the log
+    // record rate; see `kernel_accounting` for why. Today the two are the
+    // same number, one commit, one sync, so this is unchanged in value from
+    // before T1 — `syncs_per_sec` beside it is what lets a reader check that
+    // equality from the artifact itself, rather than take it on faith.
     pub device_ratio: f64,
     // 2026-08-10 interlude §4.2: this layer brackets its own batch window, as
     // core and wire already did. The shipped refusal message used to name the
@@ -80,11 +99,28 @@ pub struct SweepPoint {
     pub connections: usize,
     pub throughput_per_sec: f64,
     pub log_records_per_sec: f64,
-    // T7 rev. 4 (Noah ruling, 2026-08-09): published here but NOT gated on,
-    // unlike kernel.device_ratio. This layer's log rate is DERIVED
-    // (records_per_request * throughput) rather than observed, and a derived
-    // quantity cannot carry a gate — the gate at this layer is on the COUNTED
-    // acked-request rate instead. See wire_accounting's module doc.
+    // 2026-08-10 group-commit interlude, T1 fix wave, I-4/C-1: the
+    // device-ratio gate's ACTUAL subject. NOT a counted quantity — a client
+    // outside the process cannot see the server's log, so this is
+    // `Target::syncs_per_request() * throughput` (wire.rs), today equal to
+    // `log_records_per_sec` (one commit, one fsync, no batching). Published
+    // so the gate's own numerator is reconstructable from the artifact
+    // rather than implicit, mirroring the standing ruling that added
+    // `device_ratio_denominator` for the DENOMINATOR (T5 review C-1 / Noah
+    // ruling #1). See wire_accounting's module doc for why gating on a
+    // derived quantity here is safe as of this fix, having previously been
+    // ruled unsafe (T7 rev. 4).
+    pub syncs_per_sec: f64,
+    // T7 rev. 4 (Noah ruling, 2026-08-09), SUPERSEDED at the wire layer by
+    // the 2026-08-10 group-commit interlude's T1 fix wave (C-1): this field
+    // is still published-but-not-gated-on — it stays the log-record-rate
+    // derivation, which is a DIFFERENT quantity from the gate's numerator
+    // now that `syncs_per_sec` exists as its own field — but the gate itself
+    // moved OFF the counted acked-request rate onto `syncs_per_sec` above,
+    // reversing this comment's own "a derived quantity cannot carry a gate"
+    // claim for that specific numerator. See wire_accounting's module doc for
+    // the full reasoning and why it is not a regression to the false-alarm
+    // behaviour rev. 4 fixed.
     pub device_ratio: f64,
     // T7 rev. 3 (Noah ruling, 2026-08-09): each point brackets its own
     // ceiling (before/after, child not running) and both ratios divide by the
@@ -160,6 +196,7 @@ fn collect_non_finite(r: &Report) -> Vec<String> {
         );
         push_if_non_finite(&mut out, "core.log_records_per_sec", c.log_records_per_sec);
         push_if_non_finite(&mut out, "core.reads_per_sec", c.reads_per_sec);
+        push_if_non_finite(&mut out, "core.syncs_per_sec", c.syncs_per_sec);
         push_if_non_finite(&mut out, "core.device_ratio", c.device_ratio);
         push_if_non_finite(
             &mut out,
@@ -184,6 +221,7 @@ fn collect_non_finite(r: &Report) -> Vec<String> {
             k.log_records_per_sec,
         );
         push_if_non_finite(&mut out, "kernel.window_secs", k.window_secs);
+        push_if_non_finite(&mut out, "kernel.syncs_per_sec", k.syncs_per_sec);
         push_if_non_finite(&mut out, "kernel.device_ratio", k.device_ratio);
         // 2026-08-10 interlude: scanned by the SAME scan as core's and wire's
         // equivalents — a published field this scan skips is exactly how the
@@ -211,6 +249,11 @@ fn collect_non_finite(r: &Report) -> Vec<String> {
                 &mut out,
                 &format!("{prefix}.log_records_per_sec"),
                 p.log_records_per_sec,
+            );
+            push_if_non_finite(
+                &mut out,
+                &format!("{prefix}.syncs_per_sec"),
+                p.syncs_per_sec,
             );
             push_if_non_finite(&mut out, &format!("{prefix}.device_ratio"), p.device_ratio);
             push_if_non_finite(
@@ -294,11 +337,13 @@ pub fn render_json(r: &Report) -> Result<String, String> {
     if let Some(c) = &r.core {
         s.push_str(&format!(
             ",\"core\":{{\"acked_writes_per_sec\":{},\"log_records_per_sec\":{},\
-             \"reads_per_sec\":{},\"device_ratio\":{},\"device_ratio_denominator\":\"{}\",\
+             \"reads_per_sec\":{},\"syncs_per_sec\":{},\"device_ratio\":{},\
+             \"device_ratio_denominator\":\"{}\",\
              \"device_appends_per_sec_before\":{},\"device_appends_per_sec_after\":{}}}",
             num2(c.acked_writes_per_sec),
             num2(c.log_records_per_sec),
             num2(c.reads_per_sec),
+            num2(c.syncs_per_sec),
             num3(c.device_ratio),
             esc(c.device_ratio_denominator),
             num2(c.device_appends_per_sec_before),
@@ -308,12 +353,13 @@ pub fn render_json(r: &Report) -> Result<String, String> {
     if let Some(k) = &r.kernel {
         s.push_str(&format!(
             ",\"kernel\":{{\"acked_writes_per_sec\":{},\"log_records_per_sec\":{},\
-             \"window_secs\":{},\"device_ratio\":{},\
+             \"window_secs\":{},\"syncs_per_sec\":{},\"device_ratio\":{},\
              \"device_appends_per_sec_before\":{},\"device_appends_per_sec_after\":{},\
              \"requests_total\":{},\"jobs_done\":{}}}",
             num2(k.acked_writes_per_sec),
             num2(k.log_records_per_sec),
             num2(k.window_secs),
+            num2(k.syncs_per_sec),
             num3(k.device_ratio),
             num2(k.device_appends_per_sec_before),
             num2(k.device_appends_per_sec_after),
@@ -334,13 +380,14 @@ pub fn render_json(r: &Report) -> Result<String, String> {
                 }
                 s.push_str(&format!(
                     "{{\"connections\":{},\"throughput_per_sec\":{},\
-                     \"log_records_per_sec\":{},\"device_ratio\":{},\
+                     \"log_records_per_sec\":{},\"syncs_per_sec\":{},\"device_ratio\":{},\
                      \"device_appends_per_sec_before\":{},\"device_appends_per_sec_after\":{},\
                      \"p50_us\":{},\"p99_us\":{},\"p999_us\":{},\"client_busy_fraction\":{},\
                      \"saturated\":{}}}",
                     p.connections,
                     num2(p.throughput_per_sec),
                     num2(p.log_records_per_sec),
+                    num2(p.syncs_per_sec),
                     num3(p.device_ratio),
                     num2(p.device_appends_per_sec_before),
                     num2(p.device_appends_per_sec_after),
@@ -398,9 +445,14 @@ pub fn render_human(r: &Report) -> String {
     }
     if let Some(c) = &r.core {
         s.push_str(&format!(
-            "  core:   {:.0} acked writes/s ({:.2}x {}, bracket {:.0}/{:.0} appends/s \
-             before/after), {:.0} log records/s, {:.0} reads/s\n",
+            // 2026-08-10 group-commit interlude, T1 fix wave, M-3: the ratio
+            // is SYNCS' ratio, not acked writes' — print the syncs rate
+            // beside it rather than juxtaposing the ratio with a different
+            // published number.
+            "  core:   {:.0} acked writes/s, {:.0} durable syncs/s ({:.2}x {}, bracket \
+             {:.0}/{:.0} appends/s before/after), {:.0} log records/s, {:.0} reads/s\n",
             c.acked_writes_per_sec,
+            c.syncs_per_sec,
             c.device_ratio,
             c.device_ratio_denominator,
             c.device_appends_per_sec_before,
@@ -413,11 +465,16 @@ pub fn render_human(r: &Report) -> String {
         s.push_str(&format!(
             // T6 review, I-4: name this layer's OWN window here. The header
             // above carries --warmup/--duration, which this layer never read.
-            "  kernel: {:.0} acked writes/s, {:.0} log records/s ({} requests, {} jobs; \
-             {:.2}s batch window, no warmup; device_ratio {:.3}, bracket {:.0}/{:.0} \
-             appends/s before/after)\n",
+            // 2026-08-10 group-commit interlude, T1 fix wave, M-2/M-3: print
+            // the syncs rate the ratio actually divides by, rather than
+            // asserting in prose that it equals the log rate (a claim with a
+            // shelf life that nothing pinned).
+            "  kernel: {:.0} acked writes/s, {:.0} log records/s, {:.0} durable syncs/s ({} \
+             requests, {} jobs; {:.2}s batch window, no warmup; device_ratio {:.3}, bracket \
+             {:.0}/{:.0} appends/s before/after)\n",
             k.acked_writes_per_sec,
             k.log_records_per_sec,
+            k.syncs_per_sec,
             k.requests_total,
             k.jobs_done,
             k.window_secs,
@@ -430,12 +487,16 @@ pub fn render_human(r: &Report) -> String {
         s.push_str(&format!("  wire [{}]:\n", w.target));
         for p in &w.points {
             s.push_str(&format!(
-                "    {:>4} conns: {:>8.0} req/s  {:>8.0} rec/s  {:.3}x dev (bracket {:.0}/{:.0} \
-                 appends/s before/after)  p50 {:>6}us  p99 {:>6}us  p99.9 {:>6}us  client busy \
-                 {:.0}%{}\n",
+                // 2026-08-10 group-commit interlude, T1 fix wave, I-4: the
+                // syncs rate is what the gate actually divides by (never
+                // `log_records_per_sec`, which stays published-but-ungated).
+                "    {:>4} conns: {:>8.0} req/s  {:>8.0} rec/s  {:>8.0} sync/s  {:.3}x dev \
+                 (bracket {:.0}/{:.0} appends/s before/after)  p50 {:>6}us  p99 {:>6}us  \
+                 p99.9 {:>6}us  client busy {:.0}%{}\n",
                 p.connections,
                 p.throughput_per_sec,
                 p.log_records_per_sec,
+                p.syncs_per_sec,
                 p.device_ratio,
                 p.device_appends_per_sec_before,
                 p.device_appends_per_sec_after,
@@ -479,6 +540,7 @@ mod tests {
                 acked_writes_per_sec: 1450.0,
                 log_records_per_sec: 1450.0,
                 reads_per_sec: 800000.0,
+                syncs_per_sec: 1450.0,
                 device_ratio: 0.97,
                 device_ratio_denominator: "the device bracket max",
                 device_appends_per_sec_before: 1490.0,
@@ -488,6 +550,7 @@ mod tests {
                 acked_writes_per_sec: 1300.0,
                 log_records_per_sec: 2600.0,
                 window_secs: 38.46,
+                syncs_per_sec: 2600.0,
                 device_ratio: 0.867,
                 device_appends_per_sec_before: 2980.0,
                 device_appends_per_sec_after: 3020.0,
@@ -500,6 +563,7 @@ mod tests {
                     connections: 4,
                     throughput_per_sec: 1200.0,
                     log_records_per_sec: 2400.0,
+                    syncs_per_sec: 2400.0,
                     device_ratio: 0.685,
                     device_appends_per_sec_before: 3500.0,
                     device_appends_per_sec_after: 3600.0,
@@ -526,15 +590,18 @@ mod tests {
              \"duration_secs\":30.00,\"device\":{\"syncs_per_sec\":1500.25,\
              \"appends_per_sec\":1400.50},\"core\":{\"acked_writes_per_sec\":1450.00,\
              \"log_records_per_sec\":1450.00,\"reads_per_sec\":800000.00,\
-             \"device_ratio\":0.970,\"device_ratio_denominator\":\"the device bracket max\",\
+             \"syncs_per_sec\":1450.00,\"device_ratio\":0.970,\
+             \"device_ratio_denominator\":\"the device bracket max\",\
              \"device_appends_per_sec_before\":1490.00,\"device_appends_per_sec_after\":1510.00},\
              \"kernel\":{\"acked_writes_per_sec\":1300.00,\
              \"log_records_per_sec\":2600.00,\"window_secs\":38.46,\
+             \"syncs_per_sec\":2600.00,\
              \"device_ratio\":0.867,\"device_appends_per_sec_before\":2980.00,\
              \"device_appends_per_sec_after\":3020.00,\
              \"requests_total\":50000,\"jobs_done\":50000},\
              \"wire\":[{\"target\":\"bench-app\",\"points\":[{\"connections\":4,\
              \"throughput_per_sec\":1200.00,\"log_records_per_sec\":2400.00,\
+             \"syncs_per_sec\":2400.00,\
              \"device_ratio\":0.685,\"device_appends_per_sec_before\":3500.00,\
              \"device_appends_per_sec_after\":3600.00,\"p50_us\":800,\"p99_us\":2100,\
              \"p999_us\":5000,\
@@ -678,7 +745,7 @@ mod tests {
             json.contains(
                 "\"wire\":[{\"target\":\"bench-app\",\"points\":[{\"connections\":4,\
              \"throughput_per_sec\":1200.00,\"log_records_per_sec\":2400.00,\
-             \"device_ratio\":null"
+             \"syncs_per_sec\":2400.00,\"device_ratio\":null"
             ),
             "non-finite wire device_ratio must render as JSON null, got: {json}"
         );
@@ -753,8 +820,9 @@ mod tests {
         );
         assert_eq!(
             lines[2],
-            "  core:   1450 acked writes/s (0.97x the device bracket max, bracket 1490/1510 \
-             appends/s before/after), 1450 log records/s, 800000 reads/s",
+            "  core:   1450 acked writes/s, 1450 durable syncs/s (0.97x the device bracket \
+             max, bracket 1490/1510 appends/s before/after), 1450 log records/s, 800000 \
+             reads/s",
             "got: {human}"
         );
     }
@@ -777,9 +845,9 @@ mod tests {
         );
         assert_eq!(
             lines[3],
-            "  kernel: 1300 acked writes/s, 2600 log records/s (50000 requests, 50000 jobs; \
-             38.46s batch window, no warmup; device_ratio 0.867, bracket 2980/3020 \
-             appends/s before/after)",
+            "  kernel: 1300 acked writes/s, 2600 log records/s, 2600 durable syncs/s (50000 \
+             requests, 50000 jobs; 38.46s batch window, no warmup; device_ratio 0.867, \
+             bracket 2980/3020 appends/s before/after)",
             "got: {human}"
         );
     }

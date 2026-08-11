@@ -48,6 +48,14 @@ pub struct WriteObs {
     /// 0-based (log.rs's `next_seq` starts at 0), which is the whole of N-1.
     pub applied_before: Option<u64>,
     pub applied_after: Option<u64>,
+    /// Durable syncs this window paid — the device-ratio gate's subject
+    /// (2026-08-10 group-commit interlude, T1). `Engine::submit` today is
+    /// unconditionally `append`→`sync`→`apply` with no batching, so one
+    /// acked write costs exactly one fsync and this equals `ops`; a future
+    /// group-commit primary path is what makes the two diverge, and this
+    /// field exists so that path has an obvious place to publish its own
+    /// count rather than an assumed one.
+    pub syncs: u64,
     /// `Heartbeat::finish()` spanning both bracket samples and the write
     /// window. `None` = one continuous run on a settled machine.
     pub heartbeat: Option<String>,
@@ -104,6 +112,11 @@ pub struct CoreObservations {
 pub struct WriteAccounting {
     pub acked_writes_per_sec: f64,
     pub log_records_per_sec: f64,
+    /// The device-ratio gate's numerator (2026-08-10 group-commit interlude,
+    /// T1 fix wave, I-4) — published so `device_ratio` is reconstructable
+    /// from the artifact, mirroring the standing ruling behind
+    /// `CoreReport::device_ratio_denominator`.
+    pub syncs_per_sec: f64,
     pub device_ratio: f64,
     pub invalid: Vec<String>,
 }
@@ -236,7 +249,33 @@ pub fn write_accounting(duration: Duration, w: &WriteObs) -> Result<WriteAccount
     // Interlude spec §4.2: divide by the WORSE (larger) of this window's own
     // two bracket samples, exactly as the wire layer has since T7 rev. 3 — not
     // by a one-shot `device.syncs_per_sec` from a separate invocation.
-    let device_ratio = acked_writes_per_sec / w.device_before.max(w.device_after);
+    //
+    // 2026-08-10 group-commit interlude, T1: the numerator is SYNCS, not
+    // acked writes. Today `Engine::submit` pays one fsync per acked write, so
+    // `syncs_per_sec` equals `acked_writes_per_sec` exactly and this is a
+    // no-op change in value (pinned by
+    // `while_one_txn_costs_one_fsync_the_gate_input_is_unchanged` below); a
+    // future group-commit primary path amortizes one fsync over N acked
+    // writes, and only the sync rate stays bounded by the device's own sync
+    // ceiling.
+    //
+    // T1 fix wave, C-2: `syncs == 0` on a window that already cleared the op
+    // floor is impossible under any engine, batched or not — a nonzero batch
+    // syncs at least once. Without this a producing site that leaves
+    // `WriteObs::syncs` at `WriteObs::default()`'s 0 (e.g. a deleted trailing
+    // assignment) makes `device_ratio` a silently-published 0.0, incapable of
+    // ever refusing anything — the whole point of this gate defeated by one
+    // missed field.
+    if w.syncs == 0 {
+        return Err(format!(
+            "INVALID: the core write window completed {} ops but recorded 0 durable syncs — \
+             the device-ratio gate divides by this, and a zero numerator makes it incapable \
+             of refusing anything; core_bench::run must set WriteObs::syncs",
+            w.ops
+        ));
+    }
+    let syncs_per_sec = w.syncs as f64 / w.elapsed.as_secs_f64();
+    let device_ratio = syncs_per_sec / w.device_before.max(w.device_after);
     if let Some(reason) = device_ratio_reason(device_ratio, w.device_before, w.device_after) {
         invalid.push(reason);
     }
@@ -244,6 +283,7 @@ pub fn write_accounting(duration: Duration, w: &WriteObs) -> Result<WriteAccount
     Ok(WriteAccounting {
         acked_writes_per_sec,
         log_records_per_sec,
+        syncs_per_sec,
         device_ratio,
         invalid,
     })
@@ -303,6 +343,62 @@ mod tests {
     use super::*;
     use crate::measure::MIN_MEASURED_OPS;
 
+    /// The gate's subject is SYNCS, not records. Today they are equal (one
+    /// transaction, one fsync), which is why this passes trivially before
+    /// group commit — that equality is asserted by
+    /// `while_one_txn_costs_one_fsync_the_gate_input_is_unchanged` below.
+    /// After group commit the two diverge and only this framing stays
+    /// physically meaningful.
+    #[test]
+    fn the_gate_compares_syncs_to_the_device_ceiling_not_records() {
+        // 1000 records committed under 100 syncs, against a 120/s device ceiling.
+        // Records/sec (1000) is 8.3x the ceiling and would be refused; syncs/sec
+        // (100) is below it and is the honest comparison.
+        let w = WriteObs {
+            ops: 1000,
+            loop_delta: 1000,
+            syncs: 100,
+            elapsed: Duration::from_secs(1),
+            applied_before: Some(0),
+            applied_after: Some(1000),
+            device_before: 120.0,
+            device_after: 120.0,
+            heartbeat: None,
+        };
+        // M-1 fix (2026-08-10 group-commit interlude, T1 fix wave): the
+        // premise, asserted rather than merely stated in prose — both
+        // siblings (kernel's `..._not_log_records`, wire's
+        // `..._not_the_counted_request_rate`) already carry this.
+        let old_records_rate_ratio =
+            w.ops as f64 / w.elapsed.as_secs_f64() / w.device_before.max(w.device_after);
+        assert!(
+            old_records_rate_ratio > crate::measure::RATIO_HARD_LIMIT,
+            "premise: the OLD records-rate gate must have refused this, or this test \
+             proves nothing about the new one — ratio {old_records_rate_ratio}"
+        );
+        let a = write_accounting(Duration::from_secs(1), &w).expect("must not refuse");
+        assert!(
+            a.invalid.is_empty(),
+            "a batched run under the sync ceiling must not be refused: {:?}",
+            a.invalid
+        );
+    }
+
+    /// C-2 fix (2026-08-10 group-commit interlude, T1 fix wave): a producing
+    /// site that leaves `syncs` at 0 must refuse, not silently publish a
+    /// device_ratio of 0.0 that can never fire. RED-first per hard rule 3:
+    /// this fails against code without the guard (`write_accounting` returns
+    /// `Ok` with `device_ratio: 0.0` and an empty `invalid`).
+    #[test]
+    fn a_zero_sync_count_refuses_rather_than_silently_disabling_the_gate() {
+        let mut o = healthy();
+        o.write.syncs = 0;
+        let err = write_accounting(o.duration, &o.write).expect_err("a zero-sync window refuses");
+        assert!(err.contains("INVALID"), "got: {err}");
+        assert!(err.contains("0 durable syncs"), "got: {err}");
+        assert!(err.contains("WriteObs::syncs"), "must name the fix: {err}");
+    }
+
     // T5 review, C-1 / Noah ruling #1: a physically-impossible ratio must be
     // named, not silently published. Pure function — no hardware timing
     // dependency — so this asserts the gate itself, independent of whether
@@ -321,6 +417,7 @@ mod tests {
         let w = WriteObs {
             ops: 206,
             loop_delta: 206,
+            syncs: 206, // one fsync per transaction — today's engine
             elapsed: Duration::from_secs(1),
             applied_before: None,
             applied_after: Some(205),
@@ -339,6 +436,46 @@ mod tests {
             "the denominator must be max(before, after) = 218, got ratio {}",
             a.device_ratio
         );
+    }
+
+    /// T1's no-behaviour-change claim, ASSERTED rather than implied. While one
+    /// transaction costs one fsync, the gate's new subject and its old one are the
+    /// same number, so the published ratio must equal the records-based ratio
+    /// exactly — that equality is the claim, and a test that merely ran a healthy
+    /// case without asserting it would pass no matter what T1 broke.
+    ///
+    /// A later task makes syncs and records diverge. This test is then expected to
+    /// be REPLACED by the divergence case, never silently deleted.
+    #[test]
+    fn while_one_txn_costs_one_fsync_the_gate_input_is_unchanged() {
+        let ceiling = 250.0;
+        let w = WriteObs {
+            ops: 500,
+            loop_delta: 500,
+            syncs: 500, // one fsync per transaction — today's engine
+            elapsed: Duration::from_secs(2),
+            applied_before: Some(0),
+            applied_after: Some(500),
+            device_before: ceiling,
+            device_after: ceiling,
+            heartbeat: None,
+        };
+        let a = write_accounting(Duration::from_secs(2), &w).expect("healthy run");
+        // M-4 fix (2026-08-10 group-commit interlude, T1 fix wave): derive
+        // the comparand from the PUBLISHED `acked_writes_per_sec` rather than
+        // recomputing with a hard-coded `/ 2.0` window — the fixture's
+        // `duration` and `elapsed` happen to agree (both `Duration::from_
+        // secs(2)`), so the hard-coded divisor could not see a swap between
+        // the two go wrong. `a.acked_writes_per_sec / ceiling` is strictly
+        // stronger and shorter (mirrors kernel_accounting's twin, which
+        // already derives from a published field).
+        let records_ratio = a.acked_writes_per_sec / ceiling;
+        assert_eq!(
+            a.device_ratio, records_ratio,
+            "with syncs == records the new gate input must equal the old one exactly, \
+             or T1 changed behaviour it claimed not to"
+        );
+        assert!(a.invalid.is_empty(), "{:?}", a.invalid);
     }
 
     #[test]
@@ -409,6 +546,7 @@ mod tests {
             write: WriteObs {
                 ops: 7_500,
                 loop_delta: 7_500,
+                syncs: 7_500, // one fsync per transaction — today's engine
                 elapsed: Duration::from_secs(30),
                 applied_before: Some(99),
                 applied_after: Some(7_599),

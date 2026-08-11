@@ -53,8 +53,20 @@ invites flattering double-counting in one direction or the other:
 process cannot see the server's log, so that layer multiplies its counted
 request rate by a per-target constant: 2.0 for `bench-app` (the canonical
 transaction's own dual-write invariant) and 1.0 for invoicing's route, which is
-a get + put with no enqueue. The gate at that layer therefore sits on the
-**counted** acked-request rate, never on the derived one.
+a get + put with no enqueue.
+
+**The gate's numerator is a derived quantity too, as of the 2026-08-10
+group-commit interlude's T1 fix wave.** `syncs_per_sec` is
+`syncs_per_request * throughput` — the same per-target multiplier, honestly
+named for what it bounds. This reverses an earlier ruling that the wire gate
+must stay on a COUNTED quantity: what made that ruling necessary was a
+`1.0 + 1e-6` tolerance turning ordinary derivation error into a false alarm,
+not anything wrong with deriving per se. The device-ratio-gate bullet below
+carries the wider tolerance that absorbs it instead. **Owed work:** a
+group-commit primary path breaks the one-fsync-per-commit premise this
+multiplier assumes, and a client outside the process cannot count real sync
+calls — either a server-reported sync counter lands, or this gate is
+re-scoped honestly and this doc says so. See the group-commit plan's Task 10.
 
 ### What can invalidate a run
 
@@ -70,13 +82,19 @@ thresholds are not tunable from the command line.
 - **Client saturation.** Client CPU time is measured against wall time; a point
   where the client is more than 90% busy is measuring the client, not the
   server, and is marked. Every point below is under 2%.
-- **The device-ratio gate.** No layer may report a durable rate above what the
-  device was measured to sustain, beyond that measurement's own error. Each
-  layer brackets the device either side of its own window and compares against
-  the spread those two samples show. A gate this close to 1.0 cannot detect a
-  violation smaller than its own measurement error, and does not claim to; it
-  catches the class that matters — acking without syncing — which is an
-  order-of-magnitude effect.
+- **The device-ratio gate.** No layer may report a durable SYNC rate above what
+  the device was measured to sustain, beyond that measurement's own error. The
+  comparison is **syncs/sec against the device's own sync ceiling, not
+  records/sec** (2026-08-10 group-commit interlude, T1): records per second
+  only ever equalled the physical quantity because `Engine::submit` costs
+  exactly one fsync per transaction with no batching, and that equality is
+  what a group-commit primary path (N transactions under one fsync) breaks —
+  a gate still comparing records/sec would refuse every healthy batched run.
+  Each layer brackets the device either side of its own window and compares
+  against the spread those two samples show. A gate this close to 1.0 cannot
+  detect a violation smaller than its own measurement error, and does not
+  claim to; it catches the class that matters — acking without syncing —
+  which is an order-of-magnitude effect.
 - **Floors.** A window under one second, or under five operations, is refused
   rather than divided into a rate.
 

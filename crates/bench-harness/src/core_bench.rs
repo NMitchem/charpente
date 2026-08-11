@@ -4,7 +4,7 @@
 //! Edge tooling outside the deterministic core (DESIGN §1).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
-use crate::core_accounting::{self, CoreObservations};
+use crate::core_accounting::{self, CoreObservations, WriteObs};
 use crate::device::device_bracket_sample;
 use crate::measure::Heartbeat;
 use crate::report::CoreReport;
@@ -97,12 +97,31 @@ pub fn run(
         i += 1;
         grand += 1;
     }
-    obs.write.elapsed = start.elapsed();
-    obs.write.applied_after = db.last_applied();
-    obs.write.device_after = device_bracket_sample(dir)?;
-    obs.write.heartbeat = hb.finish();
-    obs.write.ops = grand;
-    obs.write.loop_delta = i - measured_from;
+    // C-2 fix (2026-08-10 group-commit interlude, T1 fix wave): a FULL
+    // struct literal for the fields settled at the end of the write window,
+    // not `obs.write.field = ...` trailing mutations — the shape that let
+    // `syncs` silently stay at `WriteObs::default()`'s 0 with the compiler
+    // saying nothing (review C-2, "a trailing statement 40 lines below a
+    // `..Default::default()` is the least obvious form available"). Every
+    // field is named here, so a future field added to `WriteObs`, or a
+    // future edit that drops one of these, breaks the build instead of
+    // silently zeroing a gate input. `applied_before`/`device_before` were
+    // already set above, before the loop.
+    obs.write = WriteObs {
+        applied_before: obs.write.applied_before,
+        device_before: obs.write.device_before,
+        elapsed: start.elapsed(),
+        applied_after: db.last_applied(),
+        device_after: device_bracket_sample(dir)?,
+        heartbeat: hb.finish(),
+        ops: grand,
+        loop_delta: i - measured_from,
+        // `canonical` above is one `Db::transact` per op with no batching, so
+        // one acked write costs exactly one fsync today. A future
+        // group-commit primary path is where this stops being a copy of
+        // `ops`.
+        syncs: grand,
+    };
 
     // May refuse — and refuses HERE, before the population loop below, which
     // is the ordering spec §2 requires be preserved.
@@ -185,6 +204,7 @@ pub fn run(
             acked_writes_per_sec: write.acked_writes_per_sec,
             log_records_per_sec: write.log_records_per_sec,
             reads_per_sec: read.reads_per_sec,
+            syncs_per_sec: write.syncs_per_sec,
             device_ratio: write.device_ratio,
             device_ratio_denominator: "the device bracket max",
             device_appends_per_sec_before: obs.write.device_before,

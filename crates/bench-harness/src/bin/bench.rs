@@ -716,6 +716,7 @@ mod tests {
             acked_writes_per_sec: 1.0,
             log_records_per_sec: 1.0,
             reads_per_sec: 1.0,
+            syncs_per_sec: 1.0,
             device_ratio: f64::NAN,
             device_ratio_denominator: "device.syncs_per_sec",
             device_appends_per_sec_before: 1.0,

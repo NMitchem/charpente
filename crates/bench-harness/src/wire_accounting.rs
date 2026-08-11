@@ -18,13 +18,46 @@
 //! `KernelStats::jobs_done`. This layer cannot see the server's log from
 //! outside the process, so its record rate is DERIVED —
 //! `records_per_request * throughput` — and that derivation assumes the job
-//! queue is at steady state inside the window. **That is why `device_ratio`
-//! is published but never gated on here (T7 rev. 4 ruling); the gate is on
-//! the COUNTED acked-request rate instead.** See `point_accounting` for the
-//! measurements that settled it. Read `device_ratio` as "how close this run
-//! came to the device ceiling, if the 2-records-per-request derivation
+//! queue is at steady state inside the window. `device_ratio` (this field's
+//! own ratio against the ceiling) is published but never gated on — see
+//! below for what IS gated on, which as of the 2026-08-10 group-commit
+//! interlude's T1 fix wave is a DIFFERENT derived quantity, not the counted
+//! rate T7 rev. 4 moved the gate to. Read `device_ratio` as "how close this
+//! run came to the device ceiling, if the 2-records-per-request derivation
 //! held" — informative, and above 1.0 on short windows without anything
 //! being wrong.
+//!
+//! **The gate's subject is `syncs_per_sec`, and it is ALSO a derived
+//! quantity — this reverses T7 rev. 4's ruling, deliberately, not by
+//! oversight (2026-08-10 group-commit interlude, T1 fix wave, review
+//! finding C-1).** A client outside the process cannot count the server's
+//! `wal.sync()` calls any more than it can count its log records, so
+//! `WireObs::syncs` is `Target::syncs_per_request() * throughput`
+//! (`wire.rs`) — today numerically identical to `log_records_per_sec`, since
+//! `Engine::submit` costs exactly one fsync per commit with no batching
+//! (`Target::syncs_per_request`'s doc records the equality and when it
+//! ends). T7 rev. 4 moved OFF a derived quantity because the derived record
+//! rate read 1.02x-1.10x over a bracket-stable ceiling on three consecutive
+//! healthy runs (see the paragraph below) and a `1.0 + 1e-6` gate turned
+//! that expected derivation error into a refusal every time. What makes
+//! deriving safe to gate on again is NOT a better derivation — it is the
+//! SAME one — but a wider tolerance: the 2026-08-10 device-ratio-gate
+//! interlude (landed before this one, §4.3 below) replaced `1.0 + 1e-6` with
+//! `max(10% floor, this point's own bracket spread)` everywhere, which
+//! absorbs exactly the 2-10% overshoot that broke rev. 4's premise. Read
+//! `syncs_per_sec` the same way `device_ratio` above is read: sound while
+//! one commit costs one fsync, and NOT sound the moment a group-commit
+//! primary path makes it cost less.
+//!
+//! **Owed work, stated so a future task does not discover this at the wire
+//! and reach for a fudge factor (review C-1's own warning).** This layer
+//! cannot be made syncs-based FROM THE CLIENT SIDE once batching actually
+//! lands — `syncs_per_request` stops being a sound multiplier the moment N
+//! commits can share one fsync, and there is no way to observe that from
+//! outside the process. Either a server-reported sync counter ships
+//! (surfaced over HTTP or in the child's exit output), or this gate is
+//! re-scoped honestly and BENCH.md says so plainly. See the group-commit
+//! plan's Task 10.
 //!
 //! **The ceiling is bracketed per point, not a single cross-window sample
 //! (T7 rev. 3 ruling).** Rev. 2 divided by layer 1's one-shot
@@ -56,10 +89,17 @@
 //! it.** Bracketing removed the drift and thereby refuted its own premise:
 //! with samples agreeing to ~1% the derived record rate STILL read 1.02x to
 //! 1.10x over the ceiling on three consecutive healthy runs. The denominator
-//! was never the problem. That is what moved the gate to the counted ack
-//! rate in rev. 4, and it is the general lesson this module exists to carry:
-//! a derived quantity cannot be made gate-worthy by improving the quantity
-//! it is divided by.
+//! was never the problem — improving it alone did not fix rev. 3's own
+//! symptom, and that half of the lesson still holds. What DID fix it, and
+//! what rev. 4 did not have available, is the wider tolerance the
+//! 2026-08-10 device-ratio-gate interlude landed afterward (§4.3 above):
+//! rev. 4's own conclusion — "a derived quantity cannot be made gate-worthy
+//! by improving the quantity it is divided by" — is still true of the
+//! DENOMINATOR, and is superseded regarding the NUMERATOR by the paragraph
+//! above: a derived numerator CAN be gate-worthy once the tolerance is wide
+//! enough to absorb its known derivation error. That is exactly what T1's
+//! C-1 fix relies on, and it is why the gate is back on a derived quantity
+//! rather than the counted ack rate rev. 4 moved it to.
 
 use crate::measure::{
     MIN_MEASURED_WINDOW, RATIO_TOLERANCE_FLOOR, bracket_spread, crosscheck,
@@ -115,6 +155,20 @@ pub struct WireObs {
     /// Log records committed per acked request for this target — an INPUT,
     /// the per-target constant from `Target::records_per_request` (spec §3).
     pub records_per_request: f64,
+    /// Durable syncs this point paid — the device-ratio gate's subject
+    /// (2026-08-10 group-commit interlude, T1). NOT a counted quantity (M-5
+    /// fix, T1 fix wave — the shipped doc here claimed it was "the same
+    /// counted acked-request total as `grand`", which review C-1 found wrong
+    /// by 2x for `Target::BenchApp`): a client outside the process cannot
+    /// count the server's `wal.sync()` calls, so `wire::sweep_point` sets
+    /// this to `Target::syncs_per_request() * throughput` — today
+    /// numerically identical to the derived `log_records_per_sec` above,
+    /// since one commit costs one fsync with no batching on the primary
+    /// path. See this module's doc for why gating on a derived quantity here
+    /// is safe as of this fix (it previously was not, T7 rev. 4), and what a
+    /// future group-commit primary path still owes this field (a real
+    /// server-reported sync count).
+    pub syncs: u64,
     /// `Heartbeat::finish()` over the measured window.
     pub heartbeat: Option<String>,
 }
@@ -190,10 +244,6 @@ pub fn point_accounting(w: &WireObs) -> Result<WireAccounting, String> {
     // single cross-window sample made this gate a false-alarm generator.
     let ceiling = w.device_before.max(w.device_after);
     let device_ratio = log_records_per_sec / ceiling;
-    // T7 rev. 4 (Noah ruling, 2026-08-09): the GATE is on the acked-request
-    // rate, which is COUNTED; `device_ratio` is published but does NOT gate,
-    // because it is DERIVED.
-    //
     // Rev. 3 bracketed the ceiling and thereby disproved the hypothesis it was
     // built on. With samples taken either side of each point the ceiling is
     // stable — 241.80/244.48, 241.92/239.95, 241.31/244.48, agreeing within
@@ -201,32 +251,54 @@ pub fn point_accounting(w: &WireObs) -> Result<WireAccounting, String> {
     // and 1.10x over it on three consecutive healthy runs. The overshoot is
     // the `records_per_request` derivation assuming a steady-state job drain
     // that a short window has not reached, exactly the second cause rev. 3's
-    // own refusal prose named. A derived quantity cannot be made gate-worthy
-    // by improving the quantity it is divided by.
+    // own refusal prose named.
     //
-    // The acked-request rate has no such weakness: every acked request commits
-    // at least its own effects record and pays at least one durable sync for
-    // it (ack-after-durable, DESIGN §5), so acking faster than the device can
-    // sync at all is impossible by construction rather than by assumption.
-    // Weaker than a record-level gate — it would not catch a 2x error in
-    // `records_per_request` — and sound, which the record-level gate was not.
     // 2026-08-10 interlude §4.3 (Noah ruling): the comparison is against this
     // point's OWN measurement error, not `1.0 + 1e-6`. invoicing commits
     // exactly one record per request, so its true ratio is exactly 1.0 and the
     // sign of a zero-tolerance comparison was decided entirely by noise — the
     // gate refused healthy runs about half the time (spec §1). bench-app never
     // showed it because 2.0 records/request put its ack ratio near 0.5.
-    let ack_ratio = throughput / ceiling;
+    //
+    // 2026-08-10 group-commit interlude, T1 fix wave, C-1: the numerator is
+    // `w.syncs`, honestly derived (`Target::syncs_per_request() * throughput`
+    // in `wire.rs`), NOT copied from `grand`/`throughput` — the shipped form
+    // was wrong by 2x for `Target::BenchApp`. Today numerically identical to
+    // `log_records_per_sec` above, since one commit costs one fsync with no
+    // batching. This is what makes gating on a derived quantity safe again
+    // (T7 rev. 4 moved OFF one for the reason in the comment above) — not a
+    // better derivation, but the interlude's wider tolerance absorbing the
+    // 2-10% overshoot that broke rev. 4's premise. See this module's doc for
+    // the full argument and the owed work a future group-commit primary path
+    // still needs (a real server-reported sync count).
+    let syncs_per_sec = w.syncs as f64 / secs;
+    // T1 fix wave, C-2: mirrors core_accounting's and kernel_accounting's
+    // guards. `syncs == 0` on a point that already cleared both floors above
+    // is impossible under any engine, batched or not — a nonzero point syncs
+    // at least once.
+    if w.syncs == 0 {
+        return Err(at(format!(
+            "INVALID: this point completed {ops} ops but recorded 0 durable syncs — the \
+             device-ratio gate divides by this, and a zero numerator makes it incapable of \
+             refusing anything; wire::sweep_point must set WireObs::syncs"
+        )));
+    }
+    let ack_ratio = syncs_per_sec / ceiling;
     if implausible_bracketed_ratio(ack_ratio, w.device_before, w.device_after) {
         invalid.push(at(format!(
-            "INVALID: {throughput:.0} acked requests/s is {ack_ratio:.2}x the \
-             measured device ceiling of {ceiling:.0} durable appends/s, beyond this \
-             point's own measurement error ({:.1}%) — the bracket samples either side \
-             of this point ({:.2} before / {:.2} after) disagree by {:.1}%, and the \
-             tolerance is the wider of that and the {:.1}% floor. Every acked request \
-             commits at least one log record and pays at least one durable sync for \
-             it, so this rate is not physically possible and the run is not a \
-             measurement",
+            // I-1 fix (T1 fix wave): print BOTH numbers rather than labelling
+            // the syncs rate "acked requests/s" — the two coincide today
+            // (one request, one commit, one fsync) but the label would
+            // mislead the moment C-1's honest derivation makes them diverge
+            // for bench-app. Neither pinning test needs touching: both match
+            // on the substring "acked requests/s", which still appears here.
+            "INVALID: {syncs_per_sec:.0} durable syncs/s from {throughput:.0} acked \
+             requests/s is {ack_ratio:.2}x the measured device ceiling of {ceiling:.0} \
+             durable appends/s, beyond this point's own measurement error ({:.1}%) — the \
+             bracket samples either side of this point ({:.2} before / {:.2} after) \
+             disagree by {:.1}%, and the tolerance is the wider of that and the {:.1}% \
+             floor. The device cannot sync faster than its own measured ceiling, so this \
+             rate is not physically possible and the run is not a measurement",
             ratio_tolerance(w.device_before, w.device_after) * 100.0,
             w.device_before,
             w.device_after,
@@ -245,6 +317,7 @@ pub fn point_accounting(w: &WireObs) -> Result<WireAccounting, String> {
             // Spec §3's pairing at this layer; see the module doc for why this
             // is a per-target derivation and not a count.
             log_records_per_sec,
+            syncs_per_sec,
             device_ratio,
             device_appends_per_sec_before: w.device_before,
             device_appends_per_sec_after: w.device_after,
@@ -283,6 +356,7 @@ mod tests {
             device_before: 4000.0,
             device_after: 4000.0,
             records_per_request: 2.0,
+            syncs: 1000, // one commit per acked request — today's engine
             heartbeat: None,
         }
     }
@@ -387,8 +461,12 @@ mod tests {
         );
     }
 
-    /// The gate is on the ACKED-REQUEST rate (500/s in the fixture), not on
-    /// the derived record rate (1000/s) — T7 rev. 4's ruling.
+    /// The gate is on `syncs_per_sec` (500/s in the fixture — `healthy()`
+    /// sets `syncs` to `grand`, i.e. 1.0 syncs/request, independent of
+    /// `records_per_request`'s 2.0), not on the derived record rate
+    /// (1000/s). Named "ack rate" because at 1.0 syncs/request the two
+    /// coincide; `the_gate_input_scales_with_syncs_per_request` below is
+    /// where the two are pulled apart.
     #[test]
     fn an_ack_rate_above_the_device_ceiling_is_flagged_and_at_the_ceiling_is_not() {
         let mut o = healthy();
@@ -420,6 +498,94 @@ mod tests {
             a.invalid
         );
         assert!(a.invalid[0].contains("INVALID"), "got: {:?}", a.invalid);
+    }
+
+    /// The gate's subject is SYNCS, not the counted request rate — mirroring
+    /// core_accounting's and kernel_accounting's discriminating tests. Today
+    /// the two are equal at this layer too (one acked request, one commit,
+    /// one fsync), which is why
+    /// `the_gate_input_scales_with_syncs_per_request`'s 1.0 case
+    /// passes trivially; after group commit they diverge and only the
+    /// syncs framing stays physically meaningful.
+    #[test]
+    fn the_gate_compares_syncs_to_the_device_ceiling_not_the_counted_request_rate() {
+        let mut o = healthy();
+        // 4000 requests counted (2000/s) against a 600/s ceiling would
+        // refuse under the OLD ack-rate gate (ratio 3.33, past the 1.5 hard
+        // limit). Set syncs to a batched-looking 1000 (500/s) — under the
+        // ceiling — to prove the gate now compares syncs, not the counted
+        // request rate.
+        o.per_thread = vec![1000, 1000, 1000, 1000];
+        o.grand = 4000;
+        o.latencies_us = vec![500u64; 4000];
+        o.device_before = 600.0;
+        o.device_after = 600.0;
+        let old_ack_rate_ratio =
+            o.grand as f64 / o.elapsed.as_secs_f64() / o.device_before.max(o.device_after);
+        assert!(
+            old_ack_rate_ratio > crate::measure::RATIO_HARD_LIMIT,
+            "premise: the OLD ack-rate gate must have refused this, or this \
+             test proves nothing about the new one — ratio {old_ack_rate_ratio}"
+        );
+        o.syncs = 1000;
+        let a = point_accounting(&o).expect("must not refuse");
+        assert!(
+            a.invalid.is_empty(),
+            "a batched point under the sync ceiling must not be refused: {:?}",
+            a.invalid
+        );
+    }
+
+    /// I-2 fix (2026-08-10 group-commit interlude, T1 fix wave): replaces
+    /// `while_one_request_costs_one_fsync_the_gate_verdict_is_unchanged`,
+    /// which the review found was a no-op duplicate of
+    /// `an_ack_rate_above_the_device_ceiling_is_flagged_and_at_the_ceiling_is_not`
+    /// — `healthy()` already has `syncs == grand`, so `o.syncs = o.grand;`
+    /// assigned nothing, and the test carried no assertion able to see the
+    /// gate's NUMERATOR drift (proven by the review's mutation 5: scaling the
+    /// numerator by `1.000000001` left every wire test green). This asserts
+    /// the numerator directly, now that I-4 publishes it as
+    /// `SweepPoint::syncs_per_sec`, at two multipliers — mirroring the exact
+    /// equality core's and kernel's twins already assert, and discriminating
+    /// exactly what the old test could not.
+    #[test]
+    fn the_gate_input_scales_with_syncs_per_request() {
+        // 1.0 syncs/request (invoicing's shape): the published syncs rate
+        // equals the counted acked-request rate exactly — the pre-T1 gate's
+        // own quantity.
+        let mut o = healthy();
+        o.syncs = o.grand;
+        let a = point_accounting(&o).expect("publishes");
+        let ack_rate = o.grand as f64 / o.elapsed.as_secs_f64();
+        assert_eq!(
+            a.point.syncs_per_sec, ack_rate,
+            "at 1.0 syncs/request the published syncs rate must equal the old ack rate \
+             exactly"
+        );
+
+        // 2.0 syncs/request (bench-app's shape): exactly double.
+        o.syncs = o.grand * 2;
+        let a2 = point_accounting(&o).expect("publishes");
+        assert_eq!(
+            a2.point.syncs_per_sec,
+            2.0 * a.point.syncs_per_sec,
+            "at 2.0 syncs/request the published syncs rate must be exactly 2x the 1.0 case"
+        );
+    }
+
+    /// C-2 fix (2026-08-10 group-commit interlude, T1 fix wave): mirrors
+    /// core_accounting's and kernel_accounting's guard tests. RED-first per
+    /// hard rule 3: fails against code without the guard (`point_accounting`
+    /// returns `Ok` with `device_ratio` computed off a 0.0 syncs rate and an
+    /// empty `invalid`).
+    #[test]
+    fn a_zero_sync_count_refuses_rather_than_silently_disabling_the_gate() {
+        let mut o = healthy();
+        o.syncs = 0;
+        let err = point_accounting(&o).expect_err("a zero-sync point refuses");
+        assert!(err.contains("INVALID"), "got: {err}");
+        assert!(err.contains("0 durable syncs"), "got: {err}");
+        assert!(err.contains("WireObs::syncs"), "must name the fix: {err}");
     }
 
     /// 2026-08-10 interlude, the DISCRIMINATING case for this layer's gate —
@@ -472,10 +638,14 @@ mod tests {
     }
 
     /// The refusal explains why the rate it names is impossible rather than
-    /// merely surprising — the ack-after-durable argument is the whole
-    /// justification for gating on this quantity (hard rule 5).
+    /// merely surprising (hard rule 5). Renamed and reworded (2026-08-10
+    /// group-commit interlude, T1 fix wave, I-1): the argument used to be
+    /// ack-after-durable ("every acked request pays at least one durable
+    /// sync"), which justified gating on the ACK rate. Since C-1's fix the
+    /// gate's subject is SYNCS directly, and the argument is simpler — the
+    /// device cannot sync faster than its own measured ceiling.
     #[test]
-    fn the_ceiling_refusal_names_the_ack_after_durable_argument() {
+    fn the_ceiling_refusal_names_the_device_ceiling_argument() {
         let mut o = healthy();
         // 1.2x, not 1.0 + 2*slack: the 2026-08-10 interlude gates against this
         // point's own measurement error, and with the two samples equal that is
@@ -484,7 +654,7 @@ mod tests {
         o.device_after = o.device_before;
         let a = point_accounting(&o).expect("implausible is named, not refused");
         assert!(
-            a.invalid[0].contains("at least one durable sync"),
+            a.invalid[0].contains("cannot sync faster than its own measured ceiling"),
             "got: {:?}",
             a.invalid
         );
@@ -577,6 +747,7 @@ mod tests {
             device_before: 1e12,
             device_after: 1e12,
             records_per_request: 1.0,
+            syncs: 10, // one commit per acked request — today's engine
             heartbeat: None,
         }
     }

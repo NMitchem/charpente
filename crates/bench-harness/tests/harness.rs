@@ -149,11 +149,17 @@ fn core_layer_commits_and_reports_a_ratio() {
     let core_ceiling = core
         .device_appends_per_sec_before
         .max(core.device_appends_per_sec_after);
+    // I-3 fix (2026-08-10 group-commit interlude, T1 fix wave): divide the
+    // PUBLISHED syncs rate, not `acked_writes_per_sec` — T1 moved the gate's
+    // numerator to `syncs_per_sec`, and this pin asserted the superseded
+    // one, passing only because the two coincide before group commit
+    // (`core_accounting`'s own `while_one_txn_costs_one_fsync_the_gate_
+    // input_is_unchanged` is where that coincidence is asserted directly).
     assert!(
-        (core.device_ratio - core.acked_writes_per_sec / core_ceiling).abs() < 1e-9,
-        "device_ratio must equal acked_writes_per_sec / max(bracket before, after): {} vs {}",
+        (core.device_ratio - core.syncs_per_sec / core_ceiling).abs() < 1e-9,
+        "device_ratio must equal syncs_per_sec / max(bracket before, after): {} vs {}",
         core.device_ratio,
-        core.acked_writes_per_sec / core_ceiling
+        core.syncs_per_sec / core_ceiling
     );
 }
 
@@ -363,12 +369,18 @@ fn kernel_layer_drains_the_batch_with_every_job_done() {
     let k_ceiling = k
         .device_appends_per_sec_before
         .max(k.device_appends_per_sec_after);
+    // I-3 fix (2026-08-10 group-commit interlude, T1 fix wave): divide the
+    // PUBLISHED syncs rate, not `log_records_per_sec` — T1 moved the gate's
+    // numerator to `syncs_per_sec`, and this pin asserted the superseded
+    // one, passing only because the two coincide before group commit (one
+    // sync per commit; `kernel_accounting`'s own `while_one_commit_costs_
+    // one_fsync_the_gate_input_is_unchanged` is where that coincidence is
+    // asserted directly).
     assert!(
-        (k.device_ratio - k.log_records_per_sec / k_ceiling).abs() < 1e-9,
-        "device_ratio must divide the LOG rate (two syncs per request), not the ack rate: \
-         {} vs {}",
+        (k.device_ratio - k.syncs_per_sec / k_ceiling).abs() < 1e-9,
+        "device_ratio must divide SYNCS, not the log record rate: {} vs {}",
         k.device_ratio,
-        k.log_records_per_sec / k_ceiling
+        k.syncs_per_sec / k_ceiling
     );
     assert!(
         k.device_appends_per_sec_before > 0.0 && k.device_appends_per_sec_after > 0.0,
@@ -548,6 +560,7 @@ fn a_saturated_client_is_flagged_on_the_point() {
         connections: 1,
         throughput_per_sec: 1.0,
         log_records_per_sec: 2.0,
+        syncs_per_sec: 2.0,
         device_ratio: 0.5,
         device_appends_per_sec_before: 2.0,
         device_appends_per_sec_after: 2.0,
