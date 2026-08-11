@@ -311,6 +311,20 @@ the group-commit property tests have to keep true."
 **Interfaces:**
 - Produces: `pub struct Tx<'a> { snapshot: &'a Snapshot, group: Option<&'a GroupOverlay>,
   effects: TxEffects }`. Handler signatures stay `&mut Tx` via lifetime elision.
+- Produces: `GroupOverlay` itself, which this plan referenced in two tasks and **defined in
+  none** (pre-flight, 2026-08-11 — see the amendment block below). Spec §2 fixes its shape
+  and forbids a parallel mechanism ("the group overlay is a merge of that same shape"), so
+  it is the type `TxEffects::overlay` already has (`db.rs:331`):
+
+  ```rust
+  /// The group's accumulated row writes — the same shape as `TxEffects::overlay`,
+  /// because spec §2 requires a merge of that structure, not a parallel one.
+  type GroupOverlay = BTreeMap<&'static str, BTreeMap<u64, Option<Vec<u8>>>>;
+  ```
+
+  A private alias, not a newtype: nothing in T3 needs behaviour on it, and `Tx` holds only a
+  `&`. If T4's merge/read logic argues for a newtype, that is T4's call to make with its
+  reasons stated — it is not a T3 decision.
 - Consumes: nothing.
 
 **Why:** a group shares ONE snapshot across its staged transactions (`Snapshot` owns a
@@ -318,26 +332,36 @@ the group-commit property tests have to keep true."
 this task and becomes `Some` in Task 4 — introducing the field now keeps Task 4's diff to
 behaviour only.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: (amended 2026-08-11 — Noah ruling) There is no white-box test here.**
 
-```rust
-#[test]
-fn two_transactions_can_share_one_snapshot() {
-    let mut db = fresh_db(0x60C0_0002);
-    let snap = db.snapshot().expect("snapshot");
-    let mut a = Tx::over(&snap);
-    let mut b = Tx::over(&snap);
-    a.put(&Widget { id: Id::from_raw(1), n: 1 });
-    b.put(&Widget { id: Id::from_raw(2), n: 2 });
-    assert_eq!(a.get::<Widget>(Id::from_raw(2)).unwrap(), None,
-        "staged transactions are isolated until merged");
-}
-```
+The original Step 1 constructed two `Tx::over(&snap)` values directly and asserted they are
+isolated. That test cannot exist as written, for a reason that is structural rather than
+fixable by tidying it (pre-flight findings 2–4 in the amendment block below): it needs a real
+`Db`, `charpente-core`'s `--lib` target cannot build one, and the integration target that can
+cannot reach a `pub(crate)` constructor.
 
-- [ ] **Step 2: Run it and watch it fail**
+**Ruled (Noah, 2026-08-11): defer the assertion to Task 4, keep `Tx::over` `pub(crate)`.**
+The rejected alternative was making `over` `pub` so the test could reach it — which would let
+any app holding a `&Db` mint a free-floating `Tx` from `Db::snapshot()`, write into it, and
+drop it, losing writes silently with no error. That is precisely the bug class the M0 demo
+exists to show is *inexpressible from app code* (`examples/invoicing/DEMO.md`: writing the
+split-transaction outbox bug required a temporary framework escape hatch). Widening the API
+to reach a constructor for a test is not worth re-opening it.
 
-Run: `cargo test -p charpente-core --lib two_transactions_can_share_one_snapshot`
-Expected: FAIL — no associated function `Tx::over`, and `Tx` owns its snapshot.
+Nothing is lost by deferring. The isolation property becomes **publicly observable** the
+moment `stage` exists — a staged transaction that returns `Err` has its overlay discarded and
+the group is unaffected (spec §2) — and Task 4 Step 1 now carries that assertion.
+
+**This task's evidence is therefore Step 5, and Step 5 is not a formality.** "Zero behaviour
+change" is a claim about the whole workspace, and the thing that can actually falsify it is
+the workspace suite plus both pinned seeds coming back identical. Treat a single changed
+count as this refactor having failed, not as a count to reconcile.
+
+- [ ] **Step 2: Confirm the starting counts before changing anything**
+
+Run `cargo test --workspace` (piped through `tee`, never `tail`) and record the pass / fail /
+ignored triple. That is the baseline Step 5 compares against; taking it *after* the change
+proves nothing.
 
 - [ ] **Step 3: Make the change**
 
@@ -430,31 +454,70 @@ divergence case, never silently deleted — this line exists because deleting th
 cheapest way to make this task's own test suite pass, and a doc comment alone does not stop
 that from happening.
 
-- [ ] **Step 1: Write the failing test — read-your-own-writes across the batch**
+- [ ] **Step 1: Write the failing tests — read-your-own-writes across the batch, and isolation**
+
+**Amended 2026-08-11 (pre-flight).** These live in a NEW `crates/charpente-core/tests/group_commit.rs`,
+not in `db.rs`'s `mod tests`. That module is pure `TxEffects` encode/decode and cannot build a
+`Db`: `charpente_sim` appears nowhere in `charpente-core/src/`, because a `--lib` test target
+is a distinct compilation unit from the one `charpente-sim` links against and the trait impls
+do not unify (`tests/engine.rs`'s own header documents this). Every `Db`-constructing test in
+this crate is already an integration test. `begin_group`/`stage`/`commit` are `pub`, so they
+are reachable from one.
+
+`fresh_db` and `Widget` **do not exist in `charpente-core`** and must be written here.
+`fresh_db` exists only in `charpente`'s repl modules (`follower.rs:508`, `probe.rs:386`) —
+do NOT reach for a third copy; the M1 close-out already names a third copy as the moment to
+consolidate, and these are a different crate anyway. For the row, follow the pattern the
+sibling integration tests already use: **core cannot use its own `#[table]` macro** (it emits
+`::charpente::core::` paths), so hand-write `Row` (+ `RowShape` if versioned) exactly as
+`tests/migration_gate.rs:12-44` and `tests/migrate_apply.rs:26` do, and open the db with
+`Db::open(Box::new(sim.disk()), cfg(), schema)`.
 
 ```rust
 /// The property the whole two-level overlay exists for.
 #[test]
 fn a_staged_transaction_sees_an_earlier_one_in_the_same_group() {
-    let mut db = fresh_db(0x60C0_0003);
+    let mut db = fresh_db(0x60C0_0005);
     let mut g = db.begin_group().expect("group");
-    g.stage(|tx| { tx.put(&Widget { id: Id::from_raw(1), n: 7 }); Ok::<_, ()>(()) })
+    g.stage(|tx| { tx.put(&Widget { id: Id::from_raw(1), count: 7 }); Ok::<_, ()>(()) })
         .expect("first stages");
     let seen = g
         .stage(|tx| Ok::<_, ()>(tx.get::<Widget>(Id::from_raw(1)).unwrap()))
         .expect("second stages");
-    assert_eq!(
-        seen,
-        Some(Widget { id: Id::from_raw(1), n: 7 }),
-        "B must see A's write, or a batch silently loses updates"
-    );
+    assert_eq!(seen.map(|w| w.count), Some(7),
+        "B must see A's write, or a batch silently loses updates");
     g.commit().expect("commit");
 }
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+**Plus the assertion deferred from Task 3** (Noah ruling, 2026-08-11): isolation is what makes
+panic-safety structural per spec §2, and `stage` is where it first becomes publicly
+observable. A staged transaction that returns `Err` must leave the group untouched — its
+overlay discarded, nothing queued — so a later `stage` cannot see its writes:
 
-Run: `cargo test -p charpente-core --lib a_staged_transaction_sees_an_earlier_one`
+```rust
+#[test]
+fn a_staged_transaction_that_fails_leaves_the_group_untouched() {
+    let mut db = fresh_db(0x60C0_0006);
+    let mut g = db.begin_group().expect("group");
+    let r = g.stage(|tx| {
+        tx.put(&Widget { id: Id::from_raw(1), count: 1 });
+        Err::<(), _>("rejected")
+    });
+    assert!(matches!(r, Err(TxError::App("rejected"))), "the app error surfaces as its own");
+    assert_eq!(g.len(), 0, "a rejected transaction queues no record");
+    let seen = g
+        .stage(|tx| Ok::<_, ()>(tx.get::<Widget>(Id::from_raw(1)).unwrap()))
+        .expect("stages");
+    assert!(seen.is_none(),
+        "a rejected transaction's writes must never reach the group overlay — this is what \
+         makes a panicking handler structurally unable to corrupt the batch");
+}
+```
+
+- [ ] **Step 2: Run them and watch them fail**
+
+Run: `cargo test -p charpente-core --test group_commit`
 Expected: FAIL — no method `begin_group`.
 
 - [ ] **Step 3: Implement `Group`, `stage`, `commit`**
@@ -1008,3 +1071,43 @@ re-litigated:**
   observed; nothing here is derived" (`core_accounting.rs:34-36`). At core and kernel it is
   sound (one commit, one fsync, no batching, so it really is what was observed); at wire it is
   a deliberate, documented exception. Recorded here rather than left implicit.
+
+**Resolved during T3's pre-flight (2026-08-11), recorded so the reasoning is not
+re-litigated.** Four defects, each verified against the code rather than inferred, and one
+Noah ruling. They are the same class as the three the 2026-08-10 pre-flight caught: the plan's
+test snippets name things that do not exist.
+
+- **`GroupOverlay` was referenced by T3 and T4 and defined nowhere** — not in this plan, not
+  in the spec, not in the code. T3's `Tx` field could not have compiled. Defined in T3's
+  Interfaces above, as the alias spec §2 already determines.
+- **`fresh_db` does not exist in `charpente-core`.** The 2026-08-10 pre-flight note above says
+  to "reuse the real helpers in each file rather than create these if equivalents exist" —
+  here no equivalent exists. It lives only in `charpente`'s `repl/follower.rs:508` and
+  `repl/probe.rs:386`, a different crate. T4 writes its own; it must not become a third copy
+  of those.
+- **The `Widget { id, n }` fixture does not exist either**, and cannot be written with
+  `#[table]`: core cannot use its own macro, which emits `::charpente::core::` paths
+  (`tests/migrate_apply.rs:26` states this). Hand-written `Row`/`RowShape` impls are the
+  established pattern (`tests/migration_gate.rs:12-44`). `db.rs`'s only `Widget` is a local
+  struct inside a migration test with a `count` field, not a shared fixture.
+- **T3's and T4's tests were homed in the wrong target.** `cargo test -p charpente-core --lib`
+  cannot build a `Db`: `charpente_sim` appears nowhere in `charpente-core/src/`, because the
+  `--lib` test target is a distinct compilation unit from the one `charpente-sim` links
+  against and trait impls do not unify across them (documented in `tests/engine.rs`'s header,
+  and evidenced by every `Db`-constructing test in this crate already being an integration
+  test). Both moved to `crates/charpente-core/tests/group_commit.rs`.
+- **Noah ruling (2026-08-11) on the consequence for T3:** an integration test cannot reach
+  `pub(crate) Tx::over`, so T3's white-box isolation test is deferred to T4 rather than
+  widening `over` to `pub`. Making it public would let an app holding a `&Db` mint a
+  free-floating `Tx` from `Db::snapshot()`, write into it and drop it — writes lost silently,
+  no error — re-opening the bug class `examples/invoicing/DEMO.md` exists to show is
+  inexpressible from app code. T3's evidence is its zero-behaviour-change gate; the isolation
+  property is asserted in T4, where `stage` makes it publicly observable.
+
+**Seed allocation for the `0x60C0_xxxx` namespace, so a seed number identifies exactly one
+test.** The plan as written assigned `0x60C0_0002` to T3 and `0x60C0_0003` to T4, both already
+taken — `0x60C0_0002` collided with this plan's own T2 snippet before any implementer touched
+it. Taken and committed: `0x60C0_0001` and `0x60C0_0002` (T2's two sync-count tests),
+`0x60C0_0003` (T2's fix-wave poison/empty ordering test, commit `44dd8ae`). Allocated forward:
+**`0x60C0_0004` reserved for T3** should it need one, **`0x60C0_0005`** and **`0x60C0_0006`**
+for T4's two tests above. Later tasks continue from `0x60C0_0007`.
