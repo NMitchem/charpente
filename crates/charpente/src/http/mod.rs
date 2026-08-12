@@ -8,7 +8,7 @@
 mod app;
 mod router;
 
-pub use app::{App, AppConfig, Ctx, Handled, Session};
+pub use app::{App, AppConfig, Ctx, Handled, Session, StagedDispatch};
 pub use router::{Glue, Route, RouteDef, RouteGlue, RouteMatch, Router, SubGlue};
 
 use std::collections::BTreeMap;

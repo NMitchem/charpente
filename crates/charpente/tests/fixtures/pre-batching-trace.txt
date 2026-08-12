@@ -1,0 +1,79 @@
+tables.redb set_len 1056768
+tables.redb write_at 0 320
+tables.redb sync
+tables.redb write_at 0 320
+tables.redb sync
+tables.redb write_at 0 320
+tables.redb sync
+tables.redb write_at 0 320
+tables.redb sync
+tables.redb write_at 0 320
+tables.redb sync
+tables.redb write_at 0 320
+tables.redb sync
+wal/00000000000000000000.log write_at 0 154
+wal/00000000000000000000.log sync
+tables.redb write_at 20480 4096
+tables.redb write_at 12288 4096
+tables.redb write_at 4096 4096
+tables.redb write_at 1052672 4096
+tables.redb write_at 16384 4096
+tables.redb write_at 8192 4096
+wal/00000000000000000000.log write_at 154 111
+wal/00000000000000000000.log sync
+tables.redb write_at 36864 4096
+tables.redb write_at 28672 4096
+tables.redb write_at 40960 4096
+tables.redb write_at 32768 4096
+tables.redb write_at 24576 4096
+tables.redb write_at 45056 4096
+wal/00000000000000000000.log write_at 265 48
+wal/00000000000000000000.log sync
+tables.redb write_at 20480 4096
+tables.redb write_at 49152 4096
+tables.redb write_at 4096 4096
+tables.redb write_at 61440 4096
+tables.redb write_at 53248 4096
+wal/00000000000000000000.log write_at 313 48
+wal/00000000000000000000.log sync
+tables.redb write_at 36864 4096
+tables.redb write_at 65536 4096
+tables.redb write_at 40960 4096
+tables.redb write_at 16384 4096
+tables.redb write_at 45056 4096
+wal/00000000000000000000.log write_at 361 48
+wal/00000000000000000000.log sync
+tables.redb write_at 28672 4096
+tables.redb write_at 57344 4096
+tables.redb write_at 4096 4096
+tables.redb write_at 20480 4096
+tables.redb write_at 61440 4096
+wal/00000000000000000000.log write_at 409 48
+wal/00000000000000000000.log sync
+tables.redb write_at 36864 4096
+tables.redb write_at 65536 4096
+tables.redb write_at 49152 4096
+tables.redb write_at 32768 4096
+tables.redb write_at 16384 4096
+tables.redb write_at 0 320
+tables.redb write_at 20480 4096
+tables.redb write_at 28672 4096
+tables.redb write_at 40960 4096
+tables.redb write_at 1052672 4096
+tables.redb write_at 53248 4096
+tables.redb write_at 45056 4096
+tables.redb sync
+tables.redb.horizon write_at 0 12
+tables.redb.horizon sync
+tables.redb write_at 36864 4096
+tables.redb write_at 0 320
+tables.redb write_at 57344 4096
+tables.redb write_at 4096 4096
+tables.redb write_at 49152 4096
+tables.redb write_at 16384 4096
+tables.redb sync
+tables.redb write_at 0 320
+tables.redb sync
+tables.redb sync
+tables.redb write_at 0 320
+tables.redb sync

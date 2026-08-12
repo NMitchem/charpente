@@ -7,7 +7,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use charpente_core::db::{Db, DbConfig, Job, Schema, Tx, TxError};
+use charpente_core::db::{Db, DbConfig, Group, Job, Schema, Tx, TxError};
 use charpente_core::io::{Disk, Entropy};
 use charpente_core::table::{Id, View};
 use charpente_macros::table;
@@ -164,10 +164,12 @@ pub struct App {
     router: Router,
     job_defs: Vec<JobDef>,
     cron_entries: Vec<CronEntry>,
-    /// `Arc` (not a bare reference) so `handle_or_subscribe` can clone an
-    /// owned handle before `db_mut()` takes `&mut self` — cloning an `Arc` is
-    /// an atomic refcount bump, not a JWKS re-parse. `None` until
-    /// `App::with_oidc` mounts a verifier.
+    /// `None` until `App::with_oidc` mounts a verifier. The `Arc` is now
+    /// incidental, not load-bearing: it existed so `handle_or_subscribe`
+    /// could clone an owned handle before `db_mut()` took `&mut self`, and
+    /// group-commit T5's borrow-split removed that need — `begin_group`
+    /// hands `StagedDispatch` a plain `&OidcVerifier` via `as_deref()`, and
+    /// nothing in the crate clones this field any more. A `Box` would do.
     oidc: Option<Arc<OidcVerifier>>,
 }
 
@@ -299,6 +301,30 @@ impl App {
             .expect("db taken for reseed — a kernel bug left it out")
     }
 
+    /// Opens a group over this app's `Db` (group-commit T5, spec §1) plus the
+    /// shared half of the dispatch path — everything `stage_or_subscribe`
+    /// needs besides the `Db` itself. Returns both as disjoint sub-borrows so
+    /// a caller can stage many requests into one `Group` before committing.
+    ///
+    /// Field projections, NOT method calls: `self.db.as_mut()` and the
+    /// shared field borrows split cleanly here, where `self.db_mut()`
+    /// would re-borrow all of `*self` and poison the split. See the T5
+    /// pre-flight's finding G for the failure this shape exists to avoid.
+    pub fn begin_group(&mut self) -> io::Result<(Group<'_>, StagedDispatch<'_>)> {
+        let staged = StagedDispatch {
+            router: &self.router,
+            entropy: &*self.entropy,
+            config: &self.config,
+            oidc: self.oidc.as_deref(),
+        };
+        let group = self
+            .db
+            .as_mut()
+            .expect("db taken for reseed — a kernel bug left it out")
+            .begin_group()?;
+        Ok((group, staged))
+    }
+
     /// Lifts the `Db` out for the replication reseed swap (the kernel's
     /// `Ready::Repl` arm): `Repl::run_seed` consumes it and returns a rebuilt
     /// one that `put_db` restores. Between the two calls `db()`/`db_mut()`
@@ -384,14 +410,66 @@ impl App {
         }
     }
 
-    /// Routes, then dispatches by the matched route's flavor: a plain
-    /// `#[route]` runs its handler and returns `Response`; a
-    /// `#[route(SSE …)]` extracts the resume cursor (before the handler
-    /// runs — an unparseable one is a 400, never a silent from-now), runs
-    /// its handler, and returns the validated `Subscription`. `now` is the
-    /// caller's clock reading (the kernel's own `Clock`, in production) —
-    /// threaded into `Ctx` for session expiry and minting.
+    /// The one-request wrapper (group-commit T5, spec §1): a single-request
+    /// group, staged then committed immediately — exactly `Db::transact`'s
+    /// "batch of one" reasoning, one level up. This is the whole dispatch
+    /// path most callers use; a kernel drain loop (T6) instead calls
+    /// `begin_group`/`stage_or_subscribe` directly to stage many requests
+    /// under one `commit`.
     pub fn handle_or_subscribe(&mut self, request: Request, now: u64) -> Handled {
+        let (mut group, staged) = match self.begin_group() {
+            Ok(pair) => pair,
+            Err(e) => return Handled::Response(tx_error_response(TxError::Io(e))),
+        };
+        let handled = staged.stage_or_subscribe(&mut group, request, now);
+        match group.commit() {
+            Ok(()) => handled,
+            // A lone transaction has no "partial batch" for `CommitFailure::
+            // applied` to mean anything about (same reasoning as
+            // `Db::transact`, `db.rs:1420-1423`) — this request's own
+            // `TxError::Io`, byte-identical wording to before this task.
+            Err(failure) => Handled::Response(tx_error_response(TxError::Io(failure.error))),
+        }
+    }
+}
+
+/// Everything `stage_or_subscribe` needs besides the `Db` — the shared half
+/// of `App::begin_group`'s borrow-split (group-commit T5, Noah ruling). Every
+/// field here is reached through a `&self` borrow (`Router::find`,
+/// `Entropy::fill`) or is `Copy` (`Option<&OidcVerifier>`), so it can coexist
+/// with the `Group`'s mutable loan on `App::db`.
+///
+/// Named `StagedDispatch`, NOT `Dispatcher` — `charpente::kernel::Dispatcher`
+/// (the job dispatcher, `kernel/dispatch.rs`) already owns that name and is
+/// reachable from the same file T6's drain loop lives in; a second public
+/// `Dispatcher` would collide (E0252) or, where it technically compiled,
+/// leave a `dispatcher` binding beside `Kernel::dispatcher` meaning something
+/// entirely different.
+pub struct StagedDispatch<'a> {
+    router: &'a Router,
+    entropy: &'a dyn Entropy,
+    config: &'a AppConfig,
+    oidc: Option<&'a OidcVerifier>,
+}
+
+impl<'a> StagedDispatch<'a> {
+    /// Routes, then dispatches by the matched route's flavor, staging the
+    /// handler's effects into `group` instead of committing them — the
+    /// factoring behind both `handle_or_subscribe`'s one-request wrapper and
+    /// a batched drain loop (T6). A plain `#[route]` stages its handler and
+    /// returns `Response`; a `#[route(SSE …)]` extracts the resume cursor
+    /// (before the handler runs — an unparseable one is a 400, never a
+    /// silent from-now), stages its handler, and returns the validated
+    /// `Subscription`. `now` is the caller's clock reading (the kernel's own
+    /// `Clock`, in production) — threaded into `Ctx` for session expiry and
+    /// minting.
+    ///
+    /// Both `RouteGlue` arms route through `group.stage(...)` identically
+    /// (T5 pre-flight finding F): an SSE glue closure may legitimately write
+    /// (`ctx.create_session` is the obvious case), and `Group::stage`'s
+    /// empty-effects check — not a special case here — is what makes a
+    /// typical read-only subscribe cost no record.
+    pub fn stage_or_subscribe(&self, group: &mut Group, request: Request, now: u64) -> Handled {
         let (route, captures) = match self.router.find(request.method, &request.path) {
             RouteMatch::Found(route, captures) => (route, captures),
             RouteMatch::PathNotFound => {
@@ -427,14 +505,11 @@ impl App {
         let fresh_token = hex(&fresh);
         let presented = bearer_or_cookie(&request.headers);
         let session_ttl = self.config.session_ttl;
-        // Cloning the `Arc` (an atomic refcount bump, not a JWKS re-parse)
-        // lets this outlive the `&mut self` `db_mut()` takes below — see the
-        // field doc on `App::oidc`.
-        let oidc = self.oidc.clone();
+        let oidc = self.oidc;
 
         match glue {
             RouteGlue::Http(glue) => {
-                let result = self.db_mut().transact(|tx| {
+                let result = group.stage(|tx| {
                     let ctx = build_ctx(
                         tx,
                         &presented,
@@ -442,14 +517,14 @@ impl App {
                         fresh_token,
                         now,
                         session_ttl,
-                        oidc.as_deref(),
+                        oidc,
                     )?;
                     glue(tx, &ctx, &captures, &request.body)
                 });
                 Handled::Response(result.unwrap_or_else(tx_error_response))
             }
             RouteGlue::Sse(glue) => {
-                let result = self.db_mut().transact(|tx| {
+                let result = group.stage(|tx| {
                     let ctx = build_ctx(
                         tx,
                         &presented,
@@ -457,7 +532,7 @@ impl App {
                         fresh_token,
                         now,
                         session_ttl,
-                        oidc.as_deref(),
+                        oidc,
                     )?;
                     glue(tx, &ctx, &captures, cursor)
                 });
