@@ -945,6 +945,31 @@ batch: check once after `commit`, and if poisoned, send the tail's 500s and stop
 the store-latch-first ordering and both pinned message strings verbatim — `checks::classify`
 matches on them.
 
+**Amended 2026-08-12 (T4 review Important 1 + Noah ruling). "The tail" is now a counted
+quantity, and this step is the reason it had to be.** As originally drafted, this step was
+unsatisfiable: `commit` returned `Result<(), TxError<Infallible>>`, which tells a caller *that*
+the batch failed and never *where*, so the only thing this arm could actually do was 500 the
+**whole** batch — contradicting spec §4's last row and making T8 Step 3 unassertable. `commit`
+now returns `Result<(), CommitFailure>` with `CommitFailure { applied: usize, error: io::Error }`.
+
+So the split is exact, not inferred:
+
+```rust
+match group.commit() {
+    Ok(()) => { /* every reply in the batch is a normal reply */ }
+    Err(CommitFailure { applied, error }) => {
+        // 1..=applied are durable and keep their 200s.
+        // applied+1..N get 500s — and per spec §4 their records may STILL be
+        // durable and will apply on restart, so this 500 means "unknown",
+        // never "rejected". That contract is GUIDE's to state (T11).
+    }
+}
+```
+
+Do **not** re-derive `applied` from `db.last_applied()` before-vs-after. The ruling rejected
+that shape explicitly, on this sub-project's own precedent: T1's review carried a Critical for
+gating on a derived quantity where a counted one was available.
+
 - [ ] **Step 4: Run the kernel suite and both pinned seeds**
 
 Run: `cargo test -p charpente --test kernel`, then the two `CHARPENTE_SEED` replays.
@@ -1057,6 +1082,30 @@ same workload.
 
 A route handler panics mid-batch: the other requests in the batch commit correctly and the
 panicking one gets its 500.
+
+- [ ] **Step 5b: Two coverage gaps handed here by T4's review — added 2026-08-12**
+
+Both are branches that exist in shipped code and are exercised by **nothing in the repo**. A
+conjunct that never runs is indistinguishable from one that is wrong, which is why these are
+requirements rather than suggestions.
+
+1. **Group-aware adoption** (seed `0x60C1_0006`). `Group::stage` consults `self.adopted`
+   **union** the group's `staged_adoptions` so two staged transactions writing the same
+   versioned table emit only one `SchemaVersion` row. Every fixture in the repo is
+   *unversioned* (`Widget` in `charpente-core/tests/group_commit.rs` has no `RowShape`), so
+   that union conjunct has never executed. Batch two writes to one **versioned** table and
+   assert exactly one adoption row results. Also assert the negative-space case T4's review
+   raised: a batch whose `commit` fails must not fold `staged_adoptions` into `db.adopted`,
+   since that would be a durable-state lie about a batch that never landed.
+
+2. **Enqueues and emits are invisible mid-batch** (seed `0x60C1_0007`) — a real behaviour
+   change this sub-project introduces, and one nothing currently pins. The group overlay
+   carries **rows only**; enqueues, emits and `migrate_puts` are not in it. Before batching,
+   each transaction applied before the next took its snapshot, so B saw A's `charpente.jobs`
+   row; now it does not. T4's review confirmed no platform code is affected (every
+   `JobRow`/`EventRow` read in production goes through a `Snapshot`, never a `Tx`) — but app
+   code can reach it, so pin the actual behaviour with one probe rather than leaving it to be
+   discovered. T11 states it in DESIGN.
 
 - [ ] **Step 6: Run a full swarm batch**
 
