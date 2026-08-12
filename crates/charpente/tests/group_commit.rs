@@ -53,8 +53,17 @@ fn hit(tx: &mut Tx, id: Id<Hit>) -> Result<u64, ApiError> {
     Ok(count)
 }
 
+/// A read route, so a batch can contain one. Mounting it is pure in-memory
+/// router work — it touches no disk, so the committed pre-batching fixture is
+/// unaffected (and `a_never_contended_universe_traces_identically_...` would
+/// say so immediately if that were wrong).
+#[route(GET "/count/:id")]
+fn count(tx: &mut Tx, id: Id<Hit>) -> Result<u64, ApiError> {
+    Ok(tx.get(id)?.map_or(0, |h| h.count))
+}
+
 fn hit_routes() -> Vec<charpente::http::Route> {
-    routes![hit]
+    routes![hit, count]
 }
 
 // -------------------------------------------------------- op-counting disk
@@ -622,7 +631,10 @@ fn run_two_request_batch(seed: u64) -> Vec<String> {
 /// against a kernel that batched correctly.
 #[test]
 fn no_response_is_sent_before_the_group_syncs() {
-    let trace = run_two_request_batch(0x60C0_0009);
+    // 0x60C0_0009 was this test's seed and collided with the plan's Task 6
+    // allocation; the namespace census in the T7 pre-flight put the first
+    // free value here (T6 review M-2).
+    let trace = run_two_request_batch(0x60C0_0010);
     let wal_syncs: Vec<usize> = trace
         .iter()
         .enumerate()
@@ -662,5 +674,64 @@ fn no_response_is_sent_before_the_group_syncs() {
         appends_in_batch, 2,
         "two contended requests must share ONE sync — that sync covered \
          {appends_in_batch} record(s), not 2: {trace:?}"
+    );
+}
+
+/// Group-commit T6 review C-1 (Critical, Noah ruling 2026-08-12): a read
+/// batched behind a write whose commit fails must NOT be acked with that
+/// write's data.
+///
+/// `Group::stage` points every participant's `tx` at the group overlay, so a
+/// read running after a sibling's write returns that sibling's UNCOMMITTED
+/// effects. The first form of `CommitFailure::invalidates` keyed only on
+/// "which record did you stage", on the premise that a read had nothing for a
+/// commit to make uncertain — so the writer got its honest 500 while the
+/// reader was acked 200 carrying state no durable copy ever held, or ever
+/// would. Pre-batching that is structurally impossible: the read is a
+/// separate step served against committed state.
+///
+/// No existing oracle can see this — `acked_implies_durable` checks acked
+/// WRITES, and nothing else asserts a read's content after a failed batch —
+/// which is exactly why it needs its own pin.
+#[test]
+fn a_read_batched_behind_a_failed_write_is_not_acked_with_its_data() {
+    let sim = Sim::with_faults(0x60C0_000F, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Hit>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(hit_routes());
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+
+    let mut source = SimSource::new(Box::new(sim.clock()), 10 * SEC);
+    // Same instant, write first: one batch, the read staged behind the write
+    // and therefore reading through its overlay.
+    source.push_at(0, Request::new(Method::Post, "/hit/1"));
+    source.push_at(0, Request::new(Method::Get, "/count/1"));
+    let responses = source.responses();
+
+    // Every disk op from here fails, so the batch's commit cannot apply
+    // either record: `applied == 0`.
+    sim.crash_disk_now();
+    let _ = kernel.run(&mut source);
+
+    let statuses: Vec<u16> = responses
+        .lock()
+        .expect("responses lock poisoned by an earlier panic")
+        .iter()
+        .map(|(status, _)| *status)
+        .collect();
+    assert_eq!(
+        statuses.len(),
+        2,
+        "both requests were staged in one batch, so both must be answered"
+    );
+    assert!(
+        statuses.iter().all(|&s| s == 500),
+        "nothing reached the store, so the read saw only the failed write's \
+         overlay and cannot be acked: {statuses:?}"
     );
 }

@@ -1423,13 +1423,24 @@ impl Db {
         // degenerate one — and answering it differently here is what broke
         // batch-of-one response identity (Noah ruling 2026-08-12). A record
         // that reached the store keeps its `Ok` even if the cadence
-        // checkpoint then failed; the engine is poisoned either way and the
-        // kernel stops on its own check.
-        let record = (!g.is_empty()).then_some(0);
-        if let Err(failure) = g.commit()
-            && failure.invalidates(record)
-        {
-            return Err(TxError::Io(failure.error));
+        // checkpoint then failed.
+        //
+        // But only swallow a failure something ELSE will report (T6 review
+        // I-1, Noah ruling 2026-08-12). The original form ended "the engine
+        // is poisoned either way and the kernel stops on its own check",
+        // which is measurably false: `write_horizon_breadcrumb` is raw
+        // `Disk` IO behind neither `Wal::guard` nor `DiskBackend`, so a sync
+        // failure there latches nothing, poisons nothing, and — swallowed —
+        // freezes WAL GC and the breadcrumb forever with nobody told. That
+        // is the shape of the gap M2 sub-project 0a existed to close, and it
+        // would have reached every `transact` caller: jobs reported `Done`,
+        // cron, `migrate_schema`, app code.
+        let staged = !g.is_empty();
+        if let Err(failure) = g.commit() {
+            let reported_elsewhere = self.poisoned() || self.store_failed();
+            if failure.invalidates(0, staged) || !reported_elsewhere {
+                return Err(TxError::Io(failure.error));
+            }
         }
         Ok(out)
     }
@@ -2244,26 +2255,47 @@ pub struct CommitFailure {
 }
 
 impl CommitFailure {
-    /// Whether this failure leaves the participant that staged `record` —
-    /// its index among the batch's records, or `None` if it staged none —
-    /// unable to know whether its write committed.
+    /// Whether this failure leaves a batch participant unable to trust its
+    /// own answer. `records_before` is how many records the group already
+    /// held when that participant ran; `staged` is whether it then added one.
     ///
-    /// The one rule, so the single-transaction path (`Db::transact`) and the
-    /// kernel's batched tail cannot answer the same question differently.
-    /// They did diverge (group-commit T6, Noah ruling 2026-08-12): the
-    /// batched path honoured `applied` while `transact` discarded it, so a
-    /// batch of one answered 200 where an unbatched request answered 500 —
-    /// spec §7's identity holds on the disk trace and broke on the response.
+    /// The one rule, so the single-transaction path (`Db::transact`), the
+    /// `App` one-request path and the kernel's batched tail cannot answer the
+    /// same question differently. They did diverge (group-commit T6, Noah
+    /// ruling 2026-08-12): the batched path honoured `applied` while the
+    /// others discarded it, so a batch of one answered 200 where an unbatched
+    /// request answered 500 — spec §7's identity holding on the disk trace
+    /// and breaking on the response.
     ///
-    /// Two participants are NOT invalidated: one that staged nothing (a
-    /// read, or a handler that returned `Err` — there is nothing about it for
-    /// a commit to have made uncertain), and one whose record already
-    /// applied. The latter is the checkpoint case, where `applied == n`: the
-    /// records are durable and the failure is durability BOOKKEEPING after
-    /// the fact. Telling such a request "may or may not have committed" is
-    /// the half of M2 sub-project 0a's gap that its own fix left open.
-    pub fn invalidates(&self, record: Option<usize>) -> bool {
-        record.is_some_and(|r| r >= self.applied)
+    /// **It keys on what the participant SAW, not on what it wrote** (T6
+    /// review C-1, Noah ruling 2026-08-12). The earlier form asked only
+    /// "which record did you stage", on the premise that a request staging
+    /// nothing had nothing for a commit to make uncertain. That premise is
+    /// false: `Group::stage` points every participant's `tx` at the group
+    /// overlay, so a READ running after a sibling's write returns that
+    /// sibling's uncommitted effects. If the commit then failed, the writer
+    /// got its 500 and the reader was acked 200 carrying state no durable
+    /// copy ever held. Reproduced, not theorised.
+    ///
+    /// So a participant is invalidated when any record it observed — or its
+    /// own, if it staged one — failed to apply:
+    /// - staged: its record index IS `records_before`, so `>= applied`;
+    /// - read-only: it observed `0..records_before-1`, so `> applied`.
+    ///
+    /// Under an append/sync failure (`applied == 0`) that invalidates
+    /// everything behind the first staged record, satisfying spec §4's table,
+    /// while a request that ran AHEAD of every write keeps its honest answer:
+    /// it only ever saw committed state. Under the checkpoint arm
+    /// (`applied == n`) it invalidates nobody — those records are durable and
+    /// the failure is bookkeeping after the fact. Telling such a request "may
+    /// or may not have committed" is the half of M2 sub-project 0a's gap that
+    /// its own fix left open.
+    pub fn invalidates(&self, records_before: usize, staged: bool) -> bool {
+        if staged {
+            records_before >= self.applied
+        } else {
+            records_before > self.applied
+        }
     }
 }
 

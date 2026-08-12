@@ -1225,11 +1225,22 @@ fn a_subscribe_still_sees_an_emit_that_arrives_with_it() {
     let handles = sinks.lock().expect("sinks lock");
     assert_eq!(handles.len(), 1, "exactly one subscribe opened a sink");
     let frames = handles[0].frames();
+    // Exact, not merely non-empty (T6 review M-1): `!frames.is_empty()` would
+    // also pass on a `charpente.gap` terminal frame or any wrong event, and
+    // "could this be green while the property is false" is the standard here.
+    assert_eq!(
+        frames.len(),
+        1,
+        "exactly the one emit that arrived with the subscribe — an EMPTY tail \
+         means its cursor resolved PAST the sibling's event, which is a silent \
+         gap: {:?}",
+        frames.iter().map(|f| (f.name, &f.json)).collect::<Vec<_>>()
+    );
+    assert_eq!(frames[0].name, "ping", "the Ping event, not a gap frame");
     assert!(
-        !frames.is_empty(),
-        "the subscriber must receive the emit that arrived with it — an empty \
-         tail means its cursor resolved PAST the sibling's event, which is a \
-         silent gap"
+        frames[0].json.contains('7'),
+        "carrying the emitted payload n=7: {}",
+        frames[0].json
     );
 }
 

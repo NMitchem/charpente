@@ -437,13 +437,20 @@ impl App {
             Err(e) => return Handled::Response(tx_error_response(TxError::Io(e))),
         };
         let handled = staged.stage_or_subscribe(&mut group, request, now);
+        let wrote = !group.is_empty();
         match group.commit() {
             Ok(()) => handled,
-            // A lone transaction has no "partial batch" for `CommitFailure::
-            // applied` to mean anything about (same reasoning as
-            // `Db::transact`, `db.rs:1420-1423`) — this request's own
-            // `TxError::Io`, byte-identical wording to before this task.
-            Err(failure) => Handled::Response(tx_error_response(TxError::Io(failure.error))),
+            // Routed through the SAME rule as `Db::transact` and the kernel's
+            // batched tail (T6 review I-2): this path used to map any
+            // `CommitFailure` to a 500 regardless of `applied`, which made it
+            // the divergent one the moment the other two started honouring it
+            // — a checkpoint failure the kernel answers 200 for was answered
+            // 500 here. `records_before` is 0: a batch of one sees nothing
+            // staged ahead of it.
+            Err(failure) if failure.invalidates(0, wrote) => {
+                Handled::Response(tx_error_response(TxError::Io(failure.error)))
+            }
+            Err(_) => handled,
         }
     }
 }

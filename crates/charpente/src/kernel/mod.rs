@@ -317,17 +317,39 @@ impl Kernel {
                 // runs at (seconds to days), but it is a real change from
                 // one-clock-read-per-request and is deliberate, not an
                 // oversight.
-                let (mut group, staged) = self.app.begin_group()?;
+                // A snapshot failure here is ONE request's 500, not the
+                // kernel's death (T6 review I-3). Before this task the same
+                // failure reached `handle_or_subscribe`, which absorbed it
+                // into the named 500 and let the poison check below decide
+                // whether to stop — a non-poisoning `Store::snapshot` error
+                // was survivable and the node kept serving. A bare `?` here
+                // would kill the node before `self.pending` is even taken,
+                // leaving that request unanswered and escaping `run` with a
+                // raw `io::Error` that names neither contract nor fix.
+                let (mut group, staged) = match self.app.begin_group() {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        let (_, reply) = self.pending.take().expect("checked above");
+                        reply.send(io_failure_response(&e));
+                        self.stats.requests += 1;
+                        return Ok(Step::Worked);
+                    }
+                };
                 let mut handled = Vec::with_capacity(4);
                 let mut replies = Vec::with_capacity(4);
-                // Which record index (if any) each request staged. NOT the
-                // request's position: `CommitFailure::applied` counts
-                // RECORDS, and the two are not 1:1 — a read-only request, or
-                // one whose handler returned `Err`, stages none. Comparing a
-                // request index against a record count hands a spurious 500
-                // to a read whose answer came from a snapshot the failure
-                // cannot invalidate.
-                let mut record_of = Vec::with_capacity(4);
+                // What each request SAW and whether it wrote: `(records the
+                // group already held, staged)`. NOT the request's position —
+                // `CommitFailure::applied` counts RECORDS and the two are
+                // not 1:1, since a read-only request or one whose handler
+                // returned `Err` stages none.
+                //
+                // A read's `records_before` is load-bearing, not bookkeeping:
+                // `Group::stage` points every `tx` at the group overlay, so a
+                // read running after a sibling's write returns that sibling's
+                // UNCOMMITTED effects and is invalidated with it (T6 review
+                // C-1). Only a request that ran ahead of every staged record
+                // saw purely committed state.
+                let mut saw = Vec::with_capacity(4);
                 let mut next = Some(self.pending.take().expect("checked above"));
                 while let Some((request, reply)) = next.take() {
                     let before = group.len();
@@ -345,7 +367,7 @@ impl Kernel {
                     // whatever comes after is delivered.
                     let ends_batch = matches!(outcome, Handled::Subscribe(_));
                     handled.push(outcome);
-                    record_of.push((group.len() > before).then_some(before));
+                    saw.push((before, group.len() > before));
                     replies.push(reply);
                     if !ends_batch && handled.len() < MAX_BATCH {
                         next = source.poll();
@@ -358,15 +380,17 @@ impl Kernel {
                 // `applied` inside is COUNTED by the engine, never re-derived
                 // from `last_applied()` before-vs-after.
                 let failure = group.commit().err();
-                for ((outcome, reply), record) in handled.into_iter().zip(replies).zip(record_of) {
-                    // A request keeps its response unless the record IT
-                    // staged is the one left uncertain — the same rule
-                    // `Db::transact` applies to its batch of one, so the two
-                    // paths cannot drift. The 500 means "unknown", never
-                    // "rejected": per spec §4 the record may still be durable
-                    // and apply on restart.
+                for ((outcome, reply), (before, staged)) in
+                    handled.into_iter().zip(replies).zip(saw)
+                {
+                    // A request keeps its response unless a record it saw —
+                    // or its own — is the one left uncertain. The same rule
+                    // `Db::transact` and `App::handle_or_subscribe` apply to
+                    // their batch of one, so no path can drift. The 500 means
+                    // "unknown", never "rejected": per spec §4 the record may
+                    // still be durable and apply on restart.
                     if let Some(failure) = &failure
-                        && failure.invalidates(record)
+                        && failure.invalidates(before, staged)
                     {
                         reply.send(io_failure_response(&failure.error));
                         continue;
