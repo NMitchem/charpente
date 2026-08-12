@@ -613,16 +613,26 @@ fn build_ctx(
 /// `TxError<ApiError>` -> `Response`, shared by both route flavors: `App`
 /// names the handler's own rejection; `Io`/`NotPrimary`/`Verifying` name the
 /// platform failure and the fix (hard rule 5).
+/// The 500 a request gets when the platform cannot tell it whether its write
+/// committed. One function, two callers: this path and the kernel's batched
+/// commit-failure tail (group-commit T6), which must produce byte-identical
+/// bytes — the wording is product surface (DESIGN §7) and is pinned by test.
+/// A batched request's 500 means "unknown", never "rejected": per spec §4 its
+/// record may still be durable and apply on restart.
+pub(crate) fn io_failure_response(e: &io::Error) -> Response {
+    Response::error(
+        500,
+        &format!(
+            "internal storage failure — the request may or may not have \
+             committed; retry after the server recovers: {e}"
+        ),
+    )
+}
+
 fn tx_error_response(err: TxError<ApiError>) -> Response {
     match err {
         TxError::App(e) => e.response(),
-        TxError::Io(e) => Response::error(
-            500,
-            &format!(
-                "internal storage failure — the request may or may not have \
-                 committed; retry after the server recovers: {e}"
-            ),
-        ),
+        TxError::Io(e) => io_failure_response(&e),
         TxError::NotPrimary { primary } => Response::error(
             421,
             &format!(

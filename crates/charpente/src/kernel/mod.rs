@@ -14,12 +14,12 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use charpente_core::db::Db;
+use charpente_core::db::{Db, MAX_BATCH};
 use charpente_core::event::EventRow;
 use charpente_core::io::{Clock, Instant};
 use charpente_core::table::View;
 
-use crate::http::{App, Cursor, Handled, Request, Response};
+use crate::http::{App, Cursor, Handled, Request, Response, io_failure_response};
 use crate::kernel::tail::Tail;
 use crate::repl::{REPL_TICK_NANOS, Repl};
 
@@ -301,20 +301,90 @@ impl Kernel {
         };
         match choice {
             Ready::Request => {
-                let (request, reply) = self.pending.take().expect("checked above");
-                match self.app.handle_or_subscribe(request, now) {
-                    Handled::Response(response) => reply.send(response),
-                    Handled::Subscribe(sub) => {
-                        match validate_subscribe(self.app.db(), sub.cursor) {
-                            Ok(next_id) => {
-                                let sink = reply.stream(Response::sse_headers());
-                                self.tails.push(Tail { sub, sink, next_id });
+                // Drain into ONE group, commit once, then reply (spec §1).
+                //
+                // Bounded by requests POLLED, not by records staged: a
+                // handler that returns `Err` or writes nothing stages no
+                // record, so a record-bounded loop would keep draining while
+                // `poll()` returns `Some` — holding one `Request` (up to the
+                // 1 MiB body cap) and one `Reply` per item. Counting
+                // requests bounds both. Do not "simplify" this to a
+                // staged-record check; that restores the unbounded case.
+                // Every request in this batch is handed the BATCH's `now`,
+                // not its own arrival time, so sessions minted in one batch
+                // share an `expires_at` and lazy expiry is evaluated at one
+                // instant for all of them. Harmless at the TTL scale this
+                // runs at (seconds to days), but it is a real change from
+                // one-clock-read-per-request and is deliberate, not an
+                // oversight.
+                let (mut group, staged) = self.app.begin_group()?;
+                let mut handled = Vec::with_capacity(4);
+                let mut replies = Vec::with_capacity(4);
+                // Which record index (if any) each request staged. NOT the
+                // request's position: `CommitFailure::applied` counts
+                // RECORDS, and the two are not 1:1 — a read-only request, or
+                // one whose handler returned `Err`, stages none. Comparing a
+                // request index against a record count hands a spurious 500
+                // to a read whose answer came from a snapshot the failure
+                // cannot invalidate.
+                let mut record_of = Vec::with_capacity(4);
+                let mut next = Some(self.pending.take().expect("checked above"));
+                while let Some((request, reply)) = next.take() {
+                    let before = group.len();
+                    let outcome = staged.stage_or_subscribe(&mut group, request, now);
+                    // A subscribe ENDS the batch. Its cursor is resolved
+                    // after the commit (`validate_subscribe` needs `&Db`,
+                    // which the open group holds), so any sibling staged
+                    // BEHIND it would have its events committed before that
+                    // resolution — and the tail would start past them,
+                    // silently missing events it must receive. That is a
+                    // gap, exactly what realtime's membership oracle
+                    // forbids. Ending the batch here reproduces the
+                    // unbatched order the cursor's meaning assumes: whatever
+                    // committed before this request is behind the cursor,
+                    // whatever comes after is delivered.
+                    let ends_batch = matches!(outcome, Handled::Subscribe(_));
+                    handled.push(outcome);
+                    record_of.push((group.len() > before).then_some(before));
+                    replies.push(reply);
+                    if !ends_batch && handled.len() < MAX_BATCH {
+                        next = source.poll();
+                    }
+                }
+                let drained = handled.len();
+                // Nothing has been acked yet — the replies are still held.
+                // `commit` is the only point after which any of them may be
+                // sent, which is ack-after-durable stated structurally.
+                // `applied` inside is COUNTED by the engine, never re-derived
+                // from `last_applied()` before-vs-after.
+                let failure = group.commit().err();
+                for ((outcome, reply), record) in handled.into_iter().zip(replies).zip(record_of) {
+                    // A request keeps its response unless the record IT
+                    // staged is the one left uncertain — the same rule
+                    // `Db::transact` applies to its batch of one, so the two
+                    // paths cannot drift. The 500 means "unknown", never
+                    // "rejected": per spec §4 the record may still be durable
+                    // and apply on restart.
+                    if let Some(failure) = &failure
+                        && failure.invalidates(record)
+                    {
+                        reply.send(io_failure_response(&failure.error));
+                        continue;
+                    }
+                    match outcome {
+                        Handled::Response(response) => reply.send(response),
+                        Handled::Subscribe(sub) => {
+                            match validate_subscribe(self.app.db(), sub.cursor) {
+                                Ok(next_id) => {
+                                    let sink = reply.stream(Response::sse_headers());
+                                    self.tails.push(Tail { sub, sink, next_id });
+                                }
+                                Err(response) => reply.send(response),
                             }
-                            Err(response) => reply.send(response),
                         }
                     }
                 }
-                self.stats.requests += 1;
+                self.stats.requests += drained as u64;
                 // Spec 2026-07-05 (request-arm ruling): a request-path Io
                 // is absorbed into a 500 for the client, but a poisoned
                 // engine serves no one — stop; restart-and-recover is the

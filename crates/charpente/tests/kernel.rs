@@ -535,12 +535,38 @@ fn kernel_stops_after_a_request_poisons_the_engine() {
         "stop error must also name the site and the fix (hard rule 5): {msg}"
     );
     let replies = replies.lock().unwrap();
+    // UPDATED at group-commit T6, and the guarantee is unchanged: the kernel
+    // stops rather than keep serving off a dead engine (the `expect_err`
+    // above is that assertion). What changed is the count. Both scripted
+    // requests are drained into ONE batch before the commit is attempted, so
+    // both are already in flight when it fails and both must be answered —
+    // dropping a `Reply` hangs its client forever. Neither is "served off a
+    // dead engine": they were staged before the engine was known dead, and
+    // nothing arriving after this batch is served at all.
     assert_eq!(
         replies.len(),
-        1,
-        "the poisoning request got its 500; the next was never served"
+        2,
+        "both requests were staged in one batch, so both must be answered: {} replies",
+        replies.len()
     );
-    assert_eq!(replies[0].status, 500);
+    // Here `applied == 0` — the append/sync itself failed, so NEITHER record
+    // reached the store and both requests are genuinely uncertain. Contrast
+    // `kernel_stops_on_a_latched_store`, where the records ARE durable and
+    // the same code path answers 200.
+    assert!(
+        replies.iter().all(|r| r.status == 500),
+        "no record reached the store, so every request in the batch is uncertain: {:?}",
+        replies.iter().map(|r| r.status).collect::<Vec<_>>()
+    );
+    // Moved here from `kernel_stops_on_a_latched_store` at group-commit T6:
+    // that test has no 500 left to inspect now that a durable-record
+    // checkpoint failure answers 200, so the "the 500 names the injected
+    // fault" pin (hard rule 5) lives on the case that still produces one.
+    let body = String::from_utf8_lossy(&replies[0].body);
+    assert!(
+        body.contains("simulated"),
+        "the 500 should name the injected fault: {body}"
+    );
 }
 
 // ------------- FIX: a latched redb handle now poisons `Db::poisoned()`
@@ -863,20 +889,35 @@ fn kernel_stops_on_a_latched_store() {
 
     let replies = replies.lock().unwrap();
     // THE FIX (was: the gap). The write's cadence checkpoint hits the store
-    // latch, which now poisons the Db, so the kernel stops after replying to
-    // the request that hit it. The two scripted reads are never served.
+    // latch, which now poisons the Db, so the kernel stops — that is the
+    // `expect_err` above and it is unchanged.
+    //
+    // UPDATED at group-commit T6 (Noah ruling 2026-08-12), and this test is
+    // now the one that pins the ruling. The write and the two scripted reads
+    // are drained into ONE batch, so all three are answered before the stop.
+    // All three are 200s, and that is the honest answer, not a regression:
+    // `Group::commit`'s checkpoint arm reports `applied == n`, meaning every
+    // record REACHED THE STORE and the failure is durability bookkeeping
+    // after the fact. The write's record is durable. Telling it "may or may
+    // not have committed" was the half of this sub-project's own gap (M2 0a,
+    // whose description opens "gave a 500 to a record that WAS durable")
+    // that 0a's fix left open; it is closed here, on both paths at once, by
+    // `CommitFailure::invalidates`.
+    //
+    // The reads were always going to be 200s — they stage no record, so no
+    // commit outcome can make them uncertain.
     assert_eq!(
         replies.len(),
-        1,
-        "the kernel must stop at the latched write, not serve on: {} replies",
+        3,
+        "the write and both reads were staged in one batch, so all three are \
+         answered before the kernel stops: {} replies",
         replies.len()
     );
-    // The write still gets its honest 500 first — the record IS in the WAL.
-    assert_eq!(replies[0].status, 500);
-    let body = String::from_utf8_lossy(&replies[0].body);
     assert!(
-        body.contains("simulated fsync failure"),
-        "the write's 500 should name the injected fault: {body}"
+        replies.iter().all(|r| r.status == 200),
+        "a latched CHECKPOINT means the records are durable (applied == n) — \
+         every request in the batch keeps its honest answer: {:?}",
+        replies.iter().map(|r| r.status).collect::<Vec<_>>()
     );
     // THE CORRESPONDENCE ASSERTION (spec §1), and it takes BOTH halves: one
     // reading charpente's mirror, one reading redb itself. A test that consults

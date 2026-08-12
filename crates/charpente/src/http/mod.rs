@@ -11,6 +11,10 @@ mod router;
 pub use app::{App, AppConfig, Ctx, Handled, Session, StagedDispatch};
 pub use router::{Glue, Route, RouteDef, RouteGlue, RouteMatch, Router, SubGlue};
 
+/// Not public API: the kernel's batched commit-failure tail needs the exact
+/// 500 the single-request path produces (group-commit T6).
+pub(crate) use app::io_failure_response;
+
 use std::collections::BTreeMap;
 use std::io;
 

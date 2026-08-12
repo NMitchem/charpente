@@ -1182,6 +1182,57 @@ fn the_harness_refuses_a_diverged_409_without_durable_corruption() {
     assert!(err.contains("diverged"), "{err}");
 }
 
+/// Group-commit T6 regression: a subscribe arriving in the same instant as an
+/// emit must still receive that emit.
+///
+/// The kernel's request arm drains many requests into one group, but a
+/// subscribe's cursor is resolved AFTER the commit — `validate_subscribe`
+/// needs `&Db`, which the open group holds. So a sibling staged behind a
+/// subscribe would have its events committed before that resolution, the tail
+/// would start past them, and the subscriber would silently miss events it
+/// must receive. A gap: precisely what this file's membership oracle forbids.
+/// The arm therefore ends a batch at a subscribe.
+///
+/// Found the honest way — by an existing test going red — but by
+/// `tail_encode_error_is_whole_node_fatal`, whose name promises nothing about
+/// batch ordering, so the property gets its own pin here rather than living
+/// on as a side effect of that one.
+#[test]
+fn a_subscribe_still_sees_an_emit_that_arrives_with_it() {
+    let sim = Sim::with_faults(0x2EB2_B471, FaultConfig::none());
+    let app = realtime_app(&sim).unwrap();
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+
+    let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 10 * SEC);
+    let t = sim.now().as_nanos();
+    // Same instant: both are ready in the same step, so the arm would drain
+    // them into one batch if the subscribe did not end it.
+    source.push_at(t, Request::new(Method::Get, "/feed-ping"));
+    source.push_at(
+        t,
+        Request::new(Method::Post, "/ping").json(&EmitBody { n: 7, key: None }),
+    );
+    let sinks = source.sinks();
+
+    // Run until the script is exhausted and the tail has been serviced.
+    for _ in 0..8 {
+        match kernel.step(&mut source) {
+            Ok(_) => {}
+            Err(e) => panic!("no step may fail here: {e}"),
+        }
+    }
+
+    let handles = sinks.lock().expect("sinks lock");
+    assert_eq!(handles.len(), 1, "exactly one subscribe opened a sink");
+    let frames = handles[0].frames();
+    assert!(
+        !frames.is_empty(),
+        "the subscriber must receive the emit that arrived with it — an empty \
+         tail means its cursor resolved PAST the sibling's event, which is a \
+         silent gap"
+    );
+}
+
 /// The encode-error contract (spec §5): `deliver_unit` (kernel/tail.rs)
 /// bubbles a `SubEntry::encode_json` failure with `?`, which bubbles again at
 /// the `Ready::Tail` call site (kernel/mod.rs) out of `Kernel::step`/`run` —

@@ -1417,11 +1417,20 @@ impl Db {
     ) -> Result<T, TxError<E>> {
         let mut g = self.begin_group().map_err(TxError::Io)?;
         let out = g.stage(f)?;
-        // A lone transaction has no "partial batch" for `CommitFailure::
-        // applied` to mean anything about, so it is dropped here — a
-        // single-record `commit` failure is simply this transaction's own
-        // `TxError::Io`, exactly as before.
-        g.commit().map_err(|failure| TxError::Io(failure.error))?;
+        // `applied` is consulted through the SAME rule the kernel's batched
+        // tail uses (`CommitFailure::invalidates`), not discarded. A lone
+        // transaction does have a partial-batch question after all — the
+        // degenerate one — and answering it differently here is what broke
+        // batch-of-one response identity (Noah ruling 2026-08-12). A record
+        // that reached the store keeps its `Ok` even if the cadence
+        // checkpoint then failed; the engine is poisoned either way and the
+        // kernel stops on its own check.
+        let record = (!g.is_empty()).then_some(0);
+        if let Err(failure) = g.commit()
+            && failure.invalidates(record)
+        {
+            return Err(TxError::Io(failure.error));
+        }
         Ok(out)
     }
 
@@ -1969,11 +1978,18 @@ impl Db {
 /// internal mechanism like `REPL_TICK_NANOS`, and a configurable throughput
 /// knob next to `docs/BENCH.md` is the one thing not to ship. It exists
 /// only to bound buffered memory — greedy drain is already self-limiting by
-/// arrival rate. Kept private to `db.rs`: whether a kernel drain loop
-/// should bound on `Group::is_full()` (staged records) or a separate count
-/// (staged *attempts*, since a rejected handler stages no record) is a
-/// Task 6 decision, not settled here.
-const MAX_BATCH: usize = 64;
+/// arrival rate.
+///
+/// SETTLED at Task 6 (the decision this doc used to defer): a kernel drain
+/// loop bounds on **requests polled**, not on staged records. Records are
+/// the smaller quantity — a handler returning `Err` or writing nothing
+/// stages none — so a record-bounded loop is *unbounded* in exactly the
+/// adversarial case the cap exists for, while the batch still holds one
+/// `Request` (up to the 1 MiB body cap) and one `Reply` per drained item.
+/// Bounding on requests caps both at once: `records ≤ requests ≤ MAX_BATCH`.
+/// `pub` so `charpente`'s kernel shares this one constant rather than
+/// duplicating the literal, which is how two copies of a limit drift.
+pub const MAX_BATCH: usize = 64;
 
 /// A batch of transactions sharing one commit (spec §1): one store
 /// snapshot, one accumulated overlay, one durable sync for however many
@@ -2156,12 +2172,6 @@ impl<'a> Group<'a> {
         self.records.is_empty()
     }
 
-    /// True once `len()` reaches `MAX_BATCH` — a caller's cue to stop
-    /// draining and commit (spec §3).
-    pub fn is_full(&self) -> bool {
-        self.len() >= MAX_BATCH
-    }
-
     /// Appends every staged record, syncs ONCE for the whole batch, then
     /// applies each in seq order (spec §1) — apply stays strictly after
     /// sync, so nothing here is acknowledged before it is durable. An empty
@@ -2231,6 +2241,30 @@ impl<'a> Group<'a> {
 pub struct CommitFailure {
     pub applied: usize,
     pub error: io::Error,
+}
+
+impl CommitFailure {
+    /// Whether this failure leaves the participant that staged `record` —
+    /// its index among the batch's records, or `None` if it staged none —
+    /// unable to know whether its write committed.
+    ///
+    /// The one rule, so the single-transaction path (`Db::transact`) and the
+    /// kernel's batched tail cannot answer the same question differently.
+    /// They did diverge (group-commit T6, Noah ruling 2026-08-12): the
+    /// batched path honoured `applied` while `transact` discarded it, so a
+    /// batch of one answered 200 where an unbatched request answered 500 —
+    /// spec §7's identity holds on the disk trace and broke on the response.
+    ///
+    /// Two participants are NOT invalidated: one that staged nothing (a
+    /// read, or a handler that returned `Err` — there is nothing about it for
+    /// a commit to have made uncertain), and one whose record already
+    /// applied. The latter is the checkpoint case, where `applied == n`: the
+    /// records are durable and the failure is durability BOOKKEEPING after
+    /// the fact. Telling such a request "may or may not have committed" is
+    /// the half of M2 sub-project 0a's gap that its own fix left open.
+    pub fn invalidates(&self, record: Option<usize>) -> bool {
+        record.is_some_and(|r| r >= self.applied)
+    }
 }
 
 // ---------------------------------------------------------------- seed

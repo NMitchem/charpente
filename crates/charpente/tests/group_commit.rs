@@ -26,9 +26,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use charpente::http::{ApiError, App, AppConfig, Handled, Method, Request};
-use charpente::kernel::{Kernel, SimSource};
+use charpente::kernel::{EventSink, Kernel, Reply, RequestSource, Respond, SimSource, Wake};
 use charpente::{Schema, Tx, route, routes, table};
-use charpente_core::io::{Disk, File};
+use charpente_core::io::{Disk, File, Instant};
 use charpente_core::table::{Id, View};
 use charpente_sim::{FaultConfig, Sim};
 
@@ -250,6 +250,18 @@ impl DiskTrace {
             .lock()
             .expect("disk trace lock poisoned by an earlier panic")
             .join("\n")
+    }
+
+    /// The raw ordered entries (T6): `render()`'s joined string is right for
+    /// a byte-identity comparison against the fixture, but T6's ack-ordering
+    /// test needs `Vec::position`/filtering over individual events (disk ops
+    /// AND `"reply"` markers), which a joined string cannot offer without
+    /// re-splitting it.
+    fn entries(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .expect("disk trace lock poisoned by an earlier panic")
+            .clone()
     }
 }
 
@@ -479,4 +491,176 @@ fn capture_pre_batching_trace() {
         &trace,
     )
     .expect("write the fixture");
+}
+
+// ------------------------------------------------------ reply-aware trace
+//
+// T6's ack-ordering property (spec §9.1: "no reply may leave before the
+// batch's sync") needs a trace that records a kernel-level reply alongside
+// disk ops, on one ordered timeline — and no existing tracer does that
+// (T6 pre-flight, finding A). T5's `TracingDisk`/`DiskTrace` above records
+// *disk* ops only; a reply is not a disk op (it is `Respond::send`/
+// `stream`), so it is invisible to that tracer no matter how it is driven.
+// This is deliberately a SEPARATE facility from `run_one_at_a_time_universe`
+// — it must never touch that function's trace, which backs the committed
+// fixture and must stay disk-only forever (module doc above; T5 review
+// Minor 7).
+
+/// Wraps a `Reply` so `send`/`stream` push a `"reply"` marker into the SAME
+/// `DiskTrace` a `TracingDisk` writes disk ops into — the two together are
+/// what let a test see "was the sync before or after the reply" on one
+/// timeline. `"reply"` (bare, no path prefix) can never collide with a disk
+/// entry: every disk line is `"<path> <op> ..."`.
+struct TracingReply {
+    inner: Reply,
+    trace: DiskTrace,
+}
+
+impl Respond for TracingReply {
+    fn send(self: Box<Self>, response: charpente::http::Response) {
+        self.trace.push("reply".to_string());
+        self.inner.send(response);
+    }
+
+    fn stream(self: Box<Self>, response: charpente::http::Response) -> Box<dyn EventSink> {
+        self.trace.push("reply".to_string());
+        self.inner.stream(response)
+    }
+}
+
+/// A `RequestSource` that wraps every reply `SimSource` hands out in a
+/// `TracingReply`, sharing one `DiskTrace` with a `TracingDisk` mounted on
+/// the same `App`. `poll`/`wait_until` otherwise just forward — this adds
+/// no scheduling behavior of its own, so it does not perturb which requests
+/// are ready when (the same-shape rule, DESIGN §1: this is test
+/// instrumentation, not a second source implementation).
+struct TracingSource {
+    inner: SimSource,
+    trace: DiskTrace,
+}
+
+impl RequestSource for TracingSource {
+    fn poll(&mut self) -> Option<(Request, Reply)> {
+        let (request, reply) = self.inner.poll()?;
+        Some((
+            request,
+            Box::new(TracingReply {
+                inner: reply,
+                trace: self.trace.clone(),
+            }),
+        ))
+    }
+
+    fn wait_until(&mut self, deadline: Option<Instant>) -> Wake {
+        self.inner.wait_until(deadline)
+    }
+}
+
+/// Drives two requests arriving at the SAME virtual instant (genuinely
+/// contended — both are ready the moment the kernel's drain loop polls a
+/// second time at the same `now`, not merely scheduled close together)
+/// through a disk-and-reply trace. Asserts both were actually served before
+/// handing the trace back, so a degenerate run (dropped request, kernel
+/// shutting down early) fails here with a direct message instead of
+/// producing a trace that silently satisfies the ordering assertion by
+/// having nothing in it (T5 review, Important 2's same concern, one level
+/// up).
+fn run_two_request_batch(seed: u64) -> Vec<String> {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let trace = DiskTrace::default();
+    let disk = TracingDisk {
+        inner: sim.disk(),
+        trace: trace.clone(),
+    };
+    let app = App::open(
+        Box::new(disk),
+        Schema::new().table::<Hit>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(hit_routes());
+
+    let mut inner = SimSource::new(Box::new(sim.clock()), SEC);
+    inner.push_at(0, Request::new(Method::Post, "/hit/1"));
+    inner.push_at(0, Request::new(Method::Post, "/hit/2"));
+    let responses = inner.responses();
+    let mut source = TracingSource {
+        inner,
+        trace: trace.clone(),
+    };
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    kernel.run(&mut source).unwrap();
+
+    let statuses: Vec<u16> = responses
+        .lock()
+        .expect("responses lock poisoned by an earlier panic")
+        .iter()
+        .map(|(status, _)| *status)
+        .collect();
+    assert_eq!(
+        statuses,
+        vec![200, 200],
+        "both requests must be served 200 before the ordering assertion means anything"
+    );
+    trace.entries()
+}
+
+/// Ack-after-durable, batch-wide (spec §9.1): no reply may leave before the
+/// ONE sync covering the batch it belongs to. Two genuinely contended
+/// requests must share a single WAL sync, and both replies must follow it.
+///
+/// Two assertions, because either alone is passable while the property is
+/// false. Ordering alone would hold on unbatched code if the trace happened
+/// to end after one request; batch shape alone would hold if the kernel
+/// synced once and replied *before* it. Together they are the property.
+///
+/// Note what is NOT asserted: that the whole trace contains exactly one WAL
+/// sync. It contains two — the batch's, and the startup schema-adoption
+/// record, which commits before any request is served and belongs to no
+/// batch. Keying on the total was this test's first form and it failed
+/// against a kernel that batched correctly.
+#[test]
+fn no_response_is_sent_before_the_group_syncs() {
+    let trace = run_two_request_batch(0x60C0_0009);
+    let wal_syncs: Vec<usize> = trace
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| op.starts_with("wal/") && op.ends_with(" sync"))
+        .map(|(i, _)| i)
+        .collect();
+    let reply_positions: Vec<usize> = trace
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| op.as_str() == "reply")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        reply_positions.len(),
+        2,
+        "both requests must be answered: {trace:?}"
+    );
+    let last_sync = *wal_syncs.last().expect("the batch synced");
+
+    // (1) Ordering. Unbatched code fails here: it syncs request 1, replies,
+    // then syncs request 2 — so a reply sits before the final sync.
+    assert!(
+        reply_positions.iter().all(|&p| p > last_sync),
+        "a reply was sent before the batch's sync — ack-after-durable is \
+         broken: {trace:?}"
+    );
+
+    // (2) Batch shape. Both records must ride the SAME sync: count the WAL
+    // appends between the previous sync and the batch's. Unbatched code
+    // fails here too — its final sync covers exactly one record.
+    let prev_sync = wal_syncs.len().checked_sub(2).map(|i| wal_syncs[i]);
+    let appends_in_batch = trace[prev_sync.map_or(0, |i| i + 1)..last_sync]
+        .iter()
+        .filter(|op| op.starts_with("wal/") && op.contains(" write_at "))
+        .count();
+    assert_eq!(
+        appends_in_batch, 2,
+        "two contended requests must share ONE sync — that sync covered \
+         {appends_in_batch} record(s), not 2: {trace:?}"
+    );
 }
