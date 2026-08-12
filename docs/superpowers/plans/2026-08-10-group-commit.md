@@ -430,6 +430,22 @@ Pure refactor. The group field is None everywhere until group commit lands."
   - `Group::commit(self) -> Result<(), TxError<std::convert::Infallible>>`
 - Consumes: `Engine::submit_all` (T2), `Tx<'a>` (T3).
 
+> **AS SHIPPED, this Interfaces block is out of date on two lines — corrected 2026-08-12 after
+> T4's review. The lines above are kept as the task's original text; these are the facts.**
+> - `commit` returns **`Result<(), CommitFailure>`**, not `Result<(), TxError<Infallible>>`,
+>   where `CommitFailure { applied: usize, error: io::Error }`. Ruled after the review found the
+>   original could report *that* a batch failed but never *where*, which left spec §4's only new
+>   contract inexpressible and T8 Step 3 unassertable. It is fed by a new
+>   `SubmitFailure { applied, error }` on `Engine::submit_all`, so the count originates where it
+>   is known rather than being reconstructed a layer up.
+> - `Group::is_full()` shipped but **T6 deletes it** — see T6's resolved MAX_BATCH block. The
+>   drain bounds on requests polled, not records staged, because an `is_full()`-bounded loop is
+>   unbounded when handlers return `Err`. `Group::len()` stays.
+>
+> Also shipped beyond this list: `Group::is_empty()` (forced by `clippy::len_without_is_empty`),
+> an `impl Drop for Group` that panics on a non-empty group dropped without `commit` (guarded by
+> `std::thread::panicking()`), and an assert in `stage` bounding `records.len()` by `MAX_BATCH`.
+
 **Behaviour `stage` must reproduce from today's `transact`** (`db.rs:1329-1436`), in order:
 run the closure; return `TxError::App` on `Err`; **return `Ok` with no record if effects are
 empty**; check the write gate (`Allowed` / `NotPrimary` / `Verifying`); do first-write
@@ -535,23 +551,19 @@ and keep it **private to `db.rs`**:
 const MAX_BATCH: usize = 64;
 ```
 
-Start it private and let Task 6 widen it if Task 6 earns the right to. **The visibility is
-not settled here, and the reason is a real one rather than caution.** T6 is currently drafted
-to drain with an inline `while batch.len() < MAX_BATCH` over a `Vec` of requests, which needs
-the constant `pub` and leaves `Group::is_full()` called by nothing — two copies of one limit
-and a dead method, which this repo's style rules reject. The obvious fix, bounding the drain
-on `group.is_full()` instead, is **not** merely the same loop rewritten: `is_full()` counts
-staged *records*, and a handler returning `Err` stages no record, so a run of rejected
-requests would never trip it. Those two bounds are genuinely different quantities.
+Start it private. **The visibility question this paragraph used to leave open was RESOLVED on
+2026-08-12 by T6's pre-flight — see T6's own MAX_BATCH block for the reasoning and the
+decision.** Short form, so this section does not mislead: `MAX_BATCH` becomes `pub` at T6 (one
+shared constant, never a duplicated literal), the drain bounds on **requests polled**, and
+`Group::is_full()` is **deleted** — an `is_full()`-bounded loop is unbounded exactly when
+handlers return `Err`, because a rejected request stages no record while still costing a held
+request and reply. T4 still ships it private; T6 widens it and removes `is_full()`.
 
-Which is correct is a T6 decision, to be made with `kernel/mod.rs` open, and spec §3 is the
-tiebreaker to read then: the cap exists "purely to bound memory", and it sizes that memory as
-the cap "times the existing 1 MiB body cap" — i.e. it is reasoning about buffered *payloads*,
-which is what `is_full()` counts. That argues for `is_full()` plus a separate, explicit answer
-for bounding the reply vector. **T6's pre-flight owns this; do not let it be settled by
-whichever line of code gets written first.**
-
-`commit` is:
+`commit` is — **and note the shipped signature differs from this snippet**, which is kept as
+the task's original text. See the corrected Interfaces note above: it returns
+`Result<(), CommitFailure>`, and the `let Group { .. } = self` destructure below became an
+E0509 compile error once `Drop` was added, so the shipped form is `commit(mut self)` with
+`std::mem::take` on `records`/`staged_adoptions`:
 
 ```rust
 pub fn commit(self) -> Result<(), TxError<std::convert::Infallible>> {
