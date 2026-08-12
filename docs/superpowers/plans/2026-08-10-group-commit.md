@@ -706,25 +706,63 @@ That constant must be recorded while the kernel is **still unbatched**, which is
 commit and false at every later one. Captured after T6, it would record whatever T6 produced
 and the assertion would be a tautology.
 
-```bash
-cargo test -p charpente --test group_commit -- --ignored capture_pre_batching_trace \
-  > .superpowers/sdd/2026-08-10-group-commit/pre-batching-trace.txt
+**Amended 2026-08-12 (pre-flight). The original command was broken two independent ways, and
+both would have produced a green T6 that proves nothing — the exact failure mode this repo
+has caught in itself repeatedly.**
+
+1. **The destination was gitignored.** `.superpowers/sdd/.gitignore` is a single `*`, and
+   `git ls-files .superpowers` is empty — nothing under that tree is tracked, by design; it is
+   scratch. `git add` of that path fails outright, and T6's `include_str!` of it would compile
+   on the machine that captured it and **fail to build on a fresh clone or in CI**. Spec §7's
+   batch-of-1 identity — the guarantee that lets every frozen pinned seed survive this
+   sub-project — cannot rest on an untracked file.
+2. **Redirecting `cargo test`'s stdout captures the wrong bytes.** Without `--nocapture` the
+   harness swallows `println!` entirely, so the file would contain cargo's own progress and
+   summary lines and none of the trace; with `--nocapture` it would contain the trace *plus*
+   that noise. Either way `expected.trim()` never equals `disk_trace_string()`.
+
+So the `#[ignore]`d `capture_pre_batching_trace` **writes the file itself** and there is no
+shell redirect:
+
+```rust
+/// Captures the pre-batching disk trace. `#[ignore]`d because it writes a
+/// tracked fixture rather than asserting anything. Run once, HERE, while the
+/// kernel is still unbatched — see the note below.
+#[test]
+#[ignore]
+fn capture_pre_batching_trace() {
+    let trace = run_one_at_a_time_universe(0x60C0_0008).disk_trace_string();
+    std::fs::write(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pre-batching-trace.txt"),
+        &trace,
+    )
+    .expect("write the fixture");
+}
 ```
 
-Write an `#[ignore]`d `capture_pre_batching_trace` that runs the one-request-at-a-time
-universe at seed `0x60C0_0008` and prints its disk trace. Commit the captured file, and
-state in the commit message that it was captured pre-batching — that provenance is the only
-thing that makes T6's assertion meaningful.
+```bash
+cargo test -p charpente --test group_commit -- --ignored capture_pre_batching_trace
+```
+
+The fixture lives at **`crates/charpente/tests/fixtures/pre-batching-trace.txt`** — tracked,
+and following the repo's one existing precedent for non-`.rs` test data,
+`crates/charpente-macros/tests/compile_fail/*.stderr`. A subdirectory is safe: cargo builds a
+test target from every `.rs` file directly in `tests/`, never from a subdirectory. **T6 must
+`include_str!("fixtures/pre-batching-trace.txt")`**, which resolves relative to the including
+file, not the `.superpowers` path it currently names.
+
+Commit the captured file, and state in the commit message that it was captured pre-batching —
+that provenance is the only thing that makes T6's assertion meaningful.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add crates/charpente/src/http crates/charpente/src/lib.rs \
         crates/charpente/tests/group_commit.rs \
-        .superpowers/sdd/2026-08-10-group-commit/pre-batching-trace.txt
+        crates/charpente/tests/fixtures/pre-batching-trace.txt
 git commit -m "http: stage_or_subscribe — dispatch into a group without committing
 
-Also captures the pre-batching disk trace for seed 0x60C00006 while the kernel
+Also captures the pre-batching disk trace for seed 0x60C0_0008 while the kernel
 is still unbatched. T6 asserts batch-of-1 traces identically against it;
 captured any later, that assertion would compare T6's output to itself."
 ```
@@ -788,9 +826,10 @@ each request, `commit()`, then send every reply in arrival order — and re-run:
 /// engine. This is what lets the frozen pinned seeds survive.
 #[test]
 fn a_never_contended_universe_traces_identically() {
-    let expected = include_str!(
-        "../../../.superpowers/sdd/2026-08-10-group-commit/pre-batching-trace.txt"
-    );
+    // Amended 2026-08-12 (pre-flight): the fixture moved out of the gitignored
+    // .superpowers tree, where this include_str! built only on the machine that
+    // captured it and broke on any fresh clone. Path is relative to this file.
+    let expected = include_str!("fixtures/pre-batching-trace.txt");
     let batched = run_one_at_a_time_universe(0x60C0_0008);
     assert_eq!(batched.disk_trace_string(), expected.trim(),
         "batch-of-1 must be byte-identical to the unbatched path");
