@@ -131,10 +131,11 @@ inside one.
 | failure | durable? | clients | engine |
 |---|---|---|---|
 | handler returns app `Err` | no record | that request's own error | unaffected, batch continues |
-| handler panics | no record | 500 for that request | overlay discarded, batch continues |
+| **job** handler panics | no record | n/a (retry path) | overlay discarded, batch continues |
+| **route** handler panics | no record | see the amendment below | **node stops** — no isolation |
 | append fails | nothing | whole batch 500 | log poisoned |
 | sync fails | nothing | whole batch 500 | log poisoned (fsyncgate, unchanged) |
-| apply fails at record *i* | **all N durable** | 1..*i*-1 keep their 200s; *i* and tail get 500 | poisoned, kernel stops |
+| apply fails at record *i* | **all N durable** | records at or after *i*, and anything that READ them, get 500 | poisoned, kernel stops |
 
 The last row is the only new contract. Records after the failure are durable and **will
 apply on restart**, so their 500 is a false negative: the client is told "unknown" about a
@@ -144,6 +145,55 @@ window and must be documented in GUIDE as a named contract, not left to be disco
 Note the asymmetry that makes this acceptable: a 500 never promises rejection, only
 absence of confirmation. The reverse error — a 200 for something not durable — remains
 impossible, because the ack still follows the sync.
+
+**Amended 2026-08-12 (T6 review C-1 + I-4, Noah rulings).** Two rows above were wrong as
+originally written, and both corrections are behaviour this spec must not claim it has.
+
+**(1) The last row's client column was too narrow, and the narrow reading shipped a dirty
+read.** "1..*i*-1 keep their 200s" is right about *writers* and silent about *readers*, and
+§2's overlay makes readers the harder case: `Group::stage` points every participant's `tx`
+at the group overlay, so a request that only reads still sees the uncommitted effects of
+siblings staged before it. A read batched behind a write whose record never applied was
+therefore acked 200 carrying state no durable copy ever held. The governing rule is
+what a participant **saw**, not what it wrote — a participant is invalidated when any record
+it observed, or its own, failed to apply. A request that ran ahead of every staged record
+keeps its answer, because it only ever saw committed state. This is one rule
+(`CommitFailure::invalidates`) shared by `Db::transact`, `App::handle_or_subscribe` and the
+kernel's batched tail; three copies of it is how they drifted the first time.
+
+**(2) Route-handler panic isolation does not exist, and this spec claimed it did.** There is
+no `catch_unwind` anywhere on the request path. The platform has exactly two:
+`charpente-core/src/table.rs:308` (store open) and `charpente/src/kernel/dispatch.rs:170`
+(job glue). The others in the tree live in `charpente-sim`'s universe runner, which wraps a
+whole test universe rather than a request, and so cannot isolate one. A panicking route
+handler therefore unwinds out of `Kernel::run` and the node stops. It is **not** "500 for
+that request, batch continues". What actually happens, stated so nobody re-derives it
+optimistically:
+
+- Nothing acked is lost. A handler runs during staging, strictly before `commit`, and
+  replies are held until after it — so a panic there means nothing in the batch was acked.
+  (This scopes the claim to a *handler* panic. A panic after `commit` returns, in the reply
+  loop, could leave earlier replies already sent; nothing in the shipped code panics there.)
+- `Group::Drop`'s `std::thread::panicking()` guard prevents a destructor panic during the
+  unwind, so the process unwinds rather than aborting. That guard is load-bearing here and
+  is the reason this is a stop and not an abort.
+- Every held `Reply` in the batch — up to `MAX_BATCH` of them — drops unanswered. In
+  production `serve.rs` turns each dropped oneshot into a generic
+  `500 "the kernel dropped the request"`, so clients are answered, but by the wire edge and
+  not by name.
+
+**Group commit did not introduce this; it widened it.** Before batching, one panicking
+handler cost one request. After T6 it costs every request drained into that batch. The job
+arm is genuinely isolated and stays so: `dispatch.rs:170` catches inside the transaction
+closure and converts the panic to `Err(JobError::App(...))`, so that transaction's effects
+discard cleanly and its siblings are unaffected — which is why the table now separates the
+two handler kinds instead of asserting one behaviour for both.
+
+Making route handlers isolated is a real design change (a `catch_unwind` on the request
+path, and a decision about whether a panicked handler's request gets a named 500 or the node
+still stops) and is **out of scope for group commit** — it is not a batching defect and
+predates this sub-project. It is recorded here as a known limitation rather than left as a
+claim the code disproves.
 
 ## §5 The device-ratio gate must be corrected FIRST
 
@@ -241,10 +291,20 @@ New properties, each RED-first per hard rule 3:
    byte-identical trace to pre-batching. This is §7's structural guarantee under test.
 4. **Mid-batch apply failure.** 1..*i*-1 acked, *i* and tail 500, and after restart the
    durable tail applies. The "500 may mean committed" contract pinned by text.
+   **Amended 2026-08-12:** this must also cover a *reader* batched behind the failed record,
+   which §4's amendment (1) makes a 500 rather than a 200. Twin: an implementation keying on
+   "did you stage a record" instead of "what did you see" must go red — that implementation
+   shipped at T6 and no existing oracle caught it, because `acked_implies_durable` checks
+   acked *writes* and nothing asserted a read's content after a failed batch.
 5. **Follower id identity under batching.** `next_job_id`/`next_event_id` allocation is
    byte-identical on a follower replaying a batched primary's log.
-6. **Panic isolation.** A handler that panics mid-batch leaves the group overlay clean and
-   the other transactions in the batch correct.
+6. **Panic isolation — JOB handlers only.** A job handler that panics mid-batch leaves the
+   group overlay clean and the other transactions in the batch correct.
+   **Amended 2026-08-12 (T6 review I-4):** originally written as if it held for route
+   handlers too. It does not — there is no `catch_unwind` on the request path, so a
+   panicking route handler stops the node (§4's amendment (2)). Do **not** write this
+   property against a route handler and then "fix" the resulting red by adding a
+   `catch_unwind`: that is a design change needing its own ruling, not a test repair.
 
 ## §10 Non-goals
 

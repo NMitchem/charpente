@@ -170,6 +170,75 @@ fn failing_job_follows_backoff_then_dies_with_the_story() {
     assert!(db.snapshot().unwrap().scan::<Counter>().unwrap().is_empty());
 }
 
+/// The counterpart of the test below, and the asymmetry is the point: a JOB
+/// handler's panic is absorbed into the retry path (`dispatch.rs`'s
+/// `catch_unwind` inside the transaction closure), a ROUTE handler's is not.
+/// There is no `catch_unwind` on the request path, so the panic unwinds out
+/// of `Kernel::step`/`run` and the node stops.
+///
+/// This is a CHARACTERIZATION test, not an endorsement — spec §4's amendment
+/// (2) records it as a known limitation. It predates group commit, which only
+/// widened the blast radius from one request to a whole batch. If route
+/// isolation is ever built (its own design change, needing its own ruling),
+/// update and rename this test rather than deleting it — the repo precedent
+/// is `kernel_keeps_serving_with_a_latched_store_known_gap` becoming
+/// `kernel_stops_on_a_latched_store`.
+///
+/// `Group::Drop`'s `std::thread::panicking()` guard is what keeps this an
+/// unwind rather than an abort: the batch's staged records are still in the
+/// group when it drops during the unwind. If that guard regresses, this test
+/// fails by SIGABRT instead of catching a panic, which is the loud failure
+/// the guard exists to prevent.
+#[test]
+fn a_panicking_route_handler_stops_the_node_it_is_not_isolated() {
+    let sim = Sim::with_faults(0x0DED_0003, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        crash_config(),
+    )
+    .unwrap()
+    .mount(routes![boom]);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let (mut source, replies) = scripted_source(vec![Request::new(Method::Post, "/boom")]);
+
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = kernel.run(&mut source);
+    }))
+    .expect_err(
+        "a route handler's panic must unwind out of Kernel::run — if this now \
+         returns normally, request-path isolation was added and spec §4's \
+         amendment (2) plus §9 property 6 are stale",
+    );
+    // Assert it is THE handler's panic that escaped, not some incidental one:
+    // `is_err()` alone would be satisfied by a `Group::Drop` contract panic or
+    // any other unwind, and would then pass while the property it names is
+    // false.
+    let text = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    assert!(
+        text.contains("route handler exploded"),
+        "the escaping panic must be the handler's own, not a destructor's: {text:?}"
+    );
+    // The request is never answered by the kernel. In production `serve.rs`
+    // turns the dropped oneshot into a generic 500; here the reply is simply
+    // dropped, which is what that 500 is made of.
+    assert!(
+        replies.lock().unwrap().is_empty(),
+        "the panicking request gets no reply from the kernel itself"
+    );
+}
+
+#[route(POST "/boom")]
+fn boom(tx: &mut Tx) -> Result<(), ApiError> {
+    let _ = tx;
+    panic!("route handler exploded");
+}
+
 #[test]
 fn panicking_handler_is_absorbed_into_the_retry_path() {
     let (_sim, mut app) = quiet_kernel_app(0x622);
