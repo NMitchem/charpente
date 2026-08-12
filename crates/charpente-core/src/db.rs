@@ -324,11 +324,18 @@ enum Effect {
     },
 }
 
+/// The shape of a collapsed table overlay: table -> id -> optional row bytes
+/// (`None` = tombstone). Both a transaction's own buffered writes
+/// (`TxEffects::overlay`, below) and a `Group`'s accumulated writes across a
+/// batch (spec §2) are this same alias — the sameness holds by compiler,
+/// not by comment, since `stage` merges one into the other.
+type GroupOverlay = BTreeMap<&'static str, BTreeMap<u64, Option<Vec<u8>>>>;
+
 /// A transaction's buffered effects: the collapsed per-table overlay
 /// (`None` = tombstone) plus enqueues and emits in call order.
 #[derive(Default)]
 struct TxEffects {
-    overlay: BTreeMap<&'static str, BTreeMap<u64, Option<Vec<u8>>>>,
+    overlay: GroupOverlay,
     enqueues: Vec<(&'static str, Vec<u8>, Option<String>)>,
     emits: Vec<(&'static str, Vec<u8>, Option<String>)>,
     migrate_puts: Vec<(&'static str, u64, Vec<u8>)>,
@@ -448,13 +455,14 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
 
 // ---------------------------------------------------------------- tx
 
-/// The group's accumulated row writes — the same shape as `TxEffects::overlay`,
-/// because spec §2 requires a merge of that structure, not a parallel one.
-type GroupOverlay = BTreeMap<&'static str, BTreeMap<u64, Option<Vec<u8>>>>;
-
-/// The transaction handle: reads see the snapshot plus this transaction's
-/// own writes; writes, enqueues, and emits buffer until commit. Buffering
-/// cannot fail, so the write methods return nothing.
+/// The transaction handle: reads see this transaction's own buffered
+/// writes first, then the enclosing group's accumulated writes (`group`,
+/// below), then the store snapshot the group began from — a three-level
+/// order, txn -> group -> snapshot (spec §2). `Db::transact` runs a group
+/// of exactly one, so `group` is always empty there and this degenerates to
+/// "snapshot plus this transaction's own writes". Writes, enqueues, and
+/// emits buffer until commit; buffering cannot fail, so the write methods
+/// return nothing.
 pub struct Tx<'a> {
     snapshot: &'a Snapshot,
     /// The group's accumulated writes, `None` for a lone transaction. Reads
@@ -464,6 +472,12 @@ pub struct Tx<'a> {
 }
 
 impl<'a> Tx<'a> {
+    /// `pub(crate)`, deliberately, not `pub` (Noah ruling): a `pub`
+    /// constructor would let an app holding a `&Db` mint a free-floating
+    /// `Tx` from `Db::snapshot()`, write into it, drop it, and lose the
+    /// writes silently — exactly the bug class `examples/invoicing/DEMO.md`
+    /// exists to show app code cannot express. `transact` and
+    /// `Group::stage` (below) are the only routes to a live `Tx`.
     pub(crate) fn over(snapshot: &'a Snapshot) -> Tx<'a> {
         Tx {
             snapshot,
@@ -1391,110 +1405,40 @@ impl Db {
     /// `Ok` the effects commit as one durable log record and apply to the
     /// store; on `Err` nothing happened at all. A transaction with no
     /// effects writes nothing and consumes no seq.
+    ///
+    /// A group of one (spec §1): `transact` is exactly `begin_group` + one
+    /// `stage` + `commit`, so the single-transaction path and a batched path
+    /// run the identical instruction sequence — batch-of-one byte identity
+    /// (spec §7) is a property of the code, not something tests must keep
+    /// true by hand.
     pub fn transact<T, E>(
         &mut self,
         f: impl FnOnce(&mut Tx) -> Result<T, E>,
     ) -> Result<T, TxError<E>> {
-        let snapshot = self
-            .engine
-            .machine()
-            .store
-            .snapshot()
-            .map_err(TxError::Io)?;
-        let mut tx = Tx::over(&snapshot);
-        let out = f(&mut tx).map_err(TxError::App)?;
-        if tx.effects.is_empty() {
-            return Ok(out);
-        }
-        match &self.gate {
-            WriteGate::Allowed => {}
-            WriteGate::NotPrimary(primary) => {
-                return Err(TxError::NotPrimary {
-                    primary: primary.clone(),
-                });
-            }
-            WriteGate::Verifying(unreached) => {
-                return Err(TxError::Verifying {
-                    unreached: unreached.clone(),
-                });
-            }
-        }
-        // First-write adoption (spec §1): the first write to a versioned
-        // table carries that table's `charpente.schema_versions` row, so the
-        // record declares its own version before the replay gate ever checks
-        // it. Only versioned (Some-fingerprint) tables, only the first time
-        // (`self.adopted`), and never a table this very transaction already
-        // writes a schema row for (the executor's watermark/close-out puts).
-        let adoption_tables: Vec<&'static str> = tx
-            .effects
-            .overlay
-            .keys()
-            .copied()
-            .filter(|t| {
-                *t != crate::migration::SchemaVersion::TABLE
-                    && !self.adopted.contains(*t)
-                    && self
-                        .engine
-                        .machine()
-                        .schema
-                        .table_meta(t)
-                        .is_some_and(|(_, fp)| fp.is_some())
-            })
-            .collect();
-        for table in &adoption_tables {
-            let (version, fingerprint) = self
-                .engine
-                .machine()
-                .schema
-                .table_meta(table)
-                .expect("filtered on table_meta above");
-            let vid = crate::migration::schema_version_id(table);
-            // Skip if this very transaction already writes the table's
-            // schema row (the executor's watermark/close-out puts).
-            let already = tx
-                .effects
-                .overlay
-                .get(crate::migration::SchemaVersion::TABLE)
-                .is_some_and(|m| m.contains_key(&vid.raw()));
-            if already {
-                continue;
-            }
-            let row = crate::migration::SchemaVersion {
-                id: vid,
-                table: (*table).to_string(),
-                version,
-                fingerprint: fingerprint.expect("filtered on Some above"),
-                migrating_through: None,
-                migrating_to: None,
-            };
-            let mut bytes = Vec::new();
-            row.encode_row(&mut bytes);
-            tx.effects
-                .overlay
-                .entry(crate::migration::SchemaVersion::TABLE)
-                .or_default()
-                .insert(vid.raw(), Some(bytes));
-        }
-        let record = encode_record(&tx.effects);
-        assert!(
-            record.len() <= MAX_RECORD_BYTES,
-            "transaction effects are {} bytes but one log record holds at most \
-             {MAX_RECORD_BYTES} — split the work into smaller transactions",
-            record.len()
-        );
-        self.engine.submit(&record).map_err(TxError::Io)?;
-        for table in adoption_tables {
-            self.adopted.insert(table.to_string());
-        }
-        self.records_since_checkpoint += 1;
-        if self.cfg.checkpoint_every > 0
-            && self.records_since_checkpoint >= self.cfg.checkpoint_every
-        {
-            // An fsync failure here poisons like any other (fsyncgate) — it
-            // surfaces through the same TxError::Io as a commit failure.
-            self.checkpoint().map_err(TxError::Io)?;
-        }
+        let mut g = self.begin_group().map_err(TxError::Io)?;
+        let out = g.stage(f)?;
+        g.commit().map_err(|e| match e {
+            TxError::Io(e) => TxError::Io(e),
+            _ => unreachable!("commit's app-error type is Infallible"),
+        })?;
         Ok(out)
+    }
+
+    /// Opens a group over one store snapshot (spec §1–§2): `Group::stage`
+    /// runs handlers against it, buffering each one's effects and merging
+    /// its overlay into the group's; `Group::commit` appends every queued
+    /// record, syncs ONCE for however many staged, then applies each in seq
+    /// order — the append→sync→apply discipline of a lone transaction,
+    /// N-wide, and apply stays strictly after sync either way.
+    pub fn begin_group(&mut self) -> io::Result<Group<'_>> {
+        let snapshot = self.engine.machine().store.snapshot()?;
+        Ok(Group {
+            snapshot,
+            overlay: GroupOverlay::new(),
+            records: Vec::new(),
+            staged_adoptions: BTreeSet::new(),
+            db: self,
+        })
     }
 
     /// A consistent read-only view for queries outside transactions.
@@ -2015,6 +1959,204 @@ impl Db {
         schema.remove(EventRow::TABLE);
         schema.remove(crate::migration::SchemaVersion::TABLE);
         Seeder::new(disk, self.cfg, schema)
+    }
+}
+
+// -------------------------------------------------------------- group
+
+/// The batch bound. A `const`, never a `DbConfig` field: spec §3 makes this
+/// internal mechanism like `REPL_TICK_NANOS`, and a configurable throughput
+/// knob next to `docs/BENCH.md` is the one thing not to ship. It exists
+/// only to bound buffered memory — greedy drain is already self-limiting by
+/// arrival rate. Kept private to `db.rs`: whether a kernel drain loop
+/// should bound on `Group::is_full()` (staged records) or a separate count
+/// (staged *attempts*, since a rejected handler stages no record) is a
+/// Task 6 decision, not settled here.
+const MAX_BATCH: usize = 64;
+
+/// A batch of transactions sharing one commit (spec §1): one store
+/// snapshot, one accumulated overlay, one durable sync for however many
+/// `stage` calls land before `commit`. `Db::transact` is the group-of-one
+/// case — `begin_group` + one `stage` + `commit` — so the single-request
+/// path and a batched path execute the identical instruction sequence.
+pub struct Group<'a> {
+    snapshot: Snapshot,
+    overlay: GroupOverlay,
+    records: Vec<Vec<u8>>,
+    staged_adoptions: BTreeSet<String>,
+    db: &'a mut Db,
+}
+
+impl<'a> Group<'a> {
+    /// Runs `f` against the group's snapshot plus every write staged into
+    /// the group so far — read-your-own-writes across the whole batch, not
+    /// just within one transaction (spec §2). On `Ok` with at least one
+    /// effect, the transaction's overlay merges into the group's and its
+    /// record queues for `commit`; on `Err`, or on no effects, nothing about
+    /// the group changes at all — the transaction's own overlay (`tx`,
+    /// local to this call) is simply dropped. That is what makes a
+    /// panicking or rejected handler structurally unable to corrupt the
+    /// batch: the group is never touched until `f` has already returned
+    /// `Ok`.
+    pub fn stage<T, E>(
+        &mut self,
+        f: impl FnOnce(&mut Tx) -> Result<T, E>,
+    ) -> Result<T, TxError<E>> {
+        // Two immutable reborrows of `self` (`snapshot`, `overlay`), scoped
+        // so they end here — before anything below needs `self` mutably.
+        // `Tx::over` is the canonical constructor (its own doc names
+        // `transact`/`Group::stage` as the only two callers); the group
+        // level is patched on right after, same-module field access.
+        let (out, mut effects) = {
+            let mut tx = Tx::over(&self.snapshot);
+            tx.group = Some(&self.overlay);
+            let out = f(&mut tx).map_err(TxError::App)?;
+            (out, tx.effects)
+        };
+        if effects.is_empty() {
+            return Ok(out);
+        }
+        match &self.db.gate {
+            WriteGate::Allowed => {}
+            WriteGate::NotPrimary(primary) => {
+                return Err(TxError::NotPrimary {
+                    primary: primary.clone(),
+                });
+            }
+            WriteGate::Verifying(unreached) => {
+                return Err(TxError::Verifying {
+                    unreached: unreached.clone(),
+                });
+            }
+        }
+        // First-write adoption, group-aware (spec §T4 note): two staged
+        // transactions writing the same versioned table's first row must
+        // not each emit a SchemaVersion row, so this consults
+        // `self.db.adopted` (settled by a prior `commit`) UNION
+        // `self.staged_adoptions` (settled by an earlier `stage` in THIS
+        // group, not yet committed). `commit` folds `staged_adoptions` into
+        // `db.adopted` once the whole batch is durable.
+        let adoption_tables: Vec<&'static str> = effects
+            .overlay
+            .keys()
+            .copied()
+            .filter(|t| {
+                *t != crate::migration::SchemaVersion::TABLE
+                    && !self.db.adopted.contains(*t)
+                    && !self.staged_adoptions.contains(*t)
+                    && self
+                        .db
+                        .engine
+                        .machine()
+                        .schema
+                        .table_meta(t)
+                        .is_some_and(|(_, fp)| fp.is_some())
+            })
+            .collect();
+        for table in &adoption_tables {
+            let (version, fingerprint) = self
+                .db
+                .engine
+                .machine()
+                .schema
+                .table_meta(table)
+                .expect("filtered on table_meta above");
+            let vid = crate::migration::schema_version_id(table);
+            // Skip if this very transaction already writes the table's
+            // schema row (the executor's watermark/close-out puts).
+            let already = effects
+                .overlay
+                .get(crate::migration::SchemaVersion::TABLE)
+                .is_some_and(|m| m.contains_key(&vid.raw()));
+            if already {
+                continue;
+            }
+            let row = crate::migration::SchemaVersion {
+                id: vid,
+                table: (*table).to_string(),
+                version,
+                fingerprint: fingerprint.expect("filtered on Some above"),
+                migrating_through: None,
+                migrating_to: None,
+            };
+            let mut bytes = Vec::new();
+            row.encode_row(&mut bytes);
+            effects
+                .overlay
+                .entry(crate::migration::SchemaVersion::TABLE)
+                .or_default()
+                .insert(vid.raw(), Some(bytes));
+        }
+        let record = encode_record(&effects);
+        assert!(
+            record.len() <= MAX_RECORD_BYTES,
+            "transaction effects are {} bytes but one log record holds at most \
+             {MAX_RECORD_BYTES} — split the work into smaller transactions",
+            record.len()
+        );
+        for (table, entries) in effects.overlay {
+            let group_table = self.overlay.entry(table).or_default();
+            for (id, entry) in entries {
+                group_table.insert(id, entry);
+            }
+        }
+        self.records.push(record);
+        for table in adoption_tables {
+            self.staged_adoptions.insert(table.to_string());
+        }
+        Ok(out)
+    }
+
+    /// Records staged into this group and awaiting `commit`.
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// True while `len() == 0` — nothing staged yet, or every staged
+    /// transaction so far returned `Err`/had no effects.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// True once `len()` reaches `MAX_BATCH` — a caller's cue to stop
+    /// draining and commit (spec §3).
+    pub fn is_full(&self) -> bool {
+        self.len() >= MAX_BATCH
+    }
+
+    /// Appends every staged record, syncs ONCE for the whole batch, then
+    /// applies each in seq order (spec §1) — apply stays strictly after
+    /// sync, so nothing here is acknowledged before it is durable. An empty
+    /// group (every staged transaction rejected, or nothing staged at all)
+    /// commits nothing and costs no disk op. Checkpoint cadence counts the
+    /// WHOLE batch here, once, never per-record inside `stage` (spec §3).
+    pub fn commit(self) -> Result<(), TxError<std::convert::Infallible>> {
+        let Group {
+            db,
+            records,
+            staged_adoptions,
+            ..
+        } = self;
+        if records.is_empty() {
+            return Ok(());
+        }
+        let n = records.len();
+        // `submit_all` takes `&[&[u8]]`, not `&[Vec<u8>]` (engine.rs T2):
+        // the single-commit hot path pays no extra heap copy, so the borrow
+        // is reconstructed here rather than the signature loosened — this
+        // collects N pointers, not N payloads.
+        let refs: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
+        db.engine.submit_all(&refs).map_err(TxError::Io)?;
+        for table in staged_adoptions {
+            db.adopted.insert(table);
+        }
+        db.records_since_checkpoint += n as u64;
+        if db.cfg.checkpoint_every > 0 && db.records_since_checkpoint >= db.cfg.checkpoint_every {
+            // An fsync failure here poisons like any other (fsyncgate) — it
+            // surfaces through the same TxError::Io as a commit failure.
+            db.checkpoint().map_err(TxError::Io)?;
+        }
+        Ok(())
     }
 }
 

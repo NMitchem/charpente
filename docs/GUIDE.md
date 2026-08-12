@@ -384,14 +384,15 @@ pub fn transact<T, E>(
 ) -> Result<T, TxError<E>>
 ```
 
-`f` runs synchronously against a `Tx`: reads see a snapshot taken when the
-transaction started, plus every write this same transaction has already
-made — read-your-own-writes. `Tx` implements `View` (`get`, `scan`,
-`scan_by`), so `Invoice::by_org` from §2 works on a `Tx` exactly as it does
-on a `Snapshot`. On `Ok`, every buffered write, enqueue, and emit commits as
-ONE durable log record — all or nothing — and only then applies to the
-store. On `Err`, nothing happened at all: no log position consumed, nothing
-written.
+`f` runs synchronously against a `Tx`: reads see this transaction's own
+writes first, then any writes already staged in the same commit batch —
+`transact` runs a batch of exactly one, so that level is always empty here —
+then the store snapshot the batch began from. `Tx` implements `View` (`get`,
+`scan`, `scan_by`), so `Invoice::by_org` from §2 works on a `Tx` exactly as
+it does on a `Snapshot`. On `Ok`, every buffered write, enqueue, and emit
+commits as ONE durable log record — all or nothing — and only then applies
+to the store. On `Err`, nothing happened at all: no log position consumed,
+nothing written.
 
 ```rust
 use charpente::core::table::Codec;
