@@ -22,6 +22,12 @@ use crate::kernel::JobDef;
 use crate::kernel::JobEntry;
 use crate::kernel::cron::{CronEntry, CronRow};
 
+/// Shared by `db_mut` and `begin_group`, which cannot share the *call* — the
+/// ruling behind `begin_group`'s field projection forbids it reaching for
+/// `db_mut()`. One const so a reword of the message cannot drift between the
+/// two sites.
+const DB_TAKEN: &str = "db taken for reseed — a kernel bug left it out";
+
 // ---------------------------------------------------------------- session
 
 /// Default session lifetime: 30 days, in nanoseconds — the clock's unit
@@ -289,22 +295,24 @@ impl App {
     }
 
     /// Describe-only reach: whether `App::with_oidc` mounted a verifier.
-    /// Never used by request handling itself (that reads `self.oidc`
-    /// directly, for the `Arc` clone).
+    /// Never used by request handling itself (that reaches `self.oidc`
+    /// through `begin_group`'s `as_deref`).
     pub(crate) fn oidc_mounted(&self) -> bool {
         self.oidc.is_some()
     }
 
     pub(crate) fn db_mut(&mut self) -> &mut Db {
-        self.db
-            .as_mut()
-            .expect("db taken for reseed — a kernel bug left it out")
+        self.db.as_mut().expect(DB_TAKEN)
     }
 
     /// Opens a group over this app's `Db` (group-commit T5, spec §1) plus the
     /// shared half of the dispatch path — everything `stage_or_subscribe`
     /// needs besides the `Db` itself. Returns both as disjoint sub-borrows so
     /// a caller can stage many requests into one `Group` before committing.
+    ///
+    /// The returned `Group` MUST be committed: dropping a non-empty one
+    /// panics by contract (`Group`'s `Drop`). `Err` here means the store
+    /// snapshot the group reads through could not be opened.
     ///
     /// Field projections, NOT method calls: `self.db.as_mut()` and the
     /// shared field borrows split cleanly here, where `self.db_mut()`
@@ -317,11 +325,8 @@ impl App {
             config: &self.config,
             oidc: self.oidc.as_deref(),
         };
-        let group = self
-            .db
-            .as_mut()
-            .expect("db taken for reseed — a kernel bug left it out")
-            .begin_group()?;
+        // Not `self.db_mut()` — see the doc above.
+        let group = self.db.as_mut().expect(DB_TAKEN).begin_group()?;
         Ok((group, staged))
     }
 
@@ -416,6 +421,16 @@ impl App {
     /// path most callers use; a kernel drain loop (T6) instead calls
     /// `begin_group`/`stage_or_subscribe` directly to stage many requests
     /// under one `commit`.
+    ///
+    /// One behaviour change this task does NOT preserve, recorded because
+    /// every other path here is byte-identical: opening the group takes the
+    /// store snapshot BEFORE routing, where the old code snapshotted only
+    /// after a route matched. A request that would have returned 404/405/413
+    /// or a cursor-400 therefore returns a 500 instead if `Store::snapshot`
+    /// itself fails. This ordering is inherent to group commit rather than
+    /// incidental — under T6 the group opens once at the top of a batch, so
+    /// every batched request's snapshot necessarily precedes its own routing
+    /// — so it is named here rather than worked around.
     pub fn handle_or_subscribe(&mut self, request: Request, now: u64) -> Handled {
         let (mut group, staged) = match self.begin_group() {
             Ok(pair) => pair,

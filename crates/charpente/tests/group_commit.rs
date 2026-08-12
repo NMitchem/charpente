@@ -8,9 +8,18 @@
 //!
 //! The second half of this file builds a per-operation disk tracer and
 //! captures `tests/fixtures/pre-batching-trace.txt` — the batch-of-1 byte-
-//! identity fixture T6 asserts against (spec §7). It must be captured HERE,
-//! while the kernel is still unbatched, or the assertion it backs would
-//! compare batched output to itself.
+//! identity fixture (spec §7). It had to be captured HERE, while the kernel
+//! is still unbatched, or the assertion it backs would compare batched output
+//! to itself. That assertion lives here too
+//! (`a_never_contended_universe_traces_identically_to_the_pre_batching_fixture`),
+//! deliberately: T6 must keep it green, not author it after changing the
+//! thing it polices.
+//!
+//! T6 needs a second, reply-aware trace for its contended batch. It must NOT
+//! add reply events to `run_one_at_a_time_universe`'s trace — that would grow
+//! `disk_trace_string()` by lines the committed fixture does not have, and
+//! the identity assertion would fail for a reason with nothing to do with
+//! batching. Give `run_two_request_batch` its own instrumented `Respond`.
 
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,7 +60,7 @@ fn hit_routes() -> Vec<charpente::http::Route> {
 // -------------------------------------------------------- op-counting disk
 //
 // Modelled on `SyncCounts`/`CountingDisk` in
-// `crates/charpente-core/tests/engine.rs:169-249` (group-commit T2's
+// `crates/charpente-core/tests/engine.rs:182-249` (group-commit T2's
 // precedent) but tracking write-shaped ops (`write_at`/`set_len`) and syncs
 // as two separate counters instead of syncs alone — neither that struct nor
 // its counterpart exists in this crate, so this is a local rebuild, not an
@@ -304,16 +313,30 @@ impl File for TracingFile {
     }
 }
 
-/// One traced universe's outcome. Holds the ordered disk-op trace; T6 will
-/// extend this (or a sibling) with an ordered reply/disk interleaving — see
-/// this file's module doc.
+/// One traced universe's outcome: the ordered disk-op trace, plus the
+/// responses the kernel actually sent. The responses are what let a test
+/// distinguish "the workload ran and was served" from "the kernel shut down
+/// at the horizon having served nothing" — a distinction the disk trace alone
+/// cannot make, because `App::open`'s own syncs are present either way (T5
+/// review, Important 2).
 struct UniverseTrace {
     trace: DiskTrace,
+    responses: charpente::kernel::RecordedResponses,
 }
 
 impl UniverseTrace {
     fn disk_trace_string(&self) -> String {
         self.trace.render()
+    }
+
+    /// The `(status, body)` pairs the kernel sent, in send order.
+    fn statuses(&self) -> Vec<u16> {
+        self.responses
+            .lock()
+            .expect("responses lock poisoned by an earlier panic")
+            .iter()
+            .map(|(status, _)| *status)
+            .collect()
     }
 }
 
@@ -342,25 +365,85 @@ fn run_one_at_a_time_universe(seed: u64) -> UniverseTrace {
     for i in 0..5u64 {
         source.push_at(i * SEC, Request::new(Method::Post, "/hit/1"));
     }
+    let responses = source.responses();
     let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
     kernel.run(&mut source).unwrap();
-    UniverseTrace { trace }
+    UniverseTrace { trace, responses }
 }
 
 /// Sanity check on the tracer itself, before trusting it to produce a fixture
-/// nothing else in this file asserts against: the same seed must trace
-/// identically twice, and a five-request run must actually record disk
-/// activity (at minimum one `sync` per request, since nothing is batched
-/// yet).
+/// T6's headline guarantee rests on: the same seed must trace identically
+/// twice, the five requests must actually have been served, and the WAL must
+/// show the unbatched shape — one sync per append, six times.
+///
+/// The naive form of the last assertion (`syncs >= 5`) is VACUOUS here and was
+/// replaced (T5 review, Important 2): `App::open` alone emits six
+/// `tables.redb sync` entries before the first WAL byte is written, so a
+/// threshold on the total sync count is met by a universe that served nothing
+/// at all — including one whose kernel shut down at the horizon before the
+/// first arrival. That would have let a degenerate fixture be captured and
+/// committed, and made T6's batch-of-1 assertion green and empty, which is
+/// exactly the tautology the capture-it-HERE discipline exists to prevent.
 #[test]
-fn run_one_at_a_time_universe_is_deterministic_and_nonempty() {
-    let a = run_one_at_a_time_universe(0x60C0_0009).disk_trace_string();
-    let b = run_one_at_a_time_universe(0x60C0_0009).disk_trace_string();
+fn run_one_at_a_time_universe_is_deterministic_and_unbatched() {
+    let first = run_one_at_a_time_universe(0x60C0_000C);
+    let a = first.disk_trace_string();
+    let b = run_one_at_a_time_universe(0x60C0_000C).disk_trace_string();
     assert_eq!(a, b, "the same seed must trace identically twice");
-    let sync_lines = a.lines().filter(|l| l.ends_with("sync")).count();
-    assert!(
-        sync_lines >= 5,
-        "five one-at-a-time requests, unbatched, must cost at least five syncs; trace:\n{a}"
+
+    // The workload ran and was served — the disk trace cannot tell you this.
+    assert_eq!(
+        first.statuses(),
+        vec![200; 5],
+        "all five requests must have been served 200; trace:\n{a}"
+    );
+
+    // One sync per append is what "unbatched" means on the wire. Batched
+    // output is N appends then ONE sync, so this goes red the moment
+    // anything batches — which is the property the fixture is capturing.
+    let wal: Vec<&str> = a.lines().filter(|l| l.starts_with("wal/")).collect();
+    assert_eq!(
+        wal.len(),
+        12,
+        "six WAL records, each its own append+sync pair; trace:\n{a}"
+    );
+    for pair in wal.chunks(2) {
+        assert!(
+            pair[0].contains(" write_at "),
+            "expected an append, got {pair:?}"
+        );
+        assert!(
+            pair[1].ends_with(" sync"),
+            "unbatched means one sync per append, got {pair:?}"
+        );
+    }
+}
+
+/// The batch-of-1 identity guarantee (spec §7), asserted from the commit that
+/// captures the fixture rather than from T6 — the task that changes the thing
+/// being policed.
+///
+/// This is here on the T5 review's Important 3. A test written *after* the
+/// change it is meant to catch has never been red for the right reason, and
+/// the cheapest way to make such a test green is to adjust the workload until
+/// it passes. Landing it here inverts that: it is green today on unbatched
+/// code, it goes red the instant T6's drain loop alters the schedule, and it
+/// can only go green again when batch-of-1 identity is genuinely restored.
+/// It also stops any edit to the `Hit` route, the request script,
+/// `AppConfig::default()` or the platform cron from silently invalidating the
+/// fixture between now and T6 — which would otherwise first surface inside T6
+/// looking exactly like a batching bug.
+///
+/// T6 does NOT need to author this test; it needs to keep it green.
+#[test]
+fn a_never_contended_universe_traces_identically_to_the_pre_batching_fixture() {
+    let expected = include_str!("fixtures/pre-batching-trace.txt");
+    let actual = run_one_at_a_time_universe(0x60C0_0008).disk_trace_string();
+    assert_eq!(
+        actual,
+        expected.trim(),
+        "a never-contended universe must trace byte-identically to the pre-batching \
+         capture — one request per step must cost exactly what it cost before batching"
     );
 }
 
@@ -375,6 +458,14 @@ fn run_one_at_a_time_universe_is_deterministic_and_nonempty() {
 // explicit request; it is not a `Disk` the platform runs on, so routing it
 // through the trait would mean mounting the real filesystem to write one file.
 // The test is `#[ignore]`d, so this never runs in `cargo test --workspace`.
+//
+// Note what this widens, so the next reader sees a decision and not a
+// precedent (T5 review, Minor 5): every other allow of this family in the
+// workspace lives in an EDGE crate — charpente-cli, edge-harness,
+// bench-harness, guide-examples. `crates/charpente` is the platform crate,
+// and this is the first such allow inside it. The fence is unchanged for
+// every other site: the deny-list still fires everywhere it is not spelled
+// out, and this allow is function-scoped over ten `#[ignore]`d lines.
 #[allow(clippy::disallowed_methods)]
 #[test]
 #[ignore]
