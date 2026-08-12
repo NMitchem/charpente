@@ -448,15 +448,30 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
 
 // ---------------------------------------------------------------- tx
 
+/// The group's accumulated row writes — the same shape as `TxEffects::overlay`,
+/// because spec §2 requires a merge of that structure, not a parallel one.
+type GroupOverlay = BTreeMap<&'static str, BTreeMap<u64, Option<Vec<u8>>>>;
+
 /// The transaction handle: reads see the snapshot plus this transaction's
 /// own writes; writes, enqueues, and emits buffer until commit. Buffering
 /// cannot fail, so the write methods return nothing.
-pub struct Tx {
-    snapshot: Snapshot,
+pub struct Tx<'a> {
+    snapshot: &'a Snapshot,
+    /// The group's accumulated writes, `None` for a lone transaction. Reads
+    /// fall through txn overlay -> group overlay -> snapshot (spec §2).
+    group: Option<&'a GroupOverlay>,
     effects: TxEffects,
 }
 
-impl Tx {
+impl<'a> Tx<'a> {
+    pub(crate) fn over(snapshot: &'a Snapshot) -> Tx<'a> {
+        Tx {
+            snapshot,
+            group: None,
+            effects: TxEffects::default(),
+        }
+    }
+
     pub fn put<R: Row>(&mut self, row: &R) {
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
@@ -520,7 +535,7 @@ impl Tx {
     }
 }
 
-impl View for Tx {
+impl View for Tx<'_> {
     fn get<R: Row>(&self, id: Id<R>) -> io::Result<Option<R>> {
         match self
             .effects
@@ -530,7 +545,15 @@ impl View for Tx {
         {
             Some(Some(bytes)) => Ok(Some(R::decode_row(bytes)?)),
             Some(None) => Ok(None),
-            None => self.snapshot.get(id),
+            None => match self
+                .group
+                .and_then(|g| g.get(R::TABLE))
+                .and_then(|t| t.get(&id.raw()))
+            {
+                Some(Some(bytes)) => Ok(Some(R::decode_row(bytes)?)),
+                Some(None) => Ok(None),
+                None => self.snapshot.get(id),
+            },
         }
     }
 
@@ -538,6 +561,18 @@ impl View for Tx {
         let mut merged: BTreeMap<u64, R> = BTreeMap::new();
         for row in self.snapshot.scan::<R>()? {
             merged.insert(row.id().raw(), row);
+        }
+        if let Some(overlay) = self.group.and_then(|g| g.get(R::TABLE)) {
+            for (&id, entry) in overlay {
+                match entry {
+                    Some(bytes) => {
+                        merged.insert(id, R::decode_row(bytes)?);
+                    }
+                    None => {
+                        merged.remove(&id);
+                    }
+                }
+            }
         }
         if let Some(overlay) = self.effects.overlay.get(R::TABLE) {
             for (&id, entry) in overlay {
@@ -566,6 +601,21 @@ impl View for Tx {
         for row in self.snapshot.scan_by::<R>(index_name, key)? {
             merged.insert(row.id().raw(), row);
         }
+        if let Some(overlay) = self.group.and_then(|g| g.get(R::TABLE)) {
+            for (&id, entry) in overlay {
+                // The overlay overrides the snapshot for this id either way:
+                // a tombstone, or a row whose key may no longer match.
+                merged.remove(&id);
+                if let Some(bytes) = entry {
+                    let row = R::decode_row(bytes)?;
+                    let mut row_key = Vec::new();
+                    (index.key)(&row, &mut row_key);
+                    if row_key == wanted {
+                        merged.insert(id, row);
+                    }
+                }
+            }
+        }
         if let Some(overlay) = self.effects.overlay.get(R::TABLE) {
             for (&id, entry) in overlay {
                 // The overlay overrides the snapshot for this id either way:
@@ -589,6 +639,21 @@ impl View for Tx {
         for row in self.snapshot.scan::<R>()? {
             if row.id().raw() >= from_id {
                 merged.insert(row.id().raw(), row);
+            }
+        }
+        if let Some(overlay) = self.group.and_then(|g| g.get(R::TABLE)) {
+            for (&id, entry) in overlay {
+                if id < from_id {
+                    continue;
+                }
+                match entry {
+                    Some(bytes) => {
+                        merged.insert(id, R::decode_row(bytes)?);
+                    }
+                    None => {
+                        merged.remove(&id);
+                    }
+                }
             }
         }
         if let Some(overlay) = self.effects.overlay.get(R::TABLE) {
@@ -1336,10 +1401,7 @@ impl Db {
             .store
             .snapshot()
             .map_err(TxError::Io)?;
-        let mut tx = Tx {
-            snapshot,
-            effects: TxEffects::default(),
-        };
+        let mut tx = Tx::over(&snapshot);
         let out = f(&mut tx).map_err(TxError::App)?;
         if tx.effects.is_empty() {
             return Ok(out);
