@@ -143,3 +143,77 @@ fn a_panicking_stage_leaves_the_group_clean() {
     );
     g.commit().expect("commit");
 }
+
+/// Task 4 fix round, Important 2: `Group` is reachable from any app crate
+/// via `charpente::core::db` (no `pub(crate)` boundary stops it), so a
+/// dropped-without-commit group is the same silent-write-loss bug class
+/// `Tx::over`'s own rationale comment says app code cannot express — one
+/// level up. The `Drop` guard makes it loud instead.
+#[test]
+#[should_panic(expected = "contract:")]
+fn dropping_a_group_with_staged_records_panics() {
+    let mut db = fresh_db(0x60C0_0007);
+    let mut g = db.begin_group().expect("group");
+    g.stage(|tx| {
+        tx.put(&Widget {
+            id: Id::from_raw(1),
+            count: 1,
+        });
+        Ok::<_, ()>(())
+    })
+    .expect("stages");
+    drop(g); // never committed — must panic, not silently lose the write
+}
+
+/// Task 4 fix round, Important 3: `MAX_BATCH` must actually bound the
+/// group, not merely be reported by `is_full()`. Stages one past the cap
+/// (65 single-record transactions against `MAX_BATCH = 64`) and expects the
+/// 65th `stage` call itself to refuse before queuing a 65th record.
+#[test]
+#[should_panic(expected = "contract: a group holds at most 64 staged records")]
+fn stage_refuses_past_max_batch() {
+    let mut db = fresh_db(0x60C0_0008);
+    let mut g = db.begin_group().expect("group");
+    for i in 0..65u64 {
+        g.stage(|tx| {
+            tx.put(&Widget {
+                id: Id::from_raw(i),
+                count: i as u32,
+            });
+            Ok::<_, ()>(())
+        })
+        .expect("stages");
+    }
+}
+
+/// Task 4 fix round, Important 2's `panicking()` guard specifically — not
+/// merely the ordinary arm `dropping_a_group_with_staged_records_panics`
+/// exercises. Spec §4 row 2 is a handler panicking with records already
+/// staged: the group (owned by the caller's stack frame, not the panicking
+/// closure) drops mid-unwind, non-empty. Without the guard this is a
+/// double panic during unwind, which Rust turns into `abort()` — killing
+/// the whole test process rather than failing one test — so `catch_unwind`
+/// successfully returning `Err` here IS the proof nothing doubled.
+#[test]
+fn a_panic_elsewhere_does_not_double_panic_through_a_staged_groups_drop() {
+    let mut db = fresh_db(0x60C0_0009);
+    let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut g = db.begin_group().expect("group");
+        g.stage(|tx| {
+            tx.put(&Widget {
+                id: Id::from_raw(1),
+                count: 1,
+            });
+            Ok::<_, ()>(())
+        })
+        .expect("stages");
+        panic!("unrelated failure after staging, before commit");
+        // `g` drops here during unwind, 1 record staged: the guard must
+        // stay silent (std::thread::panicking() is true), or this aborts
+        // the process instead of unwinding to catch_unwind below.
+    }));
+    assert!(
+        boom.is_err(),
+        "the original panic must propagate to catch_unwind, not abort the process"
+    );
+}

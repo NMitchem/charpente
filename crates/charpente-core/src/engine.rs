@@ -42,6 +42,35 @@ impl<S: StateMachine> fmt::Debug for Engine<S> {
     }
 }
 
+/// `submit_all`'s failure shape (group-commit T4 fix round, Important 1):
+/// `applied` is how many of the passed-in records already reached the
+/// store — durably written AND applied — before this returned `Err`. See
+/// `submit_all`'s own doc for what `0` versus a nonzero `applied` means.
+/// `Db::commit` (db.rs) is why this carries a count rather than being a
+/// bare `io::Error`: spec §4's mid-batch-apply-failure contract needs to
+/// tell a caller records `0..applied` already got their 200s.
+#[derive(Debug)]
+pub struct SubmitFailure {
+    pub applied: usize,
+    pub error: io::Error,
+}
+
+impl fmt::Display for SubmitFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+/// Lets `submit`'s `?` on `submit_all` keep returning a bare `io::Error`
+/// unchanged: `submit`'s single-record case has no meaningful "partial
+/// batch" to report (`applied` collapses to a trivial 0-or-nothing), so the
+/// count is simply dropped on this path.
+impl From<SubmitFailure> for io::Error {
+    fn from(failure: SubmitFailure) -> io::Error {
+        failure.error
+    }
+}
+
 impl<S: StateMachine> Engine<S> {
     /// Recovers the log and replays every durable record into `machine`.
     /// Replay can fail (the machine's own IO, or the log's); recovery is
@@ -109,13 +138,17 @@ impl<S: StateMachine> Engine<S> {
 
     /// The length-1 case of `submit_all` — see its docs for the
     /// append→sync→apply discipline this executes, and for what an `Err`
-    /// says about durable state.
+    /// says about durable state. `submit` has no production caller as of
+    /// group-commit T4 (`Db::commit` calls `submit_all` directly); it is
+    /// kept as a test-facing convenience for the length-1 case, not the
+    /// live single-request path.
     pub fn submit(&mut self, payload: &[u8]) -> io::Result<u64> {
-        // The payload goes straight into a length-1 slice-of-slices, so the
-        // single-request hot path pays no allocation for being routed
-        // through the batch core. Do NOT "simplify" this to a signature that
-        // copies (`&[Vec<u8>]` + `to_vec()`): that copy is O(payload), up to
-        // MAX_RECORD_BYTES, on the hottest path in the commit engine.
+        // The payload goes straight into a length-1 slice-of-slices, so this
+        // convenience pays no allocation for being routed through the batch
+        // core. Do NOT "simplify" this to a signature that copies (`&[Vec<u8>]`
+        // + `to_vec()`): that copy is O(payload), up to MAX_RECORD_BYTES.
+        // `SubmitFailure` converts to `io::Error` via `From` below, so `?`
+        // here needs no explicit mapping.
         Ok(self.submit_all(&[payload])?[0])
     }
 
@@ -145,12 +178,24 @@ impl<S: StateMachine> Engine<S> {
     /// included: its delta across the call is exactly the number of records
     /// acknowledged. `poisoned()` does not discriminate the cases above — it
     /// ORs apply-poison with log-poison.
-    pub fn submit_all(&mut self, records: &[&[u8]]) -> io::Result<Vec<u64>> {
+    ///
+    /// On `Err`, `SubmitFailure::applied` names exactly which of the three
+    /// cases above this is: `0` for an append/sync failure (or a call
+    /// against an already-poisoned engine — nothing in the batch is
+    /// durable), or `i` for an apply failure at 0-indexed record `i`
+    /// (records `0..i` are already durable, applied, and acknowledged).
+    /// This is a COUNTED value from this loop, not something a caller
+    /// derives from `last_applied()` before/after — group-commit T4's own
+    /// review flagged a derived gate input as unsound.
+    pub fn submit_all(&mut self, records: &[&[u8]]) -> Result<Vec<u64>, SubmitFailure> {
         if self.poisoned {
-            return Err(io::Error::other(
-                "engine poisoned: a durable record failed to apply, so machine state no \
-                 longer matches the log — restart and recover",
-            ));
+            return Err(SubmitFailure {
+                applied: 0,
+                error: io::Error::other(
+                    "engine poisoned: a durable record failed to apply, so machine state no \
+                     longer matches the log — restart and recover",
+                ),
+            });
         }
         // An arm with nothing ready must cost nothing: no append, no sync.
         // This check stays BELOW the poison check deliberately — poison is a
@@ -165,18 +210,23 @@ impl<S: StateMachine> Engine<S> {
         }
         let mut seqs = Vec::with_capacity(records.len());
         for payload in records {
-            seqs.push(self.wal.append(payload)?);
+            match self.wal.append(payload) {
+                Ok(seq) => seqs.push(seq),
+                Err(error) => return Err(SubmitFailure { applied: 0, error }),
+            }
         }
-        self.wal.sync()?;
-        for (seq, payload) in seqs.iter().zip(records) {
+        if let Err(error) = self.wal.sync() {
+            return Err(SubmitFailure { applied: 0, error });
+        }
+        for (i, (seq, payload)) in seqs.iter().zip(records).enumerate() {
             assert_eq!(
                 *seq,
                 self.last_applied.map_or(0, |l| l + 1),
                 "apply loop skipped a seq — append and apply have diverged"
             );
-            if let Err(e) = self.machine.apply(*seq, payload) {
+            if let Err(error) = self.machine.apply(*seq, payload) {
                 self.poisoned = true;
-                return Err(e);
+                return Err(SubmitFailure { applied: i, error });
             }
             self.last_applied = Some(*seq);
         }

@@ -1417,10 +1417,11 @@ impl Db {
     ) -> Result<T, TxError<E>> {
         let mut g = self.begin_group().map_err(TxError::Io)?;
         let out = g.stage(f)?;
-        g.commit().map_err(|e| match e {
-            TxError::Io(e) => TxError::Io(e),
-            _ => unreachable!("commit's app-error type is Infallible"),
-        })?;
+        // A lone transaction has no "partial batch" for `CommitFailure::
+        // applied` to mean anything about, so it is dropped here — a
+        // single-record `commit` failure is simply this transaction's own
+        // `TxError::Io`, exactly as before.
+        g.commit().map_err(|failure| TxError::Io(failure.error))?;
         Ok(out)
     }
 
@@ -1987,6 +1988,33 @@ pub struct Group<'a> {
     db: &'a mut Db,
 }
 
+/// `Group` is reachable from any app crate — `charpente::core::db::Db::
+/// begin_group` and `Group::stage` are both `pub`, with nothing narrower
+/// than the crate's own `pub mod db` between them and app code (review
+/// Important 2). Staging a write and dropping the group without `commit`
+/// would silently lose it — the exact bug class the `Tx::over` rationale
+/// above names, one level up. `commit` always empties `records` via
+/// `mem::take` before anything fallible, so this stays silent on every real
+/// commit — `Ok` or `Err` — and fires only when `commit` was never called.
+/// `panicking()`-guarded: a handler panicking mid-`stage` (spec §4 row 2)
+/// already leaves records staged and unwinds through this destructor —
+/// without the guard, that ordinary case would double-panic and abort the
+/// process instead of letting the kernel's caught unwind turn it into one
+/// request's 500.
+impl Drop for Group<'_> {
+    fn drop(&mut self) {
+        if !self.records.is_empty() && !std::thread::panicking() {
+            panic!(
+                "contract: Group dropped with {} staged record(s) never committed — every \
+                 write staged into a group is lost unless Group::commit runs (even on an Err \
+                 path, which still empties them) before the group goes out of scope; call \
+                 Group::commit before dropping it",
+                self.records.len()
+            );
+        }
+    }
+}
+
 impl<'a> Group<'a> {
     /// Runs `f` against the group's snapshot plus every write staged into
     /// the group so far — read-your-own-writes across the whole batch, not
@@ -2002,6 +2030,16 @@ impl<'a> Group<'a> {
         &mut self,
         f: impl FnOnce(&mut Tx) -> Result<T, E>,
     ) -> Result<T, TxError<E>> {
+        // Structural memory bound (spec §3; hard rule 4 — stays on in
+        // release): without this, MAX_BATCH/is_full() are advisory only and
+        // spec §3's "bounded by MAX_BATCH times the 1 MiB body cap" claim is
+        // not true of the code. Checked BEFORE running `f`, so a group at
+        // the cap refuses a further stage before doing any work at all.
+        assert!(
+            self.records.len() < MAX_BATCH,
+            "contract: a group holds at most {MAX_BATCH} staged records — call Group::commit \
+             and begin a new group before staging another"
+        );
         // Two immutable reborrows of `self` (`snapshot`, `overlay`), scoped
         // so they end here — before anything below needs `self` mutably.
         // `Tx::over` is the canonical constructor (its own doc names
@@ -2130,13 +2168,19 @@ impl<'a> Group<'a> {
     /// group (every staged transaction rejected, or nothing staged at all)
     /// commits nothing and costs no disk op. Checkpoint cadence counts the
     /// WHOLE batch here, once, never per-record inside `stage` (spec §3).
-    pub fn commit(self) -> Result<(), TxError<std::convert::Infallible>> {
-        let Group {
-            db,
-            records,
-            staged_adoptions,
-            ..
-        } = self;
+    ///
+    /// `records`/`staged_adoptions` are taken via `mem::take` rather than
+    /// destructured, and the db is reached through `self.db` throughout:
+    /// `Group`'s `Drop` guard (above) makes `let Group { db, records, .. } =
+    /// self;` a compile error (E0509, cannot move out of a type
+    /// implementing `Drop`). Taking `records` unconditionally, before
+    /// anything fallible, has a bonus: by the time this returns — `Ok` or
+    /// `Err` — `self.records` is already empty, so the Drop guard stays
+    /// silent by construction rather than by a flag this function has to
+    /// keep true.
+    pub fn commit(mut self) -> Result<(), CommitFailure> {
+        let records = std::mem::take(&mut self.records);
+        let staged_adoptions = std::mem::take(&mut self.staged_adoptions);
         if records.is_empty() {
             return Ok(());
         }
@@ -2146,18 +2190,47 @@ impl<'a> Group<'a> {
         // is reconstructed here rather than the signature loosened — this
         // collects N pointers, not N payloads.
         let refs: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
-        db.engine.submit_all(&refs).map_err(TxError::Io)?;
+        self.db
+            .engine
+            .submit_all(&refs)
+            .map_err(|f| CommitFailure {
+                applied: f.applied,
+                error: f.error,
+            })?;
         for table in staged_adoptions {
-            db.adopted.insert(table);
+            self.db.adopted.insert(table);
         }
-        db.records_since_checkpoint += n as u64;
-        if db.cfg.checkpoint_every > 0 && db.records_since_checkpoint >= db.cfg.checkpoint_every {
-            // An fsync failure here poisons like any other (fsyncgate) — it
-            // surfaces through the same TxError::Io as a commit failure.
-            db.checkpoint().map_err(TxError::Io)?;
+        self.db.records_since_checkpoint += n as u64;
+        if self.db.cfg.checkpoint_every > 0
+            && self.db.records_since_checkpoint >= self.db.cfg.checkpoint_every
+        {
+            // An fsync failure here poisons like any other (fsyncgate). All
+            // N records already reached the store at this point (the
+            // `submit_all` call above already returned `Ok`), so `applied`
+            // is the whole batch — this is a durability-bookkeeping failure
+            // after the fact, not a partial-apply one.
+            self.db
+                .checkpoint()
+                .map_err(|error| CommitFailure { applied: n, error })?;
         }
         Ok(())
     }
+}
+
+/// `Group::commit`'s failure (spec §4's only new contract, group-commit T4
+/// fix round Important 1): `applied` is how many of the staged records
+/// already reached the store — durably written and applied — before this
+/// returned. Records `0..applied` already got their 200s and must not be
+/// retried or re-reported; `applied` and the tail are durable but
+/// unacknowledged (they will apply on restart, so their 500 is a false
+/// negative, not a rejection — GUIDE names this contract, T11). `applied`
+/// is `0` for an append or sync failure, since nothing in the batch reached
+/// the store at all. A bare `TxError<Infallible>` could not carry this
+/// boundary, which is why `commit` does not return one.
+#[derive(Debug)]
+pub struct CommitFailure {
+    pub applied: usize,
+    pub error: io::Error,
 }
 
 // ---------------------------------------------------------------- seed

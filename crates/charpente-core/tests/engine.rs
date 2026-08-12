@@ -46,6 +46,24 @@ impl StateMachine for AlwaysFails {
     }
 }
 
+/// Succeeds the first `remaining` applies, then fails every one after —
+/// lets a test drive `submit_all` partway through a multi-record batch
+/// before it fails, so `SubmitFailure::applied`'s nonzero case is exercised
+/// (`AlwaysFails` above only ever fails at index 0).
+struct FailsAfter {
+    remaining: usize,
+}
+
+impl StateMachine for FailsAfter {
+    fn apply(&mut self, _seq: u64, _payload: &[u8]) -> io::Result<()> {
+        if self.remaining == 0 {
+            return Err(io::Error::other("configured failure"));
+        }
+        self.remaining -= 1;
+        Ok(())
+    }
+}
+
 fn wal_cfg() -> WalConfig {
     WalConfig {
         dir: "wal".to_string(),
@@ -310,5 +328,43 @@ fn an_empty_batch_on_a_poisoned_engine_still_refuses() {
         "the refusal must name the poison contract byte-exact — checks::classify \
          matches on this string's prefix, so a reword reclassifies every poisoned \
          universe in the sim suite"
+    );
+}
+
+/// Group-commit T4 fix round, Important 1: `Group::commit` needs to tell a
+/// caller WHERE a mid-batch apply failure landed, not just THAT it failed
+/// (spec §4's last row: records before the failure keep their 200s). The
+/// count must be a value `submit_all` itself counted, not one a caller
+/// derives from `last_applied()` before/after (this sub-project's own T1
+/// review flagged a derived gate input as unsound) — this test is the
+/// mechanism `SubmitFailure::applied` exists to prove.
+#[test]
+fn submit_all_reports_how_many_applied_before_a_mid_batch_failure() {
+    let sim = Sim::with_faults(0x60C4_0001, FaultConfig::none());
+    let mut engine = Engine::recover(
+        Box::new(sim.disk()),
+        wal_cfg(),
+        FailsAfter { remaining: 2 },
+        None,
+    )
+    .unwrap();
+
+    let failure = engine
+        .submit_all(&[b"a", b"b", b"c", b"d"])
+        .expect_err("the third record's apply must fail");
+    assert_eq!(
+        failure.applied, 2,
+        "two records applied before the failure — the exact boundary a caller \
+         needs to know which requests already got their 200s"
+    );
+    assert!(
+        engine.poisoned(),
+        "an apply failure poisons the engine, same as before"
+    );
+    assert_eq!(
+        engine.last_applied(),
+        Some(1),
+        "last_applied stops at the last record that actually applied (seq 1, the \
+         second of four records at seqs 0..3)"
     );
 }
