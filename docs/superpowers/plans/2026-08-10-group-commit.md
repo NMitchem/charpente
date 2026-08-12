@@ -46,7 +46,8 @@ Section references below (§1…§11) are to that spec.
 | `crates/charpente-core/src/db.rs` | `Tx<'a>` borrows its snapshot (T3); `Group`/`stage`/`commit` (T4) |
 | `crates/charpente/src/http/mod.rs` (or `App`'s dispatch site) | staged dispatch returning a deferred reply (T5) |
 | `crates/charpente/src/kernel/mod.rs` | Request/Job/Cron arms drain into a group (T6, T7) |
-| `crates/charpente/tests/group_commit.rs` | new property suite (T8, T9) |
+| `crates/charpente/tests/group_commit.rs` | new property suite (**T5 creates it** + its counting-disk/trace harness; T6, T8, T9 extend it) |
+| `crates/charpente/tests/fixtures/pre-batching-trace.txt` | tracked fixture: the pre-batching disk trace, captured at T5, asserted by T6 |
 | `docs/BENCH.md`, `DESIGN.md`, `docs/GUIDE.md` | method, commit path, 500-may-mean-committed (T11) |
 
 ---
@@ -646,22 +647,71 @@ counts once per batch."
 - Modify: `crates/charpente/src/http/mod.rs` (the `handle_or_subscribe` site)
 - Modify: `crates/charpente/src/lib.rs` if `App`'s surface changes
 
-**Interfaces:**
-- Produces: `App::stage_or_subscribe(&mut self, group: &mut Group, request: Request, now: u64)
-  -> Handled` — identical to `handle_or_subscribe` except it stages into `group` instead of
-  committing. `Handled::Subscribe` still commits nothing.
-- Consumes: `Group` (T4).
+**Interfaces (REVISED 2026-08-12 by pre-flight finding G + Noah ruling — the original
+signature could not compile):**
 
-**The mixed-batch case, which the spec under-specified:** a drained batch can contain both
-write requests and SSE subscribes. Subscribes contribute no record and must still become
-tails in arrival order. Responses for every request in the batch are held and sent only
-after `commit` returns — sending a 200 before the sync would break ack-after-durable, which
-is the entire point.
+The plan originally specified `App::stage_or_subscribe(&mut self, group: &mut Group, request:
+Request, now: u64) -> Handled`. **That signature is unusable and the defect is in the signature,
+not in any call site's phrasing.** `App::db_mut(&mut self) -> &mut Db` (`http/app.rs:296`) is
+opaque to the borrow checker, so the `Group<'_>` built from it holds a loan against the *whole*
+`App` for as long as the group lives. Calling any method on `app` afterwards — including
+`stage_or_subscribe` itself — is a second overlapping borrow. Since `App` owns exactly one `Db`
+and that is the only way a `Group` is ever constructed here, there is **no** call site at which
+the original shape works, and T6's kernel drain loop would hit the identical wall.
+
+**Ruled (Noah, 2026-08-12): the Dispatcher borrow-split.** Everything the dispatch path needs
+besides the `Db` requires only a *shared* borrow — `Router::find` is `&self`
+(`http/router.rs:125`), `Entropy::fill` is `&self` (`charpente-core/src/io.rs:72`),
+`config.body_cap`/`session_ttl` are field reads, and `oidc` is an `Arc` clone. So one `&mut self`
+call hands back both halves as disjoint sub-borrows, which Rust permits for direct field
+projections inside a single function body even though it rejects the chained opaque-method form.
+
+- Produces: `App::begin_group(&mut self) -> io::Result<(Group<'_>, Dispatcher<'_>)>` and
+  `Dispatcher::stage_or_subscribe(&self, group: &mut Group, request: Request, now: u64)
+  -> Handled` — the latter identical to `handle_or_subscribe` except it stages into `group`
+  instead of committing.
+- Produces: `pub struct Dispatcher<'a>` holding `&'a Router`, `&'a dyn Entropy`, `&'a AppConfig`
+  and `Option<&'a OidcVerifier>`.
+- `handle_or_subscribe` stays, rewritten as the one-request wrapper over this pair — the same
+  "single path and batched path are the same code" reasoning T4 applied to `transact`.
+- Consumes: `Group` (T4). Import it as `charpente_core::db::Group` inside `http/app.rs`, the way
+  `Tx`/`Db`/`TxError` already are — the `charpente::core` re-export is for external app crates.
+
+**The mixed-batch case, which the spec under-specified — and one correction to how this plan
+stated it.** A drained batch can contain both write requests and SSE subscribes. Responses for
+every request in the batch are held and sent only after `commit` returns; sending a 200 before
+the sync would break ack-after-durable, which is the entire point.
+
+> **The plan previously said "`Handled::Subscribe` still commits nothing." That is FALSE as a
+> general statement and must not be implemented as one** (pre-flight finding F). `Handled` has
+> exactly two variants and no unlisted writer, but an SSE glue closure receives `&mut Tx` and may
+> legitimately write — `ctx.create_session(tx, …)` is the obvious case — and today's
+> `handle_or_subscribe` already commits whatever an SSE handler produces, because **both**
+> `RouteGlue` arms run inside the same `db_mut().transact(...)` call (`http/app.rs:451-468`).
+> Nothing skips the commit for a `Subscribe`. What actually makes a typical read-only subscribe
+> cost no record is `Group::stage`'s general empty-effects check (`db.rs:2016-2018`), which
+> applies to any staged transaction regardless of flavour. **Route both arms through
+> `group.stage(...)` identically.** Hard-coding "Subscribe never queues a record" would silently
+> drop the writes of an SSE route that does write.
 
 - [ ] **Step 1: Write the failing test — scoped to what T5 delivers**
 
 This task ends green. The ack-ordering property belongs to T6, which is the task that makes
 the kernel capable of violating it; asserting it here would leave a red test at task end.
+
+**Amended 2026-08-12 (pre-flight finding A). None of `app_with_op_counter`, `post(...)` or a
+counter exposing `.appends()` exists anywhere in the repo** — the original snippet called four
+things into being by naming them. What exists: `Request::new(Method::Post, "/notes")` is how
+every test in `crates/charpente/tests/http.rs` builds a request (there is no `post()`
+shorthand), and the only counting-disk precedent is `SyncCounts` in
+`crates/charpente-core/tests/engine.rs:169-176` — which counts syncs only, has no append
+concept, and is a private struct in a *different crate's* test file, so it cannot be imported.
+
+**So Step 1 must first write its own harness**, local to `crates/charpente/tests/group_commit.rs`:
+a `CountingDisk`/`CountingFile` pair modelled on that `SyncCounts` precedent but tracking
+write-shaped ops and syncs as two separate counters, plus
+`fn app_with_op_counter(seed: u64) -> (App, OpCounts)` that builds a `Sim`, wraps its disk, and
+calls `App::open` with it. Budget for that; it is not a one-liner.
 
 ```rust
 /// `stage_or_subscribe` runs the whole dispatch path but commits nothing —
@@ -670,8 +720,9 @@ the kernel capable of violating it; asserting it here would leave a red test at 
 fn stage_or_subscribe_produces_a_record_without_touching_the_wal() {
     let (mut app, counts) = app_with_op_counter(0x60C0_0007);
     let before = counts.appends() + counts.syncs();
-    let mut g = app.db_mut().begin_group().expect("group");
-    let handled = app.stage_or_subscribe(&mut g, post("/hit/1"), 0);
+    let (mut g, dispatcher) = app.begin_group().expect("group");
+    let handled =
+        dispatcher.stage_or_subscribe(&mut g, Request::new(Method::Post, "/hit/1"), 0);
     assert!(matches!(handled, Handled::Response(_)), "a write route responds");
     assert_eq!(g.len(), 1, "the record is staged");
     assert_eq!(
@@ -693,6 +744,36 @@ Expected: FAIL — no method `stage_or_subscribe`.
 Factor the existing `handle_or_subscribe` body so the routing/auth/handler-invocation path is
 shared and only the commit differs. `handle_or_subscribe` becomes a wrapper that makes a
 one-transaction group, exactly as `transact` did in T4 — same reasoning, one code path.
+
+Per the ruling in Interfaces above, the factoring lands on `Dispatcher`, and `App::begin_group`
+is what produces the two disjoint sub-borrows:
+
+```rust
+impl App {
+    pub fn begin_group(&mut self) -> io::Result<(Group<'_>, Dispatcher<'_>)> {
+        // Field projections, NOT method calls: `self.db.as_mut()` and the
+        // shared field borrows split cleanly here, where `self.db_mut()`
+        // would re-borrow all of `*self` and poison the split. See the T5
+        // pre-flight's finding G for the failure this shape exists to avoid.
+        let dispatcher = Dispatcher {
+            router: &self.router,
+            entropy: &*self.entropy,
+            config: &self.config,
+            oidc: self.oidc.as_deref(),
+        };
+        let group = self
+            .db
+            .as_mut()
+            .expect("db taken for reseed — a kernel bug left it out")
+            .begin_group()?;
+        Ok((group, dispatcher))
+    }
+}
+```
+
+The `db_mut()`-vs-field-projection distinction is the whole fix and is easy to undo by accident:
+calling `self.db_mut()` here reintroduces the exact borrow conflict the ruling resolved. The
+rationale comment above must ship with the code.
 
 - [ ] **Step 4: Verify**
 
@@ -720,6 +801,22 @@ has caught in itself repeatedly.**
    harness swallows `println!` entirely, so the file would contain cargo's own progress and
    summary lines and none of the trace; with `--nocapture` it would contain the trace *plus*
    that noise. Either way `expected.trim()` never equals `disk_trace_string()`.
+
+3. **`run_one_at_a_time_universe` and `disk_trace_string()` do not exist, and neither does the
+   machinery under them** (pre-flight finding E). This is the item most likely to blow this
+   task's estimate, so it is stated plainly rather than left implied by a one-line call.
+   `charpente-sim` has **no per-operation disk trace at all**: `Sim::durable_fingerprint()`
+   (`charpente-sim/src/lib.rs:678,823`) is a single hash over final store contents, and
+   `kernel.rs`'s determinism test (`loop_replays_identically_for_the_same_seed`, :980-1003)
+   asserts on `(outcome, recorded_responses, durable_fingerprint, now)` — a fingerprint, not a
+   trace. **T5 must invent this infrastructure**, and it is not in this task's stated file list:
+   a `Disk`/`File` wrapper recording each op (`write_at offset len`, `set_len`, `sync`, per file)
+   into an ordered `Vec<String>`, plus `run_one_at_a_time_universe(seed)` driving a `Kernel` over
+   a `SimSource` through that traced disk — the pattern `kernel.rs:984` already shows
+   (`SimSource::new(Box::new(sim.clock()), HOUR)` + `Kernel::new(...).run(&mut source)`).
+   It can share the counting-disk harness Step 1 already needs; build both once.
+   A fingerprint would NOT substitute here: T6 must detect a reordered or extra disk op, which
+   is exactly what a final-state hash cannot see.
 
 So the `#[ignore]`d `capture_pre_batching_trace` **writes the file itself** and there is no
 shell redirect:
@@ -919,7 +1016,11 @@ git commit -m "kernel: the job and cron arms drain too — the canonical txn's s
 ### Task 8: The property suite
 
 **Files:**
-- Create: `crates/charpente/tests/group_commit.rs`
+- Modify: `crates/charpente/tests/group_commit.rs` — **created by T5, not by this task**
+  (corrected 2026-08-12, pre-flight finding D). By the time T8 runs, that file already holds
+  T5's `stage_or_subscribe_produces_a_record_without_touching_the_wal`, its counting-disk and
+  disk-trace harness, and the `#[ignore]`d `capture_pre_batching_trace`, plus T6's tests.
+  Reuse that harness; do not write a second one.
 
 **Interfaces:**
 - Consumes: everything above. Produces the oracles §9 requires.
