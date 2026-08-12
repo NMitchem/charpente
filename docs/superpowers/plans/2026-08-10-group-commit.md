@@ -659,19 +659,29 @@ opaque to the borrow checker, so the `Group<'_>` built from it holds a loan agai
 and that is the only way a `Group` is ever constructed here, there is **no** call site at which
 the original shape works, and T6's kernel drain loop would hit the identical wall.
 
-**Ruled (Noah, 2026-08-12): the Dispatcher borrow-split.** Everything the dispatch path needs
+**Ruled (Noah, 2026-08-12): the StagedDispatch borrow-split.** Everything the dispatch path needs
 besides the `Db` requires only a *shared* borrow — `Router::find` is `&self`
 (`http/router.rs:125`), `Entropy::fill` is `&self` (`charpente-core/src/io.rs:72`),
 `config.body_cap`/`session_ttl` are field reads, and `oidc` is an `Arc` clone. So one `&mut self`
 call hands back both halves as disjoint sub-borrows, which Rust permits for direct field
 projections inside a single function body even though it rejects the chained opaque-method form.
 
-- Produces: `App::begin_group(&mut self) -> io::Result<(Group<'_>, Dispatcher<'_>)>` and
-  `Dispatcher::stage_or_subscribe(&self, group: &mut Group, request: Request, now: u64)
+- Produces: `App::begin_group(&mut self) -> io::Result<(Group<'_>, StagedDispatch<'_>)>` and
+  `StagedDispatch::stage_or_subscribe(&self, group: &mut Group, request: Request, now: u64)
   -> Handled` — the latter identical to `handle_or_subscribe` except it stages into `group`
   instead of committing.
-- Produces: `pub struct Dispatcher<'a>` holding `&'a Router`, `&'a dyn Entropy`, `&'a AppConfig`
+- Produces: `pub struct StagedDispatch<'a>` holding `&'a Router`, `&'a dyn Entropy`, `&'a AppConfig`
   and `Option<&'a OidcVerifier>`.
+
+  **Named `StagedDispatch`, NOT `Dispatcher` — renamed 2026-08-12 by T6's pre-flight before
+  either task was written.** `charpente` already has a `pub struct Dispatcher`: the *job*
+  dispatcher (`kernel/dispatch.rs:90`), re-exported unqualified at `kernel/mod.rs:10` and stored
+  as `Kernel::dispatcher`. A second public `Dispatcher` would need to be reachable from that same
+  `kernel/mod.rs` for T6's drain loop, where the file already imports http types unqualified — so
+  the natural `use` collides outright (E0252), and even where inference avoids the import, a local
+  named `dispatcher` sitting beside `self.dispatcher` meaning something entirely different is a
+  maintenance trap. The newcomer renames because it has no callers yet; the job dispatcher is
+  `pub`, referenced, and older. Local bindings are `staged`, not `dispatcher`, for the same reason.
 - `handle_or_subscribe` stays, rewritten as the one-request wrapper over this pair — the same
   "single path and batched path are the same code" reasoning T4 applied to `transact`.
 - Consumes: `Group` (T4). Import it as `charpente_core::db::Group` inside `http/app.rs`, the way
@@ -720,9 +730,9 @@ calls `App::open` with it. Budget for that; it is not a one-liner.
 fn stage_or_subscribe_produces_a_record_without_touching_the_wal() {
     let (mut app, counts) = app_with_op_counter(0x60C0_0007);
     let before = counts.appends() + counts.syncs();
-    let (mut g, dispatcher) = app.begin_group().expect("group");
+    let (mut g, staged) = app.begin_group().expect("group");
     let handled =
-        dispatcher.stage_or_subscribe(&mut g, Request::new(Method::Post, "/hit/1"), 0);
+        staged.stage_or_subscribe(&mut g, Request::new(Method::Post, "/hit/1"), 0);
     assert!(matches!(handled, Handled::Response(_)), "a write route responds");
     assert_eq!(g.len(), 1, "the record is staged");
     assert_eq!(
@@ -745,17 +755,17 @@ Factor the existing `handle_or_subscribe` body so the routing/auth/handler-invoc
 shared and only the commit differs. `handle_or_subscribe` becomes a wrapper that makes a
 one-transaction group, exactly as `transact` did in T4 — same reasoning, one code path.
 
-Per the ruling in Interfaces above, the factoring lands on `Dispatcher`, and `App::begin_group`
+Per the ruling in Interfaces above, the factoring lands on `StagedDispatch`, and `App::begin_group`
 is what produces the two disjoint sub-borrows:
 
 ```rust
 impl App {
-    pub fn begin_group(&mut self) -> io::Result<(Group<'_>, Dispatcher<'_>)> {
+    pub fn begin_group(&mut self) -> io::Result<(Group<'_>, StagedDispatch<'_>)> {
         // Field projections, NOT method calls: `self.db.as_mut()` and the
         // shared field borrows split cleanly here, where `self.db_mut()`
         // would re-borrow all of `*self` and poison the split. See the T5
         // pre-flight's finding G for the failure this shape exists to avoid.
-        let dispatcher = Dispatcher {
+        let staged = StagedDispatch {
             router: &self.router,
             entropy: &*self.entropy,
             config: &self.config,
@@ -766,7 +776,7 @@ impl App {
             .as_mut()
             .expect("db taken for reseed — a kernel bug left it out")
             .begin_group()?;
-        Ok((group, dispatcher))
+        Ok((group, staged))
     }
 }
 ```
@@ -883,16 +893,36 @@ batch.push(r), None => break } }`. Adding a `drain` method would give the two so
 chance to disagree; reusing `poll` keeps prod and sim on the same code, which is the
 same-shape rule.
 
-> **UNRESOLVED, and this task owns it (raised by T4's pre-flight, 2026-08-12).** The loop
-> above bounds on *requests polled*; `Group::is_full()`, which T4 ships, bounds on *records
-> staged*. A handler returning `Err` stages no record, so the two are not the same quantity
-> and cannot be swapped without deciding which one the cap is about. Taking the loop above as
-> written also requires making `MAX_BATCH` `pub` and leaves `is_full()` with no caller
-> anywhere in the plan — two copies of one limit plus a dead method. Read spec §3 before
-> choosing: it sizes the cap as bounding buffered *payload* memory (cap × the 1 MiB body
-> cap), which is what `is_full()` counts, and which leaves bounding the reply vector as a
-> separate question this task must answer explicitly rather than inherit. Settle it in T6's
-> pre-flight, not by whichever line gets typed first.
+**RESOLVED 2026-08-12 by T6's pre-flight, and it went against the reading T4's pre-flight
+leaned toward — keep the loop above, bounding on requests polled.** The question was whether to
+bound the drain on requests polled or on `Group::is_full()` (records staged), since a handler
+returning `Err` stages no record and the two are different quantities.
+
+Three things settled it:
+
+1. **An `is_full()`-bounded loop is UNBOUNDED in exactly the case a cap exists for.** A run of
+   `Err`-returning or empty-effects requests stages zero records, never trips `is_full()`, and
+   the loop keeps draining for as long as `poll()` returns `Some` — while the held `Request` and
+   reply vector grows one entry per drained item, each up to the 1 MiB body cap. Bounding on
+   requests caps records and replies at once (`records ≤ requests ≤ 64`). Spec §3's one sentence
+   of arithmetic names the payload buffer, but its actual mandate is "purely to bound memory",
+   and the replies are memory.
+2. **The drafted loop cannot trip T4's new assert, and is exactly at the boundary.** `stage`
+   asserts `records.len() < MAX_BATCH` *before* running the handler, and `stage_or_subscribe`
+   calls it at most once per drained request. Worst case, 64 requests all staging: the 64th call
+   sees `records.len() == 63`, passes, and leaves 64. No 65th call exists. Safe, exactly met,
+   never exceeded.
+3. **`is_full()` has no caller anywhere** — not in the plan, not in the suite. T4's own
+   `stage_refuses_past_max_batch` proves the cap through the assert, not through `is_full()`.
+
+**So this task: make `MAX_BATCH` `pub` in `charpente_core::db` and reference it from
+`kernel/mod.rs` — one constant, two use sites (T4's assert and this drain bound), never a
+duplicated literal — and DELETE `Group::is_full()`.** Deleting it is finishing the decision T4's
+doc comment explicitly deferred here, not overriding it; a `pub` method with zero callers is the
+speculative-abstraction the style rules reject. `Group::len()` stays (the tests use it).
+
+**Put a one-line comment at the drain bound saying why it counts requests and not records**, or
+the next reader "simplifies" it to `is_full()` and silently restores the unbounded case.
 
 - [ ] **Step 1: Write the ack-ordering test (RED)**
 
@@ -914,6 +944,15 @@ fn no_response_is_sent_before_the_group_syncs() {
 
 Run it: expected FAIL (the arm still replies per request). Then implement the drain — stage
 each request, `commit()`, then send every reply in arrival order — and re-run: PASS.
+
+> **Infrastructure this task owes and its file list does not name (T6 pre-flight, finding A).**
+> `run_two_request_batch` does not exist, and the trace it returns is **not** the one T5 builds.
+> T5's tracer records *disk* operations (`write_at`, `set_len`, `sync`); this test asserts on the
+> ordering of `"sync"` against `"reply"`, and a reply is not a disk op — no disk-level tracer can
+> see one. So T6 must extend T5's tracer with a reply event (or thread a shared ordered event log
+> through both the traced `Disk` and the kernel's reply path) and write `run_two_request_batch` on
+> top of it. Budget for it. Reuse T5's harness rather than starting a second one — that is why T5
+> was told to build its counting-disk and trace facilities together.
 
 - [ ] **Step 2: Write the batch-of-1 identity test against T5's captured trace**
 
@@ -1107,10 +1146,38 @@ requirements rather than suggestions.
    code can reach it, so pin the actual behaviour with one probe rather than leaving it to be
    discovered. T11 states it in DESIGN.
 
+- [ ] **Step 5c: A subscribe now sees its later-arriving siblings' events — added 2026-08-12**
+
+Seed `0x60C1_0008`. Found by T6's pre-flight and named nowhere else, including not by Step 5b.2,
+which is about a *different* gap (enqueue/emit invisibility inside the group overlay **before**
+commit; this one is about the reply loop reading the store **after** commit).
+
+`Group::commit` calls `Engine::submit_all`, which appends, syncs **and applies every record**
+before returning. So when the post-commit reply loop reaches a `Subscribe` item and runs
+`validate_subscribe(self.app.db(), …)`, the store already reflects the whole batch — including
+requests that arrived *after* that subscribe. Its `next_event_id` is therefore computed past
+events emitted by later-arriving siblings. Pre-batching this could not happen: each request's own
+commit was the only thing visible when its `validate_subscribe` ran.
+
+**Assert the behaviour explicitly, and do not simply pin whatever the code happens to do.** Build
+a batch with a fresh subscribe arriving *before* a write that emits an event, then state in the
+test's own message which semantics is intended and why. If the answer is that the subscribe's
+cursor excludes its sibling's event, that is a named contract and T11 documents it; if it
+includes it, that is a behaviour change from today and T11 documents *that*. Either is
+defensible — silence is not, and a test that only records the current answer without judging it
+is the vacuity this plan has already caught three times.
+
 - [ ] **Step 6: Run a full swarm batch**
 
 Run: `cargo test -p charpente --test group_commit` and a 256-universe swarm.
 Expected: green. Any failure gets its seed pinned per hard rule 3.
+
+**Give no-starvation real attention here, not a glance** (T6 pre-flight, finding E). Batching is
+not determinism-affecting — batch composition draws no entropy and reads no clock, so a fixed
+seed replays identically — but one `Ready::Request` win now consumes up to 64 requests instead of
+1, at unchanged win *frequency*. That is a genuine change to the fairness profile between the
+Request arm and the Job/Cron arms, and spec §9 requires no-starvation to "hold unchanged". It is
+the property most likely to degrade quietly under this sub-project.
 
 - [ ] **Step 7: Commit**
 
@@ -1134,9 +1201,31 @@ git commit -m "test: group-commit property suite — six properties, twins for t
 
 - [ ] **Step 1: Enumerate every pinned seed**
 
+**Amended 2026-08-12 (T6 pre-flight, finding F — and the miss is not marginal).** The command
+originally written here was:
+
 ```bash
 grep -rn "CHARPENTE_SEED\|0x[0-9a-f]\{16\}" crates/*/tests/*.rs | grep -i "seed\|pin\|regression"
 ```
+
+`0x[0-9a-f]{16}` requires exactly sixteen lowercase hex digits and no underscores, so it matches
+`0x8bee1752811ae873` and **nothing in this repo's dominant seed style**. Measured on the tree at
+this commit: it finds **22 of 192** distinct seed literals and misses **170** — every
+underscore-grouped seed (`0x0DED_0002`, `0x2EB1_0001`, `0x60C0_0003`, …) and every uppercase one.
+A task whose entire purpose is re-verifying *every* pinned seed would have enumerated 11% of them
+and reported completeness. Use:
+
+```bash
+grep -rnE "CHARPENTE_SEED|0x[0-9a-fA-F_]{8,}" crates/*/tests/*.rs | grep -i "seed\|pin\|regression"
+```
+
+Cross-check the count two ways before trusting it — the distinct-literal census
+(`grep -rhoE '0x[0-9a-fA-F_]{8,}' crates/*/tests/*.rs | sort -u | wc -l`) against the line hits —
+and record both. **Note the corrected regex over-matches on purpose**: it catches non-seed hex
+constants (magic numbers, CRC polynomials such as `0x0000_0100_0000_01b3`, and byte patterns), so
+the list needs a human pass. Over-matching is the correct direction of error here: an extra
+literal costs one line of triage, a missed pin costs the guarantee this task exists to protect.
+
 Record the list and what bug each was pinned for. A seed whose bug you cannot name from the
 comments is itself a finding — record it.
 
