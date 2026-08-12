@@ -522,6 +522,34 @@ Expected: FAIL — no method `begin_group`.
 
 - [ ] **Step 3: Implement `Group`, `stage`, `commit`**
 
+**Amended 2026-08-12 (pre-flight, finding C).** Define the batch bound here, next to `Group`,
+and keep it **private to `db.rs`**:
+
+```rust
+/// The batch bound. A `const`, never a `DbConfig` field: spec §3 makes this
+/// internal mechanism like `REPL_TICK_NANOS`, and a configurable throughput
+/// knob next to `docs/BENCH.md` is the one thing not to ship. It exists only
+/// to bound buffered memory — greedy drain is already self-limiting by
+/// arrival rate.
+const MAX_BATCH: usize = 64;
+```
+
+Start it private and let Task 6 widen it if Task 6 earns the right to. **The visibility is
+not settled here, and the reason is a real one rather than caution.** T6 is currently drafted
+to drain with an inline `while batch.len() < MAX_BATCH` over a `Vec` of requests, which needs
+the constant `pub` and leaves `Group::is_full()` called by nothing — two copies of one limit
+and a dead method, which this repo's style rules reject. The obvious fix, bounding the drain
+on `group.is_full()` instead, is **not** merely the same loop rewritten: `is_full()` counts
+staged *records*, and a handler returning `Err` stages no record, so a run of rejected
+requests would never trip it. Those two bounds are genuinely different quantities.
+
+Which is correct is a T6 decision, to be made with `kernel/mod.rs` open, and spec §3 is the
+tiebreaker to read then: the cap exists "purely to bound memory", and it sizes that memory as
+the cap "times the existing 1 MiB body cap" — i.e. it is reasoning about buffered *payloads*,
+which is what `is_full()` counts. That argues for `is_full()` plus a separate, explicit answer
+for bounding the reply vector. **T6's pre-flight owns this; do not let it be settled by
+whichever line of code gets written first.**
+
 `commit` is:
 
 ```rust
@@ -531,7 +559,14 @@ pub fn commit(self) -> Result<(), TxError<std::convert::Infallible>> {
         return Ok(());
     }
     let n = records.len();
-    db.engine.submit_all(&records).map_err(TxError::Io)?;
+    // Amended 2026-08-12 (pre-flight, finding K): `submit_all` takes
+    // `&[&[u8]]`, not `&[Vec<u8>]` — the plan's original `&records` did not
+    // compile. T2 chose that signature so `submit` is `submit_all(&[payload])`
+    // with no heap copy on the single-commit hot path, so the borrow is
+    // reconstructed here rather than the signature loosened. This collects N
+    // pointers, not N payloads.
+    let refs: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
+    db.engine.submit_all(&refs).map_err(TxError::Io)?;
     for table in staged_adoptions {
         db.adopted.insert(table);
     }
@@ -569,11 +604,11 @@ pub fn transact<T, E>(
 fn a_panicking_stage_leaves_the_group_clean() {
     let mut db = fresh_db(0x60C0_0004);
     let mut g = db.begin_group().expect("group");
-    g.stage(|tx| { tx.put(&Widget { id: Id::from_raw(1), n: 1 }); Ok::<_, ()>(()) })
+    g.stage(|tx| { tx.put(&Widget { id: Id::from_raw(1), count: 1 }); Ok::<_, ()>(()) })
         .expect("first stages");
     let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         g.stage(|tx| -> Result<(), ()> {
-            tx.put(&Widget { id: Id::from_raw(2), n: 2 });
+            tx.put(&Widget { id: Id::from_raw(2), count: 2 });
             panic!("handler exploded");
         })
     }));
@@ -593,7 +628,9 @@ Expected: green, with counts equal to T3's baseline plus the new tests.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/charpente-core/src/db.rs
+# Amended 2026-08-12 (pre-flight, finding B): the new integration test file
+# was missing from this list and would have been left uncommitted.
+git add crates/charpente-core/src/db.rs crates/charpente-core/tests/group_commit.rs
 git commit -m "core: Db::begin_group/stage/commit — N transactions, one fsync
 
 transact becomes a one-transaction group, so the single path and the batched
@@ -631,7 +668,7 @@ the kernel capable of violating it; asserting it here would leave a red test at 
 /// the record lands in the group, and the WAL is untouched until commit.
 #[test]
 fn stage_or_subscribe_produces_a_record_without_touching_the_wal() {
-    let (mut app, counts) = app_with_op_counter(0x60C0_0005);
+    let (mut app, counts) = app_with_op_counter(0x60C0_0007);
     let before = counts.appends() + counts.syncs();
     let mut g = app.db_mut().begin_group().expect("group");
     let handled = app.stage_or_subscribe(&mut g, post("/hit/1"), 0);
@@ -675,7 +712,7 @@ cargo test -p charpente --test group_commit -- --ignored capture_pre_batching_tr
 ```
 
 Write an `#[ignore]`d `capture_pre_batching_trace` that runs the one-request-at-a-time
-universe at seed `0x60C0_0006` and prints its disk trace. Commit the captured file, and
+universe at seed `0x60C0_0008` and prints its disk trace. Commit the captured file, and
 state in the commit message that it was captured pre-batching — that provenance is the only
 thing that makes T6's assertion meaningful.
 
@@ -711,6 +748,17 @@ batch.push(r), None => break } }`. Adding a `drain` method would give the two so
 chance to disagree; reusing `poll` keeps prod and sim on the same code, which is the
 same-shape rule.
 
+> **UNRESOLVED, and this task owns it (raised by T4's pre-flight, 2026-08-12).** The loop
+> above bounds on *requests polled*; `Group::is_full()`, which T4 ships, bounds on *records
+> staged*. A handler returning `Err` stages no record, so the two are not the same quantity
+> and cannot be swapped without deciding which one the cap is about. Taking the loop above as
+> written also requires making `MAX_BATCH` `pub` and leaves `is_full()` with no caller
+> anywhere in the plan — two copies of one limit plus a dead method. Read spec §3 before
+> choosing: it sizes the cap as bounding buffered *payload* memory (cap × the 1 MiB body
+> cap), which is what `is_full()` counts, and which leaves bounding the reply vector as a
+> separate question this task must answer explicitly rather than inherit. Settle it in T6's
+> pre-flight, not by whichever line gets typed first.
+
 - [ ] **Step 1: Write the ack-ordering test (RED)**
 
 This is the property T6 makes it possible to violate, so it belongs here.
@@ -719,7 +767,7 @@ This is the property T6 makes it possible to violate, so it belongs here.
 /// Ack-after-durable, batch-wide: no reply may leave before the batch's sync.
 #[test]
 fn no_response_is_sent_before_the_group_syncs() {
-    let trace = run_two_request_batch(0x60C0_0005);
+    let trace = run_two_request_batch(0x60C0_0009);
     let sync_at = trace.iter().position(|op| op == "sync").expect("a sync happened");
     let first_reply = trace.iter().position(|op| op == "reply").expect("a reply happened");
     assert!(
@@ -743,7 +791,7 @@ fn a_never_contended_universe_traces_identically() {
     let expected = include_str!(
         "../../../.superpowers/sdd/2026-08-10-group-commit/pre-batching-trace.txt"
     );
-    let batched = run_one_at_a_time_universe(0x60C0_0006);
+    let batched = run_one_at_a_time_universe(0x60C0_0008);
     assert_eq!(batched.disk_trace_string(), expected.trim(),
         "batch-of-1 must be byte-identical to the unbatched path");
 }
@@ -794,7 +842,7 @@ req/s against 217 records/s. Batching requests alone caps the win near 2x.
 ```rust
 #[test]
 fn forty_due_jobs_cost_one_fsync() {
-    let g = run_universe_with_due_jobs(0x60C0_0007, 40);
+    let g = run_universe_with_due_jobs(0x60C0_000A, 40);
     assert_eq!(g.syncs_in_job_arm, 1,
         "40 due jobs must drain as one batch; got {} syncs", g.syncs_in_job_arm);
     assert_eq!(g.jobs_done, 40);
@@ -1090,6 +1138,10 @@ test snippets name things that do not exist.
   (`tests/migrate_apply.rs:26` states this). Hand-written `Row`/`RowShape` impls are the
   established pattern (`tests/migration_gate.rs:12-44`). `db.rs`'s only `Widget` is a local
   struct inside a migration test with a `count` field, not a shared fixture.
+  *(Historical wording — `{ id, n }` is what the plan said when this finding was written. The
+  2026-08-12 pre-flight found T4's own snippets still split between `n` and `count` and
+  unified them on **`count`**, which is also what the existing `db.rs` struct named in the
+  sentence above already uses. T4's task body is now the live text.)*
 - **T3's and T4's tests were homed in the wrong target.** `cargo test -p charpente-core --lib`
   cannot build a `Db`: `charpente_sim` appears nowhere in `charpente-core/src/`, because the
   `--lib` test target is a distinct compilation unit from the one `charpente-sim` links
@@ -1108,6 +1160,28 @@ test snippets name things that do not exist.
 test.** The plan as written assigned `0x60C0_0002` to T3 and `0x60C0_0003` to T4, both already
 taken — `0x60C0_0002` collided with this plan's own T2 snippet before any implementer touched
 it. Taken and committed: `0x60C0_0001` and `0x60C0_0002` (T2's two sync-count tests),
-`0x60C0_0003` (T2's fix-wave poison/empty ordering test, commit `44dd8ae`). Allocated forward:
-**`0x60C0_0004` reserved for T3** should it need one, **`0x60C0_0005`** and **`0x60C0_0006`**
-for T4's two tests above. Later tasks continue from `0x60C0_0007`.
+`0x60C0_0003` (T2's fix-wave poison/empty ordering test, commit `44dd8ae`).
+
+**Re-allocated 2026-08-12 (T4 pre-flight), because the forward allocation below was written
+but never applied to the task bodies.** T3 shipped no test, so `0x60C0_0004` fell to T4's
+panic test. T5, T6 and T7 were all still carrying their pre-allocation numbers, which put
+**three distinct tests on `0x60C0_0005`** (T4's read-your-own-writes, T5's op-counter, T6's
+ack-ordering) and put T4's isolation test on the same seed as the T5/T6 trace pair — breaking
+the very invariant the first line of this block states. The full, current allocation:
+
+| seed | task | test |
+|---|---|---|
+| `0x60C0_0001`, `0x60C0_0002` | T2 | the two sync-count tests (committed) |
+| `0x60C0_0003` | T2 fix wave | poison/empty ordering (committed, `44dd8ae`) |
+| `0x60C0_0004` | T4 | `a_panicking_stage_leaves_the_group_clean` |
+| `0x60C0_0005` | T4 | `a_staged_transaction_sees_an_earlier_one_in_the_same_group` |
+| `0x60C0_0006` | T4 | `a_staged_transaction_that_fails_leaves_the_group_untouched` |
+| `0x60C0_0007` | T5 | `app_with_op_counter` |
+| `0x60C0_0008` | T5 **and** T6 | the pre-batching trace capture and its replay |
+| `0x60C0_0009` | T6 | `run_two_request_batch` (ack ordering) |
+| `0x60C0_000A` | T7 | `run_universe_with_due_jobs` |
+
+`0x60C0_0008` appearing twice is **deliberate and must stay that way**: T5 captures that
+universe's disk trace while the kernel is still unbatched and T6 replays the same universe
+after batching to prove byte-identity. Two different seeds there would compare two different
+universes and assert nothing. Later tasks continue from `0x60C0_000B`.
