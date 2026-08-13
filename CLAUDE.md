@@ -1012,10 +1012,16 @@ do not reorder a milestone's dependency sequence.
   **done** (close-out entry below, 2026-08-10), and trigger (a) has been read against real
   numbers: it **does not fire**, so the LSM stays deferred and is NOT the next sub-project.
   What the measurement opens instead is **primary-side group commit**, already sized by
-  BENCH.md's own table — 215 durable records/sec is the number to beat — and it needs a spec
-  and a ruling before any code. Otherwise M2 per PLAN — the follow-up backlog below now holds
-  **no open work** (`applied_delta`'s release-mode wrap, its last open item, closed
-  2026-08-10).
+  BENCH.md's own table — 215 durable records/sec is the number to beat. That is now **M2
+  sub-project 2, IN PROGRESS** (spec docs/superpowers/specs/2026-08-10-group-commit-design.md,
+  11-task plan docs/superpowers/plans/2026-08-10-group-commit.md, ledger
+  .superpowers/sdd/2026-08-10-group-commit/progress.md). **T1–T7 are committed** as of
+  2026-08-13, ending at `3cd3ecd` (the job and cron arms drain, review fix round included);
+  T8–T11 remain — the property suite, re-verifying every pinned seed, measuring the win, and
+  docs/close-out. **This section is written at sub-project close-out, so it will not narrate
+  T8–T11 as they land; the ledger is authoritative mid-plan.** Otherwise M2 per PLAN — the
+  follow-up backlog below now holds **no open work** (`applied_delta`'s release-mode wrap, its
+  last open item, closed 2026-08-10).
 - **Bench interlude — the device-ratio gate, done (2026-08-10, spec
   docs/superpowers/specs/2026-08-10-device-ratio-gate-design.md, ledger
   .superpowers/sdd/2026-08-10-device-ratio-gate/progress.md, commits `c10b8fa`..this
