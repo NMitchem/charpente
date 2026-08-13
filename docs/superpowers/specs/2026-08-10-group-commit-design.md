@@ -163,7 +163,7 @@ kernel's batched tail; three copies of it is how they drifted the first time.
 
 **(2) Route-handler panic isolation does not exist, and this spec claimed it did.** There is
 no `catch_unwind` anywhere on the request path. The platform has exactly two:
-`charpente-core/src/table.rs:308` (store open) and `charpente/src/kernel/dispatch.rs:170`
+`charpente-core/src/table.rs:308` (store open) and `charpente/src/kernel/dispatch.rs:194`
 (job glue). The others in the tree live in `charpente-sim`'s universe runner, which wraps a
 whole test universe rather than a request, and so cannot isolate one. A panicking route
 handler therefore unwinds out of `Kernel::run` and the node stops. It is **not** "500 for
@@ -184,7 +184,7 @@ optimistically:
 
 **Group commit did not introduce this; it widened it.** Before batching, one panicking
 handler cost one request. After T6 it costs every request drained into that batch. The job
-arm is genuinely isolated and stays so: `dispatch.rs:170` catches inside the transaction
+arm is genuinely isolated and stays so: `dispatch.rs:194` catches inside the transaction
 closure and converts the panic to `Err(JobError::App(...))`, so that transaction's effects
 discard cleanly and its siblings are unaffected — which is why the table now separates the
 two handler kinds instead of asserting one behaviour for both.

@@ -1091,6 +1091,19 @@ git commit -m "kernel: the job and cron arms drain too — the canonical txn's s
 
 ### Task 8: The property suite
 
+> **SUPERSEDED — read `task-8a-brief.md` and `task-8b-brief.md`, not the step bodies below.**
+> The T8 pre-flight (2026-08-13) found **thirteen** defects in this text: it predates the T4,
+> T6 and T7 rulings, and its step bodies still ask for things the shipped code makes wrong or
+> impossible — route-handler panic isolation (C-1, does not exist; a panicking route handler
+> stops the node), the writer-centric client column (C-5a, superseded by spec §4's amended
+> `CommitFailure::invalidates` rule — a read is invalidated by what it SAW), interior-*i*
+> injection (C-5b), the "single-node run" oracle (C-6), a `version >= 2` fixture (C-7,
+> unnecessary — the adoption filter keys on `FINGERPRINT.is_some()`), and Step 5c (C-3,
+> structurally impossible against shipped code). Task 8 was split into **8a** (deterministic
+> properties, shipped) and **8b** (burst-swarm workload + fairness). The **seed-allocation
+> block below is current and authoritative**; the step bodies are kept only as the historical
+> record of what was asked for. T11 rewrites this section (T8a review M-6).
+
 **Files:**
 - Modify: `crates/charpente/tests/group_commit.rs` — **created by T5, not by this task**
   (corrected 2026-08-12, pre-flight finding D). By the time T8 runs, that file already holds
@@ -1483,4 +1496,31 @@ the very invariant the first line of this block states. The full, current alloca
 `0x60C0_0008` appearing twice is **deliberate and must stay that way**: T5 captures that
 universe's disk trace while the kernel is still unbatched and T6 replays the same universe
 after batching to prove byte-identity. Two different seeds there would compare two different
-universes and assert nothing. Later tasks continue from `0x60C0_000B`.
+universes and assert nothing. **The `0x60C0` namespace is CLOSED at `0x60C0_0013`** ("Later
+tasks continue from `0x60C0_000B`" was stale the moment T7's fix round minted `0x60C0_0011`
+through `0x60C0_0013` — corrected here, T8a pre-flight C-11). T8 opens `0x60C1`.
+
+**`0x60C4_0001`** is also in use — `charpente-core/tests/engine.rs:343`,
+`submit_all_reports_how_many_applied_before_a_mid_batch_failure` — a THIRD namespace this
+sub-project opened without ever recording it here (T8a pre-flight C-11). Not part of either
+task's own allocation; noted so a future census does not rediscover it as a mystery.
+
+**Seed allocation for the `0x60C1_xxxx` namespace (T8a).** The plan's Task 8 text as originally
+written cited these eight seeds only in prose inside its own step bodies — precisely the
+pattern that put three tests on `0x60C0_0005` before the T4 pre-flight caught it. Census run
+two ways before dispatch (`grep -rhoE "0x60C1_[0-9A-Fa-f]{4}"` over `crates docs .superpowers`,
+cross-checked against `grep -rn "0x60C1" crates`): all eight were free. T8a's actual landing:
+
+| seed | test |
+|---|---|
+| `0x60C1_0001` | `the_sync_is_atomic_over_the_batch` (`crates/charpente/tests/group_commit.rs`) |
+| `0x60C1_0002` | `two_same_row_requests_in_one_batch_see_each_others_writes` (`group_commit.rs`) |
+| `0x60C1_0003` | `a_failed_batchs_participants_are_invalidated_by_what_they_saw` (`group_commit.rs`) |
+| `0x60C1_0004` | `follower_ids_match_a_batched_primarys` (`crates/charpente/tests/realtime.rs` — C-6: `group_commit.rs` has no two-host rig) |
+| `0x60C1_0005` | `a_panicking_job_leaves_its_batch_siblings_correct` (`group_commit.rs` — rewritten for JOB handlers per spec §9.6's 2026-08-12 amendment; C-1) |
+| `0x60C1_0006` | `a_batchs_second_first_write_does_not_duplicate_the_adoption_row` AND `adopted_state_survives_a_commit_failure_correctly_per_arm` (`group_commit.rs` — one seed, two tests, both 5b.1's headline and its negative-space half; neither is a swarm, so sharing costs nothing) |
+| `0x60C1_0007` | `enqueues_and_emits_are_invisible_to_a_later_sibling_in_the_same_batch` (`group_commit.rs`) |
+| `0x60C1_0008` | **freed, not used by T8a** — reserved for 8b's fairness test (Step 5c, the original owner, was closed at T6 before T8a would have written it a second time; see the task-8a-brief.md/task-8-preflight.md record) |
+
+Step 3 was **not** split into two tests (its two commit-failure arms live inside one `#[test]`
+fn, as scoped by RULING 1), so `0x60C1_0009` was never minted and stays free.

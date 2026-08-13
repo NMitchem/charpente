@@ -22,7 +22,7 @@ use charpente_core::db::Db;
 use charpente_core::event::EventRow;
 use charpente_core::io::{Clock, Conn, Disk, Entropy, Net};
 use charpente_core::log::WalConfig;
-use charpente_core::table::{Codec, View};
+use charpente_core::table::{Codec, Row, View};
 use charpente_sim::checks::{durable_corruption_fired, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim, SimEntropy, SimHost, run_universes_swarm_with};
 use serde::{Deserialize, Serialize};
@@ -2085,4 +2085,157 @@ fn follower_tails_and_the_failover_resume_divergence_property() {
             "realtime:failover-diverged"
         ]
     );
+}
+
+// ==================== T8a Step 4: follower id identity under a BATCHED primary
+
+/// T8a Step 4 (spec §9.5, task-8-preflight.md C-6): follower id identity
+/// under a BATCHED primary. After T6/T7 a "single-node run of the same
+/// workload" is batched too — one commit path, hard rule 2 forbids a
+/// second — so spec §6's actual claim is primary-vs-follower, not
+/// batched-vs-unbatched. This is the only rig in the repo with real
+/// `Kernel`s on both hosts AND events (`RNode`/`spawn_rt_node`/
+/// `rt_kernel_round`, this file's own multi-node section above);
+/// `replication.rs`'s `Node` is `Db`-level with no kernel (`:157`), so its
+/// primary cannot batch at all.
+///
+/// `next_job_id` continuity under replication was already proven elsewhere
+/// (the seeder work); `next_event_id` is compared NOWHERE ELSE in the
+/// repo (C-6) — that is the genuinely new half this test exists for,
+/// alongside a full `scan_raw` comparison (the `converged_read` shape,
+/// `replication.rs:601`) over every table.
+///
+/// Deterministic, not a swarm: `FaultConfig::none()`, one fixed seed. The
+/// batch-membership guard loops `step()` up to a small budget rather than
+/// asserting on the very first call, because a `Ready::Repl` round can
+/// legitimately win arbitration before `Ready::Request` gets its turn —
+/// `Kernel::step`'s top-of-step `source.poll()` still only pulls the FIRST
+/// pending request either way, so whichever step actually services
+/// `Ready::Request` first is guaranteed to drain all four (they are all
+/// already ready at the same instant), which is what the loop confirms
+/// rather than assumes.
+#[test]
+fn follower_ids_match_a_batched_primarys() {
+    let sim = Sim::with_faults(0x60C1_0004, FaultConfig::none());
+    let db_cfg = multi_node_db_cfg();
+    let mut p = spawn_rt_node(&sim, "p", rt_primary_cfg("p:1"), db_cfg.clone(), RT_HORIZON)
+        .expect("primary spawns under FaultConfig::none()");
+    let mut f = spawn_rt_node(&sim, "f", rt_follower_cfg("f:1", "p:1"), db_cfg, RT_HORIZON)
+        .expect("follower spawns under FaultConfig::none()");
+
+    // A few quiet rounds so the follower dials and Hellos before the batch.
+    for _ in 0..20 {
+        if !rt_kernel_round(&sim, &mut [&mut p, &mut f]).expect("quiet rounds") {
+            break;
+        }
+    }
+
+    // Four requests at the SAME instant — genuinely contended, so the
+    // primary's request arm must drain all four in ONE batch whenever it
+    // finally runs.
+    let now = sim.now().as_nanos();
+    for n in 0..4u64 {
+        p.source.push_at(
+            now,
+            Request::new(Method::Post, "/ping").json(&EmitBody { n, key: None }),
+        );
+    }
+    let requests_before = p.kernel.as_ref().expect("primary alive").stats().requests;
+    let mut batch_ran = false;
+    for _ in 0..50 {
+        kstep_rt_node(&sim, &mut p).expect("primary step under FaultConfig::none()");
+        if p.kernel.as_ref().expect("primary alive").stats().requests > requests_before {
+            batch_ran = true;
+            break;
+        }
+    }
+    assert!(
+        batch_ran,
+        "the primary's request arm never ran within budget"
+    );
+    assert_eq!(
+        p.kernel.as_ref().expect("primary alive").stats().requests - requests_before,
+        4,
+        "all four same-instant emits must land in ONE batch — a primary that still serves one \
+         request per step proves nothing about follower id identity under batching"
+    );
+
+    // Drive to convergence: ship, ack, apply on the follower.
+    let mut converged = false;
+    for _ in 0..RT_STEP_BUDGET {
+        let p_next = p
+            .kernel
+            .as_ref()
+            .expect("primary alive")
+            .app()
+            .db()
+            .next_event_id()
+            .expect("primary next_event_id");
+        let f_next = f
+            .kernel
+            .as_ref()
+            .expect("follower alive")
+            .app()
+            .db()
+            .next_event_id()
+            .expect("follower next_event_id");
+        if p_next == f_next && p_next > 0 {
+            converged = true;
+            break;
+        }
+        if !rt_kernel_round(&sim, &mut [&mut p, &mut f]).expect("converge rounds") {
+            break;
+        }
+    }
+    assert!(
+        converged,
+        "primary and follower must converge on next_event_id within budget"
+    );
+
+    let pdb = p.kernel.as_ref().expect("primary alive").app().db();
+    let fdb = f.kernel.as_ref().expect("follower alive").app().db();
+    let psnap = pdb.snapshot().unwrap();
+    let fsnap = fdb.snapshot().unwrap();
+
+    // The batch must have produced FOUR events, and both sides must say so
+    // in absolute terms. Comparing the two sides ALONE is not enough, and
+    // that is measured, not argued: T8a review I-2 truncated `Group::commit`
+    // to a single record — three of four acked writes silently dropped —
+    // and this test stayed GREEN, because a one-event run satisfies both
+    // `p_next > 0` and byte-equal tables. The count is what carries this
+    // test past spec §7's batch-of-1 identity, which is the case it exists
+    // to go beyond. Two quantities, not one: the counter can in principle
+    // advance without materializing rows, so the events table is checked
+    // directly too.
+    assert_eq!(
+        pdb.next_event_id().unwrap(),
+        4,
+        "all four requests' emits must be in the batch — one event would mean a degenerate \
+         batch and an oracle that proves nothing about batching"
+    );
+    assert_eq!(
+        psnap.scan_raw(EventRow::TABLE).unwrap().len(),
+        4,
+        "four emits must materialize four event rows on the primary"
+    );
+    assert_eq!(
+        fdb.next_event_id().unwrap(),
+        4,
+        "the follower must land on the SAME id frontier from its own replay — next_event_id is \
+         compared NOWHERE else in the repo before this test (T8a pre-flight C-6)"
+    );
+    // `next_job_id` is deliberately NOT asserted here: `open_rt_kernel`
+    // mounts no jobs and this test enqueues nothing, so both sides are 0
+    // and the comparison could not fail (T8a review I-3). Wiring jobs into
+    // that shared helper to make it non-vacuous would perturb every
+    // multi-node test in this file; job-id continuity under replication is
+    // proven by the seeder work instead.
+    for table in pdb.table_names() {
+        let pr = psnap.scan_raw(table).unwrap();
+        let fr = fsnap.scan_raw(table).unwrap();
+        assert_eq!(
+            pr, fr,
+            "table {table} diverged between the batched primary and the follower's replay"
+        );
+    }
 }

@@ -22,15 +22,19 @@
 //! batching. Give `run_two_request_batch` its own instrumented `Respond`.
 
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use charpente::http::{ApiError, App, AppConfig, Handled, Method, Request};
 use charpente::kernel::{
     EventSink, JobError, Kernel, Reply, RequestSource, Respond, SimSource, Step, Wake,
 };
-use charpente::{Schema, Tx, job, jobs, route, routes, table};
+use charpente::{Schema, Tx, event, job, jobs, route, routes, table};
+use charpente_core::db::Db;
+use charpente_core::event::EventRow;
 use charpente_core::io::{Disk, File, Instant};
+use charpente_core::job::{JobRow, JobStatus};
+use charpente_core::migration::{SchemaVersion, schema_version_id};
 use charpente_core::table::{Id, View};
 use charpente_sim::{FaultConfig, Sim};
 
@@ -913,5 +917,1169 @@ fn two_same_row_jobs_in_one_batch_see_each_others_writes() {
         "both same-row jobs in one batch must see each other's staged \
          write through the group overlay, not the pre-batch snapshot \
          (a broken overlay would leave this at 1)"
+    );
+}
+
+// ======================================================================
+// T8a — the deterministic property suite (spec §9; task-8a-brief.md /
+// task-8-preflight.md). Steps 1, 2, 3, 5, 5b.1 and 5b.2 below (Step 4 lives
+// in tests/realtime.rs — C-6; Step 5c was closed at T6, freeing its seed).
+// The burst-swarm workload and the fairness invariant (plan Step 6 /
+// RULINGs 2-3) are 8b's, dispatched separately — nothing here touches
+// `kernel_workload` or adds a swarm.
+// ======================================================================
+
+/// The full schema `App::open` builds internally (`app.rs:196-202`): the
+/// app's own tables plus the platform's `Session`/`ApiKey`/`CronRow` —
+/// EVERY app gets the built-in daily session-expiry sweep's cron entry with
+/// no opt-in, so its `CronRow` lands in the log even for an app that never
+/// calls `.schedule(...)`. A direct `Db::open` reopen (bypassing
+/// `App::open`, as the crash-sweep and restart-durability checks below do)
+/// must register the identical set, or a WAL record referencing one of
+/// them fails to decode with "the Schema does not include it".
+fn hit_schema() -> Schema {
+    Schema::new()
+        .table::<Hit>()
+        .table::<charpente::http::Session>()
+        .table::<charpente::auth::ApiKey>()
+        .table::<charpente::kernel::CronRow>()
+}
+
+// --------------------------------------------- Step 1: the sync is atomic
+
+/// T8a Step 1 (spec §9.1, task-8-preflight.md C-4): a crash landing
+/// anywhere between the batch's first append and its sync must leave NO
+/// record of the batch durable and must not have acked anything.
+///
+/// **Scoped to `FaultConfig::none()`, and only there** (C-4): under
+/// `FaultConfig::default()` (`crash_apply: 0.4`) or any swarm config, an
+/// unsynced write legitimately SURVIVES a crash some of the time — "nothing
+/// survived" would then be false about correct code, not a bug. This
+/// property must never be lifted into a swarm workload (8b's territory).
+///
+/// **The sweep is self-terminating, not pre-bounded by a separate op
+/// count.** An earlier version of this test measured a "dry" op count via
+/// `CountingDisk` and swept exactly that many crash points — but
+/// `CountingDisk` and `Sim::crash_disk_after`'s own countdown do not charge
+/// identically for every op kind (`sync_dir` is one gap), so the measured
+/// bound silently undershot the real one and the sweep exited one crash
+/// point before the batch's own sync legitimately completed, so the LAST
+/// point swept still looked durable-free for the wrong reason. Instead:
+/// sweep upward from `crash_after = 0` and stop the FIRST time the batch is
+/// observed to have durably committed in full — that is the actual boundary
+/// "between the first append and the sync", read off the platform's own
+/// behaviour rather than guessed from a second counting mechanism. Sweep
+/// shape otherwise follows `transactions.rs:1416`'s
+/// `breadcrumb_write_is_crash_safe_the_old_checkpoint_stays_protected`.
+#[test]
+fn the_sync_is_atomic_over_the_batch() {
+    fn two_request_batch(source: &mut SimSource) {
+        source.push_at(0, Request::new(Method::Post, "/hit/1"));
+        source.push_at(0, Request::new(Method::Post, "/hit/2"));
+    }
+
+    const MAX_CRASH_POINTS: u64 = 60;
+    let mut observed_full_commit_at: Option<u64> = None;
+
+    for crash_after in 0..MAX_CRASH_POINTS {
+        let sim = Sim::with_faults(0x60C1_0001, FaultConfig::none());
+        let app = App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Hit>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount(hit_routes());
+        let mut source = SimSource::new(Box::new(sim.clock()), SEC);
+        two_request_batch(&mut source);
+        let responses = source.responses();
+        let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+        // Baseline BEFORE the crash countdown starts: every app durably
+        // applies the built-in daily session-expiry sweep's cron entry
+        // inside `Kernel::new` itself (`hit_schema`'s doc), so
+        // `last_applied()` is already `Some(0)`, not `None`, by this point
+        // — the batch under test must leave it EXACTLY where it was (or
+        // advance it by exactly 2, seq 1 and seq 2, if the crash landed
+        // after a legitimate full commit), never partially.
+        let baseline_applied = kernel.app().db().last_applied();
+        sim.crash_disk_after(crash_after);
+        let _ = kernel.step(&mut source);
+
+        let statuses: Vec<u16> = responses
+            .lock()
+            .expect("responses lock poisoned by an earlier panic")
+            .iter()
+            .map(|(status, _)| *status)
+            .collect();
+
+        sim.restart();
+        let db = Db::open(Box::new(sim.disk()), AppConfig::default().db, hit_schema()).unwrap();
+        let after = db.last_applied();
+
+        if after == baseline_applied {
+            // The crash landed before the batch's sync completed: nothing
+            // reached the store, and nothing may have been acked.
+            assert!(
+                statuses.iter().all(|&s| s != 200),
+                "crash_after={crash_after}: a crash before the batch's sync completed must \
+                 never leave a 200 behind: {statuses:?}"
+            );
+        } else {
+            // The crash landed strictly AFTER the sync legitimately
+            // completed — the batch really did commit, in full (never
+            // partially: `after` must be exactly two seqs past the
+            // baseline, both records at once, which is what "the sync is
+            // atomic over the batch" means from the other side). This is
+            // the sweep's natural stopping point.
+            let advanced = match (baseline_applied, after) {
+                (None, Some(a)) => a + 1,
+                (Some(b), Some(a)) => a - b,
+                other => panic!(
+                    "crash_after={crash_after}: last_applied went backwards or \
+                                  disappeared: {other:?}"
+                ),
+            };
+            assert_eq!(
+                advanced, 2,
+                "crash_after={crash_after}: the batch must apply ALL of its records or NONE — \
+                 got an advance of {advanced} from baseline {baseline_applied:?} to {after:?}. \
+                 An advance of 2 is the pass; anything in between is a torn commit. But note \
+                 that {advanced} == 1 most likely means the kernel did NOT batch at all (one \
+                 record per commit), not that a two-record commit tore — check batching before \
+                 hunting an atomicity bug"
+            );
+            observed_full_commit_at = Some(crash_after);
+            break;
+        }
+    }
+
+    let Some(boundary) = observed_full_commit_at else {
+        panic!(
+            "anti-vacuity: the sweep never observed the batch commit within \
+             {MAX_CRASH_POINTS} crash points — widen the bound, or something is preventing \
+             the batch from ever completing"
+        );
+    };
+    assert!(
+        boundary >= 2,
+        "anti-vacuity: a two-record batch must cost at least two disk ops before it can \
+         durably commit, so the boundary must be at crash_after >= 2 — got {boundary}, which \
+         means the sweep covered too few points to be meaningful"
+    );
+}
+
+// ---------------------------------- Step 2: read-your-own-writes (request arm)
+
+/// T8a Step 2 (spec §9.2, task-8-preflight.md C-2): read-your-own-writes
+/// across a batch — the property the whole group overlay exists for. Two
+/// requests against the SAME row in one batch; the second must see the
+/// first's write, so the final count is 2, not 1.
+///
+/// C-2's vacuity trap: "the final value is 2" alone holds on an UNBATCHED
+/// kernel too, since pre-batching each request already committed before the
+/// next one ran. `kernel.stats().requests == 2` after exactly ONE `step()`
+/// call proves the two requests were actually drained into the SAME
+/// batch — the identical guard T7's own M-6 fix had to add to its job-arm
+/// twin (`two_same_row_jobs_in_one_batch_see_each_others_writes`,
+/// `forty_due_jobs_cost_one_fsync`, above).
+#[test]
+fn two_same_row_requests_in_one_batch_see_each_others_writes() {
+    let sim = Sim::with_faults(0x60C1_0002, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Hit>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(hit_routes());
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let mut source = SimSource::new(Box::new(sim.clock()), SEC);
+    source.push_at(0, Request::new(Method::Post, "/hit/1"));
+    source.push_at(0, Request::new(Method::Post, "/hit/1")); // SAME row, same batch
+    let responses = source.responses();
+
+    let step = kernel.step(&mut source).unwrap();
+    assert!(
+        matches!(step, Step::Worked),
+        "the request arm must have been the ready source"
+    );
+    assert_eq!(
+        kernel.stats().requests,
+        2,
+        "both requests must be drained into this ONE step — without this conjunct the row \
+         assertion below is satisfiable by an UNBATCHED kernel too, since pre-batching each \
+         request already committed before the next ran"
+    );
+
+    let statuses: Vec<u16> = responses
+        .lock()
+        .expect("responses lock poisoned by an earlier panic")
+        .iter()
+        .map(|(status, _)| *status)
+        .collect();
+    assert_eq!(statuses, vec![200, 200]);
+
+    let app = kernel.into_app();
+    let snap = app.db().snapshot().unwrap();
+    let hits = snap.scan::<Hit>().unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].count, 2,
+        "the second request must see the first's staged write through the group overlay, not \
+         the pre-batch snapshot (a naive bare-snapshot implementation would leave this at 1)"
+    );
+}
+
+// --------------------------------------------- Step 3: invalidated by what you SAW
+
+/// `checkpoint_every: 1` so the FIRST batch that stages any record runs its
+/// checkpoint inside that same commit — mirrors `kernel.rs`'s
+/// `latch_config` (a different test binary, so this is a deliberate
+/// duplicate, not an import: integration tests share no code, per
+/// `charpente-core/tests/engine.rs`'s module doc).
+fn checkpoint_config() -> AppConfig {
+    AppConfig {
+        db: charpente::DbConfig {
+            checkpoint_every: 1,
+            ..AppConfig::default().db
+        },
+        ..AppConfig::default()
+    }
+}
+
+/// Combines a `TracingDisk`-shaped write trace with a ONE-SHOT store-sync
+/// fault: the FIRST `.sync()` call on the store's own file fails once, then
+/// disarms — transient, unlike `Sim::crash_disk_now`/`crash_disk_after`
+/// (which set a PERMANENT crashed state that only `Sim::restart` clears).
+/// Both halves are load-bearing, in different tests. The FAULT half is what
+/// Step 3(a) and 5b.1's negative-space arm both need: a controlled
+/// checkpoint failure that leaves the process able to keep serving
+/// afterward. The TRACE half is read only by 5b.1's negative-space arm,
+/// where record size is what proves `db.adopted` was folded before the
+/// failure — Step 3(a) passes a trace it never inspects, because its own
+/// oracle is the four response statuses.
+struct FaultyTracingDisk {
+    inner: charpente_sim::SimDisk,
+    trace: DiskTrace,
+    store_path: String,
+    armed: Arc<AtomicBool>,
+    fired: Arc<AtomicU64>,
+}
+
+impl Disk for FaultyTracingDisk {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        let inner = self.inner.open(path)?;
+        Ok(Box::new(FaultyTracingFile {
+            inner,
+            trace: self.trace.clone(),
+            path: path.to_string(),
+            fault: (path == self.store_path).then(|| (self.armed.clone(), self.fired.clone())),
+        }))
+    }
+
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+struct FaultyTracingFile {
+    inner: Box<dyn File>,
+    trace: DiskTrace,
+    path: String,
+    /// `Some` only for the store file — `(armed, fired)`.
+    fault: Option<(Arc<AtomicBool>, Arc<AtomicU64>)>,
+}
+
+impl File for FaultyTracingFile {
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.inner.read_at(offset, out)
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.trace
+            .push(format!("{} write_at {} {}", self.path, offset, data.len()));
+        self.inner.write_at(offset, data)
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.trace.push(format!("{} set_len {len}", self.path));
+        self.inner.set_len(len)
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        if let Some((armed, fired)) = &self.fault
+            && armed.swap(false, Ordering::SeqCst)
+        {
+            fired.fetch_add(1, Ordering::SeqCst);
+            return Err(io::Error::other(
+                "simulated fsync failure — durability of writes since the last successful \
+                 sync is unknown",
+            ));
+        }
+        self.trace.push(format!("{} sync", self.path));
+        self.inner.sync()
+    }
+}
+
+/// T8a Step 3 (spec §9.4, task-8-preflight.md C-5): a failed batch's
+/// participants are invalidated by what they SAW, per
+/// `CommitFailure::invalidates` (`db.rs:2293`) — restated here per the
+/// ruled correction (spec §4 amendment (1)), not the plan's writer-centric
+/// original.
+///
+/// Per RULING 1 (task-8a-brief.md), only the two kernel-REACHABLE arms are
+/// exercised: `applied == n` (checkpoint) and `applied == 0` (append/sync).
+/// The interior `0 < i < n` case has no seam at the kernel layer
+/// (`Store::apply` is a `Durability::None` redb write that never reaches
+/// the `Disk` boundary for a cache-resident store — M2 sub-project 0a's own
+/// measurement) and is already pinned deterministically one layer down by
+/// `submit_all_reports_how_many_applied_before_a_mid_batch_failure`
+/// (`charpente-core/tests/engine.rs:342`, seed `0x60C4_0001`).
+#[test]
+fn a_failed_batchs_participants_are_invalidated_by_what_they_saw() {
+    // (a) checkpoint arm: applied == n — every record reached the store, so
+    // the failure is bookkeeping after the fact and invalidates nobody.
+    {
+        let sim = Sim::with_faults(0x60C1_0003, FaultConfig::none());
+        let cfg = checkpoint_config();
+        let db_cfg = cfg.db.clone();
+        let trace = DiskTrace::default();
+        let armed = Arc::new(AtomicBool::new(false));
+        let fired = Arc::new(AtomicU64::new(0));
+        let disk = FaultyTracingDisk {
+            inner: sim.disk(),
+            trace: trace.clone(),
+            store_path: db_cfg.store_path.clone(),
+            armed: armed.clone(),
+            fired: fired.clone(),
+        };
+        let app = App::open(
+            Box::new(disk),
+            Schema::new().table::<Hit>(),
+            Box::new(sim.entropy()),
+            cfg,
+        )
+        .unwrap()
+        .mount(hit_routes());
+
+        // Arm PAST `Kernel::new`, not merely past `App::open`: every app
+        // gets the built-in daily session-expiry sweep's cron entry with no
+        // opt-in (`app.rs:184-189`), and `Kernel::build` upserts it via its
+        // own solo `db.transact()` — which, under THIS test's
+        // `checkpoint_every: 1`, runs its own checkpoint. Arming before
+        // `Kernel::new` faults that unrelated commit instead of this test's
+        // batch, and — since a checkpoint failure latches the store rather
+        // than merely erroring — leaves every later store operation broken
+        // for a reason this test is not about.
+        let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+        armed.store(true, Ordering::SeqCst);
+
+        let mut source = SimSource::new(Box::new(sim.clock()), SEC);
+        // Arrival order: read, write, read, write.
+        source.push_at(0, Request::new(Method::Get, "/count/1"));
+        source.push_at(0, Request::new(Method::Post, "/hit/1"));
+        source.push_at(0, Request::new(Method::Get, "/count/1"));
+        source.push_at(0, Request::new(Method::Post, "/hit/1"));
+        let responses = source.responses();
+
+        let step = kernel.step(&mut source);
+        assert!(step.is_err(), "the checkpoint's own fsync must fail");
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "the injector must fire exactly once"
+        );
+
+        let statuses: Vec<u16> = responses
+            .lock()
+            .expect("responses lock poisoned by an earlier panic")
+            .iter()
+            .map(|(status, _)| *status)
+            .collect();
+        // This vector-equality IS the batch-membership guard, and it is
+        // load-bearing rather than cosmetic (T8a review M-5): unbatched,
+        // request 1 is acked 200, request 2's `transact` swallows the
+        // checkpoint failure (`db.rs:1441`), the kernel then stops on
+        // poison, and requests 3 and 4 are never answered at all — so the
+        // vector is TWO elements and this fails. Do not "simplify" it to
+        // `statuses.iter().all(|&s| s == 200)`, which two elements satisfy.
+        assert_eq!(
+            statuses,
+            vec![200, 200, 200, 200],
+            "every record reached the store before the checkpoint's fsync failed — the \
+             failure is durability BOOKKEEPING after the fact, and invalidates nobody: \
+             {statuses:?}"
+        );
+
+        // The restart clause (spec §4): "a 500 here may mean committed" —
+        // and here nothing WAS a 500, so pin the stronger, positive half:
+        // after restart, the durable batch is present.
+        sim.restart();
+        let db2 = Db::open(Box::new(sim.disk()), db_cfg, hit_schema()).unwrap();
+        let hits = db2.snapshot().unwrap().scan::<Hit>().unwrap();
+        assert_eq!(hits.len(), 1, "one Hit row, written twice");
+        assert_eq!(
+            hits[0].count, 2,
+            "both write requests' effects must be durable after restart — the checkpoint's \
+             fsync failure never touched the WAL's own durability: got count={}",
+            hits[0].count
+        );
+    }
+
+    // (b) append/sync arm: applied == 0 — nothing reached the store, so
+    // everything at or after the first staged record is invalidated, but a
+    // read that ran strictly ahead of every write keeps its honest answer.
+    {
+        let sim = Sim::with_faults(0x60C1_0003, FaultConfig::none());
+        let app = App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Hit>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount(hit_routes());
+        let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+        let mut source = SimSource::new(Box::new(sim.clock()), SEC);
+        source.push_at(0, Request::new(Method::Get, "/count/1"));
+        source.push_at(0, Request::new(Method::Post, "/hit/1"));
+        source.push_at(0, Request::new(Method::Get, "/count/1"));
+        source.push_at(0, Request::new(Method::Post, "/hit/1"));
+        let responses = source.responses();
+
+        sim.crash_disk_now();
+        let _ = kernel.run(&mut source);
+
+        let statuses: Vec<u16> = responses
+            .lock()
+            .expect("responses lock poisoned by an earlier panic")
+            .iter()
+            .map(|(status, _)| *status)
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![200, 500, 500, 500],
+            "the leading read ran ahead of every staged record and saw only committed state \
+             (its honest 200); everything from the first write onward observed — or was — an \
+             uncommitted write that never applied: {statuses:?}"
+        );
+    }
+}
+
+// -------------------------------------------- Step 5: job-panic mid-batch
+
+/// A job that panics on command instead of writing — the shape T8a Step 5
+/// needs (task-8-preflight.md C-1): three same-instant jobs, one panicking,
+/// so the other two's isolation is provable against real siblings rather
+/// than a solo run.
+#[job]
+struct MaybeBoom {
+    id: u64,
+    boom: bool,
+}
+
+impl MaybeBoom {
+    fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+        if self.boom {
+            panic!("job handler exploded");
+        }
+        let id = Id::<Hit>::from_raw(self.id);
+        let count = tx.get(id)?.map_or(0, |h| h.count) + 1;
+        tx.put(&Hit { id, count });
+        Ok(())
+    }
+}
+
+/// T8a Step 5, REWRITTEN FOR JOB HANDLERS (spec §9.6 as amended 2026-08-12,
+/// task-8-preflight.md C-1 — the headline finding). The plan's original
+/// text asked for ROUTE-handler panic isolation, which does not exist: the
+/// request path has no `catch_unwind`, a panicking route handler STOPS THE
+/// NODE (pinned by `a_panicking_route_handler_stops_the_node_it_is_not_
+/// isolated`, `tests/kernel.rs:193`, seed `0x0DED_0003`), and §9.6 itself
+/// carries an explicit warning against writing this against a route handler
+/// and then "fixing" the resulting red with a `catch_unwind` — that is a
+/// design change disguised as a test repair, and this test does not do it.
+///
+/// What DOES survive, and is genuinely uncovered: job handlers ARE isolated
+/// (`dispatch.rs:194`'s `catch_unwind` sits inside the transaction closure
+/// and converts the panic to `Err(JobError::App(..))`), and nothing before
+/// this task asserted that a panicking job leaves its BATCH SIBLINGS
+/// correct — the only existing coverage
+/// (`panicking_handler_is_absorbed_into_the_retry_path`, `kernel.rs:243`)
+/// drives the one-job wrapper, never a batch.
+///
+/// **Scope: this covers §9.6's SIBLING clause, not its overlay clause.**
+/// §9.6 also says the panicking job "leaves the group overlay clean", and
+/// that clause is NOT assertable here — measured, not assumed (T8a review
+/// M-2). The group overlay is a read view, never a record source, so a leak
+/// is observable only by a sibling that READS the panicking job's row;
+/// reordering the handler to write-then-panic and then mutating
+/// `Group::stage` to merge a failed stage's overlay leaves this test green.
+/// The clause is genuinely discharged one layer down, at the `Group` layer:
+/// `a_staged_transaction_that_fails_leaves_the_group_untouched`
+/// (`charpente-core/tests/group_commit.rs:90`, seed `0x60C0_0006`) covers
+/// the `Err` exit — which is the exit `dispatch.rs`'s `catch_unwind`
+/// actually takes — and `a_panicking_stage_leaves_the_group_clean`
+/// (`:116`, `0x60C0_0004`) covers the unwind exit.
+#[test]
+fn a_panicking_job_leaves_its_batch_siblings_correct() {
+    let sim = Sim::with_faults(0x60C1_0005, FaultConfig::none());
+    let counts = OpCounts::default();
+    let disk = CountingDisk {
+        inner: sim.disk(),
+        counts: counts.clone(),
+    };
+    let mut app = App::open(
+        Box::new(disk),
+        Schema::new().table::<Hit>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![MaybeBoom]);
+    app.db_for_tests()
+        .transact(|tx| {
+            tx.enqueue(MaybeBoom { id: 1, boom: false });
+            tx.enqueue(MaybeBoom { id: 2, boom: true });
+            tx.enqueue(MaybeBoom { id: 3, boom: false });
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+
+    let mut source = SimSource::new(Box::new(sim.clock()), 0);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let before = counts.syncs();
+    let step = kernel.step(&mut source).unwrap();
+    assert!(
+        matches!(step, Step::Worked),
+        "the job arm must have been the ready source"
+    );
+    assert_eq!(
+        counts.syncs() - before,
+        1,
+        "three simultaneously-due jobs, one panicking, must still cost ONE sync — a panic \
+         mid-batch must not fragment the commit"
+    );
+    assert_eq!(
+        kernel.stats().jobs_done,
+        2,
+        "the two non-panicking jobs must both complete in this one step"
+    );
+    assert_eq!(
+        kernel.stats().jobs_retried,
+        1,
+        "the panicking job takes the retry path, not the dead-letter one"
+    );
+
+    let app = kernel.into_app();
+    let snap = app.db().snapshot().unwrap();
+    let hits = snap.scan::<Hit>().unwrap();
+    assert_eq!(
+        hits.len(),
+        2,
+        "both non-panicking jobs' writes must be durable: {} row(s)",
+        hits.len()
+    );
+    assert!(
+        hits.iter().all(|h| h.count == 1),
+        "each surviving job wrote its row exactly once"
+    );
+
+    let jobs = snap.scan::<JobRow>().unwrap();
+    let done = jobs.iter().filter(|j| j.status == JobStatus::Done).count();
+    let pending: Vec<_> = jobs
+        .iter()
+        .filter(|j| j.status == JobStatus::Pending)
+        .collect();
+    assert_eq!(done, 2, "two Done rows, {} of 3 total", jobs.len());
+    assert_eq!(pending.len(), 1, "one Pending row (the retried panic)");
+    assert_eq!(
+        pending[0].attempts, 1,
+        "one attempt charged to the panic, not zero and not more"
+    );
+    assert!(
+        pending[0]
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("handler panicked"),
+        "the retry record must name the panic: {:?}",
+        pending[0].last_error
+    );
+}
+
+// --------------------------------------------- Step 5b.1: group-aware adoption
+
+/// Fires ONCE on the very first `write_at` call made through this disk
+/// (targeting whichever path asks first — in these tests, that is always
+/// the WAL, since nothing else is written yet), then disarms and passes
+/// every later call straight through. Distinct from `Sim::crash_disk_now`/
+/// `crash_disk_after`, which set a PERMANENT crashed state that only
+/// `Sim::restart` clears — this needs to fail exactly one append and then
+/// let the SAME live `Db` keep working, so a retry can run without a
+/// restart in between.
+struct OneShotWalFaultDisk {
+    inner: charpente_sim::SimDisk,
+    armed: Arc<AtomicBool>,
+}
+
+impl Disk for OneShotWalFaultDisk {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        Ok(Box::new(OneShotWalFaultFile {
+            inner: self.inner.open(path)?,
+            armed: self.armed.clone(),
+        }))
+    }
+
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+struct OneShotWalFaultFile {
+    inner: Box<dyn File>,
+    armed: Arc<AtomicBool>,
+}
+
+impl File for OneShotWalFaultFile {
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.inner.read_at(offset, out)
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::other("simulated write failure (injected)"));
+        }
+        self.inner.write_at(offset, data)
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.inner.sync()
+    }
+}
+
+/// The byte counts of the WAL appends the trace recorded after `from`, in
+/// order. Record SIZE is 5b.1's discriminator on both of its halves: the
+/// adoption row rides inside the record itself, so a record carrying one is
+/// strictly larger than the same write without it, while row count cannot
+/// tell them apart (see the headline test's doc).
+fn wal_append_sizes(trace: &DiskTrace, from: usize) -> Vec<usize> {
+    trace.entries()[from..]
+        .iter()
+        .filter(|op| op.starts_with("wal/") && op.contains(" write_at "))
+        .map(|op| {
+            op.rsplit(' ')
+                .next()
+                .expect("write_at trace line always ends in a byte count")
+                .parse()
+                .expect("the trailing token is the byte count")
+        })
+        .collect()
+}
+
+/// T8a Step 5b.1, headline (task-8-preflight.md C-7): two FIRST writes to
+/// the same table in one batch must not each carry their own adoption row.
+///
+/// C-7's corrections: no new versioned fixture is needed — the adoption
+/// filter keys on `FINGERPRINT.is_some()` (`db.rs:2118`), which EVERY
+/// `#[table]` has (`charpente-macros/src/table.rs:125` emits it
+/// unconditionally), not on `version >= 2`; `Hit` already qualifies. And
+/// row COUNT cannot discriminate a working union from a broken one:
+/// `schema_version_id` hashes the TABLE NAME deterministically
+/// (`migration.rs:137`), so a redundant second write would silently
+/// OVERWRITE the same row with byte-identical content — both a correct and
+/// a broken union leave exactly one row. The discriminating signal is the
+/// SECOND record's own size: with the union present it carries only the
+/// Hit write; with it broken it also carries a redundant SchemaVersion
+/// entry, which is strictly larger.
+#[test]
+fn a_batchs_second_first_write_does_not_duplicate_the_adoption_row() {
+    let sim = Sim::with_faults(0x60C1_0006, FaultConfig::none());
+    let trace = DiskTrace::default();
+    let disk = TracingDisk {
+        inner: sim.disk(),
+        trace: trace.clone(),
+    };
+    let app = App::open(
+        Box::new(disk),
+        Schema::new().table::<Hit>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(hit_routes());
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    // Every app gets the built-in daily session-expiry sweep's cron entry
+    // with no opt-in (`app.rs:184-189`), and `Kernel::build` upserts it via
+    // its own solo commit — a WAL append this test's trace would otherwise
+    // count as if it were part of the batch below. Baseline AFTER
+    // `Kernel::new`, not after `App::open`, so that commit is excluded.
+    let before_trace = trace.entries().len();
+    let mut source = SimSource::new(Box::new(sim.clock()), SEC);
+    source.push_at(0, Request::new(Method::Post, "/hit/1")); // first write to Hit
+    source.push_at(0, Request::new(Method::Post, "/hit/2")); // ALSO a first write to Hit
+    let responses = source.responses();
+
+    let step = kernel.step(&mut source).unwrap();
+    assert!(matches!(step, Step::Worked));
+    assert_eq!(
+        kernel.stats().requests,
+        2,
+        "both first-writes must land in ONE batch — the union's second half \
+         (`staged_adoptions`) only matters within a single group"
+    );
+    let statuses: Vec<u16> = responses
+        .lock()
+        .expect("responses lock poisoned by an earlier panic")
+        .iter()
+        .map(|(status, _)| *status)
+        .collect();
+    assert_eq!(statuses, vec![200, 200]);
+
+    let sizes = wal_append_sizes(&trace, before_trace);
+    assert_eq!(
+        sizes.len(),
+        2,
+        "two staged records means two WAL appends: {sizes:?}"
+    );
+    assert!(
+        sizes[1] < sizes[0],
+        "the SECOND first-write to a table already being adopted in this batch must not carry \
+         its own redundant SchemaVersion row — its record should be strictly smaller than the \
+         first (which does carry the adoption): {sizes:?}"
+    );
+
+    let app = kernel.into_app();
+    let snap = app.db().snapshot().unwrap();
+    let sv: Option<SchemaVersion> = snap.get(schema_version_id("Hit")).unwrap();
+    assert!(sv.is_some(), "Hit must be adopted after its first write");
+}
+
+/// T8a Step 5b.1, negative space (task-8-preflight.md C-7d): a commit that
+/// fails at append/sync (`applied == 0`) must leave `db.adopted` untouched;
+/// one that fails at the checkpoint (`applied == n`) must have ALREADY
+/// folded — `Group::commit` folds `staged_adoptions` into `db.adopted`
+/// immediately after `submit_all` succeeds, strictly BEFORE the checkpoint
+/// call (`db.rs:2221` vs `:2233`). Asserting "any commit failure leaves
+/// adopted untouched" is wrong for the checkpoint arm and would provoke a
+/// "fix" that breaks correct behaviour.
+///
+/// **Scope, and the asymmetry between the two arms is REAL, not an
+/// oversight.** `db.adopted` is private and `Group` exposes no accessor for
+/// it (by design — spec §1 has no group-snapshot escape hatch), so neither
+/// arm can read the set directly. What each arm can do differs, and the
+/// difference is structural:
+///
+/// - **Append/sync arm (a): the claim is structurally UNOBSERVABLE.** The
+///   WAL itself poisons, so `submit_all`'s `?` returns before the fold loop
+///   ever runs (`db.rs:2214-2221`) — `db.adopted` is UNREACHABLE on that
+///   path, not merely untouched by luck — and every later `append` refuses
+///   before writing a byte (`engine.rs:308-310`). There is no subsequent
+///   record to measure, on this `Db` or any other, so the arm is pinned by
+///   a source read plus its clean-retry-after-reopen half. A future reader
+///   should not read this as a missing assertion: nothing can be emitted to
+///   assert on.
+/// - **Checkpoint arm (b): the claim IS observable, and is asserted at
+///   runtime below.** Only the STORE latches; the WAL stays healthy. So a
+///   follow-up `transact` on the SAME live `Db` still appends its record
+///   (before failing in apply on the latched store), and that record's size
+///   is the same discriminator the headline test above trusts: if the fold
+///   had not already run, the follow-up would re-emit the table's adoption
+///   row and be strictly LARGER. Observed instead: strictly smaller. This
+///   is a direct runtime observation of the fold, not a source-ordering
+///   argument (T8a review I-1 — the brief's "same live Db" premise is
+///   unbuildable for arm (a) only, and the record owes that correction).
+///
+/// Both arms additionally recover cleanly: a fresh reopen — which always
+/// rebuilds `db.adopted` from the durable `SchemaVersion` rows
+/// (`reload_adopted`, `db.rs:1820`) — lands the row exactly once, with no
+/// permanent brokenness and no double-adoption.
+#[test]
+fn adopted_state_survives_a_commit_failure_correctly_per_arm() {
+    // (a) append/sync arm: nothing reached the store. `db.adopted` is
+    // structurally unreachable on this path (the fold loop never runs);
+    // the kernel poisons and stops, and a fresh reopen must cleanly retry
+    // and land the adoption row it never durably made the first time.
+    {
+        let sim = Sim::with_faults(0x60C1_0006, FaultConfig::none());
+        let armed = Arc::new(AtomicBool::new(false));
+        let disk = OneShotWalFaultDisk {
+            inner: sim.disk(),
+            armed: armed.clone(),
+        };
+        let app = App::open(
+            Box::new(disk),
+            Schema::new().table::<Hit>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount(hit_routes());
+        // Arm PAST `Kernel::new`, not merely past `App::open` — the
+        // built-in cron-sweep upsert (see `hit_schema`'s doc) runs its own
+        // solo WAL append inside `Kernel::new`, and arming any earlier
+        // would fault THAT instead of this test's own write, propagating
+        // an unrelated `Err` straight out of `Kernel::new(...).unwrap()`.
+        let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+        armed.store(true, Ordering::SeqCst);
+
+        let mut source = SimSource::new(Box::new(sim.clock()), SEC);
+        source.push_at(0, Request::new(Method::Post, "/hit/1"));
+        let responses = source.responses();
+        assert!(
+            kernel.step(&mut source).is_err(),
+            "the armed append fault must poison the engine and stop the kernel"
+        );
+        let statuses: Vec<u16> = responses
+            .lock()
+            .expect("responses lock poisoned by an earlier panic")
+            .iter()
+            .map(|(status, _)| *status)
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![500],
+            "the failed write's own request must still be answered: {statuses:?}"
+        );
+
+        // Reopen fresh — the fault already fired once and disarmed, and it
+        // fails BEFORE forwarding to the real disk, so nothing it touched
+        // was ever durably written; this needs no `Sim::restart`, only
+        // fresh objects to clear the in-memory poison, exactly as a real
+        // process restart would (spec §4's "restart the process to
+        // recover from the WAL").
+        let app2 = App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Hit>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount(hit_routes());
+        let mut kernel2 = Kernel::new(app2, Box::new(sim.clock())).unwrap();
+        let mut source2 = SimSource::new(Box::new(sim.clock()), SEC);
+        source2.push_at(0, Request::new(Method::Post, "/hit/1"));
+        let responses2 = source2.responses();
+        let step2 = kernel2.step(&mut source2).unwrap();
+        assert!(matches!(step2, Step::Worked));
+        let statuses2: Vec<u16> = responses2
+            .lock()
+            .expect("responses lock poisoned by an earlier panic")
+            .iter()
+            .map(|(status, _)| *status)
+            .collect();
+        assert_eq!(
+            statuses2,
+            vec![200],
+            "the retry, on a fresh engine, must succeed cleanly: {statuses2:?}"
+        );
+
+        let app2 = kernel2.into_app();
+        let snap = app2.db().snapshot().unwrap();
+        let sv: Option<SchemaVersion> = snap.get(schema_version_id("Hit")).unwrap();
+        assert!(
+            sv.is_some(),
+            "Hit must be adopted once the retry actually reaches the store"
+        );
+    }
+
+    // (b) checkpoint arm: every record reached the store, so the fold
+    // (db.rs:2221, unconditional, strictly BEFORE the checkpoint call at
+    // db.rs:2233) already ran before this failure was even possible. Only
+    // the STORE latches here, so — unlike arm (a) — the fold is observable
+    // at runtime on this very `Db`: the probe below writes once more and
+    // measures the record. The kernel still stops (the latch poisons), so
+    // the clean-recovery half still goes through a fresh reopen.
+    {
+        let sim = Sim::with_faults(0x60C1_0006, FaultConfig::none());
+        let cfg = checkpoint_config();
+        let db_cfg = cfg.db.clone();
+        let trace = DiskTrace::default();
+        let armed = Arc::new(AtomicBool::new(false));
+        let fired = Arc::new(AtomicU64::new(0));
+        let disk = FaultyTracingDisk {
+            inner: sim.disk(),
+            trace: trace.clone(),
+            store_path: db_cfg.store_path.clone(),
+            armed: armed.clone(),
+            fired: fired.clone(),
+        };
+        let app = App::open(
+            Box::new(disk),
+            Schema::new().table::<Hit>(),
+            Box::new(sim.entropy()),
+            cfg,
+        )
+        .unwrap()
+        .mount(hit_routes());
+        // Arm PAST `Kernel::new`, not merely past `App::open` — same
+        // reason as part (a) and Step 3's checkpoint arm: the built-in
+        // cron-sweep upsert runs its own checkpoint under this test's
+        // `checkpoint_every: 1`, and arming any earlier would fault that
+        // instead, latching the store before this test's own write ever
+        // runs.
+        let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+        armed.store(true, Ordering::SeqCst);
+        // Baseline AFTER `Kernel::new` for the same reason the headline
+        // test does it: the built-in cron-sweep upsert's own solo append
+        // would otherwise be counted as this batch's record.
+        let before_trace = trace.entries().len();
+
+        let mut source = SimSource::new(Box::new(sim.clock()), SEC);
+        source.push_at(0, Request::new(Method::Post, "/hit/1"));
+        let responses = source.responses();
+        let step = kernel.step(&mut source);
+        assert!(step.is_err(), "the checkpoint's own fsync must fail");
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        let statuses: Vec<u16> = responses
+            .lock()
+            .expect("responses lock poisoned by an earlier panic")
+            .iter()
+            .map(|(status, _)| *status)
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![200],
+            "the record is durable — the checkpoint failure is bookkeeping after the fact: \
+             {statuses:?}"
+        );
+
+        // The fold, observed at RUNTIME on the same live `Db` (T8a review
+        // I-1). The store is latched but the WAL is not, so this follow-up
+        // transaction still APPENDS its record before failing in apply —
+        // and that record is the measurement. `Hit` was adopted by the
+        // batch above, so a fold that ran means this record carries the Hit
+        // write alone; a fold that had NOT run would re-emit the table's
+        // adoption row here, making the record strictly LARGER.
+        let batch = wal_append_sizes(&trace, before_trace);
+        assert_eq!(
+            batch.len(),
+            1,
+            "one request in the batch means one WAL append: {batch:?}"
+        );
+        let mut app = kernel.into_app();
+        let before_probe = trace.entries().len();
+        let probe = app.db_for_tests().transact(|tx| {
+            // A fresh id, so this is unambiguously a new row and cannot
+            // produce an empty diff (and so no record) by writing back what
+            // was already there.
+            tx.put(&Hit {
+                id: Id::from_raw(9),
+                count: 1,
+            });
+            Ok::<(), std::io::Error>(())
+        });
+        assert!(
+            probe.is_err(),
+            "the store is latched, so the probe's APPLY must fail — its append, which happens \
+             first, is what this measures"
+        );
+        let probe_appends = wal_append_sizes(&trace, before_probe);
+        assert_eq!(
+            probe_appends.len(),
+            1,
+            "the probe appends before it fails: {probe_appends:?}"
+        );
+        assert!(
+            probe_appends[0] < batch[0],
+            "`db.adopted` must ALREADY carry Hit: the fold runs strictly after `submit_all` \
+             succeeds and strictly before the checkpoint call that failed (db.rs:2221 vs \
+             :2233). A follow-up write that re-emitted the adoption row would be strictly \
+             LARGER than the batch's own record, not smaller: probe {probe_appends:?} vs batch \
+             {batch:?}"
+        );
+
+        // Reopen fresh: no fault injector needed any more (it already
+        // fired once, and the store handle it latched is being replaced
+        // outright), and confirm the follow-up write to the same
+        // already-adopted table lands cleanly.
+        let app2 = App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Hit>(),
+            Box::new(sim.entropy()),
+            checkpoint_config(),
+        )
+        .unwrap()
+        .mount(hit_routes());
+        let mut kernel2 = Kernel::new(app2, Box::new(sim.clock())).unwrap();
+        let mut source2 = SimSource::new(Box::new(sim.clock()), SEC);
+        source2.push_at(0, Request::new(Method::Post, "/hit/2"));
+        let responses2 = source2.responses();
+        let step2 = kernel2.step(&mut source2).unwrap();
+        assert!(matches!(step2, Step::Worked));
+        let statuses2: Vec<u16> = responses2
+            .lock()
+            .expect("responses lock poisoned by an earlier panic")
+            .iter()
+            .map(|(status, _)| *status)
+            .collect();
+        assert_eq!(
+            statuses2,
+            vec![200],
+            "the follow-up write must land cleanly: {statuses2:?}"
+        );
+
+        let app2 = kernel2.into_app();
+        let snap = app2.db().snapshot().unwrap();
+        let sv: Option<SchemaVersion> = snap.get(schema_version_id("Hit")).unwrap();
+        assert!(sv.is_some(), "Hit must still be adopted");
+        assert_eq!(
+            snap.scan::<Hit>().unwrap().len(),
+            3,
+            "the checkpoint-arm write (id=1), the probe's row (id=9) and the post-reopen \
+             follow-up (id=2) must all be present. The probe counts BECAUSE its append reached \
+             the WAL and synced before its apply hit the latched store — durable but \
+             unacknowledged, which is exactly spec §4's false-negative contract, and \
+             independent corroboration that the append the size assertion measures really \
+             happened"
+        );
+    }
+}
+
+// --------------------------------- Step 5b.2: enqueues/emits invisible mid-batch
+
+#[event]
+struct Tick {
+    n: u64,
+}
+
+#[job]
+struct QuietJob {}
+
+impl QuietJob {
+    fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+        Ok(())
+    }
+}
+
+#[route(POST "/enqueue")]
+fn enqueue_quiet(tx: &mut Tx) -> Result<(), ApiError> {
+    tx.enqueue(QuietJob {});
+    Ok(())
+}
+
+#[route(GET "/job-count")]
+fn job_count(tx: &mut Tx) -> Result<u64, ApiError> {
+    Ok(tx.scan::<JobRow>()?.len() as u64)
+}
+
+#[route(POST "/emit-tick")]
+fn emit_tick(tx: &mut Tx) -> Result<(), ApiError> {
+    tx.emit(Tick { n: 1 });
+    Ok(())
+}
+
+#[route(GET "/event-count")]
+fn event_count(tx: &mut Tx) -> Result<u64, ApiError> {
+    Ok(tx.scan::<EventRow>()?.len() as u64)
+}
+
+/// T8a Step 5b.2 (task-8-preflight.md C-12): the group overlay carries
+/// ROWS only — enqueues, emits and migrate_puts are not in it — so a
+/// transaction batched behind a sibling's enqueue/emit does not see it,
+/// where pre-batching it would have (each transaction applied before the
+/// next took its snapshot). `JobRow`/`EventRow` materialize at APPLY, from
+/// the log record's enqueue/emit sections, not from anything
+/// `Group::stage` merges into its read overlay.
+///
+/// C-12's correction: the T4-review citation this step originally leaned
+/// on ("every JobRow/EventRow read in production goes through a Snapshot,
+/// never a Tx") is STALE as of T7 — `Dispatcher::run_due_into` reads
+/// `JobRow` through `tx` at `dispatch.rs:179`/`:268`. The conclusion still
+/// holds (those reads touch pre-existing rows; a sibling's fresh enqueue is
+/// not due until `drain_enqueued` runs after the arm, `kernel/mod.rs:602`),
+/// so this property is real and this test — not that stale citation — is
+/// what proves it.
+#[test]
+fn enqueues_and_emits_are_invisible_to_a_later_sibling_in_the_same_batch() {
+    let sim = Sim::with_faults(0x60C1_0007, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![enqueue_quiet, job_count, emit_tick, event_count])
+    .mount_jobs(jobs![QuietJob]);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let mut source = SimSource::new(Box::new(sim.clock()), SEC);
+    source.push_at(0, Request::new(Method::Post, "/enqueue"));
+    source.push_at(0, Request::new(Method::Get, "/job-count"));
+    source.push_at(0, Request::new(Method::Post, "/emit-tick"));
+    source.push_at(0, Request::new(Method::Get, "/event-count"));
+    let responses = source.responses();
+
+    let step = kernel.step(&mut source).unwrap();
+    assert!(matches!(step, Step::Worked));
+    assert_eq!(
+        kernel.stats().requests,
+        4,
+        "all four must land in ONE batch — the invisibility this test pins only exists across \
+         a batch; pre-batching, each transaction applied before the next ran"
+    );
+
+    let bodies: Vec<(u16, String)> = responses
+        .lock()
+        .expect("responses lock poisoned by an earlier panic")
+        .iter()
+        .map(|(status, body)| (*status, String::from_utf8_lossy(body).to_string()))
+        .collect();
+    assert_eq!(bodies[0].0, 200, "the enqueue itself: {bodies:?}");
+    assert_eq!(
+        bodies[1],
+        (200, "0".to_string()),
+        "a sibling's enqueue, staged earlier in this same batch, must be INVISIBLE to a later \
+         transaction's tx: {bodies:?}"
+    );
+    assert_eq!(bodies[2].0, 200, "the emit itself: {bodies:?}");
+    assert_eq!(
+        bodies[3],
+        (200, "0".to_string()),
+        "a sibling's emit, staged earlier in this same batch, must be INVISIBLE the same way: \
+         {bodies:?}"
+    );
+
+    let app = kernel.into_app();
+    let snap = app.db().snapshot().unwrap();
+    assert_eq!(
+        snap.scan::<JobRow>().unwrap().len(),
+        1,
+        "the job DID materialize at apply, once the batch committed"
+    );
+    assert_eq!(
+        snap.scan::<EventRow>().unwrap().len(),
+        1,
+        "the event DID materialize at apply, once the batch committed"
     );
 }
