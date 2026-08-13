@@ -1046,6 +1046,166 @@ fn kernel_stops_on_a_latched_store() {
     );
 }
 
+/// Group-commit T7 fix round, I-2 (Noah ruling 2026-08-13): `Dispatcher::
+/// run_due`'s wrapper must key its commit-failure policy on
+/// `CommitFailure::invalidates` — the same rule `Db::transact` uses
+/// (`db.rs:1438-1445`) — not an unconditional restore. Reuses
+/// `OneShotStoreSyncFaultDisk`/`latch_config` (above) to drive the
+/// CHECKPOINT arm specifically: `applied == n` (the job's Done-mark reached
+/// the store) and the failure is already reported through
+/// `Db::store_failed()`. This is the arm the old code answered wrong.
+#[test]
+fn run_due_answers_ok_when_the_commit_failure_is_a_reported_elsewhere_checkpoint() {
+    let sim = Sim::with_faults(0x60C0_0012, FaultConfig::none());
+    let armed = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicU64::new(0));
+    let reads = Arc::new(AtomicU64::new(0));
+    let mut app = App::open(
+        Box::new(OneShotStoreSyncFaultDisk {
+            inner: sim.disk(),
+            store_path: latch_config().db.store_path.clone(),
+            armed: armed.clone(),
+            fired: fired.clone(),
+            reads: reads.clone(),
+        }),
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        latch_config(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![CountUp]);
+
+    let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+    let db = app.db_for_tests();
+    // Enqueue while UNARMED: this transact's own checkpoint_every: 1 cadence
+    // checkpoint fires and succeeds, resetting records_since_checkpoint to 0
+    // before the fault is armed — the fault must land on run_due's OWN
+    // commit, not this one.
+    db.transact(|tx| {
+        tx.enqueue(CountUp { slot: 1 });
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    dispatcher.note_enqueued(db.drain_enqueued());
+    assert!(dispatcher.has_due(0));
+
+    armed.store(true, Ordering::SeqCst);
+    let outcome = dispatcher.run_due(db, 0);
+
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the injector must fire exactly once — the checkpoint commit failure this test needs"
+    );
+    // RED-FIRST EVIDENCE (fix report, hard rule 3): against the
+    // unconditional-restore code this `unwrap_or_else` panicked with the
+    // commit failure's own io::Error text instead of ever reaching an Ok.
+    let outcome = outcome.unwrap_or_else(|e| {
+        panic!(
+            "run_due must answer Ok for a job whose Done-mark reached the store — the \
+             checkpoint-arm commit failure ({e}) is already reported through \
+             Db::store_failed(), so nothing further should invalidate this job's outcome"
+        )
+    });
+    assert!(
+        matches!(outcome, JobOutcome::Done { id: 0 }),
+        "got {outcome:?}"
+    );
+    assert!(
+        db.store_failed(),
+        "the fault must have actually latched the store, or this test proves nothing"
+    );
+    assert!(
+        !dispatcher.has_due(0),
+        "the job's Done-mark IS durable (checkpoint arm, applied == n) — leaving (due_at, id) \
+         in the heap here is exactly the state Dispatcher::run_due_into's own invariant assert \
+         exists to catch (a Done row the heap still calls Pending)"
+    );
+    let row = &db.snapshot().unwrap().scan::<JobRow>().unwrap()[0];
+    assert_eq!(row.status, JobStatus::Done, "durable in the store");
+}
+
+/// The cron-wrapper twin of the test above: `CronScheduler::tick` must apply
+/// the identical ruled policy. Same mechanism, same checkpoint arm — the
+/// schedule's advanced `next_due` and its enqueue both reached the store, so
+/// rolling `*cached` back to `previous` here would re-tick and re-enqueue the
+/// SAME interval the next time `has_due` is checked.
+///
+/// Seed `0x60C0_0013`: the fix-round brief allocated `0x60C0_0012` for "the
+/// I-2 test" (singular); this covers the SECOND wrapper the same review
+/// flagged (`CronScheduler::tick`, `cron.rs:142-163`) rather than leaving it
+/// unreached, so it mints one more from the same free range (namespace
+/// census re-run before use: `0x60C0_0001`..`0x60C0_0010` plus this task's
+/// own `0x0011`/`0x0012` were the only ones taken).
+#[test]
+fn tick_answers_ok_when_the_commit_failure_is_a_reported_elsewhere_checkpoint() {
+    let sim = Sim::with_faults(0x60C0_0013, FaultConfig::none());
+    let armed = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicU64::new(0));
+    let reads = Arc::new(AtomicU64::new(0));
+    let mut app = App::open(
+        Box::new(OneShotStoreSyncFaultDisk {
+            inner: sim.disk(),
+            store_path: latch_config().db.store_path.clone(),
+            armed: armed.clone(),
+            fired: fired.clone(),
+            reads: reads.clone(),
+        }),
+        Schema::new().table::<Counter>(),
+        Box::new(sim.entropy()),
+        latch_config(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![CountUp])
+    .schedule("hourly-count", Duration::from_secs(3600), || CountUp {
+        slot: 1,
+    });
+
+    let mut cron = CronScheduler::new(app.take_cron_entries_for_tests());
+    let db = app.db_for_tests();
+    // upsert while UNARMED, same reasoning as the job-wrapper test above: its
+    // own checkpoint_every: 1 cadence checkpoint must fire and succeed
+    // before the fault is armed.
+    cron.upsert(db, 0).unwrap();
+    assert!(cron.has_due(HOUR));
+
+    armed.store(true, Ordering::SeqCst);
+    let outcome = cron.tick(db, HOUR);
+
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the injector must fire exactly once — the checkpoint commit failure this test needs"
+    );
+    // RED-FIRST EVIDENCE (fix report, hard rule 3): against the
+    // unconditional-restore code this `unwrap_or_else` panicked with the
+    // commit failure's own io::Error text instead of ever reaching an Ok.
+    let (name, catchup) = outcome.unwrap_or_else(|e| {
+        panic!(
+            "tick must answer Ok for a schedule whose advance reached the store — the \
+             checkpoint-arm commit failure ({e}) is already reported through \
+             Db::store_failed(), so nothing further should invalidate this tick's outcome"
+        )
+    });
+    assert_eq!((name, catchup), ("hourly-count", false));
+    assert!(
+        db.store_failed(),
+        "the fault must have actually latched the store, or this test proves nothing"
+    );
+    assert_eq!(
+        cron.next_deadline(),
+        Some(2 * HOUR),
+        "the schedule's next_due IS durable (checkpoint arm, applied == n) — rolling *cached \
+         back to `previous` here would re-tick and re-enqueue the SAME interval the next time \
+         has_due is checked"
+    );
+    assert_eq!(
+        db.drain_enqueued().len(),
+        1,
+        "the enqueue landed in the same durable batch as the schedule's advance"
+    );
+}
+
 #[test]
 fn loop_serves_requests_runs_jobs_and_ticks_cron() {
     let sim = Sim::with_faults(0x640, FaultConfig::none());

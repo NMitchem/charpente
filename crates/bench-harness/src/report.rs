@@ -68,17 +68,24 @@ pub struct KernelReport {
     // 2026-08-10 group-commit interlude, T1 fix wave, I-4: the device-ratio
     // gate's NUMERATOR, published so `device_ratio` is reconstructable from
     // the artifact (mirrors `CoreReport::syncs_per_sec` — the same standing
-    // ruling applied symmetrically to the numerator). Today equals
-    // `log_records_per_sec` exactly (one commit, one fsync, no batching, two
-    // syncs per request); a group-commit primary path is where the two
-    // diverge.
+    // ruling applied symmetrically to the numerator). Fix round I-1,
+    // correcting this doc's own old claim: it used to say this equals
+    // `log_records_per_sec` exactly ("one commit, one fsync, no batching,
+    // two syncs per request") — false since T6/T7's batching landed. Both
+    // the request arm (T6) and the job arm (T7) now batch (`Group::commit`
+    // -> `Engine::submit_all`), and this is COUNTED at the `Disk` boundary,
+    // never derived from `log_records_per_sec` — the two are no longer the
+    // same number in general.
     pub syncs_per_sec: f64,
     // `syncs_per_sec / max(device_before, device_after)` (2026-08-10
     // group-commit interlude, T1) — the numerator is SYNCS, not the log
-    // record rate; see `kernel_accounting` for why. Today the two are the
-    // same number, one commit, one sync, so this is unchanged in value from
-    // before T1 — `syncs_per_sec` beside it is what lets a reader check that
-    // equality from the artifact itself, rather than take it on faith.
+    // record rate; see `kernel_accounting` for why. Fix round I-1: this used
+    // to say the two are "the same number, one commit, one sync" — that was
+    // true only pre-batching. Both arms batch now, so `syncs_per_sec` is
+    // genuinely counted rather than a copy of `log_records_per_sec`, and
+    // `syncs_per_sec` beside it is what lets a reader check the two AGAINST
+    // each other from the artifact itself (they diverge under batching),
+    // rather than assume they still coincide.
     pub device_ratio: f64,
     // 2026-08-10 interlude §4.2: this layer brackets its own batch window, as
     // core and wire already did. The shipped refusal message used to name the

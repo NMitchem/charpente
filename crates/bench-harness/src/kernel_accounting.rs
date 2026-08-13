@@ -173,20 +173,32 @@ pub fn kernel_accounting(k: &KernelObs) -> Result<KernelAccounting, String> {
     // deliberate: if the job counter ever disagrees, the published number shows
     // it instead of hiding it behind an assumed multiplier.
     let log_records_per_sec = (k.requests_planned + k.stats_jobs_done) as f64 / secs;
-    // T6 review, M-5 / Noah ruling: this layer's physical ceiling. Each
-    // request commits one effects record and its Bump's Done-mark commits
-    // another, and `Engine::submit` performs exactly one `wal.sync()` per
-    // transaction with no group commit — so this layer spends TWO durable
-    // syncs per request, and the rate that consumes them one-for-one is the
-    // LOG RECORD rate, not the ack rate. Hence `log_records_per_sec /
-    // syncs_per_sec`, equivalently `acked_writes_per_sec <= syncs_per_sec / 2`.
-    // Measured headroom on this machine is about 1%, so this is not slack.
+    // T6 review, M-5 / Noah ruling: this layer's physical ceiling —
+    // `syncs_per_sec` (the DURABLE SYNC rate this batch actually paid) cannot
+    // exceed the device's own durable rate, which `device_ratio` gates on
+    // below. `log_records_per_sec` stays published beside it (each request
+    // commits one effects record and its Bump's Done-mark commits another —
+    // 2x by construction, unchanged) because it is the number the physics
+    // claim used to be justified in terms of.
+    //
+    // Fix round I-1 (group-commit T7), correcting this comment's own old
+    // claim: it used to say "Engine::submit performs exactly one wal.sync()
+    // per transaction with no group commit — so this layer spends TWO
+    // durable syncs per request" and derived the gate from that
+    // (`log_records_per_sec / syncs_per_sec`, equivalently
+    // `acked_writes_per_sec <= syncs_per_sec / 2`). Both clauses are false
+    // now: both the request arm (T6) and the job arm (T7) BATCH — the commit
+    // path is `Group::commit` -> `Engine::submit_all`, one sync for however
+    // many records land in a batch, not one sync per record. `k.syncs` is
+    // COUNTED at the `Disk` boundary (`kernel_bench.rs`'s `CountingDisk`),
+    // never derived from `log_records_per_sec` — the gate's actual physics
+    // claim is unchanged; what changed is WHY `syncs_per_sec` is what it is.
     //
     // 2026-08-10 group-commit interlude, T1: the numerator is `k.syncs`, not
-    // `log_records_per_sec` — today they are the same number (one commit,
+    // `log_records_per_sec` — PRE-T6 they were the same number (one commit,
     // one fsync, pinned by
-    // `while_one_commit_costs_one_fsync_the_gate_input_is_unchanged`), and a
-    // future group-commit primary path is where they stop being equal.
+    // `while_one_commit_costs_one_fsync_the_gate_input_is_unchanged`); T6/T7
+    // together are the group-commit primary path where they diverge.
     //
     // T1 fix wave, C-2: mirrors core_accounting's guard. `syncs == 0` on a
     // batch that already cleared the floor above is impossible under any
@@ -208,11 +220,12 @@ pub fn kernel_accounting(k: &KernelObs) -> Result<KernelAccounting, String> {
     if implausible_bracketed_ratio(device_ratio, k.device_before, k.device_after) {
         invalid.push(format!(
             "INVALID: device_ratio {device_ratio:.3} exceeds 1.0 by more than this window's \
-             own measurement error ({:.1}%) — this layer spends two durable syncs per request \
-             (the request's own effects record and its Bump's Done-mark), and Engine::submit \
-             performs exactly one wal.sync() per transaction with no group commit, so \
-             {syncs_per_sec:.2} durable syncs/s ({log_records_per_sec:.2} log records/s) \
-             cannot exceed the device's own durable rate. The denominator is this batch's own \
+             own measurement error ({:.1}%) — this layer's syncs are counted directly at the \
+             Disk boundary, not derived (both the request arm and the job arm batch under \
+             Group::commit -> Engine::submit_all, so a batch pays however many syncs its own \
+             commits actually took, not one per record), so {syncs_per_sec:.2} durable syncs/s \
+             ({log_records_per_sec:.2} log records/s) cannot exceed the device's own durable \
+             rate. The denominator is this batch's own \
              bracket max ({ceiling:.2}) from the samples either side of the window ({:.2} \
              before / {:.2} after); the tolerance is the wider of those two disagreeing \
              ({:.1}%) and the {:.1}% floor for drift a bracket cannot see",
@@ -548,8 +561,14 @@ mod tests {
         assert!(a.invalid.is_empty(), "{:?}", a.invalid);
     }
 
-    /// T6 review, M-5 / Noah ruling: two durable syncs per request, so the
-    /// LOG RECORD rate is what the device ceiling bounds one-for-one.
+    /// T6 review, M-5 / Noah ruling: the SYNC rate is what the device
+    /// ceiling bounds one-for-one — `healthy()`'s fixture below is tuned so
+    /// `syncs_per_sec == log_records_per_sec` (the pre-batching shape, still
+    /// pinned by `while_one_commit_costs_one_fsync_the_gate_input_is_unchanged`),
+    /// which is why this test's own name still speaks of the LOG RECORD
+    /// rate: it is checking the SAME number under that fixture, not
+    /// asserting the old "two syncs per request" premise (fix round I-1
+    /// corrected that premise; see `kernel_accounting`'s own comment).
     #[test]
     fn a_log_rate_above_the_device_ceiling_is_flagged_and_at_the_ceiling_is_not() {
         let mut o = healthy();
@@ -578,7 +597,10 @@ mod tests {
             a.invalid
         );
         assert!(
-            a.invalid[0].contains("two durable syncs per request"),
+            // Fix round I-1: the string this pinned was falsified by
+            // batching (T6/T7) and corrected — this now pins the CURRENT
+            // physics claim (syncs are counted, not derived) instead.
+            a.invalid[0].contains("counted directly at the Disk boundary"),
             "must state this layer's physics: {:?}",
             a.invalid
         );

@@ -26,8 +26,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use charpente::http::{ApiError, App, AppConfig, Handled, Method, Request};
-use charpente::kernel::{EventSink, Kernel, Reply, RequestSource, Respond, SimSource, Wake};
-use charpente::{Schema, Tx, route, routes, table};
+use charpente::kernel::{
+    EventSink, JobError, Kernel, Reply, RequestSource, Respond, SimSource, Step, Wake,
+};
+use charpente::{Schema, Tx, job, jobs, route, routes, table};
 use charpente_core::io::{Disk, File, Instant};
 use charpente_core::table::{Id, View};
 use charpente_sim::{FaultConfig, Sim};
@@ -733,5 +735,183 @@ fn a_read_batched_behind_a_failed_write_is_not_acked_with_its_data() {
         statuses.iter().all(|&s| s == 500),
         "nothing reached the store, so the read saw only the failed write's \
          overlay and cannot be acked: {statuses:?}"
+    );
+}
+
+// -------------------------------------------------------------- job arm
+
+/// A no-op job: its handler writes nothing, so its ONLY effect is its own
+/// Done-mark — one record per job, deterministically, which is what makes
+/// `syncs_in_job_arm == 1` a meaningful assertion below (T7 pre-flight §11).
+#[job]
+struct NoOp {}
+
+impl NoOp {
+    fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+        Ok(())
+    }
+}
+
+/// `n` due jobs, drained by a single `Kernel::step` call, plus however many
+/// WAL syncs that cost.
+struct JobBatchTrace {
+    syncs_in_job_arm: u64,
+    jobs_done: u64,
+}
+
+/// T7 Step 1's rig (pre-flight §10): a job becomes due the moment its
+/// `JobRow` exists, and `Kernel::build` deliberately discards the drain
+/// buffer left over from pre-construction enqueues (`kernel/mod.rs`'s
+/// seed-0x650 comment) — so enqueuing all `n` jobs in ONE transaction before
+/// `Kernel::new` is the one shape that reliably puts all of them in the heap
+/// at once, with no race against construction order.
+///
+/// Drives exactly one `Kernel::step` — NOT `Kernel::run` — deliberately (T7
+/// pre-flight §9): `run`'s clean-shutdown path unconditionally checkpoints
+/// the STORE before returning, which would add its own syncs on top of the
+/// job arm's and defeat a raw total (App::open's own startup syncs are
+/// excluded the same way T5's fixture capture excludes them, by measuring
+/// only after construction). A single `step()` call touches disk ONLY
+/// inside the one `Ready` arm it services, so plain unscoped `OpCounts` IS
+/// the job arm's own sync count here — no WAL-path filtering required, and
+/// this reuses T5's `CountingDisk` unchanged rather than starting a fourth
+/// wrapper family.
+fn run_universe_with_due_jobs(seed: u64, n: u64) -> JobBatchTrace {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let counts = OpCounts::default();
+    let disk = CountingDisk {
+        inner: sim.disk(),
+        counts: counts.clone(),
+    };
+    let mut app = App::open(
+        Box::new(disk),
+        Schema::new().table::<Hit>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![NoOp]);
+    app.db_for_tests()
+        .transact(|tx| {
+            for _ in 0..n {
+                tx.enqueue(NoOp {});
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+
+    let mut source = SimSource::new(Box::new(sim.clock()), 0);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let before = counts.syncs();
+    let step = kernel.step(&mut source).unwrap();
+    assert!(
+        matches!(step, Step::Worked),
+        "the job arm must have been the ready source — a degenerate step \
+         would satisfy the assertions below vacuously"
+    );
+    JobBatchTrace {
+        syncs_in_job_arm: counts.syncs() - before,
+        jobs_done: kernel.stats().jobs_done,
+    }
+}
+
+/// The headline job-arm property (T7 Step 1): 40 simultaneously-due jobs
+/// must drain as one batch under one fsync, exactly as the request arm does
+/// (T6) — the canonical transaction's SECOND record (the job's Done-mark) is
+/// what T7 amortizes; T6 alone only amortized the first.
+#[test]
+fn forty_due_jobs_cost_one_fsync() {
+    let g = run_universe_with_due_jobs(0x60C0_000D, 40);
+    assert_eq!(
+        g.syncs_in_job_arm, 1,
+        "40 due jobs must drain as one batch; got {} syncs",
+        g.syncs_in_job_arm
+    );
+    assert_eq!(
+        g.jobs_done, 40,
+        // Fix round M-6: this is the DISCRIMINATING conjunct, not a sanity
+        // check — without it, `syncs_in_job_arm == 1` alone is satisfiable
+        // by a degenerate step that ran only ONE of the 40 due jobs (a
+        // single-job commit also costs exactly one sync).
+        "all 40 due jobs must have run in this one step, not merely one job under one sync"
+    );
+}
+
+/// A job that reads its own row's `count`, increments it, and writes it back
+/// — a read-modify-write, so two of these against the SAME row in one batch
+/// is the twin that discriminates a working group overlay from a bare
+/// snapshot (T7 Step 3b, C-6).
+#[job]
+struct BumpHit {
+    id: u64,
+}
+
+impl BumpHit {
+    fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+        let id = Id::<Hit>::from_raw(self.id);
+        let count = tx.get(id)?.map_or(0, |h| h.count) + 1;
+        tx.put(&Hit { id, count });
+        Ok(())
+    }
+}
+
+/// Group-commit T7, C-6: the group overlay's read-your-own-writes property,
+/// exercised for the JOB arm (T8 owns the request-arm twin). Two jobs
+/// read-modify-write the SAME row, both due at once, so both land in one
+/// `Kernel::step` batch. If the group overlay were absent or wrong, both
+/// would read the pre-batch value and both would write `count = 1` — the
+/// oracle here is a per-job REVIEW of what the store actually holds
+/// afterward, not a proxy.
+///
+/// `due_jobs_are_not_starved_by_a_request_flood` (`tests/kernel.rs`) cannot
+/// substitute: every job in it writes a distinct slot, so no two jobs in a
+/// batch ever touch the same row (T7 pre-flight C-6).
+#[test]
+fn two_same_row_jobs_in_one_batch_see_each_others_writes() {
+    let sim = Sim::with_faults(0x60C0_000E, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Hit>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![BumpHit]);
+    app.db_for_tests()
+        .transact(|tx| {
+            tx.enqueue(BumpHit { id: 1 });
+            tx.enqueue(BumpHit { id: 1 }); // same row, same batch
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+
+    let mut source = SimSource::new(Box::new(sim.clock()), 0);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let step = kernel.step(&mut source).unwrap();
+    assert!(
+        matches!(step, Step::Worked),
+        "the job arm must have been the ready source"
+    );
+    assert_eq!(
+        kernel.stats().jobs_done,
+        2,
+        "both same-instant jobs must drain in this one step — a kernel that \
+         still services one job per step is the pre-T7 shape and this \
+         assertion is meant to catch exactly that"
+    );
+    let app = kernel.into_app();
+    let snap = app.db().snapshot().unwrap();
+    let hits = snap.scan::<Hit>().unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "both jobs touch the same row, got {} rows",
+        hits.len()
+    );
+    assert_eq!(
+        hits[0].count, 2,
+        "both same-row jobs in one batch must see each other's staged \
+         write through the group overlay, not the pre-batch snapshot \
+         (a broken overlay would leave this at 1)"
     );
 }

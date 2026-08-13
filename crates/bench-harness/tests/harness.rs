@@ -303,7 +303,19 @@ fn a_below_floor_core_write_window_is_refused() {
 #[test]
 #[ignore]
 fn kernel_layer_drains_the_batch_with_every_job_done() {
-    const REQUESTS: u64 = 500;
+    // Raised from 500 (group-commit T7): the job arm now batches too, same
+    // as the request arm did from T6, so 500 requests no longer clear
+    // MIN_MEASURED_WINDOW's 1s floor (they drained in ~140ms on the box
+    // this was found on) — the identical shape as kernel_bench.rs's own
+    // sentinel test, which needed the same bump for the same reason.
+    //
+    // Fix round M-8: 500 -> 5_000 measured only ~1.4s against the 1s floor
+    // (~40% margin) on the box that found it, and this sub-project exists to
+    // make that margin SMALLER over time, not stay thin — see
+    // `kernel_bench.rs`'s identical sentinel test for the full accounting.
+    // 20_000 (~4x) trades a few extra seconds of `--ignored` test time for
+    // real headroom.
+    const REQUESTS: u64 = 20_000;
     let base = scratch("kernel");
     let kernel_dir = format!("{base}/kernel");
     std::fs::create_dir_all(&kernel_dir).expect("kernel subdir");
@@ -313,9 +325,14 @@ fn kernel_layer_drains_the_batch_with_every_job_done() {
     // batch's own window, so the separate probe that used to stand in for it
     // is gone.
     let (k, invalid) = bench_harness::kernel_bench::run(&kernel_dir, REQUESTS).expect(
-        "kernel layer runs — a refusal here naming the minimum measured window means this \
-         batch drained in under a second, i.e. the store is not on a device doing real \
-         durable syncs (RAM-backed filesystem?), which is the C-1 floor working",
+        // Fix round M-10 (same defect class as kernel_bench.rs's identical
+        // site, extended here since it sits right beside this same edit):
+        // under batching, an ordinary device is now the LIKELY reason a
+        // refusal names the floor, not a RAM-backed filesystem.
+        "kernel layer runs — a refusal here naming the minimum measured window most likely \
+         means this device is simply fast enough to drain this batch in under a second now \
+         that both arms batch (which is the C-1 floor working); less likely, it means the \
+         store is not on a device doing real durable syncs at all (RAM-backed filesystem?)",
     );
     let _ = std::fs::remove_dir_all(&base);
     // Same shape as the core smoke above: the ratio gate is DESIGNED to fire

@@ -439,16 +439,130 @@ impl Kernel {
                     }));
                 }
             }
-            Ready::Job => match self.dispatcher.run_due(self.app.db_mut(), now)? {
-                JobOutcome::Done { .. } => self.stats.jobs_done += 1,
-                JobOutcome::Retried { .. } => self.stats.jobs_retried += 1,
-                JobOutcome::Dead { .. } => self.stats.jobs_dead += 1,
-            },
+            Ready::Job => {
+                // Drain into ONE group, commit once (spec §1) — the same
+                // shape as the request arm, adapted for the one thing that
+                // differs: `run_due_into` is fallible PER ITEM (a platform
+                // read fault mid-handler, which `ReadFaults` in
+                // tests/kernel.rs drives under the fault matrix), where the
+                // request arm's `stage_or_subscribe` never returns a bare
+                // `Result`. A `?` straight through this loop would return
+                // from `step` with `group` still alive and non-empty —
+                // `Group::Drop` panics on exactly that, and the panic names
+                // none of `checks::classify`'s needles, so every injected
+                // fault in a multi-job batch would report as a real bug
+                // (group-commit T7, C-1). Fixed by commit-then-bubble: drain
+                // in an inner closure, commit UNCONDITIONALLY once it
+                // returns — whether or not it errored — and combine the two
+                // results, the commit's own failure winning (it is the one
+                // that says whether anything reached the store). The Cron
+                // arm below has the identical shape for the identical
+                // reason.
+                //
+                // Bounded by JOBS RUN, not by records staged: a job
+                // contributes at most one record but calls `stage` up to
+                // TWICE (its own attempt, then a separate failure-record
+                // transaction on an App rejection — see
+                // `Dispatcher::run_due_into`'s doc). Counting jobs run still
+                // bounds records at MAX_BATCH (each job nets ≤ 1 record),
+                // the same guarantee the request arm's poll-count bound
+                // gives by a different argument — this is NOT a repeat of
+                // that reasoning and is written down so the next reader
+                // does not assume it is.
+                let mut group = self.app.db_mut().begin_group()?;
+                let mut drained = 0usize;
+                let drain = (|| -> io::Result<()> {
+                    while self.dispatcher.has_due(now) && drained < MAX_BATCH {
+                        match self.dispatcher.run_due_into(&mut group, now)? {
+                            // Stats increment as jobs are STAGED, before the
+                            // batch commits (accepted, T7 pre-flight §3): if
+                            // the commit below then fails, these counters
+                            // claim N done against 0 (or an uncertain number)
+                            // durable — and the DUE-HEAP is left stale the
+                            // same way, and it is the more consequential of
+                            // the two (fix round M-3): a job this loop's
+                            // `run_due_into` removed as Done never comes
+                            // back, and a `Retried` job's speculative NEW
+                            // `due_at` stays in the heap too. Both are safe
+                            // only because this arm returns `Err` on ANY
+                            // commit failure below (deliberately NOT the
+                            // wrapper's finer `invalidates` policy — see the
+                            // comment on that `match` for why), so the
+                            // kernel stops right after, and a restart rebuilds
+                            // the heap from the store (the only truth) at
+                            // `Kernel::build`. `KernelStats`/`Kernel::stats()`
+                            // and `Kernel::step()` are both `pub`, so nothing
+                            // in the type system stops an external caller
+                            // from reading these counters after a `step()`
+                            // error (unlike, say, a private field) — so this
+                            // is not "nothing reads it", it is "nothing reads
+                            // it before a restart resets it", which is what
+                            // stopping the kernel guarantees.
+                            JobOutcome::Done { .. } => self.stats.jobs_done += 1,
+                            JobOutcome::Retried { .. } => self.stats.jobs_retried += 1,
+                            JobOutcome::Dead { .. } => self.stats.jobs_dead += 1,
+                        }
+                        drained += 1;
+                    }
+                    Ok(())
+                })();
+                match (drain, group.commit()) {
+                    (Ok(()), Ok(())) => {}
+                    // Fix round I-2: deliberately does NOT apply
+                    // `CommitFailure::invalidates` the way `Db::transact` and
+                    // the one-job/one-schedule wrappers now do (dispatch.rs's
+                    // `run_due`, cron.rs's `tick`). ANY commit failure here
+                    // stops the kernel outright — consistent with M2
+                    // sub-project 0a's "stop on the latch" ruling, and it
+                    // strictly reduces the window the wrappers' finer answer
+                    // exists to narrow (a checkpoint-arm failure here would
+                    // otherwise leave `self.stats`/the due-heap stale, per
+                    // the comment above, until the very next commit failed
+                    // anyway — pre-T7 behaviour). Reviewed and accepted (T7
+                    // fix round I-2), not an oversight; the Cron arm below
+                    // answers the identical way for the identical reason.
+                    (Ok(()), Err(failure)) => return Err(failure.error),
+                    (Err(e), Ok(())) => return Err(e),
+                    (Err(_), Err(failure)) => return Err(failure.error),
+                }
+            }
             Ready::Cron => {
-                let (_, catchup) = self.cron.tick(self.app.db_mut(), now)?;
-                self.stats.cron_ticks += 1;
-                if catchup {
-                    self.stats.cron_catchups += 1;
+                // Identical shape to the Job arm above, for the identical
+                // reason (`CronScheduler::tick_into`'s `io::Result` is the
+                // same fallible-per-item hazard C-1 names). Ruled (Noah,
+                // 2026-08-12): drain it for uniformity, not throughput — the
+                // EXPECTED WIN HERE IS ZERO. `tick_into` services one entry
+                // per call and pushes its `next_due` past `now`, so the max
+                // cron batch is `entries.len()`, ~2 in practice (the app's
+                // own schedule plus the platform's built-in daily session
+                // sweep), and the two phases drift apart at nanosecond
+                // resolution and essentially never co-occur. Leaving one arm
+                // on `db.transact` while the other two stage is the
+                // asymmetry someone "cleans up" later not knowing it was
+                // deliberate — do not measure this arm and report a
+                // disappointing number as a regression.
+                let mut group = self.app.db_mut().begin_group()?;
+                let mut drained = 0usize;
+                let drain = (|| -> io::Result<()> {
+                    while self.cron.has_due(now) && drained < MAX_BATCH {
+                        let (_, catchup) = self.cron.tick_into(&mut group, now)?;
+                        self.stats.cron_ticks += 1;
+                        if catchup {
+                            self.stats.cron_catchups += 1;
+                        }
+                        drained += 1;
+                    }
+                    Ok(())
+                })();
+                match (drain, group.commit()) {
+                    (Ok(()), Ok(())) => {}
+                    // Fix round I-2: same deliberate divergence from
+                    // `CommitFailure::invalidates` as the Job arm above, for
+                    // the identical reason — see that arm's comment. ANY
+                    // commit failure here stops the kernel.
+                    (Ok(()), Err(failure)) => return Err(failure.error),
+                    (Err(e), Ok(())) => return Err(e),
+                    (Err(_), Err(failure)) => return Err(failure.error),
                 }
             }
             Ready::Repl => {

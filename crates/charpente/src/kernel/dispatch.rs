@@ -5,7 +5,7 @@ use std::fmt;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use charpente_core::db::{Db, Tx, TxError};
+use charpente_core::db::{Db, Group, Tx, TxError};
 use charpente_core::job::{JobRow, JobStatus, RetryPolicy};
 use charpente_core::table::{Id, Snapshot, View};
 
@@ -137,12 +137,36 @@ impl Dispatcher {
         self.next_deadline().is_some_and(|d| d <= now)
     }
 
-    /// Runs the earliest due job. `Ok(outcome)` covers handler success and
-    /// handler failure (retry/dead — both are committed records); `Err` is a
-    /// PLATFORM failure (`TxError::Io`, or an `Io` the handler's own reads
-    /// surfaced): the job stays Pending in the store, the heap entry is
-    /// restored, and the caller decides (restart).
-    pub fn run_due(&mut self, db: &mut Db, now: u64) -> io::Result<JobOutcome> {
+    /// Runs the earliest due job by STAGING it into `group` instead of
+    /// committing on its own (group-commit T7, C-2) — the shared half of
+    /// `run_due`'s one-job wrapper and the kernel's batched job-arm drain.
+    /// `Ok(outcome)` covers handler success and handler failure (retry/dead
+    /// — both are now STAGED records, not yet durable); `Err` is a PLATFORM
+    /// failure (`TxError::Io`, or an `Io` the handler's own reads surfaced):
+    /// the heap entry is restored to its ORIGINAL `(due_at, id)` before
+    /// returning, and the job stays Pending in the store either way, since
+    /// nothing this call staged has been committed.
+    ///
+    /// **Contract for a caller sharing `group` across several jobs** (the
+    /// kernel's batched drain): an `Err` return here does NOT mean `group`
+    /// is empty — an earlier job in the same batch may already have staged
+    /// a record. The caller owns `group.commit()` and must run it whether
+    /// or not this returns `Err` — `Group`'s only non-panicking exit is
+    /// `commit()`, and dropping a non-empty one panics by contract (C-1).
+    ///
+    /// **One job calls `group.stage` up to TWICE, but nets at most ONE
+    /// record** (fix round M-4, cross-referenced from `kernel/mod.rs`'s
+    /// batched job arm, which bounds `MAX_BATCH` on jobs run rather than
+    /// records staged and needs this argument, not the request arm's
+    /// poll-count one, to justify it). On an App-level rejection the FIRST
+    /// stage (the handler attempt) nets ZERO records — `f`'s `Err` propagates
+    /// out of `Group::stage` via `?` before it ever touches `self.records` —
+    /// and only the SECOND stage (the failure-record write below) nets one.
+    /// On success there is only the one stage. Either way `stage`'s own
+    /// assert (`records.len() < MAX_BATCH`, checked BEFORE `f` runs) sees at
+    /// most `MAX_BATCH - 1` when a job's second stage runs, so a batch of
+    /// `MAX_BATCH` jobs can never push `group.len()` past `MAX_BATCH`.
+    pub fn run_due_into(&mut self, group: &mut Group, now: u64) -> io::Result<JobOutcome> {
         let &(due_at, id) = self.due.first().expect("run_due called with an empty heap");
         assert!(
             due_at <= now,
@@ -151,7 +175,7 @@ impl Dispatcher {
         self.due.remove(&(due_at, id));
 
         let defs = &self.defs;
-        let attempt = db.transact(|tx| {
+        let attempt = group.stage(|tx| {
             let mut row = tx
                 .get(Id::<JobRow>::from_raw(id))?
                 .unwrap_or_else(|| panic!("dispatcher invariant: due job {id} has no row"));
@@ -222,65 +246,67 @@ impl Dispatcher {
                 ))
             }
             Err(TxError::App(JobError::App(err))) => {
-                // Every fallible step below (the policy re-read, the
-                // failure-record transact) is run through this closure so
-                // that ANY Err exit — not just the sibling Io arm's — still
-                // restores the heap entry: run_due's contract is that a
+                // Every fallible step below (the policy read, the
+                // failure-record stage) is run through this closure so that
+                // ANY Err exit — not just the sibling Io arm's — still
+                // restores the heap entry: run_due_into's contract is that a
                 // Pending job is always in the heap on return.
-                let mut record = || -> io::Result<JobOutcome> {
-                    let retry = self
-                        .defs
-                        .get(
-                            db.snapshot()?
-                                .get(Id::<JobRow>::from_raw(id))?
-                                .expect("row existed a moment ago")
-                                .name
-                                .as_str(),
-                        )
+                //
+                // The retry-policy lookup is folded into the SAME stage as
+                // the failure record (group-commit T7, C-2), rather than a
+                // separate `db.snapshot()` re-read the way this used to
+                // work: `Group` deliberately exposes no snapshot accessor
+                // (spec §1 has no group-snapshot escape hatch), and reading
+                // `row.name` through `tx` here is strictly MORE correct
+                // anyway — `tx` sees this batch's own earlier writes through
+                // the group overlay, where a bare snapshot would not. This
+                // also deletes one of the two `expect("row existed a moment
+                // ago")` sites the old shape needed.
+                let defs = &self.defs;
+                let staged = group.stage(|tx| {
+                    let mut row = tx
+                        .get(Id::<JobRow>::from_raw(id))?
+                        .expect("row existed a moment ago");
+                    let retry = defs
+                        .get(row.name.as_str())
                         .map_or(RetryPolicy::DEFAULT, |d| d.retry);
-                    db.transact(|tx| {
-                        let mut row = tx
-                            .get(Id::<JobRow>::from_raw(id))?
-                            .expect("row existed a moment ago");
-                        row.attempts += 1;
-                        row.last_error = Some(err.clone());
-                        let outcome = if row.attempts >= retry.max {
-                            row.status = JobStatus::Dead;
-                            JobOutcome::Dead {
-                                id,
-                                attempts: row.attempts,
-                            }
-                        } else {
-                            row.due_at = now.saturating_add(retry.backoff_nanos(row.attempts));
-                            JobOutcome::Retried {
-                                id,
-                                attempts: row.attempts,
-                                due_at: row.due_at,
-                            }
-                        };
-                        tx.put(&row);
-                        Ok::<_, io::Error>(outcome)
-                    })
-                    .map_err(|e| match e {
-                        TxError::Io(e) | TxError::App(e) => e,
-                        TxError::NotPrimary { .. } => io::Error::other(
-                            "BUG: a job/cron transaction hit NotPrimary — the kernel must not \
-                             run dispatch or cron on a follower (DESIGN §5)",
-                        ),
-                        TxError::Verifying { .. } => io::Error::other(
-                            "BUG: a job/cron transaction hit Verifying — the kernel must not \
-                             run dispatch or cron on a node whose witness gate is still shut \
-                             (M2 sub-project 0b). The guard that makes this unreachable is \
-                             writes_allowed(): Kernel::build's cron.upsert, the \
-                             Ready::Job/Ready::Cron pushes, and Kernel::run's migrate_schema \
-                             all check it, and after_repl_step re-runs the skipped work when \
-                             the gate opens. Reaching here means one of those checks was \
-                             weakened back to a role test — a verifying node is a \
-                             Role::Primary, so is_primary() does not cover it",
-                        ),
-                    })
-                };
-                match record() {
+                    row.attempts += 1;
+                    row.last_error = Some(err.clone());
+                    let outcome = if row.attempts >= retry.max {
+                        row.status = JobStatus::Dead;
+                        JobOutcome::Dead {
+                            id,
+                            attempts: row.attempts,
+                        }
+                    } else {
+                        row.due_at = now.saturating_add(retry.backoff_nanos(row.attempts));
+                        JobOutcome::Retried {
+                            id,
+                            attempts: row.attempts,
+                            due_at: row.due_at,
+                        }
+                    };
+                    tx.put(&row);
+                    Ok::<_, io::Error>(outcome)
+                });
+                match staged.map_err(|e| match e {
+                    TxError::Io(e) | TxError::App(e) => e,
+                    TxError::NotPrimary { .. } => io::Error::other(
+                        "BUG: a job/cron transaction hit NotPrimary — the kernel must not \
+                         run dispatch or cron on a follower (DESIGN §5)",
+                    ),
+                    TxError::Verifying { .. } => io::Error::other(
+                        "BUG: a job/cron transaction hit Verifying — the kernel must not \
+                         run dispatch or cron on a node whose witness gate is still shut \
+                         (M2 sub-project 0b). The guard that makes this unreachable is \
+                         writes_allowed(): Kernel::build's cron.upsert, the \
+                         Ready::Job/Ready::Cron pushes, and Kernel::run's migrate_schema \
+                         all check it, and after_repl_step re-runs the skipped work when \
+                         the gate opens. Reaching here means one of those checks was \
+                         weakened back to a role test — a verifying node is a \
+                         Role::Primary, so is_primary() does not cover it",
+                    ),
+                }) {
                     Ok(outcome) => {
                         if let JobOutcome::Retried { due_at, .. } = outcome {
                             self.due.insert((due_at, id));
@@ -293,6 +319,72 @@ impl Dispatcher {
                     }
                 }
             }
+        }
+    }
+
+    /// The one-job wrapper (group-commit T7, C-2; fix round I-2):
+    /// `begin_group`, one `run_due_into`, then `commit` — the shape every
+    /// existing direct caller of `run_due` (ten call sites across
+    /// `tests/kernel.rs`) keeps compiling against unchanged. The kernel's
+    /// own batched job arm calls `run_due_into` directly against a group it
+    /// drains many jobs into instead.
+    ///
+    /// **On a commit failure, this now applies `Db::transact`'s ruled policy
+    /// exactly** (`CommitFailure::invalidates`, db.rs:1438-1445/2256-2299 —
+    /// the ONE rule, so the single-transaction path, this wrapper and
+    /// `CronScheduler::tick`'s wrapper cannot answer the same question
+    /// differently). A fresh group used by no one else means
+    /// `records_before` is always `0`, so `invalidates(0, staged)` is the
+    /// whole question. Under the checkpoint arm (`applied == n`, already
+    /// reported through `poisoned()`/`store_failed()`) the job's outcome IS
+    /// durable: this returns `Ok(outcome)` and leaves the heap alone —
+    /// re-inserting `(due_at, id)` would put the heap at Pending while the
+    /// store says `Done`, exactly the state `run_due_into`'s own invariant
+    /// assert exists to catch. On every OTHER commit failure (an
+    /// append/sync failure, or a checkpoint failure nothing else reports),
+    /// nothing this call staged is trustworthy: the heap bookkeeping
+    /// `run_due_into` already did on the assumption commit would succeed is
+    /// undone — a `Retried` outcome's speculative NEW `due_at` entry is
+    /// removed first — and the heap is restored to the ORIGINAL `(due_at,
+    /// id)`, mirroring the `Io` arm above, one level up.
+    pub fn run_due(&mut self, db: &mut Db, now: u64) -> io::Result<JobOutcome> {
+        let &(due_at, id) = self.due.first().expect("run_due called with an empty heap");
+        let mut group = db.begin_group()?;
+        let result = self.run_due_into(&mut group, now);
+        // Sampled BEFORE commit (which `mem::take`s the group's records):
+        // `run_due_into`'s Ok arm always stages exactly one record (the
+        // Done/Retried/Dead write), so `staged` is true whenever `result` is
+        // `Ok` — but read from the group itself rather than from `result`,
+        // so this stays correct if that ever changes.
+        let staged = !group.is_empty();
+        // Nothing is durable until commit runs — and it runs regardless of
+        // `result` (C-1's commit-then-bubble rule): `Group`'s only
+        // non-panicking exit is `commit()`, and by the time `run_due_into`
+        // has returned, `group` holds at most the one record it staged for
+        // THIS job (a fresh group, used by no one else).
+        match (result, group.commit()) {
+            (Ok(outcome), Ok(())) => Ok(outcome),
+            (Ok(outcome), Err(failure)) => {
+                let reported_elsewhere = db.poisoned() || db.store_failed();
+                if failure.invalidates(0, staged) || !reported_elsewhere {
+                    if let JobOutcome::Retried {
+                        due_at: new_due_at, ..
+                    } = outcome
+                    {
+                        self.due.remove(&(new_due_at, id));
+                    }
+                    self.due.insert((due_at, id));
+                    Err(failure.error)
+                } else {
+                    Ok(outcome)
+                }
+            }
+            (Err(e), Ok(())) => Err(e),
+            // The commit's own failure is the more informative fact: it says
+            // whether anything reached the store, and `run_due_into`'s own
+            // Err arms already restore (due_at, id) — nothing further to
+            // undo on this path.
+            (Err(_), Err(failure)) => Err(failure.error),
         }
     }
 }

@@ -1469,7 +1469,16 @@ the very invariant the first line of this block states. The full, current alloca
 | `0x60C0_0007` | T5 | `app_with_op_counter` |
 | `0x60C0_0008` | T5 **and** T6 | the pre-batching trace capture and its replay |
 | `0x60C0_0009` | T6 | `run_two_request_batch` (ack ordering) |
-| `0x60C0_000A` | T7 | `run_universe_with_due_jobs` |
+| `0x60C0_000A` | T5 | `a_staged_group_dropped_without_commit_panics` (committed) |
+| `0x60C0_000B` | T5 | `handle_or_subscribe_still_commits_exactly_one_request` (committed) |
+| `0x60C0_000C` | T5 | `run_one_at_a_time_universe_is_deterministic_and_unbatched` (committed) |
+| `0x60C0_000F` | T6 fix wave | `a_read_batched_behind_a_failed_write_is_not_acked_with_its_data` (committed) |
+| `0x60C0_0010` | T6 fix wave | `no_response_is_sent_before_the_group_syncs` (committed) |
+| `0x60C0_000D` | T7 | `forty_due_jobs_cost_one_fsync` (`run_universe_with_due_jobs`) |
+| `0x60C0_000E` | T7 | `two_same_row_jobs_in_one_batch_see_each_others_writes` (Step 3b, C-6 — the plan as written allocated this seed to an optional cron test; T7 wrote no cron test, so it went to Step 3b's read-your-own-writes test instead) |
+| `0x60C0_0011` | T7 fix round, I-3 | `a_group_drains_two_due_schedules_with_one_sync_and_no_index_cross_talk` (`cron.rs`'s own `#[cfg(test)]`, the cron test T7 did not write) |
+| `0x60C0_0012` | T7 fix round, I-2 | `run_due_answers_ok_when_the_commit_failure_is_a_reported_elsewhere_checkpoint` (`tests/kernel.rs`) |
+| `0x60C0_0013` | T7 fix round, I-2 | `tick_answers_ok_when_the_commit_failure_is_a_reported_elsewhere_checkpoint` (`tests/kernel.rs`) — minted beyond the brief's `0x0012` allocation to cover `CronScheduler::tick`'s wrapper too, not only `Dispatcher::run_due`'s (the brief's "the I-2 test" was singular; the review named both wrappers) |
 
 `0x60C0_0008` appearing twice is **deliberate and must stay that way**: T5 captures that
 universe's disk trace while the kernel is still unbatched and T6 replays the same universe

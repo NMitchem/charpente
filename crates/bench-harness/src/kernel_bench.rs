@@ -25,20 +25,100 @@ use crate::kernel_accounting::{self, KernelObs};
 use crate::measure::Heartbeat;
 use crate::report::KernelReport;
 use crate::{SLOTS, build};
+use charpente::core::io::{Disk, File};
 use charpente::http::{Method, Request};
 use charpente::kernel::{Kernel, SimSource};
 use charpente::prod::{ProdClock, ProdDisk, ProdEntropy};
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// Wraps `ProdDisk` to COUNT durable syncs rather than derive them (group-
+/// commit T7, C-7): `KernelObs::syncs` used to be `requests_planned +
+/// stats.jobs_done` on the premise "one fsync per commit, no batching" —
+/// T6 falsified the `requests_planned` half of that and T7 (the job arm)
+/// falsifies the other. This layer CAN count, unlike the wire layer, which
+/// genuinely cannot from outside the process — so it does, through the same
+/// `Disk`/`File` seam T5's `CountingDisk` (`tests/group_commit.rs`) uses,
+/// rather than deriving a number `run()` no longer has any way to know is
+/// still true.
+struct CountingDisk {
+    inner: ProdDisk,
+    syncs: Arc<AtomicU64>,
+}
+
+impl Disk for CountingDisk {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        let file = self.inner.open(path)?;
+        Ok(Box::new(CountingFile {
+            inner: file,
+            syncs: self.syncs.clone(),
+        }))
+    }
+
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+struct CountingFile {
+    inner: Box<dyn File>,
+    syncs: Arc<AtomicU64>,
+}
+
+impl File for CountingFile {
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.inner.read_at(offset, out)
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write_at(offset, data)
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        // Fix round M-2, stating this wrapper's scope explicitly (neither
+        // choice below is wrong, but neither was written down):
+        // EXCLUDED — `Disk::sync_dir` (the directory-entry barrier at
+        // rotation/store creation/`.horizon` writes) is a separate `Disk`
+        // method this wrapper delegates unwrapped, above, so it never
+        // reaches this counter. INCLUDED — every `File::sync` this counts
+        // covers BOTH the WAL's own fsyncs and the store's (checkpoint) and
+        // `.horizon`'s, since `CountingDisk::open` wraps every path this
+        // `Disk` opens, not the WAL's alone; `KernelObs::syncs`'s own doc
+        // ("Durable syncs this batch paid") does not name that split either.
+        self.syncs.fetch_add(1, Ordering::SeqCst);
+        self.inner.sync()
+    }
+}
 
 /// Interlude spec §4.2 (Noah ruling, 2026-08-10): this no longer takes layer
 /// 1's `device.syncs_per_sec`. It brackets its own batch window instead, which
 /// is the gap the shipped refusal message named in so many words — "this layer
 /// takes no bracket samples of its own to show the spread".
 pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> {
-    let app = build(Box::new(ProdDisk::new(dir)?), Box::new(ProdEntropy::new()?))?;
+    let sync_count = Arc::new(AtomicU64::new(0));
+    let disk = CountingDisk {
+        inner: ProdDisk::new(dir)?,
+        syncs: sync_count.clone(),
+    };
+    let app = build(Box::new(disk), Box::new(ProdEntropy::new()?))?;
     let mut source = SimSource::new(Box::new(ProdClock::new()), 0);
     for i in 0..requests {
         source.push_at(0, Request::new(Method::Post, format!("/hit/{}", i % SLOTS)));
@@ -88,9 +168,23 @@ pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> 
             }
         })
     };
+    // The counting window matches `obs.elapsed`'s exactly (same start/end
+    // points) so `syncs` counts precisely the syncs THIS batch paid — not
+    // `App::open`'s own startup syncs (before). Fix round M-1, correcting
+    // this comment's old claim: there IS a shutdown checkpoint here, not
+    // none — `Kernel::run` always checkpoints on a clean Shutdown unless the
+    // engine is poisoned (`kernel/mod.rs`'s `run`), and this batch's fixed
+    // request count always reaches Shutdown. The published number was
+    // always right regardless: that checkpoint's own sync fires INSIDE this
+    // same `Kernel::run` call, strictly between `syncs_before` and
+    // `syncs_after` below, so it is correctly counted as part of what this
+    // batch durably paid — only this comment's claim that no such
+    // checkpoint exists was wrong.
+    let syncs_before = sync_count.load(Ordering::SeqCst);
     let start = Instant::now();
     let run_outcome = kernel.run(&mut source);
     obs.elapsed = start.elapsed();
+    let syncs_after = sync_count.load(Ordering::SeqCst);
     stop_progress.store(true, Ordering::Relaxed);
     // Taken here, inside the heartbeat's span, but NOT unwrapped until after
     // `run_outcome?` below: a bracket failure must not mask the kernel's own
@@ -150,11 +244,15 @@ pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> 
         device_before: obs.device_before,
         device_after: obs.device_after,
         stats_jobs_done: stats.jobs_done,
-        // `Engine::submit` is one fsync per commit with no batching, so this
-        // equals the log record count (the request's own effects record plus
-        // its Bump's Done-mark). A future group-commit primary path is where
-        // this stops being a copy of that sum.
-        syncs: obs.requests_planned + stats.jobs_done,
+        // COUNTED, not derived (group-commit T7, C-7): both the request arm
+        // (T6) and the job arm (T7) now batch, so "one fsync per commit" is
+        // false in general and a derived sum would silently understate the
+        // batching win — or, worse, overstate `device_ratio`'s numerator and
+        // trip the device-ratio gate on healthy batched code, which is the
+        // exact failure the 2026-08-10 interlude built that gate to
+        // eliminate. `syncs_before`/`syncs_after` bracket the SAME window as
+        // `obs.elapsed` above.
+        syncs: syncs_after - syncs_before,
         first_failure: obs.first_failure.clone(),
         elapsed: obs.elapsed,
         heartbeat: obs.heartbeat.clone(),
@@ -175,4 +273,93 @@ pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> 
         },
         a.invalid,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after 1970")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "bench-kernel-syncs-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|e| panic!("scratch dir {dir:?} creates: {e}"));
+        dir.to_string_lossy().into_owned()
+    }
+
+    /// C-7 (group-commit T7, ruled into this task): `KernelObs::syncs` used
+    /// to be DERIVED as `requests_planned + jobs_done` — "one fsync per
+    /// commit, no batching" — and T6/T7 together falsify that premise (the
+    /// request and job arms both drain a whole batch under one sync now).
+    /// This is the fix's own test, per the brief: if `run` ever regresses
+    /// back to deriving rather than counting, `syncs_per_sec` would equal
+    /// the OLD formula exactly — literally `obs.requests_planned +
+    /// stats.jobs_done`, as it did before this fix — and the wide
+    /// inequality below would become a false one.
+    ///
+    /// `#[ignore]`d like this crate's other real drivers (`tests/harness.rs`
+    /// — spawns real processes and does real durable syncs); picked up by
+    /// `scripts/bench.sh --smoke`, which is `cargo test -p bench-harness --
+    /// --ignored --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn syncs_are_measured_not_derived_under_batching() {
+        // Large enough to clear MIN_MEASURED_WINDOW's 1s floor even though
+        // batching (T6 + T7) makes this MUCH faster than the pre-batching
+        // baseline that picked 500 for the crate's other kernel smoke test
+        // (`tests/harness.rs`) — 500 batched requests finish in ~0.2s on
+        // this device, which the degenerate-window guard correctly refuses.
+        //
+        // Fix round M-8: the ORIGINAL bump to 5_000 (T7 report) measured
+        // ~140ms for 500 requests, i.e. ~1.4s projected for 5_000 — only
+        // ~40% over the 1s floor, on the very box that motivated raising
+        // this constant in the first place, and this sub-project exists to
+        // make that margin SMALLER over time (T8-T10 add more batching, not
+        // less). 20_000 (~4x) trades a few extra seconds of `--ignored` test
+        // time for real headroom — if this ever refuses again naming the
+        // floor, that is the regression this margin exists to catch, not
+        // this constant sitting too close to it.
+        const REQUESTS: u64 = 20_000;
+        let dir = scratch("syncs");
+        let (report, invalid) = run(&dir, REQUESTS).expect(
+            // Fix round M-10: under batching, an ordinary SSD can drain
+            // REQUESTS this size in under a second — that is now the LIKELY
+            // cause of a MIN_MEASURED_WINDOW refusal here, named first; a
+            // RAM-backed filesystem (this device doing no real durable
+            // syncs at all) is the second, less likely possibility now.
+            "kernel layer runs — a refusal here naming the minimum measured window most \
+             likely means this device is simply fast enough to drain this batch in under a \
+             second now that both arms batch; less likely, it means the store is not on a \
+             device doing real durable syncs at all (RAM-backed filesystem?)",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        // Same shape as the crate's other smoke tests: the ratio gate is
+        // DESIGNED to fire on short/noisy windows, so tolerate that one
+        // named reason and nothing else.
+        for reason in &invalid {
+            assert!(
+                reason.contains("device_ratio") && reason.contains("exceeds 1.0"),
+                "the ratio gate legitimately fires on some short/noisy windows — but any \
+                 OTHER invalid reason here means something regressed: {reason}"
+            );
+        }
+        assert_eq!(report.jobs_done, REQUESTS, "every request's Bump ran");
+        let derived_syncs_per_sec =
+            (report.requests_total + report.jobs_done) as f64 / report.window_secs;
+        assert!(
+            report.syncs_per_sec < derived_syncs_per_sec * 0.5,
+            "measured syncs/sec ({:.2}) must be well under the old derived value \
+             ({derived_syncs_per_sec:.2} = (requests + jobs_done) / window) — both the \
+             request and the job arm batch {REQUESTS} same-instant items under MAX_BATCH, \
+             so a genuinely counted sync rate must be a small fraction of the record rate; \
+             equality here means run() is back to DERIVING syncs instead of counting them",
+            report.syncs_per_sec
+        );
+    }
 }
