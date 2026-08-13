@@ -466,7 +466,7 @@ fn rebuild_restores_pending_jobs_after_reopen() {
 use charpente::http::ApiError;
 use charpente::http::{Method, Request, Response};
 use charpente::kernel::{
-    EventFrame, EventSink, Kernel, Reply, RequestSource, Respond, SimSource, SinkStatus, Wake,
+    EventFrame, EventSink, Kernel, Reply, RequestSource, Respond, SimSource, SinkStatus, Step, Wake,
 };
 use charpente::route;
 use charpente::routes;
@@ -1677,6 +1677,118 @@ fn due_jobs_are_not_starved_by_a_request_flood() {
         kernel.stats().jobs_done,
         101,
         "every job ran despite the flood (100 request jobs + the seeded one)"
+    );
+}
+
+/// T8b RULING 3 (task-8b-brief.md, C-9): the test above asserts EVENTUAL
+/// completeness (`jobs_done == 101` once `run` reaches the horizon), which
+/// is numerically IDENTICAL whether a request-arm win consumes 1 request or
+/// 64 — post-batching, the 100-request flood drains in two `Ready::Request`
+/// wins instead of a hundred, and the count at the end is 101 either way.
+/// This is the INTERLEAVING invariant that can see the difference: the job
+/// arm must be serviced at least once while the request source still has
+/// outstanding work, not merely by the time the whole run winds down.
+/// Driven via a `Kernel::step` loop rather than `run`, discriminating which
+/// arm each step serviced from `kernel.stats()` deltas — `requests` for the
+/// request arm, `jobs_done + jobs_retried + jobs_dead` for the job arm (the
+/// same technique the request-arm swarm workload in `group_commit.rs` uses
+/// to prove a batch was genuinely contended).
+///
+/// Deliberately NOT a bound on how many request-arm wins may precede the
+/// job's service (RULING 3, option (b) over (a)): a bound pinned by a test
+/// IS a contract whatever DESIGN says, DESIGN documents one entropy draw on
+/// contention and nothing about service ratios, and greedy drain cannot
+/// honour a fixed ratio on a fast device anyway (spec §8's own argument —
+/// shallower queues mean smaller batches). What is asserted here is strictly
+/// STRONGER than the test above (it catches a genuine regression to
+/// "requests always win", which that one cannot — see the mutation proof in
+/// the report) and commits the platform to nothing about degree. T11 records
+/// the fairness-profile change in DESIGN as an OBSERVED property, not a
+/// promise.
+///
+/// **`FLOOD` is 1024 for a measured reason — do not "simplify" it back
+/// down.** The assertion is probabilistic in the flood size, because
+/// arbitration is a uniform draw over the ready set
+/// (`kernel/mod.rs:297-301`) and the flood drains in `ceil(FLOOD /
+/// MAX_BATCH)` request-arm wins, so the job arm must win at least one of
+/// that many coin flips. At the original `FLOOD` of 100 with `MAX_BATCH` of
+/// 64 that is TWO draws — P(fail) = 0.25, and the T8b review measured
+/// exactly that: **49 failures over 200 seeds against stock, correct
+/// code**. At 1024 it is 16 draws, P(fail) ≈ 1.5e-5, measured 0 over 200
+/// seeds. The runtime cost is negligible.
+///
+/// **The product observation that measurement exposed, recorded here
+/// because it is the sharpest form of what T11 owes DESIGN.** The same
+/// review measured the PRE-batching kernel (request arm draining exactly
+/// one request per step) at 200/200 passes with `FLOOD` at 100. So
+/// batching genuinely changed job-arm fairness from *certain* to
+/// *probabilistic in the queue depth*: with a flood at or below
+/// `MAX_BATCH`, a due job can legitimately wait behind the entire flood
+/// about a quarter of the time. That is a real behavioural change, not a
+/// defect — and raising `FLOOD` here makes this test assert an invariant
+/// instead of a coin flip WITHOUT hiding the change, which is why the
+/// measurement lives in this comment rather than only in a ledger.
+#[test]
+fn due_jobs_are_serviced_before_a_request_flood_exhausts_the_source() {
+    /// Both the push count and the "source still has outstanding work"
+    /// predicate below read this ONE constant: two independent literals
+    /// could drift apart with no compile error and no failure at the site
+    /// of the mistake, leaving the predicate either unsatisfiable or
+    /// trivially satisfiable (T8b review M-5).
+    const FLOOD: u64 = 1024;
+
+    let sim = Sim::with_faults(0x60C1_0008, FaultConfig::none());
+    let mut source = SimSource::new(Box::new(sim.clock()), 200 * SEC);
+    for i in 0..FLOOD {
+        // Same shape as the eventual-completeness test above: all requests
+        // arrive at t=0, maximal contention with the due job.
+        source.push_at(0, Request::new(Method::Post, "/hit").json(&Hit { slot: i }));
+    }
+    let mut app = loop_app(&sim);
+    app.db_for_tests()
+        .transact(|tx| {
+            tx.enqueue(CountUp { slot: 7777 });
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+
+    let mut serviced_while_source_open = false;
+    loop {
+        let before = kernel.stats();
+        match kernel.step(&mut source).unwrap() {
+            Step::Worked => {
+                let after = kernel.stats();
+                let job_delta = (after.jobs_done + after.jobs_retried + after.jobs_dead)
+                    - (before.jobs_done + before.jobs_retried + before.jobs_dead);
+                // `before.requests`, not `after.requests`: a step that
+                // services the job arm leaves `requests` unchanged, so
+                // either reading discriminates the SAME way for a Job step
+                // — but for a Request step (`job_delta == 0` always) it
+                // does not matter which is read. Using `before` throughout
+                // keeps the reading uniform and answers the question this
+                // test actually asks: was there still outstanding request
+                // work the INSTANT the job ran?
+                if job_delta > 0 && before.requests < FLOOD {
+                    serviced_while_source_open = true;
+                }
+            }
+            Step::Idle { deadline } => {
+                if let Wake::Shutdown = source.wait_until(deadline) {
+                    break;
+                }
+            }
+        }
+    }
+
+    assert!(
+        serviced_while_source_open,
+        "the due job was serviced only AFTER the {FLOOD}-request flood had already fully \
+         drained — the request arm starved it until the source was exhausted, exactly \
+         the regression this test exists to catch (the eventual-completeness test above \
+         cannot see this: its count is identical either way). Before concluding a \
+         regression: this assertion is probabilistic in FLOOD, so a red here can also mean \
+         FLOOD was lowered toward MAX_BATCH — see the doc comment"
     );
 }
 

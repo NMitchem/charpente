@@ -2083,3 +2083,339 @@ fn enqueues_and_emits_are_invisible_to_a_later_sibling_in_the_same_batch() {
         "the event DID materialize at apply, once the batch committed"
     );
 }
+
+// ======================================================================
+// T8b — the contended-request burst swarm workload (RULING 2,
+// task-8b-brief.md / task-8-preflight.md C-8). The fairness invariant
+// (RULING 3) lives in `tests/kernel.rs`, beside
+// `due_jobs_are_not_starved_by_a_request_flood`. `kernel_workload`
+// (`tests/kernel.rs:1374`) is untouched — RULING 2's option (b), making it
+// sometimes burst, was explicitly rejected: it would perturb the frozen
+// pinned seed `0x348270b38f166529`'s fault stream.
+// ======================================================================
+
+use charpente_core::io::Entropy;
+use charpente_sim::checks::{durable_corruption_fired, is_fault_fallout};
+use charpente_sim::run_universes_swarm_with;
+
+/// Drives `source` to completion via `Kernel::step`, not `run` — the
+/// per-step `stats().requests` delta is the only way to prove a SINGLE step
+/// drained more than one request (`stats.requests += drained` runs once per
+/// request-arm service, `kernel/mod.rs:411`), which is what "a genuinely
+/// contended batch" means. `sim.cover("request:contended")` fires exactly
+/// there, which is `contended_request_bursts_survive_the_fault_matrix`'s
+/// `require:` gate below — a swarm that only ever produced batches of one
+/// would satisfy every other assertion in this workload while covering
+/// nothing (RULING 2's own words), and this is what forecloses that.
+///
+/// Deliberately skips `Kernel::run`'s clean-shutdown checkpoint: `Kernel`
+/// exposes no `app_mut`/`db_mut` accessor outside the crate to call it from
+/// here. The next round's reopen replays the WAL either way (recovery
+/// correctness is unaffected), so only the store's compaction is deferred —
+/// harmless for a test that reopens every round regardless.
+///
+/// **The consequence is stronger than "deferred", and worth stating so the
+/// coverage is not read wider than it is** (T8b review M-2): combined with
+/// `DbConfig::checkpoint_every == 4096` and a workload writing at most 36
+/// records per universe, `Db::checkpoint()` never executes here AT ALL.
+/// So `Group::commit`'s checkpoint arm — the `CommitFailure { applied: n }`
+/// that invalidates nobody — gets ZERO coverage from this swarm. That half
+/// of the ruled `invalidates` rule stays pinned deterministically by 8a's
+/// Step 3 (`a_failed_batchs_participants_are_invalidated_by_what_they_saw`)
+/// and 5b.1, which is where most of 8a's effort went. Giving this workload
+/// a small `checkpoint_every` would buy the coverage but move the fault
+/// schedule, which is a T9-adjacent decision, not this test's to make.
+fn drive_burst(kernel: &mut Kernel, source: &mut SimSource, sim: &Sim) -> io::Result<()> {
+    loop {
+        let before = kernel.stats().requests;
+        match kernel.step(source)? {
+            Step::Worked => {
+                if kernel.stats().requests - before >= 2 {
+                    sim.cover("request:contended");
+                }
+            }
+            Step::Idle { deadline } => {
+                if let Wake::Shutdown = source.wait_until(deadline) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// T8b RULING 2 (C-8): no swarm workload anywhere in the repo ever produced
+/// a contended REQUEST batch before this — `kernel_workload` spaces arrivals
+/// one virtual second apart, and `http_workload`/`tx_workload` never build a
+/// `Kernel` at all. So spec §9's "every existing flagship property must hold
+/// unchanged with batching live" was, for the request arm, a claim about
+/// code no swarm universe ever executed; batching's headline change had
+/// ZERO fault-matrix coverage. This workload closes that: every round pushes
+/// a burst of AT LEAST two same-instant writes to the SAME row under the
+/// full fault matrix.
+///
+/// The oracle is the `acked_implies_durable` shape (`checks.rs`), applied
+/// inline rather than by calling that function directly — it constructs its
+/// OWN `Sim::new(seed)` internally, which cannot be reconciled with
+/// `run_universes_swarm_with!`'s already-constructed, already-fault-
+/// configured `&mut Sim` (see the report). `/hit/:id`'s count is monotonic
+/// under a single writer route, so the running MAXIMUM count any 200 ever
+/// reported is a durability watermark: Step 3's `invalidates` rule (a writer
+/// at or past a failed commit's `applied` cutoff gets its 500, never a 200)
+/// means every 200 this workload ever sees was for a genuinely durable
+/// write, so whatever the highest such count promised must survive every
+/// crash and reopen from then on — "no acked write is lost across
+/// crash/restart", and "acked requests are durable", the other two halves
+/// of RULING 2's stated invariant. The batch-of-1 identity (the invariant's
+/// third half) is NOT exercised here, and the earlier claim that it was is
+/// disproven by this workload's own behaviour (T8b review M-3): every burst
+/// is 2..=9 requests pushed at one instant and `MAX_BATCH` is 64, so the
+/// drain always takes them all. Measured over the shipped 256 universes —
+/// 408 request-arm services, sizes 2 through 9, **none of size 1**. The
+/// batch-of-1 case is pinned deterministically instead, by
+/// `a_never_contended_universe_traces_identically_to_the_pre_batching_fixture`.
+/// What one `verify_watermark` call actually established. `Checked` is the
+/// only outcome that asserted anything; the other two exist so the caller
+/// can tell "the oracle ran and held" from "the oracle never got to run",
+/// which the coverage gate below turns into a batch-level requirement.
+enum Verify {
+    Checked,
+    Excused,
+    Unreachable,
+}
+
+/// Reopens (retrying past injected faults, exactly as `kernel_workload`'s
+/// final verification does), reads the durable count, and compares it
+/// against everything a 200 has promised SO FAR.
+///
+/// **Called at every round boundary, not only at the end, and that cadence
+/// is the load-bearing part** (T8b review I-2). `watermark` is a running
+/// max while the durable count is re-read fresh: check only once at the end
+/// and an early round's loss is arithmetically ERASED by any later round
+/// that writes the count back above it. That is not hypothetical —
+/// measured on stock code before this was hoisted, one universe lost SEVEN
+/// acked writes at a round boundary and the end-only oracle reported green
+/// without even reaching the corruption excuse. All three references this
+/// workload is modelled on verify per round: `checks::acked_implies_durable`
+/// (`checks.rs:170-191`), `tx_workload` (`transactions.rs:519-560`) and
+/// `kernel_workload` (`kernel.rs:1393`, which also keeps a final coda, as
+/// this workload does).
+fn verify_watermark(sim: &Sim, watermark: u64) -> Result<Verify, String> {
+    for _attempt in 0..8 {
+        match App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Hit>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        ) {
+            Ok(mut app) => {
+                // The checker's own reads are disk ops too — same
+                // classify-and-reopen treatment as `kernel_workload`'s
+                // `exactly_once_holds` call needs (found by seed
+                // 0x348270b38f166529): an armed crash countdown can trip
+                // right here.
+                let snap = match app.db_for_tests().snapshot() {
+                    Ok(s) => s,
+                    Err(e) if is_fault_fallout(&e.to_string()) => {
+                        sim.restart();
+                        continue;
+                    }
+                    Err(e) => return Err(e.to_string()),
+                };
+                let durable = match snap.scan::<Hit>() {
+                    Ok(rows) => rows.iter().find(|h| h.id.raw() == 1).map_or(0, |h| h.count),
+                    Err(e) if is_fault_fallout(&e.to_string()) => {
+                        sim.restart();
+                        continue;
+                    }
+                    Err(e) => return Err(e.to_string()),
+                };
+                // Covered only when the comparison is NON-TRIVIAL. A
+                // universe that never acked anything has `watermark == 0`,
+                // and `0 < 0` is false — it passes this check without
+                // comparing anything, which is 50 of 256 universes as
+                // shipped (T8b review I-3). Keying the gate on `> 0` is
+                // what makes the `require:` below mean "the oracle really
+                // ran somewhere", not "the code path was entered".
+                if watermark > 0 {
+                    sim.cover("oracle:verified");
+                }
+                if durable < watermark {
+                    // Excused ONLY when the harness actually injected
+                    // durable corruption in this universe (`tx_workload`'s
+                    // identical idiom, `transactions.rs:543-553`), and it
+                    // keys on FIRE-TIME coverage, not on the sampled
+                    // config, so a universe that merely had the axis
+                    // configured is not excused. `Db::checkpoint` never
+                    // runs in this workload (`checkpoint_every: 4096`, and
+                    // `drive_burst` skips `Kernel::run`'s shutdown
+                    // checkpoint), but `Db::open`'s `persist_store_at_open`
+                    // (`db.rs:1399`) advances the durable `applied_seq` —
+                    // the recovery horizon — on every replaying open, and
+                    // this workload reopens every round. So only the
+                    // CURRENT round's uncheckpointed tail sits in the
+                    // silent-cut window M1 sub-project 1 documented;
+                    // corruption below the horizon surfaces as the loud,
+                    // named `DurableHorizon` hard error instead, which
+                    // `is_fault_fallout` already accepts and which fires in
+                    // 3 of 256 universes (measured — T8b review M-1
+                    // disproved the "every record is above the horizon"
+                    // reasoning this comment used to carry).
+                    if durable_corruption_fired(sim) {
+                        return Ok(Verify::Excused);
+                    }
+                    return Err(format!(
+                        "acked-implies-durable violated: a 200 promised count {watermark} \
+                         but the durable count is only {durable}"
+                    ));
+                }
+                return Ok(Verify::Checked);
+            }
+            Err(e) if is_fault_fallout(&e.to_string()) => sim.restart(),
+            Err(e) => return Err(format!("verification open failed non-injected: {e}")),
+        }
+    }
+    Ok(Verify::Unreachable)
+}
+
+fn burst_workload(sim: &mut Sim) -> Result<(), String> {
+    let entropy = sim.entropy();
+    let mut watermark: u64 = 0;
+
+    for _round in 0..4 {
+        sim.crash_disk_after(64 + entropy.next_u64() % 768);
+        let app = match App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Hit>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        ) {
+            Ok(app) => app.mount(hit_routes()),
+            Err(e) => {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("open failed non-injected: {e}"));
+                }
+                sim.restart();
+                continue;
+            }
+        };
+
+        let now = sim.now().as_nanos();
+        let mut source = SimSource::new(Box::new(sim.clock()), now + 5 * SEC);
+        // Always at least 2, so every round is a genuine burst by
+        // construction — coverage (above) decides how many universes
+        // actually land it in ONE step, not the workload shape.
+        let burst = 2 + entropy.next_u64() % 8;
+        for _ in 0..burst {
+            source.push_at(now, Request::new(Method::Post, "/hit/1"));
+        }
+        let responses = source.responses();
+
+        let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
+            Ok(k) => k,
+            Err(e) => {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("Kernel::new failed non-injected: {e}"));
+                }
+                sim.restart();
+                continue;
+            }
+        };
+
+        let run = drive_burst(&mut kernel, &mut source, sim);
+
+        // Harvest every 200's reported count regardless of how the round
+        // ended: a mid-batch fault legally acks a PREFIX of the batch
+        // (`invalidates`), and those acks are exactly what the watermark
+        // must hold onto.
+        for (status, body) in responses
+            .lock()
+            .expect("responses lock poisoned by an earlier panic")
+            .iter()
+        {
+            if *status == 200 {
+                let count: u64 = String::from_utf8_lossy(body)
+                    .trim()
+                    .parse()
+                    .unwrap_or_else(|e| panic!("a /hit/:id 200 body must be a bare u64: {e}"));
+                if watermark == 0 && count > 0 {
+                    // 80 of 256 universes as shipped never acked ANY
+                    // request, so their oracle compared 0 against 0 (T8b
+                    // review I-3). Requiring this key batch-wide means a
+                    // change that 500'd every request could no longer leave
+                    // the property green while asserting nothing.
+                    sim.cover("request:acked");
+                }
+                watermark = watermark.max(count);
+            }
+        }
+
+        if let Err(e) = run
+            && !is_fault_fallout(&e.to_string())
+        {
+            return Err(format!("kernel stopped non-injected: {e}"));
+        }
+        sim.restart();
+
+        // The round-boundary check. Without it a loss here is erased by any
+        // later round that pushes the count back above the watermark — see
+        // `verify_watermark`'s doc for the measurement.
+        if let Verify::Excused = verify_watermark(sim, watermark)? {
+            return Ok(());
+        }
+    }
+
+    // The final coda, kept alongside the per-round checks exactly as
+    // `kernel_workload` keeps its own (`kernel.rs:1393` and again at the
+    // end): the last round's writes have no round boundary after them.
+    verify_watermark(sim, watermark)?;
+    Ok(())
+}
+
+/// The flagship request-arm batching property under the full fault matrix.
+/// `0x60C1_0009` (`docs/superpowers/plans/2026-08-10-group-commit.md`'s
+/// seed table): the next free `0x60C1_*` slot after 8a's seven and the
+/// fairness test's reserved `0x60C1_0008`. Uses `run_universes_swarm_with!`
+/// with a no-op `adjust` rather than the ambient `run_universes_swarm!` (the
+/// shape `kernel_jobs_are_exactly_once_under_the_fault_matrix` uses) so this
+/// permanent, always-in-the-suite property gets a pinned, reproducible base
+/// seed like the newer flagship properties elsewhere in this sub-project
+/// (`auth.rs`'s `raw_credentials_never_touch_the_durable_store`,
+/// `replication.rs`'s several) — a judgment call, not a repeat of an
+/// established pattern in THIS file, since nothing here used
+/// `run_universes_swarm_with!` before; see the report. The census settles
+/// it: 18 pinned sites against 5 ambient ones, all five M0/early-M1.
+///
+/// The cost of a pinned base, stated so nobody mistakes it for a wider
+/// claim: this property runs the SAME 256 universes forever, so its fault
+/// coverage is frozen at what was measured, against a repo whose evidence
+/// bar is otherwise "green over N fresh seeds". The T8b review checked that
+/// the pin is not hiding anything by running the property from three
+/// unrelated bases — `0x1111222233334444`, `0xdeadbeef00000001` and
+/// `0x0badc0de5eed0007` — all green.
+///
+/// The `require:` set is the anti-vacuity contract, and two of the four
+/// keys exist because the first version could have been green while
+/// asserting nothing. `request:contended` proves batching actually
+/// happened; `request:acked` proves some universe got a 200 at all; and
+/// `oracle:verified` proves the durability comparison ran somewhere with a
+/// non-zero watermark. Without the last two, a change that 500'd every
+/// request — or that made every verification reopen fail — would satisfy
+/// every remaining key and pass 256 universes without comparing anything
+/// (T8b review I-3).
+#[test]
+fn contended_request_bursts_survive_the_fault_matrix() {
+    run_universes_swarm_with!(
+        0x60C1_0009,
+        256,
+        |_cfg: &mut FaultConfig| {},
+        burst_workload,
+        require: [
+            "request:contended",
+            "request:acked",
+            "oracle:verified",
+            "fault:crash",
+            "crash:torn",
+            "restart"
+        ]
+    );
+}

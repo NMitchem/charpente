@@ -1523,4 +1523,15 @@ cross-checked against `grep -rn "0x60C1" crates`): all eight were free. T8a's ac
 | `0x60C1_0008` | **freed, not used by T8a** — reserved for 8b's fairness test (Step 5c, the original owner, was closed at T6 before T8a would have written it a second time; see the task-8a-brief.md/task-8-preflight.md record) |
 
 Step 3 was **not** split into two tests (its two commit-failure arms live inside one `#[test]`
-fn, as scoped by RULING 1), so `0x60C1_0009` was never minted and stays free.
+fn, as scoped by RULING 1), so `0x60C1_0009` was, at T8a's close, not yet minted.
+
+**Seed allocation for T8b (RULINGs 2-3, task-8b-brief.md).** `0x60C1_0008` landed exactly as
+reserved above. `0x60C1_0009` — the "stays free" seed T8a's own account names — is the swarm
+property's base:
+
+| seed | test |
+|---|---|
+| `0x60C1_0008` | `due_jobs_are_serviced_before_a_request_flood_exhausts_the_source` (`crates/charpente/tests/kernel.rs`, RULING 3 — the interleaving invariant beside `due_jobs_are_not_starved_by_a_request_flood`) |
+| `0x60C1_0009` | `contended_request_bursts_survive_the_fault_matrix` (`crates/charpente/tests/group_commit.rs`, RULING 2 — the swarm's base seed, via `run_universes_swarm_with!` with a no-op `adjust`, not the ambient `run_universes_swarm!` `kernel_jobs_are_exactly_once_under_the_fault_matrix` uses; see the report for why) |
+
+The `0x60C1` namespace is now fully allocated, `0x60C1_0001`–`0x60C1_0009`, no gaps.
