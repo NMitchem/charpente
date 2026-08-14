@@ -49,15 +49,42 @@
 //! one commit costs one fsync, and NOT sound the moment a group-commit
 //! primary path makes it cost less.
 //!
-//! **Owed work, stated so a future task does not discover this at the wire
-//! and reach for a fudge factor (review C-1's own warning).** This layer
-//! cannot be made syncs-based FROM THE CLIENT SIDE once batching actually
-//! lands — `syncs_per_request` stops being a sound multiplier the moment N
-//! commits can share one fsync, and there is no way to observe that from
-//! outside the process. Either a server-reported sync counter ships
-//! (surfaced over HTTP or in the child's exit output), or this gate is
-//! re-scoped honestly and BENCH.md says so plainly. See the group-commit
-//! plan's Task 10.
+//! **Owed work — DISCHARGED 2026-08-14. The paragraph is kept verbatim because
+//! it predicted this exactly and its warning earned its keep:** "Owed work,
+//! stated so a future task does not discover this at the wire and reach for a
+//! fudge factor (review C-1's own warning). This layer cannot be made
+//! syncs-based FROM THE CLIENT SIDE once batching actually lands —
+//! `syncs_per_request` stops being a sound multiplier the moment N commits can
+//! share one fsync, and there is no way to observe that from outside the
+//! process. Either a server-reported sync counter ships (surfaced over HTTP or
+//! in the child's exit output), or this gate is re-scoped honestly and BENCH.md
+//! says so plainly. See the group-commit plan's Task 10." All of it happened on
+//! schedule: T6/T7 landed batching, and T10's first full matrix refused 8 of 8
+//! contended wire points at 2.39x-28.45x the ceiling.
+//!
+//! **What shipped: the server-reported counter, over HTTP.** `bench-app` wraps
+//! its `Disk` in `counting::CountingDisk` scoped to `wal/` and publishes the
+//! tally through a `/__syncs` route; `wire::sweep_point` samples it at both
+//! window edges and gates on the DELTA. Over HTTP rather than at exit because
+//! `BenchChild::drop` stops the child with `child.kill()` — SIGKILL, so no exit
+//! hook can run. `invoicing` mounts no such route and keeps deriving;
+//! `SweepPoint::syncs_counted` records which a point is, so two numbers of
+//! different evidentiary standing never sit alike in one table. The caveat
+//! above — "sound while one commit costs one fsync, and NOT sound the moment a
+//! group-commit primary path makes it cost less" — now applies to the derived
+//! case only.
+//!
+//! **The fudge factor was reached for, and this warning is why it was not
+//! taken.** With the counter first wired as a single cumulative read the gate
+//! still refused, at 1.14-1.20x, and the tempting reading was that the device
+//! bracket had stopped being an upper bound — i.e. widen
+//! `RATIO_TOLERANCE_FLOOR`. It had not. `/__syncs` is monotonic since process
+//! start, so one read carries the warmup's syncs and the child's startup syncs
+//! while the divisor is the measured window alone: for the smoke's 300ms/2s
+//! split that is exactly (2.0 + 0.3) / 2.0 = 1.15x, which is what was measured.
+//! The defect was in the NEW numerator, not the old denominator. Widening the
+//! tolerance to absorb it would have shipped a real bug and cost the gate a
+//! fifth of its resolution permanently.
 //!
 //! **The ceiling is bracketed per point, not a single cross-window sample
 //! (T7 rev. 3 ruling).** Rev. 2 divided by layer 1's one-shot
@@ -169,6 +196,18 @@ pub struct WireObs {
     /// future group-commit primary path still owes this field (a real
     /// server-reported sync count).
     pub syncs: u64,
+    /// Whether `syncs` above is a real server-reported count or the fallback
+    /// derivation. **Provenance, not arithmetic** — nothing in this module
+    /// branches on it, so the gate's maths is unchanged and this flag cannot
+    /// alter a verdict. It exists so the report and BENCH.md can say, per
+    /// target, which numbers are counted and which are derived, rather than
+    /// publishing both as though they were the same kind of fact.
+    ///
+    /// `true` for a `bench-app` that answered `/__syncs`; `false` for
+    /// `invoicing`, which mounts no such route. Under batching only the counted
+    /// form is sound — a derived `syncs_per_request` assumes one fsync per
+    /// commit, which is exactly what group commit removes.
+    pub syncs_counted: bool,
     /// `Heartbeat::finish()` over the measured window.
     pub heartbeat: Option<String>,
 }
@@ -318,6 +357,10 @@ pub fn point_accounting(w: &WireObs) -> Result<WireAccounting, String> {
             // is a per-target derivation and not a count.
             log_records_per_sec,
             syncs_per_sec,
+            // Provenance carried through unchanged: this module makes no
+            // decision on it, so a counted and a derived point are gated
+            // identically and only the artifact can tell them apart.
+            syncs_counted: w.syncs_counted,
             device_ratio,
             device_appends_per_sec_before: w.device_before,
             device_appends_per_sec_after: w.device_after,
@@ -356,7 +399,12 @@ mod tests {
             device_before: 4000.0,
             device_after: 4000.0,
             records_per_request: 2.0,
-            syncs: 1000, // one commit per acked request — today's engine
+            // One sync per acked request: the DERIVED form, which is what this
+            // fixture models. ("today's engine" was the old wording here and is
+            // now wrong — group commit landed, so N commits can share one
+            // fsync; a counted point is the one that shows it.)
+            syncs: 1000,
+            syncs_counted: false,
             heartbeat: None,
         }
     }
@@ -747,7 +795,9 @@ mod tests {
             device_before: 1e12,
             device_after: 1e12,
             records_per_request: 1.0,
-            syncs: 10, // one commit per acked request — today's engine
+            // The derived form, as in `healthy()` above.
+            syncs: 10,
+            syncs_counted: false,
             heartbeat: None,
         }
     }

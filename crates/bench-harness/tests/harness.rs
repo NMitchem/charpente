@@ -416,11 +416,33 @@ fn kernel_layer_drains_the_batch_with_every_job_done() {
 // a coin flip, and rev. 3 alone did not: with a bracket-stable ceiling this
 // smoke still failed 3 of 3, because the quantity being flagged was the
 // DERIVED record rate (records_per_request * throughput, which assumes a
-// steady-state job drain a 2s window has not reached). The gate now reads
-// the COUNTED acked-request rate, which cannot exceed the ceiling by
-// construction (ack-after-durable). See the plan's Task 7 rev. 4 block for
-// the readings. If this flakes, that is a finding to report, not a
-// threshold to widen.
+// steady-state job drain a 2s window has not reached). See the plan's Task 7
+// rev. 4 block for the readings. If this flakes, that is a finding to report,
+// not a threshold to widen.
+//
+// **Two corrections, 2026-08-14 (the wire sync counter).** The sentence that
+// used to sit here — "the gate now reads the COUNTED acked-request rate" —
+// described rev. 4's design, which the 2026-08-10 device-ratio interlude
+// deliberately REVERSED back to a derived `syncs_per_request * throughput`
+// (see `wire_accounting`'s module doc). So this comment had been wrong about
+// its own gate since that interlude.
+//
+// And the assertion below was RED for two days without anyone seeing it.
+// Group commit's T6/T7 (2026-08-12/13) made N commits share one fsync, at
+// which point the derived sync rate ran away from the ceiling and the gate
+// refused every contended point. Proven, not inferred: at the pre-fix commit
+// this test fails with "954 durable syncs/s from 477 acked requests/s is
+// 4.08x the measured device ceiling" — 954 being exactly 2.0 * 477, the
+// derivation. It stayed invisible because `#[ignore]` keeps it out of
+// `cargo test --workspace`, and the last recorded `scripts/bench.sh --smoke`
+// run (12/12 green, 2026-08-10) predates the batching. **The `#[ignore]` that
+// keeps expensive tests out of the default suite also hides their failures
+// until someone runs the matrix by hand** — same class as the kernel pin
+// having had no CI enforcement (T9 census, C4).
+//
+// The gate now reads a real server-reported sync count for bench-app
+// (`/__syncs`, lib.rs), which is what `wire_accounting`'s "owed work"
+// paragraph asked for.
 #[test]
 #[ignore]
 fn wire_layer_sweeps_the_bench_app() {
@@ -455,6 +477,35 @@ fn wire_layer_sweeps_the_bench_app() {
             p.p50_us <= p.p99_us && p.p99_us <= p.p999_us,
             "percentile ordering"
         );
+        // bench-app reports a real count; a silent fall back to the derivation
+        // would leave the gate on an unsound quantity with this test still
+        // green, which is precisely how the pre-fix state survived two days.
+        assert!(
+            p.syncs_counted,
+            "[{} conns] bench-app must report a COUNTED sync rate — `syncs_counted: false` means \
+             /__syncs was unreachable or unparseable and the unsound derivation is back in the \
+             gate",
+            p.connections
+        );
+        // The discriminating assertion, and it is unsatisfiable under the old
+        // derivation by construction: that produced `syncs_per_request *
+        // throughput` = 2.0 * throughput for bench-app, which can never be
+        // below throughput. Only amortization can put it there. Asserted at
+        // CONTENDED points only — at 1 connection nothing batches, so ~2 syncs
+        // per request is the correct answer and this must not be demanded of
+        // it.
+        if p.connections > 1 {
+            assert!(
+                p.syncs_per_sec < p.throughput_per_sec,
+                "[{} conns] group commit must amortize: {} syncs/s against {} req/s is {:.2} \
+                 syncs per request — at or above 1.0 means batches of one, i.e. either the \
+                 request arm stopped draining or the derivation is back",
+                p.connections,
+                p.syncs_per_sec,
+                p.throughput_per_sec,
+                p.syncs_per_sec / p.throughput_per_sec
+            );
+        }
     }
 }
 
@@ -578,6 +629,7 @@ fn a_saturated_client_is_flagged_on_the_point() {
         throughput_per_sec: 1.0,
         log_records_per_sec: 2.0,
         syncs_per_sec: 2.0,
+        syncs_counted: false,
         device_ratio: 0.5,
         device_appends_per_sec_before: 2.0,
         device_appends_per_sec_after: 2.0,

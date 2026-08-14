@@ -30,7 +30,19 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let serve = || -> std::io::Result<()> {
-        let disk = ProdDisk::new(&dir)?;
+        // Count durable syncs and publish the counter BEFORE serving, so the
+        // `/__syncs` route can report a real number instead of the client-side
+        // derivation group commit made unsound. The wrapper only counts — it
+        // changes no outcome — so wrapping unconditionally cannot perturb what
+        // this binary is here to measure.
+        // Scoped to `wal/`: the gate's denominator is an append+sync ceiling
+        // on one growing file, so the numerator must be WAL syncs and not the
+        // store's checkpoints and `.horizon`'s too. See `counting::with_prefix`.
+        let (disk, syncs) = bench_harness::counting::CountingDisk::with_prefix(
+            Box::new(ProdDisk::new(&dir)?),
+            Some("wal/"),
+        );
+        let _ = bench_harness::SYNC_COUNTER.set(syncs);
         let entropy = ProdEntropy::new()?;
         let app = bench_harness::build(Box::new(disk), Box::new(entropy))?;
         // serve returns a handle; dropping it does not stop serving (launch's

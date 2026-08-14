@@ -295,6 +295,30 @@ pub fn sweep(
     ))
 }
 
+/// Reads `bench-app`'s server-reported durable-sync count over HTTP (the
+/// `/__syncs` route in `lib.rs`).
+///
+/// `None` means **this target does not report a count**, not "zero syncs" —
+/// `invoicing` is a separate app that mounts no such route and answers 404, and
+/// a `bench-app` built before the counter existed would too. The caller must
+/// therefore fall back to the derivation rather than treating `None` as 0,
+/// which would read as a physically impossible ratio of 0.0 and pass the gate
+/// vacuously.
+///
+/// Every failure collapses to `None` on purpose: this runs after the measured
+/// window, so it can neither corrupt a measurement nor justify discarding one.
+/// A target that should have counted but did not shows up as `syncs_counted:
+/// false` in the report, which is the loud channel — a lost point would be the
+/// quiet one.
+fn read_server_syncs(addr: &str) -> Option<u64> {
+    let mut conn = crate::client::Conn::connect(addr).ok()?;
+    let (status, body) = conn.request("GET", "/__syncs", &[], b"").ok()?;
+    if status != 200 {
+        return None;
+    }
+    std::str::from_utf8(&body).ok()?.trim().parse::<u64>().ok()
+}
+
 fn sweep_point(
     bin: &Path,
     target: &Arc<Target>,
@@ -362,11 +386,27 @@ fn sweep_point(
     std::thread::sleep(warmup);
     let hb = Heartbeat::start();
     let cpu0 = process_cpu();
+    // Sample the sync counter at BOTH window edges and use the delta. It is
+    // monotonic since process start, so a single cumulative read carries the
+    // warmup's syncs and the child's startup syncs while `syncs_per_sec`
+    // divides by `elapsed` — the measured window alone (this module's own doc:
+    // "the child's own startup costs sit before the warmup and are excluded").
+    // That inflates the rate by (warmup + startup)/duration, which for this
+    // smoke's 300ms/2s split is 1.15x — and 1.15x is exactly the overshoot
+    // that first looked like the device bracket failing to be an upper bound
+    // on the WAL's fsync rate. It was not; it was this. Same discipline as
+    // `core_accounting::applied_delta`: a delta across the window, never a
+    // total. The two reads sit microseconds outside the edges (one HTTP round
+    // trip, ~8ms against a 2s window, and a read pays no sync of its own), so
+    // the delta spans marginally more than `elapsed` — under 0.5%, absorbed by
+    // the gate's 10% floor, and in the conservative direction.
+    let syncs_open = read_server_syncs(&addr);
     let start = Instant::now();
     measuring.store(true, Ordering::Relaxed);
     std::thread::sleep(duration);
     measuring.store(false, Ordering::Relaxed);
     let elapsed = start.elapsed();
+    let syncs_close = read_server_syncs(&addr);
     let client_cpu = process_cpu() - cpu0;
     stop.store(true, Ordering::Relaxed);
     // `Heartbeat` has no `Drop`; finish it before any `?` below can return
@@ -395,6 +435,17 @@ fn sweep_point(
             }
         }
     }
+    // The window's sync DELTA, from the two edge samples taken above while the
+    // child was still alive (`drop(node)` below is SIGKILL, so there is no exit
+    // hook available). `checked_sub` rather than `-`: a counter that went
+    // backwards is impossible, and the `applied_delta` interlude is this repo's
+    // standing lesson that an impossible subtraction still wraps in release.
+    // None on either sample, or a backwards one, means "this target does not
+    // report" and falls back to the derivation.
+    let counted_syncs = match (syncs_open, syncs_close) {
+        (Some(open), Some(close)) => close.checked_sub(open),
+        _ => None,
+    };
     drop(node);
     // The second bracket sample, taken after the child is killed (T7 rev. 3)
     // — deferred as a `Result` rather than `?`ed immediately so a worker's
@@ -426,10 +477,14 @@ fn sweep_point(
         // acked request (the request's own effects record and its Bump's
         // Done-mark), so `records_per_request` (== `syncs_per_request` while
         // one commit costs one fsync) is 2.0, not 1.0. Numerically unchanged
-        // for Invoicing (1.0). This remains a DERIVED input, not a counted
-        // one — see `Target::syncs_per_request`'s doc and
-        // `wire_accounting`'s module doc for what would make it counted.
-        syncs: (target.syncs_per_request() * acked as f64) as u64,
+        // for Invoicing (1.0). The derivation is now the FALLBACK, not the
+        // rule: a target that reports a real count is gated on that count, and
+        // the derivation stands only where no counter exists. Group commit is
+        // what forced this — `syncs_per_request` stops being a sound multiplier
+        // the moment N commits share one fsync, which is the "owed work"
+        // `wire_accounting`'s module doc named in advance.
+        syncs: counted_syncs.unwrap_or((target.syncs_per_request() * acked as f64) as u64),
+        syncs_counted: counted_syncs.is_some(),
         heartbeat,
     };
     let a = point_accounting(&obs).map_err(io::Error::other)?;

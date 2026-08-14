@@ -15,6 +15,7 @@ use charpente::{event, job, jobs, route, routes, table};
 pub mod client;
 pub mod core_accounting;
 pub mod core_bench;
+pub mod counting;
 pub mod device;
 pub mod kernel_accounting;
 pub mod kernel_bench;
@@ -69,6 +70,44 @@ pub fn read_slot(tx: &mut Tx, id: u64) -> Result<u64, ApiError> {
         .map_or(0, |s| s.hits))
 }
 
+/// The server-reported durable-sync count `wire_accounting`'s module doc has
+/// owed since the 2026-08-10 T1 fix wave: "Either a server-reported sync
+/// counter ships (surfaced over HTTP or in the child's exit output), or this
+/// gate is re-scoped honestly." Group commit is what made the client-side
+/// derivation (`syncs_per_request * throughput`) unsound — N commits can now
+/// share one fsync — and T10 attempt 1 duly refused 8 of 8 contended points.
+///
+/// **Over HTTP rather than at exit, and that is forced, not preferred.** The
+/// harness stops the child with `BenchChild::drop`'s `child.kill()`, which is
+/// SIGKILL on Unix and uncatchable, so a child cannot print a final count on
+/// the way out. Exit output would require replacing the stop mechanism with a
+/// catchable signal plus a handler — strictly more machinery than one route on
+/// a binary nobody deploys.
+///
+/// **Why a static.** `#[route]` handlers take `&mut Tx` and nothing else;
+/// there is no app-state injection to hand this the disk's counter, so
+/// `bench-app` publishes the `Arc` here before it serves. `OnceLock` rather
+/// than a mutable static so the publish is single-assignment and needs no
+/// unsafe. A layer that never publishes reads 0, which the wire layer treats
+/// as "this target does not count" rather than as zero syncs.
+///
+/// This route is read ONCE, after the measured window closes, so it lands in
+/// no throughput figure. It is a read, so it commits nothing and pays no sync
+/// of its own — reading the counter cannot move it.
+pub static SYNC_COUNTER: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicU64>> =
+    std::sync::OnceLock::new();
+
+#[route(GET "/__syncs")]
+pub fn syncs(tx: &mut Tx) -> Result<u64, ApiError> {
+    // `#[route]` requires the first parameter to be named exactly `tx` — an
+    // `_tx` is a compile error naming the contract, the site and the fix. This
+    // handler reads no state, so the binding is discarded rather than renamed.
+    let _ = tx;
+    Ok(SYNC_COUNTER
+        .get()
+        .map_or(0, |c| c.load(std::sync::atomic::Ordering::SeqCst)))
+}
+
 /// The invoicing idiom (examples/invoicing/src/lib.rs:19): one free function
 /// shared by the App builder and any bare-`Db` consumer (the core layer).
 pub fn schema() -> Schema {
@@ -77,6 +116,6 @@ pub fn schema() -> Schema {
 
 pub fn build(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> std::io::Result<App> {
     Ok(App::open(disk, schema(), entropy, AppConfig::default())?
-        .mount(routes![hit, read_slot])
+        .mount(routes![hit, read_slot, syncs])
         .mount_jobs(jobs![Bump]))
 }

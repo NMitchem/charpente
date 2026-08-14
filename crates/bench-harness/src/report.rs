@@ -107,17 +107,26 @@ pub struct SweepPoint {
     pub throughput_per_sec: f64,
     pub log_records_per_sec: f64,
     // 2026-08-10 group-commit interlude, T1 fix wave, I-4/C-1: the
-    // device-ratio gate's ACTUAL subject. NOT a counted quantity — a client
-    // outside the process cannot see the server's log, so this is
-    // `Target::syncs_per_request() * throughput` (wire.rs), today equal to
-    // `log_records_per_sec` (one commit, one fsync, no batching). Published
-    // so the gate's own numerator is reconstructable from the artifact
-    // rather than implicit, mirroring the standing ruling that added
-    // `device_ratio_denominator` for the DENOMINATOR (T5 review C-1 / Noah
-    // ruling #1). See wire_accounting's module doc for why gating on a
-    // derived quantity here is safe as of this fix, having previously been
-    // ruled unsafe (T7 rev. 4).
+    // device-ratio gate's ACTUAL subject. Published so the gate's own
+    // numerator is reconstructable from the artifact rather than implicit,
+    // mirroring the standing ruling that added `device_ratio_denominator` for
+    // the DENOMINATOR (T5 review C-1 / Noah ruling #1).
+    //
+    // **2026-08-14: this may now be COUNTED, and the comment that used to say
+    // "NOT a counted quantity — a client outside the process cannot see the
+    // server's log" is superseded.** That was true of the log, and remains
+    // true of `log_records_per_sec` below; it stopped being true of syncs the
+    // moment a target began reporting its own. bench-app now does, over
+    // `/__syncs`. Read `syncs_counted` to know which this is: counted is a
+    // real fsync tally from inside the server, derived is
+    // `Target::syncs_per_request() * throughput`, which assumes one fsync per
+    // commit and is therefore unsound under group commit.
     pub syncs_per_sec: f64,
+    /// Whether `syncs_per_sec` above is a real server-reported count (`true`)
+    /// or the one-fsync-per-commit derivation (`false`). Published because two
+    /// numbers of different evidentiary standing must not appear in one table
+    /// looking alike — the same reason `device_ratio_denominator` is published.
+    pub syncs_counted: bool,
     // T7 rev. 4 (Noah ruling, 2026-08-09), SUPERSEDED at the wire layer by
     // the 2026-08-10 group-commit interlude's T1 fix wave (C-1): this field
     // is still published-but-not-gated-on — it stays the log-record-rate
@@ -571,6 +580,7 @@ mod tests {
                     throughput_per_sec: 1200.0,
                     log_records_per_sec: 2400.0,
                     syncs_per_sec: 2400.0,
+                    syncs_counted: true,
                     device_ratio: 0.685,
                     device_appends_per_sec_before: 3500.0,
                     device_appends_per_sec_after: 3600.0,
