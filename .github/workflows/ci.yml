@@ -24,3 +24,13 @@ jobs:
       # Cross-build-mode seed replay (the mode-skew regression, seed 0xff159ed76d2806e4).
       - run: CHARPENTE_SEED=0x8bee1752811ae873 cargo test --release -p charpente-sim --test crash_recovery
       - run: CHARPENTE_SEED=0xff159ed76d2806e4 cargo test --release -p charpente --test replication -- late_follower_seeds_below_the_gcd_base_and_converges --exact
+      # The kernel pin, in DEBUG — added 2026-08-14 (T9 census finding C4). Until this line
+      # existed, seed 0x348270b38f166529 was enforced by local sweep convention alone: it appears
+      # nowhere in .github/ or scripts/, so a change that defanged it left CI silent and only a
+      # human remembering a command stood in the way. Named --exact on purpose: CHARPENTE_SEED is
+      # read only by run_universes*_in, so it forces exactly ONE test in this suite (the file's
+      # only run_universes_swarm!). Running the whole suite would report 30 passes of which 29 ran
+      # at their own literals and are not evidence about the pin. Debug because this pin is a debug
+      # replay (the two above are the release mode-skew pair), and debug artifacts are already warm
+      # from `cargo test --workspace`, so the marginal cost is one test.
+      - run: CHARPENTE_SEED=0x348270b38f166529 cargo test -p charpente --test kernel -- kernel_jobs_are_exactly_once_under_the_fault_matrix --exact
