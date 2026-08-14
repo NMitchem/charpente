@@ -240,16 +240,72 @@ workloads routinely queue many at once. `run_universes!` and every pinned seed a
 forever, so this is handled explicitly rather than absorbed.
 
 - **Batch-of-1 identity** (§1) means any universe that never has two items ready at once is
-  byte-identical, and many pins survive for free.
-- **Every pinned seed gets the worktree-isolated revert-guard proof** the migrations
+  byte-identical, and many pins survive for free. **This is pinned in the suite, not merely
+  asserted here:** `a_never_contended_universe_traces_identically_to_the_pre_batching_fixture`
+  (`crates/charpente/tests/group_commit.rs:466`) compares a byte-identical disk trace against
+  the tracked fixture `crates/charpente/tests/fixtures/pre-batching-trace.txt`, captured at T5
+  while the kernel was still unbatched. It is the single largest reason most pins survive.
+- **Every load-bearing pin gets the worktree-isolated revert-guard proof** the migrations
   close-out established: revert the historical fix, confirm the seed still goes red for its
-  original reason. Outcome recorded per seed.
+  original reason. Outcome recorded per seed. What "load-bearing" denotes is ruled below.
 - A pin that no longer exercises its bug gets a **replacement hunted**, and both are
   recorded — the old one with the reason it drifted. A silently-passing pin is
   indistinguishable from a working one, which is the failure mode this repo has caught in
   itself three times.
 
 This is a dedicated task and will not be a quick one.
+
+**Amended 2026-08-14 (Noah rulings 1, 2, 3 and 5, on the Task 9 pre-flight's census —
+`.superpowers/sdd/2026-08-10-group-commit/task-9-preflight.md`).** This section shipped
+requiring the revert-guard proof for "**every pinned seed**", with two outcomes: the pin
+reddens, or a replacement is hunted. Measured against the tree at `fceb21d`, that sentence
+denotes no population that exists, and it prescribes a procedure that is undefined for most of
+what it names. Four corrections, each carrying the census as its evidence.
+
+**(1) Scope — "every pinned seed" denotes the FOUR load-bearing pins.** A revert-guard proof is
+meaningful only where *the seed is the reproduction* — where the bug is reachable because that
+seed produces a particular fault or crash schedule. Measured, the repo has four such seeds:
+`0x8bee1752811ae873` (`crash_recovery.rs:27` + `ci.yml:25`), `0x348270b38f166529` (a comment at
+`kernel.rs:1392` + `ci.yml:26`), `0xff159ed76d2806e4` (`ci.yml` only — a literal nowhere in
+`crates/`), and `0x1f733f8d9eebf822` (`transactions.rs:910`, the one literal-driven pin running
+with faults on). Of the ~181 other genuine seed literals, ~140 are consumed by
+`Sim::with_faults(seed, FaultConfig::none())`, where every fault consumer is a `chance(0.0)` and
+the entropy stream is a separate `Rng` that batching does not touch: the seed is starting
+entropy, the *test's script* is the reproduction, and there is no historical fix to revert. For
+those, "re-verify" reduces to "the suite is green", which the close-out sweep already
+establishes. Requiring the full procedure of all of them would produce ~140 rows of `N/A` — the
+documentation theater this repo exists to refuse. The rejected wider reading is recorded so it
+is not re-derived: it is not cheaper to be vague here, it is only less honest.
+
+**(2) The census is by CALL SITE and covers `src/` too.** No hex-length threshold separates
+seeds from noise in this repo — seeds run from `0x1` to a full 64 bits — so a literal census is
+unsound by construction. Enumerate by seed-consuming constructor, over `crates/*/tests/*.rs`
+**and** `crates/*/src/**/*.rs`, and list the `CHARPENTE_SEED` replay pins separately from
+`ci.yml` and CLAUDE.md, because those are a different kind of object that no source census can
+find. The decisive evidence for including `src/`: the plan's own allocation table assigns
+`0x60C0_0011` (`crates/charpente/src/kernel/cron.rs:321`), and the plan's own enumeration
+command cannot find it. This is the third occurrence of this class — the M1 close-out already
+recorded it of the edge crate's ignored tests.
+
+**(3) Pin evidence is stated PER-TEST, never per-suite.** `CHARPENTE_SEED` is read only by
+`run_universes_in`/`run_universes_swarm_in`, so it forces the seed of exactly one test per
+suite: 1 of 30 in the kernel suite, 2 of 4 in crash_recovery. Every "26/26" or "30/30" reported
+in this repo's history as a pin replay is 29 tests running at their own literals and is not
+evidence about the pin. A revert-guard proof must name the consuming test and redden *it*.
+
+**(4) FOUR verdicts, not two.** `PIN-EXERCISES-BUG`; `IMMUNE-BY-CONSTRUCTION` (reached without
+reverting anything — the pin's own broken variant lives permanently in the test file, or the
+pin's layer is structurally outside this change); `REPLACEMENT-PINNED` (with the new seed and
+the batch that found it); and `RETIRED-UNREACHABLE`. The last is the outcome this section
+originally lacked, and it is the honest answer where a *later, stronger* fence now catches the
+condition earlier — the horizon breadcrumb, the recovery-horizon rule and the gaplessness
+triple-guard all do this. Hunting a replacement there is hunting for a universe that reaches
+unreachable code, and no budget makes it succeed. This weakens a promise the section made, so
+it is ruled rather than absorbed: the compensating requirement is that a retired pin is **kept
+in place with the fence that superseded it named in a comment**, never deleted — matching the
+`kernel_stops_on_a_latched_store` and `failover_resurrected_primary_does_not_accept_writes`
+precedent of update-and-rename. A hunt also gets a stated per-suite budget and a verdict for
+exhausting it; "until a seed reproduces the bug" is not a stopping rule.
 
 ## §8 What the measurement is worth
 

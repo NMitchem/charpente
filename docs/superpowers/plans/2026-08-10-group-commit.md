@@ -1215,6 +1215,18 @@ git commit -m "test: group-commit property suite — six properties, twins for t
 
 ### Task 9: Re-verify every pinned seed
 
+> **SUPERSEDED 2026-08-14 by `.superpowers/sdd/2026-08-10-group-commit/task-9-brief.md`** (five
+> Noah rulings on the Task 9 pre-flight's census; spec §7 amended the same day). The steps below
+> are retained as history and **must not be executed as written** — three of them are measured
+> wrong. Step 1's glob misses 101 literals under `crates/*/src/` including `0x60C0_0011`, a seed
+> *this plan's own allocation table assigns*, and cannot find either seed `ci.yml` actually
+> replays. Step 2's `/tmp/pin-check` violates the scratchpad convention and omits the
+> `CARGO_TARGET_DIR` hazard that has already produced a false RED in this sub-project. Step 3 has
+> no stopping rule and presumes two outcomes where four exist. The pre-flight's headline: the
+> expensive procedure applies to **four** seeds, not ~192, and the deliverable is the classified
+> census. This also resolves the Self-Review's "T9 is the task most likely to need splitting" —
+> it does not split.
+
 **Files:**
 - Modify: whichever test files carry pinned seeds (`crash_recovery.rs`, `wal.rs`,
   `kernel.rs`, `transactions.rs`, `replication.rs`, `realtime.rs`, `auth.rs`)
@@ -1345,6 +1357,34 @@ deep it recovers Nx"* — never as *"charpente is Nx faster"*. Bare metal stays 
 
 - [ ] **Step 2: DESIGN.md** — the staged commit path, the two-level overlay, `submit_all`,
 and the batch cap constant with its rationale.
+
+  **Plus the job-arm fairness change (Noah ruling 4, 2026-08-14 — T8b's product finding, owed
+  here).** Record it as an **observed property, not a promise**, and in the sharp measured form
+  rather than "the fairness profile changed": batching moved job-arm service from *certain* to
+  *probabilistic in the queue depth*. State it as a **bound**, because the mechanism is known
+  exactly — arbitration is a uniform draw and the flood drains in `ceil(FLOOD / MAX_BATCH)`
+  request-arm wins, so a due job must win one of that many coin flips; at flood 100 against
+  `MAX_BATCH` 64 that is 2 draws, hence P(fail) ≈ 0.25. With the measurements: pre-batching
+  200/200, post-batching **151/200** at flood 100, **0/200** at flood 1024 (controller-reproduced
+  independently, exact match to the T8b review). A reader can reason about a bound; they cannot
+  reason about an adjective — and "the profile changed" is the kind of soft claim MANIFESTO §8
+  refuses, since a guarantee that quietly became probabilistic is the thing that section is about.
+  **Where it goes, and the sentence it must not contradict (verified 2026-08-14).** DESIGN's only
+  existing fairness text is `DESIGN.md:171`, in §1's ready-source walk: one unit of `Ready::Tail`
+  work is a bounded table read "serviced round-robin across live tails so one deep resume never
+  starves the rest of the ready set (§6)". So DESIGN today makes a non-starvation **promise** about
+  a *different arm* and none about the job arm. Put the job-arm text beside it, and phrase the two
+  so a reader sees which is a promise and which is an observation.
+
+  **And check that sentence while you are there — this is an open question, not a settled one.**
+  It was written before greedy drain existed. It says a deep *tail* resume never starves the ready
+  set, which batching does not weaken; the converse is what is now unasserted — whether the request
+  arm draining up to `MAX_BATCH` starves a registered tail the same way T8b measured it doing to a
+  due job. T8b measured the job arm only. If you cannot answer it from the arbitration code, say so
+  in the DESIGN text rather than letting §1's sentence be read as covering it, and ledger it.
+
+  The existing sibling property `due_jobs_are_not_starved_by_a_request_flood` still holds and stays
+  green — say so, so the record does not read as a lost guarantee where none was lost.
 
 - [ ] **Step 3: GUIDE.md** — the mid-batch 500 contract from §4, in the operator voice: a
 500 never promises rejection, only absence of confirmation, and after a mid-batch apply
