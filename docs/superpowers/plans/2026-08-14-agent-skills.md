@@ -164,13 +164,24 @@ Extract the same range from git and diff it against what landed. Do not skip thi
 "verbatim" move that silently reflows is the doc-truth failure committed by the task meant
 to enable the doc-truth skill.
 
+Derive the offsets rather than hardcoding them, and **prove both operands are non-empty
+before believing the comparison** — `diff` reports two empty files as identical, so an
+extraction that silently yields nothing produces a pass that means nothing:
+
 ```bash
 git show HEAD:CLAUDE.md | awk '/^## Current state \/ immediate next steps/,0' > /tmp/claude-tail.txt
-tail -n +9 docs/LEDGER.md > /tmp/ledger-body.txt
+START=$(grep -n "^## Current state / immediate next steps" docs/LEDGER.md | head -1 | cut -d: -f1)
+tail -n +${START} docs/LEDGER.md > /tmp/ledger-body.txt
+test -s /tmp/claude-tail.txt && test -s /tmp/ledger-body.txt || { echo "VACUOUS: an operand is empty"; exit 1; }
 diff /tmp/claude-tail.txt /tmp/ledger-body.txt && echo "BYTE-EXACT"
+shasum -a 256 /tmp/claude-tail.txt /tmp/ledger-body.txt
 ```
 
-Expected: `BYTE-EXACT`. Any diff means fix the copy, not the check.
+Expected: `BYTE-EXACT` and two identical hashes. Any diff means fix the copy, not the check.
+
+Then prove **nothing was dropped anywhere**, which byte-exactness of the moved region alone
+does not establish: the kept region's line count plus the moved region's must equal the
+original file's exactly, so every line is accounted for in exactly one output file.
 
 - [ ] **Step 5: Trim CLAUDE.md**
 
