@@ -7,6 +7,17 @@ instruction, and every subagent dispatched in this repo was loading all of it.
 CLAUDE.md carries the standing rules. This file carries what happened. The underlying
 detail lives in git history and `.superpowers/sdd/`.
 
+**How to read the pin-replay figures below (correction, 2026-08-15, M2 T9).** Entries
+report pinned-seed replays as `0x348270b38f166529` "26/26" / "29/29" / "30/30" and
+`0x8bee1752811ae873` "4/4". Those are **suite** counts, not pin evidence.
+`CHARPENTE_SEED` is read only by `run_universes_in`/`run_universes_swarm_in`, so it forces
+the seed of exactly one test per suite — measured at `de40e0b`: **1 of 30** in the
+charpente kernel suite and **2 of 4** in charpente-sim crash_recovery (`grep -c
+"replaying seed"`). A "30/30" is 29 tests that ran at their own literals and are not
+evidence about the pin. The denominator that matters is the `replaying seed` count; read
+every figure below that way. `.github/workflows/ci.yml` now names the consuming test
+`--exact` for the kernel pin so the CI line cannot drift back into the per-suite reading.
+
 ## Current state / immediate next steps
 
 - Founding + knowledge docs committed. License: MIT OR Apache-2.0 (DECISIONS §9). All
@@ -394,7 +405,13 @@ detail lives in git history and `.superpowers/sdd/`.
   hard rule 4, a scan_raw_from u64::MAX brick guard + pin, and the plan's
   six→seven-errors text fix), and the kernel-pin re-verification (worktree-isolated
   revert-guard proof): outcome PIN-EXERCISES-BUG — pin seed `0x348270b38f166529`
-  still exercises its historical bug post-migrations. Follow-ups ledgered: the
+  still exercises its historical bug post-migrations. **Corrected 2026-08-15
+  (M2 T9):** this over-claims. The proof reverted `Kernel::build`'s drain-id
+  fix, whose own seed is `0x650`; the bug `0x348270b38f166529` was pinned for
+  is a *test-file* checker gap (the `is_fault_fallout` arm in `kernel.rs`).
+  The seed does still exercise the drain-id fix — that much re-verified at
+  `de40e0b` — but it no longer exercises its own historical bug; see
+  `.superpowers/sdd/2026-08-10-group-commit/pin-reverification.md`. Follow-ups ledgered: the
   horizon-collapse Design A fix (ruled, next up); `Db::poisoned()` reflects only
   apply-side poison, not redb read-side poison (needs its own investigation); and
   the final review's accepted minor-triage items.
@@ -420,7 +437,13 @@ detail lives in git history and `.superpowers/sdd/`.
   .superpowers/sdd/interlude-review-e978948-d7d7116.md), its one Important
   discharged same-day: kernel pin 0x348270b38f166529 revert-guard re-verified
   PIN-EXERCISES-BUG at d7d7116 (3 historical tests red incl. the pin itself,
-  identical dispatch.rs:158 panic; restored 25/25).
+  identical dispatch.rs:158 panic; restored 25/25). **Corrected 2026-08-15 (M2
+  T9):** the reverted fix was the drain-id one, which is not what this seed was
+  pinned for (as above). The `dispatch.rs:158` site has since MOVED — T7's
+  `run_due`→`run_due_into` rewrite put the same `assert_eq!` ("dispatcher
+  invariant: job {id} in the heap is not Pending") at `dispatch.rs:182`. Same
+  assertion, new line; a "same panic, same line" claim carried forward from
+  here would be false.
 - **M1 sub-project 6 done — introspection polish + the edge harness (2026-07-27, spec
   docs/superpowers/specs/2026-07-23-introspection-edge-harness-design.md (1f76801) + 3
   Noah-ruled pre-flight amendments (ea7fe4c), 14-task plan

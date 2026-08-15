@@ -1389,7 +1389,18 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
         // crash countdown can trip right here, so this call needs the same
         // classify-and-reopen treatment as every other fallible step below —
         // otherwise an injected fault mid-check reads as a real violation
-        // (found by seed 0x348270b38f166529).
+        // (originally found by seed 0x348270b38f166529).
+        //
+        // That seed no longer reaches this arm: T7's group-commit rewrite moved
+        // the op schedule, so its universe no longer trips a crash inside the
+        // checker. Re-verified 2026-08-15 (T9): deleting the is_fault_fallout
+        // classification below leaves 0x348270b38f166529 GREEN. The live
+        // reproduction is seed 0xe653f43924f17fe8, found by a 10,000-universe
+        // batch from this file's own ambient base and confirmed RED-first
+        // (RED with the classification deleted, GREEN with it restored). The
+        // old seed is kept: it is still this suite's CHARPENTE_SEED replay pin
+        // in .github/workflows/ci.yml, and it still exercises Kernel::build's
+        // drain-id fix (dispatch.rs's "job in the heap is not Pending" assert).
         match exactly_once_holds(&mut app) {
             Ok(()) => {}
             Err(msg) => {

@@ -281,8 +281,11 @@ is not re-derived: it is not cheaper to be vague here, it is only less honest.
 seeds from noise in this repo — seeds run from `0x1` to a full 64 bits — so a literal census is
 unsound by construction. Enumerate by seed-consuming constructor, over `crates/*/tests/*.rs`
 **and** `crates/*/src/**/*.rs`, and list the `CHARPENTE_SEED` replay pins separately from
-`ci.yml` and CLAUDE.md, because those are a different kind of object that no source census can
-find. The decisive evidence for including `src/`: the plan's own allocation table assigns
+`.github/workflows/ci.yml`, because those are a different kind of object that no source census
+can find. (Amended 2026-08-15: this said "from `ci.yml` and CLAUDE.md". CLAUDE.md stopped
+carrying them at `c1c0feb`, when the narrative moved to `docs/LEDGER.md`; `ci.yml` is now the
+single authority and lists **three** replay lines, the kernel pin having been added at
+`528ec76`.) The decisive evidence for including `src/`: the plan's own allocation table assigns
 `0x60C0_0011` (`crates/charpente/src/kernel/cron.rs:321`), and the plan's own enumeration
 command cannot find it. This is the third occurrence of this class — the M1 close-out already
 recorded it of the edge crate's ignored tests.
@@ -306,6 +309,28 @@ in place with the fence that superseded it named in a comment**, never deleted �
 `kernel_stops_on_a_latched_store` and `failover_resurrected_primary_does_not_accept_writes`
 precedent of update-and-rename. A hunt also gets a stated per-suite budget and a verdict for
 exhausting it; "until a seed reproduces the bug" is not a stopping rule.
+
+**Executed 2026-08-15 — outcomes, and one verdict the four do not cover**
+(`.superpowers/sdd/2026-08-10-group-commit/pin-reverification.md`). The census confirmed this
+section's scope ruling: **383** genuine seed-consuming call sites (267 in `tests/`, 116 in
+`src/`), of which exactly the four named pins are load-bearing. Outcomes:
+`0x8bee1752811ae873` IMMUNE-BY-CONSTRUCTION (self-guarding, and *proven* so — feeding its
+assertion the fixed recovery variant reddens it); `0x1f733f8d9eebf822` PIN-EXERCISES-BUG (RED
+with the discard-and-rebuild arm reverted, and RED for its original reason, `invalid data`);
+`0x348270b38f166529` split — PIN-EXERCISES-BUG against `Kernel::build`'s drain-id fix, but
+**REPLACEMENT-PINNED** against the checker-gap arm it was actually pinned for, replaced by
+`0xe653f43924f17fe8`.
+
+`0xff159ed76d2806e4` is the one this section's verdict set cannot express, and it needs a
+ruling rather than a silent classification. Reverting the redb `debug-assertions` override
+**does** diverge the universe — measured, primary fingerprint `0x27781cbd559ebcf9` (debug and
+release-with-override, identical) versus `0x80a593084e9bc3c3` (release reverted) — so the fix
+is load-bearing and the guarantee it protects is real. But the host test **passes either way**,
+at the pinned seed and across a 10,000-universe hunt (197 s, zero failures). The pin is not
+retired-unreachable and it has no replacement to hunt: the property is simply robust to the
+skew, so a pass/fail test is the wrong instrument. The thing that discriminates is the
+cross-mode *fingerprint*, which nothing in CI compares. As wired, the "cross-build-mode seed
+replay" tripwire would not catch deletion of the override it exists to protect.
 
 ## §8 What the measurement is worth
 
