@@ -135,53 +135,28 @@ roadmap; do not reorder a milestone's dependency sequence.
 
 ## Current state
 
-**M1 complete** (2026-07-27). **M2 in progress**: sub-projects 0a (store-latch poison), 0b
-(dual-primary), 1 (benchmark harness) and three ruled interludes are done. Two sub-projects
-are open, and they are independent of each other:
+**M2 is the active milestone**; M0 and M1 shipped. That is deliberately all the status
+this file carries. Task-level state goes stale every time a task lands, and a stale
+instruction is worse than an absent one — so the chronological record is
+**[docs/LEDGER.md](docs/LEDGER.md)**, and per-plan mid-flight state lives in
+`.superpowers/sdd/<date>-<name>/progress.md` (gitignored: local working files, absent from
+a fresh clone). Read either when you need the history behind a decision. Neither is
+required to start work; **ask what is in flight before starting something adjacent**,
+because two sub-projects have run concurrently in this repo before.
 
-**Sub-project 2 — primary-side group commit (the active thread).** T1–T8b are committed:
-the mechanism ships (`Engine::submit_all`, `GroupOverlay`, `Db::begin_group`,
-`App::begin_group`, the kernel drain arms) with a deterministic property suite and a
-contended swarm behind it. Open:
-- **T9** (re-verify every pinned seed) — briefed, not dispatched. Its pre-flight found
-  the task infeasible as written and resized it: of 214 seed literals only **four** are
-  load-bearing revert-guards. Five rulings landed 2026-08-14; spec §7 was amended.
-- **T10** (benchmark numbers of record) — attempt 1 rejected. Two defects: the wire
-  layer's *derived* syncs/sec is unsound once one fsync serves many commits (fixed in
-  `3ebd322`, which makes the server report real syncs), and box load contaminated the
-  300s settle. The kernel layer is valid and is the headline: **6285.16 records/sec at
-  101.44 durable syncs/sec, 29.0x sub-project 1's baseline** — ~62 records per sync
-  against `MAX_BATCH` 64, so the win is amortization, not a skipped sync. Wire numbers
-  are observation only; do not quote them.
-- **T11** (DESIGN.md close-out) — open, and carries a ruled fairness bound: a due job is
-  serviced within `ceil(FLOOD/MAX_BATCH)` request-arm wins.
-
-**Next action:** re-run the benchmark matrix on a genuinely quiet box (a fixed-duration
-wait is *not* a settle on this machine — measured, the load arrives from other daemons
-rather than draining from ours), then T9, then T11.
-
-**Sub-project 3 — agent skills and personas (2026-08-14, paused).** T1 (this file's split
-from docs/LEDGER.md) shipped. T2, T4 and T5 are complete **with no skill written**: the
-evidence gates refused, which is a valid outcome of the experiment, not a failure. T3, T6
-(the persona files) and T7 (close-out) are not started — so `.claude/skills/` and
-`.claude/agents/` do not exist on disk yet. See "Subagent dispatch" below, which is
-blocked on T6.
-
-Mid-plan records live in `.superpowers/sdd/<date>-<name>/progress.md` — **gitignored**, so
-they are local working files, absent from a fresh clone.
-
-The full chronological record — every milestone, sub-project, ruled interlude, and the M2
-follow-up backlog — is **[docs/LEDGER.md](docs/LEDGER.md)**. Read it when you need the
-history behind a decision; it is not required to start work.
+**docs/BENCH.md is the only source of quotable performance numbers.** A figure in a
+ledger, a run artifact, or a commit message is an observation until it lands there — runs
+get rejected for instrumentation and load defects after producing plausible-looking
+output, so "I saw it in a report" is not provenance.
 
 ## Subagent dispatch
 
-**Not yet in effect — `.claude/skills/` and `.claude/agents/` do not exist.** They are
-sub-project 3's T3 and T6, both unstarted (see "Current state"). Until those land,
-dispatch subagents as you otherwise would; what follows is the intended end state, not a
-description of the tree.
+This repo intends to carry its own skills (`.claude/skills/`) and personas
+(`.claude/agents/`). **Check whether those directories exist before relying on them** —
+they are a work in progress, and if they are absent, dispatch subagents as you otherwise
+would rather than naming a persona that does not resolve.
 
-Once the personas exist: when dispatching a subagent for implementation, review, a census
-or an evidence sweep, select the matching charpente persona rather than
-`general-purpose`. Note that superpowers' `subagent-driven-development` templates
-hard-code `general-purpose` and vary only the model — override that here.
+When they are present: for implementation, review, a census or an evidence sweep, select
+the matching charpente persona rather than `general-purpose`. Note that superpowers'
+`subagent-driven-development` templates hard-code `general-purpose` and vary only the
+model — override that here.
