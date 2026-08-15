@@ -5,11 +5,43 @@ any code: README.md → DESIGN.md → PLAN.md (MANIFESTO.md for spirit; DECISION
 proposing to change an approach; NEIGHBORS.md before designing any subsystem with prior
 art — DST, storage, replication).
 
+## Why this exists (orientation; MANIFESTO.md carries the full argument)
+
+Agents write expert systems code cheaply; what they cannot do cheaply is *prove it
+right*. Agent output quality tracks **oracle density** — where a dense mechanical oracle
+exists, machine-written code is excellent, and where none exists it is weak. So the
+product here is not the feature list, it is the **oracle substrate** that makes a
+machine-written backend mechanically checkable. Design questions resolve toward whatever
+gives an agent a faster and more precise *no*.
+
+Four consequences carry the design. Each can be violated without breaking a single test,
+which is why they are written down:
+
+- **One process, one commit point, one log.** State changes, job enqueues and realtime
+  events commit in the same transaction. Replication ships the log, subscriptions tail
+  it, failover replays it, the simulator feeds it. Introducing a second place where
+  things become true is the one architectural mistake this codebase cannot absorb.
+- **The framework is the reviewer.** Compile-time contracts are the oracle for business
+  logic — a schema change that breaks a query must be a compile error, not a 500 — and
+  deterministic simulation is the oracle for everything beneath it. That is why error
+  text and seeds are product surface rather than developer conveniences (hard rules 5
+  and 3).
+- **Constraints are the feature.** No network await inside a transaction. A programming
+  model that admits nondeterminism cannot be replayed; one that forbids it replays byte
+  for byte from a seed. If a feature seems to need an escape hatch, the design is wrong
+  (hard rule 2).
+- **One big box, replicated.** One ordered log on one primary; followers replay it for
+  reads and failover. There is no sharding story and there will not be one.
+
+Refused on purpose, so you don't propose them: microservice/RPC/service-mesh anything,
+SQL as the primary query interface (a read-only Postgres-wire endpoint for BI tools is
+fine later), porting existing apps, and feature flags on determinism.
+
 ## What this is
 
-An agent-native, single-binary Rust backend platform. M0 is complete; M1 is in progress
-(see "Current state" below). The milestones and exit criteria in PLAN.md are the roadmap;
-do not reorder a milestone's dependency sequence.
+An agent-native, single-binary Rust backend platform. M0 and M1 are complete; M2 is in
+progress (see "Current state" below). The milestones and exit criteria in PLAN.md are the
+roadmap; do not reorder a milestone's dependency sequence.
 
 ## Commands
 
@@ -29,6 +61,12 @@ do not reorder a milestone's dependency sequence.
   2 usage/launch error. `--master-seed` replays a whole batch byte-identically.
 - Editing docs/GUIDE.md can break the build: `crates/guide-examples`'s build.rs extracts
   and compiles every ```rust block. `cargo build -p guide-examples` checks it alone.
+- **Capturing a sweep's exit status: this shell is zsh, which does not populate bash's
+  `PIPESTATUS` at all.** `${PIPESTATUS[0]}` expands to the empty string in every case,
+  and an empty string in a log reads as "no failure" to whoever skims it. Use
+  `${pipestatus[1]}` (lowercase, 1-indexed) or `set -o pipefail` and test `$?` — and
+  prove the idiom against a deliberate failure once before trusting a run to it. Pipe
+  cargo through `tee`, never `tail`: `tail` eats the aggregate counts.
 
 ## Workspace map
 
@@ -98,9 +136,39 @@ do not reorder a milestone's dependency sequence.
 ## Current state
 
 **M1 complete** (2026-07-27). **M2 in progress**: sub-projects 0a (store-latch poison), 0b
-(dual-primary), 1 (benchmark harness) and three ruled interludes are done; **sub-project 2,
-primary-side group commit, is in flight** — T1–T7 committed, T8–T11 open. The authoritative
-mid-plan record is the ledger at `.superpowers/sdd/2026-08-10-group-commit/progress.md`.
+(dual-primary), 1 (benchmark harness) and three ruled interludes are done. Two sub-projects
+are open, and they are independent of each other:
+
+**Sub-project 2 — primary-side group commit (the active thread).** T1–T8b are committed:
+the mechanism ships (`Engine::submit_all`, `GroupOverlay`, `Db::begin_group`,
+`App::begin_group`, the kernel drain arms) with a deterministic property suite and a
+contended swarm behind it. Open:
+- **T9** (re-verify every pinned seed) — briefed, not dispatched. Its pre-flight found
+  the task infeasible as written and resized it: of 214 seed literals only **four** are
+  load-bearing revert-guards. Five rulings landed 2026-08-14; spec §7 was amended.
+- **T10** (benchmark numbers of record) — attempt 1 rejected. Two defects: the wire
+  layer's *derived* syncs/sec is unsound once one fsync serves many commits (fixed in
+  `3ebd322`, which makes the server report real syncs), and box load contaminated the
+  300s settle. The kernel layer is valid and is the headline: **6285.16 records/sec at
+  101.44 durable syncs/sec, 29.0x sub-project 1's baseline** — ~62 records per sync
+  against `MAX_BATCH` 64, so the win is amortization, not a skipped sync. Wire numbers
+  are observation only; do not quote them.
+- **T11** (DESIGN.md close-out) — open, and carries a ruled fairness bound: a due job is
+  serviced within `ceil(FLOOD/MAX_BATCH)` request-arm wins.
+
+**Next action:** re-run the benchmark matrix on a genuinely quiet box (a fixed-duration
+wait is *not* a settle on this machine — measured, the load arrives from other daemons
+rather than draining from ours), then T9, then T11.
+
+**Sub-project 3 — agent skills and personas (2026-08-14, paused).** T1 (this file's split
+from docs/LEDGER.md) shipped. T2, T4 and T5 are complete **with no skill written**: the
+evidence gates refused, which is a valid outcome of the experiment, not a failure. T3, T6
+(the persona files) and T7 (close-out) are not started — so `.claude/skills/` and
+`.claude/agents/` do not exist on disk yet. See "Subagent dispatch" below, which is
+blocked on T6.
+
+Mid-plan records live in `.superpowers/sdd/<date>-<name>/progress.md` — **gitignored**, so
+they are local working files, absent from a fresh clone.
 
 The full chronological record — every milestone, sub-project, ruled interlude, and the M2
 follow-up backlog — is **[docs/LEDGER.md](docs/LEDGER.md)**. Read it when you need the
@@ -108,8 +176,12 @@ history behind a decision; it is not required to start work.
 
 ## Subagent dispatch
 
-This repo commits its own skills (`.claude/skills/`) and personas (`.claude/agents/`).
-When dispatching a subagent for implementation, review, a census or an evidence sweep,
-select the matching charpente persona rather than `general-purpose`. Note that
-superpowers' `subagent-driven-development` templates hard-code `general-purpose` and vary
-only the model — override that here.
+**Not yet in effect — `.claude/skills/` and `.claude/agents/` do not exist.** They are
+sub-project 3's T3 and T6, both unstarted (see "Current state"). Until those land,
+dispatch subagents as you otherwise would; what follows is the intended end state, not a
+description of the tree.
+
+Once the personas exist: when dispatching a subagent for implementation, review, a census
+or an evidence sweep, select the matching charpente persona rather than
+`general-purpose`. Note that superpowers' `subagent-driven-development` templates
+hard-code `general-purpose` and vary only the model — override that here.
