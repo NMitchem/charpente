@@ -131,6 +131,7 @@
 use crate::measure::{
     MIN_MEASURED_WINDOW, RATIO_TOLERANCE_FLOOR, bracket_spread, crosscheck,
     degenerate_window_reason, implausible_bracketed_ratio, percentile, ratio_tolerance,
+    unstable_device_reason,
 };
 use crate::report::SweepPoint;
 use std::time::Duration;
@@ -344,6 +345,14 @@ pub fn point_accounting(w: &WireObs) -> Result<WireAccounting, String> {
             bracket_spread(w.device_before, w.device_after) * 100.0,
             RATIO_TOLERANCE_FLOOR * 100.0,
         )));
+    }
+    // Independent of the ratio above, and checked even when that one passed:
+    // the ratio gate asks whether the rate is plausible against the device,
+    // this asks whether "the device" was one thing for the length of the
+    // window at all. This layer is where T10 attempt 1's contamination showed
+    // up — the sweep's brackets degraded monotonically across its points.
+    if let Some(reason) = unstable_device_reason("wire", w.device_before, w.device_after) {
+        invalid.push(at(reason));
     }
 
     let mut sorted = w.latencies_us.clone();
@@ -716,20 +725,29 @@ mod tests {
     /// T7 rev. 3's gate rule, still load-bearing under rev. 4's ack gate: the
     /// ceiling is the bracket MAX, not the min and not `before` alone. The
     /// fixture is tuned so the two answers straddle the threshold — the ack
-    /// rate is 500/s, so `max` (600.0) gives 0.83 and clears, while both the
+    /// rate is 500/s, so `max` (500.0) gives 1.00 and clears, while both the
     /// min AND the "before" sample (450.0) give 1.11 and would wrongly flag.
     /// Rev. 3's original fixture (900.0/1200.0) could not fail under the ack
     /// gate: both answers land far below 1.0.
+    ///
+    /// **Re-tuned from 450.0/600.0 when `MAX_BRACKET_SPREAD` landed.** That
+    /// pair is a 25% spread, which the stability gate now refuses outright —
+    /// so the old fixture tested the max rule through a point that is no
+    /// longer publishable for an unrelated reason. 450/500 is a 10% spread:
+    /// the same straddle, inside the stable band. The discrimination this
+    /// test exists for is unchanged; only the size of the disagreement it
+    /// rides on moved, and 10% is the interlude's own measured median
+    /// estimator noise rather than a number picked to be dramatic.
     #[test]
     fn the_ratio_gate_divides_by_the_bracket_max_not_the_min_or_before() {
         let mut o = healthy();
         o.device_before = 450.0;
-        o.device_after = 600.0;
+        o.device_after = 500.0;
         let a = point_accounting(&o).expect("publishes");
         assert_eq!(
             a.point.device_ratio,
-            1000.0 / 600.0,
-            "must divide by the bracket MAX (600.0), not the min or `before` (450.0)"
+            1000.0 / 500.0,
+            "must divide by the bracket MAX (500.0), not the min or `before` (450.0)"
         );
         assert!(
             a.invalid.is_empty(),
@@ -742,13 +760,19 @@ mod tests {
     /// The product-level reading of the same mechanism: a single noisy
     /// sample — here the AFTER sample, dipping low from transient contention
     /// right as the child is killed — must not by itself flag a point whose
-    /// rate is plausible against the healthy sample. `device_before` (600.0)
+    /// rate is plausible against the healthy sample. `device_before` (500.0)
     /// clears the 500/s ack rate; only a `min`-or-single-sample gate would
     /// wrongly flag this point on `device_after` (450.0) alone.
+    ///
+    /// Re-tuned from 600.0/450.0 for the reason given on the test above. The
+    /// claim this test makes is "one dipping sample does not sink a healthy
+    /// point", and it still makes it. The claim it no longer makes is that a
+    /// **25%** dip is tolerable — see
+    /// `a_spread_past_the_ceiling_refuses_whichever_bracket_would_have_won`.
     #[test]
     fn an_under_measured_single_bracket_sample_does_not_by_itself_flag_a_healthy_point() {
         let mut o = healthy();
-        o.device_before = 600.0;
+        o.device_before = 500.0;
         o.device_after = 450.0;
         let a = point_accounting(&o).expect("publishes");
         assert!(
@@ -757,6 +781,28 @@ mod tests {
              sample shows is healthy: {:?}",
             a.invalid
         );
+    }
+
+    /// The interaction between the two gates, pinned so nobody has to infer
+    /// it: the bracket-MAX rule governs only INSIDE the stable band. Past
+    /// `MAX_BRACKET_SPREAD` the point is refused whichever way round the
+    /// samples fall, because the question stops being "which bracket bounds
+    /// this rate" and becomes "these two numbers are not measuring the same
+    /// device". The old fixtures for the two tests above are used here
+    /// verbatim — they moved because this gate claimed them.
+    #[test]
+    fn a_spread_past_the_ceiling_refuses_whichever_bracket_would_have_won() {
+        for (before, after) in [(450.0, 600.0), (600.0, 450.0)] {
+            let mut o = healthy();
+            o.device_before = before;
+            o.device_after = after;
+            let a = point_accounting(&o).expect("publishes with a reason");
+            assert!(
+                a.invalid.iter().any(|r| r.contains("moved DURING")),
+                "brackets {before}/{after} are a 25% spread and must be refused: {:?}",
+                a.invalid
+            );
+        }
     }
 
     /// `report.rs`'s renderers and `collect_non_finite` need both bracket

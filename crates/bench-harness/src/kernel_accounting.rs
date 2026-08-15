@@ -19,7 +19,7 @@
 
 use crate::measure::{
     RATIO_TOLERANCE_FLOOR, bracket_spread, crosscheck, degenerate_batch_reason,
-    implausible_bracketed_ratio, ratio_tolerance,
+    implausible_bracketed_ratio, ratio_tolerance, unstable_device_reason,
 };
 use std::time::Duration;
 
@@ -236,6 +236,13 @@ pub fn kernel_accounting(k: &KernelObs) -> Result<KernelAccounting, String> {
             RATIO_TOLERANCE_FLOOR * 100.0,
         ));
     }
+    // Independent of the ratio above, and checked even when that one passed:
+    // the ratio gate asks whether the rate is plausible against the device,
+    // this asks whether "the device" was one thing for the length of the
+    // window at all.
+    if let Some(reason) = unstable_device_reason("kernel", k.device_before, k.device_after) {
+        invalid.push(reason);
+    }
 
     Ok(KernelAccounting {
         acked_writes_per_sec: k.requests_planned as f64 / secs,
@@ -283,6 +290,44 @@ mod tests {
         let a = kernel_accounting(&healthy()).expect("a healthy batch publishes");
         assert!(a.invalid.is_empty(), "got: {:?}", a.invalid);
         assert_eq!(a.acked_writes_per_sec, 5_000.0);
+    }
+
+    /// The bracket-stability gate reaches THIS layer. Added because it did not:
+    /// the gate was wired into all three layers and pinned in only two, since
+    /// every `KernelObs` fixture here sets `device_before == device_after` and
+    /// so cannot distinguish a wired gate from an unwired one. Deleting the
+    /// `unstable_device_reason` call from `kernel_accounting` left
+    /// `cargo test --workspace` green — the exact vacuity this repo keeps
+    /// finding in its own instruments, in a change whose entire subject is a
+    /// gate that never fired.
+    ///
+    /// The fixture isolates the stability gate from the ratio gate on purpose:
+    /// 30_000/20_000 is a 33.3% spread (over the 20% ceiling), while the ratio
+    /// is 10_000/30_000 = 0.33 and passes comfortably. So exactly one reason
+    /// may appear, and if the wiring is removed there is nothing left to
+    /// report.
+    #[test]
+    fn the_bracket_stability_gate_is_wired_into_this_layer() {
+        let mut o = healthy();
+        o.device_before = 30_000.0;
+        o.device_after = 20_000.0;
+        let a = kernel_accounting(&o).expect("publishes with a reason");
+        assert!(
+            a.device_ratio < 1.0,
+            "premise: the ratio gate must NOT be what fires here (ratio {})",
+            a.device_ratio,
+        );
+        assert_eq!(
+            a.invalid.len(),
+            1,
+            "exactly the stability reason, nothing else: {:?}",
+            a.invalid,
+        );
+        assert!(
+            a.invalid[0].contains("moved DURING") && a.invalid[0].contains("kernel"),
+            "got: {:?}",
+            a.invalid,
+        );
     }
 
     /// The layer's headline accounting rule (spec §3): one effects record per

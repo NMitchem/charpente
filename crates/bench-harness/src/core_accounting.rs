@@ -27,7 +27,7 @@
 use crate::SLOTS;
 use crate::measure::{
     RATIO_TOLERANCE_FLOOR, crosscheck, degenerate_window_reason, implausible_bracketed_ratio,
-    ratio_tolerance,
+    ratio_tolerance, unstable_device_reason,
 };
 use std::time::Duration;
 
@@ -277,6 +277,13 @@ pub fn write_accounting(duration: Duration, w: &WriteObs) -> Result<WriteAccount
     let syncs_per_sec = w.syncs as f64 / w.elapsed.as_secs_f64();
     let device_ratio = syncs_per_sec / w.device_before.max(w.device_after);
     if let Some(reason) = device_ratio_reason(device_ratio, w.device_before, w.device_after) {
+        invalid.push(reason);
+    }
+    // Independent of the ratio above, and checked even when that one passed:
+    // the ratio gate asks whether the rate is plausible against the device,
+    // this asks whether "the device" was one thing for the length of the
+    // window at all.
+    if let Some(reason) = unstable_device_reason("core", w.device_before, w.device_after) {
         invalid.push(reason);
     }
 
@@ -781,12 +788,24 @@ mod tests {
         );
         // The ratio gate fires — infinity is certainly above 1.0 + slack —
         // exactly as it does today. Preserved, not new.
-        assert_eq!(a.invalid.len(), 1, "got: {:?}", a.invalid);
         assert!(
-            a.invalid[0].contains("device_ratio"),
+            a.invalid.iter().any(|r| r.contains("device_ratio")),
             "got: {:?}",
             a.invalid
         );
+        // Second entry, added with the bracket-stability gate: a 0.0/0.0
+        // bracket pair is not a measurement at all, which is a different and
+        // also-true statement about this run. Both are named rather than one
+        // suppressing the other — the artifact should say the ratio is
+        // impossible AND that the denominator was never measured.
+        assert!(
+            a.invalid
+                .iter()
+                .any(|r| r.contains("not a usable measurement")),
+            "an unmeasurable bracket must be named too: {:?}",
+            a.invalid
+        );
+        assert_eq!(a.invalid.len(), 2, "got: {:?}", a.invalid);
     }
 
     // Interlude spec §3.3: reasons are pushed in a fixed order and both

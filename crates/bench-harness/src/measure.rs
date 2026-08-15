@@ -383,6 +383,19 @@ pub const RATIO_TOLERANCE_FLOOR: f64 = 0.10;
 /// was right to fear. A real violation (ack-before-sync, a dropped fsync, a
 /// build that lies about durability) lands at 2x or beyond and is still caught
 /// at every spread this harness has ever observed.
+///
+/// **Its role narrowed when `MAX_BRACKET_SPREAD` landed, and the narrowing is
+/// recorded rather than left for someone to rediscover.** Any point that
+/// survives the stability gate has spread ≤ 0.20, so `ratio_tolerance` is
+/// ≤ 0.20 and the tolerance arm binds at ≤ 1.20 — strictly below this 1.5.
+/// A point that does NOT survive is refused whichever way the ratio falls.
+/// So this constant no longer decides whether a POINT is published; what it
+/// still decides is whether the ratio reason *also* appears alongside the
+/// stability reason, which is why a wildly-spread point reports both. Left
+/// as it is deliberately: it is the ruled backstop for the case where a
+/// future layer brackets differently or the stability gate is relaxed, and
+/// removing a backstop because a newer guard currently shadows it is how the
+/// newer guard's own regression becomes silent.
 pub const RATIO_HARD_LIMIT: f64 = 1.5;
 
 /// How much the two bracket samples disagree, as a fraction of the larger.
@@ -407,6 +420,96 @@ pub fn bracket_spread(before: f64, after: f64) -> f64 {
 /// exactly as far as the harness measured itself to be imprecise here.
 pub fn ratio_tolerance(before: f64, after: f64) -> f64 {
     RATIO_TOLERANCE_FLOOR.max(bracket_spread(before, after))
+}
+
+/// Beyond this, the two brackets are not two samples of one quantity — the
+/// device's own capability moved during the window.
+///
+/// Set from measurement, in the shape ruling #4 demanded of `RATIO_TOLERANCE_FLOOR`
+/// and for the same reason. **The first draft of this constant justified itself
+/// with a "0–7% quiet band" and a comfortable gap above it. That was wrong, and
+/// the correction is kept here because it is the whole argument.** The
+/// interlude's "spreads mostly 0–7%" was read as a range when it says *mostly*.
+/// Measured against runs this repo calls clean, the real ceiling is higher:
+///
+/// | population | worst spread | status |
+/// |---|---|---|
+/// | `RATIO_TOLERANCE_FLOOR`'s own 15 samples (197.98–234.76) | **15.7%** | clean |
+/// | `docs/BENCH.md`'s published core row (222/258) | **14.0%** | clean, published |
+/// | T10 attempt 1's three worst points | **33.5 / 34.0 / 41.6%** | contaminated |
+///
+/// So the admissible window is `(15.7%, 33.5%)`, not the wide gap first claimed,
+/// and 0.20 is close to forced rather than comfortably centred: ~1.3x above the
+/// worst spread a clean run has produced, ~1.7x below the mildest contamination.
+/// **0.15 is not available** — it would refuse BENCH.md's own published core row.
+/// A threshold with this little headroom is a real cost of the design, stated
+/// rather than hidden: a genuinely clean run that spreads past 20% on some other
+/// machine will be refused, and the fix then is to re-measure this constant on
+/// that hardware, not to widen it here.
+///
+/// Deliberately NOT cited as evidence: T10 attempt 1's passing points. They come
+/// from the contaminated run, so "the gate passed them" says nothing about
+/// whether they deserved to pass.
+///
+/// **Machine-measured, not universal** — the same caveat `RATIO_TOLERANCE_FLOOR`
+/// carries.
+pub const MAX_BRACKET_SPREAD: f64 = 0.20;
+
+/// `None` = the device held still enough to be a denominator; `Some(reason)` =
+/// refuse the point.
+///
+/// This is deliberately independent of the ratio, and that independence is the
+/// whole point. `bracket_spread` previously had exactly one consumer,
+/// `ratio_tolerance`, where a wider spread could only ever WIDEN the gate —
+/// so a device disintegrating under the instrument bought its own point a more
+/// permissive check and could never be refused by it. A rate is attributable
+/// to charpente only if the device it is divided by was one quantity for the
+/// duration of the window; when it was not, no ratio, however plausible,
+/// rescues the point.
+///
+/// Non-finite or non-positive brackets refuse here rather than pass.
+/// `bracket_spread` maps them to `0.0` so they cannot widen a tolerance, which
+/// is right for that job and exactly wrong for this one — 0.0 would read as
+/// "perfectly stable" for a bracket that was never measured at all.
+pub fn unstable_device_reason(layer: &str, before: f64, after: f64) -> Option<String> {
+    if !before.is_finite() || !after.is_finite() || before <= 0.0 || after <= 0.0 {
+        // Names the producing site, not an operator action: `device_bracket_sample`
+        // returns a positive finite rate or an `io::Error`, so nothing an operator
+        // does to the box produces this. Only an observation that was never filled
+        // in reaches here, exactly like the adjacent `syncs == 0` guards.
+        return Some(format!(
+            "INVALID: a {layer} device bracket is not a usable measurement ({before} \
+             before / {after} after) — the ratio gate divides by these, and a bracket \
+             that could not be measured cannot bound anything. device_bracket_sample \
+             yields a positive finite rate or an error, so this is a harness bug: the \
+             {layer} layer published a window without filling in its own brackets"
+        ));
+    }
+    let spread = bracket_spread(before, after);
+    if spread > MAX_BRACKET_SPREAD {
+        // Names both candidate causes rather than asserting one. Asserting "other
+        // load on the box" would be the T4 M-E defect shape — a mechanism stated
+        // as fact without being measured — and it would be wrong for at least one
+        // recorded case: BENCH.md's own worst spread is attributed to this
+        // harness's child-process spawn, which is charpente's doing, not the box's.
+        Some(format!(
+            "INVALID: the {layer} device brackets either side of this window disagree \
+             by {:.1}% ({before:.2} before / {after:.2} after), over the {:.1}% ceiling \
+             — the device's measured capability moved DURING the window, so the two \
+             samples are not two readings of one quantity and the rate has no stable \
+             denominator. The cause is not determined here and both candidates are \
+             real: other load on the box arriving or leaving mid-run, or this harness's \
+             own child spawn/teardown contending with the bracket (docs/BENCH.md records \
+             a 78% spread of that second kind). A fixed-duration settle does not fix the \
+             first — on a machine where load ARRIVES rather than drains, waiting longer \
+             measures a busier box. Re-run it undisturbed; if it reproduces on a quiet \
+             box, suspect the harness",
+            spread * 100.0,
+            MAX_BRACKET_SPREAD * 100.0,
+        ))
+    } else {
+        None
+    }
 }
 
 /// The bracketed gate (interlude spec §4.3), shared by every layer that
@@ -759,5 +862,110 @@ mod tests {
         let hb = Heartbeat::start();
         std::thread::sleep(Duration::from_millis(300));
         assert!(hb.finish().is_none(), "healthy heartbeat must not flag");
+    }
+
+    /// The T10 attempt-1 bracket pairs, recorded verbatim from that run's
+    /// artifact. Seven points where the box held still, three where it did
+    /// not. This is the gate's regression evidence and the reason
+    /// `MAX_BRACKET_SPREAD` is 0.20 rather than a rounder-looking number.
+    const T10_ATTEMPT_1_BRACKETS: &[(f64, f64, bool)] = &[
+        // bench-app sweep, 1/4/16/64/256 conns
+        (259.0, 258.0, false),
+        (261.0, 233.0, false),
+        (238.0, 224.0, false),
+        (209.0, 122.0, true), // 41.6% — the worst point in the run
+        (181.0, 192.0, false),
+        // invoicing sweep, same conns
+        (226.0, 203.0, false),
+        (215.0, 143.0, true), // 33.5%
+        (238.0, 157.0, true), // 34.0%
+        // 18.1%. NOT evidence that 18.1% is fine: this point comes from the
+        // same contaminated run, so its passing says only what the gate does,
+        // never what it should have done. The clean-run anchor lives on
+        // MAX_BRACKET_SPREAD's doc comment.
+        (216.0, 177.0, false),
+        (168.0, 181.0, false),
+    ];
+
+    #[test]
+    fn the_gate_refuses_exactly_the_contaminated_points_of_t10_attempt_1() {
+        for &(before, after, must_refuse) in T10_ATTEMPT_1_BRACKETS {
+            let refused = unstable_device_reason("core", before, after).is_some();
+            assert_eq!(
+                refused,
+                must_refuse,
+                "brackets {before}/{after} (spread {:.1}%) — expected refuse={must_refuse}",
+                bracket_spread(before, after) * 100.0,
+            );
+        }
+    }
+
+    /// The behaviour change this gate exists for. Before it, a wide spread
+    /// could only ever WIDEN `ratio_tolerance` — a device falling apart under
+    /// the instrument bought the point a more permissive gate, never a
+    /// refusal. A ratio that is itself perfectly plausible must not rescue a
+    /// window whose denominator moved underneath it.
+    #[test]
+    fn an_unstable_device_is_refused_even_when_the_ratio_looks_fine() {
+        let (before, after) = (209.0, 122.0);
+        let ratio = 0.392; // the kernel run's own, comfortably under 1.0
+        assert!(
+            !implausible_bracketed_ratio(ratio, before, after),
+            "premise: this ratio passes the ratio gate",
+        );
+        assert!(
+            unstable_device_reason("core", before, after).is_some(),
+            "a plausible ratio must not excuse a device that moved mid-window",
+        );
+    }
+
+    #[test]
+    fn the_spread_gate_is_symmetric_and_bounded_at_the_threshold() {
+        assert_eq!(
+            unstable_device_reason("core", 209.0, 122.0).is_some(),
+            unstable_device_reason("core", 122.0, 209.0).is_some(),
+        );
+        // Exactly at the threshold passes; a hair over does not.
+        assert!(
+            unstable_device_reason("core", 100.0, 80.0).is_none(),
+            "spread 0.20"
+        );
+        assert!(unstable_device_reason("core", 100.0, 79.9).is_some());
+    }
+
+    /// An unmeasurable bracket must not silently pass this gate. `bracket_spread`
+    /// deliberately yields 0.0 for non-finite input so it cannot WIDEN a
+    /// tolerance; that same 0.0 must not be read here as "the device was stable".
+    #[test]
+    fn an_unmeasurable_bracket_does_not_read_as_a_stable_device() {
+        assert!(unstable_device_reason("core", f64::NAN, 200.0).is_some());
+        assert!(unstable_device_reason("core", 200.0, f64::INFINITY).is_some());
+        assert!(unstable_device_reason("core", 0.0, 0.0).is_some());
+    }
+
+    #[test]
+    fn the_refusal_names_both_brackets_and_the_threshold() {
+        let reason = unstable_device_reason("kernel", 209.0, 122.0).expect("must refuse");
+        // Every other refusal in this crate names its layer; this one is
+        // shared across all three, so the layer arrives as an argument and
+        // the message must actually spend it.
+        assert!(
+            reason.contains("kernel"),
+            "the refusal must name its layer (hard rule 5): {reason}",
+        );
+        // The two brackets, the measured spread and the ceiling it broke —
+        // hard rule 5 wants the contract, the site and the fix, and "the fix"
+        // here is the re-run instruction (matched case-insensitively: the
+        // assertion is that the message TELLS you to, not how it capitalises).
+        for needle in ["209", "122", "41.6", "20.0"] {
+            assert!(
+                reason.contains(needle),
+                "reason must name {needle:?} (hard rule 5): {reason}",
+            );
+        }
+        assert!(
+            reason.to_lowercase().contains("re-run"),
+            "reason must tell the operator to re-run (hard rule 5): {reason}",
+        );
     }
 }

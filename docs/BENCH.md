@@ -95,6 +95,19 @@ thresholds are not tunable from the command line.
   detect a violation smaller than its own measurement error, and does not
   claim to; it catches the class that matters — acking without syncing —
   which is an order-of-magnitude effect.
+- **The bracket-stability gate.** The two device brackets either side of a
+  window must agree to within **20%**. Past that they are not two samples of one
+  quantity — the device's own capability moved *during* the measurement — so the
+  rate has no stable denominator and the point is refused whichever bracket
+  would have bounded it. This is independent of the device-ratio gate above and
+  is checked even when that one passes: a plausible-looking ratio does not
+  rescue a window whose denominator moved underneath it. The threshold is set
+  from measured populations and the margin is narrow, which is stated rather
+  than smoothed over: the worst spread a run this repo calls clean has produced
+  is **15.7%** (and the core row in the table below is 14.0%), while the run
+  this gate was added for produced **33.5%, 34.0% and 41.6%** at three of ten
+  points after an unrelated build started mid-measurement. 20% is roughly
+  forced by those two bounds — 15% would refuse the clean core row below.
 - **Floors.** A window under one second, or under five operations, is refused
   rather than divided into a rate.
 
@@ -259,3 +272,13 @@ bounded it. The honest reading is that this point's gate was far more permissive
 than the ~1.10 a well-bracketed point gets, and that the hard limit — not the
 tolerance — is what kept it bounded at all. The artifact carries both samples for
 every point so a reader can check this without taking the summary's word for it.
+
+**This point does not survive the bracket-stability gate, and the row above
+stands only because it predates it.** A 78% disagreement is nearly four times the
+20% ceiling; re-measured today the point is refused rather than disclosed, which
+is the outcome this section was already arguing for in prose. It is left in place
+rather than deleted because the reasoning above is the record of how the gate came
+to exist — the paragraph that says "this point's gate was far more permissive than
+a well-bracketed point gets" is the observation the gate was built from. Treat the
+invoicing 1-connection number as withdrawn, not as evidence; every other point in
+the table brackets within the ceiling.
