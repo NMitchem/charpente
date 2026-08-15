@@ -957,6 +957,63 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   T8–T11 as they land; the ledger is authoritative mid-plan.** Otherwise M2 per PLAN — the
   follow-up backlog below now holds **no open work** (`applied_delta`'s release-mode wrap, its
   last open item, closed 2026-08-10).
+- **Group commit T10 — the win measured (2026-08-15, harness at `d9592c2`, report
+  .superpowers/sdd/2026-08-10-group-commit/task-10-report.md).** T10 produces evidence and
+  commits no code; this entry exists because the artifacts live under `.superpowers/`, which
+  is **gitignored and absent from a fresh clone** — a number of record with no tracked
+  pointer is a number no one can find. **Everything below is an OBSERVATION, not a quotable
+  figure: docs/BENCH.md remains the only source of those** (CLAUDE.md), and T11 is what
+  lands them there. **Artifacts:** `task-10-report-run1.json` md5
+  `22dda358c86bed27f6fccc1431a0dd2d`, window 2026-08-15 **14:12:08–14:21:25 EDT**;
+  `task-10-report-run2.json` md5 `04c1a24f3994ce40fe09df8b6c3dbd38`, window
+  **14:24:00–14:33:02 EDT**; `task-10-report.json` is byte-identical to run 1. Both predate
+  `72211e1` and therefore carry **no `syncs_counted` key** — tell counted from derived by the
+  arithmetic instead (a derived figure is exactly `multiplier × throughput`; `invoicing`'s is,
+  at all ten points, and `bench-app`'s is not, at all ten). **The claim, in the only form spec
+  §8 permits** — it says the conditioning is "the price of it, to be repeated wherever the win
+  is reported", and names *"group commit makes charpente Nx faster"* as the sentence it
+  forbids: **group commit removes the one-fsync-per-transaction ceiling, and on hardware whose
+  fsync is slow enough to keep a queue deep it recovers up to ~31x — and nothing at one
+  connection.** This device flatters the mechanism (a slow fsync keeps queues deep, and greedy
+  drain converts queue depth into batch size), so the multiple is closer to an upper bound than
+  to a server's. The measured **connection-scaling curve** is the conditioning quantified
+  rather than asserted — wire `bench-app` against sub-project 1's `111, 99, 103, 110, 112`
+  req/s: **1c 1.02x, 4c 4.80x, 16c 15.44x, 64c 31.47x, 256c 24.93x**, every point green in the
+  run it is taken from (1c run 2, the rest run 1). Kernel log records/sec **217 → 5,292**
+  (24.4x), 50,000 requests in **17.55 s / 18.90 s against 460 s**, `jobs_done ==
+  requests_total == 50,000` in both runs. **Core is unchanged (215 → 222.13, ratio 0.83 →
+  0.8504) and that is the correct result** — `Db::transact` is a length-1 batch
+  (`engine.rs:152`), so a serial loop has nothing to amortize; batching acts through
+  `Group::commit` (`db.rs:2202`), which the kernel uses. **Amortization is established
+  two-sidedly, because the ceiling test alone cannot exclude skipped syncs** (a
+  sync-skipping engine also reports a low sync rate): counted sync rates stay **below** the
+  device ceiling (max counted ratio anywhere = **0.9388**; `bench-app` at 64 conns pays **108
+  durable syncs/s** for 6,924 records/s) **and** the batch factor stays **below** `MAX_BATCH`
+  = 64 (`db.rs:2003`, assert-enforced `db.rs:2066`). Primary evidence is the kernel layer,
+  counted on both operands: **61.9602 / 61.9614 records per durable sync**, and the same fixed
+  workload paid **1,614 ± 1 syncs in both runs** (= 2 arms × ⌈50,000/64⌉ = 1,564 batch syncs
+  plus ~50 store/`.horizon` syncs its unscoped counter also tallies). `bench-app`'s wire
+  figure is corroboration only — its numerator is DERIVED (`2.0 × throughput`), proved by run
+  2's 256c reading of **64.1735** against an assert-enforced cap of 64. **Layer-by-run green
+  map** (neither run is green alone; T11 needs both): core ✅run 1 / ❌run 2 (23.04% bracket
+  spread); kernel ❌run 1 (46.05%) / ✅run 2; wire `bench-app` 1c ❌run 1 / ✅run 2, 4c ✅✅,
+  16c ✅run 1 / ❌run 2 (20.21%), 64c ✅✅, 256c ✅✅; wire `invoicing` 1c ✅✅, 4c/16c/64c/256c
+  ❌❌. **Both runs exited 1 and `invalid: []` is unreachable on this matrix**: `invoicing`
+  mounts no `/__syncs`, so its sync figure is the `1.0 × throughput` fallback, and group commit
+  is exactly what makes that multiplier unsound — the harness is refusing its own unsound
+  numerator (2.06x–30.49x the ceiling), which is what `wire_accounting`'s owed-work paragraph
+  predicted. That is a T11 scoping decision; no threshold was touched here. **Caveats that must
+  travel with these numbers:** the two headline points are the closest passing points to
+  refusal in the matrix (core run 1 **17.65%**, kernel run 2 **17.61%**, against a 20% ceiling
+  and BENCH.md's own 15.7% worst-clean-spread); the box was not quiet and **the cause of the
+  bracket instability is NOT determined** (the foreign pytest workload observed at 14:18:18
+  post-dates run 1's kernel and 1c refusals by ≥2m43s and cannot explain them); run 2's
+  `bench-app` 64c/256c points carry p99→p999 excursions of **9.0x / 3.9x** that neither the
+  bracket nor the heartbeat guard saw, so a run-1 throughput must not be published with a
+  run-2 tail; and the kernel's sync counter is **unscoped** while the wire's is `wal/`-scoped
+  though both divide by the same append-shaped bracket, making 61.96 a lower bound. Reviewed
+  independently (`task-10-review.md`): evidence compliance PASS, every recomputed figure
+  correct; the report was revised for framing, not for numbers.
 - **Bench interlude — the device-ratio gate, done (2026-08-10, spec
   docs/superpowers/specs/2026-08-10-device-ratio-gate-design.md, ledger
   .superpowers/sdd/2026-08-10-device-ratio-gate/progress.md, commits `c10b8fa`..this
