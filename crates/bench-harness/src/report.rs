@@ -396,7 +396,8 @@ pub fn render_json(r: &Report) -> Result<String, String> {
                 }
                 s.push_str(&format!(
                     "{{\"connections\":{},\"throughput_per_sec\":{},\
-                     \"log_records_per_sec\":{},\"syncs_per_sec\":{},\"device_ratio\":{},\
+                     \"log_records_per_sec\":{},\"syncs_per_sec\":{},\"syncs_counted\":{},\
+                     \"device_ratio\":{},\
                      \"device_appends_per_sec_before\":{},\"device_appends_per_sec_after\":{},\
                      \"p50_us\":{},\"p99_us\":{},\"p999_us\":{},\"client_busy_fraction\":{},\
                      \"saturated\":{}}}",
@@ -404,6 +405,7 @@ pub fn render_json(r: &Report) -> Result<String, String> {
                     num2(p.throughput_per_sec),
                     num2(p.log_records_per_sec),
                     num2(p.syncs_per_sec),
+                    p.syncs_counted,
                     num3(p.device_ratio),
                     num2(p.device_appends_per_sec_before),
                     num2(p.device_appends_per_sec_after),
@@ -502,17 +504,37 @@ pub fn render_human(r: &Report) -> String {
     for w in &r.wire {
         s.push_str(&format!("  wire [{}]:\n", w.target));
         for p in &w.points {
+            // T10a fix, two defects the T10 measurement run's instrumentation
+            // review found: (1) `syncs_counted` was published nowhere, so a
+            // reader could not tell a real fsync tally from the
+            // syncs-per-request-times-throughput derivation apart — now
+            // named right after the rate it qualifies. (2) `device_ratio` is
+            // the RECORDS ratio (`log_records_per_sec` / ceiling,
+            // published-but-ungated — see wire_accounting's module doc), NOT
+            // the ratio the gate actually divides on (`syncs_per_sec` /
+            // ceiling); the old comment here claimed the line printed the
+            // latter and it printed the former, so a passing row read as
+            // confirming the ceiling claim while showing the wrong number.
+            // Both ratios are shown now, each named for what it is, the sync
+            // one computed from fields already on this same line rather than
+            // published as a new field (nothing judged here changes).
+            let sync_ratio = p.syncs_per_sec
+                / p.device_appends_per_sec_before
+                    .max(p.device_appends_per_sec_after);
             s.push_str(&format!(
-                // 2026-08-10 group-commit interlude, T1 fix wave, I-4: the
-                // syncs rate is what the gate actually divides by (never
-                // `log_records_per_sec`, which stays published-but-ungated).
-                "    {:>4} conns: {:>8.0} req/s  {:>8.0} rec/s  {:>8.0} sync/s  {:.3}x dev \
-                 (bracket {:.0}/{:.0} appends/s before/after)  p50 {:>6}us  p99 {:>6}us  \
-                 p99.9 {:>6}us  client busy {:.0}%{}\n",
+                "    {:>4} conns: {:>8.0} req/s  {:>8.0} rec/s  {:>8.0} sync/s ({})  {:.3}x dev \
+                 (sync, gated)  {:.3}x dev (records, ungated)  (bracket {:.0}/{:.0} appends/s \
+                 before/after)  p50 {:>6}us  p99 {:>6}us  p99.9 {:>6}us  client busy {:.0}%{}\n",
                 p.connections,
                 p.throughput_per_sec,
                 p.log_records_per_sec,
                 p.syncs_per_sec,
+                if p.syncs_counted {
+                    "counted"
+                } else {
+                    "derived"
+                },
+                sync_ratio,
                 p.device_ratio,
                 p.device_appends_per_sec_before,
                 p.device_appends_per_sec_after,
@@ -618,7 +640,7 @@ mod tests {
              \"requests_total\":50000,\"jobs_done\":50000},\
              \"wire\":[{\"target\":\"bench-app\",\"points\":[{\"connections\":4,\
              \"throughput_per_sec\":1200.00,\"log_records_per_sec\":2400.00,\
-             \"syncs_per_sec\":2400.00,\
+             \"syncs_per_sec\":2400.00,\"syncs_counted\":true,\
              \"device_ratio\":0.685,\"device_appends_per_sec_before\":3500.00,\
              \"device_appends_per_sec_after\":3600.00,\"p50_us\":800,\"p99_us\":2100,\
              \"p999_us\":5000,\
@@ -762,7 +784,7 @@ mod tests {
             json.contains(
                 "\"wire\":[{\"target\":\"bench-app\",\"points\":[{\"connections\":4,\
              \"throughput_per_sec\":1200.00,\"log_records_per_sec\":2400.00,\
-             \"syncs_per_sec\":2400.00,\"device_ratio\":null"
+             \"syncs_per_sec\":2400.00,\"syncs_counted\":true,\"device_ratio\":null"
             ),
             "non-finite wire device_ratio must render as JSON null, got: {json}"
         );
@@ -865,6 +887,31 @@ mod tests {
             "  kernel: 1300 acked writes/s, 2600 log records/s, 2600 durable syncs/s (50000 \
              requests, 50000 jobs; 38.46s batch window, no warmup; device_ratio 0.867, \
              bracket 2980/3020 appends/s before/after)",
+            "got: {human}"
+        );
+    }
+
+    // T10a fix: this line was pinned NOWHERE before this test, which is
+    // exactly the class of silent renderer regression the note above
+    // documents one layer over — a reviewer of that fix could not have
+    // caught either defect it fixed (`syncs_counted` never printed;
+    // `device_ratio` — the RECORDS ratio, published-but-ungated — juxtaposed
+    // right after the sync rate as if it were the ratio the gate divides on)
+    // by running the suite, only by eyeballing a manual run. Pins both the
+    // provenance tag and that the sync-gated ratio (0.667 = 2400/3600, the
+    // worse of the two brackets) and the records ratio (0.685, unchanged)
+    // are printed as two distinctly labeled numbers, not one ambiguous one.
+    #[test]
+    fn render_human_wire_line_is_pinned() {
+        let human = render_human(&fixed_report());
+        let lines: Vec<&str> = human.lines().collect();
+        assert_eq!(lines[4], "  wire [bench-app]:", "got: {human}");
+        assert_eq!(
+            lines[5],
+            "       4 conns:     1200 req/s      2400 rec/s      2400 sync/s (counted)  \
+             0.667x dev (sync, gated)  0.685x dev (records, ungated)  (bracket 3500/3600 \
+             appends/s before/after)  p50    800us  p99   2100us  p99.9   5000us  client \
+             busy 12%",
             "got: {human}"
         );
     }
