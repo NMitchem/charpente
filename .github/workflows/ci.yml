@@ -34,3 +34,14 @@ jobs:
       # replay (the two above are the release mode-skew pair), and debug artifacts are already warm
       # from `cargo test --workspace`, so the marginal cost is one test.
       - run: CHARPENTE_SEED=0x348270b38f166529 cargo test -p charpente --test kernel -- kernel_jobs_are_exactly_once_under_the_fault_matrix --exact
+      # The seed that can actually FAIL if that classification regresses — added 2026-08-19.
+      # The pin above no longer reaches the is_fault_fallout arm: T7's group-commit rewrite moved
+      # the op schedule, and T9 re-verified on 2026-08-15 that deleting the classification leaves
+      # 0x348270b38f166529 GREEN (crates/charpente/tests/kernel.rs:1388-1403). Both lines are kept
+      # deliberately — the older seed still exercises Kernel::build's drain-id fix (dispatch.rs's
+      # "job in the heap is not Pending" assert), while this one is the live RED-first
+      # reproduction, confirmed RED with the classification deleted and GREEN with it restored.
+      # Until this line existed the replacement appeared only in a source comment, which is
+      # exactly the condition the block above describes: a defanged pin leaving CI silent while a
+      # human remembering a command is the only thing standing in the way.
+      - run: CHARPENTE_SEED=0xe653f43924f17fe8 cargo test -p charpente --test kernel -- kernel_jobs_are_exactly_once_under_the_fault_matrix --exact
