@@ -21,6 +21,7 @@ pub mod kernel_accounting;
 pub mod kernel_bench;
 pub mod measure;
 pub mod report;
+pub mod tracing_disk;
 pub mod wire;
 pub mod wire_accounting;
 
