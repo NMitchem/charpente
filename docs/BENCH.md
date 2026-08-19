@@ -272,9 +272,9 @@ WAL, every reply is held until after `commit` returns, and apply stays strictly
 after sync, so no record is ever acked before it is durable. (The batch is not
 durability-atomic — one straddling a segment boundary can leave a durable
 prefix, since `Wal::rotate` syncs the old tail mid-append. Nothing was acked, so
-no guarantee moves; DESIGN §2 carries it.) This harness sized it and the result is below. It closes the *amortization*
-component of the gap and none of the device-speed component — three orders of
-magnitude was never one problem.
+no guarantee moves; DESIGN §2 carries it.) This harness sized it and the
+result is below. It closes the *amortization* component of the gap and none of
+the device-speed component — three orders of magnitude was never one problem.
 
 ### DECISIONS §7 trigger (a)
 

@@ -1035,11 +1035,12 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   the *fixture* gate is closed and the teeth are proven, but the script itself is **not**
   reliably green — T12 measured 4 red in 8 runs, all of them the pre-existing failover
   witness-gate race, none of them this sub-project's code — and on that evidence Noah ruled
-  the script must **not** become a CI step. **Four items stay OPEN and are carried forward
+  the script must **not** become a CI step. **Five items stay OPEN and are carried forward
   here rather than closed with the sub-project**: request-vs-tail contention is unmeasured,
   DECISIONS §7 trigger (a) is owed a re-read, `scripts/bench.sh --smoke` is still deferred,
-  and the failover witness-gate race must be fixed before the edge rig can be wired into CI
-  — all four below.
+  the failover witness-gate race must be fixed before the edge rig can be wired into CI, and
+  `engine.rs:159-163`'s batch-atomicity comment still contradicts the DESIGN and BENCH text
+  corrected against it — all five below.
   **Shipped (T1–T11).** The commit point is a *group*, not a transaction:
   `Db::begin_group` → N × `Group::stage` → `Group::commit`, one store snapshot, a two-level
   overlay (txn → group → snapshot), one durable sync for the whole batch.
@@ -1236,10 +1237,11 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   new guard — was **2/2 green in all eight**, as were hunts 5/5, realtime_resume 1/1, smoke
   1/1 and lib 19/19. Green runs cost 45-87 s wall, 75-78 s CPU; reds fail fast.
   **This is the load-sensitive race already recorded at 2026-08-15** — same two names, same
-  mechanism (a `login()` POST fires within ~3 ms of a mid-run primary restart and races
-  sub-project 0b's witness gate, since the HTTP port binds before the kernel thread finishes
-  `Repl::open`). **T12 cannot have caused it, and that is provable rather than argued:** its
-  entire diff is four files — the patch fixture, a doc comment in
+  mechanism: a `login()` POST after a mid-run primary restart races sub-project 0b's witness
+  gate and loses. The mechanism is stated once, in the OPEN item below; that paragraph is
+  authoritative, and in particular the window is a witness round-trip, not the bind race an
+  earlier draft of both passages claimed. **T12 cannot have caused it, and that is provable
+  rather than argued:** its entire diff is four files — the patch fixture, a doc comment in
   `edge-harness/src/lib.rs`, a new test in `edge-harness/tests/acked_durable.rs`, and this
   file. **`tests/failover.rs` is untouched because that exhaustive four-file list does not
   contain it**, which is the proof that matters here; `edge-harness/` is where it lives, so
@@ -1253,37 +1255,61 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   actually observed, and 2026-08-15's "31/31 green all three times" at a different commit
   does not license quoting a better one today.
   **OPEN — the failover witness-gate race, and it is the thing that blocks the edge rig from
-  CI.** Specified rather than left as "flaky, someone look at it".
-  **Mechanism** — stated from the code, because an earlier draft of this paragraph got it
-  wrong in a way that would have sent the fixer to the wrong place. It is NOT "the port binds
-  a few milliseconds before `Repl::open` finishes." `Repl::open` SHUTS the gate itself:
-  `db.verify_writes(witnesses)` at `repl/mod.rs:287` is part of restarting as a former
-  primary. The gate is opened only by `resolve_witness_gate` (`repl/mod.rs:651`), called from
-  `Repl::step` (`repl/mod.rs:541`) inside the kernel loop **as witness probes answer over the
-  network**. So a `login()` POST that arrives well AFTER `Repl::open` has returned still draws
-  the 503. The window is a **witness round-trip, bounded by `WITNESS_DEADLINE_NANOS` (30 s)**,
-  not a sub-millisecond bind race — which is exactly what makes it load-sensitive. The
-  harness loses because `ChildNode::restart` treats a TCP bind as readiness, and the gate's
-  resolution is asynchronous to that bind. `503 "this node is not accepting writes yet: it
-  was a primary before restarting and has not confirmed that its follower … was never
-  promoted"`. This restores the framing `:932` and `:939-940` already carried — waiting "on
-  the gate rather than the TCP port", against "the witness gate's async resolution window" —
-  which a rewrite dropped. **Affected:** `failover_wire_oracle` and
-  `failover_non_converged_tail_is_exercised_and_bounded` — the same two names 2026-08-15
-  already recorded failing the same way, so this is a second sighting of a known defect, not
-  a new one. **The fix is WRITE-readiness**: `restart` must wait until the node will accept a
-  write, not until something is listening. Explicitly NOT the fix: widening a timeout, or
-  retrying the job — both hide the window instead of closing it, and the 2026-08-10 rule
-  ("fix the environment, not the thresholds") applies with more force here, since this window
-  is in the rig's own readiness contract rather than in the box. **Measurement to beat:** 4
-  red in 8 runs at this commit, with the caveat that the box was loaded (`mds_stores` 163%,
-  `syspolicyd` 77%, an unrelated build at ~100%), so 4/8 is an upper bound and not the
-  settled-box rate. Two neighbouring gaps 2026-08-15 left open belong to the same fix round:
-  nothing reaps orphaned children when a run is killed mid-test, and the harness cannot
-  distinguish "child never reached `main`" from "child failed to bind" — which is exactly the
-  ambiguity that makes this race read as a durability failure. **Until this lands, the edge
-  rig stays a by-hand gate**, and the CLAUDE.md-level question of when it is owed is answered
-  by the guard above for the fixture-rot half and by nobody for the behavioural half.
+  CI.** Specified rather than left as "flaky, someone look at it". **Mechanism** — stated from
+  the code, because an earlier draft of this paragraph got it wrong in a way that would have
+  sent the fixer to the wrong place. It is NOT "the port binds a few milliseconds before
+  `Repl::open` finishes." `Repl::open` SHUTS the gate itself: `db.verify_writes(witnesses)` at
+  `repl/mod.rs:287` is part of restarting as a former primary. The gate is opened only by
+  `resolve_witness_gate` (`repl/mod.rs:651`), called from `Repl::step` (`repl/mod.rs:541`)
+  inside the kernel loop **as witness probes answer over the network**. So a `login()` POST
+  that arrives well AFTER `Repl::open` has returned still draws the 503. The window is a
+  **witness round-trip**, not a sub-millisecond bind race — which is exactly what makes it
+  load-sensitive. The harness loses because `ChildNode::restart` treats a TCP bind as
+  readiness, and the gate's resolution is asynchronous to that bind. **And the window is
+  UNBOUNDED in this rig — do not read `WITNESS_DEADLINE_NANOS` as a bound.** That constant's
+  own doc is explicit: "The deadline moves NOTHING — the gate stays shut and the probes keep
+  running; it only decides when the operator is told why writes are refused"
+  (`repl/mod.rs:78-85`). At the deadline a **strict** node returns `Err` (`repl/mod.rs:549`);
+  a **non-strict** one emits a single notice and falls through with the gate still shut
+  (`:551-554`) — and the harness's node sets `strict_witnesses: false`
+  (`examples/invoicing/src/bin/node.rs:169`). So the 503 ends when a witness answers, at no
+  fixed time. This is worth stating precisely because a stated 30 s bound would quietly
+  re-legitimise the "just wait longer" remedy the next paragraph forbids: if the window really
+  closed at 30 s, widening a timeout past it would be a valid fix. It does not, and it is not.
+  `503 "this node is not accepting writes yet: it was a primary before restarting and has not
+  confirmed that its follower … was never promoted"`. This restores the framing `:932` and
+  `:939-940` already carried — waiting "on the gate rather than the TCP port", against "the
+  witness gate's async resolution window" — which a rewrite dropped. **Affected:**
+  `failover_wire_oracle` and `failover_non_converged_tail_is_exercised_and_bounded` — the same
+  two names 2026-08-15 already recorded failing the same way, so this is a second sighting of
+  a known defect, not a new one. **The fix is WRITE-readiness**: `restart` must wait until the
+  node will accept a write, not until something is listening. Explicitly NOT the fix: widening
+  a timeout, or retrying the job — both hide the window instead of closing it, and the
+  2026-08-10 rule ("fix the environment, not the thresholds") applies with more force here,
+  since this window is in the rig's own readiness contract rather than in the box.
+  **Measurement to beat:** 4 red in 8 runs at this commit, with the caveat that the box was
+  loaded (`mds_stores` 163%, `syspolicyd` 77%, an unrelated build at ~100%), so 4/8 is an
+  upper bound and not the settled-box rate. Two neighbouring gaps 2026-08-15 left open belong
+  to the same fix round: nothing reaps orphaned children when a run is killed mid-test, and
+  the harness cannot distinguish "child never reached `main`" from "child failed to bind" —
+  which is exactly the ambiguity that makes this race read as a durability failure. **Until
+  this lands, the edge rig stays a by-hand gate**, and the CLAUDE.md-level question of when it
+  is owed is answered by the guard above for the fixture-rot half and by nobody for the
+  behavioural half.
+  **OPEN — `engine.rs:159-163`'s comment now contradicts the two docs that were corrected
+  against it.** Carried here for the same reason the request-vs-tail item is: its only other
+  record is a commit message and a gitignored report. The final review found that "a crash
+  between append and sync loses the whole batch and never part of it" is false — `Wal::append`
+  calls `rotate` mid-batch (`log.rs:270-272`) and `rotate` opens with `tail.sync()`
+  (`log.rs:429`), so a batch straddling a segment boundary leaves a durable PREFIX.
+  `DESIGN.md` §2 and `docs/BENCH.md` were fixed; `engine.rs` was deliberately NOT, because
+  that round was scoped to prose and it is production code. So the tree currently states two
+  different things, and the engine comment is the one a reader of the core meets first. Its
+  specific defect is the parenthetical "Batch atomicity is unaffected — that barrier falls
+  between frames, never between the batch's appends and its sync": a barrier falling *between
+  frames* is precisely what makes the prefix durable, so the sentence refutes itself. Safety
+  is untouched either way — nothing in the batch was acked — so this is a comment fix, not a
+  durability bug, and it must not be written up as one.
   **README.md carried two sentences its own source disproved, and they are FIXED, not
   flagged.** It said charpente "commits one durable record per transaction with no group
   commit" and called closing the fsync gap "a named future sub-project (group commit), not a
