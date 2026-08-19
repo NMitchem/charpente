@@ -369,19 +369,49 @@ fn run_layers(args: &Args, dir: &str, report: &mut Report) -> std::io::Result<bo
     // leave the ceiling loops at the 5 s + 30 s defaults, over a minute of
     // device loops inside something called a "smoke".
     //
-    // 1 s is safe here despite T7 rev. 2's ruling against a smoke sitting on a
-    // refusal boundary. That ruling was about `MIN_MEASURED_WINDOW`, and every
-    // measured window in this crate is structurally `>=` its requested
-    // duration: the device/core loops run `while Instant::now() < end` and the
-    // wire point sleeps `duration` before reading `elapsed`. The floor
-    // compares `elapsed < MIN_MEASURED_WINDOW`, so it cannot fire at
-    // `--duration 1` however slow the box is. The op floor needs 5 ops in that
-    // second, against ~200/s measured.
+    // 1 s is safe for the DURATION-driven layers despite T7 rev. 2's ruling
+    // against a smoke sitting on a refusal boundary. That ruling was about
+    // `MIN_MEASURED_WINDOW`, and those layers' windows are structurally `>=`
+    // their requested duration: the device/core loops run
+    // `while Instant::now() < end` and the wire point sleeps `duration` before
+    // reading `elapsed`. The floor compares `elapsed < MIN_MEASURED_WINDOW`,
+    // so it cannot fire at `--duration 1` however slow the box is. The op
+    // floor needs 5 ops in that second, against ~200/s measured.
+    //
+    // T13: that argument covers device, core and wire, and NOT the kernel arm
+    // — an omission that was silent because the sentence it sat in read as a
+    // statement about the whole crate. The kernel layer is request-COUNT
+    // driven, so `duration` never reaches it: it drains `requests` ops as
+    // fast as it can and reports however long that took. Its window is an
+    // OUTPUT, a function of device speed and batch size (`MAX_BATCH` = 64,
+    // db.rs), and `degenerate_batch_reason` bounds exactly that output. At
+    // the pre-batching ~217 rec/s, 2_000 ops spanned ~9 s and the gap could
+    // not show; post-batching the same 2_000 drained in 507 ms and the smoke
+    // refused. 8_000 measures 2.72 s and 3.01 s on two runs of this box —
+    // 2.7x-3.0x over the 1 s floor.
+    //
+    // **A fixed request count cannot be made safe, only sized, and this one
+    // has a computable expiry.** 8_000 becomes too small the moment this arm
+    // exceeds 8_000 ops/s, i.e. a ~2.7x speedup over the 2_660-2_940 ops/s
+    // measured here — reachable by a larger `MAX_BATCH`, a further batching
+    // arm on the job side, or simply a faster device (`F_FULLFSYNC` on an
+    // Apple SSD is the slow end of durable; a battery-backed controller is
+    // far faster per sync). The symptom is this same refusal rather than a
+    // wrong number, so the failure mode is loud.
+    //
+    // `kernel_bench.rs`'s fix round M-10 anticipated
+    // it exactly — "under batching, an ordinary SSD can drain REQUESTS this
+    // size in under a second" — but was applied only to the library test's
+    // `expect` message; the binary's smoke parameters, which is where an
+    // operator meets the failure, kept the pre-batching constant. Raising the
+    // constant is the cheap fix and inherits the same expiry; making this arm
+    // duration-driven like the other three is the structural one, and is
+    // deliberately NOT done here.
     let (warmup, duration, requests, connections) = if args.cmd == "smoke" {
         (
             Duration::from_millis(200),
             Duration::from_secs(1),
-            2_000,
+            8_000,
             vec![1usize, 4],
         )
     } else {

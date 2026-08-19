@@ -154,13 +154,19 @@ impl<S: StateMachine> Engine<S> {
 
     /// Appends every record, syncs once for the batch, then applies each in
     /// seq order — the append→sync→apply discipline of `submit`, N-wide.
-    /// Apply stays strictly after sync: a crash before the sync loses the
-    /// whole batch and never part of it, which is what keeps
-    /// ack-after-durable true for every record in it. (A batch large enough
-    /// to cross a segment boundary takes one more barrier than that:
-    /// `Wal::rotate` syncs the old tail before any frame lands in the new
-    /// segment. Batch atomicity is unaffected — that barrier falls between
-    /// frames, never between the batch's appends and its sync.)
+    /// Apply stays strictly after sync, which is what keeps ack-after-durable
+    /// true for every record in the batch.
+    ///
+    /// **The batch is NOT durability-atomic, and nothing here claims it is.**
+    /// A batch large enough to straddle a segment boundary takes an extra
+    /// barrier inside `Wal::append`, which calls `rotate`, which opens with
+    /// `tail.sync()` — the same "rotation syncs the old segment" rule the log
+    /// format states. A crash between that barrier and the batch's own sync
+    /// therefore leaves a durable PREFIX, not nothing. No guarantee moves:
+    /// the replies are still held, so nothing in the batch was acked, and an
+    /// unacked record that survives a crash is the ordinary "the write may be
+    /// committed" case the client contract already covers. Ack-after-durable
+    /// is the promise; batch atomicity never was (DESIGN §2, docs/BENCH.md).
     ///
     /// On `Ok`, every record is durable and applied. On `Err`, three cases
     /// with different durable standing, which a caller must NOT conflate:

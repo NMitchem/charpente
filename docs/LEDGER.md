@@ -1296,8 +1296,9 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   this lands, the edge rig stays a by-hand gate**, and the CLAUDE.md-level question of when it
   is owed is answered by the guard above for the fixture-rot half and by nobody for the
   behavioural half.
-  **OPEN — `engine.rs:159-163`'s comment now contradicts the two docs that were corrected
-  against it.** Carried here for the same reason the request-vs-tail item is: its only other
+  **CLOSED (2026-08-19, T13) — `engine.rs`'s comment contradicted the two docs that were
+  corrected against it, and now agrees with them.** Carried here for the same reason the
+  request-vs-tail item is: its only other
   record is a commit message and a gitignored report. The final review found that "a crash
   between append and sync loses the whole batch and never part of it" is false — `Wal::append`
   calls `rotate` mid-batch (`log.rs:270-272`) and `rotate` opens with `tail.sync()`
@@ -1309,7 +1310,12 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   between frames, never between the batch's appends and its sync": a barrier falling *between
   frames* is precisely what makes the prefix durable, so the sentence refutes itself. Safety
   is untouched either way — nothing in the batch was acked — so this is a comment fix, not a
-  durability bug, and it must not be written up as one.
+  durability bug, and it must not be written up as one. **The fix (T13, this commit) is
+  comment-only**: `submit_all`'s doc now states the batch is not durability-atomic, names the
+  `Wal::append` → `rotate` → `tail.sync()` mechanism, and says a straddling batch leaves a
+  durable PREFIX with no guarantee moving — the same three sentences `DESIGN.md` §2 and
+  `docs/BENCH.md` already carry. No behaviour changed; `cargo test -p charpente-core` was run
+  to prove it.
   **README.md carried two sentences its own source disproved, and they are FIXED, not
   flagged.** It said charpente "commits one durable record per transaction with no group
   commit" and called closing the fsync gap "a named future sub-project (group commit), not a
