@@ -87,13 +87,14 @@ today's harness would answer it by inspection and nobody re-ran it.
 defect, recorded rather than left to be inferred.** `device_ratio` is the SYNC
 ratio at core and kernel (`core_accounting.rs:278`, `kernel_accounting.rs:219`)
 and the RECORD ratio at wire (`wire_accounting.rs:286`); the wire gate itself
-fires on the sync ratio, which the JSON artifact publishes under no name at all.
-The human render does print it — `…x dev (sync, gated)` beside `…x dev (records,
-ungated)`, computed inline from the same line's fields (`report.rs:521-527`) —
-so a reader of the terminal output and a reader of the JSON are not looking at
-the same set of quantities. Do not read a wire `device_ratio` as a sync ratio:
-at 64 connections below it reads 26.87 while the gated sync ratio is 0.42. Both operands of the honest quantity are in
-the artifact — compute `syncs_per_sec / max(device_appends_per_sec_before,
+fires on the sync ratio, which the JSON artifact publishes under no name at
+all. The human render does print it — `…x dev (sync, gated)` beside
+`…x dev (records, ungated)`, computed inline from the same line's fields
+(`report.rs:521-527`) — so a reader of the terminal output and a reader of the
+JSON are not looking at the same set of quantities. Do not read a wire
+`device_ratio` as a sync ratio: at 64 connections below it reads 26.87 while
+the gated sync ratio is 0.42. Both operands of the honest quantity are in the
+artifact — compute `syncs_per_sec / max(device_appends_per_sec_before,
 device_appends_per_sec_after)` yourself. Every wire sync ratio in this document
 was computed that way.
 
@@ -383,8 +384,8 @@ append-shaped bracket.
 
 ### The wire layer — the connection sweep
 
-`bench-app` only. Its sync rate is COUNTED through `/__syncs`; its record rate is
-derived at 2.0 × throughput, so the records-per-sync column is a derived
+`bench-app` only. Its sync rate is COUNTED through `/__syncs`; its record rate
+is derived at 2.0 × throughput, so the records-per-sync column is a derived
 numerator over a counted denominator.
 
 | conns | acked req/sec | vs. before | durable syncs/sec | syncs ÷ ceiling | records/sync | p50 | p99 | run |

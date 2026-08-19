@@ -1170,8 +1170,10 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   needs the per-phase attribution inside the commit path that this instrument explicitly does
   not do. Recorded for Noah's sign-off per CLAUDE.md's workflow rule ("don't silently
   override it — reopen the entry with the new evidence"), deliberately not settled here.
-  `PLAN.md`'s copy of the same sentence is scoped to its 2026-08-10 measurement in `b13fcc3`;
-  `DECISIONS.md` §7 itself is untouched pending the re-read.
+  `PLAN.md` carried a copy of the same sentence, and it is scoped to its 2026-08-10
+  measurement in the same fix round that added this paragraph — not in `b13fcc3`, whose
+  `PLAN.md` diff is nine added lines and no edit. `DECISIONS.md` §7 itself is untouched
+  pending the re-read.
 
 - **Bench interlude — the device-ratio gate, done (2026-08-10, spec
   docs/superpowers/specs/2026-08-10-device-ratio-gate-design.md, ledger
