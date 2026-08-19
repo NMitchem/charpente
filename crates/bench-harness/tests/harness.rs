@@ -687,10 +687,66 @@ fn the_bench_binary_smokes_end_to_end() {
         .expect("bench smoke runs");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "bench smoke must exit 0 on a healthy box\nstderr:\n{stderr}\nstdout:\n{stdout}"
-    );
+    // T13 (Noah ruling): this used to assert `exit 0`, which is a condition
+    // this harness's OWN published documentation says cannot hold —
+    // `docs/BENCH.md` states "on this matrix `invalid: []` is unreachable" and
+    // heads a section "`examples/invoicing` is refused at every contended
+    // point, on purpose". invoicing mounts no `/__syncs`, so its sync
+    // numerator falls back to `syncs_per_request * throughput`, and group
+    // commit is exactly what makes that multiplier false once requests queue:
+    // the gate reads ~2x the ceiling and refuses, correctly.
+    //
+    // **A gate that is permanently red for an expected reason is not a gate.**
+    // A real regression in this smoke would have looked identical to the
+    // known-expected failure, which is the whole cost. So this takes the shape
+    // `wire_layer_drives_invoicing_through_login` already uses one layer down
+    // (and `kernel_bench::syncs_are_measured_not_derived_under_batching` one
+    // layer below that): tolerate the ONE named reason, redden on any other.
+    //
+    // **If a DIFFERENT reason appears here, do not read it as flakiness.** It
+    // means one of device/core/kernel, or the COUNTED bench-app wire arm, has
+    // stopped producing a measurement, and the reason text names which layer
+    // and why. Note what this text match cannot see: the refusal below names
+    // neither the target nor whether its sync rate was counted or derived, so
+    // a bench-app point tripping the same gate would be tolerated here. That
+    // case is covered, and deliberately not by this test —
+    // `wire_layer_sweeps_the_bench_app` asserts `invalid.is_empty()` for that
+    // target at the same 1/4 connection counts in this same `--ignored` batch.
+    //
+    // Reasons are read off `render_human`'s own `!! ` marker (report.rs:554),
+    // the same contract this file's `a_starved_heartbeat_flags_invalid_through_its_real_path`
+    // asserts against — this crate has no JSON parser, by design.
+    let refusals: Vec<&str> = stderr
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("!! "))
+        .collect();
+    for reason in &refusals {
+        assert!(
+            reason.contains("durable syncs/s from")
+                && reason.contains("the measured device ceiling"),
+            "the derived sync rate of a target with no /__syncs legitimately reads above the \
+             ceiling at a contended point, and refusing it is the gate working (BENCH.md: \
+             \"refused at every contended point, on purpose\") — but any OTHER reason here \
+             means a layer stopped measuring: {reason}\nstderr:\n{stderr}\nstdout:\n{stdout}"
+        );
+    }
+    // The exit contract, tied to the refusals rather than asserted blind: no
+    // reasons must mean exit 0, and reasons must mean exit 1. A smoke that
+    // refuses a point and still exits 0 is the failure `exit_code_for` exists
+    // to prevent, and tolerating the reason above must not tolerate that too.
+    if refusals.is_empty() {
+        assert!(
+            out.status.success(),
+            "bench smoke published no refusal, so it must exit 0\nstderr:\n{stderr}\nstdout:\n{stdout}"
+        );
+    } else {
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "bench smoke published {} refusal(s), so it must exit 1\nstderr:\n{stderr}\nstdout:\n{stdout}",
+            refusals.len()
+        );
+    }
     // All four layers assembled into ONE report — this is what `all`/`smoke`
     // add over the single-layer subcommands, and the only place it is checked.
     for key in [
