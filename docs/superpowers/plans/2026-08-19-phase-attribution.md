@@ -24,6 +24,24 @@ Every task's requirements implicitly include this section.
 - **Nothing is quotable until it lands in `docs/BENCH.md`** (CLAUDE.md). Intermediate artifacts are observations.
 - **`bench-harness` is edge tooling.** Its `lib.rs` already carries `#![allow(clippy::disallowed_methods, clippy::disallowed_types)]`, so real clocks are fine *in this crate*.
 - **Workflow:** commit directly to `main`. **No `Co-Authored-By` trailers.**
+- **Prove the staged bytes are the tested bytes before every commit.** A chained
+  `fmt && clippy && test && git add && git commit` protects against a FAILING gate; it does not
+  protect against the file changing underneath the chain. On 2026-08-19 that gap put a mutation
+  artifact on `main` (`217aca3`, repaired at `f2b60aa`): the gates passed on correct content, a
+  concurrent agent's sweep held the file mutated, and `git add` staged that. Use:
+
+  ```sh
+  TESTED=$(git hash-object "$F")
+  # ... gates ...
+  git add "$F"
+  STAGED=$(git ls-files -s "$F" | awk '{print $2}')
+  [ "$TESTED" = "$STAGED" ] || { echo "staged content is not what the gates validated"; exit 1; }
+  ```
+- **Never run a mutation sweep, a `git checkout` of another commit, or any experiment that leaves
+  the tree temporarily wrong, inside the main working tree.** Use
+  `git worktree add --detach <dir> <ref>` with its own `CARGO_TARGET_DIR` — sharing a target dir
+  across worktrees in this repo leaks artifacts between trees and has produced false results.
+  Remove the worktree and its target dir when done.
 - **CI gates, all three, before any commit:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 - **This shell is zsh.** `PIPESTATUS` is never populated. Use `${pipestatus[1]}` (lowercase, 1-indexed) or `set -o pipefail`. Pipe cargo through `tee`, never `tail`.
 
@@ -790,8 +808,11 @@ Expected: PASS.
 
 - [ ] **Step 6: Prove no published number moved**
 
-This is the step that protects every figure already in `docs/BENCH.md`. Run both arms at this
-commit and at the previous one, and compare `acked_writes_per_sec`, `log_records_per_sec`, `syncs`
+This is the step that protects every figure already in `docs/BENCH.md`. **Build the baseline in a
+detached worktree with its own `CARGO_TARGET_DIR`, never by checking out the previous commit in
+the main tree** — a benchmark run takes minutes, and a main tree sitting at the wrong commit for
+minutes is how a wrong artifact gets committed. Run both arms at this commit and at the previous
+one, and compare `acked_writes_per_sec`, `log_records_per_sec`, `syncs`
 and `device_ratio`. Report BOTH sides in the task report. Because these are timing measurements
 they will not be bit-identical — state the run-to-run spread from at least 3 runs per side and say
 whether the delta sits inside it, rather than declaring a match or a regression from n=1.
