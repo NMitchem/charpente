@@ -20,6 +20,7 @@ pub mod device;
 pub mod kernel_accounting;
 pub mod kernel_bench;
 pub mod measure;
+pub mod phase_accounting;
 pub mod report;
 pub mod tracing_disk;
 pub mod wire;
