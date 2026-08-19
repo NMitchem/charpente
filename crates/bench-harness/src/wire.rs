@@ -72,15 +72,18 @@ impl Target {
 
     /// Durable syncs paid per acked request, by construction (2026-08-10
     /// group-commit interlude, T1 fix wave, C-1). Equal to
-    /// `records_per_request` ONLY while one commit costs one fsync —
-    /// `Engine::submit` today is unconditionally `append`→`sync`→`apply` with
-    /// no batching, so every committed record pays its own durable sync and
-    /// the two constants coincide. A future group-commit primary path is
-    /// where this stops holding: N records can share one fsync, and at that
-    /// point this needs a real server-reported sync count (a client outside
-    /// the process cannot count the server's `wal.sync()` calls any more than
-    /// it can count its log records) — see `wire_accounting`'s module doc for
-    /// what is owed and why this is not yet built.
+    /// `records_per_request` ONLY while one commit costs one fsync.
+    ///
+    /// **That condition no longer holds, and this is now a fallback whose
+    /// output is not published.** Group commit shipped (M2 sub-project 2), so N
+    /// records can share one fsync and this multiplier over-counts by the batch
+    /// factor at any contended point. `bench-app` therefore reports a real
+    /// count over `/__syncs` and is gated on it; a target that reports none —
+    /// `invoicing` — still lands here, but since T13's ruling (b) the resulting
+    /// rate is WITHDRAWN rather than published and judged
+    /// (`SweepPoint::syncs_per_sec: None`). It survives as the value behind
+    /// `WireObs::syncs`, which the zero-sync guard and the provenance flag are
+    /// still defined against. See `wire_accounting`'s module doc.
     fn syncs_per_request(&self) -> f64 {
         self.records_per_request()
     }

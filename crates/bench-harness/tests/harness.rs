@@ -495,15 +495,23 @@ fn wire_layer_sweeps_the_bench_app() {
         // per request is the correct answer and this must not be demanded of
         // it.
         if p.connections > 1 {
+            // T13: `syncs_per_sec` is an `Option` — `None` is the WITHDRAWN
+            // derived rate, which for bench-app would mean `/__syncs` went
+            // unanswered. `expect` rather than a silent skip: the assertion
+            // above already demands `syncs_counted`, and a `None` reaching here
+            // after that would be the two fields disagreeing.
+            let syncs = p
+                .syncs_per_sec
+                .expect("a counted point publishes its rate (syncs_counted is asserted above)");
             assert!(
-                p.syncs_per_sec < p.throughput_per_sec,
+                syncs < p.throughput_per_sec,
                 "[{} conns] group commit must amortize: {} syncs/s against {} req/s is {:.2} \
                  syncs per request — at or above 1.0 means batches of one, i.e. either the \
                  request arm stopped draining or the derivation is back",
                 p.connections,
-                p.syncs_per_sec,
+                syncs,
                 p.throughput_per_sec,
-                p.syncs_per_sec / p.throughput_per_sec
+                syncs / p.throughput_per_sec
             );
         }
     }
@@ -555,6 +563,14 @@ fn wire_layer_sweeps_the_bench_app() {
 // starved heartbeat all carry different wording, and a LOST point
 // additionally fails the `points.len()` assertion below, since a lost point
 // publishes nothing.
+//
+// **T13 (Noah ruling (b)) — the tolerated reason is no longer reachable here,
+// and the tolerance is kept on purpose.** invoicing reports no `/__syncs`, so
+// its sync rate is derived; a derived rate is now withdrawn rather than gated,
+// which means this target has no sync ratio to trip. Everything above is the
+// history of why it once did. The loop stays because it is now a REGRESSION
+// guard rather than weather-tolerance: if this reason appears again, a derived
+// rate reached the gate, which is precisely what ruling (b) removed.
 #[test]
 #[ignore]
 fn wire_layer_drives_invoicing_through_login() {
@@ -628,7 +644,10 @@ fn a_saturated_client_is_flagged_on_the_point() {
         connections: 1,
         throughput_per_sec: 1.0,
         log_records_per_sec: 2.0,
-        syncs_per_sec: 2.0,
+        // T13: a derived point publishes no rate. This test renders a
+        // saturation flag and reads nothing from the sync cell, so the
+        // withdrawn form is the right fixture rather than a concession.
+        syncs_per_sec: None,
         syncs_counted: false,
         device_ratio: 0.5,
         device_appends_per_sec_before: 2.0,
@@ -687,14 +706,13 @@ fn the_bench_binary_smokes_end_to_end() {
         .expect("bench smoke runs");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // T13 (Noah ruling): this used to assert `exit 0`, which is a condition
-    // this harness's OWN published documentation says cannot hold —
-    // `docs/BENCH.md` states "on this matrix `invalid: []` is unreachable" and
-    // heads a section "`examples/invoicing` is refused at every contended
-    // point, on purpose". invoicing mounts no `/__syncs`, so its sync
-    // numerator falls back to `syncs_per_request * throughput`, and group
-    // commit is exactly what makes that multiplier false once requests queue:
-    // the gate reads ~2x the ceiling and refuses, correctly.
+    // T13 (Noah ruling (d)): this used to assert `exit 0`, which was then a
+    // condition this harness's own published documentation said could not hold
+    // — `docs/BENCH.md` recorded that `invalid: []` was unreachable on the full
+    // matrix, because invoicing mounts no `/__syncs`, its sync numerator fell
+    // back to `syncs_per_request * throughput`, and group commit makes that
+    // multiplier false once requests queue: the gate read ~2x the ceiling and
+    // refused, correctly.
     //
     // **A gate that is permanently red for an expected reason is not a gate.**
     // A real regression in this smoke would have looked identical to the
@@ -702,6 +720,15 @@ fn the_bench_binary_smokes_end_to_end() {
     // `wire_layer_drives_invoicing_through_login` already uses one layer down
     // (and `kernel_bench::syncs_are_measured_not_derived_under_batching` one
     // layer below that): tolerate the ONE named reason, redden on any other.
+    //
+    // **Ruling (b) then removed the reason itself, and this tolerance is kept
+    // deliberately rather than left by accident.** A derived sync rate is now
+    // withdrawn instead of gated, so on today's harness the invoicing refusal
+    // this was written for cannot fire, and the `refusals.is_empty()` arm below
+    // is the one a green run takes — the stronger assertion, back in force.
+    // What the loop still buys is that it reddens on ANY reason, including the
+    // one it names: if that refusal ever appears again it means a derived rate
+    // reached the gate, which is the regression ruling (b) exists to prevent.
     //
     // **If a DIFFERENT reason appears here, do not read it as flakiness.** It
     // means one of device/core/kernel, or the COUNTED bench-app wire arm, has
@@ -724,10 +751,11 @@ fn the_bench_binary_smokes_end_to_end() {
         assert!(
             reason.contains("durable syncs/s from")
                 && reason.contains("the measured device ceiling"),
-            "the derived sync rate of a target with no /__syncs legitimately reads above the \
-             ceiling at a contended point, and refusing it is the gate working (BENCH.md: \
-             \"refused at every contended point, on purpose\") — but any OTHER reason here \
-             means a layer stopped measuring: {reason}\nstderr:\n{stderr}\nstdout:\n{stdout}"
+            "the only refusal this smoke tolerates is the sync-ratio one, and since T13's \
+             ruling (b) even that should no longer be reachable — a derived sync rate is \
+             withdrawn rather than gated, so seeing it here means a derived rate reached the \
+             gate again. Any OTHER reason means a layer stopped measuring: \
+             {reason}\nstderr:\n{stderr}\nstdout:\n{stdout}"
         );
     }
     // The exit contract, tied to the refusals rather than asserted blind: no

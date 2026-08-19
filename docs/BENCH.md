@@ -65,9 +65,25 @@ gets re-scoped and this doc says so. **The counter landed** (2026-08-14).
 `bench-app` wraps its `Disk` in a `wal/`-scoped counting impl and publishes the
 tally through a `/__syncs` route; the harness samples it at both window edges
 and gates on the delta, so that target's sync rate is COUNTED. `invoicing`
-mounts no such route and still derives at 1.0 × throughput. The derived form is
-now unsound by construction, which is why every contended invoicing point below
-is refused rather than published.
+mounts no such route and derives at 1.0 × throughput. The derived form is
+unsound by construction under batching, which is why every contended invoicing
+point below was refused rather than published.
+
+**Since 2026-08-19 the derived form is not published either, and this paragraph
+describes the runs below rather than today's harness (T13, Noah ruling (b)).**
+The gate now runs on a COUNTED sync rate and on nothing else, at unchanged
+strictness — a counted WAL sync rate above the counted WAL ceiling still
+refuses — and a derived rate is WITHDRAWN: `null` in the artifact,
+`n/a (derived, unsound under batching)` in the human render. The reasoning is
+that a physical-plausibility gate applied to `syncs_per_request × throughput`
+tests the CONSTANT rather than the system, and group commit made that constant
+false at every contended point, so the gate could not fail to fire. What settled
+it was an asymmetry the harness had been carrying without noticing: the wire
+`device_ratio` is `records_per_request × throughput / ceiling`, the same shape of
+derivation, and it is published ungated at 3.4x the ceiling — two derived
+quantities, identical form, opposite treatment. So the numbers below stand as
+measured, and a re-run today would produce the same invoicing throughput and
+latencies with no sync rate beside them and no refusal.
 
 **Today's harness marks which is which; the artifacts these numbers come from
 do not.** Every point emits a `syncs_counted` flag — the counter itself landed
@@ -89,14 +105,19 @@ ratio at core and kernel (`core_accounting.rs:278`, `kernel_accounting.rs:219`)
 and the RECORD ratio at wire (`wire_accounting.rs:286`); the wire gate itself
 fires on the sync ratio, which the JSON artifact publishes under no name at
 all. The human render does print it — `…x dev (sync, gated)` beside
-`…x dev (records, ungated)`, computed inline from the same line's fields
-(`report.rs:521-527`) — so a reader of the terminal output and a reader of the
-JSON are not looking at the same set of quantities. Do not read a wire
-`device_ratio` as a sync ratio: at 64 connections below it reads 26.87 while
-the gated sync ratio is 0.42. Both operands of the honest quantity are in the
-artifact — compute `syncs_per_sec / max(device_appends_per_sec_before,
-device_appends_per_sec_after)` yourself. Every wire sync ratio in this document
-was computed that way.
+`…x dev (records, ungated)`, computed inline from the same line's fields — so a
+reader of the terminal output and a reader of the JSON are not looking at the
+same set of quantities. Do not read a wire `device_ratio` as a sync ratio: at 64
+connections below it reads 26.87 while the gated sync ratio is 0.42. Both
+operands of the honest quantity are in the artifact — compute
+`syncs_per_sec / max(device_appends_per_sec_before, device_appends_per_sec_after)`
+yourself. Every wire sync ratio in this document was computed that way.
+
+Since T13 this applies to COUNTED points only. A point whose sync rate was
+withdrawn carries `"syncs_per_sec": null` in the artifact and prints
+`n/a (derived, unsound under batching)` with no sync ratio at all — there is no
+gate on that arm, so there is no gated ratio to show. The records ratio is
+printed in both arms, unchanged and still ungated.
 
 ### What can invalidate a run
 
@@ -124,7 +145,12 @@ thresholds are not tunable from the command line.
   against the spread those two samples show. A gate this close to 1.0 cannot
   detect a violation smaller than its own measurement error, and does not
   claim to; it catches the class that matters — acking without syncing —
-  which is an order-of-magnitude effect.
+  which is an order-of-magnitude effect. **At the wire layer it applies to a
+  COUNTED sync rate only** (T13, 2026-08-19): where a target reports no count,
+  the rate would be `syncs_per_request × throughput`, which batching makes
+  false, so it is withdrawn from the artifact rather than published and gated.
+  Gating it would have tested the multiplier, not the system. Core and kernel
+  count their own syncs in-process and are unaffected.
 - **The bracket-stability gate.** The two device brackets either side of a
   window must agree to within **20%**. Past that they are not two samples of one
   quantity — the device's own capability moved *during* the measurement — so the
@@ -338,8 +364,12 @@ window. That rule is load-bearing rather than tidy — run 2's `bench-app` 64c a
 256c points carry p99→p999 excursions of 9.0x and 3.9x that neither the bracket
 gate nor the heartbeat guard saw, so a run-1 throughput published beside a run-2
 tail would be a composite of two different machines. Both runs exited non-zero;
-on this matrix `invalid: []` is unreachable, for the reason the invoicing note
-below gives.
+on this matrix, **as the harness stood on 2026-08-15**, `invalid: []` was
+unreachable, for the reason the invoicing note below gives. T13's ruling (b)
+removed that: a derived sync rate is no longer gated, so those four invoicing
+refusals would not fire on today's harness and `invalid: []` is reachable again.
+The green map above is the record of what those two runs did, not a statement
+about the current instrument.
 
 ### The kernel layer — the primary evidence
 
@@ -419,18 +449,42 @@ that enforces the cap runs inside the process. It is left visible here because
 it is the cleanest evidence in the artifact for which half of the wire ratio is
 evidence and which half is arithmetic.
 
-### `examples/invoicing` is refused at every contended point, on purpose
+### `examples/invoicing` was refused at every contended point, and the refusal was replaced rather than relaxed
 
-Eight of its ten points across the two runs are INVALID and the harness is right
-to refuse them. invoicing mounts no `/__syncs`, so its sync numerator falls back
-to 1.0 × throughput — and group commit is exactly what makes that multiplier
-unsound. The harness reads 2.06x–30.49x the device ceiling and refuses its own
-numerator, which is precisely what the owed-work paragraph in
-`wire_accounting.rs` predicted it would do. Only the 1-connection point is green
-(215 and 226 req/sec across the two runs), because a batch of one is where the
-multiplier still holds. **No invoicing speedup is published here.** Its
-pre-group-commit 1-connection baseline row is separately withdrawn — last
-section.
+Eight of its ten points across the two runs are INVALID and the harness was
+right to refuse them **on the evidence it had at the time**. invoicing mounts no
+`/__syncs`, so its sync numerator falls back to 1.0 × throughput — and group
+commit is exactly what makes that multiplier unsound. The harness read
+2.06x–30.49x the device ceiling and refused its own numerator, which is
+precisely what the owed-work paragraph in `wire_accounting.rs` predicted it
+would do. Only the 1-connection point is green (215 and 226 req/sec across the
+two runs), because a batch of one is where the multiplier still holds. **No
+invoicing speedup is published here.** Its pre-group-commit 1-connection
+baseline row is separately withdrawn — last section.
+
+**What changed on 2026-08-19 (T13, Noah ruling (b)), and why this is not a
+relaxation.** Refusing an unsound number every single time is not a gate: a
+check that must fire teaches a reader to skip refusals, and `invalid: []` had
+become unreachable, so a genuine regression in this matrix would have looked
+exactly like the expected failure. The instrument no longer computes that
+numerator for publication at all — a derived sync rate is WITHDRAWN (`null` in
+the artifact, `n/a (derived, unsound under batching)` in the human render) and
+reaches no gate, while a COUNTED rate is gated at exactly the strictness it
+always was. Nothing was widened: `RATIO_TOLERANCE_FLOOR` is untouched, and a
+counted WAL sync rate above the counted WAL ceiling still refuses. The four
+invoicing refusals recorded above would therefore not fire today, and the
+absence of a sync figure beside invoicing's throughput is the point — it says
+the harness cannot see that quantity from outside the process, which is true,
+where the old refusal said it could see it and disbelieved what it saw.
+
+**What is still owed, unchanged by the above.** A counted sync rate for
+`examples/invoicing` needs a server-reported counter it does not have. Option
+(a) of T13's investigation costs the example its single-dependency-on-`charpente`
+property (`CountingDisk` lives in `bench-harness`), needs an unauthenticated
+introspection route in an app whose every other route carries `auth`, and
+instruments the one target whose evidentiary value is that it is a stock,
+uninstrumented real application. It was investigated and deliberately not taken;
+withdrawal is the honest interim, not a substitute.
 
 ### Core is unchanged, and that is the correct result
 

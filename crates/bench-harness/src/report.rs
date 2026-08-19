@@ -117,15 +117,29 @@ pub struct SweepPoint {
     // server's log" is superseded.** That was true of the log, and remains
     // true of `log_records_per_sec` below; it stopped being true of syncs the
     // moment a target began reporting its own. bench-app now does, over
-    // `/__syncs`. Read `syncs_counted` to know which this is: counted is a
-    // real fsync tally from inside the server, derived is
-    // `Target::syncs_per_request() * throughput`, which assumes one fsync per
-    // commit and is therefore unsound under group commit.
-    pub syncs_per_sec: f64,
-    /// Whether `syncs_per_sec` above is a real server-reported count (`true`)
-    /// or the one-fsync-per-commit derivation (`false`). Published because two
-    /// numbers of different evidentiary standing must not appear in one table
-    /// looking alike — the same reason `device_ratio_denominator` is published.
+    // `/__syncs`.
+    //
+    // **T13 (Noah ruling (b), 2026-08-19): `None` where the rate would have
+    // been DERIVED, and the number is withdrawn rather than published.** The
+    // derivation is `Target::syncs_per_request() * throughput`, which assumes
+    // one fsync per commit — precisely what group commit removed. A quantity
+    // known false a priori is not made safe by labelling it, so it is no
+    // longer emitted: `null` in the artifact, `n/a (derived, unsound under
+    // batching)` in the human render. `Some` is a real fsync tally from inside
+    // the server and carries the device-ratio gate exactly as before. Read
+    // `syncs_counted` for the provenance; read this for the number, if there
+    // is one.
+    pub syncs_per_sec: Option<f64>,
+    /// Whether the sync rate for this point was a real server-reported count
+    /// (`true`) or the one-fsync-per-commit derivation (`false`). Published
+    /// because two numbers of different evidentiary standing must not appear in
+    /// one table looking alike — the same reason `device_ratio_denominator` is
+    /// published.
+    ///
+    /// Since T13 this also predicts `syncs_per_sec`: `true` ⇒ `Some`, `false` ⇒
+    /// `None`. Both are still published because they answer different
+    /// questions — this one says whether the harness COULD count, which stays
+    /// true of a target even at a point where there is no number to show.
     pub syncs_counted: bool,
     // T7 rev. 4 (Noah ruling, 2026-08-09), SUPERSEDED at the wire layer by
     // the 2026-08-10 group-commit interlude's T1 fix wave (C-1): this field
@@ -266,11 +280,12 @@ fn collect_non_finite(r: &Report) -> Vec<String> {
                 &format!("{prefix}.log_records_per_sec"),
                 p.log_records_per_sec,
             );
-            push_if_non_finite(
-                &mut out,
-                &format!("{prefix}.syncs_per_sec"),
-                p.syncs_per_sec,
-            );
+            // T13: only a published rate can be non-finite. A withdrawn one
+            // renders `null` for a reason that is not a NaN, and scanning
+            // `None` would have to invent a value to scan.
+            if let Some(syncs) = p.syncs_per_sec {
+                push_if_non_finite(&mut out, &format!("{prefix}.syncs_per_sec"), syncs);
+            }
             push_if_non_finite(&mut out, &format!("{prefix}.device_ratio"), p.device_ratio);
             push_if_non_finite(
                 &mut out,
@@ -321,6 +336,14 @@ fn num3(v: f64) -> String {
     } else {
         "null".to_string()
     }
+}
+
+/// `num2` for a rate that may have been WITHDRAWN rather than measured (T13).
+/// Collapses to the same `null` a non-finite value renders as, deliberately:
+/// the artifact's contract is "this key carries no number", and a reader who
+/// needs to know WHICH kind of absence this is reads `syncs_counted` beside it.
+fn num2_opt(v: Option<f64>) -> String {
+    v.map_or_else(|| "null".to_string(), num2)
 }
 
 pub fn render_json(r: &Report) -> Result<String, String> {
@@ -404,7 +427,7 @@ pub fn render_json(r: &Report) -> Result<String, String> {
                     p.connections,
                     num2(p.throughput_per_sec),
                     num2(p.log_records_per_sec),
-                    num2(p.syncs_per_sec),
+                    num2_opt(p.syncs_per_sec),
                     p.syncs_counted,
                     num3(p.device_ratio),
                     num2(p.device_appends_per_sec_before),
@@ -517,24 +540,33 @@ pub fn render_human(r: &Report) -> String {
             // confirming the ceiling claim while showing the wrong number.
             // Both ratios are shown now, each named for what it is, the sync
             // one computed from fields already on this same line rather than
-            // published as a new field (nothing judged here changes).
-            let sync_ratio = p.syncs_per_sec
-                / p.device_appends_per_sec_before
-                    .max(p.device_appends_per_sec_after);
+            // published as a new field (nothing judged here changes). Since T13
+            // the sync half appears on counted points only — see the next
+            // paragraph.
+            //
+            // T13 (Noah ruling (b)): a point whose rate was WITHDRAWN prints
+            // the withdrawal in place of both the number and its ratio, rather
+            // than printing a number qualified by a word. "derived" as a tag
+            // beside a figure still reads as a measurement to anyone skimming;
+            // `n/a` cannot. The records ratio stays on the line in both arms —
+            // it is the same published-but-ungated quantity it always was.
+            let sync_cell = match p.syncs_per_sec {
+                Some(syncs) => {
+                    let sync_ratio = syncs
+                        / p.device_appends_per_sec_before
+                            .max(p.device_appends_per_sec_after);
+                    format!("{syncs:>8.0} sync/s (counted)  {sync_ratio:.3}x dev (sync, gated)")
+                }
+                None => "n/a (derived, unsound under batching)".to_string(),
+            };
             s.push_str(&format!(
-                "    {:>4} conns: {:>8.0} req/s  {:>8.0} rec/s  {:>8.0} sync/s ({})  {:.3}x dev \
-                 (sync, gated)  {:.3}x dev (records, ungated)  (bracket {:.0}/{:.0} appends/s \
+                "    {:>4} conns: {:>8.0} req/s  {:>8.0} rec/s  {}  {:.3}x dev (records, \
+                 ungated)  (bracket {:.0}/{:.0} appends/s \
                  before/after)  p50 {:>6}us  p99 {:>6}us  p99.9 {:>6}us  client busy {:.0}%{}\n",
                 p.connections,
                 p.throughput_per_sec,
                 p.log_records_per_sec,
-                p.syncs_per_sec,
-                if p.syncs_counted {
-                    "counted"
-                } else {
-                    "derived"
-                },
-                sync_ratio,
+                sync_cell,
                 p.device_ratio,
                 p.device_appends_per_sec_before,
                 p.device_appends_per_sec_after,
@@ -597,21 +629,46 @@ mod tests {
             }),
             wire: vec![WireReport {
                 target: "bench-app".to_string(),
-                points: vec![SweepPoint {
-                    connections: 4,
-                    throughput_per_sec: 1200.0,
-                    log_records_per_sec: 2400.0,
-                    syncs_per_sec: 2400.0,
-                    syncs_counted: true,
-                    device_ratio: 0.685,
-                    device_appends_per_sec_before: 3500.0,
-                    device_appends_per_sec_after: 3600.0,
-                    p50_us: 800,
-                    p99_us: 2100,
-                    p999_us: 5000,
-                    client_busy_fraction: 0.12,
-                    saturated: false,
-                }],
+                points: vec![
+                    SweepPoint {
+                        connections: 4,
+                        throughput_per_sec: 1200.0,
+                        log_records_per_sec: 2400.0,
+                        syncs_per_sec: Some(2400.0),
+                        syncs_counted: true,
+                        device_ratio: 0.685,
+                        device_appends_per_sec_before: 3500.0,
+                        device_appends_per_sec_after: 3600.0,
+                        p50_us: 800,
+                        p99_us: 2100,
+                        p999_us: 5000,
+                        client_busy_fraction: 0.12,
+                        saturated: false,
+                    },
+                    // T13: the WITHDRAWN arm. Added to this fixture rather than
+                    // pinned in a test of its own because the shape pin below
+                    // is the artifact's contract, and a contract that describes
+                    // only the counted arm is how a shape change ships
+                    // unnoticed — which is exactly what happened here: making
+                    // `syncs_per_sec` an `Option` broke this fixture at COMPILE
+                    // time but would have left `json_shape_is_pinned` green,
+                    // since its only point was a counted one.
+                    SweepPoint {
+                        connections: 16,
+                        throughput_per_sec: 1800.0,
+                        log_records_per_sec: 1800.0,
+                        syncs_per_sec: None,
+                        syncs_counted: false,
+                        device_ratio: 0.514,
+                        device_appends_per_sec_before: 3500.0,
+                        device_appends_per_sec_after: 3600.0,
+                        p50_us: 1100,
+                        p99_us: 2600,
+                        p999_us: 6000,
+                        client_busy_fraction: 0.20,
+                        saturated: false,
+                    },
+                ],
             }],
             invalid: vec![],
         }
@@ -644,7 +701,14 @@ mod tests {
              \"device_ratio\":0.685,\"device_appends_per_sec_before\":3500.00,\
              \"device_appends_per_sec_after\":3600.00,\"p50_us\":800,\"p99_us\":2100,\
              \"p999_us\":5000,\
-             \"client_busy_fraction\":0.120,\"saturated\":false}]}],\"invalid\":[]}}"
+             \"client_busy_fraction\":0.120,\"saturated\":false},\
+             {\"connections\":16,\
+             \"throughput_per_sec\":1800.00,\"log_records_per_sec\":1800.00,\
+             \"syncs_per_sec\":null,\"syncs_counted\":false,\
+             \"device_ratio\":0.514,\"device_appends_per_sec_before\":3500.00,\
+             \"device_appends_per_sec_after\":3600.00,\"p50_us\":1100,\"p99_us\":2600,\
+             \"p999_us\":6000,\
+             \"client_busy_fraction\":0.200,\"saturated\":false}]}],\"invalid\":[]}}"
         );
     }
 
@@ -912,6 +976,21 @@ mod tests {
              0.667x dev (sync, gated)  0.685x dev (records, ungated)  (bracket 3500/3600 \
              appends/s before/after)  p50    800us  p99   2100us  p99.9   5000us  client \
              busy 12%",
+            "got: {human}"
+        );
+        // T13, and the reason this arm is pinned rather than trusted: the point
+        // of withdrawing a derived rate is that a reader CANNOT mistake it for
+        // a measurement, and that property lives entirely in this string. A
+        // renderer regression that printed a number here — or printed
+        // "0.000x dev (sync, gated)" from a `None` — would defeat the ruling
+        // while every other test stayed green. Note there is no sync ratio on
+        // this line at all: the ratio was the gate's subject, and there is no
+        // gate on this arm.
+        assert_eq!(
+            lines[6],
+            "      16 conns:     1800 req/s      1800 rec/s  n/a (derived, unsound under \
+             batching)  0.514x dev (records, ungated)  (bracket 3500/3600 appends/s \
+             before/after)  p50   1100us  p99   2600us  p99.9   6000us  client busy 20%",
             "got: {human}"
         );
     }

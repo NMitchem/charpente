@@ -1000,7 +1000,9 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   map** (neither run is green alone; T11 needs both): core ✅run 1 / ❌run 2 (23.04% bracket
   spread); kernel ❌run 1 (46.05%) / ✅run 2; wire `bench-app` 1c ❌run 1 / ✅run 2, 4c ✅✅,
   16c ✅run 1 / ❌run 2 (20.21%), 64c ✅✅, 256c ✅✅; wire `invoicing` 1c ✅✅, 4c/16c/64c/256c
-  ❌❌. **Both runs exited 1 and `invalid: []` is unreachable on this matrix**: `invoicing`
+  ❌❌. **Both runs exited 1 and `invalid: []` was unreachable on the matrix as it then stood**
+  (T13's ruling (b), 2026-08-19, removed that — see below; these four invoicing refusals would
+  not fire today): `invoicing`
   mounts no `/__syncs`, so its sync figure is the `1.0 × throughput` fallback, and group commit
   is exactly what makes that multiplier unsound — the harness is refusing its own unsound
   numerator (2.06x–30.49x the ceiling), which is what `wire_accounting`'s owed-work paragraph
@@ -1325,6 +1327,56 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   this entry. It now says an uncontended commit costs one durable fsync which group commit
   amortizes across a batch once requests queue, and that two M2 sub-projects have shipped
   with the amortization half of the gap closed and the device-speed half not.
+  **The wire layer stops gating a DERIVED sync rate, and stops publishing one — Noah's
+  ruling, signed off 2026-08-19 (T13, ruling (b); ruling (d) landed first in the preceding
+  commit).** The trigger was the first `scripts/bench.sh --smoke` run since batching landed:
+  11 passed, 1 failed, and after the kernel arm's request count was resized the one remaining
+  refusal was invoicing at 4 connections, 576 derived syncs/s against a 266/s ceiling.
+  **The argument, recorded because the ruling turns on it rather than on the refusal itself.**
+  A physical-plausibility gate is a claim about the SYSTEM; applied to
+  `syncs_per_request × throughput` it is a claim about the CONSTANT. Group commit made that
+  constant false at every contended point, so the gate could not fail to fire — and a check
+  that must fire is not evidence, it is a standing refusal that teaches a reader to skip
+  refusals. This ledger's own T10 entry (above) had already recorded the end state: both runs
+  exited 1 and `invalid: []` was unreachable.
+  **What decided it was an asymmetry the instrument had been carrying unnoticed**, found in
+  the T13 investigation and confirmed independently from an earlier run: on the same report
+  line, `bench-app`'s wire `device_ratio` — `records_per_request × throughput / ceiling`, the
+  same shape of derivation — is published UNGATED at 3.438x the device ceiling and passes,
+  while invoicing's derived sync ratio at 2.164x refuses. Two derived quantities, identical
+  form, opposite treatment, decided by the order the two fields landed. `syncs_counted`
+  existed and was documented inert ("Provenance, not arithmetic — nothing in this module
+  branches on it … this flag cannot alter a verdict"), and the human render's
+  `(sync, gated)`/`(records, ungated)` labels were string literals.
+  **What shipped:** the device-ratio gate runs on a COUNTED sync rate and on nothing else, and
+  a derived rate is WITHDRAWN rather than published — `"syncs_per_sec": null` in the artifact,
+  `n/a (derived, unsound under batching)` with no sync ratio in the human render. **This is
+  not a widened threshold and no number moved:** `RATIO_TOLERANCE_FLOOR` is untouched, and a
+  counted WAL sync rate above the counted WAL ceiling still refuses — pinned by
+  `a_counted_sync_rate_is_gated_exactly_as_before`, whose fixture is 5x the ceiling.
+  Considered and rejected: keeping the derived rate at 1 connection, where a batch of one means
+  the multiplier still holds. That replaces the one discriminator the harness observes
+  (`syncs_counted`) with a guess about the server's internals from the client's connection
+  count.
+  **Standing: this exercises the 2026-08-10 T1 fix wave's own escape clause rather than
+  overriding it.** That ruling gated a derived quantity on the stated premise that it is
+  "sound while one commit costs one fsync, and NOT sound the moment a group-commit primary
+  path makes it cost less". That path shipped. **`DECISIONS.md` carries no entry on this gate
+  — verified, not assumed — so no reopen is owed**; the superseded reasoning lives in
+  `wire_accounting`'s module doc and is rescoped there rather than deleted.
+  **Doc claims this falsified, all rescoped to the runs they describe rather than removed:**
+  `docs/BENCH.md`'s "every contended invoicing point below is refused rather than published",
+  its "on this matrix `invalid: []` is unreachable", its section heading
+  "`examples/invoicing` is refused at every contended point, on purpose", its device-ratio-gate
+  bullet, and its "one key means two things by layer" note; this entry's own T10 record above;
+  and in source, `Target::syncs_per_request`'s future-tense "a future group-commit primary
+  path is where this stops holding", `WireObs::syncs_counted`'s inert-flag doc, and both
+  harness tests that tolerated the refusal. **Still owed and unchanged:** a counted sync rate
+  for `examples/invoicing`. Option (a) — a `/__syncs` counter there — was investigated and
+  deliberately not taken: `CountingDisk` lives in `bench-harness` while the example is
+  single-dep on `charpente` by design, the route would have to be unauthenticated in an app
+  whose every other route carries `auth`, and it instruments the one target whose evidentiary
+  value is that it is a stock, uninstrumented real application.
   **OPEN — DECISIONS §7 trigger (a) is owed a re-read, and nothing here performs one.** The
   2026-08-10 reading ("the commit path is fsync-bound at ≈1x the device ceiling, so redb is
   not the binding constraint at this workload") was taken before batching existed, and group
