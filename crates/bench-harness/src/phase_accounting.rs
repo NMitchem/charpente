@@ -20,11 +20,19 @@
 //! traced op in flight at either edge. Events lying wholly outside
 //! `[window_start_nanos, window_end_nanos]` are ignored: that is warmup (the
 //! `Db::open` and population work that necessarily precedes a measured
-//! window), and ignoring it is the point — folding it in would silently
-//! dilute every published share by an undisclosed factor. An event that
-//! straddles a boundary instead of falling entirely inside or outside it means
-//! the window was stamped from the wrong place, and `attribute` refuses rather
-//! than clipping it, silently or otherwise.
+//! window) or teardown, and ignoring it is the point — folding it in would
+//! silently dilute every published share by an undisclosed factor. An event
+//! that straddles a boundary instead of falling entirely inside or outside it
+//! means the window was stamped from the wrong place, and `attribute` refuses
+//! rather than clipping it, silently or otherwise.
+//!
+//! **Ignoring is not the same as being unaccountable for.** A window stamped
+//! from the wrong place (the natural, compiling repair for a caller who gets
+//! the two arguments wrong) does not always straddle — it can instead drop
+//! events wholly on one side, silently, with the closure assert still passing
+//! on the diluted remainder. `Attribution`'s three counts exist so that is
+//! visible to the caller instead of invisible in a plausible-looking number
+//! (`task-2-rereview.md`, R-1).
 
 use crate::tracing_disk::{Event, OpKind, PathClass};
 
@@ -71,7 +79,7 @@ pub struct PhaseTotals {
     pub gap_store_to_wal: u64,
     /// Any gap whose neighbours do not fall in the pairs above — e.g. either
     /// side of the `.horizon` breadcrumb at a checkpoint boundary
-    /// (`(Store,Other)`, `(Other,Wal)`, and the `Other`-internal pairs).
+    /// (`(Store,Other)`, `(Other,Wal)`, `(Other,Other)`).
     pub gap_other: u64,
     /// `window_start_nanos` to the first in-window op.
     pub lead_in: u64,
@@ -83,7 +91,7 @@ impl PhaseTotals {
     pub fn total(&self) -> u64 {
         self.wal_append_io
             + self.wal_read_io
-            + self.wal_sync_io
+            + 0
             + self.store_write_io
             + self.store_read_io
             + self.store_sync_io
@@ -98,9 +106,34 @@ impl PhaseTotals {
     }
 }
 
+/// The result of attributing a window: the partition, plus how much of the
+/// input trace fed it. `PhaseTotals` alone cannot tell a caller whether every
+/// event near the window was actually inside it — a wrongly-stamped window is
+/// the natural, *compiling* mistake a caller makes, and it does not always
+/// straddle (which refuses); it can instead drop events wholly on one side,
+/// silently, while the closure assert still passes on the diluted remainder.
+/// These counts are what makes that visible. They are deliberately not
+/// `PhaseTotals` fields: that struct's fields partition the window and
+/// `total()` sums them, so a count field there would be a bug waiting to be
+/// summed into a nanosecond total.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Attribution {
+    /// The partition. `totals.total()` closes to the window exactly.
+    pub totals: PhaseTotals,
+    /// Events lying entirely within the window — the ones `totals` describes.
+    pub events_attributed: u64,
+    /// Events wholly before `window_start_nanos`. Warmup and open: expected,
+    /// and the reason ignoring them is correct rather than lossy.
+    pub events_ignored_before_window: u64,
+    /// Events wholly after `window_end_nanos`. On an arm whose window closes
+    /// at the end of its run this should be 0, and a caller can gate on it.
+    pub events_ignored_after_window: u64,
+}
+
 /// Partition `[window_start_nanos, window_end_nanos]` across the phases the
 /// trace reveals. `events` may include ops recorded before or after the
-/// window (warmup, teardown) — those are ignored, not attributed.
+/// window (warmup, teardown) — those are ignored, not attributed, and counted
+/// in the returned `Attribution` so the caller can tell.
 ///
 /// Refuses (rather than returning a number) when the trace cannot support the
 /// arithmetic: an inverted window, a malformed event (`end < start`),
@@ -112,7 +145,7 @@ pub fn attribute(
     events: &[Event],
     window_start_nanos: u64,
     window_end_nanos: u64,
-) -> Result<PhaseTotals, Vec<String>> {
+) -> Result<Attribution, Vec<String>> {
     let mut invalid = Vec::new();
 
     if window_end_nanos < window_start_nanos {
@@ -209,15 +242,42 @@ pub fn attribute(
     let window_nanos = window_end_nanos - window_start_nanos;
     let mut totals = PhaseTotals::default();
 
-    let in_window: Vec<Event> = events
+    let is_fully_inside =
+        |e: &Event| e.start_nanos >= window_start_nanos && e.end_nanos <= window_end_nanos;
+    let in_window: Vec<Event> = events.iter().copied().filter(is_fully_inside).collect();
+    let events_attributed = in_window.len() as u64;
+    // A straddle is already refused above, so every event not fully inside is
+    // fully outside — on one side or the other. `is_fully_inside` gets first
+    // claim (it is what the filter above uses), so the one input where the
+    // two boundary tests both admit an event — a zero-duration event sitting
+    // exactly on a boundary — is counted in-window here too, not double
+    // counted as ignored.
+    let events_ignored_before_window = events
         .iter()
-        .copied()
-        .filter(|e| e.start_nanos >= window_start_nanos && e.end_nanos <= window_end_nanos)
-        .collect();
+        .filter(|e| !is_fully_inside(e) && e.end_nanos <= window_start_nanos)
+        .count() as u64;
+    let events_ignored_after_window = events
+        .iter()
+        .filter(|e| !is_fully_inside(e) && e.start_nanos >= window_end_nanos)
+        .count() as u64;
+    // Negative space: every event is inside, before, or after the window —
+    // the straddle refusal already ruled out any other case, so these three
+    // counts must exactly partition `events`, with no event double-counted
+    // or dropped from the count entirely.
+    assert_eq!(
+        events_attributed + events_ignored_before_window + events_ignored_after_window,
+        events.len() as u64,
+        "every event must be classified as attributed, ignored-before or ignored-after"
+    );
 
     let Some(first) = in_window.first() else {
         totals.lead_in = window_nanos;
-        return Ok(totals);
+        return Ok(Attribution {
+            totals,
+            events_attributed,
+            events_ignored_before_window,
+            events_ignored_after_window,
+        });
     };
 
     totals.lead_in = first.start_nanos - window_start_nanos;
@@ -258,7 +318,12 @@ pub fn attribute(
         "phase totals must close to the measured window exactly"
     );
 
-    Ok(totals)
+    Ok(Attribution {
+        totals,
+        events_attributed,
+        events_ignored_before_window,
+        events_ignored_after_window,
+    })
 }
 
 #[cfg(test)]
@@ -284,16 +349,19 @@ mod tests {
             ev(PathClass::Store, OpKind::WriteAt, 1030, 1050),
             ev(PathClass::Store, OpKind::WriteAt, 1060, 1080),
         ];
-        let t = attribute(&events, 0, 1100).expect("single-threaded trace attributes");
-        assert_eq!(t.wal_append_io, 20);
-        assert_eq!(t.wal_sync_io, 1000);
-        assert_eq!(t.store_write_io, 40);
-        assert_eq!(t.gap_wal_to_store, 10, "the sync→apply transition");
+        let a = attribute(&events, 0, 1100).expect("single-threaded trace attributes");
+        assert_eq!(a.totals.wal_append_io, 20);
+        assert_eq!(a.totals.wal_sync_io, 1000);
+        assert_eq!(a.totals.store_write_io, 40);
+        assert_eq!(a.totals.gap_wal_to_store, 10, "the sync→apply transition");
         assert_eq!(
-            t.gap_within_store, 10,
+            a.totals.gap_within_store, 10,
             "a gap between two consecutive tables.redb ops"
         );
-        assert_eq!(t.tail, 20);
+        assert_eq!(a.totals.tail, 20);
+        assert_eq!(a.events_attributed, 5);
+        assert_eq!(a.events_ignored_before_window, 0);
+        assert_eq!(a.events_ignored_after_window, 0);
     }
 
     /// Every field non-zero on purpose, and every field's value distinct from
@@ -321,7 +389,8 @@ mod tests {
             ev(PathClass::Other, OpKind::Len, 198, 203), // other_io (dur 5)
             ev(PathClass::Wal, OpKind::WriteAt, 226, 234), // wal_append_io part 3 (dur 8)
         ];
-        let t = attribute(&events, 0, 253).expect("attributes");
+        let a = attribute(&events, 0, 253).expect("attributes");
+        let t = a.totals;
 
         assert_eq!(t.wal_append_io, 21, "6 + 7 + 8, three separate WAL writes");
         assert_eq!(t.wal_read_io, 9);
@@ -336,11 +405,14 @@ mod tests {
         assert_eq!(t.gap_store_to_wal, 18, "130-112");
         assert_eq!(
             t.gap_other, 43,
-            "(198-178) Store→Other + (226-203) Other→Wal — the two reachable \
+            "(198-178) Store→Other + (226-203) Other→Wal — two of the three reachable \
              gap_other members the original fixture never exercised"
         );
         assert_eq!(t.lead_in, 10);
         assert_eq!(t.tail, 19, "253-234");
+        assert_eq!(a.events_attributed, 9);
+        assert_eq!(a.events_ignored_before_window, 0);
+        assert_eq!(a.events_ignored_after_window, 0);
 
         // The fixture's own contract: if a later edit collides two fields'
         // values, this test silently stops distinguishing a swap between
@@ -380,6 +452,48 @@ mod tests {
         }
 
         assert_eq!(t.total(), 253, "totals must close to the window exactly");
+    }
+
+    /// N-1 residual (`task-2-rereview.md`): the pre-rewrite fixture covered
+    /// `(Wal,Other)`; the round-2 rewrite lost it. `(Other,Other)` is
+    /// independently reachable inside a measured window —
+    /// `write_horizon_breadcrumb` issues five consecutive `Other` events at
+    /// every checkpoint, four `(Other,Other)` gaps each — and was never
+    /// covered at all. Both land in `gap_other`, and the exact-value assert
+    /// below catches a reroute of either one regardless of which field it
+    /// gets misfiled into (the mutation does not need to be replayed to be
+    /// caught — any single-pair reroute changes this sum).
+    #[test]
+    fn gap_other_covers_every_reachable_member_of_its_catch_all() {
+        // Five distinct pair types, all of which the match arms funnel into
+        // `gap_other`. Every gap value is DISTINCT, so rerouting any single
+        // pair type out of `gap_other` changes the sum by a unique amount —
+        // which identifies WHICH pair moved, not merely that one did.
+        //
+        // `(Other,Store)` is here because its reroute was the one mutation
+        // that survived round 3's sweep (C3). It is reachable: a
+        // `write_horizon_breadcrumb` write followed by store traffic on the
+        // checkpoint path. If that arm ever regressed, horizon→store time
+        // would be filed as `gap_wal_to_store` — the sync→apply transition,
+        // one of the quantities this instrument exists to publish.
+        let events = vec![
+            ev(PathClass::Wal, OpKind::WriteAt, 0, 5), // wal_append_io (dur 5)
+            ev(PathClass::Other, OpKind::Len, 8, 11),  // other_io (dur 3); gap Wal→Other = 3
+            ev(PathClass::Other, OpKind::WriteAt, 16, 20), // other_io (dur 4); gap Other→Other = 5
+            ev(PathClass::Store, OpKind::ReadAt, 29, 32), // store_read_io (dur 3); gap Other→Store = 9
+            ev(PathClass::Other, OpKind::Len, 38, 41),    // other_io (dur 3); gap Store→Other = 6
+            ev(PathClass::Wal, OpKind::WriteAt, 48, 55), // wal_append_io (dur 7); gap Other→Wal = 7
+        ];
+        let a = attribute(&events, 0, 60).expect("attributes");
+        assert_eq!(a.totals.wal_append_io, 12, "5 + 7");
+        assert_eq!(a.totals.other_io, 10, "3 + 4 + 3");
+        assert_eq!(a.totals.store_read_io, 3);
+        assert_eq!(
+            a.totals.gap_other, 30,
+            "3 (Wal→Other) + 5 (Other→Other) + 9 (Other→Store) + 6 (Store→Other) + 7 (Other→Wal)"
+        );
+        assert_eq!(a.totals.tail, 5);
+        assert_eq!(a.totals.total(), 60);
     }
 
     #[test]
@@ -499,15 +613,168 @@ mod tests {
             ev(PathClass::Wal, OpKind::WriteAt, 0, 5), // warmup, wholly before window_start=10
             ev(PathClass::Wal, OpKind::WriteAt, 20, 30), // inside the window
         ];
-        let t =
+        let a =
             attribute(&events, 10, 100).expect("warmup before the window is ignored, not refused");
         assert_eq!(
-            t.lead_in, 10,
+            a.totals.lead_in, 10,
             "lead_in measures from window_start, not from the warmup event"
         );
-        assert_eq!(t.wal_append_io, 10, "only the in-window op is counted");
-        assert_eq!(t.tail, 70);
-        assert_eq!(t.total(), 90);
+        assert_eq!(
+            a.totals.wal_append_io, 10,
+            "only the in-window op is counted"
+        );
+        assert_eq!(a.totals.tail, 70);
+        assert_eq!(a.totals.total(), 90);
+        assert_eq!(a.events_attributed, 1);
+        assert_eq!(a.events_ignored_before_window, 1);
+        assert_eq!(a.events_ignored_after_window, 0);
+    }
+
+    /// R-3 (`task-2-rereview.md`): the teardown-side counterpart above never
+    /// had a test at all, so the mutation computing `tail` from the last
+    /// *overall* event rather than the last *in-window* one survived. Here
+    /// the last overall event is a teardown op whose end (500) is far past
+    /// `window_end` (100); under that mutation `window_end_nanos -
+    /// events.last().end_nanos` underflows a `u64` and panics immediately —
+    /// a louder kill than the closure-assert mismatch the review predicted,
+    /// but it is structurally guaranteed: any genuine "wholly after" event
+    /// has `end >= start >= window_end` by construction, so the wrong
+    /// subtraction can never merely be plausible-and-wrong here.
+    #[test]
+    fn tail_measures_from_the_last_in_window_op_not_the_last_overall_op() {
+        let events = vec![
+            ev(PathClass::Wal, OpKind::WriteAt, 0, 5), // warmup, before window_start=10
+            ev(PathClass::Wal, OpKind::WriteAt, 20, 30), // inside [10,100]
+            ev(PathClass::Wal, OpKind::Sync, 150, 500), // teardown, after window_end=100
+        ];
+        let a =
+            attribute(&events, 10, 100).expect("warmup and teardown are both ignored, not refused");
+        assert_eq!(
+            a.totals.tail, 70,
+            "measured from the in-window op's end (30), not the teardown op's (500)"
+        );
+        assert_eq!(a.totals.lead_in, 10);
+        assert_eq!(a.events_attributed, 1);
+        assert_eq!(a.events_ignored_before_window, 1);
+        assert_eq!(a.events_ignored_after_window, 1);
+        assert_eq!(
+            a.totals.total(),
+            90,
+            "window is 100-10=90; the teardown op's duration appears in no field"
+        );
+    }
+
+    /// R-1 (`task-2-rereview.md`): the natural, compiling repair a caller
+    /// reaches for when they stamp the window wrong is `attribute(&evs, 0,
+    /// elapsed)`. The pre-I-2 code refused that call
+    /// (`last.end_nanos > window_nanos`); the post-I-2 code accepts it and
+    /// silently drops the tail-side events instead. This proves the counts
+    /// are what makes that visible now — the closure assert alone does not,
+    /// since `totals.total()` still closes to the (wrong) window exactly.
+    #[test]
+    fn ignoring_events_past_the_window_end_is_visible_in_the_counts() {
+        let events = vec![
+            ev(PathClass::Wal, OpKind::WriteAt, 0, 10), // inside [0,100]
+            ev(PathClass::Wal, OpKind::WriteAt, 20, 30), // inside
+            ev(PathClass::Wal, OpKind::Sync, 150, 500), // past window_end=100 — silently dropped
+        ];
+        let a = attribute(&events, 0, 100).expect("a wrongly-stamped window is still accepted");
+        assert!(
+            a.events_attributed < events.len() as u64,
+            "the caller must be able to tell some events were dropped"
+        );
+        assert_eq!(a.events_attributed, 2);
+        assert_eq!(a.events_ignored_before_window, 0);
+        assert_eq!(
+            a.events_ignored_after_window, 1,
+            "the sync that landed after the window must be visibly ignored, not silently \
+             absorbed into a plausible-looking total"
+        );
+        // The closure assert alone would not have revealed the problem: the
+        // totals still close to the (wrongly-stamped) window exactly.
+        assert_eq!(a.totals.total(), 100);
+    }
+
+    // R-2 (`task-2-rereview.md`): the boundary-touching cases the window
+    // filter exists to get right, pinned explicitly rather than left to the
+    // closure assert (which cannot tell a silent misattribution from a
+    // correct one — see B5 below).
+
+    #[test]
+    fn an_event_ending_exactly_at_window_start_is_ignored_as_warmup() {
+        // B1: the `fully_outside` start-boundary test uses `<=`; an op ending
+        // exactly at window_start is legal warmup, not a straddle.
+        let events = vec![ev(PathClass::Wal, OpKind::WriteAt, 0, 10)];
+        let a =
+            attribute(&events, 10, 100).expect("an op ending exactly at window_start is warmup");
+        assert_eq!(a.events_ignored_before_window, 1);
+        assert_eq!(a.events_attributed, 0);
+        assert_eq!(a.totals.lead_in, 90);
+        assert_eq!(a.totals.total(), 90);
+    }
+
+    #[test]
+    fn an_event_starting_exactly_at_window_end_is_ignored_as_teardown() {
+        // B2: the `fully_outside` end-boundary test uses `>=`; an op starting
+        // exactly at window_end is legal teardown, not a straddle.
+        let events = vec![ev(PathClass::Wal, OpKind::WriteAt, 100, 110)];
+        let a =
+            attribute(&events, 0, 100).expect("an op starting exactly at window_end is teardown");
+        assert_eq!(a.events_ignored_after_window, 1);
+        assert_eq!(a.events_attributed, 0);
+        // Empty in-window set: the whole window is `lead_in`, and `tail`
+        // stays at its default 0 — there is no last in-window event to
+        // measure it from (mirrors `a_trace_with_nothing_inside_the_window_
+        // is_entirely_lead_in`, which is the warmup-side twin of this case).
+        assert_eq!(a.totals.lead_in, 100);
+        assert_eq!(a.totals.tail, 0);
+        assert_eq!(a.totals.total(), 100);
+    }
+
+    #[test]
+    fn an_event_ending_exactly_at_window_end_is_counted_with_a_zero_tail() {
+        // B5 — the one that fails SILENTLY, not safely: the in-window filter's
+        // end boundary uses `<=`, and if it instead used `<`, an op ending
+        // exactly at window_end would be dropped and its duration absorbed
+        // into `tail` with the closure assert none the wiser (the total still
+        // closes; it is just wrong about which field the time is in). Pinned
+        // explicitly rather than left to the assert.
+        let events = vec![ev(PathClass::Wal, OpKind::WriteAt, 90, 100)];
+        let a =
+            attribute(&events, 0, 100).expect("an op ending exactly at window_end is in-window");
+        assert_eq!(a.events_attributed, 1);
+        assert_eq!(a.events_ignored_after_window, 0);
+        assert_eq!(a.totals.wal_append_io, 10);
+        assert_eq!(a.totals.tail, 0);
+        assert_eq!(a.totals.total(), 100);
+    }
+
+    #[test]
+    fn a_zero_duration_event_exactly_on_window_start_is_counted_in_window() {
+        // The one input where `fully_inside` and `fully_outside` are both
+        // true (re-review Q1): end == start == window_start. The filter
+        // tests `fully_inside`, so the tie resolves to "in window" — pinned
+        // here rather than left as an undocumented tie-break, and the
+        // ignored-count computation must agree with it (see the assert in
+        // `attribute` itself).
+        let events = vec![ev(PathClass::Wal, OpKind::WriteAt, 10, 10)];
+        let a = attribute(&events, 10, 100).expect("a zero-duration boundary event is legal");
+        assert_eq!(a.events_attributed, 1);
+        assert_eq!(a.events_ignored_before_window, 0);
+        assert_eq!(a.totals.lead_in, 0);
+        assert_eq!(a.totals.tail, 90);
+        assert_eq!(a.totals.total(), 90);
+    }
+
+    #[test]
+    fn a_zero_duration_event_exactly_on_window_end_is_counted_in_window() {
+        let events = vec![ev(PathClass::Wal, OpKind::WriteAt, 100, 100)];
+        let a = attribute(&events, 0, 100).expect("a zero-duration boundary event is legal");
+        assert_eq!(a.events_attributed, 1);
+        assert_eq!(a.events_ignored_after_window, 0);
+        assert_eq!(a.totals.lead_in, 100);
+        assert_eq!(a.totals.tail, 0);
+        assert_eq!(a.totals.total(), 100);
     }
 
     #[test]
@@ -515,16 +782,22 @@ mod tests {
         // Every event is warmup; the in-window set is empty, which is legal
         // (same shape as an empty trace) rather than an error.
         let events = vec![ev(PathClass::Wal, OpKind::WriteAt, 0, 5)];
-        let t = attribute(&events, 10, 100)
+        let a = attribute(&events, 10, 100)
             .expect("a warmup-only trace has an empty in-window set, which is legal");
-        assert_eq!(t.lead_in, 90);
-        assert_eq!(t.total(), 90);
+        assert_eq!(a.totals.lead_in, 90);
+        assert_eq!(a.totals.total(), 90);
+        assert_eq!(a.events_attributed, 0);
+        assert_eq!(a.events_ignored_before_window, 1);
+        assert_eq!(a.events_ignored_after_window, 0);
     }
 
     #[test]
     fn an_empty_trace_is_all_lead_in() {
-        let t = attribute(&[], 50, 150).expect("an empty trace is legal");
-        assert_eq!(t.lead_in, 100);
-        assert_eq!(t.total(), 100);
+        let a = attribute(&[], 50, 150).expect("an empty trace is legal");
+        assert_eq!(a.totals.lead_in, 100);
+        assert_eq!(a.totals.total(), 100);
+        assert_eq!(a.events_attributed, 0);
+        assert_eq!(a.events_ignored_before_window, 0);
+        assert_eq!(a.events_ignored_after_window, 0);
     }
 }
