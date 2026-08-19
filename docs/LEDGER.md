@@ -1020,23 +1020,26 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   docs, T12 closed the one red gate; 2026-08-19, spec
   docs/superpowers/specs/2026-08-10-group-commit-design.md (`017a81c`), 11-task plan
   docs/superpowers/plans/2026-08-10-group-commit.md (`bc03e63`), ledger
-  .superpowers/sdd/2026-08-10-group-commit/progress.md, commits `017a81c`..`52a655d` plus
-  this close-out commit — 42 in that range, four of which belong to the concurrent
-  skills/personas and ledger-restructure work). Both endpoints are named rather than left as
-  "this commit": the entry has now been amended three times, and the count moved 38 → 42
-  underneath the old wording without a word of it changing.** The follow-up BENCH.md named
+  .superpowers/sdd/2026-08-10-group-commit/progress.md, commits `017a81c`..`b9c2a5c` —
+  **42** by `git rev-list --count 017a81c^..b9c2a5c` — plus this commit, the one that
+  withdraws the CI step on Noah's ruling, for **43** through HEAD; four of the 43 belong to
+  the concurrent skills/personas and ledger-restructure work). Both endpoints are named SHAs
+  and the increment is spelled out rather than left as "this commit": the entry has now been
+  amended four times and the count moved 38 → 42 → 43, twice underneath wording that never
+  changed a word.** The follow-up BENCH.md named
   at sub-project 1's close, built, measured and now published. **The sub-project is
   closed**: everything it set out to build is in the tree, and T11's one red gate — the
   `scripts/edge-harness.sh` FIXTURE failure at 30/31, a regeneration T11 was explicitly
-  scoped out of — was closed by T12 (below), which also put the script in CI so the next
-  drift cannot go a week unseen. Read that precisely: the *fixture* gate is closed and the
-  teeth are proven, but the script itself is **not** reliably green — T12 measured 4 red in
-  8 runs, all of them the pre-existing failover witness-gate race, none of them this
-  sub-project's code. **Four items stay OPEN and are carried forward here rather than closed
-  with the sub-project**: request-vs-tail contention is unmeasured, DECISIONS §7 trigger (a)
-  is owed a re-read, `scripts/bench.sh --smoke` is still deferred, and the failover
-  witness-gate race is now a CI liability this commit creates without fixing — all four
-  below.
+  scoped out of — was closed by T12 (below), which also added an un-ignored guard so the
+  next drift reds the ordinary sweep instead of going a week unseen. Read that precisely:
+  the *fixture* gate is closed and the teeth are proven, but the script itself is **not**
+  reliably green — T12 measured 4 red in 8 runs, all of them the pre-existing failover
+  witness-gate race, none of them this sub-project's code — and on that evidence Noah ruled
+  the script must **not** become a CI step. **Four items stay OPEN and are carried forward
+  here rather than closed with the sub-project**: request-vs-tail contention is unmeasured,
+  DECISIONS §7 trigger (a) is owed a re-read, `scripts/bench.sh --smoke` is still deferred,
+  and the failover witness-gate race must be fixed before the edge rig can be wired into CI
+  — all four below.
   **Shipped (T1–T11).** The commit point is a *group*, not a transaction:
   `Db::begin_group` → N × `Group::stage` → `Group::commit`, one store snapshot, a two-level
   overlay (txn → group → snapshot), one durable sync for the whole batch.
@@ -1151,12 +1154,8 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   throwaway worktree the oracle FAILED — `acked-implies-durable violated: 40 of 40 acked
   id(s) missing`, every id `status 404`, no rig-failure reasons mixed in; with the patch
   reverted the oracle PASSED and `acked_implies_durable_meta_test_has_teeth` went green.
-  **Two durable fixes, because the fixture breaking was not the defect — nothing telling
-  anyone was.** (1) `scripts/edge-harness.sh` is now a CI step (Noah's sign-off 2026-08-19),
-  landed in the same commit as the regenerated fixture so the gate is never added red; it
-  costs 87 s wall / 78 s CPU locally on a warm target dir, and CI additionally pays the
-  throwaway worktree's cold release build, which `Swatinem/rust-cache` cannot help with
-  (separate target dir). (2) A new un-ignored, zero-syscall guard
+  **The durable fix, because the fixture breaking was not the defect — nothing telling anyone
+  was.** A new un-ignored, zero-syscall guard
   `the_wrong_build_patch_still_applies_to_the_kernel_it_targets` reconstructs the patch
   hunk's pre-image with `include_str!` and requires it verbatim in `kernel/mod.rs`, so the
   ordinary `cargo test --workspace` sweep reds in microseconds when the fixture stops
@@ -1165,6 +1164,23 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   cannot go green on a patch the meta test would then fail to apply; it was itself proved
   RED against the stale patch before being trusted. It does not replace the meta test: a
   text match proves the patch applies, never that a build made from it loses acked writes.
+  **A second fix was built, measured, and deliberately WITHHELD — `scripts/edge-harness.sh`
+  is NOT in CI, and the reasoning is the record.** T12 wrote the CI step, ran it, and found
+  the script red in 4 of 8 runs (below) — never on its own account, always on the
+  pre-existing failover witness-gate race. **Noah's ruling, 2026-08-19: do not land it.** The
+  guard above already runs inside `cargo test --workspace`, which IS in CI, so the defect
+  class that caused this task — a fixture that silently stops applying — is now caught
+  deterministically on every push, in microseconds. The script would have added only the
+  behavioural half (that a build made from the patch really does lose acked writes), and
+  trading that half for a gate that flaps near half the time is a bad trade: a flapping
+  required gate destroys trust in every red CI prints, which is the exact rationale that
+  authorised the step in the first place. A detail that sharpened the ruling — the withheld
+  step's own comment said to "treat this step as informational if it flaps", which a bare
+  `- run:` cannot do: it fails the job, and nothing short of `continue-on-error: true` makes
+  it informational. The mitigation the comment offered was never implemented, so the step had
+  no soft mode to fall back to. `.github/workflows/ci.yml` is therefore byte-identical to
+  `52a655d` at this commit. Nothing about the rig is reverted: `scripts/edge-harness.sh`, the
+  patch fixture and the meta test all stand and are run by hand as before.
   **Deferred, not skipped: `scripts/bench.sh --smoke`.** It needs a settled box and its
   output would feed the one doc CLAUDE.md sanctions for numbers. At dispatch the machine
   carried load average 4.47 with a VM at 42% CPU and Docker running; the smoke run is
@@ -1222,9 +1238,9 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   **This is the load-sensitive race already recorded at 2026-08-15** — same two names, same
   mechanism (a `login()` POST fires within ~3 ms of a mid-run primary restart and races
   sub-project 0b's witness gate, since the HTTP port binds before the kernel thread finishes
-  `Repl::open`). **T12 cannot have caused it, and that is provable rather than argued:** the
-  commit's entire diff is `.github/workflows/ci.yml`, the patch fixture, a doc comment in
-  `edge-harness/src/lib.rs`, a new test in `tests/acked_durable.rs`, and this file —
+  `Repl::open`). **T12 cannot have caused it, and that is provable rather than argued:** its
+  entire diff is the patch fixture, a doc comment in `edge-harness/src/lib.rs`, a new test in
+  `tests/acked_durable.rs`, and this file —
   `git diff 52a655d -- crates/charpente crates/charpente-core crates/charpente-sim
   crates/charpente-cli crates/charpente-macros examples` is EMPTY, so the `node` binary and
   `tests/failover.rs` are byte-identical to base. The box was visibly the recorded adverse
@@ -1233,16 +1249,29 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   **4/8 is an upper bound on a loaded box, not the settled-box rate** — but it is the rate
   actually observed, and 2026-08-15's "31/31 green all three times" at a different commit
   does not license quoting a better one today.
-  **The consequence this commit creates and does not resolve: the new `ci.yml` step turns
-  that race into a required gate.** A gate that flaps teaches people to ignore every red it
-  prints, which is the opposite of why the step was added — so the step's own comment carries
-  the measurement, the 503 signature, and the instruction to fix the race rather than widen a
-  timeout or retry the job. **The fix is named and OWED, not done here** (it is production
-  and rig code, outside this task's scope): make `ChildNode::restart`'s readiness check wait
-  for WRITE-readiness instead of a bare TCP bind, which is the same gap 2026-08-15 left open
-  under "nothing reaps orphaned children" and "the harness cannot distinguish 'child never
-  reached `main`' from 'child failed to bind'." Whether the CI step should land before that
-  fix is Noah's call; nothing here has been pushed.
+  **OPEN — the failover witness-gate race, and it is the thing that blocks the edge rig from
+  CI.** Specified rather than left as "flaky, someone look at it".
+  **Mechanism:** `ChildNode::restart`'s readiness check waits on a bare TCP bind, but the
+  HTTP port binds BEFORE the kernel thread finishes `Repl::open`. That leaves a ~3 ms window
+  in which the harness believes the node is up and fires its `login()` POST, which races
+  sub-project 0b's witness gate and is answered `503 "this node is not accepting writes yet:
+  it was a primary before restarting and has not confirmed that its follower … was never
+  promoted"`. **Affected:** `failover_wire_oracle` and
+  `failover_non_converged_tail_is_exercised_and_bounded` — the same two names 2026-08-15
+  already recorded failing the same way, so this is a second sighting of a known defect, not
+  a new one. **The fix is WRITE-readiness**: `restart` must wait until the node will accept a
+  write, not until something is listening. Explicitly NOT the fix: widening a timeout, or
+  retrying the job — both hide the window instead of closing it, and the 2026-08-10 rule
+  ("fix the environment, not the thresholds") applies with more force here, since this window
+  is in the rig's own readiness contract rather than in the box. **Measurement to beat:** 4
+  red in 8 runs at this commit, with the caveat that the box was loaded (`mds_stores` 163%,
+  `syspolicyd` 77%, an unrelated build at ~100%), so 4/8 is an upper bound and not the
+  settled-box rate. Two neighbouring gaps 2026-08-15 left open belong to the same fix round:
+  nothing reaps orphaned children when a run is killed mid-test, and the harness cannot
+  distinguish "child never reached `main`" from "child failed to bind" — which is exactly the
+  ambiguity that makes this race read as a durability failure. **Until this lands, the edge
+  rig stays a by-hand gate**, and the CLAUDE.md-level question of when it is owed is answered
+  by the guard above for the fixture-rot half and by nobody for the behavioural half.
   **README.md carried two sentences its own source disproved, and they are FIXED, not
   flagged.** It said charpente "commits one durable record per transaction with no group
   commit" and called closing the fsync gap "a named future sub-project (group commit), not a
