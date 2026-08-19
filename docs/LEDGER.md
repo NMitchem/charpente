@@ -1137,18 +1137,41 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   (charpente-sim crash_recovery, suite 4/4, and **2 of those 4 actually replayed the pin** —
   the denominator this file's own 2026-08-15 correction says to read) and
   `0x348270b38f166529` (charpente kernel, suite 30/30, **1 of 30 replayed the pin**);
+  **`.github/workflows/ci.yml`'s three `CHARPENTE_SEED` lines run verbatim**, which the
+  first sweep had missed — the two `--release` mode-skew tripwires `0x8bee1752811ae873`
+  (crash_recovery 4/4) and `0xff159ed76d2806e4`
+  (`late_follower_seeds_below_the_gcd_base_and_converges --exact`, 1/1), plus the debug
+  kernel pin `0x348270b38f166529` (`kernel_jobs_are_exactly_once_under_the_fault_matrix
+  --exact`, 1/1) — **and beside it T9's live replacement pin `0xe653f43924f17fe8` on the
+  same test, 1/1**, since the older seed is drifted (green against the checker-gap arm it
+  was pinned for, still exercising `Kernel::build`'s drain-id fix). All four rc=0; `--exact`
+  makes the denominator 1 by construction on three of them;
   `scripts/edge-harness.sh` **30/31 with the single named failure above** (re-run with
   `--no-fail-fast` to enumerate the whole matrix rather than stopping at the first red
   binary: acked_durable 1/2, failover 3/3, hunts 5/5, realtime_resume 1/1, smoke 1/1, lib
   19/19).
-  **Two docs T11 did not touch and that now carry a sentence their own source disproves**,
-  flagged rather than fixed because this task's file list did not include them: `README.md`
-  lines 82-83 still say "charpente commits one durable record per transaction with no group
-  commit", and lines 112-113 still call closing the fsync gap "a named future sub-project
-  (group commit), not a shipped property". Both are false as of `3cd3ecd`. DECISIONS §7's
-  trigger-(a) reading is a dated 2026-08-10 record and stays accurate as history; group
-  commit does not change its verdict, since core still sits at the ceiling (222 against
-  215–261).
+  **README.md carried two sentences its own source disproved, and they are FIXED, not
+  flagged.** It said charpente "commits one durable record per transaction with no group
+  commit" and called closing the fsync gap "a named future sub-project (group commit), not a
+  shipped property" — both false since `3cd3ecd`, and both the M-3 defect class sitting in
+  the file a new reader meets first. `README.md` was outside T11's original file list and was
+  added to its scope for exactly that reason; the corrections landed in `b13fcc3` alongside
+  this entry. It now says an uncontended commit costs one durable fsync which group commit
+  amortizes across a batch once requests queue, and that two M2 sub-projects have shipped
+  with the amortization half of the gap closed and the device-speed half not.
+  **OPEN — DECISIONS §7 trigger (a) is owed a re-read, and nothing here performs one.** The
+  2026-08-10 reading ("the commit path is fsync-bound at ≈1x the device ceiling, so redb is
+  not the binding constraint at this workload") was taken before batching existed, and group
+  commit is precisely what removes the one-fsync-per-transaction ceiling it rests on: kernel
+  log records/sec went 217 → 5,292 at a 0.36x device ratio. The **core**-layer premise has
+  not moved (215 → 222 — a serial one-at-a-time loop has nothing to batch); the **kernel**-
+  layer premise has. Whether redb becomes the binding constraint once the fsync ceiling is
+  amortized is a live question this measurement raises and does **not** answer — settling it
+  needs the per-phase attribution inside the commit path that this instrument explicitly does
+  not do. Recorded for Noah's sign-off per CLAUDE.md's workflow rule ("don't silently
+  override it — reopen the entry with the new evidence"), deliberately not settled here.
+  `PLAN.md`'s copy of the same sentence is scoped to its 2026-08-10 measurement in `b13fcc3`;
+  `DECISIONS.md` §7 itself is untouched pending the re-read.
 
 - **Bench interlude — the device-ratio gate, done (2026-08-10, spec
   docs/superpowers/specs/2026-08-10-device-ratio-gate-design.md, ledger

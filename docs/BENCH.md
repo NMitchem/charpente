@@ -65,18 +65,34 @@ gets re-scoped and this doc says so. **The counter landed** (2026-08-14).
 `bench-app` wraps its `Disk` in a `wal/`-scoped counting impl and publishes the
 tally through a `/__syncs` route; the harness samples it at both window edges
 and gates on the delta, so that target's sync rate is COUNTED. `invoicing`
-mounts no such route and still derives at 1.0 × throughput. Every point carries
-`syncs_counted` so two numbers of different evidentiary standing never sit alike
-in one table — and the derived one is now unsound by construction, which is why
-every contended invoicing point below is refused rather than published.
+mounts no such route and still derives at 1.0 × throughput. The derived form is
+now unsound by construction, which is why every contended invoicing point below
+is refused rather than published.
+
+**Today's harness marks which is which; the artifacts these numbers come from
+do not.** Every point emits a `syncs_counted` flag — the counter itself landed
+2026-08-14, the flag that reports which kind a point is landed 2026-08-15 — so
+two numbers of different evidentiary standing never sit alike in one table. Both
+runs published below finished about a quarter of an hour before that second
+commit landed and **carry no such key**, so counted was told from derived here
+by arithmetic instead: a derived figure is exactly
+`syncs_per_request × throughput`, and `invoicing`'s `syncs_per_sec` equals its
+throughput to the digit at all ten of its points while `bench-app`'s differs
+from `2 × throughput` at all ten of its. That test is the whole basis for
+treating the `bench-app` sync rates below as measured and the invoicing ones as
+arithmetic; it is stated rather than assumed, because re-running the matrix on
+today's harness would answer it by inspection and nobody re-ran it.
 
 **One key in the artifact means two different things by layer. This is a known
 defect, recorded rather than left to be inferred.** `device_ratio` is the SYNC
 ratio at core and kernel (`core_accounting.rs:278`, `kernel_accounting.rs:219`)
 and the RECORD ratio at wire (`wire_accounting.rs:286`); the wire gate itself
-fires on the sync ratio, which is published under no name at all. Do not read a
-wire `device_ratio` as a sync ratio: at 64 connections below it reads 26.87
-while the gated sync ratio is 0.42. Both operands of the honest quantity are in
+fires on the sync ratio, which the JSON artifact publishes under no name at all.
+The human render does print it — `…x dev (sync, gated)` beside `…x dev (records,
+ungated)`, computed inline from the same line's fields (`report.rs:521-527`) —
+so a reader of the terminal output and a reader of the JSON are not looking at
+the same set of quantities. Do not read a wire `device_ratio` as a sync ratio:
+at 64 connections below it reads 26.87 while the gated sync ratio is 0.42. Both operands of the honest quantity are in
 the artifact — compute `syncs_per_sec / max(device_appends_per_sec_before,
 device_appends_per_sec_after)` yourself. Every wire sync ratio in this document
 was computed that way.

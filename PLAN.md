@@ -64,8 +64,12 @@ is why the milestone closed with them outstanding rather than silently absorbing
 - **Honest benchmark harness** — the "publish honest benchmarks early" mitigation below,
   and the instrument DECISIONS §7's LSM build triggers are read against. *Shipped
   2026-08-10*; numbers of record and method in [docs/BENCH.md](docs/BENCH.md). Trigger (a)
-  does not fire on them: the commit path is fsync-bound at ≈1x the device ceiling, so redb
-  is not the binding constraint at this workload.
+  did not fire on that reading: the commit path measured fsync-bound at ≈1x the device
+  ceiling, so redb was not the binding constraint at that workload on that hardware. **That
+  reading pre-dates group commit**, which is precisely what removes the
+  one-fsync-per-transaction ceiling it rests on — the core layer is unchanged, the kernel
+  layer is not — so the trigger is owed a re-read. Open, and Noah's to sign off;
+  DECISIONS §7 is untouched pending it (docs/LEDGER.md carries the item).
 - **Primary-side group commit** — the follow-up the harness above named and sized. *Shipped
   2026-08-15.* One commit point per kernel loop iteration rather than one per transaction:
   `begin_group`/`stage`/`commit`, a two-level overlay, one fsync for the whole batch,
