@@ -91,7 +91,7 @@ impl PhaseTotals {
     pub fn total(&self) -> u64 {
         self.wal_append_io
             + self.wal_read_io
-            + 0
+            + self.wal_sync_io
             + self.store_write_io
             + self.store_read_io
             + self.store_sync_io
