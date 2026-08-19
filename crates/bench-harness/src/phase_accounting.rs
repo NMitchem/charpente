@@ -179,12 +179,55 @@ mod tests {
 
     #[test]
     fn every_nanosecond_of_the_window_is_attributed() {
+        // Every field non-zero on purpose. A closure test whose fixture leaves
+        // a field at zero cannot detect that field being dropped from `total`,
+        // which is how the first version of this test passed while
+        // `gap_within_store` was deleted.
         let events = vec![
-            ev(PathClass::Wal, OpKind::WriteAt, 5, 15),
-            ev(PathClass::Store, OpKind::Sync, 25, 30),
+            ev(PathClass::Wal, OpKind::WriteAt, 10, 20),
+            ev(PathClass::Wal, OpKind::WriteAt, 25, 35),
+            ev(PathClass::Wal, OpKind::Sync, 40, 60),
+            ev(PathClass::Store, OpKind::WriteAt, 65, 75),
+            ev(PathClass::Store, OpKind::WriteAt, 80, 90),
+            ev(PathClass::Wal, OpKind::WriteAt, 95, 105),
+            ev(PathClass::Other, OpKind::WriteAt, 110, 120),
         ];
-        let t = attribute(&events, 100).expect("attributes");
-        assert_eq!(t.total(), 100, "totals must close to the window exactly");
+        let t = attribute(&events, 130).expect("attributes");
+
+        assert_eq!(t.lead_in, 10);
+        assert_eq!(t.wal_append_io, 30);
+        assert_eq!(t.wal_sync_io, 20);
+        assert_eq!(t.store_io, 20);
+        assert_eq!(t.other_io, 10);
+        assert_eq!(t.gap_within_wal, 10);
+        assert_eq!(t.gap_wal_to_store, 5);
+        assert_eq!(t.gap_within_store, 5);
+        assert_eq!(t.gap_store_to_wal, 5);
+        assert_eq!(t.gap_other, 5);
+        assert_eq!(t.tail, 10);
+
+        // The fixture's own contract: if a later edit zeroes any field, this
+        // test silently stops guarding that field's term in `total`.
+        for (name, value) in [
+            ("lead_in", t.lead_in),
+            ("wal_append_io", t.wal_append_io),
+            ("wal_sync_io", t.wal_sync_io),
+            ("store_io", t.store_io),
+            ("other_io", t.other_io),
+            ("gap_within_wal", t.gap_within_wal),
+            ("gap_wal_to_store", t.gap_wal_to_store),
+            ("gap_within_store", t.gap_within_store),
+            ("gap_store_to_wal", t.gap_store_to_wal),
+            ("gap_other", t.gap_other),
+            ("tail", t.tail),
+        ] {
+            assert_ne!(
+                value, 0,
+                "{name} is zero — this fixture no longer guards its term"
+            );
+        }
+
+        assert_eq!(t.total(), 130, "totals must close to the window exactly");
     }
 
     #[test]
