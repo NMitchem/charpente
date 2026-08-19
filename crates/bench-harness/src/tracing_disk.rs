@@ -110,6 +110,17 @@ impl Trace {
         self.recording
     }
 
+    /// This trace's own clock, in the same time base every recorded `Event`
+    /// uses (`start_nanos`/`end_nanos` are both `duration_since(self.origin)`).
+    /// A caller stamps a measured window's boundaries with this — not with a
+    /// second, unrelated `Instant` — so `phase_accounting::attribute` can
+    /// compare `window_start_nanos`/`window_end_nanos` against event
+    /// timestamps directly: both sides of the comparison come from the same
+    /// origin, never from two different clocks (`phase_accounting`'s I-2 fix).
+    pub fn now_nanos(&self) -> u64 {
+        Instant::now().duration_since(self.origin).as_nanos() as u64
+    }
+
     pub fn record(&self, path: PathClass, op: OpKind, start: Instant, end: Instant) {
         if !self.recording {
             return;
@@ -253,5 +264,29 @@ mod tests {
         assert_eq!(events[1].op, OpKind::Sync);
         assert_eq!(events[2].path, PathClass::Store);
         assert!(events[0].end_nanos <= events[1].start_nanos);
+    }
+
+    #[test]
+    fn now_nanos_shares_the_events_own_time_base() {
+        // The property `phase_accounting::attribute`'s window parameters
+        // depend on: a sample taken via `now_nanos` before an event and one
+        // taken after must bracket that event's own timestamps, because both
+        // come from the same `origin`.
+        let trace = Trace::recording(4);
+        let before = trace.now_nanos();
+        let start = Instant::now();
+        trace.record(PathClass::Wal, OpKind::WriteAt, start, Instant::now());
+        let after = trace.now_nanos();
+
+        let events = trace.events();
+        assert_eq!(events.len(), 1);
+        assert!(
+            before <= events[0].start_nanos,
+            "a now_nanos() sample taken before the op must not read later than the op's own start"
+        );
+        assert!(
+            events[0].end_nanos <= after,
+            "a now_nanos() sample taken after the op must not read earlier than the op's own end"
+        );
     }
 }
