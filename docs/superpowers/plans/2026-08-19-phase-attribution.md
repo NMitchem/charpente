@@ -351,6 +351,18 @@ git commit -m "bench: a Disk that records what each IO op cost, so phases need n
 
 ### Task 2: Phase reconstruction and the closure invariant
 
+> **SUPERSEDED — read `crates/bench-harness/src/phase_accounting.rs` for the shipped API.**
+> This section records the task as *planned*. Three fix rounds changed it materially, and the
+> code blocks below are kept as the argument that was made, not as current reference. What
+> changed: `attribute` now takes explicit `window_start_nanos`/`window_end_nanos` (the original
+> `window_nanos` silently assumed the trace origin was the window start, which refuses every
+> real run); it returns `Attribution { totals, events_attributed, events_ignored_before_window,
+> events_ignored_after_window }` rather than a bare `PhaseTotals`; `store_io` split into
+> `store_write_io`/`store_read_io`/`store_sync_io` with the WAL split to match, taking
+> `PhaseTotals` to 14 fields; inverted events and window-straddling events are refused by name.
+> The reasons are in `docs/LEDGER.md` and the review files under this plan's workspace.
+
+
 **Files:**
 - Create: `crates/bench-harness/src/phase_accounting.rs`
 - Modify: `crates/bench-harness/src/lib.rs` (add `pub mod phase_accounting;`)
@@ -621,7 +633,7 @@ window opens much later. Any implementer following the old text would have had e
 - Test: create `crates/bench-harness/tests/phase_trace.rs`
 
 **Interfaces:**
-- Consumes: `crate::tracing_disk::{Trace, TracingDisk}` and `Trace::now_nanos() -> u64`; `crate::phase_accounting::{attribute, PhaseTotals}` where `attribute(events: &[Event], window_start_nanos: u64, window_end_nanos: u64) -> Result<PhaseTotals, Vec<String>>`.
+- Consumes: `crate::tracing_disk::{Trace, TracingDisk}` and `Trace::now_nanos() -> u64`; `crate::phase_accounting::{attribute, Attribution, PhaseTotals}` where `attribute(events: &[Event], window_start_nanos: u64, window_end_nanos: u64) -> Result<Attribution, Vec<String>>` and `Attribution { totals: PhaseTotals, events_attributed: u64, events_ignored_before_window: u64, events_ignored_after_window: u64 }`.
 - `PhaseTotals` has 14 `u64` nanosecond fields: `wal_append_io`, `wal_read_io`, `wal_sync_io`, `store_write_io`, `store_read_io`, `store_sync_io`, `other_io`, `gap_within_wal`, `gap_wal_to_store`, `gap_within_store`, `gap_store_to_wal`, `gap_other`, `lead_in`, `tail`.
 - Produces: `phases: Option<PhaseTotals>` on both arms' observation structs. `None` means the attribution was refused (and the refusal strings went to `invalid`) or the arm ran in passthrough. **`None`, never a zeroed `PhaseTotals`** — a zeroed phase block is indistinguishable from a genuinely fast one.
 
@@ -732,7 +744,25 @@ zeroing a gate input:
 ```rust
 let events = trace.events();
 let phases = match attribute(&events, window_start_nanos, window_end_nanos) {
-    Ok(totals) => Some(totals),
+    Ok(attribution) => {
+        // The payoff of fix round 3's R-1: a window stamped from the wrong
+        // place no longer fails loudly, it dilutes quietly. Events before the
+        // window are warmup and `Db::open` — expected. Events AFTER it are not,
+        // on an arm whose window closes at the end of its run, so they mean the
+        // window and the trace disagree about what was measured.
+        if attribution.events_ignored_after_window > 0 {
+            invalid.push(format!(
+                "contract: {} traced op(s) fall after the measured window closed. On this arm \
+                 the window closes at the end of the run, so this means \
+                 `window_end_nanos` was stamped before the last IO completed and the published \
+                 phase shares would be diluted by the ops left out. Fix: stamp \
+                 `window_end_nanos` with `Trace::now_nanos()` after the measured section \
+                 finishes, not before.",
+                attribution.events_ignored_after_window
+            ));
+        }
+        Some(attribution.totals)
+    }
     Err(refusals) => {
         invalid.extend(refusals);
         None
