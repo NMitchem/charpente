@@ -954,7 +954,9 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   2026-08-13, ending at `3cd3ecd` (the job and cron arms drain, review fix round included);
   T8–T11 remain — the property suite, re-verifying every pinned seed, measuring the win, and
   docs/close-out. **This section is written at sub-project close-out, so it will not narrate
-  T8–T11 as they land; the ledger is authoritative mid-plan.** Otherwise M2 per PLAN — the
+  T8–T11 as they land; the ledger is authoritative mid-plan.** *(Superseded 2026-08-19:
+  T8–T11 all landed. See the T11 entry two bullets below for what shipped, what the numbers
+  are worth, and the one close-out gate that came back red.)* Otherwise M2 per PLAN — the
   follow-up backlog below now holds **no open work** (`applied_delta`'s release-mode wrap, its
   last open item, closed 2026-08-10).
 - **Group commit T10 — the win measured (2026-08-15, harness at `d9592c2`, report
@@ -1014,6 +1016,140 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   though both divide by the same append-shaped bracket, making 61.96 a lower bound. Reviewed
   independently (`task-10-review.md`): evidence compliance PASS, every recomputed figure
   correct; the report was revised for framing, not for numbers.
+- **M2 sub-project 2 — primary-side group commit: T11 published the docs, and the close-out
+  sweep came back with ONE RED GATE (2026-08-19, spec
+  docs/superpowers/specs/2026-08-10-group-commit-design.md (`017a81c`), 11-task plan
+  docs/superpowers/plans/2026-08-10-group-commit.md (`bc03e63`), ledger
+  .superpowers/sdd/2026-08-10-group-commit/progress.md, commits `017a81c`..this commit — 38
+  in that range, four of which belong to the concurrent skills/personas and
+  ledger-restructure work).** The follow-up BENCH.md named at sub-project 1's close, built,
+  measured and now published. **The sub-project is NOT closed**: everything it set out to
+  build is in the tree, but `scripts/edge-harness.sh` is red (below), and closing that is a
+  fixture regeneration T11 was explicitly scoped out of.
+  **Shipped (T1–T11).** The commit point is a *group*, not a transaction:
+  `Db::begin_group` → N × `Group::stage` → `Group::commit`, one store snapshot, a two-level
+  overlay (txn → group → snapshot), one durable sync for the whole batch.
+  `Engine::submit_all` is the single append→sync→apply core underneath both the batched and
+  the length-1 path, so `Db::transact` is the group-of-one case rather than a second code
+  path — byte-identity at one connection is a property of the code, not something tests must
+  keep true. `MAX_BATCH = 64`, a constant asserted inside `Group::stage`, never a `DbConfig`
+  field. Ack-after-durable is preserved structurally: `stage` never appends, replies are
+  held until `commit` returns, apply stays strictly after sync. Batching is within one
+  ready-set arm, never across arms; a subscribe ends its batch so cursors keep their
+  meaning. DESIGN §2 carries the design, docs/GUIDE.md §5 the client contract, PLAN's M2
+  list the status.
+  **The numbers, and the ONLY form the claim may take (spec §8, and this conditioning is to
+  be repeated wherever the win is reported):** *group commit removes the
+  one-fsync-per-transaction ceiling, and on hardware whose fsync is slow enough to keep a
+  queue deep it recovers up to ~31x — and nothing at one connection.* Never *"group commit
+  makes charpente Nx faster."* **docs/BENCH.md is the only quotable source** and now carries
+  the full section: the kernel at **5,292 log records/sec against 217** (24.4x) for **85
+  durable syncs/sec**, 50,000 canonical requests in **18.9 s against 460 s**, `jobs_done ==
+  requests_total == 50,000`; wire `bench-app` **1.02x / 4.80x / 15.44x / 31.47x / 24.93x**
+  across 1→256 connections; core **unchanged** (215 → 222 records/sec, ratio 0.83 → 0.85),
+  which is the correct result because `Db::transact` is a group of one. Amortization is
+  argued two-sidedly, because a sync-skipping engine also shows a low sync rate: every
+  counted sync ratio stays **below** the device ceiling (max **0.9388** anywhere) **and**
+  the batch factor stays **below** the cap (**61.96** records per durable sync, both runs,
+  against `MAX_BATCH` 64), with the fixed workload paying **1,614 ± 1 syncs in both runs** =
+  2 arms × ⌈50,000/64⌉ + ~50 store/`.horizon` syncs the unscoped counter also tallies. The
+  caveats travel with the numbers in BENCH.md itself, not only here: neither T10 run is
+  green alone (a different layer was refused in each), no published point mixes runs, the
+  bracket instability is **undiagnosed**, and the bare-metal Linux run stays owed.
+  **T11 read the artifacts through two traps that would each have produced a wrong
+  BENCH.md**, recorded because the first of them is still live in the code: the wire `device_ratio` key means
+  *records* while core's and kernel's mean *syncs* (`wire_accounting.rs:286` versus
+  `core_accounting.rs:278` / `kernel_accounting.rs:219`), so every wire sync ratio published
+  was recomputed as `syncs_per_sec / max(bracket)` — BENCH.md's method section now discloses
+  that split rather than leaving the next reader to rediscover it; and both artifacts
+  pre-date `72211e1` and carry no `syncs_counted` key, so counted was told from derived by
+  arithmetic (invoicing's sync rate equals its throughput exactly at all ten points;
+  bench-app's does not).
+  **The fairness change, recorded as an OBSERVED property and not a promise (DESIGN §1).**
+  Batching moved job-arm service from *certain* to *probabilistic in the queue depth*, and
+  it is stated as a bound because the mechanism is exact: arbitration is one uniform draw
+  and a flood drains in `ceil(FLOOD / MAX_BATCH)` request-arm wins, so a due job must win
+  one of that many coin flips — at flood 100 against `MAX_BATCH` 64 that is two draws,
+  P(fail) = 0.25, measured **200/200 pre-batching and 151/200 after**; at flood 1024 it is
+  16 draws and 200/200 pass. No guarantee was lost where none existed: T8b kept
+  `due_jobs_are_not_starved_by_a_request_flood`, which asserts eventual **completeness**
+  (`jobs_done == 101` at the horizon — a count identical whether a request-arm win consumes
+  1 request or 64), and **added**
+  `due_jobs_are_serviced_before_a_request_flood_exhausts_the_source`, which asserts the
+  **interleaving** invariant. DESIGN states what each asserts rather than echoing the first
+  name as if the name were the guarantee, and deliberately commits to no bound on degree.
+  **OPEN — request-vs-tail contention is UNMEASURED, and this is the sub-project's one
+  unmeasured consequence.** Carried here out of a gitignored workspace so it does not have
+  to be rediscovered. The verdict is deliberately **split**: certain on the mechanism,
+  unknown on the bound. `Ready::Tail` enters the same `ready` vector
+  (`kernel/mod.rs:265-271`) and the same flat uniform draw (`:293-301`) as `Ready::Job` —
+  no priority, no reserved slot, no out-of-band service path — so DESIGN §1's round-robin is
+  fairness *among* tails and not protection *from* the request arm. But T8b's bound does
+  **not** transfer, for two reasons its coin-flip arithmetic does not model: a job win
+  discharges the job while a tail win advances only ONE tail by at most `TAIL_BATCH_EVENTS`
+  ids (`mod.rs:583-591`, `tail.rs:23`), and lag is TERMINAL for a tail — past the retention
+  floor it is dropped with the `charpente.gap` frame (`tail.rs:75-89`) where a starved job is
+  merely late. Nothing in the workspace measures it; the realtime swarm reaches
+  `realtime:gap` only by configuring `event_retention: 4, checkpoint_every: 2`
+  (`realtime.rs:110-111`), which is a GC/resume oracle, not a fairness measurement.
+  **The test that would settle it, specified rather than left as "someone should measure
+  this":** the tail-side mirror of T8b's interleaving test — a `Kernel::step` loop, a
+  `SimSource` flooded at t=0 with N event-emitting requests, one subscription registered
+  first, arms discriminated via `stats().requests` deltas against `SimSinkHandle::frames()`
+  deltas, asserting a frame was delivered while `before.requests < FLOOD`; sweep N seeds for
+  the tail analogue of "151/200 at flood 100, 200/200 at flood 1024". A second variant at
+  **default** `event_retention` with a long emit-heavy flood answers the sharper question —
+  whether a request flood ALONE can drive a tail past the floor — by observing whether any
+  `charpente.gap` appears with no injected fault. That second variant is the one that
+  matters: it is the difference between a tail being late and a subscriber silently losing
+  events. Seed namespace: `0x60C0` is CLOSED at `0x60C0_0013` and `0x60C1` is fully
+  allocated `0x60C1_0001`–`0x60C1_0009`; a tail-fairness test opens a new namespace rather
+  than extending either.
+  **RED — `scripts/edge-harness.sh`, 30 of 31, and the failure is this sub-project's own
+  drift.** `acked_implies_durable_meta_test_has_teeth`
+  (`crates/edge-harness/tests/acked_durable.rs`) applies
+  `crates/edge-harness/patches/wrong-ack-before-commit.patch` to build a deliberately wrong
+  node and prove the wire oracle can fail. That patch was written 2026-07-25 (`d7367f1`)
+  against the old request arm — `handle_or_subscribe` then `reply.send` inline — and
+  `d301a52` replaced exactly those lines with the batched drain, so the patch has not
+  applied since 2026-08-13. Nothing caught it: every process-touching edge test is
+  `#[ignore]`d, so `cargo test --workspace` cannot see it and only `scripts/edge-harness.sh`
+  runs it, which no group-commit task ran. **The oracle itself passes**
+  (`acked_implies_durable_wire_oracle` green); what is unproven is that it has teeth, which
+  in this repo is the more serious half. The fixture's own error message names the drift and
+  the regeneration recipe, which is hard rule 5 doing its job. T11 ships no test changes, so
+  this is left red and named rather than papered over; **regenerating the patch against the
+  batched request arm is the work that closes this sub-project.**
+  **Deferred, not skipped: `scripts/bench.sh --smoke`.** It needs a settled box and its
+  output would feed the one doc CLAUDE.md sanctions for numbers. At dispatch the machine
+  carried load average 4.47 with a VM at 42% CPU and Docker running; the smoke run is
+  Noah's to hold. Nothing in BENCH.md was published from an unrun gate.
+  **Evidence** (final tree, this commit; every command piped through `tee`, exit status read
+  as `${pipestatus[1]}` — zsh does not populate bash's `PIPESTATUS`, and the idiom was proved
+  against a deliberate failure before the sweep was trusted to it): `cargo fmt --all
+  --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo
+  build -p guide-examples` (the GUIDE compile gate) clean; `cargo test --workspace`
+  **twice**, identical both times — **747 passed / 0 failed / 45 ignored** over 57 libtest
+  result lines, plus the two app-level `tests/sim.rs` batches (invoicing and sim-fixture),
+  which report their own summary rather than a libtest line: **256 universes per test, all
+  green**, four fresh master seeds across the two runs (`0x0d6442a67510baab`,
+  `0xa3fdbb77ccbc1cdc`, `0xad4f70fc2a8a7a90`, `0x768b4f3509830a56`); the pinned debug replays `CHARPENTE_SEED=0x8bee1752811ae873`
+  (charpente-sim crash_recovery, suite 4/4, and **2 of those 4 actually replayed the pin** —
+  the denominator this file's own 2026-08-15 correction says to read) and
+  `0x348270b38f166529` (charpente kernel, suite 30/30, **1 of 30 replayed the pin**);
+  `scripts/edge-harness.sh` **30/31 with the single named failure above** (re-run with
+  `--no-fail-fast` to enumerate the whole matrix rather than stopping at the first red
+  binary: acked_durable 1/2, failover 3/3, hunts 5/5, realtime_resume 1/1, smoke 1/1, lib
+  19/19).
+  **Two docs T11 did not touch and that now carry a sentence their own source disproves**,
+  flagged rather than fixed because this task's file list did not include them: `README.md`
+  lines 82-83 still say "charpente commits one durable record per transaction with no group
+  commit", and lines 112-113 still call closing the fsync gap "a named future sub-project
+  (group commit), not a shipped property". Both are false as of `3cd3ecd`. DECISIONS §7's
+  trigger-(a) reading is a dated 2026-08-10 record and stays accurate as history; group
+  commit does not change its verdict, since core still sits at the ceiling (222 against
+  215–261).
+
 - **Bench interlude — the device-ratio gate, done (2026-08-10, spec
   docs/superpowers/specs/2026-08-10-device-ratio-gate-design.md, ledger
   .superpowers/sdd/2026-08-10-device-ratio-gate/progress.md, commits `c10b8fa`..this

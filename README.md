@@ -79,10 +79,11 @@ you will not outgrow this before you can afford to build something bespoke, and 
 otherwise is how platforms die building a worse Spanner instead of a better SQLite.
 
 That last sentence is the argument, not a measurement of what charpente does today.
-Measured, charpente commits one durable record per transaction with no group commit, which
-puts it at the device's fsync rate — 215/sec on a dev laptop under `F_FULLFSYNC`. See
-[docs/BENCH.md](docs/BENCH.md) for the method and the numbers, and for what closing that gap
-would take.
+Measured, an uncontended commit costs one durable fsync, which puts it at the device's fsync
+rate — 215/sec on a dev laptop under `F_FULLFSYNC`. Group commit amortizes that fsync across
+a batch once requests actually queue, which is worth a great deal on a device this slow to
+sync and less on a faster one. See [docs/BENCH.md](docs/BENCH.md) for the method, the
+numbers, and the conditioning that has to travel with them.
 
 ## Status
 
@@ -104,16 +105,20 @@ API keys, static-JWKS OIDC), schema migrations as log records, `charpente
 describe`, and a black-box edge harness that drives stock binaries over
 real TCP with `kill -9` and TCP-proxy fault injection.
 
-**M2 is in progress.** Its first sub-project, an honest benchmark harness, is
-done and its numbers are in [docs/BENCH.md](docs/BENCH.md) — measured on a dev
-laptop under `F_FULLFSYNC`, and explicitly not the launch claim. Read them
-before the scaling paragraph above: the commit path is fsync-bound at ~215
+**M2 is in progress.** Two of its sub-projects have shipped — an honest
+benchmark harness and primary-side group commit — and their numbers are in
+[docs/BENCH.md](docs/BENCH.md), measured on a dev laptop under `F_FULLFSYNC`
+and explicitly not the launch claim. Read them before the scaling paragraph
+above: one connection still costs one durable fsync per transaction, ~215
 durable records/sec on that hardware, roughly three orders of magnitude below
-the headline figure, and closing that gap is a named future sub-project
-(group commit), not a shipped property. What is *not* built, so you don't have
-to go looking: no blob store, no object-storage backup (`serve::backup` is
-a promotable hot standby, not a snapshot shipper), no WebSockets, no TS
-client codegen, and no tenant scoping as typed key prefixes.
+the headline figure. Group commit closes the *amortization* half of that gap
+and none of the device-speed half — one fsync for a whole batch, worth up to
+~31x where the queue is deep enough to fill one and nothing at all at one
+connection — and the bare-metal Linux numbers that would resize it do not
+exist yet. What is *not* built, so you don't have to go looking: no blob
+store, no object-storage backup (`serve::backup` is a promotable hot standby,
+not a snapshot shipper), no WebSockets, no TS client codegen, and no tenant
+scoping as typed key prefixes.
 
 | Doc | What it is |
 |---|---|

@@ -66,6 +66,15 @@ is why the milestone closed with them outstanding rather than silently absorbing
   2026-08-10*; numbers of record and method in [docs/BENCH.md](docs/BENCH.md). Trigger (a)
   does not fire on them: the commit path is fsync-bound at ≈1x the device ceiling, so redb
   is not the binding constraint at this workload.
+- **Primary-side group commit** — the follow-up the harness above named and sized. *Shipped
+  2026-08-15.* One commit point per kernel loop iteration rather than one per transaction:
+  `begin_group`/`stage`/`commit`, a two-level overlay, one fsync for the whole batch,
+  `MAX_BATCH = 64`. Ack-after-durable is unchanged — apply stays strictly after sync, and
+  `Db::transact` is the group-of-one case, so the single-request path executes the
+  pre-batching instruction sequence. Numbers and the conditioning that must travel with
+  them are in [docs/BENCH.md](docs/BENCH.md): the win exists where the queue is deep enough
+  to fill a batch and is nothing at one connection, on a device whose slow fsync flatters
+  the mechanism. The bare-metal Linux run stays owed.
 - **Own LSM storage engine**, proven under the (by now battle-hardened) sim harness before
   it replaces redb. The harness is what makes this safe to attempt. **Deferred behind
   measurement** (ruled 2026-08-06): the build triggers live in DECISIONS §7, and the

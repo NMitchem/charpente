@@ -49,9 +49,10 @@ roadmap; do not reorder a milestone's dependency sequence.
   `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`
   (carries the nondeterminism deny-list), `cargo test --workspace`.
 - One test file: `cargo test -p charpente --test kernel` — property suites live in each
-  crate's `tests/` (charpente: http/kernel/replication/transactions/typed_tables;
-  charpente-sim: crash_recovery/determinism/net_partition/wal; charpente-core:
-  engine/materialize).
+  crate's `tests/` (charpente: http/kernel/replication/transactions/typed_tables,
+  plus auth/describe/group_commit/realtime; charpente-sim:
+  crash_recovery/determinism/net_partition/wal; charpente-core:
+  engine/group_commit/materialize).
 - Replay one universe: `CHARPENTE_SEED=0x… cargo test -p <crate> --test <file> --
   --nocapture`. Every sim failure prints this exact repro line — paste it verbatim.
   Coverage `require:` keys are skipped under `CHARPENTE_SEED`.

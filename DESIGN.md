@@ -170,6 +170,41 @@ seed replays unchanged. One unit of `Ready::Tail` work is a bounded table read
 (`TAIL_BATCH_EVENTS` rows), serviced round-robin across live tails so one deep resume never
 starves the rest of the ready set (§6).
 
+That round-robin is fairness *among* tails; it is not protection *from* the request arm.
+`Ready::Tail` sits in the same ready set as every other source and is picked by the same
+single uniform draw, so a request arm draining up to `MAX_BATCH` per win (§2) competes with
+a registered tail on exactly the coin flip it competes with a due job on — the tail arm has
+no priority, no reserved slot, and nothing that preempts a batch. Two things follow that the
+job-arm measurement below does not cover, and neither has been measured: one tail win
+advances **one** tail by at most `TAIL_BATCH_EVENTS` ids, so with several live tails, or
+handlers that emit faster than that, a tail's lag can grow while a flood lasts; and unlike a
+delayed job — which is merely late — a tail that lags past the retention floor is dropped,
+receiving the terminal `charpente.gap` frame instead of its events (§6). Whether a request
+flood alone can drive a tail past the floor at the default `event_retention` is an **open
+question**; it is not a claim in either direction, and the job arm's numbers do not answer
+it.
+
+The job arm is the one that has been measured, and group commit changed it — from *certain*
+service to *probabilistic in the queue depth*. **This is an observed property, not a
+promise**, and it is stated as a bound because the mechanism is known exactly: arbitration
+is one uniform draw, a request flood drains in `ceil(FLOOD / MAX_BATCH)` request-arm wins,
+so a due job must win at least one of that many coin flips. At a flood of 100 against a
+`MAX_BATCH` of 64 that is two draws — P(fail) = 0.25 — and measurement matches the
+arithmetic: 200 of 200 seeds serviced the job arm before the source drained pre-batching,
+**151 of 200** after. At a flood of 1024 it is 16 draws, P(fail) ≈ 1.5e-5, and 200 of 200
+pass. What the platform holds to is therefore structural rather than statistical: the job arm
+is never excluded from arbitration — it takes the same draw as every other ready source at
+every contended step — and nothing is promised about *when* it wins, or about service
+ratios. Two properties hold that line and they assert
+different things, which is worth stating because one of the names overreaches:
+`due_jobs_are_not_starved_by_a_request_flood` asserts eventual **completeness** — every due
+job has run by the horizon — a count that is identical whether a request-arm win consumes 1
+request or 64; `due_jobs_are_serviced_before_a_request_flood_exhausts_the_source` asserts
+the **interleaving** invariant, that the job arm is serviced at least once while the source
+still has outstanding work. The second is deliberately not a bound on degree: a bound pinned
+by a test is a contract whatever this document says, and greedy drain cannot honour a fixed
+ratio on a fast device anyway (docs/BENCH.md — shallower queues mean smaller batches).
+
 The HTTP kernel (`charpente::http`) lives inside the boundary — the sim drives
 `App::handle` directly; hyper only translates wire↔struct at the edge
 (`charpente::serve`) and feeds the single-threaded kernel loop.
@@ -297,6 +332,73 @@ and are not logged; enqueues and emits keep call order. Replay resolves table
 names through the `Schema` registry passed to `Db::open`. The enqueue key is
 the job's stable external identity — carried, never interpreted inside the
 deterministic boundary in v0; M1's external-IO surface is what consumes it.
+
+**Group commit (M2 sub-project 2, 2026-08-15).** The commit point is a *group*, not a
+transaction. `Db::begin_group` opens one store snapshot and an empty group overlay;
+`Group::stage` runs one handler against it and buffers that handler's effects record without
+touching the WAL; `Group::commit` appends every buffered record, syncs **once**, then
+applies them in seq order. `Db::transact` is the group-of-one case — `begin_group`, one
+`stage`, `commit` — so the single-request path and a batched path execute the identical
+instruction sequence instead of being two paths that tests must keep in agreement.
+`Engine::submit_all` is the one append→sync→apply implementation underneath both;
+`Engine::submit` is its length-1 convenience and has no production caller. What this buys is
+amortization and nothing else: N transactions, one fsync (docs/BENCH.md).
+
+**Ack-after-durable survives structurally rather than by discipline.** `stage` never
+appends, every reply is held until `commit` returns, and apply stays strictly after sync —
+so a crash between append and sync loses the **whole** batch and never part of it, and no
+participant is ever acked for a record that is not durable. The reverse error, a 200 for
+something not durable, remains impossible.
+
+**The two-level overlay.** A handler reads through its own transaction overlay, then the
+group overlay, then the store snapshot: read-your-own-writes across the whole batch, not
+merely within one transaction. On `stage` returning `Ok` with at least one effect the
+transaction's overlay merges into the group's and its record queues for commit; on `Err`, or
+on no effects, that overlay is discarded and the group is untouched. The ordering is what
+makes panic-safety structural — a handler that panics mid-transaction cannot corrupt the
+batch, because its writes were never merged. Row puts and deletes, secondary-index effects
+and session rows are all in the overlay. Platform-allocated ids (`next_job_id`,
+`next_event_id`) deliberately are not: no API hands one to a handler, and the counters bump
+at apply in seq order, which is what keeps ids byte-identical on a follower that has no
+overlay at all. Scope that panic claim to the batch's *state*: the group is safe, but there
+is no `catch_unwind` on the request path, so a panicking **route** handler still unwinds out
+of the kernel and stops the node — and batching widened the blast radius from one request to
+every reply held in that batch, which `serve` then answers with a generic 500. The job arm
+is genuinely isolated (`dispatch.rs` catches inside the transaction closure and converts the
+panic to an app error), which is why the two handler kinds are stated separately rather than
+folded into one claim.
+
+**What a participant SAW, not what it wrote, is the failure rule.** Every record in a batch
+is durable before any of them applies, so an apply failure at record *i* leaves all N on
+disk and destined to apply on restart. The participants that must not keep their answers are
+the one whose record failed and everything that *observed* it — including a read-only
+request, which sees a sibling's uncommitted effects through the group overlay. One
+implementation of that rule (`CommitFailure::invalidates`) is shared by `Db::transact`,
+`App::handle_or_subscribe` and the kernel's batched tail; three copies of it is how they
+drifted the first time. Its client-facing half is a named contract in docs/GUIDE.md §5: a
+500 never promises rejection, only absence of confirmation.
+
+**The batch cap is a constant, not configuration.** `MAX_BATCH = 64`, asserted inside
+`Group::stage` so the bound is enforced rather than advisory, and shared by the kernel
+rather than duplicated as a literal. `DbConfig` carries operator-facing policy; a batch bound
+is internal mechanism, like `REPL_TICK_NANOS`. There is nothing here for an operator to
+tune — a batch is exactly what the arm has ready at this loop iteration, so greedy drain is
+already self-limiting by arrival rate and the cap exists only to bound buffered memory
+(`MAX_BATCH` times the existing 1 MiB body cap). A configurable throughput knob would also
+be a knob tunable to flatter a benchmark, which is the one thing not to ship next to
+docs/BENCH.md. The kernel's arms bound on *items drained*, never on records staged: a
+handler that returns `Err` or writes nothing stages no record, so a record-bounded loop
+would be unbounded in exactly the adversarial case the cap exists for.
+
+**Batching is within one ready-set arm, never across arms.** Requests batch with requests and
+due jobs with due jobs; arm arbitration is untouched. No timer, clock read or entropy draw
+enters the commit path — batch composition is a pure function of the ready set, which the
+same-shape rule (§1) already governs, so prod and sim agree by construction. Checkpointing
+stays at the commit funnel and may occur only *between* batches, never inside one. Two things
+end a request batch early: the cap, and a subscribe — its cursor is resolved after the
+commit, so a sibling staged behind it would have its events committed before that
+resolution and the tail would start past them, which is exactly the gap realtime's
+membership oracle forbids.
 
 **Isolation.** Serializable, trivially: transactions apply one at a time to the
 single-threaded core. Read-only queries run against consistent snapshots (see §4) and never

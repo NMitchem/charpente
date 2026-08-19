@@ -1002,6 +1002,40 @@ may already be durable. It surfaces as its own 500, with a message that
 says so instead of guessing: `"internal storage failure — the request may
 or may not have committed; retry after the server recovers: {e}"`.
 
+**Since group commit, one request's failure can be another request's 500 —
+and a 500 can name a write that committed.** The kernel commits everything
+it drained in one loop iteration under a single fsync, up to 64 requests.
+Appends and syncs still fail the whole batch and ack nothing, exactly as
+before. The case with no analogue in a one-at-a-time kernel is a failure to
+*apply* a record after the batch has already synced: at that point every
+record in the batch is on disk, and the platform answers 500 to the request
+whose record failed, to every request behind it, and to every request that
+*read* one of those records through the batch's shared view. Read it as the
+rule above says: **a 500 never promises rejection, only the absence of
+confirmation.** What that means in practice:
+
+- **The write may be committed.** After a mid-batch apply failure the record
+  is durable and applies when the process restarts. The client was told
+  "unknown"; the durable answer turns out to be "yes". Plan for it — this is
+  a named contract, not an edge case you are expected to discover.
+- **The reverse remains impossible.** No 200 is ever emitted for something
+  that is not durable. Every reply in a batch is held until the commit
+  returns, so the ack still follows the sync.
+- **The node stops.** An apply failure means machine state no longer matches
+  the log, so the engine poisons and the kernel stops rather than serving on
+  (§9's "Poisoned-engine errors"). The fix is a restart, which replays the
+  WAL and is idempotent.
+- **A request that ran ahead of the failure keeps its answer.** The rule is
+  what a request *saw*, not where it sat in the batch: a read that only ever
+  observed committed state is not invalidated by a later sibling's failure.
+
+Operationally this is the same epistemic class as any `TxError::Io`, so
+handle it the same way: a blind retry is safe only where the operation is
+idempotent in your own schema — the platform does not dedupe for you, and
+§6 is explicit that an idempotency key is carried, not indexed. After the
+restart, the honest way to learn what happened is to read the state back
+rather than infer it from the status code.
+
 ### Starting the server
 
 `charpente::serve::serve(addr: &str, app: App) -> io::Result<Server>` spawns
@@ -2421,7 +2455,9 @@ longer matches its own history. The third (`charpente/src/http/app.rs`,
 §5's "Ack-after-durable") is how a poisoned engine surfaces to an HTTP
 caller: `TxError::Io` after the handler's own logic already returned `Ok`,
 so whether the write landed is genuinely unknown from the caller's side too
-— the 500 says so instead of guessing. In every case the fix is the same:
+— the 500 says so instead of guessing. Since group commit that third message
+can also reach requests that wrote nothing at all, and can name a write that
+is already durable; §5's "Ack-after-durable" states that contract in full. In every case the fix is the same:
 restart the process. Recovery (`Db::open`/`Engine::recover`, §3) replays the
 WAL from the last checkpoint and is itself idempotent, so restart-and-retry
 is always the correct response to any of these three, never a retry loop
