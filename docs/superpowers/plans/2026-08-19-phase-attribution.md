@@ -67,7 +67,7 @@ mod tests {
 
     #[test]
     fn path_class_splits_wal_store_and_sidecars() {
-        assert_eq!(PathClass::classify("wal/000000000000.seg"), PathClass::Wal);
+        assert_eq!(PathClass::classify("wal/00000000000000000000.log"), PathClass::Wal);
         assert_eq!(PathClass::classify("tables.redb"), PathClass::Store);
         // Exact match on purpose: the horizon breadcrumb is a sidecar, not the
         // store, and `starts_with` would swallow it (db.rs `horizon_path`).
@@ -674,7 +674,7 @@ Take the trace's events immediately after the measured window closes, alongside 
 
 Do the same in `kernel_bench.rs`, nesting inside the existing `CountingDisk` as the constraint above requires, and reading the trace between `syncs_before`/`syncs_after` — the same window `obs.elapsed` spans.
 
-Set `TRACE_CAPACITY` to `1 << 20` events (~32 MB at 32 bytes/event, comfortably above a 50,000-request run at a handful of ops per record). A reallocation inside the traced window lands in the measurement.
+Set `TRACE_CAPACITY` to `1 << 20` events. **`size_of::<Event>()` is 24 bytes** — MEASURED in Task 1, correcting this plan's original unverified "~32 bytes" estimate — so that is ~25 MB, comfortably above a 50,000-request run at a handful of ops per record. A reallocation inside the traced window lands in the measurement it is trying to take.
 
 - [ ] **Step 4: Run the tests**
 

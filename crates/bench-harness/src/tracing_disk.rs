@@ -216,7 +216,11 @@ mod tests {
 
     #[test]
     fn path_class_splits_wal_store_and_sidecars() {
-        assert_eq!(PathClass::classify("wal/000000000000.seg"), PathClass::Wal);
+        // A real segment name: `log.rs::segment_name` formats `{base_seq:020}.log`.
+        assert_eq!(
+            PathClass::classify("wal/00000000000000000000.log"),
+            PathClass::Wal
+        );
         assert_eq!(PathClass::classify("tables.redb"), PathClass::Store);
         // Exact match on purpose: the horizon breadcrumb is a sidecar, not the
         // store, and `starts_with` would swallow it (db.rs `horizon_path`).
