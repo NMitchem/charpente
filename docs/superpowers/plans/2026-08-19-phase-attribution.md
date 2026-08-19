@@ -610,97 +610,176 @@ git commit -m "bench: partition a measured window across commit phases, refusing
 
 ### Task 3: Wire the trace into the core and kernel arms
 
+**REWRITTEN 2026-08-19 after Task 2's review.** The original text specified creating the trace,
+then opening the `Db`, then measuring after a warmup loop — which is exactly the origin mismatch
+finding I-2 refuses, because `Trace::recording()` stamps its origin at construction while the
+window opens much later. Any implementer following the old text would have had every run refused.
+
 **Files:**
-- Modify: `crates/bench-harness/src/core_bench.rs:54` (the `Db::open` call) and its observations struct
-- Modify: `crates/bench-harness/src/kernel_bench.rs:117-118` (the `CountingDisk { inner: ProdDisk::new(dir)? }` construction) and `KernelObs`
-- Test: `crates/bench-harness/tests/` — add `phase_trace.rs`
+- Modify: `crates/bench-harness/src/core_bench.rs` (the `Db::open` at :54, the window at :87, the `WriteObs` literal)
+- Modify: `crates/bench-harness/src/kernel_bench.rs` (the local `CountingDisk` at :46, its construction at :117, the window at :183-187)
+- Test: create `crates/bench-harness/tests/phase_trace.rs`
 
 **Interfaces:**
-- Consumes: `TracingDisk::new`, `Trace::recording`, `Trace::events` (Task 1); `attribute` (Task 2).
-- Produces: a `phases: Option<PhaseTotals>` field on both arms' observation structs, and `trace_overhead_recorded: bool` provenance. `None` means the arm ran in passthrough.
+- Consumes: `crate::tracing_disk::{Trace, TracingDisk}` and `Trace::now_nanos() -> u64`; `crate::phase_accounting::{attribute, PhaseTotals}` where `attribute(events: &[Event], window_start_nanos: u64, window_end_nanos: u64) -> Result<PhaseTotals, Vec<String>>`.
+- `PhaseTotals` has 14 `u64` nanosecond fields: `wal_append_io`, `wal_read_io`, `wal_sync_io`, `store_write_io`, `store_read_io`, `store_sync_io`, `other_io`, `gap_within_wal`, `gap_wal_to_store`, `gap_within_store`, `gap_store_to_wal`, `gap_other`, `lead_in`, `tail`.
+- Produces: `phases: Option<PhaseTotals>` on both arms' observation structs. `None` means the attribution was refused (and the refusal strings went to `invalid`) or the arm ran in passthrough. **`None`, never a zeroed `PhaseTotals`** — a zeroed phase block is indistinguishable from a genuinely fast one.
 
-**Critical constraint:** `kernel_bench`'s existing local `CountingDisk` (line 46) stays exactly as it is and stays UNSCOPED. Nest the new wrapper INSIDE it — `CountingDisk { inner: TracingDisk::new(Box::new(ProdDisk::new(dir)?), trace) }` — so the sync counter still sees every path and no published number moves. If `CountingDisk`'s `inner` field is typed `ProdDisk` rather than `Box<dyn Disk>`, change the field type to `Box<dyn Disk>` and nothing else about it.
+**THE NESTING ORDER IS LOAD-BEARING, not a style choice.** In `kernel_bench`, put `TracingDisk` INSIDE the existing `CountingDisk`:
+
+```rust
+CountingDisk {
+    inner: Box::new(TracingDisk::new(Box::new(ProdDisk::new(dir)?), trace.clone())),
+    syncs: sync_count.clone(),
+}
+```
+
+That gives a `File` chain of `CountingFile` → `TracingFile` → `ProdFile`, so the tracer times the
+REAL IO and excludes `CountingFile`'s atomic increment from the measurement. Reversed, every
+recorded duration would include the counter's own overhead. This also keeps `CountingDisk`
+unscoped and its published `device_ratio` untouched, per Global Constraints. You will need to
+change `CountingDisk`'s `inner` field from `ProdDisk` to `Box<dyn Disk>`; change nothing else
+about it.
+
+**ONE `Trace` PER ARM.** Task 1's review flagged that sharing one `Trace` across concurrently-driven
+disks serializes their IO on its Mutex. Both arms here are single-threaded so it is dormant, but
+do not create a shared static or pass one `Trace` to two disks.
 
 - [ ] **Step 1: Write the failing integration test**
 
 Create `crates/bench-harness/tests/phase_trace.rs`:
 
 ```rust
-//! The trace must attribute a REAL run, not just synthetic events — and the
-//! two arms must disagree in the direction the mechanism predicts.
-
-use bench_harness::phase_accounting::attribute;
+//! The trace must attribute a REAL run, not just synthetic events.
+//!
+//! These tests deliberately assert NOTHING about which phase is largest. That
+//! is the measurement this instrument exists to take, and a test that encodes
+//! the expected answer stops being a check and becomes a way to confirm a
+//! prior belief.
 
 #[test]
-fn the_core_arm_produces_an_attributable_trace() {
+fn the_core_arm_attributes_a_real_run() {
     // bench-harness has NO `tempfile` dependency and does not need one — this
     // is the idiom `tests/harness.rs:21` already uses. Do not add a crate.
-    let dir = std::env::temp_dir().join(format!("bench-phase-trace-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("bench-phase-core-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
-    let path = dir.to_str().expect("utf-8 path");
-    let (report, invalid) = bench_harness::core_bench::run_traced(path, 200)
-        .expect("core arm runs");
-    assert!(invalid.is_empty(), "unexpected refusals: {invalid:?}");
-    let phases = report.phases.expect("a recording run carries phases");
-    assert!(phases.wal_sync_io > 0, "an fsync-bound arm must show sync time");
-    assert!(phases.store_io > 0 || phases.gap_within_store > 0, "redb must appear");
+    let (report, invalid) = bench_harness::core_bench::run(
+        dir.to_str().expect("utf-8 path"),
+        std::time::Duration::from_millis(200),
+        std::time::Duration::from_millis(800),
+    )
+    .expect("core arm runs");
+
+    let phases = report
+        .phases
+        .expect("a recording run carries phases; refusals were: {invalid:?}");
+    assert!(
+        invalid.is_empty(),
+        "attribution must not refuse a single-threaded arm: {invalid:?}"
+    );
     assert_eq!(
         phases.total(),
         report.window_nanos,
-        "phases must close to the window"
+        "phases must close to the measured window exactly"
     );
-    let _ = attribute; // the report already ran it; this pins the dependency
+    assert!(
+        phases.wal_sync_io > 0,
+        "a run that commits must have paid at least one WAL fsync"
+    );
 }
 ```
 
-Adapt the exact `run_traced` signature and report field names to whatever the arms actually expose — the requirement is that a real run yields a `PhaseTotals` that closes to its window. If adding a `run_traced` sibling duplicates `run`, instead add a `trace: Arc<Trace>` parameter to the existing `run` and pass `Trace::passthrough()` at every existing call site, so no caller changes behaviour.
+Name `report.window_nanos` (or whatever the arm actually publishes as
+`window_end_nanos - window_start_nanos`) consistently between the arm and this test; the
+requirement is that the closure check compares against the SAME window the attribution used, not
+against `obs.elapsed`. Those two differ by tens of nanoseconds and asserting closure against the
+wrong one produces a flaky failure nobody can reproduce.
 
 - [ ] **Step 2: Run it to verify it fails**
 
 Run: `cargo test -p bench-harness --test phase_trace`
-Expected: FAIL — no such function.
+Expected: FAIL to compile — `report.phases` does not exist yet.
 
-- [ ] **Step 3: Implement the wiring**
+- [ ] **Step 3: Wire `core_bench`**
 
-In `core_bench.rs`, replace the disk construction at line 54:
+Replace the disk construction at `core_bench.rs:54`:
 
 ```rust
 let trace = Trace::recording(TRACE_CAPACITY);
-let disk = TracingDisk::new(Box::new(ProdDisk::new(dir)?), trace.clone());
-let mut db = Db::open(Box::new(disk), DbConfig::default(), schema())?;
+let mut db = Db::open(
+    Box::new(TracingDisk::new(Box::new(ProdDisk::new(dir)?), trace.clone())),
+    DbConfig::default(),
+    schema(),
+)?;
 ```
 
-Take the trace's events immediately after the measured window closes, alongside the existing `obs.write` literal, and run `attribute(&events, obs.write.elapsed.as_nanos() as u64)`. Push any refusal strings onto the existing `invalid` vec rather than returning an error — a refused attribution must not discard a run whose throughput figures are still good.
+Stamp the window from the trace's own time base, straddling the throughput window so no op is
+half-in:
 
-Do the same in `kernel_bench.rs`, nesting inside the existing `CountingDisk` as the constraint above requires, and reading the trace between `syncs_before`/`syncs_after` — the same window `obs.elapsed` spans.
+```rust
+let window_start_nanos = trace.now_nanos();
+let start = Instant::now();
+// ... existing measured write loop, unchanged ...
+let elapsed = start.elapsed();
+let window_end_nanos = trace.now_nanos();
+```
 
-Set `TRACE_CAPACITY` to `1 << 20` events. **`size_of::<Event>()` is 24 bytes** — MEASURED in Task 1, correcting this plan's original unverified "~32 bytes" estimate — so that is ~25 MB, comfortably above a 50,000-request run at a handful of ops per record. A reallocation inside the traced window lands in the measurement it is trying to take.
+Then attribute BEFORE the `obs.write = WriteObs { .. }` literal, and put `phases` in that literal.
+Do not add it as a trailing `obs.write.phases = ...` mutation — the full-literal shape is the C-2
+fix and exists precisely so a future edit that drops a field breaks the build instead of silently
+zeroing a gate input:
 
-- [ ] **Step 4: Run the tests**
+```rust
+let events = trace.events();
+let phases = match attribute(&events, window_start_nanos, window_end_nanos) {
+    Ok(totals) => Some(totals),
+    Err(refusals) => {
+        invalid.extend(refusals);
+        None
+    }
+};
+```
+
+A refused attribution must NOT discard the run — its throughput figures are still good. That is
+why refusals go to `invalid` and `phases` goes to `None`.
+
+`TRACE_CAPACITY` is `1 << 20` events. `size_of::<Event>()` is 24 bytes (measured in Task 1), so
+that is ~25 MB. A reallocation inside the traced window lands in the measurement it is trying to
+take.
+
+- [ ] **Step 4: Wire `kernel_bench`**
+
+Same shape, with the nesting above. The window is already bracketed by `syncs_before`/`syncs_after`
+at `kernel_bench.rs:183-187`; stamp `window_start_nanos` immediately after `syncs_before` and
+`window_end_nanos` immediately after `obs.elapsed = start.elapsed()`.
+
+- [ ] **Step 5: Run the tests**
 
 Run: `cargo test -p bench-harness --test phase_trace`
 Expected: PASS.
 
-- [ ] **Step 5: Prove no published number moved**
+- [ ] **Step 6: Prove no published number moved**
 
-Run the core and kernel arms at this commit and at the previous one, and compare `acked_writes_per_sec`, `log_records_per_sec`, `syncs`, and `device_ratio`:
+This is the step that protects every figure already in `docs/BENCH.md`. Run both arms at this
+commit and at the previous one, and compare `acked_writes_per_sec`, `log_records_per_sec`, `syncs`
+and `device_ratio`. Report BOTH sides in the task report. Because these are timing measurements
+they will not be bit-identical — state the run-to-run spread from at least 3 runs per side and say
+whether the delta sits inside it, rather than declaring a match or a regression from n=1.
+
+A number moving beyond that spread means the wrapper changed an outcome, which its own module doc
+forbids. Escalate rather than accepting it.
+
+- [ ] **Step 7: Full gates and commit**
+
+Chain the commit to the gates so a failed gate cannot let it through:
 
 ```bash
-set -o pipefail
-cargo run -p bench-harness --bin bench -- kernel --json 2>&1 | tee /tmp/kernel-after.json
+cargo fmt --all --check \
+ && cargo clippy --workspace --all-targets -- -D warnings \
+ && cargo test --workspace \
+ && git add crates/bench-harness/ \
+ && git commit -m "bench: the core and kernel arms carry a phase trace through their measured window"
 ```
-
-Report both sides in the task report. A moved number here means the wrapper changed an outcome, which its own module doc forbids — escalate rather than accept it.
-
-- [ ] **Step 6: Full gates and commit**
-
-```bash
-cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
-git add crates/bench-harness/
-git commit -m "bench: the core and kernel arms carry a phase trace through their measured window"
-```
-
----
 
 ### Task 4: Measure the instrument's own overhead, and gate on it
 
