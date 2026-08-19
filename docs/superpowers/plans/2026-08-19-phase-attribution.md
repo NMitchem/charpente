@@ -1,0 +1,817 @@
+# Per-Phase Commit Attribution Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Measure which phase of a batched commit owns the wall clock, so DECISIONS §7 trigger (a) ("benchmarks show redb limiting the headline throughput claim") can be re-read against the batched path instead of the unbatched one.
+
+**Architecture:** A `TracingDisk` in `bench-harness` wraps any `Disk` and records `(op, path class, start, end)` per IO call. Because redb is mounted behind our own `Disk` trait (`table.rs:958-985`, `DiskBackend`), every redb byte crosses that wrapper — so phase attribution needs **no change to `charpente-core`** and hard rule 1 is untouched. A separate `phase_accounting` module reconstructs phases from the event stream and makes every arithmetic decision; the recorder decides nothing. This is the same observations seam `core_bench`/`core_accounting` already use.
+
+**Tech Stack:** Rust, `std::time::Instant`, `charpente::core::io::{Disk, File}`, existing `bench-harness` report/CLI plumbing.
+
+**Spec:** `.superpowers/sdd/2026-08-19-phase-attribution/SPEC.md`
+
+## Global Constraints
+
+Every task's requirements implicitly include this section.
+
+- **Hard rule 1 — no ambient nondeterminism inside the core.** This plan changes **zero files under `crates/charpente-core/`**. If a task appears to need one, stop and escalate; do not add a clock to core.
+- **Hard rule 4 — assert invariants and negative space.** Assertions stay on in release.
+- **Hard rule 5 — error messages are product surface.** A refusal names the contract, the site, and the fix.
+- **Hard rule 6 — public-API changes update the docs in the same commit.**
+- **No published number may move.** `kernel_bench`'s sync counter is UNSCOPED (counts every path) and its published `device_ratio` (0.392 at last measurement) depends on that. Do **not** rescope it, do **not** replace it with `counting::CountingDisk`, and do not "fix" the apples-to-oranges comparison `counting.rs:68-78` documents. That rescope would move a published number and is out of scope.
+- **Provenance per number.** Every published figure carries a counted-vs-derived flag, as `syncs_counted` does in `wire_accounting.rs`. A derived phase share is not a measured one.
+- **No cross-layer ratios.** A ratio whose numerator and denominator come from different layers reads as meaningful and is not (the `device_ratio` history).
+- **Nothing is quotable until it lands in `docs/BENCH.md`** (CLAUDE.md). Intermediate artifacts are observations.
+- **`bench-harness` is edge tooling.** Its `lib.rs` already carries `#![allow(clippy::disallowed_methods, clippy::disallowed_types)]`, so real clocks are fine *in this crate*.
+- **Workflow:** commit directly to `main`. **No `Co-Authored-By` trailers.**
+- **CI gates, all three, before any commit:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
+- **This shell is zsh.** `PIPESTATUS` is never populated. Use `${pipestatus[1]}` (lowercase, 1-indexed) or `set -o pipefail`. Pipe cargo through `tee`, never `tail`.
+
+## Scope ruling recorded before execution
+
+The spec says "attach to the existing connection sweep." **That is overridden here, deliberately.** The connection sweep is the *wire* arm, which runs the server as a child process killed with SIGKILL (`lib.rs`'s `SYNC_COUNTER` doc), so exporting a full trace from it would require inventing an HTTP trace-export protocol on top of `/__syncs`. The `core` and `kernel` arms are both **in-process** (`core_bench.rs:54`, `kernel_bench.rs:117-118`) and together give the contrast that actually answers the question: core runs unbatched at 1 record/sync, kernel runs at 61.96 records/sync — batch=1 versus batch≈62, the exact axis §2 of the spec argues redb's share rises along. Cost if wrong: the result is two points rather than a five-point curve, and the wire sweep remains available as a follow-on.
+
+## File Structure
+
+- **Create `crates/bench-harness/src/tracing_disk.rs`** — the recorder. Wraps a `Disk`, records one `Event` per `File` op. Makes no arithmetic decision. Mirrors `counting.rs`'s contract: never changes an outcome.
+- **Create `crates/bench-harness/src/phase_accounting.rs`** — reconstruction and every arithmetic decision. Pure functions over `&[Event]`; no IO, so its tests need no disk.
+- **Modify `crates/bench-harness/src/lib.rs`** — declare the two modules.
+- **Modify `crates/bench-harness/src/core_bench.rs`** — wrap the disk at line 54, carry the trace into observations.
+- **Modify `crates/bench-harness/src/kernel_bench.rs`** — wrap `ProdDisk` under the existing local `CountingDisk`, carry the trace.
+- **Modify `crates/bench-harness/src/report.rs`** — publish phase fields with provenance.
+- **Modify `crates/bench-harness/src/bin/bench.rs`** — surface phases in human and JSON output.
+- **Modify `docs/BENCH.md`** — the per-phase table, provenance, measured instrument overhead.
+- **Create `.superpowers/sdd/2026-08-19-phase-attribution/trigger-a-rereading.md`** — the drafted §7 re-reading. **Not** a `DECISIONS.md` edit: CLAUDE.md requires Noah's sign-off to reopen a DECISIONS entry.
+
+---
+
+### Task 1: The tracing Disk
+
+**Files:**
+- Create: `crates/bench-harness/src/tracing_disk.rs`
+- Modify: `crates/bench-harness/src/lib.rs` (add `pub mod tracing_disk;`)
+- Test: inline `#[cfg(test)] mod tests` in `tracing_disk.rs`
+
+**Interfaces:**
+- Consumes: `charpente::core::io::{Disk, File}`.
+- Produces: `PathClass` (`Wal`/`Store`/`Other`), `OpKind` (`Len`/`ReadAt`/`WriteAt`/`SetLen`/`Sync`), `Event { path, op, start_nanos, end_nanos }`, `Trace` (with `Trace::recording(capacity) -> Arc<Trace>`, `Trace::passthrough() -> Arc<Trace>`, `Trace::events(&self) -> Vec<Event>`, `Trace::is_recording(&self) -> bool`), and `TracingDisk::new(inner: Box<dyn Disk>, trace: Arc<Trace>) -> TracingDisk`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `crates/bench-harness/src/tracing_disk.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_class_splits_wal_store_and_sidecars() {
+        assert_eq!(PathClass::classify("wal/000000000000.seg"), PathClass::Wal);
+        assert_eq!(PathClass::classify("tables.redb"), PathClass::Store);
+        // Exact match on purpose: the horizon breadcrumb is a sidecar, not the
+        // store, and `starts_with` would swallow it (db.rs `horizon_path`).
+        assert_eq!(PathClass::classify("tables.redb.horizon"), PathClass::Other);
+    }
+
+    #[test]
+    fn passthrough_records_nothing_but_still_wraps() {
+        let trace = Trace::passthrough();
+        assert!(!trace.is_recording());
+        trace.record(PathClass::Wal, OpKind::Sync, Instant::now(), Instant::now());
+        assert!(trace.events().is_empty());
+    }
+
+    #[test]
+    fn recording_keeps_ops_in_call_order() {
+        let trace = Trace::recording(8);
+        let a = Instant::now();
+        trace.record(PathClass::Wal, OpKind::WriteAt, a, Instant::now());
+        trace.record(PathClass::Wal, OpKind::Sync, Instant::now(), Instant::now());
+        trace.record(PathClass::Store, OpKind::WriteAt, Instant::now(), Instant::now());
+        let events = trace.events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].op, OpKind::WriteAt);
+        assert_eq!(events[1].op, OpKind::Sync);
+        assert_eq!(events[2].path, PathClass::Store);
+        assert!(events[0].end_nanos <= events[1].start_nanos);
+    }
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p bench-harness --lib tracing_disk`
+Expected: FAIL — the module does not compile yet (`PathClass` not found).
+
+- [ ] **Step 3: Write the implementation**
+
+Write `crates/bench-harness/src/tracing_disk.rs`:
+
+```rust
+//! A `Disk` that RECORDS each IO op with its duration, so a layer can
+//! attribute a commit's wall clock to phases WITHOUT a clock inside the core.
+//!
+//! **Why this boundary works.** redb is mounted behind our own `Disk` trait —
+//! `DiskBackend` implements redb's `StorageBackend` over a `File`
+//! (`charpente-core/src/table.rs:958-985`, "the only sanctioned way") — so
+//! every byte redb touches crosses this wrapper. `Engine::submit_all`'s three
+//! phases (N appends → one sync → N applies) are therefore recoverable from
+//! the op stream alone, and hard rule 1 is never in question.
+//!
+//! **This module makes no arithmetic decision.** It records; every phase,
+//! share and verdict is computed in `phase_accounting`. That split is the same
+//! observations seam `core_bench`/`core_accounting` use, and it exists so a
+//! disagreement about attribution is a disagreement about one pure function
+//! over a `Vec<Event>` rather than about a measurement nobody can replay.
+//!
+//! **Scope, matching `counting.rs`'s decision so the two wrappers agree.**
+//! `Disk::sync_dir`, `Disk::remove` and `Disk::list` delegate UNWRAPPED and
+//! never reach the trace: they are `Disk` methods, not `File` methods, and a
+//! directory barrier is not part of any commit phase. Only `File` ops are
+//! recorded.
+//!
+//! Recording never changes an outcome — every method returns `inner`'s result
+//! verbatim, including errors, which are recorded like any other op because a
+//! failed fsync still costs time.
+
+use charpente::core::io::{Disk, File};
+use std::io;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+/// Which file a traced op touched. Decided once at `open`, not per op: the
+/// path is fixed for the life of the handle (`counting.rs` makes the same
+/// call for the same reason).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PathClass {
+    /// A WAL segment.
+    Wal,
+    /// The redb store itself.
+    Store,
+    /// Everything else — the `.horizon` breadcrumb and any future sidecar.
+    Other,
+}
+
+impl PathClass {
+    pub fn classify(path: &str) -> PathClass {
+        if path.starts_with("wal/") {
+            PathClass::Wal
+        } else if path == "tables.redb" {
+            // Exact, not `starts_with`: `tables.redb.horizon` is a sidecar
+            // written by `write_horizon_breadcrumb`, not store traffic, and
+            // folding it into the store would inflate redb's share with a
+            // write redb never made.
+            PathClass::Store
+        } else {
+            PathClass::Other
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpKind {
+    Len,
+    ReadAt,
+    WriteAt,
+    SetLen,
+    Sync,
+}
+
+/// One traced op. Times are nanoseconds since the trace's origin, so an
+/// `Event` is `Copy` and a whole run's trace is one flat `Vec`.
+#[derive(Clone, Copy, Debug)]
+pub struct Event {
+    pub path: PathClass,
+    pub op: OpKind,
+    pub start_nanos: u64,
+    pub end_nanos: u64,
+}
+
+/// The shared sink. `recording: false` is the passthrough arm of the overhead
+/// measurement (Task 4): the wrapper still wraps and still pays the virtual
+/// dispatch, so the difference between the two arms isolates the cost of
+/// RECORDING from the cost of WRAPPING.
+pub struct Trace {
+    origin: Instant,
+    events: Mutex<Vec<Event>>,
+    recording: bool,
+}
+
+impl Trace {
+    /// `capacity` preallocates the event vec. Size it generously: a reallocation
+    /// inside a traced window lands in the measurement it is trying to take.
+    pub fn recording(capacity: usize) -> Arc<Trace> {
+        Arc::new(Trace {
+            origin: Instant::now(),
+            events: Mutex::new(Vec::with_capacity(capacity)),
+            recording: true,
+        })
+    }
+
+    pub fn passthrough() -> Arc<Trace> {
+        Arc::new(Trace {
+            origin: Instant::now(),
+            events: Mutex::new(Vec::new()),
+            recording: false,
+        })
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.recording
+    }
+
+    pub fn record(&self, path: PathClass, op: OpKind, start: Instant, end: Instant) {
+        if !self.recording {
+            return;
+        }
+        let event = Event {
+            path,
+            op,
+            start_nanos: start.duration_since(self.origin).as_nanos() as u64,
+            end_nanos: end.duration_since(self.origin).as_nanos() as u64,
+        };
+        self.events.lock().expect("trace lock").push(event);
+    }
+
+    pub fn events(&self) -> Vec<Event> {
+        self.events.lock().expect("trace lock").clone()
+    }
+}
+
+pub struct TracingDisk {
+    inner: Box<dyn Disk>,
+    trace: Arc<Trace>,
+}
+
+impl TracingDisk {
+    pub fn new(inner: Box<dyn Disk>, trace: Arc<Trace>) -> TracingDisk {
+        TracingDisk { inner, trace }
+    }
+}
+
+impl Disk for TracingDisk {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        let file = self.inner.open(path)?;
+        Ok(Box::new(TracingFile {
+            inner: file,
+            path: PathClass::classify(path),
+            trace: self.trace.clone(),
+        }))
+    }
+
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+struct TracingFile {
+    inner: Box<dyn File>,
+    path: PathClass,
+    trace: Arc<Trace>,
+}
+
+impl File for TracingFile {
+    fn len(&self) -> io::Result<u64> {
+        let start = Instant::now();
+        let out = self.inner.len();
+        self.trace.record(self.path, OpKind::Len, start, Instant::now());
+        out
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        let start = Instant::now();
+        let result = self.inner.read_at(offset, out);
+        self.trace
+            .record(self.path, OpKind::ReadAt, start, Instant::now());
+        result
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        let start = Instant::now();
+        let out = self.inner.write_at(offset, data);
+        self.trace
+            .record(self.path, OpKind::WriteAt, start, Instant::now());
+        out
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        let start = Instant::now();
+        let out = self.inner.set_len(len);
+        self.trace
+            .record(self.path, OpKind::SetLen, start, Instant::now());
+        out
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        let start = Instant::now();
+        let out = self.inner.sync();
+        self.trace.record(self.path, OpKind::Sync, start, Instant::now());
+        out
+    }
+}
+```
+
+Add exactly ONE line to `crates/bench-harness/src/lib.rs`, in the existing `pub mod` block, alphabetically (after `pub mod report;`):
+
+```rust
+pub mod tracing_disk;
+```
+
+`phase_accounting` arrives in Task 2 and declares itself there. Adding it now breaks the build.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test -p bench-harness --lib tracing_disk`
+Expected: PASS, 3 tests.
+
+- [ ] **Step 5: Run the full gates**
+
+```bash
+cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+```
+Expected: clean.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/bench-harness/src/tracing_disk.rs crates/bench-harness/src/lib.rs
+git commit -m "bench: a Disk that records what each IO op cost, so phases need no clock in core"
+```
+
+---
+
+### Task 2: Phase reconstruction and the closure invariant
+
+**Files:**
+- Create: `crates/bench-harness/src/phase_accounting.rs`
+- Modify: `crates/bench-harness/src/lib.rs` (add `pub mod phase_accounting;`)
+- Test: inline `#[cfg(test)] mod tests` in `phase_accounting.rs`
+
+**Interfaces:**
+- Consumes: `crate::tracing_disk::{Event, OpKind, PathClass}` from Task 1.
+- Produces: `PhaseTotals` (all fields `u64` nanoseconds, listed in the code below) and `attribute(events: &[Event], window_nanos: u64) -> Result<PhaseTotals, Vec<String>>`.
+
+**Why the refusal path exists:** the gap between two ops is idle-or-CPU time **only if the arm is single-threaded**. On a concurrent arm, ops overlap and "the gap" is not attributable to anything. Rather than publish a meaningless number, `attribute` refuses — matching the harness's existing `invalid: Vec<String>` idiom (`core_bench.rs`).
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tracing_disk::{Event, OpKind, PathClass};
+
+    fn ev(path: PathClass, op: OpKind, start: u64, end: u64) -> Event {
+        Event { path, op, start_nanos: start, end_nanos: end }
+    }
+
+    #[test]
+    fn a_batch_attributes_append_sync_and_apply_separately() {
+        // Two WAL appends, one WAL sync, two store ops — `submit_all`'s shape.
+        let events = vec![
+            ev(PathClass::Wal, OpKind::WriteAt, 0, 10),
+            ev(PathClass::Wal, OpKind::WriteAt, 10, 20),
+            ev(PathClass::Wal, OpKind::Sync, 20, 1020),
+            ev(PathClass::Store, OpKind::WriteAt, 1030, 1050),
+            ev(PathClass::Store, OpKind::WriteAt, 1060, 1080),
+        ];
+        let t = attribute(&events, 1100).expect("single-threaded trace attributes");
+        assert_eq!(t.wal_append_io, 20);
+        assert_eq!(t.wal_sync_io, 1000);
+        assert_eq!(t.store_io, 40);
+        assert_eq!(t.gap_wal_to_store, 10, "the sync→apply transition");
+        assert_eq!(t.gap_within_store, 10, "redb-internal CPU between its own IOs");
+        assert_eq!(t.tail, 20);
+    }
+
+    #[test]
+    fn every_nanosecond_of_the_window_is_attributed() {
+        let events = vec![
+            ev(PathClass::Wal, OpKind::WriteAt, 5, 15),
+            ev(PathClass::Store, OpKind::Sync, 25, 30),
+        ];
+        let t = attribute(&events, 100).expect("attributes");
+        assert_eq!(t.total(), 100, "totals must close to the window exactly");
+    }
+
+    #[test]
+    fn overlapping_ops_are_refused_not_averaged() {
+        let events = vec![
+            ev(PathClass::Wal, OpKind::WriteAt, 0, 100),
+            ev(PathClass::Store, OpKind::WriteAt, 50, 150),
+        ];
+        let invalid = attribute(&events, 200).expect_err("overlap must refuse");
+        assert!(
+            invalid[0].contains("single-threaded"),
+            "the refusal must name the contract it enforces, got: {}",
+            invalid[0]
+        );
+    }
+
+    #[test]
+    fn an_op_past_the_window_end_is_refused() {
+        let events = vec![ev(PathClass::Wal, OpKind::Sync, 0, 500)];
+        let invalid = attribute(&events, 100).expect_err("op outside the window must refuse");
+        assert!(invalid[0].contains("window"), "got: {}", invalid[0]);
+    }
+
+    #[test]
+    fn an_empty_trace_is_all_lead_in() {
+        let t = attribute(&[], 100).expect("an empty trace is legal");
+        assert_eq!(t.lead_in, 100);
+        assert_eq!(t.total(), 100);
+    }
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p bench-harness --lib phase_accounting`
+Expected: FAIL — module does not exist.
+
+- [ ] **Step 3: Write the implementation**
+
+Write `crates/bench-harness/src/phase_accounting.rs`:
+
+```rust
+//! Every arithmetic decision about a trace lives here. `tracing_disk` records
+//! and decides nothing — the observations seam, as in `core_accounting`.
+//!
+//! **What a gap is, and the assumption that makes it mean anything.** Between
+//! two recorded ops the process is doing something the `Disk` boundary cannot
+//! see: CPU, or waiting. Attributing that time requires that ops do not
+//! overlap — i.e. that the arm is single-threaded. The `core` and `kernel`
+//! arms are; the `wire` arm is not, which is why `attribute` REFUSES an
+//! overlapping trace rather than publishing a number nobody can defend.
+//!
+//! **Measurement and inference are kept apart on purpose.** This module reports
+//! where the time went (`gap_within_store`, `gap_wal_to_store`, …). It does not
+//! decide that `gap_within_store` "is redb's CPU" — that reading is stated in
+//! `docs/BENCH.md` where it can be argued with, not buried in a field name.
+
+use crate::tracing_disk::{Event, OpKind, PathClass};
+
+/// Nanoseconds, every field. The fields partition the measured window: `total`
+/// equals the window exactly, by construction, and `attribute` asserts it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PhaseTotals {
+    /// Time inside WAL ops that are not `sync` — `submit_all`'s append loop.
+    pub wal_append_io: u64,
+    /// Time inside WAL `sync` — the one durability barrier per batch.
+    pub wal_sync_io: u64,
+    /// Time inside ops on `tables.redb` — redb's own IO.
+    pub store_io: u64,
+    /// Time inside ops on anything else (the `.horizon` breadcrumb).
+    pub other_io: u64,
+    /// Gap between two consecutive WAL ops.
+    pub gap_within_wal: u64,
+    /// Gap from a WAL op to a store op — the sync→apply transition.
+    pub gap_wal_to_store: u64,
+    /// Gap between two consecutive store ops — work redb does between its own
+    /// IOs.
+    pub gap_within_store: u64,
+    /// Gap from a store op back to a WAL op — end of one batch to the start of
+    /// the next, so: everything OUTSIDE the commit path.
+    pub gap_store_to_wal: u64,
+    /// Any gap whose neighbours do not fall in the pairs above.
+    pub gap_other: u64,
+    /// Window start to the first recorded op.
+    pub lead_in: u64,
+    /// Last recorded op to window end.
+    pub tail: u64,
+}
+
+impl PhaseTotals {
+    pub fn total(&self) -> u64 {
+        self.wal_append_io
+            + self.wal_sync_io
+            + self.store_io
+            + self.other_io
+            + self.gap_within_wal
+            + self.gap_wal_to_store
+            + self.gap_within_store
+            + self.gap_store_to_wal
+            + self.gap_other
+            + self.lead_in
+            + self.tail
+    }
+}
+
+/// Partition `window_nanos` across the phases the trace reveals.
+///
+/// Refuses (rather than returning a number) when the trace cannot support the
+/// arithmetic: overlapping ops, or an op outside the window.
+pub fn attribute(events: &[Event], window_nanos: u64) -> Result<PhaseTotals, Vec<String>> {
+    let mut invalid = Vec::new();
+
+    for pair in events.windows(2) {
+        if pair[1].start_nanos < pair[0].end_nanos {
+            invalid.push(format!(
+                "contract: phase attribution requires a single-threaded arm, but a traced op \
+                 ending at {} ns overlaps the next starting at {} ns. On a concurrent arm the \
+                 gap between ops is not idle time and every phase share below would be \
+                 meaningless. Fix: run this on the core or kernel arm (both in-process, \
+                 single-threaded), not the wire arm.",
+                pair[0].end_nanos, pair[1].start_nanos
+            ));
+            break;
+        }
+    }
+
+    if let Some(last) = events.last()
+        && last.end_nanos > window_nanos
+    {
+        invalid.push(format!(
+            "contract: a traced op ends at {} ns, past the measured window's {} ns. The trace \
+             and the window disagree about what was measured. Fix: start the trace after the \
+             window opens and read it before the window closes (see kernel_bench's \
+             syncs_before/syncs_after pair for the shape).",
+            last.end_nanos, window_nanos
+        ));
+    }
+
+    if !invalid.is_empty() {
+        return Err(invalid);
+    }
+
+    let mut totals = PhaseTotals::default();
+
+    let Some(first) = events.first() else {
+        totals.lead_in = window_nanos;
+        return Ok(totals);
+    };
+
+    totals.lead_in = first.start_nanos;
+    totals.tail = window_nanos - events[events.len() - 1].end_nanos;
+
+    for event in events {
+        let duration = event.end_nanos - event.start_nanos;
+        match (event.path, event.op) {
+            (PathClass::Wal, OpKind::Sync) => totals.wal_sync_io += duration,
+            (PathClass::Wal, _) => totals.wal_append_io += duration,
+            (PathClass::Store, _) => totals.store_io += duration,
+            (PathClass::Other, _) => totals.other_io += duration,
+        }
+    }
+
+    for pair in events.windows(2) {
+        let gap = pair[1].start_nanos - pair[0].end_nanos;
+        match (pair[0].path, pair[1].path) {
+            (PathClass::Wal, PathClass::Wal) => totals.gap_within_wal += gap,
+            (PathClass::Wal, PathClass::Store) => totals.gap_wal_to_store += gap,
+            (PathClass::Store, PathClass::Store) => totals.gap_within_store += gap,
+            (PathClass::Store, PathClass::Wal) => totals.gap_store_to_wal += gap,
+            _ => totals.gap_other += gap,
+        }
+    }
+
+    // Negative space: the fields partition the window. A residual means a gap
+    // or an op was counted twice or not at all, which would show up as a phase
+    // share that looks plausible and is wrong.
+    assert_eq!(
+        totals.total(),
+        window_nanos,
+        "phase totals must close to the measured window exactly"
+    );
+
+    Ok(totals)
+}
+```
+
+Add `pub mod phase_accounting;` to `crates/bench-harness/src/lib.rs`.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test -p bench-harness --lib phase_accounting`
+Expected: PASS, 5 tests.
+
+- [ ] **Step 5: Prove the closure assert has teeth (RED-first, hard rule 3)**
+
+Temporarily delete the `+ self.gap_within_store` term from `PhaseTotals::total`, run the suite, and confirm `a_batch_attributes_append_sync_and_apply_separately` and `every_nanosecond_of_the_window_is_attributed` FAIL on the assert. Restore the term and confirm GREEN. Record both outcomes in the task report — an assertion nobody has seen fail is not evidence.
+
+- [ ] **Step 6: Run the full gates and commit**
+
+```bash
+cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+git add crates/bench-harness/src/phase_accounting.rs crates/bench-harness/src/lib.rs
+git commit -m "bench: partition a measured window across commit phases, refusing what it cannot attribute"
+```
+
+---
+
+### Task 3: Wire the trace into the core and kernel arms
+
+**Files:**
+- Modify: `crates/bench-harness/src/core_bench.rs:54` (the `Db::open` call) and its observations struct
+- Modify: `crates/bench-harness/src/kernel_bench.rs:117-118` (the `CountingDisk { inner: ProdDisk::new(dir)? }` construction) and `KernelObs`
+- Test: `crates/bench-harness/tests/` — add `phase_trace.rs`
+
+**Interfaces:**
+- Consumes: `TracingDisk::new`, `Trace::recording`, `Trace::events` (Task 1); `attribute` (Task 2).
+- Produces: a `phases: Option<PhaseTotals>` field on both arms' observation structs, and `trace_overhead_recorded: bool` provenance. `None` means the arm ran in passthrough.
+
+**Critical constraint:** `kernel_bench`'s existing local `CountingDisk` (line 46) stays exactly as it is and stays UNSCOPED. Nest the new wrapper INSIDE it — `CountingDisk { inner: TracingDisk::new(Box::new(ProdDisk::new(dir)?), trace) }` — so the sync counter still sees every path and no published number moves. If `CountingDisk`'s `inner` field is typed `ProdDisk` rather than `Box<dyn Disk>`, change the field type to `Box<dyn Disk>` and nothing else about it.
+
+- [ ] **Step 1: Write the failing integration test**
+
+Create `crates/bench-harness/tests/phase_trace.rs`:
+
+```rust
+//! The trace must attribute a REAL run, not just synthetic events — and the
+//! two arms must disagree in the direction the mechanism predicts.
+
+use bench_harness::phase_accounting::attribute;
+
+#[test]
+fn the_core_arm_produces_an_attributable_trace() {
+    // bench-harness has NO `tempfile` dependency and does not need one — this
+    // is the idiom `tests/harness.rs:21` already uses. Do not add a crate.
+    let dir = std::env::temp_dir().join(format!("bench-phase-trace-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.to_str().expect("utf-8 path");
+    let (report, invalid) = bench_harness::core_bench::run_traced(path, 200)
+        .expect("core arm runs");
+    assert!(invalid.is_empty(), "unexpected refusals: {invalid:?}");
+    let phases = report.phases.expect("a recording run carries phases");
+    assert!(phases.wal_sync_io > 0, "an fsync-bound arm must show sync time");
+    assert!(phases.store_io > 0 || phases.gap_within_store > 0, "redb must appear");
+    assert_eq!(
+        phases.total(),
+        report.window_nanos,
+        "phases must close to the window"
+    );
+    let _ = attribute; // the report already ran it; this pins the dependency
+}
+```
+
+Adapt the exact `run_traced` signature and report field names to whatever the arms actually expose — the requirement is that a real run yields a `PhaseTotals` that closes to its window. If adding a `run_traced` sibling duplicates `run`, instead add a `trace: Arc<Trace>` parameter to the existing `run` and pass `Trace::passthrough()` at every existing call site, so no caller changes behaviour.
+
+- [ ] **Step 2: Run it to verify it fails**
+
+Run: `cargo test -p bench-harness --test phase_trace`
+Expected: FAIL — no such function.
+
+- [ ] **Step 3: Implement the wiring**
+
+In `core_bench.rs`, replace the disk construction at line 54:
+
+```rust
+let trace = Trace::recording(TRACE_CAPACITY);
+let disk = TracingDisk::new(Box::new(ProdDisk::new(dir)?), trace.clone());
+let mut db = Db::open(Box::new(disk), DbConfig::default(), schema())?;
+```
+
+Take the trace's events immediately after the measured window closes, alongside the existing `obs.write` literal, and run `attribute(&events, obs.write.elapsed.as_nanos() as u64)`. Push any refusal strings onto the existing `invalid` vec rather than returning an error — a refused attribution must not discard a run whose throughput figures are still good.
+
+Do the same in `kernel_bench.rs`, nesting inside the existing `CountingDisk` as the constraint above requires, and reading the trace between `syncs_before`/`syncs_after` — the same window `obs.elapsed` spans.
+
+Set `TRACE_CAPACITY` to `1 << 20` events (~32 MB at 32 bytes/event, comfortably above a 50,000-request run at a handful of ops per record). A reallocation inside the traced window lands in the measurement.
+
+- [ ] **Step 4: Run the tests**
+
+Run: `cargo test -p bench-harness --test phase_trace`
+Expected: PASS.
+
+- [ ] **Step 5: Prove no published number moved**
+
+Run the core and kernel arms at this commit and at the previous one, and compare `acked_writes_per_sec`, `log_records_per_sec`, `syncs`, and `device_ratio`:
+
+```bash
+set -o pipefail
+cargo run -p bench-harness --bin bench -- kernel --json 2>&1 | tee /tmp/kernel-after.json
+```
+
+Report both sides in the task report. A moved number here means the wrapper changed an outcome, which its own module doc forbids — escalate rather than accept it.
+
+- [ ] **Step 6: Full gates and commit**
+
+```bash
+cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
+git add crates/bench-harness/
+git commit -m "bench: the core and kernel arms carry a phase trace through their measured window"
+```
+
+---
+
+### Task 4: Measure the instrument's own overhead, and gate on it
+
+**Files:**
+- Modify: `crates/bench-harness/src/bin/bench.rs` (a `--trace-overhead` mode)
+- Modify: `crates/bench-harness/src/phase_accounting.rs` (the plausibility gate)
+- Test: inline test in `phase_accounting.rs`
+
+**Interfaces:**
+- Consumes: `Trace::recording` / `Trace::passthrough` (Task 1), the traced arms (Task 3).
+- Produces: `overhead_gate(totals: &PhaseTotals, overhead_nanos_per_op: u64, op_count: u64) -> Vec<String>`.
+
+**Why this task is not optional.** The spec's own con on approach (A): "a per-op `Instant::now()` perturbs a cheap buffered append far more than a multi-millisecond fsync. Measure that overhead; do not assume it. A trace whose own cost is comparable to the append phase cannot measure the append phase."
+
+- [ ] **Step 1: Write the failing test**
+
+```rust
+#[test]
+fn overhead_comparable_to_the_smallest_phase_is_refused() {
+    let totals = PhaseTotals { wal_append_io: 1_000, wal_sync_io: 1_000_000, ..Default::default() };
+    // 100 ops at 50 ns of instrument cost each = 5,000 ns, five times the
+    // append phase it is trying to measure.
+    let invalid = overhead_gate(&totals, 50, 100);
+    assert!(!invalid.is_empty(), "overhead above the smallest phase must refuse");
+    assert!(invalid[0].contains("append"), "the refusal must name the phase it invalidates");
+}
+
+#[test]
+fn overhead_far_below_every_phase_passes() {
+    let totals = PhaseTotals { wal_append_io: 1_000_000, wal_sync_io: 10_000_000, ..Default::default() };
+    assert!(overhead_gate(&totals, 50, 100).is_empty());
+}
+```
+
+- [ ] **Step 2: Run to verify it fails.** `cargo test -p bench-harness --lib overhead`
+
+- [ ] **Step 3: Implement `overhead_gate`**
+
+Refuse when `overhead_nanos_per_op * op_count` exceeds 10% of any non-zero IO phase. Name the phase, the two magnitudes, and the fix (fewer traced op kinds, or approach (B)) — hard rule 5.
+
+- [ ] **Step 4: Implement `--trace-overhead` and MEASURE**
+
+Run the kernel arm twice at identical settings — once with `Trace::recording`, once with `Trace::passthrough` — and report the throughput delta and the derived per-op cost. Both runs go through `TracingDisk`, so the delta isolates recording from wrapping.
+
+Follow `docs/CLAUDE.md`'s measurement discipline: CPU time, not wall clock; run each arm at least 3 times and report all observations, not a single number. If the delta is inside run-to-run noise, say so — "below the noise floor of n=3" is an honest result and "0%" is not.
+
+- [ ] **Step 5: Run the gates and commit**
+
+```bash
+cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
+git add crates/bench-harness/
+git commit -m "bench: the phase trace measures its own overhead and refuses a phase it cannot resolve"
+```
+
+---
+
+### Task 5: Publish the phases through report and CLI
+
+**Files:**
+- Modify: `crates/bench-harness/src/report.rs`
+- Modify: `crates/bench-harness/src/bin/bench.rs`
+- Test: inline tests in `report.rs`
+
+**Interfaces:**
+- Consumes: `PhaseTotals` (Task 2), the arms' `phases` field (Task 3), `overhead_gate` (Task 4).
+- Produces: JSON keys `phases` (object of nanosecond fields) and `phases_counted` (bool), plus a human-readable phase table.
+
+- [ ] **Step 1: Write the failing test** — assert the JSON carries `phases_counted: true` on a recording run and that `phases` is absent (not zeroed) on a passthrough run. **A zeroed phase block is indistinguishable from a fast one**; absence is the honest encoding, exactly as `SweepPoint::syncs_per_sec` became `Option<f64>` rather than `0.0`.
+
+- [ ] **Step 2: Run to verify it fails.**
+
+- [ ] **Step 3: Implement.** Follow `syncs_counted`'s precedent in `wire_accounting.rs` for the provenance flag's shape and doc.
+
+- [ ] **Step 4: Run the tests.**
+
+- [ ] **Step 5: Gates and commit.**
+
+```bash
+git commit -m "bench: publish per-phase totals with their provenance, absent rather than zeroed"
+```
+
+---
+
+### Task 6: Run the measurement, record it, draft the trigger (a) re-reading
+
+**Files:**
+- Modify: `docs/BENCH.md`
+- Create: `.superpowers/sdd/2026-08-19-phase-attribution/trigger-a-rereading.md`
+- Modify: `docs/LEDGER.md`
+
+**This task changes no code.** It runs the finished instrument and records what it says.
+
+- [ ] **Step 1: Run both arms on a quiet box AND a loaded one**
+
+At least 3 runs each. The `MIN_MEASURED_WINDOW` precedent is the reason for the loaded arm: a loaded box makes some plausibility gates PASS, so a quiet-box-only run hides that class of defect.
+
+- [ ] **Step 2: Write the BENCH.md section**
+
+Give core (batch 1) and kernel (batch ≈62) as two columns, one row per phase, each figure with provenance, plus the measured instrument overhead from Task 4. State the inference — which gap is read as redb CPU and which as kernel CPU — as prose that can be argued with, and state what the instrument does **not** resolve (redb's in-memory work that never reaches the `Disk` boundary is visible only as `gap_within_store`, and cannot be separated from allocator or page-fault time).
+
+- [ ] **Step 3: Draft the re-reading**
+
+Write `trigger-a-rereading.md` against the spec's three pre-committed outcomes (redb largest / present-but-dominated / negligible). Scope it the way the 2026-08-10 reading scoped itself: workload, hardware, and what it does not cover.
+
+**Do NOT edit `DECISIONS.md`.** CLAUDE.md: "When a decision contradicts DECISIONS.md, don't silently override it — reopen the entry with the new evidence and get Noah's sign-off." The draft goes to Noah; he edits the entry.
+
+- [ ] **Step 4: LEDGER entry, then commit**
+
+Per the standing lesson: run `git show <hash> --numstat -- <path>` before writing any commit-hash attribution, and prefer a relative reference in any entry that may be amended.
+
+```bash
+git add docs/BENCH.md docs/LEDGER.md
+git commit -m "docs: BENCH records where a batched commit's time actually goes"
+```
