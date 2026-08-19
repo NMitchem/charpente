@@ -1,36 +1,67 @@
 diff --git a/crates/charpente/src/kernel/mod.rs b/crates/charpente/src/kernel/mod.rs
-index c60ca9d..6d6ee0b 100644
+index a4cb49e..eba2eb4 100644
 --- a/crates/charpente/src/kernel/mod.rs
 +++ b/crates/charpente/src/kernel/mod.rs
-@@ -284,18 +284,19 @@ impl Kernel {
-         match choice {
-             Ready::Request => {
-                 let (request, reply) = self.pending.take().expect("checked above");
--                match self.app.handle_or_subscribe(request, now) {
--                    Handled::Response(response) => reply.send(response),
--                    Handled::Subscribe(sub) => {
--                        match validate_subscribe(self.app.db(), sub.cursor) {
--                            Ok(next_id) => {
--                                let sink = reply.stream(Response::sse_headers());
--                                self.tails.push(Tail { sub, sink, next_id });
+@@ -374,40 +374,29 @@ impl Kernel {
+                     }
+                 }
+                 let drained = handled.len();
+-                // Nothing has been acked yet — the replies are still held.
+-                // `commit` is the only point after which any of them may be
+-                // sent, which is ack-after-durable stated structurally.
+-                // `applied` inside is COUNTED by the engine, never re-derived
+-                // from `last_applied()` before-vs-after.
+-                let failure = group.commit().err();
+-                for ((outcome, reply), (before, staged)) in
+-                    handled.into_iter().zip(replies).zip(saw)
+-                {
+-                    // A request keeps its response unless a record it saw —
+-                    // or its own — is the one left uncertain. The same rule
+-                    // `Db::transact` and `App::handle_or_subscribe` apply to
+-                    // their batch of one, so no path can drift. The 500 means
+-                    // "unknown", never "rejected": per spec §4 the record may
+-                    // still be durable and apply on restart.
+-                    if let Some(failure) = &failure
+-                        && failure.invalidates(before, staged)
+-                    {
+-                        reply.send(io_failure_response(&failure.error));
+-                        continue;
+-                    }
+-                    match outcome {
+-                        Handled::Response(response) => reply.send(response),
+-                        Handled::Subscribe(sub) => {
+-                            match validate_subscribe(self.app.db(), sub.cursor) {
+-                                Ok(next_id) => {
+-                                    let sink = reply.stream(Response::sse_headers());
+-                                    self.tails.push(Tail { sub, sink, next_id });
+-                                }
+-                                Err(response) => reply.send(response),
 -                            }
--                            Err(response) => reply.send(response),
 -                        }
 -                    }
--                }
-+                // WRONG BUILD — edge-harness T11 meta-test injection
++                // WRONG BUILD — edge-harness meta-test injection
 +                // (patches/wrong-ack-before-commit.patch). NEVER MERGE: acks
-+                // the client BEFORE the write is even attempted, so a kill in
-+                // this window loses the write entirely — nothing in the page
-+                // cache to recover, unlike an ack-before-fsync variant (which
-+                // a real kill -9 would survive and so would be toothless).
-+                reply.send(Response {
-+                    status: 200,
-+                    headers: Default::default(),
-+                    body: Vec::new(),
-+                });
++                // every request in the drained batch BEFORE `Group::commit`
++                // is even called, so the group's single fsync has not been
++                // attempted when the client sees its 200 — a kill in this
++                // window loses the whole batch entirely, with nothing in the
++                // page cache to recover, unlike an ack-after-write-before-
++                // fsync variant (which a real kill -9 would survive and so
++                // would be toothless). Every response the arm would really
++                // have produced is discarded, so GETs and subscribes are
++                // corrupted the same way POSTs are — the property
++                // tests/acked_durable.rs relies on when it bootstraps and
++                // verifies through the STOCK build instead.
++                for reply in replies {
++                    reply.send(Response {
++                        status: 200,
++                        headers: Default::default(),
++                        body: Vec::new(),
++                    });
+                 }
 +                std::thread::sleep(std::time::Duration::from_millis(100));
-+                let _ = self.app.handle_or_subscribe(request, now);
-                 self.stats.requests += 1;
++                let _ = group.commit();
++                let _ = (handled, saw);
+                 self.stats.requests += drained as u64;
                  // Spec 2026-07-05 (request-arm ruling): a request-path Io
                  // is absorbed into a 500 for the client, but a poisoned

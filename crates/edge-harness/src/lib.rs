@@ -45,11 +45,13 @@
 //! TCP (seconds, not milliseconds, per test). Run that matrix explicitly via
 //! `scripts/edge-harness.sh` (which states the same rule) or `cargo test -p
 //! edge-harness -- --ignored`. Every zero-syscall test — the artifact scan and
-//! wire parsers here in `src/`, and the pure verdict/classifier pins that each
-//! oracle and hunt keeps next to the wire assertion it protects — is NOT
-//! ignored: those cost microseconds and guard the code every scenario above
-//! them depends on, so a regression there must fail the ordinary sweep rather
-//! than wait for someone to run the matrix by hand (Noah's ruling,
+//! wire parsers here in `src/`, the pure verdict/classifier pins that each
+//! oracle and hunt keeps next to the wire assertion it protects, and the
+//! `include_str!` fixture-integrity guard in `tests/acked_durable.rs` that
+//! fails when `patches/wrong-ack-before-commit.patch` stops applying — is
+//! NOT ignored: those cost microseconds and guard the code every scenario
+//! above them depends on, so a regression there must fail the ordinary sweep
+//! rather than wait for someone to run the matrix by hand (Noah's ruling,
 //! 2026-07-25, narrowing plan ruling 4's blanket wording). `cargo test -p
 //! edge-harness` prints the current split; this doc deliberately states the
 //! criterion rather than a count, which every later task invalidates.

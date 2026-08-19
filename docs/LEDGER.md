@@ -1016,16 +1016,27 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   though both divide by the same append-shaped bracket, making 61.96 a lower bound. Reviewed
   independently (`task-10-review.md`): evidence compliance PASS, every recomputed figure
   correct; the report was revised for framing, not for numbers.
-- **M2 sub-project 2 — primary-side group commit: T11 published the docs, and the close-out
-  sweep came back with ONE RED GATE (2026-08-19, spec
+- **M2 sub-project 2 — primary-side group commit: SHIPPED AND CLOSED (T11 published the
+  docs, T12 closed the one red gate; 2026-08-19, spec
   docs/superpowers/specs/2026-08-10-group-commit-design.md (`017a81c`), 11-task plan
   docs/superpowers/plans/2026-08-10-group-commit.md (`bc03e63`), ledger
-  .superpowers/sdd/2026-08-10-group-commit/progress.md, commits `017a81c`..this commit — 38
-  in that range, four of which belong to the concurrent skills/personas and
-  ledger-restructure work).** The follow-up BENCH.md named at sub-project 1's close, built,
-  measured and now published. **The sub-project is NOT closed**: everything it set out to
-  build is in the tree, but `scripts/edge-harness.sh` is red (below), and closing that is a
-  fixture regeneration T11 was explicitly scoped out of.
+  .superpowers/sdd/2026-08-10-group-commit/progress.md, commits `017a81c`..`52a655d` plus
+  this close-out commit — 42 in that range, four of which belong to the concurrent
+  skills/personas and ledger-restructure work). Both endpoints are named rather than left as
+  "this commit": the entry has now been amended three times, and the count moved 38 → 42
+  underneath the old wording without a word of it changing.** The follow-up BENCH.md named
+  at sub-project 1's close, built, measured and now published. **The sub-project is
+  closed**: everything it set out to build is in the tree, and T11's one red gate — the
+  `scripts/edge-harness.sh` FIXTURE failure at 30/31, a regeneration T11 was explicitly
+  scoped out of — was closed by T12 (below), which also put the script in CI so the next
+  drift cannot go a week unseen. Read that precisely: the *fixture* gate is closed and the
+  teeth are proven, but the script itself is **not** reliably green — T12 measured 4 red in
+  8 runs, all of them the pre-existing failover witness-gate race, none of them this
+  sub-project's code. **Four items stay OPEN and are carried forward here rather than closed
+  with the sub-project**: request-vs-tail contention is unmeasured, DECISIONS §7 trigger (a)
+  is owed a re-read, `scripts/bench.sh --smoke` is still deferred, and the failover
+  witness-gate race is now a CI liability this commit creates without fixing — all four
+  below.
   **Shipped (T1–T11).** The commit point is a *group*, not a transaction:
   `Db::begin_group` → N × `Group::stage` → `Group::commit`, one store snapshot, a two-level
   overlay (txn → group → snapshot), one durable sync for the whole batch.
@@ -1105,27 +1116,66 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   events. Seed namespace: `0x60C0` is CLOSED at `0x60C0_0013` and `0x60C1` is fully
   allocated `0x60C1_0001`–`0x60C1_0009`; a tail-fairness test opens a new namespace rather
   than extending either.
-  **RED — `scripts/edge-harness.sh`, 30 of 31, and the failure is this sub-project's own
-  drift.** `acked_implies_durable_meta_test_has_teeth`
+  **CLOSED by T12 — `scripts/edge-harness.sh` was 30 of 31, and the failure was this
+  sub-project's own drift.** `acked_implies_durable_meta_test_has_teeth`
   (`crates/edge-harness/tests/acked_durable.rs`) applies
   `crates/edge-harness/patches/wrong-ack-before-commit.patch` to build a deliberately wrong
   node and prove the wire oracle can fail. That patch was written 2026-07-25 (`d7367f1`)
   against the old request arm — `handle_or_subscribe` then `reply.send` inline — and
-  `d301a52` replaced exactly those lines with the batched drain, so the patch has not
-  applied since 2026-08-13. Nothing caught it: every process-touching edge test is
-  `#[ignore]`d, so `cargo test --workspace` cannot see it and only `scripts/edge-harness.sh`
-  runs it, which no group-commit task ran. **The oracle itself passes**
-  (`acked_implies_durable_wire_oracle` green); what is unproven is that it has teeth, which
-  in this repo is the more serious half. The fixture's own error message names the drift and
-  the regeneration recipe, which is hard rule 5 doing its job. T11 ships no test changes, so
-  this is left red and named rather than papered over; **regenerating the patch against the
-  batched request arm is the work that closes this sub-project.**
+  `d301a52` replaced exactly those lines with the batched drain, so the patch had not
+  applied since **2026-08-12** — `d301a52`'s own author and committer date, `Wed Aug 12
+  15:24:10 2026 -0400`; this entry said 2026-08-13 until T12 corrected it. Nothing caught
+  it: every process-touching edge test is `#[ignore]`d, so `cargo test --workspace` cannot
+  see it and only `scripts/edge-harness.sh` runs it, which no group-commit task ran — T4
+  through T7 all changed production code inside that window. **The oracle itself never
+  stopped passing** (`acked_implies_durable_wire_oracle` green throughout); what was
+  unproven for a week is that it has TEETH, which in this repo is the more serious half. The
+  fixture's own error message named the drift and the regeneration recipe, which is hard
+  rule 5 doing its job. T11 shipped no test changes, so it left this red and named rather
+  than papered over.
+  **What T12 shipped, and why the mutation matters more than the diff.** The patch is
+  regenerated against the batched arm and expresses the SAME bug class rather than merely
+  applying cleanly — a mutation that applies but injects a weaker bug silently lowers the
+  oracle's bar and no test would ever say so. The original acked the client with a synthetic
+  200 before `handle_or_subscribe` was called at all, slept 100 ms, then ran the real
+  handling and discarded it. The replacement sends that same synthetic 200 to every reply in
+  the drained batch before `Group::commit` is called, sleeps 100 ms, then commits and
+  discards the result. Both are ack-before-the-group's-fsync in its strongest form,
+  ack-before-the-write-is-even-attempted — the form the original chose deliberately, because
+  an ack-after-append-before-fsync variant SURVIVES `kill -9` (process death is not power
+  loss; `edge-harness/src/lib.rs`'s honesty contract) and would be toothless in this rig.
+  Every response the arm would really have produced is still discarded, so GETs and
+  subscribes stay corrupted the same way POSTs are — the property `acked_durable.rs` relies
+  on when it bootstraps its session and verifies its reads through the STOCK build.
+  **RED-first, in that order** (hard rule 3): with the regenerated patch applied to a
+  throwaway worktree the oracle FAILED — `acked-implies-durable violated: 40 of 40 acked
+  id(s) missing`, every id `status 404`, no rig-failure reasons mixed in; with the patch
+  reverted the oracle PASSED and `acked_implies_durable_meta_test_has_teeth` went green.
+  **Two durable fixes, because the fixture breaking was not the defect — nothing telling
+  anyone was.** (1) `scripts/edge-harness.sh` is now a CI step (Noah's sign-off 2026-08-19),
+  landed in the same commit as the regenerated fixture so the gate is never added red; it
+  costs 87 s wall / 78 s CPU locally on a warm target dir, and CI additionally pays the
+  throwaway worktree's cold release build, which `Swatinem/rust-cache` cannot help with
+  (separate target dir). (2) A new un-ignored, zero-syscall guard
+  `the_wrong_build_patch_still_applies_to_the_kernel_it_targets` reconstructs the patch
+  hunk's pre-image with `include_str!` and requires it verbatim in `kernel/mod.rs`, so the
+  ordinary `cargo test --workspace` sweep reds in microseconds when the fixture stops
+  matching, and an edit to `kernel/mod.rs` re-runs it by construction. It is strictly
+  stronger than `git apply`'s own match, which additionally tolerates a line offset, so it
+  cannot go green on a patch the meta test would then fail to apply; it was itself proved
+  RED against the stale patch before being trusted. It does not replace the meta test: a
+  text match proves the patch applies, never that a build made from it loses acked writes.
   **Deferred, not skipped: `scripts/bench.sh --smoke`.** It needs a settled box and its
   output would feed the one doc CLAUDE.md sanctions for numbers. At dispatch the machine
   carried load average 4.47 with a VM at 42% CPU and Docker running; the smoke run is
-  Noah's to hold. Nothing in BENCH.md was published from an unrun gate.
-  **Evidence** (final tree, this commit; every command piped through `tee`, exit status read
-  as `${pipestatus[1]}` — zsh does not populate bash's `PIPESTATUS`, and the idiom was proved
+  Noah's to hold. Nothing in BENCH.md was published from an unrun gate. **Still deferred and
+  still owed at close (2026-08-19).** T12 did not run it either — the box carried Spotlight
+  at ~300% CPU, and the whole point of the gate is that a number born on a box like that
+  must not reach BENCH.md. The sub-project closes with this gate explicitly outstanding,
+  not quietly dropped; the decision sits with Noah.
+  **Evidence — T11's close-out sweep** (tree at `b13fcc3`; every command piped through
+  `tee`, exit status read as `${pipestatus[1]}` — zsh does not populate bash's
+  `PIPESTATUS`, and the idiom was proved
   against a deliberate failure before the sweep was trusted to it): `cargo fmt --all
   --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo
   build -p guide-examples` (the GUIDE compile gate) clean; `cargo test --workspace`
@@ -1150,6 +1200,49 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   `--no-fail-fast` to enumerate the whole matrix rather than stopping at the first red
   binary: acked_durable 1/2, failover 3/3, hunts 5/5, realtime_resume 1/1, smoke 1/1, lib
   19/19).
+  **Evidence — T12's close-out sweep** (final tree, this commit; same `tee` discipline, and
+  the exit-status idiom re-proved against a deliberate `false` before the sweep was trusted
+  to it): `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets -- -D
+  warnings` clean; `cargo build -p guide-examples` clean; `cargo test --workspace`
+  **748 passed / 0 failed / 45 ignored** over 57 libtest result lines — exactly T11's 747
+  plus the one new un-ignored guard, which is the entire delta and is why the number moved —
+  plus the two app-level `tests/sim.rs` batches at **256 universes per test, all green**
+  (invoicing master seed `0xcb1ea04269d37bc3`, sim-fixture `0xb908aebde1629561`); all four
+  of `ci.yml`'s `CHARPENTE_SEED` lines rc=0 (`0x8bee1752811ae873` release crash_recovery
+  4/4, `0xff159ed76d2806e4` release `late_follower…--exact` 1/1, `0x348270b38f166529` debug
+  kernel `--exact` 1/1, `0xe653f43924f17fe8` debug kernel `--exact` 1/1).
+  **`scripts/edge-harness.sh` is 4 GREEN and 4 RED across 8 runs at this tree, and the reds
+  are reported rather than dropped — the number matters more than the green.** Every red is
+  exclusively `failover_wire_oracle` and/or
+  `failover_non_converged_tail_is_exercised_and_bounded`, each failing at `login failed:
+  status 503 … has not confirmed that its follower … was never promoted`. Nothing else in
+  the matrix was ever red: `acked_durable` — the meta test this task exists for, plus the
+  new guard — was **2/2 green in all eight**, as were hunts 5/5, realtime_resume 1/1, smoke
+  1/1 and lib 19/19. Green runs cost 45-87 s wall, 75-78 s CPU; reds fail fast.
+  **This is the load-sensitive race already recorded at 2026-08-15** — same two names, same
+  mechanism (a `login()` POST fires within ~3 ms of a mid-run primary restart and races
+  sub-project 0b's witness gate, since the HTTP port binds before the kernel thread finishes
+  `Repl::open`). **T12 cannot have caused it, and that is provable rather than argued:** the
+  commit's entire diff is `.github/workflows/ci.yml`, the patch fixture, a doc comment in
+  `edge-harness/src/lib.rs`, a new test in `tests/acked_durable.rs`, and this file —
+  `git diff 52a655d -- crates/charpente crates/charpente-core crates/charpente-sim
+  crates/charpente-cli crates/charpente-macros examples` is EMPTY, so the `node` binary and
+  `tests/failover.rs` are byte-identical to base. The box was visibly the recorded adverse
+  environment (`mds_stores` 163%, `syspolicyd` 77%, an unrelated `retrace` build at ~100%,
+  load average 9.82 off a 15-minute 27.84), and no orphaned node processes were present. So
+  **4/8 is an upper bound on a loaded box, not the settled-box rate** — but it is the rate
+  actually observed, and 2026-08-15's "31/31 green all three times" at a different commit
+  does not license quoting a better one today.
+  **The consequence this commit creates and does not resolve: the new `ci.yml` step turns
+  that race into a required gate.** A gate that flaps teaches people to ignore every red it
+  prints, which is the opposite of why the step was added — so the step's own comment carries
+  the measurement, the 503 signature, and the instruction to fix the race rather than widen a
+  timeout or retry the job. **The fix is named and OWED, not done here** (it is production
+  and rig code, outside this task's scope): make `ChildNode::restart`'s readiness check wait
+  for WRITE-readiness instead of a bare TCP bind, which is the same gap 2026-08-15 left open
+  under "nothing reaps orphaned children" and "the harness cannot distinguish 'child never
+  reached `main`' from 'child failed to bind'." Whether the CI step should land before that
+  fix is Noah's call; nothing here has been pushed.
   **README.md carried two sentences its own source disproved, and they are FIXED, not
   flagged.** It said charpente "commits one durable record per transaction with no group
   commit" and called closing the fsync gap "a named future sub-project (group commit), not a

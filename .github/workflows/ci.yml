@@ -45,3 +45,44 @@ jobs:
       # exactly the condition the block above describes: a defanged pin leaving CI silent while a
       # human remembering a command is the only thing standing in the way.
       - run: CHARPENTE_SEED=0xe653f43924f17fe8 cargo test -p charpente --test kernel -- kernel_jobs_are_exactly_once_under_the_fault_matrix --exact
+      # The edge rig — added 2026-08-19 (group-commit T12), with Noah's sign-off. NOT a
+      # duplicate of `cargo test --workspace` above: every process-, socket- or
+      # filesystem-touching test in `edge-harness` is `#[ignore]`d, so the default pass cannot see
+      # any of them, and this script (`cargo test -p edge-harness -- --ignored --test-threads=1`)
+      # is the only thing that runs them. What it catches that no step above can: whether the
+      # acked-implies-durable oracle still has TEETH.
+      # `acked_implies_durable_meta_test_has_teeth` builds a deliberately wrong node from
+      # crates/edge-harness/patches/wrong-ack-before-commit.patch — one that acks before the
+      # group's fsync — in a throwaway `git worktree`, and requires the oracle to report every
+      # acked id missing. Until this line existed that proof ran only when a human remembered the
+      # script: `d301a52` replaced the request-arm lines the patch edits, the patch stopped
+      # applying on 2026-08-12, and four consecutive tasks changed production code before anyone
+      # noticed — the oracle stayed green the whole time with nothing standing behind it. That is
+      # the same failure mode the kernel-pin block above describes, one layer out.
+      # `the_wrong_build_patch_still_applies_to_the_kernel_it_targets` (un-ignored, microseconds)
+      # now reds the sweep above when the patch stops matching, but it is a text check: only this
+      # step proves a build made from the patch actually loses acked writes.
+      # Cost, on the record: materially slower than every step above. It builds RELEASE binaries
+      # and drives real processes over loopback, and the throwaway worktree's release build gets
+      # no help from rust-cache (separate target dir, cold every run). Measured locally on a WARM
+      # target dir over three runs: ~76-78 s CPU each, 45-87 s wall (wall tracks box load, CPU
+      # does not); CI pays the cold worktree build on top. Portable — bash, loopback TCP, no
+      # macOS-only calls — so it belongs on this ubuntu-latest job rather than a runner of its
+      # own, which would re-pay the checkout and the whole build for no added coverage.
+      # KNOWN RISK, MEASURED, AND UNRESOLVED — read before trusting a red here.
+      # failover_wire_oracle and failover_non_converged_tail_is_exercised_and_bounded are
+      # load-sensitive: a login() POST can fire within ~3 ms of a mid-run primary restart and
+      # race sub-project 0b's witness gate, because the HTTP port binds before the kernel thread
+      # finishes Repl::open, and the node then answers 503 "has not confirmed that its follower
+      # ... was never promoted". LEDGER 2026-08-15 records the same two names failing the same
+      # way. T12 measured it at HEAD: **8 runs of this script, 4 green and 4 red**, every red
+      # exclusively that pair with that 503 and nothing else in the matrix ever red. The box
+      # carried heavy foreign load (mds_stores 163%, syspolicyd 77%, an unrelated build at
+      # ~100%), so 4/8 is an upper bound and not the settled-box rate — but it is not a rate a
+      # required gate can carry.
+      # So: a red on those two names with that 503 is this race, not a durability regression.
+      # A gate that flaps teaches people to ignore every red it prints, which is the opposite of
+      # why this step was added. The fix is the race — make ChildNode::restart's readiness check
+      # wait for WRITE-readiness rather than a bare TCP bind — not a wider timeout and not a job
+      # retry. Until that lands, treat this step as informational if it flaps.
+      - run: ./scripts/edge-harness.sh

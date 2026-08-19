@@ -1104,3 +1104,75 @@ fn require_full_ack_names_a_vacuous_run() {
          refusing to run a durability check over a partial or empty set"
     );
 }
+
+// ------------------------------------------------- fixture-integrity guard
+//
+// The one un-ignored test here that asks a question about the WRONG-BUILD
+// FIXTURE rather than about this file's own pure helpers. It belongs in the
+// un-ignored set by the crate's stated criterion — zero syscalls: both of
+// its inputs are embedded at COMPILE time.
+
+/// Fails the ORDINARY sweep when `patches/wrong-ack-before-commit.patch`
+/// stops applying to the kernel it targets.
+///
+/// It exists because of how that fixture last broke (T12, 2026-08-19).
+/// `d301a52` replaced the exact request-arm lines the patch edited, the
+/// patch stopped applying, and nothing said so for a week: the only test
+/// that applies it (`acked_implies_durable_meta_test_has_teeth`) is
+/// `#[ignore]`d like every process-touching test here, so `cargo test
+/// --workspace` could not see it and four consecutive tasks changed
+/// production code without running `scripts/edge-harness.sh`. The wire
+/// oracle stayed green the whole time — what was lost was the proof that it
+/// has TEETH, which in this repo is the more serious half.
+///
+/// `include_str!` also makes an edit to `kernel/mod.rs` rebuild and re-run
+/// this test, so the tripwire fires in the same sweep as the edit that
+/// tripped it. It reconstructs the hunk's pre-image (context and removed
+/// lines, markers stripped) and requires it verbatim in the kernel source —
+/// STRICTER than `git apply`, which additionally tolerates a line-number
+/// offset. So a hit here means `git apply` succeeds; this test cannot go
+/// green on a patch the meta-test would then fail to apply. The converse is
+/// deliberately not claimed: this is a seconds-fast tripwire, never a
+/// replacement for the meta test, which is the only thing that proves a
+/// build made from this patch actually loses acked writes.
+#[test]
+fn the_wrong_build_patch_still_applies_to_the_kernel_it_targets() {
+    const PATCH: &str = include_str!("../patches/wrong-ack-before-commit.patch");
+    const KERNEL: &str = include_str!("../../charpente/src/kernel/mod.rs");
+
+    let mut hunks = 0usize;
+    let mut pre_image = String::new();
+    for line in PATCH.lines() {
+        if line.starts_with("@@") {
+            hunks += 1;
+            continue;
+        }
+        // `\` is git's "\ No newline at end of file" marker, not content.
+        if hunks == 0 || line.starts_with('+') || line.starts_with('\\') {
+            continue;
+        }
+        // Context (' ') and removed ('-') lines with the marker stripped. A
+        // blank line arrives as a bare marker, so `get(1..)` is empty and
+        // contributes just the newline.
+        pre_image.push_str(line.get(1..).unwrap_or(""));
+        pre_image.push('\n');
+    }
+    assert_eq!(
+        hunks, 1,
+        "this guard reconstructs ONE hunk's pre-image, but the patch now has {hunks} hunks — \
+         splicing them together would compare a region that exists in no file. Teach it to \
+         check each hunk separately before trusting it again"
+    );
+    let pre_image = pre_image.trim_end_matches('\n');
+    assert!(
+        KERNEL.contains(pre_image),
+        "crates/edge-harness/patches/wrong-ack-before-commit.patch no longer matches \
+         crates/charpente/src/kernel/mod.rs, so `git apply` will fail and \
+         acked_implies_durable_meta_test_has_teeth can no longer build the deliberately \
+         wrong node it needs — acked_implies_durable_wire_oracle would keep passing with \
+         nothing proving it has teeth. Fix: regenerate the fixture (`git worktree add` a \
+         throwaway checkout at HEAD, hand-apply the ack-before-`Group::commit` injection, \
+         `git diff` into the patch file), then re-run `scripts/edge-harness.sh`. The text \
+         the patch expects to find:\n{pre_image}"
+    );
+}
