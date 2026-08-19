@@ -751,6 +751,8 @@ mod tests {
             device_ratio_denominator: "device.syncs_per_sec",
             device_appends_per_sec_before: 1.0,
             device_appends_per_sec_after: 1.0,
+            phases: None,
+            window_nanos: 0,
         });
         assert!(
             r.invalid.is_empty(),

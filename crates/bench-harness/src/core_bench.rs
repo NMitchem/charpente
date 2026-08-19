@@ -7,12 +7,19 @@
 use crate::core_accounting::{self, CoreObservations, WriteObs};
 use crate::device::device_bracket_sample;
 use crate::measure::Heartbeat;
+use crate::phase_accounting::attribute;
 use crate::report::CoreReport;
+use crate::tracing_disk::{Trace, TracingDisk};
 use crate::{Bump, SLOTS, Slot, SlotBumped, schema};
 use charpente::prod::ProdDisk;
 use charpente::{Db, DbConfig, Id, TxError, View};
 use std::io;
 use std::time::{Duration, Instant};
+
+/// Preallocates the trace's event vec (Task 1: `size_of::<Event>()` is 24
+/// bytes, so this is ~25 MB). Sized generously: a reallocation inside the
+/// traced window would land in the measurement it is trying to take.
+const TRACE_CAPACITY: usize = 1 << 20;
 
 fn canonical(db: &mut Db, i: u64) -> io::Result<u64> {
     db.transact(|tx| -> Result<u64, io::Error> {
@@ -51,7 +58,15 @@ pub fn run(
     warmup: Duration,
     duration: Duration,
 ) -> io::Result<(CoreReport, Vec<String>)> {
-    let mut db = Db::open(Box::new(ProdDisk::new(dir)?), DbConfig::default(), schema())?;
+    let trace = Trace::recording(TRACE_CAPACITY);
+    let mut db = Db::open(
+        Box::new(TracingDisk::new(
+            Box::new(ProdDisk::new(dir)?),
+            trace.clone(),
+        )),
+        DbConfig::default(),
+        schema(),
+    )?;
     let mut invalid = Vec::new();
     let mut i = 0u64;
     // The observations seam (interlude spec §1). Every count, duration and
@@ -84,6 +99,13 @@ pub fn run(
     let hb = Heartbeat::start();
     obs.write.device_before = device_bracket_sample(dir)?;
 
+    // Task 3 (2026-08-19 phase-attribution plan): stamped from the trace's
+    // OWN clock (`Trace::now_nanos`), not a second `Instant`, so
+    // `phase_accounting::attribute` can compare these against every
+    // recorded `Event`'s timestamps directly. Taken at the true edge of the
+    // measured section — no traced op is in flight at this instant on a
+    // single-threaded arm.
+    let window_start_nanos = trace.now_nanos();
     let start = Instant::now();
     let end = start + duration;
     let measured_from = i;
@@ -97,6 +119,37 @@ pub fn run(
         i += 1;
         grand += 1;
     }
+    let elapsed = start.elapsed();
+    let window_end_nanos = trace.now_nanos();
+
+    let events = trace.events();
+    let phases = match attribute(&events, window_start_nanos, window_end_nanos) {
+        Ok(attribution) => {
+            // The payoff of fix round 3's R-1: a window stamped from the
+            // wrong place no longer fails loudly, it dilutes quietly. Events
+            // before the window are warmup and `Db::open` — expected. Events
+            // AFTER it are not, on an arm whose window closes at the end of
+            // its run, so they mean the window and the trace disagree about
+            // what was measured.
+            if attribution.events_ignored_after_window > 0 {
+                invalid.push(format!(
+                    "contract: {} traced op(s) fall after the measured window closed. On this \
+                     arm the window closes at the end of the run, so this means \
+                     `window_end_nanos` was stamped before the last IO completed and the \
+                     published phase shares would be diluted by the ops left out. Fix: stamp \
+                     `window_end_nanos` with `Trace::now_nanos()` after the measured section \
+                     finishes, not before.",
+                    attribution.events_ignored_after_window
+                ));
+            }
+            Some(attribution.totals)
+        }
+        Err(refusals) => {
+            invalid.extend(refusals);
+            None
+        }
+    };
+
     // C-2 fix (2026-08-10 group-commit interlude, T1 fix wave): a FULL
     // struct literal for the fields settled at the end of the write window,
     // not `obs.write.field = ...` trailing mutations — the shape that let
@@ -110,7 +163,7 @@ pub fn run(
     obs.write = WriteObs {
         applied_before: obs.write.applied_before,
         device_before: obs.write.device_before,
-        elapsed: start.elapsed(),
+        elapsed,
         applied_after: db.last_applied(),
         device_after: device_bracket_sample(dir)?,
         heartbeat: hb.finish(),
@@ -209,6 +262,8 @@ pub fn run(
             device_ratio_denominator: "the device bracket max",
             device_appends_per_sec_before: obs.write.device_before,
             device_appends_per_sec_after: obs.write.device_after,
+            phases,
+            window_nanos: window_end_nanos - window_start_nanos,
         },
         invalid,
     ))

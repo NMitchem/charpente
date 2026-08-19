@@ -23,7 +23,9 @@
 use crate::device::device_bracket_sample;
 use crate::kernel_accounting::{self, KernelObs};
 use crate::measure::Heartbeat;
+use crate::phase_accounting::attribute;
 use crate::report::KernelReport;
+use crate::tracing_disk::{Trace, TracingDisk};
 use crate::{SLOTS, build};
 use charpente::core::io::{Disk, File};
 use charpente::http::{Method, Request};
@@ -33,6 +35,11 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// Preallocates the trace's event vec (Task 1: `size_of::<Event>()` is 24
+/// bytes, so this is ~25 MB). Sized generously: a reallocation inside the
+/// traced window would land in the measurement it is trying to take.
+const TRACE_CAPACITY: usize = 1 << 20;
 
 /// Wraps `ProdDisk` to COUNT durable syncs rather than derive them (group-
 /// commit T7, C-7): `KernelObs::syncs` used to be `requests_planned +
@@ -44,7 +51,14 @@ use std::time::{Duration, Instant};
 /// rather than deriving a number `run()` no longer has any way to know is
 /// still true.
 struct CountingDisk {
-    inner: ProdDisk,
+    // Task 3 (2026-08-19 phase-attribution plan): was `ProdDisk`. Now boxed
+    // so a `TracingDisk` can sit BETWEEN this wrapper and `ProdDisk` — see
+    // this module's `run` for the nesting order and why it is load-bearing
+    // (the tracer must time real IO, excluding this wrapper's own atomic
+    // increment from the measurement). Nothing else about `CountingDisk`
+    // changes: it stays unscoped, and its published `device_ratio` does not
+    // move.
+    inner: Box<dyn Disk>,
     syncs: Arc<AtomicU64>,
 }
 
@@ -114,8 +128,16 @@ impl File for CountingFile {
 /// takes no bracket samples of its own to show the spread".
 pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> {
     let sync_count = Arc::new(AtomicU64::new(0));
+    // Task 3: TracingDisk INSIDE CountingDisk, ProdDisk innermost — the
+    // tracer times the real IO, not CountingFile's own atomic increment.
+    // Reversed, every recorded duration would include the counter's
+    // overhead. ONE `Trace` per arm, not a shared static.
+    let trace = Trace::recording(TRACE_CAPACITY);
     let disk = CountingDisk {
-        inner: ProdDisk::new(dir)?,
+        inner: Box::new(TracingDisk::new(
+            Box::new(ProdDisk::new(dir)?),
+            trace.clone(),
+        )),
         syncs: sync_count.clone(),
     };
     let app = build(Box::new(disk), Box::new(ProdEntropy::new()?))?;
@@ -181,9 +203,15 @@ pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> 
     // batch durably paid — only this comment's claim that no such
     // checkpoint exists was wrong.
     let syncs_before = sync_count.load(Ordering::SeqCst);
+    // Task 3 (2026-08-19 phase-attribution plan): stamped from the trace's
+    // OWN clock (`Trace::now_nanos`), the same origin every recorded `Event`
+    // uses, so `phase_accounting::attribute` can compare these against event
+    // timestamps directly.
+    let window_start_nanos = trace.now_nanos();
     let start = Instant::now();
     let run_outcome = kernel.run(&mut source);
     obs.elapsed = start.elapsed();
+    let window_end_nanos = trace.now_nanos();
     let syncs_after = sync_count.load(Ordering::SeqCst);
     stop_progress.store(true, Ordering::Relaxed);
     // Taken here, inside the heartbeat's span, but NOT unwrapped until after
@@ -201,6 +229,35 @@ pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> 
     run_outcome?;
     obs.device_after = after?;
     let _ = progress.join();
+
+    // Task 3: attribute the batch window against the trace. A refusal goes
+    // to `invalid` (below) rather than discarding a run whose throughput
+    // figures are still good.
+    let mut invalid = Vec::new();
+    let events = trace.events();
+    let phases = match attribute(&events, window_start_nanos, window_end_nanos) {
+        Ok(attribution) => {
+            // See core_bench.rs's identical comment: events after the window
+            // mean `window_end_nanos` was stamped before the last IO
+            // completed, on an arm whose window closes at the end of its run.
+            if attribution.events_ignored_after_window > 0 {
+                invalid.push(format!(
+                    "contract: {} traced op(s) fall after the measured window closed. On this \
+                     arm the window closes at the end of the run, so this means \
+                     `window_end_nanos` was stamped before the last IO completed and the \
+                     published phase shares would be diluted by the ops left out. Fix: stamp \
+                     `window_end_nanos` with `Trace::now_nanos()` after the measured section \
+                     finishes, not before.",
+                    attribution.events_ignored_after_window
+                ));
+            }
+            Some(attribution.totals)
+        }
+        Err(refusals) => {
+            invalid.extend(refusals);
+            None
+        }
+    };
 
     {
         let responses = responses.lock().expect("responses lock");
@@ -259,6 +316,10 @@ pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> 
     };
 
     let a = kernel_accounting::kernel_accounting(&obs).map_err(io::Error::other)?;
+    // Task 3: the phase-attribution refusals collected above join the
+    // accounting layer's own non-fatal reasons, in that order — neither list
+    // discards the other.
+    invalid.extend(a.invalid);
     Ok((
         KernelReport {
             acked_writes_per_sec: a.acked_writes_per_sec,
@@ -270,8 +331,10 @@ pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> 
             device_appends_per_sec_after: obs.device_after,
             requests_total: obs.requests_planned,
             jobs_done: obs.stats_jobs_done,
+            phases,
+            window_nanos: window_end_nanos - window_start_nanos,
         },
-        a.invalid,
+        invalid,
     ))
 }
 

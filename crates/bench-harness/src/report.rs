@@ -56,6 +56,21 @@ pub struct CoreReport {
     // from cross-window noise.
     pub device_appends_per_sec_before: f64,
     pub device_appends_per_sec_after: f64,
+    // Task 3 (2026-08-19 phase-attribution plan): the measured write
+    // window's phase partition — see `tracing_disk`/`phase_accounting`.
+    // `None` means the attribution was refused (the refusal strings are
+    // among this run's `invalid` reasons), never a zeroed `PhaseTotals` —
+    // that would be indistinguishable from a genuinely fast run. Not yet
+    // rendered by `render_json`/`render_human` (a later task in the plan);
+    // this field only carries the value through to a caller that wants it.
+    pub phases: Option<crate::phase_accounting::PhaseTotals>,
+    // The measured write window's own length in nanoseconds
+    // (`window_end_nanos - window_start_nanos`), the SAME window `phases`
+    // was attributed against — not `write.elapsed`. The two are stamped
+    // from different clock reads a handful of nanoseconds apart, so a
+    // caller checking `phases.total() == window_nanos` against the wrong
+    // one would see a flaky mismatch nobody could reproduce.
+    pub window_nanos: u64,
 }
 #[derive(Debug, Clone)]
 pub struct KernelReport {
@@ -95,6 +110,16 @@ pub struct KernelReport {
     pub device_appends_per_sec_after: f64,
     pub requests_total: u64,
     pub jobs_done: u64,
+    // Task 3 (2026-08-19 phase-attribution plan): the measured batch
+    // window's phase partition — mirrors `CoreReport::phases`. `None` means
+    // the attribution was refused; the refusal strings are among this run's
+    // `invalid` reasons.
+    pub phases: Option<crate::phase_accounting::PhaseTotals>,
+    // The measured batch window's own length in nanoseconds — mirrors
+    // `CoreReport::window_nanos`. This layer already publishes
+    // `window_secs`; this is the nanosecond-precision figure `phases` was
+    // attributed against.
+    pub window_nanos: u64,
 }
 #[derive(Debug, Clone)]
 pub struct WireReport {
@@ -615,6 +640,8 @@ mod tests {
                 device_ratio_denominator: "the device bracket max",
                 device_appends_per_sec_before: 1490.0,
                 device_appends_per_sec_after: 1510.0,
+                phases: None,
+                window_nanos: 0,
             }),
             kernel: Some(KernelReport {
                 acked_writes_per_sec: 1300.0,
@@ -626,6 +653,8 @@ mod tests {
                 device_appends_per_sec_after: 3020.0,
                 requests_total: 50000,
                 jobs_done: 50000,
+                phases: None,
+                window_nanos: 0,
             }),
             wire: vec![WireReport {
                 target: "bench-app".to_string(),
