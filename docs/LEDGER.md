@@ -1239,11 +1239,14 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   mechanism (a `login()` POST fires within ~3 ms of a mid-run primary restart and races
   sub-project 0b's witness gate, since the HTTP port binds before the kernel thread finishes
   `Repl::open`). **T12 cannot have caused it, and that is provable rather than argued:** its
-  entire diff is the patch fixture, a doc comment in `edge-harness/src/lib.rs`, a new test in
-  `tests/acked_durable.rs`, and this file —
-  `git diff 52a655d -- crates/charpente crates/charpente-core crates/charpente-sim
-  crates/charpente-cli crates/charpente-macros examples` is EMPTY, so the `node` binary and
-  `tests/failover.rs` are byte-identical to base. The box was visibly the recorded adverse
+  entire diff is four files — the patch fixture, a doc comment in
+  `edge-harness/src/lib.rs`, a new test in `edge-harness/tests/acked_durable.rs`, and this
+  file. **`tests/failover.rs` is untouched because that exhaustive four-file list does not
+  contain it**, which is the proof that matters here; `edge-harness/` is where it lives, so
+  the narrower `git diff 52a655d -- crates/charpente crates/charpente-core crates/charpente-sim
+  crates/charpente-cli crates/charpente-macros examples` — also EMPTY — could never have
+  spoken to it. What that narrower diff does prove, and the reason it is quoted, is the OTHER
+  half: nothing compiled into the `node` binary the harness drives changed either. The box was visibly the recorded adverse
   environment (`mds_stores` 163%, `syspolicyd` 77%, an unrelated `retrace` build at ~100%,
   load average 9.82 off a 15-minute 27.84), and no orphaned node processes were present. So
   **4/8 is an upper bound on a loaded box, not the settled-box rate** — but it is the rate
@@ -1251,12 +1254,21 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   does not license quoting a better one today.
   **OPEN — the failover witness-gate race, and it is the thing that blocks the edge rig from
   CI.** Specified rather than left as "flaky, someone look at it".
-  **Mechanism:** `ChildNode::restart`'s readiness check waits on a bare TCP bind, but the
-  HTTP port binds BEFORE the kernel thread finishes `Repl::open`. That leaves a ~3 ms window
-  in which the harness believes the node is up and fires its `login()` POST, which races
-  sub-project 0b's witness gate and is answered `503 "this node is not accepting writes yet:
-  it was a primary before restarting and has not confirmed that its follower … was never
-  promoted"`. **Affected:** `failover_wire_oracle` and
+  **Mechanism** — stated from the code, because an earlier draft of this paragraph got it
+  wrong in a way that would have sent the fixer to the wrong place. It is NOT "the port binds
+  a few milliseconds before `Repl::open` finishes." `Repl::open` SHUTS the gate itself:
+  `db.verify_writes(witnesses)` at `repl/mod.rs:287` is part of restarting as a former
+  primary. The gate is opened only by `resolve_witness_gate` (`repl/mod.rs:651`), called from
+  `Repl::step` (`repl/mod.rs:541`) inside the kernel loop **as witness probes answer over the
+  network**. So a `login()` POST that arrives well AFTER `Repl::open` has returned still draws
+  the 503. The window is a **witness round-trip, bounded by `WITNESS_DEADLINE_NANOS` (30 s)**,
+  not a sub-millisecond bind race — which is exactly what makes it load-sensitive. The
+  harness loses because `ChildNode::restart` treats a TCP bind as readiness, and the gate's
+  resolution is asynchronous to that bind. `503 "this node is not accepting writes yet: it
+  was a primary before restarting and has not confirmed that its follower … was never
+  promoted"`. This restores the framing `:932` and `:939-940` already carried — waiting "on
+  the gate rather than the TCP port", against "the witness gate's async resolution window" —
+  which a rewrite dropped. **Affected:** `failover_wire_oracle` and
   `failover_non_converged_tail_is_exercised_and_bounded` — the same two names 2026-08-15
   already recorded failing the same way, so this is a second sighting of a known defect, not
   a new one. **The fix is WRITE-readiness**: `restart` must wait until the node will accept a

@@ -346,9 +346,18 @@ amortization and nothing else: N transactions, one fsync (docs/BENCH.md).
 
 **Ack-after-durable survives structurally rather than by discipline.** `stage` never
 appends, every reply is held until `commit` returns, and apply stays strictly after sync —
-so a crash between append and sync loses the **whole** batch and never part of it, and no
-participant is ever acked for a record that is not durable. The reverse error, a 200 for
-something not durable, remains impossible.
+so no participant is ever acked for a record that is not durable, and the reverse error, a
+200 for something not durable, remains impossible.
+
+Note what is deliberately **not** claimed: the batch is not durability-atomic. A batch large
+enough to straddle a segment boundary takes an extra barrier inside `Wal::append`, which
+calls `rotate`, which opens with `tail.sync()` — the same "rotation syncs the old segment"
+rule §2's log format states above. A crash between that rotate and the batch's own sync
+therefore leaves a durable **prefix**, not nothing. This costs no guarantee, because nothing
+in the batch was acked: the replies were still held, so no client was ever told those records
+existed, and an unacked record that survives a crash is the ordinary "the write may be
+committed" case the client contract already covers (docs/GUIDE.md §5). Atomicity of the batch
+was never the promise; ack-after-durable is, and a prefix cannot violate it.
 
 **The two-level overlay.** A handler reads through its own transaction overlay, then the
 group overlay, then the store snapshot: read-your-own-writes across the whole batch, not
@@ -360,7 +369,20 @@ batch, because its writes were never merged. Row puts and deletes, secondary-ind
 and session rows are all in the overlay. Platform-allocated ids (`next_job_id`,
 `next_event_id`) deliberately are not: no API hands one to a handler, and the counters bump
 at apply in seq order, which is what keeps ids byte-identical on a follower that has no
-overlay at all. Scope that panic claim to the batch's *state*: the group is safe, but there
+overlay at all.
+
+**The overlay carries rows only, and that is the one user-visible semantic group commit
+changed.** Enqueues, emits and migrate-puts are not in it, so a transaction batched *behind*
+a sibling's `enqueue` or `emit` does not see it — where before batching it would have, since
+each transaction applied before the next took its snapshot. `JobRow` and `EventRow`
+materialize at APPLY from the log record's enqueue/emit sections, never from anything
+`Group::stage` merges. Read-your-own-writes across a batch therefore means rows, not queue
+and event effects. Pinned by
+`enqueues_and_emits_are_invisible_to_a_later_sibling_in_the_same_batch`
+(`crates/charpente/tests/group_commit.rs`, seed `0x60C1_0007`), which also asserts all four
+requests land in one batch — the property exists only across a batch.
+
+Scope that panic claim to the batch's *state*: the group is safe, but there
 is no `catch_unwind` on the request path, so a panicking **route** handler still unwinds out
 of the kernel and stops the node — and batching widened the blast radius from one request to
 every reply held in that batch, which `serve` then answers with a generic 500. The job arm

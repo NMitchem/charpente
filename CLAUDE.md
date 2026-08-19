@@ -52,7 +52,9 @@ roadmap; do not reorder a milestone's dependency sequence.
   crate's `tests/` (charpente: http/kernel/replication/transactions/typed_tables,
   plus auth/describe/group_commit/realtime; charpente-sim:
   crash_recovery/determinism/net_partition/wal; charpente-core:
-  engine/group_commit/materialize).
+  describe_tables/engine/group_commit/materialize/migrate_apply/migration_gate/
+  migrations/store_latch). All three lists are exhaustive as written — if a name
+  is missing, the list is stale, not selective.
 - Replay one universe: `CHARPENTE_SEED=0x… cargo test -p <crate> --test <file> --
   --nocapture`. Every sim failure prints this exact repro line — paste it verbatim.
   Coverage `require:` keys are skipped under `CHARPENTE_SEED`.

@@ -1005,8 +1005,12 @@ or may not have committed; retry after the server recovers: {e}"`.
 **Since group commit, one request's failure can be another request's 500 —
 and a 500 can name a write that committed.** The kernel commits everything
 it drained in one loop iteration under a single fsync, up to 64 requests.
-Appends and syncs still fail the whole batch and ack nothing, exactly as
-before. The case with no analogue in a one-at-a-time kernel is a failure to
+An append or sync failure still commits no record in the batch — but "acks
+nothing" would overstate it, and the fourth bullet below is the reason: a
+request that ran ahead of every staged record observed only committed state,
+so it is not invalidated and keeps its 200. What such a failure invalidates is
+every request from the first staged record onward. The case with no analogue in
+a one-at-a-time kernel is a failure to
 *apply* a record after the batch has already synced: at that point every
 record in the batch is on disk, and the platform answers 500 to the request
 whose record failed, to every request behind it, and to every request that
