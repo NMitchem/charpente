@@ -410,3 +410,39 @@ fn submit_all_advances_last_applied_to_the_last_record_of_the_batch() {
         "every record reached the machine"
     );
 }
+
+/// Fix round 1, Minor 2: `submit_all`'s error-path `last_applied` advancement
+/// is pinned by `submit_all_reports_how_many_applied_before_a_mid_batch_failure`
+/// above (deleting its `if applied > 0` guard goes red); `submit_batch`'s
+/// mirror-image guard had no such test, so deleting it left the whole
+/// workspace green. This is that missing mirror.
+#[test]
+fn submit_batch_advances_last_applied_to_the_last_frame_that_actually_applied() {
+    let sim = Sim::with_faults(0x60C6_0003, FaultConfig::none());
+    let mut engine = Engine::recover(
+        Box::new(sim.disk()),
+        wal_cfg(),
+        FailsAfter { remaining: 2 },
+        None,
+    )
+    .unwrap();
+
+    engine
+        .submit_batch(&[
+            (0, b"a".to_vec()),
+            (1, b"b".to_vec()),
+            (2, b"c".to_vec()),
+            (3, b"d".to_vec()),
+        ])
+        .expect_err("the third frame's apply must fail");
+    assert!(
+        engine.poisoned(),
+        "an apply failure poisons the engine, same as submit_all"
+    );
+    assert_eq!(
+        engine.last_applied(),
+        Some(1),
+        "last_applied stops at the last frame that actually applied (seq 1, the \
+         second of four frames at seqs 0..3)"
+    );
+}

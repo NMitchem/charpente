@@ -18,9 +18,9 @@ pub trait StateMachine {
 
     /// Applies a contiguous run of records. On failure, `SubmitFailure::applied`
     /// reports how many of them are durably reflected in machine state; an
-    /// implementation may apply all or none, so a caller must not assume either
-    /// — `TableMachine` is atomic and reports 0, this default is per-record and
-    /// reports the boundary.
+    /// implementation may apply all-or-none (reporting 0) or apply per-record up
+    /// to the failing one (reporting that boundary) — a caller must not assume
+    /// either behavior, only that whatever `applied` says really did land.
     fn apply_batch(&mut self, records: &[(u64, &[u8])]) -> Result<(), SubmitFailure> {
         for (i, (seq, payload)) in records.iter().enumerate() {
             if let Err(error) = self.apply(*seq, payload) {
@@ -252,6 +252,12 @@ impl<S: StateMachine> Engine<S> {
             Err(SubmitFailure { applied, error }) => {
                 self.poisoned = true;
                 if applied > 0 {
+                    assert!(
+                        applied <= batch.len(),
+                        "a StateMachine reported {applied} of {} records applied — apply_batch \
+                         must report a count within the batch it was given",
+                        batch.len()
+                    );
                     self.last_applied = Some(batch[applied - 1].0);
                 }
                 Err(SubmitFailure { applied, error })
@@ -306,6 +312,12 @@ impl<S: StateMachine> Engine<S> {
             Err(SubmitFailure { applied, error }) => {
                 self.poisoned = true;
                 if applied > 0 {
+                    assert!(
+                        applied <= batch.len(),
+                        "a StateMachine reported {applied} of {} records applied — apply_batch \
+                         must report a count within the batch it was given",
+                        batch.len()
+                    );
                     self.last_applied = Some(batch[applied - 1].0);
                 }
                 Err(error)
