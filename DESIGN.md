@@ -977,8 +977,9 @@ slot.
   behind retention mid-stream gets the same fact set as a terminal SSE frame —
   `event: charpente.gap` — then its sink closes. Sink overflow itself sends nothing (there
   is no one left to tell); the client that reconnects with `Last-Event-ID` resumes exactly,
-  which is the point. Follower tails read the same materialized table replication keeps
-  byte-identical (§5), so a subscribe on a follower works with zero app-code changes; a
+  which is the point. Follower tails read the same materialized table whose ROWS
+  replication keeps byte-identical (§5 — the file they live in is not, property 1), so a
+  subscribe on a follower works with zero app-code changes; a
   failover honors the DECISIONS §6 bounded-loss window for events exactly as it does for
   state, and a cursor that crossed timelines gets the divergence refusal, never wrong
   events.

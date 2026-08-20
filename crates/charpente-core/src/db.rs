@@ -760,6 +760,13 @@ impl StateMachine for TableMachine {
         let mut new_ids = Vec::new();
 
         let result = self.store.apply_batch(live, |w, seq, payload| {
+            // Decoding moved INSIDE the transaction when batching landed — it
+            // used to run before the store was touched at all. That is
+            // load-bearing, not incidental: a malformed payload now fails with
+            // earlier records already written into this same transaction, so it
+            // rolls all of them back instead of leaving a committed prefix.
+            // Moving it back out would restore per-record commit semantics for
+            // exactly the failure this batch is supposed to be atomic across.
             let effects = decode_record(payload)?;
             // Pass 1: schema-table effects first, so a record that both
             // adopts a table and writes its first rows has declared the

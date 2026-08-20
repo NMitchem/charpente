@@ -1522,6 +1522,7 @@ pub fn run_universes_swarm_in(
         ambient_base_seed(),
         universes,
         require,
+        &[],
         |_cfg: &mut FaultConfig| {},
         f,
     );
@@ -1535,7 +1536,10 @@ pub fn run_universes_swarm_in(
 /// permanent, always-in-the-suite properties that must not flake batch to
 /// batch. A NEW macro: `run_universe`'s frozen replay contract is untouched
 /// (`run_universe_with_adjust`, below, is a separate function). Call as
-/// `run_universes_swarm_with!(base, N, adjust, f)` or with `require: [...]`.
+/// `run_universes_swarm_with!(base, N, adjust, f)`, with `require: [...]`, or
+/// with `require: [...], floor: [("key", N), ...]` — a floor is `require:`'s
+/// at-least-once generalized to an at-least-N measured rate, for a property
+/// whose oracle can decay toward vacuous without ever reaching zero.
 #[macro_export]
 macro_rules! run_universes_swarm_with {
     ($base:expr, $universes:expr, $adjust:expr, $f:expr) => {
@@ -1544,6 +1548,7 @@ macro_rules! run_universes_swarm_with {
             file!(),
             $base,
             $universes,
+            &[],
             &[],
             $adjust,
             $f,
@@ -1556,6 +1561,21 @@ macro_rules! run_universes_swarm_with {
             $base,
             $universes,
             &[$($key),*],
+            &[],
+            $adjust,
+            $f,
+        )
+    };
+    ($base:expr, $universes:expr, $adjust:expr, $f:expr,
+     require: [$($key:expr),* $(,)?],
+     floor: [$(($fkey:expr, $min:expr)),* $(,)?]) => {
+        $crate::run_universes_swarm_with_in(
+            env!("CARGO_PKG_NAME"),
+            file!(),
+            $base,
+            $universes,
+            &[$($key),*],
+            &[$(($fkey, $min)),*],
             $adjust,
             $f,
         )
@@ -1570,6 +1590,7 @@ pub fn run_universes_swarm_with_in(
     base: u64,
     universes: u64,
     require: &[&str],
+    floors: &[(&str, u64)],
     adjust: impl Fn(&mut FaultConfig),
     f: impl Fn(&mut Sim) -> Result<(), String>,
 ) {
@@ -1614,6 +1635,24 @@ pub fn run_universes_swarm_with_in(
         "sim coverage requirement failed in {test_file}: {missing:?} never occurred over \
          {universes} universes — raise the universe count, adjust the workload, or drop the \
          requirement (a required state that never occurs is an untested claim)"
+    );
+    // `require:` has a floor of one, which catches an oracle that stopped firing
+    // entirely and misses one that decayed to a token handful. `floor:` is the
+    // same check with the measured rate as the threshold.
+    let below: Vec<String> = floors
+        .iter()
+        .filter_map(|(key, min)| {
+            let seen = coverage.get(*key).copied().unwrap_or(0);
+            (seen < *min).then(|| format!("{key}: {seen} of {min} required"))
+        })
+        .collect();
+    assert!(
+        below.is_empty(),
+        "sim coverage floor failed in {test_file}: {below:?} over {universes} universes. \
+         A floor is a MEASURED rate, not a target: it fell because the property reaches \
+         that state less often than when the number was taken, and why is the finding. \
+         Investigate before touching it — lowering a floor to match is how a real oracle \
+         becomes decorative with the suite still green."
     );
 }
 
@@ -2226,6 +2265,54 @@ mod tests {
         assert!(msg.contains("seed:"), "{msg}");
         assert!(msg.contains("config:"), "{msg}");
         assert!(msg.contains("CHARPENTE_SEED="), "{msg}");
+    }
+
+    #[test]
+    fn swarm_runner_floor_failure_names_the_shortfall() {
+        let universes_seen = std::sync::atomic::AtomicUsize::new(0);
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_universes_swarm_with_in(
+                "charpente-sim",
+                "swarm_meta.rs",
+                0x5100_0001,
+                4,
+                &[],
+                &[("rare:key", 3)],
+                |_cfg: &mut FaultConfig| {},
+                |sim: &mut Sim| {
+                    // Covered in the FIRST universe only: 1 seen against a
+                    // floor of 3 is the shortfall shape `require:` would wave
+                    // through, since the key did occur.
+                    if universes_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                        sim.cover("rare:key");
+                    }
+                    Ok(())
+                },
+            );
+        }))
+        .expect_err("a key below its floor must fail the batch");
+        let msg = panic_message(&*payload);
+        // The count is in the message because "it dropped" is useless without
+        // "to what": 1-of-3 and 2-of-3 are different investigations.
+        assert!(msg.contains("rare:key: 1 of 3 required"), "{msg}");
+        assert!(msg.contains("MEASURED rate"), "{msg}");
+    }
+
+    #[test]
+    fn a_floor_that_is_met_does_not_fail_the_batch() {
+        run_universes_swarm_with_in(
+            "charpente-sim",
+            "swarm_meta.rs",
+            0x5100_0002,
+            4,
+            &[],
+            &[("common:key", 4)],
+            |_cfg: &mut FaultConfig| {},
+            |sim: &mut Sim| {
+                sim.cover("common:key");
+                Ok(())
+            },
+        );
     }
 
     #[test]

@@ -2509,9 +2509,27 @@ first and a charpente event second.
 
 ## 10. Replication
 
-One primary accepts writes; followers replay its log and arrive at
-byte-identical state (DESIGN §5 — replication is log-position arithmetic, not a
-merge). It is asynchronous: a follower acks a record only after it has synced
+One primary accepts writes; followers replay its log and arrive at identical
+state (DESIGN §5 — replication is log-position arithmetic, not a merge). At
+equal log position a follower holds the same rows, the same job queue and the
+same event stream as the primary, and those *contents* match byte for byte.
+
+What it does not mean is a byte-identical store file, and this one bites
+operators. redb lays its pages out according to how records were grouped into
+write transactions, and grouping is a scheduling accident: a follower that
+falls a little behind and catches up in one wide batch commits in a single
+transaction what the primary committed in forty. Two perfectly healthy,
+fully caught-up nodes therefore hold `tables.redb` files that differ byte for
+byte — and so does one node against its own earlier self, since a restarted
+node replaying its log cannot reproduce the grouping its live traffic had.
+
+So **do not build a health check that compares store files, their sizes, or
+their checksums across nodes.** It will page you for corruption on a cluster
+that is exactly converged. Compare log position instead — that is the number
+replication is actually about, and it is what `promote` and `switchover` report
+(`last_applied`, below) — and if you want to compare content, compare rows.
+
+Replication is asynchronous: a follower acks a record only after it has synced
 it locally, and the primary's own ack to a client can be ahead of any
 follower, so a failover can lose the records the primary acked but had not yet
 shipped (the bounded-loss window, named in the `promote` reply). There is no

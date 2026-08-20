@@ -512,12 +512,24 @@ impl Store {
     /// Folds one committed write transaction into `schedule`. Called AFTER the
     /// commit returns `Ok`: a transaction that failed to commit left no bytes
     /// behind and must not move the digest.
+    ///
+    /// One atomic read-modify-write, not a load/store pair. `Store` is `Sync`
+    /// and public, so nothing in the type stops a caller sharing one behind an
+    /// `Arc`; a load/store pair would silently drop an entry there and produce
+    /// a digest that says "same grouping" about two nodes that grouped
+    /// differently — a false GREEN on the byte-fingerprint oracle, which is the
+    /// worst direction for this to fail. Correct by construction rather than by
+    /// auditing today's callers (hard rule 4).
     fn mix_schedule(&self, entry: u64) {
-        let mut hash = self.schedule.load(Ordering::Relaxed);
-        for byte in entry.to_le_bytes() {
-            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        self.schedule.store(hash, Ordering::Relaxed);
+        let _ = self
+            .schedule
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |hash| {
+                let mut hash = hash;
+                for byte in entry.to_le_bytes() {
+                    hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                Some(hash)
+            });
     }
 
     /// True once this store's handle is dead: some disk operation returned

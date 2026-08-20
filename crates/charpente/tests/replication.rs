@@ -854,9 +854,26 @@ fn follower_converges_to_the_primary_fingerprint() {
             "restart",
             "repl:logical-converged",
             "repl:fingerprint-compared"
-        ]
+        ],
+        floor: [("repl:fingerprint-compared", FINGERPRINT_FLOOR)]
     );
 }
+
+/// Universes in which the byte-fingerprint oracle actually compared files,
+/// MEASURED: 17 over these 256 universes at base `0x2EB1_0001`, reproduced on
+/// two unpinned runs (apply-batching T4, 2026-08-20). `require:` alone only
+/// catches the oracle going to zero; the rest of the range between 1 and 17 is
+/// where it would quietly become decorative — a handful of comparisons out of
+/// 256 is not a property, it is a rounding error that still turns the suite
+/// green.
+///
+/// **A drop below this is a finding, not a number to lower.** It means the two
+/// nodes' store write schedules diverge more often than they did — the workload
+/// stopped producing single-record commits, or shipping got lumpier, or
+/// something changed how records are grouped. Find out which before touching
+/// this line; adjusting the floor to match the new reality is exactly how the
+/// oracle would be retired without anyone deciding to retire it.
+const FINGERPRINT_FLOOR: u64 = 17;
 
 fn convergence_universe(sim: &mut Sim) -> Result<(), String> {
     let mut p = spawn_node(sim, "p", primary_cfg("p:1"), DbConfig::default())?;
