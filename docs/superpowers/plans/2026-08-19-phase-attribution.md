@@ -898,7 +898,16 @@ git commit -m "bench: the phase trace measures its own overhead and refuses a ph
 - Consumes: `PhaseTotals` (Task 2), the arms' `phases` field (Task 3), `overhead_gate` (Task 4).
 - Produces: JSON keys `phases` (object of nanosecond fields) and `phases_counted` (bool), plus a human-readable phase table.
 
-- [ ] **Step 1: Write the failing test** — assert the JSON carries `phases_counted: true` on a recording run and that `phases` is absent (not zeroed) on a passthrough run. **A zeroed phase block is indistinguishable from a fast one**; absence is the honest encoding, exactly as `SweepPoint::syncs_per_sec` became `Option<f64>` rather than `0.0`.
+**CARRIED FROM TASK 3 (Ruling 14).** `phases: None` now has THREE distinct causes — a
+`phase_accounting::attribute` refusal, a trace-buffer reallocation detected by
+`Trace::capacity_grew_reason`, and passthrough mode. While nothing is published that ambiguity is
+harmless; the moment this task reports provenance it becomes a defect, because a reader cannot
+tell "this run was refused" from "this arm was not recording". The published provenance must
+distinguish them. The refusal strings already land in `invalid` and are `"contract:"`-prefixed;
+that is the raw material, but a consumer should not have to parse prose to learn why a share is
+missing.
+
+- [ ] **Step 1: Write the failing test** — assert the JSON carries `phases_counted: true` on a recording run and that `phases` is absent (not zeroed) on a passthrough run, and that the three absence causes above are distinguishable in the output. **A zeroed phase block is indistinguishable from a fast one**; absence is the honest encoding, exactly as `SweepPoint::syncs_per_sec` became `Option<f64>` rather than `0.0`.
 
 - [ ] **Step 2: Run to verify it fails.**
 
