@@ -120,11 +120,35 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--dir" => args.dir = Some(val("--dir")?),
             "--trace-overhead" => args.trace_overhead = true,
             "--overhead-ns-per-op" => {
-                args.overhead_ns_per_op = Some(
-                    val("--overhead-ns-per-op")?
-                        .parse()
-                        .map_err(|e| format!("--overhead-ns-per-op: {e}"))?,
-                )
+                let ns_per_op: u64 = val("--overhead-ns-per-op")?
+                    .parse()
+                    .map_err(|e| format!("--overhead-ns-per-op: {e}"))?;
+                // Fix round 1 (review I-2): 0 parses fine as a u64 but is
+                // not a measurement — `run_trace_overhead`'s own "NOT
+                // RESOLVABLE" branch (below) refuses to report exactly this
+                // figure for exactly this reason, and an accepted 0 would
+                // gate every phase against a threshold no real instrument
+                // clears, producing an artifact byte-identical to a passing
+                // gate. Contract: 0 ns/op is never an honest figure. Site:
+                // --overhead-ns-per-op. Fix: re-run `bench kernel
+                // --trace-overhead` at n>=3 and pass the resolved range's
+                // high end; if the range straddles zero, pass that high end
+                // WITHOUT --overhead-resolvable so refusals are framed as
+                // noise, not an instrument finding.
+                if ns_per_op == 0 {
+                    return Err(
+                        "--overhead-ns-per-op 0 is not a measurement: real instrumentation \
+                         never costs literally nothing, and `bench kernel --trace-overhead` \
+                         refuses to report exactly that figure for exactly this reason (\"This \
+                         is the honest result, not 0 ns/op.\"). Site: --overhead-ns-per-op. \
+                         Fix: re-run `bench kernel --trace-overhead` at n>=3 and pass the \
+                         resolved range's high end; if the range straddles zero, pass that high \
+                         end WITHOUT --overhead-resolvable so refusals are framed as noise, not \
+                         an instrument finding."
+                            .to_string(),
+                    );
+                }
+                args.overhead_ns_per_op = Some(ns_per_op);
             }
             "--overhead-resolvable" => args.overhead_resolvable = true,
             other => return Err(format!("unknown flag {other:?}\n{USAGE}")),
@@ -822,6 +846,21 @@ fn run_layers(args: &Args, dir: &str, report: &mut Report) -> std::io::Result<bo
                 args.overhead_resolvable,
             ));
         }
+        // Fix round 1 (review I-1 / Ruling 21): a second, separate pass over
+        // the SAME condition (`phases.is_some()`) rather than folding this
+        // into the block above — that block borrows `report.core`
+        // immutably to build the refusal list while this one needs it
+        // mutably, and the borrow checker forces the split anyway. Publishes
+        // the provenance fact I-1 found missing: `phases_counted: true`
+        // alone cannot tell "no gate ran" from "a gate ran and passed",
+        // since a clean pass adds nothing to `invalid`.
+        if let Some(core) = report.core.as_mut()
+            && core.phases.is_some()
+        {
+            core.phases_overhead_gated = true;
+            core.phases_overhead_gate_ns_per_op = Some(ns_per_op);
+            core.phases_overhead_gate_resolvable = Some(args.overhead_resolvable);
+        }
         if let Some(kernel) = &report.kernel
             && let Some(phases) = &kernel.phases
         {
@@ -832,6 +871,13 @@ fn run_layers(args: &Args, dir: &str, report: &mut Report) -> std::io::Result<bo
                 kernel.events_recorded,
                 args.overhead_resolvable,
             ));
+        }
+        if let Some(kernel) = report.kernel.as_mut()
+            && kernel.phases.is_some()
+        {
+            kernel.phases_overhead_gated = true;
+            kernel.phases_overhead_gate_ns_per_op = Some(ns_per_op);
+            kernel.phases_overhead_gate_resolvable = Some(args.overhead_resolvable);
         }
     }
     // T4 review, M-7: `main` gates the exit code on this. By T9 every
@@ -933,6 +979,28 @@ mod tests {
                 "input {bad:?} got: {err}"
             );
         }
+    }
+
+    // Fix round 1 (review I-2): `0` parses fine as a `u64` — a SEPARATE
+    // failure mode from the malformed-input case above, since `.parse()`
+    // never rejects it. Names the contract (0 ns/op is not a measurement),
+    // the site (--overhead-ns-per-op), and the fix (re-run --trace-overhead)
+    // per hard rule 5.
+    #[test]
+    fn parse_rejects_a_zero_overhead_ns_per_op() {
+        let err = parse(&[s("kernel"), s("--overhead-ns-per-op"), s("0")]).unwrap_err();
+        assert!(
+            err.contains("--overhead-ns-per-op"),
+            "must name the site: got {err}"
+        );
+        assert!(
+            err.contains("not a measurement"),
+            "must name the contract: got {err}"
+        );
+        assert!(
+            err.contains("--trace-overhead"),
+            "must name the fix: got {err}"
+        );
     }
 
     #[test]
@@ -1096,6 +1164,9 @@ mod tests {
             phases_absent_reason: Some(
                 bench_harness::report::PhasesAbsentReason::AttributionRefused,
             ),
+            phases_overhead_gated: false,
+            phases_overhead_gate_ns_per_op: None,
+            phases_overhead_gate_resolvable: None,
             window_nanos: 0,
             events_recorded: 0,
         });

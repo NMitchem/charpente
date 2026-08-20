@@ -79,6 +79,28 @@ pub struct CoreReport {
     // of `invalid` — see `PhasesAbsentReason`'s doc. `Some` exactly when
     // `phases` is `None`; `None` needs no reason.
     pub phases_absent_reason: Option<PhasesAbsentReason>,
+    // Fix round 1 (review I-1 / Ruling 21): Task 5 published `phases` with
+    // no way for a reader to tell "no overhead gate ever ran against this
+    // block" apart from "the gate ran and passed" — the same silence the
+    // three-cause split above exists to close for `phases` itself. `false`
+    // is the default for every arm this crate constructs directly
+    // (`core_bench` knows nothing about CLI flags); only `bin/bench.rs`'s
+    // `run_layers`, which owns `--overhead-ns-per-op`, ever sets this
+    // `true` — see that field's doc for why.
+    pub phases_overhead_gated: bool,
+    // `Some` exactly when `phases_overhead_gated` is `true`: the
+    // operator-supplied `--overhead-ns-per-op` figure the gate actually ran
+    // against, so a reader does not have to trust a bare bool — the number
+    // gated on sits right beside it.
+    pub phases_overhead_gate_ns_per_op: Option<u64>,
+    // `Some` exactly when `phases_overhead_gated` is `true`: the
+    // `--overhead-resolvable` claim in force when the gate ran. Task 4's own
+    // language distinguishes a genuinely RESOLVED ns/op figure from an
+    // unresolved noise floor (`run_trace_overhead`'s "NOT RESOLVABLE"
+    // branch) — a pass or a refusal means something different depending on
+    // which one gated it, so that claim travels with the figure rather than
+    // living only in the operator's memory of which flags they passed.
+    pub phases_overhead_gate_resolvable: Option<bool>,
     // The measured write window's own length in nanoseconds
     // (`window_end_nanos - window_start_nanos`), the SAME window `phases`
     // was attributed against — not `write.elapsed`. The two are stamped
@@ -144,6 +166,13 @@ pub struct KernelReport {
     pub phases_counted: bool,
     // Task 5: mirrors `CoreReport::phases_absent_reason`.
     pub phases_absent_reason: Option<PhasesAbsentReason>,
+    // Fix round 1 (review I-1 / Ruling 21): mirrors
+    // `CoreReport::phases_overhead_gated` exactly.
+    pub phases_overhead_gated: bool,
+    // Fix round 1: mirrors `CoreReport::phases_overhead_gate_ns_per_op`.
+    pub phases_overhead_gate_ns_per_op: Option<u64>,
+    // Fix round 1: mirrors `CoreReport::phases_overhead_gate_resolvable`.
+    pub phases_overhead_gate_resolvable: Option<bool>,
     // The measured batch window's own length in nanoseconds — mirrors
     // `CoreReport::window_nanos`. This layer already publishes
     // `window_secs`; this is the nanosecond-precision figure `phases` was
@@ -484,6 +513,44 @@ fn assert_phases_consistent(
     }
 }
 
+/// Fix round 1 (review I-1): the overhead-gate provenance triple, bundled
+/// into one value so `phases_json`/`phases_human` take one parameter for it
+/// instead of three — clippy's `too_many_arguments` lint (max 7) would
+/// otherwise fire on both functions once this triple joined the existing
+/// `phases`/`counted`/`reason` one. Not a general-purpose struct: it exists
+/// only to carry these three fields between `CoreReport`/`KernelReport` and
+/// the two renderers together, exactly as consistency-checked as the three
+/// loose parameters were.
+#[derive(Clone, Copy)]
+struct OverheadGateProvenance {
+    gated: bool,
+    ns_per_op: Option<u64>,
+    resolvable: Option<bool>,
+}
+
+/// Mirrors `assert_phases_consistent` for the overhead-gate provenance
+/// triple — the two `Option` fields must agree with the bool's presence. A
+/// construction site that sets one without the other is a bug this module
+/// refuses to render silently, same reasoning as above.
+fn assert_overhead_gate_consistent(gate: OverheadGateProvenance) {
+    assert_eq!(
+        gate.gated,
+        gate.ns_per_op.is_some(),
+        "phases_overhead_gated must agree with phases_overhead_gate_ns_per_op's presence — \
+         got phases_overhead_gated={} phases_overhead_gate_ns_per_op={:?}",
+        gate.gated,
+        gate.ns_per_op
+    );
+    assert_eq!(
+        gate.gated,
+        gate.resolvable.is_some(),
+        "phases_overhead_gated must agree with phases_overhead_gate_resolvable's presence — \
+         got phases_overhead_gated={} phases_overhead_gate_resolvable={:?}",
+        gate.gated,
+        gate.resolvable
+    );
+}
+
 /// The `phases`/`phases_counted`/`phases_absent_reason`/`window_nanos`/
 /// `events_recorded` fragment shared by `core` and `kernel` — both objects
 /// publish the identical shape (Task 5), so this is written once rather than
@@ -493,10 +560,16 @@ fn phases_json(
     phases: &Option<crate::phase_accounting::PhaseTotals>,
     counted: bool,
     reason: Option<PhasesAbsentReason>,
+    // Fix round 1 (review I-1): the overhead-gate provenance triple, always
+    // present regardless of `phases`' own state — a `phases: None` block
+    // never was gated (nothing to gate), but a healthy block's gate status
+    // is exactly the fact I-1 found missing.
+    gate: OverheadGateProvenance,
     window_nanos: u64,
     events_recorded: u64,
 ) -> String {
     assert_phases_consistent(phases, counted, reason);
+    assert_overhead_gate_consistent(gate);
     let mut s = String::new();
     match phases {
         Some(t) => {
@@ -532,6 +605,15 @@ fn phases_json(
         )),
         None => s.push_str(",\"phases_absent_reason\":null"),
     }
+    s.push_str(&format!(",\"phases_overhead_gated\":{}", gate.gated));
+    match gate.ns_per_op {
+        Some(n) => s.push_str(&format!(",\"phases_overhead_gate_ns_per_op\":{n}")),
+        None => s.push_str(",\"phases_overhead_gate_ns_per_op\":null"),
+    }
+    match gate.resolvable {
+        Some(r) => s.push_str(&format!(",\"phases_overhead_gate_resolvable\":{r}")),
+        None => s.push_str(",\"phases_overhead_gate_resolvable\":null"),
+    }
     s.push_str(&format!(
         ",\"window_nanos\":{window_nanos},\"events_recorded\":{events_recorded}"
     ));
@@ -547,9 +629,12 @@ fn phases_human(
     phases: &Option<crate::phase_accounting::PhaseTotals>,
     counted: bool,
     reason: Option<PhasesAbsentReason>,
+    // Fix round 1 (review I-1): see `phases_json`'s identical parameter.
+    gate: OverheadGateProvenance,
     window_nanos: u64,
 ) -> String {
     assert_phases_consistent(phases, counted, reason);
+    assert_overhead_gate_consistent(gate);
     let Some(t) = phases else {
         let reason = reason.expect("assert_phases_consistent just proved this is Some");
         return format!("  {label} phases: n/a ({})\n", reason.human_phrase());
@@ -561,7 +646,21 @@ fn phases_human(
             v as f64 / window_nanos as f64 * 100.0
         }
     };
-    let mut s = format!("  {label} phases (window {window_nanos} ns, counted):\n");
+    // Fix round 1 (review I-1 / Ruling 21): the same honesty the three-cause
+    // split gives `phases` itself — a reader must not have to infer "no
+    // overhead gate ever saw this block" from silence.
+    let gate_note = match gate.ns_per_op {
+        Some(n) => format!(
+            ", overhead-gated at {n} ns/op ({})",
+            if gate.resolvable == Some(true) {
+                "resolved"
+            } else {
+                "not resolvable — noise floor"
+            }
+        ),
+        None => ", overhead gate not run".to_string(),
+    };
+    let mut s = format!("  {label} phases (window {window_nanos} ns, counted{gate_note}):\n");
     for (name, v) in [
         ("wal_append_io", t.wal_append_io),
         ("wal_read_io", t.wal_read_io),
@@ -629,6 +728,11 @@ pub fn render_json(r: &Report) -> Result<String, String> {
             &c.phases,
             c.phases_counted,
             c.phases_absent_reason,
+            OverheadGateProvenance {
+                gated: c.phases_overhead_gated,
+                ns_per_op: c.phases_overhead_gate_ns_per_op,
+                resolvable: c.phases_overhead_gate_resolvable,
+            },
             c.window_nanos,
             c.events_recorded,
         ));
@@ -654,6 +758,11 @@ pub fn render_json(r: &Report) -> Result<String, String> {
             &k.phases,
             k.phases_counted,
             k.phases_absent_reason,
+            OverheadGateProvenance {
+                gated: k.phases_overhead_gated,
+                ns_per_op: k.phases_overhead_gate_ns_per_op,
+                resolvable: k.phases_overhead_gate_resolvable,
+            },
             k.window_nanos,
             k.events_recorded,
         ));
@@ -759,6 +868,11 @@ pub fn render_human(r: &Report) -> String {
             &c.phases,
             c.phases_counted,
             c.phases_absent_reason,
+            OverheadGateProvenance {
+                gated: c.phases_overhead_gated,
+                ns_per_op: c.phases_overhead_gate_ns_per_op,
+                resolvable: c.phases_overhead_gate_resolvable,
+            },
             c.window_nanos,
         ));
     }
@@ -788,6 +902,11 @@ pub fn render_human(r: &Report) -> String {
             &k.phases,
             k.phases_counted,
             k.phases_absent_reason,
+            OverheadGateProvenance {
+                gated: k.phases_overhead_gated,
+                ns_per_op: k.phases_overhead_gate_ns_per_op,
+                resolvable: k.phases_overhead_gate_resolvable,
+            },
             k.window_nanos,
         ));
     }
@@ -890,6 +1009,13 @@ mod tests {
                 phases: None,
                 phases_counted: true,
                 phases_absent_reason: Some(PhasesAbsentReason::AttributionRefused),
+                // Fix round 1 (review I-1): the base fixture models a run
+                // no gate ever saw — the gated case gets its own dedicated
+                // fixtures below, mirroring the `phases`/`phases_counted`
+                // split's own precedent.
+                phases_overhead_gated: false,
+                phases_overhead_gate_ns_per_op: None,
+                phases_overhead_gate_resolvable: None,
                 window_nanos: 0,
                 events_recorded: 94_562,
             }),
@@ -906,6 +1032,9 @@ mod tests {
                 phases: None,
                 phases_counted: true,
                 phases_absent_reason: Some(PhasesAbsentReason::TraceRegrew),
+                phases_overhead_gated: false,
+                phases_overhead_gate_ns_per_op: None,
+                phases_overhead_gate_resolvable: None,
                 window_nanos: 0,
                 events_recorded: 1_336_846,
             }),
@@ -972,7 +1101,9 @@ mod tests {
              \"device_ratio_denominator\":\"the device bracket max\",\
              \"device_appends_per_sec_before\":1490.00,\"device_appends_per_sec_after\":1510.00,\
              \"phases\":null,\"phases_counted\":true,\
-             \"phases_absent_reason\":\"attribution_refused\",\"window_nanos\":0,\
+             \"phases_absent_reason\":\"attribution_refused\",\
+             \"phases_overhead_gated\":false,\"phases_overhead_gate_ns_per_op\":null,\
+             \"phases_overhead_gate_resolvable\":null,\"window_nanos\":0,\
              \"events_recorded\":94562},\
              \"kernel\":{\"acked_writes_per_sec\":1300.00,\
              \"log_records_per_sec\":2600.00,\"window_secs\":38.46,\
@@ -981,7 +1112,9 @@ mod tests {
              \"device_appends_per_sec_after\":3020.00,\
              \"requests_total\":50000,\"jobs_done\":50000,\
              \"phases\":null,\"phases_counted\":true,\
-             \"phases_absent_reason\":\"trace_regrew\",\"window_nanos\":0,\
+             \"phases_absent_reason\":\"trace_regrew\",\
+             \"phases_overhead_gated\":false,\"phases_overhead_gate_ns_per_op\":null,\
+             \"phases_overhead_gate_resolvable\":null,\"window_nanos\":0,\
              \"events_recorded\":1336846},\
              \"wire\":[{\"target\":\"bench-app\",\"points\":[{\"connections\":4,\
              \"throughput_per_sec\":1200.00,\"log_records_per_sec\":2400.00,\
@@ -1403,8 +1536,11 @@ mod tests {
         assert!(json.contains("\"events_recorded\":777"), "got: {json}");
 
         let human = render_human(&r);
+        // Fix round 1 (review I-1): `fixed_report()`'s default gate fields
+        // are `false`/`None`/`None` (no gate ran) — this fixture never
+        // touches them, so the header must say so.
         assert!(
-            human.contains("core phases (window 6255 ns, counted):"),
+            human.contains("core phases (window 6255 ns, counted, overhead gate not run):"),
             "got: {human}"
         );
         assert!(
@@ -1530,6 +1666,93 @@ mod tests {
         c.phases = None;
         c.phases_counted = false;
         c.phases_absent_reason = Some(PhasesAbsentReason::TraceRegrew);
+        let _ = render_json(&r);
+    }
+
+    // --- Fix round 1 (review I-1 / Ruling 21): overhead-gate provenance ---
+
+    /// A run whose phases were gated and passed publishes the figure it was
+    /// gated against and the resolvability claim, both in JSON and in the
+    /// human header — the exact gap I-1 named: `phases_counted: true` alone
+    /// cannot distinguish "no gate ran" from "a gate ran and passed."
+    #[test]
+    fn overhead_gate_provenance_renders_when_the_gate_ran_and_passed() {
+        let mut r = fixed_report();
+        let c = r.core.as_mut().unwrap();
+        c.phases = Some(healthy_phases());
+        c.phases_absent_reason = None;
+        c.window_nanos = HEALTHY_PHASES_WINDOW_NANOS;
+        c.phases_overhead_gated = true;
+        c.phases_overhead_gate_ns_per_op = Some(620);
+        c.phases_overhead_gate_resolvable = Some(true);
+
+        let json = render_json(&r).expect("renders");
+        assert!(
+            json.contains("\"phases_overhead_gated\":true"),
+            "got: {json}"
+        );
+        assert!(
+            json.contains("\"phases_overhead_gate_ns_per_op\":620"),
+            "got: {json}"
+        );
+        assert!(
+            json.contains("\"phases_overhead_gate_resolvable\":true"),
+            "got: {json}"
+        );
+
+        let human = render_human(&r);
+        assert!(
+            human.contains(
+                "core phases (window 6255 ns, counted, overhead-gated at 620 ns/op (resolved)):"
+            ),
+            "got: {human}"
+        );
+    }
+
+    /// Same gap, the other resolvability arm: an unresolved noise-floor
+    /// figure must be labeled as such, not printed identically to a
+    /// resolved one — a reader deciding how much to trust a pass or a
+    /// refusal needs to see which claim gated it.
+    #[test]
+    fn overhead_gate_provenance_names_not_resolvable_when_the_claim_is_false() {
+        let mut r = fixed_report();
+        let k = r.kernel.as_mut().unwrap();
+        k.phases = Some(healthy_phases());
+        k.phases_absent_reason = None;
+        k.window_nanos = HEALTHY_PHASES_WINDOW_NANOS;
+        k.phases_overhead_gated = true;
+        k.phases_overhead_gate_ns_per_op = Some(500);
+        k.phases_overhead_gate_resolvable = Some(false);
+
+        let human = render_human(&r);
+        assert!(
+            human.contains(
+                "kernel phases (window 6255 ns, counted, overhead-gated at 500 ns/op (not \
+                 resolvable — noise floor)):"
+            ),
+            "got: {human}"
+        );
+        let json = render_json(&r).expect("renders");
+        assert!(
+            json.contains("\"phases_overhead_gate_resolvable\":false"),
+            "got: {json}"
+        );
+    }
+
+    /// Hard rule 4: `phases_overhead_gated` disagreeing with its own
+    /// `Option` companions is a construction-site bug, not a renderable
+    /// state — mirrors the two `phases`/`phases_absent_reason` panic tests
+    /// above for the overhead-gate triple.
+    #[test]
+    #[should_panic(
+        expected = "phases_overhead_gated must agree with phases_overhead_gate_ns_per_op's presence"
+    )]
+    fn overhead_gate_bool_disagreeing_with_ns_per_op_panics_rather_than_renders() {
+        let mut r = fixed_report();
+        let c = r.core.as_mut().unwrap();
+        c.phases_overhead_gated = true;
+        // phases_overhead_gate_ns_per_op left at fixed_report()'s None:
+        // contradicts the bool.
         let _ = render_json(&r);
     }
 }

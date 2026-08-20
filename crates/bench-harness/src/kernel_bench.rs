@@ -467,6 +467,12 @@ pub fn run_with_trace_mode(
             phases,
             phases_counted,
             phases_absent_reason,
+            // Fix round 1 (review I-1): mirrors `core_bench.rs`'s identical
+            // comment — this module knows nothing about
+            // `--overhead-ns-per-op` either.
+            phases_overhead_gated: false,
+            phases_overhead_gate_ns_per_op: None,
+            phases_overhead_gate_resolvable: None,
             window_nanos: window_end_nanos - window_start_nanos,
             events_recorded,
         },
@@ -653,7 +659,7 @@ mod tests {
         };
 
         let dir = scratch("trace-mode-passthrough");
-        let (_, invalid, events) = run_with_trace_mode(&dir, REQUESTS, TraceMode::Passthrough)
+        let (report, invalid, events) = run_with_trace_mode(&dir, REQUESTS, TraceMode::Passthrough)
             .expect("kernel layer runs under passthrough");
         let _ = std::fs::remove_dir_all(&dir);
         for reason in &invalid {
@@ -666,9 +672,38 @@ mod tests {
             events, 0,
             "passthrough must record nothing regardless of workload"
         );
+        // Fix round 1 (review I-3): the fix this test exists to guard
+        // (`run_with_trace_mode` checking `trace.is_recording()` BEFORE
+        // `capacity_grew_reason()`/`attribute()`, not after) touches the
+        // REPORT, not `events` — the discarded first tuple element above
+        // used to hide that entirely. Before this fix, `events == 0` alone
+        // stayed green even with the fix reverted, because `events` comes
+        // from `Trace::events()`'s own count, untouched by which branch
+        // `phases`/`phases_counted` took. Reverting the fix makes
+        // `attribute(&[], ..)` run on this arm's empty passthrough trace —
+        // legal on its own (an empty in-window set is all `lead_in`) — and
+        // publish a ZEROED-LOOKING `Some(PhaseTotals)` for an arm that was
+        // never recording, exactly the "zeroes standing in for absence" bug
+        // this whole sub-project exists to forbid. These three assertions
+        // are what catch that.
+        assert!(
+            report.phases.is_none(),
+            "a passthrough arm must publish phases: None, never a zeroed Some — got {:?}",
+            report.phases
+        );
+        assert!(
+            !report.phases_counted,
+            "a passthrough arm was never recording; phases_counted must be false"
+        );
+        assert_eq!(
+            report.phases_absent_reason,
+            Some(crate::report::PhasesAbsentReason::NotRecording),
+            "a passthrough arm's absence reason must be NotRecording, not {:?}",
+            report.phases_absent_reason
+        );
 
         let dir = scratch("trace-mode-recording");
-        let (_, invalid, events) = run_with_trace_mode(&dir, REQUESTS, TraceMode::Recording)
+        let (report, invalid, events) = run_with_trace_mode(&dir, REQUESTS, TraceMode::Recording)
             .expect("kernel layer runs under recording");
         let _ = std::fs::remove_dir_all(&dir);
         for reason in &invalid {
@@ -680,6 +715,11 @@ mod tests {
         assert!(
             events > 0,
             "recording must record at least one op for a real run of {REQUESTS} requests"
+        );
+        assert!(
+            report.phases_counted,
+            "a recording arm was recording regardless of what attribution later decides; \
+             phases_counted must be true"
         );
     }
 }

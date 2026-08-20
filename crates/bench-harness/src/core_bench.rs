@@ -355,6 +355,14 @@ pub fn run(
             phases,
             phases_counted,
             phases_absent_reason,
+            // Fix round 1 (review I-1): this module knows nothing about
+            // `--overhead-ns-per-op` — only `bin/bench.rs`'s `run_layers`
+            // owns that flag, so it is the only site that ever flips these
+            // to `true`/`Some`. See `CoreReport::phases_overhead_gated`'s
+            // doc.
+            phases_overhead_gated: false,
+            phases_overhead_gate_ns_per_op: None,
+            phases_overhead_gate_resolvable: None,
             window_nanos: window_end_nanos - window_start_nanos,
             events_recorded,
         },
