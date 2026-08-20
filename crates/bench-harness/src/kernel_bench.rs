@@ -23,9 +23,9 @@
 use crate::device::device_bracket_sample;
 use crate::kernel_accounting::{self, KernelObs};
 use crate::measure::Heartbeat;
-use crate::phase_accounting::attribute;
+use crate::phase_accounting::{attribute, window_brackets_measured_section};
 use crate::report::KernelReport;
-use crate::tracing_disk::{Trace, TracingDisk};
+use crate::tracing_disk::{MAX_TRACE_CAPACITY, Trace, TracingDisk};
 use crate::{SLOTS, build};
 use charpente::core::io::{Disk, File};
 use charpente::http::{Method, Request};
@@ -70,17 +70,27 @@ const MIN_TRACE_CAPACITY: usize = 1 << 16;
 
 /// Ruling B (2026-08-19 phase-attribution plan): this arm knows `requests`
 /// up front (unlike `core_bench`, which is duration-based and keeps a fixed
-/// floor — see `core_bench::TRACE_CAPACITY`'s doc), so its capacity is
+/// floor — see `core_bench::trace_capacity`'s doc), so its capacity is
 /// derived from the actual workload rather than a magic literal.
 /// `saturating_mul` rather than plain `*`: an absurd `--requests` value must
-/// not panic this arithmetic before the run even starts — it would simply
-/// request an enormous, likely-failing allocation, which is the right
-/// failure for that input.
+/// not panic this arithmetic before the run even starts.
+///
+/// Task 3 review, M-3: saturating was necessary and not sufficient. Not
+/// panicking still left `--requests 200000000` deriving 8e9 events (192 GB)
+/// and aborting the process on allocation failure, naming neither the flag
+/// nor the trace — a hard rule 5 violation dressed as an OOM. The
+/// `MAX_TRACE_CAPACITY` clamp turns that into a run that completes with valid
+/// throughput numbers and a phase block withheld by a refusal that names the
+/// contract, the site and the fix. See that constant's doc.
 fn trace_capacity(requests: u64) -> usize {
     (requests as usize)
         .saturating_mul(EVENTS_PER_REQUEST_ESTIMATE)
-        .max(MIN_TRACE_CAPACITY)
+        .clamp(MIN_TRACE_CAPACITY, MAX_TRACE_CAPACITY)
 }
+
+// `clamp` panics if the bounds invert. Both are consts, so prove it at compile
+// time rather than discovering it from a bench run.
+const _: () = assert!(MIN_TRACE_CAPACITY <= MAX_TRACE_CAPACITY);
 
 /// Wraps `ProdDisk` to COUNT durable syncs rather than derive them (group-
 /// commit T7, C-7): `KernelObs::syncs` used to be `requests_planned +
@@ -275,6 +285,17 @@ pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> 
     // to `invalid` (below) rather than discarding a run whose throughput
     // figures are still good.
     let mut invalid = Vec::new();
+    // Task 3 review, M-2: see core_bench.rs's identical comment. The
+    // ignored-event check below catches a window stamped too narrow; this
+    // catches one stamped too wide, using `obs.elapsed` as the second,
+    // independent clock.
+    if let Some(reason) = window_brackets_measured_section(
+        window_start_nanos,
+        window_end_nanos,
+        obs.elapsed.as_nanos() as u64,
+    ) {
+        invalid.push(reason);
+    }
     // Ruling A (2026-08-19 phase-attribution plan): checked BEFORE attribute()
     // is even attempted — see core_bench.rs's identical comment for why
     // attribute() itself cannot usefully see this contamination.
@@ -429,7 +450,27 @@ mod tests {
     fn trace_capacity_does_not_panic_on_an_absurd_request_count() {
         // `saturating_mul`, not `*`: an operator-supplied `--requests` this
         // large must not panic the arithmetic before the run even starts.
-        assert_eq!(trace_capacity(u64::MAX), usize::MAX);
+        // Task 3 review, M-3: and it must not saturate to `usize::MAX`
+        // either, which does not panic and does abort the process on
+        // allocation failure, naming neither the flag nor the trace.
+        assert_eq!(trace_capacity(u64::MAX), MAX_TRACE_CAPACITY);
+        assert_eq!(trace_capacity(200_000_000), MAX_TRACE_CAPACITY);
+    }
+
+    #[test]
+    fn the_clamp_leaves_every_realistic_request_count_untouched() {
+        // Negative space for M-3: the clamp must be a backstop on absurd
+        // input, not a silent ceiling on runs anyone actually performs.
+        // `bin/bench.rs` defaults to 50,000.
+        assert!(
+            trace_capacity(50_000) < MAX_TRACE_CAPACITY,
+            "the default run must not be clamped"
+        );
+        assert_eq!(
+            trace_capacity(200_000),
+            200_000 * EVENTS_PER_REQUEST_ESTIMATE,
+            "a 4x-default run must still be sized from its workload"
+        );
     }
 
     fn scratch(tag: &str) -> String {

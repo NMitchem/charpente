@@ -326,6 +326,59 @@ pub fn attribute(
     })
 }
 
+/// The other half of the window-integrity gate (Task 3 review, M-2).
+///
+/// `Attribution`'s ignored-event counts catch a window stamped too NARROW:
+/// ops fall outside it and get counted. Nothing catches one stamped too
+/// WIDE. Hoisting `window_start_nanos` above a warmup loop folds every warmup
+/// fsync into the published shares and moves no count at all, because those
+/// events are now legitimately inside the window — and `attribute`'s closure
+/// assert still passes, because it says the phases sum to the window, not
+/// that the window is the right window. That is a compiling, test-green,
+/// silently-diluted number: the exact failure this whole module is built to
+/// refuse.
+///
+/// One fact catches it. Both stamps bracket the same section the caller timed
+/// with `Instant`, so the window must ENCLOSE that section and exceed it only
+/// by the cost of bracketing. `SLACK_NANOS` is generous for two
+/// `Trace::now_nanos()` calls plus scheduler preemption, and two orders of
+/// magnitude below the smallest warmup a caller could accidentally fold in
+/// (`bin/bench.rs` defaults to 5 s).
+///
+/// `measured_nanos` is the caller's own `Instant`-measured elapsed time for
+/// the section — deliberately a SECOND clock. Comparing the trace clock
+/// against itself would be vacuous; the whole value here is that two
+/// independent clocks have to agree about what was measured.
+pub fn window_brackets_measured_section(
+    window_start_nanos: u64,
+    window_end_nanos: u64,
+    measured_nanos: u64,
+) -> Option<String> {
+    const SLACK_NANOS: u64 = 50_000_000;
+
+    if window_end_nanos < window_start_nanos {
+        return Some(format!(
+            "contract: the measured window is inverted — `window_start_nanos` ({window_start_nanos})              is after `window_end_nanos` ({window_end_nanos}). Fix: stamp the start with              `Trace::now_nanos()` before the measured section and the end after it."
+        ));
+    }
+    let window_nanos = window_end_nanos - window_start_nanos;
+
+    if window_nanos < measured_nanos {
+        return Some(format!(
+            "contract: the measured window ({window_nanos} ns) is SHORTER than the section it              is supposed to bracket ({measured_nanos} ns, from the caller's own `Instant`), so              some of the measured work happened outside the window and its IO is missing from              every published phase share. Fix: stamp `window_start_nanos` immediately before the              measured section starts and `window_end_nanos` immediately after it ends, with              nothing in between but the section itself."
+        ));
+    }
+
+    let excess = window_nanos - measured_nanos;
+    if excess > SLACK_NANOS {
+        return Some(format!(
+            "contract: the measured window ({window_nanos} ns) exceeds the section it is              supposed to bracket ({measured_nanos} ns, from the caller's own `Instant`) by              {excess} ns, far past the {SLACK_NANOS} ns that bracketing itself can cost. The              window therefore encloses work that was not measured — warmup and `Db::open` are              the usual culprits — and that work's IO is folded into the published phase shares              without appearing in any ignored-event count, because it is legitimately inside              the window. Fix: stamp `window_start_nanos` immediately before the measured              section, AFTER warmup completes, not before it."
+        ));
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,5 +852,55 @@ mod tests {
         assert_eq!(a.events_attributed, 0);
         assert_eq!(a.events_ignored_before_window, 0);
         assert_eq!(a.events_ignored_after_window, 0);
+    }
+
+    // --- window_brackets_measured_section (Task 3 review, M-2) ---
+
+    #[test]
+    fn a_window_that_tightly_brackets_the_measured_section_is_accepted() {
+        // 12 us of bracketing cost on a 2 s section: the normal case.
+        assert!(window_brackets_measured_section(1_000, 2_000_013_000, 2_000_000_000).is_none());
+    }
+
+    #[test]
+    fn a_window_hoisted_above_the_warmup_is_refused() {
+        // The failure this gate exists for: window_start stamped before a 5 s
+        // warmup instead of after it. Every count in `Attribution` is
+        // unmoved and the closure invariant still holds exactly.
+        let reason = window_brackets_measured_section(0, 7_000_000_000, 2_000_000_000)
+            .expect("a window 5 s wider than the section it brackets must be refused");
+        assert!(reason.starts_with("contract: "), "{reason}");
+        assert!(
+            reason.contains("warmup"),
+            "must name the usual cause: {reason}"
+        );
+        assert!(
+            reason.contains("AFTER warmup completes"),
+            "must name the fix: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_window_narrower_than_the_measured_section_is_refused() {
+        let reason = window_brackets_measured_section(0, 1_000_000_000, 2_000_000_000)
+            .expect("a window shorter than the section it brackets must be refused");
+        assert!(reason.starts_with("contract: "), "{reason}");
+        assert!(reason.contains("SHORTER"), "{reason}");
+    }
+
+    #[test]
+    fn an_inverted_window_is_refused_without_underflowing() {
+        // Release builds do not panic on overflow; the subtraction must be
+        // guarded rather than trusted to a debug assert.
+        let reason = window_brackets_measured_section(2_000_000_000, 1_000_000_000, 500)
+            .expect("an inverted window must be refused");
+        assert!(reason.contains("inverted"), "{reason}");
+    }
+
+    #[test]
+    fn the_slack_boundary_is_exact_on_both_sides() {
+        // Exactly at the slack: accepted. One nanosecond past it: refused.
+        assert!(window_brackets_measured_section(0, 1_050_000_000, 1_000_000_000).is_none());
+        assert!(window_brackets_measured_section(0, 1_050_000_001, 1_000_000_000).is_some());
     }
 }

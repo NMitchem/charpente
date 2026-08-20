@@ -87,12 +87,32 @@ pub struct Trace {
     recording: bool,
     /// The event vec's capacity immediately after construction (Task 3
     /// Ruling A, 2026-08-19 phase-attribution plan). Read from `Vec::capacity()`
-    /// itself rather than the `capacity` argument passed to `recording` —
-    /// an allocator is free to hand back more than requested to fit a size
-    /// class, and comparing against the REQUESTED value would read that
-    /// rounding as growth that never happened.
+    /// itself rather than the `capacity` argument passed to `recording`,
+    /// because `Vec::with_capacity` promises only *at least* the requested
+    /// capacity, never exactly it. Task 3 review (M-5) measured this
+    /// toolchain and found the promise currently tight — `with_capacity(7)`
+    /// yields `capacity() == 7` — which is the reason to read rather than
+    /// assume, not a reason to skip it: nothing in the contract keeps it
+    /// tight, and the day it stops being tight, a comparison against the
+    /// REQUESTED value reads slack as growth that never happened and refuses
+    /// a run that was fine.
     initial_capacity: usize,
 }
+
+/// Ceiling on a preallocated trace, in events (Task 3 review, M-3). At 24
+/// bytes an `Event` this is ~201 MB — beyond any workload either arm is meant
+/// to measure, and the point at which honouring a derived capacity literally
+/// becomes worse than refusing it: `bench kernel --requests 200000000` derives
+/// 8e9 events (192 GB) and aborts the process on allocation failure, naming
+/// neither `--requests` nor the trace.
+///
+/// Clamping instead of erroring is deliberate, and composes with
+/// `capacity_grew_reason`: past the ceiling the reservation no longer holds,
+/// the vec grows during recording, and that growth is *detected* — the run
+/// completes, its throughput numbers stand, and only its phase shares are
+/// withheld, by a refusal that names the contract, the site and the fix. A
+/// loud refusal beats an abort, and beats a silent 192 GB request.
+pub const MAX_TRACE_CAPACITY: usize = 8 << 20;
 
 impl Trace {
     /// `capacity` preallocates the event vec. Size it generously: a reallocation
@@ -149,6 +169,16 @@ impl Trace {
     /// folded silently into it. `None` means the reservation held: nothing
     /// reallocated, so nothing about this trace's gap attribution is
     /// suspect on this account.
+    ///
+    /// Known limit, parked deliberately (Task 3 review, M-4): this compares
+    /// capacity at two points and so cannot tell a reallocation that happened
+    /// during *warmup* from one during the measured window — only the latter
+    /// contaminates a published share. The error is one-directional, which is
+    /// why it is parked rather than fixed: it can refuse a run whose phases
+    /// were in fact clean, and can never pass one whose phases were not.
+    /// Making it exact would mean sampling capacity at the window edges too,
+    /// buying precision this instrument does not need in exchange for two more
+    /// things a caller can stamp from the wrong place.
     pub fn capacity_grew_reason(&self) -> Option<String> {
         let events = self.events.lock().expect("trace lock");
         let current_capacity = events.capacity();
@@ -383,8 +413,9 @@ mod tests {
     #[test]
     fn capacity_grew_reason_names_the_contract_once_the_reservation_is_exceeded() {
         let trace = Trace::recording(1);
-        // Enough pushes to force at least one regrow past any allocator
-        // size-class rounding of the initial reservation.
+        // Enough pushes to force at least one regrow even if `with_capacity`
+        // hands back slack above the 1 requested (Task 3 review, M-5: it does
+        // not on this toolchain, but this test must not depend on that).
         for _ in 0..8 {
             trace.record(
                 PathClass::Wal,

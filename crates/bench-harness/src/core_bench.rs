@@ -7,31 +7,63 @@
 use crate::core_accounting::{self, CoreObservations, WriteObs};
 use crate::device::device_bracket_sample;
 use crate::measure::Heartbeat;
-use crate::phase_accounting::attribute;
+use crate::phase_accounting::{attribute, window_brackets_measured_section};
 use crate::report::CoreReport;
-use crate::tracing_disk::{Trace, TracingDisk};
+use crate::tracing_disk::{MAX_TRACE_CAPACITY, Trace, TracingDisk};
 use crate::{Bump, SLOTS, Slot, SlotBumped, schema};
 use charpente::prod::ProdDisk;
 use charpente::{Db, DbConfig, Id, TxError, View};
 use std::io;
 use std::time::{Duration, Instant};
 
-/// Preallocates the trace's event vec (Task 1: `size_of::<Event>()` is 24
-/// bytes, so this is ~25 MB). Sized generously: a reallocation inside the
-/// traced window would land in the measurement it is trying to take.
+/// Floor on the trace's preallocated event vec (Task 1: `size_of::<Event>()`
+/// is 24 bytes, so this is ~25 MB). Covers this layer's fixed per-run cost —
+/// `Db::open` and the store materialization at entry — which does not scale
+/// with `--duration`, and keeps every run at or below the measured default
+/// allocating exactly what it allocated before this constant became a floor.
+const MIN_TRACE_CAPACITY: usize = 1 << 20;
+
+/// Events per second of wall clock, with margin (Task 3 review, M-1).
 ///
-/// Ruling B (2026-08-19 phase-attribution plan): this arm is duration-based
-/// (`--duration`), not count-based, so unlike `kernel_bench::trace_capacity`
-/// it has no workload input to derive a capacity FROM — this stays a fixed
-/// floor rather than a formula. The floor is defensible because it has been
-/// measured, not guessed: the same session's capacity finding (see
-/// `tracing_disk::Trace::capacity_grew_reason`'s doc) recorded 5,985 events
-/// over a 2 s window (0.6% of this capacity) and 94,562 events over a 30 s
-/// window — `bin/bench.rs`'s own default `--duration` (9.0%) — ample headroom
-/// at both scales actually tested. `capacity_grew_reason` is the backstop if
-/// a future, much longer run ever does exceed this: it refuses to publish
-/// rather than silently landing a reallocation's stall in a gap phase.
-const TRACE_CAPACITY: usize = 1 << 20;
+/// The Ruling B doc this replaces claimed this arm "has no workload input to
+/// derive a capacity FROM." That was false: `--duration` is one, `--warmup` is
+/// another, and both are already parameters of `run`. The consequence of the
+/// false claim was a fixed ceiling a long run silently walks past —
+/// `bench core --warmup 30 --duration 600` produces ~2M events against a
+/// 1,048,576 reservation and loses its phase block to a correct, loud refusal
+/// it never needed to trigger.
+///
+/// The rate is measured, not guessed: the capacity finding recorded 94,562
+/// events over a 30 s window (see `tracing_disk::Trace::capacity_grew_reason`),
+/// ~3,150/s, and Task 3's review independently put it near 2,900/s. 6,000
+/// carries ~90% headroom over the higher of the two — the same posture as
+/// `kernel_bench::EVENTS_PER_REQUEST_ESTIMATE`, and for the same reason: a
+/// different `SLOTS`/schema shape could move the real rate without this
+/// crate's own fixtures changing at all.
+const EVENTS_PER_SEC_ESTIMATE: usize = 6_000;
+
+/// Sized from the run's own duration, floored, and capped at
+/// `MAX_TRACE_CAPACITY` (Task 3 review, M-1 and M-3).
+///
+/// `+ 2` because both `as_secs()` truncate, so a `--warmup 0.9 --duration 1.9`
+/// run must not be sized as if it were 0 s + 1 s. Saturating throughout: an
+/// absurd duration must not panic this arithmetic before the run starts, and
+/// the clamp is what keeps an absurd one from requesting an unservable
+/// allocation — past the cap the reservation stops holding and
+/// `Trace::capacity_grew_reason` withholds the phase block loudly, which is a
+/// far better outcome than aborting the process on allocation failure.
+fn trace_capacity(warmup: Duration, duration: Duration) -> usize {
+    let secs = warmup
+        .as_secs()
+        .saturating_add(duration.as_secs())
+        .saturating_add(2) as usize;
+    secs.saturating_mul(EVENTS_PER_SEC_ESTIMATE)
+        .clamp(MIN_TRACE_CAPACITY, MAX_TRACE_CAPACITY)
+}
+
+// `clamp` panics if the bounds invert. Both are consts, so prove it at compile
+// time rather than discovering it from a bench run.
+const _: () = assert!(MIN_TRACE_CAPACITY <= MAX_TRACE_CAPACITY);
 
 fn canonical(db: &mut Db, i: u64) -> io::Result<u64> {
     db.transact(|tx| -> Result<u64, io::Error> {
@@ -70,7 +102,7 @@ pub fn run(
     warmup: Duration,
     duration: Duration,
 ) -> io::Result<(CoreReport, Vec<String>)> {
-    let trace = Trace::recording(TRACE_CAPACITY);
+    let trace = Trace::recording(trace_capacity(warmup, duration));
     let mut db = Db::open(
         Box::new(TracingDisk::new(
             Box::new(ProdDisk::new(dir)?),
@@ -134,6 +166,20 @@ pub fn run(
     let elapsed = start.elapsed();
     let window_end_nanos = trace.now_nanos();
 
+    // Task 3 review, M-2: the OTHER half of the window-integrity gate. The
+    // `events_ignored_after_window` check below catches a window stamped too
+    // narrow; nothing caught one stamped too wide, and a `window_start_nanos`
+    // hoisted above the warmup loop folds every warmup fsync into the
+    // published shares while every count stays put and the closure invariant
+    // still holds exactly. `elapsed` is the second, independent clock that
+    // makes that visible.
+    if let Some(reason) = window_brackets_measured_section(
+        window_start_nanos,
+        window_end_nanos,
+        elapsed.as_nanos() as u64,
+    ) {
+        invalid.push(reason);
+    }
     // Ruling A (2026-08-19 phase-attribution plan): checked BEFORE attribute()
     // is even attempted. A grown buffer does not corrupt any recorded event's
     // own timestamps — attribute() would still return `Ok` and its closure
@@ -291,4 +337,65 @@ pub fn run(
         },
         invalid,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Task 3 review, M-1: the fixed ceiling this formula replaces was
+    // defensible only for the two run lengths that had been measured. These
+    // pin the three things the replacement has to get right.
+
+    #[test]
+    fn the_measured_default_run_is_unchanged_by_the_formula() {
+        // `bin/bench.rs` defaults: 5 s warmup + 30 s duration. The floor
+        // governs there, so every run at or below the default allocates
+        // exactly what it allocated before this became a formula — the
+        // capacity finding's 94,562 measured events against 1,048,576.
+        let capacity = trace_capacity(Duration::from_secs(5), Duration::from_secs(30));
+        assert_eq!(capacity, MIN_TRACE_CAPACITY);
+        assert!(
+            capacity > 94_562 * 2,
+            "the default run's measured event count must clear the floor with margin"
+        );
+    }
+
+    #[test]
+    fn a_long_run_is_sized_from_its_duration_rather_than_refused() {
+        // The case the old fixed ceiling got wrong: at ~3,150 events/s a
+        // 630 s run produces ~2M events, nearly double `MIN_TRACE_CAPACITY`.
+        let capacity = trace_capacity(Duration::from_secs(30), Duration::from_secs(600));
+        assert!(
+            capacity > MIN_TRACE_CAPACITY,
+            "a 630 s run must not be sized by the floor"
+        );
+        assert!(
+            capacity as f64 > 630.0 * 3_150.0,
+            "capacity {capacity} must clear the measured ~3,150 events/s rate"
+        );
+    }
+
+    #[test]
+    fn sub_second_durations_are_rounded_up_not_truncated() {
+        // Both `as_secs()` truncate, so a run must never be sized shorter than
+        // it is. Tested above the floor, which would otherwise mask the
+        // difference by collapsing both sides onto itself.
+        let fractional = trace_capacity(Duration::from_millis(199_900), Duration::from_secs(200));
+        assert!(
+            fractional >= 400 * EVENTS_PER_SEC_ESTIMATE,
+            "199.9 s + 200 s must size as at least 400 s, not the 399 s that \
+             truncating both operands would give: {fractional}"
+        );
+    }
+
+    #[test]
+    fn an_absurd_duration_is_clamped_rather_than_aborting_the_process() {
+        // Same M-3 reasoning as the kernel arm: saturating arithmetic that
+        // does not panic still requests an unservable allocation.
+        assert_eq!(
+            trace_capacity(Duration::from_secs(u64::MAX), Duration::from_secs(u64::MAX)),
+            MAX_TRACE_CAPACITY
+        );
+    }
 }
