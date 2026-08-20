@@ -352,6 +352,19 @@ in the paragraphs above is withdrawn — the core layer really does sit at the
 device ceiling, and that is reproduced below at 90.3–90.6% of its window inside
 `wal_sync_io`.
 
+**Superseded again the same day, and this time the ambiguity above dissolves rather
+than being resolved.** That draft is marked superseded: it concludes on the
+per-record apply path, which per-batch apply deleted. On the re-measurement — *Per-batch
+apply — the store path amortized (2026-08-20)* below — **all three readings of the
+criterion agree, and by wide margins instead of 0.4 points.** Field level, the sync
+leads by ~71 points (72.4–73.4% against `gap_within_store`'s 0.23–0.26%); CPU-only,
+`gap_within_store` is 1.2–1.4% of all-gap time and is not the largest residual either;
+block level, the store path is 16.2–17.5% against the WAL path's 77.1–78.5%. Trigger (a)
+does not fire under any of them. The 0.42× gap the section below set out to attribute has
+its owner: **charpente's call pattern into redb — one write transaction and one read
+transaction per record inside an already-amortized batch — not redb.** `DECISIONS.md` §7
+is still Noah's alone.
+
 ## Numbers of record — group commit (2026-08-15)
 
 Same instrument, same box, same workload; the binary batches now. **The claim
@@ -405,6 +418,13 @@ about the current instrument.
 
 Both operands are counted in-process here, which is why this is the headline and
 the wire numbers are corroboration.
+
+> **The "after" column is the 2026-08-15 binary and has been superseded twice over
+> by per-batch apply.** Measured on a quieter box on 2026-08-20 the same arm reads
+> 6,224–6,265 acked writes/sec and 12,448–12,530 log records/sec at a `device_ratio`
+> of 0.766–0.772 — see *Per-batch apply — the store path amortized* below, which
+> carries its own interleaved baseline. This table is left as the record of its own
+> two runs, which is how every dated table in this document is treated.
 
 | metric | before | after | |
 |---|---|---|---|
@@ -552,6 +572,17 @@ spec §3 makes an acceptance criterion rather than a win.
   by no gate.
 
 ## Where a batched commit's time goes — per-phase attribution (2026-08-20)
+
+> **The kernel column below measures a code path that no longer exists** —
+> `Store::apply` opening one redb write transaction, and one read transaction, per
+> record. Per-batch apply replaced it the same day, and *Per-batch apply — the store
+> path amortized (2026-08-20)* below re-measures both arms against a fresh
+> interleaved baseline. `gap_within_store` goes from 39.6–40.1% of the kernel window
+> to 0.23–0.26%, and the `device_ratio` from 0.42× to 0.77×. **This section is
+> superseded, not withdrawn**: its figures come from its own windows, they were
+> correct for the binary they were taken on, and the reading it argues is what
+> pointed at the change. The core (batch 1) column is unaffected by construction and
+> was separately re-measured as a control.
 
 Reproduce with `cargo run --release -p bench-harness --bin bench -- kernel --json
 --requests 50000 --overhead-ns-per-op 586` (and `-- core --json
@@ -1086,6 +1117,341 @@ on one build, and its build provenance is unverifiable as stated above.
   the honest form is "each run was preceded by a direct `top` idleness check,
   whose samples the record does not carry", and a reader who wants to audit the
   box's state has the load averages and process lists to do it with.
+
+## Per-batch apply — the store path amortized (2026-08-20)
+
+Reproduce with `cargo run --release -p bench-harness --bin bench -- kernel --json
+--requests 50000 --overhead-ns-per-op 2840` (and `-- core --json --requests 50000
+--overhead-ns-per-op 2840` for the batch-1 control); the overhead figure itself comes from
+`bench kernel --trace-overhead --requests 50000`.
+
+**This section moves published numbers.** The phase attribution above measured a code path
+that no longer exists: `Store::apply` opened one redb write transaction per record, and one
+read transaction per record on top of it, inside a batch whose WAL cost group commit had
+already amortized 62×. `StateMachine::apply_batch` gives the batch one write transaction.
+The sections above keep their own figures, each with a pointer to this one; not a figure of
+theirs is rewritten. What they measured is superseded, not withdrawn.
+
+**Provenance, because it bounds what may be quoted.** Two binaries, both release, built
+minutes apart on 2026-08-20: the **baseline** at `89cb165`, the last commit before this
+change, in an isolated `CARGO_TARGET_DIR`, and the **new** binary at `6c0bd11`. The
+baseline is a fresh re-run on this machine, interleaved with the new arm — never a figure
+copied out of the table above, whose run was a different day. `diff -r crates/bench-harness`
+between the two trees is empty, so both arms are the same instrument; the workspace
+`Cargo.toml` is identical in both, and redb compiled to the **same rlib hash
+`0f310560c7234221` in both target dirs**, which is a mechanical proof that
+`[profile.release.package.redb] debug-assertions = true` was in force on both sides. (The
+2026-08-20 redb-assertions probe above could not produce that proof for itself and said so;
+this is what the check looks like when it can be made.) That override is untouched here —
+turning it off would have looked like a free speedup on this section's own benchmark.
+
+**Quiet box, gated at both ends.** A mechanical precondition script — no `cargo`, `rustc`,
+`cc1` or `lld` process from **any** repo, Spotlight family under 40% CPU, 1-minute load
+under half the core count, matched on process name rather than command line — ran **before
+the first arm and again after the last**, and both exited 0. (It lives under `.superpowers/`,
+which is gitignored, so this document is the durable copy of what it checked.) It went red once at 17:53 when another repo's test suite started, and the
+measurement waited 17 minutes for that suite to finish on its own; nothing was killed.
+Load averages either side of each set are in the run log, and they are disclosed rather
+than smoothed: the kernel arms ran between a 5.74 and a 4.02 one-minute load, still
+decaying from that suite, while the core control ran between 1.15 and 4.29. The arms are
+interleaved (baseline, new, baseline, new, baseline, new) precisely so drift subtracts out
+of each pair, and the result below is not close enough for a load effect to reach.
+
+**The instrument's own cost, re-taken FIRST, before any arm was measured.** That ordering
+is not stylistic: the phase-attribution protocol originally ran the arms first and would
+have published every one of them ungated, which a reviewer caught. Nine alternating
+recording/passthrough pairs across three invocations, every pair reported, CPU time not
+wall clock:
+
+| invocation | ns of CPU per recorded op, per pair | cpu/wall |
+|---|---|---|
+| 1 | −185.1, −421.6, +358.6 | 0.20–0.27 |
+| 2 | +790.5, −279.0, +134.7 | 0.26–0.27 |
+| 3 | +2839.5, −4887.9, +2565.3 | 0.21–0.27 |
+
+Pooled n=9: mean **+101.7**, median +134.7, range **[−4887.9, +2839.5]**, four pairs
+negative. A negative pair means passthrough measured slower than recording, which no real
+cost produces. **The result is again that the trace's own cost is below this machine's
+noise floor — not that it is zero.** Every phase block below is published with
+`phases_overhead_gated: true`, `phases_overhead_gate_ns_per_op: 2840` (the pooled range's
+high end, the same rule the 586 ns/op figure above was taken under) and
+`phases_overhead_gate_resolvable: false`. Dropping invocation 3, whose three pairs each
+disagree by 0.03–0.04 in `cpu/wall` while invocations 1 and 2 agree to within 0.01 — the
+exclusion criterion is `run_trace_overhead`'s own doc — gives n=6, mean +66.4, range
+[−421.6, +790.5], i.e. 791 ns/op. Both are recorded; 2840 is used because publishing
+against the generous end is the conservative choice, and the verdict is identical either
+way. One figure gates both arms, as the run above also did across its two arms: the per-op
+cost is a property of the tracer, not of the arm it is pointed at.
+
+**`cpu/wall` reads 0.20–0.27 here against 0.49–0.52 on the pre-batching arm, and that is
+the change working rather than the box being busy.** This arm now spends a much larger
+fraction of its wall time blocked inside `fsync`, which burns no CPU, because the store-side
+compute that used to fill the rest of it is gone. The correction recorded above — that 0.50
+was the pre-batching arm's structural signature and not a contention read — applies here in
+the same form at a different level.
+
+### The result
+
+**The pre-committed criterion is met.** Fixed in the design spec §7 before the run and
+repeated in the run protocol so it could not be restated afterwards: *on a quiet box at
+n≥3, batch ≈62, `gap_within_store` below 5% of the kernel window and `device_ratio` above
+0.7.*
+
+| | run 1 | run 2 | run 3 | criterion |
+|---|---|---|---|---|
+| `gap_within_store`, % of kernel window | **0.23** | **0.26** | **0.23** | < 5% — met |
+| `device_ratio` (counted syncs ÷ bracket max) | **0.766** | **0.772** | **0.766** | > 0.7 — met |
+| log records per durable sync | 61.96 | 61.96 | 61.96 | ≈62 — met |
+
+The baseline arm, on the same box, in the same interleave: `gap_within_store` **41.21 /
+42.25 / 39.18%** and `device_ratio` **0.423 / 0.411 / 0.426**. The ranges do not come close
+to overlapping on either quantity.
+
+**The fresh baseline reproduces the published pre-batching run, and that is what licenses
+reading these as one comparison** rather than two unrelated measurements: window 14.52 /
+15.03 / 14.29 s against the published 14.106 / 14.042 / 14.434; `device_ratio` 0.423 /
+0.411 / 0.426 against 0.429 / 0.425 / 0.419; `gap_within_store` 41.21 / 42.25 / 39.18%
+against 40.05 / 39.81 / 39.62%; 1,336,879 / 1,337,409 / 1,334,846 traced ops against
+1,334,073 / 1,333,354 / 1,333,692.
+
+### The kernel layer, before and after
+
+Both operands counted in-process. Three observations each, interleaved, all shown.
+
+| metric | baseline `89cb165` (3 obs) | per-batch apply `6c0bd11` (3 obs) | |
+|---|---|---|---|
+| acked writes/sec | 3,444 / 3,327 / 3,500 | **6,265 / 6,235 / 6,224** | 1.78–1.88× |
+| log records/sec | 6,888 / 6,654 / 7,000 | **12,530 / 12,470 / 12,448** | |
+| durable syncs/sec | 111.2 / 107.4 / 113.0 | 202.2 / 201.3 / 200.9 | |
+| `device_ratio` (syncs ÷ ceiling) | 0.423 / 0.411 / 0.426 | **0.766 / 0.772 / 0.766** | |
+| 50,000 canonical requests | 14.52 / 15.03 / 14.29 s | **7.98 / 8.02 / 8.03 s** | |
+| traced Disk ops | 1,336,879 / 1,337,409 / 1,334,846 | **123,197 / 123,779 / 123,719** | 10.8× fewer |
+| Disk ops per log record (derived) | 13.37 / 13.37 / 13.35 | **1.23 / 1.24 / 1.24** | |
+| log records per durable sync | 61.96 / 61.96 / 61.96 | 61.96 / 61.96 / 61.96 | |
+| `requests_total` = `jobs_done` | 50,000 in all three | 50,000 in all three | |
+
+`jobs_done == requests_total == 50,000` on every run in both arms: the dual-write invariant
+holds, so this is not throughput bought by dropping records. **Records per durable sync is
+unchanged at 61.96**, which is the load-bearing control here — the batch shape is the same
+on both sides, so nothing below is a comparison between two different workloads. It is a
+derived numerator over a counted denominator and a **lower bound** on the true batch
+factor, for the reason the group-commit section gives: `kernel_bench`'s sync counter is
+unscoped and tallies store checkpoints and `.horizon` writes alongside batch syncs.
+
+**Totals two ways, since a rate is a quotient and a quotient hides a moved denominator.**
+Reconstructing the counts from each window's own rate and length gives **99,961–100,034 log
+records** against the 100,000 the workload fixes — agreement to within 0.04% on all six runs
+— and **1,613.4–1,614.5 durable syncs**, from which 100,000 ÷ syncs reads 61.94–61.98,
+against the 61.957–61.960 the two published rates divide to. The two derivations agree to
+within 0.02 and both agree with the 61.96 the group-commit section above publishes, so the
+batch shape is established from the counts rather than assumed from the ratio.
+
+**The device ratio is the number this change was aimed at.** At batch cap the device was
+58% idle; it is now 23% idle. What was holding it idle was not the device, the kernel loop,
+or redb's design — it was charpente calling redb 62 times where it appended once.
+
+### Where the time goes now
+
+One row per phase, share of that arm's own measured window, all three observations shown.
+Nanosecond totals are in `target/bench/report.json` after a run.
+
+| phase | baseline, batch ≈62 — % of window (3 obs) | per-batch apply, batch ≈62 — % of window (3 obs) | provenance of the ns total | overhead gate at 2840 ns/op — base · new |
+|---|---|---|---|---|
+| `wal_append_io` | 1.47 / 1.57 / 1.61 | 4.83 / 4.99 / 4.65 | counted (traced IO) | refused 3/3 · refused 3/3 |
+| `wal_read_io` | 0.00 / 0.00 / 0.00 | 0.00 / 0.00 / 0.00 | counted; zero by design on the steady-state commit path | not gated (phase is exactly zero) |
+| `wal_sync_io` | 39.55 / 38.38 / 40.78 | **72.36 / 71.53 / 73.38** | counted (traced IO) | refused 3/3 · **passed 3/3** |
+| `store_write_io` | 11.44 / 11.29 / 11.81 | 1.56 / 1.66 / 1.60 | counted (traced IO) | refused 3/3 · refused 3/3 |
+| `store_read_io` | 0.01 / 0.01 / 0.00 | 0.01 / 0.01 / 0.01 | counted (traced IO) | refused 3/3 · refused 3/3 |
+| `store_sync_io` | 1.36 / 1.51 / 1.44 | 1.54 / 1.75 / 1.72 | counted (traced IO); checkpoints only | refused 3/3 · refused 3/3 |
+| `other_io` | 0.61 / 0.60 / 0.64 | 1.14 / 1.16 / 1.11 | counted (traced IO); the `.horizon` breadcrumb | refused 3/3 · refused 3/3 |
+| `gap_within_wal` | 0.16 / 0.15 / 0.16 | 0.51 / 0.52 / 0.50 | residual between two traced ops | outside the gate by design |
+| `gap_wal_to_store` | 2.86 / 2.91 / 2.95 | 13.46 / 13.80 / 12.66 | residual | outside the gate by design |
+| `gap_within_store` | **41.21 / 42.25 / 39.18** | **0.23 / 0.26 / 0.23** | residual | outside the gate by design |
+| `gap_store_to_wal` | 1.27 / 1.22 / 1.29 | 4.14 / 4.14 / 3.89 | residual | outside the gate by design |
+| `gap_other` | 0.06 / 0.11 / 0.12 | 0.21 / 0.17 / 0.25 | residual | outside the gate by design |
+| `lead_in` | 0.00 / 0.01 / 0.00 | 0.01 / 0.00 / 0.01 | residual (window edge) | outside the gate by design |
+| `tail` | 0.00 / 0.00 / 0.00 | 0.00 / 0.00 / 0.00 | residual (window edge) | outside the gate by design |
+| **window** | 14.52 / 15.03 / 14.29 s | 7.98 / 8.02 / 8.03 s | counted | — |
+| **traced ops** | 1,336,879 / 1,337,409 / 1,334,846 | 123,197 / 123,779 / 123,719 | counted | — |
+
+**The two percentage columns are derived** (a counted phase over a counted window), which is
+why the provenance column labels the ns total rather than the percentage. Every "residual"
+row is *the time that was not any traced op*, measured by subtraction — and a subtraction
+cannot say what it subtracted.
+
+**The gate column carries a genuine change in evidentiary standing, and it is the reason to
+read this column with more confidence than the one above it.** The bound is the same
+arithmetic in both arms — ns/op × recorded ops — but the op count fell 10.8×, so the bound
+falls with it: **3.79–3.80 s, or 25.3–26.5% of the baseline window, against 0.35 s, or
+4.37–4.38% of the new one.** On the baseline arm no IO phase can pass by arithmetic (a phase
+would need to be ≥ 38 s inside a 14.5 s window). On the new arm the largest field —
+`wal_sync_io`, at 5.775 / 5.736 / 5.894 s against thresholds of 3.499 / 3.515 / 3.514 s —
+**passes on all three runs.** No published kernel run before this one had a single certified
+IO phase. Every run here still exited non-zero, by design, and each artifact's `invalid`
+array carries the same list.
+
+**The concentration argument inverts, which matters for the criterion.** The pre-batching
+section computes that ≈92% of recorded ops are `tables.redb` ops, so ≈92% of the
+instrument's own bound lands in `gap_within_store` — the very field a store-side verdict
+would rest on. That arithmetic reproduces here on the baseline arm to the digit
+(≥ 92.4% on all three runs, derived: the workload fixes WAL ops at 100,000 appends plus
+≈1,614 counted syncs, and the sync counter is unscoped so that is an upper bound and the
+store share a lower one). On the new arm the same derivation gives **≥ 17.5–17.9%**. The
+residual the criterion is stated on is no longer the preferential sink for the instrument's
+cost; it is now the least likely place for it, and the criterion clears its threshold by a
+factor of ~20 regardless.
+
+### Per log record, which is where the attribution is unambiguous
+
+Window ÷ 100,000 log records — the count the workload fixes, since `requests_total ==
+jobs_done == 50,000` and the canonical request commits two records. Run 1 of each arm; the
+other two are within a few percent and are in the run log. Microseconds.
+
+| field | baseline | per-batch apply | Δ |
+|---|---|---|---|
+| `wal_sync_io` | 57.42 | 57.75 | **+0.33** |
+| `wal_append_io` | 2.13 | 3.86 | +1.73 |
+| `gap_within_wal` | 0.23 | 0.40 | +0.17 |
+| `gap_wal_to_store` | 4.15 | 10.75 | +6.60 |
+| `store_write_io` | 16.62 | 1.25 | **−15.37** |
+| `store_sync_io` | 1.98 | 1.23 | −0.75 |
+| `gap_within_store` | 59.84 | 0.18 | **−59.66** |
+| `gap_store_to_wal` | 1.84 | 3.30 | +1.47 |
+| five fields under 1 µs | 0.99 | 1.09 | +0.10 |
+| **per-record budget** | **145.18** | **79.81** | **−65.37** |
+
+The five fields folded into one row are `store_read_io`, `other_io`, `gap_other`, `lead_in`
+and `tail`; they are listed as a sum so the column adds up rather than nearly adding up.
+Across all three runs the budget reads 145.18 / 150.29 / 142.85 µs against 79.81 / 80.19 /
+80.33 µs.
+
+**`wal_sync_io` per record is unchanged — 57.42 against 57.75 µs, and 57.4–58.3 against
+57.4–58.9 across all six runs.** That is the strongest single control in this section. The
+durable sync is the one thing this change does not touch, the instrument confirms it costs
+exactly what it cost before, and every other movement in the table is therefore attributable
+to the apply path rather than to the box being faster on the day.
+
+Grouped into `submit_all`'s three blocks — the same grouping the section above publishes:
+
+| | baseline (3 obs) | per-batch apply (3 obs) |
+|---|---|---|
+| WAL path | 41.17 / 40.10 / 42.55% | **77.70 / 77.05 / 78.52%** |
+| store path | **56.89 / 57.96 / 55.38%** | 16.80 / 17.48 / 16.23% |
+| outside the commit path | 1.27 / 1.22 / 1.29% | 4.14 / 4.14 / 3.89% |
+| the remaining `other_io`, `gap_other`, window edges | 0.67 / 0.72 / 0.77% | 1.36 / 1.33 / 1.37% |
+
+The two blocks swap places, and not narrowly: the store path led the WAL path by **12.8–17.9
+points** before and trails it by **59.6–62.3** now. Per record the store path falls **82.59 →
+13.41 µs**, a 6.2× reduction, and that −69.18 µs is the whole of the −65.37 µs per-record
+budget improvement, offset by +2.24 µs on the WAL path, +1.47 µs outside the commit path and
++0.10 µs across the five small fields.
+
+The +2.2 µs on the WAL path is mostly `wal_append_io` (+1.73 µs per record), and **this
+measurement does not say why.** The workload issues the same 100,000 appends in both arms,
+into a window half as long in the new one; a write that more often meets the OS's writeback
+under that pressure is a plausible mechanism and is not something this instrument can
+distinguish from any other. It is 2.2% of the new per-record budget and it moves against the
+result, so it is reported rather than explained.
+
+**Part of `gap_within_store`'s fall is a boundary move, not a cost that vanished, and the
+honest figure is the 6.2× on the block rather than the 300× on the field.** A residual is
+defined by the traced ops on either side of it, and per-batch apply moved those ops: with one
+write transaction per batch, redb's B-tree descent, page allocation and dirtying happen
+*before* the batch's first disk write rather than between 62 of them. So work that used to
+land in `gap_within_store` now lands in `gap_wal_to_store` (+6.60 µs per record, and per
+*batch* 257–271 → 630–686 µs) and in `gap_store_to_wal` (+1.47 µs per record, 114 → 194–206
+µs per batch). That last field is the one the section above reads as "everything outside the
+commit path"; **it is not evidence that the kernel loop got more expensive**, because the
+same relocation feeds it, and the instrument cannot separate the two. What survives the
+relocation is the block total, which nets all of it out: 82.59 → 13.41 µs per record.
+
+### The core layer, batch 1 — unchanged, which is the required result
+
+Same protocol, separately bracketed by its own pair of quiet-box checks, three observations
+per arm interleaved.
+
+| | baseline (3 obs) | per-batch apply (3 obs) |
+|---|---|---|
+| acked writes/sec | 234.1 / 215.0 / 249.9 | 227.6 / 248.8 / 256.0 |
+| `device_ratio` | 0.881 / 0.901 / 0.931 | 0.862 / 0.937 / 0.947 |
+| snapshot reads/sec | 2,675,078 / 2,654,654 / 2,682,957 | 2,645,895 / 2,655,027 / 2,709,506 |
+| `wal_sync_io` % of window | 95.64 / 96.19 / 93.89 | 95.50 / 95.32 / 94.08 |
+| `gap_within_store` % of window | 0.02 / 0.02 / 0.04 | 0.02 / 0.02 / 0.03 |
+
+Completely overlapping on every field. `Db::transact` is a group of one, and a one-record
+batch performs one read transaction, one `begin_write` and one commit — bit for bit what a
+per-record apply performed. A core layer that had "improved" here would mean the batch-of-one
+path had stopped being the pre-batching path. **This is corroboration and not the primary
+evidence**: that identity is pinned mechanically and byte-exactly by
+`a_never_contended_universe_traces_identically_to_the_pre_batching_fixture` against
+`crates/charpente/tests/fixtures/pre-batching-trace.txt`, which is a stronger oracle than any
+benchmark. These figures also sit a few points off the core column published above
+(`wal_sync_io` 94–96% here against 90.3–90.6% there) — a machine-era difference of exactly the
+kind control 2 above documents, and one that does not touch a control whose two arms were
+interleaved on one box inside fifteen minutes.
+
+### DECISIONS §7 trigger (a), re-read on these numbers
+
+The re-reading taken on the pre-batching path
+(`.superpowers/sdd/2026-08-19-phase-attribution/trigger-a-rereading.md`) is **superseded**:
+it concludes on the code path this change deletes. It is left readable as what was true then.
+
+That reading landed on outcome 2 — present but not the largest — by 0.4–1.5 points at the
+field level, and recorded that two other readings of the criterion's own wording would have
+fired the trigger by 13.7 and 28.3–37.1 points. **It is the size of that disagreement, not
+the closeness of any measurement, that made the choice of reading Noah's.** On these numbers
+the disagreement is gone:
+
+- **Field level, "non-idle" excluding only the window's dead edges.** `wal_sync_io` leads at
+  72.36 / 71.53 / 73.38%; `gap_within_store` is **0.23 / 0.26 / 0.23%**. The lead is
+  **72.13 / 71.27 / 73.15 points**, and it is a *counted* phase over a *residual* one.
+  Trigger (a) does not fire.
+- **CPU only, "non-idle" excluding the device-blocked fsync.** `gap_within_store` no longer
+  leads that comparison either: with `wal_sync_io` out, the largest field is
+  `gap_wal_to_store` at 12.66–13.80%, and `wal_append_io` (4.65–4.99%) and `gap_store_to_wal`
+  (3.89–4.14%) also exceed it. Excluding every traced IO phase and comparing only the
+  residuals, `gap_within_store` is **1.24–1.38% of all-gap time**, against 89.6–90.6% on the
+  baseline arm. Trigger (a) does not fire.
+- **Block level, "phase" as one of `submit_all`'s three blocks.** The store path is
+  16.23–17.48% against the WAL path's 77.05–78.52%. Present, and dominated by a factor of
+  **4.4–4.8**. Trigger (a) does not fire.
+
+**All three readings now agree, and they agree by wide margins rather than by 0.4 points.**
+The pre-committed outcome the field-level reading lands on is the third one — *redb apply
+negligible → trigger (a) does not fire, and the 0.42× gap gets its actual owner* — and that
+owner is now named: **the gap was charpente's own call pattern into redb, not redb.** One
+redb write transaction and one read transaction per record, inside a batch whose WAL cost was
+already amortized 62×, cost 12.1 of every 13.4 Disk operations the workload performed. At the
+block level the reading is outcome 2, present but dominated; under no reading is it outcome 1.
+
+**What this does not say.** It does not say the store path is free — it is 16.2–17.5% of a
+batched commit window, and the redb debug-assertions probe above (whose build provenance is
+unverifiable, as that section states) is untouched by this and still points at a lever nobody
+has priced properly. It does not measure redb in isolation, and it says nothing about a
+workload with larger rows, more secondary indexes, or a different record mix. `DECISIONS.md`
+§7 stays Noah's to edit; nothing here edits it.
+
+### What this measurement does not establish
+
+- **Not a platform claim, and not the launch claim.** Dev-laptop numbers under
+  `F_FULLFSYNC`. The bare-metal Linux run stays owed, and this result makes it *more* owed,
+  not less: with the store path amortized, the durable sync is 71.5–73.4% of the commit
+  window, so the next binding constraint is precisely the quantity a different device
+  changes most.
+- **The wire layer was not re-measured.** The sweep table above is unchanged and its
+  `bench-app` rows still describe the pre-batching binary. The kernel arm's `device_ratio`
+  of 0.766–0.772 is not a wire number, and the 64-connection point has not been re-run.
+- **The instrument still cannot see inside a residual.** `gap_within_store` at 0.23% is a
+  residual reading 0.18 µs per record; that it is small does not make it a measurement of
+  redb, any more than 41% did. What can be said without inference is counted: Disk ops per
+  log record fell from 13.4 to 1.2.
+- **The load averages were not ideal and are disclosed above**, along with the 17-minute
+  wait for another repo's suite. The gate is mechanical and passed at both ends of both
+  sets; the margins here are large enough that no plausible load effect reaches them, which
+  is stated as a judgement rather than as something the gate proved.
+- **`gap_store_to_wal` rose and cannot be read as the kernel loop getting slower**, for the
+  boundary-move reason given above.
+- **Two points, not a curve.** batch 1 and batch ≈62, as before.
 
 ## What these numbers are not
 
