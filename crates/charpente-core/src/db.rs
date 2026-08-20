@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 
-use crate::engine::{Engine, StateMachine};
+use crate::engine::{Engine, StateMachine, SubmitFailure};
 use crate::event::EventRow;
 use crate::io::{Disk, File};
 use crate::job::JobRow;
@@ -720,23 +720,47 @@ struct TableMachine {
 }
 
 impl StateMachine for TableMachine {
+    /// One record is a batch of one — and a batch of one does exactly the disk
+    /// work this did before batching (one read txn, one write txn, one commit),
+    /// which is the batch-of-1 identity the pre-batching trace fixture pins.
     fn apply(&mut self, seq: u64, payload: &[u8]) -> io::Result<()> {
-        if self.skip_through.is_some_and(|s| seq <= s) {
+        self.apply_batch(&[(seq, payload)]).map_err(|f| f.error)
+    }
+
+    /// Atomic where the trait default is per-record: the whole batch commits in
+    /// one store transaction, or none of it does.
+    fn apply_batch(&mut self, records: &[(u64, &[u8])]) -> Result<(), SubmitFailure> {
+        // Skipped records are a contiguous prefix: `skip_through` is the
+        // store's own `applied_seq` (`Db::recover`), so `seq <= skip_through`
+        // is exactly what the store already holds, and the live tail starts at
+        // `skip_through + 1` gapless.
+        let skip_through = self.skip_through;
+        let start = records
+            .iter()
+            .position(|(seq, _)| skip_through.is_none_or(|s| *seq > s))
+            .unwrap_or(records.len());
+        let live = &records[start..];
+        if live.is_empty() {
             return Ok(());
         }
-        let effects = decode_record(payload)?;
+
         let schema = &self.schema;
         // The dynamic version map is mutated in pass 1 (adoption/watermark
         // rows declare their table's version) and read in pass 2 (the gate);
         // a disjoint-field borrow alongside `schema`, both distinct from the
-        // `self.store` the `apply` call borrows.
+        // `self.store` the `apply_batch` call borrows.
         let versions = &mut self.versions;
         let saw_below = &mut self.saw_below;
         // `w.materialize_job` returns the new id; collected locally because
         // the closure can't also hold `&mut self.enqueued` while `schema`
-        // (borrowed from `self`) is captured — extend after the store commits.
-        let new_ids = self.store.apply(seq, |w| {
-            let mut ids = Vec::new();
+        // (borrowed from `self`) is captured — and, load-bearing now that the
+        // batch shares one transaction, because a rolled-back batch must not
+        // hand the job runner ids for rows the store never took. Extended into
+        // `self.enqueued` only after the batch commits.
+        let mut new_ids = Vec::new();
+
+        let result = self.store.apply_batch(live, |w, seq, payload| {
+            let effects = decode_record(payload)?;
             // Pass 1: schema-table effects first, so a record that both
             // adopts a table and writes its first rows has declared the
             // table's version by the time pass 2 checks it.
@@ -828,7 +852,7 @@ impl StateMachine for TableMachine {
                         w.put_raw(table, *id, row)?;
                     }
                     Effect::Enqueue { job, payload, key } => {
-                        ids.push(w.materialize_job(job, payload, key.as_deref())?);
+                        new_ids.push(w.materialize_job(job, payload, key.as_deref())?);
                     }
                     Effect::Emit {
                         event,
@@ -839,10 +863,23 @@ impl StateMachine for TableMachine {
                     }
                 }
             }
-            Ok(ids)
-        })?;
-        self.enqueued.extend(new_ids);
-        Ok(())
+            Ok(())
+        });
+
+        match result {
+            Ok(()) => {
+                self.enqueued.extend(new_ids);
+                Ok(())
+            }
+            // A rolled-back batch applied nothing, so the count is 0 — with one
+            // transaction per batch there is no longer a mid-batch boundary to
+            // report. `versions` and `saw_below` are in-memory and were mutated
+            // inside the closure, so they keep mutations the store discarded.
+            // That divergence is tolerable ONLY because this path poisons the
+            // engine: the process must restart and recover, and recovery
+            // rebuilds both from the log. Do not try to roll them back.
+            Err(error) => Err(SubmitFailure { applied: 0, error }),
+        }
     }
 }
 
@@ -1465,6 +1502,15 @@ impl Db {
     /// A consistent read-only view for queries outside transactions.
     pub fn snapshot(&self) -> io::Result<Snapshot> {
         self.engine.machine().store.snapshot()
+    }
+
+    /// This node's store write-transaction schedule digest
+    /// (`Store::write_schedule`) — how its records were grouped into store
+    /// commits, which is what redb's physical layout depends on. Two nodes at
+    /// the same log position agree on rows and counters regardless; they agree
+    /// on store BYTES only when this also matches (DESIGN §1, property 1).
+    pub fn store_write_schedule(&self) -> u64 {
+        self.engine.machine().store.write_schedule()
     }
 
     /// The event id counter (meta counter; `0` when unset) — same access

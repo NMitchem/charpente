@@ -559,8 +559,11 @@ fn commit_widget(sim: &Sim, node: &mut Node, i: u64) -> Result<(), String> {
 // --------------------------------------------------------------- oracles
 
 /// (a) equal `last_applied`, (b) byte-equal `scan_raw` over every table plus
-/// the meta counter — the layout-independent content oracle that holds across
-/// a seed and across crash-recovery, retried under transient read faults.
+/// both meta counters — the layout-independent content oracle that holds
+/// across a seed and across crash-recovery, retried under transient read
+/// faults. Since per-batch apply, this is THE replication guarantee rather
+/// than a weaker companion to the byte fingerprint (DESIGN §1, property 1),
+/// so it runs in every universe and covers `repl:logical-converged`.
 fn assert_converged(sim: &Sim, p: &mut Node, f: &mut Node) -> Result<(), String> {
     // The two-node analogue of `retry_read_reopen`: the convergence scan reads
     // BOTH nodes' live redb handles, so a latched poison ("close and re-open
@@ -578,7 +581,14 @@ fn assert_converged(sim: &Sim, p: &mut Node, f: &mut Node) -> Result<(), String>
             return Err(format!("last_applied mismatch: p={pla:?} f={fla:?}"));
         }
         match converged_read(p, f) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                // Logical convergence is THE replication guarantee (DESIGN §1,
+                // property 1) — byte-identity is only claimed where the two
+                // nodes shared a write schedule. So this oracle runs in every
+                // universe, and covers a key the swarm `require:`s to prove it.
+                sim.cover("repl:logical-converged");
+                return Ok(());
+            }
             Err(e) if e.contains("close and re-open the database") => {
                 // Latched redb poison — recover_node-style drop+reopen clears
                 // it (fresh handle; WAL replay restores the converged applied
@@ -619,21 +629,61 @@ fn converged_read(p: &Node, f: &Node) -> Result<(), String> {
     {
         return Err("next_job_id diverged".to_string());
     }
+    // Same reason as next_job_id, and the reason it is checked at all: both
+    // counters are bumped inside the store transaction that carries
+    // `applied_seq`, so per-batch apply could desynchronize them between two
+    // nodes without moving a single row byte — which every other check here
+    // would pass.
+    if ps.next_event_id().map_err(|e| format!("p: {e}"))?
+        != fs.next_event_id().map_err(|e| format!("f: {e}"))?
+    {
+        return Err("next_event_id diverged".to_string());
+    }
     Ok(())
 }
 
-/// (c) The determinism gift: after checkpoint + graceful close on both nodes,
-/// the two hosts' store + WAL bytes are identical — both executed the
-/// identical per-record redb op sequence and identical WAL appends (DESIGN §4
-/// records redb's byte-determinism under identical op sequences). The role
-/// file is excluded: it differs by design (primary vs follower). Consumes the
-/// nodes (graceful close is part of the oracle). Falls back to nothing — with
-/// `repl:fingerprint-skipped` coverage — when this universe's injected faults
-/// made the op sequences diverge (retries/recoveries change redb's history
-/// even though the logical content converged; oracle (b) already ran).
+/// (c) The determinism gift, scoped to what the architecture actually
+/// promises: after checkpoint + graceful close, two nodes that executed the
+/// SAME redb op sequence hold identical store + WAL bytes. The role file is
+/// excluded: it differs by design (primary vs follower). Consumes the nodes
+/// (graceful close is part of the oracle).
+///
+/// Two conditions gate it, each with its own coverage key so a green suite
+/// cannot hide which one is firing:
+///
+/// - Injected faults perturb the op sequence beyond grouping (retries and
+///   recoveries change redb's history even though logical content converged)
+///   — `repl:fingerprint-skipped`.
+/// - The two nodes grouped the same records into store transactions
+///   differently, which redb's physical layout depends on (DESIGN §1,
+///   property 1) — `repl:fingerprint-skipped-grouping`. This is read off
+///   `Db::store_write_schedule()`, a digest each node RECORDS as it commits,
+///   never inferred from what faults did or did not fire: a follower that
+///   caught up in one wide ship applied in one transaction what the primary
+///   committed in forty, and no fault count reveals that.
+///
+/// When neither fires, the comparison runs for real and covers
+/// `repl:fingerprint-compared` — which the swarm `require:`s, so a change that
+/// made the schedules always differ would go red here rather than quietly
+/// retiring this oracle. Oracle (b) `assert_converged` is unconditional and
+/// has already run in every universe either way; logical convergence is the
+/// guarantee, and this is the sharper check where it is available.
 fn assert_bytes_identical(sim: &Sim, mut p: Node, mut f: Node) -> Result<(), String> {
+    // Read BEFORE the checkpoints below, which are themselves scheduled writes.
+    // They are symmetric (one per node), so comparing here or after is the same
+    // verdict — but reading first keeps the digest a fact about the universe
+    // rather than about this function.
+    let (psched, fsched) = {
+        let pdb = p.db.as_ref().ok_or("p has no db")?;
+        let fdb = f.db.as_ref().ok_or("f has no db")?;
+        (pdb.store_write_schedule(), fdb.store_write_schedule())
+    };
     if !universe_is_quiet(sim, &[&p, &f]) {
         sim.cover("repl:fingerprint-skipped");
+        return Ok(());
+    }
+    if psched != fsched {
+        sim.cover("repl:fingerprint-skipped-grouping");
         return Ok(());
     }
     for n in [&mut p, &mut f] {
@@ -647,18 +697,27 @@ fn assert_bytes_identical(sim: &Sim, mut p: Node, mut f: Node) -> Result<(), Str
     let b = data_fingerprint(&f.host)?;
     if a != b {
         return Err(format!(
-            "converged nodes' store+log bytes diverged in a fault-free universe: \
+            "converged nodes' store+log bytes diverged in a fault-free universe \
+             that also shared one store write schedule ({psched:#018x}): \
              p={a:#018x} f={b:#018x}"
         ));
     }
+    sim.cover("repl:fingerprint-compared");
     Ok(())
 }
 
-/// True when nothing in this universe could have perturbed either host's disk
-/// op sequence: no disk faults, no crashes, no restarts, no node recoveries.
-/// Net-only events (`conn_drop`, `net_spike`) don't touch bytes: a dropped
-/// conn re-Hellos and resumes from the follower's real position — no replays,
-/// no double-applies — so those universes stay byte-comparable.
+/// True when no *fault* perturbed either host's disk op sequence: no disk
+/// faults, no crashes, no restarts, no node recoveries. Net-only events
+/// (`conn_drop`, `net_spike`) stay admitted because they still cause no
+/// replays and no double-applies — a dropped conn re-Hellos and resumes from
+/// the follower's real position.
+///
+/// What they DO change, since per-batch apply landed, is how many frames ride
+/// one ship and therefore how many records share one store transaction. So
+/// this is no longer sufficient for byte-comparability on its own, and it is
+/// deliberately not stretched to cover the gap: `assert_bytes_identical` pairs
+/// it with the recorded write schedule, which observes grouping directly
+/// instead of inferring it from which faults fired.
 fn universe_is_quiet(sim: &Sim, nodes: &[&Node]) -> bool {
     if nodes.iter().any(|n| n.recoveries > 0) {
         return false;
@@ -790,7 +849,12 @@ fn follower_converges_to_the_primary_fingerprint() {
             let r = convergence_universe(sim);
             finish_universe(sim, r)
         },
-        require: ["fault:conn_drop", "restart"]
+        require: [
+            "fault:conn_drop",
+            "restart",
+            "repl:logical-converged",
+            "repl:fingerprint-compared"
+        ]
     );
 }
 

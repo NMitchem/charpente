@@ -1865,16 +1865,27 @@ fn table_contents(snap: &Snapshot) -> TableContents {
     (orgs, invoices)
 }
 
-/// The convergence oracle in miniature: a follower fed the primary's own
-/// `read_log` output via `apply_shipped`, in batches, ends up with
-/// byte-identical durable state.
+/// The convergence oracle in miniature, and the line it now stops at
+/// (DESIGN §1, property 1). A follower fed the primary's own `read_log` output
+/// via `apply_shipped` converges on content unconditionally; it converges on
+/// BYTES only when it also grouped those records into store transactions the
+/// way the primary did. `b` catches up in two wide batches and `c` frame by
+/// frame, against a primary that committed one record at a time — so the two
+/// halves of the property are asserted against each other in one run, and
+/// neither half can go vacuous without the other going red.
+///
+/// Before per-batch apply this held for `b` too, because the store committed
+/// one transaction per record no matter how frames arrived. That is the
+/// incidental byte-identity DESIGN §1 now declines to claim.
 #[test]
 fn apply_shipped_replays_records_byte_identically() {
     let sim = Sim::with_faults(0x9012_0002, FaultConfig::none());
     let host_a = sim.host("a");
     let host_b = sim.host("b");
+    let host_c = sim.host("c");
     let mut db_a = Db::open(Box::new(host_a.disk()), DbConfig::default(), app_schema()).unwrap();
     let mut db_b = Db::open(Box::new(host_b.disk()), DbConfig::default(), app_schema()).unwrap();
+    let mut db_c = Db::open(Box::new(host_c.disk()), DbConfig::default(), app_schema()).unwrap();
 
     for i in 0..20u64 {
         db_a.transact(|tx| {
@@ -1902,26 +1913,59 @@ fn apply_shipped_replays_records_byte_identically() {
     let mid = frames.len() / 2;
     db_b.apply_shipped(&frames[..mid]).unwrap();
     db_b.apply_shipped(&frames[mid..]).unwrap();
+    for frame in &frames {
+        db_c.apply_shipped(std::slice::from_ref(frame)).unwrap();
+    }
 
-    assert_eq!(db_b.last_applied(), db_a.last_applied());
-    assert_eq!(
-        table_contents(&db_a.snapshot().unwrap()),
-        table_contents(&db_b.snapshot().unwrap()),
-        "every row must match after replay"
+    assert_ne!(
+        db_b.store_write_schedule(),
+        db_a.store_write_schedule(),
+        "two ten-record transactions is not twenty one-record ones — if these \
+         ever agree this test has stopped exercising the batched case"
     );
+    assert_eq!(
+        db_c.store_write_schedule(),
+        db_a.store_write_schedule(),
+        "one frame per apply_shipped is one record per store transaction, \
+         exactly what committing one at a time does"
+    );
+
+    for (name, db) in [("b", &db_b), ("c", &db_c)] {
+        assert_eq!(db.last_applied(), db_a.last_applied(), "{name}");
+        assert_eq!(
+            table_contents(&db_a.snapshot().unwrap()),
+            table_contents(&db.snapshot().unwrap()),
+            "every row must match after replay ({name}) — content convergence \
+             does not depend on how the records were batched"
+        );
+    }
 
     db_a.checkpoint().unwrap();
     db_b.checkpoint().unwrap();
+    db_c.checkpoint().unwrap();
     drop(db_a);
     drop(db_b);
+    drop(db_c);
 
     let db_a = Db::open(Box::new(host_a.disk()), DbConfig::default(), app_schema()).unwrap();
     let db_b = Db::open(Box::new(host_b.disk()), DbConfig::default(), app_schema()).unwrap();
+    let db_c = Db::open(Box::new(host_c.disk()), DbConfig::default(), app_schema()).unwrap();
     assert_eq!(db_a.last_applied(), db_b.last_applied());
+    assert_eq!(db_a.last_applied(), db_c.last_applied());
     assert_eq!(
         host_a.durable_fingerprint(),
+        host_c.durable_fingerprint(),
+        "the convergence oracle, at the scope that survives batching: equal \
+         write schedule at equal seq means byte-identical durable state"
+    );
+    assert_ne!(
+        host_a.durable_fingerprint(),
         host_b.durable_fingerprint(),
-        "the convergence oracle: byte-identical durable state at equal seq"
+        "and the scope that does not: same log, same rows, different \
+         transaction grouping, so redb's layout differs. A green assert_eq \
+         here would mean grouping had stopped reaching the bytes — worth \
+         knowing, but it would make DESIGN §1's caveat unnecessary rather \
+         than wrong, so re-derive the caveat before deleting this line"
     );
 }
 
@@ -1944,6 +1988,66 @@ fn apply_shipped_refuses_a_seq_gap_by_name() {
     let mut db_b = Db::open(Box::new(host_b.disk()), DbConfig::default(), app_schema()).unwrap();
     let err = db_b.apply_shipped(&frames[5..]).unwrap_err();
     assert!(err.to_string().contains("expects seq"), "{err}");
+}
+
+/// `TableMachine` is atomic where the trait default is per-record: one store
+/// transaction per batch, so a failure anywhere rolls every record back and
+/// reports nothing applied — there is no mid-batch boundary left to report.
+/// Driven through `apply_shipped`, which is `submit_batch` -> `apply_batch`.
+///
+/// The `drain_enqueued` assertion is the load-bearing one: records 0 and 1
+/// materialize jobs inside the transaction that then rolls back, and
+/// enqueueing them would hand the job runner ids for rows the store never
+/// took.
+#[test]
+fn a_failed_batch_applies_nothing_and_enqueues_nothing() {
+    let sim = Sim::with_faults(0x7AB1_E001, FaultConfig::none());
+    let host_a = sim.host("a");
+    let host_b = sim.host("b");
+    let mut db_a = Db::open(Box::new(host_a.disk()), DbConfig::default(), app_schema()).unwrap();
+    for i in 0..2u64 {
+        db_a.transact(|tx| {
+            tx.put(&invoice(i, 0, 100));
+            tx.enqueue(SendReceipt { invoice: i });
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+    }
+    let mut frames = db_a.read_log(0, usize::MAX).unwrap();
+    assert_eq!(frames.len(), 2);
+
+    // One effect claimed, tag 99: `decode_record` refuses it, and it refuses
+    // INSIDE the store transaction — after the two good records have already
+    // put rows and materialized jobs into that same transaction. That
+    // interleaving is exactly what atomicity has to survive.
+    frames.push((2, vec![1u8, 0, 0, 0, 99]));
+
+    let mut db_b = Db::open(Box::new(host_b.disk()), DbConfig::default(), app_schema()).unwrap();
+    let err = db_b.apply_shipped(&frames).unwrap_err();
+    assert!(err.to_string().contains("unknown effect tag 99"), "{err}");
+
+    assert_eq!(
+        db_b.last_applied(),
+        None,
+        "a rolled-back batch applied nothing, so the engine's applied count is \
+         0 and last_applied never moves"
+    );
+    let snap = db_b.snapshot().unwrap();
+    assert_eq!(
+        snap.applied_seq().unwrap(),
+        None,
+        "a failed batch must not move the store's applied_seq"
+    );
+    assert!(
+        snap.scan::<Invoice>().unwrap().is_empty(),
+        "records 0 and 1 wrote rows into the transaction that rolled back"
+    );
+    assert!(
+        db_b.drain_enqueued().is_empty(),
+        "records 0 and 1 materialized jobs inside the transaction, but the \
+         transaction rolled back — enqueueing them would hand the job runner \
+         ids for rows the store never took"
+    );
 }
 
 /// `apply_shipped` is the follower's own write path — `forbid_writes` never

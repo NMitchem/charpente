@@ -223,7 +223,21 @@ or spawn tasks. External effects are expressed as enqueued jobs that run *after*
 **Why.** Three properties fall out of this single decision:
 
 1. **Replication for free.** Followers replay the same log through the same deterministic
-   state machine and arrive at byte-identical state. Failover is log position arithmetic.
+   state machine and arrive at identical *logical* state — the same rows, the same job
+   queue, the same event stream, at the same log position. Failover is log position
+   arithmetic. What is deliberately **not** claimed is a byte-identical store file. redb's
+   physical layout depends on how records were grouped into write transactions, and that
+   grouping is a scheduling artifact — how many records happened to be ready at once —
+   which the log does not record and is not asked to: the log fixes what became true and
+   in what order, never how many commits it took to absorb. Byte-identity held
+   incidentally while the store committed one transaction per record, and per-batch apply
+   ends it — for a recovering primary as much as for a follower, since a node replaying
+   its own log cannot reproduce the grouping its live traffic originally had either. The
+   store is a materialization of the log (§4), and two materializations of one log agree
+   on content, not on layout. `Db::store_write_schedule()` exposes a node's grouping as a
+   digest, so the sim's byte-fingerprint oracle compares files only between nodes that
+   actually scheduled their commits alike, instead of inferring it from which faults
+   fired.
 2. **Simulation for free.** A deterministic function of (state, input, seed) is trivially
    replayable. Every production incident is reproducible if you have the log segment.
 3. **The dual-write class deleted.** Job enqueues and event emissions are rows in the same
@@ -554,9 +568,16 @@ knows tree shape.
 
 **Table store (v0, implemented).** redb mounts behind `Disk` via a `StorageBackend`
 adapter (`table::Store::open` — the raw-path constructors are deny-listed). The store is
-a materialization of the log, never a second source of truth: every `apply(seq, …)`
-commits row effects atomically with the `applied_seq` meta key at `Durability::None`
-(no fsync — the WAL is the durability story); `checkpoint()` persists everything at
+a materialization of the log, never a second source of truth: `apply_batch` commits a
+contiguous run of records' row effects atomically with the `applied_seq` meta key in ONE
+redb write transaction at `Durability::None` (no fsync — the WAL is the durability
+story), and every record in the run commits or none of them does: an apply failure
+anywhere rolls the whole batch back and reports nothing applied. `apply(seq, …)` is that
+batch with one record, and does exactly the disk work a per-record commit always did —
+one read txn, one write txn, one commit — which is what keeps a never-contended universe
+tracing identically to pre-batching code. What widened is the *store's* commit point, not
+the log's; the WAL's durability stays prefix-shaped (see "the batch is not
+durability-atomic" under group commit above). `checkpoint()` persists everything at
 once; after a crash the store reverts to its last checkpoint and recovery replays the
 WAL from `applied_seq + 1`. Two redb facts the sim established: its byte layout is
 deterministic under identical op sequences (raw-fingerprint replay holds), and
@@ -624,7 +645,7 @@ five-site census above, to be re-walked on every redb upgrade.
 
 Two shapes share the fix but not its evidentiary standing. On a
 **cache-resident store — MEASURED** — the only reachable trigger is the
-store's own checkpoint fsync (`Store::apply` commits at `Durability::None`, so
+store's own checkpoint fsync (store applies commit at `Durability::None`, so
 checkpoint is the only store sync); before this fix the latch was completely
 silent, since reads kept answering 200 off redb's page cache, and the window
 closed only when the next write converted the latch into apply-side poison —

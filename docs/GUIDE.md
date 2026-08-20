@@ -1012,14 +1012,18 @@ so it is not invalidated and keeps its 200. What such a failure invalidates is
 every request from the first staged record onward. The case with no analogue in
 a one-at-a-time kernel is a failure to
 *apply* a record after the batch has already synced: at that point every
-record in the batch is on disk, and the platform answers 500 to the request
-whose record failed, to every request behind it, and to every request that
-*read* one of those records through the batch's shared view. Read it as the
+record in the batch is on disk and none of them is in the store, because the
+store takes a whole batch in one transaction — an apply failure anywhere rolls
+every record in it back rather than leaving a prefix behind. So the platform
+answers 500 to every request that staged a record in that batch, and to every
+request that *read* one of those records through the batch's shared view. A
+request that ran ahead of every staged record still keeps its 200: it only ever
+observed committed state. Read it as the
 rule above says: **a 500 never promises rejection, only the absence of
 confirmation.** What that means in practice:
 
-- **The write may be committed.** After a mid-batch apply failure the record
-  is durable and applies when the process restarts. The client was told
+- **The write may be committed.** After an apply failure every record in the
+  batch is durable and applies when the process restarts. The client was told
   "unknown"; the durable answer turns out to be "yes". Plan for it — this is
   a named contract, not an edge case you are expected to discover.
 - **The reverse remains impossible.** No 200 is ever emitted for something
@@ -2482,7 +2486,7 @@ The second is the **store latch**, and it is worth understanding because the
 message is reassuring on purpose. redb keeps its own independent "this handle
 is broken" flag: any error from its storage backend sets it, after which every
 later redb call fails with "close and re-open the database". The reachable
-trigger is the store's own checkpoint fsync — `Store::apply` commits at
+trigger is the store's own checkpoint fsync — store applies commit at
 `Durability::None`, so the checkpoint is the only store sync charpente makes.
 charpente observes that same condition at its own disk boundary and folds it
 into `Db::poisoned()`, so the kernel stops exactly as it does for engine

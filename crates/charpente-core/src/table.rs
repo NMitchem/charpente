@@ -16,7 +16,7 @@ use std::fmt;
 use std::io;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use redb::{
     Builder, Database, Durability, ReadableDatabase, ReadableTable, StorageBackend, TableDefinition,
@@ -263,6 +263,9 @@ pub struct Store {
     db: Database,
     /// Shared with this store's `DiskBackend` — see its `latch` field.
     latch: Arc<AtomicBool>,
+    /// Rolling digest of this handle's write-transaction schedule — see
+    /// `write_schedule`.
+    schedule: AtomicU64,
 }
 
 const META: TableDefinition<&str, u64> = TableDefinition::new("charpente.meta");
@@ -287,6 +290,15 @@ fn index_entry(mut key: Vec<u8>, id: u64) -> Vec<u8> {
 fn redb_err(e: impl fmt::Display) -> io::Error {
     io::Error::other(format!("table store (redb): {e}"))
 }
+
+/// FNV-1a offset basis; `Store::schedule` starts here so an untouched handle
+/// has a stable, nonzero digest.
+const SCHEDULE_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// The `schedule` marker for a checkpoint, kept distinct from any batch size
+/// so "applied 40 records, then checkpointed" cannot collide with a 40-record
+/// batch that did not.
+const SCHEDULE_CHECKPOINT: u64 = u64::MAX;
 
 /// One record's effects inside an already-open write transaction: the
 /// negative-space counter checks and the `applied_seq` bump. Free rather than
@@ -383,7 +395,11 @@ impl Store {
             ))
         })?
         .map_err(redb_err)?;
-        Ok(Store { db, latch })
+        Ok(Store {
+            db,
+            latch,
+            schedule: AtomicU64::new(SCHEDULE_SEED),
+        })
     }
 
     /// The log position this store's *committed* state corresponds to.
@@ -420,6 +436,7 @@ impl Store {
         txn.set_durability(Durability::None).map_err(redb_err)?;
         let out = apply_one_in_txn(&txn, seq, f)?;
         txn.commit().map_err(redb_err)?;
+        self.mix_schedule(1);
         Ok(out)
     }
 
@@ -456,6 +473,7 @@ impl Store {
             apply_one_in_txn(&txn, *seq, |w| f(w, *seq, payload))?;
         }
         txn.commit().map_err(redb_err)?;
+        self.mix_schedule(records.len() as u64);
         Ok(())
     }
 
@@ -471,7 +489,35 @@ impl Store {
                 .map_err(redb_err)?;
         }
         txn.commit().map_err(redb_err)?;
+        self.mix_schedule(SCHEDULE_CHECKPOINT);
         Ok(())
+    }
+
+    /// A digest of the write transactions this handle has committed, in order:
+    /// one entry per `apply`/`apply_batch` (the number of records that shared
+    /// the transaction) and one per `checkpoint`. NOT a hash of the data — two
+    /// handles fed identical records disagree here exactly when they grouped
+    /// those records into transactions differently.
+    ///
+    /// It exists because redb's physical layout is a function of that grouping
+    /// (DESIGN §1, property 1): equal digests are the condition under which two
+    /// nodes' store files can be compared byte for byte, and the sim's
+    /// fingerprint oracle reads this rather than guessing from fault counts.
+    /// Seeded/imported writes (`apply_rows`, `set_import_meta`) are outside it —
+    /// a seeded node's file is not byte-comparable to a replayed one anyway.
+    pub fn write_schedule(&self) -> u64 {
+        self.schedule.load(Ordering::Relaxed)
+    }
+
+    /// Folds one committed write transaction into `schedule`. Called AFTER the
+    /// commit returns `Ok`: a transaction that failed to commit left no bytes
+    /// behind and must not move the digest.
+    fn mix_schedule(&self, entry: u64) {
+        let mut hash = self.schedule.load(Ordering::Relaxed);
+        for byte in entry.to_le_bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.schedule.store(hash, Ordering::Relaxed);
     }
 
     /// True once this store's handle is dead: some disk operation returned
