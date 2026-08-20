@@ -288,6 +288,66 @@ fn redb_err(e: impl fmt::Display) -> io::Error {
     io::Error::other(format!("table store (redb): {e}"))
 }
 
+/// One record's effects inside an already-open write transaction: the
+/// negative-space counter checks and the `applied_seq` bump. Free rather than
+/// a method because it touches no `Store` state — which is exactly what lets a
+/// batch hold one transaction across many calls (`apply_batch`).
+fn apply_one_in_txn<T>(
+    txn: &redb::WriteTransaction,
+    seq: u64,
+    f: impl FnOnce(&mut Writer<'_>) -> io::Result<T>,
+) -> io::Result<T> {
+    let (next_job_id_before, next_event_id_before) = {
+        let meta = txn.open_table(META).map_err(redb_err)?;
+        (
+            meta.get("next_job_id")
+                .map_err(redb_err)?
+                .map_or(0, |g| g.value()),
+            meta.get("next_event_id")
+                .map_err(redb_err)?
+                .map_or(0, |g| g.value()),
+        )
+    };
+    let mut writer = Writer {
+        txn,
+        jobs_materialized: 0,
+        events_materialized: 0,
+    };
+    let out = f(&mut writer)?;
+    let mut meta = txn.open_table(META).map_err(redb_err)?;
+    // Negative-space: next_job_id is a monotonic counter bumped only
+    // by materialize_job. It must never move except by exactly one
+    // per job materialized in this apply — never backwards, never
+    // skipping, never double-counting a single effect.
+    let next_job_id_after = meta
+        .get("next_job_id")
+        .map_err(redb_err)?
+        .map_or(0, |g| g.value());
+    assert_eq!(
+        next_job_id_after,
+        next_job_id_before + writer.jobs_materialized,
+        "next_job_id moved from {next_job_id_before} to {next_job_id_after} in apply({seq}), \
+         which materialized {} job(s) — the counter must advance by exactly one per job",
+        writer.jobs_materialized
+    );
+    // Negative-space: same rule as next_job_id, for next_event_id and
+    // materialize_event.
+    let next_event_id_after = meta
+        .get("next_event_id")
+        .map_err(redb_err)?
+        .map_or(0, |g| g.value());
+    assert_eq!(
+        next_event_id_after,
+        next_event_id_before + writer.events_materialized,
+        "next_event_id moved from {next_event_id_before} to {next_event_id_after} in \
+         apply({seq}), which materialized {} event(s) — the counter must advance by \
+         exactly one per event",
+        writer.events_materialized
+    );
+    meta.insert("applied_seq", seq).map_err(redb_err)?;
+    Ok(out)
+}
+
 impl Store {
     pub fn open(disk: &dyn Disk, path: &str) -> io::Result<Store> {
         let file = disk.open(path)?;
@@ -358,57 +418,7 @@ impl Store {
         );
         let mut txn = self.db.begin_write().map_err(redb_err)?;
         txn.set_durability(Durability::None).map_err(redb_err)?;
-        let out = {
-            let (next_job_id_before, next_event_id_before) = {
-                let meta = txn.open_table(META).map_err(redb_err)?;
-                (
-                    meta.get("next_job_id")
-                        .map_err(redb_err)?
-                        .map_or(0, |g| g.value()),
-                    meta.get("next_event_id")
-                        .map_err(redb_err)?
-                        .map_or(0, |g| g.value()),
-                )
-            };
-            let mut writer = Writer {
-                txn: &txn,
-                jobs_materialized: 0,
-                events_materialized: 0,
-            };
-            let out = f(&mut writer)?;
-            let mut meta = txn.open_table(META).map_err(redb_err)?;
-            // Negative-space: next_job_id is a monotonic counter bumped only
-            // by materialize_job. It must never move except by exactly one
-            // per job materialized in this apply — never backwards, never
-            // skipping, never double-counting a single effect.
-            let next_job_id_after = meta
-                .get("next_job_id")
-                .map_err(redb_err)?
-                .map_or(0, |g| g.value());
-            assert_eq!(
-                next_job_id_after,
-                next_job_id_before + writer.jobs_materialized,
-                "next_job_id moved from {next_job_id_before} to {next_job_id_after} in apply({seq}), \
-                 which materialized {} job(s) — the counter must advance by exactly one per job",
-                writer.jobs_materialized
-            );
-            // Negative-space: same rule as next_job_id, for next_event_id and
-            // materialize_event.
-            let next_event_id_after = meta
-                .get("next_event_id")
-                .map_err(redb_err)?
-                .map_or(0, |g| g.value());
-            assert_eq!(
-                next_event_id_after,
-                next_event_id_before + writer.events_materialized,
-                "next_event_id moved from {next_event_id_before} to {next_event_id_after} in \
-                 apply({seq}), which materialized {} event(s) — the counter must advance by \
-                 exactly one per event",
-                writer.events_materialized
-            );
-            meta.insert("applied_seq", seq).map_err(redb_err)?;
-            out
-        };
+        let out = apply_one_in_txn(&txn, seq, f)?;
         txn.commit().map_err(redb_err)?;
         Ok(out)
     }
