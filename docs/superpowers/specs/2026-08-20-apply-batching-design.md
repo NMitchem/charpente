@@ -172,8 +172,12 @@ does not promise.
   are MVCC snapshots (`table.rs` module doc), so a `Store::applied_seq`-style fresh read txn
   opened mid-batch observes *pre-batch* state and would silently return stale data — redb
   permits it, so nothing errors. Enforcement is **by construction, not by assertion**: the
-  per-record closure receives only `&mut Writer<'_>`, and `Writer`'s accessors read through
-  `self.txn` (`table.rs:838`), which already sees the batch's own writes. Reads inside the
+  per-record closure receives only `&mut Writer<'_>`, and `Writer` holds `txn: &'txn
+  redb::WriteTransaction` and opens every table on it, so its accessors already see the
+  batch's own writes. (An earlier draft cited `table.rs:838` as `Writer::applied_seq`;
+  that line is inside `impl Snapshot` and the method is `Snapshot::applied_seq` — the
+  argument holds, the citation did not. `Writer::applied_seq` did not exist and was added
+  by the implementation of this design.) Reads inside the
   closure are therefore correct by definition. The only residual surface is code *outside*
   the closure — `submit_all`'s apply loop — which contains no reads today. That held by
   accident before and is a stated precondition now; a debug-only re-entrancy flag is
