@@ -328,10 +328,20 @@ instrument does not do.
 was taken on.** Group commit is exactly the workload whose store cost is no
 longer swamped by an fsync, and the per-phase profiling this paragraph says the
 instrument does not do now exists — see *"Where a batched commit's time goes"*
-below. On the batched path the store path holds more of the commit window than
-the WAL path does, and **trigger (a) fires on the reading the spec pre-committed
-to.** `DECISIONS.md` §7 is untouched pending Noah's sign-off, per CLAUDE.md's
-reopen-don't-override rule; the draft re-reading is
+below. On the batched path the store *path* holds more of the commit window
+than the WAL path does as a **group**. The spec's pre-committed criterion,
+however, is field-level and singular — "redb apply is the **largest single
+non-idle phase** at batch cap" — and at the field level the largest phase in
+every published run is still the durable sync, `wal_sync_io` at 40.5–41.2%,
+against `gap_within_store`'s 39.6–40.1%. A counted phase ahead of a residual
+one, on all three runs. **Trigger (a) therefore does not fire on the reading the
+spec pre-committed to**, and the deferral holds on fresh evidence rather than on
+the 2026-08-10 reading. Two readings of the criterion's own wording would reverse
+that — "phase" as one of `submit_all`'s three blocks rather than one of the
+fourteen trace fields, and "non-idle" as excluding the device-blocked fsync — and
+both are put to Noah in the draft rather than settled here.
+`DECISIONS.md` §7 is untouched pending Noah's sign-off,
+per CLAUDE.md's reopen-don't-override rule; the draft re-reading is
 `.superpowers/sdd/2026-08-19-phase-attribution/trigger-a-rereading.md`. Nothing
 in the paragraphs above is withdrawn — the core layer really does sit at the
 device ceiling, and that is reproduced below at 90.3–90.6% of its window inside
@@ -549,13 +559,33 @@ batch is exactly at `MAX_BATCH`, p50 is 17.2 ms, and the device is **58% idle**
 turnover and does not attribute the 64-connection gap at all. This section
 attributes it.
 
-**The answer, before the method:** at batch ≈62 the durable sync is no longer
-where the time is. **The store path holds 55.1–55.9% of the commit window and
-the WAL path 42.1–43.0%, while everything outside the commit path — the
-single-threaded kernel loop, dispatch, the handler, job execution — holds
-1.27–1.30%.** On the unbatched path the same instrument reads 91.3–91.5% WAL
-and 7.95–8.17% store. Group commit did not move the bottleneck to the kernel's
-serialization. It moved it into `Store::apply`.
+**The answer, before the method — at two levels, which do not agree, and the
+disagreement is the result.**
+
+*Field by field.* The durable sync is still the largest single phase at batch
+≈62: `wal_sync_io` at **40.48 / 40.53 / 41.15%** of the window, with
+`gap_within_store` — the store-side apply residual — second at **40.05 / 39.81 /
+39.62%**. Group commit cut the sync's share from ~90% to ~40%; it did not
+displace it from first place, and the two are 0.4 points apart.
+
+*Grouped into `submit_all`'s three blocks.* **The store path holds 55.1–55.9%
+of the commit window and the WAL path 42.1–43.0%, while everything outside the
+commit path — the single-threaded kernel loop, dispatch, the handler, job
+execution — holds 1.27–1.30%.** On the unbatched path the same instrument reads
+91.3–91.5% WAL and 7.95–8.17% store.
+
+What is settled either way: group commit did **not** move the bottleneck to the
+kernel's single-threaded serialization, which is ~1.3% of the commit window here
+and ~1% in every machine state measured below. What it produced instead is a
+window with **two comparable occupants** — one durable sync and the apply run
+that follows it — and which of the two "leads" depends on whether you count
+fields or blocks. The 0.4-point field-level margin is well inside this
+instrument's own noise amplitude (5.5% of the window, below), so at the field
+level the ordering is not resolvable in either direction. The 13.7-point group
+margin sits outside that amplitude and is real — but it belongs to a grouping,
+and the criterion the trigger-(a) note above is read against asks about a single
+phase. Both readings are published here so the difference is visible rather than
+chosen.
 
 ### How the phases are measured, and why no clock went into the core
 
@@ -626,18 +656,50 @@ Every phase block below is therefore published with
 end of the observed range — and `phases_overhead_gate_resolvable: false`. 586
 ns/op is a **noise amplitude, not a measured cost**, so the refusals it produces
 mean *this machine cannot certify these phases at that amplitude*, never *the
-instrument is too expensive*. At 586 ns/op the gate refuses every IO phase in
-both arms except the kernel arm's `wal_sync_io`; the gap fields are outside the
-gate by design, because an IO phase has a referent outside the trace and a gap is
-defined as a residual.
+instrument is too expensive*. At 586 ns/op the gate refuses **every** IO phase of
+**every** published kernel run — `wal_sync_io`, the largest field in that column,
+included — and every IO phase of the core arm **except its own `wal_sync_io`**
+(plus `store_write_io` on core run 2, which clears the threshold by a hair). The
+kernel column is published entirely uncertified at that amplitude; that is what
+each artifact's `invalid` array says, and the table below now carries the gate
+outcome per row so the two statements cannot drift apart. The gap fields are
+outside the gate by design, because an IO phase has a referent outside the trace
+and a gap is defined as a residual.
 
-That bound is worth stating in the direction that matters. 586 ns/op × 1.334 M
-recorded ops is 782 ms against a 14.1 s kernel window — **5.5% of the window,
-spread across all fourteen fields.** It cannot convert a 1.3% phase into a 40%
-one, and the orderings the reading below turns on are a 13-point gap between the
-two largest groups and a 54-point gap over the kernel loop. The gate's 10%
-threshold is stricter than the reading needs, which is why the reading survives
-refusals the gate is right to raise.
+That bound is worth stating in the direction that matters, and **it does not
+spread across the fourteen fields.** 586 ns/op × 1.334 M recorded ops is 782 ms
+against a 14.1 s kernel window — 5.5% of the window — but two facts about the
+instrument decide where it lands, and both are in the code's own words.
+`Trace::record` samples `end` *before* the mutex-guarded push, so recording's own
+cost falls into the gap that FOLLOWS an op and never into the IO phase it timed
+(`tracing_disk.rs`; `phase_accounting`'s gate-scope doc: "by construction … it
+becomes part of what that gap IS"). And the ops are not evenly distributed:
+100,000 log records at 62.0 records/sync is ≈100 k WAL appends plus ≈1.6 k WAL
+syncs, so ≈102 k of the 1.334 M recorded ops are WAL ops and **≈92% are on
+`tables.redb`**. Roughly 92% of the bound therefore lands in one field:
+**≈720 ms, or 12.7% of `gap_within_store`** and ≈5.1 points of window — and
+`gap_within_store` is the one field the gate never checks.
+
+Correcting for it moves the reading against the store side, not toward it.
+Subtract 720 ms from `gap_within_store` and from the window and run 1 reads
+store path ≈53.5% against WAL ≈44.4%; at the field level `wal_sync_io` goes to
+≈42.7% against `gap_within_store`'s ≈36.8%, so the field-level margin **widens**
+from 0.4 points to ≈5.8. The correction can only push that way, because the sink
+is the store-side residual.
+
+The bound is generous, and one field says so arithmetically: ≈100,000 append
+recordings at 586 ns is ≈59 ms of claimed cost against a `gap_within_wal` that
+totals 22.4 ms in run 1 — larger than the whole field it would have to land in.
+That is what "noise amplitude, not a measured cost" means when it is spent. It
+is still the figure every block is gated at, because publishing against the
+generous end is the conservative choice.
+
+What survives all of it: 782 ms cannot convert a 1.3% phase into a 40% one, so
+the kernel loop's ~1.3% and the 54-point gap over it stand, as does the 13.7-point
+group margin. The 0.4-point margin between the two largest *fields* does not
+survive it, in either direction — which is why this section reports those two as
+comparable rather than ranked, and why the gate refusing them is the gate being
+right rather than strict.
 
 **A correction to Task 4's own reading, recorded because it was wrong in this
 document's working notes and would otherwise be inherited.** Task 4 saw
@@ -654,32 +716,44 @@ One row per phase, share of that arm's own measured window, **all three
 observations shown rather than an average**. Nanosecond totals are in the JSON
 artifact; shares are what the question is about.
 
-| phase | core, batch 1 (3 obs) | kernel, batch ≈62 (3 obs) | provenance |
-|---|---|---|---|
-| `wal_append_io` | 0.86 / 0.95 / 0.80 | 1.50 / 1.75 / 1.68 | counted (traced IO) |
-| `wal_read_io` | 0.00 / 0.00 / 0.00 | 0.00 / 0.00 / 0.00 | counted; zero by design on the steady-state commit path |
-| `wal_sync_io` | **90.60 / 90.28 / 90.51** | **40.48 / 40.53 / 41.15** | counted (traced IO) |
-| `store_write_io` | 1.98 / 2.21 / 1.99 | 11.53 / 11.49 / 11.21 | counted (traced IO) |
-| `store_read_io` | 0.00 / 0.00 / 0.00 | 0.00 / 0.00 / 0.00 | counted (traced IO) |
-| `store_sync_io` | 0.02 / 0.01 / 0.01 | 1.33 / 1.33 / 1.31 | counted (traced IO); checkpoints only |
-| `other_io` | 0.01 / 0.01 / 0.01 | 0.64 / 0.65 / 0.64 | counted (traced IO); the `.horizon` breadcrumb |
-| `gap_within_wal` | 0.01 / 0.02 / 0.02 | 0.16 / 0.15 / 0.15 | residual between two traced ops |
-| `gap_wal_to_store` | 5.90 / 5.89 / 6.04 | 2.93 / 2.95 / 2.90 | residual |
-| `gap_within_store` | 0.05 / 0.06 / 0.05 | **40.05 / 39.81 / 39.62** | residual |
-| `gap_store_to_wal` | 0.54 / 0.55 / 0.55 | 1.30 / 1.28 / 1.27 | residual |
-| `gap_other` | 0.02 / 0.02 / 0.02 | 0.06 / 0.07 / 0.06 | residual |
-| `lead_in` | 0.00 / 0.00 / 0.00 | 0.01 / 0.00 / 0.01 | residual (window edge) |
-| `tail` | 0.00 / 0.00 / 0.00 | 0.00 / 0.00 / 0.00 | residual (window edge) |
-| **window** | 30.004 / 30.001 / 30.004 s | 14.106 / 14.042 / 14.434 s | counted |
-| **traced ops** | 102,963 / 102,391 / 102,979 | 1,334,073 / 1,333,354 / 1,333,692 | counted |
+| phase | core, batch 1 — % of window (3 obs) | kernel, batch ≈62 — % of window (3 obs) | provenance of the ns total the % is taken from | overhead gate at 586 ns/op — core · kernel |
+|---|---|---|---|---|
+| `wal_append_io` | 0.86 / 0.95 / 0.80 | 1.50 / 1.75 / 1.68 | counted (traced IO) | refused 3/3 · refused 3/3 |
+| `wal_read_io` | 0.00 / 0.00 / 0.00 | 0.00 / 0.00 / 0.00 | counted; zero by design on the steady-state commit path | not gated (phase is exactly zero) |
+| `wal_sync_io` | **90.60 / 90.28 / 90.51** | **40.48 / 40.53 / 41.15** | counted (traced IO) | **passed 3/3** · **refused 3/3** |
+| `store_write_io` | 1.98 / 2.21 / 1.99 | 11.53 / 11.49 / 11.21 | counted (traced IO) | refused 2/3 (passed on run 2) · refused 3/3 |
+| `store_read_io` | 0.00 / 0.00 / 0.00 | 0.00 / 0.00 / 0.00 | counted (traced IO) | refused 3/3 · refused 3/3 |
+| `store_sync_io` | 0.02 / 0.01 / 0.01 | 1.33 / 1.33 / 1.31 | counted (traced IO); checkpoints only | refused 3/3 · refused 3/3 |
+| `other_io` | 0.01 / 0.01 / 0.01 | 0.64 / 0.65 / 0.64 | counted (traced IO); the `.horizon` breadcrumb | refused 3/3 · refused 3/3 |
+| `gap_within_wal` | 0.01 / 0.02 / 0.02 | 0.16 / 0.15 / 0.15 | residual between two traced ops | outside the gate by design |
+| `gap_wal_to_store` | 5.90 / 5.89 / 6.04 | 2.93 / 2.95 / 2.90 | residual | outside the gate by design |
+| `gap_within_store` | 0.05 / 0.06 / 0.05 | **40.05 / 39.81 / 39.62** | residual | outside the gate by design — and the sink for ≈92% of the instrument's own bound |
+| `gap_store_to_wal` | 0.54 / 0.55 / 0.55 | 1.30 / 1.28 / 1.27 | residual | outside the gate by design |
+| `gap_other` | 0.02 / 0.02 / 0.02 | 0.06 / 0.07 / 0.06 | residual | outside the gate by design |
+| `lead_in` | 0.00 / 0.00 / 0.00 | 0.01 / 0.00 / 0.01 | residual (window edge) | outside the gate by design |
+| `tail` | 0.00 / 0.00 / 0.00 | 0.00 / 0.00 / 0.00 | residual (window edge) | outside the gate by design |
+| **window** | 30.004 / 30.001 / 30.004 s | 14.106 / 14.042 / 14.434 s | counted | — |
+| **traced ops** | 102,963 / 102,391 / 102,979 | 1,334,073 / 1,333,354 / 1,333,692 | counted | — |
 
 Every figure in the "counted" rows is a sum of durations the tracer timed at the
 `Disk` boundary. Every "residual" row is *the time that was not any traced op* —
 measured as a subtraction, which is exactly what makes the reading below an
-inference rather than a measurement. **The percentage column is derived** (a
-counted phase over a counted window); no share here is built on the sweep table's
-`records/sync`, which is already a derived numerator over a counted denominator,
-and **no ratio here crosses layers.**
+inference rather than a measurement. **The two percentage columns are derived**
+(a counted phase over a counted window), which is why the provenance column
+labels the ns total behind the percentage rather than the percentage itself; no
+share here is built on the sweep table's `records/sync`, which is already a
+derived numerator over a counted denominator, and **no ratio here crosses
+layers.**
+
+**The gate column is provenance too, and it is why the two largest kernel rows
+are printed without a winner.** The gate outcome is per row and per run, so it
+belongs beside the number rather than in prose that can drift from it: at 586
+ns/op the kernel arm's `wal_sync_io` — the largest field in that column — is
+refused on all three runs, exactly like every other kernel IO row, while the core
+arm's `wal_sync_io` passes on all three. Every published kernel observation
+therefore exited non-zero, by design. A refusal means *this machine cannot
+certify this phase at that amplitude*; it does not withdraw the number, and the
+`invalid` array in each artifact carries the same list.
 
 Both arms' throughput for the same windows: core 221.6 / 220.7 / 221.5 records/s
 at `device_ratio` 0.891 / 0.902 / 0.929; kernel 7,089 / 7,121 / 6,928 records/s
@@ -707,8 +781,10 @@ path the process was, and from that infers whose code was most likely running:
   blocked inside `Group::commit`.
 - **`gap_store_to_wal` is everything OUTSIDE the commit path** — last store op of
   one batch to first WAL append of the next. That is where the kernel loop lives:
-  decode, dispatch, the handler, job execution, response construction, ready-set
-  scheduling. It is the field that answers the kernel-serialization candidate
+  dispatch, the handler, job execution, response construction, ready-set
+  scheduling — but **not** HTTP decode, which this arm does not do at all
+  (`kernel_bench` pushes pre-built `Request` structs), so no decode cost is being
+  claimed here. It is the field that answers the kernel-serialization candidate
   separately from redb, and it reads **1.27–1.30%** of the window.
 - **`gap_wal_to_store` is the sync→apply transition**, paid once per batch rather
   than once per record — 2.90–2.95% at batch ≈62 against 5.89–6.04% at batch 1,
@@ -720,11 +796,24 @@ Grouped that way, the batched commit window is **store path 55.1–55.9%, WAL pa
 `other_io`, `gap_other` and the window edges. Against batch 1: WAL 91.3–91.5%,
 store 7.95–8.17%, outside 0.54–0.55%.
 
-**So the 58% idle device at batch cap is the store path, not the kernel's
-serialization.** The spec named four candidates for that gap; this measurement
-puts the kernel loop at ~1.3% of the commit window and the WAL append at ~1.7%,
-leaves the wire edge unmeasured by construction (the kernel arm has no TCP and
-pre-built requests), and puts the balance in `Store::apply`.
+**So the 58% idle device at batch cap is not the kernel's serialization**, and
+the balance sits between the durable sync and `Store::apply` rather than in any
+one of them. The spec named four candidates for that gap; this measurement puts
+the kernel loop at ~1.3% of the commit window and the WAL append at ~1.7%, leaves
+the wire edge unmeasured by construction, and splits the remainder ~40/40 between
+`wal_sync_io` and `gap_within_store`.
+
+**The transfer from this arm to the sweep's 64-connection point needs its own
+argument, and there is one.** The 58% figure is the *wire* sweep's; this arm has
+no TCP and pushes pre-built `Request` structs, so two of the spec's four
+candidates — the wire edge, and whatever serialization the wire edge adds — are
+absent here by construction. What licenses the transfer is published two pages
+above and is worth citing here rather than assuming: the kernel arm independently
+reproduces a `device_ratio` of **0.419–0.429**, the same 0.42x the sweep records
+at 64 connections, **with no wire at all**. The wire edge is therefore not
+required to produce the gap. That does not prove it contributes nothing at 64
+connections; it establishes that the gap survives its removal, which is the claim
+this section needs.
 
 Two things sharpen that, and one weakens it.
 
@@ -733,12 +822,28 @@ share rose.** Core spends 359–370 µs of store-path time per log record; kerne
 spends 78.0–79.5 µs. The spec's §2 argument — that redb's share of a commit rises
 with batch size because `Store::apply` opens a write transaction per record while
 the fsync is amortized 62× — is confirmed for the *share* and falsified for the
-*absolute cost*, which is a better result than the argument predicted. The most
-likely mechanism is cache warmth: 62 applies back to back keep redb's page cache
-and the CPU caches hot, where batch 1 restarts cold after every ~4.1 ms fsync.
-This is a per-record derivation (window ÷ counted records) across two arms with
-different workload shapes — the kernel arm commits two records per request, the
-core arm one — so treat it as an order-of-magnitude statement, not a coefficient.
+*absolute cost*, which is a better result than the argument predicted. **The
+mechanism is amortization of the sync→apply transition, not cache warmth**, and
+the decomposition says so — per log record, from run 1 of each arm (the other two
+runs of each are within a few percent):
+
+| field | core (batch 1) | kernel (batch ≈62) | Δ |
+|---|---|---|---|
+| `gap_wal_to_store` | 266.5 µs | 4.14 µs | **−262.3** |
+| `store_write_io` | 89.5 µs | 16.3 µs | −73.2 |
+| `store_sync_io` | 0.8 µs | 1.9 µs | +1.1 |
+| `gap_within_store` | 2.0 µs | **56.5 µs** | **+54.5** |
+
+262 of the 280 µs fall — 94% of it — is `gap_wal_to_store` alone, and *per batch*
+that field is 266 µs at batch 1 against 257 µs at batch ≈62 — one fixed cost
+divided by 62,
+which is the same amortization the bullet two above already names. Meanwhile the
+field this section reads as redb's compute, `gap_within_store`, **rises 24× per
+record** under batching. Cache warmth does not predict that; per-batch
+amortization predicts all of it. This is a per-record derivation (window ÷
+counted records) across two arms with different workload shapes — the kernel arm
+commits two records per request, the core arm one — so treat it as an
+order-of-magnitude statement, not a coefficient.
 
 **Sharpening (2): `gap_within_store` behaves like CPU under a CPU load, which is
 evidence it *is* CPU.** Under 24 synthetic spinners (below), the kernel arm's
@@ -767,9 +872,10 @@ the 12 cores, with no filesystem access of any kind**, because a disk-heavy load
 would perturb the very `Disk` boundary the instrument measures.
 
 It reproduced the precedent exactly. At 586 ns/op the overhead gate refuses the
-kernel arm's `wal_sync_io` on every quiet run (5.69–5.94 s of sync against a 782
-ms threshold) — and **passes it on loaded run 2**, where contention stretched the
-window to 43.7 s and the sync phase to 8.36 s, clearing 10% by 55 ms. Nothing
+kernel arm's `wal_sync_io` on every quiet run — 782 ms of overhead against a
+threshold of 10% of the phase, i.e. 569–594 ms — and **passes it on loaded run 2**
+(alongside `store_write_io`), where contention stretched the window to 43.7 s and
+the sync phase to 8.36 s, clearing the 836 ms threshold by 55 ms. Nothing
 about the instrument got cheaper; the machine got slower, and a threshold defined
 as a fraction of a measured phase moved with it. A quiet-only run would have
 recorded that gate as uniformly strict.
@@ -782,8 +888,9 @@ while it collapses the read loop in the same window (2.24–2.25 M reads/s quiet
 device is indifferent to CPU load, which is the correct behaviour and worth
 having observed rather than assumed.
 
-**2. The machine's own state, which moves the share and not the verdict.** The
-same shipping binary, the same 50,000-request workload, run before and after the
+**2. The machine's own state, which moves the share and not the kernel loop.**
+The same shipping *configuration* — two separate compilations in two target dirs,
+not one binary — on the same 50,000-request workload, run before and after the
 24-spinner arm, reads materially differently: 14.04–14.43 s per window before,
 17.62–21.16 s after. The most likely cause is thermal — the spinners ran every
 core flat out for twelve minutes on a laptop — and the correct response is not to
@@ -795,11 +902,21 @@ pick a number but to report what the share does across states:
 | quiet, after the loaded arm (6 obs) | 56.95–64.47% | 33.35–40.81% | 1.08–1.29% |
 | 24 CPU spinners (3 obs) | 73.67–76.27% | 21.42–23.43% | 1.34–2.51% |
 
-**The store path is the largest group in every state, and the kernel loop is
+**The store path is the largest *group* in every state, and the kernel loop is
 about 1% in every state.** The exact share is machine-dependent and is not a
-constant; the ordering the verdict rests on is not close in any state. The table
-above publishes the quiet pre-heat era, which is both the fastest and the least
-favourable to the reading — the conservative choice.
+constant; the group ordering is not close in any state.
+
+**The single-*field* ordering, which is what the pre-committed criterion asks
+about, is not state-stable and is worth recording as such.** In the published
+quiet era `wal_sync_io` leads `gap_within_store` on all three runs (40.5–41.2%
+against 39.6–40.1%). In the post-thermal era `gap_within_store` leads in five of
+six runs, and under 24 spinners it leads in all three — because contention adds
+CPU time to a residual while leaving an fsync alone. Those two eras are published
+here as *controls* on a degraded machine, not as the measurement; the table above
+publishes the quiet pre-heat era, which is both the fastest and the least
+favourable to a store-side reading — the conservative choice. The honest summary
+is that a 0.4-point field-level margin is not a stable fact about this system in
+either direction, and no verdict should be built on its sign.
 
 **3. redb's debug assertions, and how much of the store path they are.** This
 workspace forces `[profile.release.package.redb] debug-assertions = true` on
@@ -810,12 +927,28 @@ that reads "the store path is the bottleneck" owes an answer to "how much of tha
 is the flag?"
 
 Rebuilt with `--config 'profile.release.package.redb.debug-assertions=false'` in
-its own `CARGO_TARGET_DIR` — verified at the rustc invocation, where the shipping
-build carries `-C debug-assertions=on` for redb and the probe carries no such
-flag — and **interleaved in time with a control build of the shipping
-configuration**, because control 2's finding above is that a control from another
-era measures the era rather than the flag. Eleven runs, every one reported, in
-the order taken:
+its own `CARGO_TARGET_DIR` and **interleaved in time with a control build of the
+shipping configuration**, because control 2's finding above is that a control
+from another era measures the era rather than the flag.
+
+**The probe's build provenance is not verifiable from the record, and that is
+stated here rather than glossed.** The run log records the three binary paths and
+every invocation, but no `cargo build` command for the probe or its control; the
+only machine-readable provenance field in the artifact, `build_profile`, reads
+`release (redb debug-assertions on, workspace override)` on **all eleven runs**,
+because it is a literal keyed off the *harness's* own `cfg!(debug_assertions)`
+and cannot track a per-package override at all; and both probe target dirs have
+since been deleted, so it cannot be re-run. An earlier draft of this section
+claimed the flag was "verified at the rustc invocation" — **that check has no
+record and the claim is withdrawn.** What the record does support is a complete
+timing separation between two eras of binaries built for the purpose, which is
+suggestive and is not the same thing.
+
+**Nothing above depends on this probe.** The published table, the phase shares,
+and the trigger-(a) re-reading all rest on the shipping-configuration runs; the
+probe is a sensitivity observation with unverifiable build provenance, reported
+for what it is worth to a future reader deciding whether the override is worth
+re-examining. Eleven runs, every one reported, in the order taken:
 
 | taken at | build | window | log records/s | `gap_within_store`, µs/record | store path |
 |---|---|---|---|---|---|
@@ -825,7 +958,7 @@ the order taken:
 | 01:24 | assertions off | 12.19 s | 8,205 | 30.34 | 46.30% |
 | 01:27 | shipping | 20.20 s | 4,950 | 86.29 | 63.45% |
 | 01:35 | shipping | 21.16 s | 4,726 | 80.58 | 64.47% |
-| 01:41 | shipping | 19.78 s | 5,055 | 76.51 | 63.17% |
+| 01:42 | shipping | 19.78 s | 5,055 | 76.51 | 63.17% |
 | 02:02 | shipping | 18.19 s | 5,499 | 72.71 | 60.45% |
 | 02:06 | assertions off | 13.50 s | 7,406 | 38.91 | 49.04% |
 | 02:09 | shipping | 17.62 s | 5,674 | 57.95 | 56.95% |
@@ -844,14 +977,44 @@ measured twice, not two.
 
 The honest statement is that redb's debug assertions are the largest single lever
 this measurement found — a substantial fraction of the apply phase and a
-substantial fraction of end-to-end kernel throughput, for a one-line change to a
-profile override rather than a new storage engine.
+substantial fraction of end-to-end kernel throughput, for a change to one line of
+a profile override rather than a new storage engine.
 
-They do **not** change the verdict: with the flag off the store path still reads
-46.3–53.5% of the commit window against a WAL path of 44.1–50.8% — the two are
-level — and still an order of magnitude above the kernel loop's 1.3–1.6%. **This probe is a
-sensitivity control, not a published column** — no figure in the table above is
-taken from it, and it is one arm on one build.
+**"One line" is the size of the edit, not the size of the change, and the
+difference is load-bearing.** `Cargo.toml`'s comment records why the override
+exists: redb's open path walks pages only under `debug_assertions`, drawing sim
+IO rolls debug-only and skewing every downstream draw (seed
+`0xff159ed76d2806e4`), and `.github/workflows/ci.yml` carries two pinned seeds as
+the cross-build-mode replay tripwire for exactly that fix. Turning the flag off
+in release alone forfeits the cross-mode replay promise; turning it off in both
+modes keeps the promise and **re-rolls the sim IO stream, so every seed recorded
+under hard rule 3 stops reproducing its bug.** Hard rule 4's "assertions stay on
+in release until a measured reason says otherwise" is also engaged rather than
+sidestepped — this measurement is arguably that reason, and saying so is a case
+to be made explicitly, not assumed. Either route is a project. That does not
+weaken the recommendation to re-examine the override; it makes it decidable.
+
+**What the flag does to the ordering, per run rather than by range.** Grouping
+the five assertions-off runs the same way as the table above:
+
+| run | store path | WAL path | larger |
+|---|---|---|---|
+| 01:17 | 48.51% | **48.78%** | WAL |
+| 01:20 | 47.30% | **49.79%** | WAL |
+| 01:24 | 46.30% | **50.79%** | WAL |
+| 02:06 | **49.04%** | 48.23% | store |
+| 02:11 | **53.47%** | 44.14% | store |
+
+With the flag off the two paths are **statistically indistinguishable and the
+group ordering is not established in either direction** — the WAL path is larger
+in three of five runs — and at the field level `wal_sync_io` (41.81–48.72%)
+exceeds `gap_within_store` (24.89–33.21%) in **all five**. Quoting the two ranges
+side by side and concluding "the store path is still the largest thing in it"
+would be a range-overlap fallacy; the pairing above is what the same runs
+actually say. The kernel loop stays at 1.3–1.6% throughout, which is the one
+thing the flag does not touch. **This probe is a sensitivity observation, not a
+published column** — no figure in the table above is taken from it, it is one arm
+on one build, and its build provenance is unverifiable as stated above.
 
 ### What this measurement does not resolve
 
@@ -865,11 +1028,15 @@ taken from it, and it is one arm on one build.
   and `attribute` refuses an overlapping trace rather than publishing a share.
 - **It is two points, not a curve.** batch 1 and batch ≈62. The 4-, 16- and
   256-connection points of the sweep have no phase attribution.
-- **It is one device.** `F_FULLFSYNC` on an Apple SSD is the slow end of durable,
-  which is what makes the fsync large enough to have dominated batch 1 in the
-  first place. On a device with a battery-backed controller the sync shrinks and
-  the store path's share rises further — this reading is conservative in that
-  direction, not optimistic.
+- **It is one device, and the field-level ordering is sensitive to that.**
+  `F_FULLFSYNC` on an Apple SSD is the slow end of durable, which is what makes
+  the fsync large enough to have dominated batch 1 in the first place. On a device
+  with a battery-backed controller the sync shrinks and the store path's share
+  rises further — so for the *group* reading this device is the conservative
+  choice, but for the *field* reading it is the opposite: `wal_sync_io` leads
+  `gap_within_store` by 0.4 points here largely because this device's fsync is
+  slow, and a faster one is the most likely thing to invert that ordering. Any
+  verdict read off the 0.4 points travels no further than this device.
 - **The box was not quiet, and could not be made quiet.** It is shared with other
   agents whose jobs restarted faster than they could be waited out: a `pytest -q`
   from an unrelated repo peaking above 200% CPU (terminated on sight under a
@@ -877,12 +1044,23 @@ taken from it, and it is one arm on one build.
   Simulator, a `retrace` debug binary and the `syspolicyd` signing load it
   generates. **Docker Desktop's Virtualization VM was deliberately left running**
   (10–30% CPU) — it holds a 1 TB sparse `Docker.raw` and killing it to recover
-  under 1.5% of a 12-core box risks the volumes. Every observation was gated on a
-  direct `top` idleness sample of ≥88% idle across three consecutive readings
-  rather than on load average, which on this box lagged the truth badly (measured
-  00:33: `uptime` reading 7.71/15.05/20.57 while `top` read 90.8% idle and no
-  process exceeded 5.4% CPU). Load averages either side of every window are in
-  the run log regardless.
+  under 1.5% of a 12-core box risks the volumes. **The quiet-box discipline is
+  disclosed here at the strength its own record supports, which is less than an
+  earlier draft claimed.** The protocol fixed before the run (P3) required load
+  averages within ~1.5x across a window and said "discard and re-run; do not
+  pool"; **every published observation violates it** (core run 1 reads 1.92x
+  before and 2.23x after; kernel run 3 reads 4.5x). It was superseded at 00:33 by
+  a direct `top` idleness check, on the defensible ground that macOS load average
+  lags badly and counts non-runnable threads — measured at 00:33, `uptime` read
+  7.71/15.05/20.57 while `top` read 90.8% idle with no process above 5.4% CPU.
+  Two things about that substitution are stated rather than smoothed: a
+  pre-committed criterion was replaced *after* the first observations existed,
+  which is the move a pre-commitment exists to prevent; and **the substitute's own
+  samples were not transcribed** — the run log holds the load averages either side
+  of every window and the top-5 `%CPU` lists, not an idle percentage per run. So
+  the honest form is "each run was preceded by a direct `top` idleness check,
+  whose samples the record does not carry", and a reader who wants to audit the
+  box's state has the load averages and process lists to do it with.
 
 ## What these numbers are not
 

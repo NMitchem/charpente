@@ -1393,8 +1393,8 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   `PLAN.md` diff is nine added lines and no edit. `DECISIONS.md` §7 itself is untouched
   pending the re-read.
   **ANSWERED 2026-08-20 by the per-phase attribution sub-project (entry below).** The
-  re-read exists, it fires, and `DECISIONS.md` §7 is still untouched — now pending Noah's
-  sign-off on a draft rather than pending a measurement that did not exist.
+  re-read exists, it does **not** fire, and `DECISIONS.md` §7 is still untouched — now
+  pending Noah's sign-off on a draft rather than pending a measurement that did not exist.
 
 - **M2 sub-project — per-phase commit attribution, DONE (2026-08-20, plan
   docs/superpowers/plans/2026-08-19-phase-attribution.md, spec + ledger + raw observations
@@ -1411,29 +1411,54 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   transition is a phase boundary. Gaps are attributable only on a single-threaded arm, so
   `attribute` REFUSES an overlapping trace rather than publishing a share nobody can defend;
   that is why the wire arm is not instrumented and cannot be.
-  **The measurement, published in `docs/BENCH.md`** ("Where a batched commit's time goes"):
-  at batch ≈62 the commit window is **store path 55.1–55.9%, WAL path 42.1–43.0%, and
-  everything outside the commit path 1.27–1.30%**; on the unbatched core arm the same
-  instrument reads WAL 91.3–91.5%, store 7.95–8.17%. Group commit did not move the
-  bottleneck to the kernel's single-threaded serialization — it moved it into `Store::apply`.
-  The direction is robust across three machine states (quiet 55.1–55.9%, post-thermal
-  57.0–64.5%, 24-spinner CPU-contended 73.7–76.3%) and the kernel loop is ~1% in all three;
-  the exact share is not robust, and both facts are in the artifact.
-  **DECISIONS §7 trigger (a) FIRES on the spec's pre-committed reading**, which was fixed
-  2026-08-19 before any number existed. The draft re-reading is
+  **The measurement, published in `docs/BENCH.md`** ("Where a batched commit's time goes"),
+  read at both levels because they disagree and the disagreement is the result. *Field by
+  field* at batch ≈62 the largest single phase is still the durable sync — `wal_sync_io` at
+  **40.48 / 40.53 / 41.15%**, counted — with `gap_within_store`, the store-side apply
+  residual, second at **40.05 / 39.81 / 39.62%**, derived. *Grouped into `submit_all`'s three
+  blocks* the same runs read **store path 55.1–55.9%, WAL path 42.1–43.0%, everything outside
+  the commit path 1.27–1.30%**; on the unbatched core arm the same instrument reads WAL
+  91.3–91.5%, store 7.95–8.17%, `gap_within_store` 0.05%. What is settled either way: group
+  commit did **not** move the bottleneck to the kernel's single-threaded serialization
+  (~1.3%, and ~1% in all three machine states measured — quiet, post-thermal, 24-spinner). It
+  took the fsync from ~90% of an unbatched window to ~40% of a batched one and promoted
+  `Store::apply` from 0.05% to a near-equal share: **two comparable occupants, neither
+  dominant.**
+  **DECISIONS §7 trigger (a) does NOT fire** — corrected from an initial FIRES verdict during
+  the final whole-branch review, with no number moving. `SPEC.md:126` pre-committed the
+  criterion as "redb apply is the **largest single non-idle phase** at batch cap": field
+  level and singular. At the field level a **counted** phase (`wal_sync_io`) leads a
+  **derived** one (`gap_within_store`) on all three published runs, so the criterion is not
+  met; FIRES had been reached by summing store-side fields into a "store path" aggregate the
+  spec never named, chosen after the numbers existed — the post-hoc regrouping the
+  pre-commitment existed to prevent, taking the lead with a residual against a measurement
+  when the spec's own guard says a derived phase share is not a measured one. Two further
+  facts point the same way: ≈92% of the instrument's own 782 ms overhead bound lands in
+  `gap_within_store` (correcting for it widens the field-level margin from 0.4 points to
+  ≈5.8), and that field is the one the overhead gate never checks. The 0.4-point margin is
+  itself inside the instrument's noise amplitude, so the verdict is delivered as "the
+  pre-committed criterion is not met", not as "the sync beats the apply".
+  The draft re-reading is
   `.superpowers/sdd/2026-08-19-phase-attribution/trigger-a-rereading.md`; **`DECISIONS.md` is
   deliberately untouched pending Noah's sign-off**, per CLAUDE.md's reopen-don't-override
-  rule. The re-reading argues that firing the trigger does NOT indicate the LSM: two cheaper
-  experiments come first, and the measurement cannot distinguish between them and "redb is
-  slow". (1) `Store::apply` opens one redb write transaction PER RECORD inside a batch whose
-  WAL cost is already amortized 62× — group commit amortized the fsync 62× and redb 0×,
-  exactly as the spec's §2 predicted, and batching the apply has not been tried. (2) redb's
-  forced `debug-assertions = true` in the release profile is worth a large share of the apply
-  phase, measured for the first time by a sensitivity probe built with the flag off in an
-  isolated `CARGO_TARGET_DIR` and interleaved run-for-run with a shipping control: all five
-  assertions-off windows come in under all six shipping windows, complete separation, while
-  adjacent pairs put the effect anywhere from 18% to 65% — direction settled, coefficient
-  not, and BENCH.md declines to quote one.
+  rule. It puts three options to him — record not-fired on fresh evidence; record not-fired
+  with a re-read owed on the first bare-metal Linux box (a faster fsync is the likeliest
+  thing to invert a 0.4-point margin); or overrule the criterion's reading as block-level
+  rather than field-level, which is his to take and should be recorded as such. Not firing
+  does not mean the store path is cheap: it is ~40% of a batched commit window, and the two
+  cheaper experiments stand either way. (1) `Store::apply` opens one redb write transaction
+  PER RECORD inside a batch whose WAL cost is already amortized 62× — group commit amortized
+  the fsync 62× and redb 0×, exactly as the spec's §2 predicted, and batching the apply has
+  not been tried. (2) The redb `debug-assertions = true` release override, whose sensitivity
+  probe is now reported as an **observation with unverifiable build provenance** rather than
+  as evidence: no `cargo build` command for either probe binary is in the run log, the only
+  machine-readable provenance field reads "debug-assertions on" for all eleven runs because
+  it is a literal keyed off the harness's own build mode, the claimed rustc-invocation check
+  has no record, and both target dirs are deleted. Its per-run pairing also refutes the
+  earlier "the verdict survives the flag" claim: with the flag off the WAL path is the larger
+  group in three of five runs. And the change is one line but not a one-line change — it
+  re-rolls the sim IO stream and invalidates the recorded seed corpus (`Cargo.toml`'s comment
+  and the two pinned cross-mode seeds in `ci.yml`), so it trades determinism for throughput.
   **Two method findings worth more than the numbers.** First, the loaded arm reproduced the
   `MIN_MEASURED_WINDOW` precedent exactly: at 586 ns/op the overhead gate refuses the kernel
   arm's `wal_sync_io` on every quiet run and **passes it** on one loaded run, because
@@ -1450,7 +1475,23 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   `phases_overhead_gate_ns_per_op: 586` (the range's high end) and
   `phases_overhead_gate_resolvable: false` — the refusals that produces mean "this machine
   cannot certify these phases at that amplitude", never "the instrument is too expensive".
-  The honest report is "below the noise floor of n=9", never "0 ns/op".
+  The honest report is "below the noise floor of n=9", never "0 ns/op". **Every IO phase of
+  every published kernel run is refused at that amplitude**, `wal_sync_io` included; the
+  exception in the published pair is the *core* arm's `wal_sync_io` (plus `store_write_io` on
+  core run 2). BENCH.md had this backwards in one sentence and the table now carries the gate
+  outcome per row, because the gate outcome is provenance and prose drifts from it.
+  **The measurement-discipline claim is stated at the strength its own record supports**,
+  after the review found it was not: protocol P3 (load averages within ~1.5x across a window,
+  else discard and re-run) was fixed before the numbers existed and is violated by every
+  published observation, and it was superseded at 00:33 by a direct `top` idleness check on
+  the defensible ground that macOS load average lags — but after the first observations
+  existed, and the substitute's own samples were never transcribed. BENCH.md now says that
+  rather than claiming "≥88% idle across three consecutive readings", which the run log
+  cannot corroborate. Deferred minors **M-3 and M-7 are closed as discharged by this task**
+  (BENCH.md names which arm the single overhead figure came from, and carries
+  `--overhead-ns-per-op`'s semantics and the gate's meaning); M-6's BENCH.md half is fixed
+  with the provenance column, its `report.rs:566` half stays deferred as a code change; M-1,
+  M-2, M-4 and r1-M1 stay deferred.
   **No published number moved.** `kernel_bench`'s sync counter stays UNSCOPED and the
   2026-08-15 rows stand as measured; the new runs are new observations on a quieter box
   (kernel 7,089 vs 2,646 acked writes/s, `device_ratio` 0.419–0.429 vs 0.36) and revise
