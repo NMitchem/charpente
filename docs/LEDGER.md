@@ -1438,6 +1438,21 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   ≈5.8), and that field is the one the overhead gate never checks. The 0.4-point margin is
   itself inside the instrument's noise amplitude, so the verdict is delivered as "the
   pre-committed criterion is not met", not as "the sync beats the apply".
+  **The spec's own stated expectation is falsified, and it is the most interesting single
+  result here.** `SPEC.md:119-122` fixed the reference point as "~73 µs per record — so at 64
+  connections the fsync accounts for a **small minority** of the per-record budget, and the
+  attribution's job is to say what holds the rest." Measured: per-record budget **141.06 µs**,
+  `wal_sync_io` **57.09 µs = 40.5%**, append+sync 59.21 µs = 42.0%. The arithmetic was good
+  (73 predicted against 59 measured); the characterization was wrong. After a 62× amortization
+  the durable sync is the *largest single item* in the per-record budget, not a small minority
+  of it — which is also why the criterion's wording could not be stretched: it was written
+  expecting the sync to have ceded, and it had not.
+  **Both readings of the criterion are sized in the draft, because they are not close to
+  balanced.** The reading taken decides *does not fire* by 0.42 / 0.72 / 1.53 points (≈5.8
+  after the overhead-concentration correction); reading "phase" as a block fires by 13.7; and
+  reading "non-idle" as excluding the device-blocked fsync fires by **28.3–37.1**. The choice
+  of reading, not the closeness of the data, settles this — which is precisely why the choice
+  is Noah's and is recorded as an overrule if he takes it.
   The draft re-reading is
   `.superpowers/sdd/2026-08-19-phase-attribution/trigger-a-rereading.md`; **`DECISIONS.md` is
   deliberately untouched pending Noah's sign-off**, per CLAUDE.md's reopen-don't-override

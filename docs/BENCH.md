@@ -339,7 +339,12 @@ spec pre-committed to**, and the deferral holds on fresh evidence rather than on
 the 2026-08-10 reading. Two readings of the criterion's own wording would reverse
 that — "phase" as one of `submit_all`'s three blocks rather than one of the
 fourteen trace fields, and "non-idle" as excluding the device-blocked fsync — and
-both are put to Noah in the draft rather than settled here.
+**both reverse it by far more than the reading taken decides it.** The reading
+taken decides *does not fire* by 0.4–1.5 points; the block reading fires by 13.7,
+and the CPU-only reading fires by 28.3–37.1 once `wal_sync_io` leaves the
+comparison. The choice of reading, not the closeness of any measurement, is what
+settles this, and both alternatives are put to Noah in the draft rather than
+settled here.
 `DECISIONS.md` §7 is untouched pending Noah's sign-off,
 per CLAUDE.md's reopen-don't-override rule; the draft re-reading is
 `.superpowers/sdd/2026-08-19-phase-attribution/trigger-a-rereading.md`. Nothing
@@ -566,7 +571,8 @@ disagreement is the result.**
 ≈62: `wal_sync_io` at **40.48 / 40.53 / 41.15%** of the window, with
 `gap_within_store` — the store-side apply residual — second at **40.05 / 39.81 /
 39.62%**. Group commit cut the sync's share from ~90% to ~40%; it did not
-displace it from first place, and the two are 0.4 points apart.
+displace it from first place, and the two are **0.42 / 0.72 / 1.53 points
+apart**.
 
 *Grouped into `submit_all`'s three blocks.* **The store path holds 55.1–55.9%
 of the commit window and the WAL path 42.1–43.0%, while everything outside the
@@ -574,12 +580,26 @@ commit path — the single-threaded kernel loop, dispatch, the handler, job
 execution — holds 1.27–1.30%.** On the unbatched path the same instrument reads
 91.3–91.5% WAL and 7.95–8.17% store.
 
+**The prediction this task was set up against is falsified, which is a result in
+its own right.** The spec fixed a reference point before the run: the device
+ceiling of 215 appends/sec implies ~4.65 ms per append+sync, "amortized across a
+full batch that is ~73 µs per record — so at 64 connections **the fsync accounts
+for a small minority of the per-record budget**, and the attribution's job is to
+say what holds the rest." Measured at batch ≈62 the per-record budget is **141.06
+µs**, of which `wal_sync_io` is **57.09 µs — 40.5%** and WAL append + sync
+together are 59.21 µs — **42.0%**. The arithmetic was good (73 µs predicted
+against 59 µs measured, right order and on the conservative side); the
+characterization was not. **After being amortized 62×, the durable sync is not a
+small minority of the per-record budget — it is the largest single item in it**,
+and the "rest" the attribution was built to explain is smaller than the question
+assumed.
+
 What is settled either way: group commit did **not** move the bottleneck to the
 kernel's single-threaded serialization, which is ~1.3% of the commit window here
 and ~1% in every machine state measured below. What it produced instead is a
 window with **two comparable occupants** — one durable sync and the apply run
 that follows it — and which of the two "leads" depends on whether you count
-fields or blocks. The 0.4-point field-level margin is well inside this
+fields or blocks. The 0.4–1.5-point field-level margin is well inside this
 instrument's own noise amplitude (5.5% of the window, below), so at the field
 level the ordering is not resolvable in either direction. The 13.7-point group
 margin sits outside that amplitude and is real — but it belongs to a grouping,
@@ -684,8 +704,8 @@ Correcting for it moves the reading against the store side, not toward it.
 Subtract 720 ms from `gap_within_store` and from the window and run 1 reads
 store path ≈53.5% against WAL ≈44.4%; at the field level `wal_sync_io` goes to
 ≈42.7% against `gap_within_store`'s ≈36.8%, so the field-level margin **widens**
-from 0.4 points to ≈5.8. The correction can only push that way, because the sink
-is the store-side residual.
+from 0.42 points to ≈5.8 on run 1. The correction can only push that way,
+because the sink is the store-side residual.
 
 The bound is generous, and one field says so arithmetically: ≈100,000 append
 recordings at 586 ns is ≈59 ms of claimed cost against a `gap_within_wal` that
@@ -696,19 +716,24 @@ generous end is the conservative choice.
 
 What survives all of it: 782 ms cannot convert a 1.3% phase into a 40% one, so
 the kernel loop's ~1.3% and the 54-point gap over it stand, as does the 13.7-point
-group margin. The 0.4-point margin between the two largest *fields* does not
-survive it, in either direction — which is why this section reports those two as
+group margin. The 0.4–1.5-point margin between the two largest *fields* does
+not survive it, in either direction — which is why this section reports those two as
 comparable rather than ranked, and why the gate refusing them is the gate being
 right rather than strict.
 
 **A correction to Task 4's own reading, recorded because it was wrong in this
 document's working notes and would otherwise be inherited.** Task 4 saw
 `cpu/wall` of 0.41–0.52 and read it as contention: "this process got roughly half
-a core." The runs above read 0.49–0.52 on a box sampled at 91.9–93.0% idle with
-no process over ~5% CPU. **0.50 is this arm's structural signature, not a
-contention read** — the kernel arm spends about half its wall time blocked inside
-`fsync`, which burns no CPU. The contention read that survives is the *spread*
-between the two arms of a pair, not the level of either.
+a core." The runs above read 0.49–0.52 across three invocations on this box. An
+earlier draft added "on a box sampled at 91.9–93.0% idle with no process over ~5%
+CPU"; **that is withdrawn for the same reason as the idleness gate at the end of
+this section** — no per-run idle sample was transcribed, and the top-5 `%CPU`
+lists that *were* recorded show single processes at 37–57% either side of some
+overhead windows. The correction does not need it. **0.50 is this arm's
+structural signature, not a contention read** — the kernel arm spends about half
+its wall time blocked inside `fsync`, which burns no CPU, and the same 0.49–0.52
+appears on contended runs and quiet ones alike. The contention read that survives
+is the *spread* between the two arms of a pair, not the level of either.
 
 ### The table
 
@@ -838,8 +863,8 @@ runs of each are within a few percent):
 that field is 266 µs at batch 1 against 257 µs at batch ≈62 — one fixed cost
 divided by 62,
 which is the same amortization the bullet two above already names. Meanwhile the
-field this section reads as redb's compute, `gap_within_store`, **rises 24× per
-record** under batching. Cache warmth does not predict that; per-batch
+field this section reads as redb's compute, `gap_within_store`, **rises 27.7× per
+record** under batching (2.04 → 56.50 µs). Cache warmth does not predict that; per-batch
 amortization predicts all of it. This is a per-record derivation (window ÷
 counted records) across two arms with different workload shapes — the kernel arm
 commits two records per request, the core arm one — so treat it as an
@@ -915,8 +940,8 @@ CPU time to a residual while leaving an fsync alone. Those two eras are publishe
 here as *controls* on a degraded machine, not as the measurement; the table above
 publishes the quiet pre-heat era, which is both the fastest and the least
 favourable to a store-side reading — the conservative choice. The honest summary
-is that a 0.4-point field-level margin is not a stable fact about this system in
-either direction, and no verdict should be built on its sign.
+is that a 0.4–1.5-point field-level margin is not a stable fact about this
+system in either direction, and no verdict should be built on its sign.
 
 **3. redb's debug assertions, and how much of the store path they are.** This
 workspace forces `[profile.release.package.redb] debug-assertions = true` on
@@ -1034,9 +1059,9 @@ on one build, and its build provenance is unverifiable as stated above.
   with a battery-backed controller the sync shrinks and the store path's share
   rises further — so for the *group* reading this device is the conservative
   choice, but for the *field* reading it is the opposite: `wal_sync_io` leads
-  `gap_within_store` by 0.4 points here largely because this device's fsync is
-  slow, and a faster one is the most likely thing to invert that ordering. Any
-  verdict read off the 0.4 points travels no further than this device.
+  `gap_within_store` by 0.4–1.5 points here largely because this device's fsync
+  is slow, and a faster one is the most likely thing to invert that ordering. Any
+  verdict read off that margin travels no further than this device.
 - **The box was not quiet, and could not be made quiet.** It is shared with other
   agents whose jobs restarted faster than they could be waited out: a `pytest -q`
   from an unrelated repo peaking above 200% CPU (terminated on sight under a
