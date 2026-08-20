@@ -85,29 +85,92 @@ pub struct Trace {
     origin: Instant,
     events: Mutex<Vec<Event>>,
     recording: bool,
+    /// The event vec's capacity immediately after construction (Task 3
+    /// Ruling A, 2026-08-19 phase-attribution plan). Read from `Vec::capacity()`
+    /// itself rather than the `capacity` argument passed to `recording` —
+    /// an allocator is free to hand back more than requested to fit a size
+    /// class, and comparing against the REQUESTED value would read that
+    /// rounding as growth that never happened.
+    initial_capacity: usize,
 }
 
 impl Trace {
     /// `capacity` preallocates the event vec. Size it generously: a reallocation
-    /// inside a traced window lands in the measurement it is trying to take.
+    /// inside a traced window lands in the measurement it is trying to take —
+    /// see `capacity_grew_reason` for what that costs and how a caller detects
+    /// it rather than merely hoping this constant was big enough.
     pub fn recording(capacity: usize) -> Arc<Trace> {
+        let events = Vec::with_capacity(capacity);
+        let initial_capacity = events.capacity();
         Arc::new(Trace {
             origin: Instant::now(),
-            events: Mutex::new(Vec::with_capacity(capacity)),
+            events: Mutex::new(events),
             recording: true,
+            initial_capacity,
         })
     }
 
     pub fn passthrough() -> Arc<Trace> {
+        let events = Vec::new();
+        let initial_capacity = events.capacity();
         Arc::new(Trace {
             origin: Instant::now(),
-            events: Mutex::new(Vec::new()),
+            events: Mutex::new(events),
             recording: false,
+            initial_capacity,
         })
     }
 
     pub fn is_recording(&self) -> bool {
         self.recording
+    }
+
+    /// Ruling A (2026-08-19 phase-attribution plan, "The capacity finding"):
+    /// a real 50,000-request kernel-arm run — `bin/bench.rs`'s own default
+    /// `--requests` — produced 1,336,846 events against a `1 << 20`
+    /// (1,048,576) reservation, guaranteeing at least one reallocation
+    /// *during* the traced window, silently: `phase_accounting::attribute`
+    /// still returned `Ok` and its closure invariant (`totals.total() ==
+    /// window_nanos`) still held exactly, because a reallocation's stall
+    /// does not inflate any single traced op's own recorded duration
+    /// (`Trace::record`'s `start`/`end` are sampled by the caller *before*
+    /// the mutex-guarded `push` that can trigger the regrow) — it lands
+    /// instead in whichever `gap_*` bucket happens to surround that
+    /// particular `record()` call, indistinguishable after the fact from
+    /// genuine idle time in that phase. Gaps are exactly what this
+    /// instrument exists to attribute, so this is a wrong number that looks
+    /// right.
+    ///
+    /// `Some` names the contract this trace violated, the site (both arms'
+    /// capacity constants), and the fix, in the shape a caller pushes
+    /// verbatim into its own `invalid` vec — read `wire_accounting.rs`'s
+    /// `syncs_counted` for the idiom this mirrors: a fact about *how* a
+    /// number was produced, surfaced beside the number itself rather than
+    /// folded silently into it. `None` means the reservation held: nothing
+    /// reallocated, so nothing about this trace's gap attribution is
+    /// suspect on this account.
+    pub fn capacity_grew_reason(&self) -> Option<String> {
+        let events = self.events.lock().expect("trace lock");
+        let current_capacity = events.capacity();
+        if current_capacity <= self.initial_capacity {
+            return None;
+        }
+        Some(format!(
+            "contract: this run's phase trace grew its event buffer's capacity from {} to {} \
+             while recording ({} events recorded across the whole trace, not just the \
+             measured window) — `Trace::recording`'s whole point is a reservation nothing \
+             reallocates while recording, because a reallocation's stall does not land in any \
+             traced op's own duration (start/end are sampled before the mutex-guarded push \
+             that can trigger it) — it lands instead in whichever gap_* phase happens to \
+             surround that push, indistinguishable after the fact from genuine idle time in \
+             that phase. This run's phase shares cannot be trusted and are withheld rather \
+             than published. Fix: raise the capacity `Trace::recording` is constructed with \
+             for this workload — `TRACE_CAPACITY` in core_bench.rs, or `trace_capacity()` in \
+             kernel_bench.rs.",
+            self.initial_capacity,
+            current_capacity,
+            events.len()
+        ))
     }
 
     /// This trace's own clock, in the same time base every recorded `Event`
@@ -288,5 +351,87 @@ mod tests {
             events[0].end_nanos <= after,
             "a now_nanos() sample taken after the op must not read earlier than the op's own end"
         );
+    }
+
+    // Task 3 Ruling A (2026-08-19 phase-attribution plan): a real kernel-arm
+    // run at 50,000 requests produced 1,336,846 events against a `1 << 20`
+    // reservation — a silent reallocation `phase_accounting::attribute` has
+    // no way to see, since its closure invariant holds regardless of where
+    // the regrow's stall landed. These prove the detector itself, RED first
+    // per hard rule 3: `capacity_grew_reason` must distinguish "stayed inside
+    // the reservation" from "regrew during recording" using the vec's own
+    // actual capacity, not the caller's requested one, and the `Some` arm
+    // must name the contract it enforces.
+
+    #[test]
+    fn capacity_grew_reason_is_none_while_the_reservation_holds() {
+        let trace = Trace::recording(4);
+        for _ in 0..4 {
+            trace.record(
+                PathClass::Wal,
+                OpKind::WriteAt,
+                Instant::now(),
+                Instant::now(),
+            );
+        }
+        assert!(
+            trace.capacity_grew_reason().is_none(),
+            "four pushes into a 4-capacity reservation must not report growth"
+        );
+    }
+
+    #[test]
+    fn capacity_grew_reason_names_the_contract_once_the_reservation_is_exceeded() {
+        let trace = Trace::recording(1);
+        // Enough pushes to force at least one regrow past any allocator
+        // size-class rounding of the initial reservation.
+        for _ in 0..8 {
+            trace.record(
+                PathClass::Wal,
+                OpKind::WriteAt,
+                Instant::now(),
+                Instant::now(),
+            );
+        }
+        let reason = trace
+            .capacity_grew_reason()
+            .expect("eight pushes into a 1-capacity reservation must report growth");
+        assert!(
+            reason.starts_with("contract:"),
+            "must use the same refusal prefix phase_accounting's own refusals use, so a \
+             caller's \"contract:\"-scoped check catches this too: {reason}"
+        );
+        assert!(
+            reason.contains("Trace::recording"),
+            "must name the contract this trace violated: {reason}"
+        );
+        assert!(
+            reason.contains("TRACE_CAPACITY") && reason.contains("trace_capacity()"),
+            "must name the fix — both arms' capacity sites: {reason}"
+        );
+        assert!(
+            reason.contains(" 1 ") || reason.contains("from 1 "),
+            "must name the initial capacity (1): {reason}"
+        );
+        assert!(
+            reason.contains(&format!("{} events", 8)),
+            "must name how many events this trace actually recorded: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_passthrough_trace_never_reports_growth() {
+        // `recording: false` means `record` early-returns before ever
+        // touching the vec (module doc), so nothing can grow it — proven
+        // rather than assumed, since a future edit to `record`'s early
+        // return could silently defeat that.
+        let trace = Trace::passthrough();
+        trace.record(
+            PathClass::Wal,
+            OpKind::WriteAt,
+            Instant::now(),
+            Instant::now(),
+        );
+        assert!(trace.capacity_grew_reason().is_none());
     }
 }

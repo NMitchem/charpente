@@ -36,10 +36,51 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// Preallocates the trace's event vec (Task 1: `size_of::<Event>()` is 24
-/// bytes, so this is ~25 MB). Sized generously: a reallocation inside the
-/// traced window would land in the measurement it is trying to take.
-const TRACE_CAPACITY: usize = 1 << 20;
+/// Measured events per request (2026-08-19 phase-attribution plan, Task 3
+/// "capacity finding" — `.superpowers/sdd/2026-08-19-phase-attribution/
+/// task-3-report.md`). Real runs of this exact arm, counted with a temporary
+/// `eprintln!("{}", events.len())` inserted right after `trace.events()`
+/// (removed before commit; never part of any committed diff):
+///
+/// | requests | events recorded | events/request |
+/// |---|---|---|
+/// | 20,000 | 522,258 | 26.11 |
+/// | 50,000 (`bin/bench.rs`'s own default `--requests`) | 1,336,846 | 26.74 |
+///
+/// The old fixed `TRACE_CAPACITY = 1 << 20` (1,048,576) this constant
+/// replaces was 27.5% UNDER the second row — a default kernel bench run
+/// guaranteed at least one reallocation inside the traced window, silently
+/// (see `tracing_disk::Trace::capacity_grew_reason`'s doc for what that
+/// costs). 40 carries real margin over the ~26.7 measured rate (~50%
+/// headroom) rather than reusing the bare figure: a different request shape
+/// (larger bodies, more job fan-out) could push the real rate up without
+/// this crate's own fixtures changing at all. Ruling A's
+/// `capacity_grew_reason` is what makes it safe to be wrong in the other
+/// direction — an estimate that undershoots now REFUSES loudly instead of
+/// silently contaminating a gap bucket.
+const EVENTS_PER_REQUEST_ESTIMATE: usize = 40;
+
+/// Floor for small batches, where `requests * EVENTS_PER_REQUEST_ESTIMATE`
+/// alone could undershoot this layer's fixed per-run overhead (the
+/// `migrate_schema()` at entry and the `checkpoint()` at shutdown this
+/// module's doc names — both fsync-bearing, both traced, neither scaling
+/// with `requests`). `1 << 16` (65,536) is still generous next to any
+/// realistic fixed-cost op count a single run pays once.
+const MIN_TRACE_CAPACITY: usize = 1 << 16;
+
+/// Ruling B (2026-08-19 phase-attribution plan): this arm knows `requests`
+/// up front (unlike `core_bench`, which is duration-based and keeps a fixed
+/// floor — see `core_bench::TRACE_CAPACITY`'s doc), so its capacity is
+/// derived from the actual workload rather than a magic literal.
+/// `saturating_mul` rather than plain `*`: an absurd `--requests` value must
+/// not panic this arithmetic before the run even starts — it would simply
+/// request an enormous, likely-failing allocation, which is the right
+/// failure for that input.
+fn trace_capacity(requests: u64) -> usize {
+    (requests as usize)
+        .saturating_mul(EVENTS_PER_REQUEST_ESTIMATE)
+        .max(MIN_TRACE_CAPACITY)
+}
 
 /// Wraps `ProdDisk` to COUNT durable syncs rather than derive them (group-
 /// commit T7, C-7): `KernelObs::syncs` used to be `requests_planned +
@@ -132,7 +173,7 @@ pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> 
     // tracer times the real IO, not CountingFile's own atomic increment.
     // Reversed, every recorded duration would include the counter's
     // overhead. ONE `Trace` per arm, not a shared static.
-    let trace = Trace::recording(TRACE_CAPACITY);
+    let trace = Trace::recording(trace_capacity(requests));
     let disk = CountingDisk {
         inner: Box::new(TracingDisk::new(
             Box::new(ProdDisk::new(dir)?),
@@ -234,28 +275,36 @@ pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> 
     // to `invalid` (below) rather than discarding a run whose throughput
     // figures are still good.
     let mut invalid = Vec::new();
-    let events = trace.events();
-    let phases = match attribute(&events, window_start_nanos, window_end_nanos) {
-        Ok(attribution) => {
-            // See core_bench.rs's identical comment: events after the window
-            // mean `window_end_nanos` was stamped before the last IO
-            // completed, on an arm whose window closes at the end of its run.
-            if attribution.events_ignored_after_window > 0 {
-                invalid.push(format!(
-                    "contract: {} traced op(s) fall after the measured window closed. On this \
-                     arm the window closes at the end of the run, so this means \
-                     `window_end_nanos` was stamped before the last IO completed and the \
-                     published phase shares would be diluted by the ops left out. Fix: stamp \
-                     `window_end_nanos` with `Trace::now_nanos()` after the measured section \
-                     finishes, not before.",
-                    attribution.events_ignored_after_window
-                ));
+    // Ruling A (2026-08-19 phase-attribution plan): checked BEFORE attribute()
+    // is even attempted — see core_bench.rs's identical comment for why
+    // attribute() itself cannot usefully see this contamination.
+    let phases = if let Some(reason) = trace.capacity_grew_reason() {
+        invalid.push(reason);
+        None
+    } else {
+        let events = trace.events();
+        match attribute(&events, window_start_nanos, window_end_nanos) {
+            Ok(attribution) => {
+                // See core_bench.rs's identical comment: events after the window
+                // mean `window_end_nanos` was stamped before the last IO
+                // completed, on an arm whose window closes at the end of its run.
+                if attribution.events_ignored_after_window > 0 {
+                    invalid.push(format!(
+                        "contract: {} traced op(s) fall after the measured window closed. On \
+                         this arm the window closes at the end of the run, so this means \
+                         `window_end_nanos` was stamped before the last IO completed and the \
+                         published phase shares would be diluted by the ops left out. Fix: \
+                         stamp `window_end_nanos` with `Trace::now_nanos()` after the measured \
+                         section finishes, not before.",
+                        attribution.events_ignored_after_window
+                    ));
+                }
+                Some(attribution.totals)
             }
-            Some(attribution.totals)
-        }
-        Err(refusals) => {
-            invalid.extend(refusals);
-            None
+            Err(refusals) => {
+                invalid.extend(refusals);
+                None
+            }
         }
     };
 
@@ -341,6 +390,47 @@ pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Ruling B (2026-08-19 phase-attribution plan): `trace_capacity` must
+    // clear the measured 26.74 events/request rate at `bin/bench.rs`'s own
+    // default `--requests` (50,000) with real margin, not merely equal or
+    // exceed it — a formula that JUST clears today's measurement leaves no
+    // room for the next workload to differ.
+    #[test]
+    fn trace_capacity_clears_the_measured_default_run_with_margin() {
+        const MEASURED_EVENTS_AT_50K: usize = 1_336_846;
+        let capacity = trace_capacity(50_000);
+        assert!(
+            capacity > MEASURED_EVENTS_AT_50K,
+            "capacity {capacity} must exceed the measured 50,000-request event count \
+             {MEASURED_EVENTS_AT_50K}"
+        );
+        assert!(
+            capacity as f64 > MEASURED_EVENTS_AT_50K as f64 * 1.1,
+            "capacity {capacity} should carry real margin (>10%) over the measured count \
+             {MEASURED_EVENTS_AT_50K}, not merely clear it"
+        );
+    }
+
+    #[test]
+    fn trace_capacity_scales_with_requests() {
+        assert_eq!(
+            trace_capacity(50_000),
+            50_000 * EVENTS_PER_REQUEST_ESTIMATE,
+            "above the floor, capacity must be a direct multiple of requests"
+        );
+        assert!(
+            trace_capacity(100) >= MIN_TRACE_CAPACITY,
+            "a tiny batch must not undershoot the fixed-overhead floor"
+        );
+    }
+
+    #[test]
+    fn trace_capacity_does_not_panic_on_an_absurd_request_count() {
+        // `saturating_mul`, not `*`: an operator-supplied `--requests` this
+        // large must not panic the arithmetic before the run even starts.
+        assert_eq!(trace_capacity(u64::MAX), usize::MAX);
+    }
 
     fn scratch(tag: &str) -> String {
         let nanos = std::time::SystemTime::now()

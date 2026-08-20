@@ -19,6 +19,18 @@ use std::time::{Duration, Instant};
 /// Preallocates the trace's event vec (Task 1: `size_of::<Event>()` is 24
 /// bytes, so this is ~25 MB). Sized generously: a reallocation inside the
 /// traced window would land in the measurement it is trying to take.
+///
+/// Ruling B (2026-08-19 phase-attribution plan): this arm is duration-based
+/// (`--duration`), not count-based, so unlike `kernel_bench::trace_capacity`
+/// it has no workload input to derive a capacity FROM — this stays a fixed
+/// floor rather than a formula. The floor is defensible because it has been
+/// measured, not guessed: the same session's capacity finding (see
+/// `tracing_disk::Trace::capacity_grew_reason`'s doc) recorded 5,985 events
+/// over a 2 s window (0.6% of this capacity) and 94,562 events over a 30 s
+/// window — `bin/bench.rs`'s own default `--duration` (9.0%) — ample headroom
+/// at both scales actually tested. `capacity_grew_reason` is the backstop if
+/// a future, much longer run ever does exceed this: it refuses to publish
+/// rather than silently landing a reallocation's stall in a gap phase.
 const TRACE_CAPACITY: usize = 1 << 20;
 
 fn canonical(db: &mut Db, i: u64) -> io::Result<u64> {
@@ -122,31 +134,43 @@ pub fn run(
     let elapsed = start.elapsed();
     let window_end_nanos = trace.now_nanos();
 
-    let events = trace.events();
-    let phases = match attribute(&events, window_start_nanos, window_end_nanos) {
-        Ok(attribution) => {
-            // The payoff of fix round 3's R-1: a window stamped from the
-            // wrong place no longer fails loudly, it dilutes quietly. Events
-            // before the window are warmup and `Db::open` — expected. Events
-            // AFTER it are not, on an arm whose window closes at the end of
-            // its run, so they mean the window and the trace disagree about
-            // what was measured.
-            if attribution.events_ignored_after_window > 0 {
-                invalid.push(format!(
-                    "contract: {} traced op(s) fall after the measured window closed. On this \
-                     arm the window closes at the end of the run, so this means \
-                     `window_end_nanos` was stamped before the last IO completed and the \
-                     published phase shares would be diluted by the ops left out. Fix: stamp \
-                     `window_end_nanos` with `Trace::now_nanos()` after the measured section \
-                     finishes, not before.",
-                    attribution.events_ignored_after_window
-                ));
+    // Ruling A (2026-08-19 phase-attribution plan): checked BEFORE attribute()
+    // is even attempted. A grown buffer does not corrupt any recorded event's
+    // own timestamps — attribute() would still return `Ok` and its closure
+    // invariant would still hold — the contamination is invisible to that
+    // function by construction (see `Trace::capacity_grew_reason`'s doc), so
+    // there is nothing for attribute() to usefully check here; the refusal
+    // has to happen at this layer instead.
+    let phases = if let Some(reason) = trace.capacity_grew_reason() {
+        invalid.push(reason);
+        None
+    } else {
+        let events = trace.events();
+        match attribute(&events, window_start_nanos, window_end_nanos) {
+            Ok(attribution) => {
+                // The payoff of fix round 3's R-1: a window stamped from the
+                // wrong place no longer fails loudly, it dilutes quietly. Events
+                // before the window are warmup and `Db::open` — expected. Events
+                // AFTER it are not, on an arm whose window closes at the end of
+                // its run, so they mean the window and the trace disagree about
+                // what was measured.
+                if attribution.events_ignored_after_window > 0 {
+                    invalid.push(format!(
+                        "contract: {} traced op(s) fall after the measured window closed. On \
+                         this arm the window closes at the end of the run, so this means \
+                         `window_end_nanos` was stamped before the last IO completed and the \
+                         published phase shares would be diluted by the ops left out. Fix: \
+                         stamp `window_end_nanos` with `Trace::now_nanos()` after the measured \
+                         section finishes, not before.",
+                        attribution.events_ignored_after_window
+                    ));
+                }
+                Some(attribution.totals)
             }
-            Some(attribution.totals)
-        }
-        Err(refusals) => {
-            invalid.extend(refusals);
-            None
+            Err(refusals) => {
+                invalid.extend(refusals);
+                None
+            }
         }
     };
 

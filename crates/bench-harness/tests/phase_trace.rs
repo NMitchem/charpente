@@ -23,13 +23,33 @@ fn the_core_arm_attributes_a_real_run() {
     )
     .expect("core arm runs");
 
+    // Task 3 Ruling C (2026-08-19 phase-attribution plan): `invalid.is_empty()`
+    // conflated EVERY reason `core_bench::run` can push — including the
+    // pre-existing, out-of-scope `core_accounting::write_accounting`
+    // device-bracket-stability gate (`measure::unstable_device_reason`),
+    // which this crate's own ignored smoke tests already document as
+    // expected to fire occasionally on a loaded box — with a
+    // phase-attribution refusal specifically, which is what this test's own
+    // comment claims to check. A phase test must assert what IT means: no
+    // PHASE-ATTRIBUTION refusal fired. Every such refusal — from
+    // `phase_accounting::attribute` itself, or from `core_bench::run`'s own
+    // capacity-growth/window-dilution guards added alongside it — is
+    // prefixed "contract:"; every other reason this vec can carry
+    // (`core_accounting`'s heartbeat/crosscheck/ratio/stability reasons) is
+    // prefixed "INVALID:". That split is load-bearing here, not a
+    // coincidence of two unrelated authors' conventions.
+    let phase_refusals: Vec<&String> = invalid
+        .iter()
+        .filter(|r| r.starts_with("contract:"))
+        .collect();
+    assert!(
+        phase_refusals.is_empty(),
+        "phase attribution must not refuse a single-threaded arm: {phase_refusals:?}"
+    );
+
     let phases = report
         .phases
-        .expect("a recording run carries phases; refusals were: {invalid:?}");
-    assert!(
-        invalid.is_empty(),
-        "attribution must not refuse a single-threaded arm: {invalid:?}"
-    );
+        .expect("no phase-attribution refusal fired above, so phases must be Some");
     assert_eq!(
         phases.total(),
         report.window_nanos,
