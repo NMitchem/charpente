@@ -358,27 +358,41 @@ pub fn window_brackets_measured_section(
 
     if window_end_nanos < window_start_nanos {
         return Some(format!(
-            "contract: the measured window is inverted — `window_start_nanos` ({window_start_nanos})              is after `window_end_nanos` ({window_end_nanos}). Fix: stamp the start with              `Trace::now_nanos()` before the measured section and the end after it."
+            "contract: the measured window is inverted — `window_start_nanos` \
+             ({window_start_nanos}) is after `window_end_nanos` ({window_end_nanos}). Fix: \
+             stamp the start with `Trace::now_nanos()` before the measured section and the \
+             end after it."
         ));
     }
     let window_nanos = window_end_nanos - window_start_nanos;
 
     if window_nanos < measured_nanos {
         return Some(format!(
-            "contract: the measured window ({window_nanos} ns) is SHORTER than the section it              is supposed to bracket ({measured_nanos} ns, from the caller's own `Instant`), so              some of the measured work happened outside the window and its IO is missing from              every published phase share. Fix: stamp `window_start_nanos` immediately before the              measured section starts and `window_end_nanos` immediately after it ends, with              nothing in between but the section itself."
+            "contract: the measured window ({window_nanos} ns) is SHORTER than the section it \
+             is supposed to bracket ({measured_nanos} ns, from the caller's own `Instant`), so \
+             some of the measured work happened outside the window and its IO is missing from \
+             every published phase share. Fix: stamp `window_start_nanos` immediately before \
+             the measured section starts and `window_end_nanos` immediately after it ends, \
+             with nothing in between but the section itself."
         ));
     }
 
     let excess = window_nanos - measured_nanos;
     if excess > SLACK_NANOS {
         return Some(format!(
-            "contract: the measured window ({window_nanos} ns) exceeds the section it is              supposed to bracket ({measured_nanos} ns, from the caller's own `Instant`) by              {excess} ns, far past the {SLACK_NANOS} ns that bracketing itself can cost. The              window therefore encloses work that was not measured — warmup and `Db::open` are              the usual culprits — and that work's IO is folded into the published phase shares              without appearing in any ignored-event count, because it is legitimately inside              the window. Fix: stamp `window_start_nanos` immediately before the measured              section, AFTER warmup completes, not before it."
+            "contract: the measured window ({window_nanos} ns) exceeds the section it is \
+             supposed to bracket ({measured_nanos} ns, from the caller's own `Instant`) by \
+             {excess} ns, far past the {SLACK_NANOS} ns that bracketing itself can cost. The \
+             window therefore encloses work that was not measured — warmup and `Db::open` are \
+             the usual culprits — and that work's IO is folded into the published phase shares \
+             without appearing in any ignored-event count, because it is legitimately inside \
+             the window. Fix: stamp `window_start_nanos` immediately before the measured \
+             section, AFTER warmup completes, not before it."
         ));
     }
 
     None
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,5 +916,28 @@ mod tests {
         // Exactly at the slack: accepted. One nanosecond past it: refused.
         assert!(window_brackets_measured_section(0, 1_050_000_000, 1_000_000_000).is_none());
         assert!(window_brackets_measured_section(0, 1_050_000_001, 1_000_000_000).is_some());
+    }
+
+    #[test]
+    fn no_refusal_this_module_emits_contains_a_run_of_spaces() {
+        // Hard rule 5: a refusal is product surface. Rust's `\<newline>`
+        // continuation strips the following indentation; a tool that rewrites
+        // this file without honouring that (a heredoc whose own language
+        // treats `\<newline>` as a continuation will silently eat it) leaves
+        // the indentation in the message as a 14-space gap mid-sentence. That
+        // is invisible to every other assertion here, because they all use
+        // `contains` on short fragments.
+        let refusals = [
+            window_brackets_measured_section(2_000, 1_000, 500),
+            window_brackets_measured_section(0, 1_000_000_000, 2_000_000_000),
+            window_brackets_measured_section(0, 7_000_000_000, 2_000_000_000),
+        ];
+        for r in refusals {
+            let r = r.expect("each of these inputs must be refused");
+            assert!(
+                !r.contains("  "),
+                "a refusal must read as prose, with no run of spaces: {r:?}"
+            );
+        }
     }
 }
