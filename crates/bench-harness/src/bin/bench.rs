@@ -7,14 +7,17 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use bench_harness::device;
+use bench_harness::kernel_bench::{self, TraceMode};
+use bench_harness::measure;
 use bench_harness::measure::Heartbeat;
+use bench_harness::phase_accounting;
 use bench_harness::report::{Report, invalid_reasons, render_human, render_json};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage: bench <device|core|kernel|wire|all|smoke> \
 [--json] [--duration SECS] [--warmup SECS] [--requests N] \
-[--target bench-app|invoicing] [--connections N,N,...] [--dir PATH]";
+[--target bench-app|invoicing] [--connections N,N,...] [--dir PATH] [--trace-overhead]";
 
 #[derive(Debug)]
 struct Args {
@@ -29,6 +32,13 @@ struct Args {
     // operator input, not a default — None falls back to a throwaway temp
     // dir, fine on a real disk, silently wrong on tmpfs.
     dir: Option<String>,
+    // Task 4 (2026-08-19 phase-attribution plan): `bench kernel --trace-overhead`
+    // switches `main` off the normal layered report entirely and into
+    // `run_trace_overhead`, which measures the phase trace's own cost
+    // instead of the app's. Not a `Report` field: this mode publishes
+    // nothing docs/BENCH.md can quote yet (Task 5's job), so it has no
+    // business inside the artifact that does.
+    trace_overhead: bool,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -41,6 +51,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         target: "bench-app".to_string(),
         connections: vec![1, 4, 16, 64, 256],
         dir: None,
+        trace_overhead: false,
     };
     if !["device", "core", "kernel", "wire", "all", "smoke"].contains(&args.cmd.as_str()) {
         return Err(format!("unknown subcommand {:?}\n{USAGE}", args.cmd));
@@ -85,6 +96,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                     .collect::<Result<_, _>>()?
             }
             "--dir" => args.dir = Some(val("--dir")?),
+            "--trace-overhead" => args.trace_overhead = true,
             other => return Err(format!("unknown flag {other:?}\n{USAGE}")),
         }
     }
@@ -310,6 +322,199 @@ fn exit_code_for(report: &Report, implemented: bool) -> u8 {
     }
 }
 
+/// `bench kernel --trace-overhead` (Task 4, step 4): measure what the phase
+/// trace COSTS, rather than what it reports.
+///
+/// Runs the kernel arm `REPEATS` times in each mode and prints every
+/// observation. It does not print a mean, and deliberately has no `--json`
+/// form: this mode publishes nothing `docs/BENCH.md` may quote, and a single
+/// averaged figure is exactly the shape that gets quoted.
+///
+/// **The two arms ALTERNATE rather than running in blocks**, which matters
+/// more than the repeat count on any machine that is not idle. Three
+/// recording runs followed by three passthrough runs confounds the mode with
+/// whatever the machine was doing at the time — and this machine has been
+/// measured moving by more than 2x in load inside a single task. Alternating
+/// pairs each recording run with the passthrough run beside it in time, so a
+/// slow drift subtracts out of every pair instead of landing entirely on one
+/// arm.
+///
+/// **CPU time, not wall clock**, via `measure::process_cpu` — a descheduled
+/// process accumulates wall clock it never spent computing, and instrument
+/// overhead is compute. Wall time is printed too, and the `cpu/wall` column
+/// is the contention read: at 1.00 the process had a core to itself for the
+/// whole run, and the further below 1.00 it sits the more of that run was
+/// somebody else's. Two observations at materially different `cpu/wall` are
+/// not samples of the same machine and their spread is not a measurement
+/// error — it is two machines.
+fn run_trace_overhead(args: &Args) -> Result<(), String> {
+    const REPEATS: usize = 3;
+
+    if args.cmd != "kernel" {
+        return Err(format!(
+            "--trace-overhead measures the kernel arm's trace and is only implemented there, \
+             but the subcommand is {:?}. Fix: run `bench kernel --trace-overhead`.\n{USAGE}",
+            args.cmd
+        ));
+    }
+
+    struct Obs {
+        mode: &'static str,
+        cpu: Duration,
+        wall: Duration,
+        events: u64,
+    }
+    let mut obs: Vec<Obs> = Vec::new();
+    let mut last_recording_phases = None;
+
+    for _ in 0..REPEATS {
+        for (mode, label) in [
+            (TraceMode::Recording, "recording"),
+            (TraceMode::Passthrough, "passthrough"),
+        ] {
+            let dir = temp_dir("trace-overhead", args.dir.as_deref())?;
+            let cpu_before = measure::process_cpu();
+            let wall_before = Instant::now();
+            let result = kernel_bench::run_with_trace_mode(&dir, args.requests, mode);
+            let cpu = measure::process_cpu().saturating_sub(cpu_before);
+            let wall = wall_before.elapsed();
+            let _ = std::fs::remove_dir_all(&dir);
+            let (report, _invalid, events) = result.map_err(|e| format!("{label} arm: {e}"))?;
+            if mode == TraceMode::Recording {
+                last_recording_phases = report.phases;
+            }
+            obs.push(Obs {
+                mode: label,
+                cpu,
+                wall,
+                events,
+            });
+        }
+    }
+
+    println!(
+        "trace overhead: kernel arm, {} requests, n={REPEATS} per mode, alternating",
+        args.requests
+    );
+    println!(
+        "  {:<12} {:>10} {:>10} {:>8} {:>12}",
+        "mode", "cpu_ms", "wall_ms", "cpu/wall", "events"
+    );
+    for o in &obs {
+        println!(
+            "  {:<12} {:>10.1} {:>10.1} {:>8.2} {:>12}",
+            o.mode,
+            o.cpu.as_secs_f64() * 1e3,
+            o.wall.as_secs_f64() * 1e3,
+            o.cpu.as_secs_f64() / o.wall.as_secs_f64(),
+            o.events
+        );
+    }
+
+    // One delta per adjacent (recording, passthrough) pair, in nanoseconds of
+    // CPU per recorded op. Signed on purpose: a negative pair is not an error
+    // to be clamped away, it is the machine telling you the difference is
+    // below what this run can resolve.
+    println!("\n  per-pair overhead, ns of CPU per recorded op:");
+    let mut per_op: Vec<f64> = Vec::new();
+    for pair in obs.chunks(2) {
+        let (rec, pass) = (&pair[0], &pair[1]);
+        if rec.events == 0 {
+            return Err(
+                "the recording arm recorded 0 ops, so there is nothing to divide by — the \
+                 trace was not wired in. Fix: check `run_with_trace_mode`'s TraceMode plumbing."
+                    .to_string(),
+            );
+        }
+        let delta_ns = rec.cpu.as_secs_f64() * 1e9 - pass.cpu.as_secs_f64() * 1e9;
+        let ns_per_op = delta_ns / rec.events as f64;
+        per_op.push(ns_per_op);
+        println!(
+            "    {ns_per_op:>8.1} ns/op   (cpu delta {:>9.1} ms over {} ops)",
+            delta_ns / 1e6,
+            rec.events
+        );
+    }
+
+    let lo = per_op.iter().cloned().fold(f64::INFINITY, f64::min);
+    let hi = per_op.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    println!(
+        "\n  observed range: [{lo:.1}, {hi:.1}] ns/op across {} pairs",
+        per_op.len()
+    );
+    if lo <= 0.0 && hi >= 0.0 {
+        println!(
+            "  NOT RESOLVABLE at n={REPEATS}: the range straddles zero, so this run cannot \
+             say the trace costs anything at all. This is the honest result, not 0 ns/op."
+        );
+    }
+
+    // The gate, run against the last recording run's own phases and its own
+    // op count, fed the range's HIGH end: if the instrument might cost that
+    // much, the gate's question is whether that much would invalidate a
+    // phase. When the range straddles zero that high end is a noise
+    // amplitude rather than a cost, and a refusal built on it means "this
+    // run cannot certify these phases", NOT "the instrument is too
+    // expensive". Those are opposite engineering conclusions — one indicts
+    // the design, the other indicts the machine — so the difference is
+    // printed rather than left for a reader to infer from a number.
+    let resolvable = !(lo <= 0.0 && hi >= 0.0);
+    match last_recording_phases {
+        Some(phases) => {
+            let worst = hi.max(0.0).round() as u64;
+            let ops = obs
+                .iter()
+                .filter(|o| o.mode == "recording")
+                .map(|o| o.events)
+                .max()
+                .unwrap_or(0);
+            let refusals = phase_accounting::overhead_gate(&phases, worst, ops);
+            if refusals.is_empty() {
+                println!("\n  overhead_gate at {worst} ns/op x {ops} ops: no phase refused.");
+            } else if resolvable {
+                println!(
+                    "\n  overhead_gate at {worst} ns/op x {ops} ops REFUSES {} phase(s). The \
+                     overhead estimate was resolvable, so this is a finding about the \
+                     INSTRUMENT:",
+                    refusals.len()
+                );
+                for r in &refusals {
+                    println!("    {r}");
+                }
+            } else {
+                println!(
+                    "\n  overhead_gate at {worst} ns/op x {ops} ops refuses {} phase(s), but \
+                     {worst} ns/op is the high end of a range that straddles zero — a noise \
+                     amplitude, not a measured cost. These refusals therefore mean THIS RUN \
+                     CANNOT CERTIFY THESE PHASES, not that the instrument is too expensive. \
+                     Re-run on a machine whose cpu/wall is near 1.00 before drawing any \
+                     conclusion about the instrument's design. Phases refused: {}",
+                    refusals.len(),
+                    refused_phase_names(&refusals)
+                );
+            }
+        }
+        None => println!(
+            "\n  overhead_gate not run: the last recording run published no phases, so there \
+             was nothing to compare the overhead against."
+        ),
+    }
+
+    Ok(())
+}
+
+/// The phase names out of a set of `overhead_gate` refusals, for the summary
+/// line printed when the refusals are noise-driven and printing all six in
+/// full would bury the one sentence that matters.
+fn refused_phase_names(refusals: &[String]) -> String {
+    refusals
+        .iter()
+        .filter_map(|r| r.split(" phase it measured").next())
+        .filter_map(|head| head.rsplit("% of the ").next())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = match parse(&argv) {
@@ -319,6 +524,18 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Task 4: this mode measures the instrument, not the app, so it exits
+    // before `base_report` — it has no layered report to contribute to and
+    // nothing `docs/BENCH.md` may quote.
+    if args.trace_overhead {
+        return match run_trace_overhead(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("bench: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
     let dir = match temp_dir("device", args.dir.as_deref()) {
         Ok(d) => d,
         Err(e) => {

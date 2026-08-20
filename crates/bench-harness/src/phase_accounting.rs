@@ -393,6 +393,113 @@ pub fn window_brackets_measured_section(
 
     None
 }
+
+/// The overhead gate's threshold (Task 4, 2026-08-19 phase-attribution plan).
+///
+/// **Chosen, not derived — say so rather than dress it up.** No experiment
+/// sets 10%; it is a judgment call about how much of a phase's own duration
+/// the measuring apparatus is allowed to plausibly BE before that phase can
+/// no longer be told apart from the cost of measuring it. A tighter number
+/// (1%) risks refusing runs this instrument can measure just fine; a looser
+/// one (50%) would publish a phase share that could be half instrument. 10%
+/// is picked to sit clearly on the conservative side of the ~0.05% figure
+/// Task 3's review measured for the core arm's own fsync-dominated commit
+/// path (`.superpowers/sdd/2026-08-19-phase-attribution/progress.md`,
+/// "THE 9-24% GAP IS NOT INSTRUMENTATION") — i.e. it is not tuned to let any
+/// particular run through. Task 4's own measurement (that task's report) is
+/// the first real test of where a healthy run actually falls against it.
+pub const OVERHEAD_GATE_THRESHOLD: f64 = 0.10;
+
+/// Refuses a run whose own instrument overhead could plausibly BE the phase
+/// it measured (Task 4; SPEC.md approach (A)'s stated con: "a per-op
+/// `Instant::now()` perturbs a cheap buffered append far more than a
+/// multi-millisecond fsync. Measure that overhead; do not assume it. A trace
+/// whose own cost is comparable to the append phase cannot measure the
+/// append phase.").
+///
+/// `overhead_nanos_per_op` is the measured per-op cost of RECORDING — Task
+/// 4's `--trace-overhead` mode derives it from the CPU-time delta between a
+/// `Trace::recording` run and a `Trace::passthrough` run of the identical
+/// workload (both arms wrap every `Disk`/`File` call and pay the same
+/// virtual dispatch, so the delta isolates recording an event from wrapping
+/// the call), divided by the op count. `op_count` is the number of ops the
+/// trace actually recorded — not the request count; one request issues
+/// several `Disk`/`File` calls (`kernel_bench::EVENTS_PER_REQUEST_ESTIMATE`'s
+/// doc measured ~26.7).
+///
+/// Refuses when `overhead_nanos_per_op * op_count` exceeds
+/// `OVERHEAD_GATE_THRESHOLD` of any SINGLE non-zero IO phase — checked one
+/// phase at a time, so a run with a tiny `wal_read_io` and a huge
+/// `wal_sync_io` is refused for the former without the latter's health
+/// hiding it. A phase at exactly 0 ns is skipped: nothing was attributed to
+/// it, so there is no phase there for the overhead to be comparable to.
+///
+/// **Scoped to the seven IO phases, not the seven gap/lead-in/tail fields —
+/// deliberately, and this is the decision Task 4's brief asked to be
+/// resolved and documented rather than left implicit.** An IO phase has a
+/// physical meaning independent of this trace: a WAL append or an fsync
+/// takes some real, nonzero amount of time whether or not anything is
+/// tracing it, and this gate asks whether the trace's own cost could be
+/// mistaken for that real quantity. A gap phase has no such independent
+/// referent — `phase_accounting`'s own module doc defines it as "between two
+/// recorded ops the process is doing something the `Disk` boundary cannot
+/// see", i.e. entirely as a residual. Instrument overhead that lands in a
+/// gap is not error added to some true gap value that exists outside the
+/// measurement; by construction (`tracing_disk::Trace::record`'s shape —
+/// `start`/`end` are sampled either side of the real IO call, and the
+/// mutex-guarded push that is recording's own cost happens strictly AFTER
+/// `end` is captured) it becomes part of what that gap IS, the same way a
+/// reallocation's stall lands in whichever `gap_*` bucket happens to
+/// surround the `record()` call that triggered it
+/// (`Trace::capacity_grew_reason`'s doc) — indistinguishable after the fact
+/// from genuine idle time there. There is no threshold that would mean
+/// anything to apply: refusing a gap phase for "too much instrument" would
+/// be refusing it for containing some of exactly what it is defined to
+/// contain. Gap interpretation's own reliability is a different,
+/// already-flagged question that this module's own doc reserves for
+/// `docs/BENCH.md`, argued with the field's actual contents — not decided by
+/// a mechanical gate here.
+pub fn overhead_gate(
+    totals: &PhaseTotals,
+    overhead_nanos_per_op: u64,
+    op_count: u64,
+) -> Vec<String> {
+    let mut invalid = Vec::new();
+    // Negative space: an operator-supplied per-op cost and op count must not
+    // panic this arithmetic in a debug build, nor silently wrap in release
+    // (this workspace carries no `overflow-checks` override — see this
+    // module's own I-1 comment on `attribute` for the identical reasoning).
+    let total_overhead_nanos = overhead_nanos_per_op.saturating_mul(op_count);
+    let io_phases: [(&str, u64); 7] = [
+        ("wal_append_io", totals.wal_append_io),
+        ("wal_read_io", totals.wal_read_io),
+        ("wal_sync_io", totals.wal_sync_io),
+        ("store_write_io", totals.store_write_io),
+        ("store_read_io", totals.store_read_io),
+        ("store_sync_io", totals.store_sync_io),
+        ("other_io", totals.other_io),
+    ];
+    for (name, phase_nanos) in io_phases {
+        if phase_nanos == 0 {
+            continue;
+        }
+        let threshold_nanos = phase_nanos as f64 * OVERHEAD_GATE_THRESHOLD;
+        if total_overhead_nanos as f64 > threshold_nanos {
+            invalid.push(format!(
+                "contract: this trace's own instrument overhead ({overhead_nanos_per_op} ns/op \
+                 x {op_count} recorded ops = {total_overhead_nanos} ns) exceeds {:.0}% of the \
+                 {name} phase it measured ({phase_nanos} ns) — a trace whose own cost is \
+                 comparable to a phase cannot measure that phase (SPEC.md, approach (A)'s stated \
+                 con). Fix: trace fewer op kinds, shrink the measured window, or escalate to \
+                 approach (B) — phase timers inside `Engine::submit_all` via the `Clock` trait, \
+                 which pays no per-op harness-side `Instant::now()` at all.",
+                OVERHEAD_GATE_THRESHOLD * 100.0
+            ));
+        }
+    }
+    invalid
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,5 +1046,151 @@ mod tests {
                 "a refusal must read as prose, with no run of spaces: {r:?}"
             );
         }
+    }
+
+    // --- overhead_gate (Task 4) ---
+
+    #[test]
+    fn overhead_comparable_to_the_smallest_phase_is_refused() {
+        let totals = PhaseTotals {
+            wal_append_io: 1_000,
+            wal_sync_io: 1_000_000,
+            ..Default::default()
+        };
+        // 100 ops at 50 ns of instrument cost each = 5,000 ns, five times the
+        // append phase it is trying to measure.
+        let invalid = overhead_gate(&totals, 50, 100);
+        assert!(
+            !invalid.is_empty(),
+            "overhead above the smallest phase must refuse"
+        );
+        assert!(
+            invalid[0].contains("append"),
+            "the refusal must name the phase it invalidates"
+        );
+    }
+
+    #[test]
+    fn overhead_far_below_every_phase_passes() {
+        let totals = PhaseTotals {
+            wal_append_io: 1_000_000,
+            wal_sync_io: 10_000_000,
+            ..Default::default()
+        };
+        assert!(overhead_gate(&totals, 50, 100).is_empty());
+    }
+
+    #[test]
+    fn overhead_gate_refusals_carry_the_contract_prefix() {
+        // Task 4's own interface note: every refusal in this crate is
+        // "contract: "-prefixed, and `tests/phase_trace.rs` scopes its
+        // assertions to exactly that prefix — a mismatch here would silently
+        // stop being caught by that filter.
+        let totals = PhaseTotals {
+            wal_append_io: 1_000,
+            ..Default::default()
+        };
+        let invalid = overhead_gate(&totals, 50, 100);
+        assert!(invalid[0].starts_with("contract: "), "got: {}", invalid[0]);
+    }
+
+    #[test]
+    fn overhead_gate_names_the_two_magnitudes_and_the_fix() {
+        // Hard rule 5: a refusal names the contract, the site, and the fix.
+        let totals = PhaseTotals {
+            wal_append_io: 1_000,
+            ..Default::default()
+        };
+        let reason = &overhead_gate(&totals, 50, 100)[0];
+        assert!(reason.contains("5000"), "must name the overhead: {reason}");
+        assert!(reason.contains("1000"), "must name the phase: {reason}");
+        assert!(reason.contains("10%"), "must name the threshold: {reason}");
+        assert!(
+            reason.contains("approach (B)") && reason.contains("Clock"),
+            "must name the fix: {reason}"
+        );
+    }
+
+    #[test]
+    fn the_gate_is_a_boundary_at_exactly_ten_percent() {
+        // wal_append_io = 1_000_000 ns; 10% of it is exactly 100_000 ns.
+        let totals = PhaseTotals {
+            wal_append_io: 1_000_000,
+            ..Default::default()
+        };
+        assert!(
+            overhead_gate(&totals, 100_000, 1).is_empty(),
+            "exactly at the threshold must pass, not refuse"
+        );
+        assert!(
+            !overhead_gate(&totals, 100_001, 1).is_empty(),
+            "one ns past the threshold must refuse"
+        );
+    }
+
+    #[test]
+    fn every_violated_phase_is_named_not_just_the_first() {
+        let totals = PhaseTotals {
+            wal_append_io: 1_000,
+            store_read_io: 2_000,
+            wal_sync_io: 10_000_000, // healthy, must not appear
+            ..Default::default()
+        };
+        let invalid = overhead_gate(&totals, 50, 100); // 5_000 ns total overhead
+        assert_eq!(
+            invalid.len(),
+            2,
+            "both violated phases must be named, and the healthy one must not add a third: \
+             {invalid:?}"
+        );
+        assert!(invalid[0].contains("append"), "got: {invalid:?}");
+        assert!(invalid[1].contains("store_read"), "got: {invalid:?}");
+    }
+
+    #[test]
+    fn a_zero_phase_is_skipped_not_refused() {
+        // Every field defaults to 0. Nothing was attributed to any phase, so
+        // there is no phase for the overhead to be comparable TO — refusing
+        // here would be reporting a fact about a phase that carries no time.
+        let totals = PhaseTotals::default();
+        assert!(overhead_gate(&totals, u64::MAX, u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn an_absurd_overhead_input_does_not_panic() {
+        // saturating_mul, not `*`: a caller-supplied per-op cost and op count
+        // must not panic this arithmetic before a verdict is even reached.
+        let totals = PhaseTotals {
+            wal_append_io: 1,
+            ..Default::default()
+        };
+        let invalid = overhead_gate(&totals, u64::MAX, u64::MAX);
+        assert!(
+            !invalid.is_empty(),
+            "a saturated overhead must still refuse a tiny phase"
+        );
+    }
+
+    #[test]
+    fn gap_phases_are_never_gated_on_overhead() {
+        // The documented decision: gaps are excluded from this gate, however
+        // large the overhead relative to them, because overhead lands inside
+        // gaps by construction and there is no independent "true gap value"
+        // to compare it against.
+        let totals = PhaseTotals {
+            gap_within_wal: 1,
+            gap_wal_to_store: 1,
+            gap_within_store: 1,
+            gap_store_to_wal: 1,
+            gap_other: 1,
+            lead_in: 1,
+            tail: 1,
+            ..Default::default()
+        };
+        assert!(
+            overhead_gate(&totals, u64::MAX, u64::MAX).is_empty(),
+            "no IO phase is non-zero, so the gate must have nothing to refuse regardless of \
+             how large the gap/lead-in/tail fields are"
+        );
     }
 }

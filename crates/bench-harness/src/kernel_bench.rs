@@ -173,17 +173,59 @@ impl File for CountingFile {
     }
 }
 
+/// Which arm `run_with_trace_mode` wires the `TracingDisk` with (Task 4,
+/// `bin/bench.rs`'s `--trace-overhead` mode). `Recording` is `run`'s only
+/// behavior before this task, unchanged. `Passthrough` still wraps every
+/// `Disk`/`File` call through `TracingDisk` and pays the same virtual
+/// dispatch (`tracing_disk::Trace`'s module doc) — a caller comparing the
+/// two arms' cost isolates RECORDING an event from WRAPPING every IO call,
+/// rather than comparing a traced run against a genuinely untraced one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraceMode {
+    Recording,
+    Passthrough,
+}
+
+/// This layer's real, default behavior — unchanged from before Task 4: one
+/// `Trace::recording` run, sized from `requests` (`trace_capacity`).
+/// `run_with_trace_mode` is the general form this delegates to; this drops
+/// its third element (the recorded-op count), which no caller of `run`
+/// needed before Task 4 added the first one that does
+/// (`bin/bench.rs`'s `--trace-overhead`).
+pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> {
+    let (report, invalid, _events_recorded) =
+        run_with_trace_mode(dir, requests, TraceMode::Recording)?;
+    Ok((report, invalid))
+}
+
 /// Interlude spec §4.2 (Noah ruling, 2026-08-10): this no longer takes layer
 /// 1's `device.syncs_per_sec`. It brackets its own batch window instead, which
 /// is the gap the shipped refusal message named in so many words — "this layer
 /// takes no bracket samples of its own to show the spread".
-pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> {
+///
+/// Returns the recorded-op count as the third element (Task 4): the number
+/// of times `Trace::record` was called during this run, regardless of
+/// `trace_mode` — `record` early-returns before touching the event vec when
+/// `trace_mode` is `Passthrough` (`tracing_disk::Trace`'s doc), so this is
+/// always 0 in that arm. It is read from the SAME `trace.events()` clone the
+/// phase attribution below uses, not a second call, and captured
+/// unconditionally — before the `capacity_grew_reason` check — so a caller
+/// measuring this trace's own cost gets a count regardless of whether
+/// attribution itself was refused.
+pub fn run_with_trace_mode(
+    dir: &str,
+    requests: u64,
+    trace_mode: TraceMode,
+) -> io::Result<(KernelReport, Vec<String>, u64)> {
     let sync_count = Arc::new(AtomicU64::new(0));
     // Task 3: TracingDisk INSIDE CountingDisk, ProdDisk innermost — the
     // tracer times the real IO, not CountingFile's own atomic increment.
     // Reversed, every recorded duration would include the counter's
     // overhead. ONE `Trace` per arm, not a shared static.
-    let trace = Trace::recording(trace_capacity(requests));
+    let trace = match trace_mode {
+        TraceMode::Recording => Trace::recording(trace_capacity(requests)),
+        TraceMode::Passthrough => Trace::passthrough(),
+    };
     let disk = CountingDisk {
         inner: Box::new(TracingDisk::new(
             Box::new(ProdDisk::new(dir)?),
@@ -299,11 +341,14 @@ pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> 
     // Ruling A (2026-08-19 phase-attribution plan): checked BEFORE attribute()
     // is even attempted — see core_bench.rs's identical comment for why
     // attribute() itself cannot usefully see this contamination.
+    // Task 4: captured before the capacity-growth check, so a refused trace
+    // still reports how many ops it recorded — see this function's own doc.
+    let events = trace.events();
+    let events_recorded = events.len() as u64;
     let phases = if let Some(reason) = trace.capacity_grew_reason() {
         invalid.push(reason);
         None
     } else {
-        let events = trace.events();
         match attribute(&events, window_start_nanos, window_end_nanos) {
             Ok(attribution) => {
                 // See core_bench.rs's identical comment: events after the window
@@ -405,6 +450,7 @@ pub fn run(dir: &str, requests: u64) -> io::Result<(KernelReport, Vec<String>)> 
             window_nanos: window_end_nanos - window_start_nanos,
         },
         invalid,
+        events_recorded,
     ))
 }
 
@@ -554,6 +600,65 @@ mod tests {
              so a genuinely counted sync rate must be a small fraction of the record rate; \
              equality here means run() is back to DERIVING syncs instead of counting them",
             report.syncs_per_sec
+        );
+    }
+
+    /// Task 4: `TraceMode::Passthrough` must record NOTHING (`Trace::record`
+    /// early-returns before touching the event vec — `tracing_disk`'s doc)
+    /// while `TraceMode::Recording` records something on any real run —
+    /// `--trace-overhead`'s whole premise is that these two counts differ
+    /// this way. `#[ignore]`d like this module's other real-disk driver
+    /// (`syncs_are_measured_not_derived_under_batching`); picked up by
+    /// `scripts/bench.sh --smoke`.
+    #[test]
+    #[ignore]
+    fn passthrough_records_nothing_and_recording_records_something() {
+        // Mirrors `syncs_are_measured_not_derived_under_batching`'s own
+        // REQUESTS choice and its comment: under batching a small request
+        // count drains in well under `MIN_MEASURED_WINDOW` (1s), which
+        // `kernel_accounting`'s degenerate-batch check turns into a fatal
+        // `Err`, not a soft `invalid` entry — this constant has to clear
+        // that floor on BOTH arms, not merely avoid a slow test.
+        const REQUESTS: u64 = 20_000;
+        // Two gates legitimately fire on a short/noisy or loaded box, per
+        // this crate's own precedent (`tests/phase_trace.rs`'s comment on
+        // `measure::unstable_device_reason`, and this module's own
+        // `syncs_are_measured_not_derived_under_batching`): the device-ratio
+        // gate, and the device-bracket-stability gate. Anything else here
+        // means something regressed.
+        let known_noisy = |reason: &str| {
+            (reason.contains("device_ratio") && reason.contains("exceeds 1.0"))
+                || reason.contains("device brackets either side of this window disagree")
+        };
+
+        let dir = scratch("trace-mode-passthrough");
+        let (_, invalid, events) = run_with_trace_mode(&dir, REQUESTS, TraceMode::Passthrough)
+            .expect("kernel layer runs under passthrough");
+        let _ = std::fs::remove_dir_all(&dir);
+        for reason in &invalid {
+            assert!(
+                known_noisy(reason),
+                "unexpected invalid reason under passthrough: {reason}"
+            );
+        }
+        assert_eq!(
+            events, 0,
+            "passthrough must record nothing regardless of workload"
+        );
+
+        let dir = scratch("trace-mode-recording");
+        let (_, invalid, events) = run_with_trace_mode(&dir, REQUESTS, TraceMode::Recording)
+            .expect("kernel layer runs under recording");
+        let _ = std::fs::remove_dir_all(&dir);
+        for reason in &invalid {
+            assert!(
+                known_noisy(reason),
+                "unexpected invalid reason under recording: {reason}"
+            );
+        }
+        assert!(
+            events > 0,
+            "recording must record at least one op for a real run of {REQUESTS} requests"
         );
     }
 }
