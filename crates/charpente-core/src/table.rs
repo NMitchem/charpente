@@ -431,6 +431,12 @@ impl Store {
     ///
     /// The gapless invariant is preserved, not traded: it used to cost a read
     /// transaction per record, and now costs one read plus a running counter.
+    ///
+    /// Unlike `apply`, `f` is `FnMut` returning `()` rather than a generic
+    /// `T` per call — a batch has no single return value, so a caller that
+    /// needs per-record output (e.g. materialized ids) collects it into a
+    /// buffer it owns outside the closure, rather than `apply`'s discipline
+    /// of forcing everything out through the return type.
     pub fn apply_batch(
         &self,
         records: &[(u64, &[u8])],

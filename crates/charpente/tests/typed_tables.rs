@@ -7,10 +7,12 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use charpente::table;
 use charpente_core::engine::{Engine, StateMachine};
-use charpente_core::io::Entropy;
+use charpente_core::io::{Disk, Entropy, File};
 use charpente_core::job::JobRow;
 use charpente_core::log::WalConfig;
 use charpente_core::table::{Codec, Id, Snapshot, Store, View};
@@ -51,6 +53,96 @@ fn quiet_store() -> (Sim, Store) {
     let sim = Sim::with_faults(0x7AB1E, FaultConfig::none());
     let store = Store::open(&sim.disk(), "tables.redb").unwrap();
     (sim, store)
+}
+
+// -------------------------------------------------------- op-counting disk
+//
+// Modelled on `OpCounts`/`CountingDisk` in
+// `crates/charpente/tests/group_commit.rs:84-155` — same shape (write-shaped
+// ops and syncs as two counters), local here too rather than shared, since no
+// crate exports this pattern.
+
+#[derive(Clone, Default)]
+struct OpCounts {
+    writes: Arc<AtomicU64>,
+    syncs: Arc<AtomicU64>,
+}
+
+impl OpCounts {
+    /// Total disk-touching calls (write-shaped ops plus syncs) — what
+    /// distinguishes "no transaction was opened" from "a transaction was
+    /// opened and committed but changed nothing user-visible".
+    fn total(&self) -> u64 {
+        self.writes.load(Ordering::SeqCst) + self.syncs.load(Ordering::SeqCst)
+    }
+}
+
+struct CountingDisk {
+    inner: charpente_sim::SimDisk,
+    counts: OpCounts,
+}
+
+impl Disk for CountingDisk {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        let file = self.inner.open(path)?;
+        Ok(Box::new(CountingFile {
+            inner: file,
+            counts: self.counts.clone(),
+        }))
+    }
+
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+struct CountingFile {
+    inner: Box<dyn File>,
+    counts: OpCounts,
+}
+
+impl File for CountingFile {
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.inner.read_at(offset, out)
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.counts.writes.fetch_add(1, Ordering::SeqCst);
+        self.inner.write_at(offset, data)
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.counts.writes.fetch_add(1, Ordering::SeqCst);
+        self.inner.set_len(len)
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.counts.syncs.fetch_add(1, Ordering::SeqCst);
+        self.inner.sync()
+    }
+}
+
+fn counting_store() -> (Sim, Store, OpCounts) {
+    let sim = Sim::with_faults(0x7AB1E, FaultConfig::none());
+    let counts = OpCounts::default();
+    let disk = CountingDisk {
+        inner: sim.disk(),
+        counts: counts.clone(),
+    };
+    let store = Store::open(&disk, "tables.redb").unwrap();
+    (sim, store, counts)
 }
 
 #[test]
@@ -680,11 +772,23 @@ fn a_read_through_the_writer_inside_a_batch_sees_the_batch_so_far() {
 }
 
 /// An empty batch must cost nothing: no read txn, no write txn, no commit.
+/// `applied_seq() == None` alone would be vacuous here — a write transaction
+/// opened and committed with an empty loop body also leaves `applied_seq` at
+/// `None`, so that assertion cannot tell "never touched disk" from "touched
+/// disk and did nothing". Counting disk ops is what makes the "cost nothing"
+/// claim in this comment falsifiable rather than merely stated.
 #[test]
 fn apply_batch_of_nothing_is_a_no_op() {
-    let (_sim, store) = quiet_store();
+    let (_sim, store, counts) = counting_store();
+    let before = counts.total();
     store
         .apply_batch(&[], |w, _s, _p| w.put(&invoice(1, 1, 1)))
         .expect("an empty batch is a no-op");
+    let after = counts.total();
     assert_eq!(store.applied_seq().unwrap(), None);
+    assert_eq!(
+        after, before,
+        "an empty batch must not touch disk at all — no read txn to check applied_seq, \
+         no write txn, no commit"
+    );
 }
