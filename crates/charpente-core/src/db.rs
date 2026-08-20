@@ -1520,16 +1520,6 @@ impl Db {
         self.engine.machine().store.write_schedule()
     }
 
-    /// The store's own durably-recorded `applied_seq` (`Store::applied_seq`),
-    /// read directly off the store rather than derived from the log-replay
-    /// bookkeeping (`Db::last_applied`). Because a batch commits to the store
-    /// whole or not at all (T4's `apply_batch`), this value must always be a
-    /// batch boundary — it can never sit on an interior seq of a batch that
-    /// did not commit. One read-only accessor, added for that assertion.
-    pub fn store_applied_seq(&self) -> io::Result<Option<u64>> {
-        self.engine.machine().store.applied_seq()
-    }
-
     /// The event id counter (meta counter; `0` when unset) — same access
     /// shape as `Snapshot::next_job_id`.
     pub fn next_event_id(&self) -> io::Result<u64> {

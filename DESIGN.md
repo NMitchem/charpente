@@ -572,30 +572,28 @@ a materialization of the log, never a second source of truth: `apply_batch` comm
 contiguous run of records' row effects atomically with the `applied_seq` meta key in ONE
 redb write transaction at `Durability::None` (no fsync — the WAL is the durability
 story), and every record in the run commits or none of them does: an apply failure
-anywhere rolls the whole batch back and reports nothing applied — so the store's own
-`applied_seq` (`Db::store_applied_seq()`, a direct read off the store rather than the
-log-replay bookkeeping) is always a batch boundary, never an interior seq of a batch that
-did not commit. `apply(seq, …)` is that
-batch with one record, and does exactly the disk work a per-record commit always did —
-one read txn, one write txn, one commit — which is what keeps a never-contended universe
-tracing identically to pre-batching code. What widened is the *store's* commit point, not
-the log's; the WAL's durability stays prefix-shaped (see "the batch is not
-durability-atomic" under group commit above). `checkpoint()` persists everything at
-once; after a crash the store reverts to its last checkpoint and recovery replays the
-WAL from `applied_seq + 1`. Two redb facts the sim established: its byte layout is
-deterministic under identical op sequences (raw-fingerprint replay holds), and
-`Database::drop` is a *graceful close* that durably flushes non-durable commits — a
-crash is only a crash if the process dies with the database open, which is exactly what
-the sim models. Index entries are `[key len: u32][key bytes][id: u64 be]` (length prefix
-prevents prefix-collision ambiguity); exact-match lookups only until a real query
-pattern demands order-preserving key encoding. A built-in `charpente.jobs` table
-materializes transactional enqueues in the same apply as a `JobRow` per enqueue effect —
-id from the monotonic `next_job_id` meta counter (bumped atomically with `applied_seq` in
-the same store transaction, deterministic across replay), plus name, payload, key,
-status (Pending/Done/Dead), attempts, due_at, and last_error — the queue dispatcher's
-substrate (§6). Done and Dead rows are retained (GC is a later question, filed with WAL
-segment GC). A store that cannot open at all — e.g. a
-crash tore its creation — is discarded at `Db::open` and rebuilt by replaying the WAL
+anywhere rolls the whole batch back and reports nothing applied — so the `applied_seq`
+that transaction leaves durable is always a batch boundary, never an interior seq of a
+batch that did not commit. `apply(seq, …)` is that batch with one record, and does exactly
+the disk work a per-record commit always did — one read txn, one write txn, one commit —
+which is what keeps a never-contended universe tracing identically to pre-batching code.
+What widened is the *store's* commit point, not the log's; the WAL's durability stays
+prefix-shaped (see "the batch is not durability-atomic" under group commit above).
+`checkpoint()` persists everything at once; after a crash the store reverts to its last
+checkpoint and recovery replays the WAL from `applied_seq + 1`. Two redb facts the sim
+established: its byte layout is deterministic under identical op sequences
+(raw-fingerprint replay holds), and `Database::drop` is a *graceful close* that durably
+flushes non-durable commits — a crash is only a crash if the process dies with the
+database open, which is exactly what the sim models. Index entries are `[key len: u32][key
+bytes][id: u64 be]` (length prefix prevents prefix-collision ambiguity); exact-match
+lookups only until a real query pattern demands order-preserving key encoding. A built-in
+`charpente.jobs` table materializes transactional enqueues in the same apply as a `JobRow`
+per enqueue effect — id from the monotonic `next_job_id` meta counter (bumped atomically
+with `applied_seq` in the same store transaction, deterministic across replay), plus name,
+payload, key, status (Pending/Done/Dead), attempts, due_at, and last_error — the queue
+dispatcher's substrate (§6). Done and Dead rows are retained (GC is a later question,
+filed with WAL segment GC). A store that cannot open at all — e.g. a crash tore its
+creation — is discarded at `Db::open` and rebuilt by replaying the WAL
 from scratch; the log is the only source of truth. "Cannot open" includes redb panicking
 at open: redb 4.1.0 asserts (page_manager.rs:231/:257) instead of erroring when a crash
 leaves the store file's length disagreeing with its durable header's layout — an unsynced
