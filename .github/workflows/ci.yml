@@ -45,3 +45,20 @@ jobs:
       # exactly the condition the block above describes: a defanged pin leaving CI silent while a
       # human remembering a command is the only thing standing in the way.
       - run: CHARPENTE_SEED=0xe653f43924f17fe8 cargo test -p charpente --test kernel -- kernel_jobs_are_exactly_once_under_the_fault_matrix --exact
+      # The passthrough guard, in DEBUG with --ignored — added 2026-08-20. It is `#[ignore]`d
+      # because it needs a real disk, so `cargo test --workspace` above lists it as "ignored" and
+      # runs nothing: until this line existed the fix it guards was enforced by a `scripts/bench.sh
+      # --smoke` convention alone, appearing nowhere in .github/ — exactly the condition the two
+      # blocks above describe, and the reason both of those lines exist.
+      # It has teeth, proved 2026-08-20 in an isolated worktree with its own CARGO_TARGET_DIR:
+      # mutating `kernel_bench.rs`'s `let phases_counted = trace.is_recording();` fails it with
+      # "a passthrough arm must publish phases: None, never a zeroed Some", every IO field 0 and
+      # the whole 5.8 s window folded into lead_in. That zeroed-Some is the bug this whole
+      # sub-project exists to forbid, pointed at the instrument itself.
+      # Named --exact for the same reason as the pins above: --ignored alone would run every
+      # ignored test in the crate, most of which are not evidence about this fix. Debug and --lib
+      # because those artifacts are already warm from `cargo test --workspace`, so the marginal
+      # cost is one test — 17 s locally against an 18m33s run.
+      # If this proves flaky on a shared runner, tighten `known_noisy` at the test site rather
+      # than deleting the line; a guard removed for noise is a guard that never fires.
+      - run: cargo test -p bench-harness --lib -- kernel_bench::tests::passthrough_records_nothing_and_recording_records_something --exact --ignored
