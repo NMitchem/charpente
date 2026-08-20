@@ -68,8 +68,14 @@ is why the milestone closed with them outstanding rather than silently absorbing
   ceiling, so redb was not the binding constraint at that workload on that hardware. **That
   reading pre-dates group commit**, which is precisely what removes the
   one-fsync-per-transaction ceiling it rests on — the core layer is unchanged, the kernel
-  layer is not — so the trigger is owed a re-read. Open, and Noah's to sign off;
-  DECISIONS §7 is untouched pending it (docs/LEDGER.md carries the item).
+  layer is not — so the trigger was owed a re-read. **That re-read was delivered
+  2026-08-20** by the per-batch-apply sub-project below, on the same instrument and
+  protocol with a fresh interleaved baseline: **trigger (a) does not fire under any
+  reading** of "largest single non-idle phase" — the field reading leads by 71-73
+  points, and the two readings that would previously have fired now decline. DECISIONS
+  §7 remains untouched and Noah's to sign off; what changed is that the ambiguity which
+  made it a judgment call is gone, so the deferral simply stands
+  (docs/LEDGER.md carries both the item and the numbers).
 - **Primary-side group commit** — the follow-up the harness above named and sized. *Shipped
   2026-08-15.* One commit point per kernel loop iteration rather than one per transaction:
   `begin_group`/`stage`/`commit`, a two-level overlay, one fsync for the whole batch,
@@ -79,6 +85,17 @@ is why the milestone closed with them outstanding rather than silently absorbing
   them are in [docs/BENCH.md](docs/BENCH.md): the win exists where the queue is deep enough
   to fill a batch and is nothing at one connection, on a device whose slow fsync flatters
   the mechanism. The bare-metal Linux run stays owed.
+- **Per-batch apply (the store's commit point)** — the follow-on group commit exposed:
+  the WAL sync was amortized 62x while the store still paid one write transaction *and*
+  one read transaction per record. *Shipped 2026-08-20.* `Store::apply_batch` commits a
+  contiguous run's row effects atomically with `applied_seq` in ONE redb write
+  transaction; every record commits or none does. Kernel throughput 1.78-1.88x, Disk ops
+  13.37 -> 1.23 per log record, store block 6.2x. It also **retracted a guarantee**:
+  followers converge *logically*, not byte-identically — batch boundaries are a
+  scheduling artifact, not part of the log (DESIGN §1, ruled 2026-08-20). Numbers and the
+  provenance rules that constrain how they may be quoted are in
+  [docs/BENCH.md](docs/BENCH.md).
+
 - **Own LSM storage engine**, proven under the (by now battle-hardened) sim harness before
   it replaces redb. The harness is what makes this safe to attempt. **Deferred behind
   measurement** (ruled 2026-08-06): the build triggers live in DECISIONS §7, and the
