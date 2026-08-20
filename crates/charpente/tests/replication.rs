@@ -22,6 +22,7 @@ use charpente::repl::{
     MAX_MESSAGE_BYTES, PROTO_VERSION, RECONNECT_NANOS, ReplConfig, WITNESS_DEADLINE_NANOS,
 };
 use charpente::{Db, DbConfig, Id, Job, Schema, TxError, table};
+use charpente_core::engine::REHELLO_MARKER;
 use charpente_core::io::{Clock, Conn, Disk, File, Net};
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::migration::{MigrationError, SchemaVersion, TableMigration, schema_version_id};
@@ -2255,6 +2256,66 @@ fn empty_frames_delivered_to_a_fresh_follower_neither_panics_nor_acks() {
         Ok(None) => {}
         other => panic!("the follower acked (or replied to) an empty Frames batch: {other:?}"),
     }
+}
+
+// ------------------------------------------- follower-side batch atomicity
+
+/// The follower path gets the same atomicity as the primary: a shipped batch
+/// that fails mid-apply rolls back whole. The REHELLO_MARKER assertion is here
+/// because submit_batch's seq-validation loop was deliberately NOT touched by
+/// per-batch apply — this is what proves it stayed untouched, rather than
+/// trusting that the diff looked small.
+#[test]
+fn a_shipped_batch_that_fails_mid_apply_rolls_back_whole() {
+    let sim = Sim::with_faults(0x7AB1_E002, FaultConfig::none());
+    let host_a = sim.host("a");
+    let host_b = sim.host("b");
+    let host_c = sim.host("c");
+
+    // Two good committed records to ship, same tag-99 trick as
+    // transactions.rs's primary-side atomicity test: `decode_record` refuses
+    // it INSIDE the store transaction, after the two good records have
+    // already put rows into that same transaction.
+    let mut db_a = Db::open(Box::new(host_a.disk()), DbConfig::default(), make_schema()).unwrap();
+    for i in 0..2u64 {
+        db_a.transact(|tx| {
+            tx.put(&Widget {
+                id: Id::from_raw(i),
+                kind: 0,
+                weight: i as i64,
+            });
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+    }
+    let mut frames = db_a.read_log(0, usize::MAX).unwrap();
+    assert_eq!(frames.len(), 2);
+    frames.push((2, vec![1u8, 0, 0, 0, 99]));
+
+    let mut db_b = Db::open(Box::new(host_b.disk()), DbConfig::default(), make_schema()).unwrap();
+    let err = db_b.apply_shipped(&frames).unwrap_err();
+    assert!(err.to_string().contains("unknown effect tag 99"), "{err}");
+    assert_eq!(
+        db_b.last_applied(),
+        None,
+        "a batch that fails mid-apply must move the follower's applied_seq by zero"
+    );
+    assert!(
+        db_b.poisoned(),
+        "a mid-apply failure on the follower path must poison the engine, exactly like the \
+         primary path — restart-and-recover is the only exit either way"
+    );
+
+    // A second, fresh (unpoisoned) follower proves the seq-validation loop
+    // ahead of apply_batch is untouched: an out-of-order shipped seq still
+    // refuses by name before apply_batch ever runs, on a log that never saw
+    // this task's changes exercised.
+    let mut db_c = Db::open(Box::new(host_c.disk()), DbConfig::default(), make_schema()).unwrap();
+    let err = db_c.apply_shipped(&[(5, vec![0u8, 0, 0, 0])]).unwrap_err();
+    assert!(
+        err.to_string().contains(REHELLO_MARKER),
+        "an out-of-order shipped seq must still name {REHELLO_MARKER}: {err}"
+    );
 }
 
 // ----------------------------------------------------- meta-test: ack<sync

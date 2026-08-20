@@ -572,7 +572,10 @@ a materialization of the log, never a second source of truth: `apply_batch` comm
 contiguous run of records' row effects atomically with the `applied_seq` meta key in ONE
 redb write transaction at `Durability::None` (no fsync — the WAL is the durability
 story), and every record in the run commits or none of them does: an apply failure
-anywhere rolls the whole batch back and reports nothing applied. `apply(seq, …)` is that
+anywhere rolls the whole batch back and reports nothing applied — so the store's own
+`applied_seq` (`Db::store_applied_seq()`, a direct read off the store rather than the
+log-replay bookkeeping) is always a batch boundary, never an interior seq of a batch that
+did not commit. `apply(seq, …)` is that
 batch with one record, and does exactly the disk work a per-record commit always did —
 one read txn, one write txn, one commit — which is what keeps a never-contended universe
 tracing identically to pre-batching code. What widened is the *store's* commit point, not

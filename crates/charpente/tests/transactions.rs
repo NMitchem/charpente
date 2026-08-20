@@ -503,15 +503,30 @@ fn is_injected(text: &str) -> bool {
     // (from transact's commit, or from checkpoint's own gc, which can now
     // poison the WAL too) breaks and restarts the universe immediately,
     // before a second op could ever reach an already-poisoned/latched
-    // handle, so this workload never sees Poisoned or RedbLatch — unlike
-    // kernel.rs's SUT, which absorbs request Io into 500s and keeps running.
-    // Recognizing those here would only ever LOOSEN this oracle. Injected
-    // and DurableHorizon only (the latter is permanent — a universe that
-    // hits it on recovery retries into the every-attempt-died fallthrough).
+    // handle — unlike kernel.rs's SUT, which absorbs request Io into 500s
+    // and keeps running. Injected and DurableHorizon are the load-bearing
+    // families (the latter is permanent — a universe that hits it on
+    // recovery retries into the every-attempt-died fallthrough).
+    //
+    // RedbLatch is ALSO recognized (task-5 finding, seed
+    // 0x2ce7af08a308ed30): the multi-record batch path shares one read
+    // snapshot across several `Group::stage` calls before a single
+    // `commit()`, unlike the single-stage `db.transact` path this workload
+    // used exclusively before batching coverage was added. A read fault on
+    // stage 2+ can leave the store's redb handle latched, so a LATER op in
+    // the SAME live session — that batch's own commit, or the loop's next
+    // checkpoint call — surfaces redb's generic "close and re-open the
+    // database" wording instead of the original fault's own text. That is
+    // exactly the family `classify` already names `RedbLatch`; recognizing
+    // it here widens this workload's list to match what it can now
+    // legitimately reach, it does not loosen what counts as a bug — the
+    // durability and db_matches_model oracles still run on every successful
+    // reopen regardless of which family excused a mid-round failure.
     matches!(
         charpente_sim::checks::classify(text),
         charpente_sim::checks::FaultReason::Injected
             | charpente_sim::checks::FaultReason::DurableHorizon
+            | charpente_sim::checks::FaultReason::RedbLatch
     )
 }
 
@@ -600,17 +615,71 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
                     return Err("aborted transaction consumed a seq".to_string());
                 }
             }
-            match db.transact(|tx| apply_txn(tx, i)) {
-                Ok(()) => committed += 1,
-                // a tx read hit an injected fault; nothing was written
-                // (found by seed 0x5e713efe41f78d1a)
-                Err(TxError::App(_)) => break,
-                Err(TxError::Io(_)) => break, // died mid-commit; durable or not
-                Err(TxError::NotPrimary { .. }) => {
-                    unreachable!("this workload never calls forbid_writes")
+            if entropy.next_u64().is_multiple_of(7) {
+                // Multi-record batch: begin_group + several stage calls + one
+                // commit is the only way through this API to reach a batch of
+                // >1 record — db.transact above is exactly one stage per
+                // commit (spec §7's batch-of-one path). Coverage below proves
+                // this workload actually reaches ≥2-record batches under the
+                // fault matrix, not just batch-of-one — a property that never
+                // forms one proves nothing about batching.
+                let mut g = match db.begin_group() {
+                    Ok(g) => g,
+                    Err(_) => break, // snapshot failed: died here
+                };
+                let n = 2 + entropy.next_u64() % 3; // 2..=4 records
+                let mut staged = 0u64;
+                for k in 0..n {
+                    match g.stage(|tx| apply_txn(tx, i + k)) {
+                        Ok(()) => staged += 1,
+                        // a tx read hit an injected fault; Group::stage never
+                        // touches its record queue before f returns Ok, so
+                        // nothing staged here is lost
+                        Err(TxError::App(_)) => break,
+                        Err(TxError::Io(_)) => break,
+                        Err(TxError::NotPrimary { .. }) => {
+                            unreachable!("this workload never calls forbid_writes")
+                        }
+                        Err(TxError::Verifying { .. }) => {
+                            unreachable!("this workload never calls verify_writes")
+                        }
+                    }
                 }
-                Err(TxError::Verifying { .. }) => {
-                    unreachable!("this workload never calls verify_writes")
+                let multi = g.len() >= 2;
+                match g.commit() {
+                    Ok(()) => {
+                        committed += staged;
+                        if multi {
+                            sim.cover("batch:multi_record");
+                        }
+                    }
+                    Err(failure) => {
+                        // `applied` is 0 (append/sync failure — nothing
+                        // reached the store) or `staged` (all reached the
+                        // store, checkpoint bookkeeping failed after) — the
+                        // atomic-batch guarantee this task exists to fault.
+                        // Unconditional break, no is_injected classification,
+                        // matching db.transact's TxError::Io arm below: died
+                        // mid-commit, durable or not — the outer
+                        // `recovered < committed` check is what catches a
+                        // genuine loss, not a text match on this error.
+                        committed += failure.applied as u64;
+                        break;
+                    }
+                }
+            } else {
+                match db.transact(|tx| apply_txn(tx, i)) {
+                    Ok(()) => committed += 1,
+                    // a tx read hit an injected fault; nothing was written
+                    // (found by seed 0x5e713efe41f78d1a)
+                    Err(TxError::App(_)) => break,
+                    Err(TxError::Io(_)) => break, // died mid-commit; durable or not
+                    Err(TxError::NotPrimary { .. }) => {
+                        unreachable!("this workload never calls forbid_writes")
+                    }
+                    Err(TxError::Verifying { .. }) => {
+                        unreachable!("this workload never calls verify_writes")
+                    }
                 }
             }
             if entropy.next_u64().is_multiple_of(4)
@@ -655,6 +724,38 @@ fn tx_workload(sim: &mut Sim) -> Result<(), String> {
                 "durability violated: {committed} txns acknowledged, {recovered} recovered"
             ));
         }
+        // Per-batch apply (spec §2): the store commits a batch whole or not at
+        // all, so its applied_seq is always a batch boundary — never an
+        // interior seq of a batch that did not commit. Asserted separately
+        // from db_matches_model below because final state converges either
+        // way once replay finishes: a store that had briefly been in a
+        // mid-batch state still ends up correct, so a convergence-only oracle
+        // cannot see the violation this change exists to make impossible.
+        let store_at = match db.store_applied_seq() {
+            Ok(at) => at,
+            Err(e) => {
+                if is_injected(&e.to_string()) {
+                    sim.restart();
+                    continue;
+                }
+                return Err(format!(
+                    "store applied_seq read failed with a non-injected error: {e}"
+                ));
+            }
+        };
+        // `at >= recovered`, not `at > recovered.saturating_sub(1)`: the
+        // latter masks recovered == 0 (0usize.saturating_sub(1) saturates to
+        // 0, so store_at == Some(0) would silently pass when NOTHING was
+        // recovered) — found by mutation-testing this exact assertion
+        // (task-5 report).
+        if let Some(at) = store_at
+            && at >= recovered
+        {
+            return Err(format!(
+                "store applied_seq {at} is ahead of recovered {recovered} — a batch \
+                 committed to the store that the log does not cover"
+            ));
+        }
         let snap = match db.snapshot() {
             Ok(snap) => snap,
             Err(_) => {
@@ -687,6 +788,7 @@ fn transactions_survive_the_fault_matrix() {
             "crash:torn",
             "crash:dropped",
             "restart",
+            "batch:multi_record",
         ]
     );
 }
