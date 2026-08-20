@@ -15,6 +15,20 @@ use crate::log::{Wal, WalConfig};
 /// durable; the engine treats its state as diverged (see `submit`).
 pub trait StateMachine {
     fn apply(&mut self, seq: u64, payload: &[u8]) -> io::Result<()>;
+
+    /// Applies a contiguous run of records. On failure, `SubmitFailure::applied`
+    /// reports how many of them are durably reflected in machine state; an
+    /// implementation may apply all or none, so a caller must not assume either
+    /// — `TableMachine` is atomic and reports 0, this default is per-record and
+    /// reports the boundary.
+    fn apply_batch(&mut self, records: &[(u64, &[u8])]) -> Result<(), SubmitFailure> {
+        for (i, (seq, payload)) in records.iter().enumerate() {
+            if let Err(error) = self.apply(*seq, payload) {
+                return Err(SubmitFailure { applied: i, error });
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct Engine<S: StateMachine> {
@@ -224,19 +238,25 @@ impl<S: StateMachine> Engine<S> {
         if let Err(error) = self.wal.sync() {
             return Err(SubmitFailure { applied: 0, error });
         }
-        for (i, (seq, payload)) in seqs.iter().zip(records).enumerate() {
-            assert_eq!(
-                *seq,
-                self.last_applied.map_or(0, |l| l + 1),
-                "apply loop skipped a seq — append and apply have diverged"
-            );
-            if let Err(error) = self.machine.apply(*seq, payload) {
-                self.poisoned = true;
-                return Err(SubmitFailure { applied: i, error });
+        let batch: Vec<(u64, &[u8])> = seqs.iter().copied().zip(records.iter().copied()).collect();
+        assert_eq!(
+            batch[0].0,
+            self.last_applied.map_or(0, |l| l + 1),
+            "apply loop skipped a seq — append and apply have diverged"
+        );
+        match self.machine.apply_batch(&batch) {
+            Ok(()) => {
+                self.last_applied = Some(batch[batch.len() - 1].0);
+                Ok(seqs)
             }
-            self.last_applied = Some(*seq);
+            Err(SubmitFailure { applied, error }) => {
+                self.poisoned = true;
+                if applied > 0 {
+                    self.last_applied = Some(batch[applied - 1].0);
+                }
+                Err(SubmitFailure { applied, error })
+            }
         }
-        Ok(seqs)
     }
 
     /// The follower's apply path: append every frame, one sync, then apply
@@ -265,19 +285,32 @@ impl<S: StateMachine> Engine<S> {
             self.wal.append(payload)?;
         }
         self.wal.sync()?;
-        for (seq, payload) in frames {
+        let batch: Vec<(u64, &[u8])> = frames
+            .iter()
+            .map(|(seq, payload)| (*seq, payload.as_slice()))
+            .collect();
+        if let Some((first, _)) = batch.first() {
             assert_eq!(
-                *seq,
+                *first,
                 self.last_applied.map_or(0, |l| l + 1),
                 "apply loop skipped a seq — append and apply have diverged"
             );
-            if let Err(e) = self.machine.apply(*seq, payload) {
-                self.poisoned = true;
-                return Err(e);
-            }
-            self.last_applied = Some(*seq);
         }
-        Ok(())
+        match self.machine.apply_batch(&batch) {
+            Ok(()) => {
+                if let Some((last, _)) = batch.last() {
+                    self.last_applied = Some(*last);
+                }
+                Ok(())
+            }
+            Err(SubmitFailure { applied, error }) => {
+                self.poisoned = true;
+                if applied > 0 {
+                    self.last_applied = Some(batch[applied - 1].0);
+                }
+                Err(error)
+            }
+        }
     }
 
     pub fn machine(&self) -> &S {

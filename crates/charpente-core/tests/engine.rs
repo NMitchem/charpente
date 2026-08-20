@@ -368,3 +368,45 @@ fn submit_all_reports_how_many_applied_before_a_mid_batch_failure() {
          second of four records at seqs 0..3)"
     );
 }
+
+/// The default `apply_batch` must reproduce today's per-record semantics
+/// exactly — including the partial count, which is the whole reason
+/// `SubmitFailure` carries one. `FailsAfter` takes the default impl, so this
+/// is the contrast against `TableMachine`'s all-or-nothing override.
+#[test]
+fn the_default_apply_batch_applies_per_record_and_reports_the_partial_count() {
+    // No Sim and no disk: FailsAfter is pure, and the default impl is the
+    // thing under test, not the store beneath it.
+    let mut machine = FailsAfter { remaining: 2 };
+    let records: Vec<(u64, &[u8])> = vec![(0, b"a"), (1, b"b"), (2, b"c")];
+    let failure = machine
+        .apply_batch(&records)
+        .expect_err("the third record's apply must fail");
+    assert_eq!(
+        failure.applied, 2,
+        "the default impl applies per record, so two really did land"
+    );
+    assert_eq!(failure.error.to_string(), "configured failure");
+}
+
+/// The engine advances last_applied by the count the call reports and by
+/// nothing else — never inside a loop it no longer has.
+#[test]
+fn submit_all_advances_last_applied_to_the_last_record_of_the_batch() {
+    let sim = Sim::with_faults(0x60C5_0002, FaultConfig::none());
+    let mut engine =
+        Engine::recover(Box::new(sim.disk()), wal_cfg(), Counter::default(), None).unwrap();
+
+    let seqs = engine.submit_all(&[b"a", b"b", b"c"]).expect("all apply");
+    assert_eq!(seqs, vec![0, 1, 2]);
+    assert_eq!(
+        engine.last_applied(),
+        Some(2),
+        "last_applied ends at the batch's last seq"
+    );
+    assert_eq!(
+        engine.machine().applied.len(),
+        3,
+        "every record reached the machine"
+    );
+}
