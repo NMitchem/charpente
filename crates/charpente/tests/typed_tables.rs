@@ -583,3 +583,108 @@ fn row_shape_roundtrips_under_its_own_codec() {
     let back = GizmoV1::decode_row(&bytes).unwrap();
     assert_eq!((back.id, back.count), (4, 9));
 }
+
+/// A batch is one commit point (MANIFESTO §5): a failure anywhere in it must
+/// leave the store exactly where it started, not partway through.
+#[test]
+fn apply_batch_rolls_back_every_record_when_one_fails() {
+    let (_sim, store) = quiet_store();
+    store.apply(0, |w| w.put(&invoice(1, 1, 100))).unwrap();
+
+    let records: Vec<(u64, &[u8])> = vec![(1, b"a"), (2, b"b"), (3, b"c")];
+    let err = store
+        .apply_batch(&records, |w, seq, _payload| {
+            if seq == 3 {
+                return Err(io::Error::other("the third record refuses"));
+            }
+            w.put(&invoice(seq + 10, 1, 500))
+        })
+        .expect_err("the third record's failure must fail the whole batch");
+    assert_eq!(err.to_string(), "the third record refuses");
+
+    assert_eq!(
+        store.applied_seq().unwrap(),
+        Some(0),
+        "a failed batch must not move applied_seq — the store is a materialization \
+         of the log, and a partly-applied batch corresponds to no single commit point"
+    );
+    let snap = store.snapshot().unwrap();
+    assert_eq!(
+        snap.scan::<Invoice>().unwrap().len(),
+        1,
+        "records 1 and 2 succeeded inside the txn but must roll back with record 3"
+    );
+}
+
+/// The happy path: every record lands and applied_seq ends at the last seq.
+#[test]
+fn apply_batch_commits_every_record_and_ends_at_the_last_seq() {
+    let (_sim, store) = quiet_store();
+
+    let records: Vec<(u64, &[u8])> = vec![(0, b"a"), (1, b"b"), (2, b"c")];
+    store
+        .apply_batch(&records, |w, seq, _payload| {
+            w.put(&invoice(seq + 1, 1, 100))
+        })
+        .expect("all three records apply");
+
+    assert_eq!(store.applied_seq().unwrap(), Some(2));
+    assert_eq!(
+        store.snapshot().unwrap().scan::<Invoice>().unwrap().len(),
+        3
+    );
+}
+
+/// Gapless is preserved, not traded away: it used to cost a read txn per
+/// record, and now costs one read txn plus a running counter. Both shapes of
+/// violation must still fire — a wrong first seq, and a gap mid-batch.
+#[test]
+#[should_panic(expected = "apply must be gapless")]
+fn apply_batch_rejects_a_wrong_first_seq() {
+    let (_sim, store) = quiet_store();
+    let records: Vec<(u64, &[u8])> = vec![(7, b"a")];
+    let _ = store.apply_batch(&records, |w, _seq, _p| w.put(&invoice(1, 1, 1)));
+}
+
+#[test]
+#[should_panic(expected = "apply must be gapless")]
+fn apply_batch_rejects_a_gap_in_the_middle_of_a_batch() {
+    let (_sim, store) = quiet_store();
+    let records: Vec<(u64, &[u8])> = vec![(0, b"a"), (1, b"b"), (3, b"c")];
+    let _ = store.apply_batch(&records, |w, seq, _p| w.put(&invoice(seq + 1, 1, 1)));
+}
+
+/// Spec §3's new invariant, from the reader's side: a read taken through the
+/// Writer inside a batch sees the batch's OWN writes, because it reads through
+/// the batch's transaction. This is why in-closure reads are correct by
+/// construction and need no assertion — and this test is what makes that
+/// claim falsifiable rather than asserted in a comment.
+#[test]
+fn a_read_through_the_writer_inside_a_batch_sees_the_batch_so_far() {
+    let (_sim, store) = quiet_store();
+    let records: Vec<(u64, &[u8])> = vec![(0, b"a"), (1, b"b")];
+    let mut seen = Vec::new();
+    store
+        .apply_batch(&records, |w, seq, _payload| {
+            seen.push(w.applied_seq()?);
+            w.put(&invoice(seq + 1, 1, 100))
+        })
+        .expect("both records apply");
+
+    assert_eq!(
+        seen,
+        vec![None, Some(0)],
+        "the second record must observe the first record's applied_seq bump — a \
+         fresh read txn opened mid-batch would have shown None twice"
+    );
+}
+
+/// An empty batch must cost nothing: no read txn, no write txn, no commit.
+#[test]
+fn apply_batch_of_nothing_is_a_no_op() {
+    let (_sim, store) = quiet_store();
+    store
+        .apply_batch(&[], |w, _s, _p| w.put(&invoice(1, 1, 1)))
+        .expect("an empty batch is a no-op");
+    assert_eq!(store.applied_seq().unwrap(), None);
+}

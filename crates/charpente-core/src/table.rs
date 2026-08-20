@@ -326,7 +326,7 @@ fn apply_one_in_txn<T>(
     assert_eq!(
         next_job_id_after,
         next_job_id_before + writer.jobs_materialized,
-        "next_job_id moved from {next_job_id_before} to {next_job_id_after} in apply({seq}), \
+        "next_job_id moved from {next_job_id_before} to {next_job_id_after} while applying seq {seq}, \
          which materialized {} job(s) — the counter must advance by exactly one per job",
         writer.jobs_materialized
     );
@@ -339,8 +339,8 @@ fn apply_one_in_txn<T>(
     assert_eq!(
         next_event_id_after,
         next_event_id_before + writer.events_materialized,
-        "next_event_id moved from {next_event_id_before} to {next_event_id_after} in \
-         apply({seq}), which materialized {} event(s) — the counter must advance by \
+        "next_event_id moved from {next_event_id_before} to {next_event_id_after} while \
+         applying seq {seq}, which materialized {} event(s) — the counter must advance by \
          exactly one per event",
         writer.events_materialized
     );
@@ -421,6 +421,36 @@ impl Store {
         let out = apply_one_in_txn(&txn, seq, f)?;
         txn.commit().map_err(redb_err)?;
         Ok(out)
+    }
+
+    /// Applies a contiguous run of records in ONE write transaction: all of
+    /// them commit or none of them do. `apply` is this with `records.len() ==
+    /// 1`, and does exactly the same disk work in that case (one read txn, one
+    /// write txn, one commit) — which is what makes a never-contended universe
+    /// replay byte-identically to pre-batching code.
+    ///
+    /// The gapless invariant is preserved, not traded: it used to cost a read
+    /// transaction per record, and now costs one read plus a running counter.
+    pub fn apply_batch(
+        &self,
+        records: &[(u64, &[u8])],
+        mut f: impl FnMut(&mut Writer<'_>, u64, &[u8]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let applied = self.applied_seq()?;
+        let mut txn = self.db.begin_write().map_err(redb_err)?;
+        txn.set_durability(Durability::None).map_err(redb_err)?;
+        for (expected, (seq, payload)) in (applied.map_or(0, |s| s + 1)..).zip(records) {
+            assert_eq!(
+                *seq, expected,
+                "Store::apply_batch reached seq {seq} but expected {expected} — apply must be gapless; replay the WAL in order"
+            );
+            apply_one_in_txn(&txn, *seq, |w| f(w, *seq, payload))?;
+        }
+        txn.commit().map_err(redb_err)?;
+        Ok(())
     }
 
     /// Durably persists everything applied so far. After a crash the store
@@ -733,6 +763,22 @@ impl Writer<'_> {
             Err(e) => return Err(redb_err(e)),
         };
         Ok(rows.get(id).map_err(redb_err)?.map(|g| g.value().to_vec()))
+    }
+
+    /// The log position visible through THIS write transaction so far — same
+    /// own-transaction reasoning as `Snapshot::applied_seq`, just read off a
+    /// write transaction instead of a read one. Inside `apply_batch` that
+    /// includes every record before this one in the same batch, because they
+    /// share `self.txn` and `apply_one_in_txn` bumps `applied_seq` per record.
+    pub fn applied_seq(&self) -> io::Result<Option<u64>> {
+        match self.txn.open_table(META) {
+            Ok(meta) => Ok(meta
+                .get("applied_seq")
+                .map_err(redb_err)?
+                .map(|g| g.value())),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+            Err(e) => Err(redb_err(e)),
+        }
     }
 
     fn replace_row<R: Row>(&mut self, row: &R, id: u64) -> io::Result<Option<R>> {
