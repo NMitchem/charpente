@@ -208,14 +208,17 @@ wrong — recorded so the method is not re-derived.) Enumerate by seed-consuming
 over `crates/*/tests/*.rs` **and** `crates/*/src/**/*.rs`, and list `CHARPENTE_SEED` replay
 pins separately from `.github/workflows/ci.yml`, which no source census can find.
 
-**The load-bearing population is four pins**, per the T9 census, all verified live at
-`93a5e41`:
+**The load-bearing population is four pins**, per the T9 census. **Three are verified
+live; `0xff159ed76d2806e4` is NOT.** An earlier draft of this line said all four were
+verified live at `93a5e41` — that was wrong for that pin and contradicted T9's own
+measurement of 2026-08-15, which found it stayed GREEN with the fix it guards reverted.
+Corrected 2026-08-20 after this plan's T6 reproduced the same result:
 
 | seed | sites |
 |---|---|
 | `0x8bee1752811ae873` | `charpente-sim/src/harness.rs`, `ci.yml` |
 | `0x348270b38f166529` | `group_commit.rs`, `kernel.rs`, `ci.yml` |
-| `0xff159ed76d2806e4` | `ci.yml` only |
+| `0xff159ed76d2806e4` | `ci.yml` only — **VACUOUS, pre-existing** (T9 2026-08-15, reconfirmed T6 2026-08-20; no replacement in 10,000 universes). Awaiting Noah's ruling; NOT a blocker introduced by this sub-project. |
 | `0x1f733f8d9eebf822` | `charpente-core/src/db.rs`, `transactions.rs` |
 
 **This is a gate, not a cost line.** For each of the four: revert-prove on the *new* code —

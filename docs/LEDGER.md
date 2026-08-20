@@ -1825,3 +1825,111 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
   found it. A rationale comment now sits at the site. Extending the verifying guard to cover
   it (refuse, or assert unreachable) is a policy change outside spec §1's scope — a positioned
   peer, not a newcomer — and needs a ruling before it is anything but a comment.
+
+## 2026-08-20 — M2 sub-project: per-batch apply (store commit point), COMPLETE
+
+**What it does.** The store now commits a whole contiguous batch in ONE redb write
+transaction at `Durability::None`, atomically with the `applied_seq` meta key
+(`Store::apply_batch` -> `StateMachine::apply_batch` -> `TableMachine::apply_batch`, the
+engine calling it once per batch). Every record in the run commits or none does. Group
+commit (2026-08-15) had already amortized the WAL sync 62x; this closes the same gap on the
+apply side, which was still paying one write txn *and* one read txn per record. `apply(seq,
+..)` is that batch with one record and does exactly the disk work a per-record commit always
+did, which is what keeps a never-contended universe tracing identically to pre-batching code.
+
+**Measured (docs/BENCH.md, "Per-batch apply — the store path amortized").** Kernel arm acked
+3,444/3,327/3,500 -> 6,265/6,235/6,224 records/s (1.78-1.88x). Traced Disk ops 1.337M -> 123k
+(10.8x), i.e. 13.37 -> 1.23 Disk ops per log record. Store block 82.59 -> 13.41 us/record
+(6.2x). Criterion fixed before the run (spec §7) MET at n=3: `gap_within_store` 0.23/0.26/
+0.23% of the kernel window (bar < 5%), `device_ratio` 0.766/0.772/0.766 (bar > 0.7), 61.96
+records per durable sync. Fresh interleaved baseline built at `89cb165` in its own target
+dir; no run discarded, and no re-run taken after the criterion was seen to pass.
+
+**Provenance calls that constrain how these may be quoted.** `gap_within_store` fell ~300x,
+and that is deliberately NOT published as the size of the win: a residual moves when its
+bounding ops move, and this change moved them (`gap_wal_to_store` +6.60 us/record,
+`gap_store_to_wal` +1.47). The publishable figure is the 6.2x on the store *block*, which
+nets the relocation out. `gap_store_to_wal` rising is not the kernel loop slowing.
+`wal_sync_io` per record is unchanged (57.4-58.3 -> 57.4-58.9 us) — that control is what
+makes the rest attributable to the apply path rather than to a quieter machine. The
+instrument's own cost was not resolvable at n=9 (pooled mean +101.7 ns/op, four of nine
+pairs negative) and is published as a noise floor with `resolvable: false`, never as 0.
+Side effect worth knowing: recorded ops fell 10.8x, so the instrument's bound fell with
+them, and `wal_sync_io` now passes the overhead gate on all three runs — no published
+kernel run before this had a single certified IO phase.
+
+**A guarantee was retracted, not quietly weakened.** Implementing `TableMachine::apply_batch`
+broke DESIGN §1's claim that followers arrive at *byte-identical* state. Batch boundaries are
+a scheduling artifact (the primary's kernel ready-set vs the follower's ship payload), not
+part of the log, so byte-identity was never structural once batching landed — it had been an
+artifact of the old one-record-per-transaction shape. **Noah's ruling: demote to logical
+convergence**, keep the byte-fingerprint oracle only where grouping provably matches, gated
+on an observed fact rather than the old `universe_is_quiet` proxy. Byte-oracle coverage fell
+from an implied 55/256 universes to **17/256**, which is the demotion's true cost, now
+measured instead of argued; a floor of 17 is pinned so it cannot decay silently, with the
+code stating that a drop is a finding to investigate and never a number to lower. DESIGN §1
+and §7 and `docs/GUIDE.md:2512` were all corrected — the GUIDE still promised byte-identity
+after §1 had been retracted, caught by a doc grep, and that is the doc app authors read.
+
+**The T5 review found a Critical worth recording as a pattern.** Sim coverage for the batch
+boundary shipped with `is_injected` widened to accept `FaultReason::RedbLatch`, justified in
+the code comment as a classification fix for a mechanism the multi-record path could now
+reach. It was neither. Instrumentation measured the cited mechanism (a read fault on "stage
+2+") occurring **zero times in 8,825 groups**; the real one was a stage error at k==0
+leaving an *empty* group, `commit()` returning Ok without touching the store, and the round
+then walking into `checkpoint()` on the already-latched handle. And because `is_injected`
+also gates the final-recovery arm, the widening made a genuine bug that renders every
+`Db::open` permanently unopenable pass the 256-universe property **green with all coverage
+satisfied** — proven both ways (green on `0bc1184`, red on the pre-T5 classification). Fixed
+at the root: the new arm now breaks the round like `db.transact` does, after committing —
+`Group::drop` panics on a non-empty group, so the obvious bare `break` would have been a
+latent process abort. 55 runs x 256 = 14,080 universes clean afterwards. *The pattern: a
+classifier widened to make a red suite green is a loosened oracle until proven otherwise,
+and the justification comment is not the proof.*
+
+**Net new public API: zero.** `Db::store_applied_seq()` was added for a test oracle and then
+removed on Noah's ruling — `Snapshot::applied_seq()` was already public and already used in
+the same file, so it did not clear the bar that T4's `Store.schedule` digest cleared on
+evidence (no alternative existed there; one existed here). `git diff 55f15ec..6c0bd11 --
+crates/charpente-core/src/db.rs` is empty. The store-boundary assertion itself was kept but
+its claim narrowed: it is the *fourth* layer behind the gapless assert (`table.rs:469`),
+`Db::open`'s own assert (`db.rs:1413`) and redb's transaction atomicity, and its exclusive
+window is only a store advancing past the log tail *after* `Engine::recover` returned.
+Measured `at == recovered-1` in 950/950 observations — zero margin, always.
+
+**Seed gate (T6): GO.** All four load-bearing pins revert-proven on the new code in an
+isolated worktree, each reddening for its original reason. `0x1f733f8d9eebf822` was the one
+at genuine risk — it drives `tx_workload` itself, and this sub-project moved that function's
+entropy draw stream twice — and it survived both shifts (`base=55, seeds=1` unchanged from
+T9). A fifth `ci.yml` pin not in the brief was checked too and is live.
+
+**Trigger (a) of DECISIONS §7 — the ambiguity that was awaiting a ruling is dissolved.** On
+the new numbers no reading of "largest single non-idle phase" fires it. Field: `wal_sync_io`
+led by 0.4-1.5 points before, now leads by 72.13/71.27/73.15. CPU-only: led by 28.3-37.1
+points and *would have fired*, now 1.24-1.38% of all-gap time and not even the largest
+residual. Block: led by 13.7 points and *would have fired*, now dominated 4.4-4.8x. The
+asymmetry that made this Noah's call is gone. Two caveats stay attached: "negligible" is
+exact at the field level (0.23-0.26%) while the store *block* at 16.2-17.5% is dominated
+rather than negligible; and the remaining 0.42x gap has a named owner — **charpente's call
+pattern into redb, not redb** (12.1 of every 13.4 Disk ops were per-record transaction
+machinery). `.superpowers/sdd/2026-08-19-phase-attribution/trigger-a-rereading.md` is
+superseded by prepended banner, not amended. **`DECISIONS.md` is untouched and remains
+Noah's to edit.**
+
+**Open, and NOT introduced here.** `0xff159ed76d2806e4` (the redb `debug-assertions`
+cross-build-mode pin) is **vacuous and has been since at least 2026-08-15**: the replay stays
+green with the override reverted, and a 10,000-universe hunt found no replacement (T9:
+197.43 s zero hits; T6 2026-08-20: 195.46 s zero hits, against a build proven to carry the
+reverted profile by an identical follower fingerprint). The structural reason is that the
+property is robust to the skew — a diverged universe still converges — so a wider hunt is
+unlikely to help, though non-existence is not proven. Spec §4 makes an unrecoverable pin a
+merge blocker retired only by Noah's explicit sign-off; **it is recorded, not absorbed.**
+`ci.yml:24` is also the only pin comment in that file with no paragraph saying what it
+guards, and as written it misleads a reader into thinking the line protects the override; the
+guard that would actually catch the override's deletion is a cross-mode fingerprint
+comparison, which is a design change nobody has been asked for yet.
+
+**Also open, non-blocking:** the swarm runner's `run_universes_swarm!` arm has no `floor:`
+clause (only the `_in`/`_with`/`_with_in` paths do); the follower batch-atomicity test never
+reads the store, and the accessor a reviewer suggested for it is the one Ruling 20 deleted,
+so closing it is its own `replication.rs` change with its own mutation burden.
