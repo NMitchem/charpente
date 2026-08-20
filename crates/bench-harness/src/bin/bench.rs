@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage: bench <device|core|kernel|wire|all|smoke> \
 [--json] [--duration SECS] [--warmup SECS] [--requests N] \
-[--target bench-app|invoicing] [--connections N,N,...] [--dir PATH] [--trace-overhead]";
+[--target bench-app|invoicing] [--connections N,N,...] [--dir PATH] [--trace-overhead] \
+[--overhead-ns-per-op N [--overhead-resolvable]]";
 
 #[derive(Debug)]
 struct Args {
@@ -39,6 +40,25 @@ struct Args {
     // nothing docs/BENCH.md can quote yet (Task 5's job), so it has no
     // business inside the artifact that does.
     trace_overhead: bool,
+    // Task 5 (Ruling 16): wires `phase_accounting::overhead_gate` into the
+    // NORMAL publish path, which until now only `--trace-overhead` ever
+    // called (T4 report, Concern 2). No validated overhead figure exists
+    // yet — Task 4's own measurement was NOT RESOLVABLE at n=3, and
+    // `docs/BENCH.md` is the only place a number becomes quotable — so this
+    // is opt-in rather than a number this binary invents: an operator who
+    // has ALREADY obtained a figure from `bench kernel --trace-overhead`
+    // (Task 6's job) can gate a subsequent `bench core`/`bench kernel`
+    // run's phases against it. `None` (the default) leaves every layer's
+    // gate uncalled, exactly as before this task.
+    overhead_ns_per_op: Option<u64>,
+    // Preserves Task 4's noise-vs-cost distinction (`run_trace_overhead`'s
+    // own framing) at this second call site: a refusal built on a RESOLVED
+    // overhead indicts the instrument, one built on a noise amplitude
+    // indicts the machine, and this binary cannot tell the two apart on its
+    // own — the operator states which applies. Defaults to `false`, the
+    // conservative reading, matching `--trace-overhead`'s own default
+    // treatment of an unresolved range.
+    overhead_resolvable: bool,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -52,6 +72,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         connections: vec![1, 4, 16, 64, 256],
         dir: None,
         trace_overhead: false,
+        overhead_ns_per_op: None,
+        overhead_resolvable: false,
     };
     if !["device", "core", "kernel", "wire", "all", "smoke"].contains(&args.cmd.as_str()) {
         return Err(format!("unknown subcommand {:?}\n{USAGE}", args.cmd));
@@ -97,6 +119,14 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "--dir" => args.dir = Some(val("--dir")?),
             "--trace-overhead" => args.trace_overhead = true,
+            "--overhead-ns-per-op" => {
+                args.overhead_ns_per_op = Some(
+                    val("--overhead-ns-per-op")?
+                        .parse()
+                        .map_err(|e| format!("--overhead-ns-per-op: {e}"))?,
+                )
+            }
+            "--overhead-resolvable" => args.overhead_resolvable = true,
             other => return Err(format!("unknown flag {other:?}\n{USAGE}")),
         }
     }
@@ -515,6 +545,50 @@ fn refused_phase_names(refusals: &[String]) -> String {
         .join(", ")
 }
 
+/// Task 5 (Ruling 16): the SECOND caller of `phase_accounting::overhead_gate`
+/// — until this task, `run_trace_overhead` above was the only one, so the
+/// gate never ran against a phase block this binary actually publishes (T4
+/// report, Concern 2: "a normal `bench` run carries a phase block without
+/// ever having run the gate against it").
+///
+/// Pure: no IO, no clock — `--overhead-ns-per-op` supplies the number this
+/// binary has no way to measure honestly inline (see `Args::overhead_ns_per_op`'s
+/// doc for why it is an operator input rather than a fresh measurement this
+/// function takes). `layer` names the site ("core"/"kernel") in every
+/// refusal it returns, and `resolvable` carries Task 4's noise-vs-cost
+/// distinction into this second call site (Ruling 16's own requirement:
+/// "preserve that distinction wherever you surface it") — an empty result
+/// means the gate found nothing to refuse and `resolvable` is irrelevant.
+fn overhead_gate_refusals(
+    layer: &str,
+    phases: &phase_accounting::PhaseTotals,
+    ns_per_op: u64,
+    op_count: u64,
+    resolvable: bool,
+) -> Vec<String> {
+    let refusals = phase_accounting::overhead_gate(phases, ns_per_op, op_count);
+    if refusals.is_empty() {
+        return refusals;
+    }
+    let framing = if resolvable {
+        "a RESOLVED overhead figure — this is a finding about the INSTRUMENT"
+    } else {
+        "an overhead figure NOT marked resolvable (pass --overhead-resolvable once a \
+         multi-sample --trace-overhead range does not straddle zero) — treat this as \
+         inconclusive noise, not a finding about the instrument, until resolvability is \
+         established"
+    };
+    refusals
+        .into_iter()
+        .map(|r| {
+            format!(
+                "{r} [{layer}: gated against operator-supplied --overhead-ns-per-op {ns_per_op}, \
+                 {framing}]"
+            )
+        })
+        .collect()
+}
+
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = match parse(&argv) {
@@ -731,6 +805,35 @@ fn run_layers(args: &Args, dir: &str, report: &mut Report) -> std::io::Result<bo
             other => unreachable!("unmapped subcommand {other}"),
         }
     }
+    // Task 5 (Ruling 16): the gate is opt-in via `--overhead-ns-per-op` (see
+    // that field's doc) rather than run unconditionally — no validated
+    // overhead figure exists to run it against by default. Both layers use
+    // the SAME operator-supplied figure and resolvability claim; each
+    // refusal names which layer it came from.
+    if let Some(ns_per_op) = args.overhead_ns_per_op {
+        if let Some(core) = &report.core
+            && let Some(phases) = &core.phases
+        {
+            report.invalid.extend(overhead_gate_refusals(
+                "core",
+                phases,
+                ns_per_op,
+                core.events_recorded,
+                args.overhead_resolvable,
+            ));
+        }
+        if let Some(kernel) = &report.kernel
+            && let Some(phases) = &kernel.phases
+        {
+            report.invalid.extend(overhead_gate_refusals(
+                "kernel",
+                phases,
+                ns_per_op,
+                kernel.events_recorded,
+                args.overhead_resolvable,
+            ));
+        }
+    }
     // T4 review, M-7: `main` gates the exit code on this. By T9 every
     // subcommand has an arm, so this is `true` — the plumbing stays as the
     // structural guarantee that a future unmapped subcommand cannot exit 0.
@@ -787,6 +890,9 @@ mod tests {
             s("1,4,16"),
             s("--dir"),
             s("/data"),
+            s("--overhead-ns-per-op"),
+            s("620"),
+            s("--overhead-resolvable"),
         ])
         .expect("valid args parse");
         assert_eq!(args.cmd, "device");
@@ -797,6 +903,8 @@ mod tests {
         assert_eq!(args.target, "invoicing");
         assert_eq!(args.connections, vec![1, 4, 16]);
         assert_eq!(args.dir.as_deref(), Some("/data"));
+        assert_eq!(args.overhead_ns_per_op, Some(620));
+        assert!(args.overhead_resolvable);
     }
 
     #[test]
@@ -810,6 +918,21 @@ mod tests {
         assert_eq!(args.target, "bench-app");
         assert_eq!(args.connections, vec![1, 4, 16, 64, 256]);
         assert!(args.dir.is_none());
+        // Task 5 (Ruling 16): the gate stays uncalled by default — no
+        // validated overhead figure exists for this binary to invent one.
+        assert!(args.overhead_ns_per_op.is_none());
+        assert!(!args.overhead_resolvable);
+    }
+
+    #[test]
+    fn parse_rejects_a_malformed_overhead_ns_per_op_without_panicking() {
+        for bad in ["-1", "nan", "not-a-number"] {
+            let err = parse(&[s("kernel"), s("--overhead-ns-per-op"), s(bad)]).unwrap_err();
+            assert!(
+                err.contains("--overhead-ns-per-op"),
+                "input {bad:?} got: {err}"
+            );
+        }
     }
 
     #[test]
@@ -969,7 +1092,12 @@ mod tests {
             device_appends_per_sec_before: 1.0,
             device_appends_per_sec_after: 1.0,
             phases: None,
+            phases_counted: true,
+            phases_absent_reason: Some(
+                bench_harness::report::PhasesAbsentReason::AttributionRefused,
+            ),
             window_nanos: 0,
+            events_recorded: 0,
         });
         assert!(
             r.invalid.is_empty(),
@@ -984,6 +1112,67 @@ mod tests {
             exit_code_for(&r, false),
             2,
             "an unimplemented subcommand must never exit 0 or 1"
+        );
+    }
+
+    // --- Task 5 (Ruling 16): overhead_gate_refusals ---
+
+    fn tiny_phase() -> bench_harness::phase_accounting::PhaseTotals {
+        bench_harness::phase_accounting::PhaseTotals {
+            wal_append_io: 1_000,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn overhead_gate_refusals_is_empty_when_the_gate_does_not_fire() {
+        let refusals = overhead_gate_refusals("core", &tiny_phase(), 1, 1, false);
+        assert!(refusals.is_empty(), "got: {refusals:?}");
+    }
+
+    #[test]
+    fn overhead_gate_refusals_names_the_layer_and_the_flag() {
+        // 5_000 ns of overhead against a 1_000 ns phase far exceeds the 10%
+        // threshold (mirrors phase_accounting's own
+        // `overhead_comparable_to_the_smallest_phase_is_refused` fixture).
+        let refusals = overhead_gate_refusals("kernel", &tiny_phase(), 50, 100, false);
+        assert_eq!(refusals.len(), 1, "got: {refusals:?}");
+        assert!(
+            refusals[0]
+                .contains("[kernel: gated against operator-supplied --overhead-ns-per-op 50"),
+            "must name which layer and the flag that supplied the figure: {}",
+            refusals[0]
+        );
+        // The wrapped `overhead_gate` refusal itself must still be present —
+        // this function annotates, it does not replace hard rule 5's own
+        // contract/site/fix text.
+        assert!(refusals[0].contains("contract:"), "got: {}", refusals[0]);
+    }
+
+    #[test]
+    fn overhead_gate_refusals_preserves_the_noise_vs_instrument_distinction() {
+        let noise = overhead_gate_refusals("core", &tiny_phase(), 50, 100, false);
+        assert!(
+            noise[0].contains("inconclusive noise, not a finding about the instrument"),
+            "an unresolved figure must not be framed as an instrument finding: {}",
+            noise[0]
+        );
+        assert!(
+            noise[0].contains("--overhead-resolvable"),
+            "must name how to upgrade the claim: {}",
+            noise[0]
+        );
+
+        let resolved = overhead_gate_refusals("core", &tiny_phase(), 50, 100, true);
+        assert!(
+            resolved[0].contains("a finding about the INSTRUMENT"),
+            "a resolved figure's refusal must say so plainly: {}",
+            resolved[0]
+        );
+        assert!(
+            !resolved[0].contains("inconclusive noise"),
+            "must not carry both framings at once: {}",
+            resolved[0]
         );
     }
 }

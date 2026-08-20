@@ -345,8 +345,25 @@ pub fn run_with_trace_mode(
     // still reports how many ops it recorded — see this function's own doc.
     let events = trace.events();
     let events_recorded = events.len() as u64;
-    let phases = if let Some(reason) = trace.capacity_grew_reason() {
+    // Task 5: whether this arm was recording — checked FIRST, before
+    // `capacity_grew_reason`. This is the one arm where `TraceMode::
+    // Passthrough` is actually reachable (`--trace-overhead`'s other arm),
+    // and before this check `attribute(&[], ...)` on a passthrough's empty
+    // trace SUCCEEDED — an empty in-window set is legal (`phase_accounting`'s
+    // `an_empty_trace_is_all_lead_in`), so the whole window landed in
+    // `lead_in` and every other field was 0. That is a ZEROED phase block
+    // wearing a healthy `Some`, exactly what this whole sub-project's
+    // "absence, not zeroes" rule forbids — `phases_counted: false` withholds
+    // it instead, honestly, without ever calling `attribute` on a trace that
+    // was never trying to record.
+    let phases_counted = trace.is_recording();
+    let mut phases_absent_reason = None;
+    let phases = if !phases_counted {
+        phases_absent_reason = Some(crate::report::PhasesAbsentReason::NotRecording);
+        None
+    } else if let Some(reason) = trace.capacity_grew_reason() {
         invalid.push(reason);
+        phases_absent_reason = Some(crate::report::PhasesAbsentReason::TraceRegrew);
         None
     } else {
         match attribute(&events, window_start_nanos, window_end_nanos) {
@@ -369,6 +386,7 @@ pub fn run_with_trace_mode(
             }
             Err(refusals) => {
                 invalid.extend(refusals);
+                phases_absent_reason = Some(crate::report::PhasesAbsentReason::AttributionRefused);
                 None
             }
         }
@@ -447,7 +465,10 @@ pub fn run_with_trace_mode(
             requests_total: obs.requests_planned,
             jobs_done: obs.stats_jobs_done,
             phases,
+            phases_counted,
+            phases_absent_reason,
             window_nanos: window_end_nanos - window_start_nanos,
+            events_recorded,
         },
         invalid,
         events_recorded,

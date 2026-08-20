@@ -60,10 +60,25 @@ pub struct CoreReport {
     // window's phase partition — see `tracing_disk`/`phase_accounting`.
     // `None` means the attribution was refused (the refusal strings are
     // among this run's `invalid` reasons), never a zeroed `PhaseTotals` —
-    // that would be indistinguishable from a genuinely fast run. Not yet
-    // rendered by `render_json`/`render_human` (a later task in the plan);
-    // this field only carries the value through to a caller that wants it.
+    // that would be indistinguishable from a genuinely fast run.
+    //
+    // Task 5: now rendered by `render_json`/`render_human`, alongside
+    // `phases_counted` and `phases_absent_reason` — see those fields' docs
+    // for why `None` alone is not enough provenance.
     pub phases: Option<crate::phase_accounting::PhaseTotals>,
+    // Task 5: whether this arm was RECORDING at all (`TracingDisk`'s trace
+    // was `Trace::recording`, not `Trace::passthrough`) — mirrors
+    // `SweepPoint::syncs_counted`'s shape: a fact about how the measurement
+    // was taken, published beside a number that may or may not be there.
+    // `false` only when the arm was not recording in the first place, which
+    // is a DIFFERENT fact from "recorded, but this window's attribution was
+    // refused" — `phases_absent_reason` is what tells those two apart.
+    pub phases_counted: bool,
+    // Task 5 (Ruling 2 / Task 3's Ruling 14): `phases: None` conflates THREE
+    // causes a reader must be able to tell apart without parsing prose out
+    // of `invalid` — see `PhasesAbsentReason`'s doc. `Some` exactly when
+    // `phases` is `None`; `None` needs no reason.
+    pub phases_absent_reason: Option<PhasesAbsentReason>,
     // The measured write window's own length in nanoseconds
     // (`window_end_nanos - window_start_nanos`), the SAME window `phases`
     // was attributed against — not `write.elapsed`. The two are stamped
@@ -71,6 +86,13 @@ pub struct CoreReport {
     // caller checking `phases.total() == window_nanos` against the wrong
     // one would see a flaky mismatch nobody could reproduce.
     pub window_nanos: u64,
+    // Task 5: the number of ops `Trace::record` actually pushed for this
+    // arm's WHOLE run (not just the in-window subset `phases` describes) —
+    // `overhead_gate`'s own `op_count`, published so a caller wiring the
+    // gate against this run does not have to re-derive it. 0 whenever
+    // `!phases_counted` (`Trace::record` early-returns before touching the
+    // event vec in passthrough mode).
+    pub events_recorded: u64,
 }
 #[derive(Debug, Clone)]
 pub struct KernelReport {
@@ -114,12 +136,24 @@ pub struct KernelReport {
     // window's phase partition — mirrors `CoreReport::phases`. `None` means
     // the attribution was refused; the refusal strings are among this run's
     // `invalid` reasons.
+    //
+    // Task 5: now rendered — see `CoreReport::phases`'s doc, which this
+    // mirrors exactly, for `phases_counted`/`phases_absent_reason`.
     pub phases: Option<crate::phase_accounting::PhaseTotals>,
+    // Task 5: mirrors `CoreReport::phases_counted`.
+    pub phases_counted: bool,
+    // Task 5: mirrors `CoreReport::phases_absent_reason`.
+    pub phases_absent_reason: Option<PhasesAbsentReason>,
     // The measured batch window's own length in nanoseconds — mirrors
     // `CoreReport::window_nanos`. This layer already publishes
     // `window_secs`; this is the nanosecond-precision figure `phases` was
     // attributed against.
     pub window_nanos: u64,
+    // Task 5: mirrors `CoreReport::events_recorded`. This is the SAME count
+    // `run_with_trace_mode`'s third return element already carries (Task
+    // 4); `run`'s two-element wrapper drops it, so this is the first place
+    // an ordinary caller of `run` can see it.
+    pub events_recorded: u64,
 }
 #[derive(Debug, Clone)]
 pub struct WireReport {
@@ -193,6 +227,59 @@ pub struct SweepPoint {
     pub p999_us: u64,
     pub client_busy_fraction: f64,
     pub saturated: bool,
+}
+
+/// Why `phases` is `None`, when it is (Task 5, Ruling 2 / carried from Task
+/// 3's Ruling 14). `None` alone conflates three causes, and a reader must be
+/// able to tell them apart WITHOUT parsing prose out of `invalid` — the
+/// refusal strings that land there are the raw material this type is built
+/// from, not the interface a consumer reads.
+///
+/// The first two mean an attempt was made and rejected; the third means no
+/// attempt was made at all — a different fact, and the one
+/// `phases_counted` also names on its own (this type is the finer-grained
+/// sibling: `phases_counted == false` implies `NotRecording` here, and
+/// nothing else can).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhasesAbsentReason {
+    /// `phase_accounting::attribute` refused this window's trace (an
+    /// overlapping, malformed, or boundary-straddling event) — the refusal
+    /// strings themselves are in `invalid`, `"contract:"`-prefixed.
+    AttributionRefused,
+    /// `Trace::capacity_grew_reason` detected a reallocation of the event
+    /// buffer during recording — a regrow's stall lands in whichever gap
+    /// bucket happens to surround it, indistinguishable after the fact from
+    /// genuine idle time, so the shares are withheld rather than published
+    /// diluted.
+    TraceRegrew,
+    /// This arm was not recording at all (`tracing_disk::TraceMode::
+    /// Passthrough`) — there is no trace to attribute in the first place,
+    /// which is a different fact from a trace that was attributed and
+    /// refused.
+    NotRecording,
+}
+
+impl PhasesAbsentReason {
+    /// The JSON tag. Stable, lowercase, snake_case — a consumer matches on
+    /// this string, not on prose.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PhasesAbsentReason::AttributionRefused => "attribution_refused",
+            PhasesAbsentReason::TraceRegrew => "trace_regrew",
+            PhasesAbsentReason::NotRecording => "not_recording",
+        }
+    }
+
+    /// A short phrase for the human render — not a full sentence; the full
+    /// explanation is in `invalid` already (except for `NotRecording`, which
+    /// names nothing in `invalid` because there was no attempt to refuse).
+    fn human_phrase(self) -> &'static str {
+        match self {
+            PhasesAbsentReason::AttributionRefused => "attribution refused, see invalid reasons",
+            PhasesAbsentReason::TraceRegrew => "trace buffer regrew, see invalid reasons",
+            PhasesAbsentReason::NotRecording => "this arm was not recording",
+        }
+    }
 }
 
 pub const CEILING_REFUSAL: &str = "a number without its device ceiling is not publishable \
@@ -371,6 +458,131 @@ fn num2_opt(v: Option<f64>) -> String {
     v.map_or_else(|| "null".to_string(), num2)
 }
 
+/// Negative space (hard rule 4), shared by both renderers below: the four
+/// phase-provenance fields must never contradict each other. Called once per
+/// layer per render rather than trusted from construction, because a struct
+/// literal's fields are independently settable and this is the one place
+/// both renderers agree the combination has to make sense.
+fn assert_phases_consistent(
+    phases: &Option<crate::phase_accounting::PhaseTotals>,
+    counted: bool,
+    reason: Option<PhasesAbsentReason>,
+) {
+    assert_eq!(
+        phases.is_none(),
+        reason.is_some(),
+        "phases_absent_reason must be Some exactly when phases is None — got phases.is_some()={} \
+         reason={reason:?}",
+        phases.is_some()
+    );
+    if !counted {
+        assert_eq!(
+            reason,
+            Some(PhasesAbsentReason::NotRecording),
+            "an arm that was not recording must report NotRecording, not {reason:?}"
+        );
+    }
+}
+
+/// The `phases`/`phases_counted`/`phases_absent_reason`/`window_nanos`/
+/// `events_recorded` fragment shared by `core` and `kernel` — both objects
+/// publish the identical shape (Task 5), so this is written once rather than
+/// risking the two renderers drifting apart the way this file's own history
+/// warns about repeatedly.
+fn phases_json(
+    phases: &Option<crate::phase_accounting::PhaseTotals>,
+    counted: bool,
+    reason: Option<PhasesAbsentReason>,
+    window_nanos: u64,
+    events_recorded: u64,
+) -> String {
+    assert_phases_consistent(phases, counted, reason);
+    let mut s = String::new();
+    match phases {
+        Some(t) => {
+            s.push_str(&format!(
+                ",\"phases\":{{\"wal_append_io\":{},\"wal_read_io\":{},\"wal_sync_io\":{},\
+                 \"store_write_io\":{},\"store_read_io\":{},\"store_sync_io\":{},\
+                 \"other_io\":{},\"gap_within_wal\":{},\"gap_wal_to_store\":{},\
+                 \"gap_within_store\":{},\"gap_store_to_wal\":{},\"gap_other\":{},\
+                 \"lead_in\":{},\"tail\":{}}}",
+                t.wal_append_io,
+                t.wal_read_io,
+                t.wal_sync_io,
+                t.store_write_io,
+                t.store_read_io,
+                t.store_sync_io,
+                t.other_io,
+                t.gap_within_wal,
+                t.gap_wal_to_store,
+                t.gap_within_store,
+                t.gap_store_to_wal,
+                t.gap_other,
+                t.lead_in,
+                t.tail,
+            ));
+        }
+        None => s.push_str(",\"phases\":null"),
+    }
+    s.push_str(&format!(",\"phases_counted\":{counted}"));
+    match reason {
+        Some(reason) => s.push_str(&format!(
+            ",\"phases_absent_reason\":\"{}\"",
+            esc(reason.as_str())
+        )),
+        None => s.push_str(",\"phases_absent_reason\":null"),
+    }
+    s.push_str(&format!(
+        ",\"window_nanos\":{window_nanos},\"events_recorded\":{events_recorded}"
+    ));
+    s
+}
+
+/// The human phase table shared by `core`/`kernel` (Task 5) — mirrors
+/// `phases_json`'s reasoning for being one function rather than two.
+/// `label` names the layer ("core"/"kernel") for the absent-case line, which
+/// is the only line that does not already carry it from context.
+fn phases_human(
+    label: &str,
+    phases: &Option<crate::phase_accounting::PhaseTotals>,
+    counted: bool,
+    reason: Option<PhasesAbsentReason>,
+    window_nanos: u64,
+) -> String {
+    assert_phases_consistent(phases, counted, reason);
+    let Some(t) = phases else {
+        let reason = reason.expect("assert_phases_consistent just proved this is Some");
+        return format!("  {label} phases: n/a ({})\n", reason.human_phrase());
+    };
+    let pct = |v: u64| {
+        if window_nanos == 0 {
+            0.0
+        } else {
+            v as f64 / window_nanos as f64 * 100.0
+        }
+    };
+    let mut s = format!("  {label} phases (window {window_nanos} ns, counted):\n");
+    for (name, v) in [
+        ("wal_append_io", t.wal_append_io),
+        ("wal_read_io", t.wal_read_io),
+        ("wal_sync_io", t.wal_sync_io),
+        ("store_write_io", t.store_write_io),
+        ("store_read_io", t.store_read_io),
+        ("store_sync_io", t.store_sync_io),
+        ("other_io", t.other_io),
+        ("gap_within_wal", t.gap_within_wal),
+        ("gap_wal_to_store", t.gap_wal_to_store),
+        ("gap_within_store", t.gap_within_store),
+        ("gap_store_to_wal", t.gap_store_to_wal),
+        ("gap_other", t.gap_other),
+        ("lead_in", t.lead_in),
+        ("tail", t.tail),
+    ] {
+        s.push_str(&format!("    {name:<16} {v:>14} ns ({:>5.1}%)\n", pct(v)));
+    }
+    s
+}
+
 pub fn render_json(r: &Report) -> Result<String, String> {
     let has_layers = r.core.is_some() || r.kernel.is_some() || !r.wire.is_empty();
     if has_layers && r.device.is_none() {
@@ -403,7 +615,7 @@ pub fn render_json(r: &Report) -> Result<String, String> {
             ",\"core\":{{\"acked_writes_per_sec\":{},\"log_records_per_sec\":{},\
              \"reads_per_sec\":{},\"syncs_per_sec\":{},\"device_ratio\":{},\
              \"device_ratio_denominator\":\"{}\",\
-             \"device_appends_per_sec_before\":{},\"device_appends_per_sec_after\":{}}}",
+             \"device_appends_per_sec_before\":{},\"device_appends_per_sec_after\":{}",
             num2(c.acked_writes_per_sec),
             num2(c.log_records_per_sec),
             num2(c.reads_per_sec),
@@ -413,13 +625,21 @@ pub fn render_json(r: &Report) -> Result<String, String> {
             num2(c.device_appends_per_sec_before),
             num2(c.device_appends_per_sec_after)
         ));
+        s.push_str(&phases_json(
+            &c.phases,
+            c.phases_counted,
+            c.phases_absent_reason,
+            c.window_nanos,
+            c.events_recorded,
+        ));
+        s.push('}');
     }
     if let Some(k) = &r.kernel {
         s.push_str(&format!(
             ",\"kernel\":{{\"acked_writes_per_sec\":{},\"log_records_per_sec\":{},\
              \"window_secs\":{},\"syncs_per_sec\":{},\"device_ratio\":{},\
              \"device_appends_per_sec_before\":{},\"device_appends_per_sec_after\":{},\
-             \"requests_total\":{},\"jobs_done\":{}}}",
+             \"requests_total\":{},\"jobs_done\":{}",
             num2(k.acked_writes_per_sec),
             num2(k.log_records_per_sec),
             num2(k.window_secs),
@@ -430,6 +650,14 @@ pub fn render_json(r: &Report) -> Result<String, String> {
             k.requests_total,
             k.jobs_done
         ));
+        s.push_str(&phases_json(
+            &k.phases,
+            k.phases_counted,
+            k.phases_absent_reason,
+            k.window_nanos,
+            k.events_recorded,
+        ));
+        s.push('}');
     }
     if !r.wire.is_empty() {
         s.push_str(",\"wire\":[");
@@ -526,6 +754,13 @@ pub fn render_human(r: &Report) -> String {
             c.log_records_per_sec,
             c.reads_per_sec
         ));
+        s.push_str(&phases_human(
+            "core",
+            &c.phases,
+            c.phases_counted,
+            c.phases_absent_reason,
+            c.window_nanos,
+        ));
     }
     if let Some(k) = &r.kernel {
         s.push_str(&format!(
@@ -547,6 +782,13 @@ pub fn render_human(r: &Report) -> String {
             k.device_ratio,
             k.device_appends_per_sec_before,
             k.device_appends_per_sec_after
+        ));
+        s.push_str(&phases_human(
+            "kernel",
+            &k.phases,
+            k.phases_counted,
+            k.phases_absent_reason,
+            k.window_nanos,
         ));
     }
     for w in &r.wire {
@@ -640,8 +882,16 @@ mod tests {
                 device_ratio_denominator: "the device bracket max",
                 device_appends_per_sec_before: 1490.0,
                 device_appends_per_sec_after: 1510.0,
+                // T5: the base fixture models a RECORDING arm whose window's
+                // attribution was refused for some unrelated reason (the
+                // refusal string itself is not this fixture's concern) —
+                // `phases: Some(...)` and the three-cause split each get
+                // their own dedicated fixtures below rather than living here.
                 phases: None,
+                phases_counted: true,
+                phases_absent_reason: Some(PhasesAbsentReason::AttributionRefused),
                 window_nanos: 0,
+                events_recorded: 94_562,
             }),
             kernel: Some(KernelReport {
                 acked_writes_per_sec: 1300.0,
@@ -654,7 +904,10 @@ mod tests {
                 requests_total: 50000,
                 jobs_done: 50000,
                 phases: None,
+                phases_counted: true,
+                phases_absent_reason: Some(PhasesAbsentReason::TraceRegrew),
                 window_nanos: 0,
+                events_recorded: 1_336_846,
             }),
             wire: vec![WireReport {
                 target: "bench-app".to_string(),
@@ -717,13 +970,19 @@ mod tests {
              \"log_records_per_sec\":1450.00,\"reads_per_sec\":800000.00,\
              \"syncs_per_sec\":1450.00,\"device_ratio\":0.970,\
              \"device_ratio_denominator\":\"the device bracket max\",\
-             \"device_appends_per_sec_before\":1490.00,\"device_appends_per_sec_after\":1510.00},\
+             \"device_appends_per_sec_before\":1490.00,\"device_appends_per_sec_after\":1510.00,\
+             \"phases\":null,\"phases_counted\":true,\
+             \"phases_absent_reason\":\"attribution_refused\",\"window_nanos\":0,\
+             \"events_recorded\":94562},\
              \"kernel\":{\"acked_writes_per_sec\":1300.00,\
              \"log_records_per_sec\":2600.00,\"window_secs\":38.46,\
              \"syncs_per_sec\":2600.00,\
              \"device_ratio\":0.867,\"device_appends_per_sec_before\":2980.00,\
              \"device_appends_per_sec_after\":3020.00,\
-             \"requests_total\":50000,\"jobs_done\":50000},\
+             \"requests_total\":50000,\"jobs_done\":50000,\
+             \"phases\":null,\"phases_counted\":true,\
+             \"phases_absent_reason\":\"trace_regrew\",\"window_nanos\":0,\
+             \"events_recorded\":1336846},\
              \"wire\":[{\"target\":\"bench-app\",\"points\":[{\"connections\":4,\
              \"throughput_per_sec\":1200.00,\"log_records_per_sec\":2400.00,\
              \"syncs_per_sec\":2400.00,\"syncs_counted\":true,\
@@ -975,11 +1234,23 @@ mod tests {
             "  device: 1500 syncs/s, 1400 appends/s (reference; layers bracket their own)",
             "got: {human}"
         );
+        // Task 5: `core:`'s line index is unchanged (N-3's pin above still
+        // reads lines[2]) but a new `core phases:` line now sits between it
+        // and `kernel:`, since `fixed_report()`'s core arm has `phases:
+        // None`.
         assert_eq!(
-            lines[3],
+            lines[3], "  core phases: n/a (attribution refused, see invalid reasons)",
+            "got: {human}"
+        );
+        assert_eq!(
+            lines[4],
             "  kernel: 1300 acked writes/s, 2600 log records/s, 2600 durable syncs/s (50000 \
              requests, 50000 jobs; 38.46s batch window, no warmup; device_ratio 0.867, \
              bracket 2980/3020 appends/s before/after)",
+            "got: {human}"
+        );
+        assert_eq!(
+            lines[5], "  kernel phases: n/a (trace buffer regrew, see invalid reasons)",
             "got: {human}"
         );
     }
@@ -998,9 +1269,11 @@ mod tests {
     fn render_human_wire_line_is_pinned() {
         let human = render_human(&fixed_report());
         let lines: Vec<&str> = human.lines().collect();
-        assert_eq!(lines[4], "  wire [bench-app]:", "got: {human}");
+        // Task 5: shifted by 2 from `wire [bench-app]:`'s pre-Task-5 index —
+        // `core phases:` and `kernel phases:` each add one line above it.
+        assert_eq!(lines[6], "  wire [bench-app]:", "got: {human}");
         assert_eq!(
-            lines[5],
+            lines[7],
             "       4 conns:     1200 req/s      2400 rec/s      2400 sync/s (counted)  \
              0.667x dev (sync, gated)  0.685x dev (records, ungated)  (bracket 3500/3600 \
              appends/s before/after)  p50    800us  p99   2100us  p99.9   5000us  client \
@@ -1016,7 +1289,7 @@ mod tests {
         // this line at all: the ratio was the gate's subject, and there is no
         // gate on this arm.
         assert_eq!(
-            lines[6],
+            lines[8],
             "      16 conns:     1800 req/s      1800 rec/s  n/a (derived, unsound under \
              batching)  0.514x dev (records, ungated)  (bracket 3500/3600 appends/s \
              before/after)  p50   1100us  p99   2600us  p99.9   6000us  client busy 20%",
@@ -1070,5 +1343,193 @@ mod tests {
         r.invalid.push("INVALID: something else".to_string());
         let reasons = invalid_reasons(&r);
         assert_eq!(reasons, vec!["INVALID: something else".to_string()]);
+    }
+
+    // --- Task 5 (2026-08-19 phase-attribution plan): publishing phases ---
+
+    /// Every field distinct and nonzero, mirroring `phase_accounting`'s own
+    /// fixture discipline (`every_nanosecond_of_the_window_is_attributed`):
+    /// a fixture with a repeated or zeroed value cannot catch a swap or a
+    /// dropped field in the renderer either.
+    fn healthy_phases() -> crate::phase_accounting::PhaseTotals {
+        crate::phase_accounting::PhaseTotals {
+            wal_append_io: 100,
+            wal_read_io: 200,
+            wal_sync_io: 5_000,
+            store_write_io: 300,
+            store_read_io: 50,
+            store_sync_io: 400,
+            other_io: 60,
+            gap_within_wal: 10,
+            gap_wal_to_store: 20,
+            gap_within_store: 30,
+            gap_store_to_wal: 40,
+            gap_other: 15,
+            lead_in: 5,
+            tail: 25,
+        }
+    }
+    const HEALTHY_PHASES_WINDOW_NANOS: u64 = 6_255; // healthy_phases().total()
+
+    /// Step 1: a recording run whose attribution succeeded publishes
+    /// `phases_counted: true` and the phase object, byte-exact.
+    #[test]
+    fn a_recording_run_publishes_phases_counted_true_and_the_phase_object() {
+        let mut r = fixed_report();
+        let c = r.core.as_mut().unwrap();
+        c.phases = Some(healthy_phases());
+        c.phases_counted = true;
+        c.phases_absent_reason = None;
+        c.window_nanos = HEALTHY_PHASES_WINDOW_NANOS;
+        c.events_recorded = 777;
+
+        let json = render_json(&r).expect("renders");
+        assert!(json.contains("\"phases_counted\":true"), "got: {json}");
+        assert!(
+            json.contains(
+                "\"phases\":{\"wal_append_io\":100,\"wal_read_io\":200,\"wal_sync_io\":5000,\
+                 \"store_write_io\":300,\"store_read_io\":50,\"store_sync_io\":400,\
+                 \"other_io\":60,\"gap_within_wal\":10,\"gap_wal_to_store\":20,\
+                 \"gap_within_store\":30,\"gap_store_to_wal\":40,\"gap_other\":15,\
+                 \"lead_in\":5,\"tail\":25}"
+            ),
+            "got: {json}"
+        );
+        assert!(
+            json.contains("\"phases_absent_reason\":null"),
+            "a healthy attribution needs no reason: got: {json}"
+        );
+        assert!(json.contains("\"window_nanos\":6255"), "got: {json}");
+        assert!(json.contains("\"events_recorded\":777"), "got: {json}");
+
+        let human = render_human(&r);
+        assert!(
+            human.contains("core phases (window 6255 ns, counted):"),
+            "got: {human}"
+        );
+        assert!(
+            human.contains("wal_sync_io "),
+            "every phase name must appear: got: {human}"
+        );
+        // 5000/6255 = 79.9%
+        assert!(human.contains("79.9%"), "got: {human}");
+    }
+
+    /// Step 1's own wording: `phases` is ABSENT (not zeroed) on a passthrough
+    /// run — the cause `phase_accounting`'s own attribute() can never
+    /// itself report, since an empty passthrough trace attributes cleanly
+    /// to an all-`lead_in` `PhaseTotals` that LOOKS like a healthy, fast
+    /// run. A zeroed phase block is indistinguishable from a genuinely fast
+    /// one (`SweepPoint::syncs_per_sec`'s own `Option` precedent); this
+    /// proves the JSON key is `null`, never `{"lead_in": <window>, ...}`.
+    #[test]
+    fn phases_is_absent_not_zeroed_on_a_not_recording_arm() {
+        let mut r = fixed_report();
+        let k = r.kernel.as_mut().unwrap();
+        k.phases = None;
+        k.phases_counted = false;
+        k.phases_absent_reason = Some(PhasesAbsentReason::NotRecording);
+        k.window_nanos = 999_999;
+        k.events_recorded = 0;
+
+        let json = render_json(&r).expect("renders");
+        assert!(
+            json.contains("\"phases\":null"),
+            "absence must be `null`, not a zeroed object: got: {json}"
+        );
+        assert!(
+            !json.contains("\"lead_in\":999999"),
+            "the whole window must not have been folded into lead_in: got: {json}"
+        );
+        assert!(json.contains("\"phases_counted\":false"), "got: {json}");
+        assert!(
+            json.contains("\"phases_absent_reason\":\"not_recording\""),
+            "got: {json}"
+        );
+
+        let human = render_human(&r);
+        assert!(
+            human.contains("kernel phases: n/a (this arm was not recording)"),
+            "got: {human}"
+        );
+    }
+
+    /// Step 1: the three causes behind `phases: None` must be distinguishable
+    /// in the OUTPUT — without a consumer parsing prose out of `invalid`
+    /// (Ruling 2 / Task 3's Ruling 14). Each fixture below carries an EMPTY
+    /// `invalid` list, proving the distinction lives in `phases_absent_
+    /// reason` itself, not in text this test happens to also be able to grep.
+    #[test]
+    fn the_three_phase_absence_causes_are_distinguishable_without_parsing_invalid() {
+        let reasons = [
+            (
+                PhasesAbsentReason::AttributionRefused,
+                "attribution_refused",
+                "attribution refused, see invalid reasons",
+            ),
+            (
+                PhasesAbsentReason::TraceRegrew,
+                "trace_regrew",
+                "trace buffer regrew, see invalid reasons",
+            ),
+            (
+                PhasesAbsentReason::NotRecording,
+                "not_recording",
+                "this arm was not recording",
+            ),
+        ];
+        let mut seen_json_tags = std::collections::HashSet::new();
+        for (reason, json_tag, human_phrase) in reasons {
+            let mut r = fixed_report();
+            let c = r.core.as_mut().unwrap();
+            c.phases = None;
+            c.phases_counted = reason != PhasesAbsentReason::NotRecording;
+            c.phases_absent_reason = Some(reason);
+            r.invalid.clear(); // no prose to parse — the field alone must carry it
+
+            let json = render_json(&r).expect("renders");
+            assert!(
+                json.contains(&format!("\"phases_absent_reason\":\"{json_tag}\"")),
+                "reason {reason:?} got: {json}"
+            );
+            seen_json_tags.insert(json_tag);
+
+            let human = render_human(&r);
+            assert!(
+                human.contains(&format!("core phases: n/a ({human_phrase})")),
+                "reason {reason:?} got: {human}"
+            );
+        }
+        assert_eq!(
+            seen_json_tags.len(),
+            3,
+            "all three causes must produce three DISTINCT JSON tags, not two \
+             colliding onto one"
+        );
+    }
+
+    /// Hard rule 4 (assert invariants and negative space): `phases.is_none()`
+    /// and `phases_absent_reason.is_some()` must never disagree — a
+    /// construction site that sets one without the other is a bug this
+    /// module refuses to render silently.
+    #[test]
+    #[should_panic(expected = "phases_absent_reason must be Some exactly when phases is None")]
+    fn a_healthy_phases_block_with_a_stray_absent_reason_panics_rather_than_renders() {
+        let mut r = fixed_report();
+        let c = r.core.as_mut().unwrap();
+        c.phases = Some(healthy_phases());
+        c.phases_absent_reason = Some(PhasesAbsentReason::AttributionRefused);
+        let _ = render_json(&r);
+    }
+
+    #[test]
+    #[should_panic(expected = "an arm that was not recording must report NotRecording")]
+    fn an_uncounted_arm_with_a_different_reason_panics_rather_than_renders() {
+        let mut r = fixed_report();
+        let c = r.core.as_mut().unwrap();
+        c.phases = None;
+        c.phases_counted = false;
+        c.phases_absent_reason = Some(PhasesAbsentReason::TraceRegrew);
+        let _ = render_json(&r);
     }
 }

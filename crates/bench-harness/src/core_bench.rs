@@ -180,6 +180,18 @@ pub fn run(
     ) {
         invalid.push(reason);
     }
+    // Task 5: whether this arm was recording at all — always `true` for
+    // this function today (`Trace::recording` is the only trace this module
+    // ever constructs, above), computed rather than hardcoded so the
+    // `CoreReport` fields stay correct if this arm ever grows a passthrough
+    // mode the way `kernel_bench::run_with_trace_mode` already has.
+    let phases_counted = trace.is_recording();
+    // Captured unconditionally, before the capacity-growth check, mirroring
+    // `kernel_bench::run_with_trace_mode`'s identical reasoning: a refused
+    // trace should still report how many ops it recorded.
+    let events = trace.events();
+    let events_recorded = events.len() as u64;
+    let mut phases_absent_reason = None;
     // Ruling A (2026-08-19 phase-attribution plan): checked BEFORE attribute()
     // is even attempted. A grown buffer does not corrupt any recorded event's
     // own timestamps — attribute() would still return `Ok` and its closure
@@ -187,11 +199,18 @@ pub fn run(
     // function by construction (see `Trace::capacity_grew_reason`'s doc), so
     // there is nothing for attribute() to usefully check here; the refusal
     // has to happen at this layer instead.
-    let phases = if let Some(reason) = trace.capacity_grew_reason() {
+    let phases = if !phases_counted {
+        // Unreachable through this function today (see `phases_counted`'s
+        // comment above) — kept so `CoreReport`'s three-cause contract
+        // (Task 5, Ruling 2) is honoured rather than merely true by
+        // omission.
+        phases_absent_reason = Some(crate::report::PhasesAbsentReason::NotRecording);
+        None
+    } else if let Some(reason) = trace.capacity_grew_reason() {
         invalid.push(reason);
+        phases_absent_reason = Some(crate::report::PhasesAbsentReason::TraceRegrew);
         None
     } else {
-        let events = trace.events();
         match attribute(&events, window_start_nanos, window_end_nanos) {
             Ok(attribution) => {
                 // The payoff of fix round 3's R-1: a window stamped from the
@@ -215,6 +234,7 @@ pub fn run(
             }
             Err(refusals) => {
                 invalid.extend(refusals);
+                phases_absent_reason = Some(crate::report::PhasesAbsentReason::AttributionRefused);
                 None
             }
         }
@@ -333,7 +353,10 @@ pub fn run(
             device_appends_per_sec_before: obs.write.device_before,
             device_appends_per_sec_after: obs.write.device_after,
             phases,
+            phases_counted,
+            phases_absent_reason,
             window_nanos: window_end_nanos - window_start_nanos,
+            events_recorded,
         },
         invalid,
     ))
