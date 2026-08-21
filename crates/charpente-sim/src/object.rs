@@ -3,11 +3,16 @@
 //! Task 2 (`with_faults`) adds seeded fault injection (`object_put_error`,
 //! `object_get_error`, `object_lost_ack`); latency stays future work.
 //!
-//! State lives behind one `Mutex`, not `RefCell` — same reasoning as the
-//! rest of this crate (`lib.rs`'s `World`): the simulation is single-
-//! threaded and the lock is never contended, but `ObjectStore: Send`
-//! requires a handle that is honestly `Send`, and `Mutex<T>` gets that for
-//! free with no `unsafe`.
+//! State lives behind a `Mutex` and the fault stream behind a `RefCell`.
+//! Neither is forced by the trait: `ObjectStore` requires only `Send`, and
+//! `RefCell<T>` is `Send` whenever `T` is, so `RefCell` would serve for both.
+//! `lib.rs`'s `World` uses a `Mutex` for a reason that does NOT transfer
+//! here — it must be `Send + Sync`, because `File`'s supertrait requires it
+//! of storage engines mounted behind the boundary. `ObjectStore` has no such
+//! supertrait. The `Mutex` is therefore kept only because it also yields
+//! `Sync`, which no caller needs yet; consolidating both fields onto
+//! `RefCell` is deferred until the archive's ownership is known (it is the
+//! first caller that could plausibly need `Sync`).
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
