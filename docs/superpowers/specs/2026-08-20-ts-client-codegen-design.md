@@ -52,7 +52,7 @@ making `Contract` a published stable format; typed auth (see §3).
 
 ## §1 The type IR, and what `u64` / `Id<T>` become
 
-The IR lives in `charpente::describe` beside `Contract`, and `Contract` gains
+The IR lives in `charpente::wire`, and `Contract` (in `charpente::describe`) gains
 `types: Vec<TypeDef>` so slots hold references rather than inline structures — which is
 what makes reuse and recursive types expressible:
 
@@ -274,7 +274,8 @@ identical contract — is already a property of the introspection sub-project.
 
 | file | change |
 |---|---|
-| `crates/charpente/src/describe.rs` | `TypeSchema`, `TypeDef`, `Field`, `EnumRepr`; `Contract.types`; `Contract.events`; `RouteInfo` gains request/response/error `TypeRef`s and `emits` |
+| `crates/charpente/src/wire.rs` **(new)** | `TypeSchema`, `TypeDef`, `Field`, `EnumRepr`, `TypeRegistry`, the `Wire` trait and its primitive impls |
+| `crates/charpente/src/describe.rs` | `Contract.types`; `Contract.events`; `RouteInfo` gains request/response/error `TypeRef`s and `emits`. Stays the assembly point only. |
 | `crates/charpente-core/src/table.rs` | `Id<T>`: serde impls (string-encoded) |
 | `crates/charpente-macros` | `#[derive(Wire)]`; `#[route]` type capture + `emits(...)`; `#[event]` describe-time registration; the bare-`u64` diagnostic |
 | new codegen crate | `Contract` -> TypeScript emitter (pure, deterministic) |
