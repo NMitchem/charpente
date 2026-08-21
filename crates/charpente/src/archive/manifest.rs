@@ -402,6 +402,49 @@ mod tests {
         );
     }
 
+    fn one_segment_manifest(segments: Vec<SegmentRef>) -> Manifest {
+        Manifest {
+            generation: 1,
+            writer: "n".into(),
+            applied_seq: 0,
+            next_job_id: 0,
+            tables: vec![],
+            segments,
+            closed: false,
+        }
+    }
+
+    // encode()'s asserts are negative space (hard rule 4): the archive must
+    // never be able to SHIP a manifest it would itself refuse to decode.
+    // Without these two tests the asserts are unproven — removing them
+    // changes nothing observable, which is how an assertion silently stops
+    // being one.
+    #[test]
+    #[should_panic(expected = "discontiguous")]
+    fn encode_refuses_to_produce_a_holed_chain() {
+        let m = one_segment_manifest(vec![
+            SegmentRef {
+                base_seq: 0,
+                end_seq: 4095,
+            },
+            SegmentRef {
+                base_seq: 16384,
+                end_seq: 20479,
+            },
+        ]);
+        let _ = m.encode();
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds its own end_seq")]
+    fn encode_refuses_a_segment_that_ends_before_it_begins() {
+        let m = one_segment_manifest(vec![SegmentRef {
+            base_seq: 99,
+            end_seq: 4,
+        }]);
+        let _ = m.encode();
+    }
+
     #[test]
     fn manifest_roundtrips() {
         let m = Manifest {
