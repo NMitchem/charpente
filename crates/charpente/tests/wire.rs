@@ -230,11 +230,13 @@ fn a_non_numeric_id_string_is_refused_by_name() {
 #[test]
 fn an_id_refuses_a_bare_json_number() {
     // The exact mistake this sub-project exists to forbid: a JSON *number*
-    // form of an id, silently truncatable above 2^53 in a JS client. Nothing
-    // else in this file pins this — mutation: add `fn visit_u64` to `Id<T>`'s
-    // Visitor (charpente-core/src/table.rs) mapping straight to
-    // `Id::from_raw` and this test is the only thing in the whole suite that
-    // reddens.
+    // form of an id, silently truncatable above 2^53 in a JS client.
+    // Mutation: `Id<T>`'s `d.deserialize_str(V(...))` (table.rs) changed to
+    // `d.deserialize_any(V(...))`, PLUS a lenient `fn visit_u64` on the
+    // Visitor, reddens this. `visit_u64` alone is inert: serde_json's
+    // `deserialize_str` only calls the visitor on a `"` token and otherwise
+    // short-circuits into `peek_invalid_type`, so a numeric `visit_*` is
+    // unreachable on that path.
     let err = serde_json::from_str::<Id<Customer>>("9007199254740993").unwrap_err();
     assert!(
         err.to_string().contains("row id"),
