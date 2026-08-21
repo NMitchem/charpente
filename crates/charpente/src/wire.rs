@@ -200,3 +200,53 @@ impl<V: Wire> Wire for BTreeMap<String, V> {
         V::register(reg)
     }
 }
+
+// ---------------------------------------------------------------- 64-bit carriers
+
+/// Carries a `u64` across the wire as a decimal string. The generated TS type
+/// is `bigint`, parsed with `BigInt(str)` — lossless, unlike a JSON number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireU64(pub u64);
+
+/// The signed sibling of `WireU64`; same reasoning, same encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireI64(pub i64);
+
+macro_rules! wire_int {
+    ($t:ident, $inner:ty, $signed:expr, $what:expr) => {
+        impl serde::Serialize for $t {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.collect_str(&self.0)
+            }
+        }
+        impl<'de> serde::Deserialize<'de> for $t {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let s = <&str as serde::Deserialize>::deserialize(d)?;
+                s.parse::<$inner>().map($t).map_err(|_| {
+                    serde::de::Error::custom(format!(
+                        concat!($what, " must be a decimal string — got {:?}"),
+                        s
+                    ))
+                })
+            }
+        }
+        impl Wire for $t {
+            const WIRE_NAME: &'static str = "";
+            fn schema() -> TypeSchema {
+                TypeSchema::Int64 { signed: $signed }
+            }
+            fn register(_reg: &mut TypeRegistry) {}
+        }
+    };
+}
+
+wire_int!(WireU64, u64, false, "a WireU64");
+wire_int!(WireI64, i64, true, "a WireI64");
+
+impl<T: charpente_core::table::Row> Wire for charpente_core::table::Id<T> {
+    const WIRE_NAME: &'static str = "";
+    fn schema() -> TypeSchema {
+        TypeSchema::Id(T::TABLE)
+    }
+    fn register(_reg: &mut TypeRegistry) {}
+}

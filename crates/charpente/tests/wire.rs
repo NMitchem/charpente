@@ -1,4 +1,6 @@
-use charpente::wire::{TypeRegistry, TypeSchema, Wire};
+use charpente::table;
+use charpente::wire::{TypeRegistry, TypeSchema, Wire, WireI64, WireU64};
+use charpente_core::table::{Id, Row};
 
 #[test]
 fn primitives_describe_themselves() {
@@ -114,4 +116,50 @@ fn an_unnamed_types_reference_is_its_own_schema() {
     // Primitives have no name, so a reference IS the schema.
     assert_eq!(<bool as Wire>::reference(), <bool as Wire>::schema());
     assert_eq!(<bool as Wire>::reference(), TypeSchema::Bool);
+}
+
+#[test]
+fn wire_u64_and_i64_are_strings_and_lossless() {
+    let big = u64::MAX;
+    let json = serde_json::to_string(&WireU64(big)).unwrap();
+    assert_eq!(json, format!("\"{big}\""));
+    assert_eq!(serde_json::from_str::<WireU64>(&json).unwrap().0, big);
+
+    let neg = i64::MIN;
+    let json = serde_json::to_string(&WireI64(neg)).unwrap();
+    assert_eq!(json, format!("\"{neg}\""));
+    assert_eq!(serde_json::from_str::<WireI64>(&json).unwrap().0, neg);
+}
+
+#[test]
+fn wire_u64_and_i64_describe_themselves_as_signed_int64() {
+    assert_eq!(
+        <WireU64 as Wire>::schema(),
+        TypeSchema::Int64 { signed: false }
+    );
+    assert_eq!(
+        <WireI64 as Wire>::schema(),
+        TypeSchema::Int64 { signed: true }
+    );
+}
+
+#[table]
+struct WireTestRow {
+    id: Id<WireTestRow>,
+}
+
+#[test]
+fn an_ids_wire_schema_names_its_table() {
+    // Catches a schema that hardcodes some other table name, or that returns
+    // a plain Int64/String instead of the branded Id(table) variant.
+    assert_eq!(
+        <Id<WireTestRow> as Wire>::schema(),
+        TypeSchema::Id(WireTestRow::TABLE)
+    );
+    // Id, like the other primitives, is anonymous on the wire: a reference IS
+    // the schema, not a Ref into the registry.
+    assert_eq!(
+        <Id<WireTestRow> as Wire>::reference(),
+        <Id<WireTestRow> as Wire>::schema()
+    );
 }
