@@ -190,7 +190,9 @@ pub trait ObjectStore: Send {
     fn start(&self, op: ObjectOp) -> io::Result<()>;
 
     /// `None` means no completion available — nothing started, or still in
-    /// flight (same `Ok(None)` shape as `Listener::accept`/`Conn::recv`).
+    /// flight; the two are deliberately indistinguishable. Non-blocking like
+    /// `Listener::accept`/`Conn::recv`, but nested the other way round: a
+    /// failed op IS a completion, so the error rides inside the `Some`.
     fn poll(&self) -> Option<io::Result<ObjectDone>>;
 }
 
