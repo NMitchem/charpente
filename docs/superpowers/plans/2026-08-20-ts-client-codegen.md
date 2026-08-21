@@ -14,7 +14,14 @@
 
 - **Read `CLAUDE.md` before writing code.** Its hard rules override default behavior.
 - **No ambient nondeterminism.** The emitter is a pure function of `Contract`. No clocks, no RNG, no filesystem reads inside it, no `HashMap` iteration order — `BTreeMap`/sorted `Vec` only. Generation must be byte-identical across runs and machines (spec §4).
-- **No new dependency inside the deterministic boundary.** `charpente-core` gains no dependency in this plan. The emitter crate may depend only on `serde`/`serde_json` and `charpente` (for `Contract`).
+- **No new dependency inside the deterministic boundary** — meaning CLAUDE.md's rule: nothing
+  that does its own IO, threading, or time. **AMENDED at Task 2 (Ruling 13):** `charpente-core`
+  gains `serde` (no `derive` feature). Rust's orphan rule forces `Serialize`/`Deserialize` for
+  `Id<T>` into the crate that owns `Id<T>`, and serde's traits are pure computation — no IO, no
+  threading, no time. serde is already in this workspace's build graph (`charpente/Cargo.toml:11`,
+  `Cargo.lock:528`), so this adds a manifest line, not third-party code. `Codec` stays hand-rolled:
+  serde must never become the on-disk format, and a test pins the 8-byte little-endian encoding
+  so that stays mechanical. No OTHER core dependency is in scope. The emitter crate may depend only on `serde`/`serde_json` and `charpente` (for `Contract`).
 - **Error messages are product surface** (hard rule 5). Every diagnostic names the contract, the site, and the fix, and is pinned by a test against its exact text.
 - **Public-API changes update docs in the same commit** (hard rule 6).
 - **Assertions in the TigerBeetle style** (hard rule 4) — assert negative space in core code.
