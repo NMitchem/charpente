@@ -14,6 +14,7 @@ pub mod checks;
 mod disk;
 pub mod harness;
 mod net;
+pub mod object;
 pub mod rng;
 
 use std::collections::BTreeMap;

@@ -154,6 +154,45 @@ pub trait Conn {
     fn peer_addr(&self) -> String;
 }
 
+/// One object-storage operation. Whole-object, never offset-addressed —
+/// object stores have no partial writes (DESIGN §1, archive spec §1).
+#[derive(Debug)]
+pub enum ObjectOp {
+    Put { key: String, data: Vec<u8> },
+    Get { key: String },
+    List { prefix: String },
+    Delete { key: String },
+}
+
+/// The completion of an `ObjectOp`.
+#[derive(Debug)]
+pub enum ObjectDone {
+    Put,
+    Get(Vec<u8>),
+    /// All keys under the prefix, sorted — callers must never depend on
+    /// enumeration order, same rule as `Disk::list`.
+    List(Vec<String>),
+    Delete,
+}
+
+/// Off-box object storage. One operation in flight at a time.
+///
+/// **A PUT is atomic.** A failed PUT leaves the key absent or holding its
+/// previous value, never half of the new one — the precise opposite of
+/// `File`'s torn-write contract, and the reason this is not `Disk` reuse.
+/// There is no `sync_dir` analogue: there is no directory entry to persist.
+/// Ordering between distinct keys is NOT guaranteed.
+///
+/// `Send` for the same reason as `Disk`: `App` crosses into the kernel thread.
+pub trait ObjectStore: Send {
+    /// Begins `op`. Asserts nothing is already in flight — a second `start`
+    /// before `poll` returns `Some` is a caller bug, not a runtime condition.
+    fn start(&self, op: ObjectOp) -> io::Result<()>;
+
+    /// `None` means still in flight.
+    fn poll(&self) -> Option<io::Result<ObjectDone>>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
