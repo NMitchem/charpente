@@ -1,6 +1,7 @@
 use charpente::table;
 use charpente::wire::{TypeRegistry, TypeSchema, Wire, WireI64, WireU64};
 use charpente_core::table::{Id, Row};
+use charpente_macros::Wire as WireDerive;
 
 #[test]
 fn primitives_describe_themselves() {
@@ -256,5 +257,175 @@ fn wire_u64_names_the_contract_when_given_a_json_number() {
         "invalid type: integer `12`, expected a WireU64 as a decimal string — 64-bit \
          integers cross the wire as strings because a JSON number silently loses \
          precision above 2^53 in JavaScript clients at line 1 column 2"
+    );
+}
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LineItem {
+    unit_amount_cents: u32,
+    #[serde(rename = "qty")]
+    quantity: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+#[test]
+fn the_derive_uses_serde_names_not_rust_names() {
+    let TypeSchema::Struct { fields } = <LineItem as Wire>::schema() else {
+        panic!("expected a struct schema");
+    };
+    let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, vec!["unitAmountCents", "qty", "note"]);
+}
+
+#[test]
+fn skip_serializing_if_makes_a_field_optional() {
+    let TypeSchema::Struct { fields } = <LineItem as Wire>::schema() else {
+        panic!("expected a struct schema");
+    };
+    let note = fields.iter().find(|f| f.name == "note").unwrap();
+    assert!(
+        note.optional,
+        "a skip_serializing_if field is optional on the wire"
+    );
+    assert!(!fields[0].optional, "a plain field is not optional");
+}
+
+#[test]
+fn the_derive_registers_itself_under_its_name() {
+    let mut reg = TypeRegistry::default();
+    <LineItem as Wire>::register(&mut reg);
+    let defs = reg.into_sorted();
+    assert_eq!(defs.len(), 1);
+    assert_eq!(defs[0].name, "LineItem");
+}
+
+#[derive(WireDerive, serde::Serialize)]
+struct Inner {
+    v: u32,
+}
+
+#[derive(WireDerive, serde::Serialize)]
+struct Outer {
+    inner: Inner,
+}
+
+#[test]
+fn a_nested_named_field_is_a_ref_not_an_inline_expansion() {
+    // Mutation: swap `.reference()` back to `.schema()` on the field's
+    // `schema:` (crates/charpente-macros/src/wire.rs) — the field would
+    // become `Struct { fields: [...] }` instead of `Ref("Inner")`, and this
+    // goes red. `Wire::reference()`'s own contract says named types become
+    // `Ref` "for use in a FIELD or route position" specifically so the
+    // emitter does not inline them (Task 1) — inlining also means a
+    // self-referential type recurses forever at runtime (see the next test).
+    let TypeSchema::Struct { fields } = <Outer as Wire>::schema() else {
+        panic!("expected a struct schema");
+    };
+    assert_eq!(fields[0].schema, TypeSchema::Ref("Inner"));
+}
+
+#[test]
+fn registering_a_struct_registers_its_named_field_types_too() {
+    let mut reg = TypeRegistry::default();
+    <Outer as Wire>::register(&mut reg);
+    let defs = reg.into_sorted();
+    let names: Vec<&str> = defs.iter().map(|d| d.name).collect();
+    assert_eq!(names, vec!["Inner", "Outer"]);
+}
+
+#[derive(WireDerive, serde::Serialize)]
+struct TreeNode {
+    children: Vec<TreeNode>,
+}
+
+#[test]
+fn a_self_referential_type_does_not_recurse_forever() {
+    // Would stack-overflow under `Vec<T>::schema()` calling `T::schema()`
+    // (Task 1's original impl) or the derive's field schema calling
+    // `.schema()` instead of `.reference()`: neither has a base case for a
+    // self-referential `T`. `.reference()` is that base case — a named type
+    // reached a second time returns `Ref(name)` instead of expanding again.
+    let TypeSchema::Struct { fields } = <TreeNode as Wire>::schema() else {
+        panic!("expected a struct schema");
+    };
+    assert_eq!(
+        fields[0].schema,
+        TypeSchema::Seq(Box::new(TypeSchema::Ref("TreeNode")))
+    );
+}
+
+#[test]
+#[should_panic(expected = "is registered with two different shapes")]
+fn a_wire_name_collision_between_two_derived_types_panics_and_names_both() {
+    // Two distinct Rust types that happen to share a bare struct name
+    // (plausible across two modules) must NOT silently let the
+    // first-registered one win — `register()`'s recursion guard would do
+    // exactly that if it checked `contains` BEFORE calling `insert_as`
+    // (mutation: swap the two back to that order in
+    // crates/charpente-macros/src/wire.rs), because the second call would
+    // see the name already taken and return before ever comparing shapes.
+    mod a {
+        #[derive(charpente_macros::Wire)]
+        pub struct Dup {
+            pub x: u32,
+        }
+    }
+    mod b {
+        #[derive(charpente_macros::Wire)]
+        pub struct Dup {
+            pub y: String,
+        }
+    }
+    // Read back through, not just constructed: these two shapes exist only
+    // to collide on WIRE_NAME, but an unread field is dead code.
+    assert_eq!(a::Dup { x: 1 }.x, 1);
+    assert_eq!(b::Dup { y: "y".to_string() }.y, "y");
+    let mut reg = TypeRegistry::default();
+    <a::Dup as Wire>::register(&mut reg);
+    <b::Dup as Wire>::register(&mut reg);
+}
+
+#[test]
+fn the_collision_panic_names_both_colliding_rust_types() {
+    // Same setup as above, but checks the panic MESSAGE (hard rule 5) rather
+    // than just that it panics: it must name both `a::Dup` and `b::Dup`, not
+    // just the shared wire name "Dup" — that's the whole point of
+    // `insert_as` over plain `insert` (TypeRegistry::insert_as's doc
+    // comment). `std::panic::catch_unwind`, not `#[should_panic(expected)]`:
+    // the latter only checks a SUBSTRING, and two independent substring
+    // checks can't confirm both fragments appeared in the SAME message
+    // (each could hide in the other assertion's unseen half).
+    mod a {
+        #[derive(charpente_macros::Wire)]
+        pub struct Dup {
+            pub x: u32,
+        }
+    }
+    mod b {
+        #[derive(charpente_macros::Wire)]
+        pub struct Dup {
+            pub y: String,
+        }
+    }
+    // Read back through, not just constructed: these two shapes exist only
+    // to collide on WIRE_NAME, but an unread field is dead code.
+    assert_eq!(a::Dup { x: 1 }.x, 1);
+    assert_eq!(b::Dup { y: "y".to_string() }.y, "y");
+    let result = std::panic::catch_unwind(|| {
+        let mut reg = TypeRegistry::default();
+        <a::Dup as Wire>::register(&mut reg);
+        <b::Dup as Wire>::register(&mut reg);
+    });
+    let err = result.unwrap_err();
+    let msg = err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .expect("panic payload must be a string");
+    assert!(
+        msg.contains("a::Dup") && msg.contains("b::Dup"),
+        "panic message must name BOTH colliding Rust types, got: {msg}"
     );
 }

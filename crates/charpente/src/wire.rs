@@ -70,9 +70,13 @@ pub struct TypeDef {
 
 /// Collects the transitive closure of named types a contract references.
 /// `BTreeMap`, not `HashMap`: generation must be byte-deterministic (spec §4).
+///
+/// Each entry also carries the Rust type responsible for it (see `insert_as`)
+/// — not exposed through `into_sorted`, kept only so a collision panic can
+/// name the two colliding Rust types, not just the wire name they share.
 #[derive(Default)]
 pub struct TypeRegistry {
-    defs: BTreeMap<&'static str, TypeSchema>,
+    defs: BTreeMap<&'static str, (TypeSchema, &'static str)>,
 }
 
 impl TypeRegistry {
@@ -86,24 +90,41 @@ impl TypeRegistry {
     /// produce a `Contract.types` entry that matches only one of the two Rust types
     /// `Ref`-ing it, so it panics rather than silently keeping the last writer
     /// (hard rule 4 — assert negative space).
+    ///
+    /// Equivalent to `insert_as(name, schema, name)` — for a caller with no better
+    /// Rust type identity to offer than the wire name itself.
     pub fn insert(&mut self, name: &'static str, schema: TypeSchema) -> bool {
+        self.insert_as(name, schema, name)
+    }
+
+    /// Same contract as `insert`, but also records the Rust type responsible for
+    /// this entry — pass `std::any::type_name::<Self>()`. `#[derive(Wire)]` is the
+    /// first (and, so far, only) caller with real type identity to offer: it lets
+    /// a collision panic name BOTH colliding Rust types, which matters because two
+    /// types in different modules can share the same bare name.
+    pub fn insert_as(
+        &mut self,
+        name: &'static str,
+        schema: TypeSchema,
+        rust_type: &'static str,
+    ) -> bool {
         assert!(
             !name.is_empty(),
             "TypeRegistry::insert: WIRE_NAME cannot be empty — \"\" means \
              \"anonymous/inline\" (what Wire::reference() checks to skip the \
              registry entirely), never a real named type"
         );
-        if let Some(prev) = self.defs.get(name) {
+        if let Some((prev_schema, prev_type)) = self.defs.get(name) {
             assert!(
-                *prev == schema,
+                *prev_schema == schema,
                 "TypeRegistry::insert: wire name \"{name}\" is registered with two \
-                 different shapes — every Wire type needs a WIRE_NAME unique \
-                 wire-wide (one shape per wire name); rename one of the two \
-                 colliding Rust types so their WIRE_NAME differs"
+                 different shapes, by `{prev_type}` and `{rust_type}` — every Wire \
+                 type needs a WIRE_NAME unique wire-wide (one shape per wire name); \
+                 rename one of the two colliding Rust types so their WIRE_NAME differs"
             );
             return true;
         }
-        self.defs.insert(name, schema);
+        self.defs.insert(name, (schema, rust_type));
         false
     }
 
@@ -114,7 +135,7 @@ impl TypeRegistry {
     pub fn into_sorted(self) -> Vec<TypeDef> {
         self.defs
             .into_iter()
-            .map(|(name, schema)| TypeDef { name, schema })
+            .map(|(name, (schema, _))| TypeDef { name, schema })
             .collect()
     }
 }
@@ -174,7 +195,14 @@ prim! {
 impl<T: Wire> Wire for Option<T> {
     const WIRE_NAME: &'static str = "";
     fn schema() -> TypeSchema {
-        TypeSchema::Option(Box::new(T::schema()))
+        // `T::reference()`, not `T::schema()`: a named `T` must show up as
+        // `Ref(name)` here, the same as it would in a struct field — an
+        // `Option<T>` is itself always anonymous (empty WIRE_NAME), but its
+        // element is not. Using `schema()` would inline `T` instead of
+        // referencing it, and for a self-referential `T` would recurse
+        // forever at runtime (`schema()` has no base case; `reference()` is
+        // the base case for every named type).
+        TypeSchema::Option(Box::new(T::reference()))
     }
     fn register(reg: &mut TypeRegistry) {
         T::register(reg)
@@ -184,7 +212,8 @@ impl<T: Wire> Wire for Option<T> {
 impl<T: Wire> Wire for Vec<T> {
     const WIRE_NAME: &'static str = "";
     fn schema() -> TypeSchema {
-        TypeSchema::Seq(Box::new(T::schema()))
+        // See `Option<T>::schema()` above — same reasoning.
+        TypeSchema::Seq(Box::new(T::reference()))
     }
     fn register(reg: &mut TypeRegistry) {
         T::register(reg)
@@ -194,7 +223,8 @@ impl<T: Wire> Wire for Vec<T> {
 impl<V: Wire> Wire for BTreeMap<String, V> {
     const WIRE_NAME: &'static str = "";
     fn schema() -> TypeSchema {
-        TypeSchema::Map(Box::new(V::schema()))
+        // See `Option<T>::schema()` above — same reasoning.
+        TypeSchema::Map(Box::new(V::reference()))
     }
     fn register(reg: &mut TypeRegistry) {
         V::register(reg)
