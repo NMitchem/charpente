@@ -1,0 +1,19 @@
+error: #[derive(Wire)] structs cannot be generic — a wire type is one concrete shape; make `Generic` non-generic
+ --> tests/compile_fail/wire_shape_errors.rs:8:15
+  |
+8 | struct Generic<T> {
+  |               ^^^
+
+error: #[derive(Wire)] applies to structs — enum support lands in Task 4
+  --> tests/compile_fail/wire_shape_errors.rs:13:1
+   |
+13 | / enum NotAStruct {
+14 | |     A,
+15 | | }
+   | |_^
+
+error: #[derive(Wire)] needs named fields — `TupleStruct` must be a braced struct
+  --> tests/compile_fail/wire_shape_errors.rs:18:1
+   |
+18 | struct TupleStruct(u32);
+   | ^^^^^^^^^^^^^^^^^^^^^^^^

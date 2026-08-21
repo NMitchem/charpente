@@ -429,3 +429,362 @@ fn the_collision_panic_names_both_colliding_rust_types() {
         "panic message must name BOTH colliding Rust types, got: {msg}"
     );
 }
+
+// ------------------------------------------------------------ fidelity probe
+//
+// The permanent form of the reviewer's fidelity probe (fix round 1): derive
+// `Wire` and `Serialize` on the same struct, serialize a real instance, and
+// assert the JSON's keys equal the schema's field names. This is the only
+// oracle that can catch the derive silently disagreeing with what serde
+// actually emits — the F1 defect class (a swallowed parse error dropping an
+// attribute later in the same `#[serde(...)]` list) passed every prior test
+// in this file, because none of them cross-checked against real `serde_json`
+// output for a MULTI-item attribute list.
+
+/// Extracts a JSON object's top-level keys IN EMISSION ORDER. Going through
+/// `serde_json::Value` would silently re-sort them (`serde_json::Map` is a
+/// `BTreeMap` unless the `preserve_order` feature is on, which this crate
+/// does not enable) — this instead drives `serde_json`'s own parser with a
+/// `Visitor` whose `visit_map` receives keys in the order they appear in the
+/// input, which is what a positional (rust name -> serde name -> schema
+/// name) comparison needs.
+fn json_keys(json: &str) -> Vec<String> {
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Vec<String>, A::Error> {
+            let mut keys = Vec::new();
+            while let Some(key) = map.next_key::<String>()? {
+                let _: serde_json::Value = map.next_value()?;
+                keys.push(key);
+            }
+            Ok(keys)
+        }
+    }
+    struct Wrapper(Vec<String>);
+    impl<'de> serde::Deserialize<'de> for Wrapper {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            d.deserialize_map(V).map(Wrapper)
+        }
+    }
+    serde_json::from_str::<Wrapper>(json).unwrap().0
+}
+
+fn schema_field_names<T: Wire>() -> Vec<String> {
+    let TypeSchema::Struct { fields } = <T as Wire>::schema() else {
+        panic!("expected a struct schema");
+    };
+    fields.into_iter().map(|f| f.name).collect()
+}
+
+#[derive(WireDerive, serde::Serialize)]
+struct FidelityPlain {
+    alpha: u32,
+    beta_gamma: u32,
+}
+
+#[test]
+fn fidelity_plain_fields_are_unchanged() {
+    let v = FidelityPlain {
+        alpha: 1,
+        beta_gamma: 2,
+    };
+    let json = serde_json::to_string(&v).unwrap();
+    let expect = vec!["alpha", "beta_gamma"];
+    assert_eq!(json_keys(&json), expect);
+    assert_eq!(schema_field_names::<FidelityPlain>(), expect);
+}
+
+#[derive(WireDerive, serde::Serialize)]
+struct FidelityRename {
+    #[serde(rename = "qty")]
+    quantity: u32,
+}
+
+#[test]
+fn fidelity_field_rename_matches_serde() {
+    let v = FidelityRename { quantity: 1 };
+    let json = serde_json::to_string(&v).unwrap();
+    let expect = vec!["qty"];
+    assert_eq!(json_keys(&json), expect);
+    assert_eq!(schema_field_names::<FidelityRename>(), expect);
+}
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FidelityCamel {
+    unit_amount_cents: u32,
+    _id: u32,
+    x: u32,
+    trailing_: u32,
+}
+
+#[test]
+fn fidelity_camel_case_matches_serde_including_underscore_edge_cases() {
+    // The `a__b` -> `aB` (double-underscore) case is pinned directly against
+    // `to_camel_case` in crates/charpente-macros/src/wire.rs's own unit
+    // tests instead of here: a real struct field literally named `a__b`
+    // trips rustc's `non_snake_case` lint (it flags consecutive underscores
+    // as non-canonical, suggesting `a_b`), which would fail `-D warnings`.
+    let v = FidelityCamel {
+        unit_amount_cents: 1,
+        _id: 2,
+        x: 3,
+        trailing_: 4,
+    };
+    let json = serde_json::to_string(&v).unwrap();
+    let expect = vec!["unitAmountCents", "id", "x", "trailing"];
+    assert_eq!(json_keys(&json), expect);
+    assert_eq!(schema_field_names::<FidelityCamel>(), expect);
+}
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+struct FidelitySnake {
+    unit_amount_cents: u32,
+    _id: u32,
+}
+
+#[test]
+fn fidelity_explicit_snake_case_is_a_no_op_matching_serde() {
+    let v = FidelitySnake {
+        unit_amount_cents: 1,
+        _id: 2,
+    };
+    let json = serde_json::to_string(&v).unwrap();
+    let expect = vec!["unit_amount_cents", "_id"];
+    assert_eq!(json_keys(&json), expect);
+    assert_eq!(schema_field_names::<FidelitySnake>(), expect);
+}
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+struct FidelityScreaming {
+    unit_amount_cents: u32,
+    _id: u32,
+}
+
+#[test]
+fn fidelity_screaming_snake_case_matches_serde() {
+    let v = FidelityScreaming {
+        unit_amount_cents: 1,
+        _id: 2,
+    };
+    let json = serde_json::to_string(&v).unwrap();
+    let expect = vec!["UNIT_AMOUNT_CENTS", "_ID"];
+    assert_eq!(json_keys(&json), expect);
+    assert_eq!(schema_field_names::<FidelityScreaming>(), expect);
+}
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct FidelityKebab {
+    unit_amount_cents: u32,
+    _id: u32,
+}
+
+#[test]
+fn fidelity_kebab_case_matches_serde() {
+    let v = FidelityKebab {
+        unit_amount_cents: 1,
+        _id: 2,
+    };
+    let json = serde_json::to_string(&v).unwrap();
+    let expect = vec!["unit-amount-cents", "-id"];
+    assert_eq!(json_keys(&json), expect);
+    assert_eq!(schema_field_names::<FidelityKebab>(), expect);
+}
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FidelityNesting {
+    the_inner: Inner,
+    many: Vec<Inner>,
+}
+
+#[test]
+fn fidelity_nested_and_vec_wrapped_named_types_match_serde() {
+    let v = FidelityNesting {
+        the_inner: Inner { v: 1 },
+        many: vec![Inner { v: 2 }],
+    };
+    let json = serde_json::to_string(&v).unwrap();
+    let expect = vec!["theInner", "many"];
+    assert_eq!(json_keys(&json), expect);
+    assert_eq!(schema_field_names::<FidelityNesting>(), expect);
+}
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FidelityOptional {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    maybe_note: Option<String>,
+    plain_opt: Option<String>,
+}
+
+#[test]
+fn fidelity_skip_serializing_if_field_is_present_when_some() {
+    let v = FidelityOptional {
+        maybe_note: Some("hi".to_string()),
+        plain_opt: Some("x".to_string()),
+    };
+    let json = serde_json::to_string(&v).unwrap();
+    assert_eq!(json_keys(&json), vec!["maybeNote", "plainOpt"]);
+}
+
+#[test]
+fn fidelity_skip_serializing_if_field_is_absent_when_none_but_plain_option_stays() {
+    let v = FidelityOptional {
+        maybe_note: None,
+        plain_opt: None,
+    };
+    let json = serde_json::to_string(&v).unwrap();
+    // `maybeNote` is genuinely gone from the wire when `None`; `plainOpt`
+    // stays present (as `null`) because it has no `skip_serializing_if`.
+    assert_eq!(json_keys(&json), vec!["plainOpt"]);
+}
+
+#[test]
+fn fidelity_optional_schema_matches_serdes_actual_optionality() {
+    let TypeSchema::Struct { fields } = <FidelityOptional as Wire>::schema() else {
+        panic!("expected a struct schema");
+    };
+    let maybe_note = fields.iter().find(|f| f.name == "maybeNote").unwrap();
+    let plain_opt = fields.iter().find(|f| f.name == "plainOpt").unwrap();
+    assert!(maybe_note.optional);
+    assert!(!plain_opt.optional);
+}
+
+#[derive(WireDerive, serde::Serialize)]
+struct FidelitySkip {
+    kept_one: u32,
+    #[serde(skip)]
+    hidden_two: u32,
+    kept_three: u32,
+    #[serde(skip_serializing)]
+    gone: u32,
+}
+
+#[test]
+fn fidelity_skip_and_skip_serializing_omit_the_field_from_both_wire_and_schema() {
+    // Mutation: drop the `if attrs.skip { continue; }` short-circuit in the
+    // derive's field loop (crates/charpente-macros/src/wire.rs) — the
+    // schema would then claim `hiddenTwo`/`gone` as REQUIRED fields serde
+    // never emits, the worst shape available (review F2): the generated TS
+    // declares a required property whose value is always `undefined`.
+    let v = FidelitySkip {
+        kept_one: 1,
+        hidden_two: 2,
+        kept_three: 3,
+        gone: 4,
+    };
+    // Read back, not just constructed: `skip`/`skip_serializing` fields are
+    // never touched by the derived `Serialize` impl, so an unread field
+    // would be dead code.
+    assert_eq!(v.hidden_two, 2);
+    assert_eq!(v.gone, 4);
+    let json = serde_json::to_string(&v).unwrap();
+    let expect = vec!["kept_one", "kept_three"];
+    assert_eq!(json_keys(&json), expect);
+    assert_eq!(schema_field_names::<FidelitySkip>(), expect);
+}
+
+#[derive(WireDerive, serde::Serialize)]
+struct FidelityMultiItemOrder {
+    #[serde(skip_serializing_if = "Option::is_none", rename = "bbb")]
+    second_field: Option<String>,
+    #[serde(rename = "aaa", skip_serializing_if = "Option::is_none")]
+    first_field: Option<String>,
+}
+
+#[test]
+fn fidelity_a_multi_item_serde_list_keeps_every_item_regardless_of_order() {
+    // The F1 root cause: a recognized `#[serde(...)]` item that doesn't
+    // consume its own `= value` (e.g. `skip_serializing_if`'s old shape,
+    // which only set a flag and never called `meta.value()`) leaves a
+    // dangling `= "..."` for syn's outer loop, which then wants a `,` and
+    // instead finds `=` — `expected \`,\`` — aborting the walk and losing
+    // every item AFTER it in the same list. `let _ = attr.parse_nested_meta`
+    // used to additionally swallow that error into silence; propagating it
+    // (`?`) surfaces it as a compile error instead, but does NOT by itself
+    // stop the walk from aborting early — only fully consuming every
+    // recognized item's value does that. `second_field` puts
+    // `skip_serializing_if` BEFORE `rename` in the list; `first_field` puts
+    // them in the opposite order, proving both orders survive.
+    //
+    // Mutation: in `field_serde_attrs`'s `skip_serializing_if` arm, stop
+    // consuming the value (`let _: LitStr = meta.value()?.parse()?;` ->
+    // just `out.skip_serializing_if = true;`) — reproduces the historical
+    // bug shape exactly. This doesn't merely flip an assertion: since `?`
+    // now propagates the resulting `expected \`,\`` error as a genuine
+    // compile error, the WHOLE FILE fails to build (every `#[derive(Wire)]`
+    // struct using `skip_serializing_if` in a multi-item list, including
+    // `LineItem` and `FidelityOptional`, cascades into "trait `Wire` is not
+    // implemented" errors) — RED as a build failure, not a run failure.
+    let v = FidelityMultiItemOrder {
+        second_field: Some("x".to_string()),
+        first_field: Some("y".to_string()),
+    };
+    let json = serde_json::to_string(&v).unwrap();
+    let expect = vec!["bbb", "aaa"];
+    assert_eq!(json_keys(&json), expect);
+    assert_eq!(schema_field_names::<FidelityMultiItemOrder>(), expect);
+
+    let TypeSchema::Struct { fields } = <FidelityMultiItemOrder as Wire>::schema() else {
+        panic!("expected a struct schema");
+    };
+    assert!(
+        fields[0].optional,
+        "bbb (skip_serializing_if listed FIRST) must still be optional"
+    );
+    assert!(
+        fields[1].optional,
+        "aaa (skip_serializing_if listed SECOND) must still be optional"
+    );
+}
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FidelityNonAsciiCamel {
+    a_émile: u32,
+}
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+struct FidelityNonAsciiScreaming {
+    a_émile: u32,
+}
+
+#[test]
+fn fidelity_non_ascii_identifiers_use_serdes_ascii_only_case_folding() {
+    // Mutation: swap `to_ascii_uppercase`/`to_ascii_lowercase` back to
+    // `char::to_uppercase`/`to_lowercase` (Unicode-aware) in
+    // crates/charpente-macros/src/wire.rs — goes red. serde's `rename_all`
+    // is ASCII-only, so `é` passes through untouched on both sides;
+    // Unicode-aware conversion would instead produce `"aÉmile"` /
+    // `"A_ÉMILE"`.
+    let camel = FidelityNonAsciiCamel { a_émile: 1 };
+    let expect_camel = vec!["aémile"];
+    assert_eq!(
+        json_keys(&serde_json::to_string(&camel).unwrap()),
+        expect_camel
+    );
+    assert_eq!(schema_field_names::<FidelityNonAsciiCamel>(), expect_camel);
+
+    let screaming = FidelityNonAsciiScreaming { a_émile: 1 };
+    let expect_screaming = vec!["A_éMILE"];
+    assert_eq!(
+        json_keys(&serde_json::to_string(&screaming).unwrap()),
+        expect_screaming
+    );
+    assert_eq!(
+        schema_field_names::<FidelityNonAsciiScreaming>(),
+        expect_screaming
+    );
+}

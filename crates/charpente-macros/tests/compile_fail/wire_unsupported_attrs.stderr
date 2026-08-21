@@ -1,0 +1,53 @@
+error: #[derive(Wire)] does not support serde's `flatten` — it hoists the inner type's fields into this struct, which the wire IR cannot express; write the inner type's fields out on this struct directly instead
+  --> tests/compile_fail/wire_unsupported_attrs.rs:11:13
+   |
+11 |     #[serde(flatten)]
+   |             ^^^^^^^
+
+error: #[derive(Wire)] does not support serde's `default` — it changes whether the field may be absent, and the right wire semantics differ between a request type (absence is meaningful) and a response type (this server always writes a value); use `Option<T>` or `#[serde(skip_serializing_if = ...)]` to say what you mean explicitly instead
+  --> tests/compile_fail/wire_unsupported_attrs.rs:17:13
+   |
+17 |     #[serde(default)]
+   |             ^^^^^^^
+
+error: #[derive(Wire)] does not support serde's `default` — it changes whether the field may be absent, and the right wire semantics differ between a request type (absence is meaningful) and a response type (this server always writes a value); use `Option<T>` or `#[serde(skip_serializing_if = ...)]` to say what you mean explicitly instead
+  --> tests/compile_fail/wire_unsupported_attrs.rs:23:13
+   |
+23 |     #[serde(default = "make_value")]
+   |             ^^^^^^^^^^^^^^^^^^^^^^
+
+error: #[derive(Wire)] does not support serde's struct-level `tag = "..."` — it adds a wire field the schema does not model; enum tagging is a separate concern (Task 4), and a struct-level tag is out of scope here
+  --> tests/compile_fail/wire_unsupported_attrs.rs:28:9
+   |
+28 | #[serde(tag = "kind")]
+   |         ^^^
+
+error: #[derive(Wire)] does not support serde's split `rename(serialize = ...)` / `rename(deserialize = ...)` form — a wire schema is one shape, and divergent serialize/deserialize names can't be represented; use plain `rename = "..."` instead
+  --> tests/compile_fail/wire_unsupported_attrs.rs:35:13
+   |
+35 |     #[serde(rename(serialize = "v"))]
+   |             ^^^^^^
+
+error: #[derive(Wire)] does not support serde's split `rename_all(serialize = ...)` / `rename_all(deserialize = ...)` form — a wire schema is one shape, and divergent serialize/deserialize names can't be represented; use plain `rename_all = "..."` instead
+  --> tests/compile_fail/wire_unsupported_attrs.rs:40:9
+   |
+40 | #[serde(rename_all(serialize = "camelCase"))]
+   |         ^^^^^^^^^^
+
+error: #[derive(Wire)] does not support serde's `skip_deserializing` — the field is still emitted on the wire (only reads are affected), so whether a client may omit it going IN differs by whether this type is a request or a response body; write the field out normally, or use `skip` / `skip_serializing` if it should never appear at all
+  --> tests/compile_fail/wire_unsupported_attrs.rs:47:13
+   |
+47 |     #[serde(skip_deserializing)]
+   |             ^^^^^^^^^^^^^^^^^^
+
+error: #[derive(Wire)] does not recognize serde's `borrow` on a field — an attribute this derive doesn't have logic for is rejected rather than silently ignored, because a silently wrong schema is worse than a compile error; supported on a field: `rename`, `skip`, `skip_serializing`, `skip_serializing_if`
+  --> tests/compile_fail/wire_unsupported_attrs.rs:53:13
+   |
+53 |     #[serde(borrow)]
+   |             ^^^^^^
+
+error: #[derive(Wire)] does not recognize serde's `deny_unknown_fields` on a struct — an attribute this derive doesn't have logic for is rejected rather than silently ignored, because a silently wrong schema is worse than a compile error; supported on a struct: `rename_all`
+  --> tests/compile_fail/wire_unsupported_attrs.rs:58:9
+   |
+58 | #[serde(deny_unknown_fields)]
+   |         ^^^^^^^^^^^^^^^^^^^

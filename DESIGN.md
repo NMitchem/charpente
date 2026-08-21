@@ -467,8 +467,10 @@ platform is one dependency, not two.
 - **Wire.** `Wire` is the trait describing what a type looks like once serde has
   encoded it — the mechanism behind the client-side codegen named above and behind
   `Id<T>`'s promise to never be a bare u64. `#[derive(Wire)]` implements it for a
-  struct by reading serde's own `rename`, `rename_all`, and `skip_serializing_if`,
-  so the derived schema can never drift from what serde actually serializes.
+  struct by reading serde's own `rename`, `rename_all`, `skip`, `skip_serializing`,
+  and `skip_serializing_if`; any other `#[serde(...)]` attribute is a compile error
+  rather than a silent pass-through, and that supported set is pinned by tests
+  comparing the derived schema against real `serde_json` output.
   `TypeSchema`/`TypeDef` are the IR a generated client is emitted from. 64-bit
   integers are deliberately not wire primitives: a JSON number loses precision
   above 2^53 in JavaScript, so they cross the wire string-encoded.
