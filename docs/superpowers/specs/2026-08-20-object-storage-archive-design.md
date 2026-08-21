@@ -12,13 +12,18 @@ names the collision this design has to work around:
 > its own durable copy and can be promoted. That is a hot standby, not an off-site
 > snapshot shipper — there is no object-storage code path anywhere in the tree.
 
-Verified: there is none. Every `backup` hit in the tree is the hot standby, replication
-role plumbing, test fixtures, or — notably — **operator remedy text**. Five error messages
-in the deterministic core already instruct the operator to "restore from a replica or
-backup" (`log.rs:186`, `log.rs:365`, `db.rs:1056`, `db.rs:1299`, `db.rs:1359`), including
-the hard error `Db::open` raises when a compacted log can no longer rebuild an unopenable
-store. Until this subsystem exists, that second noun is unbacked: the only remedy the
-platform actually ships is a replica. No prior spec covers this.
+Verified: there is none. Every `backup` hit in the tree is the hot standby, replication role
+plumbing, test fixtures, or operator remedy text. No prior spec covers this.
+
+**Recorded so it is not re-raised:** five core error messages tell operators to "restore from
+a replica or backup" (`log.rs:186`, `log.rs:365`, `db.rs:1056`, `db.rs:1299`, `db.rs:1359`).
+This session and a concurrent one both briefly mistook that for a hard-rule-5 defect naming a
+fix that does not exist. It is not. "Backup" there means `serve::backup`, the promotable hot
+standby, and the remedy is real: `replication.rs:358-360` reads the text and says so outright
+("the path T7's promote/backup provides"), and GUIDE:2830 prescribes it ("not a local repair
+but a restore: promote a healthy replica and re-seed"). **The five messages are correct as
+written and this sub-project must not touch them.** When the archive ships,
+restore-from-archive becomes an *additional* remedy they may name.
 
 **The substrate already exists.** This design is mostly composition, not new machinery:
 
@@ -173,8 +178,8 @@ identical recovery path rather than a parallel one. Only *sealed* segments ship:
 still being appended and its unsynced bytes must never travel — the discipline replication
 already keeps by capping shipping at `last_applied` (DESIGN §5).
 
-**Periodic logical snapshots** via `Db::snapshot` + `scan_raw`, the same producer the seeder
-uses. Snapshots bound restore time and let the archive delete segments below them.
+**Periodic logical snapshots** via `Db::snapshot` + `Snapshot::scan_raw_from` — the *bounded*
+batch read (`table.rs:1043`), not `scan_raw`, for the memory reason in §10. Snapshots bound restore time and let the archive delete segments below them.
 
 **One operation in flight is a bound, not a free choice.** Serial uploads mean the archive
 falls behind whenever segments seal faster than they upload — and a permanently-behind archive
@@ -373,16 +378,24 @@ release the pin — are pure functions of log state and config, so they replay b
 from a seed. Nondeterminism lives entirely below `ObjectStore::poll`, on the far side of the
 trait, exactly as it lives below `Net::connect` today.
 
-**Inherited production ceiling — the archive does not introduce this, it is the first thing
-to hit it.** Snapshots reuse the seeding producer, and DESIGN §5 is explicit about that path:
-"v1 seeding holds the full logical snapshot in memory on BOTH sides... Right at M1 scale;
-incremental streaming is the tracked fix before large-store seeding." Seeding pays that cost
-once, when a follower joins. The archive pays it **every `archive_snapshot_every` records,
-forever**, on a node that is also serving traffic. So the archive converts a known, tolerated,
-occasional cost into a recurring one, and will encounter the ceiling before large-store seeding
-does. The plan must either bound `archive_snapshot_every` against store size, or make
-incremental snapshot streaming a prerequisite rather than a follow-on. This is the single
-largest unresolved scaling question in the design and it is not the simulator's.
+**The archive does not inherit seeding's memory ceiling, and the reason is worth stating.**
+DESIGN §5 records that "v1 seeding holds the full logical snapshot in memory on BOTH sides...
+incremental streaming is the tracked fix before large-store seeding." That buffering is a
+property of the *network seed protocol*: the follower must hold `SnapshotRows` until
+`SnapshotEnd` to apply the timeline atomically.
+
+**The archive has no such constraint.** Its atomicity comes from the manifest swap (§2), not
+from buffering, so it writes `snapshot/<table>/<n>` objects as it produces them and never holds
+a whole snapshot. The producer is therefore `Snapshot::scan_raw_from` (`table.rs:1043`) — the
+bounded batch read already built for the migration executor, whose own comment states the rule
+this design needs: "batching must bound memory, not just record size." One MVCC snapshot, paged
+reads, peak memory **O(batch) rather than O(store)**.
+
+`scan_raw` (`table.rs:1026`) returns a whole table at once and must **not** be used by the
+archive, notwithstanding that it is the call the seed path uses. Snapshot cadence is therefore
+irrelevant to peak memory — worth stating because the obvious mitigation, bounding
+`archive_snapshot_every` against store size, would not have worked: cadence changes how often an
+O(store) spike occurs, never its height. Seeding's own ceiling remains seeding's, untouched.
 
 **Simulator-side risk, recorded rather than discovered later:** the sim `ObjectStore` holds
 whole objects in memory (`Vec<u8>` per op). A 64 MiB default segment × the fault matrix × parallel universes
@@ -441,21 +454,14 @@ Hard rule 6 — same commit as the code:
 
 ## §14 Open items for Noah
 
-1. **Snapshot memory ceiling (§10) — the largest open question here.** The archive turns
-   seeding's tolerated once-per-join full-snapshot-in-memory cost into a recurring one. Either
-   `archive_snapshot_every` is bounded against store size, or incremental snapshot streaming
-   becomes a prerequisite of this sub-project rather than a tracked follow-on. That choice
-   changes the size of the work materially and is not the plan's to make unilaterally.
-2. `archive_pin_segments` default — the plan proposes a number with reasoning; this spec
+1. `archive_pin_segments` default — the plan proposes a number with reasoning; this spec
    deliberately does not invent one.
-3. Whether the capability-surface decision warrants a numbered DECISIONS.md entry at all.
+2. Whether the capability-surface decision warrants a numbered DECISIONS.md entry at all.
    §1's correction lowers the stakes — this is an application of §1, not an amendment to it —
    so an entry may be over-ceremony. Noah's call, and DECISIONS.md is a shared-spine file with
    concurrent sessions live.
-4. **The five unbacked error messages** (Context): `log.rs:186`, `log.rs:365`, `db.rs:1056`,
-   `db.rs:1299`, `db.rs:1359` tell operators to "restore from a replica or backup" when no
-   backup mechanism exists. Hard rule 5 requires an error to name *the fix*, so this is a live
-   defect at the site where a wrong remedy costs most — `Db::open`'s hard error, where the
-   operator has an unopenable store and a compacted log. Two resolutions: narrow the text to
-   "restore from a replica" now, as a small fix independent of this sub-project, or leave it and
-   let the archive make it true. If the former, it should not be gated behind this work.
+
+**Resolved and recorded rather than carried**, both by inspection after first being raised
+here as open questions: the snapshot memory ceiling (§10 — dissolved by `scan_raw_from`, which
+already exists), and the five "replica or backup" error messages (Context — not a defect;
+"backup" means `serve::backup`, and the remedy is real).
