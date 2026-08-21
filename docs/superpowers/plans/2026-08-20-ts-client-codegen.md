@@ -28,6 +28,21 @@
   Use `overwrite` only to create a new fixture, then READ the generated `.stderr` and confirm it
   says what the task requires before committing it. An unread blessed `.stderr` is a test that
   cannot fail. Applies to Tasks 1, 3, and 6.
+- **A negative assertion owes a floor or a mutation; an identity assertion owes both.**
+  Most of this plan's oracles are negative ("this must not compile", "no drift", "byte-identical")
+  and a test asserting something never happens passes trivially against an implementation that
+  never does anything. `assert_eq!(emit(c), emit(c))` is green when `emit` returns `String::new()`.
+  House precedent is explicit (`55f15ec`): byte-oracle coverage sat at 17 of 256 and "2 of 256
+  would still have passed", which is why `floor:` exists. So:
+  - **Every `compile_fail/` fixture owes a `compile_pass/` control** — the same shape with the
+    one offending element made legal, proving the rejection is the stated cause and not an
+    unrelated bound, import, or typo. Task 1's reviewer ran this ad hoc (`u32` compiles clean,
+    exit 0); it belongs in the plan so Tasks 3 and 6 repeat it.
+  - **Every byte-identity test asserts a floor before it asserts equality** — non-trivial length
+    plus named required substrings. Applies to `emission_is_byte_identical_across_runs` and
+    `gen_client_is_byte_identical_on_a_second_run`.
+  - **Every "never happens" assertion names the mutation that reddens it**, in a comment on the
+    test. If no such mutation exists, the test is decorative — delete it or make it real.
 - **Do not touch `Cargo.toml:38-39`** (`[profile.release.package.redb] debug-assertions = true`).
 
 ## File Structure
