@@ -86,6 +86,13 @@
   recursion guard, green under `if false`; and the F4 rejection, pinned against an inert
   mutation. **After fixing a bug, ask what the bug would have DONE, and pin that** — the
   overflow, the wrong JSON key, the non-termination — not the function you happened to edit.
+- **A test named `fidelity_*` must read BOTH sides.** Twice now a fidelity test has asserted
+  only what `serde_json` emitted and never called `<T as Wire>::schema()` — so no edit to
+  charpente could redden it, while its own comment claimed a mutation it does not catch.
+  Task 3 fixed one; Task 4 grew another, and the one it grew was pinning the subtlest rule in
+  the new variant table (serde tests uppercase with Unicode rules but lowercases with ASCII
+  ones). A ground-truth pin on serde's behaviour is legitimate — it catches a serde upgrade —
+  but it must be **labelled as one in a comment**, never left looking like coverage.
 - **Do not touch `Cargo.toml:38-39`** (`[profile.release.package.redb] debug-assertions = true`).
 
 ## File Structure
