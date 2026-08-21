@@ -22,6 +22,12 @@
 - **zsh:** `PIPESTATUS` does not work. Use `${pipestatus[1]}` or `set -o pipefail`. Pipe cargo through `tee`, never `tail`.
 - **Full check before any task is done:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`. No `#[allow]` may be added to pass clippy.
 - **Do not kill any process.** Another repo runs test suites on this machine.
+- **`TRYBUILD=overwrite` blesses whatever the compiler emitted — it does not verify it.**
+  The cargo test target in `charpente-macros` is `--test trybuild` (`tests/trybuild.rs`,
+  fn `macro_errors`); `compile_fail/` and `compile_pass/` are fixture DIRECTORIES, not targets.
+  Use `overwrite` only to create a new fixture, then READ the generated `.stderr` and confirm it
+  says what the task requires before committing it. An unread blessed `.stderr` is a test that
+  cannot fail. Applies to Tasks 1, 3, and 6.
 - **Do not touch `Cargo.toml:38-39`** (`[profile.release.package.redb] debug-assertions = true`).
 
 ## File Structure
@@ -261,7 +267,7 @@ fn main() {
 Run the trybuild suite and **accept the generated `.stderr` only after reading it** — confirm it contains "values above 2^53 lose precision in JavaScript clients". If the note is missing, the `on_unimplemented` attribute is wrong; fix it rather than blessing the output.
 
 ```bash
-TRYBUILD=overwrite cargo test -p charpente-macros --test compile_fail 2>&1 | tee /tmp/t1-tb.log
+TRYBUILD=overwrite cargo test -p charpente-macros --test trybuild 2>&1 | tee /tmp/t1-tb.log
 cat crates/charpente-macros/tests/compile_fail/wire_bare_u64.stderr
 ```
 
