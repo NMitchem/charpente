@@ -31,7 +31,7 @@ restore-from-archive becomes an *additional* remedy they may name.
 |---|---|
 | hold WAL segments against GC | `Db::pin_retention` (db.rs:1650), a `Box<dyn Fn() -> u64>` floor — replication already uses it |
 | read log frames, CRC-verified, never the unsynced tail | `Db::read_log` (db.rs:1731), capped at `last_applied` |
-| logical snapshot of all tables | `Db::snapshot` (db.rs:1510) + `Snapshot::scan_raw` (DESIGN §4, "Logical export") |
+| logical snapshot of all tables, bounded memory | `Db::snapshot` (db.rs:1510) + `Snapshot::scan_raw_from` (table.rs:1043) — **not** `scan_raw`, see §10 |
 | rebuild a Db from a logical snapshot | `Seeder` (db.rs:2381) — discards the target timeline, lays the horizon+1 boundary, hands off through ordinary `Db::open` |
 | segment naming | `segment_name` (log.rs:504), `{dir}/{base_seq:020}.log` |
 | whole-segment deletion with a retention floor | `Wal::gc` (log.rs:384) |
@@ -145,7 +145,7 @@ being explicit rather than assumed.
 ```
 <prefix>/manifest                            — generation pointer, CRC'd
 <prefix>/<gen>/snapshot/meta                 — applied_seq, next_job_id, table list, CRC
-<prefix>/<gen>/snapshot/<table>/<n>          — batched raw (id, bytes) from scan_raw
+<prefix>/<gen>/snapshot/<table>/<n>          — batched raw (id, bytes), scan_raw_from
 <prefix>/<gen>/segments/<base_seq:020>.log   — sealed WAL segments, verbatim
 ```
 
