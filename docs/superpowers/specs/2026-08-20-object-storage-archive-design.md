@@ -413,6 +413,15 @@ swap on 9 days uptime; memory, not cores, is the binding constraint here.
   corruption case in §7 by name.
 - Convergence property green over N fresh seeds (N stated in the commit, per CLAUDE.md's
   evidence bar), plus the recorded seed for any bug found.
+- **Every assertion mutation-proven.** House practice (LEDGER: "an 8-mutation table, 8/8 RED";
+  "its own mutation burden"), and it matters more here than usual: this design's oracles are
+  mostly *negative* — the archive never uploads while verifying, never advances a manifest it
+  does not own, never ships an unsealed segment. A test asserting something never happens
+  passes trivially against an implementation that never does anything. Each fault axis in §9
+  therefore owes a mutation that reddens it, and each `require:` coverage key owes proof that
+  it actually fires. A concurrent sub-project found five single-line mutations surviving a
+  fully green suite on 2026-08-20; a fault matrix is more exposed to that than ordinary code,
+  not less.
 - `cargo fmt --all --check`, `clippy --workspace --all-targets -D warnings`, `cargo test --workspace` green.
 - Docs updated in the same commit (§13).
 
