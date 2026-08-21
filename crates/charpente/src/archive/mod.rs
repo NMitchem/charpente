@@ -21,13 +21,26 @@
 //! duplicating an object (spec §9.2).
 //!
 //! The retention pin (`Db::add_retention_pin`) is **unbounded this task**
-//! (ruling 23 carry-forward): it holds at the lowest sealed segment this
-//! archive has not yet reflected in an uploaded manifest, with no bound on
-//! how far behind that segment may be. Because of that, `Wal::gc` can never
-//! remove a segment out from under this archive, so a "gap" (spec §2) is
-//! structurally impossible this task — `gapped()` is always `false`. The
-//! bounded pin that makes a gap possible, and the writer-identity ownership
-//! check (spec §4), both land at Task 7.
+//! (ruling 23 carry-forward): it holds at the lowest seq this archive still
+//! needs — the lowest sealed segment not yet reflected in an uploaded
+//! manifest — with no bound on how far behind that seq may be.
+//!
+//! **The pin is held from `open` and is never released outright**, not while
+//! idle, not while waiting on an unapplied segment, and never to `u64::MAX`.
+//! That is load-bearing and was a real bug once (M1): a pin that reads
+//! `u64::MAX` is a pin that holds *nothing*, so `Wal::gc` was free to delete
+//! the very segment `next_base()` was waiting for. After that deletion
+//! `step_idle`'s `find` never matches again — the archive ships nothing
+//! forever, returns no error, and reports itself caught up. Under the
+//! default `checkpoint_every` that cost 50 of 50 segments, silently. Because
+//! the pin now always holds, `Wal::gc` genuinely cannot remove a segment out
+//! from under this archive, so a "gap" (spec §2) is structurally impossible
+//! this task and `gapped()` is always `false`.
+//!
+//! Ask `Archive::idle` whether there is work left — never `pin_floor()`,
+//! which no longer has a caught-up sentinel and never should have been read
+//! as one. The bounded pin that makes a gap possible, and the
+//! writer-identity ownership check (spec §4), both land at Task 7.
 
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -125,6 +138,9 @@ pub struct Archive {
     /// `segments.last().end_seq + 1`, or 0 before anything ships.
     segments: Vec<SegmentRef>,
     state: State,
+    /// Set by the two `step_idle` arms that find no available work,
+    /// cleared by every `step`. Backs `Archive::idle`.
+    idle: bool,
 }
 
 impl Archive {
@@ -133,7 +149,13 @@ impl Archive {
     /// store — `step` is the only method that ever touches it (ruling 32),
     /// so `open` cannot fail on the store's account and never does.
     pub fn open(cfg: ArchiveConfig, db: &mut Db) -> io::Result<Archive> {
-        let pin = Arc::new(Mutex::new(u64::MAX));
+        // Hold from the moment the pin is registered (M1). Starting at
+        // `u64::MAX` left a window between `open` and the first pinning
+        // `step` in which `Wal::gc` was free to delete the very segment
+        // `next_base()` would later look for — after which `step_idle`'s
+        // `find` never matches again and the archive ships nothing,
+        // forever, reporting no error.
+        let pin = Arc::new(Mutex::new(db.log_base()));
         db.add_retention_pin(Box::new({
             let floor = Arc::clone(&pin);
             move || *floor.lock().expect("uncontended")
@@ -144,17 +166,30 @@ impl Archive {
             generation: 0,
             segments: Vec::new(),
             state: State::Idle,
+            idle: false,
         })
     }
 
-    /// The retention floor this archive holds: the lowest sealed segment
-    /// not yet reflected in an uploaded manifest, or `u64::MAX` when caught
-    /// up. A segment counts as "reflected" only once the manifest PUT
+    /// The retention floor this archive holds: the lowest seq it still
+    /// needs, which once caught up is the base the next segment to seal
+    /// will start at. **Never `u64::MAX`** — this archive holds a floor
+    /// from `open` onward and never releases outright (M1); use
+    /// `Archive::idle` to ask whether there is work left, never this.
+    /// A segment counts as "reflected" only once the manifest PUT
     /// naming it has itself succeeded — not merely once its own bytes
     /// landed — so retention never releases a segment the manifest doesn't
     /// yet acknowledge (spec §2: the manifest swap is the commit point).
     pub fn pin_floor(&self) -> u64 {
         *self.pin.lock().expect("uncontended")
+    }
+
+    /// True when the last `step` found nothing it could do: either
+    /// nothing is sealed past what has been archived, or the one sealed
+    /// segment left is not yet fully applied. Use it to stop stepping.
+    /// **Not a durability signal** — it says the archive has no work it
+    /// can do right now, never that everything reached the store.
+    pub fn idle(&self) -> bool {
+        self.idle
     }
 
     /// True once a gap has closed this generation (spec §2). Always
@@ -187,6 +222,7 @@ impl Archive {
     /// read-only). An archive IO failure is returned here and nowhere
     /// else — it never reaches `Db`, so it can never poison it (spec §7).
     pub fn step(&mut self, db: &Db, store: &dyn ObjectStore) -> io::Result<()> {
+        self.idle = false;
         match std::mem::replace(&mut self.state, State::Idle) {
             State::Idle => self.step_idle(db),
             State::Reading {
@@ -218,7 +254,12 @@ impl Archive {
             .into_iter()
             .find(|s| s.base_seq == next)
         else {
-            *self.pin.lock().expect("uncontended") = u64::MAX;
+            // Caught up: hold at the base the NEXT segment to seal will
+            // start at, never release (M1). The chain is contiguous, so
+            // `next` is exactly that base: GC still reclaims everything
+            // already archived and nothing more.
+            *self.pin.lock().expect("uncontended") = next;
+            self.idle = true;
             return Ok(());
         };
         // Ruling 29's entry gate: the second, independent truncation
@@ -228,7 +269,11 @@ impl Archive {
         // produce a short SegmentRef either way — see its doc), but this
         // avoids the futile reads.
         if seg.layout_end > db.last_applied().unwrap_or(0) {
-            *self.pin.lock().expect("uncontended") = u64::MAX;
+            // Holding, NOT releasing (M1): this arm has just identified
+            // the segment the archive needs; telling retention it holds
+            // nothing would invite GC to delete it.
+            *self.pin.lock().expect("uncontended") = seg.base_seq;
+            self.idle = true;
             return Ok(());
         }
         *self.pin.lock().expect("uncontended") = seg.base_seq;
@@ -366,10 +411,14 @@ impl Archive {
             }
             Some(Ok(ObjectDone::Put)) => {
                 // The commit point is the MANIFEST swap (spec §2), never
-                // this PUT alone — SegmentRef only enters `self.segments`
-                // (and the pin only advances past `base_seq`) once the
-                // manifest naming it has itself landed, in
-                // step_uploading_manifest below.
+                // this PUT alone. The SegmentRef joins the chain HERE so
+                // the manifest bytes below can name it, but the PIN does
+                // not advance past `base_seq` until that manifest PUT has
+                // itself landed. The chain is never READ in the window
+                // between the two — `next_base()` is called only from
+                // `step_idle`, unreachable while UploadingManifest — so a
+                // manifest that never lands cannot make the archive skip
+                // the segment it names.
                 self.segments.push(SegmentRef { base_seq, end_seq });
                 let manifest_bytes = Manifest {
                     generation: self.generation,

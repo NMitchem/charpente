@@ -50,19 +50,12 @@ fn build_fixture(store: SimObjectStore, read_budget_bytes: usize) -> (Db, SimObj
     let sim = Sim::with_faults(0x6172_6368_5f74_3500, FaultConfig::none());
     let mut db_cfg = DbConfig::default();
     db_cfg.wal.segment_bytes = 64 << 10;
-    // checkpoint_every disabled (finding, see task-5-report.md): `Archive`'s
-    // retention pin only holds a floor once `step` has run at least once —
-    // before that it reads u64::MAX, same as "no pin" (db.rs's own doc on
-    // `add_retention_pin`). A test that writes a large burst before ever
-    // calling `step` (Step 2's own `the_seal_rate_...` test does exactly
-    // this) would otherwise race the default checkpoint_every=4096 cadence,
-    // whose GC is unconstrained by a pin nobody has updated yet, and
-    // segments this archive never got a chance to protect would vanish out
-    // from under it. Real operation interleaves `step` with writes (the
-    // kernel arm, Task 9), so the pin is never that stale in practice; this
-    // is a fixture-only accommodation for the write-everything-then-step
-    // shape these tests use, not a change to `Db`'s own behavior.
-    db_cfg.checkpoint_every = 0;
+    // `checkpoint_every` is left at its DEFAULT on purpose: the archive
+    // must survive the real GC cadence. An earlier revision set it to 0
+    // to accommodate a pin that released between `open` and the first
+    // step, which disabled the one test that catches exactly that bug
+    // (M1/M2). The pin now holds from `open`, so no accommodation is
+    // needed and the default cadence is itself part of the oracle.
     let mut db = Db::open(Box::new(sim.disk()), db_cfg, Schema::new().table::<Rec>()).unwrap();
     let archive_cfg = ArchiveConfig {
         prefix: PREFIX.to_string(),
@@ -137,7 +130,7 @@ fn write_records(db: &mut Db, n: u64) {
 fn step_until_idle(arc: &mut Archive, db: &Db, store: &SimObjectStore) {
     for _ in 0..10_000 {
         let _ = arc.step(db, store);
-        if arc.pin_floor() == u64::MAX {
+        if arc.idle() {
             return;
         }
     }
@@ -345,6 +338,52 @@ fn the_pin_holds_at_the_lowest_un_uploaded_segment() {
     );
 }
 
+/// M2's missing oracle. `the_pin_holds_at_the_lowest_un_uploaded_segment`
+/// above pins the HOLD and nothing else — it compares `pin_floor()` to
+/// `db.log_base()` at a point where both are 0, so it cannot tell "pinned at
+/// the right segment" from "pinned at 0", and the whole suite passed
+/// unchanged against a pin that released on every idle step. This pins the
+/// RELEASE semantics: held from `open`, advancing only past what the
+/// manifest already names, and never `u64::MAX`.
+#[test]
+fn the_pin_holds_from_open_advances_with_the_manifest_and_never_releases() {
+    let (mut db, store, mut arc) = archive_fixture();
+    let at_open = arc.pin_floor();
+    assert_ne!(
+        at_open,
+        u64::MAX,
+        "a fresh Archive must hold a floor from `open`; releasing until the first \
+         pinning step lets Wal::gc delete the segment next_base() will wait for"
+    );
+
+    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
+    step_until_idle(&mut arc, &db, &store);
+
+    let caught_up = arc.pin_floor();
+    assert_ne!(
+        caught_up,
+        u64::MAX,
+        "the pin must never release outright, not even when caught up"
+    );
+    assert!(
+        caught_up > at_open,
+        "the pin must advance past archived segments: {at_open} -> {caught_up}"
+    );
+
+    // Exactly at the seq the next segment to seal will start at — one past
+    // the last span the manifest actually claims. Derived from the manifest
+    // (what was really shipped), never from `Db::sealed_segments` (ruling
+    // 24: an oracle built from the function it polices proves nothing).
+    let m = read_manifest(&store).expect("a manifest");
+    let last_end = m.segments.last().expect("shipped segments").end_seq;
+    assert_eq!(
+        caught_up,
+        last_end + 1,
+        "pin must hold exactly the next seq it needs, not further back (which \
+         would starve GC) and not further forward (which would drop a segment)"
+    );
+}
+
 #[test]
 fn an_archive_io_failure_never_poisons_the_db() {
     let (mut db, store, mut arc) = archive_fixture_with_unreachable_store();
@@ -402,8 +441,12 @@ fn the_seal_rate_stays_under_one_upload_per_step_budget() {
     let uploads = step_until_idle_counting(&mut arc, &db, &store);
     assert!(
         uploads >= seals,
-        "the archive fell permanently behind: {seals} seals, {uploads} uploads — \
-         one-in-flight is insufficient and ArchiveConfig needs an in_flight knob"
+        "the archive shipped {uploads} of {seals} sealed segments. Two contracts can \
+         break here and they need different fixes: if uploads is 0 (or stalls at a fixed \
+         count) the RETENTION PIN released and `Wal::gc` removed the segment `next_base()` \
+         is waiting for (M1); if uploads merely trails seals under sustained load, \
+         one-in-flight is insufficient and `ArchiveConfig` needs a documented `in_flight` \
+         knob plus a BENCH.md entry"
     );
 }
 
