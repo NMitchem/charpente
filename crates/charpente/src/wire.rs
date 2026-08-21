@@ -110,14 +110,14 @@ impl TypeRegistry {
     ) -> bool {
         assert!(
             !name.is_empty(),
-            "TypeRegistry::insert: WIRE_NAME cannot be empty — \"\" means \
+            "TypeRegistry::insert_as: WIRE_NAME cannot be empty — \"\" means \
              \"anonymous/inline\" (what Wire::reference() checks to skip the \
              registry entirely), never a real named type"
         );
         if let Some((prev_schema, prev_type)) = self.defs.get(name) {
             assert!(
                 *prev_schema == schema,
-                "TypeRegistry::insert: wire name \"{name}\" is registered with two \
+                "TypeRegistry::insert_as: wire name \"{name}\" is registered with two \
                  different shapes, by `{prev_type}` and `{rust_type}` — every Wire \
                  type needs a WIRE_NAME unique wire-wide (one shape per wire name); \
                  rename one of the two colliding Rust types so their WIRE_NAME differs"

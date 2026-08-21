@@ -26,6 +26,16 @@
 //!    the default-deny catch-all) would vanish into a silently-accepted
 //!    attribute instead of surfacing as a compile error. Propagating `?` is
 //!    what makes "reject the rest loudly" actually loud.
+//!
+//! A third check (fix round 2, item A) closes a gap those two don't touch:
+//! two fields that resolve to the SAME post-serde wire name — via a direct
+//! `rename` collision, via `rename_all` folding two different Rust names
+//! onto one string, or via one field's `rename` landing on another's
+//! untouched name — compile clean under both Rust and serde, but serde then
+//! emits a literal duplicate JSON key and the schema carries two identically
+//! named fields, with nothing downstream (registry, client `JSON.parse`)
+//! erroring either. `expand`'s field loop tracks each resolved wire name and
+//! rejects the second field that reaches one already seen.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -45,13 +55,6 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         ));
     }
 
-    // Validated here, once, independent of the field loop below: a
-    // rename_all whose VALUE is unsupported must be caught even for a
-    // fieldless struct or one where every field carries its own explicit
-    // `rename` (neither would otherwise ever ask `rename_all` to resolve a
-    // name, so a check folded into the field loop would never run for them).
-    let rename_all = struct_serde_attrs(&input)?;
-
     let Data::Struct(data) = &input.data else {
         return Err(Error::new_spanned(
             &input,
@@ -65,8 +68,38 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         ));
     };
 
+    // Validated here, once, independent of the field loop below: a
+    // rename_all whose VALUE is unsupported must be caught even for a
+    // fieldless struct or one where every field carries its own explicit
+    // `rename` (neither would otherwise ever ask `rename_all` to resolve a
+    // name, so a check folded into the field loop would never run for them).
+    //
+    // Deliberately AFTER the two shape checks above (fix round 2, NEW-1): a
+    // struct-level `#[serde(...)]` error must not be the first thing raised
+    // for a non-struct or tuple-struct input, or a shape mismatch on an enum
+    // (e.g. `#[serde(untagged)] enum E { .. }`) gets misreported as "does not
+    // recognize serde's `untagged` on a struct" instead of "enum support
+    // lands in Task 4" — the right diagnostic, which fires when this call
+    // sits after the shape checks instead of before them.
+    let rename_all = struct_serde_attrs(&input)?;
+
     let mut field_toks = Vec::new();
     let mut register_toks = Vec::new();
+    // Tracks each field's POST-serde wire name (fix round 2, item A): two
+    // fields resolving to the same name is silent at every downstream layer
+    // — serde emits a literal duplicate JSON key, the schema carries two
+    // identically-named `Field`s, and the registry stores it with no assert.
+    // A collision can arise from an explicit `rename` alone, from
+    // `rename_all` folding two distinct Rust names onto the same string
+    // (e.g. `a_b` and `a__b` both become `aB` under camelCase), or from one
+    // field's explicit `rename` landing on another field's untouched natural
+    // name — so the check below runs on `wire_name`, never on `ident`.
+    // `BTreeMap`, not `HashMap`: this repo's clippy deny-list bans `HashMap`
+    // workspace-wide (nondeterministic iteration order/ambient hash seed),
+    // with no macro-crate carve-out — and membership + first-seen lookup is
+    // all this needs, so the ordering `BTreeMap` imposes costs nothing here.
+    let mut wire_names: std::collections::BTreeMap<String, syn::Ident> =
+        std::collections::BTreeMap::new();
     for f in &fields.named {
         let ident = f.ident.as_ref().expect("named fields have idents");
         let ty = &f.ty;
@@ -90,6 +123,20 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 }
             }
         };
+        if let Some(prev_ident) = wire_names.get(&wire_name) {
+            return Err(Error::new_spanned(
+                ident,
+                format!(
+                    "#[derive(Wire)] requires one wire name per field, but `{prev_ident}` and \
+                     `{ident}` both resolve to \"{wire_name}\" — serde would emit that key \
+                     twice on the wire ({{\"{wire_name}\":...,\"{wire_name}\":...}}, last one \
+                     wins on the client) and the schema would carry two fields with the same \
+                     name; rename one of the two fields, or give it its own \
+                     #[serde(rename = \"...\")], so their resolved names differ"
+                ),
+            ));
+        }
+        wire_names.insert(wire_name.clone(), ident.clone());
         let optional = attrs.skip_serializing_if;
         field_toks.push(quote! {
             ::charpente::wire::Field {

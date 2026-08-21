@@ -17,4 +17,19 @@ enum NotAStruct {
 #[derive(charpente_macros::Wire)]
 struct TupleStruct(u32);
 
+// Fix round 2, item C (re-review NEW-1): an enum carrying a struct-level
+// `#[serde(...)]` attribute must still get the SHAPE error ("enum support
+// lands in Task 4"), not a struct-level attribute error ("does not
+// recognize serde's `untagged` on a struct") — the shape is wrong before
+// the attribute is even relevant. This regressed when `struct_serde_attrs`
+// ran before the `Data::Struct` check instead of after it; a plain
+// `enum NotAStruct { A }` (above) happened not to exercise the ordering bug
+// because it carries no `#[serde(...)]` attribute at all.
+#[derive(charpente_macros::Wire)]
+#[serde(untagged)]
+enum EnumWithSerdeAttr {
+    A,
+    B,
+}
+
 fn main() {}

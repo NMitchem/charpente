@@ -357,6 +357,27 @@ fn a_self_referential_type_does_not_recurse_forever() {
 }
 
 #[test]
+fn registering_a_self_referential_type_terminates_and_produces_one_typedef() {
+    // Fix round 2, item B: the test above covers ONLY `schema()`'s base
+    // case; nothing previously called `register()` on a self-referential
+    // type. `register()` has its own, separate recursion guard — the
+    // emitted `if already_present { return; }` — and it was completely
+    // unpinned: the re-reviewer found `if already_present {` -> `if false {`
+    // GREEN across the whole suite (39/39, exit 0), because the guard being
+    // gone is invisible to every existing assertion. It is not inert: a
+    // direct probe on this exact TreeNode shape stack-overflows under that
+    // mutation (measured: exit 134, SIGABRT) — `register()` recurses into
+    // `children: Vec<TreeNode>`'s `register()`, which calls
+    // `TreeNode::register()` again, unconditionally, forever. Same class as
+    // round 1's bug 2 (the `Vec<T>::schema()` SIGABRT): pinned on the
+    // `schema()` side back then, left open on the `register()` side until
+    // now.
+    let mut reg = TypeRegistry::default();
+    <TreeNode as Wire>::register(&mut reg);
+    assert_eq!(reg.into_sorted().len(), 1);
+}
+
+#[test]
 #[should_panic(expected = "is registered with two different shapes")]
 fn a_wire_name_collision_between_two_derived_types_panics_and_names_both() {
     // Two distinct Rust types that happen to share a bare struct name
@@ -636,10 +657,38 @@ fn fidelity_skip_serializing_if_field_is_present_when_some() {
     };
     let json = serde_json::to_string(&v).unwrap();
     assert_eq!(json_keys(&json), vec!["maybeNote", "plainOpt"]);
+    // Fix round 2, item D (re-review NEW-2): this test previously asserted
+    // ONLY serde's own output, so no charpente-side mutation could redden
+    // it — only a serde upgrade changing skip_serializing_if semantics
+    // could. Cross-checking the schema's `optional` flags against the SAME
+    // observed presence, in the SAME test, makes it a real differential.
+    // Mutation: `let optional = attrs.skip_serializing_if;` -> `let
+    // optional = false;` in crates/charpente-macros/src/wire.rs.
+    let TypeSchema::Struct { fields } = <FidelityOptional as Wire>::schema() else {
+        panic!("expected a struct schema");
+    };
+    let maybe_note = fields.iter().find(|f| f.name == "maybeNote").unwrap();
+    let plain_opt = fields.iter().find(|f| f.name == "plainOpt").unwrap();
+    assert!(
+        maybe_note.optional,
+        "maybeNote has skip_serializing_if and was genuinely omitted above; schema must say optional"
+    );
+    assert!(
+        !plain_opt.optional,
+        "plainOpt has no skip_serializing_if and was genuinely present above; schema must say required"
+    );
 }
 
 #[test]
 fn fidelity_skip_serializing_if_field_is_absent_when_none_but_plain_option_stays() {
+    // Deliberately a ground-truth pin on serde's OWN behavior (re-review
+    // NEW-2), not on charpente: no mutation of this repo can redden it —
+    // only a serde upgrade changing `skip_serializing_if` semantics could.
+    // That is still worth pinning (dependency drift), but don't "fix" this
+    // by deleting it or by expecting it to catch a derive bug; the
+    // differential half of this pair lives in
+    // `fidelity_skip_serializing_if_field_is_present_when_some` above and in
+    // `fidelity_optional_schema_matches_serdes_actual_optionality` below.
     let v = FidelityOptional {
         maybe_note: None,
         plain_opt: None,
@@ -718,15 +767,29 @@ fn fidelity_a_multi_item_serde_list_keeps_every_item_regardless_of_order() {
     // `skip_serializing_if` BEFORE `rename` in the list; `first_field` puts
     // them in the opposite order, proving both orders survive.
     //
-    // Mutation: in `field_serde_attrs`'s `skip_serializing_if` arm, stop
-    // consuming the value (`let _: LitStr = meta.value()?.parse()?;` ->
-    // just `out.skip_serializing_if = true;`) — reproduces the historical
-    // bug shape exactly. This doesn't merely flip an assertion: since `?`
-    // now propagates the resulting `expected \`,\`` error as a genuine
-    // compile error, the WHOLE FILE fails to build (every `#[derive(Wire)]`
-    // struct using `skip_serializing_if` in a multi-item list, including
-    // `LineItem` and `FidelityOptional`, cascades into "trait `Wire` is not
-    // implemented" errors) — RED as a build failure, not a run failure.
+    // Two clean, assertion-level mutations (fix round 2, item E — found by
+    // the re-reviewer, named here instead of just the build-failure one
+    // below) redden this test without touching compilation at all:
+    //   - M-C: `out.rename = Some(s.value());` -> `out.rename = None;` in
+    //     `field_serde_attrs`'s `rename` arm.
+    //   - M-D: `let optional = attrs.skip_serializing_if;` -> `let optional
+    //     = false;` in `expand`'s field loop.
+    // Both fail as ordinary `assert_eq!`/`assert!` mismatches, which is the
+    // legible signal a maintainer wants. There is also a THIRD, structural
+    // mutation that reddens this test as a build failure rather than an
+    // assertion failure, which is worth keeping precisely because it proves
+    // something the two above don't: in `field_serde_attrs`'s
+    // `skip_serializing_if` arm, stop consuming the value (`let _: LitStr =
+    // meta.value()?.parse()?;` -> just `out.skip_serializing_if = true;`) —
+    // this reproduces the historical bug's shape exactly, but can no longer
+    // manifest as a silently-wrong schema: with the `?`-propagation half of
+    // the F1 fix still in place, the resulting `expected \`,\`` error is a
+    // genuine compile error, so the WHOLE FILE fails to build (every
+    // `#[derive(Wire)]` struct using `skip_serializing_if` in a multi-item
+    // list, including `LineItem` and `FidelityOptional`, cascades into
+    // "trait `Wire` is not implemented" errors). That is F1's fix working as
+    // designed — this defect class can no longer produce a wrong VALUE, only
+    // a loud build failure — not evidence the test is weak.
     let v = FidelityMultiItemOrder {
         second_field: Some("x".to_string()),
         first_field: Some("y".to_string()),

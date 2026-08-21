@@ -17,3 +17,13 @@ error: #[derive(Wire)] needs named fields — `TupleStruct` must be a braced str
    |
 18 | struct TupleStruct(u32);
    | ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: #[derive(Wire)] applies to structs — enum support lands in Task 4
+  --> tests/compile_fail/wire_shape_errors.rs:29:1
+   |
+29 | / #[serde(untagged)]
+30 | | enum EnumWithSerdeAttr {
+31 | |     A,
+32 | |     B,
+33 | | }
+   | |_^
