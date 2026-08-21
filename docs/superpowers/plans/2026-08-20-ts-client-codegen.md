@@ -21,7 +21,18 @@
   threading, no time. serde is already in this workspace's build graph (`charpente/Cargo.toml:11`,
   `Cargo.lock:528`), so this adds a manifest line, not third-party code. `Codec` stays hand-rolled:
   serde must never become the on-disk format, and a test pins the 8-byte little-endian encoding
-  so that stays mechanical. No OTHER core dependency is in scope. The emitter crate may depend only on `serde`/`serde_json` and `charpente` (for `Contract`).
+  so that stays mechanical. No OTHER core dependency is in scope.
+  **Correction (Task 2 review):** the `default-features = false` / no-`derive` declaration is NOT
+  a fence — cargo unifies features and `charpente/Cargo.toml:11` asks for `serde/derive`, so a
+  `#[derive(Serialize)]` inside core builds fine under `--workspace`, which is all CI ran. The
+  fence is the CI line `cargo check -p charpente-core`, added in Task 2's fix round. Hard rule 1
+  says mechanically, not by manifest comment.
+  **Nearest prior art, which does NOT bind but should be cited rather than missed:**
+  `DESIGN.md:1097-1098` — "the crypto is RustCrypto (`sha2`, `rsa`, `base64ct`) ... and lives in
+  `charpente`, never inside the deterministic `charpente-core`." That is about libraries with an
+  ambient surface (`rsa` draws randomness); serde's traits execute no IO, threading, or time, and
+  `cargo tree -p charpente-core` resolves to `redb` + `serde`/`serde_core` with no proc-macro and
+  no build script. Distinguished on the mechanism, not waved past. The emitter crate may depend only on `serde`/`serde_json` and `charpente` (for `Contract`).
 - **Error messages are product surface** (hard rule 5). Every diagnostic names the contract, the site, and the fix, and is pinned by a test against its exact text.
 - **Public-API changes update docs in the same commit** (hard rule 6).
 - **Assertions in the TigerBeetle style** (hard rule 4) — assert negative space in core code.
@@ -1012,6 +1023,32 @@ the error says so."
 ---
 
 ### Task 5: `Route` carries types, and `#[route]` captures them
+
+> **SEQUENCING AMENDMENT (Ruling 14) — READ BEFORE STARTING.** This task is the one that
+> makes a bare `u64` in a wire position a compile error, because `route.response` /
+> `request` / `params` generate `<T as Wire>::reference()` and `u64` is deliberately not
+> `Wire`. **That breaks two in-repo consumers the moment it lands**, and the plan originally
+> deferred their migration to Task 12 — leaving a seven-task window where
+> `cargo test --workspace` and `cargo build -p guide-examples` could not pass, in direct
+> violation of this plan's own per-task full-check constraint.
+>
+> Migrating them is therefore **part of Task 5**, not Task 12:
+>
+> - `examples/invoicing/src/routes.rs` — bare `u64` in wire position at :19, :32, :94, :108,
+>   :109, plus `.raw()` unwrapping. `CustomerView.id`/`InvoiceView.id`/`InvoiceView.customer`
+>   become `Id<Customer>` / `Id<Invoice>`; `InvoiceFinalized.invoice` and `SendReceipt.invoice`
+>   become `Id<Invoice>`. `due_day` stays `u64` **only if** it is not a wire field — check.
+>   Leave genuine non-id `u64`s (counters, days) alone; the rule is about ids and about
+>   64-bit values crossing the wire, not about the type `u64` everywhere.
+> - `docs/GUIDE.md` — **six** route handlers return `Result<u64, ApiError>` (:606, :718,
+>   :1074, :1631, :2005, :3391), the prose at :654 instructs unwrapping "its `u64` with
+>   `.raw()`", and there are 5 `.raw()` call sites. Every ```rust block in that file is
+>   compiled by `crates/guide-examples`'s build.rs, so these are build failures, not stale
+>   prose. `cargo build -p guide-examples` is a required gate for this task.
+>
+> If the migration turns out to be larger than the mechanism, land the mechanism and the
+> migration as two commits in this same task rather than splitting the task — the invariant
+> that matters is that the workspace builds at the task boundary.
 
 **Files:**
 - Modify: `crates/charpente/src/http/router.rs:31-37` (the `Route` struct)
@@ -2309,8 +2346,8 @@ required field — each reddening tsc, each reverted."
 ### Task 12: Migrate `examples/invoicing` off bare `u64`, and update the docs
 
 **Files:**
-- Modify: `examples/invoicing/src/routes.rs` (view types), and any other app file holding a bare `u64` in a wire position
-- Modify: `DESIGN.md` §3 and §7, `docs/GUIDE.md`, `PLAN.md`
+- Modify: `DESIGN.md` §3 and §7, `PLAN.md`, and `docs/GUIDE.md` (the client-generation workflow section only)
+- **Ruling 14 moved the `examples/invoicing` and `docs/GUIDE.md` bare-`u64` migration into Task 5**, where the compile error first appears. Do not redo it here. **Do** verify it holds: `cargo build -p guide-examples` and a grep for `.raw()` in a wire position must both come back clean, and if they do not, that is a Task 5 regression to report, not a Task 12 task.
 - Test: the existing invoicing suite plus `cargo build -p guide-examples`
 
 **Interfaces:**
