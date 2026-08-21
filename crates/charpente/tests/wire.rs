@@ -897,11 +897,22 @@ fn an_internally_tagged_enum_carries_its_tag() {
 
 #[test]
 fn a_unit_only_enum_serializes_as_the_bare_variant_name_serde_matches_the_schema() {
-    // The ground-truth half of the Unit fidelity pair: every member of the
-    // string union really is a bare JSON string on the wire, nothing else.
+    // N1 sweep (re-review): this test's own name claims a serde/schema
+    // comparison, but until now it only ever asserted serde's OWN output
+    // (`serde_json::to_string`) — no `<Status as Wire>::schema()` call
+    // anywhere in the function, so no derive-side mutation could redden it.
+    // `a_unit_only_enum_is_a_string_union` (above) separately pins the
+    // schema's variant list, but the two were never cross-checked against
+    // the SAME observed JSON in the SAME test. Reading the schema back here
+    // and comparing it against what was just serialized makes this test the
+    // differential its name promises.
     assert_eq!(serde_json::to_string(&Status::Draft).unwrap(), "\"Draft\"");
     assert_eq!(serde_json::to_string(&Status::Sent).unwrap(), "\"Sent\"");
     assert_eq!(serde_json::to_string(&Status::Paid).unwrap(), "\"Paid\"");
+    let TypeSchema::Enum(EnumRepr::Unit { variants }) = <Status as Wire>::schema() else {
+        panic!("expected a unit enum");
+    };
+    assert_eq!(variants, vec!["Draft", "Sent", "Paid"]);
 }
 
 #[test]
@@ -1432,6 +1443,17 @@ fn fidelity_variant_snake_case_tests_unicode_uppercase_but_lowers_ascii_only() {
     // exactly. Mutation: swap the separator test to `is_ascii_uppercase()` —
     // this goes red (`"aÉmile"`, no separator, instead of real serde's
     // `"a_Émile"`).
+    //
+    // N1 (re-review): the two assertions below only ever pinned real
+    // serde's own output (`serde_json::to_string`) — no edit to
+    // `apply_to_variant` could redden them, since neither one reads
+    // `<T as Wire>::schema()`. Confirmed by the re-reviewer running the
+    // exact mutation this comment describes (`is_uppercase()` ->
+    // `is_ascii_uppercase()`) and finding it SURVIVED both `cargo test -p
+    // charpente --test wire` and the trybuild suite. The schema assertion
+    // below is the fix: it reads the schema back and compares it against
+    // the SAME serde output asserted above, so a schema that disagrees with
+    // serde — including under this exact mutation — now fails right here.
     assert_eq!(
         serde_json::to_string(&FidelityVariantSnakeNonAsciiAsymmetry::AÉmile).unwrap(),
         "\"a_Émile\""
@@ -1440,6 +1462,12 @@ fn fidelity_variant_snake_case_tests_unicode_uppercase_but_lowers_ascii_only() {
         serde_json::to_string(&FidelityVariantSnakeNonAsciiAsymmetry::Plain).unwrap(),
         "\"plain\""
     );
+    let TypeSchema::Enum(EnumRepr::Unit { variants }) =
+        <FidelityVariantSnakeNonAsciiAsymmetry as Wire>::schema()
+    else {
+        panic!("expected a unit enum");
+    };
+    assert_eq!(variants, vec!["a_Émile", "plain"]);
 }
 
 #[derive(WireDerive, serde::Serialize)]

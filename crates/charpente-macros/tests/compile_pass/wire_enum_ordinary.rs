@@ -29,7 +29,8 @@ enum ExternalDataOnly {
 // per-variant slot was a bare `TypeSchema`, and a unit variant serializes as
 // the bare JSON string "Idle", which no `TypeSchema` value could carry.
 // `Vec<(String, Option<TypeSchema>)>` makes it representable: `None` IS that
-// bare-string shape. See `fidelity_external_unit_variant_mixed_with_data...`
+// bare-string shape. See
+// `fidelity_external_unit_variant_is_representable_and_distinct_from_braced_empty`
 // in crates/charpente/tests/wire.rs for the serde/schema fidelity pin.
 #[derive(charpente_macros::Wire)]
 enum ExternalMixedWithUnit {
@@ -59,8 +60,9 @@ enum AdjacentDataOnly {
 // rejected outright — serde omits the `content` key entirely for a unit
 // variant (`{"t":"Idle"}`, not `{"t":"Idle","c":{}}`), which no bare
 // `TypeSchema` value could carry. `Option<TypeSchema>`'s `None` is that
-// omitted-key shape. See `fidelity_adjacent_unit_variant...` in
-// crates/charpente/tests/wire.rs for the serde/schema fidelity pin.
+// omitted-key shape. See
+// `fidelity_adjacent_unit_variant_omits_the_content_key_and_is_distinct_from_braced_empty`
+// in crates/charpente/tests/wire.rs for the serde/schema fidelity pin.
 #[derive(charpente_macros::Wire)]
 #[serde(tag = "t", content = "c")]
 enum AdjacentMixedWithUnit {

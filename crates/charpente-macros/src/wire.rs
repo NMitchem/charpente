@@ -66,10 +66,11 @@
 //!   the struct-shaped case merges the inner type's fields into the tag
 //!   object in a way this derive has no way to reconstruct from a bare
 //!   `Type` at macro-expansion time. A tuple variant with 0 or 2+ fields is
-//!   also still rejected — not because a JSON array has no useful
-//!   TypeScript type (it does: `[number, number]`), but because the wire IR
-//!   itself has no tuple type yet; that omission is fail-closed (a compile
-//!   error here, never a silently wrong client), so it can wait.
+//!   also still rejected: the wire IR itself has no tuple type yet (a JSON
+//!   array would have a perfectly good TypeScript type, `[number, number]`
+//!   — the gap is in this derive's IR, not in what TypeScript can express).
+//!   That omission is fail-closed (a compile error here, never a silently
+//!   wrong client), so it can wait.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -522,10 +523,10 @@ fn variant_inner_schema(
                     v,
                     format!(
                         "#[derive(Wire)] cannot describe tuple variant `{name_str}::{vname}` \
-                         with {} fields — the wire IR has no tuple type (not, as the JSON \
-                         array serde encodes it as might suggest, because a JSON array has no \
-                         useful TypeScript type — it does, `[number, number]`; the IR simply \
-                         doesn't model one yet). Use a braced variant with named fields.",
+                         with {} fields — the wire IR has no tuple type yet (a JSON array would \
+                         have a perfectly good TypeScript type, `[number, number]`; the gap is \
+                         in this derive's IR, not in what TypeScript can express). Use a braced \
+                         variant with named fields.",
                         f.unnamed.len()
                     ),
                 ))
