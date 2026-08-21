@@ -587,7 +587,7 @@ The handler returns `Result<T, ApiError>` where `T: serde::Serialize`; on
 use charpente::core::table::Id;
 use charpente::http::{ApiError, App, AppConfig, Ctx};
 use charpente::prod::{ProdDisk, ProdEntropy};
-use charpente::{Schema, Tx, View, route, routes, table};
+use charpente::{Schema, Tx, View, Wire, route, routes, table};
 use serde::Deserialize;
 
 #[table]
@@ -596,17 +596,20 @@ struct Note {
     text: String,
 }
 
-#[derive(Deserialize)]
+// A route's request body must be `Wire` too (§13) — `#[derive(Wire)]` sits
+// alongside `Deserialize`, one for the schema, one for the actual parse.
+#[derive(Wire, Deserialize)]
 struct NoteBody {
     text: String,
 }
 
-// tx, then :id (named `id`, path order), then the JSON body, then `ctx`.
+// tx, then :id (named `id`, path order), then the JSON body, then `ctx`. A
+// path param is a wire position too, so it is `Id<Note>`, not a bare `u64`.
 #[route(POST "/notes/:id")]
-fn create_note(tx: &mut Tx, id: u64, body: NoteBody, ctx: &Ctx) -> Result<u64, ApiError> {
+fn create_note(tx: &mut Tx, id: Id<Note>, body: NoteBody, ctx: &Ctx) -> Result<Id<Note>, ApiError> {
     let _ = ctx; // available; this route just doesn't need a session
     tx.put(&Note {
-        id: Id::from_raw(id),
+        id,
         text: body.text,
     });
     Ok(id)
@@ -657,7 +660,7 @@ in that view type — there's no need to unwrap it to a bare `u64` with
 ```rust
 use charpente::http::{ApiError, App, AppConfig};
 use charpente::prod::{ProdDisk, ProdEntropy};
-use charpente::{Id, Schema, Tx, View, route, routes, table};
+use charpente::{Id, Schema, Tx, View, Wire, route, routes, table};
 use serde::Serialize;
 
 #[table]
@@ -667,8 +670,9 @@ struct Note {
 }
 
 /// The wire shape: `Id<Note>` crosses as a decimal string, so it appears
-/// directly here — no `.raw()` unwrap, no separate id type.
-#[derive(Serialize)]
+/// directly here — no `.raw()` unwrap, no separate id type. `#[derive(Wire)]`
+/// is what lets this type appear in a route's response schema (§13).
+#[derive(Wire, Serialize)]
 struct NoteView {
     id: Id<Note>,
     text: String,
@@ -713,10 +717,16 @@ sequence of literal-vs-`:param` segments, so both could match one real path
 
 ```rust
 use charpente::http::{ApiError, App};
-use charpente::{Tx, route, routes};
+use charpente::{Id, Tx, route, routes, table};
 
+#[table]
+struct Note {
+    id: Id<Note>,
+}
+
+// A path param is a wire position too — `Id<Note>`, not a bare `u64`.
 #[route(GET "/notes/:id")]
-fn by_id(tx: &mut Tx, id: u64) -> Result<u64, ApiError> {
+fn by_id(tx: &mut Tx, id: Id<Note>) -> Result<Id<Note>, ApiError> {
     let _ = tx;
     Ok(id)
 }
@@ -1057,7 +1067,7 @@ process owns the server for as long as it runs.
 use charpente::core::table::Id;
 use charpente::http::{ApiError, App, AppConfig};
 use charpente::prod::{ProdDisk, ProdEntropy};
-use charpente::{Schema, Tx, View, route, routes, table};
+use charpente::{Schema, Tx, View, Wire, route, routes, table};
 use serde::Deserialize;
 
 #[table]
@@ -1066,15 +1076,15 @@ struct Note {
     text: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Wire, Deserialize)]
 struct NoteBody {
     text: String,
 }
 
 #[route(POST "/notes/:id")]
-fn create_note(tx: &mut Tx, id: u64, body: NoteBody) -> Result<u64, ApiError> {
+fn create_note(tx: &mut Tx, id: Id<Note>, body: NoteBody) -> Result<Id<Note>, ApiError> {
     tx.put(&Note {
-        id: Id::from_raw(id),
+        id,
         text: body.text,
     });
     Ok(id)
@@ -1312,13 +1322,17 @@ impl SendReminder {
 }
 
 #[route(POST "/invoices/:id/remind")]
-fn remind(tx: &mut Tx, id: u64) -> Result<(), ApiError> {
-    let mut inv = tx
-        .get(Id::<Invoice>::from_raw(id))?
-        .ok_or(ApiError::NotFound)?;
+fn remind(tx: &mut Tx, id: Id<Invoice>) -> Result<(), ApiError> {
+    let mut inv = tx.get(id)?.ok_or(ApiError::NotFound)?;
     inv.finalized = true;
     tx.put(&inv);
-    tx.enqueue_keyed(format!("reminder:{id}"), SendReminder { invoice: id });
+    // `SendReminder.invoice` stays a bare `u64`: a job payload is never
+    // itself a wire type (it never crosses HTTP), so it has no `Wire`
+    // requirement — only `#[route]` params/bodies/responses/errors do.
+    tx.enqueue_keyed(
+        format!("reminder:{}", id.raw()),
+        SendReminder { invoice: id.raw() },
+    );
     Ok(())
 }
 ```
@@ -1593,7 +1607,7 @@ use charpente::core::table::Id;
 use charpente::http::{ApiError, App, AppConfig, Ctx};
 use charpente::kernel::JobError;
 use charpente::prod::{ProdDisk, ProdEntropy};
-use charpente::{Schema, Tx, View, job, jobs, route, routes, table};
+use charpente::{Schema, Tx, View, Wire, job, jobs, route, routes, table};
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -1609,7 +1623,7 @@ struct DigestState {
     sent: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Wire, Deserialize)]
 struct NoteBody {
     text: String,
 }
@@ -1629,10 +1643,10 @@ impl SendDigest {
 }
 
 #[route(POST "/notes/:id")]
-fn create_note(tx: &mut Tx, id: u64, body: NoteBody, ctx: &Ctx) -> Result<u64, ApiError> {
+fn create_note(tx: &mut Tx, id: Id<Note>, body: NoteBody, ctx: &Ctx) -> Result<Id<Note>, ApiError> {
     let _ = ctx;
     tx.put(&Note {
-        id: Id::from_raw(id),
+        id,
         text: body.text,
     });
     Ok(id)
@@ -1966,7 +1980,8 @@ use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::{Codec, Id};
 use charpente::http::{ApiError, App, AppConfig, Method, Request};
 use charpente::kernel::{JobError, Kernel, SimSource};
-use charpente::{Schema, Tx, View, job, jobs, route, routes, table};
+use charpente::wire::WireU64;
+use charpente::{Schema, Tx, View, Wire, job, jobs, route, routes, table};
 use charpente_sim::Sim;
 use charpente_sim::checks::is_fault_fallout;
 use serde::{Deserialize, Serialize};
@@ -1981,6 +1996,8 @@ struct Counter {
     hits: u64,
 }
 
+// A job payload never crosses HTTP, so it has no `Wire` requirement — this
+// stays a bare `u64`.
 #[job]
 struct CountUp {
     slot: u64,
@@ -1997,14 +2014,16 @@ impl CountUp {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+// A route body IS a wire type, so `slot` is `WireU64` here even though the
+// job payload above carries the same value as a bare `u64`.
+#[derive(Wire, Serialize, Deserialize)]
 struct HitBody {
-    slot: u64,
+    slot: WireU64,
 }
 
 #[route(POST "/hit")]
-fn hit(tx: &mut Tx, body: HitBody) -> Result<u64, ApiError> {
-    tx.enqueue(CountUp { slot: body.slot });
+fn hit(tx: &mut Tx, body: HitBody) -> Result<WireU64, ApiError> {
+    tx.enqueue(CountUp { slot: body.slot.0 });
     Ok(body.slot)
 }
 
@@ -2081,7 +2100,7 @@ fn whole_app(sim: &mut Sim) -> Result<(), String> {
     for slot in 0..3u64 {
         source.push_at(
             slot * SEC,
-            Request::new(Method::Post, "/hit").json(&HitBody { slot }),
+            Request::new(Method::Post, "/hit").json(&HitBody { slot: WireU64(slot) }),
         );
     }
     let responses = source.responses();
@@ -2930,23 +2949,26 @@ fn handler(tx: &mut Tx, [captures,] ctx: &Ctx, cursor: Option<Cursor>)
 use charpente::event;
 use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, Method, Request, Subscription};
 use charpente::kernel::{Kernel, SimSource};
-use charpente::{Schema, Tx, route, routes};
+use charpente::wire::WireU64;
+use charpente::{Schema, Tx, Wire, route, routes};
 use charpente_sim::Sim;
 use serde::{Deserialize, Serialize};
 
+// `#[event]` payloads are not `#[route]` types, so `Ping.n` stays a bare
+// `u64` — only the route body below needs `Wire`.
 #[event]
 struct Ping {
     n: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Wire, Serialize, Deserialize)]
 struct PingBody {
-    n: u64,
+    n: WireU64,
 }
 
 #[route(POST "/ping")]
 fn send_ping(tx: &mut Tx, body: PingBody) -> Result<(), ApiError> {
-    tx.emit(Ping { n: body.n });
+    tx.emit(Ping { n: body.n.0 });
     Ok(())
 }
 
@@ -3101,25 +3123,28 @@ one-shot reply, recorded as a `SimSinkHandle`:
 use charpente::event;
 use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, Method, Request, Subscription};
 use charpente::kernel::{Kernel, SimSource};
-use charpente::{Schema, Tx, route, routes};
+use charpente::wire::WireU64;
+use charpente::{Schema, Tx, Wire, route, routes};
 use charpente_sim::Sim;
 use serde::{Deserialize, Serialize};
 
 const SEC: u64 = 1_000_000_000;
 
+// `#[event]` payloads are not `#[route]` types, so `Ping.n` stays a bare
+// `u64` — only the route body below needs `Wire`.
 #[event]
 struct Ping {
     n: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Wire, Serialize, Deserialize)]
 struct PingBody {
-    n: u64,
+    n: WireU64,
 }
 
 #[route(POST "/ping")]
 fn send_ping(tx: &mut Tx, body: PingBody) -> Result<(), ApiError> {
-    tx.emit(Ping { n: body.n });
+    tx.emit(Ping { n: body.n.0 });
     Ok(())
 }
 
@@ -3149,7 +3174,7 @@ fn tail_resumes_after_reconnect(sim: &mut Sim) -> Result<(), String> {
     for n in 0..3u64 {
         source.push_at(
             (n + 1) * SEC,
-            Request::new(Method::Post, "/ping").json(&PingBody { n }),
+            Request::new(Method::Post, "/ping").json(&PingBody { n: WireU64(n) }),
         );
     }
     let sinks = source.sinks();
@@ -3173,7 +3198,7 @@ fn tail_resumes_after_reconnect(sim: &mut Sim) -> Result<(), String> {
     );
     source.push_at(
         5 * SEC,
-        Request::new(Method::Post, "/ping").json(&PingBody { n: 3 }),
+        Request::new(Method::Post, "/ping").json(&PingBody { n: WireU64(3) }),
     );
     kernel.run(&mut source).map_err(|e| e.to_string())?;
 
@@ -3374,7 +3399,7 @@ one function this migration asks you to factor `fn main`'s body into.
 use charpente::core::io::{Disk, Entropy};
 use charpente::core::table::Id;
 use charpente::http::{ApiError, App, AppConfig};
-use charpente::{Schema, Tx, View, route, routes, table};
+use charpente::{Schema, Tx, View, Wire, route, routes, table};
 use serde::Deserialize;
 
 #[table]
@@ -3383,15 +3408,15 @@ struct Note {
     text: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Wire, Deserialize)]
 struct NoteBody {
     text: String,
 }
 
 #[route(POST "/notes/:id")]
-fn create_note(tx: &mut Tx, id: u64, body: NoteBody) -> Result<u64, ApiError> {
+fn create_note(tx: &mut Tx, id: Id<Note>, body: NoteBody) -> Result<Id<Note>, ApiError> {
     tx.put(&Note {
-        id: Id::from_raw(id),
+        id,
         text: body.text,
     });
     Ok(id)
@@ -3443,13 +3468,17 @@ never wrapped in a framework message.
 ### The invoicing contract
 
 The full JSON `examples/invoicing` renders — 12 routes across customers, invoices, and
-API keys; 4 jobs (3 of the app's own plus the platform's built-in session sweep); 2 cron
-entries (the app's daily overdue-check plus the platform's built-in session sweep
-schedule); 13 tables (7 of the app's own plus 6 platform tables: `Session`, `ApiKey`,
-`CronRow`, and the three untyped internal tables backing jobs, events, and schema
-versions). Every `"builtin": true` entry above is a table, job, or cron entry the
-platform itself registers, not app code — this is how an agent tells its own surface
-apart from the platform's without memorizing a list:
+API keys; 8 named types reachable from those routes' params, request, and response
+schemas (`ApiError`, `CreateCustomerBody`, `CreateInvoiceBody`, `CustomerView`,
+`InvoiceView`, `LineItemInput`, `LineItemView`, `OidcReject`, alphabetized in `"types"`
+regardless of route registration order — §5's `register_types` walk); 4 jobs (3 of the
+app's own plus the platform's built-in session sweep); 2 cron entries (the app's daily
+overdue-check plus the platform's built-in session sweep schedule); 13 tables (7 of the
+app's own plus 6 platform tables: `Session`, `ApiKey`, `CronRow`, and the three untyped
+internal tables backing jobs, events, and schema versions). Every `"builtin": true`
+entry above is a table, job, or cron entry the platform itself registers, not app
+code — this is how an agent tells its own surface apart from the platform's without
+memorizing a list:
 
 ```json
 {
@@ -3585,84 +3614,551 @@ apart from the platform's without memorizing a list:
       "pattern": "/login",
       "name": "login",
       "auth": false,
-      "stream": false
+      "stream": false,
+      "params": [],
+      "request": "String",
+      "response": "String",
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "POST",
       "pattern": "/customers/:id",
       "name": "create_customer",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Customer"
+          }
+        }
+      ],
+      "request": {
+        "Ref": "CreateCustomerBody"
+      },
+      "response": {
+        "Ref": "CustomerView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "GET",
       "pattern": "/customers/:id",
       "name": "get_customer",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Customer"
+          }
+        }
+      ],
+      "request": null,
+      "response": {
+        "Ref": "CustomerView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "GET",
       "pattern": "/customers",
       "name": "list_customers",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [],
+      "request": null,
+      "response": {
+        "Seq": {
+          "Ref": "CustomerView"
+        }
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "POST",
       "pattern": "/invoices/:id",
       "name": "create_invoice",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Invoice"
+          }
+        }
+      ],
+      "request": {
+        "Ref": "CreateInvoiceBody"
+      },
+      "response": {
+        "Ref": "InvoiceView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "GET",
       "pattern": "/invoices/:id",
       "name": "get_invoice",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Invoice"
+          }
+        }
+      ],
+      "request": null,
+      "response": {
+        "Ref": "InvoiceView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "GET",
       "pattern": "/invoices",
       "name": "list_invoices",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [],
+      "request": null,
+      "response": {
+        "Seq": {
+          "Ref": "InvoiceView"
+        }
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "POST",
       "pattern": "/invoices/:id/finalize",
       "name": "finalize_invoice",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Invoice"
+          }
+        }
+      ],
+      "request": null,
+      "response": {
+        "Ref": "InvoiceView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "POST",
       "pattern": "/invoices/:id/record-payment",
       "name": "record_payment",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Invoice"
+          }
+        }
+      ],
+      "request": null,
+      "response": {
+        "Ref": "InvoiceView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "GET",
       "pattern": "/events/feed",
       "name": "events_feed",
       "auth": true,
-      "stream": true
+      "stream": true,
+      "params": [],
+      "request": null,
+      "response": "Null",
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "POST",
       "pattern": "/keys",
       "name": "create_key",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [],
+      "request": null,
+      "response": "String",
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "DELETE",
       "pattern": "/keys/:id",
       "name": "revoke_key",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "ApiKey"
+          }
+        }
+      ],
+      "request": null,
+      "response": "String",
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
+    }
+  ],
+  "types": [
+    {
+      "name": "ApiError",
+      "schema": {
+        "Enum": {
+          "External": {
+            "variants": [
+              [
+                "BadRequest",
+                "String"
+              ],
+              [
+                "Unauthorized",
+                null
+              ],
+              [
+                "UnrecognizedCredential",
+                null
+              ],
+              [
+                "SessionExpired",
+                null
+              ],
+              [
+                "Oidc",
+                {
+                  "Ref": "OidcReject"
+                }
+              ],
+              [
+                "NotFound",
+                null
+              ],
+              [
+                "Internal",
+                "String"
+              ]
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "CreateCustomerBody",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "name",
+              "schema": "String",
+              "optional": false
+            },
+            {
+              "name": "email",
+              "schema": "String",
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "CreateInvoiceBody",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "customer",
+              "schema": {
+                "Id": "Customer"
+              },
+              "optional": false
+            },
+            {
+              "name": "due_day",
+              "schema": {
+                "Int64": {
+                  "signed": false
+                }
+              },
+              "optional": false
+            },
+            {
+              "name": "line_items",
+              "schema": {
+                "Seq": {
+                  "Ref": "LineItemInput"
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "CustomerView",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "id",
+              "schema": {
+                "Id": "Customer"
+              },
+              "optional": false
+            },
+            {
+              "name": "name",
+              "schema": "String",
+              "optional": false
+            },
+            {
+              "name": "email",
+              "schema": "String",
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "InvoiceView",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "id",
+              "schema": {
+                "Id": "Invoice"
+              },
+              "optional": false
+            },
+            {
+              "name": "customer",
+              "schema": {
+                "Id": "Customer"
+              },
+              "optional": false
+            },
+            {
+              "name": "state",
+              "schema": "String",
+              "optional": false
+            },
+            {
+              "name": "due_day",
+              "schema": {
+                "Int64": {
+                  "signed": false
+                }
+              },
+              "optional": false
+            },
+            {
+              "name": "line_items",
+              "schema": {
+                "Seq": {
+                  "Ref": "LineItemView"
+                }
+              },
+              "optional": false
+            },
+            {
+              "name": "total_cents",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "LineItemInput",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "description",
+              "schema": "String",
+              "optional": false
+            },
+            {
+              "name": "unit_amount_cents",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            },
+            {
+              "name": "quantity",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "LineItemView",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "description",
+              "schema": "String",
+              "optional": false
+            },
+            {
+              "name": "unit_amount_cents",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            },
+            {
+              "name": "quantity",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "OidcReject",
+      "schema": {
+        "Enum": {
+          "External": {
+            "variants": [
+              [
+                "Malformed",
+                "String"
+              ],
+              [
+                "UnsupportedAlg",
+                "String"
+              ],
+              [
+                "BadSignature",
+                null
+              ],
+              [
+                "Expired",
+                null
+              ],
+              [
+                "NotYetValid",
+                null
+              ],
+              [
+                "WrongIssuer",
+                {
+                  "Struct": {
+                    "fields": [
+                      {
+                        "name": "got",
+                        "schema": "String",
+                        "optional": false
+                      },
+                      {
+                        "name": "configured",
+                        "schema": "String",
+                        "optional": false
+                      }
+                    ]
+                  }
+                }
+              ],
+              [
+                "WrongAudience",
+                {
+                  "Struct": {
+                    "fields": [
+                      {
+                        "name": "got",
+                        "schema": "String",
+                        "optional": false
+                      },
+                      {
+                        "name": "configured",
+                        "schema": "String",
+                        "optional": false
+                      }
+                    ]
+                  }
+                }
+              ]
+            ]
+          }
+        }
+      }
     }
   ],
   "jobs": [

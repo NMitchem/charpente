@@ -24,12 +24,19 @@ use crate::auth::{ApiKey, SessionSweep};
 use crate::http::{App, Route, RouteGlue, Session};
 use crate::kernel::JobDef;
 use crate::kernel::cron::{CronEntry, CronRow};
+use crate::wire::{TypeDef, TypeRegistry, TypeSchema};
 
 #[derive(Serialize)]
 pub struct Contract {
     pub charpente_version: &'static str,
     pub tables: Vec<TableInfo>,
     pub routes: Vec<RouteInfo>,
+    /// The transitive closure of every named type a route's params, request,
+    /// response, or error references — `TypeRegistry::into_sorted()`, a
+    /// `BTreeMap` walk, so this is sorted by construction (spec §4's
+    /// determinism requirement holds without a separate sort call someone
+    /// could delete).
+    pub types: Vec<TypeDef>,
     pub jobs: Vec<JobInfo>,
     pub cron: Vec<CronInfo>,
     pub config: ConfigInfo,
@@ -59,6 +66,20 @@ pub struct RouteInfo {
     pub name: &'static str,
     pub auth: bool,
     pub stream: bool,
+    pub params: Vec<ParamInfo>,
+    /// `None` for routes with no JSON body.
+    pub request: Option<TypeSchema>,
+    pub response: TypeSchema,
+    pub error: TypeSchema,
+    /// Event types a stream route declares via `emits(...)` (Task 7). Empty
+    /// for non-stream routes, and for a stream route until Task 7 lands.
+    pub emits: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ParamInfo {
+    pub name: &'static str,
+    pub schema: TypeSchema,
 }
 
 #[derive(Serialize)]
@@ -102,6 +123,10 @@ impl App {
     /// this App's registries. Reads registries only — no disk writes, no
     /// socket, no kernel.
     pub fn describe(&self) -> Contract {
+        let mut reg = TypeRegistry::default();
+        for r in self.router().routes() {
+            (r.register_types)(&mut reg);
+        }
         Contract {
             charpente_version: env!("CARGO_PKG_VERSION"),
             tables: self
@@ -111,6 +136,7 @@ impl App {
                 .map(table_info)
                 .collect(),
             routes: self.router().routes().iter().map(route_info).collect(),
+            types: reg.into_sorted(),
             jobs: self.job_defs().iter().map(job_info).collect(),
             cron: self.cron_entries().iter().map(cron_info).collect(),
             config: config_info(self),
@@ -155,6 +181,15 @@ fn route_info(route: &Route) -> RouteInfo {
         name: route.name,
         auth: route.auth,
         stream: matches!(route.glue, RouteGlue::Sse(_)),
+        params: route
+            .params
+            .iter()
+            .map(|(name, f)| ParamInfo { name, schema: f() })
+            .collect(),
+        request: route.request.map(|f| f()),
+        response: (route.response)(),
+        error: (route.error)(),
+        emits: route.emits.to_vec(),
     }
 }
 
@@ -236,6 +271,24 @@ pub fn to_human(c: &Contract) -> String {
             out,
             "  {} {} name={} auth={} stream={}",
             r.method, r.pattern, r.name, r.auth, r.stream
+        )
+        .unwrap();
+        // Task 5: a route's type info (params/request/response/error) is
+        // included here, on its own indented line, rather than left JSON-only
+        // — `to_human` exists to be a complete agent-readable contract dump,
+        // and a route's types are now as central to what it IS as its
+        // method/pattern. `Debug` formatting (not a bespoke renderer): boring
+        // on purpose, matching this function's existing style, and
+        // `TypeSchema` has no `Display`. What is deliberately NOT here: the
+        // full `Contract.types` closure catalog — that belongs to the JSON
+        // format (structured, and consumed by the TS emitter, not skimmed by
+        // a human), and dumping every named type's full expansion inline
+        // per-route would work against this format's "boring, fixed-width"
+        // design intent for an app with many routes/types.
+        writeln!(
+            out,
+            "    params={:?} request={:?} response={:?} error={:?}",
+            r.params, r.request, r.response, r.error
         )
         .unwrap();
     }

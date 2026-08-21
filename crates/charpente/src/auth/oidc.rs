@@ -68,7 +68,12 @@ impl fmt::Display for OidcConfigError {
 
 /// Why `OidcVerifier::verify` rejected a presented JWT (spec §6): one named
 /// variant per check, each naming the check and the fix.
-#[derive(Debug)]
+///
+/// Derives `Wire` + `Serialize` (task 5, Amendment E): `ApiError::Oidc`
+/// wraps this, so `ApiError`'s own `Wire` derive requires it. Same caveat as
+/// `ApiError` — `ApiError::response()` never serializes this shape directly;
+/// see `ApiError`'s doc comment.
+#[derive(Debug, ::charpente::Wire, serde::Serialize)]
 pub enum OidcReject {
     Malformed(String),
     UnsupportedAlg(String),

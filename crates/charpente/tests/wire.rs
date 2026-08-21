@@ -17,6 +17,41 @@ fn primitives_describe_themselves() {
     assert_eq!(<f32 as Wire>::schema(), TypeSchema::F32);
     assert_eq!(<f64 as Wire>::schema(), TypeSchema::F64);
     assert_eq!(<String as Wire>::schema(), TypeSchema::String);
+    assert_eq!(<() as Wire>::schema(), TypeSchema::Null);
+    assert_eq!(<&str as Wire>::schema(), TypeSchema::String);
+}
+
+/// Task 5, Ruling 25: `()` is `Null`, not `Struct { fields: vec![] }` — those
+/// are different JSON documents (`null` vs `{}`). Reads BOTH sides, per the
+/// Global Constraint: real `serde_json` output (matching what
+/// `Response::json(200, &())` actually puts on the wire — measured directly
+/// in the task-5 report, not assumed) AND `<() as Wire>::schema()`.
+/// Mutation that reddens this: `Null` back to `Struct { fields: vec![] }` in
+/// `wire.rs`'s `impl Wire for ()`.
+#[test]
+fn fidelity_unit_serializes_as_the_json_null_literal_not_an_empty_object() {
+    assert_eq!(serde_json::to_string(&()).unwrap(), "null");
+    assert_ne!(
+        serde_json::to_string(&()).unwrap(),
+        "{}",
+        "null and {{}} are different documents — conflating them is the exact bug \
+         Task 4's F5 review caught (None vs Some(Struct{{fields:[]}}))"
+    );
+    assert_eq!(<() as Wire>::schema(), TypeSchema::Null);
+}
+
+/// `&'static str` is not a mistake to migrate away from — serde encodes it
+/// identically to `String` (Ruling 25). Reads both sides.
+#[test]
+fn fidelity_static_str_serializes_identically_to_string() {
+    let borrowed: &'static str = "hi";
+    let owned = "hi".to_string();
+    assert_eq!(
+        serde_json::to_string(&borrowed).unwrap(),
+        serde_json::to_string(&owned).unwrap()
+    );
+    assert_eq!(serde_json::to_string(&borrowed).unwrap(), "\"hi\"");
+    assert_eq!(<&str as Wire>::schema(), TypeSchema::String);
 }
 
 #[test]

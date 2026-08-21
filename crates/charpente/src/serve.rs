@@ -500,6 +500,7 @@ mod tests {
     use crate::http::{ApiError, AppConfig, Ctx, Cursor, Route, RouteGlue, Session, Subscription};
     use crate::prod::{ProdDisk, ProdEntropy};
     use crate::repl::role::Role;
+    use crate::wire::{TypeSchema, Wire};
     use charpente_core::db::{Event, Schema, Tx};
     use charpente_core::io::Entropy;
     use charpente_core::table::{Codec, Id, View};
@@ -530,12 +531,20 @@ mod tests {
             AppConfig::default(),
         )
         .unwrap()
+        // Untyped glue, not a described route (serve.rs can't use `::charpente`
+        // macro paths — see the comment above `hello_glue`).
         .mount(vec![Route {
             method: Method::Get,
             pattern: "/hello",
             auth: false,
             name: "hello",
             glue: RouteGlue::Http(hello_glue),
+            params: &[],
+            request: None,
+            response: || TypeSchema::Null,
+            error: || <ApiError as Wire>::reference(),
+            register_types: |_| {},
+            emits: &[],
         }]);
 
         let server = serve("127.0.0.1:0", app).unwrap();
@@ -597,6 +606,7 @@ mod tests {
         Ok(Response::json(200, &row.subject))
     }
 
+    // Untyped glue, not described routes (same reason as `hello_glue` above).
     fn smoke_routes() -> Vec<Route> {
         vec![
             Route {
@@ -605,6 +615,12 @@ mod tests {
                 auth: false,
                 name: "put_row",
                 glue: RouteGlue::Http(put_row_glue),
+                params: &[],
+                request: None,
+                response: || TypeSchema::Null,
+                error: || <ApiError as Wire>::reference(),
+                register_types: |_| {},
+                emits: &[],
             },
             Route {
                 method: Method::Get,
@@ -612,6 +628,12 @@ mod tests {
                 auth: false,
                 name: "get_row",
                 glue: RouteGlue::Http(get_row_glue),
+                params: &[],
+                request: None,
+                response: || TypeSchema::Null,
+                error: || <ApiError as Wire>::reference(),
+                register_types: |_| {},
+                emits: &[],
             },
         ]
     }
@@ -743,12 +765,20 @@ mod tests {
             },
         )
         .unwrap()
+        // Untyped glue, not a described route (serve.rs can't use `::charpente`
+        // macro paths — see the comment above `hello_glue`).
         .mount(vec![Route {
             method: Method::Get,
             pattern: "/hello",
             auth: false,
             name: "hello",
             glue: RouteGlue::Http(hello_glue),
+            params: &[],
+            request: None,
+            response: || TypeSchema::Null,
+            error: || <ApiError as Wire>::reference(),
+            register_types: |_| {},
+            emits: &[],
         }]);
 
         let server = serve("127.0.0.1:0", app).unwrap();
@@ -819,6 +849,7 @@ mod tests {
         Ok(Subscription::of::<Ping>().cursor(cursor))
     }
 
+    // Untyped glue, not described routes (same reason as `hello_glue` above).
     fn sse_routes() -> Vec<Route> {
         vec![
             Route {
@@ -827,6 +858,12 @@ mod tests {
                 auth: false,
                 name: "emit_ping",
                 glue: RouteGlue::Http(emit_ping_glue),
+                params: &[],
+                request: None,
+                response: || TypeSchema::Null,
+                error: || <ApiError as Wire>::reference(),
+                register_types: |_| {},
+                emits: &[],
             },
             Route {
                 method: Method::Get,
@@ -834,6 +871,12 @@ mod tests {
                 auth: false,
                 name: "feed",
                 glue: RouteGlue::Sse(feed_glue),
+                params: &[],
+                request: None,
+                response: || TypeSchema::Null,
+                error: || <ApiError as Wire>::reference(),
+                register_types: |_| {},
+                emits: &[],
             },
         ]
     }

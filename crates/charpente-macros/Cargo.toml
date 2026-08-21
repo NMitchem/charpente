@@ -27,3 +27,7 @@ trybuild = "1"
 # Legal cargo — dev-dependency cycles don't participate in the build-dep
 # graph the compiler needs to break.
 charpente = { path = "../charpente" }
+# route_bare_u64_body.rs / route_wire_u64_body.rs (task 5): a route body
+# struct needs a real `Deserialize` impl for `#[route]` to compile, same as
+# any app's own body type.
+serde = { version = "1", features = ["derive"] }

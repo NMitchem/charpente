@@ -29,6 +29,7 @@ use charpente::http::{ApiError, App, AppConfig, Handled, Method, Request};
 use charpente::kernel::{
     EventSink, JobError, Kernel, Reply, RequestSource, Respond, SimSource, Step, Wake,
 };
+use charpente::wire::WireU64;
 use charpente::{Schema, Tx, event, job, jobs, route, routes, table};
 use charpente_core::db::Db;
 use charpente_core::event::EventRow;
@@ -53,10 +54,10 @@ struct Hit {
 /// record (the row always changes), which is what makes `g.len() == 1` a
 /// meaningful assertion below rather than an accident of an empty diff.
 #[route(POST "/hit/:id")]
-fn hit(tx: &mut Tx, id: Id<Hit>) -> Result<u64, ApiError> {
+fn hit(tx: &mut Tx, id: Id<Hit>) -> Result<WireU64, ApiError> {
     let count = tx.get(id)?.map_or(0, |h| h.count) + 1;
     tx.put(&Hit { id, count });
-    Ok(count)
+    Ok(WireU64(count))
 }
 
 /// A read route, so a batch can contain one. Mounting it is pure in-memory
@@ -64,8 +65,8 @@ fn hit(tx: &mut Tx, id: Id<Hit>) -> Result<u64, ApiError> {
 /// unaffected (and `a_never_contended_universe_traces_identically_...` would
 /// say so immediately if that were wrong).
 #[route(GET "/count/:id")]
-fn count(tx: &mut Tx, id: Id<Hit>) -> Result<u64, ApiError> {
-    Ok(tx.get(id)?.map_or(0, |h| h.count))
+fn count(tx: &mut Tx, id: Id<Hit>) -> Result<WireU64, ApiError> {
+    Ok(WireU64(tx.get(id)?.map_or(0, |h| h.count)))
 }
 
 fn hit_routes() -> Vec<charpente::http::Route> {
@@ -1989,8 +1990,8 @@ fn enqueue_quiet(tx: &mut Tx) -> Result<(), ApiError> {
 }
 
 #[route(GET "/job-count")]
-fn job_count(tx: &mut Tx) -> Result<u64, ApiError> {
-    Ok(tx.scan::<JobRow>()?.len() as u64)
+fn job_count(tx: &mut Tx) -> Result<WireU64, ApiError> {
+    Ok(WireU64(tx.scan::<JobRow>()?.len() as u64))
 }
 
 #[route(POST "/emit-tick")]
@@ -2000,8 +2001,8 @@ fn emit_tick(tx: &mut Tx) -> Result<(), ApiError> {
 }
 
 #[route(GET "/event-count")]
-fn event_count(tx: &mut Tx) -> Result<u64, ApiError> {
-    Ok(tx.scan::<EventRow>()?.len() as u64)
+fn event_count(tx: &mut Tx) -> Result<WireU64, ApiError> {
+    Ok(WireU64(tx.scan::<EventRow>()?.len() as u64))
 }
 
 /// T8a Step 5b.2 (task-8-preflight.md C-12): the group overlay carries
@@ -2058,14 +2059,17 @@ fn enqueues_and_emits_are_invisible_to_a_later_sibling_in_the_same_batch() {
     assert_eq!(bodies[0].0, 200, "the enqueue itself: {bodies:?}");
     assert_eq!(
         bodies[1],
-        (200, "0".to_string()),
+        // job_count/event_count now return WireU64 (task 5): a 64-bit
+        // integer is ALWAYS string-encoded on the wire, so the body is the
+        // JSON string `"0"`, not the bare number `0`.
+        (200, "\"0\"".to_string()),
         "a sibling's enqueue, staged earlier in this same batch, must be INVISIBLE to a later \
          transaction's tx: {bodies:?}"
     );
     assert_eq!(bodies[2].0, 200, "the emit itself: {bodies:?}");
     assert_eq!(
         bodies[3],
-        (200, "0".to_string()),
+        (200, "\"0\"".to_string()),
         "a sibling's emit, staged earlier in this same batch, must be INVISIBLE the same way: \
          {bodies:?}"
     );
@@ -2333,10 +2337,14 @@ fn burst_workload(sim: &mut Sim) -> Result<(), String> {
             .iter()
         {
             if *status == 200 {
+                // `hit` returns `WireU64` (task 5): a 64-bit integer is
+                // always string-encoded on the wire, so the body is the
+                // JSON string `"N"`, not the bare number `N`.
                 let count: u64 = String::from_utf8_lossy(body)
                     .trim()
+                    .trim_matches('"')
                     .parse()
-                    .unwrap_or_else(|e| panic!("a /hit/:id 200 body must be a bare u64: {e}"));
+                    .unwrap_or_else(|e| panic!("a /hit/:id 200 body must be a wire u64: {e}"));
                 if watermark == 0 && count > 0 {
                     // 80 of 256 universes as shipped never acked ANY
                     // request, so their oracle compared 0 against 0 (T8b

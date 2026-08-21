@@ -17,7 +17,8 @@ use charpente::kernel::{Kernel, RecordedResponses, SimSinkHandle, SimSource, Sin
 use charpente::repl::protocol::{Msg, decode, encode};
 use charpente::repl::role::Role;
 use charpente::repl::{MAX_MESSAGE_BYTES, Repl, ReplConfig};
-use charpente::{DbConfig, Schema, Tx, route, routes};
+use charpente::wire::{TypeSchema, Wire, WireU64};
+use charpente::{DbConfig, Schema, Tx, Wire as WireDerive, route, routes};
 use charpente_core::db::Db;
 use charpente_core::event::EventRow;
 use charpente_core::io::{Clock, Conn, Disk, Entropy, Net};
@@ -41,17 +42,17 @@ struct Pong {
     n: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(WireDerive, Serialize, Deserialize)]
 struct EmitBody {
-    n: u64,
+    n: WireU64,
     key: Option<String>,
 }
 
 #[route(POST "/ping")]
 fn emit_ping(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
     match body.key {
-        Some(key) => tx.emit_keyed(key, Ping { n: body.n }),
-        None => tx.emit(Ping { n: body.n }),
+        Some(key) => tx.emit_keyed(key, Ping { n: body.n.0 }),
+        None => tx.emit(Ping { n: body.n.0 }),
     }
     Ok(())
 }
@@ -59,8 +60,8 @@ fn emit_ping(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
 #[route(POST "/pong")]
 fn emit_pong(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
     match body.key {
-        Some(key) => tx.emit_keyed(key, Pong { n: body.n }),
-        None => tx.emit(Pong { n: body.n }),
+        Some(key) => tx.emit_keyed(key, Pong { n: body.n.0 }),
+        None => tx.emit(Pong { n: body.n.0 }),
     }
     Ok(())
 }
@@ -146,7 +147,7 @@ fn pick_emit(sim: &Sim) -> (&'static str, EmitBody) {
         1 => Some("org-a".to_string()),
         _ => Some("org-b".to_string()),
     };
-    let n = sim.entropy().next_u64() % 1000;
+    let n = WireU64(sim.entropy().next_u64() % 1000);
     if is_ping {
         ("/ping", EmitBody { n, key })
     } else {
@@ -1210,7 +1211,10 @@ fn a_subscribe_still_sees_an_emit_that_arrives_with_it() {
     source.push_at(t, Request::new(Method::Get, "/feed-ping"));
     source.push_at(
         t,
-        Request::new(Method::Post, "/ping").json(&EmitBody { n: 7, key: None }),
+        Request::new(Method::Post, "/ping").json(&EmitBody {
+            n: WireU64(7),
+            key: None,
+        }),
     );
     let sinks = source.sinks();
 
@@ -1274,12 +1278,20 @@ fn failing_feed_glue(
 
 impl RouteDef for FailingFeed {
     fn route() -> Route {
+        // Untyped glue, not a described route: a hand-written `RouteDef`
+        // with no typed handler (Amendment D, task-5-brief.md).
         Route {
             method: Method::Get,
             pattern: "/feed-failing",
             auth: false,
             name: "FailingFeed",
             glue: RouteGlue::Sse(failing_feed_glue),
+            params: &[],
+            request: None,
+            response: || TypeSchema::Null,
+            error: || <ApiError as Wire>::reference(),
+            register_types: |_| {},
+            emits: &[],
         }
     }
 }
@@ -1289,14 +1301,14 @@ struct NoteAdded {
     n: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(WireDerive, Serialize, Deserialize)]
 struct NoteBody {
-    n: u64,
+    n: WireU64,
 }
 
 #[route(POST "/note")]
 fn emit_note(tx: &mut Tx, body: NoteBody) -> Result<(), ApiError> {
-    tx.emit(NoteAdded { n: body.n });
+    tx.emit(NoteAdded { n: body.n.0 });
     Ok(())
 }
 
@@ -1319,7 +1331,7 @@ fn tail_encode_error_is_whole_node_fatal() {
     source.push_at(t, Request::new(Method::Get, "/feed-failing"));
     source.push_at(
         t,
-        Request::new(Method::Post, "/note").json(&NoteBody { n: 1 }),
+        Request::new(Method::Post, "/note").json(&NoteBody { n: WireU64(1) }),
     );
 
     // Step 1: the subscribe registers the tail (no events exist yet, so it is
@@ -2137,7 +2149,10 @@ fn follower_ids_match_a_batched_primarys() {
     for n in 0..4u64 {
         p.source.push_at(
             now,
-            Request::new(Method::Post, "/ping").json(&EmitBody { n, key: None }),
+            Request::new(Method::Post, "/ping").json(&EmitBody {
+                n: WireU64(n),
+                key: None,
+            }),
         );
     }
     let requests_before = p.kernel.as_ref().expect("primary alive").stats().requests;

@@ -17,13 +17,13 @@ use charpente::{Id, Tx, View, event, job};
 /// keyed to the same org `InvoiceFinalized` was.
 #[job]
 pub struct SendReceipt {
-    pub invoice: u64,
+    pub invoice: Id<Invoice>,
     pub org: String,
 }
 
 impl SendReceipt {
     pub fn run(self, tx: &mut Tx) -> Result<(), JobError> {
-        let invoice_id = Id::<Invoice>::from_raw(self.invoice);
+        let invoice_id = self.invoice;
         let items = LineItem::by_invoice(tx, &invoice_id)?;
         let amount_cents: i64 = items
             .iter()
@@ -37,7 +37,7 @@ impl SendReceipt {
         // once), so this is a collision-free key in Receipt's own id space
         // without needing a counter.
         tx.put(&Receipt {
-            id: Id::from_raw(self.invoice),
+            id: Id::from_raw(self.invoice.raw()),
             invoice: invoice_id,
             amount_cents,
             issued_day: day,
@@ -45,7 +45,7 @@ impl SendReceipt {
         tx.emit_keyed(
             self.org,
             ReceiptSent {
-                invoice: self.invoice,
+                invoice: self.invoice.raw(),
                 amount_cents,
             },
         );

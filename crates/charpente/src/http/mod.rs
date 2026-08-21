@@ -255,7 +255,22 @@ fn ev_json<Ev: Event + serde::Serialize>(bytes: &[u8]) -> io::Result<String> {
 
 /// What a handler can reject with. `Io` failures convert via `From`, so `?`
 /// works on tx reads inside handlers.
-#[derive(Debug)]
+///
+/// Derives `Wire` + `Serialize` (task 5, Amendment E) because every route's
+/// `error: fn() -> TypeSchema` names this type — without it, no `#[route]`
+/// handler compiles. Task 4's enum-payload-free-variant IR change
+/// (`EnumRepr::External { variants: Vec<(String, Option<TypeSchema>)> }`)
+/// exists specifically so this mixed unit/newtype enum can derive at all.
+///
+/// **This is a schema for `ApiError`'s own serde shape, not for the bytes a
+/// client actually receives.** `ApiError::response()` (below) always emits
+/// the fixed envelope `{"error": "<message>"}` regardless of variant (see
+/// `docs/GUIDE.md`'s "`ApiError` and status mapping" section) — deriving
+/// `Wire`/`Serialize` here does not change that. `Contract.types["ApiError"]`
+/// therefore describes a shape the wire never actually carries; a future
+/// task (the TS emitter, or a change to `response()` itself) needs to
+/// reconcile the two. Flagged rather than silently redesigned in task 5.
+#[derive(Debug, ::charpente::Wire, serde::Serialize)]
 pub enum ApiError {
     BadRequest(String),
     /// No credential presented at all on an `auth` route.

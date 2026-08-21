@@ -319,7 +319,15 @@ fn read_server_syncs(addr: &str) -> Option<u64> {
     if status != 200 {
         return None;
     }
-    std::str::from_utf8(&body).ok()?.trim().parse::<u64>().ok()
+    // `syncs` (lib.rs) returns `WireU64` (task 5): a 64-bit integer is
+    // ALWAYS string-encoded on the wire, so the body is the JSON string
+    // `"1234"`, not the bare number `1234` — strip the quotes before parsing.
+    std::str::from_utf8(&body)
+        .ok()?
+        .trim()
+        .trim_matches('"')
+        .parse::<u64>()
+        .ok()
 }
 
 fn sweep_point(

@@ -90,6 +90,7 @@ dependencies = [
  "charpente",
  "proc-macro2",
  "quote",
+ "serde",
  "syn",
  "trybuild",
 ]

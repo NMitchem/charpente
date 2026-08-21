@@ -25,9 +25,12 @@ fn canonical_txn_round_trips_under_sim() {
     for (status, body) in responses.iter() {
         assert_eq!(*status, 200, "body: {}", String::from_utf8_lossy(body));
     }
+    // `/slot/:id` returns `WireU64` (task 5): a 64-bit integer is always
+    // string-encoded on the wire, so the body is the JSON string `"3"`, not
+    // the bare number `3`.
     assert_eq!(
         String::from_utf8_lossy(&responses[3].1),
-        "3",
+        "\"3\"",
         "GET /slot/7 sees all three hits"
     );
     let stats = kernel.stats();

@@ -463,6 +463,7 @@ fn rebuild_restores_pending_jobs_after_reopen() {
 
 // ------------------------------------------------------------------- loop
 
+use charpente::Wire as WireDerive;
 use charpente::http::ApiError;
 use charpente::http::{Method, Request, Response};
 use charpente::kernel::{
@@ -470,6 +471,7 @@ use charpente::kernel::{
 };
 use charpente::route;
 use charpente::routes;
+use charpente::wire::WireU64;
 use charpente_core::io::Instant;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -478,14 +480,14 @@ use std::sync::{Arc, Mutex};
 
 const SEC: u64 = 1_000_000_000;
 
-#[derive(Serialize, Deserialize)]
+#[derive(WireDerive, Serialize, Deserialize)]
 struct Hit {
-    slot: u64,
+    slot: WireU64,
 }
 
 #[route(POST "/hit")]
-fn hit(tx: &mut Tx, body: Hit) -> Result<u64, ApiError> {
-    tx.enqueue(CountUp { slot: body.slot });
+fn hit(tx: &mut Tx, body: Hit) -> Result<WireU64, ApiError> {
+    tx.enqueue(CountUp { slot: body.slot.0 });
     Ok(body.slot)
 }
 
@@ -585,7 +587,7 @@ fn kernel_stops_after_a_request_poisons_the_engine() {
     // validates the crash_disk_now -> Io -> poisoned mechanism used here).
     let sim = Sim::with_faults(0x0DED_0001, FaultConfig::none());
     let app = kernel_crash_app(&sim).unwrap();
-    let hit = |n: u64| Request::new(Method::Post, "/hit").json(&Hit { slot: n });
+    let hit = |n: u64| Request::new(Method::Post, "/hit").json(&Hit { slot: WireU64(n) });
     // Two requests scripted: the first 500s AND poisons; the loop must stop
     // with Err before the second is ever serviced.
     let (mut source, replies) = scripted_source(vec![hit(1), hit(2)]);
@@ -717,17 +719,17 @@ fn kernel_stops_after_a_request_poisons_the_engine() {
 /// A pure read path: no effects, so nothing it does can reach the WAL, and any
 /// status it returns is the store's answer alone.
 #[route(GET "/count/:id")]
-fn read_count(tx: &mut Tx, id: Id<Counter>) -> Result<u64, ApiError> {
-    Ok(tx.get(id)?.map_or(0, |c| c.hits))
+fn read_count(tx: &mut Tx, id: Id<Counter>) -> Result<WireU64, ApiError> {
+    Ok(WireU64(tx.get(id)?.map_or(0, |c| c.hits)))
 }
 
 /// A pure store write — no enqueue, so servicing it never also arms the job
 /// arm and the reply sequence below stays exactly one reply per request.
 #[route(POST "/bump/:id")]
-fn bump_count(tx: &mut Tx, id: Id<Counter>) -> Result<u64, ApiError> {
+fn bump_count(tx: &mut Tx, id: Id<Counter>) -> Result<WireU64, ApiError> {
     let hits = tx.get(id)?.map_or(0, |c| c.hits) + 1;
     tx.put(&Counter { id, hits });
-    Ok(hits)
+    Ok(WireU64(hits))
 }
 
 /// Delegates every call to the sim's own disk with one deliberate exception:
@@ -1213,7 +1215,7 @@ fn loop_serves_requests_runs_jobs_and_ticks_cron() {
     for i in 0..3u64 {
         source.push_at(
             i * SEC,
-            Request::new(Method::Post, "/hit").json(&Hit { slot: i }),
+            Request::new(Method::Post, "/hit").json(&Hit { slot: WireU64(i) }),
         );
     }
     let responses = source.responses();
@@ -1255,7 +1257,7 @@ fn loop_replays_identically_for_the_same_seed() {
         for i in 0..5u64 {
             source.push_at(
                 i * SEC,
-                Request::new(Method::Post, "/hit").json(&Hit { slot: i }),
+                Request::new(Method::Post, "/hit").json(&Hit { slot: WireU64(i) }),
             );
         }
         let responses = source.responses();
@@ -1419,7 +1421,9 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
             let slot = entropy.next_u64() % 8;
             source.push_at(
                 base + i * SEC,
-                Request::new(Method::Post, "/hit").json(&Hit { slot }),
+                Request::new(Method::Post, "/hit").json(&Hit {
+                    slot: WireU64(slot),
+                }),
             );
         }
         // A couple of Flaky jobs enqueued directly (retry path under faults).
@@ -1673,7 +1677,10 @@ fn due_jobs_are_not_starved_by_a_request_flood() {
     let mut source = SimSource::new(Box::new(sim.clock()), 200 * SEC);
     for i in 0..100u64 {
         // All requests arrive at t=0: maximal contention with the due job.
-        source.push_at(0, Request::new(Method::Post, "/hit").json(&Hit { slot: i }));
+        source.push_at(
+            0,
+            Request::new(Method::Post, "/hit").json(&Hit { slot: WireU64(i) }),
+        );
     }
     let mut app = loop_app(&sim);
     app.db_for_tests()
@@ -1753,7 +1760,10 @@ fn due_jobs_are_serviced_before_a_request_flood_exhausts_the_source() {
     for i in 0..FLOOD {
         // Same shape as the eventual-completeness test above: all requests
         // arrive at t=0, maximal contention with the due job.
-        source.push_at(0, Request::new(Method::Post, "/hit").json(&Hit { slot: i }));
+        source.push_at(
+            0,
+            Request::new(Method::Post, "/hit").json(&Hit { slot: WireU64(i) }),
+        );
     }
     let mut app = loop_app(&sim);
     app.db_for_tests()
@@ -1904,20 +1914,20 @@ struct Bumped {
     n: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(WireDerive, Serialize, Deserialize)]
 struct EmitBody {
-    n: u64,
+    n: WireU64,
 }
 
 #[route(POST "/emit")]
 fn emit_one(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
-    tx.emit(Bumped { n: body.n });
+    tx.emit(Bumped { n: body.n.0 });
     Ok(())
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(WireDerive, Serialize, Deserialize)]
 struct FloodBody {
-    count: u64,
+    count: WireU64,
 }
 
 /// Emits `count` events in ONE transaction — the atomic multi-event commit
@@ -1928,7 +1938,7 @@ struct FloodBody {
 /// chance to interleave a delivery attempt in between.
 #[route(POST "/flood")]
 fn flood(tx: &mut Tx, body: FloodBody) -> Result<(), ApiError> {
-    for i in 0..body.count {
+    for i in 0..body.count.0 {
         tx.emit(Bumped { n: i });
     }
     Ok(())
@@ -1974,7 +1984,7 @@ fn a_tail_receives_matching_events_exactly_and_in_order() {
     for (i, n) in [10u64, 20, 30].into_iter().enumerate() {
         source.push_at(
             (i as u64 + 1) * SEC,
-            Request::new(Method::Post, "/emit").json(&EmitBody { n }),
+            Request::new(Method::Post, "/emit").json(&EmitBody { n: WireU64(n) }),
         );
     }
     let sinks = source.sinks();
@@ -2015,7 +2025,7 @@ fn resume_from_cursor_delivers_the_successor_onward_no_dup_no_gap() {
     for n in 0..5u64 {
         source.push_at(
             (n + 1) * SEC,
-            Request::new(Method::Post, "/emit").json(&EmitBody { n }),
+            Request::new(Method::Post, "/emit").json(&EmitBody { n: WireU64(n) }),
         );
     }
     let sinks = source.sinks();
@@ -2041,7 +2051,7 @@ fn resume_from_cursor_delivers_the_successor_onward_no_dup_no_gap() {
     );
     source.push_at(
         7 * SEC,
-        Request::new(Method::Post, "/emit").json(&EmitBody { n: 5 }),
+        Request::new(Method::Post, "/emit").json(&EmitBody { n: WireU64(5) }),
     );
     kernel.run(&mut source).unwrap();
 
@@ -2069,7 +2079,7 @@ fn cursor_below_floor_and_diverged_cursor_are_named_409s() {
     // lands at 10 - 2 = 8 before any subscribe is ever evaluated.
     source.push_at(
         0,
-        Request::new(Method::Post, "/flood").json(&FloodBody { count: 10 }),
+        Request::new(Method::Post, "/flood").json(&FloodBody { count: WireU64(10) }),
     );
     source.push_at(SEC, Request::new(Method::Get, "/feed?cursor=1.0"));
     source.push_at(2 * SEC, Request::new(Method::Get, "/feed?cursor=999.1"));
@@ -2110,14 +2120,14 @@ fn a_tail_behind_retention_gets_the_gap_frame_then_closes() {
     source.push_at(0, Request::new(Method::Get, "/feed")); // from now: next_id = 0
     source.push_at(
         SEC,
-        Request::new(Method::Post, "/emit").json(&EmitBody { n: 99 }),
+        Request::new(Method::Post, "/emit").json(&EmitBody { n: WireU64(99) }),
     );
     // One atomic commit of 5 more events + its checkpoint jumps the floor to
     // 6 - 2 = 4, past the tail's stalled position (1) — no interleaved
     // delivery attempt is possible in between (see `flood`'s doc comment).
     source.push_at(
         2 * SEC,
-        Request::new(Method::Post, "/flood").json(&FloodBody { count: 5 }),
+        Request::new(Method::Post, "/flood").json(&FloodBody { count: WireU64(5) }),
     );
     let sinks = source.sinks();
     let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
@@ -2150,7 +2160,7 @@ fn a_full_sink_drops_the_tail_and_resume_recovers() {
     for n in 0..3u64 {
         source.push_at(
             (n + 1) * SEC,
-            Request::new(Method::Post, "/emit").json(&EmitBody { n }),
+            Request::new(Method::Post, "/emit").json(&EmitBody { n: WireU64(n) }),
         );
     }
     let sinks = source.sinks();
@@ -2173,11 +2183,11 @@ fn a_full_sink_drops_the_tail_and_resume_recovers() {
     // Two more events land (ids 3, 4) while the tail is dead.
     source.push_at(
         4 * SEC,
-        Request::new(Method::Post, "/emit").json(&EmitBody { n: 3 }),
+        Request::new(Method::Post, "/emit").json(&EmitBody { n: WireU64(3) }),
     );
     source.push_at(
         5 * SEC,
-        Request::new(Method::Post, "/emit").json(&EmitBody { n: 4 }),
+        Request::new(Method::Post, "/emit").json(&EmitBody { n: WireU64(4) }),
     );
     source.push_at(
         6 * SEC,

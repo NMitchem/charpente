@@ -19,6 +19,11 @@ pub type Glue = fn(&mut Tx, &Ctx, &[String], &[u8]) -> Result<Response, ApiError
 /// `Handled::Subscribe`), which has a sink to hand the tail.
 pub type SubGlue = fn(&mut Tx, &Ctx, &[String], Option<Cursor>) -> Result<Subscription, ApiError>;
 
+/// A path param's name paired with its fn-deferred wire schema (`Route::params`'s
+/// element type — factored out so the field itself stays under clippy's
+/// type-complexity threshold).
+pub type ParamSchema = (&'static str, fn() -> crate::wire::TypeSchema);
+
 /// A route's flavor-specific glue. The two flavors are dispatched
 /// differently by `App::handle_or_subscribe` — that's the only reason this
 /// wraps `Glue`/`SubGlue` instead of `Route` holding a bare `Glue`.
@@ -34,6 +39,22 @@ pub struct Route {
     pub auth: bool,
     pub name: &'static str,
     pub glue: RouteGlue,
+    /// Path params in path order, each with its wire schema. Deferred behind
+    /// a fn pointer because `TypeSchema` is not const-constructible (it owns
+    /// `Vec`s and `String`s) and `Route` is returned from a `const`-ish
+    /// `RouteDef::route()`.
+    pub params: &'static [ParamSchema],
+    /// `None` for routes with no JSON body.
+    pub request: Option<fn() -> crate::wire::TypeSchema>,
+    pub response: fn() -> crate::wire::TypeSchema,
+    pub error: fn() -> crate::wire::TypeSchema,
+    /// Registers this route's whole type closure (params, request, response,
+    /// error, and everything they transitively reference) into the contract
+    /// registry.
+    pub register_types: fn(&mut crate::wire::TypeRegistry),
+    /// Event types a stream route declares via `emits(...)` (Task 7). Empty
+    /// for non-stream routes, and for a stream route until Task 7 lands.
+    pub emits: &'static [&'static str],
 }
 
 /// Implemented by the marker struct `#[route]` emits next to each handler,
@@ -203,12 +224,21 @@ mod tests {
     }
 
     fn route(method: Method, pattern: &'static str, name: &'static str) -> Route {
+        // Untyped glue, not a described route: `ok` returns a `Response`
+        // directly with no typed handler, so there is no schema to give it
+        // (Amendment D, task-5-brief.md).
         Route {
             method,
             pattern,
             auth: false,
             name,
             glue: RouteGlue::Http(ok),
+            params: &[],
+            request: None,
+            response: || crate::wire::TypeSchema::Null,
+            error: || <ApiError as crate::wire::Wire>::reference(),
+            register_types: |_| {},
+            emits: &[],
         }
     }
 

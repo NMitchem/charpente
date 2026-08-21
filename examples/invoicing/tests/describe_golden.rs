@@ -162,84 +162,551 @@ const GOLDEN: &str = r#"{
       "pattern": "/login",
       "name": "login",
       "auth": false,
-      "stream": false
+      "stream": false,
+      "params": [],
+      "request": "String",
+      "response": "String",
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "POST",
       "pattern": "/customers/:id",
       "name": "create_customer",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Customer"
+          }
+        }
+      ],
+      "request": {
+        "Ref": "CreateCustomerBody"
+      },
+      "response": {
+        "Ref": "CustomerView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "GET",
       "pattern": "/customers/:id",
       "name": "get_customer",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Customer"
+          }
+        }
+      ],
+      "request": null,
+      "response": {
+        "Ref": "CustomerView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "GET",
       "pattern": "/customers",
       "name": "list_customers",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [],
+      "request": null,
+      "response": {
+        "Seq": {
+          "Ref": "CustomerView"
+        }
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "POST",
       "pattern": "/invoices/:id",
       "name": "create_invoice",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Invoice"
+          }
+        }
+      ],
+      "request": {
+        "Ref": "CreateInvoiceBody"
+      },
+      "response": {
+        "Ref": "InvoiceView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "GET",
       "pattern": "/invoices/:id",
       "name": "get_invoice",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Invoice"
+          }
+        }
+      ],
+      "request": null,
+      "response": {
+        "Ref": "InvoiceView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "GET",
       "pattern": "/invoices",
       "name": "list_invoices",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [],
+      "request": null,
+      "response": {
+        "Seq": {
+          "Ref": "InvoiceView"
+        }
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "POST",
       "pattern": "/invoices/:id/finalize",
       "name": "finalize_invoice",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Invoice"
+          }
+        }
+      ],
+      "request": null,
+      "response": {
+        "Ref": "InvoiceView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "POST",
       "pattern": "/invoices/:id/record-payment",
       "name": "record_payment",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Invoice"
+          }
+        }
+      ],
+      "request": null,
+      "response": {
+        "Ref": "InvoiceView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "GET",
       "pattern": "/events/feed",
       "name": "events_feed",
       "auth": true,
-      "stream": true
+      "stream": true,
+      "params": [],
+      "request": null,
+      "response": "Null",
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "POST",
       "pattern": "/keys",
       "name": "create_key",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [],
+      "request": null,
+      "response": "String",
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "DELETE",
       "pattern": "/keys/:id",
       "name": "revoke_key",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "ApiKey"
+          }
+        }
+      ],
+      "request": null,
+      "response": "String",
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
+    }
+  ],
+  "types": [
+    {
+      "name": "ApiError",
+      "schema": {
+        "Enum": {
+          "External": {
+            "variants": [
+              [
+                "BadRequest",
+                "String"
+              ],
+              [
+                "Unauthorized",
+                null
+              ],
+              [
+                "UnrecognizedCredential",
+                null
+              ],
+              [
+                "SessionExpired",
+                null
+              ],
+              [
+                "Oidc",
+                {
+                  "Ref": "OidcReject"
+                }
+              ],
+              [
+                "NotFound",
+                null
+              ],
+              [
+                "Internal",
+                "String"
+              ]
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "CreateCustomerBody",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "name",
+              "schema": "String",
+              "optional": false
+            },
+            {
+              "name": "email",
+              "schema": "String",
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "CreateInvoiceBody",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "customer",
+              "schema": {
+                "Id": "Customer"
+              },
+              "optional": false
+            },
+            {
+              "name": "due_day",
+              "schema": {
+                "Int64": {
+                  "signed": false
+                }
+              },
+              "optional": false
+            },
+            {
+              "name": "line_items",
+              "schema": {
+                "Seq": {
+                  "Ref": "LineItemInput"
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "CustomerView",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "id",
+              "schema": {
+                "Id": "Customer"
+              },
+              "optional": false
+            },
+            {
+              "name": "name",
+              "schema": "String",
+              "optional": false
+            },
+            {
+              "name": "email",
+              "schema": "String",
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "InvoiceView",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "id",
+              "schema": {
+                "Id": "Invoice"
+              },
+              "optional": false
+            },
+            {
+              "name": "customer",
+              "schema": {
+                "Id": "Customer"
+              },
+              "optional": false
+            },
+            {
+              "name": "state",
+              "schema": "String",
+              "optional": false
+            },
+            {
+              "name": "due_day",
+              "schema": {
+                "Int64": {
+                  "signed": false
+                }
+              },
+              "optional": false
+            },
+            {
+              "name": "line_items",
+              "schema": {
+                "Seq": {
+                  "Ref": "LineItemView"
+                }
+              },
+              "optional": false
+            },
+            {
+              "name": "total_cents",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "LineItemInput",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "description",
+              "schema": "String",
+              "optional": false
+            },
+            {
+              "name": "unit_amount_cents",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            },
+            {
+              "name": "quantity",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "LineItemView",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "description",
+              "schema": "String",
+              "optional": false
+            },
+            {
+              "name": "unit_amount_cents",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            },
+            {
+              "name": "quantity",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "OidcReject",
+      "schema": {
+        "Enum": {
+          "External": {
+            "variants": [
+              [
+                "Malformed",
+                "String"
+              ],
+              [
+                "UnsupportedAlg",
+                "String"
+              ],
+              [
+                "BadSignature",
+                null
+              ],
+              [
+                "Expired",
+                null
+              ],
+              [
+                "NotYetValid",
+                null
+              ],
+              [
+                "WrongIssuer",
+                {
+                  "Struct": {
+                    "fields": [
+                      {
+                        "name": "got",
+                        "schema": "String",
+                        "optional": false
+                      },
+                      {
+                        "name": "configured",
+                        "schema": "String",
+                        "optional": false
+                      }
+                    ]
+                  }
+                }
+              ],
+              [
+                "WrongAudience",
+                {
+                  "Struct": {
+                    "fields": [
+                      {
+                        "name": "got",
+                        "schema": "String",
+                        "optional": false
+                      },
+                      {
+                        "name": "configured",
+                        "schema": "String",
+                        "optional": false
+                      }
+                    ]
+                  }
+                }
+              ]
+            ]
+          }
+        }
+      }
     }
   ],
   "jobs": [

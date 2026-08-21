@@ -3824,6 +3824,7 @@ fn the_zero_loss_oracle_catches_a_promote_without_drain() {
 
 use charpente::http::{ApiError, App, AppConfig, Method, Request, Session};
 use charpente::kernel::{CronRow, Kernel, RecordedResponses, SimSource, Step};
+use charpente::wire::WireI64;
 use charpente::{Tx, job, jobs, route, routes};
 use charpente_core::job::JobRow;
 
@@ -3852,19 +3853,20 @@ impl Bump {
 }
 
 #[route(POST "/widget/:id")]
-fn put_widget(tx: &mut Tx, id: u64) -> Result<u64, ApiError> {
+fn put_widget(tx: &mut Tx, id: Id<Widget>) -> Result<Id<Widget>, ApiError> {
+    let raw = id.raw();
     tx.put(&Widget {
-        id: Id::from_raw(id),
-        kind: id % 3,
-        weight: id as i64,
+        id,
+        kind: raw % 3,
+        weight: raw as i64,
     });
-    tx.enqueue(Bump { slot: id });
+    tx.enqueue(Bump { slot: raw });
     Ok(id)
 }
 
 #[route(GET "/widget/:id")]
-fn get_widget(tx: &mut Tx, id: Id<Widget>) -> Result<i64, ApiError> {
-    Ok(tx.get(id)?.ok_or(ApiError::NotFound)?.weight)
+fn get_widget(tx: &mut Tx, id: Id<Widget>) -> Result<WireI64, ApiError> {
+    Ok(WireI64(tx.get(id)?.ok_or(ApiError::NotFound)?.weight))
 }
 
 fn kernel_schema() -> Schema {
@@ -4395,7 +4397,11 @@ fn follower_kernel_serves_reads_never_jobs_or_cron() {
     .unwrap();
     assert_eq!(status, 200, "the follower serves reads");
     assert_eq!(
-        body, b"3",
+        // get_widget returns WireI64 (task 5): a 64-bit integer is ALWAYS
+        // string-encoded on the wire, so the body is the JSON string `"3"`,
+        // not the bare number `3`.
+        body,
+        b"\"3\"",
         "the read returns the primary's replicated value"
     );
 

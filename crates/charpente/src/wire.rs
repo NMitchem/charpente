@@ -16,6 +16,12 @@ pub enum TypeSchema {
     F32,
     F64,
     String,
+    /// The JSON literal `null` — a genuinely different document from
+    /// `Struct { fields: [] }` (`{}`). `()`'s wire shape: measured directly
+    /// (task 5, Ruling 25 probe) via both `serde_json::to_string(&())` and
+    /// `Response::json(200, &())`, which agree (`"null"`) — the glue path an
+    /// app author's handler actually takes, not just a bare `to_string`.
+    Null,
     /// A 64-bit integer. ALWAYS string-encoded on the wire: JSON numbers lose
     /// precision above 2^53 in JavaScript, and a `JSON.parse` reviver cannot
     /// recover it (the value is already parsed when the reviver runs).
@@ -208,6 +214,8 @@ prim! {
     u8 => TypeSchema::U8, u16 => TypeSchema::U16, u32 => TypeSchema::U32,
     f32 => TypeSchema::F32, f64 => TypeSchema::F64,
     String => TypeSchema::String,
+    () => TypeSchema::Null,
+    &'static str => TypeSchema::String,
 }
 
 impl<T: Wire> Wire for Option<T> {

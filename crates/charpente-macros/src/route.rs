@@ -204,6 +204,42 @@ fn expand_http(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
     let auth = args.auth;
     let pattern_lit = &args.path;
 
+    let ok_ty = result_ok_type(&func.sig.output)?;
+    let err_ty = result_err_type(&func.sig.output)?;
+
+    let param_schema_entries: Vec<TokenStream> = params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let ty = &non_ctx[i].ty;
+            quote! { (#p, (|| <#ty as ::charpente::wire::Wire>::reference()) as fn() -> _) }
+        })
+        .collect();
+
+    let request_tok = if has_body {
+        let ty = &non_ctx[params.len()].ty;
+        quote! { ::std::option::Option::Some(
+            (|| <#ty as ::charpente::wire::Wire>::reference()) as fn() -> _
+        ) }
+    } else {
+        quote! { ::std::option::Option::None }
+    };
+
+    let body_register = if has_body {
+        let ty = &non_ctx[params.len()].ty;
+        quote! { <#ty as ::charpente::wire::Wire>::register(reg); }
+    } else {
+        quote! {}
+    };
+    let param_registers: Vec<TokenStream> = params
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let ty = &non_ctx[i].ty;
+            quote! { <#ty as ::charpente::wire::Wire>::register(reg); }
+        })
+        .collect();
+
     Ok(quote! {
         #func
 
@@ -234,10 +270,87 @@ fn expand_http(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
                     auth: #auth,
                     name: #name_str,
                     glue: ::charpente::http::RouteGlue::Http(#glue_name),
+                    params: &[#(#param_schema_entries),*],
+                    request: #request_tok,
+                    response: || <#ok_ty as ::charpente::wire::Wire>::reference(),
+                    error: || <#err_ty as ::charpente::wire::Wire>::reference(),
+                    register_types: |reg| {
+                        #(#param_registers)*
+                        #body_register
+                        <#ok_ty as ::charpente::wire::Wire>::register(reg);
+                        <#err_ty as ::charpente::wire::Wire>::register(reg);
+                    },
+                    emits: &[],
                 }
             }
         }
     })
+}
+
+/// Extracts `T` from a handler's `-> Result<T, E>` return type — the client
+/// needs both halves to generate a typed result, so a handler that returns
+/// anything else (a bare value, a type alias hiding the error type) is a
+/// compile error naming why (hard rule 5).
+fn result_ok_type(out: &ReturnType) -> syn::Result<syn::Type> {
+    result_arg(out, 0)
+}
+
+/// Extracts `E` from `-> Result<T, E>` — see `result_ok_type`.
+fn result_err_type(out: &ReturnType) -> syn::Result<syn::Type> {
+    result_arg(out, 1)
+}
+
+fn result_arg(out: &ReturnType, idx: usize) -> syn::Result<syn::Type> {
+    let ReturnType::Type(_, ty) = out else {
+        return Err(Error::new_spanned(
+            out,
+            "a #[route] handler must return Result<T, E> — a bare value has no error type \
+             for the generated client to model",
+        ));
+    };
+    let syn::Type::Path(p) = &**ty else {
+        return Err(Error::new_spanned(
+            ty,
+            "a #[route] handler must return Result<T, E>",
+        ));
+    };
+    let seg = p
+        .path
+        .segments
+        .last()
+        .ok_or_else(|| Error::new_spanned(ty, "a #[route] handler must return Result<T, E>"))?;
+    if seg.ident != "Result" {
+        return Err(Error::new_spanned(
+            ty,
+            format!(
+                "a #[route] handler must return Result<T, E> — got `{}`; the client needs both \
+                 the success and error types to generate a typed result",
+                seg.ident
+            ),
+        ));
+    }
+    let PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return Err(Error::new_spanned(
+            ty,
+            "a #[route] handler must return Result<T, E>",
+        ));
+    };
+    match args
+        .args
+        .iter()
+        .filter_map(|a| match a {
+            GenericArgument::Type(t) => Some(t.clone()),
+            _ => None,
+        })
+        .nth(idx)
+    {
+        Some(t) => Ok(t),
+        None => Err(Error::new_spanned(
+            ty,
+            "a #[route] handler's Result must name both type arguments explicitly — a type \
+             alias that hides the error type leaves the client with nothing to model",
+        )),
+    }
 }
 
 /// `#[route(SSE "/path")]`: registers `Method::Get` plus a subscribe-
@@ -378,6 +491,24 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
     let auth = args.auth;
     let pattern_lit = &args.path;
 
+    let err_ty = result_err_type(&func.sig.output)?;
+    let param_schema_entries: Vec<TokenStream> = params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let ty = &rest[i].ty;
+            quote! { (#p, (|| <#ty as ::charpente::wire::Wire>::reference()) as fn() -> _) }
+        })
+        .collect();
+    let param_registers: Vec<TokenStream> = params
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let ty = &rest[i].ty;
+            quote! { <#ty as ::charpente::wire::Wire>::register(reg); }
+        })
+        .collect();
+
     Ok(quote! {
         #func
 
@@ -406,6 +537,20 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
                     auth: #auth,
                     name: #name_str,
                     glue: ::charpente::http::RouteGlue::Sse(#glue_name),
+                    params: &[#(#param_schema_entries),*],
+                    request: ::std::option::Option::None,
+                    // Placeholder, NOT `Struct { fields: vec![] }` — that
+                    // would claim the stream emits an empty JSON object,
+                    // which is a lie the emitter would faithfully
+                    // transcribe. Task 7's `emits(...)` replaces this with
+                    // the subscription's real payload union.
+                    response: || ::charpente::wire::TypeSchema::Null,
+                    error: || <#err_ty as ::charpente::wire::Wire>::reference(),
+                    register_types: |reg| {
+                        #(#param_registers)*
+                        <#err_ty as ::charpente::wire::Wire>::register(reg);
+                    },
+                    emits: &[],
                 }
             }
         }
