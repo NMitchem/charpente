@@ -267,7 +267,12 @@ and recovery is idempotent. The apply loop (`Engine`) holds the standing invaria
 machine state ≡ fold(apply, durable records) — submit is append → sync → apply → ack.
 The log gains a verified read surface for the shipper (`Wal::read_from`/`Db::read_log`,
 M1 replication T3): re-checksums every frame it hands back and refuses, by name, to hand
-back one that fails — a frame corrupted on disk after append must never travel.
+back one that fails — a frame corrupted on disk after append must never travel. That
+surface's second entry is `Db::sealed_segments` (M2 object-storage-archive T5): the
+sealed WAL segments, oldest first, excluding the active tail, each paired with its end
+BY LAYOUT (the next segment's base minus one, inclusive) — the archive's completeness
+*target* for that segment, never the `end_seq` it is entitled to record in a manifest's
+`SegmentRef`, which must come from what `read_log` actually returned instead.
 
 **Three durability fences.** (1) *Held (recovery-horizon rule).* A cut can only ever
 discard unacknowledged data, so recovery must tell a torn tail from mid-log corruption

@@ -176,6 +176,20 @@ pub struct TableDescription {
     pub migrations: Vec<(u32, u32)>,
 }
 
+/// One sealed WAL segment, as `Db::sealed_segments` reports it (M2
+/// object-storage-archive T5, ruling 30).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealedSegment {
+    pub base_seq: u64,
+    /// The segment's end BY LAYOUT (the next segment's base minus one),
+    /// INCLUSIVE — the archive's completeness TARGET for this segment,
+    /// never the value it is entitled to record in a `SegmentRef`, which
+    /// must come from what `Db::read_log` actually returned (a sealed
+    /// segment whose tail records are not yet applied short-reads; ruling
+    /// 29).
+    pub layout_end: u64,
+}
+
 /// The set of tables a `Db` can replay log records into. Every `#[table]`
 /// type the application writes must be registered — replay works on raw
 /// record bytes and needs the typed codecs to maintain indexes.
@@ -1765,6 +1779,50 @@ impl Db {
     /// Design B).
     pub fn log_base(&self) -> u64 {
         self.engine.wal().base_seq()
+    }
+
+    /// The sealed WAL segments, oldest first — the archive shipper's second
+    /// read-surface entry (DESIGN.md:268, M2 object-storage-archive T5,
+    /// ruling 30). **The active tail is excluded**: it is still being
+    /// appended to and must never be archived. A segment is sealed exactly
+    /// when a later (higher base_seq) segment exists on disk — `Disk::list`
+    /// is always sorted (DESIGN §1) and segment names are 20-digit
+    /// zero-padded, so lexicographic order is numeric order (`Wal::gc`
+    /// already depends on this), which makes the last name in the listing
+    /// always the tail.
+    pub fn sealed_segments(&self) -> io::Result<Vec<SealedSegment>> {
+        let wal = self.engine.wal();
+        let prefix = format!("{}/", self.cfg.wal.dir);
+        let names = wal.disk().list(&prefix)?;
+        let mut bases = Vec::with_capacity(names.len());
+        for name in &names {
+            bases.push(parse_segment_name(&self.cfg.wal.dir, name)?);
+        }
+        let mut out = Vec::with_capacity(bases.len().saturating_sub(1));
+        for i in 0..bases.len().saturating_sub(1) {
+            let next_base = bases[i + 1];
+            // `layout_end` is INCLUSIVE (`next_base - 1`), matching
+            // `SegmentRef`'s inclusive-both-ends convention — `Wal::
+            // read_from`'s internal `seg_end` is EXCLUSIVE (log.rs:334-337).
+            // Checked arithmetic: two segments can never legitimately share
+            // a base_seq (each holds at least one record), so `next_base`
+            // is never 0 here; a 0 would mean the WAL's own segment-naming
+            // invariant already broke, which is a bug worth a clear panic
+            // rather than a silently wrapped `layout_end`.
+            let layout_end = next_base.checked_sub(1).unwrap_or_else(|| {
+                panic!(
+                    "sealed_segments: segment {} is immediately followed by a segment based at \
+                     0 — segment bases must be strictly increasing from 0; this is a WAL \
+                     invariant violation, not a caller error",
+                    bases[i]
+                )
+            });
+            out.push(SealedSegment {
+                base_seq: bases[i],
+                layout_end,
+            });
+        }
+        Ok(out)
     }
 
     /// The registered table names, in schema-registry (sorted) order —
