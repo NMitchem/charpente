@@ -327,6 +327,13 @@ pub trait FromParam: Sized {
     fn from_param(name: &str, raw: &str) -> Result<Self, ApiError>;
 }
 
+// Kept deliberately (task 5), even though a `u64` path param is now a
+// compile error at `#[route]` (it lacks `Wire`, which `Route.params` needs
+// alongside `FromParam`): removing this impl would trade the `Wire`
+// `on_unimplemented` diagnostic — which names the 2^53 JS-precision hazard
+// and the fix (`Id<T>`/`WireU64`) — for a bare "`FromParam` is not
+// satisfied" error with none of that context. Worse diagnostic, same
+// rejection, so the impl stays.
 impl FromParam for u64 {
     fn from_param(name: &str, raw: &str) -> Result<u64, ApiError> {
         raw.parse().map_err(|_| {
