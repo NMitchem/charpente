@@ -10,6 +10,12 @@ workspace = true
 
 [dependencies]
 redb = "4.1.0"
+# JSON wire identity only, for Id<T>'s hand-written Serialize/Deserialize
+# (table.rs): Rust's orphan rule forces that impl into whichever crate owns
+# Id<T>, which is here. No `derive` feature — every impl is hand-written.
+# Codec (the ON-DISK row format, also table.rs) stays hand-rolled and must
+# never become serde; table.rs's id_wire_tests module is the guard on that.
+serde = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 charpente-sim = { path = "../charpente-sim" }

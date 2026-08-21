@@ -163,3 +163,40 @@ fn an_ids_wire_schema_names_its_table() {
         <Id<WireTestRow> as Wire>::schema()
     );
 }
+
+struct Customer;
+
+#[test]
+fn an_id_is_a_json_string_and_survives_above_2_53() {
+    let big = (1u64 << 53) + 1; // the first u64 a JSON number cannot hold
+    let id = Id::<Customer>::from_raw(big);
+    let json = serde_json::to_string(&id).unwrap();
+    assert_eq!(json, format!("\"{big}\""), "an id must encode as a string");
+
+    let back: Id<Customer> = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.raw(), big, "round trip must be lossless");
+
+    // 2^53+1 alone would pass even a buggy encoding that only breaks near
+    // u64's actual ceiling (e.g. an off-by-one in a manual digit loop) — the
+    // point of string encoding is EVERY u64, so pin the far end too.
+    let max = u64::MAX;
+    let id = Id::<Customer>::from_raw(max);
+    let json = serde_json::to_string(&id).unwrap();
+    assert_eq!(
+        json,
+        format!("\"{max}\""),
+        "u64::MAX must encode as a string"
+    );
+
+    let back: Id<Customer> = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.raw(), max, "u64::MAX round trip must be lossless");
+}
+
+#[test]
+fn a_non_numeric_id_string_is_refused_by_name() {
+    let err = serde_json::from_str::<Id<Customer>>("\"not-a-number\"").unwrap_err();
+    assert!(
+        err.to_string().contains("row id"),
+        "the decode error must name what it wanted, got: {err}"
+    );
+}

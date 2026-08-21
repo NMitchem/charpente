@@ -46,6 +46,37 @@ impl<T> Id<T> {
     }
 }
 
+// A row id crosses the wire as a STRING, never a JSON number: ids are u64 and
+// a JSON number silently loses precision above 2^53 in JavaScript clients
+// (TS-codegen spec §1). This is a wire-format decision, not a style one — do
+// not "simplify" it to a derive.
+impl<T> serde::Serialize for Id<T> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(&self.raw)
+    }
+}
+
+impl<'de, T> serde::Deserialize<'de> for Id<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<T>(std::marker::PhantomData<T>);
+        impl<T> serde::de::Visitor<'_> for V<T> {
+            type Value = Id<T>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a row id as a decimal string")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Id<T>, E> {
+                v.parse::<u64>().map(Id::from_raw).map_err(|_| {
+                    E::custom(format!(
+                        "row id must be a decimal string — got {v:?}; ids cross the wire as \
+                         strings because a JSON number loses precision above 2^53"
+                    ))
+                })
+            }
+        }
+        d.deserialize_str(V(std::marker::PhantomData))
+    }
+}
+
 // Manual impls: derives would wrongly bound on `T`.
 impl<T> Clone for Id<T> {
     fn clone(&self) -> Self {
@@ -193,6 +224,37 @@ impl<T> Codec for Id<T> {
     }
     fn decode(input: &mut &[u8]) -> io::Result<Id<T>> {
         Ok(Id::from_raw(u64::decode(input)?))
+    }
+}
+
+#[cfg(test)]
+mod id_wire_tests {
+    use super::*;
+
+    struct Marker;
+
+    /// Guards the claim in this module's serde doc comment: `Codec` is the
+    /// ON-DISK format and must never become serde. Pins `Id<T>`'s `Codec`
+    /// encoding at exactly 8 bytes, fixed-width little-endian, unaffected by
+    /// the JSON `Serialize`/`Deserialize` impls above. Catches either an
+    /// `encode`/`decode` accidentally routed through serde (the byte count
+    /// or contents would no longer match a raw LE `u64`) or a width change
+    /// to the disk representation.
+    #[test]
+    fn ids_disk_codec_stays_8_byte_fixed_width_le_under_the_wire_serde_impls() {
+        let id = Id::<Marker>::from_raw(0x0102_0304_0506_0708);
+        let mut out = Vec::new();
+        id.encode(&mut out);
+        assert_eq!(out, 0x0102_0304_0506_0708u64.to_le_bytes().to_vec());
+        assert_eq!(out.len(), 8, "Id's disk codec must stay exactly 8 bytes");
+
+        let mut input: &[u8] = &out;
+        let back = Id::<Marker>::decode(&mut input).expect("8 well-formed bytes must decode");
+        assert_eq!(back.raw(), 0x0102_0304_0506_0708);
+        assert!(
+            input.is_empty(),
+            "decode must consume exactly 8 bytes, nothing more"
+        );
     }
 }
 
