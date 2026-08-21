@@ -221,13 +221,33 @@ macro_rules! wire_int {
         }
         impl<'de> serde::Deserialize<'de> for $t {
             fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-                let s = <&str as serde::Deserialize>::deserialize(d)?;
-                s.parse::<$inner>().map($t).map_err(|_| {
-                    serde::de::Error::custom(format!(
-                        concat!($what, " must be a decimal string — got {:?}"),
-                        s
-                    ))
-                })
+                // A Visitor, not `<&str as Deserialize>::deserialize`: the latter demands a
+                // BORROWED str, which serde_json can only hand back for unescaped input —
+                // every escaped JSON string and every `from_reader`/`from_value` call
+                // (nothing to borrow from) fails outright. `visit_str` takes either a
+                // borrowed or a transient owned `&str`, so it works for both. Mirrors
+                // `Id<T>`'s Visitor in charpente-core/src/table.rs — same shape on purpose.
+                struct V;
+                impl serde::de::Visitor<'_> for V {
+                    type Value = $t;
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str(concat!(
+                            $what,
+                            " as a decimal string — 64-bit integers cross the wire as \
+                             strings because a JSON number silently loses precision above \
+                             2^53 in JavaScript clients"
+                        ))
+                    }
+                    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<$t, E> {
+                        v.parse::<$inner>().map($t).map_err(|_| {
+                            E::custom(format!(
+                                concat!($what, " must be a decimal string — got {:?}"),
+                                v
+                            ))
+                        })
+                    }
+                }
+                d.deserialize_str(V)
             }
         }
         impl Wire for $t {

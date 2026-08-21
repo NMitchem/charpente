@@ -639,19 +639,20 @@ identifiers in scope — `routes![handlers::create_note]` works exactly like
 `#[route]` handler still has no argument-convention access to it (only
 `#[route(SSE ...)]`'s platform-extracted resume cursor reads it today).
 
-### Returning rows from a route: `Id<T>` isn't serializable
+### Returning rows from a route: storage shape vs. wire shape
 
 A handler's return type only needs `T: serde::Serialize` (above) — nothing
-requires `T` to be a `#[table]` row, and in practice it can't be one
-directly: `Id<T>` implements charpente's own `Codec` (§2), deliberately
-not serde, so it does not implement `serde::Serialize` or `Deserialize`.
-A route that tries to return a row whose type has an `Id<T>` field fails
-to compile with a missing-trait-bound error on `Id`, not a runtime
-surprise.
+requires `T` to be a `#[table]` row, and `#[table]` does not derive
+`Serialize` for you: a row's storage shape (`Id<T>`'s own `Codec`, §2) and
+its wire shape are separate concerns on purpose, kept apart even though
+`Id<T>` also implements `Serialize`/`Deserialize` — as a decimal string,
+never a JSON number, because `u64` values above 2^53 lose precision
+silently in JavaScript clients.
 
 The fix is the one every other example in this guide already uses without
-saying so: convert to a plain response type first, pulling `Id<T>` down to
-its `u64` with `.raw()`.
+saying so: convert to a plain response type first. `Id<T>` belongs directly
+in that view type — there's no need to unwrap it to a bare `u64` with
+`.raw()` to make it serializable.
 
 ```rust
 use charpente::http::{ApiError, App, AppConfig};
@@ -665,18 +666,18 @@ struct Note {
     text: String,
 }
 
-/// The wire shape: plain, `Serialize`-able fields only — `Id<Note>` never
-/// appears in it directly.
+/// The wire shape: `Id<Note>` crosses as a decimal string, so it appears
+/// directly here — no `.raw()` unwrap, no separate id type.
 #[derive(Serialize)]
 struct NoteView {
-    id: u64,
+    id: Id<Note>,
     text: String,
 }
 
 impl From<Note> for NoteView {
     fn from(row: Note) -> Self {
         NoteView {
-            id: row.id.raw(),
+            id: row.id,
             text: row.text,
         }
     }

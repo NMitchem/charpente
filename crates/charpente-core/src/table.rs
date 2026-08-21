@@ -116,8 +116,13 @@ impl<T> fmt::Debug for Id<T> {
 // ---------------------------------------------------------------- Codec
 
 /// The row/field codec: deterministic, versionless v0. Fixed-width
-/// little-endian integers, length-prefixed bytes. Owned here rather than a
-/// serde dependency so the byte layout can never drift under the log.
+/// little-endian integers, length-prefixed bytes. Hand-rolled, and must
+/// NEVER route through serde — this crate does depend on serde now (see
+/// Cargo.toml), but only for `Id<T>`'s JSON wire identity below; the byte
+/// layout here must never drift under the log. The actual fence is
+/// `.github/workflows/ci.yml`'s isolated `cargo check -p charpente-core`
+/// step, not this comment — `id_wire_tests` below is the mechanical guard
+/// on `Id<T>`'s own encoding specifically.
 pub trait Codec: Sized {
     fn encode(&self, out: &mut Vec<u8>);
     fn decode(input: &mut &[u8]) -> io::Result<Self>;
@@ -233,13 +238,19 @@ mod id_wire_tests {
 
     struct Marker;
 
-    /// Guards the claim in this module's serde doc comment: `Codec` is the
-    /// ON-DISK format and must never become serde. Pins `Id<T>`'s `Codec`
-    /// encoding at exactly 8 bytes, fixed-width little-endian, unaffected by
-    /// the JSON `Serialize`/`Deserialize` impls above. Catches either an
-    /// `encode`/`decode` accidentally routed through serde (the byte count
-    /// or contents would no longer match a raw LE `u64`) or a width change
-    /// to the disk representation.
+    /// Guards the `Codec` doc comment's rule for exactly ONE impl: `Id<T>`'s.
+    /// Pins `Id<T>`'s `Codec` encoding at exactly 8 bytes, fixed-width
+    /// little-endian, unaffected by the JSON `Serialize`/`Deserialize`
+    /// impls above. Catches either an `encode`/`decode` accidentally routed
+    /// through serde (the byte count or contents would no longer match a
+    /// raw LE `u64`) or a width change to the disk representation.
+    ///
+    /// Scope, precisely: `Id<T>` only. `u64`/`String`/`Vec<u8>`/`Option<T>`'s
+    /// `Codec` impls above have no byte-level pin in this module — their
+    /// only coverage is the encode/decode round-trip tests elsewhere (e.g.
+    /// db.rs's `record_roundtrip_is_canonical`), which stay green even
+    /// under a wholesale switch to a serde binary format. If that ever
+    /// needs closing, it is a new test, not a broadened claim on this one.
     #[test]
     fn ids_disk_codec_stays_8_byte_fixed_width_le_under_the_wire_serde_impls() {
         let id = Id::<Marker>::from_raw(0x0102_0304_0506_0708);

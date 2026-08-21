@@ -20,6 +20,17 @@ jobs:
       - run: cargo fmt --all --check
       # Carries the nondeterminism deny-list (clippy.toml) — hard rule 1.
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Isolates charpente-core's own feature resolution — hard rule 1's mechanical
+      # enforcement for the serde dependency added in 87d209b. Cargo unifies features
+      # across the whole workspace, so `cargo build/test --workspace` compiles
+      # charpente-core with charpente's `serde/derive` feature turned on regardless of
+      # what charpente-core's own Cargo.toml asks for: a `#[derive(Serialize)]` (or any
+      # other serde/derive macro) inside the deterministic core compiles clean under
+      # every command above and would ship green forever without this line. Built alone,
+      # charpente-core reverts to its own manifest (no `derive` feature), so the same
+      # derive fails here. Task 2 fix round 1 confirmed both directions: FAILS (101) with
+      # a `#[derive(serde::Serialize)]` probe present, PASSES (0) with it removed.
+      - run: cargo check -p charpente-core
       - run: cargo test --workspace
       # Cross-build-mode seed replay (the mode-skew regression, seed 0xff159ed76d2806e4).
       - run: CHARPENTE_SEED=0x8bee1752811ae873 cargo test --release -p charpente-sim --test crash_recovery

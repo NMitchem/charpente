@@ -132,6 +132,32 @@ fn wire_u64_and_i64_are_strings_and_lossless() {
 }
 
 #[test]
+fn wire_u64_deserializes_an_escaped_json_string() {
+    // Legal JSON: "12" written with \u escapes instead of literal digits.
+    // `<&str as Deserialize>::deserialize` (the prior implementation) can
+    // only accept a BORROWED str — serde_json cannot hand one back once it
+    // has had to unescape, so this input reddened it outright. The Visitor's
+    // `visit_str` takes either a borrowed or a transient owned `&str`.
+    let json = "\"\\u0031\\u0032\"";
+    let v: WireU64 = serde_json::from_str(json).unwrap();
+    assert_eq!(v.0, 12);
+}
+
+#[test]
+fn wire_u64_and_i64_survive_from_reader_at_both_ends_of_range() {
+    // `from_reader` can never hand back a borrowed `&str` (there is nothing
+    // to borrow from) — under the prior `<&str as Deserialize>` impl EVERY
+    // value failed this way, not just escaped ones. u64::MAX and i64::MIN
+    // are the two ends of range the string encoding exists to protect;
+    // i64::MIN especially, since a negation-based parse would overflow on it.
+    let v: WireU64 = serde_json::from_reader(format!("\"{}\"", u64::MAX).as_bytes()).unwrap();
+    assert_eq!(v.0, u64::MAX);
+
+    let v: WireI64 = serde_json::from_reader(format!("\"{}\"", i64::MIN).as_bytes()).unwrap();
+    assert_eq!(v.0, i64::MIN);
+}
+
+#[test]
 fn wire_u64_and_i64_describe_themselves_as_signed_int64() {
     assert_eq!(
         <WireU64 as Wire>::schema(),
@@ -198,5 +224,35 @@ fn a_non_numeric_id_string_is_refused_by_name() {
     assert!(
         err.to_string().contains("row id"),
         "the decode error must name what it wanted, got: {err}"
+    );
+}
+
+#[test]
+fn an_id_refuses_a_bare_json_number() {
+    // The exact mistake this sub-project exists to forbid: a JSON *number*
+    // form of an id, silently truncatable above 2^53 in a JS client. Nothing
+    // else in this file pins this — mutation: add `fn visit_u64` to `Id<T>`'s
+    // Visitor (charpente-core/src/table.rs) mapping straight to
+    // `Id::from_raw` and this test is the only thing in the whole suite that
+    // reddens.
+    let err = serde_json::from_str::<Id<Customer>>("9007199254740993").unwrap_err();
+    assert!(
+        err.to_string().contains("row id"),
+        "a bare JSON number must be refused by name, got: {err}"
+    );
+}
+
+#[test]
+fn wire_u64_names_the_contract_when_given_a_json_number() {
+    // Hard rule 5: pins the exact text a client sees for the mistake these
+    // types exist to prevent (a bare JSON number instead of a decimal
+    // string), so it can never quietly regress back to a leaked serde
+    // internal like "expected a borrowed string".
+    let err = serde_json::from_str::<WireU64>("12").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "invalid type: integer `12`, expected a WireU64 as a decimal string — 64-bit \
+         integers cross the wire as strings because a JSON number silently loses \
+         precision above 2^53 in JavaScript clients at line 1 column 2"
     );
 }
