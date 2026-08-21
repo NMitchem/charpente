@@ -1,0 +1,23 @@
+error[E0277]: `u64` cannot cross the wire
+ --> tests/compile_fail/wire_bare_u64.rs:3:18
+  |
+3 |     needs_wire::<u64>();
+  |                  ^^^ no `Wire` impl for `u64`
+  |
+  = help: the trait `Wire` is not implemented for `u64`
+  = note: if this is `u64` or `i64`: values above 2^53 lose precision in JavaScript clients, silently — use `Id<T>` for a row id, or `WireU64`/`WireI64` to carry it as a string
+  = note: otherwise: add `#[derive(Wire)]` to `u64`
+  = help: the following other types implement trait `Wire`:
+            f32
+            f64
+            i16
+            i32
+            i8
+            u16
+            u32
+            u8
+note: required by a bound in `needs_wire`
+ --> tests/compile_fail/wire_bare_u64.rs:2:22
+  |
+2 |     fn needs_wire<T: charpente::wire::Wire>() {}
+  |                      ^^^^^^^^^^^^^^^^^^^^^ required by this bound in `needs_wire`

@@ -23,5 +23,6 @@ pub mod launch;
 pub mod prod;
 pub mod repl;
 pub mod serve;
+pub mod wire;
 
 pub use launch::launch;
