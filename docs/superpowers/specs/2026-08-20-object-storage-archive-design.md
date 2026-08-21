@@ -51,10 +51,26 @@ Four rulings fix the shape (2026-08-20, Noah):
 
 ### Why this is a fifth trait, and why there is no lighter placement
 
-Adding to `charpente-core::io` amends **DESIGN §1, marked [IRREVERSIBLE]**, and makes
-CLAUDE.md hard rule 1 stale — it enumerates exactly four traits by name. That escalation
-was surfaced and approved explicitly (2026-08-20, Noah) rather than folded into a file
-list. Two verified facts justify it.
+This was first escalated as an amendment to **DESIGN §1, marked [IRREVERSIBLE]**. On
+reading §1's text rather than its header, that framing was wrong, and the correction
+matters more than the original claim did.
+
+§1's irreversible **Decision** is about *sources*: "Every source of nondeterminism — disk,
+network, time, randomness, task scheduling — passes through trait objects owned by the
+runtime, with a production implementation and a simulation implementation." Object storage
+is **network**, a source already named. `ObjectStore` adds no source; giving it a production
+and a simulation implementation behind a trait is what §1 *requires*, not a departure from it.
+
+Nor is there a closed four-trait list to breach. `io.rs` defines **seven** traits — `Clock`,
+`Entropy`, `Disk`, `File`, `Net`, `Listener`, `Conn` — and §1's own Shape block shows five.
+CLAUDE.md hard rule 1 names four of the seven, omitting `File`, `Listener` and `Conn`: it is
+shorthand for the boundary, not an exhaustive contract, and was already incomplete before
+this design existed.
+
+What is genuinely at stake is narrower: §1's Shape block gains an illustrative entry, and the
+capability surface grows by one. The real argument against is accretion, not constitutionality
+— if every subsystem that talks off-box earns a trait, the boundary grows per feature. The
+answer is that this one is forced rather than chosen:
 
 **There is no lighter placement.** `crates/charpente-sim/Cargo.toml` declares exactly one
 dependency: `charpente-core`. The simulator cannot see the `charpente` crate. A trait
@@ -160,6 +176,19 @@ already keeps by capping shipping at `last_applied` (DESIGN §5).
 **Periodic logical snapshots** via `Db::snapshot` + `scan_raw`, the same producer the seeder
 uses. Snapshots bound restore time and let the archive delete segments below them.
 
+**One operation in flight is a bound, not a free choice.** Serial uploads mean the archive
+falls behind whenever segments seal faster than they upload — and a permanently-behind archive
+releases its bounded pin continually, making gaps routine, which is the failure mode ruling 3
+exists to avoid. The bound is: *seal interval must exceed upload duration*, i.e.
+`segment_bytes / write_throughput_bytes_per_sec > segment_bytes / upload_bandwidth`, which
+reduces to **upload bandwidth must exceed sustained write throughput in bytes/sec**. An
+order-of-magnitude check against the apply-batching spike figures suggests comfortable
+headroom at a 64 MiB `segment_bytes` on current hardware, but those are sub-project
+observations, not quotable numbers — **docs/BENCH.md is the only source of those** (CLAUDE.md),
+and it has no archive measurements at all. The plan therefore owes a measured seal rate and a
+stated minimum bandwidth, plus a decision on whether N-in-flight is needed. Until then this is
+an assumption with arithmetic attached, not a verified property.
+
 **Cadence is seq-driven, never time-driven** — every `archive_snapshot_every` committed
 records, mirroring `DbConfig::checkpoint_every`. This is not a convenience: a time-driven
 cadence would put wall-clock into the archive's decisions and make replay depend on it.
@@ -177,6 +206,39 @@ Because `serve::backup` runs the same kernel against an `EmptySource`, an archiv
 hot standby compose for free: archiving *from* the standby leaves the primary's loop
 entirely untouched, which is the deployment most operators should choose. New edge:
 `serve::archive`, plus archive config on the existing replicated edges.
+
+### Archive ownership — who may write a prefix
+
+**Two nodes archiving to one prefix both write `manifest`, and the layout as described has
+no defence against it.** This is the split-brain hazard the dual-primary sub-project exists
+to contain, reappearing on a new surface — and the boot gate explicitly does not eliminate
+it. DESIGN §5 states the bound: "a probe answers 'is THIS witness a primary', never 'does
+another primary exist'." A node promoted after a switchover chain is invisible to the check.
+
+Two rules, both following precedent already in this codebase:
+
+1. **The archive arm is gated on the write gate.** A `Verifying` node — durable `Primary`,
+   witnesses unresolved — must not upload. This is precisely the oversight the verifying-peer
+   policy found and fixed (DESIGN §5): `begin_seeding` was read-only, so the write gate never
+   saw it, and a node was manufacturing durable replicas of a timeline it had not confirmed it
+   owned. Their line — *"a seed creates a fresh copy of an unverified one"* — describes an
+   archive upload exactly, except that an object in a bucket outlives the node's fail-stop far
+   more thoroughly than a seeded follower does. The archive arm is likewise read-only against
+   the `Db` and would slip past the write gate for the identical reason. It must not.
+2. **Generations carry their writer.** The manifest records the writing node's identity
+   alongside the generation counter; a writer that finds the manifest advanced by another
+   identity stops archiving and reports, rather than interleaving generations into a bucket
+   two nodes each believe they own. Detection, not prevention — the same honest posture the
+   promote path takes toward its bounded-loss window.
+
+Both rules are **additive**, which is why §5's "only change to shipped code" still holds:
+`Db::verifying()` is already public (`db.rs:1708`) and already read outside core by the seed
+refusal itself (`repl/session.rs:744`). The archive gate consults the same accessor the
+verifying-peer policy consults, and changes nothing that exists.
+
+Archiving from a follower or a `serve::backup` standby is the recommended deployment and is
+unaffected by either rule: a follower is not write-gated as a primary, and a standby that is
+promoted acquires the gate along with the role.
 
 ## §5 The retention pin — the only change to shipped code
 
@@ -218,6 +280,21 @@ both CRCs, and the re-seed fix; diverged timelines are refused, never merged"). 
 `--force` discards, naming what it destroys. Raised by the concurrent codegen session,
 2026-08-20.
 
+`--force` is an operator-invoked destructive admin action, not an escape hatch on a running
+guarantee, and so does not offend hard rule 2: it bypasses no invariant the system upholds at
+runtime, and it has direct precedent in the fresh-data-dir re-seed GUIDE §10 already
+prescribes as a remedy. It must name both frontiers and the record count it is about to
+destroy *before* acting. A `--force` that silently succeeded would be the escape hatch.
+
+**Restore resurrects the job queue, and operators must be told before they run it.**
+`charpente.jobs` is a table (DESIGN §4), so pending, due and retrying rows ride the snapshot
+like any other state. A restored Db comes back with jobs that will dispatch — meaning restore
+can re-fire emails and third-party calls that already ran before the loss. This is correct
+behavior: they are durable transactional state, and idempotency keys are exactly what make the
+re-fire exactly-once-observable (MANIFESTO §5). But it is a consequence of running `restore`
+that the operator must know in advance, so it belongs in the command's own output and in
+GUIDE's operator section, not only in this spec.
+
 The CLI owns the edge, but the logic lives in a core-testable function over
 `&dyn ObjectStore` + `Box<dyn Disk>` so the simulator drives the real path, not an analogue.
 
@@ -236,6 +313,8 @@ Hard rule 5: name the contract, the site, and the fix.
 | segment frame CRC fails on restore | refuse, naming the seq and the segment; never import corruption |
 | segment chain has a hole | refuse, naming the expected base_seq |
 | restore into a diverged timeline | refuse, naming both frontiers and `--force` |
+| node is write-gated (`Verifying`) | archive arm uploads nothing until the gate opens; no error, no gap recorded — it was never this node's timeline to ship |
+| manifest advanced by another writer identity | stop archiving; operator notice naming both identities, the generation, and the prefix; never interleave |
 | `ObjectStore` IO error on the archive arm | archive arm degrades; **never poisons the Db** — see §8 |
 
 ## §8 Invariants (assert these, TigerBeetle style — hard rule 4)
@@ -251,6 +330,10 @@ test:
 - A generation's segment chain is **never** discontinuous — a hole closes the generation.
 - The archive arm **never** reads wall-clock time, directly or transitively.
 - Restore **never** merges timelines; it replaces or refuses.
+- A write-gated (`Verifying`) node **never** uploads — it does not manufacture durable copies
+  of a timeline it has not confirmed it owns.
+- The manifest is **never** advanced by a node that is not its recorded writer; a writer that
+  finds otherwise stops rather than interleaving.
 
 ## §9 Testing — how the archive gets faulted
 
@@ -273,6 +356,12 @@ New sim fault axes on `ObjectStore`:
 7. **Manifest present, generation incomplete** (misordered writes) → detect and refuse.
 8. **Restore onto a diverged local timeline** → refuse; `--force` discards and names it.
 9. **Clock skew** → assert no behavioral difference at all; the cadence is seq-driven.
+10. **Two nodes, one prefix** → promote a follower while the old primary still archives; assert
+    the second writer stops and reports rather than interleaving generations, and that whichever
+    generation the manifest names restores to a consistent frontier.
+11. **`Verifying` node with archive configured** → assert it uploads nothing until the gate
+    opens. The verifying-peer sub-project found exactly this class by asking the question; the
+    archive arm should not have to be found the same way.
 
 Coverage keys (`require:`) for: gap-closed-generation, lost-ack-retry, diverged-restore-refused.
 Every failure prints the seed and a one-command repro (hard rule 5).
@@ -284,8 +373,19 @@ release the pin — are pure functions of log state and config, so they replay b
 from a seed. Nondeterminism lives entirely below `ObjectStore::poll`, on the far side of the
 trait, exactly as it lives below `Net::connect` today.
 
-**Risk, recorded rather than discovered later:** the sim `ObjectStore` holds whole objects in
-memory (`Vec<u8>` per op). A 64 MiB default segment × the fault matrix × parallel universes
+**Inherited production ceiling — the archive does not introduce this, it is the first thing
+to hit it.** Snapshots reuse the seeding producer, and DESIGN §5 is explicit about that path:
+"v1 seeding holds the full logical snapshot in memory on BOTH sides... Right at M1 scale;
+incremental streaming is the tracked fix before large-store seeding." Seeding pays that cost
+once, when a follower joins. The archive pays it **every `archive_snapshot_every` records,
+forever**, on a node that is also serving traffic. So the archive converts a known, tolerated,
+occasional cost into a recurring one, and will encounter the ceiling before large-store seeding
+does. The plan must either bound `archive_snapshot_every` against store size, or make
+incremental snapshot streaming a prerequisite rather than a follow-on. This is the single
+largest unresolved scaling question in the design and it is not the simulator's.
+
+**Simulator-side risk, recorded rather than discovered later:** the sim `ObjectStore` holds
+whole objects in memory (`Vec<u8>` per op). A 64 MiB default segment × the fault matrix × parallel universes
 is a real RSS story, and v1 seeding already holds a full logical snapshot in memory on both
 sides (DESIGN §5). The plan must bound this with a number — a reduced `segment_bytes` in sim
 is the likely answer — not a sentence. Flagged after a peer session measured the box at 72%
@@ -320,20 +420,42 @@ Hard rule 6 — same commit as the code:
 - **DESIGN §5** — the "Backup (M2, not built)" paragraph becomes what was built, keeping the `serve::backup` distinction explicit.
 - **PLAN.md:104-105** — the M2 bullet. **Held**: a concurrent session is landing a structural split of the adjacent WebSockets/codegen bullet first, by agreement; this edit rebases onto theirs.
 - **README.md** — the "what is *not* built" list names object-storage backup explicitly.
-- **docs/GUIDE.md** — an operator section for archive config and restore. Note: `crates/guide-examples`'s build.rs extracts and compiles every fenced `rust` block there.
+- **`charpente-cli`** — three new verbs land in this crate across two concurrent sub-projects:
+  `restore` here, `gen-client` and `check-client` from the TS-codegen stream. No file overlap
+  identified, but a shared `Cargo.toml` and probably a shared arg-dispatch site; whoever lands
+  second takes the merge. Recorded here because this coordination otherwise exists only in
+  cross-session chat.
+- **docs/GUIDE.md** — an operator section for archive config and restore, including the
+  job-resurrection consequence in §6. Note: `crates/guide-examples`'s build.rs extracts and compiles every fenced `rust` block there.
 
 **Not this session's to edit:**
 
-- **CLAUDE.md hard rule 1** enumerates four traits and goes stale when the fifth lands.
-  Noah approved the update; it belongs in the commit where the trait actually exists, not
-  in this spec — a rule naming a trait that does not exist yet is worse than a stale one.
-- **DECISIONS.md** — a new numbered entry should record the fifth-trait decision. §7
-  (redb vs LSM) is separately pending Noah's own edit for the 2026-08-20 trigger-(a)
-  re-read and is untouched here.
+- **CLAUDE.md hard rule 1** names four of `io.rs`'s seven traits. Per §1 above it is shorthand
+  rather than an exhaustive contract, and it was already incomplete before this design — so
+  updating it is optional tidying, not a correctness obligation. Noah approved an update; if it
+  happens it belongs in the commit where the trait exists, not in a spec — a rule naming a trait
+  that does not exist yet is worse than a shorthand one.
+- **DECISIONS.md** — §7 (redb vs LSM) is pending Noah's own edit for the 2026-08-20
+  trigger-(a) re-read and is untouched here. Whether this design warrants its own numbered
+  entry is §14 item 3.
 
 ## §14 Open items for Noah
 
-1. `archive_pin_segments` default — the plan proposes a number with reasoning; this spec
+1. **Snapshot memory ceiling (§10) — the largest open question here.** The archive turns
+   seeding's tolerated once-per-join full-snapshot-in-memory cost into a recurring one. Either
+   `archive_snapshot_every` is bounded against store size, or incremental snapshot streaming
+   becomes a prerequisite of this sub-project rather than a tracked follow-on. That choice
+   changes the size of the work materially and is not the plan's to make unilaterally.
+2. `archive_pin_segments` default — the plan proposes a number with reasoning; this spec
    deliberately does not invent one.
-2. Whether the DECISIONS.md entry for the fifth trait is written by this sub-project or by
-   Noah directly, given DECISIONS.md is a shared-spine file with concurrent sessions live.
+3. Whether the capability-surface decision warrants a numbered DECISIONS.md entry at all.
+   §1's correction lowers the stakes — this is an application of §1, not an amendment to it —
+   so an entry may be over-ceremony. Noah's call, and DECISIONS.md is a shared-spine file with
+   concurrent sessions live.
+4. **The five unbacked error messages** (Context): `log.rs:186`, `log.rs:365`, `db.rs:1056`,
+   `db.rs:1299`, `db.rs:1359` tell operators to "restore from a replica or backup" when no
+   backup mechanism exists. Hard rule 5 requires an error to name *the fix*, so this is a live
+   defect at the site where a wrong remedy costs most — `Db::open`'s hard error, where the
+   operator has an unopenable store and a compacted log. Two resolutions: narrow the text to
+   "restore from a replica" now, as a small fix independent of this sub-project, or leave it and
+   let the archive make it true. If the former, it should not be gated behind this work.
