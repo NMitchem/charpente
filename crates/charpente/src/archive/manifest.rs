@@ -97,14 +97,30 @@ fn assert_contiguous(segments: &[SegmentRef], generation: u64) {
         );
     }
     for pair in segments.windows(2) {
-        let expected = pair[0].end_seq + 1;
-        assert!(
-            pair[1].base_seq == expected,
-            "manifest (generation {generation}): encode() refuses to produce a discontiguous \
-             segment chain — hole at base_seq {} (expected {expected}); constructing this is a \
-             caller bug, never encode a manifest whose chain has a gap",
-            pair[1].base_seq
-        );
+        // `end_seq + 1` must not wrap: `u64::MAX + 1` wraps to 0, which would make
+        // `pair[1].base_seq == 0` read as contiguous and let this assert pass a chain it
+        // exists to forbid (C1) — an assert whose own arithmetic wraps reports the wrong
+        // answer, it is not merely a weaker check. `end_seq == u64::MAX` has no possible
+        // successor at all, so any following segment is discontiguous by construction;
+        // panic with the same contiguity message rather than let the addition overflow.
+        match pair[0].end_seq.checked_add(1) {
+            Some(expected) => assert!(
+                pair[1].base_seq == expected,
+                "manifest (generation {generation}): encode() refuses to produce a \
+                 discontiguous segment chain — hole at base_seq {} (expected {expected}); \
+                 constructing this is a caller bug, never encode a manifest whose chain has \
+                 a gap",
+                pair[1].base_seq
+            ),
+            None => panic!(
+                "manifest (generation {generation}): encode() refuses to produce a \
+                 discontiguous segment chain — segment end_seq {} is u64::MAX and has no \
+                 valid successor, so no following segment can ever be contiguous with it; \
+                 constructing this is a caller bug, never encode a manifest whose chain has \
+                 a gap",
+                pair[0].end_seq
+            ),
+        }
     }
 }
 
@@ -125,6 +141,41 @@ fn manifest_malformed_error(reason: &str) -> io::Error {
         format!(
             "manifest is malformed ({reason}) despite a valid CRC — refuse rather than parse \
              whatever fields survived; restore from a previous generation instead"
+        ),
+    )
+}
+
+/// `decode`'s truncation refusal for input too short to hold even the trailing CRC. This
+/// is deliberately a separate message from `manifest_malformed_error`, not a reason string
+/// passed through it: this check runs BEFORE the CRC is ever computed, so "despite a valid
+/// CRC" would be a false claim on this path — there was nothing to check (M4: error text
+/// is product surface, hard rule 5, and text asserting a fact it never checked misdirects
+/// exactly the operator it is written for).
+fn manifest_too_short_error(len: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "manifest is only {len} byte(s), too short to hold even a trailing CRC (4 bytes \
+             minimum) — there is nothing here to check, so refuse rather than parse whatever \
+             survived; restore from a previous generation instead"
+        ),
+    )
+}
+
+/// m1: the `closed` field decodes exactly two bytes, never guesses at a third. `encode`
+/// only ever writes 0 or 1; without this, `decode` would map every other byte to `true`,
+/// so two distinct byte strings could decode to equal `Manifest`s — the one field in this
+/// decoder that would coerce rather than refuse, in a module whose own test is named
+/// `..._never_guessed`. It matters beyond tidiness: the manifest is the archive's commit
+/// point and any later "has it changed?" check done on bytes (or a content hash) rather
+/// than the decoded struct would be wrong under a non-canonical encoding.
+fn manifest_closed_byte_error(byte: u8) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "manifest's closed flag byte is {byte}, neither 0 nor 1 — decode refuses to guess \
+             rather than coerce any nonzero byte to true; restore from a previous generation \
+             instead"
         ),
     )
 }
@@ -153,6 +204,23 @@ fn manifest_hole_error(generation: u64, got: u64, expected: u64) -> io::Error {
     )
 }
 
+/// `check_contiguous`'s counterpart to `assert_contiguous`'s overflow panic: a
+/// `SegmentRef` whose `end_seq` is `u64::MAX` has no possible successor, so any chain
+/// that claims to continue past it must be refused by name rather than evaluated with
+/// arithmetic that would wrap. `decode`'s input is untrusted, so this is a named error,
+/// never a panic.
+fn manifest_no_successor_error(generation: u64, end_seq: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "manifest for generation {generation}: segment end_seq {end_seq} is u64::MAX, so \
+             no following segment could ever be contiguous with it — a chain that claims to \
+             continue past this span cannot be verified and must be refused rather than \
+             evaluated with wrapping arithmetic; restore from an earlier generation instead"
+        ),
+    )
+}
+
 /// `decode`'s counterpart to `assert_contiguous`: the same rule, but a
 /// refusal naming the first offending base_seq rather than a panic, since
 /// this runs against bytes that arrived off the network.
@@ -163,7 +231,13 @@ fn check_contiguous(segments: &[SegmentRef], generation: u64) -> io::Result<()> 
         }
     }
     for pair in segments.windows(2) {
-        let expected = pair[0].end_seq + 1;
+        // See assert_contiguous's matching comment: `end_seq + 1` must not wrap. Here the
+        // input is untrusted bytes, so an overflow is a named refusal, never a panic and
+        // never a wrapped comparison that could read a discontiguous chain as contiguous.
+        let expected = pair[0]
+            .end_seq
+            .checked_add(1)
+            .ok_or_else(|| manifest_no_successor_error(generation, pair[0].end_seq))?;
         if pair[1].base_seq != expected {
             return Err(manifest_hole_error(generation, pair[1].base_seq, expected));
         }
@@ -222,23 +296,6 @@ impl<'a> Reader<'a> {
         self.buf.len() - self.pos
     }
 
-    /// Validates a length prefix against the bytes actually left before
-    /// anything is allocated from it. Without this, a manifest declaring
-    /// `u32::MAX` elements would have `Vec::with_capacity` attempt tens of
-    /// gigabytes and abort the process — a crash on untrusted bytes, which
-    /// is precisely what this decoder promises never to do. `min_each` is
-    /// the smallest number of bytes one element can possibly occupy.
-    fn expect_count(&self, count: usize, min_each: usize, what: &str) -> io::Result<()> {
-        if count.saturating_mul(min_each) > self.remaining() {
-            return Err(manifest_malformed_error(&format!(
-                "declares {count} {what} but only {} bytes remain — refusing before allocating \
-                 from an untrusted count",
-                self.remaining()
-            )));
-        }
-        Ok(())
-    }
-
     fn finish(&self) -> io::Result<()> {
         if self.pos != self.buf.len() {
             return Err(manifest_malformed_error(
@@ -247,6 +304,28 @@ impl<'a> Reader<'a> {
         }
         Ok(())
     }
+}
+
+/// Reads a u32 length prefix off `r` and validates it against bytes actually remaining
+/// (AFTER the prefix itself is consumed) before returning it as a `usize` — the read and
+/// the check are one atomic step, so there is no separate "declared count" variable a
+/// caller could ever bind and pass to `Vec::with_capacity` ahead of validation (Ruling 35:
+/// a test defends an ordering by noticing it broke; folding the read into the check
+/// defends it by making the wrong order impossible to *write*, not just impossible to
+/// leave green). `min_each` is the smallest number of bytes one element can possibly
+/// occupy; without this check, a manifest declaring `u32::MAX` elements would have
+/// `Vec::with_capacity` attempt tens of gigabytes and abort the process — a crash on
+/// untrusted bytes, which is precisely what this decoder promises never to do.
+fn expect_count(r: &mut Reader, min_each: usize, what: &str) -> io::Result<usize> {
+    let count = r.u32()? as usize;
+    if count.saturating_mul(min_each) > r.remaining() {
+        return Err(manifest_malformed_error(&format!(
+            "declares {count} {what} but only {} bytes remain — refusing before allocating \
+             from an untrusted count",
+            r.remaining()
+        )));
+    }
+    Ok(count)
 }
 
 impl Manifest {
@@ -265,7 +344,7 @@ impl Manifest {
     /// to a partial parse (hard rule 5).
     pub fn decode(bytes: &[u8]) -> io::Result<Manifest> {
         if bytes.len() < 4 {
-            return Err(manifest_malformed_error("too short to hold a trailing CRC"));
+            return Err(manifest_too_short_error(bytes.len()));
         }
         let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
         let stored = u32::from_le_bytes(crc_bytes.try_into().expect("sliced 4 bytes"));
@@ -279,21 +358,24 @@ impl Manifest {
         let writer = r.string()?;
         let applied_seq = r.u64()?;
         let next_job_id = r.u64()?;
-        let table_count = r.u32()? as usize;
-        r.expect_count(table_count, 4, "tables")?;
+        let table_count = expect_count(&mut r, 4, "tables")?;
         let mut tables = Vec::with_capacity(table_count);
         for _ in 0..table_count {
             tables.push(r.string()?);
         }
-        let segment_count = r.u32()? as usize;
-        r.expect_count(segment_count, 16, "segments")?;
+        let segment_count = expect_count(&mut r, 16, "segments")?;
         let mut segments = Vec::with_capacity(segment_count);
         for _ in 0..segment_count {
             let base_seq = r.u64()?;
             let end_seq = r.u64()?;
             segments.push(SegmentRef { base_seq, end_seq });
         }
-        let closed = r.byte()? != 0;
+        let closed_byte = r.byte()?;
+        let closed = match closed_byte {
+            0 => false,
+            1 => true,
+            other => return Err(manifest_closed_byte_error(other)),
+        };
         r.finish()?;
 
         check_contiguous(&segments, generation)?;
@@ -328,6 +410,17 @@ pub fn snapshot_meta_key(prefix: &str, generation: u64) -> String {
 
 /// `"<prefix>/<gen:020>/snapshot/<table>/<n:020>"`.
 pub fn snapshot_batch_key(prefix: &str, generation: u64, table: &str, n: u64) -> String {
+    // m2: negative space (hard rule 4). `#[table]` derives the name from the struct ident
+    // (charpente-macros/src/table.rs), so no sanctioned path produces a `/` or an empty
+    // name — but `Row::TABLE` is a public trait const an app can implement by hand, and
+    // restore (Task 10) parses `<gen>/snapshot/<table>/<n>` back into components; a `/` in
+    // `table` makes that parse ambiguous and an empty `table` produces a `//` segment.
+    assert!(
+        !table.is_empty() && !table.contains('/'),
+        "snapshot_batch_key: table name {table:?} must be non-empty and contain no '/' — \
+         restore parses <gen>/snapshot/<table>/<n> back into components, and this name would \
+         make that parse ambiguous; this is a caller bug in a hand-implemented Row::TABLE"
+    );
     format!("{prefix}/{generation:020}/snapshot/{table}/{n:020}")
 }
 
@@ -396,6 +489,44 @@ mod tests {
         let e = Manifest::decode(&body_declaring_segments(1_000_000)).unwrap_err();
         let t = e.to_string();
         assert!(t.contains("1000000"), "must name the declared count: {t}");
+        assert!(
+            t.contains("bytes remain"),
+            "must name what was actually there: {t}"
+        );
+    }
+
+    /// M2's counterpart to `body_declaring_segments`: a CRC-VALID body declaring
+    /// `table_count` tables while supplying none, stopping right after the table_count
+    /// field (decode's `expect_count(table_count, ...)` runs before it reads any
+    /// segment field, so nothing past that point is needed to exercise the guard).
+    fn body_declaring_tables(table_count: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u64.to_le_bytes()); // generation
+        buf.extend_from_slice(&1u32.to_le_bytes()); // writer len
+        buf.push(b'n'); // writer
+        buf.extend_from_slice(&0u64.to_le_bytes()); // applied_seq
+        buf.extend_from_slice(&0u64.to_le_bytes()); // next_job_id
+        buf.extend_from_slice(&table_count.to_le_bytes());
+        buf.extend_from_slice(&crc32(&buf).to_le_bytes());
+        buf
+    }
+
+    // M2: only the *segments* allocation guard had a covering test; the `tables` guard
+    // (:283, `r.expect_count(table_count, 4, "tables")?`) protects the same crash class
+    // with a worse constant (String is 24 bytes on 64-bit, vs 16 for SegmentRef) and had
+    // none — deleting it left `-p charpente` fully green. Same deliberately-modest count
+    // as the segments test and the same reasoning: proving this test has teeth means
+    // removing the guard and re-running, and a million is already impossible against a
+    // body with no table bytes while staying safe to actually run.
+    #[test]
+    fn a_huge_declared_table_count_is_refused_before_anything_is_allocated() {
+        let e = Manifest::decode(&body_declaring_tables(1_000_000)).unwrap_err();
+        let t = e.to_string();
+        assert!(t.contains("1000000"), "must name the declared count: {t}");
+        assert!(
+            t.contains("tables"),
+            "must name what was being counted: {t}"
+        );
         assert!(
             t.contains("bytes remain"),
             "must name what was actually there: {t}"
@@ -511,6 +642,78 @@ mod tests {
         );
     }
 
+    // C1: `pair[0].end_seq + 1` was unchecked at both :100 (encode's assert_contiguous) and
+    // :166 (decode's check_contiguous). In release, `u64::MAX + 1` wraps to 0, so
+    // `[{0, u64::MAX}, {0, 5}]` reads as contiguous and both encode's assert AND decode's
+    // check pass an overlapping, discontiguous chain. In debug, the same arithmetic panics
+    // with "attempt to add with overflow" — decode panicking on untrusted bytes, which this
+    // module's own doc (:11-13) promises never happens. These two tests pin the fix: decode
+    // must name a refusal (never panic), and encode must still panic, but with the
+    // contiguity message, not an arithmetic one.
+    #[test]
+    fn a_chain_whose_end_seq_has_no_successor_is_refused_at_decode_never_wrapped() {
+        let m = one_segment_manifest(vec![
+            SegmentRef {
+                base_seq: 0,
+                end_seq: u64::MAX,
+            },
+            SegmentRef {
+                base_seq: 0,
+                end_seq: 5,
+            },
+        ]);
+        // encode() would itself panic on this input (see the should_panic test below), so
+        // hand-build the bytes via write_body + a fresh CRC, the same route
+        // hand_built_with_hole uses, to exercise decode's check independently.
+        let mut buf = write_body(&m);
+        buf.extend_from_slice(&crc32(&buf).to_le_bytes());
+        let e = Manifest::decode(&buf).unwrap_err();
+        let t = e.to_string();
+        assert!(
+            t.contains("18446744073709551615"),
+            "must name the offending end_seq: {t}"
+        );
+        assert!(t.contains("restore"), "must name the fix: {t}");
+    }
+
+    #[test]
+    #[should_panic(expected = "has no valid successor")]
+    fn encode_refuses_a_chain_whose_end_seq_has_no_successor() {
+        let m = one_segment_manifest(vec![
+            SegmentRef {
+                base_seq: 0,
+                end_seq: u64::MAX,
+            },
+            SegmentRef {
+                base_seq: 0,
+                end_seq: 5,
+            },
+        ]);
+        let _ = m.encode();
+    }
+
+    // M1: decode's `base_seq > end_seq` refusal (:160-164) had no covering test — deleting
+    // the whole loop left `cargo test --workspace` fully green. `encode_refuses_a_segment_
+    // that_ends_before_it_begins` covers only encode's counterpart assert.
+    #[test]
+    fn a_segment_whose_base_seq_exceeds_its_end_seq_is_refused_at_decode() {
+        let m = one_segment_manifest(vec![SegmentRef {
+            base_seq: 99,
+            end_seq: 4,
+        }]);
+        // encode() asserts base_seq <= end_seq (assert_contiguous's span check), so
+        // hand-build the bytes the same way hand_built_with_hole does, to exercise
+        // decode's own span check independently.
+        let mut buf = write_body(&m);
+        buf.extend_from_slice(&crc32(&buf).to_le_bytes());
+        let e = Manifest::decode(&buf).unwrap_err();
+        let t = e.to_string();
+        assert!(
+            t.contains("base_seq 99 exceeds its own end_seq 4"),
+            "must name the offending span: {t}"
+        );
+    }
+
     #[test]
     fn keys_are_stable_and_zero_padded() {
         assert_eq!(manifest_key("bk"), "bk/manifest");
@@ -526,5 +729,64 @@ mod tests {
             snapshot_batch_key("bk", 2, "invoice", 0),
             "bk/00000000000000000002/snapshot/invoice/00000000000000000000"
         );
+    }
+
+    // M4: `manifest_malformed_error`'s "despite a valid CRC" clause is true for every
+    // caller except the too-short check, which runs BEFORE the CRC is ever computed. An
+    // operator triaging a truncated manifest was told the CRC checked out when there was
+    // nothing to check. These pin the corrected wording on both the empty and 3-byte
+    // truncation paths (M4 also asked to check the other truncation paths for the same
+    // defect and for `len() - 1` style underflow; both are the same `bytes.len() < 4`
+    // branch, and it runs before any subtraction on `bytes.len()`).
+    #[test]
+    fn decode_of_empty_bytes_is_refused_without_claiming_a_valid_crc() {
+        let e = Manifest::decode(&[]).unwrap_err();
+        let t = e.to_string();
+        assert!(t.contains("too short"), "must name the defect: {t}");
+        assert!(
+            !t.contains("valid CRC"),
+            "must not claim a CRC that was never computed: {t}"
+        );
+    }
+
+    #[test]
+    fn decode_of_three_bytes_is_refused_the_same_way() {
+        let e = Manifest::decode(&[0u8; 3]).unwrap_err();
+        let t = e.to_string();
+        assert!(t.contains("too short"), "must name the defect: {t}");
+        assert!(
+            !t.contains("valid CRC"),
+            "must not claim a CRC that was never computed: {t}"
+        );
+    }
+
+    // m1: `closed` is the one field that coerced instead of refusing. `encode` only ever
+    // writes 0 or 1; this hand-builds a CRC-valid body with a `closed` byte of 7 and
+    // proves decode refuses by name instead of reading it as `true`.
+    #[test]
+    fn a_closed_byte_that_is_neither_0_nor_1_is_refused_not_guessed() {
+        let m = one_segment_manifest(vec![]);
+        let mut buf = write_body(&m);
+        let last = buf.len() - 1; // write_body's last push is always the closed byte
+        buf[last] = 7;
+        buf.extend_from_slice(&crc32(&buf).to_le_bytes());
+        let e = Manifest::decode(&buf).unwrap_err();
+        let t = e.to_string();
+        assert!(t.contains("neither 0 nor 1"), "must name the defect: {t}");
+        assert!(t.contains('7'), "must name the offending byte: {t}");
+    }
+
+    // m2: `snapshot_batch_key`'s `table` precondition (non-empty, no '/') is asserted
+    // (Ruling 28: every assert needs its own should_panic row).
+    #[test]
+    #[should_panic(expected = "must be non-empty and contain no '/'")]
+    fn snapshot_batch_key_refuses_a_table_name_containing_a_slash() {
+        let _ = snapshot_batch_key("bk", 1, "a/b", 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be non-empty and contain no '/'")]
+    fn snapshot_batch_key_refuses_an_empty_table_name() {
+        let _ = snapshot_batch_key("bk", 1, "", 0);
     }
 }
