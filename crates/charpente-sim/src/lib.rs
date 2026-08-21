@@ -55,6 +55,15 @@ pub struct FaultConfig {
     /// P(a `read_at` returns a transient injected IO error — the next read
     /// of the same bytes may succeed).
     pub read_error: f64,
+    /// P(an `ObjectOp::Put` fails and the object does NOT land).
+    pub object_put_error: f64,
+    /// P(an `ObjectOp::Get`/`List` returns a transient injected IO error).
+    pub object_get_error: f64,
+    /// P(a `Put` lands durably but the caller is told it failed — the case
+    /// that makes retry-idempotence load-bearing. Not a duplicate of
+    /// `object_put_error`: that one leaves the object absent, this one does
+    /// not. There is deliberately no torn-object axis; a PUT is atomic.
+    pub object_lost_ack: f64,
     /// Path prefix scoping the durable-corruption axes: `bit_flip` and
     /// `misdirected_write` only affect files whose path starts with this
     /// prefix. These two axes exist to prove the WAL-layer fences (frame
@@ -105,6 +114,9 @@ impl Default for FaultConfig {
             bit_flip: 0.0,
             misdirected_write: 0.0,
             read_error: 0.0,
+            object_put_error: 0.0,
+            object_get_error: 0.0,
+            object_lost_ack: 0.0,
             corruption_scope: CORRUPTION_SCOPE_DEFAULT.to_string(),
             conn_drop: 0.0,
             net_spike: 0.0,
@@ -126,6 +138,9 @@ impl FaultConfig {
             bit_flip: 0.0,
             misdirected_write: 0.0,
             read_error: 0.0,
+            object_put_error: 0.0,
+            object_get_error: 0.0,
+            object_lost_ack: 0.0,
             corruption_scope: CORRUPTION_SCOPE_DEFAULT.to_string(),
             conn_drop: 0.0,
             net_spike: 0.0,
@@ -183,7 +198,7 @@ impl FaultConfig {
             sync_error,
             crash_apply,
             crash_torn,
-            // These seven axes draw from field-keyed sub-streams
+            // These ten axes draw from field-keyed sub-streams
             // (`sample_extended_fields`, applied in `run_universe`/
             // `run_universe_with_adjust` right after this function returns)
             // rather than this sequential stream, so they cannot perturb the
@@ -196,6 +211,9 @@ impl FaultConfig {
             bit_flip: 0.0,
             misdirected_write: 0.0,
             read_error: 0.0,
+            object_put_error: 0.0,
+            object_get_error: 0.0,
+            object_lost_ack: 0.0,
             conn_drop: 0.0,
             net_spike: 0.0,
             subscriber_stall: 0.0,
@@ -219,6 +237,9 @@ impl FaultConfig {
             ("bit_flip", self.bit_flip),
             ("misdirected_write", self.misdirected_write),
             ("read_error", self.read_error),
+            ("object_put_error", self.object_put_error),
+            ("object_get_error", self.object_get_error),
+            ("object_lost_ack", self.object_lost_ack),
             ("conn_drop", self.conn_drop),
             ("net_spike", self.net_spike),
             ("subscriber_stall", self.subscriber_stall),
@@ -293,6 +314,24 @@ pub fn sample_extended_fields(seed: u64, cfg: &mut FaultConfig) {
     let mut r = keyed_stream(seed, "subscriber_stall");
     cfg.subscriber_stall = if r.chance(0.25) {
         r.below(250) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "object_put_error");
+    cfg.object_put_error = if r.chance(0.25) {
+        r.below(50) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "object_get_error");
+    cfg.object_get_error = if r.chance(0.25) {
+        r.below(50) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let mut r = keyed_stream(seed, "object_lost_ack");
+    cfg.object_lost_ack = if r.chance(0.20) {
+        r.below(20) as f64 / 1000.0
     } else {
         0.0
     };
