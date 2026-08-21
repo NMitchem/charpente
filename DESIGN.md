@@ -464,6 +464,12 @@ platform is one dependency, not two.
   handler signatures are checked against each other.
 - **Events.** `#[event]` structs; `tx.emit(...)` is typed; subscribers (server-side and
   client-side codegen) consume typed streams off the log.
+- **Wire.** `Wire` is the trait describing what a type looks like once serde has
+  encoded it — the mechanism behind the client-side codegen named above and behind
+  `Id<T>`'s promise to never be a bare u64. `TypeSchema`/`TypeDef` are the IR a
+  generated client is emitted from. 64-bit integers are deliberately not wire
+  primitives: a JSON number loses precision above 2^53 in JavaScript, so they cross
+  the wire string-encoded.
 - **Config.** A typed struct, validated at startup, no stringly `env::var` in app code.
 - **Telemetry.** Counters, histograms, and log fields are declared as types with
   change-time checks: deleting a metric a dashboard depends on, or renaming a label, is a

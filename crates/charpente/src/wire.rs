@@ -76,10 +76,35 @@ pub struct TypeRegistry {
 }
 
 impl TypeRegistry {
-    /// Returns true if this name was already present — the recursion guard.
-    /// Without it a self-referential type registers forever.
+    /// Registers `name -> schema`. Returns `true` if `name` was already present —
+    /// the recursion guard: a self-referential type's `register` uses this to stop
+    /// recursing into its own fields a second time.
+    ///
+    /// Re-inserting the SAME schema under a name already present is the dedup path
+    /// (the same type reached through two routes) and returns `true` quietly. Two
+    /// DIFFERENT schemas under the same name is a wire-name collision: it would
+    /// produce a `Contract.types` entry that matches only one of the two Rust types
+    /// `Ref`-ing it, so it panics rather than silently keeping the last writer
+    /// (hard rule 4 — assert negative space).
     pub fn insert(&mut self, name: &'static str, schema: TypeSchema) -> bool {
-        self.defs.insert(name, schema).is_some()
+        assert!(
+            !name.is_empty(),
+            "TypeRegistry::insert: WIRE_NAME cannot be empty — \"\" means \
+             \"anonymous/inline\" (what Wire::reference() checks to skip the \
+             registry entirely), never a real named type"
+        );
+        if let Some(prev) = self.defs.get(name) {
+            assert!(
+                *prev == schema,
+                "TypeRegistry::insert: wire name \"{name}\" is registered with two \
+                 different shapes — every Wire type needs a WIRE_NAME unique \
+                 wire-wide (one shape per wire name); rename one of the two \
+                 colliding Rust types so their WIRE_NAME differs"
+            );
+            return true;
+        }
+        self.defs.insert(name, schema);
+        false
     }
 
     pub fn contains(&self, name: &str) -> bool {
