@@ -1220,14 +1220,15 @@ enum WriteGate {
 /// The composed deterministic core: WAL + store + schema. One `Db` is the
 /// single writer; `transact` takes `&mut self`, so transactions are
 /// serializable because two cannot exist at once.
-// `Debug` is hand-written, not derived: `retention_pin` is a `Box<dyn Fn>`,
-// which has no `Debug` impl, and the derive would require one. `Db::open(..)
-// .unwrap_err()` needs SOME `Debug` bound on the `Ok` type, so `engine` and
-// `cfg` are shown and `retention_pin` is simply omitted.
+// `Debug` is hand-written, not derived: `retention_pins` is a
+// `Vec<Box<dyn Fn>>`, whose element has no `Debug` impl, and the derive
+// would require one. `Db::open(..).unwrap_err()` needs SOME `Debug` bound on
+// the `Ok` type, so `engine` and `cfg` are shown and `retention_pins` is
+// simply omitted.
 pub struct Db {
     engine: Engine<TableMachine>,
     cfg: DbConfig,
-    retention_pin: Option<Box<dyn Fn() -> u64 + Send>>,
+    retention_pins: Vec<Box<dyn Fn() -> u64 + Send>>,
     records_since_checkpoint: u64,
     /// `WriteGate::Allowed` (the default) permits commits; `NotPrimary`
     /// (`forbid_writes`) and `Verifying` (`verify_writes`) both refuse every
@@ -1236,7 +1237,7 @@ pub struct Db {
     gate: WriteGate,
     /// Tables that already carry a `charpente.schema_versions` row (T6's
     /// first-write adoption): rebuilt from the store at open and by
-    /// `migrate_schema`. Omitted from `Debug` like `retention_pin`.
+    /// `migrate_schema`. Omitted from `Debug` like `retention_pins`.
     adopted: BTreeSet<String>,
 }
 
@@ -1422,7 +1423,7 @@ impl Db {
         let mut db = Db {
             engine,
             cfg,
-            retention_pin: None,
+            retention_pins: Vec::new(),
             records_since_checkpoint: 0,
             gate: WriteGate::Allowed,
             adopted: BTreeSet::new(),
@@ -1567,9 +1568,7 @@ impl Db {
             write_horizon_breadcrumb(self.engine.wal().disk(), &self.cfg.store_path, applied)?;
         }
         let mut keep_from = applied.map_or(0, |s| s + 1);
-        if let Some(pin) = &self.retention_pin {
-            keep_from = keep_from.min(pin());
-        }
+        keep_from = keep_from.min(self.retention_floor());
         // Event retention GC runs ONLY here, at the cadence-driven
         // checkpoint — never inside `transact`/`Store::apply`, because GC is
         // not a log record. That is the determinism argument: a primary and
@@ -1645,10 +1644,25 @@ impl Db {
     }
 
     /// Registers a floor `checkpoint`'s GC will never delete past — e.g. a
-    /// replication cursor that still needs older records than the store's
-    /// own checkpoint does. Overrides any previously registered pin.
-    pub fn pin_retention(&mut self, pin: Box<dyn Fn() -> u64 + Send>) {
-        self.retention_pin = Some(pin);
+    /// replication cursor, or the archive's un-uploaded segment (archive
+    /// spec §5). **Pins accumulate; the effective floor is the min over all
+    /// of them.** A pin that is not holding returns `u64::MAX`.
+    ///
+    /// Renamed from `pin_retention`, which overrode: two subsystems now hold
+    /// floors independently, and an override would have let whichever
+    /// registered last silently delete the other's records.
+    pub fn add_retention_pin(&mut self, pin: Box<dyn Fn() -> u64 + Send>) {
+        self.retention_pins.push(pin);
+    }
+
+    /// The effective retention floor: the min over registered pins, or
+    /// `u64::MAX` when none holds.
+    pub fn retention_floor(&self) -> u64 {
+        self.retention_pins
+            .iter()
+            .map(|p| p())
+            .min()
+            .unwrap_or(u64::MAX)
     }
 
     /// Marks this node a read-only follower: every further effectful

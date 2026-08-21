@@ -252,7 +252,7 @@ impl Repl {
         let witnesses = open_witnesses(&*role_disk)?;
 
         let pin_floor = Arc::new(Mutex::new(u64::MAX));
-        db.pin_retention(Box::new({
+        db.add_retention_pin(Box::new({
             let floor = Arc::clone(&pin_floor);
             move || *floor.lock().expect("uncontended")
         }));

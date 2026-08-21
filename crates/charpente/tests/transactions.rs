@@ -5,6 +5,8 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use charpente::{Db, DbConfig, Event, Job, Schema, Seeder, TxError, View, table};
 use charpente_core::event::EventRow;
@@ -1202,13 +1204,53 @@ fn retention_pin_holds_segments_gc_would_otherwise_delete() {
     }
     let before = sim.disk().list("wal/").unwrap().len();
 
-    db.pin_retention(Box::new(|| 0));
+    db.add_retention_pin(Box::new(|| 0));
     db.checkpoint().unwrap();
 
     let after = sim.disk().list("wal/").unwrap().len();
     assert_eq!(
         after, before,
         "a pin at seq 0 must block every deletion: {before} -> {after}"
+    );
+}
+
+#[test]
+fn retention_pins_compose_as_a_min() {
+    let (_sim, mut db) = quiet_db(0x3);
+    let a = Arc::new(AtomicU64::new(50));
+    let b = Arc::new(AtomicU64::new(20));
+    db.add_retention_pin(Box::new({
+        let a = Arc::clone(&a);
+        move || a.load(Ordering::Relaxed)
+    }));
+    db.add_retention_pin(Box::new({
+        let b = Arc::clone(&b);
+        move || b.load(Ordering::Relaxed)
+    }));
+
+    assert_eq!(db.retention_floor(), 20, "floor must be the min over pins");
+    b.store(90, Ordering::Relaxed);
+    assert_eq!(
+        db.retention_floor(),
+        50,
+        "floor must track the new min, not the first pin"
+    );
+    a.store(u64::MAX, Ordering::Relaxed);
+    b.store(u64::MAX, Ordering::Relaxed);
+    assert_eq!(
+        db.retention_floor(),
+        u64::MAX,
+        "no pin holding means no floor"
+    );
+}
+
+#[test]
+fn no_registered_pins_means_no_floor() {
+    let (_sim, db) = quiet_db(0x4);
+    assert_eq!(
+        db.retention_floor(),
+        u64::MAX,
+        "an unpinned db must not hold any segment"
     );
 }
 

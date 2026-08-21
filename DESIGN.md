@@ -748,10 +748,11 @@ shipped seq gap means a different timeline — drop the conn and re-`Hello`. An 
 `Frames` batch — never sent by the real shipper (it only ships when it has something to
 ship), but not enforced by the wire — is a no-op on the follower side: `apply_shipped`
 doesn't advance `last_applied` on an empty batch, so there is nothing to ack. The retention
-pin is wired at `Repl::open`: `Db::pin_retention` reads a shared floor recomputed on every
-ack and session change — the min over live sessions of acked + 1 (a not-yet-acked
-session pins at its cursor; a seeding session at its snapshot's `applied_seq + 1`) — so a
-live lagging session holds GC exactly as long as it lives and releases it when reaped. A
+pin is wired at `Repl::open`: `Db::add_retention_pin` registers a pin that reads a shared
+floor recomputed on every ack and session change — the min over live sessions of acked + 1
+(a not-yet-acked session pins at its cursor; a seeding session at its snapshot's
+`applied_seq + 1`) — so a live lagging session holds GC exactly as long as it lives and
+releases it when reaped. A
 session still `AwaitHello` (accepted but silent) pins at 0 like any not-yet-acked session;
 `HELLO_DEADLINE_NANOS` (10× the heartbeat interval, checked and reaped the same shape as
 the heartbeat deadline) fires for one that never sends its first message — `Hello` or a
