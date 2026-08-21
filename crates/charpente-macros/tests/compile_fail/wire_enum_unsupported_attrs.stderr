@@ -1,0 +1,38 @@
+error: #[derive(Wire)] does not support serde's `untagged` — an untagged enum carries no discriminator, so the wire schema cannot tell which variant a given JSON value belongs to; #[derive(Wire)] only supports the tagged representations (the default external tagging, `tag`, or `tag` + `content`)
+  --> tests/compile_fail/wire_enum_unsupported_attrs.rs:10:9
+   |
+10 | #[serde(untagged)]
+   |         ^^^^^^^^
+
+error: serde's `content` requires `tag` — an adjacently tagged enum needs both
+  --> tests/compile_fail/wire_enum_unsupported_attrs.rs:17:1
+   |
+17 | / #[serde(content = "c")]
+18 | | enum ContentWithoutTag {
+19 | |     A(u32),
+20 | | }
+   | |_^
+
+error: #[derive(Wire)] does not recognize serde's `deny_unknown_fields` on an enum — an attribute this derive doesn't have logic for is rejected rather than silently ignored, because a silently wrong schema is worse than a compile error; supported on an enum: `tag`, `content`, `rename_all`
+  --> tests/compile_fail/wire_enum_unsupported_attrs.rs:23:9
+   |
+23 | #[serde(deny_unknown_fields)]
+   |         ^^^^^^^^^^^^^^^^^^^
+
+error: #[derive(Wire)] does not support serde's split `rename_all(serialize = ...)` / `rename_all(deserialize = ...)` form — a wire schema is one shape, and divergent serialize/deserialize names can't be represented; use plain `rename_all = "..."` instead
+  --> tests/compile_fail/wire_enum_unsupported_attrs.rs:29:9
+   |
+29 | #[serde(rename_all(serialize = "camelCase"))]
+   |         ^^^^^^^^^^
+
+error: #[derive(Wire)] does not recognize serde's `skip` on a variant — an attribute this derive doesn't have logic for is rejected rather than silently ignored, because a silently wrong schema is worse than a compile error; supported on a variant: `rename`
+  --> tests/compile_fail/wire_enum_unsupported_attrs.rs:36:13
+   |
+36 |     #[serde(skip)]
+   |             ^^^^
+
+error: #[derive(Wire)] does not support serde's split `rename(serialize = ...)` / `rename(deserialize = ...)` form — a wire schema is one shape, and divergent serialize/deserialize names can't be represented; use plain `rename = "..."` instead
+  --> tests/compile_fail/wire_enum_unsupported_attrs.rs:43:13
+   |
+43 |     #[serde(rename(serialize = "a"))]
+   |             ^^^^^^

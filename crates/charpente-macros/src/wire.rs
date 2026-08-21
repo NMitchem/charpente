@@ -36,6 +36,29 @@
 //! named fields, with nothing downstream (registry, client `JSON.parse`)
 //! erroring either. `expand`'s field loop tracks each resolved wire name and
 //! rejects the second field that reaches one already seen.
+//!
+//! Task 4 extends every one of those disciplines to `Data::Enum` (`expand_enum`
+//! and friends below): default-deny for enum- and variant-level `#[serde(...)]`
+//! attributes, `?`-propagation through every `parse_nested_meta` call, and a
+//! variant-name analogue of the duplicate-wire-name check. It also adds a
+//! fourth discipline of its own, found by MEASURING real `serde_json` output
+//! rather than reasoning about it (see the probes behind the fix that added
+//! this paragraph): serde's four enum representations are not uniformly
+//! expressible by `EnumRepr`'s `Vec<(String, TypeSchema)>` shape. A unit
+//! variant serializes as a bare JSON string under external tagging
+//! (`"Draft"`, not `{"Draft":{}}`) and drops its `content` key entirely under
+//! adjacent tagging (`{"t":"A"}`, not `{"t":"A","c":{}}`) — neither is
+//! expressible as *some* `TypeSchema` in the per-variant slot the IR gives
+//! this derive, so a unit variant mixed with data-carrying variants under
+//! external tagging, and a unit variant under adjacent tagging at all, are
+//! both rejected at compile time rather than described wrong. Internally
+//! tagged tuple/newtype variants are rejected for a different, harder
+//! reason: serde itself refuses to serialize a newtype variant over
+//! anything but a struct under `tag`-only representation ("cannot serialize
+//! tagged newtype variant ... containing an integer"), and even the
+//! struct-shaped case merges the inner type's fields into the tag object in
+//! a way this derive has no way to reconstruct from a bare `Type` at
+//! macro-expansion time.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -49,21 +72,34 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         return Err(Error::new_spanned(
             &input.generics,
             format!(
-                "#[derive(Wire)] structs cannot be generic — a wire type is one concrete \
-                 shape; make `{name_str}` non-generic"
+                "#[derive(Wire)] types cannot be generic — a wire type is one concrete shape; \
+                 make `{name_str}` non-generic"
             ),
         ));
     }
 
-    let Data::Struct(data) = &input.data else {
-        return Err(Error::new_spanned(
+    match &input.data {
+        Data::Struct(data) => expand_struct(name, &name_str, data, &input),
+        Data::Enum(data) => expand_enum(name, &name_str, data, &input),
+        Data::Union(_) => Err(Error::new_spanned(
             &input,
-            "#[derive(Wire)] applies to structs — enum support lands in Task 4",
-        ));
-    };
+            format!(
+                "#[derive(Wire)] applies to structs and enums — `{name_str}` is a union, which \
+                 has no serde representation to describe"
+            ),
+        )),
+    }
+}
+
+fn expand_struct(
+    name: &syn::Ident,
+    name_str: &str,
+    data: &syn::DataStruct,
+    input: &DeriveInput,
+) -> syn::Result<TokenStream> {
     let Fields::Named(fields) = &data.fields else {
         return Err(Error::new_spanned(
-            &input,
+            input,
             format!("#[derive(Wire)] needs named fields — `{name_str}` must be a braced struct"),
         ));
     };
@@ -74,14 +110,16 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     // `rename` (neither would otherwise ever ask `rename_all` to resolve a
     // name, so a check folded into the field loop would never run for them).
     //
-    // Deliberately AFTER the two shape checks above (fix round 2, NEW-1): a
+    // Deliberately AFTER the shape check above (fix round 2, NEW-1): a
     // struct-level `#[serde(...)]` error must not be the first thing raised
-    // for a non-struct or tuple-struct input, or a shape mismatch on an enum
-    // (e.g. `#[serde(untagged)] enum E { .. }`) gets misreported as "does not
-    // recognize serde's `untagged` on a struct" instead of "enum support
-    // lands in Task 4" — the right diagnostic, which fires when this call
-    // sits after the shape checks instead of before them.
-    let rename_all = struct_serde_attrs(&input)?;
+    // for a tuple struct — "needs named fields" is the right diagnostic,
+    // which fires when this call sits after the shape check instead of
+    // before it. (The `Data::Struct` vs `Data::Enum` vs `Data::Union` split
+    // now happens one level up, in `expand`, before this function is ever
+    // called — so the historical "enum carrying a struct-level attribute
+    // must get the shape error first" case has its own coverage under
+    // `expand_enum` instead; see `enum_serde_attrs`.)
+    let rename_all = struct_serde_attrs(input)?;
 
     let mut field_toks = Vec::new();
     let mut register_toks = Vec::new();
@@ -203,6 +241,371 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     })
 }
 
+/// Enum-container-level `#[serde(...)]`: `tag`, `content`, and `rename_all`
+/// are supported — `tag`/`content` choose the representation (see the module
+/// doc comment), `rename_all` folds every variant's name the same way the
+/// struct-level one folds field names. `untagged` gets a dedicated message
+/// (common enough to name specifically, like struct-level `tag`/`default`
+/// do); anything else falls through to the default-deny catch-all.
+struct EnumAttrs {
+    tag: Option<String>,
+    content: Option<String>,
+    rename_all: Option<RenameAll>,
+}
+
+fn enum_serde_attrs(input: &DeriveInput) -> syn::Result<EnumAttrs> {
+    let mut tag = None;
+    let mut content = None;
+    let mut rename_all = None;
+    for attr in &input.attrs {
+        if !attr.path().is_ident("serde") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("tag") {
+                tag = Some(meta.value()?.parse::<LitStr>()?.value());
+                return Ok(());
+            }
+            if meta.path.is_ident("content") {
+                content = Some(meta.value()?.parse::<LitStr>()?.value());
+                return Ok(());
+            }
+            if meta.path.is_ident("rename_all") {
+                rename_all = Some(parse_rename_all(&meta)?);
+                return Ok(());
+            }
+            if meta.path.is_ident("untagged") {
+                return Err(meta.error(
+                    "#[derive(Wire)] does not support serde's `untagged` — an untagged enum \
+                     carries no discriminator, so the wire schema cannot tell which variant a \
+                     given JSON value belongs to; #[derive(Wire)] only supports the tagged \
+                     representations (the default external tagging, `tag`, or `tag` + \
+                     `content`)",
+                ));
+            }
+            Err(unrecognized_serde_attr(
+                &meta,
+                "an enum",
+                "`tag`, `content`, `rename_all`",
+            ))
+        })?;
+    }
+    if content.is_some() && tag.is_none() {
+        return Err(Error::new_spanned(
+            input,
+            "serde's `content` requires `tag` — an adjacently tagged enum needs both",
+        ));
+    }
+    Ok(EnumAttrs {
+        tag,
+        content,
+        rename_all,
+    })
+}
+
+/// Variant-level `#[serde(...)]`: only `rename` is supported. `skip`,
+/// `other`, `alias` and the rest have no wire semantics defined for them
+/// here yet, so — same default-deny discipline as everywhere else in this
+/// derive — they are rejected rather than silently ignored.
+struct VariantAttrs {
+    rename: Option<String>,
+}
+
+fn variant_serde_attrs(v: &syn::Variant) -> syn::Result<VariantAttrs> {
+    let mut rename = None;
+    for attr in &v.attrs {
+        if !attr.path().is_ident("serde") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                if meta.input.peek(syn::token::Paren) {
+                    return Err(meta.error(
+                        "#[derive(Wire)] does not support serde's split `rename(serialize = \
+                         ...)` / `rename(deserialize = ...)` form — a wire schema is one shape, \
+                         and divergent serialize/deserialize names can't be represented; use \
+                         plain `rename = \"...\"` instead",
+                    ));
+                }
+                let s: LitStr = meta.value()?.parse()?;
+                rename = Some(s.value());
+                return Ok(());
+            }
+            Err(unrecognized_serde_attr(&meta, "a variant", "`rename`"))
+        })?;
+    }
+    Ok(VariantAttrs { rename })
+}
+
+/// Resolves every variant's post-serde wire name (`rename`, else
+/// `rename_all`, else the bare ident) and rejects two variants landing on
+/// the same one — the enum analogue of `expand_struct`'s field-name check.
+/// Two variants sharing a wire name are indistinguishable on the wire
+/// whichever representation is in play: a repeated string-union member, a
+/// repeated externally-tagged object key, or a repeated tag/discriminant
+/// value. Unlike the field check, Rust itself already forbids two variants
+/// sharing an ident — this only becomes reachable once `rename`/`rename_all`
+/// can fold two DIFFERENT idents onto the same string, the same way
+/// `rename_all` can for fields (`a_b`/`a__b` both becoming `aB`).
+fn resolve_variant_names(
+    data: &syn::DataEnum,
+    rename_all: Option<RenameAll>,
+) -> syn::Result<Vec<String>> {
+    let mut wire_names: std::collections::BTreeMap<String, syn::Ident> =
+        std::collections::BTreeMap::new();
+    let mut names = Vec::new();
+    for v in &data.variants {
+        let attrs = variant_serde_attrs(v)?;
+        let wire_name = match attrs.rename {
+            Some(r) => r,
+            None => {
+                let raw = v.ident.to_string();
+                match rename_all {
+                    Some(rule) => rule.apply(&raw),
+                    None => raw,
+                }
+            }
+        };
+        if let Some(prev_ident) = wire_names.get(&wire_name) {
+            return Err(Error::new_spanned(
+                &v.ident,
+                format!(
+                    "#[derive(Wire)] requires one wire name per variant, but `{prev_ident}` and \
+                     `{}` both resolve to \"{wire_name}\" — two variants sharing a wire name are \
+                     indistinguishable on the wire, whether as a string-union member, an \
+                     externally-tagged object key, or an internally/adjacently-tagged \
+                     discriminant value; rename one of the two variants, or give it its own \
+                     #[serde(rename = \"...\")], so their resolved names differ",
+                    v.ident
+                ),
+            ));
+        }
+        wire_names.insert(wire_name.clone(), v.ident.clone());
+        names.push(wire_name);
+    }
+    Ok(names)
+}
+
+/// Builds one variant's CONTENT schema (its wire name is resolved
+/// separately, by `resolve_variant_names`) and the `register()` calls for
+/// whatever types it references. Never called for `EnumRepr::Unit`'s
+/// variants — a unit-only, untagged enum's variants have no content at all,
+/// only a name.
+///
+/// The three rejections below (unit-under-external-when-mixed,
+/// unit-under-adjacent, unnamed-under-internal) all come from the same
+/// place: `EnumRepr`'s per-variant slot is always SOME `TypeSchema` (see the
+/// module doc comment), and three real serde shapes cannot be written as
+/// one — confirmed by driving real `serde_json::to_string` on each shape,
+/// not reasoned from serde's docs alone (spec §5's fidelity discipline
+/// applies to what this derive REFUSES, not just what it accepts).
+fn variant_inner_schema(
+    name_str: &str,
+    v: &syn::Variant,
+    tag: &Option<String>,
+    content: &Option<String>,
+) -> syn::Result<(TokenStream, Vec<TokenStream>)> {
+    let vname = v.ident.to_string();
+    match &v.fields {
+        Fields::Unit => match (tag, content) {
+            (None, _) => Err(Error::new_spanned(
+                &v.ident,
+                format!(
+                    "#[derive(Wire)] cannot describe unit variant `{name_str}::{vname}` under \
+                     serde's default (externally tagged) representation when other variants \
+                     carry data — serde serializes a bare unit variant here as the JSON string \
+                     \"{vname}\", not an object, and a per-variant wire schema has no way to \
+                     express that; make every variant unit-only, or add \
+                     #[serde(tag = \"...\")] to switch to internally tagged"
+                ),
+            )),
+            (Some(_), Some(c)) => Err(Error::new_spanned(
+                &v.ident,
+                format!(
+                    "#[derive(Wire)] cannot describe unit variant `{name_str}::{vname}` under \
+                     serde's adjacently tagged representation (`tag` + `content`) — serde omits \
+                     the \"{c}\" key entirely for a unit variant instead of writing an empty \
+                     object, which this per-variant schema cannot express; use \
+                     #[serde(tag = \"...\")] alone (internally tagged) instead, or give the \
+                     variant a body"
+                ),
+            )),
+            (Some(_), None) => Ok((
+                quote! { ::charpente::wire::TypeSchema::Struct { fields: ::std::vec![] } },
+                Vec::new(),
+            )),
+        },
+        Fields::Named(f) => {
+            let mut fs = Vec::new();
+            let mut registers = Vec::new();
+            // Fresh per variant, deliberately: fields in two different
+            // variants never appear in the same JSON object at once (only
+            // one variant is ever serialized for a given value), so a
+            // collision check spanning the whole enum would reject shapes
+            // that are perfectly fine on the wire.
+            let mut wire_names: std::collections::BTreeMap<String, syn::Ident> =
+                std::collections::BTreeMap::new();
+            for field in &f.named {
+                let fid = field.ident.as_ref().expect("named fields have idents");
+                let attrs = field_serde_attrs(field)?;
+                if attrs.skip {
+                    continue;
+                }
+                let fname = match &attrs.rename {
+                    Some(r) => r.clone(),
+                    None => fid.to_string(),
+                };
+                if let Some(prev_ident) = wire_names.get(&fname) {
+                    return Err(Error::new_spanned(
+                        fid,
+                        format!(
+                            "#[derive(Wire)] requires one wire name per field, but \
+                             `{prev_ident}` and `{fid}` in variant `{name_str}::{vname}` both \
+                             resolve to \"{fname}\" — serde would emit that key twice on the \
+                             wire and the schema would carry two fields with the same name; \
+                             rename one of the two fields, or give it its own \
+                             #[serde(rename = \"...\")], so their resolved names differ"
+                        ),
+                    ));
+                }
+                wire_names.insert(fname.clone(), fid.clone());
+                let fty = &field.ty;
+                let optional = attrs.skip_serializing_if;
+                fs.push(quote! {
+                    ::charpente::wire::Field {
+                        name: #fname.to_string(),
+                        schema: <#fty as ::charpente::wire::Wire>::reference(),
+                        optional: #optional,
+                    }
+                });
+                registers.push(quote! { <#fty as ::charpente::wire::Wire>::register(reg); });
+            }
+            Ok((
+                quote! { ::charpente::wire::TypeSchema::Struct { fields: ::std::vec![#(#fs),*] } },
+                registers,
+            ))
+        }
+        Fields::Unnamed(f) => {
+            if tag.is_some() && content.is_none() {
+                return Err(Error::new_spanned(
+                    v,
+                    format!(
+                        "#[derive(Wire)] cannot describe tuple variant `{name_str}::{vname}` \
+                         under serde's internally tagged representation (`tag = \"...\"`) — for \
+                         anything but a single struct-shaped field serde refuses to serialize it \
+                         at all (\"cannot serialize tagged newtype variant\"), and even a \
+                         struct-shaped field has its fields merged into the tag object in a way \
+                         this schema cannot reconstruct from a bare type at compile time; use a \
+                         braced variant with named fields instead"
+                    ),
+                ));
+            }
+            if f.unnamed.len() == 1 {
+                let fty = &f.unnamed[0].ty;
+                Ok((
+                    quote! { <#fty as ::charpente::wire::Wire>::reference() },
+                    vec![quote! { <#fty as ::charpente::wire::Wire>::register(reg); }],
+                ))
+            } else {
+                Err(Error::new_spanned(
+                    v,
+                    format!(
+                        "#[derive(Wire)] cannot describe tuple variant `{name_str}::{vname}` \
+                         with {} fields — serde encodes it as a JSON array, which has no useful \
+                         TypeScript type. Use a braced variant with named fields.",
+                        f.unnamed.len()
+                    ),
+                ))
+            }
+        }
+    }
+}
+
+fn expand_enum(
+    name: &syn::Ident,
+    name_str: &str,
+    data: &syn::DataEnum,
+    input: &DeriveInput,
+) -> syn::Result<TokenStream> {
+    let EnumAttrs {
+        tag,
+        content,
+        rename_all,
+    } = enum_serde_attrs(input)?;
+    let all_unit = data
+        .variants
+        .iter()
+        .all(|v| matches!(v.fields, Fields::Unit));
+    // Resolved (and dup-checked) once, up front, independent of which branch
+    // below runs — the unit-string-union shortcut needs the names directly,
+    // the general path zips them against each variant's content schema.
+    let resolved_names = resolve_variant_names(data, rename_all)?;
+
+    let mut register_toks = Vec::new();
+
+    let repr = if all_unit && tag.is_none() {
+        quote! {
+            ::charpente::wire::EnumRepr::Unit {
+                variants: ::std::vec![#(#resolved_names.to_string()),*]
+            }
+        }
+    } else {
+        let mut arms = Vec::new();
+        for (v, vname) in data.variants.iter().zip(resolved_names.iter()) {
+            let (inner, regs) = variant_inner_schema(name_str, v, &tag, &content)?;
+            register_toks.extend(regs);
+            arms.push(quote! { (#vname.to_string(), #inner) });
+        }
+        match (&tag, &content) {
+            (Some(t), None) => quote! {
+                ::charpente::wire::EnumRepr::Internal {
+                    tag: #t.to_string(),
+                    variants: ::std::vec![#(#arms),*],
+                }
+            },
+            (Some(t), Some(c)) => quote! {
+                ::charpente::wire::EnumRepr::Adjacent {
+                    tag: #t.to_string(),
+                    content: #c.to_string(),
+                    variants: ::std::vec![#(#arms),*],
+                }
+            },
+            (None, _) => quote! {
+                ::charpente::wire::EnumRepr::External { variants: ::std::vec![#(#arms),*] }
+            },
+        }
+    };
+
+    Ok(quote! {
+        impl ::charpente::wire::Wire for #name {
+            const WIRE_NAME: &'static str = #name_str;
+
+            fn schema() -> ::charpente::wire::TypeSchema {
+                ::charpente::wire::TypeSchema::Enum(#repr)
+            }
+
+            fn register(reg: &mut ::charpente::wire::TypeRegistry) {
+                // Same `insert_as`-then-guard shape as `expand_struct`, and
+                // for the same reason: checking `contains` FIRST would let a
+                // genuine collision between two different enums sharing a
+                // `WIRE_NAME` return early on the second one without ever
+                // comparing schemas, silently keeping whichever registered
+                // first instead of panicking (see `TypeRegistry::insert_as`'s
+                // doc comment and `expand_struct`'s matching comment).
+                let already_present = reg.insert_as(
+                    #name_str,
+                    <Self as ::charpente::wire::Wire>::schema(),
+                    ::std::any::type_name::<#name>(),
+                );
+                if already_present {
+                    return;
+                }
+                #(#register_toks)*
+            }
+        }
+    })
+}
+
 /// Case-conversion rules serde's `rename_all` supports, resolved and
 /// validated ONCE (see the call site in `expand`), not re-checked per field.
 #[derive(Clone, Copy)]
@@ -234,16 +637,85 @@ impl RenameAll {
         }
     }
 
-    /// Mirrors serde_derive_internals' `RenameRule::apply_to_field`, ASCII
-    /// case conversion only (see `to_camel_case` below for why).
+    /// Mirrors serde_derive_internals' `RenameRule::apply_to_field` — and, as
+    /// of Task 4, `apply_to_variant` too, which is where the pre-existing
+    /// (Task 3) implementation of the non-`Camel` arms turned out to be
+    /// wrong. Task 3's fidelity tests only ever exercised STRUCT FIELDS,
+    /// which by Rust convention are already snake_case (no uppercase
+    /// letters at all) — so `Snake => raw.to_string()` (pure identity),
+    /// `ScreamingSnake => raw.to_ascii_uppercase()`, and
+    /// `Kebab => raw.replace('_', "-")` all happened to agree with real
+    /// serde, because none of those inputs ever exercised the one thing
+    /// they were missing: inserting a NEW separator before an
+    /// uppercase letter that isn't already preceded by one. ENUM VARIANTS
+    /// (Task 4) are conventionally PascalCase, which exercises exactly that
+    /// gap — confirmed by driving real `serde_json` on a battery of variant
+    /// names, not reasoned from serde's docs (see `insert_before_uppercase`'s
+    /// doc comment for the measured shapes). `Camel` needed no change: it
+    /// already preserves every character it doesn't explicitly touch exactly
+    /// as written, which — since PascalCase variant names have no
+    /// underscores at all — already reproduces the correct per-word
+    /// capitalization for free (each "word" it would otherwise need to find
+    /// is, by construction, already capitalized in the source).
     fn apply(self, raw: &str) -> String {
         match self {
             RenameAll::Camel => to_camel_case(raw),
-            RenameAll::Snake => raw.to_string(),
-            RenameAll::ScreamingSnake => raw.to_ascii_uppercase(),
-            RenameAll::Kebab => raw.replace('_', "-"),
+            RenameAll::Snake => insert_before_uppercase(raw, '_').to_ascii_lowercase(),
+            RenameAll::ScreamingSnake => insert_before_uppercase(raw, '_').to_ascii_uppercase(),
+            RenameAll::Kebab => insert_before_uppercase(raw, '-')
+                .to_ascii_lowercase()
+                .replace('_', "-"),
         }
     }
+}
+
+/// Inserts `sep` immediately before every ASCII-uppercase letter that is NOT
+/// the first character of `raw` — used by the `Snake`/`ScreamingSnake`/
+/// `Kebab` arms of `RenameAll::apply`, which otherwise never touch anything
+/// but case and (for `Kebab`) the underscore-to-hyphen swap.
+///
+/// Deliberately does NOT consume or collapse any existing `_` in `raw` (it
+/// only ever INSERTS `sep`, never removes a character) — confirmed against
+/// real `serde_json`: `#[serde(rename_all = "snake_case")]` on a field named
+/// `_id` produces `"_id"` (leading underscore intact, NOT `"id"`), and on
+/// `a__b` produces `"a__b"` (both underscores intact, NOT collapsed to one).
+/// `Camel` (`to_camel_case`) is the ONE rule that consumes underscores as
+/// delimiters — the split between "these three insert-only" and "Camel
+/// consumes" is real, not an implementation shortcut: `#[serde(rename_all =
+/// "kebab-case")]` on `a__b` produces `"a--b"` (each underscore individually
+/// replaced, count preserved) where camelCase's `a__b` produces `"aB"`
+/// (collapsed to one boundary) — two structurally different transforms, not
+/// one transform expressed two ways.
+fn insert_before_uppercase(raw: &str, sep: char) -> String {
+    let mut out = String::with_capacity(raw.len() + 4);
+    let mut chars = raw.chars();
+    if let Some(first) = chars.next() {
+        out.push(first);
+    }
+    for c in chars {
+        if c.is_ascii_uppercase() {
+            out.push(sep);
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Parses `rename_all`'s value form and rejects its split
+/// `rename_all(serialize = ...)` form. Shared by `struct_serde_attrs` and
+/// `enum_serde_attrs` — serde supports `rename_all` on both containers, with
+/// the same split-form restriction either way.
+fn parse_rename_all(meta: &syn::meta::ParseNestedMeta) -> syn::Result<RenameAll> {
+    if meta.input.peek(syn::token::Paren) {
+        return Err(meta.error(
+            "#[derive(Wire)] does not support serde's split `rename_all(serialize = ...)` / \
+             `rename_all(deserialize = ...)` form — a wire schema is one shape, and divergent \
+             serialize/deserialize names can't be represented; use plain \
+             `rename_all = \"...\"` instead",
+        ));
+    }
+    let s: LitStr = meta.value()?.parse()?;
+    RenameAll::parse(&s)
 }
 
 /// Struct-level `#[serde(...)]`: `rename_all` is supported (see `RenameAll`);
@@ -258,23 +730,15 @@ fn struct_serde_attrs(input: &DeriveInput) -> syn::Result<Option<RenameAll>> {
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("rename_all") {
-                if meta.input.peek(syn::token::Paren) {
-                    return Err(meta.error(
-                        "#[derive(Wire)] does not support serde's split \
-                         `rename_all(serialize = ...)` / `rename_all(deserialize = ...)` form \
-                         — a wire schema is one shape, and divergent serialize/deserialize \
-                         names can't be represented; use plain `rename_all = \"...\"` instead",
-                    ));
-                }
-                let s: LitStr = meta.value()?.parse()?;
-                rename_all = Some(RenameAll::parse(&s)?);
+                rename_all = Some(parse_rename_all(&meta)?);
                 return Ok(());
             }
             if meta.path.is_ident("tag") {
                 return Err(meta.error(
                     "#[derive(Wire)] does not support serde's struct-level `tag = \"...\"` — it \
-                     adds a wire field the schema does not model; enum tagging is a separate \
-                     concern (Task 4), and a struct-level tag is out of scope here",
+                     adds a wire field the schema does not model; tagging is a per-enum concern \
+                     (`#[derive(Wire)]` on the enum itself resolves `tag`/`content` there), and \
+                     a struct-level tag stays out of scope",
                 ));
             }
             if meta.path.is_ident("default") {
@@ -286,7 +750,7 @@ fn struct_serde_attrs(input: &DeriveInput) -> syn::Result<Option<RenameAll>> {
                      per field instead",
                 ));
             }
-            Err(unrecognized_serde_attr(&meta, "struct", "`rename_all`"))
+            Err(unrecognized_serde_attr(&meta, "a struct", "`rename_all`"))
         })?;
     }
     Ok(rename_all)
@@ -363,7 +827,7 @@ fn field_serde_attrs(f: &syn::Field) -> syn::Result<FieldAttrs> {
             }
             Err(unrecognized_serde_attr(
                 &meta,
-                "field",
+                "a field",
                 "`rename`, `skip`, `skip_serializing`, `skip_serializing_if`",
             ))
         })?;
@@ -386,6 +850,10 @@ fn consume_optional_value(meta: &syn::meta::ParseNestedMeta) -> syn::Result<()> 
 /// explicitly rejected above lands here. Whatever it does to serde's output,
 /// this derive has no logic for it — passing it through silently is exactly
 /// the failure mode spec §5 exists to catch, so it is a hard error instead.
+/// `position` carries its own article ("a struct", "a field", "a variant",
+/// "an enum") — an enum is the one position that needs "an", so the article
+/// lives at each call site instead of this function guessing it from the
+/// noun.
 fn unrecognized_serde_attr(
     meta: &syn::meta::ParseNestedMeta,
     position: &str,
@@ -397,9 +865,9 @@ fn unrecognized_serde_attr(
         .map(|i| i.to_string())
         .unwrap_or_else(|| "<path>".to_string());
     meta.error(format!(
-        "#[derive(Wire)] does not recognize serde's `{key}` on a {position} — an attribute \
-         this derive doesn't have logic for is rejected rather than silently ignored, because a \
-         silently wrong schema is worse than a compile error; supported on a {position}: \
+        "#[derive(Wire)] does not recognize serde's `{key}` on {position} — an attribute this \
+         derive doesn't have logic for is rejected rather than silently ignored, because a \
+         silently wrong schema is worse than a compile error; supported on {position}: \
          {supported}"
     ))
 }

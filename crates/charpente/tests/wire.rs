@@ -1,5 +1,5 @@
 use charpente::table;
-use charpente::wire::{TypeRegistry, TypeSchema, Wire, WireI64, WireU64};
+use charpente::wire::{EnumRepr, Field, TypeRegistry, TypeSchema, Wire, WireI64, WireU64};
 use charpente_core::table::{Id, Row};
 use charpente_macros::Wire as WireDerive;
 
@@ -849,5 +849,449 @@ fn fidelity_non_ascii_identifiers_use_serdes_ascii_only_case_folding() {
     assert_eq!(
         schema_field_names::<FidelityNonAsciiScreaming>(),
         expect_screaming
+    );
+}
+
+// ------------------------------------------------------------------ enums
+//
+// Task 4: `#[derive(Wire)]` for enums, across serde's four representations.
+// The brief's own two tests come first, verbatim (names and all), then this
+// file extends the same fidelity discipline used above for structs: derive
+// `Wire` and `Serialize` on the same type, serialize a REAL instance of
+// every variant kind each representation allows, and assert the JSON
+// literally produced by `serde_json` against the schema — the only oracle
+// that catches this derive silently disagreeing with what serde actually
+// emits (see the fidelity-probe comment further up this file).
+
+#[derive(WireDerive, serde::Serialize)]
+enum Status {
+    Draft,
+    Sent,
+    Paid,
+}
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(tag = "kind")]
+enum Notice {
+    Overdue { days: u32 },
+    Voided { reason: String },
+}
+
+#[test]
+fn a_unit_only_enum_is_a_string_union() {
+    let TypeSchema::Enum(EnumRepr::Unit { variants }) = <Status as Wire>::schema() else {
+        panic!("expected a unit enum");
+    };
+    assert_eq!(variants, vec!["Draft", "Sent", "Paid"]);
+}
+
+#[test]
+fn an_internally_tagged_enum_carries_its_tag() {
+    let TypeSchema::Enum(EnumRepr::Internal { tag, variants }) = <Notice as Wire>::schema() else {
+        panic!("expected an internally tagged enum");
+    };
+    assert_eq!(tag, "kind");
+    assert_eq!(variants.len(), 2);
+    assert_eq!(variants[0].0, "Overdue");
+}
+
+#[test]
+fn a_unit_only_enum_serializes_as_the_bare_variant_name_serde_matches_the_schema() {
+    // The ground-truth half of the Unit fidelity pair: every member of the
+    // string union really is a bare JSON string on the wire, nothing else.
+    assert_eq!(serde_json::to_string(&Status::Draft).unwrap(), "\"Draft\"");
+    assert_eq!(serde_json::to_string(&Status::Sent).unwrap(), "\"Sent\"");
+    assert_eq!(serde_json::to_string(&Status::Paid).unwrap(), "\"Paid\"");
+}
+
+#[test]
+fn an_internally_tagged_struct_variant_merges_fields_with_the_tag_serde_matches_the_schema() {
+    let overdue_json = serde_json::to_string(&Notice::Overdue { days: 5 }).unwrap();
+    assert_eq!(overdue_json, "{\"kind\":\"Overdue\",\"days\":5}");
+    let voided_json = serde_json::to_string(&Notice::Voided {
+        reason: "test".to_string(),
+    })
+    .unwrap();
+    assert_eq!(voided_json, "{\"kind\":\"Voided\",\"reason\":\"test\"}");
+
+    let TypeSchema::Enum(EnumRepr::Internal { variants, .. }) = <Notice as Wire>::schema() else {
+        panic!("expected an internally tagged enum");
+    };
+    let TypeSchema::Struct { fields } = &variants[0].1 else {
+        panic!("expected Overdue's content to be a struct schema");
+    };
+    assert_eq!(
+        fields,
+        &vec![Field {
+            name: "days".to_string(),
+            schema: TypeSchema::U32,
+            optional: false,
+        }]
+    );
+}
+
+// ----- EnumRepr::Unit: rename / rename_all fidelity -----
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum FidelityUnitRenameAll {
+    InProgress,
+    Done,
+}
+
+#[test]
+fn fidelity_unit_enum_rename_all_matches_serde() {
+    assert_eq!(
+        serde_json::to_string(&FidelityUnitRenameAll::InProgress).unwrap(),
+        "\"IN_PROGRESS\""
+    );
+    assert_eq!(
+        serde_json::to_string(&FidelityUnitRenameAll::Done).unwrap(),
+        "\"DONE\""
+    );
+    let TypeSchema::Enum(EnumRepr::Unit { variants }) = <FidelityUnitRenameAll as Wire>::schema()
+    else {
+        panic!("expected a unit enum");
+    };
+    assert_eq!(variants, vec!["IN_PROGRESS", "DONE"]);
+}
+
+#[derive(WireDerive, serde::Serialize)]
+enum FidelityUnitVariantRename {
+    #[serde(rename = "old_name")]
+    New,
+    Other,
+}
+
+#[test]
+fn fidelity_unit_enum_variant_rename_matches_serde() {
+    assert_eq!(
+        serde_json::to_string(&FidelityUnitVariantRename::New).unwrap(),
+        "\"old_name\""
+    );
+    assert_eq!(
+        serde_json::to_string(&FidelityUnitVariantRename::Other).unwrap(),
+        "\"Other\""
+    );
+    let TypeSchema::Enum(EnumRepr::Unit { variants }) =
+        <FidelityUnitVariantRename as Wire>::schema()
+    else {
+        panic!("expected a unit enum");
+    };
+    assert_eq!(variants, vec!["old_name", "Other"]);
+}
+
+// ----- EnumRepr::External (default, no tag): newtype and struct variants -----
+
+#[derive(WireDerive, serde::Serialize)]
+enum FidelityExternal {
+    Ping(u32),
+    Message { body: String },
+}
+
+#[test]
+fn fidelity_external_newtype_variant_matches_serde() {
+    let json = serde_json::to_string(&FidelityExternal::Ping(5)).unwrap();
+    assert_eq!(json, "{\"Ping\":5}");
+    let TypeSchema::Enum(EnumRepr::External { variants }) = <FidelityExternal as Wire>::schema()
+    else {
+        panic!("expected an externally tagged enum");
+    };
+    assert_eq!(variants[0], ("Ping".to_string(), TypeSchema::U32));
+}
+
+#[test]
+fn fidelity_external_struct_variant_matches_serde() {
+    let json = serde_json::to_string(&FidelityExternal::Message {
+        body: "hi".to_string(),
+    })
+    .unwrap();
+    assert_eq!(json, "{\"Message\":{\"body\":\"hi\"}}");
+    let TypeSchema::Enum(EnumRepr::External { variants }) = <FidelityExternal as Wire>::schema()
+    else {
+        panic!("expected an externally tagged enum");
+    };
+    assert_eq!(
+        variants[1],
+        (
+            "Message".to_string(),
+            TypeSchema::Struct {
+                fields: vec![Field {
+                    name: "body".to_string(),
+                    schema: TypeSchema::String,
+                    optional: false,
+                }]
+            }
+        )
+    );
+}
+
+#[derive(WireDerive, serde::Serialize)]
+enum FidelityExternalNewtypeRef {
+    Wrapped(Inner),
+}
+
+#[test]
+fn fidelity_external_newtype_over_a_named_type_is_a_ref_not_an_inline_expansion() {
+    // Mirrors `a_nested_named_field_is_a_ref_not_an_inline_expansion`
+    // (structs), but for a newtype variant's content: `variant_inner_schema`
+    // must call `.reference()`, not `.schema()`, or a self-referential
+    // newtype variant would recurse forever at runtime (`schema()` has no
+    // base case) and every other named type would get inlined into the
+    // enum's schema instead of referenced by name.
+    let json = serde_json::to_string(&FidelityExternalNewtypeRef::Wrapped(Inner { v: 1 })).unwrap();
+    assert_eq!(json, "{\"Wrapped\":{\"v\":1}}");
+    let TypeSchema::Enum(EnumRepr::External { variants }) =
+        <FidelityExternalNewtypeRef as Wire>::schema()
+    else {
+        panic!("expected an externally tagged enum");
+    };
+    assert_eq!(variants[0].1, TypeSchema::Ref("Inner"));
+}
+
+#[test]
+fn registering_an_externally_tagged_enum_registers_its_named_variant_types_too() {
+    let mut reg = TypeRegistry::default();
+    <FidelityExternalNewtypeRef as Wire>::register(&mut reg);
+    let names: Vec<&str> = reg.into_sorted().iter().map(|d| d.name).collect();
+    assert_eq!(names, vec!["FidelityExternalNewtypeRef", "Inner"]);
+}
+
+#[derive(WireDerive, serde::Serialize)]
+enum FidelityExternalStructWithFieldAttrs {
+    Item {
+        #[serde(rename = "n")]
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+}
+
+#[test]
+fn fidelity_external_struct_variant_field_attrs_match_serde() {
+    // Field-level `#[serde(...)]` inside a struct VARIANT reuses the exact
+    // same `field_serde_attrs` logic `expand_struct` uses for a plain
+    // struct's fields — proving that reuse actually fires (rename AND
+    // skip_serializing_if), not just that it compiles.
+    let some = FidelityExternalStructWithFieldAttrs::Item {
+        name: "widget".to_string(),
+        note: Some("hi".to_string()),
+    };
+    let some_json = serde_json::to_string(&some).unwrap();
+    assert_eq!(some_json, "{\"Item\":{\"n\":\"widget\",\"note\":\"hi\"}}");
+    let none = FidelityExternalStructWithFieldAttrs::Item {
+        name: "widget".to_string(),
+        note: None,
+    };
+    let none_json = serde_json::to_string(&none).unwrap();
+    assert_eq!(none_json, "{\"Item\":{\"n\":\"widget\"}}");
+
+    let TypeSchema::Enum(EnumRepr::External { variants }) =
+        <FidelityExternalStructWithFieldAttrs as Wire>::schema()
+    else {
+        panic!("expected an externally tagged enum");
+    };
+    let TypeSchema::Struct { fields } = &variants[0].1 else {
+        panic!("expected a struct schema");
+    };
+    assert_eq!(fields[0].name, "n");
+    assert!(!fields[0].optional);
+    assert_eq!(fields[1].name, "note");
+    assert!(fields[1].optional);
+}
+
+// ----- EnumRepr::Adjacent (tag + content): newtype and struct variants -----
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(tag = "t", content = "c")]
+enum FidelityAdjacent {
+    Ping(u32),
+    Message { body: String },
+}
+
+#[test]
+fn fidelity_adjacent_newtype_variant_matches_serde() {
+    let json = serde_json::to_string(&FidelityAdjacent::Ping(5)).unwrap();
+    assert_eq!(json, "{\"t\":\"Ping\",\"c\":5}");
+    let TypeSchema::Enum(EnumRepr::Adjacent {
+        tag,
+        content,
+        variants,
+    }) = <FidelityAdjacent as Wire>::schema()
+    else {
+        panic!("expected an adjacently tagged enum");
+    };
+    assert_eq!(tag, "t");
+    assert_eq!(content, "c");
+    assert_eq!(variants[0], ("Ping".to_string(), TypeSchema::U32));
+}
+
+#[test]
+fn fidelity_adjacent_struct_variant_matches_serde() {
+    let json = serde_json::to_string(&FidelityAdjacent::Message {
+        body: "hi".to_string(),
+    })
+    .unwrap();
+    assert_eq!(json, "{\"t\":\"Message\",\"c\":{\"body\":\"hi\"}}");
+    let TypeSchema::Enum(EnumRepr::Adjacent { variants, .. }) =
+        <FidelityAdjacent as Wire>::schema()
+    else {
+        panic!("expected an adjacently tagged enum");
+    };
+    assert_eq!(
+        variants[1],
+        (
+            "Message".to_string(),
+            TypeSchema::Struct {
+                fields: vec![Field {
+                    name: "body".to_string(),
+                    schema: TypeSchema::String,
+                    optional: false,
+                }]
+            }
+        )
+    );
+}
+
+// ----- EnumRepr::Internal (tag only): unit variant fidelity -----
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(tag = "kind")]
+enum FidelityInternalWithUnit {
+    Idle,
+    Working { pct: u32 },
+}
+
+#[test]
+fn fidelity_internal_unit_variant_matches_serde() {
+    // The case `EnumRepr::External` and `EnumRepr::Adjacent` cannot
+    // represent at all (see wire_enum_shape_gaps.rs): a unit variant under
+    // internal tagging serializes as JUST the tag object, which IS exactly
+    // `Struct { fields: [] }` merged with the tag — fully representable,
+    // unlike the other two.
+    let json = serde_json::to_string(&FidelityInternalWithUnit::Idle).unwrap();
+    assert_eq!(json, "{\"kind\":\"Idle\"}");
+    // `Working` too, so the mixed enum's OTHER variant is also read back
+    // through a real `serde_json` call, not just constructed for the type
+    // to compile.
+    let working_json =
+        serde_json::to_string(&FidelityInternalWithUnit::Working { pct: 5 }).unwrap();
+    assert_eq!(working_json, "{\"kind\":\"Working\",\"pct\":5}");
+    let TypeSchema::Enum(EnumRepr::Internal { variants, .. }) =
+        <FidelityInternalWithUnit as Wire>::schema()
+    else {
+        panic!("expected an internally tagged enum");
+    };
+    assert_eq!(
+        variants[0],
+        ("Idle".to_string(), TypeSchema::Struct { fields: vec![] })
+    );
+}
+
+// ----- self-reference and registration termination -----
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(tag = "kind")]
+enum Tree {
+    Leaf,
+    Node { children: Vec<Tree> },
+}
+
+#[test]
+fn a_self_referential_enum_does_not_recurse_forever() {
+    // The enum analogue of `a_self_referential_type_does_not_recurse_forever`
+    // (structs): `Node`'s `children: Vec<Tree>` field must describe itself
+    // via `Vec<Tree>::schema()` calling `Tree::reference()` (a `Ref`), not
+    // `Tree::schema()` (the full expansion) — `Node`'s field goes through
+    // the SAME `field_serde_attrs`/`.reference()` path `expand_struct` uses
+    // (see `variant_inner_schema`'s `Fields::Named` arm), so this also
+    // covers that reuse actually applies `.reference()` inside a variant,
+    // not just at the top level.
+    //
+    // Deliberately built via internal tagging (`Leaf` unit + `Node` struct),
+    // not external: a Leaf/Node shape under DEFAULT tagging would mix a unit
+    // variant with a data-carrying one, which wire_enum_shape_gaps.rs
+    // documents as unrepresentable — internal tagging is the one
+    // representation where a unit variant coexists with data variants.
+    let TypeSchema::Enum(EnumRepr::Internal { variants, .. }) = <Tree as Wire>::schema() else {
+        panic!("expected an internally tagged enum");
+    };
+    let TypeSchema::Struct { fields } = &variants[1].1 else {
+        panic!("expected Node's content to be a struct schema");
+    };
+    assert_eq!(
+        fields[0].schema,
+        TypeSchema::Seq(Box::new(TypeSchema::Ref("Tree")))
+    );
+
+    // Read back through real values too, not just the schema: a genuinely
+    // recursive value (Node holding a Leaf) serializes without blowing the
+    // stack either.
+    let json = serde_json::to_string(&Tree::Node {
+        children: vec![Tree::Leaf],
+    })
+    .unwrap();
+    assert_eq!(
+        json,
+        "{\"kind\":\"Node\",\"children\":[{\"kind\":\"Leaf\"}]}"
+    );
+}
+
+#[test]
+fn registering_a_self_referential_enum_terminates_and_produces_one_typedef() {
+    // The enum analogue of
+    // `registering_a_self_referential_type_terminates_and_produces_one_typedef`:
+    // `register()`'s recursion guard (`insert_as` called UNCONDITIONALLY,
+    // then `if already_present { return; }`) must stop `Tree::register()` ->
+    // `Vec<Tree>::register()` -> `Tree::register()` from recursing forever.
+    let mut reg = TypeRegistry::default();
+    <Tree as Wire>::register(&mut reg);
+    assert_eq!(reg.into_sorted().len(), 1);
+}
+
+#[test]
+fn a_wire_name_collision_between_two_derived_enums_panics_and_names_both() {
+    // The enum analogue of
+    // `the_collision_panic_names_both_colliding_rust_types`: proves
+    // `expand_enum`'s `register()` uses the SAME `insert_as`-then-guard
+    // ordering `expand_struct` does, not the naive `if contains { return; }
+    // insert(...)` ordering that would let the second of two same-named
+    // enums silently win without ever comparing schemas. Mutation: swap
+    // `expand_enum`'s `register()` back to that naive ordering.
+    mod a {
+        #[derive(charpente_macros::Wire, serde::Serialize)]
+        pub enum DupEnum {
+            X(u32),
+        }
+    }
+    mod b {
+        #[derive(charpente_macros::Wire, serde::Serialize)]
+        pub enum DupEnum {
+            Y(String),
+        }
+    }
+    // Read back through, not just constructed: an unread variant is dead code.
+    assert_eq!(
+        serde_json::to_string(&a::DupEnum::X(1)).unwrap(),
+        "{\"X\":1}"
+    );
+    assert_eq!(
+        serde_json::to_string(&b::DupEnum::Y("y".to_string())).unwrap(),
+        "{\"Y\":\"y\"}"
+    );
+    let result = std::panic::catch_unwind(|| {
+        let mut reg = TypeRegistry::default();
+        <a::DupEnum as Wire>::register(&mut reg);
+        <b::DupEnum as Wire>::register(&mut reg);
+    });
+    let err = result.unwrap_err();
+    let msg = err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .expect("panic payload must be a string");
+    assert!(
+        msg.contains("a::DupEnum") && msg.contains("b::DupEnum"),
+        "panic message must name BOTH colliding Rust types, got: {msg}"
     );
 }

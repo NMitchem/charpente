@@ -16,7 +16,7 @@ error: #[derive(Wire)] does not support serde's `default` — it changes whether
 23 |     #[serde(default = "make_value")]
    |             ^^^^^^^^^^^^^^^^^^^^^^
 
-error: #[derive(Wire)] does not support serde's struct-level `tag = "..."` — it adds a wire field the schema does not model; enum tagging is a separate concern (Task 4), and a struct-level tag is out of scope here
+error: #[derive(Wire)] does not support serde's struct-level `tag = "..."` — it adds a wire field the schema does not model; tagging is a per-enum concern (`#[derive(Wire)]` on the enum itself resolves `tag`/`content` there), and a struct-level tag stays out of scope
   --> tests/compile_fail/wire_unsupported_attrs.rs:28:9
    |
 28 | #[serde(tag = "kind")]

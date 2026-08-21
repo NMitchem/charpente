@@ -1,29 +1,25 @@
-error: #[derive(Wire)] structs cannot be generic — a wire type is one concrete shape; make `Generic` non-generic
- --> tests/compile_fail/wire_shape_errors.rs:8:15
-  |
-8 | struct Generic<T> {
-  |               ^^^
-
-error: #[derive(Wire)] applies to structs — enum support lands in Task 4
-  --> tests/compile_fail/wire_shape_errors.rs:13:1
+error: #[derive(Wire)] types cannot be generic — a wire type is one concrete shape; make `Generic` non-generic
+  --> tests/compile_fail/wire_shape_errors.rs:22:15
    |
-13 | / enum NotAStruct {
-14 | |     A,
-15 | | }
-   | |_^
+22 | struct Generic<T> {
+   |               ^^^
+
+error: #[derive(Wire)] types cannot be generic — a wire type is one concrete shape; make `GenericEnum` non-generic
+  --> tests/compile_fail/wire_shape_errors.rs:27:17
+   |
+27 | enum GenericEnum<T> {
+   |                 ^^^
 
 error: #[derive(Wire)] needs named fields — `TupleStruct` must be a braced struct
-  --> tests/compile_fail/wire_shape_errors.rs:18:1
+  --> tests/compile_fail/wire_shape_errors.rs:32:1
    |
-18 | struct TupleStruct(u32);
+32 | struct TupleStruct(u32);
    | ^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: #[derive(Wire)] applies to structs — enum support lands in Task 4
-  --> tests/compile_fail/wire_shape_errors.rs:29:1
+error: #[derive(Wire)] applies to structs and enums — `NotAStructOrEnum` is a union, which has no serde representation to describe
+  --> tests/compile_fail/wire_shape_errors.rs:35:1
    |
-29 | / #[serde(untagged)]
-30 | | enum EnumWithSerdeAttr {
-31 | |     A,
-32 | |     B,
-33 | | }
+35 | / union NotAStructOrEnum {
+36 | |     a: u32,
+37 | | }
    | |_^
