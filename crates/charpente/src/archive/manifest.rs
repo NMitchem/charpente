@@ -551,7 +551,7 @@ mod tests {
     // changes nothing observable, which is how an assertion silently stops
     // being one.
     #[test]
-    #[should_panic(expected = "discontiguous")]
+    #[should_panic(expected = "hole at base_seq 16384 (expected 4096)")]
     fn encode_refuses_to_produce_a_holed_chain() {
         let m = one_segment_manifest(vec![
             SegmentRef {
@@ -599,6 +599,28 @@ mod tests {
         assert_eq!(Manifest::decode(&m.encode()).unwrap(), m);
     }
 
+    // Major 2 (round 2): the m1 fix made decode strict about the closed byte (0 or 1 only),
+    // which silently created a new obligation on encode — that it only ever emit 0 or 1 —
+    // and nothing proved it. `manifest_roundtrips` above only ever encodes closed: false;
+    // this is its closed: true counterpart, so the true half of the field is round-tripped
+    // by at least one test.
+    #[test]
+    fn a_closed_manifest_roundtrips_too() {
+        let m = Manifest {
+            generation: 3,
+            writer: "node-a:9000".into(),
+            applied_seq: 4096,
+            next_job_id: 12,
+            tables: vec!["invoice".into()],
+            segments: vec![SegmentRef {
+                base_seq: 0,
+                end_seq: 4095,
+            }],
+            closed: true,
+        };
+        assert_eq!(Manifest::decode(&m.encode()).unwrap(), m);
+    }
+
     #[test]
     fn a_corrupt_manifest_is_refused_by_name_never_guessed() {
         let m = Manifest {
@@ -636,10 +658,10 @@ mod tests {
         // (see `hand_built_with_hole`'s doc); decode of it must still
         // refuse, because decode's input is untrusted bytes off the wire.
         let e = Manifest::decode(&hand_built_with_hole(&m)).unwrap_err();
-        assert!(
-            e.to_string().contains("16384"),
-            "must name the offending base_seq: {e}"
-        );
+        let t = e.to_string();
+        assert!(t.contains("16384"), "must name the offending base_seq: {t}");
+        assert!(t.contains("4096"), "must name the expected base_seq: {t}");
+        assert!(t.contains("restore"), "must name the fix: {t}");
     }
 
     // C1: `pair[0].end_seq + 1` was unchecked at both :100 (encode's assert_contiguous) and
@@ -774,6 +796,60 @@ mod tests {
         let t = e.to_string();
         assert!(t.contains("neither 0 nor 1"), "must name the defect: {t}");
         assert!(t.contains('7'), "must name the offending byte: {t}");
+    }
+
+    // Major 1 (round 2): `Reader::take`, `finish` and `string` implement the module's
+    // headline promise (module doc :11-13 — decode never panics on untrusted bytes) and had
+    // zero coverage: each of the three refusals below can be disarmed with the whole module
+    // green. These pin each one by name, independently of the others.
+
+    // `take`'s bound check: a length-prefixed field whose declared length runs past what is
+    // actually in the buffer. Hand-built directly (not via write_body) because the defect is
+    // in the length prefix itself, which write_body never produces incorrectly.
+    #[test]
+    fn a_field_whose_length_prefix_runs_past_the_buffer_is_refused_at_decode() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u64.to_le_bytes()); // generation
+        buf.extend_from_slice(&100u32.to_le_bytes()); // writer len, declared far past what follows
+        buf.push(b'n'); // only 1 byte actually supplied
+        buf.extend_from_slice(&crc32(&buf).to_le_bytes());
+        let e = Manifest::decode(&buf).unwrap_err();
+        let t = e.to_string();
+        assert!(
+            t.contains("a field runs past the end of the manifest"),
+            "must name the defect: {t}"
+        );
+    }
+
+    // `finish`'s refusal: a CRC-valid manifest with one extra byte appended after the last
+    // real field. The byte is appended before the CRC is computed, so it is inside the
+    // CRC-covered body — only finish's trailing-bytes check, not the CRC check, can catch it.
+    #[test]
+    fn trailing_bytes_after_the_last_field_are_refused_at_decode() {
+        let m = one_segment_manifest(vec![]);
+        let mut buf = write_body(&m);
+        buf.push(0xAA);
+        buf.extend_from_slice(&crc32(&buf).to_le_bytes());
+        let e = Manifest::decode(&buf).unwrap_err();
+        let t = e.to_string();
+        assert!(
+            t.contains("trailing bytes after the last field"),
+            "must name the defect: {t}"
+        );
+    }
+
+    // `string`'s UTF-8 refusal: a writer field carrying an invalid UTF-8 byte sequence must
+    // be refused by name, never coerced via a lossy conversion.
+    #[test]
+    fn a_non_utf8_writer_field_is_refused_not_coerced() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u64.to_le_bytes()); // generation
+        buf.extend_from_slice(&2u32.to_le_bytes()); // writer len
+        buf.extend_from_slice(&[0xFF, 0xFE]); // not valid UTF-8
+        buf.extend_from_slice(&crc32(&buf).to_le_bytes());
+        let e = Manifest::decode(&buf).unwrap_err();
+        let t = e.to_string();
+        assert!(t.contains("not valid UTF-8"), "must name the defect: {t}");
     }
 
     // m2: `snapshot_batch_key`'s `table` precondition (non-empty, no '/') is asserted
