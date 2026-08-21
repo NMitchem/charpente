@@ -37,7 +37,13 @@
 - **Public-API changes update docs in the same commit** (hard rule 6).
 - **Assertions in the TigerBeetle style** (hard rule 4) — assert negative space in core code.
 - **Commit directly to `main`. No Co-Authored-By trailers.** `git add` named paths only, never `-A` or `.` — other sessions share this working tree.
-- **zsh:** `PIPESTATUS` does not work. Use `${pipestatus[1]}` or `set -o pipefail`. Pipe cargo through `tee`, never `tail`.
+- **zsh:** `PIPESTATUS` does not work. Use `${pipestatus[1]}` or `set -o pipefail`. Pipe cargo
+  through `tee` — **never `tail`, `grep`, or `head`.** `tail` eats the aggregate counts; `grep`
+  under `pipefail` reports failure when it simply matches nothing (a reviewer got a false
+  `fmt exit=1` on a clean `cargo fmt` that way, and discarded a good run over it). The rule is
+  not "avoid tail" — it is that **the last command in the pipe owns `$?`**, so the last command
+  must be one whose success means what you think it does.
+
 - **Full check before any task is done:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`. No `#[allow]` may be added to pass clippy.
 - **Do not kill any process.** Another repo runs test suites on this machine.
 - **`TRYBUILD=overwrite` blesses whatever the compiler emitted — it does not verify it.**
@@ -72,6 +78,14 @@
     green, print the observable behaviour under the mutation before concluding anything** — the
     parsed value, the error text, a `dbg!` on the mutated path. An exit code is not a measurement
     of the thing you changed.
+- **Pinning the function you fixed is not pinning the behaviour you fixed.** Four times in this
+  plan a test has covered a function while leaving the property it exists to protect uncovered:
+  Task 1's `reference()` tested in isolation while every container caller ignored it (a genuine
+  stack overflow, found two tasks later); Task 3's serde fidelity, which no test compared
+  against real `serde_json` output until a reviewer wrote a probe; Task 3's `register()`
+  recursion guard, green under `if false`; and the F4 rejection, pinned against an inert
+  mutation. **After fixing a bug, ask what the bug would have DONE, and pin that** — the
+  overflow, the wrong JSON key, the non-termination — not the function you happened to edit.
 - **Do not touch `Cargo.toml:38-39`** (`[profile.release.package.redb] debug-assertions = true`).
 
 ## File Structure
