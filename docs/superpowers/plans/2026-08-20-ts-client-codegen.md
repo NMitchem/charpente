@@ -61,6 +61,17 @@
     `gen_client_is_byte_identical_on_a_second_run`.
   - **Every "never happens" assertion names the mutation that reddens it**, in a comment on the
     test. If no such mutation exists, the test is decorative — delete it or make it real.
+  - **A mutation that leaves the suite GREEN has proved nothing until you show the mutation was
+    not inert.** RED is self-proving: the mutation clearly changed behaviour. GREEN is ambiguous
+    between "the test is vacuous" and "my mutation did nothing," and those look identical from the
+    exit code alone. Learned the hard way at Task 2 (F4): a reviewer mutated `Id<T>`'s Visitor by
+    adding `visit_u64`, saw green, and filed the test as vacuous — but `serde_json`'s
+    `deserialize_str` is type-strict (`serde_json-1.0.150/src/de.rs:1524-1550`: only a `"` token
+    reaches the visitor, everything else short-circuits into `peek_invalid_type`), so `visit_u64`
+    was unreachable dead code and the mutation was a no-op. **So: when a mutation leaves the suite
+    green, print the observable behaviour under the mutation before concluding anything** — the
+    parsed value, the error text, a `dbg!` on the mutated path. An exit code is not a measurement
+    of the thing you changed.
 - **Do not touch `Cargo.toml:38-39`** (`[profile.release.package.redb] debug-assertions = true`).
 
 ## File Structure
