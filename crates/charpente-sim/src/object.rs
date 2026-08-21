@@ -55,13 +55,16 @@ impl SimObjectStore {
 
 impl ObjectStore for SimObjectStore {
     fn start(&self, op: ObjectOp) -> io::Result<()> {
-        let mut state = self.lock();
+        // Copy the flag and drop the guard before asserting: an assert that
+        // fires while the guard is held poisons the mutex on unwind, turning
+        // a caller-bug contract error into an unrelated "lock poisoned" one.
+        let already_in_flight = self.lock().in_flight.is_some();
         assert!(
-            state.in_flight.is_none(),
+            !already_in_flight,
             "ObjectStore::start called with an operation already in flight — \
              poll to completion before starting another (archive spec §1)"
         );
-        state.in_flight = Some(op);
+        self.lock().in_flight = Some(op);
         Ok(())
     }
 
@@ -108,12 +111,20 @@ mod tests {
     use super::*;
     use charpente_core::io::{ObjectDone, ObjectOp, ObjectStore};
 
+    // Bounded, not an unbounded spin: precedent is `poll_accept` (lib.rs),
+    // which advances virtual time between polls. This helper cannot do that
+    // yet — Task 1's `SimObjectStore` completes every op immediately and has
+    // no `Clock` handle to advance; that lands with Task 2's latency. An
+    // unbounded loop here would silently hang the instant Task 2 adds it, so
+    // the bound goes in now, generous enough that a legitimately slow future
+    // op still finishes well inside it.
     fn drain(s: &SimObjectStore) -> std::io::Result<ObjectDone> {
-        loop {
+        for _ in 0..10_000 {
             if let Some(r) = s.poll() {
                 return r;
             }
         }
+        panic!("drain: ObjectStore::poll returned None 10,000 times in a row — stuck in flight");
     }
 
     #[test]
@@ -176,6 +187,27 @@ mod tests {
         }
     }
 
+    // The other half of the atomic-PUT contract: a failed PUT to a key that
+    // never existed must leave it absent, not present-and-empty.
+    #[test]
+    fn failed_put_to_a_fresh_key_leaves_it_absent() {
+        let s = SimObjectStore::new();
+        s.fail_next_put();
+        s.start(ObjectOp::Put {
+            key: "new".into(),
+            data: vec![1, 2, 3],
+        })
+        .unwrap();
+        assert!(drain(&s).is_err());
+        s.start(ObjectOp::Get { key: "new".into() }).unwrap();
+        let e = drain(&s).unwrap_err();
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::NotFound,
+            "a failed PUT must not create the key"
+        );
+    }
+
     #[test]
     #[should_panic(expected = "operation already in flight")]
     fn second_start_before_poll_asserts() {
@@ -193,6 +225,26 @@ mod tests {
         assert!(
             e.to_string().contains("nope"),
             "error must name the key: {e}"
+        );
+    }
+
+    #[test]
+    fn delete_removes_the_object() {
+        let s = SimObjectStore::new();
+        s.start(ObjectOp::Put {
+            key: "a".into(),
+            data: vec![9],
+        })
+        .unwrap();
+        drain(&s).unwrap();
+        s.start(ObjectOp::Delete { key: "a".into() }).unwrap();
+        assert!(matches!(drain(&s).unwrap(), ObjectDone::Delete));
+        s.start(ObjectOp::Get { key: "a".into() }).unwrap();
+        let e = drain(&s).unwrap_err();
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::NotFound,
+            "delete did not remove the object"
         );
     }
 }

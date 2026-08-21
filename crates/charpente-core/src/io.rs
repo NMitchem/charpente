@@ -189,7 +189,8 @@ pub trait ObjectStore: Send {
     /// before `poll` returns `Some` is a caller bug, not a runtime condition.
     fn start(&self, op: ObjectOp) -> io::Result<()>;
 
-    /// `None` means still in flight.
+    /// `None` means no completion available — nothing started, or still in
+    /// flight (same `Ok(None)` shape as `Listener::accept`/`Conn::recv`).
     fn poll(&self) -> Option<io::Result<ObjectDone>>;
 }
 

@@ -76,6 +76,8 @@ trait Net     { fn listen(&self, addr: &str) -> Result<Box<dyn Listener>>;
                 fn connect(&self, addr: &str) -> Result<Box<dyn Conn>>; }
 // Listener::accept and Conn::recv are non-blocking polls; Net is
 // message-oriented until the HTTP edge demands byte streams.
+trait ObjectStore { fn start(&self, op: ObjectOp) -> Result<()>;
+                    fn poll(&self) -> Option<Result<ObjectDone>>; }  // PUT is atomic, never torn
 ```
 
 The simulator implements all of it with one seed driving: latency distributions, virtual
