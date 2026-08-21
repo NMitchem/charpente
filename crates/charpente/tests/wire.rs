@@ -997,7 +997,7 @@ fn fidelity_external_newtype_variant_matches_serde() {
     else {
         panic!("expected an externally tagged enum");
     };
-    assert_eq!(variants[0], ("Ping".to_string(), TypeSchema::U32));
+    assert_eq!(variants[0], ("Ping".to_string(), Some(TypeSchema::U32)));
 }
 
 #[test]
@@ -1015,13 +1015,13 @@ fn fidelity_external_struct_variant_matches_serde() {
         variants[1],
         (
             "Message".to_string(),
-            TypeSchema::Struct {
+            Some(TypeSchema::Struct {
                 fields: vec![Field {
                     name: "body".to_string(),
                     schema: TypeSchema::String,
                     optional: false,
                 }]
-            }
+            })
         )
     );
 }
@@ -1046,7 +1046,7 @@ fn fidelity_external_newtype_over_a_named_type_is_a_ref_not_an_inline_expansion(
     else {
         panic!("expected an externally tagged enum");
     };
-    assert_eq!(variants[0].1, TypeSchema::Ref("Inner"));
+    assert_eq!(variants[0].1, Some(TypeSchema::Ref("Inner")));
 }
 
 #[test]
@@ -1091,7 +1091,7 @@ fn fidelity_external_struct_variant_field_attrs_match_serde() {
     else {
         panic!("expected an externally tagged enum");
     };
-    let TypeSchema::Struct { fields } = &variants[0].1 else {
+    let Some(TypeSchema::Struct { fields }) = &variants[0].1 else {
         panic!("expected a struct schema");
     };
     assert_eq!(fields[0].name, "n");
@@ -1123,7 +1123,7 @@ fn fidelity_adjacent_newtype_variant_matches_serde() {
     };
     assert_eq!(tag, "t");
     assert_eq!(content, "c");
-    assert_eq!(variants[0], ("Ping".to_string(), TypeSchema::U32));
+    assert_eq!(variants[0], ("Ping".to_string(), Some(TypeSchema::U32)));
 }
 
 #[test]
@@ -1142,13 +1142,13 @@ fn fidelity_adjacent_struct_variant_matches_serde() {
         variants[1],
         (
             "Message".to_string(),
-            TypeSchema::Struct {
+            Some(TypeSchema::Struct {
                 fields: vec![Field {
                     name: "body".to_string(),
                     schema: TypeSchema::String,
                     optional: false,
                 }]
-            }
+            })
         )
     );
 }
@@ -1293,5 +1293,391 @@ fn a_wire_name_collision_between_two_derived_enums_panics_and_names_both() {
     assert!(
         msg.contains("a::DupEnum") && msg.contains("b::DupEnum"),
         "panic message must name BOTH colliding Rust types, got: {msg}"
+    );
+}
+
+// ------------------------------------------------------ fix round 1 fidelity
+//
+// Task 4's fix round 1: F1 (serde has TWO rename tables — `apply_to_field`
+// and `apply_to_variant` — and the derive had collapsed them into one), F3
+// and F4 (two surviving mutations — uncovered properties, not fidelity
+// gaps), and F5 (`EnumRepr::External`/`Adjacent` gained
+// `Option<TypeSchema>`, making a unit variant mixed with data representable
+// under both). Every JSON value below is a real `serde_json::to_string`
+// call, not reasoned from serde's docs — same discipline as the fidelity
+// section above.
+
+// ----- F1: apply_to_variant vs apply_to_field is a REAL split, not one table -----
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FidelityVariantSnake {
+    FooBar,
+    HTTPServer,
+}
+
+#[test]
+fn fidelity_variant_snake_case_matches_serdes_variant_table() {
+    // Confirms the variant table's separator-insertion behavior against a
+    // PascalCase name AND a leading acronym, matching serde exactly (measured).
+    assert_eq!(
+        serde_json::to_string(&FidelityVariantSnake::FooBar).unwrap(),
+        "\"foo_bar\""
+    );
+    assert_eq!(
+        serde_json::to_string(&FidelityVariantSnake::HTTPServer).unwrap(),
+        "\"h_t_t_p_server\""
+    );
+    let TypeSchema::Enum(EnumRepr::Unit { variants }) = <FidelityVariantSnake as Wire>::schema()
+    else {
+        panic!("expected a unit enum");
+    };
+    assert_eq!(variants, vec!["foo_bar", "h_t_t_p_server"]);
+}
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum FidelityVariantKebab {
+    FooBar,
+    HTTPServer,
+}
+
+#[test]
+fn fidelity_variant_kebab_case_matches_serdes_variant_table() {
+    assert_eq!(
+        serde_json::to_string(&FidelityVariantKebab::FooBar).unwrap(),
+        "\"foo-bar\""
+    );
+    assert_eq!(
+        serde_json::to_string(&FidelityVariantKebab::HTTPServer).unwrap(),
+        "\"h-t-t-p-server\""
+    );
+    let TypeSchema::Enum(EnumRepr::Unit { variants }) = <FidelityVariantKebab as Wire>::schema()
+    else {
+        panic!("expected a unit enum");
+    };
+    assert_eq!(variants, vec!["foo-bar", "h-t-t-p-server"]);
+}
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+enum FidelityVariantCamel {
+    FooBar,
+    HTTPServer,
+}
+
+#[test]
+fn fidelity_variant_camel_case_matches_serdes_variant_table() {
+    assert_eq!(
+        serde_json::to_string(&FidelityVariantCamel::FooBar).unwrap(),
+        "\"fooBar\""
+    );
+    assert_eq!(
+        serde_json::to_string(&FidelityVariantCamel::HTTPServer).unwrap(),
+        "\"hTTPServer\""
+    );
+    let TypeSchema::Enum(EnumRepr::Unit { variants }) = <FidelityVariantCamel as Wire>::schema()
+    else {
+        panic!("expected a unit enum");
+    };
+    assert_eq!(variants, vec!["fooBar", "hTTPServer"]);
+}
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(non_camel_case_types)]
+enum FidelityVariantCamelDoesNotConsumeUnderscores {
+    A_B,
+    Plain,
+}
+
+#[test]
+fn fidelity_variant_camel_case_lowercases_only_the_first_character_unlike_the_field_table() {
+    // The exact F1 regression, pinned directly: the FIELD camelCase table
+    // (`to_camel_case`) word-splits on `_` as a delimiter and would fold
+    // `A_B` to `aB`. The VARIANT table does not — it lowercases only the
+    // first character and leaves the rest untouched. Mutation: swap
+    // `RenameAll::apply_to_variant`'s `Camel` arm to call `to_camel_case`
+    // (the field table) instead — this goes red, asserting `"aB"` instead
+    // of real serde's `"a_B"`.
+    assert_eq!(
+        serde_json::to_string(&FidelityVariantCamelDoesNotConsumeUnderscores::A_B).unwrap(),
+        "\"a_B\""
+    );
+    assert_eq!(
+        serde_json::to_string(&FidelityVariantCamelDoesNotConsumeUnderscores::Plain).unwrap(),
+        "\"plain\""
+    );
+    let TypeSchema::Enum(EnumRepr::Unit { variants }) =
+        <FidelityVariantCamelDoesNotConsumeUnderscores as Wire>::schema()
+    else {
+        panic!("expected a unit enum");
+    };
+    assert_eq!(variants, vec!["a_B", "plain"]);
+}
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(non_snake_case)]
+enum FidelityVariantSnakeNonAsciiAsymmetry {
+    AÉmile,
+    Plain,
+}
+
+#[test]
+fn fidelity_variant_snake_case_tests_unicode_uppercase_but_lowers_ascii_only() {
+    // serde's variant snake rule tests `char::is_uppercase()` (Unicode) to
+    // decide where to insert a separator, but converts case with
+    // `to_ascii_lowercase()` (ASCII-only) — an asymmetry that must be copied
+    // exactly. Mutation: swap the separator test to `is_ascii_uppercase()` —
+    // this goes red (`"aÉmile"`, no separator, instead of real serde's
+    // `"a_Émile"`).
+    assert_eq!(
+        serde_json::to_string(&FidelityVariantSnakeNonAsciiAsymmetry::AÉmile).unwrap(),
+        "\"a_Émile\""
+    );
+    assert_eq!(
+        serde_json::to_string(&FidelityVariantSnakeNonAsciiAsymmetry::Plain).unwrap(),
+        "\"plain\""
+    );
+}
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(non_snake_case)]
+struct FidelityFieldSnakeIsIdentityNotSeparatorInsertion {
+    fooBar: u32,
+}
+
+#[test]
+fn fidelity_field_snake_case_is_identity_matching_serdes_field_table() {
+    // The F1 regression on the FIELD side: serde's field snake_case rule is
+    // a pure no-op (it never re-splits on internal case the way the variant
+    // rule does). Mutation: swap `RenameAll::apply_to_field`'s `Snake` arm to
+    // call the variant-table `snake` helper instead — this goes red
+    // (`"foo_bar"` instead of real serde's unchanged `"fooBar"`).
+    let v = FidelityFieldSnakeIsIdentityNotSeparatorInsertion { fooBar: 1 };
+    let json = serde_json::to_string(&v).unwrap();
+    let expect = vec!["fooBar"];
+    assert_eq!(json_keys(&json), expect);
+    assert_eq!(
+        schema_field_names::<FidelityFieldSnakeIsIdentityNotSeparatorInsertion>(),
+        expect
+    );
+}
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[allow(non_snake_case)]
+struct FidelityFieldScreamingIsPlainUppercaseNotSeparatorInsertion {
+    fooBar: u32,
+}
+
+#[test]
+fn fidelity_field_screaming_snake_case_is_plain_uppercase_matching_serdes_field_table() {
+    // THE headline F1 regression: `#[allow(non_snake_case)] userID`-shaped
+    // fields under SCREAMING_SNAKE_CASE. serde's field rule is a plain
+    // `to_ascii_uppercase()` with NO separator inserted. Mutation: swap
+    // `RenameAll::apply_to_field`'s `ScreamingSnake` arm to build on the
+    // variant-table `snake` helper (insert `_` before uppercase, then
+    // uppercase) instead — this goes red (`"FOO_BAR"` instead of real
+    // serde's `"FOOBAR"`), which is exactly the silent-`undefined`-at-runtime
+    // bug the fix round exists to close.
+    let v = FidelityFieldScreamingIsPlainUppercaseNotSeparatorInsertion { fooBar: 1 };
+    let json = serde_json::to_string(&v).unwrap();
+    let expect = vec!["FOOBAR"];
+    assert_eq!(json_keys(&json), expect);
+    assert_eq!(
+        schema_field_names::<FidelityFieldScreamingIsPlainUppercaseNotSeparatorInsertion>(),
+        expect
+    );
+}
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[allow(non_snake_case)]
+struct FidelityFieldKebabOnlySwapsUnderscoresNotSeparatorInsertion {
+    fooBar: u32,
+}
+
+#[test]
+fn fidelity_field_kebab_case_only_swaps_underscores_matching_serdes_field_table() {
+    // serde's field kebab rule is `field.replace('_', "-")` — it never
+    // inserts a NEW separator before an uppercase letter. Mutation: swap
+    // `RenameAll::apply_to_field`'s `Kebab` arm to build on the variant-table
+    // `snake` helper instead — this goes red (`"foo-bar"` instead of real
+    // serde's unchanged `"fooBar"`, since there is no underscore here to
+    // swap).
+    let v = FidelityFieldKebabOnlySwapsUnderscoresNotSeparatorInsertion { fooBar: 1 };
+    let json = serde_json::to_string(&v).unwrap();
+    let expect = vec!["fooBar"];
+    assert_eq!(json_keys(&json), expect);
+    assert_eq!(
+        schema_field_names::<FidelityFieldKebabOnlySwapsUnderscoresNotSeparatorInsertion>(),
+        expect
+    );
+}
+
+// ----- F3: an all-unit enum with a `tag` is internally tagged, not a string union -----
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(tag = "kind")]
+enum FidelityAllUnitInternallyTagged {
+    Draft,
+    Sent,
+}
+
+#[test]
+fn an_all_unit_enum_with_a_tag_is_internally_tagged_not_a_string_union() {
+    // Mutation (F3): `expand_enum`'s `if all_unit && tag.is_none()` -> `if
+    // all_unit` (dropping the `tag.is_none()` half) survives the whole
+    // suite otherwise — every OTHER tagged enum in this file has at least
+    // one data-carrying variant, so the guard's `tag.is_none()` half was
+    // never exercised. Under the mutation this enum would wrongly take the
+    // `EnumRepr::Unit` (bare string) shortcut even though it has a `tag`.
+    let json = serde_json::to_string(&FidelityAllUnitInternallyTagged::Draft).unwrap();
+    assert_eq!(json, "{\"kind\":\"Draft\"}");
+    let TypeSchema::Enum(EnumRepr::Internal { tag, variants }) =
+        <FidelityAllUnitInternallyTagged as Wire>::schema()
+    else {
+        panic!("expected an internally tagged enum, not a string union");
+    };
+    assert_eq!(tag, "kind");
+    assert_eq!(
+        variants,
+        vec![
+            ("Draft".to_string(), TypeSchema::Struct { fields: vec![] }),
+            ("Sent".to_string(), TypeSchema::Struct { fields: vec![] }),
+        ]
+    );
+    // Read Sent back through a real value too, not just the schema.
+    assert_eq!(
+        serde_json::to_string(&FidelityAllUnitInternallyTagged::Sent).unwrap(),
+        "{\"kind\":\"Sent\"}"
+    );
+}
+
+// ----- F4: `#[serde(skip)]` inside a struct VARIANT's fields -----
+
+#[derive(WireDerive, serde::Serialize)]
+enum FidelitySkipInsideStructVariant {
+    Item {
+        kept: u32,
+        #[serde(skip)]
+        hidden: u32,
+    },
+}
+
+#[test]
+fn fidelity_skip_field_inside_a_struct_variant_is_omitted_from_wire_and_schema() {
+    // Mutation (F4): `variant_inner_schema`'s `Fields::Named` arm has its own
+    // `if attrs.skip { continue; }` — `if false { continue; }` survives the
+    // whole suite otherwise, because no prior test puts `#[serde(skip)]` on
+    // a field INSIDE an enum variant (only inside a plain struct, and inside
+    // a struct-variant's `rename`/`skip_serializing_if`, never `skip`
+    // itself). Under the mutation the schema would claim `hidden` as a
+    // required field serde never emits.
+    let v = FidelitySkipInsideStructVariant::Item { kept: 1, hidden: 2 };
+    let FidelitySkipInsideStructVariant::Item { hidden, .. } = &v; // read back, not dead code
+    assert_eq!(*hidden, 2);
+    let json = serde_json::to_string(&v).unwrap();
+    assert_eq!(json, "{\"Item\":{\"kept\":1}}");
+    let TypeSchema::Enum(EnumRepr::External { variants }) =
+        <FidelitySkipInsideStructVariant as Wire>::schema()
+    else {
+        panic!("expected an externally tagged enum");
+    };
+    let Some(TypeSchema::Struct { fields }) = &variants[0].1 else {
+        panic!("expected a struct schema");
+    };
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].name, "kept");
+}
+
+// ----- F5: EnumRepr::External/Adjacent gained Option<TypeSchema> -----
+
+#[derive(WireDerive, serde::Serialize)]
+enum FidelityExternalWithUnit {
+    Idle,
+    Working(u32),
+    Braced {},
+}
+
+#[test]
+fn fidelity_external_unit_variant_is_representable_and_distinct_from_braced_empty() {
+    // Fix round 1 (F5): mutation — revert `variant_inner_schema`'s
+    // `Fields::Unit` arm (external/adjacent branch) back to rejecting, or
+    // revert `EnumRepr::External`'s `variants` field from
+    // `Vec<(String, Option<TypeSchema>)>` to `Vec<(String, TypeSchema)>` —
+    // either reddens this (the first as a compile failure, the second as a
+    // type error at this very assertion).
+    assert_eq!(
+        serde_json::to_string(&FidelityExternalWithUnit::Idle).unwrap(),
+        "\"Idle\""
+    );
+    assert_eq!(
+        serde_json::to_string(&FidelityExternalWithUnit::Working(5)).unwrap(),
+        "{\"Working\":5}"
+    );
+    assert_eq!(
+        serde_json::to_string(&FidelityExternalWithUnit::Braced {}).unwrap(),
+        "{\"Braced\":{}}"
+    );
+    let TypeSchema::Enum(EnumRepr::External { variants }) =
+        <FidelityExternalWithUnit as Wire>::schema()
+    else {
+        panic!("expected an externally tagged enum");
+    };
+    assert_eq!(variants[0], ("Idle".to_string(), None));
+    assert_eq!(variants[1], ("Working".to_string(), Some(TypeSchema::U32)));
+    assert_eq!(
+        variants[2],
+        (
+            "Braced".to_string(),
+            Some(TypeSchema::Struct { fields: vec![] })
+        )
+    );
+}
+
+#[derive(WireDerive, serde::Serialize)]
+#[serde(tag = "t", content = "c")]
+enum FidelityAdjacentWithUnit {
+    Idle,
+    Working(u32),
+    Braced {},
+}
+
+#[test]
+fn fidelity_adjacent_unit_variant_omits_the_content_key_and_is_distinct_from_braced_empty() {
+    assert_eq!(
+        serde_json::to_string(&FidelityAdjacentWithUnit::Idle).unwrap(),
+        "{\"t\":\"Idle\"}"
+    );
+    assert_eq!(
+        serde_json::to_string(&FidelityAdjacentWithUnit::Working(5)).unwrap(),
+        "{\"t\":\"Working\",\"c\":5}"
+    );
+    assert_eq!(
+        serde_json::to_string(&FidelityAdjacentWithUnit::Braced {}).unwrap(),
+        "{\"t\":\"Braced\",\"c\":{}}"
+    );
+    let TypeSchema::Enum(EnumRepr::Adjacent {
+        tag,
+        content,
+        variants,
+    }) = <FidelityAdjacentWithUnit as Wire>::schema()
+    else {
+        panic!("expected an adjacently tagged enum");
+    };
+    assert_eq!(tag, "t");
+    assert_eq!(content, "c");
+    assert_eq!(variants[0], ("Idle".to_string(), None));
+    assert_eq!(variants[1], ("Working".to_string(), Some(TypeSchema::U32)));
+    assert_eq!(
+        variants[2],
+        (
+            "Braced".to_string(),
+            Some(TypeSchema::Struct { fields: vec![] })
+        )
     );
 }

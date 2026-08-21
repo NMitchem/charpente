@@ -1,41 +1,29 @@
-error: #[derive(Wire)] cannot describe unit variant `ExternalUnitMixedWithData::Idle` under serde's default (externally tagged) representation when other variants carry data — serde serializes a bare unit variant here as the JSON string "Idle", not an object, and a per-variant wire schema has no way to express that; make every variant unit-only, or add #[serde(tag = "...")] to switch to internally tagged
-  --> tests/compile_fail/wire_enum_shape_gaps.rs:24:5
-   |
-24 |     Idle,
-   |     ^^^^
-
-error: #[derive(Wire)] cannot describe unit variant `AdjacentUnit::Idle` under serde's adjacently tagged representation (`tag` + `content`) — serde omits the "c" key entirely for a unit variant instead of writing an empty object, which this per-variant schema cannot express; use #[serde(tag = "...")] alone (internally tagged) instead, or give the variant a body
-  --> tests/compile_fail/wire_enum_shape_gaps.rs:31:5
-   |
-31 |     Idle,
-   |     ^^^^
-
 error: #[derive(Wire)] cannot describe tuple variant `InternalNewtypeNonStruct::Wrapped` under serde's internally tagged representation (`tag = "..."`) — for anything but a single struct-shaped field serde refuses to serialize it at all ("cannot serialize tagged newtype variant"), and even a struct-shaped field has its fields merged into the tag object in a way this schema cannot reconstruct from a bare type at compile time; use a braced variant with named fields instead
-  --> tests/compile_fail/wire_enum_shape_gaps.rs:38:5
+  --> tests/compile_fail/wire_enum_shape_gaps.rs:23:5
    |
-38 |     Wrapped(u32),
+23 |     Wrapped(u32),
    |     ^^^^^^^^^^^^
 
 error: #[derive(Wire)] cannot describe tuple variant `InternalNewtypeStruct::Wrapped` under serde's internally tagged representation (`tag = "..."`) — for anything but a single struct-shaped field serde refuses to serialize it at all ("cannot serialize tagged newtype variant"), and even a struct-shaped field has its fields merged into the tag object in a way this schema cannot reconstruct from a bare type at compile time; use a braced variant with named fields instead
-  --> tests/compile_fail/wire_enum_shape_gaps.rs:49:5
+  --> tests/compile_fail/wire_enum_shape_gaps.rs:34:5
    |
-49 |     Wrapped(InnerForInternalTuple),
+34 |     Wrapped(InnerForInternalTuple),
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: #[derive(Wire)] cannot describe tuple variant `ExternalZeroFieldTuple::Empty` with 0 fields — serde encodes it as a JSON array, which has no useful TypeScript type. Use a braced variant with named fields.
-  --> tests/compile_fail/wire_enum_shape_gaps.rs:54:5
+error: #[derive(Wire)] cannot describe tuple variant `ExternalZeroFieldTuple::Empty` with 0 fields — the wire IR has no tuple type (not, as the JSON array serde encodes it as might suggest, because a JSON array has no useful TypeScript type — it does, `[number, number]`; the IR simply doesn't model one yet). Use a braced variant with named fields.
+  --> tests/compile_fail/wire_enum_shape_gaps.rs:39:5
    |
-54 |     Empty(),
+39 |     Empty(),
    |     ^^^^^^^
 
-error: #[derive(Wire)] cannot describe tuple variant `ExternalMultiFieldTuple::Pair` with 2 fields — serde encodes it as a JSON array, which has no useful TypeScript type. Use a braced variant with named fields.
-  --> tests/compile_fail/wire_enum_shape_gaps.rs:60:5
+error: #[derive(Wire)] cannot describe tuple variant `ExternalMultiFieldTuple::Pair` with 2 fields — the wire IR has no tuple type (not, as the JSON array serde encodes it as might suggest, because a JSON array has no useful TypeScript type — it does, `[number, number]`; the IR simply doesn't model one yet). Use a braced variant with named fields.
+  --> tests/compile_fail/wire_enum_shape_gaps.rs:45:5
    |
-60 |     Pair(u32, u32),
+45 |     Pair(u32, u32),
    |     ^^^^^^^^^^^^^^
 
-error: #[derive(Wire)] cannot describe tuple variant `AdjacentMultiFieldTuple::Pair` with 2 fields — serde encodes it as a JSON array, which has no useful TypeScript type. Use a braced variant with named fields.
-  --> tests/compile_fail/wire_enum_shape_gaps.rs:66:5
+error: #[derive(Wire)] cannot describe tuple variant `AdjacentMultiFieldTuple::Pair` with 2 fields — the wire IR has no tuple type (not, as the JSON array serde encodes it as might suggest, because a JSON array has no useful TypeScript type — it does, `[number, number]`; the IR simply doesn't model one yet). Use a braced variant with named fields.
+  --> tests/compile_fail/wire_enum_shape_gaps.rs:51:5
    |
-66 |     Pair(u32, u32),
+51 |     Pair(u32, u32),
    |     ^^^^^^^^^^^^^^

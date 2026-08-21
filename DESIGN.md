@@ -471,12 +471,14 @@ platform is one dependency, not two.
   and `skip_serializing_if`; any other `#[serde(...)]` attribute is a compile error
   rather than a silent pass-through, and that supported set is pinned by tests
   comparing the derived schema against real `serde_json` output. For an enum it
-  describes whichever of serde's tagging representations the type actually uses —
-  a unit-only enum as a string union, otherwise external (default), internal
-  (`tag`), or adjacent (`tag` + `content`) — and refuses at compile time any
-  variant shape a representation can't faithfully carry (e.g. a bare unit variant
-  mixed with data under external tagging, which serializes as a JSON string no
-  per-variant schema slot can express).
+  describes whichever of serde's *tagged* representations the type actually uses
+  — a unit-only enum as a string union, otherwise external (default), internal
+  (`tag`), or adjacent (`tag` + `content`); `untagged` is refused outright, since
+  an untagged value carries no discriminator for the schema to key on. It refuses
+  at compile time any variant shape a representation still can't faithfully carry
+  (e.g. a newtype variant under internal tagging, which serde either refuses to
+  serialize at all or merges into the tag object in a way no per-variant schema
+  slot can reconstruct).
   `TypeSchema`/`TypeDef` are the IR a generated client is emitted from. 64-bit
   integers are deliberately not wire primitives: a JSON number loses precision
   above 2^53 in JavaScript, so they cross the wire string-encoded.

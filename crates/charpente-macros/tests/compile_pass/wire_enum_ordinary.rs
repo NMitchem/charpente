@@ -24,6 +24,19 @@ enum ExternalDataOnly {
     Message { body: String },
 }
 
+// Fix round 1 (F5): a unit variant mixed with data-carrying variants under
+// external tagging used to be rejected outright — `EnumRepr::External`'s
+// per-variant slot was a bare `TypeSchema`, and a unit variant serializes as
+// the bare JSON string "Idle", which no `TypeSchema` value could carry.
+// `Vec<(String, Option<TypeSchema>)>` makes it representable: `None` IS that
+// bare-string shape. See `fidelity_external_unit_variant_mixed_with_data...`
+// in crates/charpente/tests/wire.rs for the serde/schema fidelity pin.
+#[derive(charpente_macros::Wire)]
+enum ExternalMixedWithUnit {
+    Idle,
+    Working(u32),
+}
+
 // Internal tagging (`tag` only): unit variants ARE allowed here (unlike
 // external/adjacent) — `{"kind":"Idle"}` is exactly `Struct { fields: [] }`
 // merged with the tag, so this is fully representable.
@@ -34,14 +47,25 @@ enum InternalMixed {
     Working { pct: u32 },
 }
 
-// Adjacently tagged (`tag` + `content`): unit variants are NOT allowed
-// (content key is dropped entirely on the wire), but newtype and struct
-// variants are fine.
+// Adjacently tagged (`tag` + `content`): newtype and struct variants.
 #[derive(charpente_macros::Wire)]
 #[serde(tag = "t", content = "c")]
 enum AdjacentDataOnly {
     Ping(u32),
     Message { body: String },
+}
+
+// Fix round 1 (F5): a unit variant under adjacent tagging used to be
+// rejected outright — serde omits the `content` key entirely for a unit
+// variant (`{"t":"Idle"}`, not `{"t":"Idle","c":{}}`), which no bare
+// `TypeSchema` value could carry. `Option<TypeSchema>`'s `None` is that
+// omitted-key shape. See `fidelity_adjacent_unit_variant...` in
+// crates/charpente/tests/wire.rs for the serde/schema fidelity pin.
+#[derive(charpente_macros::Wire)]
+#[serde(tag = "t", content = "c")]
+enum AdjacentMixedWithUnit {
+    Idle,
+    Working(u32),
 }
 
 fn main() {}

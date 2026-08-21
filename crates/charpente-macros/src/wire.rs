@@ -40,25 +40,36 @@
 //! Task 4 extends every one of those disciplines to `Data::Enum` (`expand_enum`
 //! and friends below): default-deny for enum- and variant-level `#[serde(...)]`
 //! attributes, `?`-propagation through every `parse_nested_meta` call, and a
-//! variant-name analogue of the duplicate-wire-name check. It also adds a
-//! fourth discipline of its own, found by MEASURING real `serde_json` output
-//! rather than reasoning about it (see the probes behind the fix that added
-//! this paragraph): serde's four enum representations are not uniformly
-//! expressible by `EnumRepr`'s `Vec<(String, TypeSchema)>` shape. A unit
-//! variant serializes as a bare JSON string under external tagging
-//! (`"Draft"`, not `{"Draft":{}}`) and drops its `content` key entirely under
-//! adjacent tagging (`{"t":"A"}`, not `{"t":"A","c":{}}`) — neither is
-//! expressible as *some* `TypeSchema` in the per-variant slot the IR gives
-//! this derive, so a unit variant mixed with data-carrying variants under
-//! external tagging, and a unit variant under adjacent tagging at all, are
-//! both rejected at compile time rather than described wrong. Internally
-//! tagged tuple/newtype variants are rejected for a different, harder
-//! reason: serde itself refuses to serialize a newtype variant over
-//! anything but a struct under `tag`-only representation ("cannot serialize
-//! tagged newtype variant ... containing an integer"), and even the
-//! struct-shaped case merges the inner type's fields into the tag object in
-//! a way this derive has no way to reconstruct from a bare `Type` at
-//! macro-expansion time.
+//! variant-name analogue of the duplicate-wire-name check.
+//!
+//! Fix round 1 corrected two things Task 4 got wrong, both found by MEASURING
+//! real `serde_json` output rather than reasoning about it:
+//!
+//! - serde has TWO rename tables, `apply_to_field` and `apply_to_variant`,
+//!   and they disagree (see `RenameAll::apply_to_field`/`apply_to_variant`'s
+//!   own doc comments for the measured shapes). Task 4's first pass used the
+//!   variant table for both, which regressed Task 3's struct-field fidelity;
+//!   `RenameAll` now carries both tables, called from the site that matches.
+//! - `EnumRepr::External` and `EnumRepr::Adjacent` carry
+//!   `Vec<(String, Option<TypeSchema>)>`; `None` means "this variant has no
+//!   payload on the wire" — exactly serde's own distinction. A unit variant
+//!   serializes as a bare JSON string under external tagging (`"Draft"`, not
+//!   `{"Draft":{}}`) and drops its `content` key entirely under adjacent
+//!   tagging (`{"t":"A"}`, not `{"t":"A","c":{}}`), while a braced-EMPTY
+//!   variant (`Msg {}`) is a genuinely different document (`{"Msg":{}}` /
+//!   `{"t":"Msg","c":{}}`) that `Some(Struct { fields: [] })` still carries —
+//!   `None` vs `Some` separates the two with nothing left over. Internally
+//!   tagged tuple/newtype variants stay rejected, for a different, harder
+//!   reason: serde itself refuses to serialize a newtype variant over
+//!   anything but a struct under `tag`-only representation ("cannot
+//!   serialize tagged newtype variant ... containing an integer"), and even
+//!   the struct-shaped case merges the inner type's fields into the tag
+//!   object in a way this derive has no way to reconstruct from a bare
+//!   `Type` at macro-expansion time. A tuple variant with 0 or 2+ fields is
+//!   also still rejected — not because a JSON array has no useful
+//!   TypeScript type (it does: `[number, number]`), but because the wire IR
+//!   itself has no tuple type yet; that omission is fail-closed (a compile
+//!   error here, never a silently wrong client), so it can wait.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -156,7 +167,7 @@ fn expand_struct(
             None => {
                 let raw = ident.to_string();
                 match rename_all {
-                    Some(rule) => rule.apply(&raw),
+                    Some(rule) => rule.apply_to_field(&raw),
                     None => raw,
                 }
             }
@@ -361,7 +372,7 @@ fn resolve_variant_names(
             None => {
                 let raw = v.ident.to_string();
                 match rename_all {
-                    Some(rule) => rule.apply(&raw),
+                    Some(rule) => rule.apply_to_variant(&raw),
                     None => raw,
                 }
             }
@@ -392,13 +403,26 @@ fn resolve_variant_names(
 /// variants — a unit-only, untagged enum's variants have no content at all,
 /// only a name.
 ///
-/// The three rejections below (unit-under-external-when-mixed,
-/// unit-under-adjacent, unnamed-under-internal) all come from the same
-/// place: `EnumRepr`'s per-variant slot is always SOME `TypeSchema` (see the
-/// module doc comment), and three real serde shapes cannot be written as
-/// one — confirmed by driving real `serde_json::to_string` on each shape,
-/// not reasoned from serde's docs alone (spec §5's fidelity discipline
-/// applies to what this derive REFUSES, not just what it accepts).
+/// `internal` (`tag.is_some() && content.is_none()`) picks which of
+/// `EnumRepr`'s two variant-slot shapes this function must emit tokens for:
+/// `Internal`'s slot is a bare `TypeSchema` (a unit variant merges into the
+/// tag object exactly as `Struct { fields: [] }`, nothing left over), while
+/// `External`'s and `Adjacent`'s slot is `Option<TypeSchema>` (`None` for a
+/// unit variant, `Some(..)` otherwise — fix round 1, F5; see `EnumRepr`'s own
+/// doc comment in `crates/charpente/src/wire.rs` for the measured shapes
+/// this distinction is drawn from). `expand_enum` calls this once per
+/// variant for a SINGLE enum, whose representation (and therefore `internal`)
+/// is fixed for every variant — there is no enum that mixes the two slot
+/// shapes.
+///
+/// The two rejections still here (unnamed-under-internal, and a tuple
+/// variant with 0 or 2+ fields) come from real limits, not from the
+/// `Option` gap fix round 1 closed: serde itself refuses to serialize an
+/// internally tagged newtype variant over anything but a struct, and the
+/// wire IR has no tuple type at all — both confirmed by driving real
+/// `serde_json::to_string` on each shape, not reasoned from serde's docs
+/// alone (spec §5's fidelity discipline applies to what this derive
+/// REFUSES, not just what it accepts).
 fn variant_inner_schema(
     name_str: &str,
     v: &syn::Variant,
@@ -406,35 +430,18 @@ fn variant_inner_schema(
     content: &Option<String>,
 ) -> syn::Result<(TokenStream, Vec<TokenStream>)> {
     let vname = v.ident.to_string();
+    let internal = tag.is_some() && content.is_none();
     match &v.fields {
-        Fields::Unit => match (tag, content) {
-            (None, _) => Err(Error::new_spanned(
-                &v.ident,
-                format!(
-                    "#[derive(Wire)] cannot describe unit variant `{name_str}::{vname}` under \
-                     serde's default (externally tagged) representation when other variants \
-                     carry data — serde serializes a bare unit variant here as the JSON string \
-                     \"{vname}\", not an object, and a per-variant wire schema has no way to \
-                     express that; make every variant unit-only, or add \
-                     #[serde(tag = \"...\")] to switch to internally tagged"
-                ),
-            )),
-            (Some(_), Some(c)) => Err(Error::new_spanned(
-                &v.ident,
-                format!(
-                    "#[derive(Wire)] cannot describe unit variant `{name_str}::{vname}` under \
-                     serde's adjacently tagged representation (`tag` + `content`) — serde omits \
-                     the \"{c}\" key entirely for a unit variant instead of writing an empty \
-                     object, which this per-variant schema cannot express; use \
-                     #[serde(tag = \"...\")] alone (internally tagged) instead, or give the \
-                     variant a body"
-                ),
-            )),
-            (Some(_), None) => Ok((
-                quote! { ::charpente::wire::TypeSchema::Struct { fields: ::std::vec![] } },
-                Vec::new(),
-            )),
-        },
+        Fields::Unit => {
+            if internal {
+                Ok((
+                    quote! { ::charpente::wire::TypeSchema::Struct { fields: ::std::vec![] } },
+                    Vec::new(),
+                ))
+            } else {
+                Ok((quote! { ::std::option::Option::None }, Vec::new()))
+            }
+        }
         Fields::Named(f) => {
             let mut fs = Vec::new();
             let mut registers = Vec::new();
@@ -480,13 +487,17 @@ fn variant_inner_schema(
                 });
                 registers.push(quote! { <#fty as ::charpente::wire::Wire>::register(reg); });
             }
-            Ok((
-                quote! { ::charpente::wire::TypeSchema::Struct { fields: ::std::vec![#(#fs),*] } },
-                registers,
-            ))
+            let schema =
+                quote! { ::charpente::wire::TypeSchema::Struct { fields: ::std::vec![#(#fs),*] } };
+            let out = if internal {
+                schema
+            } else {
+                quote! { ::std::option::Option::Some(#schema) }
+            };
+            Ok((out, registers))
         }
         Fields::Unnamed(f) => {
-            if tag.is_some() && content.is_none() {
+            if internal {
                 return Err(Error::new_spanned(
                     v,
                     format!(
@@ -503,7 +514,7 @@ fn variant_inner_schema(
             if f.unnamed.len() == 1 {
                 let fty = &f.unnamed[0].ty;
                 Ok((
-                    quote! { <#fty as ::charpente::wire::Wire>::reference() },
+                    quote! { ::std::option::Option::Some(<#fty as ::charpente::wire::Wire>::reference()) },
                     vec![quote! { <#fty as ::charpente::wire::Wire>::register(reg); }],
                 ))
             } else {
@@ -511,8 +522,10 @@ fn variant_inner_schema(
                     v,
                     format!(
                         "#[derive(Wire)] cannot describe tuple variant `{name_str}::{vname}` \
-                         with {} fields — serde encodes it as a JSON array, which has no useful \
-                         TypeScript type. Use a braced variant with named fields.",
+                         with {} fields — the wire IR has no tuple type (not, as the JSON \
+                         array serde encodes it as might suggest, because a JSON array has no \
+                         useful TypeScript type — it does, `[number, number]`; the IR simply \
+                         doesn't model one yet). Use a braced variant with named fields.",
                         f.unnamed.len()
                     ),
                 ))
@@ -637,68 +650,87 @@ impl RenameAll {
         }
     }
 
-    /// Mirrors serde_derive_internals' `RenameRule::apply_to_field` — and, as
-    /// of Task 4, `apply_to_variant` too, which is where the pre-existing
-    /// (Task 3) implementation of the non-`Camel` arms turned out to be
-    /// wrong. Task 3's fidelity tests only ever exercised STRUCT FIELDS,
-    /// which by Rust convention are already snake_case (no uppercase
-    /// letters at all) — so `Snake => raw.to_string()` (pure identity),
-    /// `ScreamingSnake => raw.to_ascii_uppercase()`, and
-    /// `Kebab => raw.replace('_', "-")` all happened to agree with real
-    /// serde, because none of those inputs ever exercised the one thing
-    /// they were missing: inserting a NEW separator before an
-    /// uppercase letter that isn't already preceded by one. ENUM VARIANTS
-    /// (Task 4) are conventionally PascalCase, which exercises exactly that
-    /// gap — confirmed by driving real `serde_json` on a battery of variant
-    /// names, not reasoned from serde's docs (see `insert_before_uppercase`'s
-    /// doc comment for the measured shapes). `Camel` needed no change: it
-    /// already preserves every character it doesn't explicitly touch exactly
-    /// as written, which — since PascalCase variant names have no
-    /// underscores at all — already reproduces the correct per-word
-    /// capitalization for free (each "word" it would otherwise need to find
-    /// is, by construction, already capitalized in the source).
-    fn apply(self, raw: &str) -> String {
+    /// Mirrors serde_derive_internals' `RenameRule::apply_to_field` exactly —
+    /// Task 3's original three non-`Camel` bodies, verbatim.
+    ///
+    /// Fix round 1 (F1/F8): a first pass at Task 4 replaced these bodies with
+    /// the *variant* table below (`apply_to_variant`), on the theory that
+    /// Task 3's fidelity tests only "happened" to pass because they never
+    /// exercised a field name with an internal uppercase letter. That theory
+    /// was wrong: serde has two genuinely DIFFERENT rename tables —
+    /// `apply_to_field` and `apply_to_variant` — and Task 3's three bodies
+    /// were serde's field table, correct for every field name, not just
+    /// already-snake_case ones. Measured directly against real `serde_json`
+    /// on a field named `fooBar` (not just `unit_amount_cents`-shaped names):
+    /// `snake_case` is a genuine no-op (`"fooBar"`, unchanged — serde's field
+    /// snake rule never re-splits on case), `SCREAMING_SNAKE_CASE` is a plain
+    /// `to_ascii_uppercase()` with NO separator inserted (`"FOOBAR"`, not
+    /// `"FOO_BAR"`), and `kebab-case` only ever swaps `_` for `-`
+    /// (`"fooBar"`, unchanged — no separator inserted there either). Using
+    /// the variant table for fields was the actual regression; this reverts
+    /// it. `Camel` needed no change either way: `to_camel_case` already IS
+    /// serde's field camelCase rule (PascalCase-build, demote first char).
+    fn apply_to_field(self, raw: &str) -> String {
         match self {
             RenameAll::Camel => to_camel_case(raw),
-            RenameAll::Snake => insert_before_uppercase(raw, '_').to_ascii_lowercase(),
-            RenameAll::ScreamingSnake => insert_before_uppercase(raw, '_').to_ascii_uppercase(),
-            RenameAll::Kebab => insert_before_uppercase(raw, '-')
-                .to_ascii_lowercase()
-                .replace('_', "-"),
+            RenameAll::Snake => raw.to_string(),
+            RenameAll::ScreamingSnake => raw.to_ascii_uppercase(),
+            RenameAll::Kebab => raw.replace('_', "-"),
         }
     }
-}
 
-/// Inserts `sep` immediately before every ASCII-uppercase letter that is NOT
-/// the first character of `raw` — used by the `Snake`/`ScreamingSnake`/
-/// `Kebab` arms of `RenameAll::apply`, which otherwise never touch anything
-/// but case and (for `Kebab`) the underscore-to-hyphen swap.
-///
-/// Deliberately does NOT consume or collapse any existing `_` in `raw` (it
-/// only ever INSERTS `sep`, never removes a character) — confirmed against
-/// real `serde_json`: `#[serde(rename_all = "snake_case")]` on a field named
-/// `_id` produces `"_id"` (leading underscore intact, NOT `"id"`), and on
-/// `a__b` produces `"a__b"` (both underscores intact, NOT collapsed to one).
-/// `Camel` (`to_camel_case`) is the ONE rule that consumes underscores as
-/// delimiters — the split between "these three insert-only" and "Camel
-/// consumes" is real, not an implementation shortcut: `#[serde(rename_all =
-/// "kebab-case")]` on `a__b` produces `"a--b"` (each underscore individually
-/// replaced, count preserved) where camelCase's `a__b` produces `"aB"`
-/// (collapsed to one boundary) — two structurally different transforms, not
-/// one transform expressed two ways.
-fn insert_before_uppercase(raw: &str, sep: char) -> String {
-    let mut out = String::with_capacity(raw.len() + 4);
-    let mut chars = raw.chars();
-    if let Some(first) = chars.next() {
-        out.push(first);
-    }
-    for c in chars {
-        if c.is_ascii_uppercase() {
-            out.push(sep);
+    /// Mirrors serde_derive_internals' `RenameRule::apply_to_variant` — a
+    /// DIFFERENT table from `apply_to_field` above, confirmed by measuring
+    /// real `serde_json` output on a battery of variant names (PascalCase,
+    /// acronym-leading and acronym-trailing, and a name already containing an
+    /// underscore), not reasoned from serde's docs. Two things about it are
+    /// easy to get wrong by analogy with the field table, so both are pinned
+    /// by a fidelity test:
+    ///
+    /// - `Camel` here is NOT `to_camel_case` — serde's variant camelCase rule
+    ///   lowercases only the FIRST character and leaves every other
+    ///   character exactly as written, including any underscore. It does not
+    ///   word-split on `_` the way the field rule does: `A_B` -> `"a_B"`, not
+    ///   `"aB"` (measured).
+    /// - `Snake`, `SCREAMING_SNAKE_CASE`, and `kebab-case` all insert a NEW
+    ///   separator before every character position (other than the first)
+    ///   testing true for Unicode `char::is_uppercase()` — not
+    ///   `is_ascii_uppercase()` — and then lowercase that character with
+    ///   `to_ascii_lowercase()` (ASCII-only). That asymmetry is deliberate on
+    ///   serde's part and must be copied exactly: it is what makes a variant
+    ///   named `AÉmile` fold to `"a_Émile"` under `snake_case` (separator
+    ///   inserted because `É` is Unicode-uppercase; `É` itself left
+    ///   untouched because `to_ascii_lowercase` doesn't touch non-ASCII) —
+    ///   measured, not assumed.
+    fn apply_to_variant(self, raw: &str) -> String {
+        fn snake(raw: &str) -> String {
+            let mut out = String::with_capacity(raw.len() + 4);
+            for (i, c) in raw.chars().enumerate() {
+                if i > 0 && c.is_uppercase() {
+                    out.push('_');
+                }
+                out.push(c.to_ascii_lowercase());
+            }
+            out
         }
-        out.push(c);
+        match self {
+            RenameAll::Camel => {
+                let mut chars = raw.chars();
+                match chars.next() {
+                    Some(first) => {
+                        let mut out = String::with_capacity(raw.len());
+                        out.push(first.to_ascii_lowercase());
+                        out.push_str(chars.as_str());
+                        out
+                    }
+                    None => String::new(),
+                }
+            }
+            RenameAll::Snake => snake(raw),
+            RenameAll::ScreamingSnake => snake(raw).to_ascii_uppercase(),
+            RenameAll::Kebab => snake(raw).replace('_', "-"),
+        }
     }
-    out
 }
 
 /// Parses `rename_all`'s value form and rejects its split

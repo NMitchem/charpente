@@ -47,18 +47,36 @@ pub struct Field {
 pub enum EnumRepr {
     /// All variants are unit variants: a string union.
     Unit { variants: Vec<String> },
-    /// serde's externally-tagged default: `{ "VariantName": {...} }`.
-    External { variants: Vec<(String, TypeSchema)> },
-    /// `#[serde(tag = "...")]`: `{ "type": "VariantName", ...fields }`.
+    /// serde's externally-tagged default: `{ "VariantName": {...} }`. A
+    /// variant's schema is `None` when it carries no payload at all — a
+    /// unit variant serializes as the bare JSON string `"VariantName"`, not
+    /// an object, so there is no per-variant object shape to describe.
+    /// `Some(Struct { fields: [] })` is a DIFFERENT, genuinely distinct
+    /// document (a braced-empty variant, `{"VariantName":{}}`) — the two are
+    /// not the same case, measured against real `serde_json` (fix round 1,
+    /// F5): `None` vs `Some` carries that distinction with nothing left
+    /// over.
+    External {
+        variants: Vec<(String, Option<TypeSchema>)>,
+    },
+    /// `#[serde(tag = "...")]`: `{ "type": "VariantName", ...fields }`. No
+    /// `Option` here — a unit variant merges into the tag object exactly as
+    /// `Struct { fields: [] }` (`{"type":"VariantName"}`), so the bare
+    /// `TypeSchema` slot already carries every representable shape.
     Internal {
         tag: String,
         variants: Vec<(String, TypeSchema)>,
     },
-    /// `#[serde(tag = "...", content = "...")]`.
+    /// `#[serde(tag = "...", content = "...")]`. Same `Option` distinction as
+    /// `External`: a unit variant omits the `content` key entirely
+    /// (`{"tag":"VariantName"}`, no `content` key at all), which `None`
+    /// carries; a braced-empty variant still writes an empty `content`
+    /// object (`{"tag":"VariantName","content":{}}`), which stays
+    /// `Some(Struct { fields: [] })`.
     Adjacent {
         tag: String,
         content: String,
-        variants: Vec<(String, TypeSchema)>,
+        variants: Vec<(String, Option<TypeSchema>)>,
     },
 }
 
