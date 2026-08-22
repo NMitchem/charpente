@@ -46,6 +46,17 @@
 
 - **Full check before any task is done:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`. No `#[allow]` may be added to pass clippy.
 - **Do not kill any process.** Another repo runs test suites on this machine.
+- **A tool's DEFAULT is not a tool's LIMIT — check before building a workaround.** Three
+  separate hazards in this plan trace to one root: the Bash tool's 2-minute default timeout
+  was read as a hard ceiling. Task 5's implementer concluded `cargo test --workspace` "could
+  not run as one command" and segmented the entire suite per-package/per-file; fix round 1's
+  implementer backgrounded the same command, parked waiting on a notification a subagent never
+  receives, and returned control with 19 paths uncommitted. **The tool accepts `timeout` up to
+  600000 ms and the run takes about six minutes.** Each workaround produced evidence that was
+  equivalent-or-worse at the cost of a whole session, plus a deviation for a reviewer to audit.
+  The rule generalizes past this one parameter: when a tool appears to refuse something, read
+  its parameters before designing around the refusal — and if you do work around it, say so in
+  the report as a deviation, which both implementers did correctly.
 - **`TRYBUILD=overwrite` blesses whatever the compiler emitted — it does not verify it.**
   The cargo test target in `charpente-macros` is `--test trybuild` (`tests/trybuild.rs`,
   fn `macro_errors`); `compile_fail/` and `compile_pass/` are fixture DIRECTORIES, not targets.
