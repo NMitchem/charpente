@@ -207,16 +207,54 @@ impl Archive {
 
     /// The base_seq the next un-shipped sealed segment must have, by the
     /// contiguity this archive maintains in `self.segments`.
-    fn next_base(&self) -> u64 {
-        self.segments.last().map_or(0, |s| {
-            s.end_seq.checked_add(1).unwrap_or_else(|| {
-                panic!(
-                    "Archive: the last shipped segment's end_seq is u64::MAX with more to ship \
-                     after it — Manifest::encode would refuse this chain (hard rule 4); \
-                     unreachable while this archive only ever appends contiguous SegmentRefs"
-                )
-            })
-        })
+    ///
+    /// Floored at `db.log_base()` when nothing has shipped yet: **seq 0 is
+    /// usually gone.** Any node restarted after its first checkpoint, and
+    /// every seeded follower (`Seeder::finish` lays the first segment at
+    /// `applied_seq + 1`), opens on a log whose base is far above 0.
+    /// Answering 0 there made `step_idle` find no segment, pin the floor at
+    /// 0 — which holds the ENTIRE log — and ship nothing, forever, while
+    /// `Wal::gc` could never advance again (M1').
+    fn next_base(&self, db: &Db) -> u64 {
+        let Some(last) = self.segments.last() else {
+            return db.log_base();
+        };
+        let next = last.end_seq.checked_add(1).unwrap_or_else(|| {
+            panic!(
+                "Archive: the last shipped segment's end_seq is u64::MAX with more to ship \
+                 after it — Manifest::encode would refuse this chain (hard rule 4); \
+                 unreachable while this archive only ever appends contiguous SegmentRefs"
+            )
+        });
+        // Negative space (hard rule 4): the pin holds everything from `next`
+        // up, so gc cannot have reclaimed it. If it has, the chain this
+        // archive would build next has a HOLE in it, and silently skipping
+        // to the log's new base would produce exactly the manifest that
+        // claims a span it never shipped. Closing a generation on a gap is
+        // Task 7's job; until then this is unreachable and says so.
+        assert!(
+            next >= db.log_base(),
+            "Archive: next needed seq {next} is below the log's base {} — gc reclaimed a \
+             segment this archive still needed, which its retention pin exists to prevent",
+            db.log_base()
+        );
+        next
+    }
+
+    /// The pin only ever moves FORWARD. It is a retention floor, and both
+    /// directions of getting it wrong have already been real bugs: moving it
+    /// to `u64::MAX` releases everything and let gc delete the segment the
+    /// archive was waiting for (M1), while moving it BACKWARDS re-holds
+    /// segments already released and freezes gc for good (M1'). Neither was
+    /// caught by a test; an assert catches both by construction.
+    fn hold(&self, floor: u64) {
+        let mut pin = self.pin.lock().expect("uncontended");
+        assert!(
+            floor >= *pin,
+            "Archive: retention pin moved backwards, {} -> {floor}; a floor may only advance",
+            *pin
+        );
+        *pin = floor;
     }
 
     /// One unit of work: start one upload, poll one in flight, or read one
@@ -252,7 +290,7 @@ impl Archive {
     /// `mem::replace`) — safe to use `?` throughout: there is nothing
     /// resumable to lose on an early return, unlike every other arm below.
     fn step_idle(&mut self, db: &Db) -> io::Result<()> {
-        let next = self.next_base();
+        let next = self.next_base(db);
         let Some(seg) = db
             .sealed_segments()?
             .into_iter()
@@ -262,7 +300,7 @@ impl Archive {
             // start at, never release (M1). The chain is contiguous, so
             // `next` is exactly that base: GC still reclaims everything
             // already archived and nothing more.
-            *self.pin.lock().expect("uncontended") = next;
+            self.hold(next);
             self.idle = true;
             return Ok(());
         };
@@ -276,11 +314,11 @@ impl Archive {
             // Holding, NOT releasing (M1): this arm has just identified
             // the segment the archive needs; telling retention it holds
             // nothing would invite GC to delete it.
-            *self.pin.lock().expect("uncontended") = seg.base_seq;
+            self.hold(seg.base_seq);
             self.idle = true;
             return Ok(());
         }
-        *self.pin.lock().expect("uncontended") = seg.base_seq;
+        self.hold(seg.base_seq);
         self.state = State::Reading {
             base_seq: seg.base_seq,
             layout_end: seg.layout_end,

@@ -148,6 +148,29 @@ fn build_fixture<S>(store: S, read_budget_bytes: usize) -> (Db, S, Archive) {
 /// default is 64 MiB (`log.rs:75`). Default `read_budget_bytes` (8 MiB, spec
 /// default) comfortably covers a whole 64 KiB test segment in one
 /// `Db::read_log` call.
+/// A Db whose WAL has ALREADY been GC'd by the time `Archive::open` runs —
+/// the restart / seeded-follower shape (M1'). `checkpoint_every` is left at
+/// its default so the writes below really do drive a checkpoint and a gc.
+fn fixture_with_precompacted_log() -> (Db, SimObjectStore, Archive) {
+    let sim = Sim::with_faults(0x6172_6368_5f74_3501, FaultConfig::none());
+    let mut db_cfg = DbConfig::default();
+    db_cfg.wal.segment_bytes = 64 << 10;
+    let mut db = Db::open(Box::new(sim.disk()), db_cfg, Schema::new().table::<Rec>()).unwrap();
+    write_records(&mut db, 20 * RECORDS_PER_SEGMENT);
+    let arc = Archive::open(
+        ArchiveConfig {
+            prefix: PREFIX.to_string(),
+            writer: WRITER.to_string(),
+            snapshot_every: 0,
+            pin_segments: 8,
+            read_budget_bytes: 8 << 20,
+        },
+        &mut db,
+    )
+    .unwrap();
+    (db, SimObjectStore::new(), arc)
+}
+
 fn archive_fixture() -> (Db, SimObjectStore, Archive) {
     build_fixture(SimObjectStore::new(), 8 << 20)
 }
@@ -463,6 +486,54 @@ fn the_pin_holds_from_open_advances_with_the_manifest_and_never_releases() {
     );
 }
 
+/// M1' (task-5-rereview.md) — a REGRESSION introduced by r1's fix for M1.
+/// A Db whose WAL was already GC'd before any `Archive` existed: any node
+/// restarted after its first checkpoint, and EVERY seeded follower
+/// (`Seeder::finish` lays the first segment at `applied_seq + 1`,
+/// db.rs:2543). `next_base()` answered 0 with nothing shipped, `step_idle`
+/// found no sealed segment based at 0, and r1's caught-up arm pinned at
+/// `next` == 0 — which ships nothing AND freezes `Wal::gc` forever, because
+/// a floor of 0 holds the entire log. r1 turned a silent no-ship into a
+/// silent no-ship PLUS unbounded WAL growth.
+#[test]
+fn an_archive_opened_on_a_compacted_log_starts_at_the_logs_base() {
+    let (mut db, store, mut arc) = fixture_with_precompacted_log();
+    let base = db.log_base();
+    assert!(
+        base > 0,
+        "fixture needs a log GC'd before the archive opened; got base 0 — the rest is vacuous"
+    );
+
+    step_until_idle(&mut arc, &db, &store);
+
+    let shipped = store
+        .keys()
+        .iter()
+        .filter(|k| k.contains("/segments/"))
+        .count();
+    assert!(
+        shipped > 0,
+        "archive shipped nothing from a compacted log (base {base}): it looked for a segment \
+         based at seq 0, which was reclaimed long ago"
+    );
+
+    // The pin must never sit below the log's own base: a floor beneath what
+    // still exists holds the whole log and gc can never advance again.
+    assert!(
+        arc.pin_floor() >= base,
+        "pin {} is below log_base {base} — gc is now frozen forever",
+        arc.pin_floor()
+    );
+
+    // And gc must still be able to advance as new data arrives.
+    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
+    step_until_idle(&mut arc, &db, &store);
+    assert!(
+        db.log_base() > base,
+        "log_base stuck at {base} after archiving and further writes — gc is frozen"
+    );
+}
+
 #[test]
 fn an_archive_io_failure_never_poisons_the_db() {
     let (mut db, store, mut arc) = archive_fixture_with_unreachable_store();
@@ -487,10 +558,16 @@ fn an_archive_io_failure_never_poisons_the_db() {
 #[test]
 fn a_store_that_comes_back_lets_the_archive_catch_up() {
     let (mut db, store, mut arc) = archive_fixture_with_unreachable_store();
-    write_records(&mut db, RECORDS_PER_SEGMENT + 50);
+    // m1' (task-5-rereview.md): the earlier `RECORDS_PER_SEGMENT + 50` sealed
+    // exactly ONE segment, so "every sealed segment lands" was proven only
+    // for n == 1 — and the chain assertion below cannot distinguish a
+    // complete chain from a chain missing its head at n == 1.
+    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
+    let sealed = sealed_segment_count(&db);
     assert!(
-        sealed_segment_count(&db) >= 1,
-        "fixture sealed nothing; the rest is vacuous"
+        sealed >= 2,
+        "fixture sealed {sealed} segment(s); this test needs >= 2 or it cannot tell a \
+         complete chain from one missing its head"
     );
 
     // While unreachable: no progress, but no fabricated completion and no
@@ -515,10 +592,28 @@ fn a_store_that_comes_back_lets_the_archive_catch_up() {
 
     let m = read_manifest(&store).expect("a manifest after the store came back");
     let tail = current_tail_base_seq(&db);
+    // Both ENDS, not just the last one. `Manifest`'s contiguity check proves
+    // the chain has no interior hole but never that it starts where the log
+    // does, so a chain missing its head is internally consistent and would
+    // pass a last-segment-only assertion (m1').
+    assert_eq!(
+        m.segments.first().map(|s| s.base_seq),
+        Some(db.log_base()),
+        "the chain must start at the log's base, not part-way in: manifest {:?}, log_base {}",
+        m.segments,
+        db.log_base()
+    );
     assert_eq!(
         m.segments.last().map(|s| s.end_seq + 1),
         Some(tail),
         "every sealed segment must land once the store comes back: manifest {:?}, tail base {tail}",
+        m.segments
+    );
+    assert_eq!(
+        m.segments.len(),
+        sealed,
+        "chain covers {} segments but {sealed} were sealed: {:?}",
+        m.segments.len(),
         m.segments
     );
 }

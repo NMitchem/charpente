@@ -1824,7 +1824,12 @@ impl Db {
             // a base_seq (each holds at least one record), so `next_base`
             // is never 0 here; a 0 would mean the WAL's own segment-naming
             // invariant already broke, which is a bug worth a clear panic
-            // rather than a silently wrapped `layout_end`.
+            // rather than a silently wrapped `layout_end`. Since the
+            // sortedness assert above, this panic is provably UNREACHABLE
+            // (`bases[i + 1] == 0` would need `i + 1 == 0`) — it is kept as
+            // defence in depth downstream of that assert, not as live
+            // behaviour, so do not read it as the guard against unsorted
+            // listings. That guard is the assert.
             let layout_end = next_base.checked_sub(1).unwrap_or_else(|| {
                 panic!(
                     "sealed_segments: segment {} is immediately followed by a segment based at \
