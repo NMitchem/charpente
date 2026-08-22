@@ -45,7 +45,7 @@ impl SendReceipt {
         tx.emit_keyed(
             self.org,
             ReceiptSent {
-                invoice: self.invoice.raw(),
+                invoice: self.invoice,
                 amount_cents,
             },
         );
@@ -53,15 +53,26 @@ impl SendReceipt {
     }
 }
 
+/// `invoice: Id<Invoice>` (fix round 1, F7 / Ruling 29), not a bare `u64`:
+/// `#[event]` payloads DO cross the wire (`ev_json` in `http/mod.rs`
+/// serializes them straight into the SSE frame body — unlike a `#[job]`
+/// payload, which never leaves the process), and `InvoiceFinalized`
+/// (`routes.rs`) — the other `#[event]` on this same `/events/feed` stream,
+/// also naming an `Invoice` row id — already carries `Id<Invoice>`. Before
+/// this fix the two disagreed: `invoice_finalized` frames quoted the id,
+/// `receipt_sent` frames did not, on one feed. One id, one encoding.
 #[event]
 pub struct ReceiptSent {
-    pub invoice: u64,
+    pub invoice: Id<Invoice>,
     pub amount_cents: i64,
 }
 
 /// One per overdue Final invoice, enqueued from `AdvanceDay`'s own
 /// transaction (below) — this is where "a reminder is a reminders-table
-/// row" (brief) actually happens.
+/// row" (brief) actually happens. `invoice` stays a bare `u64`: this is a
+/// `#[job]` payload, which never crosses HTTP (jobs run in-process; only
+/// their effects are observable), so it has no `Wire` requirement — unlike
+/// `ReceiptSent` above, which is an `#[event]` and does cross the wire.
 #[job]
 pub struct SendOverdueReminder {
     pub invoice: u64,

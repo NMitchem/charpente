@@ -175,15 +175,25 @@ runtime we own.
 
 ```ts
 const r = await api.createCustomer(id, body);
-if (!r.ok) { /* r.error : the typed ApiError union */ }
+if (!r.ok) { /* r.error : { error: string } — the ApiError envelope, not a per-variant union */ }
 ```
 
-The route's error type is part of its declared Rust signature, so it belongs in the
-return type. Throwing erases it — `catch` binds `unknown`, discarding precisely the
-information this project exists to carry. The cost is verbosity at every call site; the
-purchase is that `tsc` refuses to let a caller ignore a failure the server declares.
-Transport-level faults (socket died, body did not parse) still throw: those are not in
-the contract.
+**Correction (task 5 fix round 1, F1):** `r.error` is the fixed `ApiError` envelope
+`{ error: string }`, not a discriminated union of `ApiError`'s Rust variants.
+`ApiError::response()` always emits that one shape regardless of which variant a
+handler returned — the variant distinction never reaches the wire — so `Contract.types["ApiError"]`
+describes the envelope (a hand-written `Wire` impl, not the derive), and this emitter
+must type every route's error branch from it. The status code (which the fetch response
+already carries) is what discriminates 400/401/404/500 for a caller that needs to, not
+the error body's shape.
+
+The route's error type is still part of its declared Rust signature, so the ENVELOPE
+belongs in the return type even though it is not itself a per-variant type — a caller
+still cannot silently ignore a failure the server declares. Throwing would erase it
+entirely — `catch` binds `unknown`, discarding even the message. The cost is verbosity
+at every call site; the purchase is that `tsc` refuses to let a caller skip past `!r.ok`
+before reading `r.error`. Transport-level faults (socket died, body did not parse) still
+throw: those are not in the contract.
 
 **The client runtime uses fetch-based SSE, not `EventSource`.** `EventSource` is
 browser-native and handles `Last-Event-ID` resume for free, but **it cannot set request

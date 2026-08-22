@@ -9,6 +9,7 @@
 
 use std::time::Duration;
 
+use charpente::describe::ParamInfo;
 use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, Subscription};
 use charpente::kernel::JobError;
 use charpente::wire::{TypeSchema, WireU64};
@@ -59,6 +60,23 @@ fn list_widgets(tx: &mut Tx) -> Result<Vec<WidgetView>, ApiError> {
         .collect())
 }
 
+/// Two path params (fix round 1, F10): `param_schema_entries` indexes
+/// `non_ctx[i]` by param position, and no route anywhere else in the
+/// workspace has two — so nothing pinned that params come back in PATH
+/// order (not alphabetical, not declaration order of some other kind) with
+/// distinct schemas attached to the right names. `org: String` and
+/// `id: Id<Widget>` are deliberately different shapes so a mix-up (schemas
+/// swapped between names) would be visible, not just a coincidental match.
+#[route(GET "/orgs/:org/widgets/:id")]
+fn get_org_widget(tx: &mut Tx, org: String, id: Id<Widget>) -> Result<WidgetView, ApiError> {
+    let _ = org;
+    let w = tx.get(id)?.ok_or(ApiError::NotFound)?;
+    Ok(WidgetView {
+        id: w.id,
+        org: WireU64(w.org),
+    })
+}
+
 #[event]
 struct WidgetAdded {
     org: u64,
@@ -90,7 +108,12 @@ fn fixture_app() -> App {
         AppConfig::default(),
     )
     .unwrap()
-    .mount(routes![create_widget, list_widgets, widget_feed])
+    .mount(routes![
+        create_widget,
+        list_widgets,
+        get_org_widget,
+        widget_feed
+    ])
     .mount_jobs(jobs![Ping])
     .schedule("ping-hourly", Duration::from_secs(3600), || Ping { n: 0 })
 }
@@ -202,6 +225,33 @@ const GOLDEN: &str = r#"{
     },
     {
       "method": "GET",
+      "pattern": "/orgs/:org/widgets/:id",
+      "name": "get_org_widget",
+      "auth": false,
+      "stream": false,
+      "params": [
+        {
+          "name": "org",
+          "schema": "String"
+        },
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Widget"
+          }
+        }
+      ],
+      "request": null,
+      "response": {
+        "Ref": "WidgetView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
+    },
+    {
+      "method": "GET",
       "pattern": "/widgets/feed",
       "name": "widget_feed",
       "auth": false,
@@ -219,41 +269,14 @@ const GOLDEN: &str = r#"{
     {
       "name": "ApiError",
       "schema": {
-        "Enum": {
-          "External": {
-            "variants": [
-              [
-                "BadRequest",
-                "String"
-              ],
-              [
-                "Unauthorized",
-                null
-              ],
-              [
-                "UnrecognizedCredential",
-                null
-              ],
-              [
-                "SessionExpired",
-                null
-              ],
-              [
-                "Oidc",
-                {
-                  "Ref": "OidcReject"
-                }
-              ],
-              [
-                "NotFound",
-                null
-              ],
-              [
-                "Internal",
-                "String"
-              ]
-            ]
-          }
+        "Struct": {
+          "fields": [
+            {
+              "name": "error",
+              "schema": "String",
+              "optional": false
+            }
+          ]
         }
       }
     },
@@ -272,75 +295,6 @@ const GOLDEN: &str = r#"{
               "optional": false
             }
           ]
-        }
-      }
-    },
-    {
-      "name": "OidcReject",
-      "schema": {
-        "Enum": {
-          "External": {
-            "variants": [
-              [
-                "Malformed",
-                "String"
-              ],
-              [
-                "UnsupportedAlg",
-                "String"
-              ],
-              [
-                "BadSignature",
-                null
-              ],
-              [
-                "Expired",
-                null
-              ],
-              [
-                "NotYetValid",
-                null
-              ],
-              [
-                "WrongIssuer",
-                {
-                  "Struct": {
-                    "fields": [
-                      {
-                        "name": "got",
-                        "schema": "String",
-                        "optional": false
-                      },
-                      {
-                        "name": "configured",
-                        "schema": "String",
-                        "optional": false
-                      }
-                    ]
-                  }
-                }
-              ],
-              [
-                "WrongAudience",
-                {
-                  "Struct": {
-                    "fields": [
-                      {
-                        "name": "got",
-                        "schema": "String",
-                        "optional": false
-                      },
-                      {
-                        "name": "configured",
-                        "schema": "String",
-                        "optional": false
-                      }
-                    ]
-                  }
-                }
-              ]
-            ]
-          }
         }
       }
     },
@@ -429,10 +383,40 @@ fn describe_is_deterministic_across_runs_and_reopens() {
     assert_eq!(a, b, "two fresh constructions must render byte-identical");
 }
 
+/// Fix round 1, F9: `to_human`'s new route line (`describe.rs:288-293`) had
+/// zero test coverage — "the human golden is pinned too" (the original
+/// brief's claim, deciding the `to_human` question) was false, and neither
+/// the implementer nor the controller checked. A `contains` on one known
+/// route's exact line is enough to catch a field being dropped, reordered,
+/// or renamed, without pinning the WHOLE human dump byte-for-byte the way
+/// `contract_json_shape_is_pinned` pins the JSON.
+#[test]
+fn to_human_pins_a_known_routes_type_line() {
+    let out = charpente::describe::to_human(&fixture_app().describe());
+    assert!(
+        out.contains(
+            "  POST /widgets name=create_widget auth=false stream=false\n    \
+             params=[] request=Some(Ref(\"CreateWidget\")) response=Ref(\"WidgetView\") \
+             error=Ref(\"ApiError\") emits=[]\n"
+        ),
+        "{out}"
+    );
+}
+
 /// Task 5, Ruling 24's shape: a route with a body names its request type,
 /// and both response and error are `Ref`s into `Contract.types` (not bare
 /// names — `Vec<T>`'s `WIRE_NAME` is `""`, so a name-only field can't
 /// describe a container response; see the next test).
+///
+/// **This is the test that actually pins Ruling 24** (fix round 1, F5): the
+/// `assert_eq!(r.response, TypeSchema::Ref("WidgetView"))` below is a
+/// SCALAR response, where `reference()` and `schema()` diverge —
+/// `reference()` returns `Ref("WidgetView")`, `schema()` would inline the
+/// whole struct. Swap `reference()` for `schema()` at the response position
+/// in `crates/charpente-macros/src/route.rs` and this assertion (and
+/// `contract_json_shape_is_pinned`) reddens. The next test's container case
+/// CANNOT discriminate the two (see its own doc comment) — that discovery
+/// is F5, measured against the exact mutation the original brief asked for.
 #[test]
 fn a_route_carries_its_request_and_response_types() {
     let app = fixture_app();
@@ -447,10 +431,24 @@ fn a_route_carries_its_request_and_response_types() {
     assert_eq!(r.error, TypeSchema::Ref("ApiError"));
 }
 
-/// The whole reason Ruling 24 exists: a `Vec<T>`-returning route's response
-/// must come back as `Seq(Ref(..))`, not `None`/inlined — a name-only field
-/// (the plan's original `response_name: &'static str`) cannot express this
-/// at all, because `Vec<T>`'s own `WIRE_NAME` is `""`.
+/// A `Vec<T>`-returning route's response must come back as `Seq(Ref(..))`,
+/// not `None`/inlined — a name-only field (the plan's original
+/// `response_name: &'static str`) cannot express this at all, because
+/// `Vec<T>`'s own `WIRE_NAME` is `""`.
+///
+/// **This does NOT discriminate `reference()` from `schema()`** (fix round
+/// 1, F5, measured): `Vec<T>::WIRE_NAME` is `""`, so `Vec<T>::reference()`
+/// falls through to `Vec<T>::schema()` — they are the same function for
+/// every container, so swapping `reference()` for `schema()` at the
+/// response position leaves this test GREEN. The scalar assertion in
+/// `a_route_carries_its_request_and_response_types` (above) is the test
+/// that carries Ruling 24. What this test DOES catch: changing
+/// `Vec<T>::schema()` to inline `T::schema()` instead of `T::reference()`
+/// reddens it — but that property is already pinned by
+/// `crates/charpente/tests/wire.rs`'s
+/// `fidelity_nested_and_vec_wrapped_named_types_match_serde`. Kept anyway
+/// as a direct pin on the container-response shape at the `RouteInfo`
+/// level, which that fidelity test does not touch.
 #[test]
 fn a_container_response_keeps_its_element_reference() {
     let app = fixture_app();
@@ -464,6 +462,56 @@ fn a_container_response_keeps_its_element_reference() {
     assert_eq!(r.error, TypeSchema::Ref("ApiError"));
 }
 
+/// Fix round 1, F10: `param_schema_entries` (`crates/charpente-macros/src/route.rs`)
+/// indexes `non_ctx[i]` by param position, and before this test no route
+/// anywhere in the workspace had two path params — so nothing pinned that
+/// `Route.params` comes back in PATH order (not alphabetical, e.g.) with
+/// each schema attached to the right name. `get_org_widget`'s two params
+/// have deliberately different schemas (`String` vs `Id("Widget")`) so a
+/// mix-up (schemas swapped between the two names) would show up here, not
+/// just a coincidental match.
+#[test]
+fn two_path_params_come_back_in_path_order_with_distinct_schemas() {
+    let app = fixture_app();
+    let c = app.describe();
+    let r = c
+        .routes
+        .iter()
+        .find(|r| r.name == "get_org_widget")
+        .unwrap();
+    assert_eq!(
+        r.params,
+        vec![
+            ParamInfo {
+                name: "org",
+                schema: TypeSchema::String,
+            },
+            ParamInfo {
+                name: "id",
+                schema: TypeSchema::Id("Widget"),
+            },
+        ],
+        "params must come back in the path's own order (:org before :id in \
+         \"/orgs/:org/widgets/:id\"), each with its own distinct schema"
+    );
+}
+
+/// `WidgetView`/`CreateWidget` reach the registry via `register_types`
+/// (direct: `create_widget`'s request and response) and `list_widgets`'s
+/// `register_types` reaches `WidgetView` by calling `Vec<WidgetView>::register`,
+/// which forwards into `WidgetView::register` (`Vec<T>`'s own `WIRE_NAME` is
+/// `""`, so it contributes no entry of its own) — the container wrapper
+/// does not stop the walk.
+///
+/// **`OidcReject` must NOT appear here** (fix round 1, F1): before the fix,
+/// `ApiError` derived `Wire` and its `Oidc(OidcReject)` variant put a
+/// `Ref("OidcReject")` in `ApiError::schema()`, so `ApiError::register()`
+/// recursed into it — even though no route names `OidcReject` directly, and
+/// even though the wire never actually carries that shape (see `ApiError`'s
+/// doc comment in `http/mod.rs`). `ApiError`'s hand-written schema now
+/// describes the `{"error": "<message>"}` envelope instead, which has no
+/// `Ref` to anything, so `register()` never reaches `OidcReject` and it
+/// correctly falls out of `Contract.types` entirely.
 #[test]
 fn the_contract_carries_the_transitive_type_closure() {
     let app = fixture_app();
@@ -474,12 +522,10 @@ fn the_contract_carries_the_transitive_type_closure() {
         names.contains(&"ApiError"),
         "the error type must be described too: {names:?}"
     );
-    // Transitive, not just direct: ApiError::Oidc wraps OidcReject, which
-    // no route names directly — it only reaches the registry by walking
-    // ApiError's own fields (ApiError::register()).
     assert!(
-        names.contains(&"OidcReject"),
-        "the closure must walk INTO ApiError, not just register it: {names:?}"
+        !names.contains(&"OidcReject"),
+        "ApiError's hand-written schema describes the envelope, which names \
+         no other type — OidcReject must not reach Contract.types: {names:?}"
     );
 }
 
@@ -501,9 +547,11 @@ fn the_type_list_is_sorted_so_generation_is_deterministic() {
     let c = app.describe();
     let names: Vec<&str> = c.types.iter().map(|t| t.name).collect();
     assert!(
-        names.len() >= 4,
-        "the floor: at least the four types this fixture's routes reach \
-         (transitively, via ApiError -> OidcReject) — got {names:?}"
+        names.len() >= 3,
+        "the floor: at least the three types this fixture's routes reach \
+         (WidgetView, CreateWidget, ApiError — OidcReject is deliberately \
+         NOT among them since fix round 1's F1, see the previous test) — \
+         got {names:?}"
     );
     let mut sorted = names.clone();
     sorted.sort_unstable();

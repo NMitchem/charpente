@@ -1011,14 +1011,29 @@ Charpente treats the coding agent as the primary developer persona:
   walk of a mounted app's own registries — no disk writes beyond an ephemeral run's own
   temp store, no socket, no kernel loop. It returns a `Contract`: tables (name, version,
   structural fingerprint, indexes, migration chain), routes (method, pattern, name,
-  whether it requires auth, whether it's an SSE stream), jobs (name, retry policy), cron
+  whether it requires auth, whether it's an SSE stream, **plus, since the TS-client-codegen
+  work: `params` — each path param's name and wire schema (`ParamInfo { name,
+  schema: TypeSchema }`); `request` — the JSON body's schema, `None` for a bodyless route;
+  `response` and `error` — the success and `ApiError` schemas every handler's `Result<T,
+  ApiError>` carries; and `emits` — the event names a stream route declares via
+  `emits(...)`, empty until that mechanism lands**), jobs (name, retry policy), cron
   (name, interval), and config, each serialized in registry order (routes/jobs/cron) or
   sorted-name order (tables — `Db::describe_tables`'s `BTreeMap` walk); field order is
-  part of the pinned shape. A `builtin: bool` on each table/job/cron entry marks the
-  platform's own surface (`Session`, `ApiKey`, the internal job/event/schema-version
-  tables, the session-sweep job and its cron entry) apart from the app's, keyed on each
-  row's own `TABLE`/`NAME` const rather than a typed-in string list. `to_json`/`to_human`
-  render it as pretty JSON or fixed-width text. Two entry points ship it:
+  part of the pinned shape. `Contract` also carries **`types: Vec<TypeDef>`** — the
+  transitive closure of every NAMED wire type a route's params/request/response/error
+  reference (a `TypeRegistry` walk, `BTreeMap`-sorted by wire name so generation stays
+  deterministic — spec §4); an anonymous type (a primitive, `Vec<T>`, `Option<T>`)
+  contributes no entry of its own, only whatever named type it wraps. `ApiError` is
+  always one such entry, and its schema describes the fixed `{"error": "<message>"}`
+  envelope `Response::error` actually emits on the wire — not `ApiError`'s own Rust
+  variant shape, which no client ever receives (a hand-written `Wire` impl, not the
+  derive `#[table]`/`#[route]` types otherwise get). A `builtin: bool` on each table/job/cron
+  entry marks the platform's own surface (`Session`, `ApiKey`, the internal
+  job/event/schema-version tables, the session-sweep job and its cron entry) apart from
+  the app's, keyed on each row's own `TABLE`/`NAME` const rather than a typed-in string
+  list. `to_json`/`to_human` render it as pretty JSON or fixed-width text (`to_human`'s
+  route line renders `params`/`request`/`response`/`error`/`emits` too, via `Debug`).
+  Two entry points ship it:
   `charpente::launch(addr, data_dir, build)` is the standard app `fn main` — argv
   dispatch owned by the platform instead of hand-rolled per app, so `describe` is free
   the moment an app adopts it (no verb still serves, as a hand-rolled `main` would;
@@ -1033,8 +1048,10 @@ Charpente treats the coding agent as the primary developer persona:
   live server's real data. Event *types* are deliberately not enumerated here in v0:
   `tx.emit`/`tx.emit_keyed` names are compiled into each `#[route(SSE …)]` handler's
   `Subscription` at the call site, not registered anywhere an app-wide registry walk
-  could discover ahead of time (ruling 6, sub-project 6 spec) — the contract reports only
-  whether a route streams (`stream: true`), not what it emits.
+  could discover ahead of time (ruling 6, sub-project 6 spec) — a stream route's `emits`
+  field exists in the contract (`stream: true` marks it, `RouteInfo.emits: Vec<&'static
+  str>` is the field an eventual `emits(...)` declaration will populate) but stays empty
+  today, so the contract still reports only that a route streams, not what it emits.
 - **Errors are prompts.** Compile-time and sim-failure output is structured for machine
   consumption: the exact contract violated, the file/line, the seed and fault schedule for
   sim failures, and the minimal repro command. Error quality is a feature with a test suite.

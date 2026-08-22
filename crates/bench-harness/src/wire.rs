@@ -319,10 +319,21 @@ fn read_server_syncs(addr: &str) -> Option<u64> {
     if status != 200 {
         return None;
     }
-    // `syncs` (lib.rs) returns `WireU64` (task 5): a 64-bit integer is
-    // ALWAYS string-encoded on the wire, so the body is the JSON string
-    // `"1234"`, not the bare number `1234` — strip the quotes before parsing.
-    std::str::from_utf8(&body)
+    parse_syncs_body(&body)
+}
+
+/// `syncs` (`lib.rs`) returns `WireU64` (task 5): a 64-bit integer is ALWAYS
+/// string-encoded on the wire, so the body is the JSON string `"1234"`, not
+/// the bare number `1234` — strip the quotes before parsing. Split out of
+/// `read_server_syncs` (fix round 1, F11) so this parse is unit-testable
+/// without the network round trip: unfixed, a parse failure here returns
+/// `None`, and the caller (`sweep_point`, above) silently falls back to a
+/// DERIVED sync-rate estimate with `syncs_counted: false` — plausible-looking
+/// numbers with a downgraded fsync provenance, the exact hazard CLAUDE.md
+/// warns about. `#[ignore]`d syscall tests (`bench-harness/tests/harness.rs`)
+/// don't run under the default `cargo test --workspace` gate; this does.
+fn parse_syncs_body(body: &[u8]) -> Option<u64> {
+    std::str::from_utf8(body)
         .ok()?
         .trim()
         .trim_matches('"')
@@ -513,4 +524,28 @@ pub fn point_dir(target: &str, conns: usize) -> String {
     ));
     std::fs::create_dir_all(&dir).expect("scratch dir creates");
     dir.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_syncs_body;
+
+    #[test]
+    fn parse_syncs_body_strips_the_wire_u64_quotes() {
+        assert_eq!(parse_syncs_body(b"\"1234\""), Some(1234));
+    }
+
+    #[test]
+    fn parse_syncs_body_tolerates_trailing_whitespace() {
+        assert_eq!(parse_syncs_body(b"\"1234\"\n"), Some(1234));
+        assert_eq!(parse_syncs_body(b"  \"1234\"  "), Some(1234));
+    }
+
+    #[test]
+    fn parse_syncs_body_rejects_non_numeric_bodies() {
+        assert_eq!(parse_syncs_body(b"\"not-a-number\""), None);
+        assert_eq!(parse_syncs_body(b""), None);
+        assert_eq!(parse_syncs_body(b"null"), None);
+        assert_eq!(parse_syncs_body(&[0xff, 0xfe]), None, "invalid UTF-8");
+    }
 }

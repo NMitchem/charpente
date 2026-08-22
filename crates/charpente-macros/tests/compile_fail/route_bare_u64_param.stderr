@@ -1,0 +1,18 @@
+error[E0277]: `u64` cannot cross the wire
+  --> tests/compile_fail/route_bare_u64_param.rs:14:40
+   |
+14 | fn handler(tx: &mut charpente::Tx, id: u64) -> Result<(), charpente::http::ApiError> {
+   |                                        ^^^ no `Wire` impl for `u64`
+   |
+   = help: the trait `Wire` is not implemented for `u64`
+   = note: if this is `u64` or `i64`: values above 2^53 lose precision in JavaScript clients, silently — use `Id<T>` for a row id, or `WireU64`/`WireI64` to carry it as a string
+   = note: otherwise: add `#[derive(Wire)]` to `u64`
+   = help: the following other types implement trait `Wire`:
+             f32
+             f64
+             i16
+             i32
+             i8
+             u16
+             u32
+             u8

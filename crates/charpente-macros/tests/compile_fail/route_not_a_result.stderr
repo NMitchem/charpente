@@ -1,0 +1,5 @@
+error: a #[route] handler must return Result<T, E> — got `String`; the client needs both the success and error types to generate a typed result, so write `-> Result<YourResponseType, ApiError>`
+ --> tests/compile_fail/route_not_a_result.rs:9:39
+  |
+9 | fn handler(tx: &mut charpente::Tx) -> String {
+  |                                       ^^^^^^

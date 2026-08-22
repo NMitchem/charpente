@@ -404,41 +404,14 @@ const GOLDEN: &str = r#"{
     {
       "name": "ApiError",
       "schema": {
-        "Enum": {
-          "External": {
-            "variants": [
-              [
-                "BadRequest",
-                "String"
-              ],
-              [
-                "Unauthorized",
-                null
-              ],
-              [
-                "UnrecognizedCredential",
-                null
-              ],
-              [
-                "SessionExpired",
-                null
-              ],
-              [
-                "Oidc",
-                {
-                  "Ref": "OidcReject"
-                }
-              ],
-              [
-                "NotFound",
-                null
-              ],
-              [
-                "Internal",
-                "String"
-              ]
-            ]
-          }
+        "Struct": {
+          "fields": [
+            {
+              "name": "error",
+              "schema": "String",
+              "optional": false
+            }
+          ]
         }
       }
     },
@@ -637,75 +610,6 @@ const GOLDEN: &str = r#"{
               "optional": false
             }
           ]
-        }
-      }
-    },
-    {
-      "name": "OidcReject",
-      "schema": {
-        "Enum": {
-          "External": {
-            "variants": [
-              [
-                "Malformed",
-                "String"
-              ],
-              [
-                "UnsupportedAlg",
-                "String"
-              ],
-              [
-                "BadSignature",
-                null
-              ],
-              [
-                "Expired",
-                null
-              ],
-              [
-                "NotYetValid",
-                null
-              ],
-              [
-                "WrongIssuer",
-                {
-                  "Struct": {
-                    "fields": [
-                      {
-                        "name": "got",
-                        "schema": "String",
-                        "optional": false
-                      },
-                      {
-                        "name": "configured",
-                        "schema": "String",
-                        "optional": false
-                      }
-                    ]
-                  }
-                }
-              ],
-              [
-                "WrongAudience",
-                {
-                  "Struct": {
-                    "fields": [
-                      {
-                        "name": "got",
-                        "schema": "String",
-                        "optional": false
-                      },
-                      {
-                        "name": "configured",
-                        "schema": "String",
-                        "optional": false
-                      }
-                    ]
-                  }
-                }
-              ]
-            ]
-          }
         }
       }
     }

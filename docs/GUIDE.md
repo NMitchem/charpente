@@ -572,16 +572,23 @@ decodes, and dispatches to it:
 - The first argument must be named exactly `tx`, typed `&mut Tx`.
 - Then one argument per `:param` in the path, **in path order**, each named
   exactly like its param (`:id` needs an argument named `id`). Its type
-  must implement `FromParam` — `u64`, `String`, and `Id<T>` (any `T`) are
-  provided; a bad path segment fails as a named 400, not a panic.
-- Then at most one JSON body argument, of any owned deserializable type
-  (`serde::de::DeserializeOwned` — the glue's actual bound); a type
-  borrowing from the input won't compile.
+  must implement **both** `FromParam` (parses the path segment; a bad one
+  fails as a named 400, not a panic) **and** `Wire` (§13 — the client needs
+  a schema for it too). `String` and `Id<T>` (any `T`) satisfy both. `u64`
+  implements `FromParam` but not `Wire` — a bare `u64` path param is a
+  compile error naming the fix (`Id<T>` for a row id, or `WireU64`); use
+  `Id<T>` for a row id.
+- Then at most one JSON body argument, of any type that is both an owned
+  deserializable AND `Wire` (`serde::de::DeserializeOwned + Wire` — the
+  glue's actual bound); a type borrowing from the input won't compile, and
+  neither will one missing `#[derive(Wire)]`.
 - Then, optionally, a trailing argument named exactly `ctx`, typed `&Ctx`
   (session access — see Sessions below).
 
-The handler returns `Result<T, ApiError>` where `T: serde::Serialize`; on
-`Ok`, the glue emits `Response::json(200, &value)`.
+The handler returns `Result<T, ApiError>` where `T: serde::Serialize + Wire`
+— the `Result<_, _>` shape itself is enforced too, and named (a bare return
+value is a compile error naming the fix, `-> Result<YourResponseType,
+ApiError>`); on `Ok`, the glue emits `Response::json(200, &value)`.
 
 ```rust
 use charpente::core::table::Id;
@@ -644,9 +651,9 @@ identifiers in scope — `routes![handlers::create_note]` works exactly like
 
 ### Returning rows from a route: storage shape vs. wire shape
 
-A handler's return type only needs `T: serde::Serialize` (above) — nothing
-requires `T` to be a `#[table]` row, and `#[table]` does not derive
-`Serialize` for you: a row's storage shape (`Id<T>`'s own `Codec`, §2) and
+A handler's return type only needs `T: serde::Serialize + Wire` (above) —
+nothing requires `T` to be a `#[table]` row, and `#[table]` does not derive
+`Serialize` or `Wire` for you: a row's storage shape (`Id<T>`'s own `Codec`, §2) and
 its wire shape are separate concerns on purpose, kept apart even though
 `Id<T>` also implements `Serialize`/`Deserialize` — as a decimal string,
 never a JSON number, because `u64` values above 2^53 lose precision
@@ -3468,10 +3475,14 @@ never wrapped in a framework message.
 ### The invoicing contract
 
 The full JSON `examples/invoicing` renders — 12 routes across customers, invoices, and
-API keys; 8 named types reachable from those routes' params, request, and response
+API keys; 7 named types reachable from those routes' params, request, and response
 schemas (`ApiError`, `CreateCustomerBody`, `CreateInvoiceBody`, `CustomerView`,
-`InvoiceView`, `LineItemInput`, `LineItemView`, `OidcReject`, alphabetized in `"types"`
-regardless of route registration order — §5's `register_types` walk); 4 jobs (3 of the
+`InvoiceView`, `LineItemInput`, `LineItemView`, alphabetized in `"types"`
+regardless of route registration order — §5's `register_types` walk). `ApiError`'s own
+schema is the fixed `{"error": "<message>"}` envelope every route's error response
+actually carries — not a per-variant union of its Rust shape, and not `OidcReject`
+(which `ApiError::Oidc` wraps at the Rust level but never puts on the wire, so it does
+not appear in `"types"` at all; see "`ApiError` and status mapping" below); 4 jobs (3 of the
 app's own plus the platform's built-in session sweep); 2 cron entries (the app's daily
 overdue-check plus the platform's built-in session sweep schedule); 13 tables (7 of the
 app's own plus 6 platform tables: `Session`, `ApiKey`, `CronRow`, and the three untyped
@@ -3855,41 +3866,14 @@ memorizing a list:
     {
       "name": "ApiError",
       "schema": {
-        "Enum": {
-          "External": {
-            "variants": [
-              [
-                "BadRequest",
-                "String"
-              ],
-              [
-                "Unauthorized",
-                null
-              ],
-              [
-                "UnrecognizedCredential",
-                null
-              ],
-              [
-                "SessionExpired",
-                null
-              ],
-              [
-                "Oidc",
-                {
-                  "Ref": "OidcReject"
-                }
-              ],
-              [
-                "NotFound",
-                null
-              ],
-              [
-                "Internal",
-                "String"
-              ]
-            ]
-          }
+        "Struct": {
+          "fields": [
+            {
+              "name": "error",
+              "schema": "String",
+              "optional": false
+            }
+          ]
         }
       }
     },
@@ -4088,75 +4072,6 @@ memorizing a list:
               "optional": false
             }
           ]
-        }
-      }
-    },
-    {
-      "name": "OidcReject",
-      "schema": {
-        "Enum": {
-          "External": {
-            "variants": [
-              [
-                "Malformed",
-                "String"
-              ],
-              [
-                "UnsupportedAlg",
-                "String"
-              ],
-              [
-                "BadSignature",
-                null
-              ],
-              [
-                "Expired",
-                null
-              ],
-              [
-                "NotYetValid",
-                null
-              ],
-              [
-                "WrongIssuer",
-                {
-                  "Struct": {
-                    "fields": [
-                      {
-                        "name": "got",
-                        "schema": "String",
-                        "optional": false
-                      },
-                      {
-                        "name": "configured",
-                        "schema": "String",
-                        "optional": false
-                      }
-                    ]
-                  }
-                }
-              ],
-              [
-                "WrongAudience",
-                {
-                  "Struct": {
-                    "fields": [
-                      {
-                        "name": "got",
-                        "schema": "String",
-                        "optional": false
-                      },
-                      {
-                        "name": "configured",
-                        "schema": "String",
-                        "optional": false
-                      }
-                    ]
-                  }
-                }
-              ]
-            ]
-          }
         }
       }
     }

@@ -76,7 +76,7 @@ pub struct RouteInfo {
     pub emits: Vec<&'static str>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 pub struct ParamInfo {
     pub name: &'static str,
     pub schema: TypeSchema,
@@ -273,22 +273,26 @@ pub fn to_human(c: &Contract) -> String {
             r.method, r.pattern, r.name, r.auth, r.stream
         )
         .unwrap();
-        // Task 5: a route's type info (params/request/response/error) is
-        // included here, on its own indented line, rather than left JSON-only
-        // — `to_human` exists to be a complete agent-readable contract dump,
-        // and a route's types are now as central to what it IS as its
-        // method/pattern. `Debug` formatting (not a bespoke renderer): boring
-        // on purpose, matching this function's existing style, and
-        // `TypeSchema` has no `Display`. What is deliberately NOT here: the
-        // full `Contract.types` closure catalog — that belongs to the JSON
-        // format (structured, and consumed by the TS emitter, not skimmed by
-        // a human), and dumping every named type's full expansion inline
-        // per-route would work against this format's "boring, fixed-width"
-        // design intent for an app with many routes/types.
+        // Task 5: a route's type info (params/request/response/error/emits)
+        // is included here, on its own indented line, rather than left
+        // JSON-only — `to_human` exists to be a complete agent-readable
+        // contract dump, and a route's types are now as central to what it
+        // IS as its method/pattern. `emits` is included too (fix round 1,
+        // F9): it was omitted at first, which contradicted this same
+        // "complete contract dump" rationale — `RouteInfo` carries it and
+        // the JSON prints it, so the human dump must too. `Debug` formatting
+        // (not a bespoke renderer): boring on purpose, matching this
+        // function's existing style, and `TypeSchema` has no `Display`.
+        // What is deliberately NOT here: the full `Contract.types` closure
+        // catalog — that belongs to the JSON format (structured, and
+        // consumed by the TS emitter, not skimmed by a human), and dumping
+        // every named type's full expansion inline per-route would work
+        // against this format's "boring, fixed-width" design intent for an
+        // app with many routes/types.
         writeln!(
             out,
-            "    params={:?} request={:?} response={:?} error={:?}",
-            r.params, r.request, r.response, r.error
+            "    params={:?} request={:?} response={:?} error={:?} emits={:?}",
+            r.params, r.request, r.response, r.error, r.emits
         )
         .unwrap();
     }

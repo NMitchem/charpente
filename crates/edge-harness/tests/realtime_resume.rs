@@ -165,13 +165,15 @@ fn create_and_finalize_invoice(http: &mut Http, id: u64, customer: u64) -> Resul
 
 // ------------------------------------------------------------- pure parsing
 
-/// Extracts a `u64` field from a compact JSON object body. `ReceiptSent`'s
-/// wire shape is `{"invoice":N,"amount_cents":M}` — a bare `#[event]`
-/// payload field, unaffected by task 5's `Wire` migration. `InvoiceFinalized`'s
-/// `invoice` is `Id<Invoice>` (task 5): `Id<T>` always crosses as a quoted
-/// decimal string, so its shape is `{"invoice":"N"}` — one optional leading
-/// `"` is stripped before the digit scan to read either shape; field order
-/// and presence are never in doubt here, so this stays a scan, not a parser.
+/// Extracts a `u64` field from a compact JSON object body. Both
+/// `InvoiceFinalized` and `ReceiptSent` (task 5 fix round 1, F7 — the two
+/// disagreed before this fix) name their `invoice` field `Id<Invoice>`,
+/// which always crosses the wire as a quoted decimal string, so the shape
+/// this scans is `{"invoice":"N", ...}` — one optional leading `"` is
+/// stripped before the digit scan (kept optional so this also tolerates a
+/// bare-number shape, matching this function's pre-task-5 behavior and any
+/// other bare-`u64` field a caller might point it at). Field order and
+/// presence are never in doubt here, so this stays a scan, not a parser.
 /// This crate has no JSON dependency, matching `acked_durable.rs`'s
 /// `extract_field`.
 fn extract_u64_field(json: &str, key: &str) -> Option<u64> {

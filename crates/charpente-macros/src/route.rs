@@ -305,26 +305,30 @@ fn result_arg(out: &ReturnType, idx: usize) -> syn::Result<syn::Type> {
         return Err(Error::new_spanned(
             out,
             "a #[route] handler must return Result<T, E> — a bare value has no error type \
-             for the generated client to model",
+             for the generated client to model; write `-> Result<YourResponseType, ApiError>`",
         ));
     };
     let syn::Type::Path(p) = &**ty else {
         return Err(Error::new_spanned(
             ty,
-            "a #[route] handler must return Result<T, E>",
+            "a #[route] handler must return Result<T, E> — this return type isn't one; write \
+             `-> Result<YourResponseType, ApiError>`",
         ));
     };
-    let seg = p
-        .path
-        .segments
-        .last()
-        .ok_or_else(|| Error::new_spanned(ty, "a #[route] handler must return Result<T, E>"))?;
+    let seg = p.path.segments.last().ok_or_else(|| {
+        Error::new_spanned(
+            ty,
+            "a #[route] handler must return Result<T, E> — write \
+             `-> Result<YourResponseType, ApiError>`",
+        )
+    })?;
     if seg.ident != "Result" {
         return Err(Error::new_spanned(
             ty,
             format!(
                 "a #[route] handler must return Result<T, E> — got `{}`; the client needs both \
-                 the success and error types to generate a typed result",
+                 the success and error types to generate a typed result, so write \
+                 `-> Result<YourResponseType, ApiError>`",
                 seg.ident
             ),
         ));
@@ -332,7 +336,8 @@ fn result_arg(out: &ReturnType, idx: usize) -> syn::Result<syn::Type> {
     let PathArguments::AngleBracketed(args) = &seg.arguments else {
         return Err(Error::new_spanned(
             ty,
-            "a #[route] handler must return Result<T, E>",
+            "a #[route] handler must return Result<T, E> — write \
+             `-> Result<YourResponseType, ApiError>` with both type arguments explicit",
         ));
     };
     match args
@@ -348,7 +353,8 @@ fn result_arg(out: &ReturnType, idx: usize) -> syn::Result<syn::Type> {
         None => Err(Error::new_spanned(
             ty,
             "a #[route] handler's Result must name both type arguments explicitly — a type \
-             alias that hides the error type leaves the client with nothing to model",
+             alias that hides the error type leaves the client with nothing to model; write \
+             `-> Result<YourResponseType, ApiError>`",
         )),
     }
 }
