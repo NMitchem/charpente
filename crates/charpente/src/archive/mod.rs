@@ -76,9 +76,13 @@ pub struct ArchiveConfig {
     /// object-store outage. **Unused this task** (ruling 23 carry-forward):
     /// Task 5's pin is unbounded by design; the bound lands at Task 7.
     pub pin_segments: usize,
-    /// Bounds one `Db::read_log` call's allocation while shipping a
-    /// segment — never a `SegmentRef`'s span (ruling 29). Default 8 MiB:
-    /// at the 64 MiB production `WalConfig::segment_bytes` that's 8
+    /// Bounds `Db::read_log`'s PAYLOAD accounting for one call while
+    /// shipping a segment (`bytes += flen`, log.rs:349) — never a
+    /// `SegmentRef`'s span (ruling 29), and not the buffer allocation:
+    /// `step_reading`'s own re-framed `buf` carries an additional
+    /// `HEADER_BYTES` (16) per frame on top of the payload, so one `step`
+    /// can allocate somewhat more than this bound, never less. Default
+    /// 8 MiB: at the 64 MiB production `WalConfig::segment_bytes` that's 8
     /// `step`s per segment, so no single `step` reads the whole 64 MiB —
     /// which matters once `step` becomes a kernel arm (Task 9), where a
     /// long step is a stalled kernel. Smaller means more steps per
@@ -268,7 +272,7 @@ impl Archive {
         // the segment anyway is still safe (step_reading below can never
         // produce a short SegmentRef either way — see its doc), but this
         // avoids the futile reads.
-        if seg.layout_end > db.last_applied().unwrap_or(0) {
+        if db.last_applied().is_none_or(|l| seg.layout_end > l) {
             // Holding, NOT releasing (M1): this arm has just identified
             // the segment the archive needs; telling retention it holds
             // nothing would invite GC to delete it.

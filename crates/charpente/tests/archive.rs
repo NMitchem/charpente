@@ -7,6 +7,7 @@
 //! (ruling 31), so each one is a real, working helper — not a name the
 //! plan merely announced.
 
+use std::cell::Cell;
 use std::io;
 
 use charpente::archive::manifest::{Manifest, manifest_key};
@@ -46,7 +47,80 @@ const FIRST_SEGMENT_RECORDS: u64 = RECORDS_PER_SEGMENT - 1;
 
 // ------------------------------------------------------------- fixtures
 
-fn build_fixture(store: SimObjectStore, read_budget_bytes: usize) -> (Db, SimObjectStore, Archive) {
+/// Wraps a `SimObjectStore`, adding two live switches this repo's own fault
+/// matrix cannot give a test (task-5-review.md m5/m7): `SimObjectStore`'s
+/// `FaultConfig` is fixed at construction with no public way to reverse it,
+/// and `crates/charpente-sim/src/object.rs` is off-limits this task
+/// (Ruling 37, deferred to a later whole-branch review) — so a *reversible*
+/// PUT/GET outage has to live here instead. Same idiom as the hand-rolled
+/// `Disk` wrappers in `charpente/tests/group_commit.rs` (`FaultyTracingDisk`
+/// et al.): delegate to `inner` for everything the switch doesn't touch, so
+/// this stays byte-identical to a plain `SimObjectStore` on every other
+/// path.
+///
+/// `reachable = false` fails `start` before it ever reaches `inner` — no op
+/// goes "in flight" on the inner store, so a subsequent `start` retry after
+/// `reachable` flips back to `true` is a clean first attempt, never a
+/// double-start (`SimObjectStore::start` asserts against exactly that).
+///
+/// `start_errors = true` is independent of `reachable`: it makes
+/// `ObjectStore::start`'s `Err` arm reachable at all (m7) — `SimObjectStore`
+/// itself never fails `start`, only `poll`, so `Archive::step_uploading_
+/// segment`'s and `step_uploading_manifest`'s `Err(e)` arms on the `start`
+/// call have no oracle without it.
+struct FlakyStore {
+    inner: SimObjectStore,
+    reachable: Cell<bool>,
+    start_errors: Cell<bool>,
+}
+
+impl FlakyStore {
+    fn new(inner: SimObjectStore) -> FlakyStore {
+        FlakyStore {
+            inner,
+            reachable: Cell::new(true),
+            start_errors: Cell::new(false),
+        }
+    }
+
+    fn set_reachable(&self, reachable: bool) {
+        self.reachable.set(reachable);
+    }
+
+    fn set_start_errors(&self, fail: bool) {
+        self.start_errors.set(fail);
+    }
+
+    /// Test-only inspection, delegated straight through — same contract as
+    /// `SimObjectStore::keys`.
+    fn keys(&self) -> Vec<String> {
+        self.inner.keys()
+    }
+}
+
+impl ObjectStore for FlakyStore {
+    fn start(&self, op: ObjectOp) -> io::Result<()> {
+        if !self.reachable.get() {
+            return Err(io::Error::other(
+                "simulated FlakyStore outage: start refused because the store is unreachable \
+                 (test-local switch — flips back via restore_store_reachability)",
+            ));
+        }
+        if self.start_errors.get() {
+            return Err(io::Error::other(
+                "simulated FlakyStore start failure: start refused by the test's start_errors \
+                 switch",
+            ));
+        }
+        self.inner.start(op)
+    }
+
+    fn poll(&self) -> Option<io::Result<ObjectDone>> {
+        self.inner.poll()
+    }
+}
+
+fn build_fixture<S>(store: S, read_budget_bytes: usize) -> (Db, S, Archive) {
     let sim = Sim::with_faults(0x6172_6368_5f74_3500, FaultConfig::none());
     let mut db_cfg = DbConfig::default();
     db_cfg.wal.segment_bytes = 64 << 10;
@@ -78,16 +152,25 @@ fn archive_fixture() -> (Db, SimObjectStore, Archive) {
     build_fixture(SimObjectStore::new(), 8 << 20)
 }
 
-fn archive_fixture_with_unreachable_store() -> (Db, SimObjectStore, Archive) {
-    let cfg = FaultConfig {
-        object_put_error: 1.0,
-        object_get_error: 1.0,
-        ..Default::default()
-    };
-    build_fixture(
-        SimObjectStore::with_faults(0x756e_5265_6163_0000, cfg),
-        8 << 20,
-    )
+/// Starts UNREACHABLE (m5): every earlier revision of this fixture used
+/// `SimObjectStore::with_faults(..., object_put_error: 1.0, ...)`, a fault
+/// that cannot be reversed through `SimObjectStore`'s public API without
+/// touching `object.rs` (off-limits, Ruling 37) — so `restore_store_
+/// reachability` could not genuinely restore it and shipped as a panic
+/// stub. `FlakyStore`'s `reachable` switch is a real, reversible outage.
+fn archive_fixture_with_unreachable_store() -> (Db, FlakyStore, Archive) {
+    let store = FlakyStore::new(SimObjectStore::new());
+    store.set_reachable(false);
+    build_fixture(store, 8 << 20)
+}
+
+/// Starts reachable, with `start_errors` on (m7): makes `ObjectStore::
+/// start`'s `Err` arm reachable, which `SimObjectStore` itself can never
+/// produce (it only ever fails `poll`).
+fn archive_fixture_with_start_errors() -> (Db, FlakyStore, Archive) {
+    let store = FlakyStore::new(SimObjectStore::new());
+    store.set_start_errors(true);
+    build_fixture(store, 8 << 20)
 }
 
 fn archive_fixture_with_lost_acks() -> (Db, SimObjectStore, Archive) {
@@ -125,9 +208,11 @@ fn write_records(db: &mut Db, n: u64) {
 /// Bounded, never a panic on timeout: some fixtures (an unreachable store,
 /// a permanently lost-ack store) never catch up by design, and those tests
 /// want the bounded progress this makes, not a failure. 10,000 steps is
-/// generous next to the ~300-step worst case in this file (the tiny-budget
-/// fixture reading three ~1365-record segments a few records at a time).
-fn step_until_idle(arc: &mut Archive, db: &Db, store: &SimObjectStore) {
+/// generous next to the measured ~529-step worst case in this file (the
+/// tiny-budget fixture reading three ~1365-record segments a few records at
+/// a time, `read_budget_bytes = 256` against a steady-state 48-byte frame:
+/// measured directly, not estimated — see task-5-fix-r2-report.md).
+fn step_until_idle(arc: &mut Archive, db: &Db, store: &dyn ObjectStore) {
     for _ in 0..10_000 {
         let _ = arc.step(db, store);
         if arc.idle() {
@@ -154,7 +239,7 @@ fn step_until_idle_counting(arc: &mut Archive, db: &Db, store: &SimObjectStore) 
 /// erroring means the fixture doesn't fault the way the caller expected,
 /// so this one panics rather than returning nothing a caller could
 /// silently misread as "no error occurred".
-fn step_until_error(arc: &mut Archive, db: &Db, store: &SimObjectStore) -> io::Error {
+fn step_until_error(arc: &mut Archive, db: &Db, store: &dyn ObjectStore) -> io::Error {
     for _ in 0..10_000 {
         if let Err(e) = arc.step(db, store) {
             return e;
@@ -169,7 +254,7 @@ fn step_until_error(arc: &mut Archive, db: &Db, store: &SimObjectStore) -> io::E
 /// terminal notice (e.g. a foreign-writer manifest, spec §4); Task 5's
 /// `Archive` makes no such distinction yet, so this is `step_until_error`
 /// in substance until it does.
-fn step_until_notice(arc: &mut Archive, db: &Db, store: &SimObjectStore) -> io::Error {
+fn step_until_notice(arc: &mut Archive, db: &Db, store: &dyn ObjectStore) -> io::Error {
     step_until_error(arc, db, store)
 }
 
@@ -190,7 +275,7 @@ fn current_tail_base_seq(db: &Db) -> u64 {
         .map_or(0, |s| s.layout_end + 1)
 }
 
-fn drain(store: &SimObjectStore) -> io::Result<ObjectDone> {
+fn drain(store: &dyn ObjectStore) -> io::Result<ObjectDone> {
     for _ in 0..10_000 {
         if let Some(r) = store.poll() {
             return r;
@@ -199,7 +284,7 @@ fn drain(store: &SimObjectStore) -> io::Result<ObjectDone> {
     panic!("drain: ObjectStore::poll returned None 10,000 times in a row — stuck in flight");
 }
 
-fn read_manifest(store: &SimObjectStore) -> Option<Manifest> {
+fn read_manifest(store: &dyn ObjectStore) -> Option<Manifest> {
     store
         .start(ObjectOp::Get {
             key: manifest_key(PREFIX),
@@ -231,22 +316,16 @@ fn write_foreign_manifest(store: &SimObjectStore, writer: &str, generation: u64)
     drain(store).unwrap();
 }
 
-/// An addition this brief did not resolve (see task-5-report.md): under
-/// Ruling 37, `crates/charpente-sim/src/object.rs` is off-limits this task,
-/// but `SimObjectStore`'s `FaultConfig` is fixed at construction
-/// (`with_faults`) with no public setter, and `fail_next_put` is a one-shot
-/// single-failure toggle, not a persistent-reachability one. There is no
-/// way to flip a `with_faults(..., object_put_error: 1.0, ...)` store back
-/// to reachable through `SimObjectStore`'s current public API without
-/// touching object.rs. This fails loudly rather than silently doing
-/// nothing, so a future caller cannot mistake a no-op for a real recovery.
-fn restore_store_reachability(_store: &SimObjectStore) {
-    panic!(
-        "restore_store_reachability: SimObjectStore's FaultConfig is fixed at construction and \
-         object.rs is off-limits this task (Ruling 37) — there is no public API to reverse a \
-         persistent fault. This fixture cannot be implemented under Task 5's constraints; see \
-         task-5-report.md's brief-defect list before calling it."
-    );
+/// m5 (task-5-review.md): genuinely restores a `FlakyStore` that
+/// `archive_fixture_with_unreachable_store` started unreachable. An earlier
+/// revision of this fixture shipped as a panic stub — `SimObjectStore`'s own
+/// `FaultConfig` really cannot be reversed without touching the off-limits
+/// `object.rs` (Ruling 37) — but that was a defect in the fixture's chosen
+/// store, not a structural impossibility: `ObjectStore` is a public
+/// two-method trait, and `FlakyStore` above implements a real, reversible
+/// outage against it.
+fn restore_store_reachability(store: &FlakyStore) {
+    store.set_reachable(true);
 }
 
 // ----------------------------------------------------------------- tests
@@ -401,6 +480,115 @@ fn an_archive_io_failure_never_poisons_the_db() {
     write_records(&mut db, 10); // still writable
 }
 
+/// m5's core property (task-5-review.md): the whole reason `restore_store_
+/// reachability` is worth building for real. T6/T7 need exactly this —
+/// "the store comes back and the archive catches up" — so it must be proven
+/// at T5, not merely asserted possible.
+#[test]
+fn a_store_that_comes_back_lets_the_archive_catch_up() {
+    let (mut db, store, mut arc) = archive_fixture_with_unreachable_store();
+    write_records(&mut db, RECORDS_PER_SEGMENT + 50);
+    assert!(
+        sealed_segment_count(&db) >= 1,
+        "fixture sealed nothing; the rest is vacuous"
+    );
+
+    // While unreachable: no progress, but no fabricated completion and no
+    // poisoned Db either (an_archive_io_failure_never_poisons_the_db covers
+    // the poison half on its own; re-asserted here because it is the
+    // precondition this test's recovery half depends on).
+    for _ in 0..50 {
+        let _ = arc.step(&db, &store);
+    }
+    assert!(
+        store.keys().is_empty(),
+        "an unreachable store must never receive a PUT: {:?}",
+        store.keys()
+    );
+    assert!(
+        !db.poisoned(),
+        "an archive failure is not a database failure"
+    );
+
+    restore_store_reachability(&store);
+    step_until_idle(&mut arc, &db, &store);
+
+    let m = read_manifest(&store).expect("a manifest after the store came back");
+    let tail = current_tail_base_seq(&db);
+    assert_eq!(
+        m.segments.last().map(|s| s.end_seq + 1),
+        Some(tail),
+        "every sealed segment must land once the store comes back: manifest {:?}, tail base {tail}",
+        m.segments
+    );
+}
+
+/// m7 (task-5-review.md): `SimObjectStore::start` always returns `Ok`, so
+/// `step_uploading_segment`'s and `step_uploading_manifest`'s `Err(e)` arms
+/// on the `start` call have no oracle without `FlakyStore`'s `start_errors`
+/// switch. Covers both — the segment's own PUT and the manifest's — in one
+/// narrative: the first is the archive's very first `start` attempt (the
+/// switch starts on), the second is caught right as the archive transitions
+/// from `UploadingSegment` to `UploadingManifest` (the same `step` that
+/// lands the segment's PUT also makes that transition — mod.rs:412-441 —
+/// so the segment key appearing in the store IS that signal).
+#[test]
+fn start_errors_surface_from_both_the_segment_and_the_manifest_put() {
+    let (mut db, store, mut arc) = archive_fixture_with_start_errors();
+    write_records(&mut db, RECORDS_PER_SEGMENT + 50);
+
+    // Phase 1: step_uploading_segment's start Err arm. Idle->Reading and
+    // Reading->UploadingSegment never touch the store, so it is safe that
+    // the switch was already on before the very first step.
+    let e = step_until_error(&mut arc, &db, &store);
+    assert!(
+        e.to_string().contains("simulated FlakyStore start failure"),
+        "expected the start-refusal text, got: {e}"
+    );
+    assert!(
+        store.keys().is_empty(),
+        "a refused start must not have PUT anything: {:?}",
+        store.keys()
+    );
+
+    // Let the segment PUT actually land, then stop the instant it has.
+    store.set_start_errors(false);
+    for _ in 0..10_000 {
+        if store.keys().iter().any(|k| k.contains("/segments/")) {
+            break;
+        }
+        arc.step(&db, &store).unwrap();
+    }
+    assert!(
+        store.keys().iter().any(|k| k.contains("/segments/")),
+        "the segment never landed: {:?}",
+        store.keys()
+    );
+
+    // Phase 2: step_uploading_manifest's start Err arm.
+    store.set_start_errors(true);
+    let e = arc
+        .step(&db, &store)
+        .expect_err("start_errors must surface from step_uploading_manifest's start too");
+    assert!(
+        e.to_string().contains("simulated FlakyStore start failure"),
+        "expected the start-refusal text, got: {e}"
+    );
+    assert!(
+        !store.keys().iter().any(|k| k.contains("manifest")),
+        "a refused start must not have PUT the manifest: {:?}",
+        store.keys()
+    );
+
+    // Recovery: the archive still catches up once the switch flips back.
+    store.set_start_errors(false);
+    step_until_idle(&mut arc, &db, &store);
+    assert!(
+        read_manifest(&store).is_some(),
+        "the archive never caught up after start_errors cleared"
+    );
+}
+
 #[test]
 fn a_lost_ack_retry_uploads_the_same_bytes_and_does_not_duplicate() {
     let (mut db, store, mut arc) = archive_fixture_with_lost_acks();
@@ -441,12 +629,14 @@ fn the_seal_rate_stays_under_one_upload_per_step_budget() {
     let uploads = step_until_idle_counting(&mut arc, &db, &store);
     assert!(
         uploads >= seals,
-        "the archive shipped {uploads} of {seals} sealed segments. Two contracts can \
-         break here and they need different fixes: if uploads is 0 (or stalls at a fixed \
-         count) the RETENTION PIN released and `Wal::gc` removed the segment `next_base()` \
-         is waiting for (M1); if uploads merely trails seals under sustained load, \
-         one-in-flight is insufficient and `ArchiveConfig` needs a documented `in_flight` \
-         knob plus a BENCH.md entry"
+        "the archive shipped {uploads} of {seals} sealed segments (db.log_base()={}, \
+         arc.pin_floor()={}). Two contracts can break here and they need different fixes: if \
+         uploads is 0 (or stalls at a fixed count) the RETENTION PIN released and `Wal::gc` \
+         removed the segment `next_base()` is waiting for (M1); if uploads merely trails seals \
+         under sustained load, one-in-flight is insufficient and `ArchiveConfig` needs a \
+         documented `in_flight` knob plus a BENCH.md entry",
+        db.log_base(),
+        arc.pin_floor()
     );
 }
 
@@ -466,25 +656,20 @@ fn write_foreign_manifest_round_trips_through_read_manifest() {
     assert_eq!(m.generation, 7);
 }
 
+/// m6 (task-5-review.md): `!e.to_string().is_empty()` is vacuous — no
+/// `io::Error` can ever fail it — and the sibling test this collapses
+/// (`step_until_notice_surfaces_the_unreachable_stores_failure`) called
+/// `step_until_notice`, which is `step_until_error` in substance (its own
+/// doc), so the two bodies were identical bar the helper name. One test,
+/// calling `step_until_notice` so both fixture helpers stay exercised
+/// (Ruling 31), with a real assertion on the error text (hard rule 5).
 #[test]
 fn step_until_error_surfaces_the_unreachable_stores_failure() {
     let (mut db, store, mut arc) = archive_fixture_with_unreachable_store();
     write_records(&mut db, RECORDS_PER_SEGMENT + 50);
-    let e = step_until_error(&mut arc, &db, &store);
-    assert!(!e.to_string().is_empty());
-}
-
-#[test]
-#[should_panic(expected = "no public API to reverse a persistent fault")]
-fn restore_store_reachability_is_not_implementable_this_task() {
-    let store = SimObjectStore::new();
-    restore_store_reachability(&store);
-}
-
-#[test]
-fn step_until_notice_surfaces_the_unreachable_stores_failure() {
-    let (mut db, store, mut arc) = archive_fixture_with_unreachable_store();
-    write_records(&mut db, RECORDS_PER_SEGMENT + 50);
     let e = step_until_notice(&mut arc, &db, &store);
-    assert!(!e.to_string().is_empty());
+    assert!(
+        e.to_string().contains("FlakyStore outage"),
+        "expected the unreachable store's own failure text, got: {e}"
+    );
 }

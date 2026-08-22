@@ -14,8 +14,11 @@
 //! test in this crate.
 
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use charpente_core::db::{Db, DbConfig, Schema, TxError};
+use charpente_core::io::{Disk, File};
 use charpente_core::table::{Codec, Id, IndexDef, Row, View};
 use charpente_sim::{FaultConfig, Sim};
 
@@ -216,4 +219,123 @@ fn a_panic_elsewhere_does_not_double_panic_through_a_staged_groups_drop() {
         boom.is_err(),
         "the original panic must propagate to catch_unwind, not abort the process"
     );
+}
+
+// -------------------------------------------------- t5 fix r2, m1
+
+/// A fixed-width row: two `u64` fields, nothing schema-dependent, so it
+/// seals in a small, easy-to-reason-about number of bytes per record.
+struct Tiny {
+    id: Id<Tiny>,
+    value: u64,
+}
+
+impl Row for Tiny {
+    const TABLE: &'static str = "Tiny";
+    const INDEXES: &'static [IndexDef<Tiny>] = &[];
+
+    fn id(&self) -> Id<Tiny> {
+        self.id
+    }
+
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.value.encode(out);
+    }
+
+    fn decode_row(bytes: &[u8]) -> io::Result<Tiny> {
+        let input = &mut &bytes[..];
+        Ok(Tiny {
+            id: Id::decode(input)?,
+            value: u64::decode(input)?,
+        })
+    }
+}
+
+/// Wraps a real `SimDisk`, adding one test-only switch: once armed, `list`
+/// swaps the SECOND and THIRD names in whatever the inner disk actually
+/// returned, leaving the first (base_seq 0) exactly where it was. Everything
+/// else (`open`/`remove`/`sync_dir`) delegates straight through — same idiom
+/// as `FaultyTracingDisk` in `charpente/tests/group_commit.rs`, an
+/// `Arc`-shared flag rather than an owned one because `Db::open` takes
+/// ownership of the `Box<dyn Disk>` and the test needs to flip the switch
+/// afterward.
+///
+/// A swap, not a full reversal: reversing a real segment listing always
+/// moves base_seq 0 to the END, which trips the OLD `checked_sub` panic (the
+/// specific `[…, 0]` shape it already half-covers per m1) rather than
+/// proving the NEW assert. Swapping an interior pair produces the general
+/// `[…, 8, 4, …]` shape the review's `[5, 3]` example is about — unsorted,
+/// but not ending in 0 — which the old panic does not catch at all.
+struct ScrambledListDisk {
+    inner: charpente_sim::SimDisk,
+    scramble: Arc<AtomicBool>,
+}
+
+impl Disk for ScrambledListDisk {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        self.inner.open(path)
+    }
+
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        let mut names = self.inner.list(prefix)?;
+        if self.scramble.load(Ordering::SeqCst) && names.len() >= 3 {
+            names.swap(1, 2);
+        }
+        Ok(names)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+/// m1 (task-5-review.md): `Db::sealed_segments`'s `checked_sub` panic only
+/// covers the single unsorted shape `[…, 0]` — any other unsorted listing
+/// (e.g. `[5, 3]`) silently produced an inverted `layout_end < base_seq`
+/// with no assert to catch it at the source. This proves the new
+/// `bases.windows(2)` assert (db.rs) actually fires: seal several real
+/// segments through a normal, unscrambled disk (so WAL recovery/rotation
+/// never sees a bad listing), then arm the switch and call
+/// `sealed_segments()` again — now fed the same real segment names with an
+/// interior pair swapped (an unsorted, non-zero-terminated shape, the same
+/// violation class as `[5, 3]`).
+#[test]
+#[should_panic(
+    expected = "Disk::list(\"wal/\") returned a segment listing that is not strictly \
+                            increasing"
+)]
+fn sealed_segments_asserts_disk_list_is_sorted() {
+    let sim = Sim::with_faults(0x5EA1_5E67_1157, FaultConfig::none());
+    let scramble = Arc::new(AtomicBool::new(false));
+    let disk = ScrambledListDisk {
+        inner: sim.disk(),
+        scramble: scramble.clone(),
+    };
+    let mut db_cfg = cfg();
+    db_cfg.wal.segment_bytes = 200; // tiny: several records seal a segment
+    let mut db = Db::open(Box::new(disk), db_cfg, Schema::new().table::<Tiny>()).unwrap();
+    for i in 0..50u64 {
+        db.transact(|tx| -> Result<(), std::convert::Infallible> {
+            tx.put(&Tiny {
+                id: Id::from_raw(i),
+                value: i,
+            });
+            Ok(())
+        })
+        .unwrap();
+    }
+    let sealed = db.sealed_segments().unwrap();
+    assert!(
+        sealed.len() >= 3,
+        "fixture sealed too few segments to exercise the assert meaningfully: {}",
+        sealed.len()
+    );
+
+    scramble.store(true, Ordering::SeqCst);
+    let _ = db.sealed_segments();
 }

@@ -1798,6 +1798,22 @@ impl Db {
         for name in &names {
             bases.push(parse_segment_name(&self.cfg.wal.dir, name)?);
         }
+        // `Disk::list` is contractually sorted (DESIGN §1), which is the
+        // only reason the loop below can treat "next name in the listing" as
+        // "next segment in the chain". The `checked_sub` panic just below
+        // covers only the single unsorted shape `[…, 0]` (an unsorted
+        // listing whose last name parses to base_seq 0); any other unsorted
+        // shape (e.g. `[5, 3]`) would silently compute an inverted
+        // `layout_end < base_seq` for that pair, caught only much later by
+        // `Manifest::encode`'s own contiguity assert. Naming the contract
+        // here closes that gap at its source.
+        assert!(
+            bases.windows(2).all(|w| w[0] < w[1]),
+            "sealed_segments: Disk::list(\"{prefix}\") returned a segment listing that is not \
+             strictly increasing ({bases:?}) — Disk::list is contractually sorted (DESIGN §1) \
+             and segment bases are contractually strictly increasing from 0; this is a WAL \
+             invariant violation, not a caller error"
+        );
         let mut out = Vec::with_capacity(bases.len().saturating_sub(1));
         for i in 0..bases.len().saturating_sub(1) {
             let next_base = bases[i + 1];
