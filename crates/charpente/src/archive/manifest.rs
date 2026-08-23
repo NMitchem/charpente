@@ -448,6 +448,21 @@ impl Manifest {
         assert_contiguous(&self.segments, self.generation);
         let mut buf = write_body(self);
         buf.extend_from_slice(&crc32(&buf).to_le_bytes());
+        // F7, negative space (hard rule 4): the producer must never emit an
+        // object its own `decode` would refuse. The cap is sized so this
+        // cannot fire for any reachable chain (see MANIFEST_MAX_BYTES), so
+        // if it ever does, the cap's arithmetic is wrong — not the caller.
+        assert!(
+            buf.len() <= MANIFEST_MAX_BYTES,
+            "Manifest::encode produced {} bytes, past the {MANIFEST_MAX_BYTES}-byte cap its own \
+             decode enforces: generation {}, {} segment(s), {} table(s). This is unreachable \
+             for any chain a bounded pin admits, so re-derive MANIFEST_MAX_BYTES rather than \
+             raising it",
+            buf.len(),
+            self.generation,
+            self.segments.len(),
+            self.tables.len()
+        );
         buf
     }
 
@@ -535,10 +550,36 @@ impl SnapshotMeta {
         buf.extend_from_slice(&self.next_job_id.to_le_bytes());
         buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
         for t in &self.tables {
+            // F6, negative space (hard rule 4): `snapshot_batch_key` already
+            // refuses these names, but a table with ZERO rows never reaches
+            // it — the walk records `batches: 0` and moves on — so without
+            // this the one path that skips the key builder is also the one
+            // path that could ship a meta `SnapshotMeta::decode` refuses.
+            // The name comes from `Row::TABLE`, a public trait const an app
+            // can implement by hand, so this is a caller bug, not an
+            // impossible state.
+            assert!(
+                !t.name.is_empty() && !t.name.contains('/'),
+                "SnapshotMeta::encode: table name {:?} must be non-empty and contain no '/' — \
+                 restore parses <gen>/snapshot/<table>/<n> back into components, and this name \
+                 would make that parse ambiguous; this is a caller bug in a hand-implemented \
+                 Row::TABLE",
+                t.name
+            );
             put_field(&mut buf, t.name.as_bytes());
             buf.extend_from_slice(&t.batches.to_le_bytes());
         }
         buf.extend_from_slice(&crc32(&buf).to_le_bytes());
+        // F7: same rule as `Manifest::encode` — never produce what this
+        // module's own decoder refuses.
+        assert!(
+            buf.len() <= SNAPSHOT_META_MAX_BYTES,
+            "SnapshotMeta::encode produced {} bytes, past the {SNAPSHOT_META_MAX_BYTES}-byte \
+             cap its own decode enforces, for {} table(s). Re-derive \
+             SNAPSHOT_META_MAX_BYTES rather than raising it",
+            buf.len(),
+            self.tables.len()
+        );
         buf
     }
 
@@ -1185,18 +1226,56 @@ mod tests {
     // named error, never a panic.
     #[test]
     fn a_snapshot_meta_table_name_with_a_slash_is_refused_at_decode() {
-        let m = SnapshotMeta {
+        // Hand-rolled rather than built with `SnapshotMeta::encode`, which
+        // now asserts against exactly this name (F6). That is not a reason
+        // to weaken the decode side: these bytes crossed the network, and
+        // this module's own producer is not the only thing that can have
+        // written them.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u64.to_le_bytes()); // applied_seq
+        buf.extend_from_slice(&0u64.to_le_bytes()); // next_job_id
+        buf.extend_from_slice(&1u32.to_le_bytes()); // one table
+        put_field(&mut buf, b"a/b");
+        buf.extend_from_slice(&1u64.to_le_bytes()); // batches
+        buf.extend_from_slice(&crc32(&buf).to_le_bytes());
+
+        let e = SnapshotMeta::decode(&buf).unwrap_err();
+        let t = e.to_string();
+        assert!(t.contains("a/b"), "must name the offending table: {t}");
+        assert!(t.contains("cannot be parsed back"), "must say why: {t}");
+    }
+
+    /// F6's producer half: a zero-row table never reaches
+    /// `snapshot_batch_key`, so `SnapshotMeta::encode` is the only place
+    /// that can refuse a name the meta's own decoder would reject.
+    #[test]
+    #[should_panic(expected = "hand-implemented Row::TABLE")]
+    fn a_snapshot_meta_table_name_with_a_slash_is_refused_at_encode() {
+        SnapshotMeta {
             applied_seq: 1,
             next_job_id: 0,
             tables: vec![TableBatches {
                 name: "a/b".to_string(),
-                batches: 1,
+                // Zero rows: the case that never builds a batch key, and so
+                // the case that would otherwise ship unchecked.
+                batches: 0,
             }],
-        };
-        let e = SnapshotMeta::decode(&m.encode()).unwrap_err();
-        let t = e.to_string();
-        assert!(t.contains("a/b"), "must name the offending table: {t}");
-        assert!(t.contains("cannot be parsed back"), "must say why: {t}");
+        }
+        .encode();
+    }
+
+    #[test]
+    #[should_panic(expected = "hand-implemented Row::TABLE")]
+    fn an_empty_snapshot_meta_table_name_is_refused_at_encode() {
+        SnapshotMeta {
+            applied_seq: 1,
+            next_job_id: 0,
+            tables: vec![TableBatches {
+                name: String::new(),
+                batches: 0,
+            }],
+        }
+        .encode();
     }
 
     #[test]

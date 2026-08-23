@@ -11,11 +11,13 @@ use std::cell::{Cell, RefCell};
 use std::io;
 
 use charpente::archive::manifest::{
-    Manifest, SnapshotMeta, manifest_key, segment_key, snapshot_batch_key, snapshot_meta_key,
+    Manifest, SnapshotMeta, TableBatches, decode_snapshot_batch, manifest_key, segment_key,
+    snapshot_batch_key, snapshot_meta_key,
 };
 use charpente::archive::{Archive, ArchiveConfig};
 use charpente::{Db, DbConfig, Id, Schema, table};
 use charpente_core::io::{ObjectDone, ObjectOp, ObjectStore};
+use charpente_core::table::Row;
 use charpente_sim::object::SimObjectStore;
 use charpente_sim::{FaultConfig, Sim};
 
@@ -269,6 +271,18 @@ fn archive_fixture_with_lost_manifest_acks() -> (Db, FlakyStore, Archive) {
     build_fixture(store, 8 << 20)
 }
 
+/// A store whose SEGMENT PUTs land and are then reported as failed (F3).
+/// Aimed at `/segments/` alone so the opening snapshot and its manifest
+/// complete normally and the archive really does sit in
+/// `State::UploadingSegment` across the retry — which
+/// `archive_fixture_with_lost_acks` can no longer reach, since at
+/// `object_lost_ack: 1.0` nothing gets past the snapshot's first batch.
+fn archive_fixture_with_lost_segment_acks() -> (Db, FlakyStore, Archive) {
+    let store = FlakyStore::new(SimObjectStore::new());
+    store.set_lost_ack_for(Some("/segments/"));
+    build_fixture(store, 8 << 20)
+}
+
 fn archive_fixture_with_lost_acks() -> (Db, SimObjectStore, Archive) {
     let cfg = FaultConfig {
         object_lost_ack: 1.0,
@@ -437,6 +451,14 @@ fn expected_keys(store: &dyn ObjectStore, m: &Manifest) -> Vec<String> {
 /// outcomes: the store accepted the write. The other outcome (the write
 /// never landed) leaves strictly fewer objects present, so anything that
 /// holds here holds there.
+///
+/// F8: each call `Archive::open`s a fresh archive on the SAME `Db`, and
+/// `Db::add_retention_pin` only ever pushes — nothing removes a pin — so a
+/// full cut loop leaves one pin per cut behind and `retention_floor()` (the
+/// minimum) sticks at the first one. That freezes `Wal::gc` for the rest of
+/// the loop, which is harmless here (the loop asserts about objects, never
+/// about gc) but is not something to build a gc-sensitive test on. Task 7
+/// works on this pin.
 fn replay_archive_to_step(db: &mut Db, cut: usize) -> (SimObjectStore, Archive) {
     let store = SimObjectStore::new();
     let mut arc = Archive::open(archive_config(0, 8 << 20), db).unwrap();
@@ -500,6 +522,45 @@ fn read_manifest(store: &dyn ObjectStore) -> Option<Manifest> {
 fn read_snapshot_meta(store: &dyn ObjectStore, generation: u64) -> Option<SnapshotMeta> {
     let bytes = get_object(store, &snapshot_meta_key(PREFIX, generation))?;
     Some(SnapshotMeta::decode(&bytes).expect("a valid snapshot meta"))
+}
+
+/// Every row a generation's snapshot actually carries for one table, in the
+/// order its batch objects lay them out — decoded from the objects, so this
+/// is what a restore would read rather than what the archive believes it
+/// wrote (F1).
+fn read_snapshot_rows(
+    store: &dyn ObjectStore,
+    generation: u64,
+    t: &TableBatches,
+) -> Vec<(u64, Vec<u8>)> {
+    let mut out = Vec::new();
+    for n in 0..t.batches {
+        let key = snapshot_batch_key(PREFIX, generation, &t.name, n);
+        let bytes = get_object(store, &key)
+            .unwrap_or_else(|| panic!("the meta declares batch {key}, which is not in the store"));
+        out.extend(decode_snapshot_batch(&bytes).expect("a valid snapshot batch"));
+    }
+    out
+}
+
+/// Key and bytes of every object under `<prefix>/<gen>/snapshot/` — meta and
+/// batches alike — read out of the store rather than derived from a meta, so
+/// an EXTRA object appearing is as visible as an existing one changing (F2).
+fn snapshot_objects(
+    store: &dyn ObjectStore,
+    generation: u64,
+    keys: &[String],
+) -> Vec<(String, Vec<u8>)> {
+    let under = format!("{PREFIX}/{generation:020}/snapshot/");
+    keys.iter()
+        .filter(|k| k.starts_with(&under))
+        .map(|k| {
+            (
+                k.clone(),
+                get_object(store, k).expect("a key the store just listed"),
+            )
+        })
+        .collect()
 }
 
 fn write_foreign_manifest(store: &SimObjectStore, writer: &str, generation: u64) {
@@ -875,10 +936,20 @@ fn start_errors_surface_from_both_the_segment_and_the_manifest_put() {
     );
 
     // Recovery: the archive still catches up once the switch flips back.
+    //
+    // F4. This asserted `read_manifest(&store).is_some()` at Task 5, when it
+    // was a real question — no manifest existed until a segment shipped. It
+    // cannot fail under Task 6: the opening snapshot wrote a manifest before
+    // this test's second phase began, `before` above already `expect`ed it,
+    // and `SimObjectStore` never deletes a key. "Caught up" now means the
+    // chain ADVANCED past the empty one `before` captured.
     step_until_idle(&mut arc, &db, &store);
+    let caught_up = read_manifest(&store).expect("a manifest");
     assert!(
-        read_manifest(&store).is_some(),
-        "the archive never caught up after start_errors cleared"
+        !caught_up.segments.is_empty(),
+        "the archive never shipped a segment after start_errors cleared; the manifest is \
+         still the opening snapshot's ({:?})",
+        caught_up.segments
     );
 }
 
@@ -889,39 +960,43 @@ fn a_lost_ack_retry_uploads_the_same_bytes_and_does_not_duplicate() {
     // at the measured RECORDS_PER_SEGMENT — this write count does.
     write_records(&mut db, RECORDS_PER_SEGMENT + 50);
     step_until_idle(&mut arc, &db, &store);
+    // F3. Task 5's two assertions here (`keys == deduped`, and
+    // `segment_keys <= sealed_segment_count`) BOTH went vacuous under Task
+    // 6's ordering and are gone rather than left standing: at
+    // `object_lost_ack: 1.0` every ack is lost, so the archive never gets
+    // past its FIRST object — which is now the opening snapshot's first
+    // batch, not a segment. The bucket therefore holds one key and no
+    // segment at all, which makes `dedup` trivially true of a one-element
+    // Vec and `segment_keys <= n` the tautology `0 <= n`. A permanently
+    // true assertion is worse than no assertion: it reads as coverage.
+    //
+    // The SEGMENT half of the property this test used to carry now lives in
+    // `a_lost_segment_ack_retries_the_same_key_with_the_same_bytes`, which
+    // aims the fault at `/segments/` so the archive really does reach
+    // `State::UploadingSegment` and carry its key and bytes across a retry.
     let keys = store.keys();
-    let mut deduped = keys.clone();
-    deduped.dedup();
-    assert_eq!(keys, deduped, "retry duplicated an object");
-    // The brief's dedup check alone cannot catch a retry that invents a
-    // NEW, distinct key each attempt (`SimObjectStore`'s bucket is a
-    // `BTreeMap`, so it can never literally hold two equal keys regardless
-    // of what the archive does — `dedup` only ever removes adjacent equal
-    // elements). Addition beyond the brief's literal text (see
-    // task-5-report.md): a retrying key must be the SAME key every time,
-    // so the number of distinct segment objects can never exceed the
-    // number of sealed segments, no matter how many times a lost ack
-    // forces a retry.
-    let segment_keys = keys.iter().filter(|k| k.contains("/segments/")).count();
-    assert!(
-        segment_keys <= sealed_segment_count(&db),
-        "retry produced more segment objects ({segment_keys}) than sealed segments \
-         ({}) — a key must have been bumped rather than reused on retry: {keys:?}",
-        sealed_segment_count(&db)
-    );
-    // Task 6 strengthening, needed to keep this test from going vacuous. At
-    // `object_lost_ack: 1.0` EVERY ack is lost, so the archive can never get
-    // past its first object — which since Task 6 is the opening snapshot's
-    // first batch rather than a segment. Both of the assertions above are
-    // then satisfied by a bucket holding nothing at all, which would prove
-    // nothing about retry. This is the property they were reaching for: over
-    // 10,000 retries the bucket holds exactly ONE key, so the retry reused
-    // it every single time.
     assert_eq!(
         keys.len(),
         1,
         "a permanently unacknowledged PUT must retry ONE key forever, never mint new ones: \
          {keys:?}"
+    );
+    // Name which key, so a future reordering that changes what the archive
+    // does first cannot leave this test quietly covering something else.
+    assert_eq!(
+        keys[0],
+        snapshot_batch_key(PREFIX, 0, "Rec", 0),
+        "the first object the archive writes is no longer the opening snapshot's first \
+         batch; this test's subject moved and its comment above is now wrong"
+    );
+    let first = get_object(&store, &keys[0]).expect("the object landed despite the lost ack");
+    for _ in 0..200 {
+        let _ = arc.step(&db, &store);
+    }
+    assert_eq!(
+        get_object(&store, &keys[0]).as_ref(),
+        Some(&first),
+        "a retry must re-PUT the SAME bytes, not rebuild them"
     );
 }
 
@@ -933,6 +1008,12 @@ fn the_seal_rate_stays_under_one_upload_per_step_budget() {
     let (mut db, store, mut arc) = archive_fixture();
     write_records(&mut db, 50 * RECORDS_PER_SEGMENT);
     let seals = sealed_segment_count(&db);
+    // F4's sweep: `uploads >= seals` cannot fail when `seals` is 0, and a
+    // seal count is a measurement, not a given. Guard it.
+    assert!(
+        seals >= 2,
+        "fixture sealed {seals} segment(s); a rate assertion against 0 or 1 is not a rate"
+    );
     let uploads = step_until_idle_counting(&mut arc, &db, &store);
     assert!(
         uploads >= seals,
@@ -964,6 +1045,13 @@ const STEPS_TO_ARCHIVE_5000_RECORDS: usize = 47;
 /// guaranteed, so the manifest swap is the only operation whose completion
 /// means anything — a crash at any earlier point must leave an older
 /// COMPLETE generation still pointed at, never a torn one.
+///
+/// F10, for anyone mutating the archive against this test: the step-count
+/// assertion below fires BEFORE the cut loop, so a mutation that changes how
+/// many steps a run takes reddens on that assertion and never reaches the
+/// ordering property at all. To prove the loop itself, mutate in a
+/// step-count-neutral way — reorder the manifest PUT ahead of the meta PUT,
+/// rather than removing a state.
 #[test]
 fn the_manifest_never_points_at_an_incomplete_generation() {
     let (mut db, _store, _arc) = archive_fixture();
@@ -1132,14 +1220,21 @@ fn the_manifest_carries_the_snapshots_real_frontier_never_a_placeholder() {
         m.next_job_id, meta.next_job_id,
         "the manifest's job counter must be the snapshot's"
     );
+    // F11: written out rather than compared against `Db::table_names()`,
+    // which is the very function `manifest_bytes` derives this list from
+    // (ruling 24 — an oracle built from the function it polices cannot
+    // catch that function being wrong). This fixture registers `Rec`; the
+    // other three are the platform-owned tables `Db::open` adds, and they
+    // are here because they carry state restore needs.
     assert_eq!(
         m.tables,
-        db.table_names()
-            .iter()
-            .map(|t| t.to_string())
-            .collect::<Vec<_>>(),
-        "the manifest must name every registered table, in schema order — including the \
-         platform-owned ones, which carry state restore needs"
+        vec![
+            "Rec".to_string(),
+            "charpente.events".to_string(),
+            "charpente.jobs".to_string(),
+            "charpente.schema_versions".to_string(),
+        ],
+        "the manifest must name every registered table, in schema (sorted) order"
     );
     // Every table the meta names, empty ones included: "this table had no
     // rows" is a fact restore needs, not an absence it should infer.
@@ -1243,6 +1338,239 @@ fn a_lost_manifest_ack_retries_the_same_key_with_the_same_bytes() {
     assert!(
         !keys.iter().any(|k| k.contains("/segments/")),
         "the archive moved on to a segment while its manifest was unacknowledged: {keys:?}"
+    );
+}
+
+/// F1 (task-6-review.md). Every other snapshot test here checks the SHAPE of
+/// the snapshot — which keys exist, what the meta claims, that paging
+/// happened — and until this one nothing decoded a
+/// `<gen>/snapshot/<table>/<n>` object to ask whether the rows inside are
+/// the rows the `Db` held. A snapshot that dropped the last row of every
+/// batch, or wrote every payload blank, satisfies all of those tests and
+/// restores silently wrong data; the CRC cannot catch it either, because the
+/// archive would be checksumming its own mistake.
+#[test]
+fn the_snapshot_objects_hold_exactly_the_rows_the_db_held() {
+    let rows = 3 * RECORDS_PER_SEGMENT;
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, rows);
+    step_until_idle(&mut arc, &db, &store);
+
+    let m = read_manifest(&store).expect("a manifest");
+    let meta = read_snapshot_meta(&store, m.generation).expect("a snapshot meta");
+
+    // Nothing is committed after `step_until_idle`, so a fresh snapshot is
+    // the same MVCC view the archive walked. ASSERT that rather than assume
+    // it: comparing rows across two different frontiers would report a
+    // content bug for what is really just time passing.
+    let snap = db.snapshot().unwrap();
+    assert_eq!(
+        snap.applied_seq().unwrap(),
+        Some(meta.applied_seq),
+        "the oracle's view sits at a different frontier than the snapshot's, which would make \
+         every comparison below meaningless"
+    );
+
+    let rec = meta
+        .tables
+        .iter()
+        .find(|t| t.name == "Rec")
+        .expect("Rec in the meta");
+    assert!(
+        rec.batches >= 4,
+        "Rec's {rows} rows landed in {} batch object(s); the point of this test is that content \
+         survives PAGING, so a single batch would say nothing about the seams",
+        rec.batches
+    );
+
+    // `Rec` gets the independent oracle (ruling 24): `write_records` wrote
+    // ids 0..{rows} with `value == id`, so the archived bytes are checked
+    // against what this test itself put in, decoded through the row's own
+    // decoder — not against a re-read of the same `scan_raw_from` the
+    // archive used to produce them.
+    let archived = read_snapshot_rows(&store, m.generation, rec);
+    assert_eq!(
+        archived.len() as u64,
+        rows,
+        "the snapshot carries {} of the {rows} rows written",
+        archived.len()
+    );
+    for (i, (id, bytes)) in archived.iter().enumerate() {
+        let i = i as u64;
+        assert_eq!(
+            *id, i,
+            "snapshot rows must be complete and in ascending id order; row {i} of the \
+             concatenated batches has id {id}"
+        );
+        let r = Rec::decode_row(bytes).unwrap_or_else(|e| {
+            panic!(
+                "snapshot row {id} does not decode as a Rec ({e}); {} bytes: {bytes:?}",
+                bytes.len()
+            )
+        });
+        assert_eq!(
+            (r.id.raw(), r.value),
+            (i, i),
+            "snapshot row {id} came back holding different data than was written"
+        );
+    }
+
+    // The platform-owned tables have no such independent expectation, so
+    // they are checked against the Db view at the snapshot's own frontier.
+    let mut tables_checked = 0;
+    for t in &meta.tables {
+        let archived = read_snapshot_rows(&store, m.generation, t);
+        let live = snap.scan_raw_from(&t.name, None, usize::MAX).unwrap();
+        assert_eq!(
+            archived,
+            live,
+            "table {:?}: the snapshot's {} row(s) differ from the {} the Db holds at the same \
+             frontier",
+            t.name,
+            archived.len(),
+            live.len()
+        );
+        tables_checked += 1;
+    }
+    assert_eq!(
+        tables_checked,
+        db.table_names().len(),
+        "the loop above must cover the whole schema, or an untouched table is an unchecked one"
+    );
+}
+
+/// F2 (task-6-review.md) — ruling 42's headline property, and the reason
+/// this task declined the brief's literal repeated cadence: a generation
+/// carries EXACTLY ONE snapshot.
+///
+/// `<gen>/snapshot/**` keys are immutable once written — spec §2, "the
+/// manifest is the only mutable key in the layout" — so a second snapshot
+/// taken into a live generation would overwrite the very objects the current
+/// manifest still points at. That is a torn generation reachable with no
+/// crash and no mis-ordering at all, which is why it is a separate property
+/// from `the_manifest_never_points_at_an_incomplete_generation` rather than
+/// a case of it. A refresh is a NEW generation (Task 7), never a rewrite of
+/// this one.
+#[test]
+fn a_generation_never_takes_a_second_snapshot() {
+    let cadence = 2 * RECORDS_PER_SEGMENT;
+    let (mut db, store, mut arc) = archive_fixture_with_snapshot_cadence(cadence);
+
+    write_records(&mut db, cadence);
+    step_until_idle(&mut arc, &db, &store);
+    // Exactly `cadence` records, not one more: `snapshot_every` counts
+    // committed RECORDS (spec §3) while `Db::last_applied` reports the
+    // highest 0-based SEQ, so the cadence must be crossed by the
+    // {cadence}th record — one late is a real, silent unit bug (found by
+    // this test).
+    assert_eq!(
+        db.last_applied(),
+        Some(cadence - 1),
+        "the fixture must have committed exactly {cadence} records for the cadence boundary \
+         below to be the boundary"
+    );
+    let before = read_manifest(&store).expect("a manifest once the cadence was crossed");
+    let objects_before = snapshot_objects(&store, before.generation, &store.keys());
+    assert!(
+        objects_before.len() > 2,
+        "phase 1 left {} snapshot object(s); with nothing much written there is nothing much to \
+         overwrite and phase 2 proves little",
+        objects_before.len()
+    );
+
+    // Cross the cadence again, four times over.
+    write_records(&mut db, 4 * cadence);
+    step_until_idle(&mut arc, &db, &store);
+    let after = read_manifest(&store).expect("a manifest");
+
+    // Anti-vacuity first (spec §11): "nothing changed" is trivially true of
+    // an archive that did nothing in phase 2.
+    assert!(
+        after.segments.len() > before.segments.len(),
+        "the archive shipped nothing in phase 2 ({} segments before, {} after), so it never \
+         reached the cadence multiple this test exists to survive",
+        before.segments.len(),
+        after.segments.len()
+    );
+    assert_eq!(
+        after.generation, before.generation,
+        "the archive rolled the generation on its own; Task 6 opens exactly one, and rolling is \
+         Task 7's"
+    );
+    assert_eq!(
+        snapshot_objects(&store, before.generation, &store.keys()),
+        objects_before,
+        "a second snapshot was written into a live generation's keys. Those keys are immutable \
+         (spec §2 — the manifest is the layout's only mutable key): overwriting them replaces \
+         the content the CURRENT manifest points at, which tears the generation without any \
+         crash or reordering at all"
+    );
+    assert_eq!(
+        after.applied_seq, before.applied_seq,
+        "the manifest's frontier advanced past its own snapshot. The frontier a restore reads is \
+         the SNAPSHOT's; this generation's snapshot is still at {}, so a restore would replay \
+         from a point the snapshot never reached",
+        before.applied_seq
+    );
+}
+
+/// F3 (task-6-review.md). Task 5 aimed `object_lost_ack: 1.0` at every
+/// object, which at the time meant the SEGMENT PUT — the only lost-ack
+/// coverage that arm ever had. Under Task 6's ordering the archive never
+/// reaches a segment before the snapshot's first batch, so that coverage
+/// silently became coverage of a batch PUT instead. This restores it by
+/// aiming the fault at `/segments/` alone.
+#[test]
+fn a_lost_segment_ack_retries_the_same_key_with_the_same_bytes() {
+    let (mut db, store, mut arc) = archive_fixture_with_lost_segment_acks();
+    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
+
+    let e = step_until_error(&mut arc, &db, &store);
+    assert!(
+        e.to_string().contains("simulated FlakyStore lost ack"),
+        "expected the lost-ack text from a segment PUT, got: {e}"
+    );
+    // Anti-vacuity: the fault only fires on `/segments/`, so reaching it at
+    // all proves the snapshot and its manifest completed first — this test
+    // really is sitting in `State::UploadingSegment`, not somewhere earlier.
+    let key = {
+        let segments: Vec<String> = store
+            .keys()
+            .into_iter()
+            .filter(|k| k.contains("/segments/"))
+            .collect();
+        assert_eq!(
+            segments.len(),
+            1,
+            "expected exactly one segment object in flight, found: {segments:?}"
+        );
+        segments.into_iter().next().unwrap()
+    };
+    let first = get_object(&store, &key).expect("the segment object landed despite the lost ack");
+
+    // Keep stepping: every attempt fails the same way, forever.
+    for _ in 0..200 {
+        let _ = arc.step(&db, &store);
+    }
+
+    assert_eq!(
+        get_object(&store, &key).as_ref(),
+        Some(&first),
+        "a segment retry must re-PUT the SAME bytes, not re-read the log and rebuild them"
+    );
+    let keys = store.keys();
+    assert_eq!(
+        keys.iter().filter(|k| k.contains("/segments/")).count(),
+        1,
+        "a lost-ack retry minted a second segment key instead of reusing the first: {keys:?}"
+    );
+    // And the manifest never names a segment the archive was not told had
+    // landed — the ordering property, seen from the segment's side.
+    let m = read_manifest(&store).expect("the opening snapshot's manifest");
+    assert!(
+        m.segments.is_empty(),
+        "the manifest names a segment whose PUT was never acknowledged: {:?}",
+        m.segments
     );
 }
 

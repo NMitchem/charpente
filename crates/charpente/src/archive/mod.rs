@@ -79,6 +79,18 @@
 //! needs — the lowest sealed segment not yet reflected in an uploaded
 //! manifest — with no bound on how far behind that seq may be.
 //!
+//! **Carried to Task 7 — this task adds a CONFIGURATION trigger for that
+//! unbounded pin.** The archive ships nothing at all, sealed segments
+//! included, until its generation's opening snapshot has landed, and while
+//! it waits it still holds at `next_base()` — the log's base. So a
+//! `snapshot_every` the `Db` has not crossed yet now freezes `Wal::gc` at
+//! the log's base against a perfectly healthy object store. At Task 5 the
+//! same hazard needed an outage to reach. Spec §5 states the stake: "an
+//! unbounded pin means an object-store outage grows the WAL until the disk
+//! fills and the log poisons — the archive would have acquired the power to
+//! stop the thing it derives from." Task 7's bounded pin is the fix, and it
+//! is now load-bearing for a case with no outage in it.
+//!
 //! **The pin is held from `open` and is never released outright**, not while
 //! idle, not while waiting on an unapplied segment, and never to `u64::MAX`.
 //! That is load-bearing and was a real bug once (M1): a pin that reads
@@ -141,10 +153,14 @@ pub struct ArchiveConfig {
     /// time-driven so that replay never depends on a wall clock.
     ///
     /// It gates when this generation's opening snapshot is taken: the
-    /// archive uploads nothing at all until `last_applied` has crossed it,
-    /// because a manifest with no snapshot behind it names a generation
-    /// that does not exist. `0` means "no cadence configured" — snapshot as
-    /// soon as there is a frontier to name.
+    /// archive uploads nothing at all until this many records have been
+    /// committed, because a manifest with no snapshot behind it names a
+    /// generation that does not exist. `0` means "no cadence configured" —
+    /// snapshot as soon as there is a frontier to name.
+    ///
+    /// RECORDS, not seqs: `snapshot_every: N` is satisfied by the Nth
+    /// committed record, whose `Db::last_applied` seq is `N - 1`. Comparing
+    /// against the raw seq would fire one record late.
     ///
     /// A generation carries exactly one snapshot (module docs), so a *later*
     /// multiple does not re-snapshot in place; refreshing means opening a
@@ -510,7 +526,13 @@ impl Archive {
         let Some(last_applied) = db.last_applied() else {
             return Ok(false);
         };
-        if self.cfg.snapshot_every > 0 && last_applied < self.cfg.snapshot_every {
+        // `snapshot_every` is a count of committed records (spec §3), and
+        // `last_applied` is the highest applied SEQ — seqs are 0-based, so
+        // the count is one MORE than the seq. Comparing the raw seq would
+        // take every snapshot one record later than the configured cadence
+        // says, which no test of the cadence's own unit would notice.
+        let applied_records = last_applied.saturating_add(1);
+        if self.cfg.snapshot_every > 0 && applied_records < self.cfg.snapshot_every {
             return Ok(false);
         }
         let snapshot = db.snapshot()?;
