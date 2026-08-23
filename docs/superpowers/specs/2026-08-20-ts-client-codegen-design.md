@@ -150,7 +150,18 @@ these are two different registries for two different purposes:
   as `#[table]` already populates schema. It is read by `App::describe` and by nothing
   on the delivery path.
 
-`Contract` gains `events: Vec<EventInfo { name, payload: TypeRef, keyed: bool }>`.
+`Contract` gains `events: Vec<EventInfo { name, payload, keyed: bool }>`.
+
+**Correction (task 6 review, Ruling 37):** this line first said `payload: TypeRef`.
+`TypeRef` is a spec-level notion with no Rust type behind it — task 5 realized it two
+ways, by position: `TypeSchema` where a route's request/response/error needs a full
+shape, and a bare `&'static str` wire NAME where a name is all a consumer needs
+(`Route.response_name`). `EventInfo.payload` is the second kind and shipped as
+`&'static str` (`Wire::WIRE_NAME`, an entry in `Contract.types`), matching
+`RouteInfo.emits: Vec<&'static str>`, which task 7 fills with exactly this kind of
+value and which sits right beside it in the rendered contract. The code is correct;
+this sentence was stale — same discharge as Ruling 10, where the IR shipped in
+`charpente::wire` rather than `charpente::describe`.
 
 **Binding events to streams.** `RouteInfo.stream` is a bare bool; nothing records which
 events a given stream carries, so a generated client could only offer "subscribe to

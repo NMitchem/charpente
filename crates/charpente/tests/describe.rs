@@ -746,8 +746,18 @@ fn to_human_pins_the_events_section() {
 /// a client cannot resolve. `#[event]` can't produce one — its `Wire` derive
 /// always names the struct — so the only way to reach it is a hand-written
 /// `EventEntry`, which is exactly what this builds.
+///
+/// The WHOLE message is pinned, remedy included (review round 1, finding 3):
+/// hard rule 5 makes the fix half of a diagnostic product surface, and pinning
+/// only the first clause lets "make the payload a #[derive(Wire)] type" rot
+/// into something that no longer says what to do.
 #[test]
-#[should_panic(expected = "event \"anonymous\" registers an empty payload name")]
+#[should_panic(
+    expected = "event \"anonymous\" registers an empty payload name — every \
+                           Contract.events entry must name a type in Contract.types, and \
+                           \"\" is `Wire`'s \"anonymous/inline\" marker; make the payload a \
+                           #[derive(Wire)] type and pass its WIRE_NAME"
+)]
 fn mounting_an_event_whose_payload_names_no_type_panics() {
     struct HandWritten;
     impl charpente::describe::EventEntry for HandWritten {

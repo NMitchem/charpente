@@ -457,8 +457,14 @@ fn finalize(db: &mut Db, id: u64) -> Result<(), TxError<io::Error>> {
 derives the rest of a job's registration for you (a later section).
 `#[event]` derives everything an event needs in one step: `Codec` (the log
 format), `Event` (`NAME` is the snake_case of the type name — §11 has the
-exact splitting rule), and `Serialize` (the wire format `#[route(SSE …)]`
-subscribers receive, §11). `tx.put` and `tx.delete` cannot fail — they only
+exact splitting rule), `Serialize` (the wire format `#[route(SSE …)]`
+subscribers receive, §11), `Wire` (that wire format's schema, so the contract
+can name it), and an `EventEntry` impl so `events![...]` can register it (§11).
+Because the payload IS what a subscriber receives, it obeys the wire rules a
+route's types obey — which is why `InvoiceFinalized.invoice` above is
+`Id<Invoice>` and not the bare `u64` the `SendReceipt` *job* beside it carries:
+a job payload never leaves the process, an event payload is a JSON document
+someone parses. `tx.put` and `tx.delete` cannot fail — they only
 buffer a write into the transaction's overlay; `tx.get`/`scan`/`scan_by`
 return `io::Result` because they read through the snapshot. A transaction
 that never calls `put`/`delete`/`enqueue`/`emit` writes nothing and consumes

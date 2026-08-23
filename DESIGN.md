@@ -475,7 +475,12 @@ platform is one dependency, not two.
   struct by reading serde's own `rename`, `rename_all`, `skip`, `skip_serializing`,
   and `skip_serializing_if`; any other `#[serde(...)]` attribute is a compile error
   rather than a silent pass-through, and that supported set is pinned by tests
-  comparing the derived schema against real `serde_json` output. For an enum it
+  comparing the derived schema against real `serde_json` output. The one deliberate
+  exception is `#[serde(crate = "...")]`, accepted and ignored on both structs and
+  enums: it redirects serde_derive's own generated paths (`#[event]` emits it so app
+  crates stay single-dep) and changes no field, name or wire shape, so there is nothing
+  for the schema to get wrong — the `.stderr` pins list it as supported alongside
+  `rename_all`. For an enum it
   describes whichever of serde's *tagged* representations the type actually uses
   — a unit-only enum as a string union, otherwise external (default), internal
   (`tag`), or adjacent (`tag` + `content`); `untagged` is refused outright, since

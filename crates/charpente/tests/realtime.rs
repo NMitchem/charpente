@@ -1245,10 +1245,55 @@ fn a_subscribe_still_sees_an_emit_that_arrives_with_it() {
         frames.iter().map(|f| (f.name, &f.json)).collect::<Vec<_>>()
     );
     assert_eq!(frames[0].name, "ping", "the Ping event, not a gap frame");
-    assert!(
-        frames[0].json.contains('7'),
-        "carrying the emitted payload n=7: {}",
-        frames[0].json
+    // Exact, not `contains('7')` (review round 1, finding 4): a substring test
+    // for one digit also passes on `{"n":17}`, on `{"n":7}`, and on any other
+    // encoding of the field — including the one this event does NOT use.
+    assert_eq!(
+        frames[0].json, r#"{"n":"7"}"#,
+        "carrying the emitted payload n=7"
+    );
+}
+
+/// The literal bytes a subscriber receives, pinned as bytes (review round 1,
+/// finding 4). Task 6 moved `Ping.n` from a bare `u64` to `WireU64`, which
+/// changed this document: the frame body is now `{"n":"7"}`, a decimal STRING,
+/// not `{"n":7}`. That is the most product-visible thing task 6 changed, and
+/// every other assertion around it holds only by COMPOSITION —
+/// `serde_json::to_string(&Ping { .. })` on both sides agrees with itself no
+/// matter what the encoding is, so all of them would stay green if the wire
+/// form silently reverted. This one asserts the delivered frame directly, at
+/// the boundary a browser's `JSON.parse` reads.
+#[test]
+fn a_delivered_frame_carries_its_64_bit_field_as_a_decimal_string() {
+    let sim = Sim::with_faults(0x2EB2_D511, FaultConfig::none());
+    let app = realtime_app(&sim).unwrap();
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+
+    let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 10 * SEC);
+    let t = sim.now().as_nanos();
+    source.push_at(t, Request::new(Method::Get, "/feed-ping"));
+    source.push_at(
+        t,
+        Request::new(Method::Post, "/ping").json(&EmitBody {
+            // Above 2^53: the exact value a JSON number would have corrupted,
+            // which is why the carrier exists at all.
+            n: WireU64(9_007_199_254_740_993),
+            key: None,
+        }),
+    );
+    let sinks = source.sinks();
+    for _ in 0..8 {
+        kernel.step(&mut source).expect("no step may fail here");
+    }
+
+    let handles = sinks.lock().expect("sinks lock");
+    let frames = handles[0].frames();
+    assert_eq!(frames.len(), 1, "exactly one delivered frame");
+    assert_eq!(frames[0].name, "ping");
+    assert_eq!(
+        frames[0].json, r#"{"n":"9007199254740993"}"#,
+        "the frame body is the decimal STRING form — a JSON number here would \
+         reach a JavaScript client as 9007199254740992"
     );
 }
 
