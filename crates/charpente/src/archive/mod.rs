@@ -3,9 +3,10 @@
 //! logical snapshots to object storage behind a generation-pointer
 //! manifest (§2), and restores from it (§6). Task 4 landed the manifest and
 //! the key layout with nothing uploading yet; Task 5 landed the engine that
-//! ships sealed segments (§3's first half); Task 6 lands the snapshot
-//! (§3's other half) and the ordering that is the whole safety argument.
-//! Restore (§6) is still to come.
+//! ships sealed segments (§3's first half); Task 6 landed the snapshot
+//! (§3's other half) and the ordering that is the whole safety argument;
+//! Task 7 lands the bounded pin, the named gap, generation transitions and
+//! resume-or-open. Restore (§6) is still to come.
 //!
 //! **The manifest swaps last.** Inter-key ordering is not guaranteed by
 //! `ObjectStore` (§1), so the manifest swap is the only operation whose
@@ -30,17 +31,15 @@
 //!   `<gen>/snapshot/**` while the manifest still names the old frontier,
 //!   making a second mutable key in a layout whose safety argument is that
 //!   the manifest is the only one (§2), and exposing exactly the torn
-//!   generation this task exists to prevent. Refresh is therefore a *new
-//!   generation*, and generation transitions land at Task 7 alongside the
-//!   bounded pin and the gap. Until then `snapshot_every` gates when the
-//!   generation's opening snapshot is taken and nothing more. **Carried to
-//!   Task 7**, with the same reasoning: a restart re-opens generation 0 and
-//!   would re-snapshot into its keys, so T7's generation management (and
-//!   §4's writer-identity check) must either resume the generation the
-//!   manifest already names or open a fresh one — Task 5's "always writes
-//!   fresh" is idempotent for segment objects, whose bytes are a function
-//!   of their key, but not for a snapshot, whose bytes are a function of
-//!   when it was taken.
+//!   generation Task 6 exists to prevent. Refresh is therefore a *new
+//!   generation* (`roll_generation`), which is why `snapshot_every` gates
+//!   two things that look like one: when a generation's opening snapshot is
+//!   taken, and when the live generation is closed in favour of a fresh one.
+//!   A RESTART is the same hazard on a different trigger, which is why
+//!   `State::Opening` reads the bucket before writing to it: Task 5's
+//!   "always writes fresh" is idempotent for segment objects, whose bytes
+//!   are a function of their key, but not for a snapshot, whose bytes are a
+//!   function of when it was taken.
 //!
 //! **Cadence is seq-driven, and structurally so** (§3). `step` receives no
 //! clock, `Db` exposes none, and nothing in this module names one — so
@@ -56,7 +55,10 @@
 //! meets a ceiling seeding never does.
 //!
 //! `Archive::step` is a state machine, one transition per call, the same
-//! shape `Repl` already has (DESIGN §5): `Idle` opens the generation's
+//! shape `Repl` already has (DESIGN §5): `Opening` GETs the manifest and
+//! decides whether to resume the generation the bucket names or open a
+//! fresh one; `ClosingGeneration` marks a gapped generation finished;
+//! `Idle` opens the generation's
 //! snapshot if it has none, otherwise picks the lowest sealed,
 //! un-uploaded WAL segment; `Snapshotting` pages one batch of one table out
 //! of the single MVCC `Db::snapshot` view, walking `Db::table_names()` in
@@ -74,39 +76,79 @@
 //! bytes — never a fresh one — which is what keeps a lost-ack retry from
 //! duplicating an object (spec §9.2).
 //!
-//! The retention pin (`Db::add_retention_pin`) is **unbounded this task**
-//! (ruling 23 carry-forward): it holds at the lowest seq this archive still
-//! needs — the lowest sealed segment not yet reflected in an uploaded
-//! manifest — with no bound on how far behind that seq may be.
+//! **The retention pin is BOUNDED** (spec §5, ruling 3): it holds at the
+//! lowest seq this archive still needs — the lowest sealed segment not yet
+//! reflected in an uploaded manifest — but never more than
+//! `pin_segments` segments' worth. Past the bound the archive **yields**:
+//! it releases the pin so `Wal::gc` proceeds, closes its generation, and
+//! returns one named notice. Spec §5 states the stake: "an unbounded pin
+//! means an object-store outage grows the WAL until the disk fills and the
+//! log poisons — the archive would have acquired the power to stop the thing
+//! it derives from." On outage the archive yields, never the primary.
 //!
-//! **Carried to Task 7 — this task adds a CONFIGURATION trigger for that
-//! unbounded pin.** The archive ships nothing at all, sealed segments
-//! included, until its generation's opening snapshot has landed, and while
-//! it waits it still holds at `next_base()` — the log's base. So a
-//! `snapshot_every` the `Db` has not crossed yet now freezes `Wal::gc` at
-//! the log's base against a perfectly healthy object store. At Task 5 the
-//! same hazard needed an outage to reach. Spec §5 states the stake: "an
-//! unbounded pin means an object-store outage grows the WAL until the disk
-//! fills and the log poisons — the archive would have acquired the power to
-//! stop the thing it derives from." Task 7's bounded pin is the fix, and it
-//! is now load-bearing for a case with no outage in it.
+//! **The release is a STATE, not a VALUE** (ruling 49). `Db::retention_floor`
+//! is a *min* over pin closures and `db.rs` documents `u64::MAX` as what "a
+//! pin that is not holding returns" — the identity element of that min, not
+//! a hold-everything sentinel. So the registered closure reports `u64::MAX`
+//! while `Pin::holding` is clear, while `Pin::floor` stays a real,
+//! monotonic seq that `pin_floor()` keeps reporting. Writing `u64::MAX` into
+//! the floor instead would be verbatim the M1 bug `hold` asserts against,
+//! and re-holding afterwards — at the new generation's lower base — would
+//! then trip the same assert in the M1' direction on the way back.
 //!
-//! **The pin is held from `open` and is never released outright**, not while
-//! idle, not while waiting on an unapplied segment, and never to `u64::MAX`.
-//! That is load-bearing and was a real bug once (M1): a pin that reads
-//! `u64::MAX` is a pin that holds *nothing*, so `Wal::gc` was free to delete
-//! the very segment `next_base()` was waiting for. After that deletion
-//! `step_idle`'s `find` never matches again — the archive ships nothing
-//! forever, returns no error, and reports itself caught up. Under the
-//! default `checkpoint_every` that cost 50 of 50 segments, silently. Because
-//! the pin now always holds, `Wal::gc` genuinely cannot remove a segment out
-//! from under this archive, so a "gap" (spec §2) is structurally impossible
-//! this task and `gapped()` is always `false`.
+//! **M1, and why yielding does not re-open it.** A pin that reads
+//! `u64::MAX` used to be a pin that let `Wal::gc` delete the very segment
+//! `next_base()` was waiting for; after that deletion `step_idle`'s `find`
+//! never matched again and the archive shipped nothing, forever, reporting
+//! no error — 50 of 50 segments, silently. What made that a *bug* was that
+//! the archive still needed those records and had frozen its own cursor at
+//! a seq that no longer existed. Here the two always move together: the
+//! archive yields only when it holds nothing it needs, and `next_needed`
+//! tracks `db.log_base()` for exactly as long as it is yielding, so the
+//! cursor can never point below the log. `next_base`'s assert is the live
+//! check on that.
+//!
+//! Two states yield, and only one of them is a gap:
+//!
+//! - **No generation open.** The archive's chain has not started, so it
+//!   needs nothing from the log: whatever it eventually snapshots will name
+//!   its own frontier. That is the fix for Task 6's configuration-triggered
+//!   growth (ruling 46) — the archive used to hold at the log's base while
+//!   waiting for a `snapshot_every` the `Db` had not crossed, freezing
+//!   `Wal::gc` against a perfectly healthy store. Bounding that wait would
+//!   have been the wrong shape: a bound sized for outages is sized wrong for
+//!   a cadence that has simply not arrived, and waiting loses nothing, so it
+//!   must not spend a gap.
+//! - **Gapped.** The bound was crossed while the archive *was* holding
+//!   something it needed. Records the log reclaims from here are not in the
+//!   archive, so the generation is closed (spec §2: a generation is either
+//!   continuous or it is finished) and the next successful contact opens a
+//!   fresh one with a full snapshot. `gapped()` reports this, and `step`
+//!   returns the operator notice once — when it happens, not once per step.
+//!
+//! **Generations transition on two triggers and one path** (`roll_generation`):
+//! a gap, and a `snapshot_every` crossing. A generation carries exactly one
+//! snapshot, so a *refresh* is a new generation — never a second snapshot
+//! written into `<gen>/snapshot/**`, whose keys the live manifest already
+//! points at. A roll deliberately CARRIES `next_needed`: the new
+//! generation's chain continues exactly where the old one stopped, which
+//! keeps every un-shipped record inside some generation and keeps the pin
+//! monotonic across the roll.
+//!
+//! **`Archive::step`'s first act is a store READ** (`State::Opening`): a GET
+//! of `<prefix>/manifest`, which decides whether this archive RESUMES the
+//! generation the bucket names or opens a fresh one — never blindly reuses 0
+//! (ruling 43). Task 6 could defer this only because nothing wires the
+//! archive into a kernel arm until Task 9; a restart that reused generation
+//! 0 would re-snapshot into a live generation's immutable keys. The same GET
+//! is the archive's contact probe after a gap, which is why the walk for the
+//! next generation never opens against a store that has not answered.
 //!
 //! Ask `Archive::idle` whether there is work left — never `pin_floor()`,
-//! which no longer has a caught-up sentinel and never should have been read
-//! as one. The bounded pin that makes a gap possible, and the
-//! writer-identity ownership check (spec §4), both land at Task 7.
+//! which has no caught-up sentinel and never should have been read as one.
+//! The writer-identity ownership check (spec §4) lands at Task 8: this task
+//! declines to *extend* a generation whose manifest names another writer,
+//! but does not yet refuse to archive at all.
 
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -163,14 +205,24 @@ pub struct ArchiveConfig {
     /// against the raw seq would fire one record late.
     ///
     /// A generation carries exactly one snapshot (module docs), so a *later*
-    /// multiple does not re-snapshot in place; refreshing means opening a
-    /// new generation, which lands at Task 7.
+    /// multiple does not re-snapshot in place: it opens a NEW generation
+    /// with a fresh full snapshot, the same transition a gap performs.
+    /// Measured from the live generation's own frontier, so the cadence is
+    /// "this many records since the last snapshot", never since seq 0.
     pub snapshot_every: u64,
     /// The archive's retention-pin bound, in segments (spec §5): 4x
     /// `DbConfig::retain_segments`'s default of 2, bounding the WAL held
-    /// above the checkpoint floor at 512 MiB (64 MiB segments) during an
-    /// object-store outage. **Unused this task** (ruling 23 carry-forward):
-    /// Task 5's pin is unbounded by design; the bound lands at Task 7.
+    /// above the checkpoint floor at 512 MiB (64 MiB segments).
+    ///
+    /// Counted as sealed segments at or above `next_needed` — exactly what
+    /// this archive's pin is keeping alive. Past it the archive yields
+    /// (module docs). Size it for the LONGER of the two waits it covers: an
+    /// object-store outage, and the time one generation's full snapshot
+    /// takes to upload, during which the archive ships no segment at all and
+    /// its pin holds every one of them.
+    ///
+    /// Must be at least 1; `open` asserts it. Zero would yield at the first
+    /// un-archived segment and make every generation one segment long.
     pub pin_segments: usize,
     /// Bounds `Db::read_log`'s PAYLOAD accounting for one call while
     /// shipping a segment (`bytes += flen`, log.rs:349) — never a
@@ -215,8 +267,53 @@ struct SnapshotWalk {
     done: Vec<TableBatches>,
 }
 
+/// What a generation's manifest repeats on every write: the frontier its one
+/// snapshot was taken at, the job counter, and the table names.
+///
+/// Kept instead of the whole `SnapshotMeta` because the per-table BATCH
+/// COUNTS are the reader's business — restore enumerates a generation's
+/// objects from them — and never the writer's, and because `State::Opening`
+/// reconstructs this from the manifest alone when it resumes a generation
+/// (ruling 43), where the counts are not available without a second GET.
+struct Frontier {
+    applied_seq: u64,
+    next_job_id: u64,
+    tables: Vec<String>,
+}
+
+/// The retention pin as `Db` sees it (module docs, ruling 49).
+struct Pin {
+    /// The lowest seq this archive still needs. Monotonic and never
+    /// `u64::MAX` — `hold` asserts the first, `pin_floor`'s doc promises the
+    /// second — in BOTH states, because the release is `holding`, not this.
+    floor: u64,
+    /// Whether the closure registered with `Db::add_retention_pin` reports
+    /// `floor` at all. Clear means it reports `u64::MAX`, which `db.rs`
+    /// documents as what "a pin that is not holding returns" and which is
+    /// the identity element of `Db::retention_floor`'s min.
+    holding: bool,
+}
+
 /// One transition of `Archive::step`'s state machine (module docs).
 enum State {
+    /// The archive's first act, and its first act again after a gap: GET
+    /// `<prefix>/manifest` to learn what the bucket already holds, so this
+    /// archive resumes that generation or opens a fresh one rather than
+    /// blindly reusing 0 (ruling 43). After a gap it doubles as the contact
+    /// probe: the next generation's snapshot walk must not open against a
+    /// store that has not answered, or it would be taken at a frontier the
+    /// log has moved past by the time it lands.
+    Opening {
+        started: bool,
+    },
+    /// Marking the generation a gap broke as `closed` (spec §2) before the
+    /// fresh one is built. The manifest still names it until the fresh
+    /// generation's snapshot lands, which can be a long time, and "stale"
+    /// and "finished" are different facts to a restore.
+    ClosingGeneration {
+        bytes: Vec<u8>,
+        started: bool,
+    },
     Idle,
     /// Paging the generation's snapshot out, one batch object per step.
     Snapshotting {
@@ -266,7 +363,7 @@ enum State {
         /// as its own only when this PUT lands, because the manifest swap
         /// is the archive's commit point (spec §2) — not when the snapshot
         /// objects themselves landed.
-        commits: Option<SnapshotMeta>,
+        commits: Option<Frontier>,
     },
 }
 
@@ -317,28 +414,39 @@ pub struct Archive {
     /// Shared with the closure `Db::add_retention_pin` holds — the ONLY
     /// channel back into `Db` this struct has (ruling 1/32: `open` takes
     /// `&mut Db` just long enough to register it).
-    pin: Arc<Mutex<u64>>,
-    /// This archive's generation counter (spec §2). Always 0 through Task
-    /// 6: nothing here ever closes a generation or opens a second one (both
-    /// need the bounded pin, T7), and nothing reads a prior one back (T7).
+    pin: Arc<Mutex<Pin>>,
+    /// This archive's generation counter (spec §2), 0-based. Advances by
+    /// exactly one per transition, and only through `roll_generation` or
+    /// `State::Opening`'s adoption of what the bucket already holds.
     generation: u64,
-    /// This generation's snapshot, recorded only once the manifest naming
-    /// it has landed. `None` means the generation has no snapshot yet, and
-    /// while it is `None` the archive ships nothing at all: a manifest with
-    /// no snapshot behind it names a frontier restore would reason from and
-    /// no object backs (module docs). Every later manifest this archive
-    /// writes repeats these values, since a generation carries exactly one
-    /// snapshot.
-    snapshot: Option<SnapshotMeta>,
+    /// This generation's frontier, recorded only once the manifest naming
+    /// its snapshot has landed. `None` means the generation has no snapshot
+    /// yet, and while it is `None` the archive ships nothing at all: a
+    /// manifest with no snapshot behind it names a frontier restore would
+    /// reason from and no object backs (module docs). Every later manifest
+    /// this archive writes repeats these values, since a generation carries
+    /// exactly one snapshot.
+    frontier: Option<Frontier>,
     /// The manifest's segment chain as this archive has built it so far,
     /// oldest first, contiguous (`Manifest::encode` asserts this — hard
-    /// rule 4). The next un-shipped segment's expected base_seq is
-    /// `segments.last().end_seq + 1`, or 0 before anything ships.
+    /// rule 4). Empty until the generation ships its first segment; a
+    /// generation roll clears it while deliberately carrying `next_needed`.
     segments: Vec<SegmentRef>,
+    /// The base_seq of the next sealed segment this archive needs — the head
+    /// of the chain it is still building, and the seq its pin holds at.
+    /// Held as a field rather than derived from `segments` because it
+    /// SURVIVES a generation roll: the new generation continues where the
+    /// old one stopped, and re-deriving it from an empty chain would move a
+    /// caught-up floor backwards onto `db.log_base()` (M1').
+    next_needed: u64,
     state: State,
-    /// Set by the two `step_idle` arms that find no available work,
-    /// cleared by every `step`. Backs `Archive::idle`.
+    /// Set by the `step_idle` arms that find no available work, cleared by
+    /// every `step`. Backs `Archive::idle`.
     idle: bool,
+    /// Backs `Archive::gapped` — see its doc for what it does and does not
+    /// mean. Distinct from `Pin::holding`, which is also clear while the
+    /// archive simply has no generation open and so nothing to hold.
+    gapped: bool,
 }
 
 impl Archive {
@@ -347,39 +455,63 @@ impl Archive {
     /// store — `step` is the only method that ever touches it (ruling 32),
     /// so `open` cannot fail on the store's account and never does.
     pub fn open(cfg: ArchiveConfig, db: &mut Db) -> io::Result<Archive> {
+        assert!(
+            cfg.pin_segments > 0,
+            "ArchiveConfig::pin_segments is 0, which yields at the first un-archived segment and \
+             makes every generation one segment long; set it to the number of WAL segments this \
+             archive may hold above the checkpoint floor (spec §5)"
+        );
         // Hold from the moment the pin is registered (M1). Starting at
         // `u64::MAX` left a window between `open` and the first pinning
         // `step` in which `Wal::gc` was free to delete the very segment
         // `next_base()` would later look for — after which `step_idle`'s
         // `find` never matches again and the archive ships nothing,
-        // forever, reporting no error.
-        let pin = Arc::new(Mutex::new(db.log_base()));
+        // forever, reporting no error. It matters here for a second reason:
+        // `State::Opening` may be about to RESUME the generation the bucket
+        // names, and a gc that ran in the two steps that GET takes could
+        // otherwise put a hole in the very chain being resumed.
+        let pin = Arc::new(Mutex::new(Pin {
+            floor: db.log_base(),
+            holding: true,
+        }));
         db.add_retention_pin(Box::new({
-            let floor = Arc::clone(&pin);
-            move || *floor.lock().expect("uncontended")
+            let pin = Arc::clone(&pin);
+            // RULING 49: the release lives HERE, in what the closure
+            // reports, and never in `floor`. `Db::retention_floor` is a min
+            // and `db.rs` documents `u64::MAX` as "a pin that is not
+            // holding" — its identity element.
+            move || {
+                let pin = pin.lock().expect("uncontended");
+                if pin.holding { pin.floor } else { u64::MAX }
+            }
         }));
         Ok(Archive {
             cfg,
             pin,
             generation: 0,
-            snapshot: None,
+            frontier: None,
             segments: Vec::new(),
-            state: State::Idle,
+            next_needed: db.log_base(),
+            state: State::Opening { started: false },
             idle: false,
+            gapped: false,
         })
     }
 
-    /// The retention floor this archive holds: the lowest seq it still
+    /// The retention floor this archive carries: the lowest seq it still
     /// needs, which once caught up is the base the next segment to seal
-    /// will start at. **Never `u64::MAX`** — this archive holds a floor
-    /// from `open` onward and never releases outright (M1); use
-    /// `Archive::idle` to ask whether there is work left, never this.
-    /// A segment counts as "reflected" only once the manifest PUT
-    /// naming it has itself succeeded — not merely once its own bytes
-    /// landed — so retention never releases a segment the manifest doesn't
-    /// yet acknowledge (spec §2: the manifest swap is the commit point).
+    /// will start at. **Never `u64::MAX`**, in either state — when the
+    /// archive yields it clears `Pin::holding` and leaves this a real,
+    /// monotonic seq (ruling 49). Use `Archive::idle` to ask whether there
+    /// is work left and `Archive::gapped` to ask whether the pin is live;
+    /// never read a sentinel out of this.
+    ///
+    /// A segment counts as "reflected" only once the manifest PUT naming it
+    /// has itself succeeded — not merely once its own bytes landed — so
+    /// retention never releases a segment the manifest doesn't yet
+    /// acknowledge (spec §2: the manifest swap is the commit point).
     pub fn pin_floor(&self) -> u64 {
-        *self.pin.lock().expect("uncontended")
+        self.pin.lock().expect("uncontended").floor
     }
 
     /// True when the last `step` found nothing it could do: either
@@ -391,49 +523,49 @@ impl Archive {
         self.idle
     }
 
-    /// True once a gap has closed this generation (spec §2). Always
-    /// `false` this task — see the module docs: Task 5's pin is unbounded
-    /// (ruling 23 carry-forward), so `Wal::gc` can never remove a sealed
-    /// segment this archive has not yet uploaded, which is the only way a
-    /// gap happens. The bounded pin that makes one possible lands at Task 7.
+    /// True while this archive is YIELDING after a gap (spec §2, ruling 3):
+    /// its bounded pin released, its generation closed, and the records
+    /// `Wal::gc` reclaims meanwhile absent from the archive. Cleared when
+    /// the next generation's snapshot opens — the point at which the archive
+    /// is building a continuous generation again and holds the log for it.
+    ///
+    /// It answers "is the archive yielding right now", which is what a
+    /// kernel arm needs; it is not a historical flag. The operator-facing
+    /// record that a gap HAPPENED is the notice `step` returns once, when it
+    /// happens (hard rule 5).
+    ///
+    /// Not the same question as "is the pin live": an archive with no
+    /// generation open holds nothing either, and that is not a gap.
     pub fn gapped(&self) -> bool {
-        false
+        self.gapped
     }
 
-    /// The base_seq the next un-shipped sealed segment must have, by the
-    /// contiguity this archive maintains in `self.segments`.
+    /// The base_seq of the next sealed segment this archive needs.
     ///
-    /// Floored at `db.log_base()` when nothing has shipped yet: **seq 0 is
-    /// usually gone.** Any node restarted after its first checkpoint, and
-    /// every seeded follower (`Seeder::finish` lays the first segment at
-    /// `applied_seq + 1`), opens on a log whose base is far above 0.
-    /// Answering 0 there made `step_idle` find no segment, pin the floor at
-    /// 0 — which holds the ENTIRE log — and ship nothing, forever, while
-    /// `Wal::gc` could never advance again (M1').
+    /// `next_needed` is floored at `db.log_base()` for as long as the
+    /// archive holds nothing (`yield_or_bound`): **seq 0 is usually gone.**
+    /// Any node restarted after its first checkpoint, and every seeded
+    /// follower (`Seeder::finish` lays the first segment at `applied_seq +
+    /// 1`), opens on a log whose base is far above 0. Answering 0 there made
+    /// `step_idle` find no segment, pin the floor at 0 — which holds the
+    /// ENTIRE log — and ship nothing, forever, while `Wal::gc` could never
+    /// advance again (M1').
     fn next_base(&self, db: &Db) -> u64 {
-        let Some(last) = self.segments.last() else {
-            return db.log_base();
-        };
-        let next = last.end_seq.checked_add(1).unwrap_or_else(|| {
-            panic!(
-                "Archive: the last shipped segment's end_seq is u64::MAX with more to ship \
-                 after it — Manifest::encode would refuse this chain (hard rule 4); \
-                 unreachable while this archive only ever appends contiguous SegmentRefs"
-            )
-        });
-        // Negative space (hard rule 4): the pin holds everything from `next`
-        // up, so gc cannot have reclaimed it. If it has, the chain this
-        // archive would build next has a HOLE in it, and silently skipping
-        // to the log's new base would produce exactly the manifest that
-        // claims a span it never shipped. Closing a generation on a gap is
-        // Task 7's job; until then this is unreachable and says so.
+        // Negative space (hard rule 4): while the archive HOLDS, the pin
+        // covers everything from here up, so gc cannot have reclaimed it. If
+        // it has, the chain this archive would build next has a HOLE in it,
+        // and silently skipping to the log's new base would produce exactly
+        // the manifest that claims a span it never shipped. Losing records
+        // to gc is what a GAP is, and a gap yields the pin and re-derives
+        // `next_needed` rather than reaching here.
         assert!(
-            next >= db.log_base(),
-            "Archive: next needed seq {next} is below the log's base {} — gc reclaimed a \
+            self.next_needed >= db.log_base(),
+            "Archive: next needed seq {} is below the log's base {} — gc reclaimed a \
              segment this archive still needed, which its retention pin exists to prevent",
+            self.next_needed,
             db.log_base()
         );
-        next
+        self.next_needed
     }
 
     /// The pin only ever moves FORWARD. It is a retention floor, and both
@@ -442,14 +574,33 @@ impl Archive {
     /// archive was waiting for (M1), while moving it BACKWARDS re-holds
     /// segments already released and freezes gc for good (M1'). Neither was
     /// caught by a test; an assert catches both by construction.
+    ///
+    /// RULING 49: releasing therefore does NOT go through the floor. It
+    /// clears `Pin::holding` (`yield_pin`) and leaves the floor exactly
+    /// where it was, so both failure modes stay unreachable by construction
+    /// in a task whose whole subject is releasing the pin.
     fn hold(&self, floor: u64) {
+        self.set_floor(floor, true);
+    }
+
+    /// Yields: the same monotonic floor, no longer reported to `Db`.
+    fn yield_pin(&self, floor: u64) {
+        self.set_floor(floor, false);
+    }
+
+    fn set_floor(&self, floor: u64, holding: bool) {
         let mut pin = self.pin.lock().expect("uncontended");
         assert!(
-            floor >= *pin,
+            floor >= pin.floor,
             "Archive: retention pin moved backwards, {} -> {floor}; a floor may only advance",
-            *pin
+            pin.floor
         );
-        *pin = floor;
+        pin.floor = floor;
+        pin.holding = holding;
+    }
+
+    fn holding(&self) -> bool {
+        self.pin.lock().expect("uncontended").holding
     }
 
     /// One unit of work: start one upload, poll one in flight, or read one
@@ -460,7 +611,17 @@ impl Archive {
     /// else — it never reaches `Db`, so it can never poison it (spec §7).
     pub fn step(&mut self, db: &Db, store: &dyn ObjectStore) -> io::Result<()> {
         self.idle = false;
+        // Before the transition, never inside one: the bound is about how
+        // far behind the archive IS, which grows while it is stuck retrying
+        // an upload — and a stuck retry is exactly what an outage leaves it
+        // doing, so a check that only ran from `Idle` would never run at all
+        // in the case it exists for.
+        self.yield_or_bound(db)?;
         match std::mem::replace(&mut self.state, State::Idle) {
+            State::Opening { started } => self.step_opening(db, store, started),
+            State::ClosingGeneration { bytes, started } => {
+                self.step_closing_generation(store, bytes, started)
+            }
             State::Idle => self.step_idle(db),
             State::Snapshotting { walk } => self.step_snapshotting(walk),
             State::UploadingSnapshotBatch {
@@ -495,22 +656,318 @@ impl Archive {
         }
     }
 
-    /// The manifest bytes for the generation as it stands: `snapshot`'s
-    /// frontier, and whatever segment chain has been built so far. Every
-    /// manifest this archive writes goes through here, so the frontier can
-    /// never diverge between the one written after the snapshot and the one
-    /// written after each segment.
-    fn manifest_bytes(&self, snapshot: &SnapshotMeta) -> Vec<u8> {
+    /// The manifest bytes for the generation as it stands: its frontier, and
+    /// whatever segment chain has been built so far. Every manifest this
+    /// archive writes goes through here, so the frontier can never diverge
+    /// between the one written after the snapshot and the one written after
+    /// each segment.
+    fn manifest_bytes(&self, frontier: &Frontier) -> Vec<u8> {
         Manifest {
             generation: self.generation,
             writer: self.cfg.writer.clone(),
-            applied_seq: snapshot.applied_seq,
-            next_job_id: snapshot.next_job_id,
-            tables: snapshot.tables.iter().map(|t| t.name.clone()).collect(),
+            applied_seq: frontier.applied_seq,
+            next_job_id: frontier.next_job_id,
+            tables: frontier.tables.clone(),
             segments: self.segments.clone(),
             closed: false,
         }
         .encode()
+    }
+
+    /// SPEC RULING 3 / §5. Runs before every transition (`step`).
+    ///
+    /// Two jobs, and they are one function because they are the same
+    /// question asked in the two states: *does this archive hold the log,
+    /// and may it?*
+    fn yield_or_bound(&mut self, db: &Db) -> io::Result<()> {
+        if !self.holding() {
+            // Holding nothing — either no generation is open or a gap is
+            // live. Track the log's base so the floor stays a real,
+            // monotonic seq (never `u64::MAX`, ruling 49), so `next_base`'s
+            // assert cannot fire on a cursor gc has passed, and so the
+            // re-hold on the next contact is monotonic FOR FREE: gc only
+            // ever advances the base.
+            let base = db.log_base();
+            if base > self.next_needed {
+                self.next_needed = base;
+                self.yield_pin(base);
+            }
+            return Ok(());
+        }
+        // Never abandon a started operation: `ObjectStore::start` asserts
+        // against a second one while the first is in flight (spec §1), and
+        // the gap below discards whatever the archive was doing. A retry
+        // that has FAILED leaves `started` false, which is the state an
+        // outage parks the archive in, so this costs the bound nothing.
+        if self.op_in_flight() {
+            return Ok(());
+        }
+        let sealed = db.sealed_segments()?;
+        let behind = sealed
+            .iter()
+            .filter(|s| s.base_seq >= self.next_needed)
+            .count();
+        if behind <= self.cfg.pin_segments {
+            return Ok(());
+        }
+        let notice = self.gap_notice(behind);
+        // The gap FORFEITS every sealed segment this archive was holding —
+        // that is what yielding means, and the fresh generation's own full
+        // snapshot covers all of them, since its frontier can only be at or
+        // above the last record in the last of them. Carrying `next_needed`
+        // across a gap the way `roll_generation` carries it across a cadence
+        // roll would take those segments straight back on the next hold, the
+        // bound would be over on the very next step, and the archive would
+        // churn generations without ever shipping anything (the notice once
+        // per churn). The new chain therefore starts at the live tail's base.
+        let tail = sealed.last().map_or(db.log_base(), |s| s.layout_end + 1);
+        self.next_needed = self.next_needed.max(tail);
+        self.yield_pin(self.next_needed);
+        self.gapped = true;
+        self.roll_generation();
+        self.state = State::Opening { started: false };
+        Err(notice)
+    }
+
+    /// True while an `ObjectStore` operation this archive started has not
+    /// been polled to completion.
+    fn op_in_flight(&self) -> bool {
+        matches!(
+            self.state,
+            State::Opening { started: true }
+                | State::ClosingGeneration { started: true, .. }
+                | State::UploadingSnapshotBatch { started: true, .. }
+                | State::UploadingSnapshotMeta { started: true, .. }
+                | State::UploadingSegment { started: true, .. }
+                | State::UploadingManifest { started: true, .. }
+        )
+    }
+
+    /// HARD RULE 5, and this task's entire operator surface: a gap is the
+    /// one failure here that silently costs continuity, so the text names
+    /// the contract (the bound and its value), the site (the prefix and the
+    /// generation), and BOTH fixes (spec §7).
+    fn gap_notice(&self, behind: usize) -> io::Error {
+        io::Error::other(format!(
+            "Archive: gap at prefix \"{}\" — {behind} sealed WAL segments are un-archived, past \
+             the configured bound of pin_segments = {}. The retention pin is released so \
+             Wal::gc can proceed and the primary keeps accepting writes: on outage the archive \
+             yields, never the primary (spec ruling 3). Generation {} is closed; the next \
+             successful contact opens a fresh generation with a full snapshot, and whatever the \
+             log reclaims meanwhile is not in the archive. Fix: raise \
+             ArchiveConfig::pin_segments if the WAL can afford to hold more, or accept the new \
+             generation and the gap it leaves.",
+            self.cfg.prefix, self.cfg.pin_segments, self.generation
+        ))
+    }
+
+    /// Closes this generation and opens the next. The ONE path behind both
+    /// triggers that need it — a `snapshot_every` crossing and a gap —
+    /// because they differ only in what provoked them and in whether the pin
+    /// is yielded on the way. A generation carries exactly one snapshot, so
+    /// a refresh cannot be a second snapshot in place: `<gen>/snapshot/**`
+    /// is what the live manifest already points at.
+    ///
+    /// `next_needed` is deliberately CARRIED. The new generation's chain
+    /// continues exactly where the old one stopped, which keeps every
+    /// un-shipped record inside some generation and keeps the pin monotonic
+    /// across the roll — re-deriving it from the now-empty chain would move
+    /// a caught-up floor backwards onto `db.log_base()` and trip `hold`'s
+    /// M1' assert.
+    fn roll_generation(&mut self) {
+        self.generation += 1;
+        self.frontier = None;
+        self.segments.clear();
+    }
+
+    /// True when this generation's snapshot is `snapshot_every` records old.
+    ///
+    /// RECORDS, not seqs (ruling 48): the frontier is the 0-based seq of the
+    /// snapshot's last record, so the Nth record after it has seq
+    /// `applied_seq + N`. Measuring from seq 0 instead would fire on the
+    /// wrong multiple for every generation but the first.
+    fn cadence_due(&self, db: &Db) -> bool {
+        if self.cfg.snapshot_every == 0 {
+            return false;
+        }
+        let Some(frontier) = &self.frontier else {
+            return false;
+        };
+        db.last_applied()
+            .is_some_and(|l| l >= frontier.applied_seq.saturating_add(self.cfg.snapshot_every))
+    }
+
+    /// RULING 43 / spec §4: reads `<prefix>/manifest` so this archive
+    /// resumes the generation the bucket names or opens a fresh one, never
+    /// blindly reuses 0. A missing manifest is a fresh bucket, not an error;
+    /// every other failure is a retry, with `started` cleared so the next
+    /// step re-issues the GET.
+    fn step_opening(&mut self, db: &Db, store: &dyn ObjectStore, started: bool) -> io::Result<()> {
+        // `self.state` is the placeholder `Idle` on entry (`step`'s
+        // `mem::replace`), and unlike `step_idle` there IS something
+        // resumable to lose here: an archive that fell back to `Idle` would
+        // snapshot without ever having read the bucket. Every arm below
+        // therefore sets the state explicitly.
+        if !started {
+            let key = manifest_key(&self.cfg.prefix);
+            if let Err(e) = store.start(ObjectOp::Get { key }) {
+                self.state = State::Opening { started: false };
+                return Err(e);
+            }
+            self.state = State::Opening { started: true };
+            return Ok(());
+        }
+        match store.poll() {
+            None => {
+                self.state = State::Opening { started: true };
+                Ok(())
+            }
+            Some(Ok(ObjectDone::Get(bytes))) => match Manifest::decode(&bytes) {
+                Ok(m) => {
+                    self.adopt(db, Some(m));
+                    Ok(())
+                }
+                Err(e) => {
+                    // Untrusted bytes, and refusing outright is spec §4's
+                    // ownership rule, which lands at Task 8. Retrying is the
+                    // conservative reading until then: the archive writes
+                    // nothing and never poisons the Db, which is what a
+                    // corrupt manifest calls for either way.
+                    self.state = State::Opening { started: false };
+                    Err(e)
+                }
+            },
+            Some(Ok(other)) => unreachable!(
+                "a Get was started; only ObjectDone::Get or an error can complete it, got \
+                 {other:?}"
+            ),
+            // A bucket this archive has never written to. Not a failure.
+            Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => {
+                self.adopt(db, None);
+                Ok(())
+            }
+            Some(Err(e)) => {
+                self.state = State::Opening { started: false };
+                Err(e)
+            }
+        }
+    }
+
+    /// Decides, from what the bucket already holds, whether this archive
+    /// extends that generation or opens a fresh one (ruling 43).
+    fn adopt(&mut self, db: &Db, found: Option<Manifest>) {
+        self.state = State::Idle;
+        let Some(m) = found else {
+            // Nothing in the bucket: generation 0 on a first open, and on a
+            // gap whatever `roll_generation` already moved to — a gap spends
+            // a generation whether or not the closed one ever wrote, so the
+            // counter advances by exactly one either way (ruling 50).
+            self.hold_or_yield_for_generation(db);
+            return;
+        };
+        if let Some(resume_at) = self.resume_point(db, &m) {
+            self.generation = m.generation;
+            self.segments = m.segments;
+            self.frontier = Some(Frontier {
+                applied_seq: m.applied_seq,
+                next_job_id: m.next_job_id,
+                tables: m.tables,
+            });
+            self.next_needed = resume_at;
+            self.hold(resume_at);
+            return;
+        }
+        // A fresh generation over an existing one. `max` rather than
+        // `m.generation + 1` alone: after a gap this archive has ALREADY
+        // rolled, and re-deriving from the manifest would either double the
+        // increment or reuse a number whose objects are in the bucket. With
+        // one writer both forms are the same +1, which is what ruling 50's
+        // exactly-one assertion pins.
+        self.generation = self.generation.max(m.generation + 1);
+        self.segments.clear();
+        self.frontier = None;
+        self.hold_or_yield_for_generation(db);
+        // Spec §2: a gap CLOSES the generation it broke. The manifest still
+        // names it until the fresh generation's snapshot lands, which can be
+        // a long time, and "stale" and "finished" are different facts to a
+        // restore. Only ever this archive's own generation: extending or
+        // annotating another writer's is spec §4's refusal, never a repair.
+        if m.writer == self.cfg.writer && !m.closed {
+            let closed = Manifest { closed: true, ..m };
+            self.state = State::ClosingGeneration {
+                bytes: closed.encode(),
+                started: false,
+            };
+        }
+    }
+
+    /// With no generation open the archive needs nothing from the log
+    /// (module docs, ruling 46), so it yields rather than holding at a base
+    /// whose records its future snapshot will cover anyway.
+    fn hold_or_yield_for_generation(&mut self, db: &Db) {
+        self.next_needed = self.next_needed.max(db.log_base());
+        self.yield_pin(self.next_needed);
+    }
+
+    /// The seq a resumed generation continues its chain at, or `None` when
+    /// this generation must not be extended. Every refusal below is a reason
+    /// the extension would produce a chain that claims more than it covers.
+    fn resume_point(&self, db: &Db, m: &Manifest) -> Option<u64> {
+        if self.gapped {
+            // gc has taken records this generation never shipped: extending
+            // it is exactly the hole spec §2 says a generation never has.
+            return None;
+        }
+        if m.writer != self.cfg.writer {
+            // Never interleave generations (spec §4). Refusing to archive at
+            // all is Task 8's; declining to extend somebody else's chain is
+            // strictly safer than the blind reuse this replaces.
+            return None;
+        }
+        if m.closed {
+            return None;
+        }
+        // Negative space, checked rather than asserted because these bytes
+        // crossed the network: a chain starting ABOVE its own snapshot's
+        // frontier already fails to cover the records between them.
+        if m.segments
+            .first()
+            .is_some_and(|s| s.base_seq > m.applied_seq.saturating_add(1))
+        {
+            return None;
+        }
+        let at = match m.segments.last() {
+            Some(last) => last.end_seq.checked_add(1)?,
+            // No chain yet: it would start at the log's base, which has to
+            // be at or below the snapshot's frontier for the same reason.
+            None => {
+                let base = db.log_base();
+                if base > m.applied_seq.saturating_add(1) {
+                    return None;
+                }
+                base
+            }
+        };
+        // And everything from there must still be in the local log.
+        if db.log_base() > at {
+            return None;
+        }
+        Some(at)
+    }
+
+    fn step_closing_generation(
+        &mut self,
+        store: &dyn ObjectStore,
+        bytes: Vec<u8>,
+        mut started: bool,
+    ) -> io::Result<()> {
+        let key = manifest_key(&self.cfg.prefix);
+        let done = put_step(store, &key, &bytes, &mut started);
+        self.state = match done {
+            Ok(true) => State::Idle,
+            _ => State::ClosingGeneration { bytes, started },
+        };
+        done.map(|_| ())
     }
 
     /// Opens this generation's snapshot if the cadence admits one, and
@@ -667,11 +1124,16 @@ impl Archive {
             // above any of those PUTs makes the manifest point at a
             // generation whose objects are not all there, which is the one
             // thing the layout has no defence against.
-            let manifest = self.manifest_bytes(&meta);
+            let frontier = Frontier {
+                applied_seq: meta.applied_seq,
+                next_job_id: meta.next_job_id,
+                tables: meta.tables.iter().map(|t| t.name.clone()).collect(),
+            };
+            let manifest = self.manifest_bytes(&frontier);
             self.state = State::UploadingManifest {
                 bytes: manifest,
                 started: false,
-                commits: Some(meta),
+                commits: Some(frontier),
             };
             return Ok(());
         }
@@ -687,18 +1149,33 @@ impl Archive {
     /// `mem::replace`) — safe to use `?` throughout: there is nothing
     /// resumable to lose on an early return, unlike every other arm below.
     fn step_idle(&mut self, db: &Db) -> io::Result<()> {
+        // A `snapshot_every` crossing closes this generation and opens the
+        // next — the same `roll_generation` a gap performs, on a different
+        // trigger (module docs). Safe here and nowhere else: `Idle` is the
+        // one state with nothing in flight and nothing half-written.
+        if self.cadence_due(db) {
+            self.roll_generation();
+        }
         // The generation's snapshot comes before anything else it contains,
         // and no manifest is written until it has landed (module docs). A
         // segment shipped first would need a manifest to name it, and that
         // manifest would carry a frontier no snapshot backs.
-        if self.snapshot.is_none() {
+        if self.frontier.is_none() {
             if self.open_snapshot(db)? {
-                // Holding, not releasing (M1): the whole log from here is
-                // still needed — nothing has been archived at all.
-                self.hold(self.next_base(db));
+                // From here the archive is building a chain continuing from
+                // `next_needed` and needs the log again: hold (M1), and the
+                // gap — if there was one — is closed by the generation now
+                // opening.
+                self.hold(self.next_needed);
+                self.gapped = false;
                 return Ok(());
             }
-            self.hold(self.next_base(db));
+            // No generation to open: the cadence has not arrived, or the Db
+            // has applied nothing. The chain has not started, so the archive
+            // needs NOTHING from the log — holding here is ruling 46's
+            // configuration-triggered WAL growth, against a store that may
+            // be perfectly healthy.
+            self.hold_or_yield_for_generation(db);
             self.idle = true;
             return Ok(());
         }
@@ -841,12 +1318,12 @@ impl Archive {
             // the segment it names.
             self.segments.push(SegmentRef { base_seq, end_seq });
             let manifest_bytes = {
-                let snapshot = self.snapshot.as_ref().expect(
+                let frontier = self.frontier.as_ref().expect(
                     "Archive: a segment landed for a generation with no snapshot — step_idle \
                      ships nothing until the opening snapshot's manifest has itself landed, so \
                      the manifest built here can never lack a frontier",
                 );
-                self.manifest_bytes(snapshot)
+                self.manifest_bytes(frontier)
             };
             self.state = State::UploadingManifest {
                 bytes: manifest_bytes,
@@ -870,7 +1347,7 @@ impl Archive {
         store: &dyn ObjectStore,
         bytes: Vec<u8>,
         mut started: bool,
-        commits: Option<SnapshotMeta>,
+        commits: Option<Frontier>,
     ) -> io::Result<()> {
         let key = manifest_key(&self.cfg.prefix);
         let done = put_step(store, &key, &bytes, &mut started);
@@ -878,10 +1355,19 @@ impl Archive {
             // The manifest swap landed: whatever this manifest names —
             // the generation's snapshot, a segment, or both — is now
             // durably reflected off-box, so the pin may release it. The
-            // NEXT `Idle` step recomputes the true floor (another sealed
-            // segment may already be waiting, or none is).
-            if let Some(meta) = commits {
-                self.snapshot = Some(meta);
+            // NEXT `Idle` step re-holds at the floor computed here (another
+            // sealed segment may already be waiting, or none is).
+            if let Some(frontier) = commits {
+                self.frontier = Some(frontier);
+            }
+            if let Some(last) = self.segments.last() {
+                self.next_needed = last.end_seq.checked_add(1).unwrap_or_else(|| {
+                    panic!(
+                        "Archive: the last shipped segment's end_seq is u64::MAX with more to \
+                         ship after it — Manifest::encode would refuse this chain (hard rule 4); \
+                         unreachable while this archive only ever appends contiguous SegmentRefs"
+                    )
+                });
             }
             self.state = State::Idle;
             return Ok(());

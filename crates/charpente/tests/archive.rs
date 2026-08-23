@@ -16,6 +16,7 @@ use charpente::archive::manifest::{
 };
 use charpente::archive::{Archive, ArchiveConfig};
 use charpente::{Db, DbConfig, Id, Schema, table};
+use charpente_core::crc::crc32;
 use charpente_core::io::{ObjectDone, ObjectOp, ObjectStore};
 use charpente_core::table::Row;
 use charpente_sim::object::SimObjectStore;
@@ -169,33 +170,57 @@ impl ObjectStore for FlakyStore {
     }
 }
 
+/// The default retention-pin bound (Task 7), deliberately generous: several
+/// tests here starve the archive on purpose — `the_seal_rate_stays_under_
+/// one_upload_per_step_budget` writes FIFTY segments before stepping it at
+/// all — and under a small bound that starvation would gap, which is a side
+/// effect rather than the property those tests exist to check. The gap
+/// tests set their own, small bound instead.
+const PIN_SEGMENTS: usize = 64;
+
+/// The bound where crossing it IS the property (Task 7). Small enough that
+/// the gap tests' `20 * RECORDS_PER_SEGMENT` crosses it twice over, and
+/// large enough that the three-segment fixtures sharing
+/// `archive_fixture_with_unreachable_store` never reach it.
+const GAP_PIN_SEGMENTS: usize = 8;
+
 /// The one place an `ArchiveConfig` is spelled out, so a field added to it
 /// lands in every fixture at once.
 ///
 /// `snapshot_every: 0` is not "snapshots off" — it is "no cadence
 /// configured", i.e. take this generation's opening snapshot as soon as
-/// there is a frontier to name. That is what the existing fixtures pass, and
-/// it is deliberate: the archive writes no manifest until its generation
-/// carries a snapshot (Defect 4), so a fixture that suppressed the snapshot
-/// would suppress every manifest assertion in this file along with it.
+/// there is a frontier to name, and never refresh it into a new generation
+/// (Task 7). That is what the existing fixtures pass, and it is deliberate:
+/// the archive writes no manifest until its generation carries a snapshot
+/// (Defect 4), so a fixture that suppressed the snapshot would suppress
+/// every manifest assertion in this file along with it.
 fn archive_config(snapshot_every: u64, read_budget_bytes: usize) -> ArchiveConfig {
+    archive_config_bounded(snapshot_every, read_budget_bytes, PIN_SEGMENTS)
+}
+
+fn archive_config_bounded(
+    snapshot_every: u64,
+    read_budget_bytes: usize,
+    pin_segments: usize,
+) -> ArchiveConfig {
     ArchiveConfig {
         prefix: PREFIX.to_string(),
         writer: WRITER.to_string(),
         snapshot_every,
-        pin_segments: 8,
+        pin_segments,
         read_budget_bytes,
     }
 }
 
 fn build_fixture<S>(store: S, read_budget_bytes: usize) -> (Db, S, Archive) {
-    build_fixture_with_cadence(store, 0, read_budget_bytes)
+    build_fixture_with_cadence(store, 0, read_budget_bytes, PIN_SEGMENTS)
 }
 
 fn build_fixture_with_cadence<S>(
     store: S,
     snapshot_every: u64,
     read_budget_bytes: usize,
+    pin_segments: usize,
 ) -> (Db, S, Archive) {
     let sim = Sim::with_faults(0x6172_6368_5f74_3500, FaultConfig::none());
     let mut db_cfg = DbConfig::default();
@@ -207,7 +232,11 @@ fn build_fixture_with_cadence<S>(
     // (M1/M2). The pin now holds from `open`, so no accommodation is
     // needed and the default cadence is itself part of the oracle.
     let mut db = Db::open(Box::new(sim.disk()), db_cfg, Schema::new().table::<Rec>()).unwrap();
-    let arc = Archive::open(archive_config(snapshot_every, read_budget_bytes), &mut db).unwrap();
+    let arc = Archive::open(
+        archive_config_bounded(snapshot_every, read_budget_bytes, pin_segments),
+        &mut db,
+    )
+    .unwrap();
     (db, store, arc)
 }
 
@@ -240,10 +269,14 @@ fn archive_fixture() -> (Db, SimObjectStore, Archive) {
 /// touching `object.rs` (off-limits, Ruling 37) — so `restore_store_
 /// reachability` could not genuinely restore it and shipped as a panic
 /// stub. `FlakyStore`'s `reachable` switch is a real, reversible outage.
+///
+/// Runs at `GAP_PIN_SEGMENTS` rather than the file default: this is the
+/// fixture Task 7's gap tests use, and a bound they cannot reach would make
+/// every one of them vacuous.
 fn archive_fixture_with_unreachable_store() -> (Db, FlakyStore, Archive) {
     let store = FlakyStore::new(SimObjectStore::new());
     store.set_reachable(false);
-    build_fixture(store, 8 << 20)
+    build_fixture_with_cadence(store, 0, 8 << 20, GAP_PIN_SEGMENTS)
 }
 
 /// Starts reachable, with `start_errors` on (m7): makes `ObjectStore::
@@ -259,7 +292,7 @@ fn archive_fixture_with_start_errors() -> (Db, FlakyStore, Archive) {
 /// until `last_applied` has crossed `snapshot_every`, because a manifest
 /// with no snapshot behind it names a frontier nothing backs (Defect 4).
 fn archive_fixture_with_snapshot_cadence(snapshot_every: u64) -> (Db, SimObjectStore, Archive) {
-    build_fixture_with_cadence(SimObjectStore::new(), snapshot_every, 8 << 20)
+    build_fixture_with_cadence(SimObjectStore::new(), snapshot_every, 8 << 20, PIN_SEGMENTS)
 }
 
 /// A store whose MANIFEST PUTs land and are then reported as failed — the
@@ -358,14 +391,34 @@ fn step_until_error(arc: &mut Archive, db: &Db, store: &dyn ObjectStore) -> io::
     panic!("step_until_error: Archive::step never returned Err in 10,000 steps");
 }
 
-/// Same shape as `step_until_error` today — an addition this brief named
-/// but did not define (Ruling 31). Kept as a distinct name for later tasks
-/// (T6/T7), which will need to tell an ordinary IO retry apart from a
-/// terminal notice (e.g. a foreign-writer manifest, spec §4); Task 5's
-/// `Archive` makes no such distinction yet, so this is `step_until_error`
-/// in substance until it does.
+/// Task 7 makes this genuinely distinct from `step_until_error`, which its
+/// Task 5 doc promised and Defect 4 turned into a real defect: on an
+/// unreachable-store fixture the FIRST `Err` is an ordinary IO retry, not
+/// the gap notice — which cannot arrive until the bound is crossed — so a
+/// notice test built on `step_until_error` asserts its needles against the
+/// wrong error entirely.
+///
+/// This skips retryable IO errors and returns the terminal notice. It
+/// recognises it by the STATE TRANSITION that accompanies it rather than by
+/// matching its prose: the gap notice is the only error `Archive::step`
+/// returns on the step that flips `Archive::gapped` from false to true.
+/// Matching a substring instead would make the notice test circular — it
+/// would find the words it is about to assert are present.
+///
+/// Task 8's foreign-writer refusal (spec §4) is terminal too and sets no
+/// such flag; it will need its own signal here, and this doc is where to
+/// add it.
 fn step_until_notice(arc: &mut Archive, db: &Db, store: &dyn ObjectStore) -> io::Error {
-    step_until_error(arc, db, store)
+    for _ in 0..10_000 {
+        let before = arc.gapped();
+        if let Err(e) = arc.step(db, store)
+            && arc.gapped()
+            && !before
+        {
+            return e;
+        }
+    }
+    panic!("step_until_notice: Archive::step never raised a terminal notice in 10,000 steps");
 }
 
 fn sealed_segment_count(db: &Db) -> usize {
@@ -374,15 +427,24 @@ fn sealed_segment_count(db: &Db) -> usize {
 
 /// The active tail's base_seq, derived only from `Db`'s public surface: the
 /// last `SealedSegment`'s layout end is one less than the tail's base by
-/// construction (`Db::sealed_segments` never emits the tail itself), and a
-/// fresh WAL's first-ever segment starts at 0. Valid in this file because
-/// no fixture here ever runs GC (no checkpoint cadence is reached, and the
-/// archive's own retention pin holds everything besides).
+/// construction (`Db::sealed_segments` never emits the tail itself).
+///
+/// Defect 5: the `map_or(0, ..)` fallback — "a WAL with no sealed segment
+/// has its tail at 0" — is the part GC can falsify, and Task 7 brought GC
+/// into this file for the first time (the bound tests call `db.checkpoint()`
+/// and assert `log_base` ADVANCED, and an archive holding nothing lets the
+/// default cadence reclaim on its own). A GC'd log whose sealed segments
+/// were all reclaimed would answer 0 for a tail sitting far above it. The
+/// helper is therefore re-derived rather than re-documented: `db.log_base()`
+/// is the floor of what the WAL still holds, so a listing with no sealed
+/// segment has its tail there, at 0 or anywhere above it. Every caller in
+/// this file is unaffected — each has sealed segments — but the answer is
+/// now correct without a precondition a later test can silently break.
 fn current_tail_base_seq(db: &Db) -> u64 {
     db.sealed_segments()
         .unwrap()
         .last()
-        .map_or(0, |s| s.layout_end + 1)
+        .map_or_else(|| db.log_base(), |s| s.layout_end + 1)
 }
 
 fn drain(store: &dyn ObjectStore) -> io::Result<ObjectDone> {
@@ -561,6 +623,34 @@ fn snapshot_objects(
             )
         })
         .collect()
+}
+
+/// RULING 51: comparing two `Vec<(String, Vec<u8>)>` with `assert_eq!`
+/// dumps ~20 KB of raw bytes on failure and names nothing — a message no
+/// operator or agent can act on (hard rule 5). This names the first key that
+/// differs and reports its length and CRC instead of its contents, which is
+/// the whole of what the reader needs: WHICH object changed.
+fn assert_snapshot_objects_unchanged(
+    now: &[(String, Vec<u8>)],
+    before: &[(String, Vec<u8>)],
+    why: &str,
+) {
+    let names = |v: &[(String, Vec<u8>)]| v.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
+    assert_eq!(
+        names(now),
+        names(before),
+        "the generation's object SET changed. {why}"
+    );
+    for ((key, now), (_, before)) in now.iter().zip(before) {
+        assert!(
+            now == before,
+            "object {key} was rewritten: {} bytes (crc {:08x}) -> {} bytes (crc {:08x}). {why}",
+            before.len(),
+            crc32(before),
+            now.len(),
+            crc32(now)
+        );
+    }
 }
 
 fn write_foreign_manifest(store: &SimObjectStore, writer: &str, generation: u64) {
@@ -875,18 +965,47 @@ fn start_errors_surface_from_both_the_segment_and_the_manifest_put() {
     let (mut db, store, mut arc) = archive_fixture_with_start_errors();
     write_records(&mut db, RECORDS_PER_SEGMENT + 50);
 
+    // Task 7 put a store READ in front of everything the archive does: its
+    // first act is a GET of `<prefix>/manifest` (resume-or-open, carried
+    // obligation (a)). `start_errors` refuses every `start`, reads included,
+    // so leaving the switch on from step 1 would make Phase 1 below catch
+    // the GET's refusal and pass for the wrong reason — F4's hazard, one
+    // task later. Let the archive reach its first SEGMENT upload with the
+    // switch off, stopping the instant the opening snapshot's manifest lands
+    // (nothing is in flight at that moment, so `store.keys()` is safe to
+    // read between steps; `read_manifest` would `start` a GET of its own).
+    store.set_start_errors(false);
+    let manifest = manifest_key(PREFIX);
+    for _ in 0..10_000 {
+        if store.keys().contains(&manifest) {
+            break;
+        }
+        let _ = arc.step(&db, &store);
+    }
+    let keys_before = store.keys();
+    assert!(
+        keys_before.contains(&manifest),
+        "the opening snapshot's manifest never landed; Phase 1 has nothing to sit in front of"
+    );
+    assert!(
+        !keys_before.iter().any(|k| k.contains("/segments/")),
+        "a segment shipped before the switch went back on, so Phase 1 would be testing a later \
+         start than the one it names: {keys_before:?}"
+    );
+    store.set_start_errors(true);
+
     // Phase 1: step_uploading_segment's start Err arm. Idle->Reading and
-    // Reading->UploadingSegment never touch the store, so it is safe that
-    // the switch was already on before the very first step.
+    // Reading->UploadingSegment never touch the store, so the next `start`
+    // after the switch goes on is the segment PUT's.
     let e = step_until_error(&mut arc, &db, &store);
     assert!(
         e.to_string().contains("simulated FlakyStore start failure"),
         "expected the start-refusal text, got: {e}"
     );
-    assert!(
-        store.keys().is_empty(),
-        "a refused start must not have PUT anything: {:?}",
-        store.keys()
+    assert_eq!(
+        store.keys(),
+        keys_before,
+        "a refused start must not have PUT anything"
     );
 
     // Let the segment PUT actually land, then stop the instant it has.
@@ -1038,7 +1157,13 @@ fn the_seal_rate_stays_under_one_upload_per_step_budget() {
 /// a fraction of the run. Asserted below so it cannot silently drift into
 /// either failure — re-measure and update if the archive's step shape
 /// changes.
-const STEPS_TO_ARCHIVE_5000_RECORDS: usize = 47;
+///
+/// RE-MEASURED at Task 7: 47 -> 49. `State::Opening` puts a manifest GET in
+/// front of everything (resume-or-open, ruling 43), and it costs exactly the
+/// two steps every store operation costs here — one to `start`, one to
+/// `poll`. The delta being 2 and not more is itself the check that Task 7
+/// added a prologue rather than changing the shipping loop.
+const STEPS_TO_ARCHIVE_5000_RECORDS: usize = 49;
 
 /// The property this task exists to establish (spec §2): upload every object
 /// of a generation, THEN swap the manifest. Inter-key ordering is not
@@ -1281,10 +1406,17 @@ fn the_snapshot_waits_for_the_configured_record_cadence() {
     write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
     step_until_idle(&mut arc, &db, &store);
     let m = read_manifest(&store).expect("a manifest once the cadence was crossed");
+    // RULING 51: `applied_seq >= cadence` is ONE RECORD STRICTER than the
+    // contract Ruling 48 established — `snapshot_every` counts committed
+    // records and `applied_seq` is a 0-based seq, so the Nth record's seq is
+    // N - 1. It passes today only because this fixture overshoots the
+    // boundary; against correct code sitting exactly on it, it is a false
+    // RED inside the test named after that very cadence.
     assert!(
-        m.applied_seq >= cadence,
-        "snapshot taken at {} but the cadence is {cadence}",
-        m.applied_seq
+        m.applied_seq + 1 >= cadence,
+        "snapshot taken at seq {} ({} records) but the cadence is {cadence} records",
+        m.applied_seq,
+        m.applied_seq + 1
     );
     assert!(
         !m.segments.is_empty(),
@@ -1484,33 +1616,42 @@ fn a_generation_never_takes_a_second_snapshot() {
     let after = read_manifest(&store).expect("a manifest");
 
     // Anti-vacuity first (spec §11): "nothing changed" is trivially true of
-    // an archive that did nothing in phase 2.
+    // an archive that did nothing in phase 2. Task 7 changed what phase 2's
+    // progress LOOKS like — a cadence crossing now opens a new generation
+    // (carried obligation (b)) instead of extending generation 0 — so the
+    // signal is the roll, not a longer chain.
     assert!(
-        after.segments.len() > before.segments.len(),
-        "the archive shipped nothing in phase 2 ({} segments before, {} after), so it never \
-         reached the cadence multiple this test exists to survive",
-        before.segments.len(),
-        after.segments.len()
+        after.generation > before.generation,
+        "the archive never crossed the cadence in phase 2 (generation {} -> {}), so it never \
+         reached the refresh this test exists to survive",
+        before.generation,
+        after.generation
     );
-    assert_eq!(
-        after.generation, before.generation,
-        "the archive rolled the generation on its own; Task 6 opens exactly one, and rolling is \
-         Task 7's"
-    );
-    assert_eq!(
-        snapshot_objects(&store, before.generation, &store.keys()),
-        objects_before,
-        "a second snapshot was written into a live generation's keys. Those keys are immutable \
-         (spec §2 — the manifest is the layout's only mutable key): overwriting them replaces \
-         the content the CURRENT manifest points at, which tears the generation without any \
-         crash or reordering at all"
-    );
-    assert_eq!(
-        after.applied_seq, before.applied_seq,
-        "the manifest's frontier advanced past its own snapshot. The frontier a restore reads is \
-         the SNAPSHOT's; this generation's snapshot is still at {}, so a restore would replay \
-         from a point the snapshot never reached",
+    assert!(
+        after.applied_seq > before.applied_seq,
+        "the new generation's snapshot sits at the CLOSED generation's frontier ({}), so the \
+         refresh copied a frontier instead of taking one",
         before.applied_seq
+    );
+    // THE PROPERTY, and it is unchanged by Task 7: a generation's snapshot
+    // objects are written ONCE. They are immutable (spec §2 — the manifest
+    // is the layout's only mutable key), so overwriting them replaces
+    // content a manifest pointed at, which tears a generation without any
+    // crash or reordering at all. That is exactly why a refresh has to be a
+    // new generation rather than a second snapshot in place.
+    assert_snapshot_objects_unchanged(
+        &snapshot_objects(&store, before.generation, &store.keys()),
+        &objects_before,
+        "a refreshed snapshot was written into generation 0's keys instead of a new \
+         generation's.",
+    );
+    // And the frontier a restore would read is this generation's OWN
+    // snapshot's, never one carried across the roll.
+    let meta = read_snapshot_meta(&store, after.generation).expect("the new generation's meta");
+    assert_eq!(
+        after.applied_seq, meta.applied_seq,
+        "the manifest's frontier is not the frontier its own snapshot was taken at, so a \
+         restore would replay from a point that snapshot never reached"
     );
 }
 
@@ -1593,17 +1734,454 @@ fn write_foreign_manifest_round_trips_through_read_manifest() {
 /// m6 (task-5-review.md): `!e.to_string().is_empty()` is vacuous — no
 /// `io::Error` can ever fail it — and the sibling test this collapses
 /// (`step_until_notice_surfaces_the_unreachable_stores_failure`) called
-/// `step_until_notice`, which is `step_until_error` in substance (its own
-/// doc), so the two bodies were identical bar the helper name. One test,
-/// calling `step_until_notice` so both fixture helpers stay exercised
-/// (Ruling 31), with a real assertion on the error text (hard rule 5).
+/// `step_until_notice`, which was `step_until_error` in substance (its own
+/// doc), so the two bodies were identical bar the helper name.
+///
+/// Task 7 separated them for real (Defect 4): `step_until_notice` now SKIPS
+/// retryable IO errors, so it can no longer stand in here — this fixture's
+/// one segment never crosses the bound and no notice ever arrives. It calls
+/// `step_until_error` now, and `step_until_notice` is exercised by
+/// `the_gap_notice_names_the_bound_the_prefix_and_both_fixes`, which is the
+/// test it was named for (Ruling 31 is satisfied by both being used, not by
+/// both being used here).
 #[test]
 fn step_until_error_surfaces_the_unreachable_stores_failure() {
     let (mut db, store, mut arc) = archive_fixture_with_unreachable_store();
     write_records(&mut db, RECORDS_PER_SEGMENT + 50);
-    let e = step_until_notice(&mut arc, &db, &store);
+    let e = step_until_error(&mut arc, &db, &store);
     assert!(
         e.to_string().contains("FlakyStore outage"),
         "expected the unreachable store's own failure text, got: {e}"
+    );
+}
+
+// ------------------------- Task 7: the bounded pin, and the named gap
+
+/// SPEC RULING 3 (§5), the OUTAGE case: on outage the archive yields, never
+/// the primary. An unbounded pin means an object-store outage grows the WAL
+/// until the disk fills and the log poisons — the archive would have
+/// acquired the power to stop the thing it derives from.
+///
+/// RULING 49: the pin releases by STATE, not by VALUE. `pin_floor()` keeps
+/// reporting a real, monotonic floor throughout (writing `u64::MAX` into it
+/// is verbatim the M1 bug `hold()`'s assert exists to catch); what changes
+/// is that `Db::retention_floor` stops consulting it.
+#[test]
+fn past_the_bound_gc_proceeds_and_the_primary_keeps_writing() {
+    let (mut db, store, mut arc) = archive_fixture_with_unreachable_store();
+    let base_before = db.log_base();
+    write_records(&mut db, 20 * RECORDS_PER_SEGMENT); // far past pin_segments
+    let sealed = sealed_segment_count(&db);
+    assert!(
+        sealed > GAP_PIN_SEGMENTS,
+        "fixture sealed {sealed} segment(s) against a bound of {GAP_PIN_SEGMENTS}; the bound is \
+         never crossed and every assertion below is vacuous"
+    );
+    step_until_idle(&mut arc, &db, &store);
+    db.checkpoint().unwrap();
+    assert!(
+        db.log_base() > base_before,
+        "GC did not proceed past {base_before}; the archive stalled the primary"
+    );
+    assert!(
+        !db.poisoned(),
+        "an archive failure is not a database failure"
+    );
+    write_records(&mut db, 10); // still writable
+    assert!(arc.gapped(), "a released pin must record a gap");
+    // Ruling 49, both halves. The pin is not consulted...
+    assert_eq!(
+        db.retention_floor(),
+        u64::MAX,
+        "the archive is still holding a floor Wal::gc must respect, so the release did not \
+         happen where it has to happen — in what the registered closure reports"
+    );
+    // ...and yet the floor it carries is a real seq, never the sentinel.
+    assert_ne!(
+        arc.pin_floor(),
+        u64::MAX,
+        "the pin released BY VALUE — verbatim the M1 bug hold()'s assert exists to catch, and \
+         the value pin_floor()'s own doc promises it never returns"
+    );
+
+    // And GC keeps proceeding, which is the half an outage actually tests.
+    // The plan's assertion above — `log_base` advanced once — passes against
+    // an archive that never released at all, because the gap ALSO forfeits
+    // the sealed segments it was holding and moves the floor to the live
+    // tail; one checkpoint after that reclaims a great deal either way
+    // (measured: this exact mutation leaves that assertion green). What
+    // separates "yielded" from "still holding, one segment higher" only
+    // shows over a longer outage: the log keeps growing, and a floor that is
+    // still consulted holds everything above it forever.
+    let floor_at_gap = arc.pin_floor();
+    write_records(&mut db, 20 * RECORDS_PER_SEGMENT);
+    step_until_idle(&mut arc, &db, &store);
+    db.checkpoint().unwrap();
+    assert!(
+        db.log_base() > floor_at_gap,
+        "gc stalled at the floor the archive held when it gapped ({floor_at_gap}); a yielded \
+         pin must stop being CONSULTED, not merely stop advancing — the outage continues and \
+         the WAL grows behind it"
+    );
+    assert!(
+        !db.poisoned(),
+        "an archive failure is not a database failure"
+    );
+}
+
+/// HARD RULE 5, and the whole operator surface of this task: a gap is the
+/// one thing that silently costs data continuity, so the notice must name
+/// the bound, the elapsed segments, the prefix, and BOTH fixes (spec §7).
+#[test]
+fn the_gap_notice_names_the_bound_the_prefix_and_both_fixes() {
+    let (mut db, store, mut arc) = archive_fixture_with_unreachable_store();
+    write_records(&mut db, 20 * RECORDS_PER_SEGMENT);
+    let notice = step_until_notice(&mut arc, &db, &store);
+    let t = notice.to_string();
+    for needle in ["pin_segments", PREFIX, "raise", "generation"] {
+        assert!(t.contains(needle), "notice must name {needle}: {t}");
+    }
+    // Spec §7 names two more the plan's needle list does not: the bound's
+    // VALUE (an operator deciding whether to raise it needs to know what it
+    // is) and the elapsed segments (how far behind the archive actually got).
+    assert!(
+        t.contains(&GAP_PIN_SEGMENTS.to_string()),
+        "notice must name the configured bound's value ({GAP_PIN_SEGMENTS}), not just the \
+         field's name: {t}"
+    );
+    assert!(
+        t.contains("segment"),
+        "notice must name the elapsed segments (spec §7): {t}"
+    );
+
+    // "ONE operator notice" (spec §7), not one per step: a gap is a latch.
+    // `pin_segments` appears in no other error this archive can raise, so
+    // its reappearance is exactly a second notice.
+    for _ in 0..500 {
+        if let Err(e) = arc.step(&db, &store) {
+            assert!(
+                !e.to_string().contains("pin_segments"),
+                "the gap notice repeated; spec §7 asks for one, and a per-step notice is how an \
+                 operator learns to filter the one message that matters: {e}"
+            );
+        }
+    }
+}
+
+/// SPEC §2: a gap closes a generation, and the next successful contact opens
+/// a new one with a fresh FULL snapshot — restore never reasons across a
+/// hole, so a generation is either continuous or it is finished.
+///
+/// RULING 50: generations are 0-based (Task 6 opens 0), so ONE gap opens
+/// generation 1. The plan asserted 2, which only a DOUBLE increment would
+/// have satisfied — the assertion would have concealed the one bug it looked
+/// like it was testing. The second half below pins the increment itself.
+#[test]
+fn after_a_gap_the_next_contact_opens_a_new_generation_with_a_full_snapshot() {
+    let (mut db, store, mut arc) = archive_fixture_with_unreachable_store();
+    write_records(&mut db, 20 * RECORDS_PER_SEGMENT);
+    step_until_idle(&mut arc, &db, &store);
+    assert!(
+        arc.gapped(),
+        "the fixture never crossed the bound, so there is no gap to recover from"
+    );
+
+    restore_store_reachability(&store);
+    // The gap forfeited every sealed segment the archive was holding — the
+    // new generation's own snapshot covers them — so the chain it builds is
+    // of what comes AFTER. Write that, or `!m.segments.is_empty()` below is
+    // asserting the archive re-shipped what it just gave up.
+    step_until_idle(&mut arc, &db, &store);
+    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
+    step_until_idle(&mut arc, &db, &store);
+    let m = read_manifest(&store).expect("a generation must land");
+    assert_eq!(
+        m.generation, 1,
+        "a gap must close a generation and open the next"
+    );
+    assert!(
+        !m.segments.is_empty() && m.applied_seq > 0,
+        "the new generation needs its own snapshot and chain: {m:?}"
+    );
+    // Its OWN full snapshot, in its own keys — not a manifest pointing back
+    // at the closed generation's objects.
+    let meta = read_snapshot_meta(&store, 1).expect("generation 1's own snapshot meta");
+    assert_eq!(
+        meta.applied_seq, m.applied_seq,
+        "the new generation's manifest frontier is not its own snapshot's"
+    );
+    assert_eq!(
+        meta.tables.len(),
+        db.table_names().len(),
+        "a gap's recovery snapshot must be FULL — every table, empty ones included: {:?}",
+        meta.tables
+    );
+    assert!(
+        !arc.gapped(),
+        "the archive is building a continuous generation again; `gapped` says it is still \
+         yielding, and the kernel arm reads it to decide whether the pin is live"
+    );
+
+    // RULING 50's other half: EXACTLY one per gap. A counter that advanced
+    // by two would have made the plan's `2` correct after one gap, so
+    // nothing above can tell the two apart — this can.
+    store.set_reachable(false);
+    write_records(&mut db, 20 * RECORDS_PER_SEGMENT);
+    step_until_idle(&mut arc, &db, &store);
+    assert!(arc.gapped(), "the second outage never crossed the bound");
+    restore_store_reachability(&store);
+    step_until_idle(&mut arc, &db, &store);
+    let m2 = read_manifest(&store).expect("a second recovered generation");
+    assert_eq!(
+        m2.generation, 2,
+        "the generation counter must advance by exactly one per gap: two gaps from 0 is 2"
+    );
+}
+
+/// RULING 43 / carried obligation (a) — the restart hazard Task 6 flagged in
+/// its module doc and was allowed to defer only because nothing wires the
+/// archive into a kernel arm until Task 9. A restart re-opened generation 0
+/// and would re-snapshot into its keys: a generation torn by a RESTART
+/// rather than by a cadence, and the same immutability violation
+/// `a_generation_never_takes_a_second_snapshot` exists to prevent.
+#[test]
+fn a_restarted_archive_resumes_the_generation_the_bucket_names() {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
+    step_until_idle(&mut arc, &db, &store);
+    let before = read_manifest(&store).expect("a manifest");
+    let objects_before = snapshot_objects(&store, before.generation, &store.keys());
+    assert!(
+        objects_before.len() > 2 && !before.segments.is_empty(),
+        "phase 1 left {} snapshot object(s) and {} segment(s); with nothing much archived there \
+         is nothing much for a restart to resume",
+        objects_before.len(),
+        before.segments.len()
+    );
+    drop(arc);
+
+    // The restart: a fresh `Archive` over the same Db and the same bucket.
+    let mut restarted = Archive::open(archive_config(0, 8 << 20), &mut db).unwrap();
+    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
+    step_until_idle(&mut restarted, &db, &store);
+    let after = read_manifest(&store).expect("a manifest after the restart");
+
+    assert_eq!(
+        after.generation, before.generation,
+        "the restart opened a new generation over a resumable one; the bucket's manifest names \
+         generation {} and nothing about it was closed or holed",
+        before.generation
+    );
+    assert!(
+        after.segments.len() > before.segments.len(),
+        "the restarted archive shipped nothing ({} segments before, {} after), so 'it resumed' \
+         is vacuous",
+        before.segments.len(),
+        after.segments.len()
+    );
+    assert_eq!(
+        after.segments[..before.segments.len()],
+        before.segments[..],
+        "the resumed chain must EXTEND the one the manifest named, not restart it: {:?} vs {:?}",
+        after.segments,
+        before.segments
+    );
+    assert_eq!(
+        after.applied_seq, before.applied_seq,
+        "the restart re-snapshotted: a generation carries exactly ONE snapshot, and its frontier \
+         is fixed when that snapshot is taken"
+    );
+    assert_snapshot_objects_unchanged(
+        &snapshot_objects(&store, before.generation, &store.keys()),
+        &objects_before,
+        "a restart re-snapshotted into the live generation's keys (Ruling 43's restart hazard).",
+    );
+}
+
+/// RULING 43 / carried obligation (b) — the seq-cadenced refresh Task 6
+/// deferred, and an exit-criteria line ("Archive arm ships sealed segments
+/// and seq-cadenced snapshots"). A cadence crossing opens a NEW generation
+/// with a fresh full snapshot, which is the same transition a gap performs
+/// on a different trigger. `a_generation_never_takes_a_second_snapshot`
+/// covers the immutability half; this covers that a refresh happens at all,
+/// and that the new generation is whole rather than a pointer to the old one.
+#[test]
+fn a_cadence_crossing_opens_a_new_generation_with_its_own_full_snapshot() {
+    let cadence = 2 * RECORDS_PER_SEGMENT;
+    let (mut db, store, mut arc) = archive_fixture_with_snapshot_cadence(cadence);
+    write_records(&mut db, cadence);
+    step_until_idle(&mut arc, &db, &store);
+    let before = read_manifest(&store).expect("a manifest once the cadence was crossed");
+    assert_eq!(
+        before.generation, 0,
+        "the opening generation is 0 (Ruling 50)"
+    );
+
+    write_records(&mut db, cadence);
+    step_until_idle(&mut arc, &db, &store);
+    let after = read_manifest(&store).expect("a manifest after the second crossing");
+
+    assert_eq!(
+        after.generation, 1,
+        "a cadence crossing must open a new generation; a second snapshot into generation 0's \
+         keys would overwrite what the live manifest points at"
+    );
+    assert!(
+        after.applied_seq >= before.applied_seq + cadence,
+        "the refreshed snapshot sits at seq {} but the previous one was at {} and the cadence \
+         is {cadence} records; the refresh did not re-read the Db",
+        after.applied_seq,
+        before.applied_seq
+    );
+    let meta = read_snapshot_meta(&store, 1).expect("generation 1's own snapshot meta");
+    assert_eq!(
+        meta.tables.len(),
+        db.table_names().len(),
+        "a refresh must be a FULL snapshot — every table, empty ones included: {:?}",
+        meta.tables
+    );
+    assert_eq!(
+        after.applied_seq, meta.applied_seq,
+        "the refreshed manifest's frontier is not its own snapshot's"
+    );
+    // A refresh is not a gap: nothing was lost, so no notice and no yield.
+    assert!(
+        !arc.gapped(),
+        "a cadence refresh recorded a gap; a gap means records fell out of the archive's chain, \
+         and nothing here did"
+    );
+}
+
+/// RULING 46 / Task 6 review F5 / carried obligation (c) — the
+/// CONFIGURATION-triggered WAL growth Task 6 introduced. The archive ships
+/// nothing at all until its generation's opening snapshot lands, and while
+/// it waited it held at the log's base — so a `snapshot_every` the Db has
+/// not crossed yet froze `Wal::gc` against a perfectly healthy store. At
+/// Task 5 the same hazard needed an outage.
+///
+/// The fix is not to bound that wait but to REMOVE it: an archive with no
+/// generation open needs nothing from the log at all — its chain has not
+/// started, and whatever it eventually snapshots will name its own frontier.
+/// Task 6's implementer put the sharp version of why bounding it is wrong:
+/// "a bound sized only for outages may be sized wrong for a cadence that has
+/// simply not arrived". Waiting is not a gap and must not spend one.
+#[test]
+fn an_archive_waiting_for_its_cadence_holds_nothing_against_a_healthy_store() {
+    // Far past anything this test writes, so the cadence never arrives.
+    let cadence = 100 * RECORDS_PER_SEGMENT;
+    let (mut db, store, mut arc) = archive_fixture_with_snapshot_cadence(cadence);
+    let base_before = db.log_base();
+    write_records(&mut db, 20 * RECORDS_PER_SEGMENT);
+    assert!(
+        sealed_segment_count(&db) > 2,
+        "the fixture sealed nothing to reclaim; 'gc advanced' would be vacuous"
+    );
+    step_until_idle(&mut arc, &db, &store);
+    assert!(
+        store.keys().is_empty(),
+        "the cadence is not reached, so the archive must ship nothing: {:?}",
+        store.keys()
+    );
+
+    db.checkpoint().unwrap();
+    assert!(
+        db.log_base() > base_before,
+        "the archive froze Wal::gc at {base_before} while waiting for a cadence it has not \
+         reached, against a healthy store (Ruling 46). It has no generation open, so it needs \
+         nothing from the log"
+    );
+    assert!(
+        !arc.gapped(),
+        "waiting for a cadence is not a gap: nothing fell out of a chain that has not started"
+    );
+    assert_ne!(
+        arc.pin_floor(),
+        u64::MAX,
+        "ruling 49: the floor stays a real, monotonic seq even while the pin holds nothing"
+    );
+
+    // And it still archives once the cadence does arrive — the release is a
+    // yield, not a shutdown.
+    write_records(&mut db, 100 * RECORDS_PER_SEGMENT);
+    step_until_idle(&mut arc, &db, &store);
+    let m = read_manifest(&store).expect("a manifest once the cadence was finally crossed");
+    assert!(
+        !m.segments.is_empty(),
+        "the archive never resumed shipping after its cadence arrived: {m:?}"
+    );
+    assert_eq!(
+        m.segments.first().map(|s| s.base_seq),
+        Some(db.log_base()),
+        "the resumed chain must start at the log's base — the archive released everything below \
+         it, so a chain starting anywhere else claims a span nothing backs: {:?}, log_base {}",
+        m.segments,
+        db.log_base()
+    );
+}
+
+/// SPEC §2, and the one thing `Manifest::closed` exists for (Task 4 built
+/// the field; nothing until now wrote it). Between a gap and the fresh
+/// generation's snapshot landing — which is a full snapshot's worth of
+/// uploads, so not a short window — the manifest still names the generation
+/// the gap broke. "Stale" and "finished" are different facts to a restore,
+/// so closing it is the first thing that lands when contact returns, before
+/// any object of the next generation.
+#[test]
+fn a_gap_marks_the_generation_it_broke_closed_before_opening_the_next() {
+    // The unreachable fixture for its reachability switch and its small
+    // bound; restored immediately, because phase 1 needs a healthy
+    // generation 0 for the gap in phase 2 to have something to close.
+    let (mut db, store, mut arc) = archive_fixture_with_unreachable_store();
+    restore_store_reachability(&store);
+    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
+    step_until_idle(&mut arc, &db, &store);
+    let before = read_manifest(&store).expect("generation 0's manifest");
+    assert!(
+        !before.closed && !before.segments.is_empty(),
+        "phase 1 must leave a live generation with a chain: {before:?}"
+    );
+
+    store.set_reachable(false);
+    write_records(&mut db, 20 * RECORDS_PER_SEGMENT);
+    step_until_idle(&mut arc, &db, &store);
+    assert!(arc.gapped(), "the fixture never crossed the bound");
+    restore_store_reachability(&store);
+    assert_eq!(
+        read_manifest(&store).map(|m| m.closed),
+        Some(false),
+        "an unreachable store cannot be told anything, so the manifest must still be exactly \
+         what generation 0 left"
+    );
+
+    // Step until the NEXT generation's first object appears — read off the
+    // key listing, which starts no operation of its own (`read_manifest`
+    // would `start` a GET, and a step that has just started a PUT leaves one
+    // in flight, which `ObjectStore::start` asserts against).
+    let next_generation = format!("{PREFIX}/{:020}/", before.generation + 1);
+    for _ in 0..10_000 {
+        if store.keys().iter().any(|k| k.starts_with(&next_generation)) {
+            break;
+        }
+        let _ = arc.step(&db, &store);
+    }
+    let closed = read_manifest(&store).expect("a manifest");
+    assert!(
+        closed.closed,
+        "the fresh generation began uploading while the manifest still named generation {} as \
+         LIVE; a restore reading it there cannot tell a stale generation from a finished one",
+        before.generation
+    );
+    assert_eq!(
+        closed.generation, before.generation,
+        "closing must mark the generation the gap broke, not some other one"
+    );
+    assert_eq!(
+        closed.segments, before.segments,
+        "closing a generation must not change what it contains — every object it names is still \
+         in the bucket and still exactly what it was"
+    );
+    assert_eq!(
+        closed.applied_seq, before.applied_seq,
+        "closing a generation must not move its frontier"
     );
 }
