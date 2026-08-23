@@ -15,10 +15,62 @@
 //! assert negative space), so `encode` asserts contiguity rather than
 //! erroring. The archive must never be able to produce a manifest it could
 //! not itself decode.
+//!
+//! Task 6 adds the generation's other two metadata objects, which share this
+//! module because they share its codec discipline and its private helpers
+//! (`Reader`, `put_field`, `expect_count`) rather than duplicating them:
+//! `SnapshotMeta` (`<gen>/snapshot/meta` — the snapshot's frontier, the job
+//! counter, and the per-table batch counts) and the `<gen>/snapshot/<table>/
+//! <n>` batch codec. Every one of the three is length-prefixed with a
+//! trailing CRC32, refuses untrusted bytes by name, and round-trips what
+//! this process encodes.
+//!
+//! The batch counts in `SnapshotMeta` are what make a generation's object
+//! set *enumerable* rather than guessable: the manifest names the tables but
+//! carries no counts, so without them neither restore nor a test could say
+//! which `<n>` objects a generation is supposed to contain, and "the
+//! manifest never points at an incomplete generation" would have nothing to
+//! check against.
 
 use std::io;
 
 use charpente_core::crc::crc32;
+
+/// Upper bound on a `<prefix>/manifest` object, enforced by `Manifest::
+/// decode` before it looks at a single field (Task 4 carry-forward 5,
+/// ruling 40). It is a named constant rather than a number stated in prose
+/// precisely so the producer here and restore (Task 10) *share* one bound
+/// instead of inventing two that drift.
+///
+/// The arithmetic, worst case, against `Manifest`'s encoding:
+///
+/// - fixed fields — generation 8, applied_seq 8, next_job_id 8, two u32
+///   counts 8, `closed` 1, trailing CRC 4 = **37 bytes**
+/// - writer — 4 + a generous 1,024-byte identity = **1,028 bytes**
+/// - tables — 4,096 tables x (4 + a 255-byte name) = **1,060,864 bytes**
+/// - segments — the rest, at 16 bytes per `SegmentRef`: (16,777,216 -
+///   1,061,929) / 16 = **982,205 segments**, which at the 64 MiB production
+///   `WalConfig::segment_bytes` is a **59 TiB** single generation.
+///
+/// A generation that long is far past anything one box writes between two
+/// snapshots, so 16 MiB is a bound that refuses absurd input without ever
+/// refusing real input. It is deliberately checked on LENGTH before decode
+/// rather than at each call site: a cap a caller must remember to apply is a
+/// cap that will be forgotten (ruling 35 — prefer the defence that cannot be
+/// left green).
+pub(crate) const MANIFEST_MAX_BYTES: usize = 16 << 20;
+
+/// Upper bound on a `<gen>/snapshot/meta` object, same reasoning and same
+/// per-table figures as `MANIFEST_MAX_BYTES`: fixed fields (8 + 8 + 4 + 4)
+/// = 24, plus 4,096 tables x (4 + 255-byte name + 8-byte batch count) =
+/// 1,093,632, = 1,093,656 bytes. 2 MiB clears that with room to spare.
+///
+/// The `<table>/<n>` batch objects get no such constant on purpose: their
+/// size is a property of the rows in them, not of the schema, so no honest
+/// worst case can be written down. `expect_count` bounds their decode
+/// against the bytes actually present, which is the bound that matters for
+/// an untrusted allocation.
+pub(crate) const SNAPSHOT_META_MAX_BYTES: usize = 2 << 20;
 
 /// One sealed WAL segment's span within a generation's chain, inclusive on
 /// both ends. Segments are sealed by byte size (`WalConfig::segment_bytes`,
@@ -124,42 +176,64 @@ fn assert_contiguous(segments: &[SegmentRef], generation: u64) {
     }
 }
 
-fn manifest_crc_error(stored: u32, computed: u32) -> io::Error {
+/// `kind` names which of the three metadata objects failed — the manifest,
+/// the snapshot meta, or a snapshot batch. All three are CRC'd the same way,
+/// so they share one refusal rather than three near-identical ones; naming
+/// the object is what keeps the text honest (hard rule 5) once there is more
+/// than one of them in the bucket.
+fn crc_error(kind: &str, stored: u32, computed: u32) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!(
-            "manifest failed its CRC check (stored {stored:08x}, computed {computed:08x}) — a \
+            "{kind} failed its CRC check (stored {stored:08x}, computed {computed:08x}) — a \
              torn write or a corrupted read; never restore from it. Re-fetch the object and \
              retry; if the mismatch persists, restore from the previous generation instead"
         ),
     )
 }
 
-fn manifest_malformed_error(reason: &str) -> io::Error {
+fn malformed_error(kind: &str, reason: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!(
-            "manifest is malformed ({reason}) despite a valid CRC — refuse rather than parse \
+            "{kind} is malformed ({reason}) despite a valid CRC — refuse rather than parse \
              whatever fields survived; restore from a previous generation instead"
         ),
     )
 }
 
-/// `decode`'s truncation refusal for input too short to hold even the trailing CRC. This
-/// is deliberately a separate message from `manifest_malformed_error`, not a reason string
+/// The truncation refusal for input too short to hold even the trailing CRC. This
+/// is deliberately a separate message from `malformed_error`, not a reason string
 /// passed through it: this check runs BEFORE the CRC is ever computed, so "despite a valid
 /// CRC" would be a false claim on this path — there was nothing to check (M4: error text
 /// is product surface, hard rule 5, and text asserting a fact it never checked misdirects
 /// exactly the operator it is written for).
-fn manifest_too_short_error(len: usize) -> io::Error {
+fn too_short_error(kind: &str, len: usize) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!(
-            "manifest is only {len} byte(s), too short to hold even a trailing CRC (4 bytes \
+            "{kind} is only {len} byte(s), too short to hold even a trailing CRC (4 bytes \
              minimum) — there is nothing here to check, so refuse rather than parse whatever \
              survived; restore from a previous generation instead"
         ),
     )
+}
+
+/// Splits off the trailing CRC32 and verifies it, the first act of all three
+/// decoders: no field is read out of an object whose checksum has not
+/// already cleared, so `malformed_error`'s "despite a valid CRC" is true
+/// wherever it can be reached.
+fn check_crc<'a>(kind: &str, bytes: &'a [u8]) -> io::Result<&'a [u8]> {
+    if bytes.len() < 4 {
+        return Err(too_short_error(kind, bytes.len()));
+    }
+    let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
+    let stored = u32::from_le_bytes(crc_bytes.try_into().expect("sliced 4 bytes"));
+    let computed = crc32(body);
+    if stored != computed {
+        return Err(crc_error(kind, stored, computed));
+    }
+    Ok(body)
 }
 
 /// m1: the `closed` field decodes exactly two bytes, never guesses at a third. `encode`
@@ -176,6 +250,35 @@ fn manifest_closed_byte_error(byte: u8) -> io::Error {
             "manifest's closed flag byte is {byte}, neither 0 nor 1 — decode refuses to guess \
              rather than coerce any nonzero byte to true; restore from a previous generation \
              instead"
+        ),
+    )
+}
+
+/// `decode`'s LENGTH refusal (`MANIFEST_MAX_BYTES`, ruling 40). Like
+/// `manifest_too_short_error` this fires before the CRC is computed, so it
+/// makes no claim about one — the point is precisely that nothing walks or
+/// checksums an object this size in the first place.
+fn manifest_too_large_error(len: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "manifest object is {len} bytes, which exceeds the archive's manifest size cap of \
+             {MANIFEST_MAX_BYTES} bytes — refuse before decoding rather than walk an object no \
+             honest generation can produce; re-fetch the object, and if it is genuinely this \
+             large the generation is corrupt, so restore from a previous one instead"
+        ),
+    )
+}
+
+/// `SnapshotMeta::decode`'s length refusal — the same rule and the same
+/// reasoning as `manifest_too_large_error`, against `SNAPSHOT_META_MAX_BYTES`.
+fn snapshot_meta_too_large_error(len: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "snapshot meta object is {len} bytes, which exceeds the archive's snapshot meta size \
+             cap of {SNAPSHOT_META_MAX_BYTES} bytes — refuse before decoding rather than walk an \
+             object no honest schema can produce; restore from a previous generation instead"
         ),
     )
 }
@@ -251,19 +354,24 @@ fn check_contiguous(segments: &[SegmentRef], generation: u64) -> io::Result<()> 
 struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// Which metadata object this is reading, for the refusal text.
+    kind: &'static str,
 }
 
 impl<'a> Reader<'a> {
-    fn new(buf: &'a [u8]) -> Reader<'a> {
-        Reader { buf, pos: 0 }
+    fn new(buf: &'a [u8], kind: &'static str) -> Reader<'a> {
+        Reader { buf, pos: 0, kind }
     }
 
     fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {
+        let kind = self.kind;
         let end = self
             .pos
             .checked_add(n)
             .filter(|&end| end <= self.buf.len())
-            .ok_or_else(|| manifest_malformed_error("a field runs past the end of the manifest"))?;
+            .ok_or_else(|| {
+                malformed_error(kind, &format!("a field runs past the end of the {kind}"))
+            })?;
         let slice = &self.buf[self.pos..end];
         self.pos = end;
         Ok(slice)
@@ -289,7 +397,7 @@ impl<'a> Reader<'a> {
         let len = self.u32()? as usize;
         let bytes = self.take(len)?;
         String::from_utf8(bytes.to_vec())
-            .map_err(|_| manifest_malformed_error("a length-prefixed field is not valid UTF-8"))
+            .map_err(|_| malformed_error(self.kind, "a length-prefixed field is not valid UTF-8"))
     }
 
     fn remaining(&self) -> usize {
@@ -298,7 +406,8 @@ impl<'a> Reader<'a> {
 
     fn finish(&self) -> io::Result<()> {
         if self.pos != self.buf.len() {
-            return Err(manifest_malformed_error(
+            return Err(malformed_error(
+                self.kind,
                 "trailing bytes after the last field",
             ));
         }
@@ -319,11 +428,14 @@ impl<'a> Reader<'a> {
 fn expect_count(r: &mut Reader, min_each: usize, what: &str) -> io::Result<usize> {
     let count = r.u32()? as usize;
     if count.saturating_mul(min_each) > r.remaining() {
-        return Err(manifest_malformed_error(&format!(
-            "declares {count} {what} but only {} bytes remain — refusing before allocating \
-             from an untrusted count",
-            r.remaining()
-        )));
+        return Err(malformed_error(
+            r.kind,
+            &format!(
+                "declares {count} {what} but only {} bytes remain — refusing before allocating \
+                 from an untrusted count",
+                r.remaining()
+            ),
+        ));
     }
     Ok(count)
 }
@@ -343,17 +455,14 @@ impl Manifest {
     /// the first offending base_seq — both are refusals, never a fallback
     /// to a partial parse (hard rule 5).
     pub fn decode(bytes: &[u8]) -> io::Result<Manifest> {
-        if bytes.len() < 4 {
-            return Err(manifest_too_short_error(bytes.len()));
+        // Length first, before the CRC is computed over it (ruling 40): the
+        // whole point of a cap is that an absurd object is never walked.
+        if bytes.len() > MANIFEST_MAX_BYTES {
+            return Err(manifest_too_large_error(bytes.len()));
         }
-        let (body, crc_bytes) = bytes.split_at(bytes.len() - 4);
-        let stored = u32::from_le_bytes(crc_bytes.try_into().expect("sliced 4 bytes"));
-        let computed = crc32(body);
-        if stored != computed {
-            return Err(manifest_crc_error(stored, computed));
-        }
+        let body = check_crc("manifest", bytes)?;
 
-        let mut r = Reader::new(body);
+        let mut r = Reader::new(body, "manifest");
         let generation = r.u64()?;
         let writer = r.string()?;
         let applied_seq = r.u64()?;
@@ -390,6 +499,136 @@ impl Manifest {
             closed,
         })
     }
+}
+
+/// One table's presence in a generation's snapshot: its name, and how many
+/// `<gen>/snapshot/<table>/<n>` batch objects were written for it. A table
+/// with no rows carries `batches: 0` and still appears — the snapshot covers
+/// the whole schema, and "this table was empty" is a fact restore needs, not
+/// an absence it should have to infer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableBatches {
+    pub name: String,
+    pub batches: u64,
+}
+
+/// `<gen>/snapshot/meta` (spec §2) — the last object of a generation's
+/// snapshot and the only one that says how many of the others there are.
+/// Written after every batch object and before the manifest, so a manifest
+/// that names this generation names a snapshot whose extent is knowable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotMeta {
+    /// The frontier the snapshot was taken at — `Snapshot::applied_seq`,
+    /// never `Db::last_applied` read separately (they can differ by the
+    /// time the walk starts). Restore replays the segment chain from
+    /// `applied_seq + 1`.
+    pub applied_seq: u64,
+    pub next_job_id: u64,
+    /// Every registered table, in `Db::table_names()` (schema-sorted) order.
+    pub tables: Vec<TableBatches>,
+}
+
+impl SnapshotMeta {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&self.applied_seq.to_le_bytes());
+        buf.extend_from_slice(&self.next_job_id.to_le_bytes());
+        buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
+        for t in &self.tables {
+            put_field(&mut buf, t.name.as_bytes());
+            buf.extend_from_slice(&t.batches.to_le_bytes());
+        }
+        buf.extend_from_slice(&crc32(&buf).to_le_bytes());
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> io::Result<SnapshotMeta> {
+        if bytes.len() > SNAPSHOT_META_MAX_BYTES {
+            return Err(snapshot_meta_too_large_error(bytes.len()));
+        }
+        let body = check_crc("snapshot meta", bytes)?;
+        let mut r = Reader::new(body, "snapshot meta");
+        let applied_seq = r.u64()?;
+        let next_job_id = r.u64()?;
+        // 12 = the 4-byte name length prefix plus the 8-byte batch count; a
+        // zero-length name is refused below, so this is the true minimum.
+        let count = expect_count(&mut r, 12, "tables")?;
+        let mut tables = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name = r.string()?;
+            let batches = r.u64()?;
+            if name.is_empty() || name.contains('/') {
+                return Err(malformed_error(
+                    "snapshot meta",
+                    &format!(
+                        "table name {name:?} is empty or contains '/', so the \
+                         <gen>/snapshot/<table>/<n> keys it implies cannot be parsed back"
+                    ),
+                ));
+            }
+            tables.push(TableBatches { name, batches });
+        }
+        r.finish()?;
+        Ok(SnapshotMeta {
+            applied_seq,
+            next_job_id,
+            tables,
+        })
+    }
+}
+
+/// One `<gen>/snapshot/<table>/<n>` object: raw `(id, bytes)` rows exactly as
+/// `Snapshot::scan_raw_from` produced them, ascending by id, CRC'd like every
+/// other object here. The archive pages these out one batch at a time and
+/// never holds a whole table (spec §10), so the batch — not the table — is
+/// the unit that has to encode.
+pub fn encode_snapshot_batch(rows: &[(u64, Vec<u8>)]) -> Vec<u8> {
+    // Negative space (hard rule 4): an empty batch is never written — the
+    // walk stops a table the moment `scan_raw_from` comes back empty, so an
+    // empty object in the bucket would mean a batch count that overstates
+    // the objects present, which is the exact confusion `SnapshotMeta`
+    // exists to remove.
+    assert!(
+        !rows.is_empty(),
+        "encode_snapshot_batch: refusing to encode an empty batch — the snapshot walk stops a \
+         table on its first empty read, so an empty batch object would leave SnapshotMeta \
+         claiming an object that carries nothing"
+    );
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+    for (id, bytes) in rows {
+        buf.extend_from_slice(&id.to_le_bytes());
+        put_field(&mut buf, bytes);
+    }
+    buf.extend_from_slice(&crc32(&buf).to_le_bytes());
+    buf
+}
+
+pub fn decode_snapshot_batch(bytes: &[u8]) -> io::Result<Vec<(u64, Vec<u8>)>> {
+    let body = check_crc("snapshot batch", bytes)?;
+    let mut r = Reader::new(body, "snapshot batch");
+    // 12 = the 8-byte id plus the 4-byte length prefix of a zero-length row.
+    let count = expect_count(&mut r, 12, "rows")?;
+    let mut rows: Vec<(u64, Vec<u8>)> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = r.u64()?;
+        let len = r.u32()? as usize;
+        let row = r.take(len)?.to_vec();
+        // Ascending, strictly: `scan_raw_from` walks a redb range in key
+        // order, so anything else is corruption or a hand-built object, and
+        // restore must not import rows it cannot trust the order of.
+        if let Some((prev, _)) = rows.last()
+            && *prev >= id
+        {
+            return Err(malformed_error(
+                "snapshot batch",
+                &format!("row ids are not strictly ascending ({prev} then {id})"),
+            ));
+        }
+        rows.push((id, row));
+    }
+    r.finish()?;
+    Ok(rows)
 }
 
 /// `"<prefix>/manifest"` — the generation pointer (spec §2).
@@ -864,5 +1103,158 @@ mod tests {
     #[should_panic(expected = "must be non-empty and contain no '/'")]
     fn snapshot_batch_key_refuses_an_empty_table_name() {
         let _ = snapshot_batch_key("bk", 1, "", 0);
+    }
+
+    // ------------------------------------------------ Task 6: the size cap
+
+    // Defect 5 / ruling 40. `decode` must refuse on LENGTH before it reads a
+    // field, so an absurd object cannot be walked at all. The bytes below
+    // carry no valid CRC and would be refused anyway — the assertion is on
+    // WHICH refusal comes back, because only the length check can fire
+    // before the CRC is computed over 16 MiB of it.
+    #[test]
+    fn a_manifest_object_past_the_size_cap_is_refused_before_it_is_decoded() {
+        let e = Manifest::decode(&vec![0u8; MANIFEST_MAX_BYTES + 1]).unwrap_err();
+        let t = e.to_string();
+        assert!(
+            t.contains("exceeds the archive's manifest size cap"),
+            "must be refused by the size cap, not by a downstream check: {t}"
+        );
+        assert!(
+            t.contains(&MANIFEST_MAX_BYTES.to_string()),
+            "the refusal must name the cap it enforced: {t}"
+        );
+    }
+
+    // The other side of the cap: a manifest exactly at the bound is still
+    // decoded (as far as its own contents allow), so the cap cannot be
+    // "fixed" by lowering it until real input stops fitting. A CRC-valid
+    // manifest padded to exactly the cap would need a 16 MiB segment chain
+    // to build, so this proves the boundary the cheap way: at the cap, the
+    // refusal that comes back is the CRC's, never the cap's.
+    // ------------------------------- Task 6: snapshot meta and batch codecs
+
+    fn meta() -> SnapshotMeta {
+        SnapshotMeta {
+            applied_seq: 4_094,
+            next_job_id: 17,
+            tables: vec![
+                TableBatches {
+                    name: "Rec".to_string(),
+                    batches: 5,
+                },
+                // Empty tables are carried, not omitted.
+                TableBatches {
+                    name: "charpente.jobs".to_string(),
+                    batches: 0,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn snapshot_meta_roundtrips() {
+        let m = meta();
+        assert_eq!(SnapshotMeta::decode(&m.encode()).unwrap(), m);
+    }
+
+    #[test]
+    fn a_corrupt_snapshot_meta_is_refused_by_name() {
+        let mut bytes = meta().encode();
+        bytes[0] ^= 0xFF;
+        let e = SnapshotMeta::decode(&bytes).unwrap_err();
+        let t = e.to_string();
+        assert!(t.contains("snapshot meta"), "must name the object: {t}");
+        assert!(t.contains("CRC"), "must name what failed: {t}");
+        assert!(t.contains("restore"), "must name the fix: {t}");
+    }
+
+    #[test]
+    fn a_snapshot_meta_object_past_the_size_cap_is_refused_before_it_is_decoded() {
+        let e = SnapshotMeta::decode(&vec![0u8; SNAPSHOT_META_MAX_BYTES + 1]).unwrap_err();
+        let t = e.to_string();
+        assert!(
+            t.contains("exceeds the archive's snapshot meta size cap"),
+            "must be refused by the size cap: {t}"
+        );
+    }
+
+    // The key-parse precondition `snapshot_batch_key` asserts on the producer
+    // side has to be a REFUSAL on the consumer side: these bytes crossed the
+    // network, so a table name restore could not turn back into a key is a
+    // named error, never a panic.
+    #[test]
+    fn a_snapshot_meta_table_name_with_a_slash_is_refused_at_decode() {
+        let m = SnapshotMeta {
+            applied_seq: 1,
+            next_job_id: 0,
+            tables: vec![TableBatches {
+                name: "a/b".to_string(),
+                batches: 1,
+            }],
+        };
+        let e = SnapshotMeta::decode(&m.encode()).unwrap_err();
+        let t = e.to_string();
+        assert!(t.contains("a/b"), "must name the offending table: {t}");
+        assert!(t.contains("cannot be parsed back"), "must say why: {t}");
+    }
+
+    #[test]
+    fn snapshot_batches_roundtrip() {
+        let rows = vec![
+            (0u64, vec![1u8, 2, 3]),
+            (7, Vec::new()),
+            (u64::MAX, vec![9]),
+        ];
+        assert_eq!(
+            decode_snapshot_batch(&encode_snapshot_batch(&rows)).unwrap(),
+            rows
+        );
+    }
+
+    #[test]
+    fn a_corrupt_snapshot_batch_is_refused_by_name() {
+        let mut bytes = encode_snapshot_batch(&[(1u64, vec![4, 5])]);
+        bytes[0] ^= 0xFF;
+        let e = decode_snapshot_batch(&bytes).unwrap_err();
+        let t = e.to_string();
+        assert!(t.contains("snapshot batch"), "must name the object: {t}");
+        assert!(t.contains("CRC"), "must name what failed: {t}");
+    }
+
+    // Hand-built so the CRC is valid over out-of-order ids: only the ordering
+    // check can catch this, which is what makes it a test of that check
+    // rather than a second CRC test.
+    #[test]
+    fn a_snapshot_batch_whose_ids_are_not_ascending_is_refused() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        for id in [9u64, 4] {
+            buf.extend_from_slice(&id.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+        }
+        buf.extend_from_slice(&crc32(&buf).to_le_bytes());
+        let e = decode_snapshot_batch(&buf).unwrap_err();
+        let t = e.to_string();
+        assert!(
+            t.contains("not strictly ascending (9 then 4)"),
+            "must name both ids: {t}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "refusing to encode an empty batch")]
+    fn encode_snapshot_batch_refuses_an_empty_batch() {
+        let _ = encode_snapshot_batch(&[]);
+    }
+
+    #[test]
+    fn a_manifest_object_exactly_at_the_size_cap_is_not_refused_by_the_cap() {
+        let e = Manifest::decode(&vec![0u8; MANIFEST_MAX_BYTES]).unwrap_err();
+        let t = e.to_string();
+        assert!(
+            !t.contains("exceeds the archive's manifest size cap"),
+            "the cap must be inclusive of its own bound: {t}"
+        );
     }
 }
