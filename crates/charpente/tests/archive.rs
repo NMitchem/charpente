@@ -1853,6 +1853,17 @@ fn the_gap_notice_names_the_bound_the_prefix_and_both_fixes() {
         t.contains("segment"),
         "notice must name the elapsed segments (spec §7): {t}"
     );
+    // F-C. Two different generations are involved in a gap and the notice
+    // has to keep them apart: the one being ABANDONED (whose already-written
+    // objects nobody collects) and the one the manifest names, which is what
+    // `ClosingGeneration` marks closed. An earlier wording said the
+    // abandoned one was "closed", which is the one thing that is not true of
+    // it — and the orphans it leaves went unmentioned entirely.
+    assert!(
+        t.contains("orphaned"),
+        "notice must say the abandoned generation's objects are orphaned; nothing collects them \
+         and the operator is the only one who can: {t}"
+    );
 
     // "ONE operator notice" (spec §7), not one per step: a gap is a latch.
     // `pin_segments` appears in no other error this archive can raise, so
@@ -2109,13 +2120,24 @@ fn an_archive_waiting_for_its_cadence_holds_nothing_against_a_healthy_store() {
         !m.segments.is_empty(),
         "the archive never resumed shipping after its cadence arrived: {m:?}"
     );
-    assert_eq!(
-        m.segments.first().map(|s| s.base_seq),
-        Some(db.log_base()),
-        "the resumed chain must start at the log's base — the archive released everything below \
-         it, so a chain starting anywhere else claims a span nothing backs: {:?}, log_base {}",
-        m.segments,
-        db.log_base()
+    // F-E: asserted as the INVARIANT, not as today's chain-start rule. The
+    // chain must claim nothing the log no longer holds, and must not begin
+    // above its own snapshot's frontier (which would leave the records
+    // between them in neither). Pinning `== db.log_base()` instead would
+    // hard-code the behaviour Ruling 53 is about to change and turn this
+    // into a false RED against the fix.
+    let start = m
+        .segments
+        .first()
+        .map(|s| s.base_seq)
+        .expect("checked non-empty above");
+    assert!(
+        start >= db.log_base() && start <= m.applied_seq + 1,
+        "the resumed chain starts at {start}, outside [log_base {}, frontier+1 {}]: below the \
+         log's base it claims a span nothing backs, above the frontier it leaves the records \
+         between the snapshot and the chain in no generation at all",
+        db.log_base(),
+        m.applied_seq + 1
     );
 }
 
@@ -2183,5 +2205,93 @@ fn a_gap_marks_the_generation_it_broke_closed_before_opening_the_next() {
     assert_eq!(
         closed.applied_seq, before.applied_seq,
         "closing a generation must not move its frontier"
+    );
+}
+
+/// F-A (task-7-review.md). A restart against a HEALTHY store must not
+/// declare a gap — and this is deliberately sited where the boundary
+/// actually is. `a_restarted_archive_resumes_the_generation_the_bucket_names`
+/// runs at `PIN_SEGMENTS` (64) over three segments, so the oracle for
+/// resume-or-open existed but sat where a false gap is unobservable.
+///
+/// The defect: `yield_or_bound` ran BEFORE `State::Opening` had read the
+/// bucket, against a `next_needed` that `open` sets to `db.log_base()` as a
+/// provisional hold — so every already-archived segment counted as backlog.
+/// The first `step` returned the gap notice, latched `gapped`, and
+/// `resume_point`'s `if self.gapped` then defeated obligation (a) outright.
+#[test]
+fn a_restart_over_an_archived_log_is_not_a_gap() {
+    let (mut db, store, mut arc) =
+        build_fixture_with_cadence(SimObjectStore::new(), 0, 8 << 20, GAP_PIN_SEGMENTS);
+    // A SECOND floor, the way spec §5 says the pin must compose: a
+    // replication cursor holding the log at its base. Without it the
+    // archive's own advancing pin lets gc reclaim what it has archived and a
+    // restart sees a two-segment log — which is exactly the shape that hid
+    // this defect.
+    db.add_retention_pin(Box::new(|| 0));
+    // Archived INCREMENTALLY, a segment at a time. Writing all twelve first
+    // and then stepping would leave the archive twelve behind against a
+    // bound of eight on its very first step, which is a real gap and not the
+    // false one under test — an archive may not hold more than its bound
+    // even to catch up. This is the state a healthy box is actually in: it
+    // archives as it writes, and something else (here a replication cursor)
+    // is what keeps the segments on disk afterwards.
+    for _ in 0..12 {
+        write_records(&mut db, RECORDS_PER_SEGMENT);
+        step_until_idle(&mut arc, &db, &store);
+    }
+    let before = read_manifest(&store).expect("a manifest");
+    let sealed = sealed_segment_count(&db);
+    assert!(
+        sealed > GAP_PIN_SEGMENTS,
+        "the fixture left {sealed} sealed segment(s) against a bound of {GAP_PIN_SEGMENTS}; a \
+         FALSE gap is not even possible here and the test proves nothing"
+    );
+    assert_eq!(
+        before.segments.len(),
+        sealed,
+        "every sealed segment must already be archived, so none of them is backlog: {:?}",
+        before.segments
+    );
+    drop(arc);
+
+    let mut restarted = Archive::open(
+        archive_config_bounded(0, 8 << 20, GAP_PIN_SEGMENTS),
+        &mut db,
+    )
+    .unwrap();
+    if let Err(e) = restarted.step(&db, &store) {
+        panic!(
+            "a restart over a FULLY ARCHIVED log failed on its very first step, before it had \
+             read the bucket at all: {e}"
+        );
+    }
+    assert!(
+        !restarted.gapped(),
+        "a restart against a healthy store recorded a gap; nothing was lost and nothing was \
+         even behind"
+    );
+
+    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
+    step_until_idle(&mut restarted, &db, &store);
+    assert!(
+        !restarted.gapped(),
+        "the restarted archive gapped while catching up on a healthy store"
+    );
+    let after = read_manifest(&store).expect("a manifest after the restart");
+    assert_eq!(
+        after.generation, before.generation,
+        "a false gap defeated resume-or-open: `resume_point` refuses while `gapped`, so the \
+         restart opened a new generation over a perfectly resumable one"
+    );
+    assert_eq!(
+        after.applied_seq, before.applied_seq,
+        "the restart re-snapshotted; a generation carries exactly ONE snapshot"
+    );
+    assert!(
+        after.segments.len() > before.segments.len(),
+        "the restarted archive shipped nothing ({} -> {}), so 'it resumed' is vacuous",
+        before.segments.len(),
+        after.segments.len()
     );
 }

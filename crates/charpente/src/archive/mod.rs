@@ -126,6 +126,18 @@
 //!   fresh one with a full snapshot. `gapped()` reports this, and `step`
 //!   returns the operator notice once — when it happens, not once per step.
 //!
+//! **Two different generations are involved in a gap, and the notice says
+//! so** (F-C). The one this archive was BUILDING is abandoned: if it had
+//! already written snapshot objects but no manifest yet, those objects are
+//! orphaned, and **nothing in this design collects them** — not the archive
+//! (it never lists the bucket), not restore, and no task in the plan. The
+//! two honest answers are a bucket lifecycle rule on `<prefix>/<gen>/`, or a
+//! sweep built on `ObjectOp::Delete`, which the trait already carries and
+//! nothing yet calls. The one `ClosingGeneration` marks `closed` is a
+//! different thing: the generation the MANIFEST names, which is what a
+//! restore would read, and which is only the same generation when this one
+//! had already published.
+//!
 //! **Generations transition on two triggers and one path** (`roll_generation`):
 //! a gap, and a `snapshot_every` crossing. A generation carries exactly one
 //! snapshot, so a *refresh* is a new generation — never a second snapshot
@@ -439,6 +451,21 @@ pub struct Archive {
     /// old one stopped, and re-deriving it from an empty chain would move a
     /// caught-up floor backwards onto `db.log_base()` (M1').
     next_needed: u64,
+    /// The BOUND's baseline while `State::Opening` has not yet told this
+    /// archive what it actually needs (F-A, task-7-review.md). `next_needed`
+    /// is `db.log_base()` at that point — a PROVISIONAL hold that keeps a
+    /// resumable chain intact across the two steps the manifest GET takes,
+    /// not a claim that everything above it is un-archived. Counting it as
+    /// backlog made a restart over a FULLY ARCHIVED log declare a gap on its
+    /// very first `step`, before it had read the bucket at all, and
+    /// `resume_point`'s `gapped` refusal then defeated resume-or-open
+    /// outright.
+    ///
+    /// The live tail's base at `open`, because what a STALLED `Opening` is
+    /// actually causing to be retained is what seals AFTER it: zero on a
+    /// healthy restart, growing only while the store cannot answer. `None`
+    /// once `adopt` has set a real cursor.
+    opening_baseline: Option<u64>,
     state: State,
     /// Set by the `step_idle` arms that find no available work, cleared by
     /// every `step`. Backs `Archive::idle`.
@@ -474,6 +501,10 @@ impl Archive {
             floor: db.log_base(),
             holding: true,
         }));
+        let opening_tail = db
+            .sealed_segments()?
+            .last()
+            .map_or_else(|| db.log_base(), |s| s.layout_end + 1);
         db.add_retention_pin(Box::new({
             let pin = Arc::clone(&pin);
             // RULING 49: the release lives HERE, in what the closure
@@ -492,6 +523,7 @@ impl Archive {
             frontier: None,
             segments: Vec::new(),
             next_needed: db.log_base(),
+            opening_baseline: Some(opening_tail),
             state: State::Opening { started: false },
             idle: false,
             gapped: false,
@@ -703,10 +735,10 @@ impl Archive {
             return Ok(());
         }
         let sealed = db.sealed_segments()?;
-        let behind = sealed
-            .iter()
-            .filter(|s| s.base_seq >= self.next_needed)
-            .count();
+        // F-A: `next_needed` is only a real cursor once `adopt` has read the
+        // bucket; until then the bound measures against the tail at `open`.
+        let from = self.opening_baseline.unwrap_or(self.next_needed);
+        let behind = sealed.iter().filter(|s| s.base_seq >= from).count();
         if behind <= self.cfg.pin_segments {
             return Ok(());
         }
@@ -720,8 +752,34 @@ impl Archive {
         // bound would be over on the very next step, and the archive would
         // churn generations without ever shipping anything (the notice once
         // per churn). The new chain therefore starts at the live tail's base.
-        let tail = sealed.last().map_or(db.log_base(), |s| s.layout_end + 1);
-        self.next_needed = self.next_needed.max(tail);
+        // F-B: what makes the forfeit safe is that the fresh generation's
+        // own snapshot covers every segment given up — and it can only cover
+        // what the Db has APPLIED. `SealedSegment::layout_end` may sit above
+        // `Db::last_applied` (its own doc says so, and `step_idle`'s gate
+        // waits for exactly that case), so the forfeit stops at the first
+        // sealed segment that is not fully applied rather than at the tail
+        // regardless. `resume_point` refuses the same condition on the read
+        // side; this is the write side of it.
+        let applied = db.last_applied();
+        let unapplied = sealed
+            .iter()
+            .find(|s| applied.is_none_or(|l| s.layout_end > l));
+        let forfeit_to = self.next_needed.max(unapplied.map_or_else(
+            || sealed.last().map_or(db.log_base(), |s| s.layout_end + 1),
+            |s| s.base_seq,
+        ));
+        // Negative space (hard rule 4): forfeiting past the applied frontier
+        // would leave those records in NO generation at all — not in the
+        // closed one, which never shipped them, and not in the fresh one,
+        // whose snapshot cannot contain what was never applied.
+        assert!(
+            forfeit_to == self.next_needed
+                || applied.is_some_and(|l| l.saturating_add(1) >= forfeit_to),
+            "Archive: the gap is forfeiting up to seq {forfeit_to} but the Db has applied only \
+             {applied:?} — the fresh generation's snapshot cannot cover records that were never \
+             applied, so they would end up in no archived generation at all"
+        );
+        self.next_needed = forfeit_to;
         self.yield_pin(self.next_needed);
         self.gapped = true;
         self.roll_generation();
@@ -752,9 +810,11 @@ impl Archive {
             "Archive: gap at prefix \"{}\" — {behind} sealed WAL segments are un-archived, past \
              the configured bound of pin_segments = {}. The retention pin is released so \
              Wal::gc can proceed and the primary keeps accepting writes: on outage the archive \
-             yields, never the primary (spec ruling 3). Generation {} is closed; the next \
-             successful contact opens a fresh generation with a full snapshot, and whatever the \
-             log reclaims meanwhile is not in the archive. Fix: raise \
+             yields, never the primary (spec ruling 3). Generation {} is abandoned, and whatever \
+             it had already written is orphaned in the bucket — nothing in this design collects \
+             it. The next successful contact marks the generation the manifest names closed and \
+             opens a fresh generation with a full snapshot; whatever the log reclaims meanwhile \
+             is in no archived generation at all. Fix: raise \
              ArchiveConfig::pin_segments if the WAL can afford to hold more, or accept the new \
              generation and the gap it leaves.",
             self.cfg.prefix, self.cfg.pin_segments, self.generation
@@ -857,6 +917,9 @@ impl Archive {
     /// extends that generation or opens a fresh one (ruling 43).
     fn adopt(&mut self, db: &Db, found: Option<Manifest>) {
         self.state = State::Idle;
+        // The bucket has answered: `next_needed` becomes a real cursor below
+        // and the bound measures against it from here (F-A).
+        self.opening_baseline = None;
         let Some(m) = found else {
             // Nothing in the bucket: generation 0 on a first open, and on a
             // gap whatever `roll_generation` already moved to — a gap spends
