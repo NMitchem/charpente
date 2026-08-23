@@ -2316,7 +2316,9 @@ this argument must be named `id` to match :id in "/notes/:id" — got `key`
 route path must start with '/' — got "notes"
 unknown method PUSH — one of GET, POST, PUT, PATCH, DELETE, SSE
 the route path must be a string literal — e.g. #[route(GET "/notes/:id")]
-the only route flag is `auth` — write `#[route(GET "/path", auth)]`
+a route flag is `auth` or `emits(Ev, …)` — write `#[route(GET "/path", auth)]`, or `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`
+emits(...) applies to SSE routes only — a plain route returns one response, not a stream of events; drop emits(...) or make this `#[route(SSE "…")]`
+emits(...) must name at least one #[event] type — write `emits(NoteAdded, NoteRemoved)`, or drop it
 #[route] handlers are free functions — no `self`
 empty :param name in "/notes/:"
 write `#[route(METHOD "/path")]` — e.g. #[route(GET "/notes/:id")]
@@ -2325,8 +2327,10 @@ write `#[route(METHOD "/path")]` — e.g. #[route(GET "/notes/:id")]
 §5's "What `#[route]` rejects" walks through the first three with full
 examples. The rest, in order: the path literal doesn't start with `/`; the
 method name isn't one of `GET`/`POST`/`PUT`/`PATCH`/`DELETE`/`SSE`; the path
-isn't a string literal at all (e.g. a `const`); the trailing flag after the
-path isn't `auth`; the handler takes `self` (route handlers are free
+isn't a string literal at all (e.g. a `const`); a flag after the path is
+neither `auth` nor `emits(...)`; `emits(...)` is on a route that isn't a
+stream (only an SSE route has events to declare — see §11); `emits()` names
+nothing at all; the handler takes `self` (route handlers are free
 functions); a `:` segment has nothing after it; and the macro's own
 argument list didn't parse as `METHOD "/path"` to begin with. Every one of
 these is a compile error at the `#[route]` call site — fix the signature or
@@ -3042,7 +3046,10 @@ fn send_ping(tx: &mut Tx, body: PingBody) -> Result<(), ApiError> {
 /// A real handler would narrow `.key(...)` to the caller's own org, read off
 /// `ctx.session()` exactly like any other route's access control — the
 /// platform enforces nothing about the key beyond the exact-match filter.
-#[route(SSE "/feed")]
+///
+/// `emits(Ping)` declares what this stream carries, for the contract and the
+/// generated client — see "Declaring what a stream carries" below.
+#[route(SSE "/feed", emits(Ping))]
 fn feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<Ping>().cursor(cursor))
@@ -3074,6 +3081,51 @@ second type to the same tail; `.key(...)` narrows delivery to one exact-match va
 `.cursor(...)` takes the resume point the platform already extracted (next) — the
 handler can pass it straight through, as `feed` does above, or clamp it to some
 app-level boundary.
+
+### Declaring what a stream carries
+
+`Subscription::of::<Ping>()` runs inside the handler's body, so nothing outside the
+handler can see it — not `App::describe`, and therefore not a generated client, which
+would otherwise have to offer "subscribe to anything". A stream route says so on the
+attribute instead:
+
+```rust,ignore
+#[route(SSE "/feed", emits(Ping, Pong))]
+```
+
+The names inside `emits(...)` are the `#[event]` TYPES, exactly like `Subscription::of`
+— a typo is a compile error, and a type that isn't an `#[event]` fails with an
+unsatisfied `Event` bound naming it. The contract records each one's `Event::NAME`, so
+`Ping` shows up as `"ping"` in `RouteInfo.emits` without you repeating the snake_case
+rule anywhere. Their payload types join `Contract.types` too, so a client can resolve
+the union even in an app that never calls `mount_events`.
+
+Three things it deliberately is not:
+
+- **Not a filter.** Delivery still runs off the encoders `Subscription::of::<Ev>()`
+  captured. Declaring `emits(Ping)` does not stop a handler subscribing to `Pong`, and
+  it does not make the platform drop a `Pong` frame.
+- **Not required.** Leave it off and the route's `emits` is `[]` — `stream: true` with
+  no binding, exactly as before this existed. Combine it with `auth` in either order:
+  `#[route(SSE "/feed", auth, emits(Ping))]`.
+- **Not the key.** `.key(...)` narrows which *rows* reach the tail, and that value is a
+  per-emit call-site choice the contract cannot know. `emits(...)` names event TYPES, so
+  a keyed feed declares the same types an unkeyed one does.
+
+Since it is a declaration rather than a rule, it can drift from the handler. That is
+handled with an oracle: `App::subscription_event_names(route_name)` runs the route's
+subscribe glue and reports the names the returned `Subscription` actually holds, and a
+test compares the two.
+
+```rust,ignore
+let actual = app.subscription_event_names("feed").unwrap();
+assert_eq!(feed_route.emits, actual);
+```
+
+Order counts — the declaration's order is the contract's order — so write `emits(...)`
+in the same order the handler chains `of`/`and`. `crates/charpente/tests/describe.rs`
+and `crates/charpente/tests/realtime.rs` both carry this check; copy one into your own
+app's tests and every stream route you declare stays honest for free.
 
 ### Cursor semantics
 
@@ -3216,7 +3268,7 @@ fn send_ping(tx: &mut Tx, body: PingBody) -> Result<(), ApiError> {
     Ok(())
 }
 
-#[route(SSE "/feed")]
+#[route(SSE "/feed", emits(Ping))]
 fn feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<Ping>().cursor(cursor))
@@ -4264,13 +4316,12 @@ starting with a `tables:` header.)
 Two honesty notes. First: a `describe` run never touches the app's real data
 directory — it builds and opens the app against a fresh, throwaway temp directory the
 CLI verb (or `launch`, when invoked with the `describe` verb) creates and removes around
-the run, so it is always safe to run against a live server's data dir. Second: the contract
-enumerates every *registered* `#[event]` type and its payload shape (§11's
-`events![...]`/`mount_events`), but not the binding between a stream route and the
-events that route carries. `Subscription::of::<Ev>()` runs inside each
-`#[route(SSE …)]` handler's body, not anywhere an app-wide walk could observe, so
-`events_feed`'s entry still carries only `"stream": true` and an empty `"emits": []`
-— reading the handler is how you find out which of the app's events a given feed
-delivers. An event that is never passed to `mount_events` is invisible here as well:
-registration is what puts an event in the contract, and it still emits and delivers
-either way.
+the run, so it is always safe to run against a live server's data dir. Second: everything
+in the contract is *declared*, never discovered by walking bodies. That shows up twice
+here. `events_feed`'s entry above carries `"stream": true` and an empty `"emits": []`
+because this example has not adopted `emits(...)` yet (§11, "Declaring what a stream
+carries") — `Subscription::of::<Ev>()` runs inside the handler's body, where no app-wide
+walk can see it, so an undeclared feed tells you nothing about which events it delivers
+and reading the handler is the only way to find out. Likewise an event never passed to
+`mount_events` is absent from `events` entirely: registration is what puts an event in
+the contract, and it still emits and delivers either way.

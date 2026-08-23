@@ -296,7 +296,7 @@ identical contract — is already a property of the introspection sub-project.
 | file | change |
 |---|---|
 | `crates/charpente/src/wire.rs` **(new)** | `TypeSchema`, `TypeDef`, `Field`, `EnumRepr`, `TypeRegistry`, the `Wire` trait and its primitive impls |
-| `crates/charpente/src/describe.rs` | `Contract.types`; `Contract.events`; `RouteInfo` gains request/response/error `TypeRef`s and `emits`. Stays the assembly point only. |
+| `crates/charpente/src/describe.rs` | `Contract.types`; `Contract.events`; `RouteInfo` gains request/response/error `TypeSchema`s and `emits`. Stays the assembly point only. |
 | `crates/charpente-core/src/table.rs` | `Id<T>`: serde impls (string-encoded) |
 | `crates/charpente-macros` | `#[derive(Wire)]`; `#[route]` type capture + `emits(...)`; `#[event]` describe-time registration; the bare-`u64` diagnostic |
 | new codegen crate | `Contract` -> TypeScript emitter (pure, deterministic) |

@@ -94,10 +94,16 @@ struct WidgetRemoved {
     id: Id<Widget>,
 }
 
-#[route(SSE "/widgets/feed")]
+/// Two declared events, not one (task 7): with a single event the drift
+/// oracle below cannot tell "the declaration and the subscription agree"
+/// from "both happen to be one element long", and narrowing the declaration
+/// to prove the oracle red would have nothing to narrow to.
+#[route(SSE "/widgets/feed", emits(WidgetAdded, WidgetRemoved))]
 fn widget_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
-    Ok(Subscription::of::<WidgetAdded>().cursor(cursor))
+    Ok(Subscription::of::<WidgetAdded>()
+        .and::<WidgetRemoved>()
+        .cursor(cursor))
 }
 
 #[job]
@@ -277,7 +283,10 @@ const GOLDEN: &str = r#"{
       "error": {
         "Ref": "ApiError"
       },
-      "emits": []
+      "emits": [
+        "widget_added",
+        "widget_removed"
+      ]
     }
   ],
   "events": [
@@ -782,4 +791,126 @@ fn mounting_an_event_whose_payload_names_no_type_panics() {
 )]
 fn mounting_one_event_twice_panics_at_mount_time() {
     let _ = fixture_app().mount_events(events![WidgetAdded]);
+}
+
+/// Task 7, Step 1: a stream route names the events it carries, so a generated
+/// client can give `subscribe()` a discriminated union of exactly those
+/// payloads instead of "subscribe to anything" (`RouteInfo.stream` alone).
+///
+/// The names come from `<Ev as Event>::NAME` (amendment B1), not from a
+/// snake_case rule recomputed in `route.rs` — which is why `WidgetAdded`
+/// renders as `widget_added` here without `#[route]` knowing that rule at
+/// all. `emits` is empty on the three non-stream routes; the pinned golden
+/// (`contract_json_shape_is_pinned`) carries that half.
+#[test]
+fn a_stream_route_declares_the_events_it_carries() {
+    let app = fixture_app();
+    let c = app.describe();
+    let feed = c.routes.iter().find(|r| r.name == "widget_feed").unwrap();
+    assert!(feed.stream);
+    assert_eq!(feed.emits, vec!["widget_added", "widget_removed"]);
+    for r in c.routes.iter().filter(|r| !r.stream) {
+        assert!(
+            r.emits.is_empty(),
+            "a non-stream route carries no emits: {} -> {:?}",
+            r.name,
+            r.emits
+        );
+    }
+}
+
+/// The drift oracle (spec §2/§5): the `emits(...)` declaration and the
+/// handler's own `Subscription` must agree, or a client is generated for
+/// events the route never sends. `App::subscription_event_names` gets the
+/// second half by actually running the route's subscribe glue.
+///
+/// Order-sensitive on purpose. Declaration order is the contract's order —
+/// it is what the emitter's union order will be — so `emits(B, A)` against
+/// `of::<A>().and::<B>()` is a mismatch worth naming, not a set-equality
+/// pass. The failure prints both lists, so the diagnosis is one read.
+///
+/// Undeclared stream routes are skipped rather than failed: `emits(...)` is
+/// optional syntax, and `[]` means "not declared", not "declares nothing".
+/// That makes the loop vacuously green for an app that declares none, so it
+/// owes the floor below — proven by narrowing `widget_feed`'s declaration to
+/// one event and watching this redden (task-7 report, Step 5).
+#[test]
+fn a_declared_emits_set_matches_the_handlers_subscription() {
+    let mut app = fixture_app();
+    let declared: Vec<(&'static str, Vec<&'static str>)> = app
+        .describe()
+        .routes
+        .iter()
+        .filter(|r| r.stream && !r.emits.is_empty())
+        .map(|r| (r.name, r.emits.clone()))
+        .collect();
+    assert_eq!(
+        declared.len(),
+        1,
+        "the floor: this fixture has exactly one stream route with a declared \
+         emits(...), so an empty loop below would be a vacuous pass — got {declared:?}"
+    );
+    for (name, emits) in declared {
+        let actual = app
+            .subscription_event_names(name)
+            .expect("a stream route must expose its subscription's event names");
+        assert_eq!(
+            emits, actual,
+            "route `{name}` declares emits{emits:?} but its Subscription names {actual:?}"
+        );
+    }
+}
+
+/// `to_human`'s stream-route line, pinned the same way its plain-route line
+/// and its events section are (task 5's F9): `emits` is the one field on that
+/// line a stream route actually fills, and nothing pinned its rendering.
+#[test]
+fn to_human_pins_a_stream_routes_emits() {
+    let out = charpente::describe::to_human(&fixture_app().describe());
+    assert!(
+        out.contains(
+            "  GET /widgets/feed name=widget_feed auth=false stream=true\n    \
+             params=[] request=None response=Null error=Ref(\"ApiError\") \
+             emits=[\"widget_added\", \"widget_removed\"]\n"
+        ),
+        "{out}"
+    );
+}
+
+/// A declared payload joins the ROUTE's own type closure — the stream
+/// route's `register_types` walks `emits(...)` too, not just params/request/
+/// response/error — so a client can resolve the union even for an app that
+/// never calls `mount_events`.
+///
+/// Deliberately NOT `fixture_app()` (pin the behaviour, not the function):
+/// that app mounts both events, and `describe()` registers every mounted
+/// event's payload, so asserting the two names there would stay green with
+/// `#(#emit_registers)*` deleted from `expand_sse`. This app mounts none, so
+/// the route's own registration is the only path either name can take.
+///
+/// It is also the live proof that double registration is safe in the fixture
+/// app, where BOTH paths run: `TypeRegistry::insert_as` returns quietly for
+/// an identical schema under a name already present, and would panic on a
+/// genuine collision — `contract_json_shape_is_pinned` reaching its
+/// assertion at all is that half.
+#[test]
+fn a_declared_emits_payload_reaches_the_closure_without_mount_events() {
+    let sim = Sim::with_faults(0x2EC2_0007, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![widget_feed]);
+    let c = app.describe();
+    assert!(
+        c.events.is_empty(),
+        "this app registers no events on purpose: {:?}",
+        c.events.iter().map(|e| e.name).collect::<Vec<_>>()
+    );
+    let names: Vec<&str> = c.types.iter().map(|t| t.name).collect();
+    assert!(names.contains(&"WidgetAdded"), "types: {names:?}");
+    assert!(names.contains(&"WidgetRemoved"), "types: {names:?}");
 }

@@ -29,6 +29,25 @@ use crate::kernel::cron::{CronEntry, CronRow};
 /// two sites.
 const DB_TAKEN: &str = "db taken for reseed — a kernel bug left it out";
 
+/// What `App::subscription_event_names` feeds each `:param` of the stream
+/// route it probes. `"0"` parses for every `FromParam` the platform ships
+/// (`u64`, `String`, `Id<T>`); a hand-written one that rejects it turns the
+/// probe into a named `Err`, not a silently empty answer.
+const PROBE_CAPTURE: &str = "0";
+
+/// The `Ctx` fresh-token slot for the same probe: a fixed literal rather
+/// than an `Entropy` draw, so probing a route cannot shift the app's entropy
+/// stream and change every value drawn after it. 64 hex chars, the shape
+/// `Ctx::create_session` slices its first 16 of.
+const PROBE_TOKEN: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Negative space, at compile time (hard rule 4): `Ctx::create_session` and
+/// `create_api_key` slice `fresh_token[..16]`, so a shortened `PROBE_TOKEN`
+/// would turn a probe of a session-minting subscribe handler into a slice
+/// panic — reachable only from that one handler shape, i.e. exactly the bug
+/// a test run would not find.
+const _: () = assert!(PROBE_TOKEN.len() >= 16);
+
 // ---------------------------------------------------------------- session
 
 /// Default session lifetime: 30 days, in nanoseconds — the clock's unit
@@ -433,6 +452,81 @@ impl App {
     #[doc(hidden)]
     pub fn put_db_for_tests(&mut self, db: Db) {
         self.put_db(db);
+    }
+
+    /// The `emits(...)` drift oracle's reach (TS-codegen spec §2/§5): runs
+    /// one stream route's subscribe glue and reports the event names the
+    /// `Subscription` it returned actually carries, so a test can compare
+    /// them against what `#[route(SSE …, emits(…))]` declared. A declaration
+    /// nothing verifies is a decorative pin; this is the "nothing" made into
+    /// something.
+    ///
+    /// It really runs the handler — it does not simulate one. The glue is
+    /// staged into its own group and that group is committed, exactly as
+    /// `handle_or_subscribe` does, so a subscribe handler that writes (e.g.
+    /// `ctx.create_session`) has its writes committed here too. Read-only
+    /// subscribe handlers, which is all of them in practice, stage no record
+    /// at all (`Group::stage`'s empty-effects check).
+    ///
+    /// Three deliberate departures from a real request, all so the probe can
+    /// reach EVERY stream route rather than only the trivially reachable
+    /// ones: `auth` is not enforced (no credential is presented and none is
+    /// demanded, so an `auth` stream route is probeable); each `:param` is
+    /// fed the literal `"0"`, which parses for every `FromParam` the
+    /// platform ships (`u64`, `String`, `Id<T>`); and the fresh-token slot
+    /// is a fixed literal rather than an `Entropy` draw, so probing cannot
+    /// shift the app's entropy stream and perturb everything after it (hard
+    /// rule 1). A handler that rejects that synthetic input comes back as
+    /// `Err` naming the route, never as a silently empty name list.
+    #[doc(hidden)]
+    pub fn subscription_event_names(&mut self, route: &str) -> Result<Vec<&'static str>, String> {
+        let Some(found) = self.router.routes().iter().find(|r| r.name == route) else {
+            return Err(format!("no route named `{route}` is mounted"));
+        };
+        let RouteGlue::Sse(glue) = found.glue else {
+            return Err(format!(
+                "route `{route}` is not a stream route — only `#[route(SSE …)]` returns a \
+                 Subscription to read event names from"
+            ));
+        };
+        let captures: Vec<String> = found
+            .params
+            .iter()
+            .map(|_| PROBE_CAPTURE.to_string())
+            .collect();
+        let session_ttl = self.config.session_ttl;
+        let (mut group, _) = self
+            .begin_group()
+            .map_err(|e| format!("route `{route}`: the probe could not open a group: {e}"))?;
+        let staged = group.stage(|tx| {
+            let ctx = build_ctx(
+                tx,
+                &Presented::None,
+                false,
+                PROBE_TOKEN.to_string(),
+                0,
+                session_ttl,
+                None,
+            )?;
+            glue(tx, &ctx, &captures, None)
+        });
+        let names = match staged {
+            Ok(sub) => Ok(sub.entries.iter().map(|e| e.name).collect()),
+            Err(e) => Err(format!(
+                "route `{route}`'s subscribe handler returned {e:?} under the emits(...) drift \
+                 probe, so what it subscribes to cannot be read — a handler that rejects a \
+                 credential-free request with `\"0\"` for every :param is not probeable"
+            )),
+        };
+        // Unconditional, and before returning either way: `Group`'s `Drop`
+        // panics on a non-empty group that was never committed.
+        group.commit().map_err(|f| {
+            format!(
+                "route `{route}`: the probe's group failed to commit: {}",
+                f.error
+            )
+        })?;
+        names
     }
 
     /// The plain surface: routes to a `Response` (`handle_or_subscribe`'s

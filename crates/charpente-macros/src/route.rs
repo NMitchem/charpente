@@ -1,9 +1,10 @@
-//! `#[route(METHOD "/path/:param"[, auth])]` (DESIGN.md §3, spec
-//! 2026-07-02-http-layer): validates the handler signature against the path
-//! and emits typed extraction glue plus a `RouteDef` marker struct. The
-//! argument convention — `tx`, one arg per `:param` by name in path order,
-//! at most one JSON body arg, optional trailing `ctx` — is enforced here
-//! with errors that name the contract and the fix.
+//! `#[route(METHOD "/path/:param"[, auth][, emits(Ev, …)])]` (DESIGN.md §3,
+//! specs 2026-07-02-http-layer and 2026-08-20-ts-client-codegen §2):
+//! validates the handler signature against the path and emits typed
+//! extraction glue plus a `RouteDef` marker struct. The argument convention
+//! — `tx`, one arg per `:param` by name in path order, at most one JSON body
+//! arg, optional trailing `ctx` — is enforced here with errors that name the
+//! contract and the fix.
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -11,13 +12,18 @@ use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
 use syn::{
     Error, FnArg, GenericArgument, Ident, ItemFn, LitStr, Pat, PatType, PathArguments, ReturnType,
-    Token, Type,
+    Token, Type, parenthesized,
 };
 
 pub(crate) struct RouteArgs {
     method: Ident,
     path: LitStr,
     auth: bool,
+    /// The event types a stream route declares with `emits(Ev, …)`
+    /// (TS-codegen spec §2) — empty when the attribute carries none, which
+    /// is every non-stream route and any stream route that has not adopted
+    /// the declaration.
+    emits: Vec<Ident>,
 }
 
 impl Parse for RouteArgs {
@@ -35,23 +41,47 @@ impl Parse for RouteArgs {
             )
         })?;
         let mut auth = false;
-        if input.peek(Token![,]) {
+        let mut emits: Vec<Ident> = Vec::new();
+        while input.peek(Token![,]) {
             input.parse::<Token![,]>()?;
-            let flag: Ident = input.parse()?;
-            if flag != "auth" {
-                return Err(Error::new(
-                    flag.span(),
-                    "the only route flag is `auth` — write `#[route(GET \"/path\", auth)]`",
-                ));
+            let flag: Ident = input.parse().map_err(|e| Error::new(e.span(), FLAGS))?;
+            if flag == "auth" {
+                auth = true;
+            } else if flag == "emits" {
+                let content;
+                parenthesized!(content in input);
+                let names = content.parse_terminated(Ident::parse, Token![,])?;
+                if names.is_empty() {
+                    return Err(Error::new(
+                        flag.span(),
+                        "emits(...) must name at least one #[event] type — write \
+                         `emits(NoteAdded, NoteRemoved)`, or drop it",
+                    ));
+                }
+                emits.extend(names);
+            } else {
+                return Err(Error::new(flag.span(), FLAGS));
             }
-            auth = true;
         }
         if !input.is_empty() {
             return Err(input.error("unexpected tokens after the route flags"));
         }
-        Ok(RouteArgs { method, path, auth })
+        Ok(RouteArgs {
+            method,
+            path,
+            auth,
+            emits,
+        })
     }
 }
+
+/// The one wording for "that isn't a route flag", shared by the two sites
+/// that can reach it (a non-identifier token, and an identifier that isn't
+/// one of the flags) so they cannot drift apart. Pinned by
+/// `docs/GUIDE.md`'s error catalog (hard rule 5).
+const FLAGS: &str = "a route flag is `auth` or `emits(Ev, …)` — write \
+                     `#[route(GET \"/path\", auth)]`, or \
+                     `#[route(SSE \"/path\", emits(NoteAdded, NoteRemoved))]`";
 
 fn arg_name(pat: &PatType) -> Option<String> {
     match &*pat.pat {
@@ -61,6 +91,13 @@ fn arg_name(pat: &PatType) -> Option<String> {
 }
 
 pub(crate) fn expand(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
+    if !args.emits.is_empty() && args.method != "SSE" {
+        return Err(Error::new(
+            args.path.span(),
+            "emits(...) applies to SSE routes only — a plain route returns one response, \
+             not a stream of events; drop emits(...) or make this `#[route(SSE \"…\")]`",
+        ));
+    }
     if args.method == "SSE" {
         return expand_sse(args, func);
     }
@@ -514,6 +551,30 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
             quote! { <#ty as ::charpente::wire::Wire>::register(reg); }
         })
         .collect();
+    // `<Ev as Event>::NAME`, NOT a snake_case recomputed here (task 7,
+    // amendment B1): `#[event]` already computed that name once, and a
+    // second copy of the rule would be a drift source living inside the very
+    // thing that detects drift — invisible to it whenever both copies were
+    // wrong the same way. Naming the const also means `emits(NotAnEvent)`
+    // fails with an unsatisfied `Event` bound naming the type, instead of
+    // baking a wrong string into the contract.
+    let emit_names: Vec<TokenStream> = args
+        .emits
+        .iter()
+        .map(|i| quote! { <#i as ::charpente::core::db::Event>::NAME })
+        .collect();
+    // The declared payloads join the route's own type closure. `describe()`
+    // also registers every MOUNTED event's payload, so a declared-and-
+    // mounted event is registered twice — that is the documented dedup path
+    // (`TypeRegistry::insert_as` returns quietly for an identical schema
+    // under a name already present), not a collision. Registering here is
+    // what makes an emitted payload resolvable from the contract even for an
+    // app that never calls `mount_events`.
+    let emit_registers: Vec<TokenStream> = args
+        .emits
+        .iter()
+        .map(|i| quote! { <#i as ::charpente::wire::Wire>::register(reg); })
+        .collect();
 
     Ok(quote! {
         #func
@@ -548,15 +609,21 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
                     // Placeholder, NOT `Struct { fields: vec![] }` — that
                     // would claim the stream emits an empty JSON object,
                     // which is a lie the emitter would faithfully
-                    // transcribe. Task 7's `emits(...)` replaces this with
-                    // the subscription's real payload union.
+                    // transcribe. It STAYS a placeholder now that task 7 has
+                    // landed: the payload union lives in `emits` below (a
+                    // list of event NAMES, each resolvable through
+                    // `Contract.types`), and the emitter forms the
+                    // discriminated union from that. Duplicating it into
+                    // `response` as well would be a second place the same
+                    // fact becomes true.
                     response: || ::charpente::wire::TypeSchema::Null,
                     error: || <#err_ty as ::charpente::wire::Wire>::reference(),
                     register_types: |reg| {
                         #(#param_registers)*
                         <#err_ty as ::charpente::wire::Wire>::register(reg);
+                        #(#emit_registers)*
                     },
-                    emits: &[],
+                    emits: &[#(#emit_names),*],
                 }
             }
         }

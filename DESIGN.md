@@ -982,7 +982,18 @@ slot.
   platform's). The platform extracts the client's cursor before the handler runs:
   `Last-Event-ID` header wins (browser-native SSE resume), else a `cursor` query
   parameter, else `None` ("from now" — only future events); an unparseable cursor is a 400
-  and the handler never runs.
+  and the handler never runs. The route may also DECLARE the event types its stream
+  carries — `#[route(SSE "/path", emits(InvoicePaid, InvoiceVoided))]` — which is what
+  lets a generated client type `subscribe()` as a discriminated union of exactly those
+  payloads instead of "anything". The declaration names Rust types, and the contract
+  records `<Ev as Event>::NAME` for each, so the name has one source rather than a copy
+  of `#[event]`'s snake_case rule. The declaration is optional (an undeclared stream
+  route simply carries an empty `emits`) and it is not a filter: nothing enforces it at
+  delivery, because delivery is still the encoder each `Subscription::of::<Ev>()`
+  captured. What holds the two together is an ORACLE, not a rule — a declaration nothing
+  verifies is decorative — `App::subscription_event_names` runs a stream route's
+  subscribe glue and reports the names its `Subscription` actually holds, and a test
+  compares the two sets (TS-codegen spec §5).
 - **Kernel delivery is one path, no modes.** A validated subscribe registers a `Tail`
   (`{ subscription, sink, next_id }`) on the fifth ready source (§1) — eligible the instant
   a commit advances `next_event_id` past it, never a timer. One unit of work reads up to
@@ -1026,7 +1037,8 @@ Charpente treats the coding agent as the primary developer persona:
   schema: TypeSchema }`); `request` — the JSON body's schema, `None` for a bodyless route;
   `response` and `error` — the success and `ApiError` schemas every handler's `Result<T,
   ApiError>` carries; and `emits` — the event names a stream route declares via
-  `emits(...)`, empty until that mechanism lands**), **`events` — every `#[event]` type
+  `#[route(SSE …, emits(Ev, …))]`, empty on every non-stream route and on a stream route
+  that has not adopted the declaration**), **`events` — every `#[event]` type
   registered with `mount_events(events![…])` as `EventInfo { name, payload, keyed }`,
   sorted by event name (`keyed` is always `false`: `emit` vs `emit_keyed` is a call-site
   choice, so nothing static can know it)**, jobs (name, retry policy), cron
@@ -1065,11 +1077,14 @@ Charpente treats the coding agent as the primary developer persona:
   describe-time registry `events![…]`/`mount_events` fills — never by walking
   emit sites, which is impossible for the same reason it always was: `tx.emit` and
   `Subscription::of::<Ev>()` run inside handler bodies, not anywhere an app-wide walk can
-  observe (ruling 6, sub-project 6 spec). What is still missing is the BINDING between a
-  stream route and the events it carries: `stream: true` marks the route and
-  `RouteInfo.emits: Vec<&'static str>` is the field an eventual `emits(...)` declaration
-  will populate, but it stays empty today, so the contract reports which events the app
-  has and that a route streams — not which of them that route delivers.
+  observe (ruling 6, sub-project 6 spec). The BINDING between a stream route and the
+  events it carries is therefore DECLARED rather than discovered: `emits(Ev, …)` on the
+  route fills `RouteInfo.emits: Vec<&'static str>`, and the drift between that
+  declaration and the handler's own `Subscription` is caught by an oracle
+  (`App::subscription_event_names`, §6), not by a rule the platform could enforce at
+  delivery. An undeclared stream route still reports `stream: true` with an empty
+  `emits` — reading its handler is how you find out which of the app's events it
+  delivers.
 - **Errors are prompts.** Compile-time and sim-failure output is structured for machine
   consumption: the exact contract violated, the file/line, the seed and fault schedule for
   sim failures, and the minimal repro command. Error quality is a feature with a test suite.

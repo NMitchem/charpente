@@ -74,19 +74,23 @@ fn emit_pong(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
 /// key filter branches, not just "everything, unfiltered" (T5 left both
 /// unexercised) — one mode, deterministically chosen per universe from the
 /// seed, drives every (re)subscribe within that universe.
-#[route(SSE "/feed-both")]
+#[route(SSE "/feed-both", emits(Ping, Pong))]
 fn feed_both(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<Ping>().and::<Pong>().cursor(cursor))
 }
 
-#[route(SSE "/feed-ping")]
+#[route(SSE "/feed-ping", emits(Ping))]
 fn feed_ping(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<Ping>().cursor(cursor))
 }
 
-#[route(SSE "/feed-keyed")]
+/// `emits(...)` describes WHICH event types reach the stream, not which rows
+/// pass `.key(...)` — the key is a per-emit call-site value the contract
+/// cannot know (same reason `EventInfo.keyed` is always false), so a keyed
+/// feed declares the same two types the unkeyed one does.
+#[route(SSE "/feed-keyed", emits(Ping, Pong))]
 fn feed_keyed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<Ping>()
@@ -2300,6 +2304,65 @@ fn follower_ids_match_a_batched_primarys() {
         assert_eq!(
             pr, fr,
             "table {table} diverged between the batched primary and the follower's replay"
+        );
+    }
+}
+
+/// Task 7's drift oracle on the app that actually delivers events: three
+/// stream routes, two distinct declared sets, and one of them keyed — so an
+/// `emits(...)` that quietly followed `.key(...)`, or that collapsed every
+/// feed to the same set, shows up here rather than in the describe fixture's
+/// single feed.
+///
+/// The declaration is the THIRD place these names are written in this file:
+/// `Subscription::of/and` in each handler, `PING_ONLY`/`BOTH` in `mode_for`
+/// (which the flagship workload uses as data — it subscribes by path and
+/// checks the frames it receives against those names), and now `emits(...)`.
+/// Task 7 deletes neither of the first two, so the cross-check at the end is
+/// what keeps a future edit from moving one without the others.
+#[test]
+fn every_stream_routes_declared_emits_matches_its_subscription() {
+    let sim = Sim::with_faults(0x2EB7_0007, FaultConfig::none());
+    let mut app = realtime_app(&sim).expect("the realtime fixture app must open");
+    let declared: Vec<(&'static str, Vec<&'static str>)> = app
+        .describe()
+        .routes
+        .iter()
+        .filter(|r| r.stream)
+        .map(|r| (r.name, r.emits.clone()))
+        .collect();
+    // The floor for the loop below (an empty one would pass vacuously), and
+    // the pin on registration order, which is the contract's route order.
+    assert_eq!(
+        declared,
+        vec![
+            ("feed_both", vec!["ping", "pong"]),
+            ("feed_ping", vec!["ping"]),
+            ("feed_keyed", vec!["ping", "pong"]),
+        ]
+    );
+    for (name, emits) in declared {
+        let actual = app
+            .subscription_event_names(name)
+            .expect("a stream route must expose its subscription's event names");
+        assert_eq!(
+            emits, actual,
+            "route `{name}` declares emits{emits:?} but its Subscription names {actual:?}"
+        );
+    }
+    for seed in 0..3u64 {
+        let (path, names, _) = mode_for(seed);
+        let emits = app
+            .describe()
+            .routes
+            .iter()
+            .find(|r| r.pattern == path)
+            .map(|r| r.emits.clone())
+            .expect("mode_for names a mounted route");
+        assert_eq!(
+            emits,
+            names.to_vec(),
+            "mode_for(\"{path}\") and that route's emits(...) must name the same events"
         );
     }
 }
