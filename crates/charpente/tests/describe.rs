@@ -94,6 +94,27 @@ struct WidgetRemoved {
     id: Id<Widget>,
 }
 
+/// A subscribe handler that WRITES — the one shape the drift probe refuses
+/// (task 7 review, Important 4). Deliberately NOT mounted in `fixture_app`:
+/// it would change the pinned golden and it exists only for the guard's own
+/// test, which builds its own app around it. `create_session` on a subscribe
+/// path is the realistic case the guard exists for — minting a credential
+/// for the stream the client is about to open.
+#[route(SSE "/widgets/minting-feed", emits(WidgetAdded))]
+fn minting_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = ctx.create_session(tx, "probe-subject");
+    Ok(Subscription::of::<WidgetAdded>().cursor(cursor))
+}
+
+/// A subscribe handler that REJECTS the probe's synthetic request — the
+/// third of the probe's three error strings (task 7 review, Minor 3). Not
+/// mounted in `fixture_app`, for the same reason `minting_feed` is not.
+#[route(SSE "/widgets/picky-feed", emits(WidgetAdded))]
+fn picky_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx, cursor);
+    Err(ApiError::Unauthorized)
+}
+
 /// Two declared events, not one (task 7): with a single event the drift
 /// oracle below cannot tell "the declaration and the subscription agree"
 /// from "both happen to be one element long", and narrowing the declaration
@@ -809,6 +830,19 @@ fn a_stream_route_declares_the_events_it_carries() {
     let feed = c.routes.iter().find(|r| r.name == "widget_feed").unwrap();
     assert!(feed.stream);
     assert_eq!(feed.emits, vec!["widget_added", "widget_removed"]);
+    let plain: Vec<&str> = c
+        .routes
+        .iter()
+        .filter(|r| !r.stream)
+        .map(|r| r.name)
+        .collect();
+    // The floor (task 7 review, Minor 4): the loop below asserts a negative,
+    // so an empty `plain` would pass it without checking anything.
+    assert_eq!(
+        plain,
+        vec!["create_widget", "list_widgets", "get_org_widget"],
+        "the fixture's three non-stream routes, in registration order"
+    );
     for r in c.routes.iter().filter(|r| !r.stream) {
         assert!(
             r.emits.is_empty(),
@@ -913,4 +947,106 @@ fn a_declared_emits_payload_reaches_the_closure_without_mount_events() {
     let names: Vec<&str> = c.types.iter().map(|t| t.name).collect();
     assert!(names.contains(&"WidgetAdded"), "types: {names:?}");
     assert!(names.contains(&"WidgetRemoved"), "types: {names:?}");
+}
+
+/// Two of the probe's three "you cannot probe that" branches, pinned by
+/// their exact text (hard rule 5; task 7 review, Minor 3). The third — a
+/// handler that rejects the synthetic request — needs an unmounted route, so
+/// it has its own test below. `subscription_event_names` is `pub`, and
+/// `docs/GUIDE.md` §11 tells app authors to call it, so these are product
+/// surface — and before this test no branch was executed by anything at all.
+#[test]
+fn the_drift_probe_names_a_route_it_cannot_read() {
+    let mut app = fixture_app();
+    assert_eq!(
+        app.subscription_event_names("nope"),
+        Err("no route named `nope` is mounted".to_string())
+    );
+    assert_eq!(
+        app.subscription_event_names("create_widget"),
+        Err(
+            "route `create_widget` is not a stream route — only `#[route(SSE …)]` \
+             returns a Subscription to read event names from"
+                .to_string()
+        )
+    );
+}
+
+/// The probe's third branch (task 7 review, Minor 3): a subscribe handler
+/// that refuses the credential-free, `"0"`-for-every-param request the probe
+/// synthesizes comes back as an `Err` naming the route and quoting what the
+/// handler returned — never as a silently empty name list, which a drift
+/// test would read as "this route declares nothing".
+///
+/// The quoted value is `App(Unauthorized)`, not `Unauthorized`: the probe
+/// formats `Group::stage`'s error, which wraps a handler's `ApiError` in
+/// `App(..)`. Pinned as it actually reads, so a reword of that wrapper is a
+/// visible change rather than a silent one.
+#[test]
+fn the_drift_probe_names_a_handler_that_rejected_it() {
+    let sim = Sim::with_faults(0x2EC2_0009, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![picky_feed]);
+
+    assert_eq!(
+        app.subscription_event_names("picky_feed"),
+        Err(
+            "route `picky_feed`'s subscribe handler returned App(Unauthorized) under the \
+             emits(...) drift probe, so what it subscribes to cannot be read — a handler \
+             that rejects a credential-free request with `\"0\"` for every :param is not \
+             probeable"
+                .to_string()
+        )
+    );
+}
+
+/// The write guard (task 7 review, Important 4): a subscribe handler that
+/// stages is refused with a named error rather than having its write
+/// committed silently into the app under test.
+///
+/// The second half is what keeps this from being a string test. The guard's
+/// message asserts the write "has just committed into this app" — because
+/// `Group`'s `Drop` panics on a non-empty uncommitted group, refusing cannot
+/// mean skipping the commit. So the test reads the `Session` row back: it is
+/// there, exactly one, and that is the fact the message exists to disclose.
+/// Delete the `if wrote` guard and the first assertion reddens; make the
+/// guard skip the commit instead and the group's `Drop` panics.
+#[test]
+fn the_drift_probe_refuses_a_subscribe_handler_that_writes() {
+    let sim = Sim::with_faults(0x2EC2_0008, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![minting_feed]);
+
+    assert_eq!(
+        app.subscription_event_names("minting_feed"),
+        Err(
+            "route `minting_feed`'s subscribe handler staged a write, which the \
+             emits(...) drift probe has just committed into this app — a probe is not \
+             a request, so nothing here asked for that row; move the write out of the \
+             subscribe path, or leave this route out of the drift test"
+                .to_string()
+        )
+    );
+
+    let sessions = app
+        .db_for_tests()
+        .transact(|tx| Ok::<_, ApiError>(tx.scan::<charpente::http::Session>()?.len()))
+        .unwrap();
+    assert_eq!(
+        sessions, 1,
+        "the guard reports a committed write, so the row must really be there — \
+         refusing cannot mean skipping the commit"
+    );
 }

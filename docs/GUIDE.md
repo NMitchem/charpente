@@ -2319,6 +2319,10 @@ the route path must be a string literal — e.g. #[route(GET "/notes/:id")]
 a route flag is `auth` or `emits(Ev, …)` — write `#[route(GET "/path", auth)]`, or `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`
 emits(...) applies to SSE routes only — a plain route returns one response, not a stream of events; drop emits(...) or make this `#[route(SSE "…")]`
 emits(...) must name at least one #[event] type — write `emits(NoteAdded, NoteRemoved)`, or drop it
+emits takes a parenthesized list of #[event] types — write `emits(NoteAdded, NoteRemoved)`
+`auth` given twice — write it once
+`emits(...)` given twice — a route declares one set, so name every event in one list: `emits(NoteAdded, NoteRemoved)`
+`NoteAdded` is named twice in emits(...) — a stream declares each event type once, and a repeat would put the same member in a generated client's union twice; write it once
 #[route] handlers are free functions — no `self`
 empty :param name in "/notes/:"
 write `#[route(METHOD "/path")]` — e.g. #[route(GET "/notes/:id")]
@@ -2330,7 +2334,11 @@ method name isn't one of `GET`/`POST`/`PUT`/`PATCH`/`DELETE`/`SSE`; the path
 isn't a string literal at all (e.g. a `const`); a flag after the path is
 neither `auth` nor `emits(...)`; `emits(...)` is on a route that isn't a
 stream (only an SSE route has events to declare — see §11); `emits()` names
-nothing at all; the handler takes `self` (route handlers are free
+nothing at all; `emits` was written without its parentheses; `auth` or
+`emits(...)` appears twice on the same route (a flag is a yes/no and a route
+declares one set, so a repeat is always a typo or a bad merge); the same
+event type appears twice inside one `emits(...)` list; the handler takes
+`self` (route handlers are free
 functions); a `:` segment has nothing after it; and the macro's own
 argument list didn't parse as `METHOD "/path"` to begin with. Every one of
 these is a compile error at the `#[route]` call site — fix the signature or
@@ -3106,8 +3114,10 @@ Three things it deliberately is not:
   captured. Declaring `emits(Ping)` does not stop a handler subscribing to `Pong`, and
   it does not make the platform drop a `Pong` frame.
 - **Not required.** Leave it off and the route's `emits` is `[]` — `stream: true` with
-  no binding, exactly as before this existed. Combine it with `auth` in either order:
-  `#[route(SSE "/feed", auth, emits(Ping))]`.
+  no binding, exactly as before this existed. Combine it with `auth` in either order —
+  `#[route(SSE "/feed", auth, emits(Ping))]` and `#[route(SSE "/feed", emits(Ping), auth)]`
+  both parse, and both are pinned by
+  `crates/charpente-macros/tests/compile_pass/route_emits_on_sse.rs`.
 - **Not the key.** `.key(...)` narrows which *rows* reach the tail, and that value is a
   per-emit call-site choice the contract cannot know. `emits(...)` names event TYPES, so
   a keyed feed declares the same types an unkeyed one does.
@@ -3115,17 +3125,31 @@ Three things it deliberately is not:
 Since it is a declaration rather than a rule, it can drift from the handler. That is
 handled with an oracle: `App::subscription_event_names(route_name)` runs the route's
 subscribe glue and reports the names the returned `Subscription` actually holds, and a
-test compares the two.
+test compares the two. It takes `&mut self`, because reaching a live `Tx` means opening
+a transaction group:
 
 ```rust,ignore
+let mut app = build_app(&sim)?;                 // &mut — the probe runs the handler
+let feed = app.describe().routes.iter().find(|r| r.name == "feed").unwrap().emits.clone();
 let actual = app.subscription_event_names("feed").unwrap();
-assert_eq!(feed_route.emits, actual);
+assert_eq!(feed, actual);
 ```
 
 Order counts — the declaration's order is the contract's order — so write `emits(...)`
 in the same order the handler chains `of`/`and`. `crates/charpente/tests/describe.rs`
 and `crates/charpente/tests/realtime.rs` both carry this check; copy one into your own
 app's tests and every stream route you declare stays honest for free.
+
+**One thing to know before you copy it: the probe really runs your handler**, inside a
+transaction group it then commits. A read-only subscribe handler stages nothing and this
+costs nothing, which covers essentially every handler. But if yours writes on the
+subscribe path — minting a stream credential with `ctx.create_session` is the case that
+comes up — the probe refuses it with an error naming the route, *after* the write has
+committed: a group holding a staged record cannot be dropped uncommitted, so refusing
+means telling you, not undoing it. And because the probe feeds a fixed token rather than
+drawing entropy (it must not perturb your app's entropy stream), a credential minted
+that way is the same one every run. Move the write off the subscribe path, or leave that
+route out of the drift test.
 
 ### Cursor semantics
 

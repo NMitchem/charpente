@@ -157,11 +157,37 @@ these are two different registries for two different purposes:
 ways, by position: `TypeSchema` where a route's request/response/error needs a full
 shape, and a bare `&'static str` wire NAME where a name is all a consumer needs
 (`Route.response_name`). `EventInfo.payload` is the second kind and shipped as
-`&'static str` (`Wire::WIRE_NAME`, an entry in `Contract.types`), matching
-`RouteInfo.emits: Vec<&'static str>`, which task 7 fills with exactly this kind of
-value and which sits right beside it in the rendered contract. The code is correct;
-this sentence was stale — same discharge as Ruling 10, where the IR shipped in
-`charpente::wire` rather than `charpente::describe`.
+`&'static str` (`Wire::WIRE_NAME`, an entry in `Contract.types`). It sits right beside
+`RouteInfo.emits: Vec<&'static str>` in the rendered contract, and the two have the
+same Rust type. The code is correct; this sentence was stale — same discharge as
+Ruling 10, where the IR shipped in `charpente::wire` rather than `charpente::describe`.
+
+**Correction (task 7 review, Ruling 39):** the sentence above originally continued
+"…matching `RouteInfo.emits`, which task 7 fills with exactly this kind of value". That
+prediction was wrong, and it contradicted amendment B1, which task 7 implemented. The
+two fields carry the same Rust type but NOT the same kind of value:
+
+- `EventInfo.payload` is `Wire::WIRE_NAME` — `"WidgetAdded"` — and IS a key into
+  `Contract.types`.
+- `RouteInfo.emits[i]` is `<Ev as Event>::NAME` — `"widget_added"` — the name an SSE
+  frame's `event:` field carries. It is **not** a key into `Contract.types`.
+
+`Event::NAME` is correct and stays. §7's acceptance criterion 6 is "an `emits(...)`
+declaration that disagrees with its handler's `Subscription` fails", and a
+`Subscription`'s entries hold `Event::NAME`; filling `emits` with the same value is what
+makes that criterion a direct comparison rather than one with a lookup inside it. It is
+also the value a client must switch on, since it is what arrives on the wire. And
+because both sides of the oracle now derive from `Ev::NAME`, the check detects
+**type-set** drift while name drift becomes inexpressible rather than merely detected.
+
+**Ruling 40 (task 7 review) — the join is Task 9's to design.** The emitter must resolve
+every `emits` entry to a payload type. Nothing here prescribes how. The constraint it has
+to satisfy: a stream route may declare an event the app never passes to `mount_events`,
+and that is a supported state, not a mistake — task 7 registers a declared payload into
+`Contract.types` from the ROUTE, and
+`crates/charpente/tests/describe.rs::a_declared_emits_payload_reaches_the_closure_without_mount_events`
+pins it. So a resolution that only works for mounted events is insufficient. Task 9
+picks the mechanism with sight of the emitter.
 
 **Binding events to streams.** `RouteInfo.stream` is a bare bool; nothing records which
 events a given stream carries, so a generated client could only offer "subscribe to

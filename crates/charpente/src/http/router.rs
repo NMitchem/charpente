@@ -52,8 +52,11 @@ pub struct Route {
     /// error, and everything they transitively reference) into the contract
     /// registry.
     pub register_types: fn(&mut crate::wire::TypeRegistry),
-    /// Event types a stream route declares via `emits(...)` (Task 7). Empty
-    /// for non-stream routes, and for a stream route until Task 7 lands.
+    /// Event types a stream route declares via `#[route(SSE …, emits(Ev, …))]`,
+    /// in declaration order, each one's `Event::NAME` (the name an SSE frame
+    /// carries) — NOT its `Wire::WIRE_NAME`, so these are not themselves keys
+    /// into `Contract.types`. Empty for non-stream routes, and for a stream
+    /// route that has not adopted the declaration.
     pub emits: &'static [&'static str],
 }
 

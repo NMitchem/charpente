@@ -1047,9 +1047,11 @@ Charpente treats the coding agent as the primary developer persona:
   field order is
   part of the pinned shape. `Contract` also carries **`types: Vec<TypeDef>`** — the
   transitive closure of every NAMED wire type a route's params/request/response/error
-  or a registered event's payload references (a `TypeRegistry` walk, `BTreeMap`-sorted by
-  wire name so generation stays
-  deterministic — spec §4); an anonymous type (a primitive, `Vec<T>`, `Option<T>`)
+  or a registered event's payload references, plus every event type a stream route
+  declares with `emits(...)` — that last one registered by the ROUTE, so a declared
+  payload is in the closure even when the event is never mounted. It is a
+  `TypeRegistry` walk, `BTreeMap`-sorted by wire name so generation stays
+  deterministic (spec §4); an anonymous type (a primitive, `Vec<T>`, `Option<T>`)
   contributes no entry of its own, only whatever named type it wraps. `ApiError` is
   always one such entry, and its schema describes the fixed `{"error": "<message>"}`
   envelope `Response::error` actually emits on the wire — not `ApiError`'s own Rust

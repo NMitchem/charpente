@@ -38,7 +38,10 @@ pub struct Contract {
     /// registry at all, see `EventDef`), it just isn't in the contract.
     pub events: Vec<EventInfo>,
     /// The transitive closure of every named type a route's params, request,
-    /// response, or error references, plus every registered event's payload
+    /// response, or error references, plus every event type a stream route
+    /// declares with `emits(...)` (registered by the ROUTE, so a declared
+    /// payload is here even when the event is never mounted — task 7), plus
+    /// every registered event's payload
     /// — `TypeRegistry::into_sorted()`, a `BTreeMap` walk, so this is sorted
     /// by construction (spec §4's determinism requirement holds without a
     /// separate sort call someone could delete).
@@ -77,8 +80,11 @@ pub struct RouteInfo {
     pub request: Option<TypeSchema>,
     pub response: TypeSchema,
     pub error: TypeSchema,
-    /// Event types a stream route declares via `emits(...)` (Task 7). Empty
-    /// for non-stream routes, and for a stream route until Task 7 lands.
+    /// Event types a stream route declares via `#[route(SSE …, emits(Ev, …))]`,
+    /// in declaration order, each one's `Event::NAME` (the name an SSE frame
+    /// carries) — NOT its `Wire::WIRE_NAME`, so these are not themselves keys
+    /// into `Contract.types`. Empty for non-stream routes, and for a stream
+    /// route that has not adopted the declaration.
     pub emits: Vec<&'static str>,
 }
 

@@ -46,8 +46,36 @@ impl Parse for RouteArgs {
             input.parse::<Token![,]>()?;
             let flag: Ident = input.parse().map_err(|e| Error::new(e.span(), FLAGS))?;
             if flag == "auth" {
+                if auth {
+                    return Err(Error::new(
+                        flag.span(),
+                        "`auth` given twice — write it once",
+                    ));
+                }
                 auth = true;
             } else if flag == "emits" {
+                // Non-empty means an earlier `emits(...)` clause landed:
+                // `emits()` is refused below, so the vector cannot be
+                // non-empty for any other reason.
+                if !emits.is_empty() {
+                    return Err(Error::new(
+                        flag.span(),
+                        "`emits(...)` given twice — a route declares one set, so name every \
+                         event in one list: `emits(NoteAdded, NoteRemoved)`",
+                    ));
+                }
+                // Peeked, not left to `parenthesized!`: that macro's own
+                // early return is syn's generic "expected parentheses",
+                // which names no fix (hard rule 5). `emits` with the
+                // parentheses forgotten is a realistic typo, so it gets a
+                // charpente message like every other branch here.
+                if !input.peek(syn::token::Paren) {
+                    return Err(Error::new(
+                        flag.span(),
+                        "emits takes a parenthesized list of #[event] types — write \
+                         `emits(NoteAdded, NoteRemoved)`",
+                    ));
+                }
                 let content;
                 parenthesized!(content in input);
                 let names = content.parse_terminated(Ident::parse, Token![,])?;
@@ -58,7 +86,19 @@ impl Parse for RouteArgs {
                          `emits(NoteAdded, NoteRemoved)`, or drop it",
                     ));
                 }
-                emits.extend(names);
+                for name in names {
+                    if emits.contains(&name) {
+                        return Err(Error::new(
+                            name.span(),
+                            format!(
+                                "`{name}` is named twice in emits(...) — a stream declares each \
+                                 event type once, and a repeat would put the same member in a \
+                                 generated client's union twice; write it once"
+                            ),
+                        ));
+                    }
+                    emits.push(name);
+                }
             } else {
                 return Err(Error::new(flag.span(), FLAGS));
             }

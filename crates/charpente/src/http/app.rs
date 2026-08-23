@@ -462,11 +462,25 @@ impl App {
     /// something.
     ///
     /// It really runs the handler — it does not simulate one. The glue is
-    /// staged into its own group and that group is committed, exactly as
-    /// `handle_or_subscribe` does, so a subscribe handler that writes (e.g.
-    /// `ctx.create_session`) has its writes committed here too. Read-only
-    /// subscribe handlers, which is all of them in practice, stage no record
-    /// at all (`Group::stage`'s empty-effects check).
+    /// staged into its own group, the same way `handle_or_subscribe` stages
+    /// a real subscribe. It is NOT the same commit rule, deliberately: the
+    /// real path forgives a `CommitFailure` that `invalidates(0, wrote)`
+    /// says left the record durable, and this one maps every `CommitFailure`
+    /// to `Err`, because a probe has no request to answer.
+    ///
+    /// **A subscribe handler that WRITES is refused, not committed.** A
+    /// read-only subscribe handler — which is all of them in practice —
+    /// stages no record at all (`Group::stage`'s empty-effects check) and
+    /// this costs nothing. But a handler that stages (`ctx.create_session`
+    /// on the subscribe path is the realistic case) would otherwise have its
+    /// write committed into the app under test by what reads as a
+    /// describe-time query, and with `PROBE_TOKEN` fixed that write is a
+    /// FIXED, publicly derivable credential. So the probe checks
+    /// `Group::is_empty` after staging and returns a named `Err` on the
+    /// write path. The group is still committed either way — `Group`'s
+    /// `Drop` panics on a non-empty group that was never committed, so
+    /// refusing cannot mean "skip the commit"; refusing means the caller is
+    /// told rather than left to discover a row it never asked for.
     ///
     /// Three deliberate departures from a real request, all so the probe can
     /// reach EVERY stream route rather than only the trivially reachable
@@ -510,6 +524,9 @@ impl App {
             )?;
             glue(tx, &ctx, &captures, None)
         });
+        // Read BEFORE the commit that empties it, and used below — the same
+        // `Group::is_empty` reading `handle_or_subscribe` takes for `wrote`.
+        let wrote = !group.is_empty();
         let names = match staged {
             Ok(sub) => Ok(sub.entries.iter().map(|e| e.name).collect()),
             Err(e) => Err(format!(
@@ -518,14 +535,24 @@ impl App {
                  credential-free request with `\"0\"` for every :param is not probeable"
             )),
         };
-        // Unconditional, and before returning either way: `Group`'s `Drop`
-        // panics on a non-empty group that was never committed.
+        // Unconditional, and before returning on any path: `Group`'s `Drop`
+        // panics on a non-empty group that was never committed, so the write
+        // the guard below refuses still has to be committed — the guard's job
+        // is to say so, not to pretend it did not happen.
         group.commit().map_err(|f| {
             format!(
                 "route `{route}`: the probe's group failed to commit: {}",
                 f.error
             )
         })?;
+        if wrote {
+            return Err(format!(
+                "route `{route}`'s subscribe handler staged a write, which the emits(...) \
+                 drift probe has just committed into this app — a probe is not a request, so \
+                 nothing here asked for that row; move the write out of the subscribe path, \
+                 or leave this route out of the drift test"
+            ));
+        }
         names
     }
 
