@@ -313,6 +313,23 @@ macro_rules! wire_int {
             }
             fn register(_reg: &mut TypeRegistry) {}
         }
+
+        // An `#[event]` payload is BOTH log-encoded (`Codec`, the versionless
+        // byte layout under the log) and wire-encoded (serde + `Wire`), and
+        // since task 6 an event payload's 64-bit field must be one of these
+        // carriers — so they need `Codec` too, or a 64-bit value could not be
+        // carried by an event at all. The bytes are the inner integer's own,
+        // deliberately: a field that moves from `u64` to `WireU64` keeps its
+        // stored layout byte-for-byte and changes only its JSON (a number
+        // becomes a decimal string).
+        impl charpente_core::table::Codec for $t {
+            fn encode(&self, out: &mut Vec<u8>) {
+                <$inner as charpente_core::table::Codec>::encode(&self.0, out);
+            }
+            fn decode(input: &mut &[u8]) -> std::io::Result<Self> {
+                <$inner as charpente_core::table::Codec>::decode(input).map($t)
+            }
+        }
     };
 }
 

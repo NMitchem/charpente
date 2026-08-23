@@ -24,8 +24,11 @@ fn fixture_app() -> App {
 // 13 tables (7 app: AppClock, Customer, IdCounter, Invoice, LineItem,
 // Receipt, Reminder; 6 builtin: ApiKey, CronRow, Session, charpente.events,
 // charpente.jobs, charpente.schema_versions), 12 routes (build_app's
-// `routes_macro![...]` list, in registration order), 4 jobs (SessionSweep
-// builtin + the app's SendReceipt/SendOverdueReminder/AdvanceDay), 2 cron
+// `routes_macro![...]` list, in registration order), 2 events (task 6:
+// build_app's `events_macro![InvoiceFinalized, ReceiptSent]`, rendered in
+// event-NAME order — invoice_finalized, receipt_sent — not registration
+// order), 4 jobs (SessionSweep builtin + the app's
+// SendReceipt/SendOverdueReminder/AdvanceDay), 2 cron
 // (charpente.session_sweep builtin + the app's daily-overdue-check) — every
 // count reviewed field-by-field against invoicing's actual surface (T5
 // report).
@@ -399,6 +402,18 @@ const GOLDEN: &str = r#"{
       "emits": []
     }
   ],
+  "events": [
+    {
+      "name": "invoice_finalized",
+      "payload": "InvoiceFinalized",
+      "keyed": false
+    },
+    {
+      "name": "receipt_sent",
+      "payload": "ReceiptSent",
+      "keyed": false
+    }
+  ],
   "types": [
     {
       "name": "ApiError",
@@ -487,6 +502,22 @@ const GOLDEN: &str = r#"{
             {
               "name": "email",
               "schema": "String",
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "InvoiceFinalized",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "invoice",
+              "schema": {
+                "Id": "Invoice"
+              },
               "optional": false
             }
           ]
@@ -601,6 +632,31 @@ const GOLDEN: &str = r#"{
             },
             {
               "name": "quantity",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "ReceiptSent",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "invoice",
+              "schema": {
+                "Id": "Invoice"
+              },
+              "optional": false
+            },
+            {
+              "name": "amount_cents",
               "schema": {
                 "Int64": {
                   "signed": true

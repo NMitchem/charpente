@@ -286,6 +286,16 @@ fn enum_serde_attrs(input: &DeriveInput) -> syn::Result<EnumAttrs> {
                 rename_all = Some(parse_rename_all(&meta)?);
                 return Ok(());
             }
+            if meta.path.is_ident("crate") {
+                // `#[serde(crate = "...")]` only tells serde_derive which
+                // path to write into ITS generated code — what `#[event]`
+                // emits so app crates stay single-dep on `charpente`. It
+                // changes no field, no name and no shape, so it is accepted
+                // and ignored rather than rejected. The value is consumed
+                // either way (this file's module doc, point 1).
+                let _: LitStr = meta.value()?.parse()?;
+                return Ok(());
+            }
             if meta.path.is_ident("untagged") {
                 return Err(meta.error(
                     "#[derive(Wire)] does not support serde's `untagged` — an untagged enum \
@@ -298,7 +308,7 @@ fn enum_serde_attrs(input: &DeriveInput) -> syn::Result<EnumAttrs> {
             Err(unrecognized_serde_attr(
                 &meta,
                 "an enum",
-                "`tag`, `content`, `rename_all`",
+                "`tag`, `content`, `rename_all`, `crate`",
             ))
         })?;
     }
@@ -766,6 +776,16 @@ fn struct_serde_attrs(input: &DeriveInput) -> syn::Result<Option<RenameAll>> {
                 rename_all = Some(parse_rename_all(&meta)?);
                 return Ok(());
             }
+            if meta.path.is_ident("crate") {
+                // `#[serde(crate = "...")]` only tells serde_derive which
+                // path to write into ITS generated code — what `#[event]`
+                // emits so app crates stay single-dep on `charpente`. It
+                // changes no field, no name and no shape, so it is accepted
+                // and ignored rather than rejected. The value is consumed
+                // either way (this file's module doc, point 1).
+                let _: LitStr = meta.value()?.parse()?;
+                return Ok(());
+            }
             if meta.path.is_ident("tag") {
                 return Err(meta.error(
                     "#[derive(Wire)] does not support serde's struct-level `tag = \"...\"` — it \
@@ -783,7 +803,11 @@ fn struct_serde_attrs(input: &DeriveInput) -> syn::Result<Option<RenameAll>> {
                      per field instead",
                 ));
             }
-            Err(unrecognized_serde_attr(&meta, "a struct", "`rename_all`"))
+            Err(unrecognized_serde_attr(
+                &meta,
+                "a struct",
+                "`rename_all`, `crate`",
+            ))
         })?;
     }
     Ok(rename_all)

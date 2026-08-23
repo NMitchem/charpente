@@ -1971,7 +1971,7 @@ fn adopted_state_survives_a_commit_failure_correctly_per_arm() {
 
 #[event]
 struct Tick {
-    n: u64,
+    n: WireU64,
 }
 
 #[job]
@@ -1996,7 +1996,7 @@ fn job_count(tx: &mut Tx) -> Result<WireU64, ApiError> {
 
 #[route(POST "/emit-tick")]
 fn emit_tick(tx: &mut Tx) -> Result<(), ApiError> {
-    tx.emit(Tick { n: 1 });
+    tx.emit(Tick { n: WireU64(1) });
     Ok(())
 }
 

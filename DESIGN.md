@@ -463,7 +463,12 @@ platform is one dependency, not two.
 - **Jobs.** `#[job]` structs with typed payloads and typed retry policy. Enqueue sites and
   handler signatures are checked against each other.
 - **Events.** `#[event]` structs; `tx.emit(...)` is typed; subscribers (server-side and
-  client-side codegen) consume typed streams off the log.
+  client-side codegen) consume typed streams off the log. An event payload is itself a
+  wire type (it is exactly the JSON a subscriber receives), so `#[event]` derives `Wire`
+  — and `events![…]`/`App::mount_events` register the type for `describe` only.
+  Delivery deliberately has NO registry: `Subscription::of::<Ev>()` captures its encoder
+  statically at the subscribe site, which is what makes "unregistered event at delivery"
+  inexpressible rather than an error case.
 - **Wire.** `Wire` is the trait describing what a type looks like once serde has
   encoded it — the mechanism behind the client-side codegen named above and behind
   `Id<T>`'s promise to never be a bare u64. `#[derive(Wire)]` implements it for a
@@ -1016,12 +1021,17 @@ Charpente treats the coding agent as the primary developer persona:
   schema: TypeSchema }`); `request` — the JSON body's schema, `None` for a bodyless route;
   `response` and `error` — the success and `ApiError` schemas every handler's `Result<T,
   ApiError>` carries; and `emits` — the event names a stream route declares via
-  `emits(...)`, empty until that mechanism lands**), jobs (name, retry policy), cron
+  `emits(...)`, empty until that mechanism lands**), **`events` — every `#[event]` type
+  registered with `mount_events(events![…])` as `EventInfo { name, payload, keyed }`,
+  sorted by event name (`keyed` is always `false`: `emit` vs `emit_keyed` is a call-site
+  choice, so nothing static can know it)**, jobs (name, retry policy), cron
   (name, interval), and config, each serialized in registry order (routes/jobs/cron) or
-  sorted-name order (tables — `Db::describe_tables`'s `BTreeMap` walk); field order is
+  sorted-name order (tables — `Db::describe_tables`'s `BTreeMap` walk; events — by name);
+  field order is
   part of the pinned shape. `Contract` also carries **`types: Vec<TypeDef>`** — the
   transitive closure of every NAMED wire type a route's params/request/response/error
-  reference (a `TypeRegistry` walk, `BTreeMap`-sorted by wire name so generation stays
+  or a registered event's payload references (a `TypeRegistry` walk, `BTreeMap`-sorted by
+  wire name so generation stays
   deterministic — spec §4); an anonymous type (a primitive, `Vec<T>`, `Option<T>`)
   contributes no entry of its own, only whatever named type it wraps. `ApiError` is
   always one such entry, and its schema describes the fixed `{"error": "<message>"}`
@@ -1032,7 +1042,8 @@ Charpente treats the coding agent as the primary developer persona:
   job/event/schema-version tables, the session-sweep job and its cron entry) apart from
   the app's, keyed on each row's own `TABLE`/`NAME` const rather than a typed-in string
   list. `to_json`/`to_human` render it as pretty JSON or fixed-width text (`to_human`'s
-  route line renders `params`/`request`/`response`/`error`/`emits` too, via `Debug`).
+  route line renders `params`/`request`/`response`/`error`/`emits` too, via `Debug`, and
+  it has an `events:` section of its own).
   Two entry points ship it:
   `charpente::launch(addr, data_dir, build)` is the standard app `fn main` — argv
   dispatch owned by the platform instead of hand-rolled per app, so `describe` is free
@@ -1045,13 +1056,15 @@ Charpente treats the coding agent as the primary developer persona:
   failing build) are forwarded verbatim rather than wrapped. Both paths build the app
   against a fresh, throwaway temp directory that is created and removed around the run —
   never the app's configured `data_dir` — so a describe is always safe to run next to a
-  live server's real data. Event *types* are deliberately not enumerated here in v0:
-  `tx.emit`/`tx.emit_keyed` names are compiled into each `#[route(SSE …)]` handler's
-  `Subscription` at the call site, not registered anywhere an app-wide registry walk
-  could discover ahead of time (ruling 6, sub-project 6 spec) — a stream route's `emits`
-  field exists in the contract (`stream: true` marks it, `RouteInfo.emits: Vec<&'static
-  str>` is the field an eventual `emits(...)` declaration will populate) but stays empty
-  today, so the contract still reports only that a route streams, not what it emits.
+  live server's real data. Event *types* ARE enumerated, but only through the
+  describe-time registry `events![…]`/`mount_events` fills — never by walking
+  emit sites, which is impossible for the same reason it always was: `tx.emit` and
+  `Subscription::of::<Ev>()` run inside handler bodies, not anywhere an app-wide walk can
+  observe (ruling 6, sub-project 6 spec). What is still missing is the BINDING between a
+  stream route and the events it carries: `stream: true` marks the route and
+  `RouteInfo.emits: Vec<&'static str>` is the field an eventual `emits(...)` declaration
+  will populate, but it stays empty today, so the contract reports which events the app
+  has and that a route streams — not which of them that route delivers.
 - **Errors are prompts.** Compile-time and sim-failure output is structured for machine
   consumption: the exact contract violated, the file/line, the seed and fault schedule for
   sim failures, and the minimal repro command. Error quality is a feature with a test suite.

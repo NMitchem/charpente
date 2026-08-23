@@ -429,7 +429,7 @@ impl Job for SendReceipt {
 
 #[event]
 struct InvoiceFinalized {
-    invoice: u64,
+    invoice: Id<Invoice>,
 }
 
 /// The row update, the receipt job, and the realtime event all commit in
@@ -445,7 +445,9 @@ fn finalize(db: &mut Db, id: u64) -> Result<(), TxError<io::Error>> {
         inv.paid = true;
         tx.put(&inv);
         tx.enqueue(SendReceipt { invoice: id });
-        tx.emit(InvoiceFinalized { invoice: id });
+        tx.emit(InvoiceFinalized {
+            invoice: Id::from_raw(id),
+        });
         Ok(())
     })
 }
@@ -2881,6 +2883,7 @@ dispatcher reads `charpente.jobs`.
 ### `#[event]`
 
 ```rust
+use charpente::wire::WireU64;
 use charpente::{Event, event};
 
 #[event]
@@ -2890,7 +2893,7 @@ struct HTTPEvent {
 
 #[event]
 struct InvoicePDFSent {
-    invoice: u64,
+    invoice: WireU64,
 }
 
 fn names() -> (&'static str, &'static str) {
@@ -2898,9 +2901,15 @@ fn names() -> (&'static str, &'static str) {
 }
 ```
 
-`#[event]` derives three things a plain struct doesn't have: `Codec` (the log/table
+`#[event]` derives five things a plain struct doesn't have: `Codec` (the log/table
 format — the same machinery `#[table]`/`#[job]` use), `impl Event` (`NAME`, the wire
-and delivery-filter name), and `serde::Serialize` (the JSON a subscriber receives).
+and delivery-filter name), `serde::Serialize` (the JSON a subscriber receives),
+`Wire` (that JSON's schema, so `charpente describe` and a generated client can name
+the payload type — which is also why a bare `u64`/`i64` field is a compile error
+here, exactly as in a route's request or response: use `Id<T>` for a row id, or
+`WireU64`/`WireI64`), and an `EventEntry` impl so `events![...]` can collect the type
+(next section). A `#[job]` payload has no `Wire` requirement, because it never leaves
+the process — only an event's payload is itself a wire document.
 `NAME` is the snake_case of the type name, computed at compile time — not a name you
 choose, so it can never drift from the type. The splitting rule inserts `_` before an
 uppercase letter that follows a lowercase letter or digit, and before the *last*
@@ -2909,6 +2918,50 @@ one — so a whole acronym run stays one word except right at its boundary with 
 next word: `NoteAdded` → `note_added`; `HTTPEvent` → `http_event` (the run `HTTP`
 stays together, splitting only where the trailing `E` turns out to start `Event`);
 `InvoicePDFSent` → `invoice_pdf_sent` (`PDF` stays together, `S` starts `Sent`).
+
+### Registering events: `events![...]` and `mount_events`
+
+Like `jobs![...]`, `events![...]` collects descriptors explicitly and
+`App::mount_events(...)` registers them — but for a different purpose. This
+registry is read by `charpente describe` (and by the client generator
+downstream of it) and by **nothing on the delivery path**: emitting and
+subscribing work exactly the same whether or not an event is registered,
+because a `Subscription::of::<Ev>()` captures its encoder at the subscribe
+site. What registration buys is that the event, and its payload type, appear
+in the contract at all:
+
+```rust
+use charpente::http::{App, AppConfig};
+use charpente::prod::{ProdDisk, ProdEntropy};
+use charpente::wire::WireU64;
+use charpente::{Schema, event, events};
+
+#[event]
+struct NoteAdded {
+    note: WireU64,
+}
+
+fn build_app(data_dir: &str) -> std::io::Result<App> {
+    Ok(App::open(
+        Box::new(ProdDisk::new(data_dir)?),
+        Schema::new(),
+        Box::new(ProdEntropy::new()?),
+        AppConfig::default(),
+    )?
+    .mount_events(events![NoteAdded]))
+}
+```
+
+That app's `Contract.events` carries one entry — `{"name": "note_added",
+"payload": "NoteAdded", "keyed": false}` — and `NoteAdded`'s own field schema
+joins `"types"` beside the route types (§13). `keyed` is always `false`, and
+honestly so: `tx.emit` versus `tx.emit_keyed` is a *call-site* choice, not a
+property of the event type, so nothing static can know it.
+
+Mounting the same event type twice — in one `mount_events` call, or across
+several — panics at mount time: `"event \"note_added\" registered twice —
+each #[event] type is mounted once"`. The name in that message is the event's
+`NAME` (snake_case), not the Rust type name.
 
 ### Emitting: `tx.emit` and `tx.emit_keyed`
 
@@ -2961,11 +3014,12 @@ use charpente::{Schema, Tx, Wire, route, routes};
 use charpente_sim::Sim;
 use serde::{Deserialize, Serialize};
 
-// `#[event]` payloads are not `#[route]` types, so `Ping.n` stays a bare
-// `u64` — only the route body below needs `Wire`.
+// An `#[event]` payload IS a wire type — it is exactly the JSON a
+// subscriber receives — so `#[event]` derives `Wire` and `n` needs the same
+// `WireU64` a route body would.
 #[event]
 struct Ping {
-    n: u64,
+    n: WireU64,
 }
 
 #[derive(Wire, Serialize, Deserialize)]
@@ -2975,7 +3029,7 @@ struct PingBody {
 
 #[route(POST "/ping")]
 fn send_ping(tx: &mut Tx, body: PingBody) -> Result<(), ApiError> {
-    tx.emit(Ping { n: body.n.0 });
+    tx.emit(Ping { n: body.n });
     Ok(())
 }
 
@@ -3103,11 +3157,11 @@ which is why every case above ends the same way: re-sync, then reconnect.
 ```text
 id: 0.0
 event: ping
-data: {"n":1}
+data: {"n":"1"}
 
 id: 1.1
 event: ping
-data: {"n":2}
+data: {"n":"2"}
 
 ```
 
@@ -3137,11 +3191,12 @@ use serde::{Deserialize, Serialize};
 
 const SEC: u64 = 1_000_000_000;
 
-// `#[event]` payloads are not `#[route]` types, so `Ping.n` stays a bare
-// `u64` — only the route body below needs `Wire`.
+// An `#[event]` payload IS a wire type — it is exactly the JSON a
+// subscriber receives — so `#[event]` derives `Wire` and `n` needs the same
+// `WireU64` a route body would.
 #[event]
 struct Ping {
-    n: u64,
+    n: WireU64,
 }
 
 #[derive(Wire, Serialize, Deserialize)]
@@ -3151,7 +3206,7 @@ struct PingBody {
 
 #[route(POST "/ping")]
 fn send_ping(tx: &mut Tx, body: PingBody) -> Result<(), ApiError> {
-    tx.emit(Ping { n: body.n.0 });
+    tx.emit(Ping { n: body.n });
     Ok(())
 }
 
@@ -3381,9 +3436,9 @@ opts that table out of drift protection. Use `#[table]`.
 
 `charpente describe` renders the full shape of a mounted `App` — every table (with its
 version, structural fingerprint, indexes, and migration chain), every route (method,
-pattern, name, whether it requires auth, whether it's an SSE stream), every job (name,
-retry policy), every cron entry (name, interval), and the app's config — as one JSON (or
-human-readable) document. It is a pure walk of the app's own registries (DESIGN §7): no
+pattern, name, whether it requires auth, whether it's an SSE stream), every registered
+event (name, payload type — §11), every job (name, retry policy), every cron entry
+(name, interval), and the app's config — as one JSON (or human-readable) document. It is a pure walk of the app's own registries (DESIGN §7): no
 disk writes beyond the ephemeral describe run itself, no socket, no kernel loop. This is
 the "what exists" query an agent would otherwise burn context reconstructing by reading
 every `#[table]`/`#[route]`/`#[job]` item across the crate by hand.
@@ -3475,10 +3530,13 @@ never wrapped in a framework message.
 ### The invoicing contract
 
 The full JSON `examples/invoicing` renders — 12 routes across customers, invoices, and
-API keys; 7 named types reachable from those routes' params, request, and response
-schemas (`ApiError`, `CreateCustomerBody`, `CreateInvoiceBody`, `CustomerView`,
-`InvoiceView`, `LineItemInput`, `LineItemView`, alphabetized in `"types"`
-regardless of route registration order — §5's `register_types` walk). `ApiError`'s own
+API keys; 2 registered events (`invoice_finalized` and `receipt_sent`, the two payloads
+`/events/feed` delivers, in event-name order rather than registration order); 9 named
+types reachable from those routes' params, request, and response schemas and from those
+two event payloads (`ApiError`, `CreateCustomerBody`, `CreateInvoiceBody`,
+`CustomerView`, `InvoiceFinalized`, `InvoiceView`, `LineItemInput`, `LineItemView`,
+`ReceiptSent`, alphabetized in `"types"` regardless of registration order — §5's
+`register_types` walk). `ApiError`'s own
 schema is the fixed `{"error": "<message>"}` envelope every route's error response
 actually carries — not a per-variant union of its Rust shape, and not `OidcReject`
 (which `ApiError::Oidc` wraps at the Rust level but never puts on the wire, so it does
@@ -3862,6 +3920,18 @@ memorizing a list:
       "emits": []
     }
   ],
+  "events": [
+    {
+      "name": "invoice_finalized",
+      "payload": "InvoiceFinalized",
+      "keyed": false
+    },
+    {
+      "name": "receipt_sent",
+      "payload": "ReceiptSent",
+      "keyed": false
+    }
+  ],
   "types": [
     {
       "name": "ApiError",
@@ -3950,6 +4020,22 @@ memorizing a list:
             {
               "name": "email",
               "schema": "String",
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "InvoiceFinalized",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "invoice",
+              "schema": {
+                "Id": "Invoice"
+              },
               "optional": false
             }
           ]
@@ -4074,6 +4160,31 @@ memorizing a list:
           ]
         }
       }
+    },
+    {
+      "name": "ReceiptSent",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "invoice",
+              "schema": {
+                "Id": "Invoice"
+              },
+              "optional": false
+            },
+            {
+              "name": "amount_cents",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
     }
   ],
   "jobs": [
@@ -4147,9 +4258,13 @@ starting with a `tables:` header.)
 Two honesty notes. First: a `describe` run never touches the app's real data
 directory — it builds and opens the app against a fresh, throwaway temp directory the
 CLI verb (or `launch`, when invoked with the `describe` verb) creates and removes around
-the run, so it is always safe to run against a live server's data dir. Second: emitted
-event *types* are not enumerated here in v0 — `tx.emit`/`tx.emit_keyed` names are compiled
-into each `#[route(SSE …)]` handler's `Subscription`, not registered anywhere an app-wide
-walk could discover ahead of time (spec ruling 6). The only trace of realtime in the
-contract above is `"stream": true` on `events_feed` — the fact that a route serves SSE at
-all, not what it emits. Reading a route's handler is still how you find that out.
+the run, so it is always safe to run against a live server's data dir. Second: the contract
+enumerates every *registered* `#[event]` type and its payload shape (§11's
+`events![...]`/`mount_events`), but not the binding between a stream route and the
+events that route carries. `Subscription::of::<Ev>()` runs inside each
+`#[route(SSE …)]` handler's body, not anywhere an app-wide walk could observe, so
+`events_feed`'s entry still carries only `"stream": true` and an empty `"emits": []`
+— reading the handler is how you find out which of the app's events a given feed
+delivers. An event that is never passed to `mount_events` is invisible here as well:
+registration is what puts an event in the contract, and it still emits and delivers
+either way.

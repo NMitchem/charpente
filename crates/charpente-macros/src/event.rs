@@ -1,12 +1,19 @@
 //! `#[event]` (DESIGN.md §6, realtime spec): turns a struct into a typed
 //! realtime event — a field-wise `Codec` impl (mirrors `#[job]`'s payload
-//! codec), `impl Event` carrying the name (snake_case of the type name), and
-//! a `Serialize` derive emitted through the `::charpente::serde` re-export
+//! codec), `impl Event` carrying the name (snake_case of the type name), a
+//! `Serialize` derive emitted through the `::charpente::serde` re-export
 //! (with `#[serde(crate = "::charpente::serde")]` redirecting serde_derive's
 //! generated code off the ambient `::serde` path) so app crates emitting
-//! events stay single-dep. No runtime registry: unlike `#[job]`/`jobs![]`,
-//! there is no `events![]` — `Subscription` (T4) captures encoders
-//! statically. Errors name the accepted form (hard rule 5).
+//! events stay single-dep, a `Wire` derive (the payload is exactly the JSON
+//! a subscriber receives, so it is a wire type — which is also why a bare
+//! `u64` field is a compile error here, TS-codegen spec §1), and an
+//! `EventEntry` impl so `events![]` can collect the type.
+//!
+//! Two registries, deliberately: DELIVERY has none — `Subscription` (T4)
+//! captures encoders statically at the subscribe site, so "unregistered
+//! event at delivery" stays inexpressible (realtime spec §3). DESCRIBE has
+//! one, filled by `events![]` and read only by `App::describe` (TS-codegen
+//! spec §2). Errors name the accepted form (hard rule 5).
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -48,7 +55,7 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     let event_name = snake_case(&name_str);
 
     Ok(quote! {
-        #[derive(::charpente::serde::Serialize)]
+        #[derive(::charpente::Wire, ::charpente::serde::Serialize)]
         #[serde(crate = "::charpente::serde")]
         #input
 
@@ -66,6 +73,16 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
 
         impl ::charpente::core::db::Event for #name {
             const NAME: &'static str = #event_name;
+        }
+
+        impl ::charpente::describe::EventEntry for #name {
+            fn def() -> ::charpente::describe::EventDef {
+                ::charpente::describe::EventDef {
+                    name: #event_name,
+                    payload: <#name as ::charpente::wire::Wire>::WIRE_NAME,
+                    register_types: |reg| <#name as ::charpente::wire::Wire>::register(reg),
+                }
+            }
         }
     })
 }

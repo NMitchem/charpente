@@ -32,14 +32,18 @@ const SEC: u64 = 1_000_000_000;
 
 // ------------------------------------------------------------------ events
 
+// `n: WireU64`, not a bare `u64` (task 6): `#[event]` derives `Wire`, and a
+// 64-bit integer only crosses the wire as a string. The stored `Codec` bytes
+// are unchanged — `WireU64`'s codec IS `u64`'s — so only the frame JSON
+// differs ({"n":"3"} rather than {"n":3}).
 #[event]
 struct Ping {
-    n: u64,
+    n: WireU64,
 }
 
 #[event]
 struct Pong {
-    n: u64,
+    n: WireU64,
 }
 
 #[derive(WireDerive, Serialize, Deserialize)]
@@ -51,8 +55,8 @@ struct EmitBody {
 #[route(POST "/ping")]
 fn emit_ping(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
     match body.key {
-        Some(key) => tx.emit_keyed(key, Ping { n: body.n.0 }),
-        None => tx.emit(Ping { n: body.n.0 }),
+        Some(key) => tx.emit_keyed(key, Ping { n: body.n }),
+        None => tx.emit(Ping { n: body.n }),
     }
     Ok(())
 }
@@ -60,8 +64,8 @@ fn emit_ping(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
 #[route(POST "/pong")]
 fn emit_pong(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
     match body.key {
-        Some(key) => tx.emit_keyed(key, Pong { n: body.n.0 }),
-        None => tx.emit(Pong { n: body.n.0 }),
+        Some(key) => tx.emit_keyed(key, Pong { n: body.n }),
+        None => tx.emit(Pong { n: body.n }),
     }
     Ok(())
 }
@@ -952,7 +956,7 @@ fn the_harness_catches_a_resume_that_replays_the_cursor_event() {
     for n in 0..4u64 {
         app.db_for_tests()
             .transact(|tx| {
-                tx.emit(Ping { n });
+                tx.emit(Ping { n: WireU64(n) });
                 Ok::<(), std::io::Error>(())
             })
             .unwrap();
@@ -1008,7 +1012,7 @@ fn the_harness_catches_a_resume_that_skips_the_successor_event() {
     for n in 0..6u64 {
         app.db_for_tests()
             .transact(|tx| {
-                tx.emit(Ping { n });
+                tx.emit(Ping { n: WireU64(n) });
                 Ok::<(), std::io::Error>(())
             })
             .unwrap();
@@ -1085,7 +1089,7 @@ fn the_below_floor_confirm_resolves_only_received_frames() {
     for n in 0..8u64 {
         app.db_for_tests()
             .transact(|tx| {
-                tx.emit(Ping { n });
+                tx.emit(Ping { n: WireU64(n) });
                 Ok::<(), std::io::Error>(())
             })
             .unwrap();
@@ -1103,7 +1107,7 @@ fn the_below_floor_confirm_resolves_only_received_frames() {
         (
             id,
             "ping",
-            serde_json::to_string(&Ping { n: id }).expect("Ping serializes"),
+            serde_json::to_string(&Ping { n: WireU64(id) }).expect("Ping serializes"),
         )
     };
 
@@ -1298,7 +1302,7 @@ impl RouteDef for FailingFeed {
 
 #[event]
 struct NoteAdded {
-    n: u64,
+    n: WireU64,
 }
 
 #[derive(WireDerive, Serialize, Deserialize)]
@@ -1308,7 +1312,7 @@ struct NoteBody {
 
 #[route(POST "/note")]
 fn emit_note(tx: &mut Tx, body: NoteBody) -> Result<(), ApiError> {
-    tx.emit(NoteAdded { n: body.n.0 });
+    tx.emit(NoteAdded { n: body.n });
     Ok(())
 }
 

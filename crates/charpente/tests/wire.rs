@@ -205,6 +205,35 @@ fn wire_u64_and_i64_describe_themselves_as_signed_int64() {
     );
 }
 
+/// Task 6 gave the carriers a `Codec` so an event payload can carry a 64-bit
+/// value at all (an `#[event]` payload is both log-encoded and wire-encoded).
+/// The stored bytes must stay the INNER integer's, byte for byte: that is what
+/// lets an existing event field move from `u64` to `WireU64` — as several did
+/// in task 6 — without rewriting a single durable record. A mutation that
+/// length-prefixed or string-encoded the carrier's `Codec` reddens here.
+#[test]
+fn the_64_bit_carriers_encode_exactly_as_their_inner_integer() {
+    use charpente_core::table::Codec;
+
+    let mut carrier = Vec::new();
+    WireU64(1 << 60).encode(&mut carrier);
+    let mut plain = Vec::new();
+    (1u64 << 60).encode(&mut plain);
+    assert_eq!(carrier, plain, "WireU64's log bytes are u64's log bytes");
+    assert_eq!(
+        WireU64::decode(&mut &plain[..]).unwrap(),
+        WireU64(1 << 60),
+        "and decode reads them back"
+    );
+
+    let mut carrier = Vec::new();
+    WireI64(-42).encode(&mut carrier);
+    let mut plain = Vec::new();
+    (-42i64).encode(&mut plain);
+    assert_eq!(carrier, plain, "WireI64's log bytes are i64's log bytes");
+    assert_eq!(WireI64::decode(&mut &plain[..]).unwrap(), WireI64(-42));
+}
+
 #[table]
 struct WireTestRow {
     id: Id<WireTestRow>,

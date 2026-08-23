@@ -12,6 +12,7 @@ use crate::report::CoreReport;
 use crate::tracing_disk::{MAX_TRACE_CAPACITY, Trace, TracingDisk};
 use crate::{Bump, SLOTS, Slot, SlotBumped, schema};
 use charpente::prod::ProdDisk;
+use charpente::wire::WireU64;
 use charpente::{Db, DbConfig, Id, TxError, View};
 use std::io;
 use std::time::{Duration, Instant};
@@ -83,7 +84,9 @@ fn canonical(db: &mut Db, i: u64) -> io::Result<u64> {
         // to a much larger backlog, longer runs, or faster storage, where
         // the backlog's relative cost would grow — untested, not ruled out.
         tx.enqueue(Bump { slot: i % SLOTS });
-        tx.emit(SlotBumped { slot: i % SLOTS });
+        tx.emit(SlotBumped {
+            slot: WireU64(i % SLOTS),
+        });
         Ok(hits)
     })
     .map_err(|e| match e {

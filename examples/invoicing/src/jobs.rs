@@ -7,6 +7,7 @@ use crate::model::{
     next_id,
 };
 use charpente::kernel::JobError;
+use charpente::wire::WireI64;
 use charpente::{Id, Tx, View, event, job};
 
 /// Enqueued once, in the same transaction as `finalize_invoice` (routes.rs).
@@ -46,7 +47,7 @@ impl SendReceipt {
             self.org,
             ReceiptSent {
                 invoice: self.invoice,
-                amount_cents,
+                amount_cents: WireI64(amount_cents),
             },
         );
         Ok(())
@@ -61,10 +62,15 @@ impl SendReceipt {
 /// also naming an `Invoice` row id — already carries `Id<Invoice>`. Before
 /// this fix the two disagreed: `invoice_finalized` frames quoted the id,
 /// `receipt_sent` frames did not, on one feed. One id, one encoding.
+///
+/// `amount_cents: WireI64` for the same reason, now enforced rather than
+/// argued: since task 6 `#[event]` derives `Wire`, so a bare `i64` here is a
+/// compile error — the money field crosses this feed exactly like
+/// `LineItemView.unit_amount_cents` crosses a route response.
 #[event]
 pub struct ReceiptSent {
     pub invoice: Id<Invoice>,
-    pub amount_cents: i64,
+    pub amount_cents: WireI64,
 }
 
 /// One per overdue Final invoice, enqueued from `AdvanceDay`'s own

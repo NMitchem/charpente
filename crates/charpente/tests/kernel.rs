@@ -1911,7 +1911,7 @@ use charpente::http::{Ctx, Cursor, Subscription};
 
 #[event]
 struct Bumped {
-    n: u64,
+    n: WireU64,
 }
 
 #[derive(WireDerive, Serialize, Deserialize)]
@@ -1921,7 +1921,7 @@ struct EmitBody {
 
 #[route(POST "/emit")]
 fn emit_one(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
-    tx.emit(Bumped { n: body.n.0 });
+    tx.emit(Bumped { n: body.n });
     Ok(())
 }
 
@@ -1939,7 +1939,7 @@ struct FloodBody {
 #[route(POST "/flood")]
 fn flood(tx: &mut Tx, body: FloodBody) -> Result<(), ApiError> {
     for i in 0..body.count.0 {
-        tx.emit(Bumped { n: i });
+        tx.emit(Bumped { n: WireU64(i) });
     }
     Ok(())
 }
@@ -1996,7 +1996,7 @@ fn a_tail_receives_matching_events_exactly_and_in_order() {
     let frames = handles[0].frames();
     assert_eq!(frames.len(), 3);
     let mut prev: Option<u64> = None;
-    for (frame, n) in frames.iter().zip([10u64, 20, 30]) {
+    for (frame, n) in frames.iter().zip([10u64, 20, 30].map(WireU64)) {
         assert_eq!(frame.name, "bumped");
         assert_eq!(frame.json, serde_json::to_string(&Bumped { n }).unwrap());
         if let Some(p) = prev {

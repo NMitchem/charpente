@@ -37,9 +37,12 @@ pub struct Slot {
     pub hits: u64,
 }
 
+/// `slot: WireU64`, unlike `Bump.slot` below: an `#[event]` payload crosses
+/// the wire (it IS the SSE frame body), so a bare 64-bit integer is a
+/// compile error in it; a `#[job]` payload never leaves the process.
 #[event]
 pub struct SlotBumped {
-    pub slot: u64,
+    pub slot: WireU64,
 }
 
 #[job]
@@ -63,7 +66,7 @@ pub fn hit(tx: &mut Tx, id: Id<Slot>) -> Result<WireU64, ApiError> {
     let hits = tx.get(slot_id)?.map_or(0, |s| s.hits) + 1;
     tx.put(&Slot { id: slot_id, hits });
     tx.enqueue(Bump { slot: raw });
-    tx.emit(SlotBumped { slot: raw });
+    tx.emit(SlotBumped { slot: WireU64(raw) });
     Ok(WireU64(hits))
 }
 

@@ -4,8 +4,8 @@
 //! `Disk`/`Entropy`); one #[table] row with a #[index] field, one plain
 //! #[route] with a body and a named response (task 5: also a `Vec<T>`-
 //! returning route, to pin the container-response case), one SSE #[route],
-//! one #[job], one .schedule — enough surface to pin every `Contract` field
-//! without pulling in auth/OIDC.
+//! one #[job], one #[event] (task 6), one .schedule — enough surface to pin
+//! every `Contract` field without pulling in auth/OIDC.
 
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ use charpente::describe::ParamInfo;
 use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, Subscription};
 use charpente::kernel::JobError;
 use charpente::wire::{TypeSchema, WireU64};
-use charpente::{Schema, Tx, View, Wire, event, job, jobs, route, routes, table};
+use charpente::{Schema, Tx, View, Wire, event, events, job, jobs, route, routes, table};
 use charpente_core::table::Id;
 use charpente_sim::{FaultConfig, Sim};
 
@@ -77,9 +77,21 @@ fn get_org_widget(tx: &mut Tx, org: String, id: Id<Widget>) -> Result<WidgetView
     })
 }
 
+/// `org: WireU64`, not a bare `u64` (task 6): an `#[event]` payload is
+/// exactly the JSON a subscriber receives, so it is a wire type — the
+/// `Wire` derive `#[event]` emits refuses a bare 64-bit integer here for the
+/// same reason a route body's does.
 #[event]
 struct WidgetAdded {
-    org: u64,
+    org: WireU64,
+}
+
+/// A second event, with a payload shape unlike `WidgetAdded`'s — the two are
+/// registered in REVERSE name order below, which is what makes
+/// `Contract.events`' sort a real assertion rather than a coincidence.
+#[event]
+struct WidgetRemoved {
+    id: Id<Widget>,
 }
 
 #[route(SSE "/widgets/feed")]
@@ -115,6 +127,9 @@ fn fixture_app() -> App {
         widget_feed
     ])
     .mount_jobs(jobs![Ping])
+    // Reverse name order on purpose: `describe()` sorts events by name, so
+    // registering them sorted would leave that sort unpinned.
+    .mount_events(events![WidgetRemoved, WidgetAdded])
     .schedule("ping-hourly", Duration::from_secs(3600), || Ping { n: 0 })
 }
 
@@ -265,6 +280,18 @@ const GOLDEN: &str = r#"{
       "emits": []
     }
   ],
+  "events": [
+    {
+      "name": "widget_added",
+      "payload": "WidgetAdded",
+      "keyed": false
+    },
+    {
+      "name": "widget_removed",
+      "payload": "WidgetRemoved",
+      "keyed": false
+    }
+  ],
   "types": [
     {
       "name": "ApiError",
@@ -291,6 +318,40 @@ const GOLDEN: &str = r#"{
                 "Int64": {
                   "signed": false
                 }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "WidgetAdded",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "org",
+              "schema": {
+                "Int64": {
+                  "signed": false
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "WidgetRemoved",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "id",
+              "schema": {
+                "Id": "Widget"
               },
               "optional": false
             }
@@ -620,4 +681,95 @@ fn builtin_flags_mark_exactly_the_platform_tables_jobs_and_cron() {
         !ping_cron.builtin,
         "the fixture's own cron schedule must not be builtin"
     );
+}
+
+/// Task 6, Step 1: the contract enumerates every registered `#[event]` with
+/// its payload type, and that payload joins the same type closure a route's
+/// types do — a TS client cannot type a subscription without both halves.
+#[test]
+fn the_contract_enumerates_events_with_their_payload_types() {
+    let app = fixture_app();
+    let c = app.describe();
+    let e = c.events.iter().find(|e| e.name == "widget_added").unwrap();
+    assert_eq!(e.payload, "WidgetAdded");
+    assert!(
+        c.types.iter().any(|t| t.name == "WidgetAdded"),
+        "an event payload must be in the type closure too: {:?}",
+        c.types.iter().map(|t| t.name).collect::<Vec<_>>()
+    );
+}
+
+/// The events list is sorted by event name, NOT registration order — the
+/// fixture registers `events![WidgetRemoved, WidgetAdded]`, so registration
+/// order is the exact reverse of what this asserts. Delete
+/// `v.sort_unstable_by_key(...)` in `describe()` and this reddens (as does
+/// `contract_json_shape_is_pinned`); an `assert!(is_sorted)` on a
+/// one-event fixture would not.
+///
+/// `keyed` is pinned false here too, for both events: `emit` vs
+/// `emit_keyed` is a call-site choice, so nothing static can know it and
+/// the contract must not pretend otherwise.
+#[test]
+fn events_render_in_name_order_and_report_keyed_false() {
+    let c = fixture_app().describe();
+    let rendered: Vec<(&str, &str, bool)> = c
+        .events
+        .iter()
+        .map(|e| (e.name, e.payload, e.keyed))
+        .collect();
+    assert_eq!(
+        rendered,
+        vec![
+            ("widget_added", "WidgetAdded", false),
+            ("widget_removed", "WidgetRemoved", false),
+        ]
+    );
+}
+
+/// `to_human`'s events section, pinned the same way its route line is (task
+/// 5, fix round 1's F9: a new `to_human` section with no test is a section
+/// whose fields can be dropped, reordered or renamed silently).
+#[test]
+fn to_human_pins_the_events_section() {
+    let out = charpente::describe::to_human(&fixture_app().describe());
+    assert!(
+        out.contains(
+            "events:\n  widget_added payload=WidgetAdded keyed=false\n  \
+             widget_removed payload=WidgetRemoved keyed=false\n"
+        ),
+        "{out}"
+    );
+}
+
+/// The negative-space assert beside the duplicate check (hard rule 4): an
+/// `EventInfo` whose payload names nothing in `Contract.types` is a contract
+/// a client cannot resolve. `#[event]` can't produce one — its `Wire` derive
+/// always names the struct — so the only way to reach it is a hand-written
+/// `EventEntry`, which is exactly what this builds.
+#[test]
+#[should_panic(expected = "event \"anonymous\" registers an empty payload name")]
+fn mounting_an_event_whose_payload_names_no_type_panics() {
+    struct HandWritten;
+    impl charpente::describe::EventEntry for HandWritten {
+        fn def() -> charpente::describe::EventDef {
+            charpente::describe::EventDef {
+                name: "anonymous",
+                payload: "",
+                register_types: |_| {},
+            }
+        }
+    }
+    let _ = fixture_app().mount_events(events![HandWritten]);
+}
+
+/// Mount-time duplicate rejection, with its exact text (hard rule 5) —
+/// mirrors `mount_jobs`' own panic, and is why registering the same event
+/// twice can't quietly produce two `Contract.events` entries with one name.
+#[test]
+#[should_panic(
+    expected = "event \"widget_added\" registered twice — each #[event] type is \
+                           mounted once"
+)]
+fn mounting_one_event_twice_panics_at_mount_time() {
+    let _ = fixture_app().mount_events(events![WidgetAdded]);
 }

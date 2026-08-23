@@ -46,7 +46,7 @@ error: #[derive(Wire)] does not recognize serde's `borrow` on a field — an att
 53 |     #[serde(borrow)]
    |             ^^^^^^
 
-error: #[derive(Wire)] does not recognize serde's `deny_unknown_fields` on a struct — an attribute this derive doesn't have logic for is rejected rather than silently ignored, because a silently wrong schema is worse than a compile error; supported on a struct: `rename_all`
+error: #[derive(Wire)] does not recognize serde's `deny_unknown_fields` on a struct — an attribute this derive doesn't have logic for is rejected rather than silently ignored, because a silently wrong schema is worse than a compile error; supported on a struct: `rename_all`, `crate`
   --> tests/compile_fail/wire_unsupported_attrs.rs:58:9
    |
 58 | #[serde(deny_unknown_fields)]

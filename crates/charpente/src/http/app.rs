@@ -16,6 +16,7 @@ use crate::auth::sweep::{self, SessionSweep};
 use crate::auth::{
     ApiKey, AuthReject, OidcConfig, OidcVerifier, Presented, Principal, Via, hash_token, resolve,
 };
+use crate::describe::EventDef;
 use crate::http::router::{RouteGlue, RouteMatch, Router};
 use crate::http::{ApiError, Cursor, Request, Response, Route, Subscription, hex};
 use crate::kernel::JobDef;
@@ -169,6 +170,10 @@ pub struct App {
     config: AppConfig,
     router: Router,
     job_defs: Vec<JobDef>,
+    /// Describe-only (TS-codegen spec §2). Delivery reads nothing here: an
+    /// event reaches a subscriber through the encoder `Subscription::of::
+    /// <Ev>()` captured statically at the subscribe site, registered or not.
+    event_defs: Vec<EventDef>,
     cron_entries: Vec<CronEntry>,
     /// `None` until `App::with_oidc` mounts a verifier. The `Arc` is now
     /// incidental, not load-bearing: it existed so `handle_or_subscribe`
@@ -207,6 +212,8 @@ impl App {
             config,
             router: Router::new(),
             job_defs: vec![<SessionSweep as JobEntry>::def()],
+            // No platform events to seed: the built-in surface emits none.
+            event_defs: Vec::new(),
             cron_entries: vec![sweep::platform_cron_entry()],
             oidc: None,
         })
@@ -238,6 +245,38 @@ impl App {
                 def.name
             );
             self.job_defs.push(def);
+        }
+        self
+    }
+
+    /// Registers `#[event]` descriptors for `describe` (mount-time
+    /// duplicate-name panic — each event type is mounted once, like jobs).
+    ///
+    /// This registry is describe-only, and mounting is therefore optional:
+    /// an unregistered `#[event]` still emits and still delivers, it just
+    /// does not appear in `Contract.events` (nor its payload in
+    /// `Contract.types`), so a generated client cannot see it.
+    pub fn mount_events(mut self, defs: Vec<EventDef>) -> App {
+        for def in defs {
+            assert!(
+                !self.event_defs.iter().any(|d| d.name == def.name),
+                "event \"{}\" registered twice — each #[event] type is mounted once",
+                def.name
+            );
+            // Negative space: an events entry that names no type would leave
+            // a describe consumer with a payload it cannot resolve.
+            // `#[event]` always supplies a name (its `Wire` derive sets
+            // `WIRE_NAME` to the struct's name), so reaching this means a
+            // hand-written `EventEntry` impl.
+            assert!(
+                !def.payload.is_empty(),
+                "event \"{}\" registers an empty payload name — every Contract.events \
+                 entry must name a type in Contract.types, and \"\" is `Wire`'s \
+                 \"anonymous/inline\" marker; make the payload a #[derive(Wire)] type \
+                 and pass its WIRE_NAME",
+                def.name
+            );
+            self.event_defs.push(def);
         }
         self
     }
@@ -286,6 +325,13 @@ impl App {
     /// order. Never used by request handling itself.
     pub(crate) fn job_defs(&self) -> &[JobDef] {
         &self.job_defs
+    }
+
+    /// Describe-only reach: the registered event descriptors, in
+    /// registration order (`describe` sorts them by name). Never used by
+    /// request handling or by delivery — see the field's own comment.
+    pub(crate) fn event_defs(&self) -> &[EventDef] {
+        &self.event_defs
     }
 
     /// Describe-only reach: the registered cron schedules, in registration

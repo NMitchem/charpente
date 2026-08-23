@@ -1037,7 +1037,7 @@ fn routes_macro_collects_descriptors() {
 
 #[event]
 struct NoteAdded {
-    note: u64,
+    note: WireU64,
 }
 
 #[route(SSE "/feed")]

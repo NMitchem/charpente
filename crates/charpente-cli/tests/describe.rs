@@ -400,6 +400,18 @@ const GOLDEN: &str = r#"{
       "emits": []
     }
   ],
+  "events": [
+    {
+      "name": "invoice_finalized",
+      "payload": "InvoiceFinalized",
+      "keyed": false
+    },
+    {
+      "name": "receipt_sent",
+      "payload": "ReceiptSent",
+      "keyed": false
+    }
+  ],
   "types": [
     {
       "name": "ApiError",
@@ -488,6 +500,22 @@ const GOLDEN: &str = r#"{
             {
               "name": "email",
               "schema": "String",
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "InvoiceFinalized",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "invoice",
+              "schema": {
+                "Id": "Invoice"
+              },
               "optional": false
             }
           ]
@@ -602,6 +630,31 @@ const GOLDEN: &str = r#"{
             },
             {
               "name": "quantity",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "ReceiptSent",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "invoice",
+              "schema": {
+                "Id": "Invoice"
+              },
+              "optional": false
+            },
+            {
+              "name": "amount_cents",
               "schema": {
                 "Int64": {
                   "signed": true
