@@ -103,6 +103,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "charpente-tsgen"
+version = "0.0.0"
+dependencies = [
+ "charpente",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
