@@ -3,7 +3,7 @@
 //! a generator that flaps trains people to ignore a red `check-client`.
 
 use charpente::describe::Contract;
-use charpente::wire::{EnumRepr, TypeSchema};
+use charpente::wire::{EnumRepr, Field, TypeSchema};
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
@@ -19,6 +19,42 @@ pub fn emit_types(c: &Contract) -> String {
     for def in &c.types {
         collect_id_tables(&def.schema, &mut tables);
     }
+    // Review round 1, Important 6: `Id<T>` has WIRE_NAME "" and a no-op
+    // `register` (wire.rs), so an `Id<T>` that appears ONLY in a route's
+    // params/request/response/error — never inside a registered named type
+    // — is invisible to the loop above. Task 9 emits a route function that
+    // names `<T>Id` for a typed param regardless, so the branded type must
+    // be declared here or the generated client fails to compile one task
+    // from now.
+    for r in &c.routes {
+        for p in &r.params {
+            collect_id_tables(&p.schema, &mut tables);
+        }
+        if let Some(req) = &r.request {
+            collect_id_tables(req, &mut tables);
+        }
+        collect_id_tables(&r.response, &mut tables);
+        collect_id_tables(&r.error, &mut tables);
+    }
+
+    // Review round 1, Minor 10: a registered wire type can share a name with
+    // a branded id this same contract needs (`Id("Customer")` alongside a
+    // `#[derive(Wire)]` type literally named `CustomerId`) — two `export
+    // type CustomerId` declarations is a `tsc` "Duplicate identifier", not a
+    // warning. Refuse it by name, the same way `TypeRegistry::insert_as`
+    // already refuses a wire-name collision (wire.rs).
+    let type_names: BTreeSet<&str> = c.types.iter().map(|d| d.name).collect();
+    for t in &tables {
+        let id_name = format!("{t}Id");
+        assert!(
+            !type_names.contains(id_name.as_str()),
+            "emit_types: the branded id type `{id_name}` (generated for table \"{t}\") \
+             collides with a registered wire type of the same name in Contract.types — \
+             rename the `#[derive(Wire)]` type literally named `{id_name}`, or rename the \
+             table `{t}`, so the two don't share a TypeScript name"
+        );
+    }
+
     for t in &tables {
         let _ = writeln!(
             out,
@@ -82,34 +118,121 @@ fn collect_id_tables(s: &TypeSchema, acc: &mut BTreeSet<&'static str>) {
     }
 }
 
+/// A TypeScript object-type key: bare when `name` is a valid TS identifier,
+/// quoted otherwise. Review round 1, Important 3: `#[derive(Wire)]` supports
+/// `rename_all = "kebab-case"` for both fields and variants, and an
+/// arbitrary `#[serde(rename = "...")]` — a bare `unit-amount-cents: number`
+/// is a `tsc` syntax error, not a style choice, so every site that writes a
+/// key (an interface field, an internally-tagged variant's merged fields,
+/// an externally/adjacently-tagged variant name, a `tag`/`content` key
+/// itself) must go through this, not just the one site round 1 flagged.
+fn key(name: &str) -> String {
+    let is_ident = !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+    if is_ident {
+        name.to_string()
+    } else {
+        format!("{name:?}")
+    }
+}
+
+/// Joins a braced variant's fields as `key: type; key: type` — no
+/// surrounding braces, so `Internal` can splice this after its own
+/// `{ tag: "V"` and `External`/`Adjacent` can wrap it as `{ ... }` via
+/// `render_struct_literal`.
+fn field_list(fields: &[Field], vname: &str, enum_name: &str) -> String {
+    fields
+        .iter()
+        .map(|f| {
+            let opt = if f.optional { "?" } else { "" };
+            let ctx = format!(
+                "field `{}` of variant `{vname}` of enum `{enum_name}`",
+                f.name
+            );
+            format!("{}{opt}: {}", key(&f.name), ts_type(&f.schema, &ctx))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Renders a braced enum variant's anonymous field list as a TS object-type
+/// literal: `{ key: type; key: type }`, or exactly `{}` for the zero-field
+/// ("braced-empty") variant — `{"Variant":{}}` on the wire, a document
+/// `EnumRepr`'s own doc comment deliberately distinguishes from the
+/// no-payload `None` case (fix round 1, F5).
+fn render_struct_literal(fields: &[Field], vname: &str, enum_name: &str) -> String {
+    if fields.is_empty() {
+        "{}".to_string()
+    } else {
+        format!("{{ {} }}", field_list(fields, vname, enum_name))
+    }
+}
+
 fn emit_def(out: &mut String, name: &str, schema: &TypeSchema) {
     match schema {
         TypeSchema::Struct { fields } => {
             let _ = writeln!(out, "export interface {name} {{");
             for f in fields {
                 let opt = if f.optional { "?" } else { "" };
-                let _ = writeln!(out, "  {}{}: {};", f.name, opt, ts_type(&f.schema));
+                let ctx = format!("field `{}` of interface `{name}`", f.name);
+                let _ = writeln!(
+                    out,
+                    "  {}{opt}: {};",
+                    key(&f.name),
+                    ts_type(&f.schema, &ctx)
+                );
             }
             out.push_str("}\n");
         }
         TypeSchema::Enum(EnumRepr::Unit { variants }) => {
-            let union = variants
-                .iter()
-                .map(|v| format!("\"{v}\""))
-                .collect::<Vec<_>>()
-                .join(" | ");
-            let _ = writeln!(out, "export type {name} = {union};");
+            // Review round 1, Minor 8: `.all(..)` over an empty variant list
+            // is vacuously true, so a `#[derive(Wire)] enum Never {}`
+            // reaches here with `variants: []`. `.join(" | ")` on nothing is
+            // `""`, which would render `export type Never = ;` — a syntax
+            // error. TypeScript's own bottom type is the correct rendering
+            // of "this type has no values".
+            if variants.is_empty() {
+                let _ = writeln!(out, "export type {name} = never;");
+            } else {
+                let union = variants
+                    .iter()
+                    .map(|v| format!("{v:?}"))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let _ = writeln!(out, "export type {name} = {union};");
+            }
         }
         TypeSchema::Enum(EnumRepr::Internal { tag, variants }) => {
             let arms: Vec<String> = variants
                 .iter()
                 .map(|(vname, vschema)| {
-                    let mut inner = format!("{{ {tag}: \"{vname}\"");
-                    if let TypeSchema::Struct { fields } = vschema {
-                        for f in fields {
-                            let opt = if f.optional { "?" } else { "" };
-                            inner.push_str(&format!("; {}{}: {}", f.name, opt, ts_type(&f.schema)));
-                        }
+                    // Review round 1, Minor 7 (resolving the implementer's
+                    // own open item #1): the derive's `variant_inner_schema`
+                    // makes an internally-tagged variant's slot ALWAYS a
+                    // `Struct` (Unit -> `Struct{fields:[]}`, Named ->
+                    // `Struct{fields}`, Unnamed -> a compile error, since
+                    // serde itself refuses to serialize that shape) — see
+                    // `EnumRepr::Internal`'s own doc comment. A non-`Struct`
+                    // payload here means a hand-built `Contract` broke that
+                    // invariant; asserting negative space beats silently
+                    // dropping the payload (hard rule 4).
+                    let TypeSchema::Struct { fields } = vschema else {
+                        unreachable!(
+                            "EnumRepr::Internal's variant slot is always a Struct (see the \
+                             derive's variant_inner_schema) — got {vschema:?} for variant \
+                             `{vname}` of enum `{name}`"
+                        );
+                    };
+                    let mut inner = format!("{{ {}: {vname:?}", key(tag));
+                    if !fields.is_empty() {
+                        inner.push_str("; ");
+                        inner.push_str(&field_list(fields, vname, name));
                     }
                     inner.push_str(" }");
                     inner
@@ -120,13 +243,26 @@ fn emit_def(out: &mut String, name: &str, schema: &TypeSchema) {
         TypeSchema::Enum(EnumRepr::External { variants }) => {
             // A unit variant (no payload, `vschema: None`) serializes as the
             // bare JSON string `"VariantName"`, not `{ VariantName: ... }`
-            // (see `EnumRepr::External`'s doc comment) — the two arms below
-            // are not interchangeable.
+            // (see `EnumRepr::External`'s doc comment). A braced variant's
+            // payload (`Some(Struct { fields })`) is an ANONYMOUS inline
+            // struct by construction — the derive's `variant_inner_schema`
+            // never returns `Ref` for it — so it renders inline here rather
+            // than through `ts_type`, whose `Struct | Enum` arm is only
+            // correct for a field position (review round 1, Critical 1).
             let arms: Vec<String> = variants
                 .iter()
                 .map(|(vname, vschema)| match vschema {
-                    Some(s) => format!("{{ {vname}: {} }}", ts_type(s)),
-                    None => format!("\"{vname}\""),
+                    Some(TypeSchema::Struct { fields }) => format!(
+                        "{{ {}: {} }}",
+                        key(vname),
+                        render_struct_literal(fields, vname, name)
+                    ),
+                    Some(s) => format!(
+                        "{{ {}: {} }}",
+                        key(vname),
+                        ts_type(s, &format!("payload of variant `{vname}` of enum `{name}`"))
+                    ),
+                    None => format!("{vname:?}"),
                 })
                 .collect();
             let _ = writeln!(out, "export type {name} =\n  | {};", arms.join("\n  | "));
@@ -138,22 +274,39 @@ fn emit_def(out: &mut String, name: &str, schema: &TypeSchema) {
         }) => {
             // Same `None` distinction as `External`: a unit variant omits
             // the `content` key entirely rather than writing it as `{}`.
+            // Same braced-variant-is-anonymous-inline-struct reasoning as
+            // `External` above.
             let arms: Vec<String> = variants
                 .iter()
                 .map(|(vname, vschema)| match vschema {
-                    Some(s) => format!("{{ {tag}: \"{vname}\"; {content}: {} }}", ts_type(s)),
-                    None => format!("{{ {tag}: \"{vname}\" }}"),
+                    Some(TypeSchema::Struct { fields }) => format!(
+                        "{{ {}: {vname:?}; {}: {} }}",
+                        key(tag),
+                        key(content),
+                        render_struct_literal(fields, vname, name)
+                    ),
+                    Some(s) => format!(
+                        "{{ {}: {vname:?}; {}: {} }}",
+                        key(tag),
+                        key(content),
+                        ts_type(s, &format!("payload of variant `{vname}` of enum `{name}`"))
+                    ),
+                    None => format!("{{ {}: {vname:?} }}", key(tag)),
                 })
                 .collect();
             let _ = writeln!(out, "export type {name} =\n  | {};", arms.join("\n  | "));
         }
         other => {
-            let _ = writeln!(out, "export type {name} = {};", ts_type(other));
+            let ctx = format!("type alias `{name}`");
+            let _ = writeln!(out, "export type {name} = {};", ts_type(other, &ctx));
         }
     }
 }
 
-fn ts_type(s: &TypeSchema) -> String {
+/// `ctx` names WHERE `s` came from (a field, a variant payload, a type
+/// alias) purely for the `unreachable!` message below — review round 1,
+/// Minor 9: the escape hatch should name the site, not just the contract.
+fn ts_type(s: &TypeSchema, ctx: &str) -> String {
     match s {
         TypeSchema::Bool => "boolean".into(),
         TypeSchema::I8
@@ -173,15 +326,31 @@ fn ts_type(s: &TypeSchema) -> String {
         // lossless, which a JSON number is not (spec §1).
         TypeSchema::Int64 { .. } => "bigint".into(),
         TypeSchema::Id(t) => format!("{t}Id"),
-        TypeSchema::Option(inner) => format!("{} | null", ts_type(inner)),
-        TypeSchema::Seq(inner) => format!("{}[]", ts_type(inner)),
-        TypeSchema::Map(inner) => format!("Record<string, {}>", ts_type(inner)),
+        TypeSchema::Option(inner) => format!("{} | null", ts_type(inner, ctx)),
+        TypeSchema::Seq(inner) => {
+            // Review round 1, Critical 2: TypeScript's postfix `[]` binds
+            // tighter than `|`, so `Seq(Option(T))` must NOT render as
+            // `T | null[]` (parsed as `T | (null[])` — silently wrong, not a
+            // syntax error). Parenthesize unconditionally: `(string)[]` is
+            // legal and unambiguous even when `inner` is never a union.
+            format!("({})[]", ts_type(inner, ctx))
+        }
+        TypeSchema::Map(inner) => format!("Record<string, {}>", ts_type(inner, ctx)),
         TypeSchema::Ref(n) => (*n).to_string(),
         TypeSchema::Struct { .. } | TypeSchema::Enum(_) => {
-            // Anonymous nested shapes are not expected: the derive returns
-            // Ref for named types (Task 5). Reaching here means a type
-            // escaped the registry.
-            unreachable!("anonymous nested shape in a named position — the registry missed a type")
+            // Correct ONLY for a field/alias position, where Ruling 1
+            // guarantees the derive returns `Ref` for a named type — NOT for
+            // a braced enum variant's payload, which `emit_def` handles
+            // before ever calling `ts_type` (Critical 1). Reaching this from
+            // a field means a named type escaped the registry; reaching it
+            // from a hand-built Contract means the same rule was violated
+            // by hand.
+            unreachable!(
+                "emit_types: anonymous Struct/Enum shape in {ctx} — a named type must \
+                 register itself and appear here as TypeSchema::Ref(\"Name\"), never \
+                 inlined; register the type (or reference it via Ref) instead of \
+                 embedding its schema directly"
+            )
         }
     }
 }
