@@ -50,7 +50,9 @@ pub struct Route {
     pub error: fn() -> crate::wire::TypeSchema,
     /// Registers this route's whole type closure (params, request, response,
     /// error, and everything they transitively reference) into the contract
-    /// registry.
+    /// registry, plus every event payload this route declares via
+    /// `emits(...)` — a declared payload is registered even when the event
+    /// is never mounted (task 7).
     pub register_types: fn(&mut crate::wire::TypeRegistry),
     /// Event types a stream route declares via `#[route(SSE …, emits(Ev, …))]`,
     /// in declaration order, each one's `Event::NAME` (the name an SSE frame
