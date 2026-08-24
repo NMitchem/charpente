@@ -461,10 +461,17 @@ pub struct Archive {
     /// `resume_point`'s `gapped` refusal then defeated resume-or-open
     /// outright.
     ///
-    /// The live tail's base at `open`, because what a STALLED `Opening` is
-    /// actually causing to be retained is what seals AFTER it: zero on a
-    /// healthy restart, growing only while the store cannot answer. `None`
-    /// once `adopt` has set a real cursor.
+    /// The live tail's base at `open`, so a restart over a fully archived
+    /// log counts zero segments behind. This bounds the BOUND and nothing
+    /// else — it is NOT what is being retained. The pin's floor tracks
+    /// `next_needed`, which stays `db.log_base()` until `adopt` runs, so a
+    /// STALLED `Opening` goes on holding every segment already sealed at
+    /// `open` as well (measured at 26 held against a bound of 8: R-1,
+    /// task-7-rereview-r1.md). That hold is bounded, not unbounded — once
+    /// `pin_segments` further segments seal past this baseline the gap fires
+    /// and releases it — but while it lasts the quantity the bound measures
+    /// is not the quantity spec §5 names. `None` once `adopt` has set a real
+    /// cursor.
     opening_baseline: Option<u64>,
     state: State,
     /// Set by the `step_idle` arms that find no available work, cleared by
@@ -772,6 +779,18 @@ impl Archive {
         // would leave those records in NO generation at all — not in the
         // closed one, which never shipped them, and not in the fresh one,
         // whose snapshot cannot contain what was never applied.
+        //
+        // R-2: the `forfeit_to == self.next_needed` disjunct is also the
+        // CHURN branch. It holds exactly when the first un-archived sealed
+        // segment is itself unapplied, so the forfeit does not advance and
+        // the bound is over again on the next step — the very churn the
+        // paragraph above says the forfeit exists to prevent (measured: 750
+        // notices, nothing shipped, over 3000 steps). Kept deliberately: an
+        // unsafe forfeit is traded for a churn reachable only in a strictly
+        // narrower corner of the same window, since `Engine::submit` applies
+        // per batch and a partial apply poisons the engine, so the frontier
+        // can lag by at most one batch and this needs it to lag by eight-plus
+        // segments.
         assert!(
             forfeit_to == self.next_needed
                 || applied.is_some_and(|l| l.saturating_add(1) >= forfeit_to),
