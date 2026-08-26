@@ -1068,11 +1068,56 @@ impl Archive {
         notice
     }
 
+    /// True when this archive's CURRENT generation has objects in the
+    /// bucket: a snapshot (which is what sets `frontier`) or any segment in
+    /// its chain.
+    ///
+    /// Both refusal notices below are raised from two sites whose answer
+    /// here is OPPOSITE, and each of them used to state one site's answer
+    /// unconditionally — which made it false at the other. `adopt` refuses
+    /// before anything is uploaded (a fresh open and a post-gap re-open both
+    /// reach it with no frontier and an empty chain, since `roll_generation`
+    /// clears both); `step_checking_owner` refuses part-way through a
+    /// generation that already has objects under it. Hard rule 5's third
+    /// element is THE FIX, and the fix genuinely differs: at `adopt` the
+    /// operator can act freely, while at `CheckingOwner` "remove that
+    /// manifest" is the step that strands a partial generation for good.
+    fn uploaded_this_generation(&self) -> bool {
+        self.frontier.is_some() || !self.segments.is_empty()
+    }
+
     /// HARD RULE 5 / spec §7's row ("operator notice naming both identities,
     /// the generation, and the prefix"): the contract is archive ownership,
     /// the site is this prefix's manifest key, and the fix is a
     /// configuration change no amount of retrying reaches.
+    ///
+    /// What it says about the BUCKET is conditional on
+    /// `uploaded_this_generation`. At `adopt` on a fresh open
+    /// `self.generation` is 0, so an unconditional "objects under generation
+    /// 0 are orphaned" names the generation the manifest points at — the
+    /// LIVE one, intact — and tells the operator their good data is garbage.
     fn foreign_writer_notice(&self, theirs: &str, their_generation: u64) -> io::Error {
+        let (left_behind, strands) = if self.uploaded_this_generation() {
+            (
+                format!(
+                    "Detection, not prevention: the objects this archive wrote under its own \
+                     generation {} are orphaned in the bucket — no manifest names them now — \
+                     and nothing in this design collects them.",
+                    self.generation
+                ),
+                " Doing that abandons this archive's own generation objects for good.",
+            )
+        } else {
+            (
+                format!(
+                    "Detection, not prevention: this archive refused before uploading anything, \
+                     so it has left nothing of its own under this prefix; generation \
+                     {their_generation}, which that manifest names, is the live one and is \
+                     untouched."
+                ),
+                "",
+            )
+        };
         io::Error::other(format!(
             "Archive: the prefix \"{}\" is owned by another writer — its manifest (\"{}\") names \
              writer \"{theirs}\" at generation {their_generation}, while this archive is \"{}\" at \
@@ -1080,15 +1125,15 @@ impl Archive {
              generation interleaved into it leaves a bucket neither node can restore from (spec \
              §2, §4), so this archive stops rather than advancing a manifest it does not own. It \
              has released its WAL retention pin so Wal::gc proceeds, and the Db is untouched. \
-             Detection, not prevention: objects this archive already uploaded under generation \
-             {} are orphaned in the bucket and nothing in this design collects them. Fix: give \
-             this node its own ArchiveConfig::prefix, or — once you have confirmed \"{theirs}\" \
-             has stopped archiving here — remove that manifest object so a fresh generation can \
-             open. Either way this archive resumes only on restart.",
+             {left_behind} Fix: give this node its own ArchiveConfig::prefix, or — once you have \
+             confirmed \"{theirs}\" has stopped archiving here — remove that manifest object so a \
+             fresh generation can open.{strands} Either way this archive resumes only on restart, \
+             and restart here is the whole PROCESS: the archive is an arm of this Db, there is no \
+             in-process re-open, and recovering a stopped archive therefore costs a database \
+             restart.",
             self.cfg.prefix,
             manifest_key(&self.cfg.prefix),
             self.cfg.writer,
-            self.generation,
             self.generation
         ))
     }
@@ -1112,21 +1157,44 @@ impl Archive {
     /// The decode failure is WRAPPED, never replaced: a CRC mismatch, a
     /// truncated object and a malformed body call for different operator
     /// actions and only the decoder can tell them apart.
+    ///
+    /// Like `foreign_writer_notice`, what it says about the bucket is
+    /// conditional on `uploaded_this_generation`: this is raised from
+    /// `step_opening`, where nothing has been uploaded, AND from
+    /// `step_checking_owner`, where a snapshot and part of a chain are
+    /// already sitting under the prefix. Telling that second operator
+    /// "nothing was uploaded" and then offering to remove the manifest is
+    /// the pair of sentences that strands a whole generation.
     fn unreadable_manifest_notice(&self, source: &io::Error) -> io::Error {
+        let (left_behind, strands) = if self.uploaded_this_generation() {
+            (
+                format!(
+                    "the objects it has already written under generation {} stay in the bucket, \
+                     named by no manifest it can read",
+                    self.generation
+                ),
+                " Removing it abandons those objects too, and nothing in this design collects \
+                 them.",
+            )
+        } else {
+            ("nothing was uploaded".to_string(), "")
+        };
         io::Error::other(format!(
             "Archive: refusing to archive to prefix \"{}\" — the manifest at \"{}\" could not be \
              read: {source}. That object is this archive's only evidence of who owns this prefix \
              and which generation is live (spec §2, §4), so an archive that cannot read it \
              cannot tell whether the objects here are its own or another writer's; opening a \
              fresh generation over them would be exactly the interleave spec §4 forbids, on no \
-             evidence at all. This archive stops rather than guessing: nothing was uploaded, its \
+             evidence at all. This archive stops rather than guessing: {left_behind}, its \
              retention pin is released so Wal::gc proceeds, and the Db is untouched. The refusal \
              does not lapse on its own — a re-fetch may well succeed, since a CRC mismatch \
              cannot distinguish a corrupt object from a corrupted read, but retrying it silently \
              and forever is how an archive stops shipping without ever saying so. Fix: re-fetch \
              or restore that manifest object and restart this node, or — once you have confirmed \
              no other node is archiving to this prefix — remove it so the next start opens a \
-             fresh generation.",
+             fresh generation.{strands} Restart here is the whole PROCESS: the archive is an arm \
+             of this Db, there is no in-process re-open, and recovering a stopped archive \
+             therefore costs a database restart.",
             self.cfg.prefix,
             manifest_key(&self.cfg.prefix)
         ))

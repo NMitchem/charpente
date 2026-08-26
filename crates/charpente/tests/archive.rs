@@ -3151,6 +3151,47 @@ fn the_foreign_writer_refusal_names_both_identities_the_generation_and_the_prefi
     }
 }
 
+/// HARD RULE 5 at the site the test above does not reach: what the refusal
+/// says about the BUCKET, at `adopt`, where this archive has uploaded
+/// nothing.
+///
+/// `self.generation` is 0 on a fresh open, so a notice that unconditionally
+/// calls "objects under generation {self.generation}" orphaned names the
+/// generation the manifest points at — the LIVE one, six intact objects in
+/// the review's measurement — and tells the operator their good data is
+/// garbage. The foreign manifest here is planted at generation 0 on purpose,
+/// so the two numbers collide exactly as they do on a fresh open.
+///
+/// The claim is checked against the bucket rather than against other words
+/// in the same string.
+#[test]
+fn the_foreign_writer_refusal_at_open_never_calls_the_live_generation_orphaned() {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, 500);
+    write_foreign_manifest(&store, FOREIGN_WRITER, 0);
+
+    let notice = step_until_error(&mut arc, &db, &store);
+    let t = notice.to_string();
+    assert_eq!(
+        store.keys(),
+        vec![manifest_key(PREFIX)],
+        "this archive uploaded something before it refused, so 'it left nothing behind' is not \
+         the fact the notice should be stating here"
+    );
+    assert!(
+        !t.contains("orphan"),
+        "the refusal claims orphaned objects at a site where this archive uploaded nothing, and \
+         on a fresh open its own generation counter is 0 — so the generation it calls orphaned \
+         is the LIVE one the manifest points at, and the operator is told their good data is \
+         garbage: {t}"
+    );
+    assert!(
+        t.contains("is the live one and is untouched"),
+        "the refusal must say which generation is live at this site — the operator's next act \
+         is deciding what to delete: {t}"
+    );
+}
+
 /// SPEC §5, and the reason a terminal state cannot simply sit there: "a
 /// derived artifact must not be able to halt the thing it derives from". An
 /// archive that will never ship again must not go on holding the WAL against
@@ -3424,4 +3465,45 @@ fn the_unreadable_manifest_refusal_names_the_key_the_prefix_and_the_fix() {
     for needle in [PREFIX, &manifest_key(PREFIX), "CRC", "remove", "restart"] {
         assert!(t.contains(needle), "the refusal must name {needle}: {t}");
     }
+}
+
+/// HARD RULE 5 at the OTHER site, which the test above does not reach: it
+/// plants its corrupt manifest before the first step, so it only ever reads
+/// the `Opening` site — where "nothing was uploaded" happens to be true.
+///
+/// Mid-run it is false. The bucket holds this generation's snapshot and a
+/// segment, and an operator told nothing was left behind then follows
+/// "remove the manifest" and strands every one of them, with no reclamation
+/// anywhere in this design. `foreign_writer_notice` warns about exactly that
+/// hazard in its own text; this one used to deny it.
+///
+/// Asserted against the BUCKET, not against other words in the same string.
+#[test]
+fn the_unreadable_manifest_refusal_mid_run_does_not_claim_nothing_was_uploaded() {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, RECORDS_PER_SEGMENT + 50);
+    step_until_idle(&mut arc, &db, &store);
+    plant_corrupt_manifest(&store);
+    write_records(&mut db, 2 * RECORDS_PER_SEGMENT); // work to do, so the check is reached
+
+    let notice = step_until_error(&mut arc, &db, &store);
+    let t = notice.to_string();
+    let left = store.keys();
+    assert!(
+        left.len() > 1,
+        "the archive had written nothing but the manifest key when it refused, so the claim \
+         under test is not being measured against anything: {left:?}"
+    );
+    assert!(
+        !t.contains("nothing was uploaded"),
+        "the refusal tells the operator nothing was uploaded while {} objects sit under this \
+         prefix, and then offers to remove the manifest — which strands every one of them, \
+         since nothing in this design collects orphaned objects: {left:?}\n{t}",
+        left.len()
+    );
+    assert!(
+        t.contains("stay in the bucket"),
+        "the refusal must name what it left behind at this site: hard rule 5's third element \
+         is the fix, and the fix is what differs between the two sites: {t}"
+    );
 }
