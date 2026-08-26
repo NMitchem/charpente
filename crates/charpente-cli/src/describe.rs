@@ -44,6 +44,61 @@ pub fn run(args: &[String]) -> i32 {
     exit_code_for(result)
 }
 
+/// The contract JSON for the app crate at `dir`: the SAME two phases `run`
+/// performs — build, then exec the app's own `describe` verb — with stdout
+/// captured instead of streamed straight through.
+///
+/// `gen-client` and `check-client` obtain a contract through here rather
+/// than growing a second build-and-exec path. A second path would be a
+/// second answer to "what is this app's contract", and drift between two
+/// answers is the failure this whole codegen sub-project exists to remove.
+///
+/// Errors are already reported to stderr when this returns `Err`; the code
+/// is 2 in every case, because everything that can go wrong here is a launch
+/// or build fault, never a verdict about the client.
+pub(crate) fn contract_json(dir: &str, bin: Option<&str>) -> Result<String, i32> {
+    let executable = build_and_locate(dir, bin)?;
+
+    // Process spawning is edge tooling here, outside the deterministic core
+    // (DESIGN.md §1) — this execs the built app binary directly; nothing
+    // inside the core spawns processes.
+    #[allow(clippy::disallowed_methods)]
+    let output = Command::new(&executable)
+        .args(["describe", "--format", "json"])
+        .output();
+
+    let output = match output {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!(
+                "error: failed to run the app binary: {e} — rebuild (it may have vanished \
+                 between build and exec)"
+            );
+            return Err(2);
+        }
+    };
+
+    if !output.status.success() {
+        // The app's own describe failure is the oracle — forwarded verbatim,
+        // then named so the reader knows which of the two processes failed.
+        let _ = std::io::stderr().write_all(&output.stderr);
+        eprintln!(
+            "error: `{executable} describe --format json` failed ({}) — a client can only be \
+             generated from an app whose own describe verb succeeds",
+            output.status
+        );
+        return Err(2);
+    }
+
+    String::from_utf8(output.stdout).map_err(|e| {
+        eprintln!(
+            "error: the contract `{executable} describe --format json` printed is not UTF-8: \
+             {e}"
+        );
+        2
+    })
+}
+
 /// Maps the app binary's completed `Command` result to this verb's own exit
 /// code — copied from sim.rs's `exit_code_for` (two small copies beat a
 /// premature module). The child's own code passes through unchanged (0/2
