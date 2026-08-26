@@ -211,11 +211,20 @@ archive's retention pin nor shipped (§2, ruling 53). That is permission, not ac
 primary's disk. **Nothing in `charpente` or `charpente-core` ever issues an
 `ObjectOp::Delete`**, so a superseded generation's snapshot and segment objects — and the
 partial objects a crashed upload leaves behind — accumulate in the object store forever.
-Reclaiming them is **unimplemented and assigned to no task**: review finding R-3, filed
-against an earlier and more ambiguous wording of this paragraph, alongside F-C's orphaned
-partials. Recorded rather than dropped, because the paragraph above was narrowed to the WAL
-sense in Task 7.5 and a narrowed sentence that quietly sheds a promise is exactly the drifted
-doc hard rule 6 exists to prevent. Open, and Noah's to route.
+Reclaiming them is **unimplemented**: review finding R-3, filed against an earlier and more
+ambiguous wording of this paragraph, alongside F-C's orphaned partials. It was carried unrouted
+rather than dropped, because the paragraph above was narrowed to the WAL sense in Task 7.5, and a
+narrowed sentence that quietly sheds a promise is exactly the drifted doc hard rule 6 exists to
+prevent.
+
+**Routed 2026-08-26.** Delete-on-supersede for what a manifest names: when a generation
+rolls, the superseded generation's objects are deleted **by name, out of its own manifest**, so
+no LIST and no key-discovery surface enters the system. The orphaned partials get a documented
+bucket lifecycle rule instead, because an object orphaned by a failed upload is orphaned
+precisely in that no manifest recorded it, and only a LIST could ever find it. It lands as
+**Task 12.5, after restore and the convergence property** — deletion does not ship before the
+oracle that proves what it would delete is recoverable. Reclamation is an optimisation and never
+a correctness dependency: the archive stays correct when every delete fails forever.
 
 **One operation in flight is a bound, not a free choice.** Serial uploads mean the archive
 falls behind whenever segments seal faster than they upload — and a permanently-behind archive
@@ -507,7 +516,13 @@ Hard rule 6 — same commit as the code:
    the log's base. Now that a generation holds only what seals above its own snapshot, the
    quantity the bound measures has changed and the default should be re-derived against it.
    Recorded rather than re-picked: the default is explicitly Noah's.
-2. Whether the capability-surface decision warrants a numbered DECISIONS.md entry at all.
+2. **RULED 2026-08-26 — bucket reclamation.** Recorded here because it was carried as an open
+   item: nothing ever issued an `ObjectOp::Delete`, so superseded objects and orphaned partial
+   uploads accumulated forever (findings R-3 and F-C, which are one gap seen twice). Ruling:
+   delete-on-supersede by manifest name, plus a documented lifecycle rule for the orphans, as
+   **Task 12.5** after restore and the convergence property. The full argument is in §3; the
+   deciding asymmetry is whether the objects can be named without asking the bucket.
+3. Whether the capability-surface decision warrants a numbered DECISIONS.md entry at all.
    §1's correction lowers the stakes — this is an application of §1, not an amendment to it —
    so an entry may be over-ceremony. Noah's call, and DECISIONS.md is a shared-spine file with
    concurrent sessions live.

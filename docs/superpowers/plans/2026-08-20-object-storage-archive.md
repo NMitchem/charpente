@@ -1382,6 +1382,79 @@ oracle passes forever.**
 
 ---
 
+## Task 12.5: Bucket reclamation — delete what a manifest names
+
+**Inserted during execution (2026-08-26), not in the original thirteen.** It exists because
+review findings R-3 and F-C turned out to be one gap: the archive could only ever add. Nothing in
+`charpente` or `charpente-core` issued an `ObjectOp::Delete`, so superseded snapshot and segment
+objects accumulated in the bucket forever, and spec §3's promise that snapshots let the archive
+delete segments below them was true only of WAL on local disk.
+
+**This task is deliberately sited AFTER Task 12.** Do not move it earlier. Deletion must not ship
+before the convergence property proves that what it would delete is recoverable; ordering it
+ahead of its own oracle is the correctness bet this plan exists to avoid.
+
+**Files:**
+- Modify: `crates/charpente/src/archive/mod.rs`
+- Modify: `crates/charpente/tests/archive.rs`
+- Modify: `docs/superpowers/specs/2026-08-20-object-storage-archive-design.md` (§3)
+
+**Interfaces:**
+- Consumes: `ObjectOp::Delete` (exists on the trait, issued nowhere in production), `Manifest`'s
+  object list (T4).
+- Produces: no new public names.
+
+**Scope — the asymmetry that decides the design.** Can the objects be named without asking the
+bucket?
+
+- **Superseded segments and snapshots: yes.** The retired generation's manifest enumerates exactly
+  the keys it wrote. Delete those, by name, from a document already held. **No LIST.**
+- **Orphaned partial uploads: no, by construction.** An object is orphaned precisely because no
+  manifest recorded it. Only a LIST could find it, so it is NOT code's job here — Task 13 documents
+  a bucket lifecycle rule ("abort incomplete multipart uploads after N days") as an operator
+  requirement, stated as a requirement and not a footnote, because without it they are unbounded.
+
+**Explicitly rejected:** a periodic LIST-and-sweep of the prefix. It closes both items in one
+mechanism and is the most dangerous thing available — a sweep whose arithmetic is wrong deletes
+objects restore needs, and it compounds F2's existing per-step `Disk::list` concern.
+
+- [ ] **Step 1: Write the failing tests**
+
+At minimum: a rolled generation's predecessor objects are gone from the store; the CURRENT
+generation's objects are never touched; a delete that fails leaves the archive correct and
+advancing; a crash between the manifest swap and the delete leaves no dangling reference (the
+swap is the commit point — objects may outlive their manifest, never the reverse).
+
+- [ ] **Step 2: Run to verify failure**
+
+- [ ] **Step 3: Implement**
+
+Deletion follows the manifest swap, never precedes it. **Reclamation is an optimisation, never a
+correctness dependency: the archive must remain correct and keep making progress when every
+delete fails forever.** Assert the negative space (hard rule 4) — never delete a key belonging to
+the live generation, and never delete on a path that has not first durably swapped the manifest.
+
+- [ ] **Step 4: Run to verify pass**
+
+- [ ] **Step 5: Mutation table**
+
+| # | mutation | must redden |
+|---|---|---|
+| 1 | delete before the manifest swap instead of after | the crash-between test |
+| 2 | widen the key set to the live generation | the current-generation test |
+| 3 | propagate a failed delete as a fatal error | the delete-fails-forever test |
+| 4 | make the delete a no-op | the predecessor-objects-gone test |
+
+Row 4 is the vacuity check: if the suite stays green with deletion removed entirely, the test
+asserting reclamation is reading the wrong thing.
+
+- [ ] **Step 6: Gate and commit** (named paths; 4/4 RED)
+
+**Spec:** §3's routed paragraph becomes a description of what was built, and §14 item 2's ruling is marked
+delivered. Hard rule 6 — same commit.
+
+---
+
 ## Task 13: Docs
 
 **Files:**
@@ -1422,6 +1495,7 @@ git commit -m "docs: the archive ships — DESIGN §1/§5, README, GUIDE, PLAN"
 - [ ] Archive ships sealed segments and seq-cadenced snapshots; bounded pin composes with replication's.
 - [ ] `charpente restore` rebuilds a Db; refuses diverged timelines and every §7 corruption case by name.
 - [ ] Convergence property green over N fresh seeds — **N and the master seed stated in the commit**.
+- [ ] Bucket reclamation: a superseded generation's objects are deleted by manifest name; orphan lifecycle rule documented (Task 12.5).
 - [ ] Every task's mutation table run, RED confirmed, result recorded in its commit message.
 - [ ] `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` all green.
 - [ ] Docs updated (Task 13).
