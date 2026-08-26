@@ -383,6 +383,7 @@ Hard rule 5: name the contract, the site, and the fix.
 | restore into a diverged timeline | refuse, naming both frontiers and `--force` |
 | node is write-gated (`Verifying`) | archive arm uploads nothing until the gate opens; no error, no gap recorded — it was never this node's timeline to ship |
 | manifest names another writer identity — at open, or before any swap | stop archiving permanently, releasing the retention pin; one operator notice naming both identities, both generations, the manifest key, the prefix, and the fix; never interleave |
+| manifest fails CRC or will not decode **on the archive arm** | stop archiving permanently, releasing the retention pin; one operator notice wrapping the decode failure and naming the key, the prefix and both fixes (re-fetch or restore the object and restart; or remove it once no other writer is confirmed). Never open a fresh generation over it: the manifest is the only evidence of who owns the prefix, so an archive that cannot read it cannot know the objects there are its own. **Not a bounded retry** — the retry this replaces held the WAL at the archive's pin for as long as it lasted, which is forever, and never reached a verdict (Task 8) |
 | `ObjectStore` IO error on the archive arm | archive arm degrades; **never poisons the Db** — see §8 |
 
 ## §8 Invariants (assert these, TigerBeetle style — hard rule 4)
@@ -402,6 +403,9 @@ test:
   of a timeline it has not confirmed it owns.
 - The manifest is **never** advanced by a node that is not its recorded writer; a writer that
   finds otherwise stops rather than interleaving.
+- An archive that cannot establish ownership of a prefix — the manifest names another writer, or
+  will not decode — **never** writes to it. Ownership is decided before anything is uploaded, not
+  after.
 
 ## §9 Testing — how the archive gets faulted
 

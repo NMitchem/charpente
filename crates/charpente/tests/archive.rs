@@ -3198,3 +3198,139 @@ fn a_stopped_archive_releases_the_log_and_stops_erroring() {
         "an archive failure is not a database failure (spec §8)"
     );
 }
+
+// ------------------------------- Task 8 / F5: a manifest it cannot read
+
+/// The bytes of a real manifest with one body byte flipped: unambiguously a
+/// CRC failure rather than a truncation, since `Manifest::decode` verifies
+/// the trailing CRC before it reads a single field. Deterministic, so the
+/// object planted below is the same one on every run.
+///
+/// Written as THIS archive's own writer identity on purpose, so the refusal
+/// under test is "the manifest is unreadable" and not "the manifest belongs
+/// to someone else" — the two land in the same terminal state and would
+/// otherwise be indistinguishable.
+fn corrupt_manifest_bytes() -> Vec<u8> {
+    let mut bytes = Manifest {
+        generation: 0,
+        writer: WRITER.to_string(),
+        applied_seq: 0,
+        next_job_id: 0,
+        tables: Vec::new(),
+        segments: Vec::new(),
+        closed: false,
+    }
+    .encode();
+    bytes[0] ^= 0xff;
+    bytes
+}
+
+fn plant_corrupt_manifest(store: &SimObjectStore) -> Vec<u8> {
+    let bytes = corrupt_manifest_bytes();
+    plant(store, &[(manifest_key(PREFIX), bytes.clone())]);
+    bytes
+}
+
+/// F5 (task-6/7 carry-forward, routed to Task 8). A manifest failing its CRC
+/// at `Opening` was returned as an `Err` and retried FOREVER: the archive
+/// shipped nothing, held the WAL at its pin while it did, and said the same
+/// thing every step without ever reaching a verdict.
+///
+/// The manifest is this archive's only evidence of who owns the prefix and
+/// which generation is live, so an archive that cannot read it cannot know
+/// whether the objects here are its own — opening a fresh generation over
+/// them is spec §4's interleave on no evidence at all. It refuses.
+#[test]
+fn a_manifest_this_archive_cannot_read_stops_it_instead_of_retrying_forever() {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, 2 * RECORDS_PER_SEGMENT);
+    let corrupt = plant_corrupt_manifest(&store);
+    assert_ne!(
+        db.retention_floor(),
+        u64::MAX,
+        "the archive was not holding the log before it refused, so the release below proves \
+         nothing"
+    );
+
+    step_times(&mut arc, &db, &store, 500);
+
+    assert_eq!(
+        get_object(&store, &manifest_key(PREFIX)).expect("a manifest object"),
+        corrupt,
+        "the archive overwrote a manifest it could not read; with the ownership evidence \
+         unreadable it cannot know whose bucket this is (spec §2, §4)"
+    );
+    assert_eq!(
+        store.keys(),
+        vec![manifest_key(PREFIX)],
+        "the archive uploaded into a bucket whose ownership it could not establish"
+    );
+    assert_eq!(
+        db.retention_floor(),
+        u64::MAX,
+        "an archive that will never ship is still holding the WAL against gc — the retry loop \
+         held the log for as long as it lasted, which is forever (spec §5)"
+    );
+    for _ in 0..200 {
+        arc.step(&db, &store).expect(
+            "the refusal is a retry loop, not a stop — the archive raised it again, which is \
+             the F5 behaviour this test exists to remove",
+        );
+    }
+    assert!(
+        !db.poisoned(),
+        "an archive failure is not a database failure (spec §8)"
+    );
+    assert!(arc.stopped(), "the archive did not reach a verdict");
+}
+
+/// The same refusal at the OTHER site that decodes a manifest: the ownership
+/// check in front of a swap. An archive part-way through a generation that
+/// finds the manifest unreadable is in the same position as one at `Opening`
+/// — it cannot tell whether the prefix is still its own — and must not
+/// resolve that by overwriting the evidence.
+#[test]
+fn a_manifest_that_becomes_unreadable_mid_run_stops_this_writer_too() {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, RECORDS_PER_SEGMENT + 50);
+    step_until_idle(&mut arc, &db, &store);
+    assert_eq!(
+        read_manifest(&store).expect("a manifest").writer,
+        WRITER,
+        "the fixture did not establish a readable generation first, so 'it BECAME unreadable' \
+         is not what is being tested"
+    );
+
+    let corrupt = plant_corrupt_manifest(&store);
+    write_records(&mut db, 2 * RECORDS_PER_SEGMENT); // work to do, so the check is reached
+    step_times(&mut arc, &db, &store, 1_000);
+
+    assert_eq!(
+        get_object(&store, &manifest_key(PREFIX)).expect("a manifest object"),
+        corrupt,
+        "the archive swapped a manifest it could not read"
+    );
+    assert_eq!(
+        db.retention_floor(),
+        u64::MAX,
+        "a stopped archive is still holding the WAL against gc (spec §5)"
+    );
+    assert!(arc.stopped(), "the archive did not reach a verdict");
+}
+
+/// HARD RULE 5. The refusal has to name the contract (what the manifest is
+/// for), the site (the key and the prefix), and the fix — and it must carry
+/// the decode failure it wraps, or an operator cannot tell a CRC mismatch
+/// from a truncated object.
+#[test]
+fn the_unreadable_manifest_refusal_names_the_key_the_prefix_and_the_fix() {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, 500);
+    plant_corrupt_manifest(&store);
+
+    let notice = step_until_error(&mut arc, &db, &store);
+    let t = notice.to_string();
+    for needle in [PREFIX, &manifest_key(PREFIX), "CRC", "remove", "restart"] {
+        assert!(t.contains(needle), "the refusal must name {needle}: {t}");
+    }
+}

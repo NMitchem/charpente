@@ -221,8 +221,18 @@
 //!   the GET-to-PUT window is real — the same honest posture the promote
 //!   path takes toward its bounded-loss window.
 //!
+//! - **A manifest this archive cannot decode** (F5) is that same question
+//!   with no answer at all, and takes the same refusal: it is the only
+//!   evidence of who owns the prefix, so an archive that cannot read it
+//!   cannot tell whether the objects here are its own, and opening a fresh
+//!   generation over them is the interleave above on no evidence
+//!   whatsoever. It does not retry — see `unreadable_manifest_notice` for
+//!   why, and for what the retry it replaces was costing.
+//!
 //! A refusal is TERMINAL (`stop`), unlike a gap: two writers on one prefix
-//! is an operator-configuration fact and no amount of retrying reaches it.
+//! is an operator-configuration fact and an unreadable manifest is an object
+//! that will not change on re-reading, and no amount of retrying reaches
+//! either.
 //! It releases the retention pin on the way in, because an archive that will
 //! never ship again but goes on holding the WAL is the archive acquiring the
 //! power to halt the primary (spec §5), and it raises its notice ONCE rather
@@ -456,9 +466,10 @@ enum State {
         started: bool,
     },
     /// TERMINAL (`stop`). This archive found the prefix owned by another
-    /// writer: it does nothing further, having released the log on the way
-    /// in — a stopped archive that went on holding the WAL would be the
-    /// archive acquiring the power to halt the primary (spec §5).
+    /// writer, or a manifest it could not decode at all: it does nothing
+    /// further, having released the log on the way in — a stopped archive
+    /// that went on holding the WAL would be the archive acquiring the power
+    /// to halt the primary (spec §5).
     Stopped,
     UploadingManifest {
         bytes: Vec<u8>,
@@ -739,11 +750,12 @@ impl Archive {
         self.gapped
     }
 
-    /// True once this archive has STOPPED PERMANENTLY (spec §4 rule 2): it
-    /// found `<prefix>/manifest` naming a writer that is not this node, so
-    /// it refused rather than interleaving its generations into a bucket
-    /// another node believes it owns. It has released its retention pin and
-    /// will do nothing further; only a restart re-reads the bucket.
+    /// True once this archive has STOPPED PERMANENTLY (spec §4, §7): it
+    /// found `<prefix>/manifest` naming a writer that is not this node, or
+    /// could not decode it at all, so it refused rather than interleaving
+    /// its generations into a bucket another node may own. It has released
+    /// its retention pin and will do nothing further; only a restart
+    /// re-reads the bucket.
     ///
     /// Distinct from `gapped()`, which is recoverable — the next successful
     /// contact opens a fresh generation. This one is not: two writers on one
@@ -1081,6 +1093,45 @@ impl Archive {
         ))
     }
 
+    /// HARD RULE 5, F5 (task-6/7 carry-forward). A manifest that will not
+    /// decode is an OWNERSHIP question with no answer: it is this archive's
+    /// only evidence of who owns the prefix and which generation is live
+    /// (spec §2, §4), so an archive that cannot read it cannot tell whether
+    /// the objects under this prefix are its own, and opening a fresh
+    /// generation over them is spec §4's interleave on no evidence at all.
+    ///
+    /// LATCHED, with no retry budget, and the retry it replaces was not
+    /// free: it held the WAL at this archive's pin for as long as it lasted,
+    /// which is forever (spec §5's hazard, reached without an outage). A
+    /// re-fetch may well succeed — a CRC mismatch cannot distinguish a
+    /// corrupt object from a corrupted read — so the notice says so and
+    /// names the restart that re-reads the bucket. What it removes is
+    /// retrying silently and forever, which is how an archive stops shipping
+    /// without ever saying so.
+    ///
+    /// The decode failure is WRAPPED, never replaced: a CRC mismatch, a
+    /// truncated object and a malformed body call for different operator
+    /// actions and only the decoder can tell them apart.
+    fn unreadable_manifest_notice(&self, source: &io::Error) -> io::Error {
+        io::Error::other(format!(
+            "Archive: refusing to archive to prefix \"{}\" — the manifest at \"{}\" could not be \
+             read: {source}. That object is this archive's only evidence of who owns this prefix \
+             and which generation is live (spec §2, §4), so an archive that cannot read it \
+             cannot tell whether the objects here are its own or another writer's; opening a \
+             fresh generation over them would be exactly the interleave spec §4 forbids, on no \
+             evidence at all. This archive stops rather than guessing: nothing was uploaded, its \
+             retention pin is released so Wal::gc proceeds, and the Db is untouched. The refusal \
+             does not lapse on its own — a re-fetch may well succeed, since a CRC mismatch \
+             cannot distinguish a corrupt object from a corrupted read, but retrying it silently \
+             and forever is how an archive stops shipping without ever saying so. Fix: re-fetch \
+             or restore that manifest object and restart this node, or — once you have confirmed \
+             no other node is archiving to this prefix — remove it so the next start opens a \
+             fresh generation.",
+            self.cfg.prefix,
+            manifest_key(&self.cfg.prefix)
+        ))
+    }
+
     /// HARD RULE 5, and this task's entire operator surface: a gap is the
     /// one failure here that silently costs continuity, so the text names
     /// the contract (the bound and its value), the site (the prefix and the
@@ -1166,13 +1217,11 @@ impl Archive {
             Some(Ok(ObjectDone::Get(bytes))) => match Manifest::decode(&bytes) {
                 Ok(m) => self.adopt(db, Some(m)),
                 Err(e) => {
-                    // Untrusted bytes, and refusing outright is spec §4's
-                    // ownership rule, which lands at Task 8. Retrying is the
-                    // conservative reading until then: the archive writes
-                    // nothing and never poisons the Db, which is what a
-                    // corrupt manifest calls for either way.
-                    self.state = State::Opening { started: false };
-                    Err(e)
+                    // F5. Untrusted bytes that will not decode: refuse, do
+                    // not retry. See `unreadable_manifest_notice` for why
+                    // this is terminal rather than a bounded retry.
+                    let notice = self.unreadable_manifest_notice(&e);
+                    Err(self.stop(notice))
                 }
             },
             Some(Ok(other)) => unreachable!(
@@ -1808,13 +1857,15 @@ impl Archive {
                     };
                     Ok(())
                 }
+                // F5, at the second of the two sites that decode a
+                // manifest. An archive part-way through a generation that
+                // finds this unreadable is in exactly the position one at
+                // `Opening` is: it cannot tell whether the prefix is still
+                // its own, and must not resolve that by overwriting the
+                // evidence.
                 Err(e) => {
-                    self.state = State::CheckingOwner {
-                        bytes,
-                        commits,
-                        started: false,
-                    };
-                    Err(e)
+                    let notice = self.unreadable_manifest_notice(&e);
+                    Err(self.stop(notice))
                 }
             },
             Some(Ok(other)) => unreachable!(
