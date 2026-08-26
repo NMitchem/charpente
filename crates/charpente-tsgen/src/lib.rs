@@ -39,7 +39,7 @@ pub fn emit_client(c: &Contract) -> String {
     out.push_str(runtime::RUNTIME);
     out.push('\n');
     out.push_str(&events::emit_unions(c));
-    out.push_str("export class Api extends ApiBase {\n");
+    out.push_str(CLASS_DECL);
     let mut body = routes::emit_methods(c);
     body.push_str(&events::emit_methods(c));
     // Each method block ends in a blank line so the members are separated;
@@ -51,6 +51,11 @@ pub fn emit_client(c: &Contract) -> String {
     out.push_str("}\n");
     out
 }
+
+/// The one module-scope name this file declares itself, rather than through
+/// `runtime::RUNTIME` — a const so the sync test below reads the class name
+/// out of the same bytes `emit_client` writes instead of repeating it.
+const CLASS_DECL: &str = "export class Api extends ApiBase {\n";
 
 /// A wire type shares module scope with everything the runtime declares, so
 /// one named like a runtime declaration produces two `export`s of that name
@@ -73,20 +78,16 @@ fn check_reserved(c: &Contract) {
 
 #[cfg(test)]
 mod tests {
+    use super::CLASS_DECL;
     use super::runtime::{RESERVED, RUNTIME};
     use std::collections::BTreeSet;
 
-    /// `RESERVED` is only protection if it lists what the generated file
-    /// really declares: a name added to the runtime TypeScript without being
-    /// added there would go unguarded, and a wire type of that name would
-    /// silently redeclare it. Both directions are checked, over the runtime's
-    /// module-scope declarations plus the one name `emit_client` writes
-    /// itself, `class Api`.
-    #[test]
-    fn runtime_declares_exactly_the_reserved_names() {
-        let mut declared: BTreeSet<&str> = BTreeSet::new();
-        declared.insert("Api");
-        for line in RUNTIME.lines() {
+    /// Every module-scope name in the FIXED half of a generated file — the
+    /// runtime's declarations, plus the `class Api` line `emit_client` writes
+    /// itself — and nothing else.
+    fn declarations(ts: &str) -> BTreeSet<&str> {
+        let mut found = BTreeSet::new();
+        for line in ts.lines() {
             // Column 0 only: an indented `export`/`function` is a class
             // member or a local, which shares no namespace with a wire type.
             let Some(rest) = [
@@ -102,8 +103,25 @@ mod tests {
             let end = rest
                 .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'))
                 .unwrap_or(rest.len());
-            declared.insert(&rest[..end]);
+            found.insert(&rest[..end]);
         }
+        found
+    }
+
+    /// `RESERVED` is only protection if it lists what the generated file's
+    /// fixed half really declares: a name added to the runtime TypeScript
+    /// without being added there would go unguarded, and a wire type of that
+    /// name would silently redeclare it.
+    ///
+    /// The name says "the runtime AND the class" rather than "the runtime",
+    /// because `Api` is in `RESERVED` and is NOT in `RUNTIME` — `emit_client`
+    /// writes that line. Both names are read out of the bytes that produce
+    /// them, so neither is a literal this test could hold stale (task 9a
+    /// review, finding B).
+    #[test]
+    fn reserved_lists_exactly_what_the_runtime_and_the_api_class_declare() {
+        let mut declared = declarations(RUNTIME);
+        declared.extend(declarations(CLASS_DECL));
         assert_eq!(
             declared,
             RESERVED.iter().copied().collect::<BTreeSet<&str>>(),

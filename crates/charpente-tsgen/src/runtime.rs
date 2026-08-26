@@ -12,9 +12,10 @@
 /// `export type Result` in one file is a `tsc` "Duplicate identifier" landing
 /// in an app author's build, pointing at generated code they did not write.
 ///
-/// Sorted, and kept in sync by `runtime_declares_exactly_the_reserved_names`
-/// in `lib.rs` — a name added to the TypeScript below without being added
-/// here would go unprotected. `sseValue` is not exported and is still listed:
+/// Sorted, and kept in sync by
+/// `reserved_lists_exactly_what_the_runtime_and_the_api_class_declare` in
+/// `lib.rs` — a name added to the TypeScript below without being added here
+/// would go unprotected. `sseValue` is not exported and is still listed:
 /// module scope is module scope, and a wire type of that name would collide
 /// with it exactly as loudly.
 pub const RESERVED: &[&str] = &[
@@ -25,6 +26,7 @@ pub const RESERVED: &[&str] = &[
     "StreamEnd",
     "StreamRejected",
     "SubscribeOptions",
+    "UndeclaredEvent",
     "UnknownEvent",
     "sseValue",
 ];
@@ -105,11 +107,39 @@ export class StreamRejected extends Error {
  */
 export type UnknownEvent = { event: string; data: unknown };
 
+/**
+ * A frame carrying an `event:` name the route did not declare in `emits(...)`.
+ *
+ * That declaration is NOT a filter (DESIGN §6): delivery runs off the encoders
+ * each `Subscription::of::<Ev>()` captured, so declaring `emits(Ping)` does not
+ * stop the platform sending a `pong` frame — most often because the server is
+ * newer than this generated file. Casting such a frame into the union would be
+ * a lie the type system then propagates: an exhaustive `switch` falls through
+ * and destructured fields read `undefined`. It is refused by name instead, and
+ * `onUnknown` is the way to tolerate the skew deliberately.
+ */
+export class UndeclaredEvent extends Error {
+  constructor(readonly event: string) {
+    super(
+      "the server sent an event this client's union does not declare: " + event +
+      ". `emits(...)` is a declaration, not a filter, so this is skew rather than a " +
+      "protocol violation — regenerate this client from the server's contract, or pass " +
+      "`onUnknown` to handle events it was not generated for.",
+    );
+  }
+}
+
 export interface SubscribeOptions<Ev> {
   /** A `Cursor::wire` string from a previous `onEvent`, to resume from. */
   cursor?: string;
   onEvent: (ev: Ev, cursor: string) => void;
   onEnd: (end: StreamEnd) => void;
+  /**
+   * A frame whose name is not one this route declared. Without it, such a
+   * frame raises `UndeclaredEvent` — it is never cast into `Ev`, and never
+   * dropped silently.
+   */
+  onUnknown?: (ev: UnknownEvent, cursor: string) => void;
   signal?: AbortSignal;
 }
 
@@ -149,9 +179,13 @@ export class ApiBase {
   // Fetch-based, NOT EventSource: EventSource cannot set an Authorization
   // header, and the alternative is a token in a query string, where it lands
   // in logs and referrers. The cost is that reconnect is owed explicitly.
+  // `declared` is the route's `emits(...)` names, passed by the generated
+  // subscribe method; a route that declared none passes nothing and takes
+  // every frame as the honest `UnknownEvent`.
   protected async stream<Ev extends { event: string; data: unknown }>(
     path: string,
     opts: SubscribeOptions<Ev>,
+    declared?: readonly string[],
   ): Promise<void> {
     const headers = this.headers(false);
     if (opts.cursor) headers["last-event-id"] = opts.cursor;
@@ -201,7 +235,18 @@ export class ApiBase {
           opts.onEnd({ kind: "gap", detail: data });
           return;
         }
-        opts.onEvent({ event: name, data: JSON.parse(data) } as Ev, id);
+        const ev = { event: name, data: JSON.parse(data) as unknown };
+        // The declaration is checked before the cast, so `as Ev` narrows only
+        // the discriminant this client was generated for. The payload carries
+        // the same trust `request()` places in the server's JSON — that is a
+        // boundary no client can verify without a schema validator, and it is
+        // deliberately the SAME trust, not a wider one.
+        if (declared && !declared.includes(name)) {
+          if (!opts.onUnknown) throw new UndeclaredEvent(name);
+          opts.onUnknown(ev, id);
+          continue;
+        }
+        opts.onEvent(ev as Ev, id);
       }
     }
   }

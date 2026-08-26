@@ -3,7 +3,7 @@
 //! `tests/common/mod.rs` (amendment D3) — the same value `tests/types.rs`
 //! reads, so the two files cannot drift apart.
 
-use charpente::describe::{Contract, RouteInfo};
+use charpente::describe::{Contract, ParamInfo, RouteInfo};
 use charpente::http::EmittedEvent;
 use charpente::wire::{TypeDef, TypeSchema};
 use charpente_tsgen::emit_client;
@@ -200,6 +200,86 @@ fn an_undeclared_stream_route_gets_the_honest_unknown_shape() {
     assert!(
         ts.contains("export type UnknownEvent ="),
         "the shape must be declared: {ts}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// `emits(...)` is a DECLARATION, not a filter — DESIGN §6 and GUIDE's "Three
+// things it deliberately is not" both say so: delivery runs off the encoders
+// each `Subscription::of::<Ev>()` captured, and nothing drops a frame the
+// route never declared. A server one deploy ahead of this file will send one.
+// So the union may not simply be asserted onto whatever arrives: the
+// subscribe method hands the runtime the names it WAS generated for, and the
+// runtime refuses anything outside them by name rather than casting it into
+// the union, where an exhaustive `switch` would fall through and destructured
+// fields would read `undefined`. (Task 9a review, finding A.)
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_declared_stream_hands_the_runtime_the_names_it_was_generated_for() {
+    let ts = emit_client(&fixture_contract());
+    assert!(
+        ts.contains(
+            r#"return this.stream<FeedEvent>("/feed", opts, ["invoice_paid", "invoice_voided"]);"#
+        ),
+        "{ts}"
+    );
+    // A route that declared nothing has no names to pass, and its
+    // `UnknownEvent` shape is already honest without them.
+    assert!(
+        ts.contains(r#"return this.stream<UnknownEvent>("/raw-feed", opts);"#),
+        "{ts}"
+    );
+}
+
+#[test]
+fn an_undeclared_event_name_is_refused_by_name_rather_than_cast_into_the_union() {
+    let ts = emit_client(&fixture_contract());
+    assert!(
+        ts.contains("export class UndeclaredEvent extends Error"),
+        "the refusal must be a named condition: {ts}"
+    );
+    assert!(
+        ts.contains("declared.includes(name)") && ts.contains("throw new UndeclaredEvent(name)"),
+        "the discriminant must be checked before the cast: {ts}"
+    );
+}
+
+/// A stream route with a path param. Its params come first and `opts` last,
+/// and its path is substituted exactly as a request method's is: the two
+/// emitters share one `param_args`/`path_expr` pair precisely so they cannot
+/// drift into two path formats.
+#[test]
+fn a_stream_route_with_a_path_param_takes_it_before_opts() {
+    let mut c = fixture_contract();
+    c.routes.push(RouteInfo {
+        method: "GET",
+        pattern: "/orgs/:org_id/feed",
+        name: "org_feed",
+        auth: false,
+        stream: true,
+        params: vec![ParamInfo {
+            name: "org_id",
+            schema: TypeSchema::String,
+        }],
+        request: None,
+        response: TypeSchema::Null,
+        error: TypeSchema::Ref("ApiError"),
+        emits: vec![EmittedEvent {
+            event: "invoice_paid",
+            payload: "InvoicePaid",
+        }],
+    });
+    let ts = emit_client(&c);
+    assert!(
+        ts.contains("orgFeed(orgId: string, opts: SubscribeOptions<OrgFeedEvent>)"),
+        "{ts}"
+    );
+    assert!(
+        ts.contains(
+            r#"return this.stream<OrgFeedEvent>(`/orgs/${encodeURIComponent(orgId)}/feed`, opts, ["invoice_paid"]);"#
+        ),
+        "{ts}"
     );
 }
 

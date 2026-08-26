@@ -122,7 +122,21 @@ pub(crate) fn emit_methods(c: &Contract) -> String {
             camel(r.name),
             args.join(", ")
         );
-        let _ = writeln!(out, "    return this.stream<{ev}>({}, opts);", path_expr(r));
+        // `emits(...)` is a DECLARATION, not a filter (DESIGN §6): the
+        // platform does not drop a frame the route never declared, so the
+        // names go to the runtime, which refuses to cast anything outside
+        // them into this union (task 9a review, finding A).
+        let declared = if r.emits.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<String> = r.emits.iter().map(|e| format!("{:?}", e.event)).collect();
+            format!(", [{}]", names.join(", "))
+        };
+        let _ = writeln!(
+            out,
+            "    return this.stream<{ev}>({}, opts{declared});",
+            path_expr(r)
+        );
         out.push_str("  }\n\n");
     }
     out
