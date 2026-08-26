@@ -552,7 +552,21 @@ Hard rule 6 — same commit as the code:
 
 ## §14 Open items for Noah
 
-1. `archive_pin_segments` default — the plan proposes a number with reasoning; this spec
+1. `archive_pin_segments` default — **RE-DERIVED 2026-08-26, and the answer is a rule plus a
+   measurement that does not exist yet, not a new number.** The old justification is not
+   mis-computed but categorically invalid: it bounded a *history* quantity as a multiple of
+   `retain_segments`, and ruling 53 made it a *rate x duration* quantity with no relationship to
+   `retain_segments` at all. The replacing rule is at `ArchiveConfig::pin_segments`. Its dominant
+   input — snapshot upload duration — has **no measured basis anywhere**: `docs/BENCH.md` has zero
+   archive or object-store coverage, and CLAUDE.md makes it the only quotable source. So 8 is kept
+   provisionally rather than re-picked, since raising it would repeat the original error with
+   fresher-looking numbers. **What would settle it:** track the peak count of sealed segments at
+   or above `next_needed` across a generation and have Task 12's convergence property record it
+   across the fault matrix — one counter, on runs that task performs anyway, turning the default
+   from a guess into a distribution. If a healthy generation routinely exceeds 8, that is a real
+   finding: healthy boxes gap routinely, which is Task 7.5's startup-gap failure reappearing at
+   steady state. The number remains Noah's.
+   Prior wording, retained for the record: the plan proposes a number with reasoning; this spec
    deliberately does not invent one. **Ruling 53 moves this item.** The plan's default of 8
    was justified as "512 MiB of held WAL at the default 64 MiB `segment_bytes`", and that
    arithmetic was computed against the pre-ruling-53 held quantity — a chain that started at

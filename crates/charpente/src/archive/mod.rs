@@ -347,15 +347,43 @@ pub struct ArchiveConfig {
     /// Measured from the live generation's own frontier, so the cadence is
     /// "this many records since the last snapshot", never since seq 0.
     pub snapshot_every: u64,
-    /// The archive's retention-pin bound, in segments (spec §5): 4x
-    /// `DbConfig::retain_segments`'s default of 2, bounding the WAL held
-    /// above the checkpoint floor at 512 MiB (64 MiB segments).
+    /// The archive's retention-pin bound, in segments (spec §5).
     ///
-    /// That 512 MiB arithmetic was computed BEFORE ruling 53, against a
-    /// chain that started at the log's base — a different held quantity than
-    /// the one this now bounds. Spec §14 open item 1 carries the
-    /// re-derivation; the default is Noah's to rule and is not re-picked
-    /// here.
+    /// **The default of 8 is PROVISIONAL and its old derivation is void.** It
+    /// was justified as "4x `DbConfig::retain_segments`'s default of 2, 512
+    /// MiB of held WAL at 64 MiB segments". That is not a coefficient that
+    /// needs updating — after ruling 53 it relates two quantities that no
+    /// longer have a relationship. Before ruling 53 the pin held everything
+    /// from the log's base upward: a HISTORY quantity, growing with how far
+    /// behind the archive was, for which a multiple of the `Db`'s own
+    /// retention was at least dimensionally sensible. It now holds only what
+    /// seals above this generation's snapshot frontier during the upload
+    /// window: a RATE x DURATION quantity, unrelated to `retain_segments`,
+    /// which bounds the `Db`'s checkpoint recycling and is not a party to the
+    /// archive's upload window at all.
+    ///
+    /// The rule that replaces it:
+    ///
+    /// ```text
+    /// pin_segments >= ceil(write_rate_bytes_per_sec * T_wait / segment_bytes)
+    /// T_wait        = max(outage_tolerance, db_logical_bytes / upload_bytes_per_sec)
+    /// ```
+    ///
+    /// Both right-hand inputs are DEPLOYMENT properties, not properties of
+    /// charpente, and the dominant one is unmeasured: `docs/BENCH.md` carries
+    /// no archive or object-store coverage at all, so no defensible constant
+    /// can be quoted for it today (CLAUDE.md makes BENCH.md the only source
+    /// of quotable performance numbers). 8 is therefore kept as-is rather
+    /// than re-picked, because raising it would look like a re-derivation
+    /// while being the same species of unfounded number as the one it
+    /// replaced. Spec §14 open item 1 carries the analysis and what to
+    /// measure.
+    ///
+    /// Getting it wrong is not a correctness failure in either direction, and
+    /// that is why shipping a provisional constant is acceptable here while
+    /// shipping an invalid derivation was not: past the bound the archive
+    /// yields, never the primary (spec ruling 3). Too small costs wasted
+    /// upload bandwidth and gap churn; too large costs held WAL on disk.
     ///
     /// Counted as sealed segments at or above `next_needed` — exactly what
     /// this archive's pin is keeping alive. Past it the archive yields
