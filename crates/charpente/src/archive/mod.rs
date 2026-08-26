@@ -229,10 +229,18 @@
 //!   whatsoever. It does not retry — see `unreadable_manifest_notice` for
 //!   why, and for what the retry it replaces was costing.
 //!
-//! A refusal is TERMINAL (`stop`), unlike a gap: two writers on one prefix
-//! is an operator-configuration fact and an unreadable manifest is an object
-//! that will not change on re-reading, and no amount of retrying reaches
-//! either.
+//! A refusal is TERMINAL (`stop`), unlike a gap — but the two refusals reach
+//! that for different reasons, and only the first is a fact about the world.
+//! Two writers on one prefix is an operator-configuration fact that no
+//! amount of retrying reaches. An unreadable manifest is NOT that kind of
+//! fact: a re-fetch may well succeed, since a CRC mismatch cannot
+//! distinguish a corrupt object from a corrupted read, and
+//! `unreadable_manifest_notice` says so in as many words. What makes
+//! latching right THERE is measured rather than asserted — retrying forever
+//! reaches no verdict while holding the WAL at this archive's pin the whole
+//! time (`retention_floor` stuck at 0 at the `Opening` site and at 1364
+//! mid-run, ~2500 `Err`s in 5000 steps, no verdict either way) — and
+//! latching does not destroy the retry, it hands it to the operator.
 //! It releases the retention pin on the way in, because an archive that will
 //! never ship again but goes on holding the WAL is the archive acquiring the
 //! power to halt the primary (spec §5), and it raises its notice ONCE rather
@@ -724,11 +732,31 @@ impl Archive {
         self.pin.lock().expect("uncontended").floor
     }
 
-    /// True when the last `step` found nothing it could do: either
-    /// nothing is sealed past what has been archived, or the one sealed
-    /// segment left is not yet fully applied. Use it to stop stepping.
-    /// **Not a durability signal** — it says the archive has no work it
-    /// can do right now, never that everything reached the store.
+    /// True when the last `step` found nothing it could do. Use it to stop
+    /// stepping — that is the whole of its meaning, and it is why the
+    /// terminal case below answers true rather than false.
+    ///
+    /// FOUR states answer true here, and this accessor does not distinguish
+    /// them:
+    ///
+    /// - **Caught up** — nothing is sealed past what has been archived.
+    /// - **Waiting** — the one sealed segment left is not yet fully applied.
+    /// - **Write-gated** — `db.verifying()`, so this node may upload nothing
+    ///   at all (spec §4 rule 1). Transient: the archive resumes by itself
+    ///   when the gate opens, since the guard is re-read every step. A test
+    ///   loop keyed on `idle` therefore exits after ONE step against a gated
+    ///   archive and proves nothing; step a fixed count instead.
+    /// - **Stopped** — a permanent ownership refusal (spec §4 rule 2, §7),
+    ///   where it is true forever. A stopped archive genuinely has nothing
+    ///   it can ever do, and answering false would tell every caller to go
+    ///   on driving a terminal state.
+    ///
+    /// **Not a durability signal, and not a health signal.** It says the
+    /// archive has no work it can do right now — never that everything
+    /// reached the store, and never that anything is well. `gapped()` and
+    /// `stopped()` are the two accessors that answer "is something wrong",
+    /// and an arm that renders only `idle` presents a permanently dead
+    /// archive as a healthy one.
     pub fn idle(&self) -> bool {
         self.idle
     }
@@ -835,6 +863,15 @@ impl Archive {
     /// read-only). An archive IO failure is returned here and nowhere
     /// else — it never reaches `Db`, so it can never poison it (spec §7).
     pub fn step(&mut self, db: &Db, store: &dyn ObjectStore) -> io::Result<()> {
+        // Terminal, and checked before the `mem::replace` below could
+        // replace it with `Idle`. A stopped archive holds nothing, writes
+        // nothing, and says nothing further: its notice was raised once,
+        // when it happened (the `gap_notice` precedent), and `stopped()` is
+        // the standing answer.
+        if matches!(self.state, State::Stopped) {
+            self.idle = true;
+            return Ok(());
+        }
         // SPEC §4 rule 1 / DESIGN §5, "What a `Verifying` node may do as a
         // peer". A durably-`Primary` node whose witnesses have not answered
         // has not confirmed it owns this timeline, and an upload manufactures
@@ -852,15 +889,6 @@ impl Archive {
         // would be a false alarm naming a continuity break that did not
         // happen. Nothing accumulates behind the gate either, since a gated
         // node accepts no writes.
-        // Terminal, and checked before the `mem::replace` below could
-        // replace it with `Idle`. A stopped archive holds nothing, writes
-        // nothing, and says nothing further: its notice was raised once,
-        // when it happened (the `gap_notice` precedent), and `stopped()` is
-        // the standing answer.
-        if matches!(self.state, State::Stopped) {
-            self.idle = true;
-            return Ok(());
-        }
         if db.verifying() {
             // `idle` is the honest answer to "is there work this archive can
             // do right now" (its doc's words), which is what a kernel arm

@@ -2935,6 +2935,14 @@ fn a_frontier_on_a_segment_boundary_starts_the_chain_at_the_segment_above_it() {
 /// poll), so "nothing was uploaded" is a property of the gate rather than
 /// of a loop that stopped too early.
 ///
+/// That ~6 is RE-DERIVED rather than left as a claim (review R-6): a bound
+/// justified by a number nobody re-derives is how a stale oracle starts.
+/// `the_gate_opening_releases_the_archive` counts it and asserts this bound
+/// is at least ten times it — and the count it takes really is the ungated
+/// cold start, because the gate returns before any transition, so an archive
+/// gated from `open` is still in `Opening { started: false }` when the gate
+/// opens.
+///
 /// Deliberately NOT `step_until_idle`: a gated archive reports `idle`, so a
 /// loop keyed on it would exit after ONE step and every assertion below
 /// would hold against an archive that had simply not been driven yet. The
@@ -2996,12 +3004,26 @@ fn the_gate_opening_releases_the_archive() {
     );
 
     db.allow_writes(); // every witness answered "not a primary"
+    let mut ungated = 0;
+    for _ in 0..GATED_STEPS {
+        ungated += 1;
+        let _ = arc.step(&db, &store);
+        if !store.keys().is_empty() {
+            break;
+        }
+    }
     step_until_idle(&mut arc, &db, &store);
 
     assert!(
         !store.keys().is_empty(),
         "the archive never resumed after the gate opened — the guard latched instead of being \
          re-read, and a resolved verification became a permanent archive outage"
+    );
+    assert!(
+        ungated * 10 <= GATED_STEPS,
+        "an ungated archive took {ungated} steps to land its first object, so GATED_STEPS = \
+         {GATED_STEPS} is no longer FAR past it, and 'nothing was uploaded' in the test above \
+         could be a loop that stopped too early rather than a property of the gate"
     );
     assert!(
         read_manifest(&store).is_some(),
