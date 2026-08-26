@@ -52,7 +52,17 @@
   not run as one command" and segmented the entire suite per-package/per-file; fix round 1's
   implementer backgrounded the same command, parked waiting on a notification a subagent never
   receives, and returned control with 19 paths uncommitted. **The tool accepts `timeout` up to
-  600000 ms and the run takes about six minutes.** Each workaround produced evidence that was
+  600000 ms.** **CORRECTED 2026-08-26 by measurement: "about six minutes" was wrong, and the
+  error cut the wrong way.** Timed as one command at `1ac64c9`: `cargo test --workspace` takes
+  **2482.86 s wall (41.4 min)**, 789 s user CPU, exit 0, 62 suites / 947 tests green. That is
+  **four times the tool's 600 s hard maximum**, so the full suite genuinely CANNOT run as a
+  single Bash call, and a per-package partition is the correct approach rather than the
+  workaround this bullet warns about — Task 9a's implementer reached that conclusion
+  independently and was right. Wall greatly exceeds CPU (32% utilisation) because a concurrent
+  session builds in a sibling worktree; treat the wall figure as a scheduling fact, not a
+  benchmark (docs/BENCH.md remains the only source of quotable performance numbers).
+  **The generalisation below still stands, and so does its inverse: check the ceiling before
+  designing around it, AND check it before insisting the ceiling is not there.** Each workaround produced evidence that was
   equivalent-or-worse at the cost of a whole session, plus a deviation for a reviewer to audit.
   The rule generalizes past this one parameter: when a tool appears to refuse something, read
   its parameters before designing around the refusal — and if you do work around it, say so in
