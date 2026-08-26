@@ -3199,6 +3199,97 @@ fn a_stopped_archive_releases_the_log_and_stops_erroring() {
     );
 }
 
+// ------------------- Task 8: the ownership GET is an operation in flight
+
+/// SPEC §1: never a second `ObjectStore::start` while the first operation is
+/// unpolled. This is the oracle for `op_in_flight`'s `State::CheckingOwner`
+/// arm, which nothing else in this file exercises.
+///
+/// The ownership check GETs the manifest in front of every swap, so from
+/// Task 8 on the archive has a started store operation that is NOT an
+/// upload. `yield_or_bound` runs in front of every transition and its gap
+/// arm DISCARDS whatever the archive was doing, so a bound crossed while
+/// that GET is in flight abandons it — and the next step's `store.start` is
+/// then a second one against an unpolled op, which trips
+/// `SimObjectStore::start`'s double-start assert.
+///
+/// The window is entered deliberately, never waited for: the step that lands
+/// the first `/segments/` object is the step that enters `CheckingOwner`,
+/// the step after it issues the GET, and only then is the bound crossed. If
+/// the archive were NOT sitting on a started operation at that point,
+/// `yield_or_bound` would gap on the crossing step and the first assertion
+/// below would fire — so this test cannot pass against a fixture that never
+/// reached the window.
+#[test]
+fn a_gap_crossing_while_the_ownership_get_is_in_flight_never_abandons_it() {
+    let (mut db, store, mut arc) =
+        build_fixture_with_cadence(SimObjectStore::new(), 0, 8 << 20, GAP_PIN_SEGMENTS);
+    // The opening snapshot FIRST, at a frontier below the log's tail. With
+    // `snapshot_every: 0` a fixture that writes everything up front
+    // snapshots at the tail and never ships a segment at all, so the window
+    // below would never be entered at all.
+    write_records(&mut db, 500);
+    step_until_idle(&mut arc, &db, &store);
+    assert!(
+        read_manifest(&store).is_some(),
+        "the opening snapshot never landed, so there is no generation for a segment to ship \
+         into: {:?}",
+        store.keys()
+    );
+
+    // Segments seal ABOVE that frontier, still inside the bound.
+    write_records(&mut db, 2 * RECORDS_PER_SEGMENT);
+    let mut shipped = false;
+    for _ in 0..10_000 {
+        let _ = arc.step(&db, &store);
+        if store.keys().iter().any(|k| k.contains("/segments/")) {
+            shipped = true;
+            break;
+        }
+    }
+    assert!(
+        shipped,
+        "no segment object ever landed, so the archive never reached the pre-swap ownership \
+         check and the window below is never opened: {:?}",
+        store.keys()
+    );
+    // That segment's PUT completed on the step above, which is what enters
+    // `CheckingOwner`; this step issues the manifest GET and leaves it
+    // unpolled.
+    arc.step(&db, &store)
+        .expect("the step that issues the ownership GET");
+
+    // The bound is crossed with that GET still in flight.
+    write_records(&mut db, GAP_PIN_SEGMENTS as u64 * RECORDS_PER_SEGMENT);
+    assert!(
+        sealed_segment_count(&db) > GAP_PIN_SEGMENTS,
+        "the bound was never crossed, so nothing below is about a gap: {} sealed segments \
+         against pin_segments = {GAP_PIN_SEGMENTS}",
+        sealed_segment_count(&db)
+    );
+    let crossing = arc.step(&db, &store);
+    let gapped_at_crossing = arc.gapped();
+    // Stepped BEFORE the assertions, deliberately: this is the step whose
+    // `store.start` panics if the one above abandoned the GET, and that
+    // panic is the failure worth seeing.
+    let after = arc.step(&db, &store);
+
+    assert!(
+        crossing.is_ok() && !gapped_at_crossing,
+        "the archive gapped while its own ownership GET was still in flight, discarding a \
+         started operation — the next `ObjectStore::start` is then a second one against an \
+         unpolled op (spec §1), which is a contract violation and not a retry. `op_in_flight` \
+         must count `State::CheckingOwner {{ started: true }}` exactly as it counts the upload \
+         states: {crossing:?}"
+    );
+    assert!(
+        arc.gapped() && after.is_err(),
+        "the bound was crossed with {} segments sealed and the archive never gapped: holding a \
+         started operation must DELAY the gap by one step, never cancel it",
+        sealed_segment_count(&db)
+    );
+}
+
 // ------------------------------- Task 8 / F5: a manifest it cannot read
 
 /// The bytes of a real manifest with one body byte flipped: unambiguously a
