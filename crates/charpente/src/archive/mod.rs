@@ -7,7 +7,8 @@
 //! (§3's other half) and the ordering that is the whole safety argument;
 //! Task 7 lands the bounded pin, the named gap, generation transitions and
 //! resume-or-open; Task 7.5 makes a generation's chain CONTINUE its snapshot
-//! instead of overlapping it (ruling 53). Restore (§6) is still to come.
+//! instead of overlapping it (ruling 53); Task 8 lands ownership (§4) — the
+//! write gate and the writer identity. Restore (§6) is still to come.
 //!
 //! **The manifest swaps last.** Inter-key ordering is not guaranteed by
 //! `ObjectStore` (§1), so the manifest swap is the only operation whose
@@ -97,9 +98,12 @@
 //! `[seq][len][crc][payload]` shape the WAL itself uses (`frame_crc`) so a
 //! downloaded object is byte-identical to what `Wal::open` would recover
 //! from the original segment (spec §3: "verbatim"); `UploadingSegment`
-//! PUTs the reassembled bytes; `UploadingManifest` swaps the manifest to
+//! PUTs the reassembled bytes; `CheckingOwner` GETs the manifest this
+//! archive is about to replace and refuses if it names another writer
+//! (§4); `UploadingManifest` swaps the manifest to
 //! reference the new segment, the one mutable key and the archive's own
-//! commit point (spec §2). A failed PUT retries with the identical key and
+//! commit point (spec §2); `Stopped` is where an ownership refusal parks,
+//! permanently and holding nothing. A failed PUT retries with the identical key and
 //! bytes — never a fresh one — which is what keeps a lost-ack retry from
 //! duplicating an object (spec §9.2).
 //!
@@ -187,9 +191,42 @@
 //!
 //! Ask `Archive::idle` whether there is work left — never `pin_floor()`,
 //! which has no caught-up sentinel and never should have been read as one.
-//! The writer-identity ownership check (spec §4) lands at Task 8: this task
-//! declines to *extend* a generation whose manifest names another writer,
-//! but does not yet refuse to archive at all.
+//!
+//! **OWNERSHIP** (spec §4), Task 8. Both rules are things this module can
+//! violate without failing a single test, which is why they are written here
+//! as well as asserted there.
+//!
+//! - **The write gate.** A `Verifying` node uploads NOTHING. `step` returns
+//!   before any transition while `db.verifying()`, and reads it afresh every
+//!   call rather than latching. The precedent is exact and is the reason
+//!   this exists at all: the verifying-peer policy (DESIGN §5,
+//!   specs/2026-08-06-verifying-peer-policy-design.md) found `begin_seeding`
+//!   slipping past the write gate BECAUSE IT WAS READ-ONLY, manufacturing
+//!   durable replicas of a timeline the node had not confirmed it owned. The
+//!   archive arm is read-only against the `Db` in exactly the same way, and
+//!   an object in a bucket outlives this node's fail-stop far more
+//!   thoroughly than a seeded follower does. Gating is NOT a gap: nothing is
+//!   missing from an archive that was never this node's to ship, so the
+//!   guard sits in front of `yield_or_bound` and no notice fires.
+//! - **The writer identity.** The manifest records who wrote it, and this
+//!   archive refuses to advance one that names anyone else — at `adopt`,
+//!   before a single object is uploaded, and again at `CheckingOwner` before
+//!   every swap, since a peer can be promoted at any point in between. Both
+//!   are needed and neither subsumes the other: without the `adopt` refusal
+//!   an archive opens a fresh generation NUMBERED ABOVE the foreign one and
+//!   then swaps the manifest to name itself (measured: generation 4 written
+//!   over node-b's generation 3); without the pre-swap check nothing catches
+//!   a takeover that happens while this archive is already running.
+//!   DETECTION, NOT PREVENTION — `ObjectStore` has no compare-and-swap and
+//!   the GET-to-PUT window is real — the same honest posture the promote
+//!   path takes toward its bounded-loss window.
+//!
+//! A refusal is TERMINAL (`stop`), unlike a gap: two writers on one prefix
+//! is an operator-configuration fact and no amount of retrying reaches it.
+//! It releases the retention pin on the way in, because an archive that will
+//! never ship again but goes on holding the WAL is the archive acquiring the
+//! power to halt the primary (spec §5), and it raises its notice ONCE rather
+//! than once per step — `stopped()` is the standing answer after that.
 
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -226,10 +263,11 @@ pub struct ArchiveConfig {
     pub prefix: String,
     /// This node's identity, recorded in every manifest this archive writes
     /// (spec §4's ownership rule): a future writer that finds the manifest
-    /// advanced by a different identity is meant to stop rather than
-    /// interleave generations. Task 5 always writes fresh (it never reads
-    /// an existing manifest before writing), so nothing yet consults this
-    /// on the read side — that arrives with restore/ownership at T6/T7.
+    /// advanced by a different identity stops rather than interleaving
+    /// generations. Read on both sides since Task 8: written into every
+    /// manifest this archive PUTs, and compared against the manifest already
+    /// in the bucket at `adopt` and again before every swap
+    /// (`step_checking_owner`).
     pub writer: String,
     /// Cadence for logical snapshots, in committed records — mirrors
     /// `DbConfig::checkpoint_every` (spec §3), and seq-driven rather than
@@ -404,6 +442,24 @@ enum State {
         /// `poll`.
         started: bool,
     },
+    /// SPEC §4 rule 2: the ownership check standing in front of EVERY
+    /// manifest swap this archive performs. The manifest is the layout's
+    /// one mutable key (spec §2) and `ObjectStore` has no compare-and-swap,
+    /// so reading it and refusing is the only way not to advance a manifest
+    /// this node does not own. DETECTION, NOT PREVENTION — the window
+    /// between this GET and the PUT that follows it is real, the same
+    /// honest posture the promote path takes toward its bounded-loss
+    /// window.
+    CheckingOwner {
+        bytes: Vec<u8>,
+        commits: Option<Frontier>,
+        started: bool,
+    },
+    /// TERMINAL (`stop`). This archive found the prefix owned by another
+    /// writer: it does nothing further, having released the log on the way
+    /// in — a stopped archive that went on holding the WAL would be the
+    /// archive acquiring the power to halt the primary (spec §5).
+    Stopped,
     UploadingManifest {
         bytes: Vec<u8>,
         started: bool,
@@ -683,6 +739,20 @@ impl Archive {
         self.gapped
     }
 
+    /// True once this archive has STOPPED PERMANENTLY (spec §4 rule 2): it
+    /// found `<prefix>/manifest` naming a writer that is not this node, so
+    /// it refused rather than interleaving its generations into a bucket
+    /// another node believes it owns. It has released its retention pin and
+    /// will do nothing further; only a restart re-reads the bucket.
+    ///
+    /// Distinct from `gapped()`, which is recoverable — the next successful
+    /// contact opens a fresh generation. This one is not: two writers on one
+    /// prefix is an operator-configuration fact, and nothing the archive can
+    /// do about it.
+    pub fn stopped(&self) -> bool {
+        matches!(self.state, State::Stopped)
+    }
+
     /// The base_seq of the next sealed segment this archive needs.
     ///
     /// `next_needed` is floored at `db.log_base()` for as long as the
@@ -770,6 +840,15 @@ impl Archive {
         // would be a false alarm naming a continuity break that did not
         // happen. Nothing accumulates behind the gate either, since a gated
         // node accepts no writes.
+        // Terminal, and checked before the `mem::replace` below could
+        // replace it with `Idle`. A stopped archive holds nothing, writes
+        // nothing, and says nothing further: its notice was raised once,
+        // when it happened (the `gap_notice` precedent), and `stopped()` is
+        // the standing answer.
+        if matches!(self.state, State::Stopped) {
+            self.idle = true;
+            return Ok(());
+        }
         if db.verifying() {
             // `idle` is the honest answer to "is there work this archive can
             // do right now" (its doc's words), which is what a kernel arm
@@ -791,6 +870,15 @@ impl Archive {
                 self.step_closing_generation(store, bytes, started)
             }
             State::Idle => self.step_idle(db),
+            State::CheckingOwner {
+                bytes,
+                commits,
+                started,
+            } => self.step_checking_owner(store, bytes, commits, started),
+            State::Stopped => unreachable!(
+                "State::Stopped is terminal and `step` returns above before this transition; \
+                 nothing ever puts the archive back into it"
+            ),
             State::Snapshotting { walk } => self.step_snapshotting(walk),
             State::UploadingSnapshotBatch {
                 walk,
@@ -941,12 +1029,56 @@ impl Archive {
         matches!(
             self.state,
             State::Opening { started: true }
+                | State::CheckingOwner { started: true, .. }
                 | State::ClosingGeneration { started: true, .. }
                 | State::UploadingSnapshotBatch { started: true, .. }
                 | State::UploadingSnapshotMeta { started: true, .. }
                 | State::UploadingSegment { started: true, .. }
                 | State::UploadingManifest { started: true, .. }
         )
+    }
+
+    /// Latches this archive into `State::Stopped` and hands back the notice
+    /// that put it there, so every caller reads `Err(self.stop(notice))`.
+    ///
+    /// The pin release is the part that is not optional. A stopped archive
+    /// will never ship again, so every segment its pin holds is held
+    /// FOREVER — the archive acquiring the power to stop the thing it
+    /// derives from, which is exactly what spec §5's bound exists to
+    /// prevent. RULING 49: the release is `Pin::holding`, never a
+    /// `u64::MAX` written into the floor, so the floor stays the real,
+    /// monotonic seq `pin_floor()`'s doc promises.
+    fn stop(&mut self, notice: io::Error) -> io::Error {
+        let floor = self.pin_floor();
+        self.yield_pin(floor);
+        self.state = State::Stopped;
+        self.idle = true;
+        notice
+    }
+
+    /// HARD RULE 5 / spec §7's row ("operator notice naming both identities,
+    /// the generation, and the prefix"): the contract is archive ownership,
+    /// the site is this prefix's manifest key, and the fix is a
+    /// configuration change no amount of retrying reaches.
+    fn foreign_writer_notice(&self, theirs: &str, their_generation: u64) -> io::Error {
+        io::Error::other(format!(
+            "Archive: the prefix \"{}\" is owned by another writer — its manifest (\"{}\") names \
+             writer \"{theirs}\" at generation {their_generation}, while this archive is \"{}\" at \
+             generation {}. Two nodes archiving to one prefix both write that single key, and a \
+             generation interleaved into it leaves a bucket neither node can restore from (spec \
+             §2, §4), so this archive stops rather than advancing a manifest it does not own. It \
+             has released its WAL retention pin so Wal::gc proceeds, and the Db is untouched. \
+             Detection, not prevention: objects this archive already uploaded under generation \
+             {} are orphaned in the bucket and nothing in this design collects them. Fix: give \
+             this node its own ArchiveConfig::prefix, or — once you have confirmed \"{theirs}\" \
+             has stopped archiving here — remove that manifest object so a fresh generation can \
+             open. Either way this archive resumes only on restart.",
+            self.cfg.prefix,
+            manifest_key(&self.cfg.prefix),
+            self.cfg.writer,
+            self.generation,
+            self.generation
+        ))
     }
 
     /// HARD RULE 5, and this task's entire operator surface: a gap is the
@@ -1059,6 +1191,24 @@ impl Archive {
     /// Decides, from what the bucket already holds, whether this archive
     /// extends that generation or opens a fresh one (ruling 43).
     fn adopt(&mut self, db: &Db, found: Option<Manifest>) -> io::Result<()> {
+        // SPEC §4 rule 2, at the FIRST of the two places it has to be asked,
+        // and the one the pre-swap check cannot cover. An archive that opens
+        // over another writer's manifest declines to EXTEND that generation
+        // (`resume_point`) and then opens a fresh one NUMBERED ABOVE it — so
+        // by the time it reaches a swap the foreign manifest sits BELOW its
+        // own generation, and a check that asked "is the other writer AHEAD
+        // of me" would wave it through. It is still another node's manifest
+        // and advancing it is still the interleave spec §8 forbids. Refusing
+        // here is what makes "ownership is decided before anything is
+        // uploaded, not after" true: measured before this landed, an archive
+        // opening over node-b's generation 3 wrote a complete generation 4
+        // over it and swapped the manifest to name itself.
+        if let Some(m) = &found
+            && m.writer != self.cfg.writer
+        {
+            let notice = self.foreign_writer_notice(&m.writer, m.generation);
+            return Err(self.stop(notice));
+        }
         // The resume decision reads the segment layout (`chain_start`) and
         // so can fail. It is taken before anything below is mutated, and a
         // failure returns to `Opening` rather than to `Idle`: an archive
@@ -1112,9 +1262,16 @@ impl Archive {
         // Spec §2: a gap CLOSES the generation it broke. The manifest still
         // names it until the fresh generation's snapshot lands, which can be
         // a long time, and "stale" and "finished" are different facts to a
-        // restore. Only ever this archive's own generation: extending or
-        // annotating another writer's is spec §4's refusal, never a repair.
-        if m.writer == self.cfg.writer && !m.closed {
+        // restore. Only ever this archive's own generation — annotating
+        // another writer's is spec §4's refusal, never a repair — which the
+        // ownership check at the top of this function now guarantees
+        // outright, so the writer conjunct that used to stand here would be
+        // dead. This is also the one manifest swap that does NOT go through
+        // `CheckingOwner`, and deliberately: its bytes come from a manifest
+        // GET that completed in the immediately preceding step, so it is
+        // already a checked swap and a second GET would only re-read what
+        // `adopt` has just decided on.
+        if !m.closed {
             let closed = Manifest { closed: true, ..m };
             self.state = State::ClosingGeneration {
                 bytes: closed.encode(),
@@ -1135,16 +1292,16 @@ impl Archive {
     /// The seq a resumed generation continues its chain at, or `None` when
     /// this generation must not be extended. Every refusal below is a reason
     /// the extension would produce a chain that claims more than it covers.
+    ///
+    /// A FOREIGN writer is no longer among them: Task 7's "decline to extend
+    /// somebody else's chain" was the conservative interim, and `adopt` now
+    /// refuses to archive at all before this is ever called (spec §4 rule
+    /// 2), so a branch for it here would be dead code claiming a decision it
+    /// no longer makes.
     fn resume_point(&self, db: &Db, m: &Manifest) -> io::Result<Option<u64>> {
         if self.gapped {
             // gc has taken records this generation never shipped: extending
             // it is exactly the hole spec §2 says a generation never has.
-            return Ok(None);
-        }
-        if m.writer != self.cfg.writer {
-            // Never interleave generations (spec §4). Refusing to archive at
-            // all is Task 8's; declining to extend somebody else's chain is
-            // strictly safer than the blind reuse this replaces.
             return Ok(None);
         }
         if m.closed {
@@ -1378,10 +1535,10 @@ impl Archive {
                 tables: meta.tables.iter().map(|t| t.name.clone()).collect(),
             };
             let manifest = self.manifest_bytes(&frontier);
-            self.state = State::UploadingManifest {
+            self.state = State::CheckingOwner {
                 bytes: manifest,
-                started: false,
                 commits: Some(frontier),
+                started: false,
             };
             return Ok(());
         }
@@ -1574,10 +1731,10 @@ impl Archive {
                 );
                 self.manifest_bytes(frontier)
             };
-            self.state = State::UploadingManifest {
+            self.state = State::CheckingOwner {
                 bytes: manifest_bytes,
-                started: false,
                 commits: None,
+                started: false,
             };
             return Ok(());
         }
@@ -1589,6 +1746,99 @@ impl Archive {
             started,
         };
         done.map(|_| ())
+    }
+
+    /// SPEC §4 rule 2. Reads `<prefix>/manifest` and refuses to swap it if
+    /// it names anyone but this writer.
+    ///
+    /// The comparison is IDENTITY ALONE, with no generation conjunct. A
+    /// foreign manifest at a generation below this archive's is still
+    /// another node's manifest, and `a_foreign_manifest_below_this_archives_
+    /// generation_stops_it_too` is the oracle: a generation comparison
+    /// answers "who is further along", which is not the question spec §8's
+    /// invariant asks.
+    ///
+    /// A `NotFound` is a bucket with no manifest at all — nothing to
+    /// overwrite, and the ordinary first swap of a fresh generation. Every
+    /// other store failure retries with `started` cleared, exactly as the
+    /// upload arms do.
+    fn step_checking_owner(
+        &mut self,
+        store: &dyn ObjectStore,
+        bytes: Vec<u8>,
+        commits: Option<Frontier>,
+        started: bool,
+    ) -> io::Result<()> {
+        if !started {
+            let key = manifest_key(&self.cfg.prefix);
+            if let Err(e) = store.start(ObjectOp::Get { key }) {
+                self.state = State::CheckingOwner {
+                    bytes,
+                    commits,
+                    started: false,
+                };
+                return Err(e);
+            }
+            self.state = State::CheckingOwner {
+                bytes,
+                commits,
+                started: true,
+            };
+            return Ok(());
+        }
+        match store.poll() {
+            None => {
+                self.state = State::CheckingOwner {
+                    bytes,
+                    commits,
+                    started: true,
+                };
+                Ok(())
+            }
+            Some(Ok(ObjectDone::Get(found))) => match Manifest::decode(&found) {
+                Ok(m) if m.writer != self.cfg.writer => {
+                    let notice = self.foreign_writer_notice(&m.writer, m.generation);
+                    Err(self.stop(notice))
+                }
+                Ok(_) => {
+                    self.state = State::UploadingManifest {
+                        bytes,
+                        started: false,
+                        commits,
+                    };
+                    Ok(())
+                }
+                Err(e) => {
+                    self.state = State::CheckingOwner {
+                        bytes,
+                        commits,
+                        started: false,
+                    };
+                    Err(e)
+                }
+            },
+            Some(Ok(other)) => unreachable!(
+                "a Get was started; only ObjectDone::Get or an error can complete it, got \
+                 {other:?}"
+            ),
+            // No manifest yet: this generation's first swap creates it.
+            Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => {
+                self.state = State::UploadingManifest {
+                    bytes,
+                    started: false,
+                    commits,
+                };
+                Ok(())
+            }
+            Some(Err(e)) => {
+                self.state = State::CheckingOwner {
+                    bytes,
+                    commits,
+                    started: false,
+                };
+                Err(e)
+            }
+        }
     }
 
     fn step_uploading_manifest(

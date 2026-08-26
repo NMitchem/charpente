@@ -281,6 +281,23 @@ Two rules, both following precedent already in this codebase:
    two nodes each believe they own. Detection, not prevention — the same honest posture the
    promote path takes toward its bounded-loss window.
 
+   **The check is asked at two places and neither subsumes the other** (Task 8, implemented):
+   once when the archive first reads the bucket, *before it uploads anything*, and again before
+   every manifest swap, since a peer can be promoted at any point in between. The first is what
+   makes "ownership is decided before anything is uploaded" true, and it is not redundant: an
+   archive that only checked before swapping declines to *extend* a foreign generation and then
+   opens a fresh one **numbered above** it, so by the time it reaches a swap the foreign manifest
+   sits *below* its own generation — measured at Task 8 against the open-time check removed, an
+   archive wrote a complete generation 4 over another writer's generation 3 and swapped the
+   manifest to name itself. The comparison is therefore **identity alone**: "is the other writer
+   further along" is a different question from "is this manifest mine", and only the second is the
+   invariant §8 states.
+
+   A refusal is **terminal**, unlike a gap: two writers on one prefix is an operator-configuration
+   fact that no amount of retrying reaches. The archive releases its retention pin on the way in —
+   one that will never ship again but goes on holding the WAL is the archive acquiring the power
+   to halt the primary (§5) — and raises the notice once, when it happens, not once per step.
+
 Both rules are **additive**, which is why §5's "only change to shipped code" still holds:
 `Db::verifying()` is already public (`db.rs:1708`) and already read outside core by the seed
 refusal itself (`repl/session.rs:744`). The archive gate consults the same accessor the
@@ -365,7 +382,7 @@ Hard rule 5: name the contract, the site, and the fix.
 | segment chain has a hole | refuse, naming the expected base_seq |
 | restore into a diverged timeline | refuse, naming both frontiers and `--force` |
 | node is write-gated (`Verifying`) | archive arm uploads nothing until the gate opens; no error, no gap recorded — it was never this node's timeline to ship |
-| manifest advanced by another writer identity | stop archiving; operator notice naming both identities, the generation, and the prefix; never interleave |
+| manifest names another writer identity — at open, or before any swap | stop archiving permanently, releasing the retention pin; one operator notice naming both identities, both generations, the manifest key, the prefix, and the fix; never interleave |
 | `ObjectStore` IO error on the archive arm | archive arm degrades; **never poisons the Db** — see §8 |
 
 ## §8 Invariants (assert these, TigerBeetle style — hard rule 4)

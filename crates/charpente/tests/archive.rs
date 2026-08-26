@@ -1320,7 +1320,18 @@ fn the_seal_rate_stays_under_one_upload_per_step_budget() {
 /// the second 5,000, instead of opening a fresh generation and re-shipping
 /// the whole log underneath its own snapshot. It is a step count of the cut
 /// loop's run, nothing more — the number to keep honest, not to defend.
-const STEPS_TO_ARCHIVE_5000_RECORDS: usize = 27;
+///
+/// RE-MEASURED at Task 8 (spec §4 rule 2): 27 -> 35. Every manifest swap is
+/// now preceded by a GET of the manifest it is about to replace
+/// (`State::CheckingOwner`), because `ObjectStore` has no compare-and-swap
+/// and reading first is the only way not to advance a manifest this node
+/// does not own. This run resumes a planted generation and ships the four
+/// segments that sealed above its frontier, so it performs four swaps: +8
+/// steps, at the two every store operation costs here (one to `start`, one
+/// to `poll`). The delta being exactly twice the swap count is itself the
+/// check that Task 8 added a prologue per swap rather than changing the
+/// shipping loop.
+const STEPS_TO_ARCHIVE_5000_RECORDS: usize = 35;
 
 /// The property this task exists to establish (spec §2): upload every object
 /// of a generation, THEN swap the manifest. Inter-key ordering is not
@@ -1414,9 +1425,17 @@ fn the_manifest_never_points_at_an_incomplete_generation() {
     // longer says anything — what does is how many cuts saw the manifest
     // ADVANCED to name a chain, which is the half of the ordering property
     // that involves a segment at all.
+    //
+    // RE-MEASURED at Task 8: 21 of 28 -> 27 of 36. CONFIRMED as the first of
+    // the two readings this message names, not the second: what the
+    // ownership check adds is a two-step GET in front of each swap, so the
+    // cuts that see NO chain — the prologue before the first chain-naming
+    // manifest lands — went 7 -> 9, exactly one prologue, while the total
+    // went 28 -> 36, exactly four. A manifest naming segments EARLIER in the
+    // run would have moved that prefix the other way.
     assert_eq!(
         cuts_with_a_chain,
-        21,
+        27,
         "{cuts_with_a_chain} of the {} cuts saw a manifest naming a chain; MEASURED. Fewer \
          means the loop above checked the segment half of the ordering almost nowhere and its \
          silence means nothing; MORE means a manifest is naming segments earlier in the run \
@@ -2988,5 +3007,194 @@ fn the_gate_opening_releases_the_archive() {
         read_manifest(&store).is_some(),
         "the archive uploaded objects after the gate opened but never swapped the manifest, so \
          nothing it wrote is reachable by a restore"
+    );
+}
+
+// -------------------------------------------- Task 8: the writer identity
+
+/// The identity of a node that is NOT this archive — a peer promoted after a
+/// switchover chain, which DESIGN §5 states the boot gate cannot see ("a
+/// probe answers 'is THIS witness a primary', never 'does another primary
+/// exist'"). Deliberately in the same `host:port` shape as `WRITER` so a
+/// substring assertion on one cannot accidentally match the other.
+const FOREIGN_WRITER: &str = "node-b:9000";
+
+/// SPEC §4 rule 2 / §8's last invariant: "the manifest is NEVER advanced by
+/// a node that is not its recorded writer". This is the case the plan's
+/// snippet aims at — a manifest advanced by another identity WHILE this
+/// archive is running.
+///
+/// Checked from the BUCKET, never from the archive's own bookkeeping: what
+/// makes two writers unrestorable is the object the other node reads, so the
+/// oracle is what the manifest key actually holds afterwards.
+#[test]
+fn a_foreign_manifest_advance_stops_this_writer_rather_than_interleaving() {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, RECORDS_PER_SEGMENT + 50);
+    step_until_idle(&mut arc, &db, &store);
+    let before = read_manifest(&store).expect("this archive's own opening manifest");
+    assert_eq!(
+        before.writer, WRITER,
+        "the fixture did not establish this archive as the bucket's writer, so 'a FOREIGN \
+         advance' below is not the thing being tested: {before:?}"
+    );
+
+    // A promoted peer takes the prefix over, several generations ahead.
+    write_foreign_manifest(&store, FOREIGN_WRITER, before.generation + 5);
+    write_records(&mut db, 2 * RECORDS_PER_SEGMENT); // segments seal above the frontier
+    step_times(&mut arc, &db, &store, 500);
+
+    let after = read_manifest(&store).expect("a manifest");
+    assert_eq!(
+        (after.writer.as_str(), after.generation),
+        (FOREIGN_WRITER, before.generation + 5),
+        "this writer interleaved into a bucket another node owns: the manifest is the archive's \
+         one mutable key and its commit point, so a second writer advancing it makes every \
+         generation in the bucket unreadable to whichever node reads it next (spec §2, §4)"
+    );
+    assert!(
+        arc.stopped(),
+        "the archive did not stop after finding the prefix taken over; it will retry the same \
+         swap forever, and every retry is another attempt to clobber another node's manifest"
+    );
+}
+
+/// The same rule at the OTHER end: an archive that finds another writer's
+/// manifest the first time it reads the bucket must never start.
+///
+/// This case is not reachable by the pre-swap check alone — see the report's
+/// deviation note. `adopt` used to decline to EXTEND a foreign generation
+/// (`resume_point`) and then open a FRESH one over it, which is interleaving
+/// by another name: the fresh generation's own manifest swap replaces the
+/// other node's.
+#[test]
+fn an_archive_that_finds_another_writers_manifest_at_open_never_starts() {
+    let (mut db, store, mut arc) = archive_fixture();
+    // Enough for segments to SEAL, so an archive that failed to refuse has
+    // real work to do and the emptiness asserted below is a property of the
+    // refusal rather than of a fixture with nothing to ship. Measured
+    // against the open-time refusal removed: the archive resumes the foreign
+    // generation and writes segment objects into it.
+    write_records(&mut db, 2 * RECORDS_PER_SEGMENT);
+    write_foreign_manifest(&store, FOREIGN_WRITER, 3);
+
+    step_times(&mut arc, &db, &store, 500);
+
+    assert_eq!(
+        store.keys(),
+        vec![manifest_key(PREFIX)],
+        "this archive wrote objects into a bucket whose manifest names {FOREIGN_WRITER}; \
+         ownership is decided before anything is uploaded, not after"
+    );
+    let m = read_manifest(&store).expect("a manifest");
+    assert_eq!(
+        (m.writer.as_str(), m.generation),
+        (FOREIGN_WRITER, 3),
+        "the manifest was advanced by a node that is not its recorded writer (spec §8)"
+    );
+    assert!(arc.stopped(), "the archive started anyway");
+}
+
+/// The corner that decides the SHAPE of the pre-swap comparison, and the
+/// oracle for this task's one deviation from its brief (see the report).
+///
+/// A foreign manifest sitting at a generation BELOW the one this archive is
+/// about to write is still another node's manifest, and advancing it is
+/// still the interleave spec §8 forbids. A comparison that additionally
+/// required the foreign generation to be at or above this archive's would
+/// let exactly this through — and it is not a contrived state: it is what a
+/// node that opened over a bucket, rolled a generation, and only then lost
+/// the prefix looks like.
+#[test]
+fn a_foreign_manifest_below_this_archives_generation_stops_it_too() {
+    let cadence = 2 * RECORDS_PER_SEGMENT;
+    let (mut db, store, mut arc) = archive_fixture_with_snapshot_cadence(cadence);
+    write_records(&mut db, cadence);
+    step_until_idle(&mut arc, &db, &store);
+    let before = read_manifest(&store).expect("a manifest once the cadence was crossed");
+    assert_eq!(
+        (before.writer.as_str(), before.generation),
+        (WRITER, 0),
+        "the fixture did not leave this archive owning generation 0: {before:?}"
+    );
+
+    // Another writer clobbers the manifest, naming a generation BELOW the
+    // one the cadence crossing below is about to make this archive write.
+    write_foreign_manifest(&store, FOREIGN_WRITER, 0);
+    write_records(&mut db, cadence); // crossing -> this archive rolls to generation 1
+    step_times(&mut arc, &db, &store, 1_000);
+
+    let after = read_manifest(&store).expect("a manifest");
+    assert_eq!(
+        (after.writer.as_str(), after.generation),
+        (FOREIGN_WRITER, 0),
+        "this archive advanced a manifest it does not own because the foreign generation was \
+         BELOW its own — a generation comparison is not an ownership check, and the bucket is \
+         now two writers deep"
+    );
+    assert!(arc.stopped(), "the archive kept going");
+}
+
+/// HARD RULE 5 (spec §7's row: "operator notice naming both identities, the
+/// generation, and the prefix"). Kept apart from the property tests above so
+/// neither is asserting the words it is about to read back.
+#[test]
+fn the_foreign_writer_refusal_names_both_identities_the_generation_and_the_prefix() {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, 500);
+    write_foreign_manifest(&store, FOREIGN_WRITER, 3);
+
+    let notice = step_until_error(&mut arc, &db, &store);
+    let t = notice.to_string();
+    for needle in [WRITER, FOREIGN_WRITER, PREFIX, "generation", "prefix"] {
+        assert!(t.contains(needle), "the refusal must name {needle}: {t}");
+    }
+}
+
+/// SPEC §5, and the reason a terminal state cannot simply sit there: "a
+/// derived artifact must not be able to halt the thing it derives from". An
+/// archive that will never ship again must not go on holding the WAL against
+/// `Wal::gc` — that is the archive acquiring the power to stop the primary,
+/// which is the exact hazard the bounded pin exists for.
+///
+/// Also pins that the refusal is raised ONCE rather than once per step
+/// (the `gap_notice` precedent), which is what keeps a stopped archive from
+/// filling an operator's log with the same paragraph forever.
+#[test]
+fn a_stopped_archive_releases_the_log_and_stops_erroring() {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, 500);
+    write_foreign_manifest(&store, FOREIGN_WRITER, 3);
+    assert_ne!(
+        db.retention_floor(),
+        u64::MAX,
+        "the archive was not holding the log before it stopped, so the release below proves \
+         nothing"
+    );
+
+    step_times(&mut arc, &db, &store, 500);
+
+    assert_eq!(
+        db.retention_floor(),
+        u64::MAX,
+        "a stopped archive is still holding the WAL against gc; it will never ship again, so \
+         every segment it holds is held forever — a derived artifact must not be able to halt \
+         the thing it derives from (spec §5)"
+    );
+    let settled = store.keys();
+    for _ in 0..200 {
+        arc.step(&db, &store).expect(
+            "a stopped archive returned its refusal again; the notice is raised once, when it \
+             happens, not once per step",
+        );
+    }
+    assert_eq!(
+        store.keys(),
+        settled,
+        "a stopped archive kept writing to a bucket it does not own"
+    );
+    assert!(
+        !db.poisoned(),
+        "an archive failure is not a database failure (spec §8)"
     );
 }
