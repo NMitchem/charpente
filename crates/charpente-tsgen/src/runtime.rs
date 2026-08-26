@@ -29,7 +29,7 @@
 pub const RESERVED: &[&str] = &[
     "Api",
     "ApiBase",
-    "CursorDiverged",
+    "CursorRefused",
     "Result",
     "StreamEnd",
     "StreamRejected",
@@ -71,7 +71,7 @@ export type Result<T, E> =
  * `closed` is the ordinary end of the response body.
  *
  * The conditions THIS CLIENT raises are deliberately not members:
- * `CursorDiverged` before a frame arrives, `UndeclaredEvent` arbitrarily far
+ * `CursorRefused` before a frame arrives, `UndeclaredEvent` arbitrarily far
  * into a healthy stream. Handling a refusal in the same branch as a normal end
  * is the mistake, and each carries a name and a fix no `kind` could. The
  * consequence, stated because it is easy to get wrong: `onEnd` is NOT a
@@ -91,7 +91,7 @@ export type StreamEnd =
  * not the history the cursor came from. Both are in `validate_subscribe`.
  * The rule is in the message on purpose — it is what a developer reads at 3am.
  */
-export class CursorDiverged extends Error {
+export class CursorRefused extends Error {
   constructor(readonly detail: string) {
     super(
       "cursor refused: " + detail + " — a client must not auto-resume across this, " +
@@ -106,7 +106,7 @@ export class CursorDiverged extends Error {
 
 /**
  * A subscribe the server rejected before any frame: 401 with no credential, or
- * 400 on a cursor it could not even parse. Distinct from `CursorDiverged`,
+ * 400 on a cursor it could not even parse. Distinct from `CursorRefused`,
  * which is a parseable cursor this node cannot serve from.
  */
 export class StreamRejected extends Error {
@@ -208,8 +208,8 @@ export class ApiBase {
     const res = await fetch(this.baseUrl + path, { headers, signal: opts.signal });
     if (res.status === 409) {
       // The server refused the cursor. Surfaced, never retried: see
-      // CursorDiverged.
-      throw new CursorDiverged(await res.text());
+      // CursorRefused.
+      throw new CursorRefused(await res.text());
     }
     if (!res.ok) throw new StreamRejected(res.status, await res.text());
     if (!res.body) {

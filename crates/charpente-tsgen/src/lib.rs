@@ -61,8 +61,8 @@ const CLASS_DECL: &str = "export class Api extends ApiBase {\n";
 /// one named like a runtime declaration produces two `export`s of that name in
 /// a single file. Sometimes that is a `tsc` "Duplicate identifier" (TS2300, as
 /// two `export type Result` would be); worse, sometimes it is not an error at
-/// all — an `export interface CursorDiverged` beside the runtime's
-/// `export class CursorDiverged` MERGES silently, tsc exit 0, and the app
+/// all — an `export interface CursorRefused` beside the runtime's
+/// `export class CursorRefused` MERGES silently, tsc exit 0, and the app
 /// author gets a class carrying fields nobody declared on it. So this check is
 /// the guard, not the compiler. Refused by name here, the same way
 /// `TypeRegistry::insert_as` already refuses a wire-name collision (wire.rs)

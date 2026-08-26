@@ -54,7 +54,7 @@ fn a_stream_route_becomes_a_typed_subscribe() {
 #[test]
 fn the_gap_and_divergence_frames_are_modelled_not_swallowed() {
     let ts = emit_client(&fixture_contract());
-    // Scoped to ApiBase's body, the way the CursorDiverged sibling below is:
+    // Scoped to ApiBase's body, the way the CursorRefused sibling below is:
     // `charpente.gap` also appears in `StreamEnd`'s doc comment, so an
     // unscoped `contains` was satisfied by prose that dispatches nothing.
     let base = ts
@@ -67,7 +67,7 @@ fn the_gap_and_divergence_frames_are_modelled_not_swallowed() {
         "the gap frame must be dispatched on, not only documented: {base}"
     );
     assert!(
-        ts.contains("export class CursorDiverged extends Error"),
+        ts.contains("export class CursorRefused extends Error"),
         "divergence must be a typed condition, not a mention: {ts}"
     );
     assert!(
@@ -77,7 +77,7 @@ fn the_gap_and_divergence_frames_are_modelled_not_swallowed() {
 }
 
 /// The rule above is stated where a CALLER meets it, not only where a reader
-/// of the generated source does: it is inside the message `CursorDiverged`
+/// of the generated source does: it is inside the message `CursorRefused`
 /// carries, so the developer who hits a 409 at 3am reads it in their console.
 /// A comment satisfying `contains("must not auto-resume")` would pass the
 /// test above and tell that developer nothing.
@@ -85,8 +85,8 @@ fn the_gap_and_divergence_frames_are_modelled_not_swallowed() {
 fn the_no_auto_resume_rule_is_in_the_thrown_errors_message_not_only_a_comment() {
     let ts = emit_client(&fixture_contract());
     let class = ts
-        .split_once("export class CursorDiverged")
-        .expect("the runtime must declare CursorDiverged")
+        .split_once("export class CursorRefused")
+        .expect("the runtime must declare CursorRefused")
         .1;
     let body = &class[..class.find("\n}").expect("the class must close")];
     assert!(

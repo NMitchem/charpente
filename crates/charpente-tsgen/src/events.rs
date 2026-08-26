@@ -106,7 +106,7 @@ pub(crate) fn emit_unions(c: &Contract) -> String {
 
 /// One subscribe method per stream route, in mount order. Not `async`: it
 /// hands back `ApiBase.stream`'s promise, which resolves when the stream ends
-/// and rejects with `CursorDiverged`/`StreamRejected`.
+/// and rejects with `CursorRefused`/`StreamRejected`.
 pub(crate) fn emit_methods(c: &Contract) -> String {
     let mut out = String::new();
     for r in c.routes.iter().filter(|r| r.stream) {
