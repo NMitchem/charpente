@@ -72,10 +72,20 @@ export function describeInvoice(inv: InvoiceView): string[] {
   else if ("Ack" in inv.lastItem) parts.push(String(inv.lastItem.Ack));
 
   // `skip_serializing_if` makes `note` optional, so it can be absent.
+  //
+  // `units` does ARITHMETIC on `quantity`, and that is load-bearing rather
+  // than decorative. `String(item.quantity)` alone would compile for a
+  // string, a number, a bigint or a boolean — so a call site that only
+  // stringifies a numeric field does not depend on its numeric-ness, and a
+  // Rust `u32 -> String` change would regenerate cleanly and leave `tsc`
+  // green. `tsc` can only redden where a hand-written site DEPENDS on the
+  // shape that changed; this is the site that depends on this one.
+  let units = 0;
   for (const item of inv.lineItems) {
     if (item.note != null) parts.push(item.note);
-    parts.push(String(item.quantity));
+    units += item.quantity;
   }
+  parts.push(`${units} units`);
   // `Seq(Option(_))` is `(string | null)[]`, not `string | null[]`.
   for (const tag of inv.tags) if (tag !== null) parts.push(tag);
   // `Map` is a `Record`, keyed by string.
