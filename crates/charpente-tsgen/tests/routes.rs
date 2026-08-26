@@ -93,6 +93,21 @@ fn the_no_auto_resume_rule_is_in_the_thrown_errors_message_not_only_a_comment() 
         body.contains("super(") && body.contains("must not auto-resume"),
         "the rule must be inside the message the constructor builds: {body}"
     );
+    // Hard rule 5: the message must be true for EVERY path that raises it.
+    // `validate_subscribe` (charpente/src/kernel/mod.rs) answers 409 for a
+    // cursor below the retention floor — "events that old are gone" — as well
+    // as for the two divergence cases. The message used to assert "the history
+    // behind that cursor came from another primary" for all three, naming a
+    // cause that is false on the retention path (task 9a review, finding 3).
+    assert!(
+        body.contains("retention floor") && body.contains("divergence"),
+        "the 409 message must name both of its causes, not only divergence: {body}"
+    );
+    assert!(
+        !body.contains("the history behind that cursor came from another primary"),
+        "the message must not assert divergence unconditionally — the retention 409 \
+         is not divergence: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------

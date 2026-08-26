@@ -85,18 +85,21 @@ export type StreamEnd =
   | { kind: "closed" };
 
 /**
- * The server refused the cursor as cross-timeline: HTTP 409 (DESIGN §6). The
- * rule is in the message on purpose — it is what a developer reads at 3am.
+ * The server refused the cursor: HTTP 409 (DESIGN §6). TWO different causes
+ * raise this, and only the server's `detail` distinguishes them — the cursor
+ * is below this node's retention floor, or this node's history at that id is
+ * not the history the cursor came from. Both are in `validate_subscribe`.
+ * The rule is in the message on purpose — it is what a developer reads at 3am.
  */
 export class CursorDiverged extends Error {
   constructor(readonly detail: string) {
     super(
-      "cursor diverged: " + detail + " — a client must not auto-resume across a " +
-      "divergence: the history behind that cursor came from another primary, so " +
-      "resuming would deliver events from another timeline under ids this client " +
-      "has already used. That silent misattribution is what the cursor's seq half " +
-      "exists to prevent. Re-sync current state through reads, then reconnect " +
-      "without a cursor.",
+      "cursor refused: " + detail + " — a client must not auto-resume across this, " +
+      "whichever cause the server names above. Past a retention floor, resuming would " +
+      "deliver a history with a silent hole in it; past a divergence, it would deliver " +
+      "another timeline's events under ids this client has already used, which is the " +
+      "misattribution the cursor's seq half exists to detect. Re-sync current state " +
+      "through reads, then reconnect without a cursor.",
     );
   }
 }
@@ -104,7 +107,7 @@ export class CursorDiverged extends Error {
 /**
  * A subscribe the server rejected before any frame: 401 with no credential, or
  * 400 on a cursor it could not even parse. Distinct from `CursorDiverged`,
- * which is a parseable cursor from a history this node does not have.
+ * which is a parseable cursor this node cannot serve from.
  */
 export class StreamRejected extends Error {
   constructor(readonly status: number, readonly detail: string) {
