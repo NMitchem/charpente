@@ -52,7 +52,7 @@ export type Result<T, E> =
   | { ok: false; error: E };
 
 /**
- * Why a subscribed stream stopped.
+ * Why a subscribed stream stopped — the two ways the SERVER ends one.
  *
  * `gap` is DESIGN §6's terminal `charpente.gap` frame: the tail fell behind
  * retention, so events the server no longer holds were skipped. It is a
@@ -62,10 +62,15 @@ export type Result<T, E> =
  *
  * `closed` is the ordinary end of the response body.
  *
- * A REFUSED CURSOR is deliberately not a member here. It happens before any
- * frame arrives, so nothing has ended, and handling it in the same branch as a
- * normal end is the mistake; it is raised as `CursorDiverged` instead. Every
- * member of this union has a producer in `ApiBase.stream` below.
+ * The conditions THIS CLIENT raises are deliberately not members:
+ * `CursorDiverged` before a frame arrives, `UndeclaredEvent` arbitrarily far
+ * into a healthy stream. Handling a refusal in the same branch as a normal end
+ * is the mistake, and each carries a name and a fix no `kind` could. The
+ * consequence, stated because it is easy to get wrong: `onEnd` is NOT a
+ * cleanup hook. It fires only for the two members below, so teardown that must
+ * run on every exit belongs in `.finally()` on the promise `subscribe` returns,
+ * which those throws reject. Every member of this union has a producer in
+ * `ApiBase.stream` below.
  */
 export type StreamEnd =
   | { kind: "gap"; detail: string }
@@ -202,52 +207,63 @@ export class ApiBase {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";
-    for (;;) {
-      const chunk = await reader.read();
-      if (chunk.done) {
-        opts.onEnd({ kind: "closed" });
-        return;
-      }
-      buf += decoder.decode(chunk.value, { stream: true });
-      let idx: number;
-      while ((idx = buf.indexOf("\n\n")) >= 0) {
-        const frame = buf.slice(0, idx);
-        buf = buf.slice(idx + 2);
-        let name = "message";
-        let id = "";
-        let data: string | undefined;
-        for (const line of frame.split("\n")) {
-          // A line starting with ':' is an SSE comment. charpente sends `:hb`
-          // every 15s on an idle connection; reading it as a field would hand
-          // JSON.parse an empty string on every heartbeat.
-          if (line.startsWith(":")) continue;
-          if (line.startsWith("event:")) name = sseValue(line, 6);
-          else if (line.startsWith("id:")) id = sseValue(line, 3);
-          else if (line.startsWith("data:")) {
-            const v = sseValue(line, 5);
-            data = data === undefined ? v : data + "\n" + v;
-          }
-        }
-        // No data field at all (a lone comment, a keepalive): nothing to
-        // dispatch, and nothing has gone wrong.
-        if (data === undefined) continue;
-        if (name === "charpente.gap") {
-          opts.onEnd({ kind: "gap", detail: data });
+    // Every exit from the loop below cancels the reader: the `gap` return,
+    // an `UndeclaredEvent` throw, or a callback of the caller's that throws.
+    // charpente notices a gone client only when hyper drops the response body
+    // (serve.rs `sse_pump`), so a reader left locked and abandoned lets the
+    // kernel Tail outlive the client that stopped reading. `catch` because
+    // cancelling an already-errored body rejects, and that must not replace
+    // the reason we are leaving.
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) {
+          opts.onEnd({ kind: "closed" });
           return;
         }
-        const ev = { event: name, data: JSON.parse(data) as unknown };
-        // The declaration is checked before the cast, so `as Ev` narrows only
-        // the discriminant this client was generated for. The payload carries
-        // the same trust `request()` places in the server's JSON — that is a
-        // boundary no client can verify without a schema validator, and it is
-        // deliberately the SAME trust, not a wider one.
-        if (declared && !declared.includes(name)) {
-          if (!opts.onUnknown) throw new UndeclaredEvent(name);
-          opts.onUnknown(ev, id);
-          continue;
+        buf += decoder.decode(chunk.value, { stream: true });
+        let idx: number;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const frame = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          let name = "message";
+          let id = "";
+          let data: string | undefined;
+          for (const line of frame.split("\n")) {
+            // A line starting with ':' is an SSE comment. charpente sends `:hb`
+            // every 15s on an idle connection; reading it as a field would hand
+            // JSON.parse an empty string on every heartbeat.
+            if (line.startsWith(":")) continue;
+            if (line.startsWith("event:")) name = sseValue(line, 6);
+            else if (line.startsWith("id:")) id = sseValue(line, 3);
+            else if (line.startsWith("data:")) {
+              const v = sseValue(line, 5);
+              data = data === undefined ? v : data + "\n" + v;
+            }
+          }
+          // No data field at all (a lone comment, a keepalive): nothing to
+          // dispatch, and nothing has gone wrong.
+          if (data === undefined) continue;
+          if (name === "charpente.gap") {
+            opts.onEnd({ kind: "gap", detail: data });
+            return;
+          }
+          const ev = { event: name, data: JSON.parse(data) as unknown };
+          // The declaration is checked before the cast, so `as Ev` narrows only
+          // the discriminant this client was generated for. The payload carries
+          // the same trust `request()` places in the server's JSON — that is a
+          // boundary no client can verify without a schema validator, and it is
+          // deliberately the SAME trust, not a wider one.
+          if (declared && !declared.includes(name)) {
+            if (!opts.onUnknown) throw new UndeclaredEvent(name);
+            opts.onUnknown(ev, id);
+            continue;
+          }
+          opts.onEvent(ev as Ev, id);
         }
-        opts.onEvent(ev as Ev, id);
       }
+    } finally {
+      await reader.cancel().catch(() => {});
     }
   }
 }

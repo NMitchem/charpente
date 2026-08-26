@@ -260,6 +260,40 @@ fn an_undeclared_event_name_is_refused_by_name_rather_than_cast_into_the_union()
     );
 }
 
+/// Both early exits from the read loop — the terminal `charpente.gap` return
+/// and the `UndeclaredEvent` throw — walk away from a body the server may
+/// still be writing to. charpente notices a gone client only when hyper drops
+/// that body (`serve.rs` `sse_pump`), so a reader left locked lets the kernel
+/// `Tail` outlive the client that stopped reading.
+///
+/// The guarantee is structural, so the check is structural: this pins that
+/// both exits fall between the `try` and the `finally` that cancels, which is
+/// what the emitter can be held to. It does not execute the JavaScript.
+#[test]
+fn both_early_exits_sit_inside_the_try_whose_finally_cancels_the_reader() {
+    let ts = emit_client(&fixture_contract());
+    let at = |needle: &str| {
+        ts.find(needle)
+            .unwrap_or_else(|| panic!("the runtime must contain `{needle}`: {ts}"))
+    };
+    let reader = at("res.body.getReader()");
+    let try_ = at("\n    try {\n");
+    let gap = at(r#"opts.onEnd({ kind: "gap", detail: data });"#);
+    let throw = at("throw new UndeclaredEvent(name);");
+    let finally = at("\n    } finally {\n");
+    let cancel = at("await reader.cancel()");
+    assert!(
+        reader < try_ && try_ < gap && try_ < throw && gap < finally && throw < finally,
+        "both early exits must be inside the try: reader {reader}, try {try_}, gap {gap}, \
+         throw {throw}, finally {finally}: {ts}"
+    );
+    assert!(
+        finally < cancel,
+        "the cancel must be in the finally, not on one path: finally {finally}, \
+         cancel {cancel}: {ts}"
+    );
+}
+
 /// A stream route with a path param. Its params come first and `opts` last,
 /// and its path is substituted exactly as a request method's is: the two
 /// emitters share one `param_args`/`path_expr` pair precisely so they cannot
