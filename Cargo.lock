@@ -749,6 +749,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ts-fixture-app"
+version = "0.0.0"
+dependencies = [
+ "charpente",
+ "charpente-sim",
+ "serde_json",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

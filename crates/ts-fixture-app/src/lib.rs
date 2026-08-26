@@ -1,0 +1,284 @@
+//! The dogfood app for the TypeScript client (TS-codegen spec §5's
+//! "dogfood target"). Deliberately small in the spirit of
+//! `crates/sim-fixture` — it exists to be *described*, not to be an
+//! application.
+//!
+//! **What makes it worth a whole crate.** `crates/charpente-tsgen/tests/
+//! common/mod.rs` reaches every `TypeSchema` and `EnumRepr` shape, but it is
+//! a HAND-BUILT `Contract`: it proves things about the emitter and nothing
+//! about the path from Rust source to generated TypeScript. Its own doc
+//! comment names this fixture as the oracle that closes that gap. So every
+//! shape it hand-builds is reached HERE through the real macros —
+//! `#[table]`, `#[route]`, `#[event]`, `#[derive(Wire)]` — and the client
+//! generated from the result is type-checked by `tsc` against real call
+//! sites (`ts-fixture/src/calls.ts`).
+//!
+//! The handlers are stubs on purpose. Nothing here is executed by a request
+//! in anger; `charpente describe` walks the registry, and the drift probe
+//! (`tests/drift.rs`) runs only the subscribe glue. Bodies that did real
+//! work would be surface with no oracle attached.
+//!
+//! Every derive reaches serde through the `::charpente::serde` re-export, so
+//! this crate has no direct `serde` dependency and pins macro-path expansion
+//! the way `crates/sim-fixture` does.
+
+pub mod samples;
+
+use std::collections::BTreeMap;
+
+use charpente::core::io::{Disk, Entropy};
+use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, Subscription};
+use charpente::serde::{Deserialize, Serialize};
+use charpente::wire::{WireI64, WireU64};
+use charpente::{Id, Schema, Tx, View, Wire as WireDerive, event, route, routes};
+use charpente::{events as events_macro, table};
+
+// ------------------------------------------------------------------ tables
+//
+// Three, for three different reasons: `Customer` and `Invoice` give the
+// generated client two DIFFERENT branded id types, which is what makes
+// `ts-fixture/src/negatives.ts` a real assertion rather than a comment; and
+// `Widget`'s id is reachable ONLY through a route param, never through a
+// registered wire type, which is the case `emit_types` had to grow a second
+// collection loop for (types.rs, review round 1 Important 6).
+
+#[table]
+pub struct Customer {
+    pub id: Id<Customer>,
+    pub name: String,
+}
+
+#[table]
+pub struct Invoice {
+    pub id: Id<Invoice>,
+    pub customer: Id<Customer>,
+}
+
+#[table]
+pub struct Widget {
+    pub id: Id<Widget>,
+    pub hits: u64,
+}
+
+// ------------------------------------------------------------- wire types
+
+/// A request body: `rename_all = "camelCase"` so the wire names differ from
+/// the Rust names, which is what makes the serde-fidelity literal in
+/// `ts-fixture/src/generated/samples.ts` a check rather than a tautology.
+#[derive(WireDerive, Serialize, Deserialize)]
+#[serde(crate = "::charpente::serde")]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCustomerBody {
+    pub display_name: String,
+    pub email_address: Option<String>,
+}
+
+#[derive(WireDerive, Serialize, Deserialize)]
+#[serde(crate = "::charpente::serde")]
+#[serde(rename_all = "camelCase")]
+pub struct CustomerView {
+    pub id: Id<Customer>,
+    pub display_name: String,
+    pub email_address: Option<String>,
+    pub status: Status,
+}
+
+/// Every variant is a unit variant: `EnumRepr::Unit`, a TypeScript string
+/// union.
+#[derive(WireDerive, Serialize, Deserialize)]
+#[serde(crate = "::charpente::serde")]
+#[serde(rename_all = "kebab-case")]
+pub enum Status {
+    Active,
+    OnHold,
+}
+
+/// `skip_serializing_if` is the one thing that makes a field OPTIONAL in the
+/// schema (`Field.optional`), which is a different TypeScript rendering
+/// (`note?:`) from a plain `Option` (`| null`) — both appear here.
+#[derive(WireDerive, Serialize, Deserialize)]
+#[serde(crate = "::charpente::serde")]
+#[serde(rename_all = "camelCase")]
+pub struct LineItem {
+    pub unit_amount_cents: WireI64,
+    pub quantity: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// The wide one. Every remaining `TypeSchema` leaf is here so the generated
+/// client has to render each of them, and so `samples.ts` puts serde's real
+/// document for each of them in front of `tsc`.
+#[derive(WireDerive, Serialize)]
+#[serde(crate = "::charpente::serde")]
+#[serde(rename_all = "camelCase")]
+pub struct InvoiceView {
+    pub id: Id<Invoice>,
+    pub customer: Id<Customer>,
+    /// `Int64 { signed: true }` — a decimal string on the wire.
+    pub total_cents: WireI64,
+    /// `Int64 { signed: false }`.
+    pub sequence: WireU64,
+    /// `Seq(Ref)`.
+    pub line_items: Vec<LineItem>,
+    /// `Seq(Option(_))` — `[]` binds tighter than `|` in TypeScript, so this
+    /// is the shape that must render as `(string | null)[]`.
+    pub tags: Vec<Option<String>>,
+    /// `Map` — `BTreeMap` only; `HashMap` has no `Wire` impl on purpose.
+    pub labels: BTreeMap<String, String>,
+    pub paid: bool,
+    pub ratio: f64,
+    pub ratio32: f32,
+    pub tiny: i8,
+    pub small: i16,
+    pub medium: i32,
+    pub ubyte: u8,
+    pub ushort: u16,
+    pub payment: Payment,
+    pub notice: Notification,
+    pub last_item: FeedItem,
+}
+
+/// serde's externally-tagged default, reaching all four representable
+/// variant shapes: a unit variant (the bare JSON string `"Ping"`), a newtype
+/// variant over a primitive, a braced variant, and a BRACED-EMPTY variant —
+/// `{"in-progress":{}}`, a genuinely different document from the unit case
+/// (`EnumRepr::External`'s doc comment) — under a kebab-case name, which is
+/// not a legal TypeScript object key unquoted.
+#[derive(WireDerive, Serialize)]
+#[serde(crate = "::charpente::serde")]
+pub enum FeedItem {
+    Ping,
+    Ack(u32),
+    Message {
+        body: String,
+    },
+    #[serde(rename = "in-progress")]
+    InProgress {},
+}
+
+/// `#[serde(tag = "...")]`: the variant name merges into the payload object.
+#[derive(WireDerive, Serialize)]
+#[serde(crate = "::charpente::serde")]
+#[serde(tag = "type")]
+pub enum Payment {
+    Cash,
+    Card {
+        #[serde(rename = "card-number")]
+        card_number: String,
+    },
+}
+
+/// `#[serde(tag = "...", content = "...")]`, with a kebab-case tag key — an
+/// arbitrary string literal is legal there, so this needs no `rename_all` to
+/// reach the quoting path.
+#[derive(WireDerive, Serialize)]
+#[serde(crate = "::charpente::serde")]
+#[serde(tag = "kind-of", content = "payload")]
+pub enum Notification {
+    Started,
+    Progress { percent: u32 },
+}
+
+// ------------------------------------------------------------------ events
+
+#[event]
+pub struct InvoicePaid {
+    pub invoice: Id<Invoice>,
+    /// `WireU64`, not a bare `u64`: an event payload IS the JSON a
+    /// subscriber receives, so a 64-bit integer crosses as a string here for
+    /// the same reason it does in a route type.
+    pub amount_cents: WireU64,
+}
+
+#[event]
+pub struct InvoiceVoided {
+    pub invoice: Id<Invoice>,
+}
+
+// ------------------------------------------------------------------ routes
+
+#[route(POST "/customers/:id", auth)]
+pub fn create_customer(
+    tx: &mut Tx,
+    id: Id<Customer>,
+    body: CreateCustomerBody,
+) -> Result<CustomerView, ApiError> {
+    let row = Customer {
+        id,
+        name: body.display_name,
+    };
+    tx.put(&row);
+    Ok(CustomerView {
+        id: row.id,
+        display_name: row.name,
+        email_address: body.email_address,
+        status: Status::Active,
+    })
+}
+
+#[route(GET "/invoices/:id")]
+pub fn get_invoice(tx: &mut Tx, id: Id<Invoice>) -> Result<InvoiceView, ApiError> {
+    let inv = tx.get(id)?.ok_or(ApiError::NotFound)?;
+    Ok(samples::invoice_view(inv.id, inv.customer))
+}
+
+#[route(GET "/invoices")]
+pub fn list_invoices(tx: &mut Tx) -> Result<Vec<InvoiceView>, ApiError> {
+    Ok(tx
+        .scan::<Invoice>()?
+        .into_iter()
+        .map(|inv| samples::invoice_view(inv.id, inv.customer))
+        .collect())
+}
+
+/// `-> Result<(), ApiError>`: the response schema is `Null`, the JSON
+/// literal `null`, which is a different document from `{}`. Also the one
+/// route whose `Id<Widget>` never appears in any registered wire type.
+#[route(DELETE "/widgets/:id")]
+pub fn delete_widget(tx: &mut Tx, id: Id<Widget>) -> Result<(), ApiError> {
+    let _ = (tx, id);
+    Ok(())
+}
+
+/// The declared stream: `emits(...)` names both payloads, so the generated
+/// client gets a `FeedEvent` union discriminated by the frame's `event:`
+/// name. `tests/drift.rs` checks the declaration against what the
+/// `Subscription` below actually subscribes to.
+#[route(SSE "/feed", auth, emits(InvoicePaid, InvoiceVoided))]
+pub fn feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<InvoicePaid>()
+        .and::<InvoiceVoided>()
+        .cursor(cursor))
+}
+
+/// A stream route that has NOT adopted `emits(...)`. Legal — the declaration
+/// is optional — and the contract genuinely does not know what it carries,
+/// so the generated client types it as the honest `UnknownEvent` rather than
+/// inventing a union. Kept precisely so that branch has a real app behind it.
+#[route(SSE "/raw-feed")]
+pub fn raw_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<InvoicePaid>().cursor(cursor))
+}
+
+pub fn schema() -> Schema {
+    Schema::new()
+        .table::<Customer>()
+        .table::<Invoice>()
+        .table::<Widget>()
+}
+
+pub fn build_app(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> std::io::Result<App> {
+    Ok(App::open(disk, schema(), entropy, AppConfig::default())?
+        .mount(routes![
+            create_customer,
+            get_invoice,
+            list_invoices,
+            delete_widget,
+            feed,
+            raw_feed,
+        ])
+        .mount_events(events_macro![InvoicePaid, InvoiceVoided]))
+}
