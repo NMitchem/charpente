@@ -2794,3 +2794,83 @@ fn a_generation_snapshotted_before_any_segment_seals_starts_at_the_logs_base() {
         after.segments
     );
 }
+
+/// RULING 53's boundary, and the ONLY input on which `chain_start`'s
+/// `frontier + 1` and `frontier` differ: a frontier landing exactly on a
+/// sealed segment's `layout_end`. `Manifest::applied_seq` is inclusive, so
+/// that segment holds nothing the snapshot does not already carry and the
+/// chain must start at the next one. Off by one and it ships that segment
+/// again and holds its WAL — ruling 53's defect in miniature.
+///
+/// Every other frontier in this file falls strictly inside a segment or
+/// above every segment, where the two derivations agree, so without this
+/// test `let target = frontier.saturating_add(1)` can be changed to
+/// `let target = frontier` with the whole file still green. `chain_start`'s
+/// two construction asserts do not close that gap: both are written in
+/// terms of the same `target`, so both stay satisfied by the wrong answer.
+#[test]
+fn a_frontier_on_a_segment_boundary_starts_the_chain_at_the_segment_above_it() {
+    let sim = Sim::with_faults(0x6172_6368_5f74_3504, FaultConfig::none());
+    let mut db_cfg = DbConfig::default();
+    db_cfg.wal.segment_bytes = 64 << 10;
+    let mut db = Db::open(Box::new(sim.disk()), db_cfg, Schema::new().table::<Rec>()).unwrap();
+    // Every segment stays on disk, so a chain reaching below the frontier is
+    // observable rather than already reclaimed.
+    db.add_retention_pin(Box::new(|| 0));
+    write_records(&mut db, 5 * RECORDS_PER_SEGMENT);
+    assert_eq!(db.log_base(), 0, "the second pin must hold the whole log");
+
+    // Arithmetic from the two measured constants, not read back out of
+    // `Db::sealed_segments` (ruling 24): the inclusive last seq of the
+    // second sealed segment.
+    let frontier = FIRST_SEGMENT_RECORDS + RECORDS_PER_SEGMENT - 1;
+    let sealed = db.sealed_segments().unwrap();
+    assert!(
+        sealed.iter().any(|s| s.layout_end == frontier),
+        "the frontier {frontier} must land EXACTLY on a sealed segment's layout_end, or this \
+         test does not distinguish `frontier` from `frontier + 1` at all: {sealed:?}"
+    );
+    assert!(
+        sealed.iter().any(|s| s.base_seq > frontier),
+        "a segment must seal ABOVE the frontier or the chain is empty and everything below \
+         is vacuous: {sealed:?}"
+    );
+
+    let store = SimObjectStore::new();
+    write_own_manifest(&store, &db, 0, frontier);
+    let mut arc = Archive::open(archive_config(0, 8 << 20), &mut db).unwrap();
+    step_until_idle(&mut arc, &db, &store);
+
+    let m = read_manifest(&store).expect("a manifest");
+    assert_eq!(
+        (m.generation, m.applied_seq),
+        (0, frontier),
+        "the archive did not resume the generation the bucket named, so nothing below is \
+         about the boundary: {m:?}"
+    );
+    assert!(
+        !m.segments.is_empty(),
+        "the resumed generation shipped no chain at all, so 'it started above the boundary' \
+         is vacuous: {m:?}"
+    );
+    for s in &m.segments {
+        assert!(
+            s.end_seq > m.applied_seq,
+            "the chain ships segment [{}, {}], which ends at or below the generation's \
+             frontier {}: every record in it is already in the snapshot, so the chain starts \
+             one segment too low — `chain_start` must derive from `frontier + 1`, the first \
+             record the snapshot does NOT carry, not from the frontier itself",
+            s.base_seq,
+            s.end_seq,
+            m.applied_seq
+        );
+    }
+    assert_eq!(
+        m.segments[0].base_seq,
+        frontier + 1,
+        "the frontier is a segment's inclusive last seq, so the next seq is the next \
+         segment's base and the chain starts there — neither below it (the overlap ruling 53 \
+         removes) nor above it (a hole): {:?}",
+        m.segments
+    );
+}

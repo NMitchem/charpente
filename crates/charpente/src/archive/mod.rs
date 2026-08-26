@@ -465,6 +465,13 @@ fn put_step(
 /// replays from. What ruling 53 removes is the UNBOUNDED part: every segment
 /// lying wholly below `F`, which is the whole log at a fresh generation.
 fn chain_start(db: &Db, frontier: u64) -> io::Result<u64> {
+    // `F + 1`, never `F`: `applied_seq` is INCLUSIVE, so a frontier landing
+    // exactly on a `layout_end` belongs wholly to the snapshot and the chain
+    // starts at the NEXT segment. Neither assert below catches getting this
+    // wrong — both are written in terms of `target`, so both stay satisfied
+    // by the shifted answer — and every other frontier in the test file
+    // falls strictly inside a segment, where the two agree. The oracle is
+    // `a_frontier_on_a_segment_boundary_starts_the_chain_at_the_segment_above_it`.
     let target = frontier.saturating_add(1);
     let sealed = db.sealed_segments()?;
     let start = match sealed.iter().find(|s| target <= s.layout_end) {
