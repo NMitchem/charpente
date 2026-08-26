@@ -239,9 +239,24 @@ fn an_undeclared_event_name_is_refused_by_name_rather_than_cast_into_the_union()
         ts.contains("export class UndeclaredEvent extends Error"),
         "the refusal must be a named condition: {ts}"
     );
+    // ORDER, not presence: two `contains` calls joined by `&&` are green with
+    // the guard sitting BELOW the cast, which is exactly the regression this
+    // commit exists to prevent. Positions are compared, and each anchor is
+    // `expect`ed so a missing one fails by name instead of making `None` sort
+    // first and pass.
+    let guard = ts
+        .find("declared.includes(name)")
+        .expect("the runtime must check the declared list");
+    let refusal = ts
+        .find("throw new UndeclaredEvent(name)")
+        .expect("an undeclared name must be refused by name");
+    let cast = ts
+        .find("opts.onEvent(ev as Ev")
+        .expect("declared frames must reach onEvent through the union cast");
     assert!(
-        ts.contains("declared.includes(name)") && ts.contains("throw new UndeclaredEvent(name)"),
-        "the discriminant must be checked before the cast: {ts}"
+        guard < cast && refusal < cast,
+        "the discriminant must be checked BEFORE the cast, but the guard is at byte {guard}, \
+         the refusal at {refusal}, and `as Ev` at {cast}: {ts}"
     );
 }
 
