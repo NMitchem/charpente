@@ -6,14 +6,17 @@
 //! it has nothing to assemble from — which also makes this half of the output
 //! byte-identical by construction (spec §4).
 
-/// Reserved TypeScript names this text declares at module scope. `lib.rs`
+/// Every name the generated file occupies at module scope: the ones this text
+/// declares, plus `Api`, the class `emit_client` writes itself. `lib.rs`
 /// refuses a contract that would redeclare any of them, because two
 /// `export type Result` in one file is a `tsc` "Duplicate identifier" landing
 /// in an app author's build, pointing at generated code they did not write.
 ///
-/// Sorted, and kept in sync by `RUNTIME_DECLARES_EXACTLY_THE_RESERVED_NAMES`
+/// Sorted, and kept in sync by `runtime_declares_exactly_the_reserved_names`
 /// in `lib.rs` — a name added to the TypeScript below without being added
-/// here would go unprotected.
+/// here would go unprotected. `sseValue` is not exported and is still listed:
+/// module scope is module scope, and a wire type of that name would collide
+/// with it exactly as loudly.
 pub const RESERVED: &[&str] = &[
     "Api",
     "ApiBase",
@@ -23,6 +26,7 @@ pub const RESERVED: &[&str] = &[
     "StreamRejected",
     "SubscribeOptions",
     "UnknownEvent",
+    "sseValue",
 ];
 
 /// Members `ApiBase` defines. A route whose generated method name matched one
