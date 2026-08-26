@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use charpente::event;
 use charpente::http::{
-    ApiError, App, AppConfig, Ctx, Cursor, Method, Request, Route, RouteDef, RouteGlue, SubEntry,
-    Subscription,
+    ApiError, App, AppConfig, Ctx, Cursor, EmittedEvent, Method, Request, Route, RouteDef,
+    RouteGlue, SubEntry, Subscription,
 };
 use charpente::kernel::{Kernel, RecordedResponses, SimSinkHandle, SimSource, SinkHandles, Step};
 use charpente::repl::protocol::{Msg, decode, encode};
@@ -2324,12 +2324,16 @@ fn follower_ids_match_a_batched_primarys() {
 fn every_stream_routes_declared_emits_matches_its_subscription() {
     let sim = Sim::with_faults(0x2EB7_0007, FaultConfig::none());
     let mut app = realtime_app(&sim).expect("the realtime fixture app must open");
+    // Ruling 46: `emits` elements now carry (event name, payload name). The
+    // oracle compares the event half — the only half a `Subscription` holds
+    // — and the payload half rides along in `declared_pairs` below, so
+    // widening the type did not quietly drop it from this file's coverage.
     let declared: Vec<(&'static str, Vec<&'static str>)> = app
         .describe()
         .routes
         .iter()
         .filter(|r| r.stream)
-        .map(|r| (r.name, r.emits.clone()))
+        .map(|r| (r.name, r.emits.iter().map(|e| e.event).collect()))
         .collect();
     // The floor for the loop below (an empty one would pass vacuously), and
     // the pin on registration order, which is the contract's route order.
@@ -2352,12 +2356,12 @@ fn every_stream_routes_declared_emits_matches_its_subscription() {
     }
     for seed in 0..3u64 {
         let (path, names, _) = mode_for(seed);
-        let emits = app
+        let emits: Vec<&str> = app
             .describe()
             .routes
             .iter()
             .find(|r| r.pattern == path)
-            .map(|r| r.emits.clone())
+            .map(|r| r.emits.iter().map(|e| e.event).collect())
             .expect("mode_for names a mounted route");
         assert_eq!(
             emits,
@@ -2365,4 +2369,56 @@ fn every_stream_routes_declared_emits_matches_its_subscription() {
             "mode_for(\"{path}\") and that route's emits(...) must name the same events"
         );
     }
+
+    // The payload half of the pair (ruling 46), which the loops above do not
+    // touch: `Ping`/`Pong` are the `Wire::WIRE_NAME`s a generated TypeScript
+    // union writes, and they must line up with the event names one-for-one
+    // in declaration order. Both names come off the same type in the macro,
+    // so a mismatch here means the pairing itself broke — the one failure
+    // the projected-to-`event` comparisons above are blind to.
+    let declared_pairs: Vec<(&'static str, Vec<EmittedEvent>)> = app
+        .describe()
+        .routes
+        .iter()
+        .filter(|r| r.stream)
+        .map(|r| (r.name, r.emits.clone()))
+        .collect();
+    assert_eq!(
+        declared_pairs,
+        vec![
+            (
+                "feed_both",
+                vec![
+                    EmittedEvent {
+                        event: "ping",
+                        payload: "Ping"
+                    },
+                    EmittedEvent {
+                        event: "pong",
+                        payload: "Pong"
+                    },
+                ]
+            ),
+            (
+                "feed_ping",
+                vec![EmittedEvent {
+                    event: "ping",
+                    payload: "Ping"
+                }]
+            ),
+            (
+                "feed_keyed",
+                vec![
+                    EmittedEvent {
+                        event: "ping",
+                        payload: "Ping"
+                    },
+                    EmittedEvent {
+                        event: "pong",
+                        payload: "Pong"
+                    },
+                ]
+            ),
+        ]
+    );
 }

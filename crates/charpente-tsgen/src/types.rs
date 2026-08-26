@@ -126,7 +126,7 @@ fn collect_id_tables(s: &TypeSchema, acc: &mut BTreeSet<&'static str>) {
 /// key (an interface field, an internally-tagged variant's merged fields,
 /// an externally/adjacently-tagged variant name, a `tag`/`content` key
 /// itself) must go through this, not just the one site round 1 flagged.
-fn key(name: &str) -> String {
+pub(crate) fn key(name: &str) -> String {
     let is_ident = !name.is_empty()
         && name
             .chars()
@@ -306,7 +306,7 @@ fn emit_def(out: &mut String, name: &str, schema: &TypeSchema) {
 /// `ctx` names WHERE `s` came from (a field, a variant payload, a type
 /// alias) purely for the `unreachable!` message below — review round 1,
 /// Minor 9: the escape hatch should name the site, not just the contract.
-fn ts_type(s: &TypeSchema, ctx: &str) -> String {
+pub(crate) fn ts_type(s: &TypeSchema, ctx: &str) -> String {
     match s {
         TypeSchema::Bool => "boolean".into(),
         TypeSchema::I8

@@ -598,10 +598,25 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
     // wrong the same way. Naming the const also means `emits(NotAnEvent)`
     // fails with an unsatisfied `Event` bound naming the type, instead of
     // baking a wrong string into the contract.
+    //
+    // `<Ev as Wire>::WIRE_NAME` rides along for the same reason (ruling 46):
+    // the SSE `event:` field carries the first name and a generated
+    // TypeScript union names the second, and NEITHER is recoverable from the
+    // other (`#[event]`'s acronym rule maps `HTTPServer` to `http_server`).
+    // Both are one token apart here, where both are already in hand; a
+    // downstream conversion would be the second copy of the rule this
+    // comment refuses.
     let emit_names: Vec<TokenStream> = args
         .emits
         .iter()
-        .map(|i| quote! { <#i as ::charpente::core::db::Event>::NAME })
+        .map(|i| {
+            quote! {
+                ::charpente::http::EmittedEvent {
+                    event: <#i as ::charpente::core::db::Event>::NAME,
+                    payload: <#i as ::charpente::wire::Wire>::WIRE_NAME,
+                }
+            }
+        })
         .collect();
     // The declared payloads join the route's own type closure. `describe()`
     // also registers every MOUNTED event's payload, so a declared-and-

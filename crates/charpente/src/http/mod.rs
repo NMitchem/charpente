@@ -9,7 +9,7 @@ mod app;
 mod router;
 
 pub use app::{App, AppConfig, Ctx, Handled, Session, StagedDispatch};
-pub use router::{Glue, Route, RouteDef, RouteGlue, RouteMatch, Router, SubGlue};
+pub use router::{EmittedEvent, Glue, Route, RouteDef, RouteGlue, RouteMatch, Router, SubGlue};
 
 /// Not public API: the kernel's batched commit-failure tail needs the exact
 /// 500 the single-request path produces (group-commit T6).

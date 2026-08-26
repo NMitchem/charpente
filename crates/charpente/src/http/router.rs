@@ -55,11 +55,33 @@ pub struct Route {
     /// is never mounted (task 7).
     pub register_types: fn(&mut crate::wire::TypeRegistry),
     /// Event types a stream route declares via `#[route(SSE …, emits(Ev, …))]`,
-    /// in declaration order, each one's `Event::NAME` (the name an SSE frame
-    /// carries) — NOT its `Wire::WIRE_NAME`, so these are not themselves keys
-    /// into `Contract.types`. Empty for non-stream routes, and for a stream
+    /// in declaration order. Empty for non-stream routes, and for a stream
     /// route that has not adopted the declaration.
-    pub emits: &'static [&'static str],
+    pub emits: &'static [EmittedEvent],
+}
+
+/// One event a stream route declares with `emits(Ev, …)`, carrying BOTH names
+/// the declaration produces — because the two consumers need different ones
+/// and NEITHER can be computed from the other (ruling 46).
+///
+/// - `event` is `<Ev as Event>::NAME`, the snake_case name an SSE frame's
+///   `event:` field carries and the one the drift oracle
+///   (`App::subscription_event_names`) compares against.
+/// - `payload` is `<Ev as Wire>::WIRE_NAME`, the payload type's key into
+///   `Contract.types` and the name a generated TypeScript union writes.
+///
+/// Deriving one from the other is refused: `#[event]`'s acronym rule maps
+/// `HTTPServer` to `http_server`, so snake_case -> PascalCase is not a
+/// function, and a second case-conversion implementation would be a drift
+/// source living inside the thing that detects drift. Both are read off the
+/// type at expansion time instead, where both are already in hand.
+///
+/// A named two-field struct rather than a tuple so call sites read
+/// `e.event`/`e.payload`; still const-constructible, which `Route` requires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct EmittedEvent {
+    pub event: &'static str,
+    pub payload: &'static str,
 }
 
 /// Implemented by the marker struct `#[route]` emits next to each handler,

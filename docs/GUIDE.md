@@ -3103,10 +3103,15 @@ attribute instead:
 
 The names inside `emits(...)` are the `#[event]` TYPES, exactly like `Subscription::of`
 — a typo is a compile error, and a type that isn't an `#[event]` fails with an
-unsatisfied `Event` bound naming it. The contract records each one's `Event::NAME`, so
-`Ping` shows up as `"ping"` in `RouteInfo.emits` without you repeating the snake_case
-rule anywhere. Their payload types join `Contract.types` too, so a client can resolve
-the union even in an app that never calls `mount_events`.
+unsatisfied `Event` bound naming it. The contract records BOTH names each type has, so
+`Ping` shows up in `RouteInfo.emits` as
+`EmittedEvent { event: "ping", payload: "Ping" }` (`charpente::http::EmittedEvent`)
+without you repeating the snake_case rule anywhere. `event` is the `Event::NAME` an SSE
+frame's `event:` field carries; `payload` is the `Wire::WIRE_NAME` a generated client's
+union member uses. Both are recorded because neither derives from the other —
+`#[event]`'s acronym rule maps `HTTPServer` to `http_server`, and nothing inverts that.
+Their payload types join `Contract.types` too, so a client can resolve the union even in
+an app that never calls `mount_events`.
 
 Three things it deliberately is not:
 
@@ -3131,8 +3136,11 @@ a transaction group:
 ```rust,ignore
 let mut app = build_app(&sim)?;                 // &mut — the probe runs the handler
 let feed = app.describe().routes.iter().find(|r| r.name == "feed").unwrap().emits.clone();
+// A `Subscription` holds `Event::NAME`s and nothing else, so the `event` half is
+// the half this compares; the `payload` half is pinned by your contract golden.
+let declared: Vec<&str> = feed.iter().map(|e| e.event).collect();
 let actual = app.subscription_event_names("feed").unwrap();
-assert_eq!(feed, actual);
+assert_eq!(declared, actual);
 ```
 
 Order counts — the declaration's order is the contract's order — so write `emits(...)`

@@ -986,8 +986,13 @@ slot.
   carries — `#[route(SSE "/path", emits(InvoicePaid, InvoiceVoided))]` — which is what
   lets a generated client type `subscribe()` as a discriminated union of exactly those
   payloads instead of "anything". The declaration names Rust types, and the contract
-  records `<Ev as Event>::NAME` for each, so the name has one source rather than a copy
-  of `#[event]`'s snake_case rule. The declaration is optional (an undeclared stream
+  records BOTH names each type has — `<Ev as Event>::NAME` (snake_case, what an SSE
+  frame's `event:` field carries) and `<Ev as Wire>::WIRE_NAME` (the payload type's key
+  into `Contract.types`, and the member a generated union writes) — so each name has one
+  source rather than a copy of `#[event]`'s snake_case rule. Both are carried instead of
+  one being derived from the other because that derivation does not exist: `#[event]`'s
+  acronym rule maps `HTTPServer` to `http_server`, and nothing inverts it. The
+  declaration is optional (an undeclared stream
   route simply carries an empty `emits`) and it is not a filter: nothing enforces it at
   delivery, because delivery is still the encoder each `Subscription::of::<Ev>()`
   captured. What holds the two together is an ORACLE, not a rule — a declaration nothing
@@ -1036,9 +1041,10 @@ Charpente treats the coding agent as the primary developer persona:
   work: `params` — each path param's name and wire schema (`ParamInfo { name,
   schema: TypeSchema }`); `request` — the JSON body's schema, `None` for a bodyless route;
   `response` and `error` — the success and `ApiError` schemas every handler's `Result<T,
-  ApiError>` carries; and `emits` — the event names a stream route declares via
-  `#[route(SSE …, emits(Ev, …))]`, empty on every non-stream route and on a stream route
-  that has not adopted the declaration**), **`events` — every `#[event]` type
+  ApiError>` carries; and `emits` — the events a stream route declares via
+  `#[route(SSE …, emits(Ev, …))]`, each an `EmittedEvent { event, payload }` holding the
+  SSE frame's name and the payload type's name, empty on every non-stream route and on a
+  stream route that has not adopted the declaration**), **`events` — every `#[event]` type
   registered with `mount_events(events![…])` as `EventInfo { name, payload, keyed }`,
   sorted by event name (`keyed` is always `false`: `emit` vs `emit_keyed` is a call-site
   choice, so nothing static can know it)**, jobs (name, retry policy), cron
@@ -1061,8 +1067,8 @@ Charpente treats the coding agent as the primary developer persona:
   job/event/schema-version tables, the session-sweep job and its cron entry) apart from
   the app's, keyed on each row's own `TABLE`/`NAME` const rather than a typed-in string
   list. `to_json`/`to_human` render it as pretty JSON or fixed-width text (`to_human`'s
-  route line renders `params`/`request`/`response`/`error`/`emits` too, via `Debug`, and
-  it has an `events:` section of its own).
+  route line renders `params`/`request`/`response`/`error` too, via `Debug`, and `emits`
+  as `event->payload` pairs, and it has an `events:` section of its own).
   Two entry points ship it:
   `charpente::launch(addr, data_dir, build)` is the standard app `fn main` — argv
   dispatch owned by the platform instead of hand-rolled per app, so `describe` is free
@@ -1081,12 +1087,18 @@ Charpente treats the coding agent as the primary developer persona:
   `Subscription::of::<Ev>()` run inside handler bodies, not anywhere an app-wide walk can
   observe (ruling 6, sub-project 6 spec). The BINDING between a stream route and the
   events it carries is therefore DECLARED rather than discovered: `emits(Ev, …)` on the
-  route fills `RouteInfo.emits: Vec<&'static str>`, and the drift between that
-  declaration and the handler's own `Subscription` is caught by an oracle
-  (`App::subscription_event_names`, §6), not by a rule the platform could enforce at
-  delivery. An undeclared stream route still reports `stream: true` with an empty
-  `emits` — reading its handler is how you find out which of the app's events it
-  delivers.
+  route fills `RouteInfo.emits: Vec<EmittedEvent>`, each element pairing the
+  `Event::NAME` an SSE frame carries with the `Wire::WIRE_NAME` of its payload. The pair
+  exists because the two consumers need different names and neither is computable from
+  the other — `#[event]`'s acronym rule maps `HTTPServer` to `http_server`, so
+  snake_case -> PascalCase is not a function — and both are read off the type at
+  expansion time, where both are in hand. The drift between that declaration and the
+  handler's own `Subscription` is caught by an oracle
+  (`App::subscription_event_names`, §6) comparing the `event` half, which is the only
+  half a `Subscription` holds; the `payload` half is pinned by the contract goldens. It
+  is an oracle, not a rule the platform could enforce at delivery. An undeclared stream
+  route still reports `stream: true` with an empty `emits` — reading its handler is how
+  you find out which of the app's events it delivers.
 - **Errors are prompts.** Compile-time and sim-failure output is structured for machine
   consumption: the exact contract violated, the file/line, the seed and fault schedule for
   sim failures, and the minimal repro command. Error quality is a feature with a test suite.

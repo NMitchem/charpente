@@ -22,7 +22,7 @@ use charpente_core::table::Row;
 
 use crate::auth::sweep::SESSION_SWEEP_NAME;
 use crate::auth::{ApiKey, SessionSweep};
-use crate::http::{App, Route, RouteGlue, Session};
+use crate::http::{App, EmittedEvent, Route, RouteGlue, Session};
 use crate::kernel::JobDef;
 use crate::kernel::cron::{CronEntry, CronRow};
 use crate::wire::{TypeDef, TypeRegistry, TypeSchema};
@@ -81,11 +81,12 @@ pub struct RouteInfo {
     pub response: TypeSchema,
     pub error: TypeSchema,
     /// Event types a stream route declares via `#[route(SSE …, emits(Ev, …))]`,
-    /// in declaration order, each one's `Event::NAME` (the name an SSE frame
-    /// carries) — NOT its `Wire::WIRE_NAME`, so these are not themselves keys
-    /// into `Contract.types`. Empty for non-stream routes, and for a stream
-    /// route that has not adopted the declaration.
-    pub emits: Vec<&'static str>,
+    /// in declaration order. Each element carries BOTH names — the
+    /// `Event::NAME` an SSE frame's `event:` field uses, and the payload's
+    /// `Wire::WIRE_NAME`, which IS a key into `Contract.types` (see
+    /// `EmittedEvent`). Empty for non-stream routes, and for a stream route
+    /// that has not adopted the declaration.
+    pub emits: Vec<EmittedEvent>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -371,10 +372,22 @@ pub fn to_human(c: &Contract) -> String {
         // every named type's full expansion inline per-route would work
         // against this format's "boring, fixed-width" design intent for an
         // app with many routes/types.
+        //
+        // `emits` is the one field that does NOT use `Debug`: ruling 46 made
+        // its element a two-field struct, and `[EmittedEvent { event:
+        // "widget_added", payload: "WidgetAdded" }, …]` buries both names in
+        // boilerplate. `event->payload` shows the same two facts, in the same
+        // order, in a fraction of the width.
+        let emits = r
+            .emits
+            .iter()
+            .map(|e| format!("{}->{}", e.event, e.payload))
+            .collect::<Vec<_>>()
+            .join(", ");
         writeln!(
             out,
-            "    params={:?} request={:?} response={:?} error={:?} emits={:?}",
-            r.params, r.request, r.response, r.error, r.emits
+            "    params={:?} request={:?} response={:?} error={:?} emits=[{emits}]",
+            r.params, r.request, r.response, r.error
         )
         .unwrap();
     }

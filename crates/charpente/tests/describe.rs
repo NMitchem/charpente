@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use charpente::describe::ParamInfo;
-use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, Subscription};
+use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, EmittedEvent, Subscription};
 use charpente::kernel::JobError;
 use charpente::wire::{TypeSchema, WireU64};
 use charpente::{Schema, Tx, View, Wire, event, events, job, jobs, route, routes, table};
@@ -305,8 +305,14 @@ const GOLDEN: &str = r#"{
         "Ref": "ApiError"
       },
       "emits": [
-        "widget_added",
-        "widget_removed"
+        {
+          "event": "widget_added",
+          "payload": "WidgetAdded"
+        },
+        {
+          "event": "widget_removed",
+          "payload": "WidgetRemoved"
+        }
       ]
     }
   ],
@@ -829,7 +835,22 @@ fn a_stream_route_declares_the_events_it_carries() {
     let c = app.describe();
     let feed = c.routes.iter().find(|r| r.name == "widget_feed").unwrap();
     assert!(feed.stream);
-    assert_eq!(feed.emits, vec!["widget_added", "widget_removed"]);
+    // Ruling 46: each element carries BOTH names, so this pins the pairing
+    // itself — a payload name silently copied from the event name (or the
+    // reverse) fails here, which is the whole reason the pair exists.
+    assert_eq!(
+        feed.emits,
+        vec![
+            EmittedEvent {
+                event: "widget_added",
+                payload: "WidgetAdded",
+            },
+            EmittedEvent {
+                event: "widget_removed",
+                payload: "WidgetRemoved",
+            },
+        ]
+    );
     let plain: Vec<&str> = c
         .routes
         .iter()
@@ -871,12 +892,18 @@ fn a_stream_route_declares_the_events_it_carries() {
 #[test]
 fn a_declared_emits_set_matches_the_handlers_subscription() {
     let mut app = fixture_app();
+    // Ruling 46 widened `emits`'s element to a two-field struct, so the
+    // oracle projects the `event` half — the ONLY half a `Subscription`
+    // knows, since `Subscription::of::<Ev>()` records `Event::NAME`. The
+    // payload half is pinned by `a_stream_route_declares_the_events_it_carries`
+    // and by the JSON golden; comparing it here would compare a name against
+    // a list that never contained it.
     let declared: Vec<(&'static str, Vec<&'static str>)> = app
         .describe()
         .routes
         .iter()
         .filter(|r| r.stream && !r.emits.is_empty())
-        .map(|r| (r.name, r.emits.clone()))
+        .map(|r| (r.name, r.emits.iter().map(|e| e.event).collect()))
         .collect();
     assert_eq!(
         declared.len(),
@@ -905,7 +932,7 @@ fn to_human_pins_a_stream_routes_emits() {
         out.contains(
             "  GET /widgets/feed name=widget_feed auth=false stream=true\n    \
              params=[] request=None response=Null error=Ref(\"ApiError\") \
-             emits=[\"widget_added\", \"widget_removed\"]\n"
+             emits=[widget_added->WidgetAdded, widget_removed->WidgetRemoved]\n"
         ),
         "{out}"
     );
