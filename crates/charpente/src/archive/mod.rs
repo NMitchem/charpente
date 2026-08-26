@@ -753,6 +753,31 @@ impl Archive {
     /// read-only). An archive IO failure is returned here and nowhere
     /// else — it never reaches `Db`, so it can never poison it (spec §7).
     pub fn step(&mut self, db: &Db, store: &dyn ObjectStore) -> io::Result<()> {
+        // SPEC §4 rule 1 / DESIGN §5, "What a `Verifying` node may do as a
+        // peer". A durably-`Primary` node whose witnesses have not answered
+        // has not confirmed it owns this timeline, and an upload manufactures
+        // a durable copy of it that OUTLIVES this node's own fail-stop —
+        // exactly what the verifying-peer policy found `begin_seeding` doing,
+        // and for the identical reason: the archive arm is read-only against
+        // the `Db`, so the write gate would never see it unless it is asked.
+        //
+        // Re-read every step, never latched: the gate opening is what makes
+        // this the legitimate primary, and the archive must resume there.
+        //
+        // Before `yield_or_bound`, deliberately. Gating is NOT a gap: the
+        // bound measures how far behind the archive is on a timeline it is
+        // shipping, and this one it may not ship at all — so a notice here
+        // would be a false alarm naming a continuity break that did not
+        // happen. Nothing accumulates behind the gate either, since a gated
+        // node accepts no writes.
+        if db.verifying() {
+            // `idle` is the honest answer to "is there work this archive can
+            // do right now" (its doc's words), which is what a kernel arm
+            // needs to stop scheduling it. Every write-gate oracle in the
+            // test file therefore steps a fixed count rather than to idle.
+            self.idle = true;
+            return Ok(());
+        }
         self.idle = false;
         // Before the transition, never inside one: the bound is about how
         // far behind the archive IS, which grows while it is stuck retrying

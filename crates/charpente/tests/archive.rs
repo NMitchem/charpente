@@ -2907,3 +2907,86 @@ fn a_frontier_on_a_segment_boundary_starts_the_chain_at_the_segment_above_it() {
         m.segments
     );
 }
+
+// ------------------------------------------------- Task 8: the write gate
+
+/// The number of `step`s each write-gate test drives the archive for. Far
+/// past the ~6 an UNGATED archive needs to land its first snapshot object
+/// (Opening start, Opening poll, Idle, Snapshotting, batch start, batch
+/// poll), so "nothing was uploaded" is a property of the gate rather than
+/// of a loop that stopped too early.
+///
+/// Deliberately NOT `step_until_idle`: a gated archive reports `idle`, so a
+/// loop keyed on it would exit after ONE step and every assertion below
+/// would hold against an archive that had simply not been driven yet. The
+/// oracle has to outlast the thing it is checking.
+const GATED_STEPS: usize = 500;
+
+fn step_times(arc: &mut Archive, db: &Db, store: &dyn ObjectStore, n: usize) {
+    for _ in 0..n {
+        let _ = arc.step(db, store);
+    }
+}
+
+/// SPEC §4 rule 1, DESIGN §5's "What a `Verifying` node may do as a peer",
+/// and `docs/superpowers/specs/2026-08-06-verifying-peer-policy-design.md`.
+///
+/// That sub-project found `begin_seeding` slipping past the write gate
+/// BECAUSE IT WAS READ-ONLY, and a node manufacturing durable replicas of a
+/// timeline it had not confirmed it owned. The archive arm is read-only
+/// against the `Db` in exactly the same way, and an object in a bucket
+/// outlives this node's fail-stop far more thoroughly than a seeded
+/// follower does. Their line — "a seed creates a fresh copy of an unverified
+/// one" — describes an archive upload exactly.
+#[test]
+fn a_verifying_node_uploads_nothing() {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, 500);
+    // Durable Primary, witnesses unresolved: this node believes it owns the
+    // timeline and has not confirmed it.
+    db.verify_writes(vec!["witness-a:9000".into()]);
+
+    step_times(&mut arc, &db, &store, GATED_STEPS);
+
+    assert!(
+        store.keys().is_empty(),
+        "a verifying node manufactured durable copies of an unconfirmed timeline: {:?}",
+        store.keys()
+    );
+    assert!(
+        !arc.gapped(),
+        "gating is not a gap — it was never this node's timeline to ship, so there is nothing \
+         missing from the archive and nothing for an operator to act on"
+    );
+}
+
+/// The gate must be re-checked on every `step`, never latched: a node whose
+/// witnesses answer "not a primary" is the legitimate primary and its
+/// archive must resume. A gate that only closed would turn a transient
+/// verification into a permanent archive outage.
+#[test]
+fn the_gate_opening_releases_the_archive() {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, 500);
+    db.verify_writes(vec!["witness-a:9000".into()]);
+    step_times(&mut arc, &db, &store, GATED_STEPS);
+    assert!(
+        store.keys().is_empty(),
+        "the gate did not hold, so 'it reopened' below proves nothing: {:?}",
+        store.keys()
+    );
+
+    db.allow_writes(); // every witness answered "not a primary"
+    step_until_idle(&mut arc, &db, &store);
+
+    assert!(
+        !store.keys().is_empty(),
+        "the archive never resumed after the gate opened — the guard latched instead of being \
+         re-read, and a resolved verification became a permanent archive outage"
+    );
+    assert!(
+        read_manifest(&store).is_some(),
+        "the archive uploaded objects after the gate opened but never swapped the manifest, so \
+         nothing it wrote is reachable by a restore"
+    );
+}
