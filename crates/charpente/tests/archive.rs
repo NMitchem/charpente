@@ -2480,6 +2480,20 @@ fn a_restart_over_an_archived_log_is_not_a_gap() {
         .first()
         .expect("phase 1 must have shipped a chain")
         .base_seq;
+    // `start` is read out of the artifact this test polices, so the count
+    // below can only catch a HOLE above it, never a wrong ORIGIN (ruling 24:
+    // an oracle built from the same output it polices proves nothing about
+    // that output). Pin the origin separately, against the generation's own
+    // frontier: the chain's head must be the segment CONTAINING the first
+    // record the snapshot does not carry.
+    assert!(
+        start <= before.applied_seq + 1 && before.segments[0].end_seq > before.applied_seq,
+        "the chain's head [{}, {}] does not hold the first record its snapshot does not \
+         carry ({}), so the count below is measured from the wrong origin",
+        start,
+        before.segments[0].end_seq,
+        before.applied_seq + 1
+    );
     let above = db
         .sealed_segments()
         .unwrap()
@@ -2606,6 +2620,10 @@ fn an_archive_opening_on_a_long_log_snapshots_it_instead_of_gapping() {
         "the fixture left {sealed} sealed segment(s) against a bound of {GAP_PIN_SEGMENTS}; the \
          bound is never in question and this test proves nothing"
     );
+    // Measured BEFORE the archive steps, so the expectation below is not
+    // read out of the artifact it polices: nothing is written after this
+    // point, so the live tail's base does not move.
+    let tail_at_open = current_tail_base_seq(&db);
     for _ in 0..10_000 {
         if let Err(e) = arc.step(&db, &store) {
             panic!(
@@ -2626,6 +2644,21 @@ fn an_archive_opening_on_a_long_log_snapshots_it_instead_of_gapping() {
         "an archive that has just snapshotted a {sealed}-segment log recorded a gap; the \
          snapshot covers every one of those segments, so nothing was lost and nothing is behind"
     );
+    // Spec §3, in the WAL sense that is the whole point of taking a snapshot:
+    // it RELEASES the segments lying wholly below it. Every sealed segment
+    // here does lie below the frontier, so the pin must have moved off the
+    // log's base and up to the live tail — the base of the first segment
+    // that can ever seal above this snapshot. Nothing else in this file
+    // asserts that; "no gap fired" is a different release (no generation
+    // open, or one already forfeited).
+    assert!(
+        arc.pin_floor() >= tail_at_open,
+        "the archive holds the log at {} after snapshotting all {sealed} sealed segments, \
+         every one of which lies wholly below its own frontier; the snapshot carries them, \
+         so the pin must have released to the live tail's base ({tail_at_open}) — spec §3, \
+         'snapshots bound restore time and release the WAL below them'",
+        arc.pin_floor()
+    );
     let m = read_manifest(&store).expect("the opening snapshot's manifest");
     assert_eq!(
         m.generation, 0,
@@ -2639,7 +2672,7 @@ fn an_archive_opening_on_a_long_log_snapshots_it_instead_of_gapping() {
 }
 
 /// RULING 53 / spec §2 ("the chain of sealed segments CONTINUING it") and
-/// §3 ("snapshots ... let the archive delete segments below them").
+/// §3 ("snapshots ... release the WAL below them").
 ///
 /// A segment lying wholly below the generation's frontier holds nothing the
 /// snapshot does not already carry. Shipping it uploads those records twice,

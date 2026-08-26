@@ -153,10 +153,11 @@ A **generation** is one full logical snapshot plus the chain of sealed segments 
 it. `<gen>` is a monotonic counter, zero-padded, held in the manifest.
 
 **Continuing it, precisely** (ruling 53). The chain starts at the base of the sealed segment
-holding `applied_seq + 1` — the first record the snapshot does not carry — and never at the
-log's base. Every segment lying *wholly* below the frontier is the snapshot's: the archive
-releases it and never ships it, which is what §3's "let the archive delete segments below
-them" means in the layout. Two consequences worth stating because neither is obvious:
+holding `applied_seq + 1` — the first record the snapshot does not carry — and never *below*
+it. Every segment lying *wholly* below the frontier is the snapshot's: the archive releases it
+and never ships it, which is what §3's "snapshots ... release the WAL below them" means in the
+layout. (§3 is deliberate about the scope of that: it is WAL on disk, never objects in the
+bucket, which nothing reclaims.) Three consequences worth stating because none is obvious:
 
 - The chain's HEAD segment still carries the records between its own base and the frontier,
   which the snapshot has too. A frontier is wherever the `Db` had applied to, never a segment
@@ -166,6 +167,12 @@ them" means in the layout. Two consequences worth stating because neither is obv
 - `applied_seq + 1` may sit above every sealed segment, in the live tail. The chain then
   starts at the tail's base, which is the base of the first segment that can ever seal above
   this snapshot, and the generation legitimately has an empty chain until it does.
+- The chain therefore CAN start at the log's base, and that is not the defect: with nothing
+  sealed at all the whole log is the live tail and its base is the log's base, where nothing
+  lies wholly below the frontier to drop. What ruling 53 removes is a chain starting *below
+  segments the snapshot already covers*, never the value `log_base` itself. The rule is
+  "never below the frontier's own segment", not "never at zero" — a generation snapshotted
+  before its first segment seals starts there by construction.
 
 **Write ordering is the whole safety argument.** Upload every object of a generation, *then*
 swap the manifest. Because inter-key ordering is not guaranteed, the manifest swap is the
@@ -195,9 +202,20 @@ already keeps by capping shipping at `last_applied` (DESIGN §5).
 
 **Periodic logical snapshots** via `Db::snapshot` + `Snapshot::scan_raw_from` — the *bounded*
 batch read (`table.rs:1043`), not `scan_raw`, for the memory reason in §10. Snapshots bound
-restore time and let the archive delete the segments lying wholly below them: a generation's
-chain starts at its own frontier's segment, so those segments are neither held nor shipped
-(§2, ruling 53).
+restore time and release the WAL below them: a generation's chain starts at its own frontier's
+segment, so a sealed segment lying *wholly* below that frontier is neither held by the
+archive's retention pin nor shipped (§2, ruling 53). That is permission, not action — it is
+`Wal::gc`, under the `Db`'s own `retain_segments` policy, that actually reclaims the file.
+
+**What that sentence does NOT cover: the bucket.** The release above is of WAL on the
+primary's disk. **Nothing in `charpente` or `charpente-core` ever issues an
+`ObjectOp::Delete`**, so a superseded generation's snapshot and segment objects — and the
+partial objects a crashed upload leaves behind — accumulate in the object store forever.
+Reclaiming them is **unimplemented and assigned to no task**: review finding R-3, filed
+against an earlier and more ambiguous wording of this paragraph, alongside F-C's orphaned
+partials. Recorded rather than dropped, because the paragraph above was narrowed to the WAL
+sense in Task 7.5 and a narrowed sentence that quietly sheds a promise is exactly the drifted
+doc hard rule 6 exists to prevent. Open, and Noah's to route.
 
 **One operation in flight is a bound, not a free choice.** Serial uploads mean the archive
 falls behind whenever segments seal faster than they upload — and a permanently-behind archive

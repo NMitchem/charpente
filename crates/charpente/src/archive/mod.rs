@@ -43,14 +43,23 @@
 //!   function of when it was taken.
 //!
 //! **A generation's chain CONTINUES its snapshot** (ruling 53, spec §2), and
-//! that is what makes a snapshot worth taking: §3's "snapshots let the
-//! archive delete segments below them". The chain starts at the base of the
+//! that is what makes a snapshot worth taking: §3's "snapshots ... release
+//! the WAL below them" — WAL on this node's disk, never objects in the
+//! bucket, which nothing here reclaims. The chain starts at the base of the
 //! sealed segment holding the first record the snapshot does not carry
-//! (`chain_start`), never at the log's base — every segment lying wholly
-//! below the frontier is the snapshot's, so the archive neither holds nor
-//! ships it. Before this the chain began at `db.log_base()` and a generation
-//! uploaded its whole log twice: once as a snapshot, once as a chain
-//! underneath it, holding all of that WAL while it did.
+//! (`chain_start`), never *below* it — every segment lying wholly below the
+//! frontier is the snapshot's, so the archive neither holds nor ships it.
+//! Before this the chain began at `db.log_base()` and a generation uploaded
+//! its whole log twice: once as a snapshot, once as a chain underneath it,
+//! holding all of that WAL while it did.
+//!
+//! It can still start AT `db.log_base()`, and that is not the defect: when
+//! nothing is sealed the whole log is the live tail, whose base is the log's
+//! base, and nothing lies wholly below the frontier to drop
+//! (`chain_start`'s empty-listing fallback, and the test
+//! `a_generation_snapshotted_before_any_segment_seals_starts_at_the_logs_base`).
+//! What ruling 53 removes is a chain starting below segments the snapshot
+//! already covers, never the value `log_base` itself.
 //!
 //! The residue this leaves is one segment's worth, and it is structural
 //! rather than an oversight: whole segments ship verbatim and a frontier is
@@ -1131,9 +1140,11 @@ impl Archive {
                 None => return Ok(None),
             },
             // No chain yet: RULING 53 puts its start where this generation's
-            // snapshot stops, never at the log's base — resuming at the base
+            // snapshot stops, never BELOW it — resuming at the log's base
             // re-introduces the overlap on every restart, for as long as the
-            // generation lives. The refusal below is what makes the boundary
+            // generation lives. (It may still land ON the log's base, when
+            // that is the base of the frontier's own segment; that is not
+            // the overlap — see the module doc.) The refusal below is what makes the boundary
             // derivable at all: everything from `applied_seq + 1` up must
             // still be in the local log, so the segment holding it is intact
             // and at or above the base.
