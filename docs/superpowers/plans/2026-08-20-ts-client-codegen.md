@@ -1897,6 +1897,21 @@ hide that."
 
 ### Task 9: The emitter — routes, the result union, and the SSE client
 
+> **AMENDMENT (2026-08-26, after execution).** The literal code below still names the 409 error
+> class `CursorDiverged`. **It shipped as `CursorRefused`** (`f2594d7`). The rename was made
+> because the class is raised for TWO conditions — a cursor below the retention floor, and a
+> cross-timeline divergence (`kernel/mod.rs:674-720`, and this sub-project's spec says "a 409
+> naming **either** the retention floor **or** a cross-timeline divergence") — so the old name
+> asserted a cause that is sometimes false, which is hard rule 5 applied to an identifier rather
+> than a message. Fix round 1 had already corrected the message text; the name carried the same
+> over-claim one level up.
+>
+> The code below is left as written: it is the record of what was dispatched, not a description
+> of what is in the tree. **Read `crates/charpente-tsgen/src/runtime.rs` for the current
+> shape.** This note exists because the plan has twice been bitten by a stale artifact that read
+> as current (Rulings 44/47).
+
+
 **Files:**
 - Create: `crates/charpente-tsgen/src/routes.rs`, `src/events.rs`, `src/runtime.rs`
 - Modify: `crates/charpente-tsgen/src/lib.rs`

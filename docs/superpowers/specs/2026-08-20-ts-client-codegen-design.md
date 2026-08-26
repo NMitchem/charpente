@@ -180,6 +180,27 @@ also the value a client must switch on, since it is what arrives on the wire. An
 because both sides of the oracle now derive from `Ev::NAME`, the check detects
 **type-set** drift while name drift becomes inexpressible rather than merely detected.
 
+**Superseded by Ruling 46 (task 9a, landed `1ac64c9`) — `RouteInfo.emits` is no longer
+`Vec<&'static str>`.** Everything above describes the shape correctly as of task 7 and is kept
+as the record of why `Event::NAME` was the right single value then. Task 9 needed the payload
+name too — the TypeScript union names payload TYPES (`InvoicePaid`), the SSE `event:` field
+carries `Event::NAME` (`invoice_paid`), and **neither computes from the other**, because
+`#[event]`'s acronym rule maps `HTTPServer` to `http_server` and nothing inverts that. So
+`emits` now carries both per declared event:
+
+```rust
+pub struct EmittedEvent { pub event: &'static str, pub payload: &'static str }
+pub emits: Vec<EmittedEvent>   // RouteInfo; &'static [EmittedEvent] on Route
+```
+
+The oracle above is unchanged in substance: it compares the `event` half, because a
+`Subscription` holds `Event::NAME` and nothing else. The `payload` half is pinned separately by
+`declared_pairs` in `crates/charpente/tests/realtime.rs` and by the describe JSON golden.
+`DESIGN.md` and `docs/GUIDE.md` are the live spec and were updated in the same commit; this
+file is the sub-project's design record, corrected here rather than rewritten. **Flagged by the
+task 9a review** — this plan has twice been bitten by a stale artifact that read as current
+(Rulings 44/47, the hand-built fixture), so the note is here rather than left implicit.
+
 **Ruling 40 (task 7 review) — the join is Task 9's to design.** The emitter must resolve
 every `emits` entry to a payload type. Nothing here prescribes how. The constraint it has
 to satisfy: a stream route may declare an event the app never passes to `mount_events`,
