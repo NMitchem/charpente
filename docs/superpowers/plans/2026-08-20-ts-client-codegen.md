@@ -52,15 +52,23 @@
   not run as one command" and segmented the entire suite per-package/per-file; fix round 1's
   implementer backgrounded the same command, parked waiting on a notification a subagent never
   receives, and returned control with 19 paths uncommitted. **The tool accepts `timeout` up to
-  600000 ms.** **CORRECTED 2026-08-26 by measurement: "about six minutes" was wrong, and the
-  error cut the wrong way.** Timed as one command at `1ac64c9`: `cargo test --workspace` takes
-  **2482.86 s wall (41.4 min)**, 789 s user CPU, exit 0, 62 suites / 947 tests green. That is
-  **four times the tool's 600 s hard maximum**, so the full suite genuinely CANNOT run as a
-  single Bash call, and a per-package partition is the correct approach rather than the
-  workaround this bullet warns about — Task 9a's implementer reached that conclusion
-  independently and was right. Wall greatly exceeds CPU (32% utilisation) because a concurrent
-  session builds in a sibling worktree; treat the wall figure as a scheduling fact, not a
-  benchmark (docs/BENCH.md remains the only source of quotable performance numbers).
+  600000 ms.** **CORRECTED 2026-08-26 by measurement, twice — read both numbers, because one
+  alone misleads.** `cargo test --workspace` timed as a single command:
+  - **2482.86 s wall (41.4 min)** at `1ac64c9` — cold-ish, with a concurrent session building in
+    a sibling worktree. 789 s user CPU, so 32% utilisation: mostly waiting, not computing.
+  - **568 s wall** at `af14e74` — warm target dir, machine otherwise quiet. Exit 0, 63 suites,
+    968 tests.
+
+  So the honest rule is **not** "it takes N minutes". It is: **the suite's wall time swings by
+  more than 4x with build warmth and machine contention, straddling the tool's 600 s hard
+  maximum, so it cannot be RELIED on to finish inside one Bash call.** Partition per package, or
+  background it from the top-level agent (which gets re-invoked on completion — a mechanism
+  subagents lack). Task 9a's implementer partitioned and was right to.
+  "About six minutes" was wrong in the dangerous direction: it attached a confident number to a
+  bullet whose whole point is checking limits rather than assuming them, and a later implementer
+  had to defend correct practice against it. **Do not replace it with a different confident
+  number.** Wall time here is a scheduling fact, never a benchmark — docs/BENCH.md remains the
+  only source of quotable performance figures.
   **The generalisation below still stands, and so does its inverse: check the ceiling before
   designing around it, AND check it before insisting the ceiling is not there.** Each workaround produced evidence that was
   equivalent-or-worse at the cost of a whole session, plus a deviation for a reviewer to audit.
