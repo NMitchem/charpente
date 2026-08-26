@@ -3117,6 +3117,82 @@ fn an_archive_that_finds_another_writers_manifest_at_open_never_starts() {
     assert!(arc.stopped(), "the archive started anyway");
 }
 
+/// The SAME node, redeployed on a new port: `ArchiveConfig::writer` changes
+/// and nothing else about the bucket, the `Db` or the timeline does.
+const RENAMED_WRITER: &str = "node-a:9001";
+
+/// The COST of comparing identity alone, pinned so the spec's claim about it
+/// is checked rather than asserted (spec §4 rule 2's trade, review §1(b)).
+///
+/// This archive owns the prefix. Renamed, it refuses PERMANENTLY on a bucket
+/// that is genuinely its own — at `adopt`, before anything is uploaded —
+/// where a comparison that also asked "is the other writer further along"
+/// would have kept it archiving under a fresh generation. Nothing in the
+/// bucket distinguishes a rename from a takeover: the manifest carries one
+/// string and both cases present identically, so this is the deliberate side
+/// of an asymmetric trade rather than an oversight. Wrongly continuing
+/// leaves a bucket neither node can restore from; wrongly stopping costs
+/// availability, with a notice, a live bucket and an untouched `Db`.
+///
+/// It follows — and `ArchiveConfig::writer`'s doc says so — that `writer`
+/// must not be derived from anything a redeploy moves.
+#[test]
+fn a_renamed_writer_refuses_permanently_on_the_bucket_it_owns() {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, 500);
+    step_until_idle(&mut arc, &db, &store);
+    let before = read_manifest(&store).expect("this archive's own manifest");
+    assert_eq!(
+        (before.writer.as_str(), before.generation),
+        (WRITER, 0),
+        "the fixture did not leave this archive owning the prefix, so 'its own bucket' below is \
+         not what is being tested: {before:?}"
+    );
+    // Segments seal above that frontier and are left UNSHIPPED, so an
+    // archive that failed to refuse has real work to do: without this the
+    // bucket assertion below would hold for the wrong reason (the M3b shape
+    // the report and the review both record).
+    write_records(&mut db, 2 * RECORDS_PER_SEGMENT);
+    let owned = store.keys();
+
+    // The same node, back on a new port. Same Db, same bucket, same records.
+    let mut renamed = Archive::open(
+        ArchiveConfig {
+            writer: RENAMED_WRITER.to_string(),
+            ..archive_config(0, 8 << 20)
+        },
+        &mut db,
+    )
+    .unwrap();
+    step_times(&mut renamed, &db, &store, 500);
+
+    assert!(
+        renamed.stopped(),
+        "a renamed writer kept archiving into a bucket whose manifest names another identity — \
+         the comparison is identity alone precisely so it cannot tell this case from a takeover"
+    );
+    assert!(
+        renamed.idle(),
+        "a stopped archive reports idle so a kernel arm stops scheduling it; `stopped()` is what \
+         says it is not healthy (Archive::idle's doc)"
+    );
+    assert!(
+        !renamed.gapped(),
+        "an ownership refusal is not a gap: a gap is recoverable on the next contact and this is \
+         not recoverable at all"
+    );
+    assert_eq!(
+        store.keys(),
+        owned,
+        "the refusal happened at `adopt`, before anything is uploaded — nothing may have landed"
+    );
+    assert_eq!(
+        read_manifest(&store).map(|m| (m.writer, m.generation)),
+        Some((WRITER.to_string(), 0)),
+        "the renamed archive advanced a manifest it no longer matches"
+    );
+}
+
 /// The corner that decides the SHAPE of the pre-swap comparison, and the
 /// oracle for this task's one deviation from its brief (see the report).
 ///

@@ -298,6 +298,28 @@ Two rules, both following precedent already in this codebase:
    one that will never ship again but goes on holding the WAL is the archive acquiring the power
    to halt the primary (§5) — and raises the notice once, when it happens, not once per step.
 
+   **The trade identity-alone makes, stated so nobody has to rediscover it** (Task 8 review
+   §1(b), measured). A node whose writer identity legitimately *changes* — the same node
+   redeployed on a new port, nothing else about the bucket or the timeline different — now refuses
+   **permanently** at open on a bucket it genuinely owns, before anything is uploaded, reporting
+   `stopped() == true` for the life of the process. Measured against the discarded generation
+   conjunct, that same node would have kept archiving under a fresh generation. This is the
+   deliberate side of an **asymmetric** choice: nothing in the bucket distinguishes "I am the same
+   node, renamed" from "a second node has taken this prefix over" — the manifest carries one
+   string and both cases present identically — and the two errors do not cost the same. Wrongly
+   continuing interleaves two writers and leaves a bucket neither can restore from; wrongly
+   stopping costs archive availability, with a named operator notice, a live intact bucket and an
+   untouched `Db`. Recovery is the operator action §7's row names, and it is not free: it abandons
+   the live generation's objects into a bucket with no reclamation (§14) and re-uploads a full
+   snapshot.
+
+   **Operational consequence, binding on whoever wires the archive up (Task 9):**
+   `ArchiveConfig::writer` is part of the archive's durable state, not a label. It **must be
+   stable across a redeploy and must not be derived from anything a redeploy moves** — a listen
+   address, a port, a pod name, a container id, an ephemeral IP. Deriving it from the serve bind
+   address turns an ordinary port change into a permanent archive outage that reports
+   `idle() == true` while it lasts.
+
 Both rules are **additive**, which is why §5's "only change to shipped code" still holds:
 `Db::verifying()` is already public (`db.rs:1708`) and already read outside core by the seed
 refusal itself (`repl/session.rs:744`). The archive gate consults the same accessor the

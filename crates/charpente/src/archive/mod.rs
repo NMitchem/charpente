@@ -221,6 +221,21 @@
 //!   the GET-to-PUT window is real — the same honest posture the promote
 //!   path takes toward its bounded-loss window.
 //!
+//!   **IDENTITY ALONE, and what that costs.** The comparison carries no
+//!   generation term, so a node whose `ArchiveConfig::writer` legitimately
+//!   CHANGES — the same node redeployed on a new port — refuses permanently
+//!   at `adopt` on a bucket it genuinely owns, before anything is uploaded,
+//!   where a comparison that also asked "is the other writer further along"
+//!   would have kept it archiving. That is the trade taken deliberately, and
+//!   the asymmetry is the reason: no fact in the bucket distinguishes a
+//!   rename from a takeover (the manifest carries one string, and both
+//!   present identically), while getting it wrong toward liveness produces a
+//!   bucket neither node can restore from and getting it wrong toward safety
+//!   produces a stopped archive with a named notice and a live, intact
+//!   bucket. `ArchiveConfig::writer`'s doc carries what follows for whoever
+//!   wires this up: it is a stability contract, and must not be derived from
+//!   anything a redeploy moves.
+//!
 //! - **A manifest this archive cannot decode** (F5) is that same question
 //!   with no answer at all, and takes the same refusal: it is the only
 //!   evidence of who owns the prefix, so an archive that cannot read it
@@ -286,6 +301,31 @@ pub struct ArchiveConfig {
     /// manifest this archive PUTs, and compared against the manifest already
     /// in the bucket at `adopt` and again before every swap
     /// (`step_checking_owner`).
+    ///
+    /// **A STABILITY CONTRACT, not a label.** The comparison at both sites
+    /// is identity ALONE, so this string is part of the archive's durable
+    /// state: change it on a prefix this node already owns and the archive
+    /// refuses PERMANENTLY at `adopt`, before uploading anything, on a
+    /// bucket that is genuinely its own — `stopped() == true` for the life
+    /// of the process, recoverable only by the operator action
+    /// `foreign_writer_notice` names (remove the manifest object and take a
+    /// fresh generation's full snapshot, abandoning the live generation's
+    /// objects, which nothing in this design collects).
+    ///
+    /// That is the deliberate side of an asymmetric trade (spec §4 rule 2),
+    /// not an oversight: nothing in the bucket distinguishes "I am the same
+    /// node, renamed" from "a second node has taken this prefix over" — the
+    /// manifest carries one string and both cases present identically — and
+    /// the two errors are not symmetric. Wrongly continuing interleaves two
+    /// writers' generations and leaves a bucket neither can restore from;
+    /// wrongly stopping costs archive availability, with a named notice, a
+    /// live intact bucket, and an untouched `Db`.
+    ///
+    /// **It follows that `writer` must be stable across a redeploy, and must
+    /// not be derived from anything a redeploy moves** — a listen address, a
+    /// port, a pod name, a container id, an ephemeral IP. Deriving it from
+    /// `serve`'s bind address would make an ordinary port change a permanent
+    /// archive outage that reports `idle() == true` while it lasts.
     pub writer: String,
     /// Cadence for logical snapshots, in committed records — mirrors
     /// `DbConfig::checkpoint_every` (spec §3), and seq-driven rather than
