@@ -152,6 +152,21 @@ being explicit rather than assumed.
 A **generation** is one full logical snapshot plus the chain of sealed segments continuing
 it. `<gen>` is a monotonic counter, zero-padded, held in the manifest.
 
+**Continuing it, precisely** (ruling 53). The chain starts at the base of the sealed segment
+holding `applied_seq + 1` — the first record the snapshot does not carry — and never at the
+log's base. Every segment lying *wholly* below the frontier is the snapshot's: the archive
+releases it and never ships it, which is what §3's "let the archive delete segments below
+them" means in the layout. Two consequences worth stating because neither is obvious:
+
+- The chain's HEAD segment still carries the records between its own base and the frontier,
+  which the snapshot has too. A frontier is wherever the `Db` had applied to, never a segment
+  boundary, and segments ship verbatim rather than re-cut — so this residue is structural. It
+  is bounded by one segment, and it is skippable by arithmetic rather than by search:
+  `applied_seq` is the seq a restore replays the chain from.
+- `applied_seq + 1` may sit above every sealed segment, in the live tail. The chain then
+  starts at the tail's base, which is the base of the first segment that can ever seal above
+  this snapshot, and the generation legitimately has an empty chain until it does.
+
 **Write ordering is the whole safety argument.** Upload every object of a generation, *then*
 swap the manifest. Because inter-key ordering is not guaranteed, the manifest swap is the
 one operation whose completion means anything: a crash at any earlier point leaves an older
@@ -179,7 +194,10 @@ still being appended and its unsynced bytes must never travel — the discipline
 already keeps by capping shipping at `last_applied` (DESIGN §5).
 
 **Periodic logical snapshots** via `Db::snapshot` + `Snapshot::scan_raw_from` — the *bounded*
-batch read (`table.rs:1043`), not `scan_raw`, for the memory reason in §10. Snapshots bound restore time and let the archive delete segments below them.
+batch read (`table.rs:1043`), not `scan_raw`, for the memory reason in §10. Snapshots bound
+restore time and let the archive delete the segments lying wholly below them: a generation's
+chain starts at its own frontier's segment, so those segments are neither held nor shipped
+(§2, ruling 53).
 
 **One operation in flight is a bound, not a free choice.** Serial uploads mean the archive
 falls behind whenever segments seal faster than they upload — and a permanently-behind archive
@@ -252,7 +270,8 @@ replication owns it (`Repl::open`). The archive needs a second floor, so the pin
 **compose as a min over pins**. Everything else in this design is additive.
 
 The archive's pin is **bounded** (ruling 3): it holds at the base_seq of the lowest
-un-uploaded sealed segment, but never further back than `archive_pin_segments` (config,
+un-uploaded sealed segment — never below its generation's chain start, since everything under
+that is the snapshot's (§2) — but never further back than `archive_pin_segments` (config,
 default deliberately unset here — §14 records it as Noah's to rule, and the plan must justify a number rather than invent one). Past the bound
 the archive releases, `Wal::gc` proceeds, the primary keeps serving writes, and the
 generation closes with a named gap.
@@ -464,7 +483,12 @@ Hard rule 6 — same commit as the code:
 ## §14 Open items for Noah
 
 1. `archive_pin_segments` default — the plan proposes a number with reasoning; this spec
-   deliberately does not invent one.
+   deliberately does not invent one. **Ruling 53 moves this item.** The plan's default of 8
+   was justified as "512 MiB of held WAL at the default 64 MiB `segment_bytes`", and that
+   arithmetic was computed against the pre-ruling-53 held quantity — a chain that started at
+   the log's base. Now that a generation holds only what seals above its own snapshot, the
+   quantity the bound measures has changed and the default should be re-derived against it.
+   Recorded rather than re-picked: the default is explicitly Noah's.
 2. Whether the capability-surface decision warrants a numbered DECISIONS.md entry at all.
    §1's correction lowers the stakes — this is an application of §1, not an amendment to it —
    so an entry may be over-ceremony. Noah's call, and DECISIONS.md is a shared-spine file with

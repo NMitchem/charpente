@@ -348,6 +348,26 @@ fn write_records(db: &mut Db, n: u64) {
     }
 }
 
+/// The two phases every chain assertion in this file needs since RULING 53:
+/// a generation's chain carries only what seals ABOVE its snapshot's
+/// frontier, so a fixture that writes N records and only then steps produces
+/// a snapshot and NO chain at all, and every "the archive shipped a segment"
+/// oracle in the file would be asserting against an empty manifest.
+///
+/// Phase 1 takes the generation's opening snapshot at whatever the `Db` has
+/// applied; phase 2 writes `chain_records` more so segments seal above that
+/// frontier, and steps again so the chain continuing it actually ships.
+fn snapshot_then_chain(
+    arc: &mut Archive,
+    db: &mut Db,
+    store: &dyn ObjectStore,
+    chain_records: u64,
+) {
+    step_until_idle(arc, db, store);
+    write_records(db, chain_records);
+    step_until_idle(arc, db, store);
+}
+
 /// Bounded, never a panic on timeout: some fixtures (an unreachable store,
 /// a permanently lost-ack store) never catch up by design, and those tests
 /// want the bounded progress this makes, not a failure. 10,000 steps is
@@ -502,9 +522,43 @@ fn expected_keys(store: &dyn ObjectStore, m: &Manifest) -> Vec<String> {
     keys
 }
 
-/// Runs a FRESH archive over `db` against a FRESH store and stops after
-/// exactly `cut` steps — the crash cut (Defect 3: the plan named this helper
-/// and never defined it).
+/// Every object the bucket holds, key and bytes — one generation exactly as
+/// a real archive wrote it, so a fresh store can be seeded with it.
+fn store_contents(store: &SimObjectStore) -> Vec<(String, Vec<u8>)> {
+    store
+        .keys()
+        .into_iter()
+        .map(|k| {
+            let bytes = get_object(store, &k).expect("a key the store just listed");
+            (k, bytes)
+        })
+        .collect()
+}
+
+/// Seeds a fresh store with objects captured by `store_contents`.
+fn plant(store: &SimObjectStore, objects: &[(String, Vec<u8>)]) {
+    for (key, data) in objects {
+        store
+            .start(ObjectOp::Put {
+                key: key.clone(),
+                data: data.clone(),
+            })
+            .unwrap();
+        drain(store).unwrap();
+    }
+}
+
+/// Runs a FRESH archive over `db` against a FRESH store seeded with
+/// `planted` and stops after exactly `cut` steps — the crash cut (Defect 3:
+/// the plan named this helper and never defined it).
+///
+/// RULING 53 is why `planted` exists. A fresh archive over a STATIC `Db`
+/// takes its snapshot at the current frontier and continues the chain from
+/// there, so it can never ship a segment: a cut loop built on it would cover
+/// the snapshot's object ordering and nothing of the chain's. Seeded with a
+/// generation captured at an EARLIER frontier, the archive under test
+/// resumes it instead and ships the segments that sealed since — which is
+/// the ordering the loop exists to check.
 ///
 /// A cut usually lands with one operation in flight, because `Archive::step`
 /// deliberately splits `ObjectStore::start` from the `poll` that completes
@@ -521,8 +575,13 @@ fn expected_keys(store: &dyn ObjectStore, m: &Manifest) -> Vec<String> {
 /// the loop, which is harmless here (the loop asserts about objects, never
 /// about gc) but is not something to build a gc-sensitive test on. Task 7
 /// works on this pin.
-fn replay_archive_to_step(db: &mut Db, cut: usize) -> (SimObjectStore, Archive) {
+fn replay_archive_to_step(
+    db: &mut Db,
+    planted: &[(String, Vec<u8>)],
+    cut: usize,
+) -> (SimObjectStore, Archive) {
     let store = SimObjectStore::new();
+    plant(&store, planted);
     let mut arc = Archive::open(archive_config(0, 8 << 20), db).unwrap();
     for _ in 0..cut {
         let _ = arc.step(&*db, &store);
@@ -538,8 +597,9 @@ fn replay_archive_to_step(db: &mut Db, cut: usize) -> (SimObjectStore, Archive) 
 /// took — Defect 6's measurement. The crash-cut loop's bound is derived from
 /// this rather than hard-coded, so it can neither run past the end (proving
 /// nothing at full replay cost) nor stop short of it.
-fn steps_to_idle(db: &mut Db) -> usize {
+fn steps_to_idle(db: &mut Db, planted: &[(String, Vec<u8>)]) -> usize {
     let store = SimObjectStore::new();
+    plant(&store, planted);
     let mut arc = Archive::open(archive_config(0, 8 << 20), db).unwrap();
     for n in 0..10_000 {
         arc.step(&*db, &store).unwrap();
@@ -694,7 +754,11 @@ fn only_sealed_segments_ship_never_the_tail() {
         sealed_segment_count(&db) >= 2,
         "fixture sealed nothing; the rest is vacuous"
     );
-    step_until_idle(&mut arc, &db, &store);
+    // RULING 53: everything written above is the generation's SNAPSHOT's,
+    // and only what seals after it is ever shipped — so without a second
+    // phase the manifest below names no segment and "never the tail" is a
+    // property of an empty chain rather than of the shipper.
+    snapshot_then_chain(&mut arc, &mut db, &store, 3 * RECORDS_PER_SEGMENT);
     let shipped = store.keys();
     let tail = current_tail_base_seq(&db);
     assert!(
@@ -713,8 +777,11 @@ fn only_sealed_segments_ship_never_the_tail() {
     // this task's own mutation testing — see the report). This is
     // independent: the true end of the last of the >=2 fully-sealed
     // segments this fixture guarantees, computed purely arithmetically from
-    // the two measured constants, never from `Db`'s own accounting.
-    let last_sealed_end = FIRST_SEGMENT_RECORDS + 2 * RECORDS_PER_SEGMENT - 1;
+    // the two measured constants, never from `Db`'s own accounting. Six
+    // segments' worth of records are written in total (three per phase), so
+    // the last fully-sealed one ends after the first segment plus five
+    // steady-state ones.
+    let last_sealed_end = FIRST_SEGMENT_RECORDS + 5 * RECORDS_PER_SEGMENT - 1;
     let m = read_manifest(&store).expect("a manifest");
     assert!(
         m.segments.iter().all(|s| s.end_seq <= last_sealed_end),
@@ -730,23 +797,35 @@ fn a_short_read_never_becomes_a_short_segment_ref() {
     // segment takes many `Reading` steps.
     let (mut db, store, mut arc) = archive_fixture_with_tiny_read_budget();
     write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
-    step_until_idle(&mut arc, &db, &store);
+    snapshot_then_chain(&mut arc, &mut db, &store, 3 * RECORDS_PER_SEGMENT);
     let m = read_manifest(&store).expect("a manifest");
     assert!(
         m.segments.len() >= 2,
         "fixture didn't ship enough segments to be a meaningful check: {:?}",
         m.segments
     );
+    // RULING 53 re-baselines the ORIGIN here, never the property. The old
+    // form indexed every span off segment 0 (`FIRST_SEGMENT_RECORDS + i *
+    // RECORDS_PER_SEGMENT - 1`), which reads correctly only while the chain
+    // starts at the log's base — the overlap itself, written into the
+    // oracle. The chain now starts at the segment holding the first record
+    // its snapshot does not carry, which phase 1's 3 * RECORDS_PER_SEGMENT
+    // records put exactly one first segment plus two steady-state ones in.
+    // Independent of `Db::sealed_segments` either way (Ruling 24's lesson:
+    // an oracle built from the same function it is meant to police proves
+    // nothing) — pure arithmetic from the two measured constants above.
+    assert_eq!(
+        m.segments[0].base_seq,
+        FIRST_SEGMENT_RECORDS + 2 * RECORDS_PER_SEGMENT,
+        "the chain does not start at the segment holding the first record its snapshot does \
+         not carry, so the spans below would be measured from the wrong origin: {:?}",
+        m.segments
+    );
     for (i, s) in m.segments.iter().enumerate() {
-        // Independent of `Db::sealed_segments` on purpose (Ruling 24's
-        // lesson: an oracle built from the same function it is meant to
-        // police proves nothing) — pure arithmetic from the two measured
-        // constants above.
-        let layout = if i == 0 {
-            FIRST_SEGMENT_RECORDS - 1
-        } else {
-            FIRST_SEGMENT_RECORDS + i as u64 * RECORDS_PER_SEGMENT - 1
-        };
+        // Every segment but the log's first holds exactly
+        // RECORDS_PER_SEGMENT records, and the chain contains none of the
+        // first. A short read shows up as an end_seq below this.
+        let layout = s.base_seq + RECORDS_PER_SEGMENT - 1;
         assert_eq!(
             s.end_seq, layout,
             "segment {i} claims a span it did not ship: end_seq {} vs layout end {layout}",
@@ -791,8 +870,11 @@ fn the_pin_holds_from_open_advances_with_the_manifest_and_never_releases() {
          pinning step lets Wal::gc delete the segment next_base() will wait for"
     );
 
+    // RULING 53: phase 2 is what gives this generation a chain at all. The
+    // records written first are its snapshot's, and the pin advancing past a
+    // SHIPPED segment is the whole subject here.
     write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
-    step_until_idle(&mut arc, &db, &store);
+    snapshot_then_chain(&mut arc, &mut db, &store, 3 * RECORDS_PER_SEGMENT);
 
     let caught_up = arc.pin_floor();
     assert_ne!(
@@ -828,8 +910,16 @@ fn the_pin_holds_from_open_advances_with_the_manifest_and_never_releases() {
 /// `next` == 0 — which ships nothing AND freezes `Wal::gc` forever, because
 /// a floor of 0 holds the entire log. r1 turned a silent no-ship into a
 /// silent no-ship PLUS unbounded WAL growth.
+///
+/// RULING 53 renamed this. The old name — `…_starts_at_the_logs_base` — was
+/// the overlap stated as a requirement: an archive does NOT start at the
+/// log's base any more, it starts at the segment holding the first record
+/// its snapshot does not carry. All three properties M1' is about survive
+/// verbatim, because none of them was ever about the base itself: the cursor
+/// must never be a seq the log has reclaimed, the archive must ship, and gc
+/// must keep advancing.
 #[test]
-fn an_archive_opened_on_a_compacted_log_starts_at_the_logs_base() {
+fn an_archive_opened_on_a_compacted_log_never_reaches_below_the_logs_base() {
     let (mut db, store, mut arc) = fixture_with_precompacted_log();
     let base = db.log_base();
     assert!(
@@ -837,6 +927,21 @@ fn an_archive_opened_on_a_compacted_log_starts_at_the_logs_base() {
         "fixture needs a log GC'd before the archive opened; got base 0 — the rest is vacuous"
     );
 
+    step_until_idle(&mut arc, &db, &store);
+
+    // The pin must never sit below the log's own base: a floor beneath what
+    // still exists holds the whole log and gc can never advance again.
+    assert!(
+        arc.pin_floor() >= base,
+        "pin {} is below log_base {base} — gc is now frozen forever",
+        arc.pin_floor()
+    );
+
+    // The generation's snapshot covers everything already in the log, so
+    // what its chain ships is what seals ABOVE it (ruling 53). Write that:
+    // "shipped nothing" asserted before it would be a fact about the
+    // fixture, not about the cursor.
+    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
     step_until_idle(&mut arc, &db, &store);
 
     let shipped = store
@@ -847,20 +952,14 @@ fn an_archive_opened_on_a_compacted_log_starts_at_the_logs_base() {
     assert!(
         shipped > 0,
         "archive shipped nothing from a compacted log (base {base}): it looked for a segment \
-         based at seq 0, which was reclaimed long ago"
+         based at a seq that was reclaimed long ago"
     );
-
-    // The pin must never sit below the log's own base: a floor beneath what
-    // still exists holds the whole log and gc can never advance again.
     assert!(
         arc.pin_floor() >= base,
         "pin {} is below log_base {base} — gc is now frozen forever",
         arc.pin_floor()
     );
-
     // And gc must still be able to advance as new data arrives.
-    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
-    step_until_idle(&mut arc, &db, &store);
     assert!(
         db.log_base() > base,
         "log_base stuck at {base} after archiving and further writes — gc is frozen"
@@ -921,20 +1020,36 @@ fn a_store_that_comes_back_lets_the_archive_catch_up() {
     );
 
     restore_store_reachability(&store);
-    step_until_idle(&mut arc, &db, &store);
+    // RULING 53: what a recovering archive catches up ON is the chain
+    // continuing its snapshot, so phase 2 is what gives it a chain to catch
+    // up on at all — the segments sealed during the outage are the
+    // snapshot's, and re-shipping them is the overlap ruling 53 removes.
+    snapshot_then_chain(&mut arc, &mut db, &store, 3 * RECORDS_PER_SEGMENT);
 
     let m = read_manifest(&store).expect("a manifest after the store came back");
     let tail = current_tail_base_seq(&db);
     // Both ENDS, not just the last one. `Manifest`'s contiguity check proves
-    // the chain has no interior hole but never that it starts where the log
-    // does, so a chain missing its head is internally consistent and would
-    // pass a last-segment-only assertion (m1').
-    assert_eq!(
-        m.segments.first().map(|s| s.base_seq),
-        Some(db.log_base()),
-        "the chain must start at the log's base, not part-way in: manifest {:?}, log_base {}",
-        m.segments,
-        db.log_base()
+    // the chain has no interior hole but never that it starts where it must,
+    // so a chain missing its head is internally consistent and would pass a
+    // last-segment-only assertion (m1').
+    //
+    // RULING 53 re-baselines the head. The old form asserted `== db
+    // .log_base()`, which is the overlap stated as a requirement; the head
+    // must now be the segment CONTAINING the first record the snapshot does
+    // not carry — at or below it, so nothing falls between the two, and
+    // reaching above it, so it is not a segment the snapshot already holds.
+    let head = *m
+        .segments
+        .first()
+        .expect("a chain after the store came back");
+    assert!(
+        head.base_seq <= m.applied_seq + 1 && head.end_seq > m.applied_seq,
+        "the chain's head [{}, {}] does not hold the first record its snapshot does not carry \
+         ({}): below it the records between them are in neither, above it the head is a \
+         segment the snapshot already covers",
+        head.base_seq,
+        head.end_seq,
+        m.applied_seq + 1
     );
     assert_eq!(
         m.segments.last().map(|s| s.end_seq + 1),
@@ -942,10 +1057,16 @@ fn a_store_that_comes_back_lets_the_archive_catch_up() {
         "every sealed segment must land once the store comes back: manifest {:?}, tail base {tail}",
         m.segments
     );
+    let above = db
+        .sealed_segments()
+        .unwrap()
+        .iter()
+        .filter(|s| s.base_seq >= head.base_seq)
+        .count();
     assert_eq!(
         m.segments.len(),
-        sealed,
-        "chain covers {} segments but {sealed} were sealed: {:?}",
+        above,
+        "chain covers {} segments but {above} are sealed at or above its start: {:?}",
         m.segments.len(),
         m.segments
     );
@@ -982,6 +1103,11 @@ fn start_errors_surface_from_both_the_segment_and_the_manifest_put() {
         }
         let _ = arc.step(&db, &store);
     }
+    // RULING 53: the segment PUT Phase 1 is named after only happens once a
+    // segment seals ABOVE the generation's frontier — everything written so
+    // far is the snapshot's. Written here rather than up front so the
+    // manifest-landed loop above still stops where it says it does.
+    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
     let keys_before = store.keys();
     assert!(
         keys_before.contains(&manifest),
@@ -1125,13 +1251,37 @@ fn a_lost_ack_retry_uploads_the_same_bytes_and_does_not_duplicate() {
 #[test]
 fn the_seal_rate_stays_under_one_upload_per_step_budget() {
     let (mut db, store, mut arc) = archive_fixture();
+    // RULING 53: a rate measured over every sealed segment in the log is
+    // measuring the OVERLAP, not the seal rate — the segments below the
+    // generation's frontier are the snapshot's and are never shipped. So the
+    // generation's snapshot is taken first, and the rate is measured over
+    // what seals above it.
+    write_records(&mut db, RECORDS_PER_SEGMENT + 50);
+    step_until_idle(&mut arc, &db, &store);
+    // Arithmetic from the measured constants rather than from the archive's
+    // own bookkeeping (ruling 24): RECORDS_PER_SEGMENT + 50 records leave the
+    // live tail based one first segment in, and that is where the chain
+    // starts.
+    let chain_start = FIRST_SEGMENT_RECORDS;
+    assert!(
+        store.keys().iter().all(|k| !k.contains("/segments/")),
+        "a segment shipped before the rate window opened, so `uploads` below counts uploads \
+         this test did not measure the seals for: {:?}",
+        store.keys()
+    );
     write_records(&mut db, 50 * RECORDS_PER_SEGMENT);
-    let seals = sealed_segment_count(&db);
+    let seals = db
+        .sealed_segments()
+        .unwrap()
+        .iter()
+        .filter(|s| s.base_seq >= chain_start)
+        .count();
     // F4's sweep: `uploads >= seals` cannot fail when `seals` is 0, and a
     // seal count is a measurement, not a given. Guard it.
     assert!(
         seals >= 2,
-        "fixture sealed {seals} segment(s); a rate assertion against 0 or 1 is not a rate"
+        "fixture sealed {seals} segment(s) above the generation's frontier; a rate assertion \
+         against 0 or 1 is not a rate"
     );
     let uploads = step_until_idle_counting(&mut arc, &db, &store);
     assert!(
@@ -1163,7 +1313,14 @@ fn the_seal_rate_stays_under_one_upload_per_step_budget() {
 /// two steps every store operation costs here — one to `start`, one to
 /// `poll`. The delta being 2 and not more is itself the check that Task 7
 /// added a prologue rather than changing the shipping loop.
-const STEPS_TO_ARCHIVE_5000_RECORDS: usize = 49;
+///
+/// RE-MEASURED at Task 7.5 (ruling 53), and the run it counts is a different
+/// one: the archive now RESUMES a planted generation taken at the frontier
+/// of the first 5,000 records and ships only the segments that sealed over
+/// the second 5,000, instead of opening a fresh generation and re-shipping
+/// the whole log underneath its own snapshot. It is a step count of the cut
+/// loop's run, nothing more — the number to keep honest, not to defend.
+const STEPS_TO_ARCHIVE_5000_RECORDS: usize = 27;
 
 /// The property this task exists to establish (spec §2): upload every object
 /// of a generation, THEN swap the manifest. Inter-key ordering is not
@@ -1179,10 +1336,28 @@ const STEPS_TO_ARCHIVE_5000_RECORDS: usize = 49;
 /// rather than removing a state.
 #[test]
 fn the_manifest_never_points_at_an_incomplete_generation() {
-    let (mut db, _store, _arc) = archive_fixture();
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, 5_000);
+    // RULING 53: capture a complete generation at THIS frontier, then write
+    // past it. Every cut below replays against a store seeded with it, so
+    // the archive under test resumes that generation and ships the segments
+    // that sealed afterwards — see `replay_archive_to_step`. Without this
+    // the loop would only ever see snapshot objects, and the manifest-swaps-
+    // last property would go untested for the chain entirely.
+    step_until_idle(&mut arc, &db, &store);
+    let planted = store_contents(&store);
+    assert!(
+        planted.iter().any(|(k, _)| k.ends_with("/snapshot/meta"))
+            && planted.iter().any(|(k, _)| k.ends_with("/manifest"))
+            && planted.len() > 3,
+        "the captured generation must be a COMPLETE published snapshot, or every cut below \
+         resumes nothing: {:?}",
+        planted.iter().map(|(k, _)| k).collect::<Vec<_>>()
+    );
+    drop(arc);
     write_records(&mut db, 5_000);
 
-    let steps = steps_to_idle(&mut db);
+    let steps = steps_to_idle(&mut db, &planted);
     assert_eq!(
         steps, STEPS_TO_ARCHIVE_5000_RECORDS,
         "the archive's step count moved; the cut loop below is derived from it, so re-measure \
@@ -1192,13 +1367,18 @@ fn the_manifest_never_points_at_an_incomplete_generation() {
 
     // One past the end deliberately: the last cut must see a finished,
     // consistent generation, not merely a partial one.
-    let mut cuts_with_a_manifest = 0;
+    let mut cuts_with_a_chain = 0;
     for cut in 0..=steps {
-        let (store, _arc) = replay_archive_to_step(&mut db, cut);
-        let Some(m) = read_manifest(&store) else {
-            continue;
-        };
-        cuts_with_a_manifest += 1;
+        let (store, _arc) = replay_archive_to_step(&mut db, &planted, cut);
+        let m = read_manifest(&store).unwrap_or_else(|| {
+            panic!(
+                "the planted generation's manifest is gone at cut {cut}; the manifest is the \
+                 one mutable key in the layout and nothing may remove it"
+            )
+        });
+        if !m.segments.is_empty() {
+            cuts_with_a_chain += 1;
+        }
         let present = store.keys();
         for key in expected_keys(&store, &m) {
             assert!(
@@ -1229,17 +1409,18 @@ fn the_manifest_never_points_at_an_incomplete_generation() {
     }
     // Spec §11, and the reason this loop cannot be trusted without it: "a
     // test asserting something never happens passes trivially against an
-    // implementation that never does anything." Every cut above `continue`s
-    // when there is no manifest yet, so an archive that stopped writing
-    // manifests altogether would sail through the whole loop with an empty
-    // body. Count the cuts that actually checked something.
+    // implementation that never does anything." Every cut now starts from a
+    // planted manifest, so "saw a manifest" is true by construction and no
+    // longer says anything — what does is how many cuts saw the manifest
+    // ADVANCED to name a chain, which is the half of the ordering property
+    // that involves a segment at all.
     assert_eq!(
-        cuts_with_a_manifest,
+        cuts_with_a_chain,
         21,
-        "{cuts_with_a_manifest} of the {} cuts saw a manifest; MEASURED at 21. Fewer means the \
-         loop above checked almost nothing and its silence means nothing; MORE means a manifest \
-         is landing earlier in the run than the snapshot that has to precede it. Re-measure only \
-         after confirming which",
+        "{cuts_with_a_chain} of the {} cuts saw a manifest naming a chain; MEASURED. Fewer \
+         means the loop above checked the segment half of the ordering almost nowhere and its \
+         silence means nothing; MORE means a manifest is naming segments earlier in the run \
+         than the objects it names can have landed. Re-measure only after confirming which",
         steps + 1
     );
 }
@@ -1403,8 +1584,13 @@ fn the_snapshot_waits_for_the_configured_record_cadence() {
         store.keys()
     );
 
+    // RULING 53: the chain continues the generation's snapshot, so it ships
+    // what seals above the frontier that snapshot was taken at — hence two
+    // phases rather than one. Phase 2 stays BELOW the cadence deliberately:
+    // another crossing would roll to a second generation whose own chain is
+    // empty again, and the assertion below would be about that one.
     write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
-    step_until_idle(&mut arc, &db, &store);
+    snapshot_then_chain(&mut arc, &mut db, &store, 2 * RECORDS_PER_SEGMENT);
     let m = read_manifest(&store).expect("a manifest once the cadence was crossed");
     // RULING 51: `applied_seq >= cadence` is ONE RECORD STRICTER than the
     // contract Ruling 48 established — `snapshot_every` counts committed
@@ -1460,12 +1646,25 @@ fn a_lost_manifest_ack_retries_the_same_key_with_the_same_bytes() {
         "a lost-ack retry minted a second manifest key; the manifest is the ONE mutable key in \
          the layout (spec §2): {keys:?}"
     );
-    // And the pin never advances on an unacknowledged manifest: a segment
-    // counts as reflected only once the manifest PUT naming it has landed.
+    // And the pin sits exactly where the generation's chain starts, which is
+    // where taking the snapshot parked it — never further forward, since
+    // nothing has been acknowledged.
+    //
+    // RULING 53 re-baselines this from `db.log_base()`, which was only ever
+    // right because the chain started there. Arithmetic from the two
+    // measured constants (ruling 24): 3 * RECORDS_PER_SEGMENT records leave
+    // the live tail based one first segment plus two steady-state ones in,
+    // and that is the segment holding the first record the snapshot does not
+    // carry. The manifest-gated half of this property — a pin that never
+    // advances past a SEGMENT whose manifest has not landed — is asserted in
+    // `a_lost_segment_ack_retries_the_same_key_with_the_same_bytes`, which
+    // is the test that really does sit in `State::UploadingSegment`.
     assert_eq!(
         arc.pin_floor(),
-        db.log_base(),
-        "the pin advanced past a manifest the archive was never told had landed"
+        FIRST_SEGMENT_RECORDS + 2 * RECORDS_PER_SEGMENT,
+        "the pin moved off the generation's chain start while its manifest was unacknowledged \
+         (log_base {})",
+        db.log_base()
     );
     assert!(
         !keys.iter().any(|k| k.contains("/segments/")),
@@ -1664,6 +1863,12 @@ fn a_generation_never_takes_a_second_snapshot() {
 #[test]
 fn a_lost_segment_ack_retries_the_same_key_with_the_same_bytes() {
     let (mut db, store, mut arc) = archive_fixture_with_lost_segment_acks();
+    // RULING 53: the fault is aimed at `/segments/`, and a segment only
+    // ships once one seals ABOVE the generation's frontier. Phase 1 takes
+    // the snapshot (unfaulted, since nothing it writes is a segment); phase
+    // 2 is what this test is about.
+    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
+    step_until_idle(&mut arc, &db, &store);
     write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
 
     let e = step_until_error(&mut arc, &db, &store);
@@ -1712,6 +1917,18 @@ fn a_lost_segment_ack_retries_the_same_key_with_the_same_bytes() {
         m.segments.is_empty(),
         "the manifest names a segment whose PUT was never acknowledged: {:?}",
         m.segments
+    );
+    // And the pin has not advanced past that segment either: a segment
+    // counts as reflected only once the manifest PUT naming it has landed
+    // (carried here from `a_lost_manifest_ack_…`, whose own archive never
+    // reaches a segment at all once the chain continues its snapshot).
+    // Arithmetic from the two measured constants: phase 1's 3 *
+    // RECORDS_PER_SEGMENT records leave the chain starting one first segment
+    // plus two steady-state ones in, and that is the segment in flight.
+    assert_eq!(
+        arc.pin_floor(),
+        FIRST_SEGMENT_RECORDS + 2 * RECORDS_PER_SEGMENT,
+        "the pin advanced past a segment whose PUT the archive was never told had landed"
     );
 }
 
@@ -1958,8 +2175,10 @@ fn after_a_gap_the_next_contact_opens_a_new_generation_with_a_full_snapshot() {
 #[test]
 fn a_restarted_archive_resumes_the_generation_the_bucket_names() {
     let (mut db, store, mut arc) = archive_fixture();
+    // RULING 53: a resumable generation needs a chain to resume, and a chain
+    // only exists once a segment seals above the snapshot's frontier.
     write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
-    step_until_idle(&mut arc, &db, &store);
+    snapshot_then_chain(&mut arc, &mut db, &store, 3 * RECORDS_PER_SEGMENT);
     let before = read_manifest(&store).expect("a manifest");
     let objects_before = snapshot_objects(&store, before.generation, &store.keys());
     assert!(
@@ -2112,9 +2331,11 @@ fn an_archive_waiting_for_its_cadence_holds_nothing_against_a_healthy_store() {
     );
 
     // And it still archives once the cadence does arrive — the release is a
-    // yield, not a shutdown.
+    // yield, not a shutdown. Two phases (ruling 53): crossing the cadence
+    // buys the generation its snapshot, and the chain continuing it carries
+    // what seals above that.
     write_records(&mut db, 100 * RECORDS_PER_SEGMENT);
-    step_until_idle(&mut arc, &db, &store);
+    snapshot_then_chain(&mut arc, &mut db, &store, 3 * RECORDS_PER_SEGMENT);
     let m = read_manifest(&store).expect("a manifest once the cadence was finally crossed");
     assert!(
         !m.segments.is_empty(),
@@ -2155,8 +2376,11 @@ fn a_gap_marks_the_generation_it_broke_closed_before_opening_the_next() {
     // generation 0 for the gap in phase 2 to have something to close.
     let (mut db, store, mut arc) = archive_fixture_with_unreachable_store();
     restore_store_reachability(&store);
+    // Two phases (ruling 53): phase 1 buys generation 0 its snapshot, phase 2
+    // the chain continuing it — a generation with no chain is not the "live
+    // generation with a chain" this test needs something to close.
     write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
-    step_until_idle(&mut arc, &db, &store);
+    snapshot_then_chain(&mut arc, &mut db, &store, 3 * RECORDS_PER_SEGMENT);
     let before = read_manifest(&store).expect("generation 0's manifest");
     assert!(
         !before.closed && !before.segments.is_empty(),
@@ -2247,10 +2471,26 @@ fn a_restart_over_an_archived_log_is_not_a_gap() {
         "the fixture left {sealed} sealed segment(s) against a bound of {GAP_PIN_SEGMENTS}; a \
          FALSE gap is not even possible here and the test proves nothing"
     );
+    // RULING 53 re-baselines what "nothing is backlog" means. The segments
+    // BELOW this generation's frontier are its snapshot's — archiving them
+    // is the overlap ruling 53 removes — so the quantity that must already
+    // be archived is the sealed segments at or above the chain's own start.
+    let start = before
+        .segments
+        .first()
+        .expect("phase 1 must have shipped a chain")
+        .base_seq;
+    let above = db
+        .sealed_segments()
+        .unwrap()
+        .iter()
+        .filter(|s| s.base_seq >= start)
+        .count();
     assert_eq!(
         before.segments.len(),
-        sealed,
-        "every sealed segment must already be archived, so none of them is backlog: {:?}",
+        above,
+        "every sealed segment at or above the chain's start ({start}) must already be \
+         archived, so none of them is backlog: {:?}",
         before.segments
     );
     drop(arc);
@@ -2293,5 +2533,264 @@ fn a_restart_over_an_archived_log_is_not_a_gap() {
         "the restarted archive shipped nothing ({} -> {}), so 'it resumed' is vacuous",
         before.segments.len(),
         after.segments.len()
+    );
+}
+
+// ------------------ Task 7.5: the chain CONTINUES the snapshot (ruling 53)
+
+/// A `Db` whose log already holds far more sealed segments than the bound
+/// allows by the time `Archive::open` runs, with every one of them still on
+/// disk — the shape acceptance criterion 1 is about.
+///
+/// The second retention pin is not decoration: without it the default
+/// checkpoint cadence reclaims as the writes go in and the archive opens on
+/// a short log, which is precisely the shape that cannot exhibit the
+/// startup gap. Spec §5 says the pin composes as a min over pins, so a
+/// replication cursor holding the log at its base is the honest way to put
+/// those segments there.
+fn fixture_with_a_long_unarchived_log() -> (Db, SimObjectStore, Archive) {
+    let sim = Sim::with_faults(0x6172_6368_5f74_3502, FaultConfig::none());
+    let mut db_cfg = DbConfig::default();
+    db_cfg.wal.segment_bytes = 64 << 10;
+    let mut db = Db::open(Box::new(sim.disk()), db_cfg, Schema::new().table::<Rec>()).unwrap();
+    db.add_retention_pin(Box::new(|| 0));
+    write_records(&mut db, 20 * RECORDS_PER_SEGMENT);
+    let arc = Archive::open(
+        archive_config_bounded(0, 8 << 20, GAP_PIN_SEGMENTS),
+        &mut db,
+    )
+    .unwrap();
+    (db, SimObjectStore::new(), arc)
+}
+
+/// A manifest THIS archive's own writer left behind, naming a generation
+/// whose snapshot landed and whose chain has not started.
+///
+/// `resume_point`'s no-chain-yet arm is reachable from a test no other way:
+/// an archive that overlaps its snapshot ships a segment before its first
+/// manifest can ever be read back with an empty chain, so the arm only has
+/// a natural producer once ruling 53 is in place. Writing the manifest by
+/// hand makes the arm testable from either side of the change.
+fn write_own_manifest(store: &SimObjectStore, db: &Db, generation: u64, applied_seq: u64) {
+    let m = Manifest {
+        generation,
+        writer: WRITER.to_string(),
+        applied_seq,
+        next_job_id: 0,
+        tables: db.table_names().iter().map(|t| t.to_string()).collect(),
+        segments: Vec::new(),
+        closed: false,
+    };
+    store
+        .start(ObjectOp::Put {
+            key: manifest_key(PREFIX),
+            data: m.encode(),
+        })
+        .unwrap();
+    drain(store).unwrap();
+}
+
+/// RULING 53, acceptance criterion 1. An archive opening on a log with more
+/// sealed segments than its bound must SNAPSHOT that log, not gap on it.
+///
+/// Task 7 left this as a known symptom and accepted it only because ruling
+/// 53 removes it: the generation's snapshot already covers every one of
+/// those segments, so once the chain starts at the snapshot's frontier the
+/// backlog is zero and there is nothing for the bound to be over.
+#[test]
+fn an_archive_opening_on_a_long_log_snapshots_it_instead_of_gapping() {
+    let (db, store, mut arc) = fixture_with_a_long_unarchived_log();
+    let sealed = sealed_segment_count(&db);
+    assert!(
+        sealed > GAP_PIN_SEGMENTS,
+        "the fixture left {sealed} sealed segment(s) against a bound of {GAP_PIN_SEGMENTS}; the \
+         bound is never in question and this test proves nothing"
+    );
+    for _ in 0..10_000 {
+        if let Err(e) = arc.step(&db, &store) {
+            panic!(
+                "an archive opening on a {sealed}-segment log against a HEALTHY store failed: \
+                 {e}"
+            );
+        }
+        if arc.idle() {
+            break;
+        }
+    }
+    assert!(
+        arc.idle(),
+        "the archive never reached idle; the assertions below would be about a half-finished run"
+    );
+    assert!(
+        !arc.gapped(),
+        "an archive that has just snapshotted a {sealed}-segment log recorded a gap; the \
+         snapshot covers every one of those segments, so nothing was lost and nothing is behind"
+    );
+    let m = read_manifest(&store).expect("the opening snapshot's manifest");
+    assert_eq!(
+        m.generation, 0,
+        "the archive rolled off generation 0, which on a healthy store it does only after a gap"
+    );
+    assert!(
+        m.applied_seq > 0,
+        "the generation names a frontier of 0 over a Db that applied {:?}",
+        db.last_applied()
+    );
+}
+
+/// RULING 53 / spec §2 ("the chain of sealed segments CONTINUING it") and
+/// §3 ("snapshots ... let the archive delete segments below them").
+///
+/// A segment lying wholly below the generation's frontier holds nothing the
+/// snapshot does not already carry. Shipping it uploads those records twice,
+/// holds WAL the archive does not need, and hands restore an overlap it must
+/// either skip or double-apply.
+#[test]
+fn a_generations_chain_continues_its_snapshot_instead_of_overlapping_it() {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
+    step_until_idle(&mut arc, &db, &store); // generation 0's snapshot
+    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
+    step_until_idle(&mut arc, &db, &store); // and the chain continuing it
+
+    let m = read_manifest(&store).expect("a manifest");
+    assert!(
+        !m.segments.is_empty(),
+        "the archive shipped no chain at all, so 'the chain does not overlap' is vacuous: {m:?}"
+    );
+    for s in &m.segments {
+        assert!(
+            s.end_seq > m.applied_seq,
+            "segment [{}, {}] lies wholly below the generation's frontier {}: every record in \
+             it is already in the snapshot, so the chain OVERLAPS the snapshot instead of \
+             continuing it (spec §2)",
+            s.base_seq,
+            s.end_seq,
+            m.applied_seq
+        );
+    }
+    // And no hole in the other direction: the chain must start at or below
+    // the first record the snapshot does not carry, or the records between
+    // the two are in neither.
+    let start = m.segments[0].base_seq;
+    assert!(
+        start <= m.applied_seq + 1,
+        "the chain starts at {start}, above the first record its snapshot does not carry ({}); \
+         the records between them are in no part of this generation",
+        m.applied_seq + 1
+    );
+}
+
+/// RULING 53's second site: `resume_point`'s no-chain-yet arm. A restarted
+/// archive that adopts a generation whose snapshot landed and whose chain
+/// has not started must continue that snapshot too — resuming at the log's
+/// base re-introduces the overlap across every restart.
+#[test]
+fn a_resumed_generation_continues_its_snapshot_rather_than_the_logs_base() {
+    let sim = Sim::with_faults(0x6172_6368_5f74_3503, FaultConfig::none());
+    let mut db_cfg = DbConfig::default();
+    db_cfg.wal.segment_bytes = 64 << 10;
+    let mut db = Db::open(Box::new(sim.disk()), db_cfg, Schema::new().table::<Rec>()).unwrap();
+    // Every segment stays on disk, so the archive really can reach back to
+    // the log's base and the overlap is observable rather than reclaimed.
+    db.add_retention_pin(Box::new(|| 0));
+    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
+    assert_eq!(db.log_base(), 0, "the second pin must hold the whole log");
+
+    // A frontier INSIDE the last sealed segment, not at a boundary: the
+    // chain must start at that segment's base, and the two segments wholly
+    // below it must never ship.
+    let frontier = FIRST_SEGMENT_RECORDS + RECORDS_PER_SEGMENT + 100;
+    let sealed = db.sealed_segments().unwrap();
+    assert!(
+        sealed.len() >= 3
+            && sealed
+                .iter()
+                .any(|s| s.base_seq <= frontier && frontier < s.layout_end),
+        "the frontier {frontier} must fall strictly inside a sealed segment for this test to \
+         distinguish a segment boundary from a snapshot boundary: {sealed:?}"
+    );
+
+    let store = SimObjectStore::new();
+    write_own_manifest(&store, &db, 0, frontier);
+    let mut arc = Archive::open(archive_config(0, 8 << 20), &mut db).unwrap();
+    step_until_idle(&mut arc, &db, &store);
+
+    let m = read_manifest(&store).expect("a manifest");
+    assert_eq!(
+        (m.generation, m.applied_seq),
+        (0, frontier),
+        "the archive did not resume the generation the bucket named, so nothing below is about \
+         the resume path: {m:?}"
+    );
+    assert!(
+        !m.segments.is_empty(),
+        "the resumed generation shipped no chain at all, so 'it continued its snapshot' is \
+         vacuous: {m:?}"
+    );
+    for s in &m.segments {
+        assert!(
+            s.end_seq > m.applied_seq,
+            "the resumed chain ships segment [{}, {}], wholly below the generation's frontier \
+             {}: the resume path started the chain at the log's base instead of at the \
+             snapshot the manifest names",
+            s.base_seq,
+            s.end_seq,
+            m.applied_seq
+        );
+    }
+}
+
+/// RULING 53's other end, and `chain_start`'s empty-listing fallback, which
+/// has no other producer in this file: with NO sealed segment at all the
+/// whole log is the live tail, so the chain starts at the log's base — and
+/// that is not the defect. Nothing lies wholly below the frontier there, so
+/// there is nothing to drop; what ruling 53 removes is a chain that starts
+/// below segments the snapshot already covers, not the value 0 itself.
+///
+/// It also exhibits the residue §2 records: the chain's head segment holds
+/// the records between its base and the frontier, which the snapshot has
+/// too. Bounded by one segment, and skippable from `Manifest::applied_seq`.
+#[test]
+fn a_generation_snapshotted_before_any_segment_seals_starts_at_the_logs_base() {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, 100);
+    assert_eq!(
+        sealed_segment_count(&db),
+        0,
+        "this test is about a log with NOTHING sealed; the fallback it covers is unreachable \
+         once a segment exists"
+    );
+    step_until_idle(&mut arc, &db, &store);
+
+    let m = read_manifest(&store).expect("the opening snapshot's manifest");
+    assert!(
+        m.segments.is_empty(),
+        "nothing is sealed, so nothing can have shipped: {m:?}"
+    );
+    assert_eq!(
+        arc.pin_floor(),
+        db.log_base(),
+        "with no sealed segment the whole log is the live tail, and its base is where the \
+         chain has to start"
+    );
+
+    // And the chain it goes on to build really does start there, head
+    // segment and all.
+    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
+    step_until_idle(&mut arc, &db, &store);
+    let after = read_manifest(&store).expect("a manifest once segments sealed");
+    assert_eq!(
+        after.segments.first().map(|s| s.base_seq),
+        Some(db.log_base()),
+        "the chain skipped past the base of a log that has nothing below its frontier to \
+         skip: {:?}",
+        after.segments
+    );
+    assert!(
+        after.segments[0].end_seq > after.applied_seq,
+        "even the head segment must reach above the frontier, or it is a segment the \
+         snapshot wholly covers: {:?}",
+        after.segments
     );
 }

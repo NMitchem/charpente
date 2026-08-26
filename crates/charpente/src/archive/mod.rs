@@ -6,7 +6,8 @@
 //! ships sealed segments (§3's first half); Task 6 landed the snapshot
 //! (§3's other half) and the ordering that is the whole safety argument;
 //! Task 7 lands the bounded pin, the named gap, generation transitions and
-//! resume-or-open. Restore (§6) is still to come.
+//! resume-or-open; Task 7.5 makes a generation's chain CONTINUE its snapshot
+//! instead of overlapping it (ruling 53). Restore (§6) is still to come.
 //!
 //! **The manifest swaps last.** Inter-key ordering is not guaranteed by
 //! `ObjectStore` (§1), so the manifest swap is the only operation whose
@@ -40,6 +41,23 @@
 //!   "always writes fresh" is idempotent for segment objects, whose bytes
 //!   are a function of their key, but not for a snapshot, whose bytes are a
 //!   function of when it was taken.
+//!
+//! **A generation's chain CONTINUES its snapshot** (ruling 53, spec §2), and
+//! that is what makes a snapshot worth taking: §3's "snapshots let the
+//! archive delete segments below them". The chain starts at the base of the
+//! sealed segment holding the first record the snapshot does not carry
+//! (`chain_start`), never at the log's base — every segment lying wholly
+//! below the frontier is the snapshot's, so the archive neither holds nor
+//! ships it. Before this the chain began at `db.log_base()` and a generation
+//! uploaded its whole log twice: once as a snapshot, once as a chain
+//! underneath it, holding all of that WAL while it did.
+//!
+//! The residue this leaves is one segment's worth, and it is structural
+//! rather than an oversight: whole segments ship verbatim and a frontier is
+//! wherever the `Db` had applied to, never a segment boundary, so the
+//! chain's HEAD segment still carries the records between its own base and
+//! the frontier. `Manifest::applied_seq` is the seq a restore replays from,
+//! which makes that head skippable by arithmetic rather than by search.
 //!
 //! **Cadence is seq-driven, and structurally so** (§3). `step` receives no
 //! clock, `Db` exposes none, and nothing in this module names one — so
@@ -142,10 +160,12 @@
 //! a gap, and a `snapshot_every` crossing. A generation carries exactly one
 //! snapshot, so a *refresh* is a new generation — never a second snapshot
 //! written into `<gen>/snapshot/**`, whose keys the live manifest already
-//! points at. A roll deliberately CARRIES `next_needed`: the new
-//! generation's chain continues exactly where the old one stopped, which
-//! keeps every un-shipped record inside some generation and keeps the pin
-//! monotonic across the roll.
+//! points at. A roll deliberately CARRIES `next_needed`, as a FLOOR: it
+//! keeps the pin monotonic across the roll (M1'), and the new generation's
+//! own snapshot then moves it up to that snapshot's frontier segment. What
+//! the old chain never shipped is not lost by that move — the new
+//! generation's snapshot contains it, since a snapshot's frontier is at or
+//! above every record its predecessor shipped.
 //!
 //! **`Archive::step`'s first act is a store READ** (`State::Opening`): a GET
 //! of `<prefix>/manifest`, which decides whether this archive RESUMES the
@@ -226,12 +246,20 @@ pub struct ArchiveConfig {
     /// `DbConfig::retain_segments`'s default of 2, bounding the WAL held
     /// above the checkpoint floor at 512 MiB (64 MiB segments).
     ///
+    /// That 512 MiB arithmetic was computed BEFORE ruling 53, against a
+    /// chain that started at the log's base — a different held quantity than
+    /// the one this now bounds. Spec §14 open item 1 carries the
+    /// re-derivation; the default is Noah's to rule and is not re-picked
+    /// here.
+    ///
     /// Counted as sealed segments at or above `next_needed` — exactly what
     /// this archive's pin is keeping alive. Past it the archive yields
     /// (module docs). Size it for the LONGER of the two waits it covers: an
     /// object-store outage, and the time one generation's full snapshot
     /// takes to upload, during which the archive ships no segment at all and
-    /// its pin holds every one of them.
+    /// its pin holds every segment that seals meanwhile. (Not every segment
+    /// on disk: the snapshot's own frontier is where its chain starts, so
+    /// what sealed before it was taken is released rather than held.)
     ///
     /// Must be at least 1; `open` asserts it. Zero would yield at the first
     /// un-archived segment and make every generation one segment long.
@@ -417,6 +445,62 @@ fn put_step(
     }
 }
 
+/// The seq a generation's chain starts at, given the frontier `F` its one
+/// snapshot was taken at. SPEC §2 — the chain CONTINUES the snapshot — and
+/// spec §3, which is what makes a snapshot worth taking: it is what lets the
+/// archive drop the segments below it (RULING 53).
+///
+/// `F + 1` is the first record the snapshot does not carry, but the chain
+/// ships whole sealed segments verbatim (spec §3), so it starts at the BASE
+/// of the segment `F + 1` falls in — the live tail's base when it falls
+/// above every sealed segment, that being the base of the first segment that
+/// can ever seal above this snapshot.
+///
+/// The head of the chain therefore still carries the records between its own
+/// base and `F`, which the snapshot has too. That residue is bounded by one
+/// segment and is structural rather than an oversight: a frontier is
+/// wherever the `Db` had applied to, never a segment boundary, and §3 ships
+/// segments verbatim rather than re-cut. It is also skippable by arithmetic
+/// rather than by search, since `Manifest::applied_seq` is the seq a restore
+/// replays from. What ruling 53 removes is the UNBOUNDED part: every segment
+/// lying wholly below `F`, which is the whole log at a fresh generation.
+fn chain_start(db: &Db, frontier: u64) -> io::Result<u64> {
+    let target = frontier.saturating_add(1);
+    let sealed = db.sealed_segments()?;
+    let start = match sealed.iter().find(|s| target <= s.layout_end) {
+        Some(s) => s.base_seq,
+        None => sealed
+            .last()
+            .map_or_else(|| db.log_base(), |s| s.layout_end + 1),
+    };
+    // Negative space (hard rule 4), and both directions of getting this
+    // wrong have a name. ABOVE `target` is a HOLE: the records between the
+    // snapshot and the chain would be in neither, which is the one thing
+    // spec §2 says a generation never has. Reachable only if gc has taken a
+    // segment at or below the frontier, which the retention pin exists to
+    // prevent — so it is asserted, not handled.
+    assert!(
+        start <= target,
+        "Archive: a generation's chain would start at {start}, above the first record its \
+         snapshot does not carry ({target}) — those records would be in no part of the \
+         generation; the log's base is {} and its sealed segments are {sealed:?}",
+        db.log_base()
+    );
+    // BELOW the frontier's own segment is the OVERLAP ruling 53 removes: a
+    // sealed segment at or above the chain's start that lies wholly below
+    // the frontier holds nothing the snapshot does not already carry, so
+    // shipping it uploads those records twice and holds WAL for them.
+    assert!(
+        sealed
+            .iter()
+            .all(|s| s.base_seq < start || s.layout_end >= target),
+        "Archive: a generation's chain would start at {start} while a sealed segment at or \
+         above it lies wholly below the snapshot's frontier {frontier} — the chain must \
+         continue the snapshot, not repeat it (spec §2); sealed segments are {sealed:?}"
+    );
+    Ok(start)
+}
+
 /// The archive engine for one node (module docs). Borrows `Db`/`ObjectStore`
 /// one `step` at a time rather than owning either (ruling 32): `ObjectStore`
 /// is `Send` but not `Sync`-bound, and the sim fixture's store is not `Send`
@@ -446,10 +530,14 @@ pub struct Archive {
     segments: Vec<SegmentRef>,
     /// The base_seq of the next sealed segment this archive needs — the head
     /// of the chain it is still building, and the seq its pin holds at.
+    /// Set to the generation's chain start (`chain_start`, ruling 53) when
+    /// that generation's snapshot is taken, and advanced one segment at a
+    /// time from there as each manifest lands.
+    ///
     /// Held as a field rather than derived from `segments` because it
-    /// SURVIVES a generation roll: the new generation continues where the
-    /// old one stopped, and re-deriving it from an empty chain would move a
-    /// caught-up floor backwards onto `db.log_base()` (M1').
+    /// SURVIVES a generation roll as the floor the next one starts from, and
+    /// re-deriving it from an empty chain would move a caught-up floor
+    /// backwards onto `db.log_base()` (M1').
     next_needed: u64,
     /// The BOUND's baseline while `State::Opening` has not yet told this
     /// archive what it actually needs (F-A, task-7-review.md). `next_needed`
@@ -847,12 +935,13 @@ impl Archive {
     /// a refresh cannot be a second snapshot in place: `<gen>/snapshot/**`
     /// is what the live manifest already points at.
     ///
-    /// `next_needed` is deliberately CARRIED. The new generation's chain
-    /// continues exactly where the old one stopped, which keeps every
-    /// un-shipped record inside some generation and keeps the pin monotonic
-    /// across the roll — re-deriving it from the now-empty chain would move
-    /// a caught-up floor backwards onto `db.log_base()` and trip `hold`'s
-    /// M1' assert.
+    /// `next_needed` is deliberately CARRIED, as a FLOOR: re-deriving it from
+    /// the now-empty chain would move a caught-up floor backwards onto
+    /// `db.log_base()` and trip `hold`'s M1' assert. It is only a floor
+    /// because the new generation's own snapshot moves it up to that
+    /// snapshot's frontier segment (`chain_start`, ruling 53); whatever the
+    /// old chain never shipped is in that snapshot, which is why skipping
+    /// past it loses nothing.
     fn roll_generation(&mut self) {
         self.generation += 1;
         self.frontier = None;
@@ -902,10 +991,7 @@ impl Archive {
                 Ok(())
             }
             Some(Ok(ObjectDone::Get(bytes))) => match Manifest::decode(&bytes) {
-                Ok(m) => {
-                    self.adopt(db, Some(m));
-                    Ok(())
-                }
+                Ok(m) => self.adopt(db, Some(m)),
                 Err(e) => {
                     // Untrusted bytes, and refusing outright is spec §4's
                     // ownership rule, which lands at Task 8. Retrying is the
@@ -921,10 +1007,7 @@ impl Archive {
                  {other:?}"
             ),
             // A bucket this archive has never written to. Not a failure.
-            Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => {
-                self.adopt(db, None);
-                Ok(())
-            }
+            Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => self.adopt(db, None),
             Some(Err(e)) => {
                 self.state = State::Opening { started: false };
                 Err(e)
@@ -934,7 +1017,23 @@ impl Archive {
 
     /// Decides, from what the bucket already holds, whether this archive
     /// extends that generation or opens a fresh one (ruling 43).
-    fn adopt(&mut self, db: &Db, found: Option<Manifest>) {
+    fn adopt(&mut self, db: &Db, found: Option<Manifest>) -> io::Result<()> {
+        // The resume decision reads the segment layout (`chain_start`) and
+        // so can fail. It is taken before anything below is mutated, and a
+        // failure returns to `Opening` rather than to `Idle`: an archive
+        // half-adopted here would snapshot without having finished reading
+        // the bucket, which is the very thing ruling 43 put this state in
+        // front of everything for.
+        let resume = match &found {
+            Some(m) => match self.resume_point(db, m) {
+                Ok(at) => at,
+                Err(e) => {
+                    self.state = State::Opening { started: false };
+                    return Err(e);
+                }
+            },
+            None => None,
+        };
         self.state = State::Idle;
         // The bucket has answered: `next_needed` becomes a real cursor below
         // and the bound measures against it from here (F-A).
@@ -945,9 +1044,9 @@ impl Archive {
             // a generation whether or not the closed one ever wrote, so the
             // counter advances by exactly one either way (ruling 50).
             self.hold_or_yield_for_generation(db);
-            return;
+            return Ok(());
         };
-        if let Some(resume_at) = self.resume_point(db, &m) {
+        if let Some(resume_at) = resume {
             self.generation = m.generation;
             self.segments = m.segments;
             self.frontier = Some(Frontier {
@@ -957,7 +1056,7 @@ impl Archive {
             });
             self.next_needed = resume_at;
             self.hold(resume_at);
-            return;
+            return Ok(());
         }
         // A fresh generation over an existing one. `max` rather than
         // `m.generation + 1` alone: after a gap this archive has ALREADY
@@ -981,6 +1080,7 @@ impl Archive {
                 started: false,
             };
         }
+        Ok(())
     }
 
     /// With no generation open the archive needs nothing from the log
@@ -994,20 +1094,20 @@ impl Archive {
     /// The seq a resumed generation continues its chain at, or `None` when
     /// this generation must not be extended. Every refusal below is a reason
     /// the extension would produce a chain that claims more than it covers.
-    fn resume_point(&self, db: &Db, m: &Manifest) -> Option<u64> {
+    fn resume_point(&self, db: &Db, m: &Manifest) -> io::Result<Option<u64>> {
         if self.gapped {
             // gc has taken records this generation never shipped: extending
             // it is exactly the hole spec §2 says a generation never has.
-            return None;
+            return Ok(None);
         }
         if m.writer != self.cfg.writer {
             // Never interleave generations (spec §4). Refusing to archive at
             // all is Task 8's; declining to extend somebody else's chain is
             // strictly safer than the blind reuse this replaces.
-            return None;
+            return Ok(None);
         }
         if m.closed {
-            return None;
+            return Ok(None);
         }
         // Negative space, checked rather than asserted because these bytes
         // crossed the network: a chain starting ABOVE its own snapshot's
@@ -1016,25 +1116,32 @@ impl Archive {
             .first()
             .is_some_and(|s| s.base_seq > m.applied_seq.saturating_add(1))
         {
-            return None;
+            return Ok(None);
         }
         let at = match m.segments.last() {
-            Some(last) => last.end_seq.checked_add(1)?,
-            // No chain yet: it would start at the log's base, which has to
-            // be at or below the snapshot's frontier for the same reason.
+            Some(last) => match last.end_seq.checked_add(1) {
+                Some(at) => at,
+                None => return Ok(None),
+            },
+            // No chain yet: RULING 53 puts its start where this generation's
+            // snapshot stops, never at the log's base — resuming at the base
+            // re-introduces the overlap on every restart, for as long as the
+            // generation lives. The refusal below is what makes the boundary
+            // derivable at all: everything from `applied_seq + 1` up must
+            // still be in the local log, so the segment holding it is intact
+            // and at or above the base.
             None => {
-                let base = db.log_base();
-                if base > m.applied_seq.saturating_add(1) {
-                    return None;
+                if db.log_base() > m.applied_seq.saturating_add(1) {
+                    return Ok(None);
                 }
-                base
+                chain_start(db, m.applied_seq)?
             }
         };
         // And everything from there must still be in the local log.
         if db.log_base() > at {
-            return None;
+            return Ok(None);
         }
-        Some(at)
+        Ok(Some(at))
     }
 
     fn step_closing_generation(
@@ -1081,6 +1188,22 @@ impl Archive {
             return Ok(false);
         };
         let next_job_id = snapshot.next_job_id()?;
+        // RULING 53 / spec §2: the chain this generation is about to build
+        // CONTINUES this snapshot rather than overlapping it. Sited here,
+        // before the walk is committed to `self.state`, for two reasons: the
+        // frontier is fixed by the MVCC view above, so every row below it
+        // belongs to this generation whatever the WAL does next; and a `?`
+        // on this line leaves the archive exactly where it was, with nothing
+        // half-moved.
+        //
+        // Deliberately NOT deferred to the manifest swap that commits the
+        // snapshot. The rows below the frontier come from the table store,
+        // not the WAL, so a snapshot that never lands costs nothing it
+        // released: the next generation simply snapshots at a later
+        // frontier. Waiting would instead keep the whole log held for the
+        // length of a full snapshot upload — which is exactly the startup
+        // gap this task exists to remove.
+        self.next_needed = chain_start(db, applied_seq)?;
         self.state = State::Snapshotting {
             walk: SnapshotWalk {
                 snapshot,
@@ -1244,10 +1367,11 @@ impl Archive {
         // manifest would carry a frontier no snapshot backs.
         if self.frontier.is_none() {
             if self.open_snapshot(db)? {
-                // From here the archive is building a chain continuing from
-                // `next_needed` and needs the log again: hold (M1), and the
-                // gap — if there was one — is closed by the generation now
-                // opening.
+                // From here the archive is building a chain continuing
+                // from the frontier `open_snapshot` has just moved
+                // `next_needed` to (ruling 53), and it needs the log again:
+                // hold (M1), and the gap — if there was one — is closed by
+                // the generation now opening.
                 self.hold(self.next_needed);
                 self.gapped = false;
                 return Ok(());
