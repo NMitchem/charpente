@@ -58,11 +58,15 @@ pub fn emit_client(c: &Contract) -> String {
 const CLASS_DECL: &str = "export class Api extends ApiBase {\n";
 
 /// A wire type shares module scope with everything the runtime declares, so
-/// one named like a runtime declaration produces two `export`s of that name
-/// in a single file — a `tsc` "Duplicate identifier", not a warning. Refused
-/// by name here, the same way `TypeRegistry::insert_as` already refuses a
-/// wire-name collision (wire.rs) and `emit_types` refuses a branded id
-/// colliding with a wire type.
+/// one named like a runtime declaration produces two `export`s of that name in
+/// a single file. Sometimes that is a `tsc` "Duplicate identifier" (TS2300, as
+/// two `export type Result` would be); worse, sometimes it is not an error at
+/// all — an `export interface CursorDiverged` beside the runtime's
+/// `export class CursorDiverged` MERGES silently, tsc exit 0, and the app
+/// author gets a class carrying fields nobody declared on it. So this check is
+/// the guard, not the compiler. Refused by name here, the same way
+/// `TypeRegistry::insert_as` already refuses a wire-name collision (wire.rs)
+/// and `emit_types` refuses a branded id colliding with a wire type.
 fn check_reserved(c: &Contract) {
     for d in &c.types {
         assert!(
@@ -85,6 +89,15 @@ mod tests {
     /// Every module-scope name in the FIXED half of a generated file — the
     /// runtime's declarations, plus the `class Api` line `emit_client` writes
     /// itself — and nothing else.
+    ///
+    /// The keyword list covers every form that occupies TYPE space, which is
+    /// the space `emit_types` writes into (`export type` / `export interface`).
+    /// `enum` in all three of its spellings is in the list because it really
+    /// does collide — `export enum Order` beside either an `interface Order` or
+    /// a `type Order` is `TS2567`, run under tsc 5.9.3 — and `abstract class`
+    /// because it is a `class` the plain prefix would miss. Deliberately NOT
+    /// matched: `export const `, `export let `, `export function `. Those are
+    /// value space only, and a wire type cannot collide with them.
     fn declarations(ts: &str) -> BTreeSet<&str> {
         let mut found = BTreeSet::new();
         for line in ts.lines() {
@@ -93,7 +106,10 @@ mod tests {
             let Some(rest) = [
                 "export type ",
                 "export class ",
+                "export abstract class ",
                 "export interface ",
+                "export enum ",
+                "export const enum ",
                 "function ",
             ]
             .iter()

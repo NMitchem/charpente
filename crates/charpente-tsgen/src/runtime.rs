@@ -15,9 +15,17 @@
 /// Sorted, and kept in sync by
 /// `reserved_lists_exactly_what_the_runtime_and_the_api_class_declare` in
 /// `lib.rs` — a name added to the TypeScript below without being added here
-/// would go unprotected. `sseValue` is not exported and is still listed:
-/// module scope is module scope, and a wire type of that name would collide
-/// with it exactly as loudly.
+/// would go unprotected.
+///
+/// `sseValue` is listed even though a wire type of that name could not in fact
+/// collide with it: TypeScript keeps type space and value space apart, so a
+/// plain `function sseValue` and an `export type sseValue` coexist (tsc 5.9.3,
+/// run, exit 0). It is listed because this list is checked mechanically
+/// against every module-scope declaration the fixed half makes, and one
+/// remembered exception is what makes the next one get forgotten — the same
+/// name declared as a `class` or an `enum` DOES collide (TS2300 / TS2567,
+/// both run). The cost of over-reserving is refusing a contract whose wire
+/// type is literally named `sseValue`, which a Rust type name will not be.
 pub const RESERVED: &[&str] = &[
     "Api",
     "ApiBase",

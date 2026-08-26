@@ -32,24 +32,43 @@ fn a_stream_route_becomes_a_typed_subscribe() {
         ts.contains("feed(opts: SubscribeOptions<FeedEvent>)"),
         "{ts}"
     );
+    // Scoped to the union's own declaration. Unscoped, the payload names were
+    // satisfied by the `export interface InvoicePaid {` emitted above, so the
+    // assertion held whether or not the union mentioned them at all. That the
+    // arms are EXACTLY these two is pinned by
+    // `the_event_union_is_discriminated_by_the_wire_event_name`, which
+    // compares the whole declaration, so this one does not repeat it.
+    let union = ts
+        .split_once("export type FeedEvent =")
+        .expect("a declared stream route must get a union")
+        .1;
+    // `;\n` and not `;`: each arm carries its own `;` between the discriminant
+    // and the payload, so a bare `;` would cut the union after its first arm.
+    let union = &union[..union.find(";\n").expect("the union must terminate")];
     assert!(
-        ts.contains("export type FeedEvent =")
-            && ts.contains("InvoicePaid")
-            && ts.contains("InvoiceVoided"),
-        "the union must name exactly the declared emits: {ts}"
+        union.contains("InvoicePaid") && union.contains("InvoiceVoided"),
+        "the union's arms must carry the declared payload types: {union}"
     );
 }
 
 #[test]
 fn the_gap_and_divergence_frames_are_modelled_not_swallowed() {
     let ts = emit_client(&fixture_contract());
+    // Scoped to ApiBase's body, the way the CursorDiverged sibling below is:
+    // `charpente.gap` also appears in `StreamEnd`'s doc comment, so an
+    // unscoped `contains` was satisfied by prose that dispatches nothing.
+    let base = ts
+        .split_once("export class ApiBase {")
+        .expect("the runtime must declare ApiBase")
+        .1;
+    let base = &base[..base.find("\n}").expect("the class must close")];
     assert!(
-        ts.contains("charpente.gap"),
-        "the gap frame must be handled: {ts}"
+        base.contains(r#"name === "charpente.gap""#),
+        "the gap frame must be dispatched on, not only documented: {base}"
     );
     assert!(
-        ts.contains("CursorDiverged"),
-        "divergence must be a typed condition: {ts}"
+        ts.contains("export class CursorDiverged extends Error"),
+        "divergence must be a typed condition, not a mention: {ts}"
     );
     assert!(
         ts.contains("must not auto-resume"),
