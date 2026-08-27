@@ -1365,8 +1365,21 @@ fn the_manifest_never_points_at_an_incomplete_generation() {
          resumes nothing: {:?}",
         planted.iter().map(|(k, _)| k).collect::<Vec<_>>()
     );
-    drop(arc);
+    // `arc` stays ALIVE across these writes, and that is load-bearing since
+    // T9's F4 fix (`impl Drop for Archive`): its retention pin is the only
+    // thing holding the segments the planted generation's chain continues
+    // from. Dropping it first releases the pin, the checkpoint that these
+    // 5,000 records drive GCs the log to base 6824 (MEASURED — it was 4094
+    // with the archive holding), and every cut below then resumes a
+    // generation whose chain start is already reclaimed: a manifest that
+    // never grows a chain, and the ordering property untested for segments
+    // entirely. Before F4 this read `drop(arc); write_records(...)` and
+    // worked only because the dropped archive LEAKED its hold — the test
+    // was resting on the defect. Alive-then-dropped is also the honest
+    // model of what it means to test: an archive that was running while the
+    // writes happened, and a process that then restarted.
     write_records(&mut db, 5_000);
+    drop(arc);
 
     let steps = steps_to_idle(&mut db, &planted);
     assert_eq!(
@@ -3836,5 +3849,46 @@ fn the_idle_doc_names_every_state_that_answers_true() {
         "`self.idle = true` is assigned at {sites} sites, not the 6 the doc's five states account \
          for (`Stopped` is reached twice). A new site is a new state until proven otherwise, and \
          `Archive::idle`'s doc must name it before this test goes green again"
+    );
+}
+
+// ------------------------------------------- T9 / F4: the dropped-pin leak
+
+/// F4 (Ruling 58). `Db::add_retention_pin` has no unregister and the
+/// registered closure keeps its own `Arc` to the `Pin`, so a dropped
+/// `Archive` goes on reporting the floor it last held — forever, because
+/// nothing can ever advance it again. That is spec §5's hazard (a derived
+/// artifact acquiring the power to halt the thing it derives from) arriving
+/// with no outage at all: `Wal::gc` can never pass the floor, so the WAL
+/// grows until the disk fills.
+///
+/// Task 9 is the commit that makes it reachable rather than theoretical.
+/// Once the `Kernel` owns the `Archive`, dropping the `Kernel` drops the
+/// `Archive` — including every test that builds a kernel and lets it fall
+/// out of scope, and every `serve::archive` whose `run` returns.
+///
+/// The first assert is not decoration: without it a `Drop` that did nothing
+/// would still pass whenever the archive happened not to be holding, and
+/// the test would prove nothing.
+#[test]
+fn dropping_an_archive_releases_its_retention_pin() {
+    let (mut db, store, mut arc) = archive_fixture();
+    snapshot_then_chain(&mut arc, &mut db, &store, 3 * RECORDS_PER_SEGMENT);
+
+    let held = arc.pin_floor();
+    assert_eq!(
+        db.retention_floor(),
+        held,
+        "the archive is not holding the log, so dropping it could not leak a hold and this test \
+         proves nothing"
+    );
+
+    drop(arc);
+
+    assert_eq!(
+        db.retention_floor(),
+        u64::MAX,
+        "a dropped Archive left its retention pin reporting {held}: Wal::gc can never pass that \
+         seq again and the WAL grows forever, with no archive left to release it"
     );
 }
