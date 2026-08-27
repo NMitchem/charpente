@@ -474,6 +474,29 @@ mod tests {
         );
     }
 
+    /// Hard rule 6, made mechanical. GUIDE §13 quotes `LAUNCH_USAGE`
+    /// verbatim as "a pinned usage message", and Task 11 changed the const
+    /// without changing the quote — so the GUIDE printed text the binary no
+    /// longer says. `include_str!` is a compile-time read, not ambient IO,
+    /// and it turns that silent drift into a failing test.
+    ///
+    /// The same guard for `RESTORE_USAGE`, whose whole reason to exist is
+    /// telling an operator what `--force` destroys: a GUIDE that quotes a
+    /// stale version of that is worse than one that quotes none.
+    #[test]
+    fn the_guide_quotes_the_usage_text_the_binary_actually_prints() {
+        const GUIDE: &str = include_str!("../../../docs/GUIDE.md");
+        assert!(
+            GUIDE.contains(LAUNCH_USAGE),
+            "docs/GUIDE.md no longer quotes LAUNCH_USAGE verbatim — the doc is the spec, so \
+             update the quoted block to:\n{LAUNCH_USAGE}"
+        );
+        assert!(
+            GUIDE.contains("--force          discard a destination timeline"),
+            "docs/GUIDE.md must quote restore's flag list as RESTORE_USAGE states it"
+        );
+    }
+
     // ------------------------------------- Task 11: the `restore` verb
     //
     // Deny-list opt-out for this section's fixtures only, same rationale as

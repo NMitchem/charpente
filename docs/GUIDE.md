@@ -3408,12 +3408,17 @@ fn main() -> std::io::Result<()> {
 
 That's the whole migration: no verb still serves on `"0.0.0.0:8080"` against `./data`
 exactly as a hand-rolled `main` would; `myapp describe` and `myapp describe --format json`
-are new, for free. An unrecognized verb or a bad `--format` value exits 2 with a pinned
-usage message:
+are new, for free — and so is `restore` (§14). An unrecognized verb or a bad `--format`
+value exits 2 with a pinned usage message:
 
 ```text
-usage: <app> [describe [--format json|human]]  — no verb serves the app
+usage: <app> [describe [--format json|human]]
+       <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]  — no verb serves the app
 ```
+
+(`launch.rs`'s `the_guide_quotes_the_usage_text_the_binary_actually_prints` `include_str!`s
+this file and asserts the block above is the constant verbatim, so the two cannot drift
+apart silently again — they did once, when §14 was added.)
 
 ### `charpente describe` — the CLI verb
 
