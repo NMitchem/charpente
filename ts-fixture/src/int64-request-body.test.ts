@@ -26,6 +26,15 @@ test("an Int64 in a request body serializes to its decimal string, not a thrown 
     });
     assert.equal(result.ok, true);
 
+    // Which of these three assertions actually catches THIS bug: only the
+    // `deepEqual`. Under the unfixed emitter `JSON.stringify` throws before
+    // `fetch` runs, so the two `assert.equal` lines are never reached -- the
+    // test fails by uncaught exception, and they are regression guards for
+    // other bugs (a double-send, a broken `res.ok` ternary), not oracles for
+    // this one. The `deepEqual` is the line that survives the near-miss fix:
+    // a replacer using `Number(v)` instead of `v.toString()` would NOT throw,
+    // would reach here, and would fail on the JSON-number-vs-string mismatch.
+    //
     // The exact bytes that reached `fetch`: not the JS number
     // 9007199254740993 (which would silently corrupt any value above 2^53,
     // the whole reason Int64 is a string on the wire) and not corrupted some
