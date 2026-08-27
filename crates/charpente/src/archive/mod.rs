@@ -804,11 +804,21 @@ impl Archive {
     /// stepping — that is the whole of its meaning, and it is why the
     /// terminal case below answers true rather than false.
     ///
-    /// FOUR states answer true here, and this accessor does not distinguish
-    /// them:
+    /// FIVE states answer true here, and this accessor does not distinguish
+    /// them. `the_idle_doc_names_every_state_that_answers_true` is the
+    /// tripwire on that count — it counts this list against the
+    /// `self.idle = true` sites, so a sixth state cannot land without
+    /// landing here too:
     ///
     /// - **Caught up** — nothing is sealed past what has been archived.
     /// - **Waiting** — the one sealed segment left is not yet fully applied.
+    /// - **No generation open** — `frontier` is `None` and `open_snapshot`
+    ///   declined: `snapshot_every` has not been reached, or the `Db` has
+    ///   applied nothing to snapshot. **Sealed, un-archived segments can be
+    ///   sitting behind this** — measured, two of them with an empty bucket
+    ///   — so it is neither "caught up" nor "waiting", and nothing is wrong:
+    ///   the archive opens the generation itself once the cadence arrives,
+    ///   and holds nothing against `Wal::gc` meanwhile (ruling 46).
     /// - **Write-gated** — `db.verifying()`, so this node may upload nothing
     ///   at all (spec §4 rule 1). Transient: the archive resumes by itself
     ///   when the gate opens, since the guard is re-read every step. A test
@@ -824,7 +834,10 @@ impl Archive {
     /// reached the store, and never that anything is well. `gapped()` and
     /// `stopped()` are the two accessors that answer "is something wrong",
     /// and an arm that renders only `idle` presents a permanently dead
-    /// archive as a healthy one.
+    /// archive as a healthy one. In THREE of the five — no generation open,
+    /// write-gated, stopped — there is un-archived data behind the `true`,
+    /// so a caller that reads `idle` as "everything is shipped" is wrong
+    /// more often than it is right.
     pub fn idle(&self) -> bool {
         self.idle
     }
