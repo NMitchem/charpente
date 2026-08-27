@@ -3741,3 +3741,103 @@ into each `#[route(SSE …)]` handler's `Subscription`, not registered anywhere 
 walk could discover ahead of time (spec ruling 6). The only trace of realtime in the
 contract above is `"stream": true` on `events_feed` — the fact that a route serves SSE at
 all, not what it emits. Reading a route's handler is still how you find that out.
+
+## 14. Restoring from an archive
+
+An archive is worth exactly what can be read back from it. `restore` is the reading-back:
+it rebuilds a data directory from a bucket an archive wrote, to the newest recoverable
+point in it.
+
+Every app binary that calls `charpente::launch` has the verb already:
+
+```text
+usage: <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]
+       --from BUCKET    the archive's root directory (the bucket an archive wrote)
+       --prefix PREFIX  the key prefix that archive owned — ArchiveConfig::prefix, verbatim
+       --to DIR         the data directory to rebuild (default: this app's own data directory)
+       --force          discard a destination timeline the archive cannot prove is its own
+```
+
+and the CLI runs it against any app crate from the outside, exactly as `charpente
+describe` does:
+
+```bash
+charpente restore --dir ./myapp --from /mnt/archive --prefix node-a --to ./data
+```
+
+`--dir` defaults to the current directory. The CLI runs `cargo build` there, picks the
+binary, and execs it with `restore …`. It has to go through the app's own binary rather
+than doing the work itself: restoring a table applies its rows through that table's typed
+ops, so the restore needs the app's `#[table]` types, and the CLI does not have them.
+
+A successful restore prints what it rebuilt and exits 0:
+
+```text
+restored generation 7 into "./data"
+  frontier      seq 41203
+  segments      12
+  pending jobs  4 — these WILL dispatch when this node starts, so restore can re-fire mail
+  and third-party calls that already ran (idempotency keys are what make that
+  exactly-once-observable)
+```
+
+### Restoring in place needs `--force`, and `--force` destroys records
+
+Read this before you need it.
+
+**Restore replaces a data directory. It never merges into one.** Into an empty or absent
+directory that is all there is to it. But the second time you restore into a directory a
+node has *run on* — the ordinary shape of "restore, bring it up, something is still wrong,
+restore again" — the destination now holds records **above** the archive's frontier, and
+those records exist nowhere else. Restore refuses:
+
+```text
+error: restore: the destination is ahead of the archive: the two agree through seq 41203,
+but the destination's frontier is 41255. Generation 7's frontier is 41203. Discarding it
+loses the 52 record(s) above 41203, which exist nowhere else. Refusing rather than
+overwriting it — restore never merges timelines, it replaces or refuses (spec §8). Re-run
+with --force to discard the destination's timeline and replace it with generation 7.
+Nothing in the destination has been touched
+```
+
+Exit code 1, and — as the last sentence says — the destination is exactly as it was.
+
+`--force` is the way through, and it is the *normal* way through for an in-place
+re-restore, not an exotic flag. It says what it is about to destroy before it acts:
+
+```text
+--force: about to discard the destination's timeline. the destination is ahead of the
+archive: … Discarding it loses the 52 record(s) above 41203, which exist nowhere else.
+This is irreversible and nothing here is archived; it happens before any restore write.
+```
+
+The same refusal covers two other cases: a **diverged** destination (the two disagree on
+the checksum of a record they both hold — two timelines, not one) and an **unrelated**
+one (there is no seq at which they can be compared at all). Neither is proven divergence
+and neither is silently overwritten.
+
+### The two things a restored node does that a fresh one does not
+
+**It comes back with its job queue.** `charpente.jobs` is a table, so pending, due and
+retrying rows ride the archive like any other state, and a restored node will dispatch
+them. That means restore can re-fire emails and third-party calls that already ran before
+the loss. This is correct — they are durable transactional state — and idempotency keys
+(`enqueue_keyed`, §6) are exactly what make the re-fire exactly-once-*observable*. But it
+is a consequence of running the command, which is why the command prints the count.
+
+**A restore that fails part-way leaves a partial rebuild, not the old directory.** Reading
+the bucket, verifying every segment's frames, and judging the destination all happen
+before anything is written, and failures in that phase promise an untouched destination.
+Past that point the old timeline is already discarded, and a failure says so:
+
+```text
+… The destination has been discarded and now holds a PARTIAL restore: its own timeline was
+replaced before this failed, so what is there is neither the database it was nor the one
+the archive holds. Do not start a node on it — it will open and serve stale or empty
+state. Re-run restore against the same directory once the cause above is fixed; restore
+discards and rebuilds from scratch, so a re-run converges rather than resuming
+```
+
+Take that sentence literally: a half-restored directory *opens*. Nothing stops a node
+starting on one and serving stale reads. The remedy is the re-run, which converges because
+restore discards and rebuilds rather than resuming.
