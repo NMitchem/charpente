@@ -5701,3 +5701,283 @@ fn a_store_that_never_completes_is_refused_rather_than_spun_on() {
         "must name the operation it was waiting for: {t}"
     );
 }
+
+// ------------------------------- Task 11: the filesystem `ObjectStore`
+//
+// The same contract `charpente-sim/src/object.rs`'s test module pins for
+// `SimObjectStore`, run against the FIRST non-simulator `ObjectStore` in the
+// tree — plus the two properties only a real filesystem can have: a PUT that
+// fails between the temp write and the rename, and the temp file a crash in
+// that window leaves behind.
+//
+// Module-wide deny-list opt-out, same rationale as `prod.rs`'s: these tests
+// exercise the production filesystem impl, and setting up a failed rename or
+// planting crash residue means touching the filesystem directly. Nothing
+// here is inside the deterministic boundary.
+mod fs_object_store {
+    #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
+    use std::io;
+    use std::path::PathBuf;
+
+    use charpente::prod::{FsObjectStore, ProdEntropy};
+    use charpente_core::io::{Entropy, ObjectDone, ObjectOp, ObjectStore};
+
+    /// A fresh, empty directory nobody else is using. `FsObjectStore::new`
+    /// does not create it — a store pointed at an absent bucket must answer
+    /// NotFound, not blow up — so the ones that need it created let a PUT
+    /// do the creating.
+    fn tmp(tag: &str) -> PathBuf {
+        let mut suffix = [0u8; 8];
+        ProdEntropy::new().unwrap().fill(&mut suffix);
+        std::env::temp_dir().join(format!(
+            "charpente-fsobj-{tag}-{:016x}",
+            u64::from_le_bytes(suffix)
+        ))
+    }
+
+    /// Bounded, exactly as `SimObjectStore`'s own test drain is bounded and
+    /// for the same reason (spec §4b): `poll`'s `None` means "still in
+    /// flight", so a store answering `None` forever is a broken store, and
+    /// an unbounded spin here would hang with no seed and no repro line.
+    fn drain(s: &FsObjectStore) -> io::Result<ObjectDone> {
+        for _ in 0..10_000 {
+            if let Some(r) = s.poll() {
+                return r;
+            }
+        }
+        panic!("drain: ObjectStore::poll returned None 10,000 times in a row — stuck in flight");
+    }
+
+    fn put(s: &FsObjectStore, key: &str, data: &[u8]) -> io::Result<()> {
+        s.start(ObjectOp::Put {
+            key: key.to_string(),
+            data: data.to_vec(),
+        })
+        .unwrap();
+        drain(s).map(|d| assert!(matches!(d, ObjectDone::Put)))
+    }
+
+    fn get(s: &FsObjectStore, key: &str) -> io::Result<Vec<u8>> {
+        s.start(ObjectOp::Get {
+            key: key.to_string(),
+        })
+        .unwrap();
+        match drain(s)? {
+            ObjectDone::Get(v) => Ok(v),
+            other => panic!("expected Get, got {other:?}"),
+        }
+    }
+
+    fn list(s: &FsObjectStore, prefix: &str) -> Vec<String> {
+        s.start(ObjectOp::List {
+            prefix: prefix.to_string(),
+        })
+        .unwrap();
+        match drain(s).unwrap() {
+            ObjectDone::List(v) => v,
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    // ---------------------------------------- T1's contract, re-run here
+
+    #[test]
+    fn put_then_get_roundtrips() {
+        let root = tmp("roundtrip");
+        let s = FsObjectStore::new(root.clone());
+        put(&s, "bk/000/segments/1.log", &[1, 2, 3]).unwrap();
+        assert_eq!(get(&s, "bk/000/segments/1.log").unwrap(), vec![1, 2, 3]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn list_is_sorted_and_prefix_scoped() {
+        let root = tmp("list");
+        let s = FsObjectStore::new(root.clone());
+        for k in ["p/b", "p/a", "q/c"] {
+            put(&s, k, &[]).unwrap();
+        }
+        assert_eq!(list(&s, "p/"), vec!["p/a".to_string(), "p/b".to_string()]);
+        assert_eq!(
+            list(&s, ""),
+            vec!["p/a".to_string(), "p/b".to_string(), "q/c".to_string()],
+            "an empty prefix lists the whole bucket"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn get_absent_key_is_not_found_and_names_the_key() {
+        let s = FsObjectStore::new(tmp("absent"));
+        let e = get(&s, "nope").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        assert!(
+            e.to_string().contains("nope"),
+            "error must name the key: {e}"
+        );
+    }
+
+    #[test]
+    fn delete_removes_the_object() {
+        let root = tmp("delete");
+        let s = FsObjectStore::new(root.clone());
+        put(&s, "a", &[9]).unwrap();
+        s.start(ObjectOp::Delete { key: "a".into() }).unwrap();
+        assert!(matches!(drain(&s).unwrap(), ObjectDone::Delete));
+        assert_eq!(
+            get(&s, "a").unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+            "delete did not remove the object"
+        );
+        // Deleting an absent key is not an error — same as `SimObjectStore`,
+        // and the archive's own retry paths depend on it.
+        s.start(ObjectOp::Delete { key: "a".into() }).unwrap();
+        assert!(matches!(drain(&s).unwrap(), ObjectDone::Delete));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "operation already in flight")]
+    fn second_start_before_poll_asserts() {
+        let s = FsObjectStore::new(tmp("inflight"));
+        s.start(ObjectOp::Get { key: "a".into() }).unwrap();
+        let _ = s.start(ObjectOp::Get { key: "b".into() });
+    }
+
+    // ------------------------------- the atomic-PUT contract, for real
+
+    /// The contract that distinguishes `ObjectStore` from `Disk` (spec §1),
+    /// proven against the mechanism that makes a filesystem able to honour
+    /// it: write `<key>.tmp`, then rename.
+    ///
+    /// The failure is injected by making the bucket directory read-only, so
+    /// creating `<key>.tmp` fails — a real `EACCES` from the kernel, not a
+    /// test hook. The brief's sketch named a kill between the write and the
+    /// rename; there is no way to time that reliably from a single-threaded
+    /// test without forking, and this failure lands in the same window with
+    /// the same observable consequence. What it costs: it proves the PUT
+    /// never REACHED the destination key, not that a half-written one was
+    /// discarded. The residue test below covers that half.
+    ///
+    /// This is the oracle for mutation 1 (write straight to `<key>`): an
+    /// existing file can be opened for writing without write permission on
+    /// its directory, so the mutation survives the chmod and clobbers the
+    /// object.
+    #[test]
+    fn put_is_atomic_under_a_failed_rename() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tmp("atomic");
+        let s = FsObjectStore::new(root.clone());
+        put(&s, "a", &[1; 4096]).unwrap();
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let e = put(&s, "a", &[2; 4096]).unwrap_err();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            e.to_string().contains('a'),
+            "a failed PUT must name the key: {e}"
+        );
+        assert_eq!(
+            get(&s, "a").unwrap(),
+            vec![1; 4096],
+            "a torn or clobbered object escaped the rename"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The other half of the contract: a failed PUT to a key that never
+    /// existed leaves it ABSENT, not present-and-empty.
+    #[test]
+    fn a_failed_put_to_a_fresh_key_leaves_it_absent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tmp("fresh");
+        let s = FsObjectStore::new(root.clone());
+        put(&s, "seed", &[0]).unwrap(); // creates the bucket directory
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(put(&s, "new", &[1, 2, 3]).is_err());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            get(&s, "new").unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+            "a failed PUT must not create the key"
+        );
+        assert_eq!(
+            list(&s, ""),
+            vec!["seed".to_string()],
+            "a failed PUT must not appear in the bucket"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// What a crash between the write and the rename actually leaves on
+    /// disk: a `<key>.tmp` holding the new bytes and `<key>` holding the old
+    /// ones. Neither `Get` nor `List` may ever surface that residue — a
+    /// restore that saw `<key>.tmp` in a `List` would treat it as an object
+    /// the manifest never named.
+    #[test]
+    fn a_temp_left_by_a_crash_is_never_served_or_listed() {
+        let root = tmp("residue");
+        let s = FsObjectStore::new(root.clone());
+        put(&s, "gen/seg", &[1; 64]).unwrap();
+        std::fs::write(root.join("gen/seg.tmp"), [2u8; 64]).unwrap();
+
+        assert_eq!(
+            get(&s, "gen/seg").unwrap(),
+            vec![1; 64],
+            "the object's own value must be untouched by the residue"
+        );
+        assert_eq!(
+            list(&s, ""),
+            vec!["gen/seg".to_string()],
+            "a crash's temp file was listed as an object"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Keys ending in `.tmp` are reserved by this implementation: it is the
+    /// name the atomic PUT writes through, so accepting one would let a
+    /// caller's object be mistaken for another's crash residue.
+    #[test]
+    #[should_panic(expected = "reserves")]
+    fn a_key_ending_in_tmp_is_refused() {
+        let s = FsObjectStore::new(tmp("reserved"));
+        let _ = s.start(ObjectOp::Get {
+            key: "a/b.tmp".into(),
+        });
+    }
+
+    /// Spec §4b bounds every `ObjectStore` drive loop at 10,000 polls. That
+    /// bound is an ITERATION COUNT, not a timeout, and it is harmless only
+    /// while stores complete on the first poll. This store does — pinned
+    /// here so the next store's author has to change a test to change the
+    /// assumption, rather than inheriting it silently.
+    #[test]
+    fn every_op_completes_on_the_first_poll() {
+        let root = tmp("firstpoll");
+        let s = FsObjectStore::new(root.clone());
+        for op in [
+            ObjectOp::Put {
+                key: "k".into(),
+                data: vec![7; 128],
+            },
+            ObjectOp::Get { key: "k".into() },
+            ObjectOp::List { prefix: "".into() },
+            ObjectOp::Delete { key: "k".into() },
+            ObjectOp::Get { key: "gone".into() },
+        ] {
+            s.start(op).unwrap();
+            assert!(
+                s.poll().is_some(),
+                "FsObjectStore must complete on the FIRST poll — spec §4b's bound is \
+                 an iteration count, and a store that needs a second poll makes it live"
+            );
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}

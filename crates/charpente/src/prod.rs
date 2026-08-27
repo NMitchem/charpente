@@ -9,7 +9,9 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use charpente_core::io::{Clock, Conn, Disk, Entropy, File, Instant, Listener, Net};
+use charpente_core::io::{
+    Clock, Conn, Disk, Entropy, File, Instant, Listener, Net, ObjectDone, ObjectOp, ObjectStore,
+};
 
 // ---------------------------------------------------------------- Clock
 
@@ -295,6 +297,224 @@ impl Conn for ProdConn {
             .peer_addr()
             .map_or_else(|_| "<disconnected>".to_string(), |a| a.to_string())
     }
+}
+
+// ---------------------------------------------------------- ObjectStore
+
+/// The suffix a PUT writes through before renaming into place. Reserved:
+/// a caller key ending in it would be indistinguishable from another key's
+/// crash residue, so `start` refuses one rather than letting the two
+/// namespaces overlap.
+const TMP_SUFFIX: &str = ".tmp";
+
+/// Objects as files under a root directory — the first non-simulator
+/// `ObjectStore`, and the one v1 ships (archive spec §1 ruling 4: no S3
+/// client yet). Keys map to paths, `/` to subdirectories, exactly as
+/// `ProdDisk` maps its flat names.
+///
+/// **Completions are immediate**: `start` records the op and does no IO;
+/// `poll` does the whole operation and always returns `Some` on its first
+/// call. Spec §4b's 10,000-poll bound therefore never counts past 1 against
+/// this store. That is a property of THIS impl, not of the trait — a store
+/// with real network latency will need the bound to become a deadline.
+///
+/// **How the atomic-PUT contract is honoured, and what it costs here.** The
+/// trait says a PUT is atomic and that there is "no `sync_dir` analogue:
+/// there is no directory entry to persist". The first is the contract; the
+/// second is true of a real object store and FALSE of a filesystem, which
+/// has a directory entry and nothing else. `rename(2)` is atomic against a
+/// process dying, but neither the renamed file's data nor the new directory
+/// entry is durable against a machine crash until each is fsynced. So a PUT
+/// here is four steps and all four are load-bearing: write `<key>.tmp`,
+/// fsync it, rename it onto `<key>`, fsync the parent directory. Dropping
+/// step 2 lets a crash resurrect the key holding zeros; dropping step 4 lets
+/// a crash lose an acked object outright.
+///
+/// Not covered, deliberately: the ancestor directories a PUT creates on
+/// first write are not themselves fsynced into their parents, so a crash in
+/// that window can lose a newly created generation prefix. It degrades
+/// exactly like spec §7's "PUT lands but the ack is lost" row — the retry
+/// re-creates it — and closing it would mean fsyncing the whole chain on
+/// every PUT.
+pub struct FsObjectStore {
+    root: PathBuf,
+    /// One operation in flight at a time (the trait's own words). `RefCell`,
+    /// not `Mutex`: `ObjectStore` requires only `Send`, and `RefCell<T>` is
+    /// `Send` whenever `T` is.
+    in_flight: RefCell<Option<ObjectOp>>,
+}
+
+impl FsObjectStore {
+    /// The bucket root. Not created here — a store pointed at an absent
+    /// directory answers `NotFound` for a `Get` and an empty `List`, which
+    /// is what an empty bucket looks like; a PUT creates what it needs.
+    pub fn new(root: impl Into<PathBuf>) -> FsObjectStore {
+        FsObjectStore {
+            root: root.into(),
+            in_flight: RefCell::new(None),
+        }
+    }
+
+    /// Keys are relative flat names like `"bucket/00…01/segments/00…07.log"`.
+    /// Asserted, not error-returned: a malformed key is a caller bug, the
+    /// same judgement `ProdDisk::resolve` and `ObjectStore::start`'s
+    /// in-flight check already make.
+    fn resolve(&self, key: &str) -> PathBuf {
+        assert!(
+            !key.is_empty()
+                && !key.starts_with('/')
+                && !key
+                    .split('/')
+                    .any(|c| c == "." || c == ".." || c.is_empty()),
+            "ObjectStore keys are relative flat names like \"bucket/gen/segments/1.log\" — got \"{key}\""
+        );
+        assert!(
+            !key.ends_with(TMP_SUFFIX),
+            "ObjectStore key \"{key}\" ends in \"{TMP_SUFFIX}\", which FsObjectStore reserves \
+             for the temp file every atomic PUT renames from — pick another key"
+        );
+        self.root.join(key)
+    }
+
+    fn put(&self, key: &str, data: &[u8]) -> io::Result<()> {
+        let path = self.resolve(key);
+        let parent = path
+            .parent()
+            .expect("resolve joins onto the root, so there is always a parent");
+        std::fs::create_dir_all(parent)?;
+        let tmp = path.with_file_name(format!(
+            "{}{TMP_SUFFIX}",
+            path.file_name()
+                .expect("resolve rejects empty components")
+                .to_string_lossy()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        (&file).write_all(data)?;
+        // Before the rename: the name must never point at bytes that are not
+        // on the platter yet.
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, &path)?;
+        // After the rename: the directory entry that makes the object exist
+        // is itself a write, and an unsynced one loses an acked PUT.
+        std::fs::File::open(parent)?.sync_all()
+    }
+
+    fn get(&self, key: &str) -> io::Result<Vec<u8>> {
+        let path = self.resolve(key);
+        let mut file = match std::fs::OpenOptions::new().read(true).open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no object at key \"{key}\""),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+        let mut out = Vec::new();
+        file.read_to_end(&mut out)?;
+        Ok(out)
+    }
+
+    /// Every key under `prefix`, sorted — never filesystem enumeration
+    /// order, the same rule `Disk::list` follows. A missing root is an empty
+    /// bucket, not an error. Temp files a crashed PUT left behind are not
+    /// objects and are never listed.
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        let mut keys = Vec::new();
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            for entry in entries {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    stack.push(entry.path());
+                    continue;
+                }
+                let key = entry
+                    .path()
+                    .strip_prefix(&self.root)
+                    .expect("walked entries live under the root")
+                    .to_string_lossy()
+                    .into_owned();
+                if !key.ends_with(TMP_SUFFIX) && key.starts_with(prefix) {
+                    keys.push(key);
+                }
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
+
+    fn delete(&self, key: &str) -> io::Result<()> {
+        match std::fs::remove_file(self.resolve(key)) {
+            // Deleting what is not there is not a failure — the archive's
+            // retry paths and `SimObjectStore` both rely on it.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    }
+}
+
+impl ObjectStore for FsObjectStore {
+    fn start(&self, op: ObjectOp) -> io::Result<()> {
+        // Key shape is validated HERE as well as at use: `start` is where
+        // the caller's bug is, and a `List` never resolves a path at all.
+        match &op {
+            ObjectOp::Put { key, .. } | ObjectOp::Get { key } | ObjectOp::Delete { key } => {
+                let _ = self.resolve(key);
+            }
+            ObjectOp::List { .. } => {}
+        }
+        assert!(
+            self.in_flight.borrow().is_none(),
+            "ObjectStore::start called with an operation already in flight — \
+             poll to completion before starting another (archive spec §1)"
+        );
+        *self.in_flight.borrow_mut() = Some(op);
+        Ok(())
+    }
+
+    fn poll(&self) -> Option<io::Result<ObjectDone>> {
+        let op = self.in_flight.borrow_mut().take()?;
+        Some(match op {
+            ObjectOp::Put { key, data } => self
+                .put(&key, &data)
+                .map(|()| ObjectDone::Put)
+                .map_err(|e| named(&e, "PUT", &key)),
+            ObjectOp::Get { key } => self
+                .get(&key)
+                .map(ObjectDone::Get)
+                .map_err(|e| named(&e, "GET", &key)),
+            ObjectOp::List { prefix } => self
+                .list(&prefix)
+                .map(ObjectDone::List)
+                .map_err(|e| named(&e, "LIST", &prefix)),
+            ObjectOp::Delete { key } => self
+                .delete(&key)
+                .map(|()| ObjectDone::Delete)
+                .map_err(|e| named(&e, "DELETE", &key)),
+        })
+    }
+}
+
+/// Hard rule 5 at the IO boundary: an `EACCES` on its own names neither the
+/// operation nor the key an operator has to go and look at. `NotFound` from
+/// `get` is already phrased for the caller and passes through unchanged.
+fn named(e: &io::Error, op: &str, key: &str) -> io::Error {
+    if e.kind() == io::ErrorKind::NotFound && op == "GET" {
+        return io::Error::new(e.kind(), e.to_string());
+    }
+    io::Error::new(e.kind(), format!("object {op} \"{key}\" failed: {e}"))
 }
 
 #[cfg(test)]
