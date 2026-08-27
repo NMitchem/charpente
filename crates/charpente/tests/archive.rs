@@ -4683,3 +4683,54 @@ fn a_read_only_flood_still_lets_a_failed_archive_retry() {
          forever — silently, with a backlog it can still see"
     );
 }
+
+/// The retry hold's own correctness content, as opposed to its cost.
+///
+/// A failed `start` leaves the archive in a non-`Idle` state permanently, so
+/// without the hold the arm is READY on every iteration for the whole
+/// duration of an outage — and `Kernel::step` that returns `Worked` forever
+/// never reaches `Step::Idle`, so `RequestSource::wait_until` is never
+/// called. That is a core pegged at 100% in production and, under the
+/// simulator, virtual time that never advances at all: the same spin
+/// `a_caught_up_archive_still_lets_the_kernel_reach_idle` pins for a HEALTHY
+/// archive, which is exactly why it does not cover this one.
+///
+/// Measured cost of the hold, for the record rather than as an assertion
+/// (docs/BENCH.md carries no archive numbers, so no threshold here could be
+/// justified): over 2,000 iterations of a saturating read-only outage the arm
+/// takes 659 of them with the hold and 989 without, and the request arm
+/// serves 85,824 requests against 64,704.
+#[test]
+fn a_failing_archive_still_lets_the_kernel_park() {
+    let (sim, mut app) = kernel_app(0x746b_3961_0000_0009);
+    write_records(app.db_for_tests(), 3 * RECORDS_PER_SEGMENT);
+    let arc = Archive::open(archive_config(0, 8 << 20), app.db_for_tests()).unwrap();
+    let store = SharedStore::new();
+    store.set_puts_fail(true);
+    let mut k = Kernel::with_archive(
+        app,
+        Box::new(sim.clock()),
+        arc,
+        Box::new(store.clone()) as Box<dyn ObjectStore>,
+    )
+    .unwrap();
+    let mut source = SilentSource;
+
+    let steps = steps_to_kernel_idle(&mut k, &mut source, 10_000).expect(
+        "the kernel never went idle while its archive was failing: the arm is ready on \
+         every iteration, so `wait_until` is never called — a core at 100% in production, \
+         and virtual time that never advances under the sim",
+    );
+
+    assert!(
+        store.keys().is_empty(),
+        "the outage did not hold, so the kernel may have gone idle simply because the \
+         archive succeeded: {:?}",
+        store.keys()
+    );
+    assert!(
+        k.stats().archive_steps > 0,
+        "the kernel went idle after {steps} steps without the arm ever running, so this \
+         measures an archive that was never scheduled rather than one that failed"
+    );
+}
