@@ -48,26 +48,3 @@ declare const camelCasedCard: { type: "Card"; cardNumber: string };
 // `"card-number"`, not `cardNumber` — a serde rename the emitter dropped
 // would make this line compile.
 export const wrongTaggedField: InvoiceView["payment"] = camelCasedCard;
-
-// --------------------------------------------------------------------------
-// KNOWN GAP — task 11 finding 1, recorded as a tripwire rather than a note.
-//
-// `InvoiceView.totalCents` is typed `bigint`, and `WireI64` really is carried
-// as the decimal STRING "9007199254740993" (that is the point: a JSON number
-// loses precision above 2^53). But the generated client's `request()` does
-// `JSON.parse(text) as T` with no revival — nothing in
-// charpente-tsgen/src/runtime.rs ever calls `BigInt(...)` — so at runtime this
-// field holds a string while the type promises a bigint, and
-// `inv.totalCents * 2n` throws TypeError. That is a generated type which is
-// wrong AND type-checks, which spec §5 calls the worst failure available here.
-//
-// The line below pins the CURRENT state. If the emitter starts rendering
-// `Int64` as a string (or as a branded string), this assignment compiles, the
-// `@ts-expect-error` fires, and whoever made the change is sent here. Note
-// what it does NOT catch: the other fix — reviving with `BigInt(...)` in the
-// runtime — leaves the type as `bigint` and this line unchanged. So deleting
-// this block is part of that fix, not a side effect of it.
-// --------------------------------------------------------------------------
-
-// @ts-expect-error see KNOWN GAP above: the type still claims bigint
-export const int64StillClaimsBigint: string = view.totalCents;

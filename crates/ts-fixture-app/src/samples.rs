@@ -35,7 +35,7 @@ use charpente::wire::{WireI64, WireU64};
 
 use crate::{
     AdjustInvoiceBody, CreateCustomerBody, Customer, CustomerView, FeedItem, Invoice, InvoicePaid,
-    InvoiceView, InvoiceVoided, LineItem, Notification, Payment, Status,
+    InvoiceView, InvoiceVoided, LimitExceeded, LineItem, Notification, Payment, Status,
 };
 
 /// The relative path this file is rendered to, named once so the generator,
@@ -109,6 +109,13 @@ pub fn invoice_view(id: Id<Invoice>, customer: Id<Customer>) -> InvoiceView {
         last_item: FeedItem::Message {
             body: "hello".to_string(),
         },
+        // Both null/absent -- the A1 landmine's two shapes (chunk B1b), on
+        // the specimen every existing route/test already exercises: an
+        // invoice with no adjustment and no late fee is the ordinary case,
+        // not an edge case, which is exactly why it belongs on the value
+        // shared everywhere rather than a one-off.
+        adjustment_cents: None,
+        late_fee_cents: WireI64(0),
     }
 }
 
@@ -179,7 +186,15 @@ fn specimens() -> Vec<Specimen> {
         // All four externally-tagged variant shapes, which are four
         // genuinely different JSON documents.
         specimen("feedItemPing", "FeedItem", &FeedItem::Ping),
-        specimen("feedItemAck", "FeedItem", &FeedItem::Ack(7)),
+        specimen(
+            "feedItemAck",
+            "FeedItem",
+            // Above 2^53, same reasoning as `invoiceView.totalCents`: a
+            // newtype variant carrying an `Int64` alongside `Ping` (a unit
+            // variant, a bare JSON string) is the mixed shape chunk B1b's
+            // `EnumRepr::External` revive has to guard without throwing.
+            &FeedItem::Ack(WireU64(9_007_199_254_740_993)),
+        ),
         specimen(
             "feedItemMessage",
             "FeedItem",
@@ -215,6 +230,18 @@ fn specimens() -> Vec<Specimen> {
             },
         ),
         specimen("invoiceVoided", "InvoiceVoided", &InvoiceVoided { invoice }),
+        // Exit criterion 5 (chunk B1b): an `Int64` in an ERROR position.
+        // Every other error in this fixture is `ApiError`'s fixed
+        // `{error: string}` envelope, which carries no `Int64` anywhere --
+        // see `LimitExceeded`'s doc comment in `lib.rs` for what this
+        // specimen does and does not prove about a real running server.
+        specimen(
+            "limitExceeded",
+            "LimitExceeded",
+            &LimitExceeded {
+                max_cents: WireI64(9_007_199_254_740_993),
+            },
+        ),
     ]
 }
 
@@ -253,9 +280,13 @@ const WIRE_OF: &str = r#"
  *    string — but TypeScript will not infer a brand for a string literal, so
  *    without this a correct document would fail to satisfy a correct type.
  * 2. An `Int64` field is typed `bigint` and carried as a decimal STRING,
- *    because a JSON number loses precision above 2^53. See the KNOWN GAP
- *    block in ../negatives.ts: the generated client does not yet convert it,
- *    so at runtime the value is still the string this rewrite describes.
+ *    because a JSON number loses precision above 2^53. This rewrite
+ *    describes the WIRE shape, not what the client hands back: chunk B1b's
+ *    generated client revives an Int64 position to a real `bigint` at
+ *    runtime, but that conversion happens in `request()`'s caller, after
+ *    `JSON.parse` -- these literals are the server's raw `serde_json`
+ *    documents, exactly the string this rewrite still describes, and that
+ *    is unchanged by anything the CLIENT does with them afterward.
  */
 type WireOf<T> =
   T extends string & { readonly __table: string } ? string

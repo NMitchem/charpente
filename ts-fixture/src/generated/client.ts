@@ -28,7 +28,7 @@ export interface CustomerView {
 
 export type FeedItem =
   | "Ping"
-  | { Ack: number }
+  | { Ack: bigint }
   | { Message: { body: string } }
   | { "in-progress": {} };
 
@@ -56,10 +56,16 @@ export interface InvoiceView {
   payment: Payment;
   notice: Notification;
   lastItem: FeedItem;
+  adjustmentCents: bigint | null;
+  lateFeeCents?: bigint;
 }
 
 export interface InvoiceVoided {
   invoice: InvoiceId;
+}
+
+export interface LimitExceeded {
+  maxCents: bigint;
 }
 
 export interface LineItem {
@@ -334,6 +340,40 @@ function sseValue(line: string, at: number): string {
   return v.startsWith(" ") ? v.slice(1) : v;
 }
 
+/**
+ * The one `Int64` revive primitive every generated walker calls (chunk B1b):
+ * `JSON.parse` hands back a decimal STRING wherever the schema says `Int64`
+ * (a `bigint` in the generated types), because `BigInt(str)` is lossless and
+ * a JSON number is not (spec §1) — this is the other half of that trade.
+ *
+ * Converts ONLY when `v` really is a string. `BigInt(null)` and
+ * `BigInt(undefined)` both THROW ("Cannot convert null/undefined to a
+ * BigInt", measured) — and null/undefined is exactly what an absent
+ * `Option<Int64>` or a `skip_serializing_if`-omitted `Int64` field hands
+ * this function, on a document the server was correct to send. Every
+ * generated call site already guards those two cases with its own
+ * null-check before ever reaching here (an `Option` position never even
+ * calls this on `null`), so this `typeof` check is normally a formality —
+ * it is written anyway because it is the one place A1's "convert only
+ * strings, never throw on null/undefined" rule can be stated once instead
+ * of trusted to every call site that wraps it.
+ *
+ * `""` and a hex-looking string are NOT special-cased: `BigInt("")` is `0n`
+ * and `BigInt("0x10")` is `16n`. Guarding either would be validating the
+ * server's document rather than narrowly converting it — the same line
+ * `request()`'s own doc comment already draws for the payload as a whole.
+ *
+ * The `as bigint` in the untaken branch is the same kind of boundary cast
+ * `request()`'s `parsed as T` already is: every REACHABLE call in generated
+ * code only takes this branch when `v` is not a string (a value some outer
+ * null-check has already let through unchanged, e.g. `null`), so the static
+ * type here is a promise about how this is called, not a runtime guarantee
+ * — exactly the gap spec §1 exists to name elsewhere in this file.
+ */
+function reviveInt64(v: unknown): bigint {
+  return typeof v === "string" ? BigInt(v) : (v as bigint);
+}
+
 // --------------------------------------------------------------------------
 // What each stream carries, from its `emits(...)` declaration.
 // --------------------------------------------------------------------------
@@ -343,6 +383,23 @@ export type FeedEvent =
   | { event: "invoice_paid"; data: InvoicePaid }
   | { event: "invoice_voided"; data: InvoiceVoided };
 
+function reviveFeedItem(v: FeedItem): FeedItem {
+  if (v != null && typeof v === "object" && "Ack" in v) return { ...v, Ack: reviveInt64(v.Ack) };
+  return v;
+}
+
+function reviveInvoiceView(v: InvoiceView): InvoiceView {
+  return { ...v, totalCents: reviveInt64(v.totalCents), sequence: reviveInt64(v.sequence), lineItems: (v.lineItems).map((x0) => reviveLineItem(x0)), lastItem: reviveFeedItem(v.lastItem), adjustmentCents: (v.adjustmentCents) == null ? null : (reviveInt64(v.adjustmentCents)), lateFeeCents: (v.lateFeeCents) == null ? (v.lateFeeCents) : (reviveInt64(v.lateFeeCents)) };
+}
+
+function reviveLimitExceeded(v: LimitExceeded): LimitExceeded {
+  return { ...v, maxCents: reviveInt64(v.maxCents) };
+}
+
+function reviveLineItem(v: LineItem): LineItem {
+  return { ...v, unitAmountCents: reviveInt64(v.unitAmountCents) };
+}
+
 export class Api extends ApiBase {
   /** Requires a session token: call `setToken` first. */
   async createCustomer(id: CustomerId, body: CreateCustomerBody): Promise<Result<CustomerView, ApiError>> {
@@ -350,15 +407,23 @@ export class Api extends ApiBase {
   }
 
   async getInvoice(id: InvoiceId): Promise<Result<InvoiceView, ApiError>> {
-    return this.request<InvoiceView, ApiError>("GET", `/invoices/${encodeURIComponent(id)}`);
+    const r = await this.request<InvoiceView, ApiError>("GET", `/invoices/${encodeURIComponent(id)}`);
+    return r.ok ? { ok: true, data: reviveInvoiceView(r.data) } : { ok: false, error: r.error };
   }
 
   async listInvoices(): Promise<Result<(InvoiceView)[], ApiError>> {
-    return this.request<(InvoiceView)[], ApiError>("GET", "/invoices");
+    const r = await this.request<(InvoiceView)[], ApiError>("GET", "/invoices");
+    return r.ok ? { ok: true, data: (r.data).map((x0) => reviveInvoiceView(x0)) } : { ok: false, error: r.error };
   }
 
   async adjustInvoice(id: InvoiceId, body: AdjustInvoiceBody): Promise<Result<InvoiceView, ApiError>> {
-    return this.request<InvoiceView, ApiError>("POST", `/invoices/${encodeURIComponent(id)}/adjust`, body);
+    const r = await this.request<InvoiceView, ApiError>("POST", `/invoices/${encodeURIComponent(id)}/adjust`, body);
+    return r.ok ? { ok: true, data: reviveInvoiceView(r.data) } : { ok: false, error: r.error };
+  }
+
+  async withdrawInvoice(id: InvoiceId): Promise<Result<InvoiceView, LimitExceeded>> {
+    const r = await this.request<InvoiceView, LimitExceeded>("POST", `/invoices/${encodeURIComponent(id)}/withdraw`);
+    return r.ok ? { ok: true, data: reviveInvoiceView(r.data) } : { ok: false, error: reviveLimitExceeded(r.error) };
   }
 
   async deleteWidget(id: WidgetId): Promise<Result<null, ApiError>> {

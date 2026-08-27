@@ -1,18 +1,19 @@
-// RED until chunk B1 — see chunk-b1-brief.md.
+// The Int64 gap's original oracle (chunk-b0-brief.md A1), RED from B0
+// through B1a, GREEN as of chunk B1b (the inbound walker,
+// crates/charpente-tsgen/src/revive.rs).
 //
-// `InvoiceView.totalCents` is typed `bigint` (generated/client.ts:39) but the
-// wire carries a decimal STRING (generated/samples.ts:40 — a real serde_json
+// `InvoiceView.totalCents` is typed `bigint` (generated/client.ts) and the
+// wire carries a decimal STRING (generated/samples.ts — a real serde_json
 // document, "totalCents":"9007199254740993", 2^53+1: the value a JSON number
-// would corrupt). Nothing in the generated client converts it — runtime.rs's
-// `request()` does `JSON.parse(text) as T` with no revival — so at runtime
-// this field holds a string while the type promises a bigint.
+// would corrupt). `getInvoice`'s generated method now revives it before
+// returning (`reviveInvoiceView`, called from the method body, not from
+// `request()` itself — B1a's decision) — so the arithmetic below is real,
+// not thrown away.
 //
-// This test IS that gap, executing: it feeds the real `Api` client the real
-// sample document through a stubbed `fetch`, then does arithmetic the
-// generated type says is legal. It throws.
-//
-// DO NOT fix this test, weaken it, or mark it skipped. It is chunk B1's
-// starting point (chunk-b0-brief.md A1) — wiring it green is B1's job.
+// This test feeds the real `Api` client the real sample document through a
+// stubbed `fetch`, then does arithmetic the generated type says is legal.
+// DO NOT weaken it or mark it skipped — it is what going green LOOKS like
+// for the whole sub-project's Int64 gap.
 
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
@@ -21,7 +22,7 @@ import type { InvoiceId } from "./generated/client";
 import { invoiceView } from "./generated/samples";
 import { stubJsonResponse } from "./testing/fetch-stub";
 
-test("Int64 arithmetic on a real client response (RED until B1)", async () => {
+test("Int64 arithmetic on a real client response", async () => {
   const { restore } = stubJsonResponse(invoiceView);
   try {
     const api = new Api("http://fixture.invalid");

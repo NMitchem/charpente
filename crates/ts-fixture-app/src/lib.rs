@@ -85,6 +85,37 @@ pub struct AdjustInvoiceBody {
     pub delta_cents: WireI64,
 }
 
+/// A route's ERROR type carrying an `Int64` (chunk B1b, exit criterion 5):
+/// every OTHER route's error is `ApiError`, whose hand-written `Wire` impl
+/// (`charpente/src/http/mod.rs`) is the fixed `{error: string}` envelope
+/// with no `Int64` position anywhere — nothing before this route existed
+/// exercised the generated client's ERROR-position revival at all.
+///
+/// **A latent framework gap this route's existence surfaces, not fixes**:
+/// `#[route]`'s glue calls the handler with `?` (`route.rs:334`), which
+/// needs `From<LimitExceeded> for ApiError` below to compile — meaning a
+/// REAL running server would put `ApiError`'s fixed envelope on the wire for
+/// this route's error case, never `LimitExceeded`'s own shape, no matter
+/// what `RouteInfo.error`'s schema advertises to a generated client. That
+/// does not affect anything this fixture checks: `withdraw_invoice` is never
+/// invoked by a real request (`lib.rs`'s own doc comment — `describe()` only
+/// walks the registry), and `ts-fixture/*.test.ts` never hits a live server
+/// either (every test stubs `fetch()` with a real `serde_json` document from
+/// `samples.rs`). Recorded here rather than fixed, the same posture chunk-
+/// b1-brief.md's A8 takes for a bare `Int64` in a path param.
+#[derive(WireDerive, Serialize, Deserialize, Debug)]
+#[serde(crate = "::charpente::serde")]
+#[serde(rename_all = "camelCase")]
+pub struct LimitExceeded {
+    pub max_cents: WireI64,
+}
+
+impl From<LimitExceeded> for ApiError {
+    fn from(e: LimitExceeded) -> ApiError {
+        ApiError::BadRequest(format!("limit exceeded: {} cents", e.max_cents.0))
+    }
+}
+
 #[derive(WireDerive, Serialize, Deserialize)]
 #[serde(crate = "::charpente::serde")]
 #[serde(rename_all = "camelCase")]
@@ -149,6 +180,28 @@ pub struct InvoiceView {
     pub payment: Payment,
     pub notice: Notification,
     pub last_item: FeedItem,
+    /// `Option(Int64)` (chunk B1b): the wire ALWAYS carries this key, `null`
+    /// when there is no adjustment — the A1 landmine's first shape. Distinct
+    /// from `late_fee_cents` below, whose ABSENCE omits the key entirely
+    /// rather than writing an explicit `null`.
+    pub adjustment_cents: Option<WireI64>,
+    /// `Field.optional` over a BARE `Int64`, no `Option` wrapper
+    /// (chunk B1b): `skip_serializing_if` omits the key entirely below the
+    /// threshold, which is a DIFFERENT runtime shape from `Option`'s
+    /// explicit `null` — property access on an omitted key hands the revive
+    /// walker `undefined`, not `null` (A1's second landmine shape).
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub late_fee_cents: WireI64,
+}
+
+/// The `skip_serializing_if` predicate for `InvoiceView::late_fee_cents` —
+/// any predicate name is accepted by `#[derive(Wire)]` (it only checks that
+/// the attribute is PRESENT, not which function it names), so this is not
+/// `Option::is_none`: the point of this field is a `skip_serializing_if` on
+/// a type that is NOT `Option<_>`, the shape `Field.optional` takes without
+/// also being `Option(_)` at the schema level.
+fn is_zero_i64(v: &WireI64) -> bool {
+    v.0 == 0
 }
 
 /// serde's externally-tagged default, reaching all four representable
@@ -157,11 +210,19 @@ pub struct InvoiceView {
 /// `{"in-progress":{}}`, a genuinely different document from the unit case
 /// (`EnumRepr::External`'s doc comment) — under a kebab-case name, which is
 /// not a legal TypeScript object key unquoted.
+///
+/// `Ack` is `WireU64`, not a bare `u32` (chunk B1b): `Ping` alongside it is a
+/// bare JSON STRING on the wire, not an object, so this is also the fixture
+/// for the one hazard `EnumRepr::External`'s revive uniquely has — a
+/// presence check (`"Ack" in v`) that runs on a legitimate `Ping` value
+/// would THROW (`in` on a primitive string), which a mixed unit/Int64-
+/// carrying externally-tagged enum is the minimal shape to prove doesn't
+/// happen.
 #[derive(WireDerive, Serialize)]
 #[serde(crate = "::charpente::serde")]
 pub enum FeedItem {
     Ping,
-    Ack(u32),
+    Ack(WireU64),
     Message {
         body: String,
     },
@@ -258,6 +319,15 @@ pub fn adjust_invoice(
     Ok(samples::invoice_view(inv.id, inv.customer))
 }
 
+/// The route whose ERROR type carries an `Int64` (chunk B1b, exit
+/// criterion 5) — see `LimitExceeded`'s doc comment for what this route
+/// does and does not prove. The handler is a stub like its neighbours.
+#[route(POST "/invoices/:id/withdraw")]
+pub fn withdraw_invoice(tx: &mut Tx, id: Id<Invoice>) -> Result<InvoiceView, LimitExceeded> {
+    let _ = tx;
+    Ok(samples::invoice_view(id, Id::<Customer>::from_raw(0)))
+}
+
 /// `-> Result<(), ApiError>`: the response schema is `Null`, the JSON
 /// literal `null`, which is a different document from `{}`. Also the one
 /// route whose `Id<Widget>` never appears in any registered wire type.
@@ -303,6 +373,7 @@ pub fn build_app(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> std::io::Res
             get_invoice,
             list_invoices,
             adjust_invoice,
+            withdraw_invoice,
             delete_widget,
             feed,
             raw_feed,

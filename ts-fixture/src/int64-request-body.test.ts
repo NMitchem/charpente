@@ -8,7 +8,10 @@
 // verbatim RED output this test produced against the unfixed emitter.
 //
 // This is deliberately a DIFFERENT file from int64.test.ts, which pins the
-// INBOUND gap (chunk B1b's target) and must stay red until that chunk lands.
+// INBOUND gap (chunk B1b's target, green as of that chunk) — outbound and
+// inbound are separate mechanisms (a `JSON.stringify` replacer needs no
+// schema; the generated per-route revive does, chunk-b1a-report.md), so this
+// test's oracle must not be conflated with that one's.
 
 import { test } from "node:test";
 import * as assert from "node:assert/strict";

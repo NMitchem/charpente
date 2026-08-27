@@ -13,7 +13,7 @@
 // correcting it here (b0-review Minor 4) rather than in the generated output,
 // which regenerates from this string.
 
-import type { AdjustInvoiceBody, CreateCustomerBody, CustomerView, FeedItem, InvoicePaid, InvoiceView, InvoiceVoided, LineItem, Notification, Payment, Status } from "./client";
+import type { AdjustInvoiceBody, CreateCustomerBody, CustomerView, FeedItem, InvoicePaid, InvoiceView, InvoiceVoided, LimitExceeded, LineItem, Notification, Payment, Status } from "./client";
 
 /**
  * The wire view of a generated type: what `JSON.parse` of the server's own
@@ -25,9 +25,13 @@ import type { AdjustInvoiceBody, CreateCustomerBody, CustomerView, FeedItem, Inv
  *    string — but TypeScript will not infer a brand for a string literal, so
  *    without this a correct document would fail to satisfy a correct type.
  * 2. An `Int64` field is typed `bigint` and carried as a decimal STRING,
- *    because a JSON number loses precision above 2^53. See the KNOWN GAP
- *    block in ../negatives.ts: the generated client does not yet convert it,
- *    so at runtime the value is still the string this rewrite describes.
+ *    because a JSON number loses precision above 2^53. This rewrite
+ *    describes the WIRE shape, not what the client hands back: chunk B1b's
+ *    generated client revives an Int64 position to a real `bigint` at
+ *    runtime, but that conversion happens in `request()`'s caller, after
+ *    `JSON.parse` -- these literals are the server's raw `serde_json`
+ *    documents, exactly the string this rewrite still describes, and that
+ *    is unchanged by anything the CLIENT does with them afterward.
  */
 type WireOf<T> =
   T extends string & { readonly __table: string } ? string
@@ -43,9 +47,9 @@ export const statusActive = "active" satisfies WireOf<Status>;
 export const statusOnHold = "on-hold" satisfies WireOf<Status>;
 export const lineItemWithNote = {"unitAmountCents":"1000","quantity":1,"note":"rush"} satisfies WireOf<LineItem>;
 export const lineItemWithoutNote = {"unitAmountCents":"-250","quantity":3} satisfies WireOf<LineItem>;
-export const invoiceView = {"id":"7","customer":"9007199254740993","totalCents":"9007199254740993","sequence":"18446744073709551615","lineItems":[{"unitAmountCents":"-250","quantity":3},{"unitAmountCents":"1000","quantity":1,"note":"rush"}],"tags":["urgent",null],"labels":{"region":"eu"},"paid":true,"ratio":0.5,"ratio32":0.25,"tiny":-8,"small":-16,"medium":-32,"ubyte":8,"ushort":16,"payment":{"type":"Card","card-number":"4242"},"notice":{"kind-of":"Progress","payload":{"percent":42}},"lastItem":{"Message":{"body":"hello"}}} satisfies WireOf<InvoiceView>;
+export const invoiceView = {"id":"7","customer":"9007199254740993","totalCents":"9007199254740993","sequence":"18446744073709551615","lineItems":[{"unitAmountCents":"-250","quantity":3},{"unitAmountCents":"1000","quantity":1,"note":"rush"}],"tags":["urgent",null],"labels":{"region":"eu"},"paid":true,"ratio":0.5,"ratio32":0.25,"tiny":-8,"small":-16,"medium":-32,"ubyte":8,"ushort":16,"payment":{"type":"Card","card-number":"4242"},"notice":{"kind-of":"Progress","payload":{"percent":42}},"lastItem":{"Message":{"body":"hello"}},"adjustmentCents":null} satisfies WireOf<InvoiceView>;
 export const feedItemPing = "Ping" satisfies WireOf<FeedItem>;
-export const feedItemAck = {"Ack":7} satisfies WireOf<FeedItem>;
+export const feedItemAck = {"Ack":"9007199254740993"} satisfies WireOf<FeedItem>;
 export const feedItemMessage = {"Message":{"body":"hello"}} satisfies WireOf<FeedItem>;
 export const feedItemInProgress = {"in-progress":{}} satisfies WireOf<FeedItem>;
 export const paymentCash = {"type":"Cash"} satisfies WireOf<Payment>;
@@ -54,3 +58,4 @@ export const notificationStarted = {"kind-of":"Started"} satisfies WireOf<Notifi
 export const notificationProgress = {"kind-of":"Progress","payload":{"percent":42}} satisfies WireOf<Notification>;
 export const invoicePaid = {"invoice":"7","amount_cents":"9007199254740993"} satisfies WireOf<InvoicePaid>;
 export const invoiceVoided = {"invoice":"7"} satisfies WireOf<InvoiceVoided>;
+export const limitExceeded = {"maxCents":"9007199254740993"} satisfies WireOf<LimitExceeded>;
