@@ -3959,7 +3959,11 @@ struct SharedStore(Arc<Mutex<SimObjectStore>>);
 
 impl SharedStore {
     fn new() -> SharedStore {
-        SharedStore(Arc::new(Mutex::new(SimObjectStore::new())))
+        SharedStore::wrapping(SimObjectStore::new())
+    }
+
+    fn wrapping(inner: SimObjectStore) -> SharedStore {
+        SharedStore(Arc::new(Mutex::new(inner)))
     }
 
     fn keys(&self) -> Vec<String> {
@@ -4306,6 +4310,63 @@ fn a_caught_up_archive_costs_no_disk_list_per_kernel_iteration() {
          the archive's bound check is running once per LOOP PASS, on the same thread that \
          serves requests",
         lists.load(Ordering::Relaxed) - caught_up
+    );
+}
+
+/// Spec §7's last row ("`ObjectStore` IO error on the archive arm | archive
+/// arm degrades; **never poisons the Db**") and §8's first invariant ("an
+/// archive failure is not a database failure"), which together decide what
+/// the arm does with an `Err` — and nothing in the plan pinned it.
+///
+/// A `?` in the arm would kill a serving node over a transient PUT: exactly
+/// the power spec §5 says a derived artifact must not have over the thing it
+/// derives from. `run_kernel_steps` expects `Ok` from every `Kernel::step`,
+/// so that mutation panics here rather than passing quietly.
+///
+/// Seeded fault injection (hard rule 3): `object_put_error: 1.0` through
+/// `SimObjectStore`'s own fault stream, so the failure is drawn from the
+/// seed rather than from a test-local switch.
+#[test]
+fn an_archive_io_failure_degrades_the_arm_and_never_the_kernel() {
+    let (sim, mut app) = kernel_app(0x746b_3961_0000_0007);
+    write_records(app.db_for_tests(), 3 * RECORDS_PER_SEGMENT);
+    let arc = Archive::open(archive_config(0, 8 << 20), app.db_for_tests()).unwrap();
+    let store = SharedStore::wrapping(SimObjectStore::with_faults(
+        0x746b_3961_0000_0007,
+        FaultConfig {
+            object_put_error: 1.0,
+            ..Default::default()
+        },
+    ));
+    let mut k = Kernel::with_archive(
+        app,
+        Box::new(sim.clock()),
+        arc,
+        Box::new(store.clone()) as Box<dyn ObjectStore>,
+    )
+    .unwrap();
+    let mut source = EndlessSource { next: 0 };
+
+    let served = run_kernel_steps(&mut k, &mut source, 1_000);
+
+    assert!(
+        served.archive_steps > 0,
+        "the arm never ran, so 'the kernel survived it' is untested"
+    );
+    assert!(
+        served.requests > 0,
+        "the kernel stopped serving requests while its archive was failing"
+    );
+    assert!(
+        store.keys().is_empty(),
+        "a store failing every PUT still holds objects: {:?}",
+        store.keys()
+    );
+    assert!(
+        !k.app().db().poisoned(),
+        "an archive IO failure poisoned the Db — an archive failure is not a database \
+         failure (spec §8), and the archive must never acquire the power to stop the \
+         primary (spec §5)"
     );
 }
 
