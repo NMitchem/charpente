@@ -29,7 +29,7 @@ pub fn run(args: &[String]) -> i32 {
         Err(code) => return code,
     };
 
-    let executable = match build_and_locate(&parsed.dir, parsed.bin.as_deref()) {
+    let executable = match build_and_locate("describe", &parsed.dir, parsed.bin.as_deref()) {
         Ok(path) => path,
         Err(code) => return code,
     };
@@ -41,7 +41,7 @@ pub fn run(args: &[String]) -> i32 {
     let result = Command::new(executable)
         .args(["describe", "--format", &parsed.format])
         .status();
-    exit_code_for(result)
+    exit_code_for("describe", result)
 }
 
 /// Maps the app binary's completed `Command` result to this verb's own exit
@@ -51,14 +51,14 @@ pub fn run(args: &[String]) -> i32 {
 /// all — killed by a signal, or never launched — is this layer's problem
 /// instead, both collapsing to 2 so an infrastructure fault is never
 /// misreported as the app's own answer.
-fn exit_code_for(result: Result<ExitStatus, std::io::Error>) -> i32 {
+pub(crate) fn exit_code_for(verb: &str, result: Result<ExitStatus, std::io::Error>) -> i32 {
     match result {
         Ok(status) => match status.code() {
             Some(code) => code,
             None => {
                 eprintln!(
                     "error: the app binary did not exit normally ({status}) — rerun \
-                     charpente describe"
+                     charpente {verb}"
                 );
                 2
             }
@@ -115,7 +115,7 @@ fn parse(args: &[String]) -> Result<Parsed, i32> {
 /// not a test target), then locate its bin among the resulting artifacts.
 /// Build errors are the compiler's oracle — forwarded verbatim, never
 /// wrapped.
-fn build_and_locate(dir: &str, bin: Option<&str>) -> Result<String, i32> {
+pub(crate) fn build_and_locate(verb: &str, dir: &str, bin: Option<&str>) -> Result<String, i32> {
     // Process spawning is edge tooling here, outside the deterministic core
     // (DESIGN.md §1) — this shells out to cargo to build the app crate;
     // nothing inside the core spawns processes.
@@ -140,7 +140,7 @@ fn build_and_locate(dir: &str, bin: Option<&str>) -> Result<String, i32> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let bins = find_bins(&stdout);
-    choose_bin(&bins, bin, dir).map_err(|msg| {
+    choose_bin(verb, &bins, bin, dir).map_err(|msg| {
         eprintln!("{msg}");
         2
     })
@@ -187,10 +187,15 @@ fn extract_field(line: &str, key: &str) -> Option<String> {
 /// unambiguous, several first honor an explicit `--bin`, else prefer the
 /// bin named like the package (`Cargo.toml`'s first `name = "…"`), else
 /// fail listing the candidates and naming `--bin` as the fix.
-fn choose_bin(bins: &[(String, String)], bin: Option<&str>, dir: &str) -> Result<String, String> {
+fn choose_bin(
+    verb: &str,
+    bins: &[(String, String)],
+    bin: Option<&str>,
+    dir: &str,
+) -> Result<String, String> {
     if bins.is_empty() {
         return Err(format!(
-            "error: no binary target in {dir} — charpente describe needs the app crate to \
+            "error: no binary target in {dir} — charpente {verb} needs the app crate to \
              build an executable (a `[[bin]]` in Cargo.toml, or src/main.rs) that calls \
              charpente::launch"
         ));
@@ -298,7 +303,7 @@ mod tests {
 
     #[test]
     fn choose_bin_zero_is_a_named_error() {
-        let err = choose_bin(&[], None, "/app").unwrap_err();
+        let err = choose_bin("describe", &[], None, "/app").unwrap_err();
         assert_eq!(
             err,
             "error: no binary target in /app — charpente describe needs the app crate to \
@@ -311,7 +316,7 @@ mod tests {
     fn choose_bin_one_is_unambiguous() {
         let bins = vec![("only".to_string(), "/x/only".to_string())];
         assert_eq!(
-            choose_bin(&bins, None, "/app").unwrap(),
+            choose_bin("describe", &bins, None, "/app").unwrap(),
             "/x/only".to_string()
         );
     }
@@ -323,7 +328,7 @@ mod tests {
             ("worker".to_string(), "/x/worker".to_string()),
         ];
         assert_eq!(
-            choose_bin(&bins, Some("worker"), "/app").unwrap(),
+            choose_bin("describe", &bins, Some("worker"), "/app").unwrap(),
             "/x/worker".to_string()
         );
     }
@@ -334,7 +339,7 @@ mod tests {
             ("api".to_string(), "/x/api".to_string()),
             ("worker".to_string(), "/x/worker".to_string()),
         ];
-        let err = choose_bin(&bins, Some("bogus"), "/app").unwrap_err();
+        let err = choose_bin("describe", &bins, Some("bogus"), "/app").unwrap_err();
         assert_eq!(
             err,
             "error: no binary named 'bogus' in /app — available: api, worker"
@@ -350,7 +355,7 @@ mod tests {
         // /app/Cargo.toml does not exist, so package_name(dir) is None —
         // exercises the "no match" branch without touching real disk state
         // beyond a lookup that's expected to fail.
-        let err = choose_bin(&bins, None, "/app").unwrap_err();
+        let err = choose_bin("describe", &bins, None, "/app").unwrap_err();
         assert_eq!(
             err,
             "error: several binaries in /app (api, worker) and none named like the package — \
@@ -377,7 +382,7 @@ mod tests {
             ("other".to_string(), "/x/other".to_string()),
         ];
         assert_eq!(
-            choose_bin(&bins, None, &dir).unwrap(),
+            choose_bin("describe", &bins, None, &dir).unwrap(),
             "/x/charpente-cli".to_string()
         );
     }
@@ -386,9 +391,15 @@ mod tests {
     #[test]
     fn exit_code_for_passes_through_the_child_exit_code() {
         use std::os::unix::process::ExitStatusExt;
-        assert_eq!(exit_code_for(Ok(ExitStatus::from_raw(0))), 0);
-        assert_eq!(exit_code_for(Ok(ExitStatus::from_raw(1 << 8))), 1);
-        assert_eq!(exit_code_for(Ok(ExitStatus::from_raw(2 << 8))), 2);
+        assert_eq!(exit_code_for("describe", Ok(ExitStatus::from_raw(0))), 0);
+        assert_eq!(
+            exit_code_for("describe", Ok(ExitStatus::from_raw(1 << 8))),
+            1
+        );
+        assert_eq!(
+            exit_code_for("describe", Ok(ExitStatus::from_raw(2 << 8))),
+            2
+        );
     }
 
     #[cfg(unix)]
@@ -397,7 +408,7 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         let status = ExitStatus::from_raw(9);
         assert_eq!(status.code(), None, "test fixture: expected no exit code");
-        assert_eq!(exit_code_for(Ok(status)), 2);
+        assert_eq!(exit_code_for("describe", Ok(status)), 2);
     }
 
     #[test]
@@ -405,6 +416,6 @@ mod tests {
         #[allow(clippy::disallowed_methods)]
         let result = Command::new("/definitely/not/a/real/charpente-app-binary-xyz").status();
         assert!(result.is_err(), "test fixture: expected the exec to fail");
-        assert_eq!(exit_code_for(result), 2);
+        assert_eq!(exit_code_for("describe", result), 2);
     }
 }
