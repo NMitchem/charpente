@@ -6059,6 +6059,25 @@ const CONV_DISK_ERROR_DIVISOR: f64 = 16.0;
 /// `replication.rs`'s `FINGERPRINT_FLOOR` and the rule is the same one):
 /// it means the universes reach that state less often than when the numbers
 /// were taken, and why is the finding.
+///
+/// **These are rates against ONE base, and fresh bases DO trip them. That is
+/// the design, not a regression.** Measured over 1,024 universes at four bases:
+///
+/// | base | `restored` | `substantial` | `chained` |
+/// |---|---|---|---|
+/// | `0xA2C0_0001` (pinned) | 216 | 181 | 168 |
+/// | `0xD9E3_0001` | 223 | 180 | 164 |
+/// | `0x5B71_0001` | 224 | 191 | 167 |
+/// | `0x3C0D_0001` | 225 | 169 | 178 |
+///
+/// A fresh-base run panicking `restored_substantial: 180 of 181` or
+/// `chained: 164 of 168` is therefore CORRECT, not a finding: a rate against a
+/// moving base is not a rate, which is why the base is pinned. This table is
+/// here rather than in a run report because the evidence bar ASKS for
+/// fresh-base runs, so whoever performs one meets these panics — and a report
+/// is not in the tree they will be reading. Note the difference from
+/// `replication.rs`'s `FINGERPRINT_FLOOR`, whose value was corroborated on
+/// unpinned runs: these deliberately are not, and the spread above is why.
 const CONV_RESTORED_FLOOR: u64 = 216;
 const CONV_SUBSTANTIAL_FLOOR: u64 = 181;
 const CONV_CHAINED_FLOOR: u64 = 168;
