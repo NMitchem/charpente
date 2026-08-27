@@ -27,11 +27,13 @@ test("Int64 arithmetic on a real client ERROR response", async () => {
     assert.equal(result.ok, false);
     if (result.ok) throw new Error("unreachable: stub always returns 400");
 
-    // `maxCents` is declared `bigint` on `LimitExceeded`. At runtime it is
-    // still the wire string "9007199254740993" unless `withdrawInvoice`'s
-    // error path also revives it -- so this throws
-    // `TypeError: Cannot mix BigInt and other types, use explicit
-    // conversions` instead of returning 18014398509481986n.
+    // `maxCents` is declared `bigint` on `LimitExceeded`. `withdrawInvoice`'s
+    // generated method revives the error position too (`reviveLimitExceeded`,
+    // called on `r.error`), so this is real arithmetic on a real `bigint` --
+    // the assertion this test exists for is that error positions are not a
+    // gap: had they been, this would throw `TypeError: Cannot mix BigInt and
+    // other types, use explicit conversions` instead of returning
+    // 18014398509481986n.
     assert.equal(result.error.maxCents * 2n, 18014398509481986n);
   } finally {
     restore();

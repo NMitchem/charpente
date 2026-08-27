@@ -51,19 +51,30 @@
 //! needed, a type's function is scheduled once and its own fields are fully
 //! explored) is not the same hazard as skipping a CALL at one occurrence.
 //!
-//! **Naming cannot collide.** A generated function is named `revive` +
-//! `TypeDef.name`; since every `Contract.types` name is already unique
-//! (`TypeRegistry`) and TypeScript keeps type space (what `emit_types`
-//! writes: `export type` / `export interface`) and value space (a plain
-//! `function`) apart — the exact reasoning `runtime.rs::RESERVED`'s own doc
-//! comment gives for `sseValue` coexisting with an interface of the same
-//! name — a `function reviveOrder` cannot collide with a wire type, wire
-//! types are never declared as a `class`/`enum` (the one case that doc
+//! **Naming CAN collide, in exactly one direction — fixed in fix round 1
+//! (F1).** A generated function is named `revive` + `TypeDef.name`. Between
+//! TYPE space and VALUE space this is safe: TypeScript keeps `export type` /
+//! `export interface` (what `emit_types` writes) apart from a plain
+//! `function` — the exact reasoning `runtime.rs::RESERVED`'s own doc comment
+//! gives for `sseValue` coexisting with an interface of the same name — so a
+//! `function reviveOrder` cannot collide with a wire type's OWN declaration
+//! (wire types are never declared as a `class`/`enum`, the one case that doc
 //! comment says really does collide), and a route's own camelCase method
 //! name is a CLASS MEMBER (`this.foo()`), never a bare identifier, so it
-//! cannot shadow or be shadowed by a module-scope `function` either. No
-//! separate collision assert is needed for the reasons `check_reserved`
-//! needs one; there is nothing reachable for it to catch.
+//! cannot shadow or be shadowed by a module-scope `function` either.
+//!
+//! But VALUE space against VALUE space is NOT automatically safe, and this
+//! module used to claim it was: a wire type literally named `Int64`
+//! (`WIRE_NAME` renders as `"Int64"`) derives `revive` + `"Int64"` =
+//! `"reviveInt64"` — the runtime's own fixed helper, declared once already in
+//! `RUNTIME`. `check_reserved` (`lib.rs:72`) does not catch this: it compares
+//! `TypeDef.name` itself against `RESERVED`, never the DERIVED name this
+//! module builds, so `"Int64"` (unreserved) sails through it and
+//! `emit_revivers` used to emit a second, colliding `function reviveInt64`
+//! — a `tsc` "Duplicate function implementation" the app author did not
+//! write. [`emit_revivers`] now asserts every derived name against a `taken`
+//! set seeded from `RESERVED` and grown as each function is emitted, so this
+//! is caught by a named Rust-side panic instead of shipping to `tsc`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -71,6 +82,7 @@ use std::fmt::Write as _;
 use charpente::describe::Contract;
 use charpente::wire::{EnumRepr, Field, TypeSchema};
 
+use crate::runtime;
 use crate::types::key;
 
 /// Every registered type by name, for chasing `Ref`.
@@ -232,15 +244,46 @@ fn field_access(receiver: &str, name: &str) -> String {
     }
 }
 
-/// `{ key: expr, ... }` for exactly the fields of `fields` that need
-/// conversion — an optional (`skip_serializing_if`) field whose OWN schema
-/// is not already `Option(_)` gets an extra outer null-guard: the wire omits
-/// the key entirely when absent, so `field_access` reads back `undefined`
-/// (not `null`), and passing `undefined` to `BigInt` throws the same as
-/// `null` does (A1) — the `Option(_)` case already guards this at the
-/// `revive_expr` level (`== null` is true for `undefined` too, by loose
-/// equality), so doubling the guard there would be redundant, not wrong; the
-/// non-`Option` case has no such guard yet, so it needs one here.
+/// One override piece per field of `fields` that needs conversion — either a
+/// plain `key: expr` (spliced into `{ ...receiver, PIECE, ... }` as a normal
+/// property) or, for `f.optional && Option(_)` (fix round 1, F3, below), a
+/// conditional SPREAD piece that can omit the key entirely.
+///
+/// Two DIFFERENT optional shapes need two DIFFERENT fixes, and conflating
+/// them was the bug:
+///
+/// - `f.optional` over a schema that is NOT already `Option(_)` (a bare
+///   `Int64` behind `skip_serializing_if`, e.g. `lateFeeCents`): the wire
+///   omits the key entirely when absent, so `field_access` reads back
+///   `undefined` (not `null`), and passing `undefined` to `BigInt` throws
+///   the same as `null` does (A1) — guarded here with an outer
+///   `(access) == null ? (access) : (inner)` (`== null` is true for
+///   `undefined` too, by loose equality). This DOES still materialize the
+///   key as an own property with value `undefined` (`"k" in result` is
+///   `true` even though the wire never sent `k`) — left as is, deliberately,
+///   because `undefined` is what `field_access` itself already reads back
+///   for an absent key: nothing about this path *introduces* a value the
+///   wire didn't already read as absent under `===` comparison, and
+///   `JSON.stringify` drops `undefined`-valued properties on the way back
+///   out, so a round trip through this client does not corrupt the
+///   distinction the way the next case does.
+/// - `f.optional && Option(_)` (e.g. `#[serde(skip_serializing_if =
+///   "Option::is_none")] pub x: Option<WireI64>` — the single most
+///   idiomatic serde optional pattern): this USED TO take the plain
+///   `k: expr` path, where `expr` is `Option(_)`'s own
+///   `(access) == null ? null : (inner)`. That guard treats `undefined`
+///   (absent) and `null` (explicit) identically, on PURPOSE, for the VALUE
+///   it computes — but a plain `k: expr` property ALWAYS materializes `k`,
+///   so an absent key came back as an explicit, present `null`: the client
+///   told the caller "the server sent null" for "the field was absent",
+///   exactly the distinction `skip_serializing_if` on an `Option` exists to
+///   express (measured: `"skipOpt" in revived === true`,
+///   `revived.skipOpt === null`, for a document that never had the key at
+///   all). Fixed with a conditional spread: `...(access === undefined ? {}
+///   : { k: inner })` — spreading `{}` adds nothing to the result, so an
+///   absent key STAYS absent; spreading `{ k: inner }` only happens when
+///   `access` is not `undefined`, at which point `inner`'s own guard still
+///   correctly tells an explicit `null` apart from a real value.
 fn revive_struct_overrides(
     fields: &[Field],
     receiver: &str,
@@ -252,12 +295,16 @@ fn revive_struct_overrides(
         .filter_map(|f| {
             let access = field_access(receiver, &f.name);
             let inner = revive_expr(&f.schema, &access, types, depth)?;
-            let wrapped = if f.optional && !matches!(f.schema, TypeSchema::Option(_)) {
-                format!("({access}) == null ? ({access}) : ({inner})")
+            let k = key(&f.name);
+            if f.optional && matches!(f.schema, TypeSchema::Option(_)) {
+                Some(format!(
+                    "...({access} === undefined ? {{}} : {{ {k}: {inner} }})"
+                ))
+            } else if f.optional {
+                Some(format!("{k}: ({access}) == null ? ({access}) : ({inner})"))
             } else {
-                inner
-            };
-            Some(format!("{}: {wrapped}", key(&f.name)))
+                Some(format!("{k}: {inner}"))
+            }
         })
         .collect()
 }
@@ -502,6 +549,26 @@ fn collect_needed_types<'a>(
 /// revive function's own body produces the type it claims is a second, free
 /// oracle on this module's codegen, the same "framework is the reviewer"
 /// property the rest of this sub-project leans on.
+///
+/// **Asserts every derived `revive<Name>` is a name nothing else already
+/// owns** (fix round 1, F1). The module doc's old "naming cannot collide"
+/// argument covered only type-space-vs-value-space (a wire type's own
+/// `export interface`/`export type` declaration never collides with a
+/// `function` of a different spelling) — it never checked VALUE space
+/// against VALUE space, which is exactly where a wire type literally named
+/// `Int64` breaks it: `revive` + `"Int64"` is `"reviveInt64"`, the runtime's
+/// own fixed helper (`runtime::RESERVED`), and `check_reserved`
+/// (`lib.rs:72`) only compares `TypeDef.name` itself against `RESERVED`, never
+/// the DERIVED name this function builds — so a type named `Int64` sailed
+/// through `check_reserved` and produced a second, colliding
+/// `function reviveInt64`, a `tsc` "Duplicate function implementation" the
+/// app author did not write. `taken` starts pre-loaded with every `RESERVED`
+/// name (catches that case, and any future `RESERVED` addition that already
+/// starts with `revive`) and then accumulates each derived name as it is
+/// emitted, so two DIFFERENT needed types that happened to derive the same
+/// string (impossible today by construction, since `TypeRegistry` names are
+/// unique and concatenation with a fixed prefix is injective — asserted
+/// anyway, per hard rule 4, rather than left as an argument nothing checks).
 pub(crate) fn emit_revivers(c: &Contract) -> String {
     let types = type_map(c);
     let mut needed: BTreeSet<&str> = BTreeSet::new();
@@ -511,7 +578,18 @@ pub(crate) fn emit_revivers(c: &Contract) -> String {
         collect_needed_types(&r.error, &types, &mut needed, &mut stack);
     }
     let mut out = String::new();
+    let mut taken: BTreeSet<String> = runtime::RESERVED.iter().map(|s| s.to_string()).collect();
     for name in &needed {
+        let fn_name = format!("revive{name}");
+        assert!(
+            !taken.contains(&fn_name),
+            "emit_revivers: the wire type `{name}` needs an Int64 revive function, but the \
+             generated name `{fn_name}` collides with a name the generated client runtime \
+             declares or another type's own generated reviver — the generated file would export \
+             `{fn_name}` twice; rename the wire type `{name}` (its `WIRE_NAME` is its type name) \
+             so its generated reviver does not share a TypeScript name with {fn_name}"
+        );
+        taken.insert(fn_name.clone());
         let schema = types[name];
         let body = revive_body(schema, &types).unwrap_or_else(|| {
             unreachable!(
@@ -520,7 +598,7 @@ pub(crate) fn emit_revivers(c: &Contract) -> String {
                  disagreement here means the two traversals in this module have drifted apart"
             )
         });
-        let _ = writeln!(out, "function revive{name}(v: {name}): {name} {{");
+        let _ = writeln!(out, "function {fn_name}(v: {name}): {name} {{");
         out.push_str(&body);
         out.push_str("\n}\n\n");
     }

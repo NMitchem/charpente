@@ -314,10 +314,17 @@ function sseValue(line: string, at: number): string {
  * this function, on a document the server was correct to send. Every
  * generated call site already guards those two cases with its own
  * null-check before ever reaching here (an `Option` position never even
- * calls this on `null`), so this `typeof` check is normally a formality —
- * it is written anyway because it is the one place A1's "convert only
- * strings, never throw on null/undefined" rule can be stated once instead
- * of trusted to every call site that wraps it.
+ * calls this on `null`) — so this `typeof` check and every call site's own
+ * guard are each INDEPENDENTLY sufficient (fix round 1, F2: measured by
+ * regenerating with exactly one guard removed at a time — either alone
+ * leaves `npm run test` green; only removing BOTH throws). This is written
+ * deliberately, not "just in case": it is the one place A1's "convert only
+ * strings, never throw on null/undefined" rule holds regardless of whether
+ * some future call site's own guard is ever weakened, and it is the ONLY
+ * layer a per-Contract generated-source test can never see, since this
+ * function's body is fixed text in `RUNTIME`, not emitted per contract —
+ * pinned by `lib.rs`'s
+ * `revive_int64_guards_null_and_undefined_on_its_own_not_only_via_call_sites`.
  *
  * `""` and a hex-looking string are NOT special-cased: `BigInt("")` is `0n`
  * and `BigInt("0x10")` is `16n`. Guarding either would be validating the

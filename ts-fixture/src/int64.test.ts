@@ -39,10 +39,11 @@ test("Int64 arithmetic on a real client response", async () => {
     assert.equal(result.ok, true);
     if (!result.ok) throw new Error("unreachable: stub always returns 200");
 
-    // `totalCents` is declared `bigint`. At runtime it is still the wire
-    // string "9007199254740993", because nothing revives it — so this throws
-    // `TypeError: Cannot mix BigInt and other types, use explicit conversions`
-    // instead of returning 18014398509481986n.
+    // `totalCents` is declared `bigint`. `getInvoice`'s generated method
+    // revives it (`reviveInvoiceView`) before this line ever runs, so it is
+    // a real `bigint` here, not the wire's decimal STRING — this is the
+    // arithmetic that would throw `TypeError: Cannot mix BigInt and other
+    // types, use explicit conversions` if that revive were ever lost.
     assert.equal(result.data.totalCents * 2n, 18014398509481986n);
 
     // `sequence` is unsigned and at the top of the u64 range — a JS `number`

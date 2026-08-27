@@ -149,4 +149,30 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(RESERVED, sorted.as_slice(), "RESERVED must stay sorted");
     }
+
+    /// Fix round 1, F2/I2: the review measured that `reviveInt64`'s call
+    /// sites (the `== null ? null : ...` guard `revive.rs` emits at every
+    /// `Option`/`Field.optional` position) and `reviveInt64`'s OWN
+    /// `typeof v === "string"` guard are each INDEPENDENTLY sufficient to
+    /// stop `BigInt(null)`/`BigInt(undefined)` from throwing — removing
+    /// either alone still leaves `npm run test` green, only removing both
+    /// throws. The call-site half is already pinned at the source level by
+    /// `tests/revive.rs` (`option_of_int64_guards_null_before_reviving` and
+    /// its `Seq`/`Map`/`Field.optional` siblings — each reddens if its
+    /// route's generated call site drops its guard). This test pins the
+    /// OTHER half: `reviveInt64`'s own guard, the one hand-written primitive
+    /// in `RUNTIME` rather than per-contract generated code, which nothing
+    /// else in this suite inspected. A future edit that deletes this line
+    /// from `RUNTIME` believing it "redundant" now reddens here instead of
+    /// silently losing defense-in-depth `npm run test` cannot observe on its
+    /// own (per-contract call sites already guard every reachable position).
+    #[test]
+    fn revive_int64_guards_null_and_undefined_on_its_own_not_only_via_call_sites() {
+        assert!(
+            RUNTIME.contains("typeof v === \"string\" ? BigInt(v) : (v as bigint)"),
+            "reviveInt64's own null/undefined guard is gone from RUNTIME -- this is the half of \
+             the A1 defense that no per-contract call-site test can see, since RUNTIME is a fixed \
+             string, not generated per Contract: {RUNTIME}"
+        );
+    }
 }

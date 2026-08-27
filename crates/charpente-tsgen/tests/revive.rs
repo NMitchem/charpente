@@ -307,6 +307,51 @@ fn field_optional_bare_int64_guards_the_absent_key() {
 }
 
 // ---------------------------------------------------------------------
+// Fix round 1, F3: `Field { optional: true, schema: Option(Int64) }` -- the
+// single most idiomatic `#[serde(skip_serializing_if = "Option::is_none")]`
+// pattern -- is a DIFFERENT shape from the bare-optional test above, and
+// needs a DIFFERENT fix. A plain `key: expr` override always materializes
+// `key` as an own property, even when `expr` evaluates to `null`; the wire
+// omitting the key entirely (server said "absent") must not come back as an
+// explicit `null` (server said "present but null") -- exactly the
+// distinction `skip_serializing_if` on an `Option` exists to express. The
+// walker must emit a conditional SPREAD, not a plain property, so an absent
+// key stays absent rather than being normalized to `null`.
+// ---------------------------------------------------------------------
+
+#[test]
+fn field_optional_option_int64_omits_the_key_entirely_rather_than_writing_null() {
+    let c = Contract {
+        types: vec![
+            api_error_typedef(),
+            TypeDef {
+                name: "Ledger",
+                schema: TypeSchema::Struct {
+                    fields: vec![Field {
+                        name: "adjustmentCents".to_string(),
+                        schema: TypeSchema::Option(Box::new(TypeSchema::Int64 { signed: true })),
+                        optional: true,
+                    }],
+                },
+            },
+        ],
+        routes: vec![route("ledger", TypeSchema::Ref("Ledger"), api_error())],
+        ..base()
+    };
+    let ts = emit_client(&c);
+    let body = reviver_body(&ts, "Ledger");
+    assert!(
+        body.contains(
+            "...(v.adjustmentCents === undefined ? {} : { adjustmentCents: \
+             (v.adjustmentCents) == null ? null : (reviveInt64(v.adjustmentCents)) })"
+        ),
+        "an absent key must be omitted via a conditional spread, not written as an explicit \
+         `null` via a plain property -- that would turn \"the server omitted this\" into \"the \
+         server sent null\": {body}"
+    );
+}
+
+// ---------------------------------------------------------------------
 // `EnumRepr::Unit` never carries an `Int64` — reachable, but must emit
 // nothing (A5: the common path stays a plain cast).
 // ---------------------------------------------------------------------
@@ -603,12 +648,25 @@ fn sibling_fields_of_the_same_ref_type_are_both_converted() {
 }
 
 // ---------------------------------------------------------------------
-// A type reached from two DIFFERENT routes still gets exactly one
-// function — the safe kind of dedup (see revive.rs's module doc comment).
-// ---------------------------------------------------------------------
-
+// A type reached from two DIFFERENT routes still gets its function emitted
+// — the safe kind of dedup (see revive.rs's module doc comment).
+//
+// Named for what it actually pins (fix round 1, F5): the "not two" half of
+// this property is unfireable by any logic change in `emit_revivers` today
+// -- `needed` is a `BTreeSet<&str>` and the emission loop iterates it once
+// per name, so producing `occurrences == 2` would take swapping the
+// container type to something that allows a duplicate key, not a bug this
+// test's assertion could ever catch. Reviewer measured it directly: removing
+// `collect_needed_types`'s `needed.contains(name)` memo left every test
+// green and the regenerated client byte-identical -- the memo is a pure
+// optimization on an already-deduplicated set, not the property protecting
+// against a duplicate function. What DOES fire, and is the real thing this
+// test exists to prove, is the "not zero" half: a type reached from TWO
+// DIFFERENT routes must still get its function emitted (not silently missed
+// because the second route's walk saw the name already scheduled and
+// stopped short of finding a genuinely new need).
 #[test]
-fn a_type_reached_from_two_routes_gets_exactly_one_function() {
+fn a_type_reached_from_two_routes_still_gets_its_function_emitted() {
     let c = Contract {
         types: vec![
             api_error_typedef(),
@@ -630,11 +688,10 @@ fn a_type_reached_from_two_routes_gets_exactly_one_function() {
         ..base()
     };
     let ts = emit_client(&c);
-    let occurrences = ts.matches("function reviveMoney(").count();
-    assert_eq!(
-        occurrences, 1,
-        "a type shared by two routes must get exactly one function, not zero (missed) or two \
-         (a tsc duplicate-function error): {ts}"
+    assert!(
+        ts.contains("function reviveMoney("),
+        "a type shared by two routes must still get its function emitted, not silently missed \
+         because a different route already scheduled it: {ts}"
     );
 }
 
@@ -734,4 +791,40 @@ fn an_int64_bearing_type_unreachable_from_any_route_gets_no_function() {
         "an Int64-bearing type unreached by any route method must emit no function, or \
          `noUnusedLocals` fails the real generated client with TS6133: {ts}"
     );
+}
+
+// ---------------------------------------------------------------------
+// Asserted negative space (hard rule 4, fix round 1 F1). A wire type
+// literally named `Int64` derives `revive` + `"Int64"` = `"reviveInt64"`,
+// the runtime's own fixed helper -- `check_reserved` (lib.rs:72) compares
+// `TypeDef.name` against `RESERVED`, never the DERIVED name this module
+// builds, so `"Int64"` (itself unreserved) used to sail through it and
+// `emit_revivers` emitted a second, colliding `function reviveInt64`: a
+// `tsc` "Duplicate function implementation" the app author did not write.
+// This must be a named Rust-side panic instead, the same failure class
+// `check_reserved`/`check_member_names` already convert for every other
+// generated-name collision.
+// ---------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "collides with a name the generated client runtime declares")]
+fn a_wire_type_named_int64_that_needs_its_own_revive_function_panics_by_name() {
+    let c = Contract {
+        types: vec![
+            api_error_typedef(),
+            TypeDef {
+                name: "Int64",
+                schema: TypeSchema::Struct {
+                    fields: vec![Field {
+                        name: "cents".to_string(),
+                        schema: TypeSchema::Int64 { signed: true },
+                        optional: false,
+                    }],
+                },
+            },
+        ],
+        routes: vec![route("getIt", TypeSchema::Ref("Int64"), api_error())],
+        ..base()
+    };
+    emit_client(&c);
 }
