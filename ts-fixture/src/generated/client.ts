@@ -69,6 +69,7 @@ export interface InvoiceView {
   feesByCategory: Record<string, bigint>;
   refundBatchesCents: (bigint)[] | null;
   disputedLineCents: (bigint | null)[];
+  creditNoteCents?: bigint | null;
 }
 
 export interface InvoiceVoided {
@@ -415,7 +416,7 @@ function reviveFeedItem(v: FeedItem): FeedItem {
 }
 
 function reviveInvoiceView(v: InvoiceView): InvoiceView {
-  return { ...v, totalCents: reviveInt64(v.totalCents), sequence: reviveInt64(v.sequence), lineItems: (v.lineItems).map((x0) => reviveLineItem(x0)), payment: revivePayment(v.payment), notice: reviveNotification(v.notice), lastItem: reviveFeedItem(v.lastItem), adjustmentCents: (v.adjustmentCents) == null ? null : (reviveInt64(v.adjustmentCents)), lateFeeCents: (v.lateFeeCents) == null ? (v.lateFeeCents) : (reviveInt64(v.lateFeeCents)), installmentCents: (v.installmentCents).map((x0) => reviveInt64(x0)), feesByCategory: Object.fromEntries(Object.entries(v.feesByCategory).map(([k0, x0]) => [k0, reviveInt64(x0)])), refundBatchesCents: (v.refundBatchesCents) == null ? null : ((v.refundBatchesCents).map((x0) => reviveInt64(x0))), disputedLineCents: (v.disputedLineCents).map((x0) => (x0) == null ? null : (reviveInt64(x0))) };
+  return { ...v, totalCents: reviveInt64(v.totalCents), sequence: reviveInt64(v.sequence), lineItems: (v.lineItems).map((x0) => reviveLineItem(x0)), payment: revivePayment(v.payment), notice: reviveNotification(v.notice), lastItem: reviveFeedItem(v.lastItem), adjustmentCents: (v.adjustmentCents) == null ? null : (reviveInt64(v.adjustmentCents)), lateFeeCents: (v.lateFeeCents) == null ? (v.lateFeeCents) : (reviveInt64(v.lateFeeCents)), installmentCents: (v.installmentCents).map((x0) => reviveInt64(x0)), feesByCategory: Object.fromEntries(Object.entries(v.feesByCategory).map(([k0, x0]) => [k0, reviveInt64(x0)])), refundBatchesCents: (v.refundBatchesCents) == null ? null : ((v.refundBatchesCents).map((x0) => reviveInt64(x0))), disputedLineCents: (v.disputedLineCents).map((x0) => (x0) == null ? null : (reviveInt64(x0))), ...(v.creditNoteCents === undefined ? {} : { creditNoteCents: (v.creditNoteCents) == null ? null : (reviveInt64(v.creditNoteCents)) }) };
 }
 
 function reviveLimitExceeded(v: LimitExceeded): LimitExceeded {

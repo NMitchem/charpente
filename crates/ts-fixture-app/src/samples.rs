@@ -120,6 +120,7 @@ pub fn invoice_view(id: Id<Invoice>, customer: Id<Customer>) -> InvoiceView {
         // not an edge case, which is exactly why it belongs on the value
         // shared everywhere rather than a one-off.
         adjustment_cents: None,
+        credit_note_cents: None,
         late_fee_cents: WireI64(0),
         // The four collection shapes below (fix round 1, F6) all carry the
         // same precision-breaking value already used elsewhere in this

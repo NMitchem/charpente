@@ -11,7 +11,10 @@
 // the key is present, the value is JSON `null`), and `lateFeeCents` is
 // OMITTED entirely (`skip_serializing_if` on a bare, non-Option `WireI64`
 // that happens to be zero) — a different runtime shape from `null`: property
-// access on an omitted key hands the revive walker `undefined`.
+// access on an omitted key hands the revive walker `undefined`. A third,
+// `creditNoteCents`, combines the two (`skip_serializing_if` over an
+// `Option<WireI64>`) and is the only shape that reaches the walker's
+// conditional-spread branch.
 //
 // The test completing at all (no uncaught TypeError) IS the primary oracle:
 // under a walker that skipped the null-guard, `getInvoice` would throw
@@ -40,6 +43,19 @@ test("Option(Int64) and an optional bare Int64 both round-trip null/absent witho
     // `late_fee_cents: WireI64(0)` in samples.rs omits the key entirely, so
     // this reads `undefined`, not `null` and not `0n`.
     assert.equal(result.data.lateFeeCents, undefined);
+
+    // `skip_serializing_if` over an `Option<WireI64>` -- the ONE shape that
+    // makes the walker emit its conditional spread, and the shape that had no
+    // executing coverage at all until the fix-round-1 re-review found it (N1).
+    // `in` rather than `== undefined` on purpose: the bug it pins is the key
+    // being MATERIALIZED, so a walker that spread `{creditNoteCents: null}`
+    // over an omitted key passes an equality check against `null` while
+    // reporting "the server sent null" for "the server sent nothing" -- the
+    // exact distinction `skip_serializing_if` exists to express.
+    assert.ok(
+      !("creditNoteCents" in result.data),
+      "an omitted key must stay omitted, not come back as an explicit null",
+    );
 
     // The type still promises `bigint`, so a caller doing arithmetic on the
     // ORDINARY (present) Int64 positions on the SAME document must still
