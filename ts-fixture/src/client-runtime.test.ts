@@ -8,6 +8,10 @@
 // Neither test here does bigint arithmetic, so neither observes the Int64 gap
 // int64.test.ts pins — a wire STRING compared to itself is true whether or not
 // the type lies about it being a bigint.
+//
+// The JSON round trip also asserts on the stub's recorded call (`calls[0]`) —
+// proof that request-body capture itself works, on a real body
+// (`createCustomerBody`), not just that responses can be served.
 
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
@@ -22,7 +26,7 @@ import {
 import { stubJsonResponse, stubSseResponse } from "./testing/fetch-stub";
 
 test("JSON round trip: a real sample document survives request()", async () => {
-  const restore = stubJsonResponse(customerView);
+  const { restore, calls } = stubJsonResponse(customerView);
   try {
     const api = new Api("http://fixture.invalid");
     const result = await api.createCustomer(
@@ -35,13 +39,22 @@ test("JSON round trip: a real sample document survives request()", async () => {
     assert.equal(result.data.displayName, customerView.displayName);
     assert.equal(result.data.emailAddress, customerView.emailAddress);
     assert.equal(result.data.status, customerView.status);
+
+    // The stub captured what `request()` actually sent — proof the capture
+    // itself works, on a real request body.
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "POST");
+    assert.deepEqual(
+      JSON.parse(calls[0].body as string),
+      createCustomerBody,
+    );
   } finally {
     restore();
   }
 });
 
 test("SSE round trip: real sample frames dispatch through stream()", async () => {
-  const restore = stubSseResponse([
+  const { restore } = stubSseResponse([
     { event: "invoice_paid", data: invoicePaid },
     { event: "invoice_voided", data: invoiceVoided },
   ]);

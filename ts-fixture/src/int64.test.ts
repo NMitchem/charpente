@@ -22,7 +22,7 @@ import { invoiceView } from "./generated/samples";
 import { stubJsonResponse } from "./testing/fetch-stub";
 
 test("Int64 arithmetic on a real client response (RED until B1)", async () => {
-  const restore = stubJsonResponse(invoiceView);
+  const { restore } = stubJsonResponse(invoiceView);
   try {
     const api = new Api("http://fixture.invalid");
     const result = await api.getInvoice(invoiceView.id as InvoiceId);

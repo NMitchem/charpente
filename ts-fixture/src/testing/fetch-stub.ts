@@ -9,20 +9,48 @@
 // oracles have: real Rust serialization <-> the committed literal <-> the
 // client's actual runtime behaviour (chunk-b0-brief.md A2).
 
-type Restore = () => void;
+/** One call this stub served, exactly as `ApiBase` passed it to `fetch`. `body`
+ * is `init.body` verbatim (a JSON string for `request()`, `undefined` for
+ * `stream()`, which sends none) — not re-parsed here, so a test can observe a
+ * serialization failure as readily as a value. Added after B0 landed: chunk
+ * B1 needs to assert an `Int64` in a REQUEST body serializes correctly
+ * instead of throwing, which requires seeing what `request()` actually handed
+ * to `fetch`, not just what the stub served back. */
+export interface RecordedCall {
+  url: string;
+  method: string;
+  body: BodyInit | null | undefined;
+}
 
-function install(impl: typeof fetch): Restore {
+export interface Stubbed {
+  restore: () => void;
+  /** Every call this stub has served, in call order. */
+  readonly calls: readonly RecordedCall[];
+}
+
+function install(respond: (init: RequestInit | undefined) => Promise<Response>): Stubbed {
   const original = globalThis.fetch;
-  globalThis.fetch = impl;
-  return () => {
-    globalThis.fetch = original;
+  const calls: RecordedCall[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({
+      url: String(input),
+      method: init?.method ?? "GET",
+      body: init?.body,
+    });
+    return respond(init);
+  }) as typeof fetch;
+  return {
+    calls,
+    restore: () => {
+      globalThis.fetch = original;
+    },
   };
 }
 
 /** One JSON response body, as `ApiBase.request` receives it: `res.text()` then
  * `JSON.parse`. No revival happens here — this is the wire exactly as the real
  * server would send it, which is the point. */
-export function stubJsonResponse(body: unknown, status = 200): Restore {
+export function stubJsonResponse(body: unknown, status = 200): Stubbed {
   return install(async () => new Response(JSON.stringify(body), { status }));
 }
 
@@ -36,7 +64,7 @@ export interface SseFrame {
 
 /** An SSE response body built from real frames, formatted the way charpente's
  * wire does (DESIGN §6): one `data:` line per frame, blank-line terminated. */
-export function stubSseResponse(frames: readonly SseFrame[]): Restore {
+export function stubSseResponse(frames: readonly SseFrame[]): Stubbed {
   const text = frames
     .map((f) => {
       const id = f.id !== undefined ? `id: ${f.id}\n` : "";
