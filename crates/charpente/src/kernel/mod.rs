@@ -146,15 +146,22 @@ pub struct Kernel {
     /// that unrepresentable instead of merely unhandled, which is hard rule
     /// 4's negative space applied to a type.
     archive: Option<(Archive, Box<dyn ObjectStore>)>,
-    /// What the archive knew last time it found nothing to do:
-    /// `Some(last_applied)` if the previous `Archive::step` left it idle,
-    /// `None` if it left work pending. The ready predicate's watermark —
-    /// see the ready-set build for why `idle()` alone cannot be it.
-    archive_idle_at: Option<Option<u64>>,
-    /// Set when the last `Archive::step` returned `Err`, cleared when the
-    /// loop parks. Paces a retry at one per PARK rather than one per
-    /// iteration; see the ready-set build.
-    archive_retry_parked: bool,
+    /// The archive's RE-ARM WATERMARK: `Some(L)` means "do not schedule the
+    /// archive arm again until `db.last_applied()` differs from `L`".
+    ///
+    /// Set after every archive step — to the `Db` that step actually saw
+    /// when the step left the archive idle or returned an error, and to
+    /// `None` (re-arm on the next iteration) when it left work pending and
+    /// succeeded. The ready predicate's whole state; see the ready-set build
+    /// for why `Archive::idle()` alone cannot be it.
+    archive_waiting_at: Option<Option<u64>>,
+    /// Whether `archive_waiting_at` was set by a FAILED step rather than by
+    /// an idle one. A failure is a retry, and a retry needs a second way to
+    /// be re-armed: an archive-only node's `Db` never moves at all, so the
+    /// watermark alone would strand it forever after one transient error.
+    /// Parking clears it; an idle watermark is left alone, because a
+    /// caught-up archive genuinely has nothing to re-check.
+    archive_waiting_on_failure: bool,
     /// `gapped()`/`stopped()` as of the last archive step, so the arm can
     /// raise spec §7's two operator notices on the EDGE rather than once per
     /// retry.
@@ -245,8 +252,8 @@ impl Kernel {
             // `None`, not `Some(db.last_applied())`: the archive has never
             // been stepped, so it has never had a chance to find nothing to
             // do, and its opening manifest GET is real work.
-            archive_idle_at: None,
-            archive_retry_parked: false,
+            archive_waiting_at: None,
+            archive_waiting_on_failure: false,
             archive_gapped: false,
             archive_stopped: false,
             archive_notice: None,
@@ -372,20 +379,24 @@ impl Kernel {
         // which is what makes the gate OPENING re-arm the arm with no step
         // in between (spec §4 rule 1).
         //
-        // `archive_retry_parked` paces a FAILED store op at one retry per
-        // kernel PARK instead of one per iteration. Without it an object
-        // store outage pegs the loop: a failed `start` leaves the archive in
-        // a non-`Idle` state permanently, so `archive_idle_at` stays `None`
-        // and the arm is ready forever — and `Archive::step`'s
-        // `yield_or_bound` does a `Disk::list` on every one of those
-        // iterations. Not a timer, deliberately: spec §8 states the archive
-        // arm never reads wall-clock time, directly or transitively, which
-        // is also why `snapshot_every` counts records rather than seconds.
+        // A FAILED step sets the same watermark, which is what keeps an
+        // object-store outage from pegging the loop: a failed `start` leaves
+        // the archive in a non-`Idle` state permanently, so a watermark set
+        // only on `idle` would leave the arm ready forever — retrying at
+        // loop speed, with a `Disk::list` inside `yield_or_bound` on every
+        // one of those iterations. Under load the retry rate is then the
+        // COMMIT rate, which is also the rate the archive's work arrives at,
+        // so a failing archive costs no more scheduling than a healthy one.
+        // `archive_waiting_on_failure` is the second re-arm, for the node
+        // whose `Db` never moves at all (`serve::archive`): parking clears
+        // it, so the retry falls back to one per park. Not a timer,
+        // deliberately — spec §8 states the archive arm never reads
+        // wall-clock time, directly or transitively, which is also why
+        // `snapshot_every` counts records rather than seconds.
         if let Some((archive, _)) = &self.archive
             && !archive.stopped()
             && !self.app.db().verifying()
-            && !self.archive_retry_parked
-            && self.archive_idle_at != Some(self.app.db().last_applied())
+            && self.archive_waiting_at != Some(self.app.db().last_applied())
         {
             ready.push(Ready::Archive);
         }
@@ -402,10 +413,16 @@ impl Kernel {
             }
         }
         if ready.is_empty() {
-            // The loop is about to park, which is the archive's retry
-            // pacing: whatever `wait_until` does with the deadline below is
-            // what separates one failed store attempt from the next.
-            self.archive_retry_parked = false;
+            // The loop is about to park, and that park is the archive's
+            // SECOND re-arm: whatever `wait_until` does with the deadline
+            // below separates one failed store attempt from the next on a
+            // node whose `Db` is not moving. An IDLE watermark is left
+            // alone — a caught-up archive has nothing to re-check, and
+            // clearing it here would cost one archive step per park forever.
+            if self.archive_waiting_on_failure {
+                self.archive_waiting_at = None;
+                self.archive_waiting_on_failure = false;
+            }
             // Gate the job/cron deadlines on `writable` too: a node with a
             // due-but-gated job must not busy-spin on a deadline already in the
             // past — the park tick (below) is what wakes it to re-check.
@@ -734,6 +751,23 @@ impl Kernel {
                     .archive
                     .as_mut()
                     .expect("Archive arm only pushed when Some");
+                // Negative space (hard rule 4). `Archive::step` returns
+                // EARLY and idle in both of these states, so a step taken in
+                // either would record a "nothing to do" watermark against a
+                // `Db` that has work behind the gate — after which
+                // `archive_waiting_at` never differs again and the gate
+                // opening is never observed. Measured: removing the
+                // `verifying()` clause from the ready predicate makes a
+                // resolved verification a PERMANENT archive outage, and the
+                // symptom appears nowhere near the cause.
+                assert!(
+                    !archive.stopped() && !self.app.db().verifying(),
+                    "Archive arm reached with a stopped ({}) or write-gated ({}) archive — \
+                     the ready predicate must exclude both, because `Archive::step` returns \
+                     early and idle in each and would poison the arm's re-arm watermark",
+                    archive.stopped(),
+                    self.app.db().verifying()
+                );
                 // ONE `step` per iteration, never a loop to completion.
                 // `Archive::step`'s own `read_budget_bytes` exists precisely
                 // so no single call reads a whole 64 MiB segment, and that
@@ -741,9 +775,13 @@ impl Kernel {
                 let outcome = archive.step(self.app.db(), &**store);
                 let (idle, gapped, stopped) = (archive.idle(), archive.gapped(), archive.stopped());
                 self.stats.archive_steps += 1;
+                let failed = outcome.is_err();
                 // The watermark the ready predicate reads. Taken AFTER the
-                // step, against the `Db` the step actually saw.
-                self.archive_idle_at = idle.then(|| self.app.db().last_applied());
+                // step, against the `Db` the step actually saw. An error
+                // sets it for the same reason an idle step does: neither
+                // makes progress possible again until something changes.
+                self.archive_waiting_at = (idle || failed).then(|| self.app.db().last_applied());
+                self.archive_waiting_on_failure = failed;
                 // Spec §7's last row and §8's first invariant: an archive
                 // failure is NOT a database failure. A `?` here would kill a
                 // serving node over a transient PUT, which is precisely the
@@ -762,19 +800,18 @@ impl Kernel {
                 // notices over 3,000 steps) collapses to one, and a
                 // within-bound retry storm produces none at all, which is
                 // what §7's first row asks for.
-                if let Err(e) = outcome {
-                    if (gapped && !self.archive_gapped) || (stopped && !self.archive_stopped) {
-                        // Written from inside the loop for the reason
-                        // `Repl::emit_witness_notice` gives for the same
-                        // choice: it is produced mid-run and no driver polls
-                        // the kernel while it is looping, so an operator
-                        // would otherwise have nothing to read. The string
-                        // is also left on `archive_notice` for a driver that
-                        // would rather route it.
-                        eprintln!("charpente archive: {e}");
-                        self.archive_notice = Some(e.to_string());
-                    }
-                    self.archive_retry_parked = true;
+                if let Err(e) = outcome
+                    && ((gapped && !self.archive_gapped) || (stopped && !self.archive_stopped))
+                {
+                    // Written from inside the loop for the reason
+                    // `Repl::emit_witness_notice` gives for the same choice:
+                    // it is produced mid-run and no driver polls the kernel
+                    // while it is looping, so an operator would otherwise
+                    // have nothing to read. The string is also left on
+                    // `archive_notice` for a driver that would rather route
+                    // it.
+                    eprintln!("charpente archive: {e}");
+                    self.archive_notice = Some(e.to_string());
                 }
                 self.archive_gapped = gapped;
                 self.archive_stopped = stopped;

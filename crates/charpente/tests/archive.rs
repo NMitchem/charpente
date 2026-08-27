@@ -335,6 +335,21 @@ fn archive_fixture_with_tiny_read_budget() -> (Db, SimObjectStore, Archive) {
     build_fixture(SimObjectStore::new(), 256)
 }
 
+/// `write_records`, but starting at `from` — so a test can go on committing
+/// FRESH rows mid-run without overwriting the ones it already wrote.
+fn write_records_at(db: &mut Db, from: u64, n: u64) {
+    for i in from..from + n {
+        db.transact(|tx| -> Result<(), std::convert::Infallible> {
+            tx.put(&Rec {
+                id: Id::from_raw(i),
+                value: i,
+            });
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
 fn write_records(db: &mut Db, n: u64) {
     for i in 0..n {
         db.transact(|tx| -> Result<(), std::convert::Infallible> {
@@ -4244,15 +4259,19 @@ fn a_write_gated_archive_resumes_archiving_after_the_gate_opens() {
 /// no natural symptom, which is what hard rule 4 asks for an assertion
 /// against.
 ///
-/// The oracle is phrased against WORK ARRIVING: commits keep coming after
-/// the archive stops, and every one of them is a fresh reason a
-/// data-watermark predicate would re-arm the arm. A predicate that does not
-/// consult `stopped()` therefore keeps stepping, and `archive_steps` keeps
-/// climbing, while the bucket never changes.
+/// THE LOAD IS THE ORACLE, and the first version of this test got it wrong.
+/// It drove an endless request source, which meant the ready set was never
+/// empty, the kernel never parked, and the arm's failure backoff never
+/// cleared — so the stopped archive went unstepped for a reason that had
+/// nothing to do with `stopped()`, and dropping the `stopped()` clause left
+/// the whole suite green. What isolates the clause is a `Db` that keeps
+/// COMMITTING while nothing else is ready: every commit moves
+/// `db.last_applied()`, which is the watermark the ready predicate re-arms
+/// on, so a predicate missing `stopped()` re-arms on every one of them.
 #[test]
 fn the_kernel_stops_stepping_a_stopped_archive() {
-    let (_sim, mut k, store, mut source) =
-        kernel_with_archive_and_requests_over(0x746b_3961_0000_0004, FOREIGN_WRITER);
+    let (_sim, mut k, store) = kernel_with_archive_over(0x746b_3961_0000_0004, FOREIGN_WRITER);
+    let mut source = SilentSource;
 
     let stopped_at = (0..2_000)
         .find_map(|_| {
@@ -4264,19 +4283,25 @@ fn the_kernel_stops_stepping_a_stopped_archive() {
         })
         .expect("the planted foreign manifest never stopped the archive");
     let bucket = store.keys();
+    let applied_at_stop = k.app().db().last_applied();
 
-    let after = run_kernel_steps(&mut k, &mut source, 1_000);
-    assert!(
-        after.requests > 0,
-        "no request was served over the second run, so 'the archive stopped being stepped' \
-         could be a kernel that stopped doing anything"
+    for i in 0..200u64 {
+        write_records_at(k.app_mut_for_tests().db_for_tests(), 10_000 + i, 1);
+        k.step(&mut source).expect("the kernel must not stop");
+    }
+
+    assert_ne!(
+        k.app().db().last_applied(),
+        applied_at_stop,
+        "nothing committed over the second run, so the ready predicate was never re-armed \
+         and 'the arm did not run' says nothing about `stopped()`"
     );
     assert_eq!(
-        after.archive_steps,
+        k.stats().archive_steps,
         stopped_at,
         "the kernel drove a permanently stopped archive {} more times: it never asked \
          `stopped()`, and a dead archive is being presented as the healthy steady state",
-        after.archive_steps - stopped_at
+        k.stats().archive_steps - stopped_at
     );
     assert_eq!(
         store.keys(),
@@ -4285,13 +4310,9 @@ fn the_kernel_stops_stepping_a_stopped_archive() {
     );
 }
 
-/// `kernel_with_archive_and_requests`, but over a bucket a DIFFERENT writer
-/// already owns — so `adopt` refuses and latches `State::Stopped` (spec §4
-/// rule 2).
-fn kernel_with_archive_and_requests_over(
-    seed: u64,
-    writer: &str,
-) -> (Sim, Kernel, SharedStore, EndlessSource) {
+/// `kernel_with_archive`, but over a bucket a DIFFERENT writer already owns
+/// — so `adopt` refuses and latches `State::Stopped` (spec §4 rule 2).
+fn kernel_with_archive_over(seed: u64, writer: &str) -> (Sim, Kernel, SharedStore) {
     let (sim, mut app) = kernel_app(seed);
     write_records(app.db_for_tests(), RECORDS_PER_SEGMENT);
     let arc = Archive::open(archive_config(0, 8 << 20), app.db_for_tests()).unwrap();
@@ -4304,5 +4325,5 @@ fn kernel_with_archive_and_requests_over(
         Box::new(store.clone()) as Box<dyn ObjectStore>,
     )
     .unwrap();
-    (sim, kernel, store, EndlessSource { next: 0 })
+    (sim, kernel, store)
 }
