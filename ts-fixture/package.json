@@ -6,7 +6,7 @@
   "description": "The dogfood target for charpente's TypeScript client: tsc --noEmit over a generated client, real call sites, serde-fidelity literals and brand negatives.",
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "tsc -p tsconfig.test.json && node scripts/mark-dist-commonjs.cjs && node --test dist/*.test.js"
+    "test": "tsc -p tsconfig.test.json && node scripts/mark-dist-commonjs.cjs && node scripts/require-test-files.cjs && node --test 'dist/**/*.test.js'"
   },
   "devDependencies": {
     "typescript": "5.9.3"
