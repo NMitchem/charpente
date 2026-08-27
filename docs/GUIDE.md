@@ -3840,8 +3840,12 @@ is a consequence of running the command, which is why the command prints the cou
 **A restore that fails part-way leaves a partial rebuild, not the old directory.** Reading
 the bucket, verifying every segment's frames, and judging the destination all happen
 before anything is written, and failures in that phase promise an untouched destination —
-including the directory itself: if `--to` did not exist, the CLI removes what it created
-rather than leaving you a directory you never had.
+including the directory itself: if `--to` did not exist, the CLI removes it again rather
+than leaving you a directory you never had. Precisely: **the `--to` directory itself, and
+only while it is still empty.** A nested `--to a/b/c` leaves `a` and `a/b` behind, because
+deleting ancestor directories you may have meant to keep is worse than leaving two empty
+ones; and a directory holding a partial restore is never removed, since the failure text
+below tells you to re-run against exactly that directory.
 Past that point the old timeline is already discarded, and a failure says so:
 
 ```text
