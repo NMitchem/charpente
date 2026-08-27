@@ -371,8 +371,20 @@ be able to halt the thing it derives from.
    have deleted entirely, and the frame at `applied_seq` lies *below* the chain whenever
    the frontier falls on a segment boundary — which is exactly when a restored node's
    `seed_frontier` is the value a replication peer reads. Added Task 10.
-4. `Get` the segment chain and lay it into `wal/`, verifying each frame CRC.
-5. Hand off to ordinary `Db::open`, which replays from `applied_seq + 1`.
+4. `Get` the segment chain and verify every frame's CRC — **before step 3**, and holding
+   no object longer than it takes to walk it. Steps 1, 2, 4 and the divergence check below
+   write NOTHING to the destination, which is what makes "a corrupt segment object is
+   refused, never imported" a fact rather than an intention. It costs a second `Get` per
+   segment (verify, then fetch again to apply); a chain is unbounded in length, so holding
+   it instead would put an O(generation) allocation on a machine already having a bad day.
+5. Apply the chain's frames through `Db::apply_shipped` — the follower's own
+   append-and-apply path — from `applied_seq + 1`, dropping the below-frontier residue
+   §2 calls structural by arithmetic rather than by search. **Amended Task 10**: this step
+   said "lay it into `wal/` … hand off to ordinary `Db::open`", which is not reachable —
+   `Seeder::new` consumes the `Box<dyn Disk>` and neither `Seeder` nor `Db` lends it back,
+   so laying files between `rows` and `finish` needs a new public accessor in core. The
+   follower path needs none, re-frames every record through `Wal::append`, and refuses an
+   out-of-order seq by name.
 
 `Seeder::new` already discards any store file and `wal/` segments at the target, dir-barriered
 (DESIGN §5, "seeding always replaces a timeline, never merges into one"), so restoring into a
@@ -381,7 +393,22 @@ inherits that property rather than reimplementing it.
 
 **Restore refuses a diverged local timeline.** If the target directory holds a log whose
 frontier CRC disagrees with the archive's timeline at the same seq, restore refuses by name
-rather than overwriting or resuming across it. This is the same class the replication ladder
+rather than overwriting or resuming across it. The comparison is made at the highest seq
+BOTH sides hold a frame for — `min(destination frontier, chain end)` — and both frames are
+read and re-checksummed in that call: the destination's off `Disk`, frame by frame (never
+through `Db::open`, which fails on exactly the directories an operator restores and would
+consume the disk handle on the way), the archive's out of the segment object whose span
+contains it.
+
+**Two further refusals, added Task 10, on the same "destroy nothing you cannot account
+for" rule.** *Ahead*: the two agree at the comparison seq but the destination holds records
+above the chain's end, which exist nowhere else. *Unrelated*: there is no seq at which the
+two can be compared at all — the generation has no chain yet, or the destination's whole
+log lies below it, where the archive's copy is folded into the snapshot rather than into an
+object. Neither is proven divergence, and both are refused rather than silently overwritten;
+both name `--force`. A destination holding no verifiable frame at all is not one of these —
+there is nothing to compare and restore proceeds, which is the fresh-directory case and the
+retry-after-a-crashed-restore case. This is the same class the replication ladder
 already refuses (DESIGN §5: "a CRC mismatch on a retained frame → `Refuse` naming both seqs,
 both CRCs, and the re-seed fix; diverged timelines are refused, never merged"). An explicit
 `--force` discards, naming what it destroys. Raised by the concurrent codegen session,
@@ -404,6 +431,22 @@ GUIDE's operator section, not only in this spec.
 
 The CLI owns the edge, but the logic lives in a core-testable function over
 `&dyn ObjectStore` + `Box<dyn Disk>` so the simulator drives the real path, not an analogue.
+IMPLEMENTED as of T10: `charpente::archive::restore::restore(store, disk, cfg, schema,
+opts, notice)`. Two arguments the sketch did not carry, both forced: a `DbConfig`, without
+which restore cannot know `wal.dir` or `store_path`; and `notice: &mut dyn FnMut(&str)`,
+because a value returned in `RestoreReport` cannot say anything BEFORE the fact and this
+section requires `--force` to name what it destroys before acting. `RestoreReport` carries
+the generation, the frontier restored to, the segment count and the pending-job count.
+
+**What a failed restore leaves behind, stated so nobody assumes atomicity.** Steps 1, 2, 4
+and the divergence check leave the destination untouched. Past that, a failure leaves a
+discarded-and-partially-rebuilt directory: a store seeded at the snapshot's frontier plus a
+contiguous PREFIX of the chain, never a hole. That state is on the archive's own timeline,
+so a retry's divergence check passes and `Seeder::new` discards it — the crashed restore
+converges rather than resuming. It is NOT protected against being started as a database: a
+half-restored directory opens and serves stale reads, and closing that would mean teaching
+`Db::open` about a restore-in-progress marker. Restore says so in the failure's own text
+instead.
 
 ## §7 Failure semantics and error text
 
