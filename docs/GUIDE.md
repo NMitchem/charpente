@@ -3859,3 +3859,38 @@ discards and rebuilds from scratch, so a re-run converges rather than resuming
 Take that sentence literally: a half-restored directory *opens*. Nothing stops a node
 starting on one and serving stale reads. The remedy is the re-run, which converges because
 restore discards and rebuilds rather than resuming.
+
+### Required: a lifecycle rule on the archive's bucket
+
+**This is a requirement on whoever runs the archive, not a tuning note.** Configure the
+archive's bucket with a rule that **aborts incomplete multipart uploads after N days**:
+
+```text
+S3:                 lifecycle rule -> AbortIncompleteMultipartUpload, DaysAfterInitiation: N
+GCS:                lifecycle rule -> AbortIncompleteMultipartUpload, age N
+Azure Blob:         lifecycle rule -> delete uncommitted blobs after N days
+```
+
+Pick N larger than the longest upload the archive will ever make — a full snapshot of your
+largest table — and small enough that a few of them are not a bill. Seven days is the
+common default and is fine for most deployments.
+
+**What happens without it.** An upload that dies part-way (the process is killed, the
+network drops, the node fails over) can leave the bucket holding parts nothing will ever
+finish. Those parts are unbounded and **nothing in charpente can reach them** — not the
+archive, which never lists the bucket; not `restore`, which reads only what a manifest
+names; and not reclamation, which deletes only what a manifest *did* name. The bucket grows
+for as long as the deployment lives.
+
+**Why no code closes this.** An object left by a failed upload is orphaned *precisely in
+that no manifest ever recorded it*. Nothing but a LIST of the prefix could find one, and a
+periodic list-and-sweep is deliberately not built: a sweep whose arithmetic is wrong deletes
+objects a restore needs, which is a strictly worse failure than a bucket that grows. The
+lifecycle rule is the mechanism designed for exactly this, so it is where this belongs.
+
+**What the archive does reclaim, so you do not double up.** When a generation rolls, the
+archive deletes the superseded generation's objects **by name**, out of its own manifest and
+its own snapshot metadata. That happens after the new manifest is durable, never before.
+Do **not** add an age-based expiry over the generation objects themselves to "help": age has
+nothing to do with supersession, and a rule aggressive enough to reclaim a superseded
+generation will eventually delete a live one that a restore needs.

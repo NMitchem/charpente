@@ -7,8 +7,10 @@
 //! (§3's other half) and the ordering that is the whole safety argument;
 //! Task 7 lands the bounded pin, the named gap, generation transitions and
 //! resume-or-open; Task 7.5 makes a generation's chain CONTINUE its snapshot
-//! instead of overlapping it (ruling 53); Task 8 lands ownership (§4) — the
-//! write gate and the writer identity. Restore (§6) is still to come.
+//! instead of overlapping it (ruling 53); Task 8 landed ownership (§4) — the
+//! write gate and the writer identity; Task 12.5 lands RECLAMATION, the
+//! first `ObjectOp::Delete` this codebase ever issues (§3, below). Restore
+//! (§6) landed at Task 10 and lives in `restore.rs`.
 //!
 //! **The manifest swaps last.** Inter-key ordering is not guaranteed by
 //! `ObjectStore` (§1), so the manifest swap is the only operation whose
@@ -45,8 +47,10 @@
 //!
 //! **A generation's chain CONTINUES its snapshot** (ruling 53, spec §2), and
 //! that is what makes a snapshot worth taking: §3's "snapshots ... release
-//! the WAL below them" — WAL on this node's disk, never objects in the
-//! bucket, which nothing here reclaims. The chain starts at the base of the
+//! the WAL below them" — WAL on this node's disk. The bucket is a separate
+//! question with a separate answer (Task 12.5, "RECLAMATION" below): a
+//! generation the manifest has stopped naming is deleted by name, and
+//! nothing else in the bucket ever is. The chain starts at the base of the
 //! sealed segment holding the first record the snapshot does not carry
 //! (`chain_start`), never *below* it — every segment lying wholly below the
 //! frontier is the snapshot's, so the archive neither holds nor ships it.
@@ -102,10 +106,52 @@
 //! archive is about to replace and refuses if it names another writer
 //! (§4); `UploadingManifest` swaps the manifest to
 //! reference the new segment, the one mutable key and the archive's own
-//! commit point (spec §2); `Stopped` is where an ownership refusal parks,
+//! commit point (spec §2); `ReadingRetiredMeta` and `DeletingRetired`
+//! reclaim the generation that swap superseded, if it superseded one;
+//! `Stopped` is where an ownership refusal parks,
 //! permanently and holding nothing. A failed PUT retries with the identical key and
 //! bytes — never a fresh one — which is what keeps a lost-ack retry from
 //! duplicating an object (spec §9.2).
+//!
+//! **RECLAMATION** (spec §3, Task 12.5). When a generation rolls, the
+//! superseded generation's objects are deleted BY NAME, out of documents
+//! this archive itself wrote: its manifest names the chain, and its
+//! `snapshot/meta` names the batch objects (`Manifest` carries the table
+//! NAMES and no counts, so that one GET is what makes them nameable at all).
+//! **No LIST.** A periodic list-and-sweep of the prefix would close the
+//! orphan case too and is refused outright: a sweep whose arithmetic is
+//! wrong deletes objects a restore needs, and discovering keys by
+//! enumeration is a surface this design does not want to have.
+//!
+//! Three properties, each of which can be violated without failing a test
+//! that was written before it:
+//!
+//! - **Deletion FOLLOWS the manifest swap, and structurally.** The key set
+//!   (`Retired`) is built in `step_checking_owner` out of the manifest the
+//!   swap is about to replace, rides on `State::UploadingManifest`, and is
+//!   acted on in exactly one place — the arm where that PUT has landed. No
+//!   other state carries one, so there is nowhere else a delete could be
+//!   issued from. Get this backwards and a crash between the two leaves a
+//!   manifest naming objects that are gone, which no restore recovers from.
+//! - **Only ever a manifest THIS writer wrote.** `step_checking_owner` has
+//!   already refused a foreign manifest by the time the candidate is built,
+//!   so the ownership rule spec §8 states for writes covers the delete: an
+//!   archive that cannot establish ownership of a prefix never writes to it,
+//!   and a delete is a write.
+//! - **An optimisation, never a correctness dependency.** A failed delete
+//!   drops its key and moves on — no retry, and no state anywhere waits on
+//!   one. An archive whose deletes fail forever stays correct and keeps
+//!   rolling generations; its bucket simply grows, exactly as it did before
+//!   this existed. The drain is bounded by `yield_or_bound`, which runs
+//!   before these transitions like any other: a reclamation long enough to
+//!   leave the archive `pin_segments` behind yields, gaps, and abandons what
+//!   is left.
+//!
+//! What reclamation CANNOT reach, by construction: a generation the archive
+//! began and abandoned without ever writing its manifest. Its objects are
+//! orphaned precisely in that nothing names them, so nothing but a LIST
+//! could find one — spec §3 routes those to an operator bucket lifecycle
+//! rule, which is stated there as a requirement.
 //!
 //! **The retention pin is BOUNDED** (spec §5, ruling 3): it holds at the
 //! lowest seq this archive still needs — the lowest sealed segment not yet
@@ -161,10 +207,14 @@
 //! so** (F-C). The one this archive was BUILDING is abandoned: if it had
 //! already written snapshot objects but no manifest yet, those objects are
 //! orphaned, and **nothing in this design collects them** — not the archive
-//! (it never lists the bucket), not restore, and no task in the plan. The
-//! two honest answers are a bucket lifecycle rule on `<prefix>/<gen>/`, or a
-//! sweep built on `ObjectOp::Delete`, which the trait already carries and
-//! nothing yet calls. The one `ClosingGeneration` marks `closed` is a
+//! (it never lists the bucket), not restore, and not Task 12.5's
+//! reclamation, which names only what a manifest named and so cannot reach a
+//! generation no manifest ever recorded. That is the asymmetry the whole
+//! reclamation design turns on and it survives here intact: these objects
+//! are orphaned PRECISELY IN THAT nothing names them, so only a LIST could
+//! find one, and the LIST sweep is refused (spec §3). The operator answer is
+//! the bucket lifecycle rule spec §3 requires. The one `ClosingGeneration`
+//! marks `closed` is a
 //! different thing: the generation the MANIFEST names, which is what a
 //! restore would read, and which is only the same generation when this one
 //! had already published.
@@ -311,7 +361,8 @@ pub struct ArchiveConfig {
     /// of the process, recoverable only by the operator action
     /// `foreign_writer_notice` names (remove the manifest object and take a
     /// fresh generation's full snapshot, abandoning the live generation's
-    /// objects, which nothing in this design collects).
+    /// objects — which nothing collects, since reclamation names only what a
+    /// manifest superseded and a stopped archive writes no further manifest).
     ///
     /// That is the deliberate side of an asymmetric trade (spec §4 rule 2),
     /// not an oversight: nothing in the bucket distinguishes "I am the same
@@ -462,6 +513,85 @@ struct Frontier {
     tables: Vec<String>,
 }
 
+/// The object set of a generation the manifest no longer names (spec §3,
+/// Task 12.5) — what reclamation deletes, enumerated lazily.
+///
+/// **Where a value of this type can come from is the safety argument.** It
+/// is built in exactly one place, `step_checking_owner`, out of the manifest
+/// that swap is about to REPLACE: a document already decoded, already found
+/// to name this writer, and already found to name a generation below this
+/// archive's own. And it is acted on in exactly one place,
+/// `step_uploading_manifest`'s landed arm — so the delete cannot precede the
+/// swap, because until that PUT lands there is no state that carries this
+/// anywhere a delete could be issued from.
+///
+/// **Lazily** because `SnapshotMeta::batches` is a `u64` read back out of the
+/// bucket: materialising every key at once would make a generation's
+/// reclamation cost O(objects) of memory, where the snapshot walk that WROTE
+/// them is O(batch) by construction (spec §10). Enumerating one key per step
+/// keeps both sides of the generation to the same ceiling.
+struct Retired {
+    generation: u64,
+    /// Straight off the retired manifest, which names its own chain.
+    segments: Vec<SegmentRef>,
+    /// Off the retired generation's `snapshot/meta`, the only document that
+    /// records how many objects each table was paged into — `Manifest`
+    /// carries the table NAMES and no counts, so the batch keys cannot be
+    /// named without it. Empty until that GET completes, and empty FOREVER
+    /// if it fails: reclamation does not retry.
+    tables: Vec<TableBatches>,
+    /// Cursor into `segments`.
+    segment: usize,
+    /// Cursor into `tables`, and into the current table's batches.
+    table: usize,
+    batch: u64,
+    /// Whether the `snapshot/meta` object itself has been handed out.
+    meta_done: bool,
+}
+
+impl Retired {
+    fn new(m: Manifest) -> Retired {
+        Retired {
+            generation: m.generation,
+            segments: m.segments,
+            tables: Vec::new(),
+            segment: 0,
+            table: 0,
+            batch: 0,
+            meta_done: false,
+        }
+    }
+
+    /// The next key to delete, or `None` when the generation is drained.
+    ///
+    /// **Segments first**: they are one `WalConfig::segment_bytes` each
+    /// against a snapshot batch's `SNAPSHOT_BATCH_ROWS` rows, so a drain cut
+    /// short — by a gap, by a restart, by the process dying — has reclaimed
+    /// the most bytes it could have. **The meta last**, after the batches it
+    /// names: it is the only document that could re-enumerate them, so
+    /// deleting it first would strand them behind a number nothing records.
+    fn next_key(&mut self, prefix: &str) -> Option<String> {
+        if let Some(s) = self.segments.get(self.segment) {
+            self.segment += 1;
+            return Some(segment_key(prefix, self.generation, s.base_seq));
+        }
+        while let Some(t) = self.tables.get(self.table) {
+            if self.batch < t.batches {
+                let key = snapshot_batch_key(prefix, self.generation, &t.name, self.batch);
+                self.batch += 1;
+                return Some(key);
+            }
+            self.table += 1;
+            self.batch = 0;
+        }
+        if !self.meta_done {
+            self.meta_done = true;
+            return Some(snapshot_meta_key(prefix, self.generation));
+        }
+        None
+    }
+}
+
 /// The retention pin as `Db` sees it (module docs, ruling 49).
 struct Pin {
     /// The lowest seq this archive still needs. Monotonic and never
@@ -564,6 +694,34 @@ enum State {
         /// is the archive's commit point (spec §2) — not when the snapshot
         /// objects themselves landed.
         commits: Option<Frontier>,
+        /// TASK 12.5. The generation this swap RETIRES, when there is one:
+        /// the manifest `CheckingOwner` just read back, decoded, found to
+        /// name this writer, and found to sit below this archive's own
+        /// generation. It only RIDES here — nothing deletes anything until
+        /// the PUT below lands, which is what makes "deletion follows the
+        /// manifest swap" a property of the state machine rather than of a
+        /// comment.
+        retiring: Option<Retired>,
+    },
+    /// TASK 12.5 / spec §3. The retired generation's `snapshot/meta` GET.
+    /// One attempt, never a retry: it is the only document naming that
+    /// generation's batch objects, and an archive that waited on it would
+    /// have made reclamation a thing progress depends on. On failure the
+    /// chain is still reclaimed and the batches are left — the same
+    /// bucket-grows outcome as before Task 12.5, for that one generation.
+    ReadingRetiredMeta {
+        retired: Retired,
+        started: bool,
+    },
+    /// TASK 12.5 / spec §3. One `ObjectOp::Delete` per step, drained until
+    /// the retired generation is empty. A key whose delete fails is DROPPED,
+    /// never retried: the archive must keep making progress when every
+    /// delete fails forever.
+    DeletingRetired {
+        retired: Retired,
+        /// The key of the DELETE in flight. `None` means the next step pops
+        /// the next key — `Some` is this state's `started`.
+        key: Option<String>,
     },
 }
 
@@ -1130,7 +1288,14 @@ impl Archive {
                 bytes,
                 started,
                 commits,
-            } => self.step_uploading_manifest(store, bytes, started, commits),
+                retiring,
+            } => self.step_uploading_manifest(store, bytes, started, commits, retiring),
+            State::ReadingRetiredMeta { retired, started } => {
+                self.step_reading_retired_meta(store, retired, started)
+            }
+            State::DeletingRetired { retired, key } => {
+                self.step_deleting_retired(store, retired, key)
+            }
         }
     }
 
@@ -1257,6 +1422,8 @@ impl Archive {
                 | State::UploadingSnapshotMeta { started: true, .. }
                 | State::UploadingSegment { started: true, .. }
                 | State::UploadingManifest { started: true, .. }
+                | State::ReadingRetiredMeta { started: true, .. }
+                | State::DeletingRetired { key: Some(_), .. }
         )
     }
 
@@ -2175,11 +2342,27 @@ impl Archive {
                         self.foreign_writer_notice(&m.writer, m.generation, commits.is_some());
                     Err(self.stop(notice))
                 }
-                Ok(_) => {
+                Ok(m) => {
+                    // TASK 12.5 / spec §3. `m` is the manifest this swap is
+                    // about to replace, and the arm above has already
+                    // refused it if it names anyone else — so a generation
+                    // BELOW this archive's own is one this archive wrote and
+                    // is about to stop referencing. That discharges spec
+                    // §8's ownership rule for the delete: the only keys
+                    // reclamation can ever name come out of a manifest this
+                    // writer wrote.
+                    //
+                    // CHECKED rather than asserted, for `resume_point`'s
+                    // reason: these bytes crossed the network. A manifest at
+                    // or above this generation retires nothing — the first
+                    // swap of any generation is its opening snapshot's, so
+                    // that is every within-generation segment swap.
+                    let retiring = (m.generation < self.generation).then(|| Retired::new(m));
                     self.state = State::UploadingManifest {
                         bytes,
                         started: false,
                         commits,
+                        retiring,
                     };
                     Ok(())
                 }
@@ -2198,12 +2381,14 @@ impl Archive {
                 "a Get was started; only ObjectDone::Get or an error can complete it, got \
                  {other:?}"
             ),
-            // No manifest yet: this generation's first swap creates it.
+            // No manifest yet: this generation's first swap creates it, and
+            // it supersedes nothing.
             Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => {
                 self.state = State::UploadingManifest {
                     bytes,
                     started: false,
                     commits,
+                    retiring: None,
                 };
                 Ok(())
             }
@@ -2224,8 +2409,10 @@ impl Archive {
         bytes: Vec<u8>,
         mut started: bool,
         commits: Option<Frontier>,
+        retiring: Option<Retired>,
     ) -> io::Result<()> {
         let key = manifest_key(&self.cfg.prefix);
+        let opened_generation = commits.is_some();
         let done = put_step(store, &key, &bytes, &mut started);
         if let Ok(true) = done {
             // The manifest swap landed: whatever this manifest names —
@@ -2245,6 +2432,43 @@ impl Archive {
                     )
                 });
             }
+            // TASK 12.5 / spec §3. THE ORDERING, and it is structural: this
+            // arm is the only place a `Retired` can be acted on, and it is
+            // inside the branch where the manifest naming the LIVE
+            // generation has landed. Until this PUT completes the retired
+            // generation is still the only complete generation in the
+            // bucket, and a restore reads it.
+            if let Some(retired) = retiring {
+                // REGRESSION GUARDS, not fault coverage (hard rule 4): no
+                // store fault can reach either. `Retired` is constructed
+                // under the first condition, and `self.generation` only ever
+                // rises between there and here; the second holds because a
+                // generation's FIRST swap is always its opening snapshot's,
+                // so a swap that retires a predecessor is always one that
+                // commits a successor. They go red on a code change that
+                // moved the construction or the transition, which is exactly
+                // the change that would make this ordering false.
+                assert!(
+                    retired.generation < self.generation,
+                    "Archive: about to reclaim generation {} while this archive's own generation \
+                     is {} — reclamation may only ever name a generation the manifest has \
+                     stopped pointing at (spec §3)",
+                    retired.generation,
+                    self.generation
+                );
+                assert!(
+                    opened_generation,
+                    "Archive: about to reclaim generation {} on a swap that commits no snapshot \
+                     — a generation's first manifest is its opening snapshot's, so a swap that \
+                     retires a predecessor is always one that opens a successor (spec §2)",
+                    retired.generation
+                );
+                self.state = State::ReadingRetiredMeta {
+                    retired,
+                    started: false,
+                };
+                return Ok(());
+            }
             self.state = State::Idle;
             return Ok(());
         }
@@ -2252,7 +2476,141 @@ impl Archive {
             bytes,
             started,
             commits,
+            retiring,
         };
         done.map(|_| ())
+    }
+
+    /// TASK 12.5 / spec §3. Reads the retired generation's `snapshot/meta`,
+    /// the only document that records how many objects each of its tables
+    /// was paged into — `Manifest` carries the table NAMES and no counts, so
+    /// without this the batch objects cannot be NAMED, and naming them any
+    /// other way means asking the bucket what is there, which is the LIST
+    /// sweep this design refuses outright.
+    ///
+    /// ONE attempt. A retry loop here would be a state that waits on
+    /// reclamation, and reclamation is an optimisation: a generation whose
+    /// meta will not come back has its chain reclaimed and its batches left,
+    /// which is the pre-Task-12.5 outcome for that one generation and
+    /// nothing worse.
+    fn step_reading_retired_meta(
+        &mut self,
+        store: &dyn ObjectStore,
+        mut retired: Retired,
+        started: bool,
+    ) -> io::Result<()> {
+        if !started {
+            let key = snapshot_meta_key(&self.cfg.prefix, retired.generation);
+            if let Err(e) = store.start(ObjectOp::Get { key }) {
+                self.state = State::DeletingRetired { retired, key: None };
+                return Err(e);
+            }
+            self.state = State::ReadingRetiredMeta {
+                retired,
+                started: true,
+            };
+            return Ok(());
+        }
+        match store.poll() {
+            None => {
+                self.state = State::ReadingRetiredMeta {
+                    retired,
+                    started: true,
+                };
+                Ok(())
+            }
+            Some(Ok(ObjectDone::Get(bytes))) => {
+                let out = match SnapshotMeta::decode(&bytes) {
+                    Ok(meta) => {
+                        retired.tables = meta.tables;
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                };
+                self.state = State::DeletingRetired { retired, key: None };
+                out
+            }
+            Some(Ok(other)) => unreachable!(
+                "a Get was started; only ObjectDone::Get or an error can complete it, got \
+                 {other:?}"
+            ),
+            Some(Err(e)) => {
+                self.state = State::DeletingRetired { retired, key: None };
+                Err(e)
+            }
+        }
+    }
+
+    /// TASK 12.5 / spec §3. One `ObjectOp::Delete` per step until the
+    /// retired generation is drained.
+    ///
+    /// **A failed delete is dropped, never retried.** The `Err` still
+    /// bubbles — it is the only signal that a bucket is not being reclaimed,
+    /// and the kernel arm absorbs archive errors without touching the `Db`
+    /// (spec §8) — but the key is gone from the plan either way, so a store
+    /// that refuses every delete costs the archive one step per retired
+    /// object and nothing else. Nothing here waits on a delete, and no state
+    /// the archive can reach depends on one having succeeded.
+    ///
+    /// The drain is bounded by the same thing everything else here is
+    /// bounded by: `yield_or_bound` runs before this transition like any
+    /// other, so a reclamation long enough to leave the archive
+    /// `pin_segments` segments behind yields, gaps, and abandons what is
+    /// left. Reclamation can therefore never wedge the archive, only cost it.
+    fn step_deleting_retired(
+        &mut self,
+        store: &dyn ObjectStore,
+        mut retired: Retired,
+        key: Option<String>,
+    ) -> io::Result<()> {
+        let Some(key) = key else {
+            let Some(next) = retired.next_key(&self.cfg.prefix) else {
+                self.state = State::Idle;
+                return Ok(());
+            };
+            // REGRESSION GUARD, not fault coverage (hard rule 4): every key
+            // above is built by this module from `retired.generation`, and
+            // `SnapshotMeta::decode` already refuses a table name that is
+            // empty or holds a '/', so no bucket bytes can steer one out of
+            // this prefix. It goes red on a code change that widened the key
+            // set — the mutation that would delete the live generation.
+            let under = format!("{}/{:020}/", self.cfg.prefix, retired.generation);
+            assert!(
+                next.starts_with(&under),
+                "Archive: about to DELETE \"{next}\", which is not under \"{under}\" — \
+                 reclamation deletes the retired generation's own objects and nothing else \
+                 (spec §3)"
+            );
+            if let Err(e) = store.start(ObjectOp::Delete { key: next.clone() }) {
+                self.state = State::DeletingRetired { retired, key: None };
+                return Err(e);
+            }
+            self.state = State::DeletingRetired {
+                retired,
+                key: Some(next),
+            };
+            return Ok(());
+        };
+        match store.poll() {
+            None => {
+                self.state = State::DeletingRetired {
+                    retired,
+                    key: Some(key),
+                };
+                Ok(())
+            }
+            Some(Ok(ObjectDone::Delete)) => {
+                self.state = State::DeletingRetired { retired, key: None };
+                Ok(())
+            }
+            Some(Ok(other)) => unreachable!(
+                "a Delete was started; only ObjectDone::Delete or an error can complete it, got \
+                 {other:?}"
+            ),
+            Some(Err(e)) => {
+                self.state = State::DeletingRetired { retired, key: None };
+                Err(e)
+            }
+        }
     }
 }

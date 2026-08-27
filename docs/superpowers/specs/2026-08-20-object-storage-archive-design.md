@@ -164,8 +164,9 @@ it. `<gen>` is a monotonic counter, zero-padded, held in the manifest.
 holding `applied_seq + 1` — the first record the snapshot does not carry — and never *below*
 it. Every segment lying *wholly* below the frontier is the snapshot's: the archive releases it
 and never ships it, which is what §3's "snapshots ... release the WAL below them" means in the
-layout. (§3 is deliberate about the scope of that: it is WAL on disk, never objects in the
-bucket, which nothing reclaims.) Three consequences worth stating because none is obvious:
+layout. (§3 is deliberate about the scope of that: it is WAL on disk. The bucket is a separate
+question with a separate answer — a generation the manifest has stopped naming is deleted by
+name, §3's "Reclamation".) Three consequences worth stating because none is obvious:
 
 - The chain's HEAD segment still carries the records between its own base and the frontier,
   which the snapshot has too. A frontier is wherever the `Db` had applied to, never a segment
@@ -215,24 +216,60 @@ segment, so a sealed segment lying *wholly* below that frontier is neither held 
 archive's retention pin nor shipped (§2, ruling 53). That is permission, not action — it is
 `Wal::gc`, under the `Db`'s own `retain_segments` policy, that actually reclaims the file.
 
-**What that sentence does NOT cover: the bucket.** The release above is of WAL on the
-primary's disk. **Nothing in `charpente` or `charpente-core` ever issues an
-`ObjectOp::Delete`**, so a superseded generation's snapshot and segment objects — and the
-partial objects a crashed upload leaves behind — accumulate in the object store forever.
-Reclaiming them is **unimplemented**: review finding R-3, filed against an earlier and more
-ambiguous wording of this paragraph, alongside F-C's orphaned partials. It was carried unrouted
-rather than dropped, because the paragraph above was narrowed to the WAL sense in Task 7.5, and a
-narrowed sentence that quietly sheds a promise is exactly the drifted doc hard rule 6 exists to
-prevent.
+**What that sentence does NOT cover: the bucket**, which is a separate question with a separate
+answer. The release above is of WAL on the primary's disk. Until Task 12.5 nothing in
+`charpente` or `charpente-core` ever issued an `ObjectOp::Delete`, so a superseded generation's
+objects accumulated in the object store forever — review findings R-3 and F-C, which turned out
+to be one gap seen twice. The deciding question is whether the objects can be NAMED without
+asking the bucket, and it splits the gap in two.
 
-**Routed 2026-08-26.** Delete-on-supersede for what a manifest names: when a generation
-rolls, the superseded generation's objects are deleted **by name, out of its own manifest**, so
-no LIST and no key-discovery surface enters the system. The orphaned partials get a documented
-bucket lifecycle rule instead, because an object orphaned by a failed upload is orphaned
-precisely in that no manifest recorded it, and only a LIST could ever find it. It lands as
-**Task 12.5, after restore and the convergence property** — deletion does not ship before the
-oracle that proves what it would delete is recoverable. Reclamation is an optimisation and never
-a correctness dependency: the archive stays correct when every delete fails forever.
+**Reclamation — delete-on-supersede (Task 12.5, IMPLEMENTED).** When a generation rolls, the
+superseded generation's objects are deleted **by name, out of documents this writer wrote**: its
+manifest names the segment chain, and its `<gen>/snapshot/meta` names the batch objects, since
+`Manifest` carries the table names and no per-table counts. That one keyed GET is what makes the
+batch objects nameable at all. **No LIST**, and so no key-discovery surface enters the system.
+Four properties carry it:
+
+- **Deletion FOLLOWS the manifest swap, never precedes it.** The manifest swap is the archive's
+  commit point (§2); until it lands, the retired generation is still the only complete generation
+  in the bucket and a restore reads it. In `archive/mod.rs` this is structural rather than
+  commented: the retired key set is built where the pre-swap ownership check already holds the
+  decoded manifest, rides on `State::UploadingManifest`, and is acted on only in the arm where
+  that PUT has landed. **An object may outlive its manifest; a manifest must never outlive its
+  objects.**
+- **Only ever a manifest this writer wrote.** §7's pre-swap ownership check has already refused a
+  foreign manifest by the time a candidate exists, so §8's rule — an archive that cannot
+  establish ownership of a prefix never writes to it — covers the delete, because a delete is a
+  write.
+- **An optimisation, never a correctness dependency.** A failed delete drops its key: no retry,
+  and no state anywhere waits on one. An archive whose deletes fail forever stays correct and
+  keeps rolling generations, and its bucket simply grows as it did before. The drain is bounded
+  by the pin bound (§5) like every other transition, so reclamation can cost the archive steps
+  but can never wedge it.
+- **It costs steps, and the bound has to cover them.** Reclaiming a generation is one step per
+  retired object, paid immediately after the successor's own snapshot upload — so a roll's step
+  cost is roughly doubled, and `archive_pin_segments` (§14 item 1) has to cover both. A restore
+  that read a manifest immediately before it was superseded can also find an object gone; that is
+  §7's "object listed in manifest but absent" row and the answer is to re-run against the manifest
+  now in the bucket.
+
+**What no code can reclaim, and the operator requirement that follows.** An object orphaned by a
+failed multipart upload, or by a generation the archive began and abandoned without ever writing
+its manifest, is orphaned **precisely in that no manifest recorded it**. Only a LIST could find
+one, and a periodic LIST-and-sweep of the prefix is **refused**: a sweep whose arithmetic is wrong
+deletes objects a restore needs, and it compounds the per-step `Disk::list` concern already on
+record. So this is not code's to close, and it is stated here as a **requirement on the operator,
+not a footnote**:
+
+> **Operators MUST configure a bucket lifecycle rule on the archive's prefix that aborts
+> incomplete multipart uploads after N days.** Without it those orphans are unbounded and nothing
+> in the system can reach them — not the archive, which never lists the bucket; not restore, which
+> reads only what a manifest names; and not reclamation, which names only what a manifest named.
+
+Note what that rule must NOT be pointed at: an age-based expiry over `<prefix>/<gen>/` objects
+themselves would delete objects a valid restore still needs, because age is uncorrelated with
+supersession. The lifecycle rule covers incomplete uploads; supersession is reclamation's job and
+is done by name.
 
 **One operation in flight is a bound, not a free choice.** Serial uploads mean the archive
 falls behind whenever segments seal faster than they upload — and a permanently-behind archive
@@ -327,8 +364,9 @@ Two rules, both following precedent already in this codebase:
    continuing interleaves two writers and leaves a bucket neither can restore from; wrongly
    stopping costs archive availability, with a named operator notice, a live intact bucket and an
    untouched `Db`. Recovery is the operator action §7's row names, and it is not free: it abandons
-   the live generation's objects into a bucket with no reclamation (§14) and re-uploads a full
-   snapshot.
+   the live generation's objects with nothing that will ever collect them — reclamation names only
+   what a manifest superseded (§3), and a stopped archive writes no further manifest — and
+   re-uploads a full snapshot.
 
    **Operational consequence, binding on whoever wires the archive up (Task 9):**
    `ArchiveConfig::writer` is part of the archive's durable state, not a label. It **must be
@@ -517,6 +555,8 @@ Hard rule 5: name the contract, the site, and the fix.
 | node is write-gated (`Verifying`) | archive arm uploads nothing until the gate opens; no error, no gap recorded — it was never this node's timeline to ship |
 | manifest names another writer identity — at open, or before any swap | stop archiving permanently, releasing the retention pin; one operator notice naming both identities, both generations, the manifest key, the prefix, and the fix; never interleave. **What the notice says about the bucket is conditional on which of the two sites raised it**, because the fix differs: at open this archive has uploaded nothing and the generation the manifest names is the live one, intact; at **every** swap — the OPENING SNAPSHOT's included, where that whole snapshot is in the bucket while this archive's own `frontier` is still unset — its own generation objects are already there and unreferenced, and the "remove that manifest object" remedy abandons them too. A notice that states one site's answer at the other misdirects the operator at the moment they are acting on it (hard rule 5, Task 8 review R-1) |
 | manifest fails CRC or will not decode **on the archive arm** | stop archiving permanently, releasing the retention pin; one operator notice wrapping the decode failure and naming the key, the prefix and both fixes (re-fetch or restore the object and restart; or remove it once no other writer is confirmed), and stating what restart costs: the archive is an arm of the same single process, so recovering a stopped archive is a **database** restart and there is no in-process re-open. Conditional on the site for the same reason as the row above — at `Opening` nothing was uploaded, while at **every** swap, the opening snapshot's first one included, this generation's objects are already in the bucket and "remove it" strands them too. Never open a fresh generation over it: the manifest is the only evidence of who owns the prefix, so an archive that cannot read it cannot know the objects there are its own. **Not a bounded retry** — the retry this replaces held the WAL at the archive's pin for as long as it lasted, which is forever, and never reached a verdict (Task 8) |
+| DELETE of a superseded object fails | the key is DROPPED, never retried: the object stays in the bucket and the archive advances. The error bubbles from `step` and the kernel arm absorbs it — there is no operator notice, because a single failed delete names no operator action. A bucket where deletes fail *systematically* (a policy denying `DeleteObject`, say) shows up as growth, which is the same condition as before reclamation existed and never as a correctness fault. Reclamation is an optimisation, never a correctness dependency (§3) |
+| GET of a retired generation's `snapshot/meta` fails | one attempt, no retry: that generation's chain is still reclaimed and its snapshot batch objects are left, because the meta is the only document that names them. A retry loop here would be a state that waits on reclamation |
 | `ObjectStore` IO error on the archive arm | archive arm degrades; **never poisons the Db** — see §8 |
 
 ## §8 Invariants (assert these, TigerBeetle style — hard rule 4)
@@ -568,7 +608,15 @@ test:
   finds otherwise stops rather than interleaving.
 - An archive that cannot establish ownership of a prefix — the manifest names another writer, or
   will not decode — **never** writes to it. Ownership is decided before anything is uploaded, not
-  after.
+  after. **A DELETE is a write**, so this covers reclamation: the only keys reclamation can ever
+  name come out of a manifest read back and found to name this writer.
+- The archive **never** deletes an object of the generation the manifest names, and **never**
+  deletes anything at all before the manifest that superseded it has durably landed. An object
+  may outlive its manifest; a manifest may never outlive its objects — the first costs bucket
+  space, the second costs the restore.
+- No state the archive can reach **ever** waits on a delete. A delete that fails is dropped, and
+  an archive whose every delete fails forever still rolls generations and still produces a bucket
+  a restore converges from.
 
 ## §9 Testing — how the archive gets faulted
 
@@ -726,12 +774,17 @@ Hard rule 6 — same commit as the code:
    the log's base. Now that a generation holds only what seals above its own snapshot, the
    quantity the bound measures has changed and the default should be re-derived against it.
    Recorded rather than re-picked: the default is explicitly Noah's.
-2. **RULED 2026-08-26 — bucket reclamation.** Recorded here because it was carried as an open
-   item: nothing ever issued an `ObjectOp::Delete`, so superseded objects and orphaned partial
-   uploads accumulated forever (findings R-3 and F-C, which are one gap seen twice). Ruling:
-   delete-on-supersede by manifest name, plus a documented lifecycle rule for the orphans, as
-   **Task 12.5** after restore and the convergence property. The full argument is in §3; the
-   deciding asymmetry is whether the objects can be named without asking the bucket.
+2. **RULED 2026-08-26, DELIVERED 2026-08-27 — bucket reclamation.** Recorded here because it was
+   carried as an open item: nothing ever issued an `ObjectOp::Delete`, so superseded objects and
+   orphaned partial uploads accumulated forever (findings R-3 and F-C, which are one gap seen
+   twice). Ruling: delete-on-supersede by manifest name, plus a documented lifecycle rule for the
+   orphans, as **Task 12.5** after restore and the convergence property. The full argument is in
+   §3; the deciding asymmetry is whether the objects can be named without asking the bucket.
+   Both halves shipped in Task 12.5: R-3 is closed in code (§3's "Reclamation"), and F-C is closed
+   as a stated **operator requirement** — the bucket lifecycle rule in §3, restated in
+   `docs/GUIDE.md`'s operator section — rather than as a footnote, because on a bucket without it
+   the orphans are unbounded. The item stays here rather than being deleted so the routing is
+   readable: what was open, what was ruled, and what shipped.
 3. Whether the capability-surface decision warrants a numbered DECISIONS.md entry at all.
    §1's correction lowers the stakes — this is an application of §1, not an amendment to it —
    so an entry may be over-ceremony. Noah's call, and DECISIONS.md is a shared-spine file with

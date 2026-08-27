@@ -119,6 +119,107 @@ struct FlakyStore {
     /// the property, and one low enough to let the retry through cuts almost
     /// nothing. A COUNT is the aimable version of the same fault.
     fail_next_gets: Cell<u64>,
+    /// TASK 12.5. What to do with an `ObjectOp::Delete`. Both failure modes
+    /// leave the object IN the bucket, which is the realistic shape of a
+    /// delete that fails forever — a bucket policy that denies deletion —
+    /// and the only shape that can prove reclamation never became a
+    /// correctness dependency: if the archive stays correct and keeps
+    /// advancing while nothing is ever reclaimed, reclamation is the
+    /// optimisation spec §3 says it is. `SimObjectStore`'s own `Delete` arm
+    /// cannot fail at all and no `FaultConfig` axis covers it — adding one
+    /// would change the frozen seed->config mapping, so the fault lives
+    /// here.
+    deletes: Cell<DeleteMode>,
+    /// Every DELETE key the archive ASKED for, in order. Attempted, not
+    /// necessarily applied — which is what the ownership and
+    /// live-generation oracles need to read, since a delete that was
+    /// refused is still a delete that was ISSUED.
+    deleted: RefCell<Vec<String>>,
+    /// A DELETE intercepted at `start` and owed an `Err` from `poll`
+    /// (`DeleteMode::FailPoll`). The inner store never sees it, so the
+    /// object survives the failure the archive is told about — the same "no
+    /// op went in flight" contract `reachable` carries.
+    refused_delete: Cell<bool>,
+    /// Every PUT key the archive asked for, with the CRC of the bytes it
+    /// asked to write. A generation's snapshot objects are written ONCE
+    /// (spec §2), and now that reclamation DELETES a retired generation's
+    /// objects an end-state comparison can no longer see an overwrite —
+    /// this ledger can, and it also catches an overwrite that is later
+    /// reclaimed away, which an end-state comparison never could.
+    put_ledger: RefCell<Vec<(String, u32)>>,
+    /// The generation the manifest in the bucket names, mirrored as manifest
+    /// PUTs land. Mirrored rather than read back because `assert_deletable`
+    /// runs INSIDE `start`, where a nested `ObjectStore` op would trip the
+    /// in-flight assert (spec §1).
+    live_generation: Cell<Option<u64>>,
+    /// The generation of a manifest PUT in flight, promoted to
+    /// `live_generation` when it lands.
+    manifest_in_flight: Cell<Option<u64>>,
+}
+
+/// TASK 12.5. What `FlakyStore` does with an `ObjectOp::Delete`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DeleteMode {
+    /// Delegate to the inner store: the object really goes.
+    Pass,
+    /// Refuse at `start`, before the inner store sees the op.
+    FailStart,
+    /// Accept at `start`, never forward it, and fail the `poll` — the arm
+    /// `FailStart` cannot reach.
+    FailPoll,
+}
+
+/// THE reclamation invariant (Task 12.5; spec §3, §8), enforced at the
+/// INSTANT of the delete by the store itself rather than at the end of a
+/// test: **an object may outlive the manifest that named it, never the
+/// reverse.**
+///
+/// Checked here rather than in each test because it has to hold on every
+/// step of every test that can reach a delete, including the ones whose
+/// subject is something else entirely. A per-test end-state assertion cannot
+/// see a window that opened and closed between two `step`s, and the whole
+/// hazard this task carries lives in exactly such a window.
+///
+/// The check is a GENERATION comparison and needs nothing else. Keys are
+/// partitioned by generation (`<prefix>/<gen:020>/...`) and a manifest names
+/// exactly one generation, so "this key is not the live generation's" is the
+/// whole of it: no snapshot meta to read, no nested store op, and no
+/// dependence on the batch counts a manifest does not carry.
+fn assert_deletable(key: &str, live_generation: Option<u64>) {
+    assert_ne!(
+        key,
+        manifest_key(PREFIX),
+        "DELETE of \"{key}\", the manifest key itself: it is the generation pointer and the only \
+         evidence of who owns the prefix (spec §2, §4), so nothing in this design may delete it"
+    );
+    let Some(live) = live_generation else {
+        panic!(
+            "DELETE \"{key}\" with no manifest in the bucket at all — nothing has been \
+             superseded, so nothing is reclaimable. Deletion FOLLOWS the manifest swap (spec §3, \
+             Task 12.5); a delete that precedes it can leave a manifest naming objects that are \
+             already gone"
+        );
+    };
+    let Some(generation) = key_generation(key) else {
+        panic!(
+            "DELETE \"{key}\" is not under \"{PREFIX}/<gen:020>/\", so it names no generation and \
+             nothing can establish that a manifest stopped referencing it (spec §3, Task 12.5)"
+        );
+    };
+    assert!(
+        generation < live,
+        "DELETE \"{key}\" belongs to generation {generation} and the manifest in the bucket names \
+         generation {live} — deleting it strands that manifest on an object that is gone. Only a \
+         generation the manifest NO LONGER names is reclaimable (spec §3, Task 12.5)"
+    );
+}
+
+/// The generation a `<prefix>/<gen:020>/...` key belongs to. `None` for a key
+/// outside this archive's generation layout, which `assert_deletable` treats
+/// as a violation rather than as a pass.
+fn key_generation(key: &str) -> Option<u64> {
+    let rest = key.strip_prefix(PREFIX)?.strip_prefix('/')?;
+    rest.split_once('/')?.0.parse().ok()
 }
 
 impl FlakyStore {
@@ -130,6 +231,12 @@ impl FlakyStore {
             in_flight_put: RefCell::new(None),
             lost_ack_for: RefCell::new(None),
             fail_next_gets: Cell::new(0),
+            deletes: Cell::new(DeleteMode::Pass),
+            deleted: RefCell::new(Vec::new()),
+            refused_delete: Cell::new(false),
+            put_ledger: RefCell::new(Vec::new()),
+            live_generation: Cell::new(None),
+            manifest_in_flight: Cell::new(None),
         }
     }
 
@@ -159,6 +266,26 @@ impl FlakyStore {
     fn keys(&self) -> Vec<String> {
         self.inner.keys()
     }
+
+    /// TASK 12.5. What happens to an `ObjectOp::Delete` from here on.
+    fn set_deletes(&self, mode: DeleteMode) {
+        self.deletes.set(mode);
+    }
+
+    /// Every DELETE this store was asked for, in order.
+    fn deleted(&self) -> Vec<String> {
+        self.deleted.borrow().clone()
+    }
+
+    /// A mark into the PUT ledger, for `puts_since`.
+    fn put_mark(&self) -> usize {
+        self.put_ledger.borrow().len()
+    }
+
+    /// Every PUT asked for since `mark`, key and CRC of the bytes.
+    fn puts_since(&self, mark: usize) -> Vec<(String, u32)> {
+        self.put_ledger.borrow()[mark..].to_vec()
+    }
 }
 
 impl ObjectStore for FlakyStore {
@@ -183,6 +310,41 @@ impl ObjectStore for FlakyStore {
                 "simulated FlakyStore GET failure for \"{key}\" (test-local counted switch)"
             )));
         }
+        // TASK 12.5. Every delete this store is ever asked for passes the
+        // reclamation invariant first, so it holds on every step of every
+        // test rather than at the end of the few that look.
+        if let ObjectOp::Delete { key } = &op {
+            self.deleted.borrow_mut().push(key.clone());
+            assert_deletable(key, self.live_generation.get());
+            match self.deletes.get() {
+                DeleteMode::Pass => {}
+                DeleteMode::FailStart => {
+                    return Err(io::Error::other(format!(
+                        "simulated FlakyStore delete refusal: DELETE \"{key}\" was refused at \
+                         start and never applied (test-local switch)"
+                    )));
+                }
+                DeleteMode::FailPoll => {
+                    self.refused_delete.set(true);
+                    return Ok(());
+                }
+            }
+        }
+        self.manifest_in_flight.set(None);
+        if let ObjectOp::Put { key, data } = &op {
+            self.put_ledger
+                .borrow_mut()
+                .push((key.clone(), crc32(data)));
+            // Only a manifest that DECODES moves the mirror: the tests that
+            // plant an undecodable one are asserting that the archive stops,
+            // and a decode failure here must not be read as "the bucket has
+            // no manifest".
+            if *key == manifest_key(PREFIX)
+                && let Ok(m) = Manifest::decode(data)
+            {
+                self.manifest_in_flight.set(Some(m.generation));
+            }
+        }
         *self.in_flight_put.borrow_mut() = match &op {
             ObjectOp::Put { key, .. } => Some(key.clone()),
             _ => None,
@@ -191,17 +353,35 @@ impl ObjectStore for FlakyStore {
     }
 
     fn poll(&self) -> Option<io::Result<ObjectDone>> {
+        // Nothing was forwarded, so the inner store has nothing in flight
+        // and the object is still there — a delete the archive is told
+        // failed, and that really did not happen.
+        if self.refused_delete.replace(false) {
+            return Some(Err(io::Error::other(
+                "simulated FlakyStore delete refusal: the DELETE was never applied (test-local \
+                 switch)",
+            )));
+        }
         let done = self.inner.poll()?;
         let key = self.in_flight_put.borrow_mut().take();
+        let landed = self.manifest_in_flight.replace(None);
         if let (Ok(ObjectDone::Put), Some(key)) = (&done, &key)
             && let Some(needle) = self.lost_ack_for.borrow().as_deref()
             && key.contains(needle)
         {
-            // The inner store already applied it — that is the whole point.
+            // The inner store already applied it — that is the whole point,
+            // and it is why the manifest mirror advances on this path too:
+            // the bucket really does name the new generation now.
+            if landed.is_some() {
+                self.live_generation.set(landed);
+            }
             return Some(Err(io::Error::other(format!(
                 "simulated FlakyStore lost ack: PUT \"{key}\" landed but the ack was lost \
                  (test-local switch)"
             ))));
+        }
+        if matches!(done, Ok(ObjectDone::Put)) && landed.is_some() {
+            self.live_generation.set(landed);
         }
         Some(done)
     }
@@ -782,7 +962,7 @@ fn assert_snapshot_objects_unchanged(
     }
 }
 
-fn write_foreign_manifest(store: &SimObjectStore, writer: &str, generation: u64) {
+fn write_foreign_manifest(store: &dyn ObjectStore, writer: &str, generation: u64) {
     let m = Manifest {
         generation,
         writer: writer.to_string(),
@@ -1899,7 +2079,15 @@ fn the_snapshot_objects_hold_exactly_the_rows_the_db_held() {
 #[test]
 fn a_generation_never_takes_a_second_snapshot() {
     let cadence = 2 * RECORDS_PER_SEGMENT;
-    let (mut db, store, mut arc) = archive_fixture_with_snapshot_cadence(cadence);
+    // TASK 12.5 changed what this test can READ, not what it asserts. A
+    // retired generation's objects are now DELETED when the next one's
+    // manifest lands, so an end-state comparison of generation 0's snapshot
+    // objects finds an empty set and proves nothing. The property — a
+    // generation's snapshot objects are written ONCE — moves to the store's
+    // PUT ledger, which is strictly stronger: it also catches an overwrite
+    // that reclamation later removed, which the end-state comparison never
+    // could see at all.
+    let (mut db, store, mut arc) = archive_fixture_with_delete_watch(cadence);
 
     write_records(&mut db, cadence);
     step_until_idle(&mut arc, &db, &store);
@@ -1922,6 +2110,7 @@ fn a_generation_never_takes_a_second_snapshot() {
          overwrite and phase 2 proves little",
         objects_before.len()
     );
+    let mark = store.put_mark();
 
     // Cross the cadence again, four times over.
     write_records(&mut db, 4 * cadence);
@@ -1952,11 +2141,25 @@ fn a_generation_never_takes_a_second_snapshot() {
     // content a manifest pointed at, which tears a generation without any
     // crash or reordering at all. That is exactly why a refresh has to be a
     // new generation rather than a second snapshot in place.
-    assert_snapshot_objects_unchanged(
-        &snapshot_objects(&store, before.generation, &store.keys()),
-        &objects_before,
-        "a refreshed snapshot was written into generation 0's keys instead of a new \
-         generation's.",
+    //
+    // Read off the PUT ledger rather than the bucket, since reclamation has
+    // by now removed generation 0 entirely: NOTHING was written to one of
+    // its keys after phase 1 — not the same bytes, and certainly not
+    // different ones.
+    let under = format!("{PREFIX}/{:020}/", before.generation);
+    let rewrites: Vec<_> = store
+        .puts_since(mark)
+        .into_iter()
+        .filter(|(k, _)| k.starts_with(&under))
+        .collect();
+    assert_eq!(
+        rewrites,
+        Vec::new(),
+        "phase 2 wrote into the CLOSED generation {}'s keys: {rewrites:?}. A refreshed snapshot \
+         must be a new generation — writing one in place replaces content a manifest pointed at, \
+         which tears a generation with no crash and no reordering at all (spec §2: the manifest \
+         is the layout's only mutable key)",
+        before.generation
     );
     // And the frontier a restore would read is this generation's OWN
     // snapshot's, never one carried across the roll.
@@ -4596,7 +4799,7 @@ fn kernel_with_archive_over(seed: u64, writer: &str) -> (Sim, Kernel, SharedStor
     write_records(app.db_for_tests(), RECORDS_PER_SEGMENT);
     let arc = Archive::open(archive_config(0, 8 << 20), app.db_for_tests()).unwrap();
     let store = SharedStore::new();
-    write_foreign_manifest(&store.lock(), writer, 3);
+    write_foreign_manifest(&*store.lock(), writer, 3);
     let kernel = Kernel::with_archive(
         app,
         Box::new(sim.clock()),
@@ -5840,6 +6043,408 @@ fn a_generation_with_a_hole_makes_the_untouched_claim_once() {
     );
 }
 
+// ------------- Task 12.5: bucket reclamation — delete what a manifest names
+//
+// The archive's first `ObjectOp::Delete` in production code. Spec §3: when a
+// generation rolls, the superseded generation's objects are deleted BY NAME
+// out of documents this writer wrote — its own manifest for the chain, its
+// own `snapshot/meta` for the batch objects. No LIST, and so no
+// key-discovery surface at all.
+//
+// Every one of these tests runs against a `FlakyStore`, which runs
+// `assert_deletable` on every DELETE it is asked for. That is deliberate and
+// is where most of the strength is: the ordering hazard this task carries
+// lives inside a window between two `step`s, and an end-state assertion
+// cannot see a window.
+
+/// Small enough that four crossings fit in a fast test, large enough that a
+/// generation has a real snapshot to reclaim.
+const RECLAIM_CADENCE: u64 = 2 * RECORDS_PER_SEGMENT;
+
+/// Enough to seal a segment WITHOUT crossing the cadence, so a generation
+/// has a chain under its snapshot and reclamation has segment objects to
+/// delete as well as batch objects.
+const RECLAIM_CHAIN: u64 = RECORDS_PER_SEGMENT + 10;
+
+/// TASK 12.5. A cadence fixture over a `FlakyStore`, so a test can watch —
+/// and refuse — the DELETEs a generation roll issues. `SimObjectStore` can do
+/// neither: it has no delete hook, and its `Delete` arm cannot fail.
+fn archive_fixture_with_delete_watch(snapshot_every: u64) -> (Db, FlakyStore, Archive) {
+    let store = FlakyStore::new(SimObjectStore::new());
+    build_fixture_with_cadence(store, snapshot_every, 8 << 20, PIN_SEGMENTS)
+}
+
+/// Commits `n` fresh records and runs the archive back to idle. The id
+/// cursor is carried so every record has a distinct id and the seq <-> id
+/// correspondence `source_at` rests on survives every phase.
+fn reclaim_round(arc: &mut Archive, db: &mut Db, store: &FlakyStore, at: &mut u64, n: u64) {
+    write_records_emitting(db, *at, n);
+    *at += n;
+    step_until_idle(arc, db, store);
+}
+
+/// Every key the bucket actually holds under one generation.
+fn generation_keys(store: &FlakyStore, generation: u64) -> Vec<String> {
+    let under = format!("{PREFIX}/{generation:020}/");
+    store
+        .keys()
+        .into_iter()
+        .filter(|k| k.starts_with(&under))
+        .collect()
+}
+
+/// Every object the manifest currently in the bucket names is present.
+/// "Objects may outlive their manifest, never the reverse" — spec §2's write
+/// ordering read the other way round, and the one thing a reclamation defect
+/// destroys.
+fn assert_no_dangling_reference(store: &FlakyStore, why: &str) {
+    let m = read_manifest(store).expect("a manifest");
+    for key in expected_keys(store, &m) {
+        assert!(
+            get_object(store, &key).is_some(),
+            "the manifest names generation {} and \"{key}\" is not in the bucket — the manifest \
+             outlived an object it points at, so a restore from this bucket refuses. {why}",
+            m.generation
+        );
+    }
+}
+
+/// Restores the bucket into a fresh host and asserts the result is logically
+/// equal to `src` at the archived frontier — the flagship guarantee (spec
+/// §9), used here as the end-to-end oracle that reclamation removed nothing a
+/// restore needs.
+fn assert_bucket_restores(store: &FlakyStore, src: &Db, why: &str) {
+    let f = archived_frontier(store);
+    let sim = fresh_sim();
+    restore(
+        store,
+        Box::new(sim.disk()),
+        restore_cfg(),
+        restore_schema(),
+        restore_opts(),
+        &mut |_| {},
+    )
+    .unwrap_or_else(|e| panic!("restore from the reclaimed bucket failed: {e}. {why}"));
+    let dst = Db::open(Box::new(sim.disk()), restore_cfg(), restore_schema()).unwrap();
+    assert_eq!(dst.last_applied(), Some(f), "{why}");
+    assert_eq!(
+        logical_rows(&dst),
+        source_at(src, f),
+        "the restored Db is not logically equal to the source at the archived frontier. {why}"
+    );
+}
+
+/// Steps until the roll's manifest has landed AND reclamation has started but
+/// not finished — the window the whole ordering argument is about. Returns
+/// how many deletes had been issued at that point.
+fn step_into_a_partial_reclaim(arc: &mut Archive, db: &Db, store: &FlakyStore) -> usize {
+    for _ in 0..10_000 {
+        let _ = arc.step(db, store);
+        let attempted = store.deleted().len();
+        if attempted > 0 && !generation_keys(store, 0).is_empty() {
+            // The archive may have left an op in flight, and nothing else
+            // may touch the store until it is cleared (spec §1's assert).
+            let _ = store.poll();
+            return attempted;
+        }
+    }
+    panic!("the archive never reached a partially-reclaimed generation 0 in 10,000 steps");
+}
+
+/// THE property (spec §3, review finding R-3): a generation the manifest no
+/// longer names does not stay in the bucket forever. This is also the
+/// vacuity check for everything else here — if deletion is removed entirely,
+/// this is what must go red.
+#[test]
+fn a_rolled_generations_predecessor_objects_are_deleted_from_the_store() {
+    let (mut db, store, mut arc) = archive_fixture_with_delete_watch(RECLAIM_CADENCE);
+    let mut at = 0;
+    reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CADENCE);
+    reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CHAIN);
+    let first = read_manifest(&store).expect("a manifest once the cadence was crossed");
+    assert_eq!(
+        first.generation, 0,
+        "the opening generation is 0 (ruling 50)"
+    );
+    let retired = generation_keys(&store, 0);
+    assert!(
+        retired.len() > 2,
+        "generation 0 left {} object(s); with nothing much in the bucket there is nothing much \
+         to reclaim and this test proves little: {retired:?}",
+        retired.len()
+    );
+    assert!(
+        retired.iter().any(|k| k.contains("/segments/")),
+        "generation 0 shipped no segment, so this test would only ever reclaim snapshot \
+         objects: {retired:?}"
+    );
+
+    reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CADENCE);
+    let live = read_manifest(&store).expect("a manifest after the roll");
+    assert_eq!(
+        live.generation, 1,
+        "the cadence crossing did not roll the generation, so nothing was superseded"
+    );
+
+    assert_eq!(
+        generation_keys(&store, 0),
+        Vec::<String>::new(),
+        "generation 1's manifest is in the bucket, so nothing names generation 0 and nothing \
+         can ever reach it — but its objects are still there. That is spec §3's \
+         unbounded-growth failure mode, which Task 12.5 exists to close"
+    );
+    assert_no_dangling_reference(&store, "The roll's own generation must be intact.");
+}
+
+/// NEGATIVE SPACE (hard rule 4, spec §8): the generation the manifest names
+/// is never the one being deleted. `assert_deletable` enforces this inside
+/// the store at the instant of every delete; this reads the same property off
+/// the end state, over four rolls, so the two are independent.
+#[test]
+fn the_live_generations_objects_are_never_deleted() {
+    let (mut db, store, mut arc) = archive_fixture_with_delete_watch(RECLAIM_CADENCE);
+    let mut at = 0;
+    for _ in 0..4 {
+        reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CADENCE);
+        reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CHAIN);
+        assert_no_dangling_reference(&store, "Checked after every roll, not only at the end.");
+    }
+    let live = read_manifest(&store).expect("a manifest");
+    assert!(
+        live.generation >= 3,
+        "four cadence crossings produced generation {} — with fewer rolls than that there is \
+         little for reclamation to get wrong",
+        live.generation
+    );
+    let deleted = store.deleted();
+    assert!(
+        !deleted.is_empty(),
+        "no delete was issued at all across {} generations, so 'the live generation is never \
+         deleted' is vacuously true",
+        live.generation
+    );
+    let under_live = format!("{PREFIX}/{:020}/", live.generation);
+    assert!(
+        deleted.iter().all(|k| !k.starts_with(&under_live)),
+        "a key of the LIVE generation {} was deleted: {:?}",
+        live.generation,
+        deleted
+            .iter()
+            .filter(|k| k.starts_with(&under_live))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        deleted
+            .iter()
+            .all(|k| key_generation(k).is_some_and(|g| g < live.generation)),
+        "a delete named no generation below the live one: {deleted:?}"
+    );
+    assert_bucket_restores(
+        &store,
+        &db,
+        "Reclamation removed something a restore needed.",
+    );
+}
+
+/// SPEC §3: "reclamation is an optimisation and never a correctness
+/// dependency: the archive stays correct when every delete fails forever."
+/// Both failure arms, since they are different code paths — refused at
+/// `start`, and refused at `poll` after a clean start — and in both the
+/// object survives, which is what a bucket policy that denies deletion
+/// actually does.
+#[test]
+fn an_archive_whose_deletes_all_fail_stays_correct_and_keeps_advancing() {
+    for mode in [DeleteMode::FailStart, DeleteMode::FailPoll] {
+        let (mut db, store, mut arc) = archive_fixture_with_delete_watch(RECLAIM_CADENCE);
+        store.set_deletes(mode);
+        let mut at = 0;
+        for _ in 0..4 {
+            reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CADENCE);
+            reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CHAIN);
+        }
+        let live = read_manifest(&store).expect("a manifest");
+        assert!(
+            live.generation >= 3,
+            "{mode:?}: the archive reached only generation {} — it stopped making progress \
+             because its deletes were failing, which makes reclamation a correctness dependency",
+            live.generation
+        );
+        assert!(
+            !arc.stopped(),
+            "{mode:?}: a failed delete stopped the archive permanently. A delete that fails is \
+             not an ownership fact and reaches no verdict; only spec §4's two refusals are \
+             terminal"
+        );
+        assert!(
+            !arc.gapped(),
+            "{mode:?}: a failed delete cost the archive its continuity — a gap means records \
+             fell out of the chain, and a delete cannot do that"
+        );
+        assert!(
+            !store.deleted().is_empty(),
+            "{mode:?}: no delete was ever attempted, so 'they all failed' is vacuous"
+        );
+        assert!(
+            !generation_keys(&store, 0).is_empty(),
+            "{mode:?}: generation 0's objects are gone although every delete was refused — the \
+             fixture is not injecting the fault it claims to"
+        );
+        assert_no_dangling_reference(&store, "A bucket nothing reclaims is still a valid bucket.");
+        assert_bucket_restores(
+            &store,
+            &db,
+            "An archive whose deletes all fail must still produce a restorable bucket.",
+        );
+    }
+}
+
+/// THE ORDERING, which is the whole safety argument (spec §2/§3): deletion
+/// FOLLOWS the manifest swap. A crash between the two leaves objects that no
+/// manifest names — harmless — and never a manifest naming objects that are
+/// gone, which is not recoverable at all.
+///
+/// The crash is a real one: the `Archive` is dropped mid-drain and nothing
+/// resumes it, which is what a process death leaves behind.
+#[test]
+fn a_crash_between_the_manifest_swap_and_the_delete_leaves_no_dangling_reference() {
+    let (mut db, store, mut arc) = archive_fixture_with_delete_watch(RECLAIM_CADENCE);
+    let mut at = 0;
+    reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CADENCE);
+    reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CHAIN);
+    write_records_emitting(&mut db, at, RECLAIM_CADENCE);
+
+    let attempted = step_into_a_partial_reclaim(&mut arc, &db, &store);
+    drop(arc);
+
+    // THE INVARIANT FIRST, before the anti-vacuity guards below. It has to
+    // hold at this crash point whatever the crash point turned out to be,
+    // and if the ordering is wrong it is the sentence that should be read.
+    assert_no_dangling_reference(
+        &store,
+        "A crash between the manifest swap and the delete must leave the manifest's generation \
+         whole.",
+    );
+    let live = read_manifest(&store).expect("the manifest the roll swapped in");
+    assert_eq!(
+        live.generation, 1,
+        "the crash point must be AFTER the roll's manifest landed, or this test does not \
+         straddle the window it exists for"
+    );
+    assert!(
+        attempted > 0,
+        "no delete had been issued at the crash point, so this is an ordinary post-swap crash \
+         and not the window between the swap and the delete"
+    );
+    assert!(
+        !generation_keys(&store, 0).is_empty(),
+        "generation 0 was fully reclaimed before the crash point, so nothing here is partial"
+    );
+    assert_bucket_restores(
+        &store,
+        &db,
+        "The bucket a mid-reclaim crash leaves behind must still restore.",
+    );
+}
+
+/// SPEC §7/§8: "an archive that cannot establish ownership of a prefix never
+/// writes to it" — and a DELETE is a write. The manifest a swap is about to
+/// replace is the only evidence of who owns the prefix, so a foreign one
+/// stops the archive before a single key of that generation is deleted.
+#[test]
+fn no_delete_is_issued_against_a_manifest_this_writer_did_not_write() {
+    let (mut db, store, mut arc) = archive_fixture_with_delete_watch(RECLAIM_CADENCE);
+    let mut at = 0;
+    reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CADENCE);
+    reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CHAIN);
+    assert_eq!(
+        read_manifest(&store).expect("a manifest").generation,
+        0,
+        "phase 1 must leave a generation for a peer to take over"
+    );
+    let owned = generation_keys(&store, 0);
+    assert!(
+        owned.len() > 2,
+        "generation 0 left {} object(s), so there is little for a mistaken reclaim to destroy",
+        owned.len()
+    );
+
+    // A peer is promoted and takes the prefix over at the generation this
+    // archive is about to retire.
+    write_foreign_manifest(&store, FOREIGN_WRITER, 0);
+    write_records_emitting(&mut db, at, RECLAIM_CADENCE);
+    for _ in 0..10_000 {
+        let _ = arc.step(&db, &store);
+        if arc.stopped() {
+            break;
+        }
+    }
+    let _ = store.poll();
+
+    assert!(
+        arc.stopped(),
+        "the archive never refused the foreign manifest, so this test never reaches the \
+         question it asks"
+    );
+    assert_eq!(
+        store.deleted(),
+        Vec::<String>::new(),
+        "the archive deleted objects while the manifest named another writer. Ownership is \
+         decided before anything is WRITTEN to a prefix (spec §8) and a DELETE is a write — \
+         these keys belong to a bucket this node has just been told it does not own"
+    );
+    assert_eq!(
+        generation_keys(&store, 0),
+        owned,
+        "generation 0's objects changed under a refusal that must not touch the bucket"
+    );
+}
+
+/// A gap can land while the archive is reclaiming, and the gap path discards
+/// whatever the archive was doing (`yield_or_bound`). `ObjectStore::start`
+/// asserts against a second op while one is in flight (spec §1), so a
+/// reclaim state missing from `op_in_flight` makes that discard abandon a
+/// live GET or DELETE and the next `start` panics.
+///
+/// Both parities: the reclaim states alternate between "an op is in flight"
+/// and "nothing is started", and only one of them is the hazard.
+#[test]
+fn a_gap_that_lands_mid_reclaim_never_abandons_an_operation_in_flight() {
+    for extra in [0usize, 1] {
+        let (mut db, store, mut arc) = build_fixture_with_cadence(
+            FlakyStore::new(SimObjectStore::new()),
+            RECLAIM_CADENCE,
+            8 << 20,
+            GAP_PIN_SEGMENTS,
+        );
+        let mut at = 0;
+        reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CADENCE);
+        reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CHAIN);
+        write_records_emitting(&mut db, at, RECLAIM_CADENCE);
+        at += RECLAIM_CADENCE;
+        step_into_a_partial_reclaim(&mut arc, &db, &store);
+        for _ in 0..extra {
+            let _ = arc.step(&db, &store);
+        }
+
+        // Past the bound while the reclaim is still draining.
+        write_records_emitting(
+            &mut db,
+            at,
+            (GAP_PIN_SEGMENTS as u64 + 4) * RECORDS_PER_SEGMENT,
+        );
+        step_until_idle(&mut arc, &db, &store);
+
+        assert!(
+            read_manifest(&store).is_some(),
+            "extra={extra}: the bucket lost its manifest across a gap that landed mid-reclaim"
+        );
+        assert_no_dangling_reference(
+            &store,
+            "A gap that interrupts a reclaim must leave the manifest's own objects intact.",
+        );
+    }
+}
+
 // ------------------------------- Task 11: the filesystem `ObjectStore`
 //
 // The same contract `charpente-sim/src/object.rs`'s test module pins for
@@ -6065,10 +6670,29 @@ const CONV_DISK_ERROR_DIVISOR: f64 = 16.0;
 ///
 /// | base | `restored` | `substantial` | `chained` |
 /// |---|---|---|---|
-/// | `0xA2C0_0001` (pinned) | 216 | 181 | 168 |
-/// | `0xD9E3_0001` | 223 | 180 | 164 |
-/// | `0x5B71_0001` | 224 | 191 | 167 |
-/// | `0x3C0D_0001` | 225 | 169 | 178 |
+/// | `0xA2C0_0001` (pinned) | 215 | 183 | 169 |
+/// | `0xD9E3_0001` | 224 | 179 | 162 |
+/// | `0x5B71_0001` | 224 | 192 | 168 |
+/// | `0x3C0D_0001` | 225 | 169 | 177 |
+///
+/// **All twelve numbers were re-measured at Task 12.5, and the reason they
+/// moved is not decay.** Reclamation adds `ObjectStore` operations to the
+/// workload, so from a generation's first roll onward every universe's
+/// seeded fault stream is drawn against a different op sequence — the runs
+/// are as reproducible as they ever were, but they are different runs. The
+/// movement is ±2 in BOTH directions at every base (216->215, 223->224,
+/// 181->183, 180->179, 168->169, 164->162, ...), which is trace jitter and
+/// not a rate that fell. The pinned base's one lost `restored` is matched by
+/// `verify_never_read_cleanly` going 12 -> 13, alongside `fault:read_error`
+/// 3430 -> 3512: a universe that restores but never gets a clean read of its
+/// own destination reports the second key instead of the first, which is the
+/// arm directly above `archive:restored`'s `cover`. **A reclaimed object a
+/// restore needed is ruled out mechanically rather than by that argument**:
+/// restore's missing-object refusal carries neither "simulated" nor
+/// "injected", so `is_fault_fallout` classifies it `Unrelated` and
+/// `conv_restore_into` fails the universe with an unclassified error. All
+/// 256 universes pass at the pinned base, so no restore was refused for a
+/// missing object.
 ///
 /// A fresh-base run panicking `restored_substantial: 180 of 181` or
 /// `chained: 164 of 168` is therefore reporting a MISSING PRECONDITION rather
@@ -6085,9 +6709,9 @@ const CONV_DISK_ERROR_DIVISOR: f64 = 16.0;
 /// report is not in the tree they will be reading. Note the difference from
 /// `replication.rs`'s `FINGERPRINT_FLOOR`, whose value was corroborated on
 /// unpinned runs: these deliberately are not, and the spread above is why.
-const CONV_RESTORED_FLOOR: u64 = 216;
-const CONV_SUBSTANTIAL_FLOOR: u64 = 181;
-const CONV_CHAINED_FLOOR: u64 = 168;
+const CONV_RESTORED_FLOOR: u64 = 215;
+const CONV_SUBSTANTIAL_FLOOR: u64 = 183;
+const CONV_CHAINED_FLOOR: u64 = 169;
 
 /// A restored `Db` this size or larger counts as a substantial verdict.
 /// `require:`'s floor is one occurrence, which catches an oracle that
@@ -7080,9 +7704,23 @@ fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
     // SAME key, so the object is there under the key the failure named.
     // `keys()` is the store's own inventory and takes no fault roll, so this
     // cannot be excused by an unlucky GET.
+    //
+    // TASK 12.5 adds one excuse, and only one: an object the archive itself
+    // RECLAIMED is legitimately absent, and its absence says nothing about
+    // whether the retry went to the same key. `deleted()` is the store's own
+    // record of what the archive ASKED to delete, so the excuse is the exact
+    // event rather than an inference from the bucket — and, like `keys()`, it
+    // takes no store operation, which matters here: the archive may have one
+    // in flight at this point and a GET would trip spec §1's assert (found at
+    // base 0xD9E3_0001, seed 0x71cec6ac14e0525a). That the excuse is needed
+    // at all was found by seed 0xfadf45b42f89ce91, where a lost-ack key under
+    // generation 3 was reclaimed by generation 4's swap before this ran.
     if let Some(key) = st.lost_ack_key.clone() {
+        let reclaimed = store.deleted().contains(&key);
         if store.keys().contains(&key) {
             sim.cover("archive:lost_ack_retried");
+        } else if reclaimed {
+            sim.cover("archive:lost_ack_key_reclaimed");
         } else if !arc.stopped() && !st.gapped && src.is_some() {
             return Err(format!(
                 "a PUT to \"{key}\" landed and its ack was lost, and the object is not in the \
@@ -7090,6 +7728,12 @@ fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
                  (spec §9.2)"
             ));
         }
+    }
+    // TASK 12.5 / spec §3. Reclamation across the whole fault matrix, and
+    // not only in the six hand-built tests: a generation the manifest has
+    // stopped naming does not stay in the bucket forever.
+    if !store.deleted().is_empty() {
+        sim.cover("archive:generation_reclaimed");
     }
     if st.rolled_generation {
         sim.cover("archive:generation_rolled");
@@ -7391,6 +8035,7 @@ fn archive_converges() {
             "archive:diverged_refused",
             "archive:verifying_gated",
             "archive:foreign_writer_stopped",
+            "archive:generation_reclaimed",
         ],
         floor: [
             ("archive:restored", CONV_RESTORED_FLOOR),
