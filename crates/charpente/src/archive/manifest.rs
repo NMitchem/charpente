@@ -1266,6 +1266,8 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(&1u64.to_le_bytes()); // applied_seq
         buf.extend_from_slice(&0u64.to_le_bytes()); // next_job_id
+        buf.extend_from_slice(&0u64.to_le_bytes()); // next_event_id
+        buf.extend_from_slice(&0u32.to_le_bytes()); // frontier_crc
         buf.extend_from_slice(&1u32.to_le_bytes()); // one table
         put_field(&mut buf, b"a/b");
         buf.extend_from_slice(&1u64.to_le_bytes()); // batches
