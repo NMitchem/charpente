@@ -3752,3 +3752,89 @@ fn the_unreadable_manifest_refusal_at_the_first_swap_does_not_claim_nothing_was_
          is the fix, and the fix is what differs between the two sites: {landed:?}\n{t}"
     );
 }
+
+// ------------------------------------- `idle()`'s enumeration is the spec
+
+/// The `///` block immediately above `pub fn idle`, RAW — `archive_source_
+/// code` strips comments, which is right for the no-clock proxies and
+/// useless here, where the doc IS the thing under test.
+fn idle_doc_block() -> String {
+    let mut block: Vec<&str> = Vec::new();
+    for line in include_str!("../src/archive/mod.rs").lines() {
+        let t = line.trim_start();
+        if t.starts_with("pub fn idle(&self) -> bool") {
+            return block.join("\n");
+        }
+        if t.starts_with("///") {
+            block.push(t);
+        } else {
+            block.clear();
+        }
+    }
+    panic!("`pub fn idle(&self) -> bool` not found in crates/charpente/src/archive/mod.rs");
+}
+
+/// NEW-2 (`task-8-rereview-r1.md`), and hard rule 6: `Archive::idle`'s doc
+/// enumerates the states that answer true, and Task 9's kernel arm builds
+/// its ready predicate on that enumeration — so a state the list omits is a
+/// defect in the spec, not a wording nit. An enumeration that says "four"
+/// and has five is the same defect R-3 was.
+///
+/// Three halves, and the first is what stops the other two being vacuous:
+///
+/// 1. The waiting-for-a-generation state is REAL — `idle` true with sealed,
+///    un-archived segments and an empty bucket. It is neither "caught up"
+///    (two segments are sealed past what has been archived) nor "waiting"
+///    (both are fully applied) nor gated nor stopped.
+/// 2. The doc names it.
+/// 3. The `self.idle = true` site count is the tripwire for the NEXT one: a
+///    sixth state means a seventh assignment, and this test reddens until
+///    the list is updated with it. Six sites, five states — `Stopped` is
+///    reached from `step`'s terminal guard and from `stop()`.
+#[test]
+fn the_idle_doc_names_every_state_that_answers_true() {
+    // Far past anything written below, so the cadence never arrives.
+    let (mut db, store, mut arc) = archive_fixture_with_snapshot_cadence(100 * RECORDS_PER_SEGMENT);
+    write_records(&mut db, 2 * RECORDS_PER_SEGMENT);
+    step_until_idle(&mut arc, &db, &store);
+
+    assert!(arc.idle(), "the fifth state was not reached");
+    assert!(!arc.stopped() && !arc.gapped(), "not the fifth state");
+    assert!(
+        sealed_segment_count(&db) >= 2,
+        "nothing is sealed, so 'idle with un-archived segments behind it' is not being measured: \
+         {} sealed",
+        sealed_segment_count(&db)
+    );
+    assert!(
+        store.keys().is_empty(),
+        "the archive shipped something, so this is not the never-opened-a-generation state: {:?}",
+        store.keys()
+    );
+
+    let doc = idle_doc_block();
+    assert!(
+        doc.contains("snapshot_every"),
+        "`idle` answers true with {} segments sealed and nothing in the bucket, and its doc does \
+         not name that state. Task 9 reads this list to decide what its ready predicate must \
+         handle, and would conclude idle implies caught-up-or-gated-or-dead: {doc}",
+        sealed_segment_count(&db)
+    );
+
+    let bullets = doc.lines().filter(|l| l.starts_with("/// - **")).count();
+    assert_eq!(
+        bullets, 5,
+        "the doc claims to enumerate the states answering true and lists {bullets}. If a state \
+         was added, name it here and in the doc; if one was removed, likewise — the count is a \
+         tripwire on purpose (NEW-2: the list said FOUR and there were five)"
+    );
+    let sites = include_str!("../src/archive/mod.rs")
+        .matches("self.idle = true;")
+        .count();
+    assert_eq!(
+        sites, 6,
+        "`self.idle = true` is assigned at {sites} sites, not the 6 the doc's five states account \
+         for (`Stopped` is reached twice). A new site is a new state until proven otherwise, and \
+         `Archive::idle`'s doc must name it before this test goes green again"
+    );
+}
