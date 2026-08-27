@@ -3926,7 +3926,7 @@ use charpente::{Tx, route, routes};
 use charpente_core::io::{Disk, Instant};
 use charpente_sim::SimDisk;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Serialize, Deserialize)]
@@ -3955,7 +3955,21 @@ fn put_rec(tx: &mut Tx, body: RecBody) -> Result<u64, ApiError> {
 /// is `Sync` whenever `T: Send`, so wrapping restores it. Never contended —
 /// the kernel loop is single-threaded and so is every test here.
 #[derive(Clone)]
-struct SharedStore(Arc<Mutex<SimObjectStore>>);
+struct SharedStore {
+    inner: Arc<Mutex<SimObjectStore>>,
+    /// A REVERSIBLE PUT outage. `SimObjectStore`'s `object_put_error` axis is
+    /// fixed at construction with no public way to turn it back off, and
+    /// `crates/charpente-sim/src/object.rs` is off-limits (Ruling 37) — so a
+    /// store that fails and then HEALS has to live here, exactly as
+    /// `FlakyStore` above exists for the same reason. Recovery is the
+    /// property the retry mechanism is really about, and it cannot be
+    /// observed with a one-way fault.
+    ///
+    /// Fails at `start`, before the op reaches `inner`, so nothing goes in
+    /// flight and a later retry is a clean first attempt rather than the
+    /// double-start `SimObjectStore::start` asserts against.
+    puts_fail: Arc<AtomicBool>,
+}
 
 impl SharedStore {
     fn new() -> SharedStore {
@@ -3963,7 +3977,14 @@ impl SharedStore {
     }
 
     fn wrapping(inner: SimObjectStore) -> SharedStore {
-        SharedStore(Arc::new(Mutex::new(inner)))
+        SharedStore {
+            inner: Arc::new(Mutex::new(inner)),
+            puts_fail: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn set_puts_fail(&self, fail: bool) {
+        self.puts_fail.store(fail, Ordering::Relaxed);
     }
 
     fn keys(&self) -> Vec<String> {
@@ -3971,12 +3992,22 @@ impl SharedStore {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, SimObjectStore> {
-        self.0.lock().expect("SharedStore lock poisoned by a panic")
+        self.inner
+            .lock()
+            .expect("SharedStore lock poisoned by a panic")
     }
 }
 
 impl ObjectStore for SharedStore {
     fn start(&self, op: ObjectOp) -> io::Result<()> {
+        if self.puts_fail.load(Ordering::Relaxed)
+            && let ObjectOp::Put { key, .. } = &op
+        {
+            return Err(io::Error::other(format!(
+                "simulated SharedStore outage: PUT \"{key}\" refused (test-local switch — \
+                 flips back via set_puts_fail(false))"
+            )));
+        }
         self.lock().start(op)
     }
 
@@ -4483,4 +4514,85 @@ fn kernel_with_archive_over(seed: u64, writer: &str) -> (Sim, Kernel, SharedStor
     )
     .unwrap();
     (sim, kernel, store)
+}
+
+// ------------------- T9 fix round 1: the two clauses that carried no oracle
+//
+// The review found both Criticals in the same place, and they share a cause:
+// the ready predicate's two risk-bearing clauses — the data watermark and
+// the failure re-arm — were the two nothing tested. Each mutation below was
+// GREEN over all 61 tests before these landed.
+
+/// C-1. The DATA WATERMARK clause, on its own.
+///
+/// Ruling 57's whole subject is that `Archive::idle()` cannot be the ready
+/// predicate: it is a snapshot that only updates when you step, so gating on
+/// it is self-sealing — the archive goes idle once and is never scheduled
+/// again to notice that the world moved. Replacing ONLY that clause with
+/// `!archive.idle()` (leaving `stopped()`/`verifying()` in place) left all
+/// 61 tests green while the archive froze at 10 objects and the `Db` ran on
+/// past seq 321,000. The task's central trap could be reintroduced in one
+/// line with no oracle firing.
+///
+/// This pins the PROPERTY, never the expression: with the `Db` committing
+/// continuously, the bucket must keep GROWING. The first-run guard is what
+/// stops it degenerating into "the archive started once".
+#[test]
+fn the_archive_keeps_shipping_while_the_db_keeps_committing() {
+    let (_sim, mut k, store, mut source) = kernel_with_archive_and_requests();
+
+    run_kernel_steps(&mut k, &mut source, 1_000);
+    let early = store.keys().len();
+    assert!(
+        early > 0,
+        "the archive shipped nothing at all in the first run, so 'it stopped shipping' below \
+         would be measuring an archive that never started"
+    );
+
+    run_kernel_steps(&mut k, &mut source, 2_000);
+    let late = store.keys().len();
+
+    assert!(
+        late > early,
+        "the archive shipped {early} objects and then stopped, while the request arm went on \
+         committing to seq {:?}. The ready predicate is reading a STALE idle snapshot instead \
+         of asking whether the Db has moved since the archive last looked — Ruling 57's Trap 3, \
+         and a silent data-retention failure with no crash and no notice",
+        k.app().db().last_applied()
+    );
+}
+
+/// I-1. The FAILURE RE-ARM clause, at the property that actually matters:
+/// an archive that failed must come back on its own when the store heals.
+///
+/// `an_archive_io_failure_degrades_the_arm_and_never_the_kernel` above only
+/// asks `archive_steps > 0`, so reinstating the `a359356` defect (park-only
+/// re-arm) left it green at 7 steps against a control of 406 — the archive
+/// stalled permanently after its first failed PUT and nothing noticed.
+/// Recovery is the cheapest honest oracle for the whole mechanism: it fails
+/// for any re-arm that stops firing, whatever the reason.
+///
+/// Committing load here; `a_read_only_flood_still_lets_a_failed_archive_retry`
+/// is the same property under the load that has no commits at all.
+#[test]
+fn an_archive_recovers_on_its_own_when_a_store_outage_heals() {
+    let (_sim, mut k, store, mut source) = kernel_with_archive_and_requests();
+    store.set_puts_fail(true);
+
+    run_kernel_steps(&mut k, &mut source, 1_000);
+    assert!(
+        store.keys().is_empty(),
+        "the outage did not hold, so 'it recovered' below proves nothing: {:?}",
+        store.keys()
+    );
+
+    store.set_puts_fail(false);
+    run_kernel_steps(&mut k, &mut source, 1_000);
+
+    assert!(
+        !store.keys().is_empty(),
+        "the store healed and the archive never came back. Its failure re-arm stopped firing, \
+         so one transient PUT error is a permanent, silent archive outage — no crash, no \
+         notice, and a bucket that quietly stopped growing"
+    );
 }
