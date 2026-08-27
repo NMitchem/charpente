@@ -122,6 +122,36 @@ pub fn restore(
     opts: RestoreOpts,
     notice: &mut dyn FnMut(&str),
 ) -> io::Result<RestoreReport> {
+    // THE ONE PLACE EITHER CLAIM IS MADE. Every failure below reaches the
+    // operator through exactly one of these two wrappers, so "nothing was
+    // touched" and "a partial restore is sitting there" cannot drift apart
+    // per message — which is how this defect arrived (Task 8's R-1, its
+    // NEW-1 regression, and this task's C-1 are the same class three times:
+    // a sentence that is true where it was written and false at another of
+    // its sites). `Seeder::new` is INSIDE `rebuild` on purpose: it discards
+    // the store file before it discards `wal/`, so a failure part-way
+    // through it has already touched the destination.
+    let plan = prepare(store, &*disk, &cfg, &opts, notice).map_err(untouched)?;
+    rebuild(store, disk, cfg, schema, &plan, &opts.prefix, notice).map_err(discarded)
+}
+
+/// A generation, read and fully verified, with the destination judged
+/// against it — and not one byte written.
+struct Plan {
+    m: Manifest,
+    meta: SnapshotMeta,
+}
+
+/// Everything restore does BEFORE the destination is touched: read the
+/// generation, verify every segment object frame by frame, read the
+/// destination's own frontier, and decide whether replacing it is allowed.
+fn prepare(
+    store: &dyn ObjectStore,
+    disk: &dyn Disk,
+    cfg: &DbConfig,
+    opts: &RestoreOpts,
+    notice: &mut dyn FnMut(&str),
+) -> io::Result<Plan> {
     let prefix = opts.prefix.as_str();
 
     // ---- 1. the generation pointer, and the snapshot it names.
@@ -131,8 +161,8 @@ pub fn restore(
             e.kind(),
             format!(
                 "restore: the manifest at \"{}\" will not decode ({e}) — refusing to guess at \
-                 a generation pointer. Nothing in the destination has been touched. Re-fetch \
-                 the object, or restore it from the bucket's own versioning",
+                 a generation pointer. Re-fetch the object, or restore it from the bucket's \
+                 own versioning",
                 manifest_key(prefix)
             ),
         )
@@ -144,7 +174,7 @@ pub fn restore(
             e.kind(),
             format!(
                 "restore: generation {} names a snapshot meta at \"{meta_key}\" that will not \
-                 decode ({e}). Nothing in the destination has been touched",
+                 decode ({e})",
                 m.generation
             ),
         )
@@ -160,7 +190,7 @@ pub fn restore(
     // failed probe would consume the disk and leave `--force` nothing to
     // force.
     let chain = ChainSpan::of(&m.segments);
-    let local = local_frontier(&*disk, &cfg, chain.as_ref().map(|c| c.end))?;
+    let local = local_frontier(disk, cfg, chain.as_ref().map(|c| c.end))?;
 
     // ---- 3. download and verify the whole chain, holding none of it.
     let compare_at = local
@@ -177,9 +207,8 @@ pub fn restore(
                 io::ErrorKind::InvalidData,
                 format!(
                     "restore: {detail} Refusing rather than overwriting it — restore never \
-                     merges timelines, it replaces or refuses (spec §8). Nothing in the \
-                     destination has been touched. Re-run with --force to discard the \
-                     destination's timeline and replace it with generation {}",
+                     merges timelines, it replaces or refuses (spec §8). Re-run with --force \
+                     to discard the destination's timeline and replace it with generation {}",
                     m.generation
                 ),
             ));
@@ -189,11 +218,24 @@ pub fn restore(
              irreversible and nothing here is archived; it happens before any restore write."
         ));
     }
+    Ok(Plan { m, meta })
+}
 
-    // ---- 5. from here the destination is being replaced. `Seeder::new`
-    // discards the store file, the horizon breadcrumb and every `wal/`
-    // segment, dir-barriered (DESIGN §5) — which is also why a crashed
-    // restore converges on re-run rather than resuming across itself.
+/// Everything restore does once the destination is being replaced.
+///
+/// `Seeder::new` discards the store file, the horizon breadcrumb and every
+/// `wal/` segment, dir-barriered (DESIGN §5) — which is also why a crashed
+/// restore converges on re-run rather than resuming across itself.
+fn rebuild(
+    store: &dyn ObjectStore,
+    disk: Box<dyn Disk>,
+    cfg: DbConfig,
+    schema: Schema,
+    plan: &Plan,
+    prefix: &str,
+    notice: &mut dyn FnMut(&str),
+) -> io::Result<RestoreReport> {
+    let Plan { m, meta } = plan;
     let mut seeder = Seeder::new(disk, cfg, schema)?;
     for t in &meta.tables {
         for n in 0..t.batches {
@@ -202,11 +244,7 @@ pub fn restore(
             let rows = decode_snapshot_batch(&bytes).map_err(|e| {
                 io::Error::new(
                     e.kind(),
-                    format!(
-                        "restore: snapshot batch \"{key}\" will not decode ({e}). The \
-                         destination now holds a PARTIAL restore and must not be started; \
-                         re-run restore once the object is readable"
-                    ),
+                    format!("restore: snapshot batch \"{key}\" will not decode ({e})"),
                 )
             })?;
             seeder.rows(&t.name, &rows)?;
@@ -219,11 +257,11 @@ pub fn restore(
         meta.frontier_crc,
     )?;
 
-    // ---- 6. the chain, applied through the follower's own path.
+    // The chain, applied through the follower's own path.
     for s in &m.segments {
         let key = segment_key(prefix, m.generation, s.base_seq);
         let bytes = get(store, &key, prefix)?;
-        let frames = verify_segment(&bytes, s, &key, m.generation)?;
+        let frames = verify_segment(&bytes, s, &key, m.generation, Stage::AfterImport)?;
         let from = db.last_applied().map_or(0, |l| l + 1);
         let frames: Vec<(u64, Vec<u8>)> =
             frames.into_iter().filter(|(seq, _)| *seq >= from).collect();
@@ -249,23 +287,84 @@ pub fn restore(
     })
 }
 
+/// The promise every pre-write refusal carries — and it is TRUE by
+/// construction, because `prepare` has no write path at all.
+fn untouched(e: io::Error) -> io::Error {
+    io::Error::new(
+        e.kind(),
+        format!("{e}. Nothing in the destination has been touched"),
+    )
+}
+
+/// The warning every post-discard failure carries. The state it describes is
+/// not a corrupted directory — it is a database that OPENS, at an earlier
+/// frontier of the archived timeline or at nothing at all, and serves that
+/// state to whoever starts it. Restore cannot prevent that from outside
+/// (`Db::open` would have to learn about a restore-in-progress marker, spec
+/// §6), so naming it is the whole mitigation and it has to be on every path
+/// that produces the state.
+fn discarded(e: io::Error) -> io::Error {
+    io::Error::new(
+        e.kind(),
+        format!(
+            "{e}. The destination has been discarded and now holds a PARTIAL restore: its \
+             own timeline was replaced before this failed, so what is there is neither the \
+             database it was nor the one the archive holds. Do not start a node on it — it \
+             will open and serve stale or empty state. Re-run restore against the same \
+             directory once the cause above is fixed; restore discards and rebuilds from \
+             scratch, so a re-run converges rather than resuming"
+        ),
+    )
+}
+
 // -------------------------------------------------------------- the bucket
+
+/// Polls per operation before restore gives up on the store.
+///
+/// A LIVENESS ASSERTION, not a tuning constant (hard rule 4, negative
+/// space): `ObjectStore::poll` returning `None` means "still in flight", so
+/// a store that answers `None` this many times in a row is a store that will
+/// never answer. Same number and same reasoning as the two bounded drains
+/// this subsystem already has — `charpente-sim/src/object.rs`'s, whose
+/// comment says an unbounded loop "would silently hang the instant a future
+/// task adds latency" while its own header names latency as future work, and
+/// `charpente/tests/archive.rs`'s. `restore` is the PRODUCTION path, so it
+/// is the one that must not hang: under Task 12's fault matrix a hang fails
+/// with no seed and no repro line, which is the worst outcome hard rule 5
+/// admits.
+const POLLS_PER_OP: usize = 10_000;
 
 /// Drives one `ObjectStore` operation to completion.
 ///
-/// The spin is unbounded on purpose. `restore` is a one-shot that owns the
-/// process while it runs — it is not a kernel arm and has nothing to yield
-/// to — and `ObjectStore::poll`'s contract is that `None` means "still in
-/// flight", so a store that never completes is a broken store rather than a
-/// slow one. Bounding it would need a constant that is either wrong for a
-/// real network or meaningless, and `docs/BENCH.md` has no object-store
-/// coverage to derive one from.
+/// `restore` is a one-shot that owns the process while it runs — it is not a
+/// kernel arm and has nothing to yield to — so the poll loop is the whole
+/// loop. It is bounded because exhausting the bound is a real answer an
+/// operator can act on, and spinning forever is not.
 fn run_op(store: &dyn ObjectStore, op: ObjectOp) -> io::Result<ObjectDone> {
+    let described = describe(&op);
     store.start(op)?;
-    loop {
+    for _ in 0..POLLS_PER_OP {
         if let Some(done) = store.poll() {
             return done;
         }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "restore: the object store never completed {described} — it answered \"still in \
+             flight\" to {POLLS_PER_OP} consecutive polls, which is a store that will never \
+             answer rather than a slow one. Check the store's reachability and credentials, \
+             then re-run restore"
+        ),
+    ))
+}
+
+fn describe(op: &ObjectOp) -> String {
+    match op {
+        ObjectOp::Get { key } => format!("a Get of \"{key}\""),
+        ObjectOp::Put { key, .. } => format!("a Put of \"{key}\""),
+        ObjectOp::Delete { key } => format!("a Delete of \"{key}\""),
+        ObjectOp::List { prefix } => format!("a List of \"{prefix}\""),
     }
 }
 
@@ -454,6 +553,28 @@ fn walk_frames(bytes: &[u8], base_seq: u64, want: Option<u64>) -> (FrameWalk, Ve
     )
 }
 
+/// Which of `verify_segment`'s two call sites is asking. The refusal's
+/// closing clause differs between them and MUST: the pre-write pass can
+/// honestly say corruption is never imported, and the apply pass — reached
+/// when an object changes in the bucket between restore's two GETs — cannot,
+/// because the snapshot's rows went in minutes earlier. A message that names
+/// a contract the code does not keep at that site is worse than silence
+/// (hard rule 5); it is the sentence the operator acts on.
+#[derive(Clone, Copy)]
+enum Stage {
+    BeforeAnyWrite,
+    AfterImport,
+}
+
+impl Stage {
+    fn refusal_clause(self) -> &'static str {
+        match self {
+            Stage::BeforeAnyWrite => "Refusing; corruption is never imported",
+            Stage::AfterImport => "Refusing",
+        }
+    }
+}
+
 /// Verifies one downloaded segment object against what the manifest claims of
 /// it, and returns its frames.
 fn verify_segment(
@@ -461,6 +582,7 @@ fn verify_segment(
     s: &SegmentRef,
     key: &str,
     generation: u64,
+    stage: Stage,
 ) -> io::Result<Vec<(u64, Vec<u8>)>> {
     let (walk, frames) = walk_frames(bytes, s.base_seq, None);
     if !walk.clean {
@@ -469,10 +591,12 @@ fn verify_segment(
             format!(
                 "restore: segment object \"{key}\" fails frame verification at seq {} — its \
                  CRC, its length or its seq does not match the frame the log requires there. \
-                 Generation {generation} claims this segment spans {}..={}. Refusing; \
-                 corruption is never imported. Restore the object, or restore an earlier \
-                 generation",
-                walk.stopped_at, s.base_seq, s.end_seq
+                 Generation {generation} claims this segment spans {}..={}. {}. Restore the \
+                 object, or restore an earlier generation",
+                walk.stopped_at,
+                s.base_seq,
+                s.end_seq,
+                stage.refusal_clause()
             ),
         ));
     }
@@ -508,7 +632,7 @@ fn verify_chain(
         let (walk, _frames) = walk_frames(&bytes, s.base_seq, compare_at);
         if !walk.clean || walk.last.is_none_or(|l| l.seq != s.end_seq) {
             // Re-run the shared refusal so the two paths cannot drift.
-            verify_segment(&bytes, s, &key, m.generation)?;
+            verify_segment(&bytes, s, &key, m.generation, Stage::BeforeAnyWrite)?;
         }
         if let Some(crc) = walk.wanted {
             archive_crc = Some(crc);
@@ -709,6 +833,18 @@ fn judge(
         }
     };
     if local_crc != archive_crc {
+        // Negative space (hard rule 4). `refusal` renders `local - seq + 1`
+        // as the record count an operator is about to destroy, and `seq` is
+        // `min(local.seq, chain.end)` — so the ordering holds by
+        // construction HERE and is invisible over there. Asserting it at the
+        // site that establishes it is what keeps the count from being a
+        // wrapped u64 in release, where the workspace sets no
+        // `overflow-checks`.
+        assert!(
+            seq <= local.seq,
+            "judge: comparison seq {seq} is above the destination's own frontier {}",
+            local.seq
+        );
         return Verdict::Diverged {
             seq,
             local_crc,
@@ -745,7 +881,7 @@ impl Verdict {
                  the {} record(s) from {seq} to {local}, which exist nowhere else.",
                 m.generation,
                 m.segments.last().map_or(m.applied_seq, |s| s.end_seq),
-                local - seq + 1
+                local.saturating_sub(*seq).saturating_add(1)
             )),
             Verdict::Ahead { local, chain_end } => Some(format!(
                 "the destination is ahead of the archive: the two agree through seq \
@@ -753,7 +889,7 @@ impl Verdict {
                  frontier is {chain_end}. Discarding it loses the {} record(s) above \
                  {chain_end}, which exist nowhere else.",
                 m.generation,
-                local - chain_end
+                local.saturating_sub(*chain_end)
             )),
             Verdict::Unrelated { base, local } => Some(format!(
                 "the destination holds a timeline this archive cannot compare itself against: \
@@ -771,7 +907,7 @@ impl Verdict {
                         m.segments.last().expect("first implies last").end_seq
                     )
                 ),
-                local - base + 1
+                local.saturating_sub(*base).saturating_add(1)
             )),
         }
     }

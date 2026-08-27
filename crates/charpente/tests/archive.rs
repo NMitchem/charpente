@@ -5388,3 +5388,316 @@ fn a_restored_node_can_vouch_the_frontier_its_snapshot_came_from() {
         "a restored node cannot prove its position to a replication peer"
     );
 }
+
+// --------------------- T10 fix r1: what a failure says about the destination
+
+/// Serves a key correctly on its FIRST `Get` and corrupted on every later
+/// one — the only way to reach `verify_segment` from step 6, where the rows
+/// have already been imported. Models an object that changed in the bucket
+/// between restore's verify pass and its apply pass, which is reachable
+/// whenever anything else is writing to the prefix.
+struct SecondGetCorrupts {
+    inner: SimObjectStore,
+    needle: String,
+    /// Keys already served once. PER KEY, not a running total: restore GETs
+    /// every segment in the verify pass before it GETs any of them again in
+    /// the apply pass, so a global counter corrupts the SECOND SEGMENT
+    /// during the verify pass and never reaches the apply pass at all.
+    /// Measured — that is exactly what the first version of this fixture did.
+    served: RefCell<Vec<String>>,
+    in_flight_get: RefCell<Option<String>>,
+}
+
+impl SecondGetCorrupts {
+    fn planted_from(source: &SimObjectStore, needle: &str) -> SecondGetCorrupts {
+        let inner = SimObjectStore::new();
+        plant(&inner, &store_contents(source));
+        SecondGetCorrupts {
+            inner,
+            needle: needle.to_string(),
+            served: RefCell::new(Vec::new()),
+            in_flight_get: RefCell::new(None),
+        }
+    }
+}
+
+impl ObjectStore for SecondGetCorrupts {
+    fn start(&self, op: ObjectOp) -> io::Result<()> {
+        *self.in_flight_get.borrow_mut() = match &op {
+            ObjectOp::Get { key } if key.contains(&self.needle) => Some(key.clone()),
+            _ => None,
+        };
+        self.inner.start(op)
+    }
+
+    fn poll(&self) -> Option<io::Result<ObjectDone>> {
+        let watched = self.in_flight_get.borrow_mut().take();
+        let done = self.inner.poll()?;
+        match (watched, done) {
+            (Some(key), Ok(ObjectDone::Get(mut bytes))) => {
+                let mut served = self.served.borrow_mut();
+                if served.contains(&key) {
+                    bytes[20] ^= 0xff;
+                } else {
+                    served.push(key);
+                }
+                Some(Ok(ObjectDone::Get(bytes)))
+            }
+            (_, other) => Some(other),
+        }
+    }
+}
+
+/// A store that accepts every operation and never completes one — the shape
+/// `ObjectStore::poll`'s `None` describes, and the shape a real network store
+/// takes the moment a request is lost. `restore` must refuse by name rather
+/// than spin forever.
+struct StalledStore;
+
+impl ObjectStore for StalledStore {
+    fn start(&self, _op: ObjectOp) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn poll(&self) -> Option<io::Result<ObjectDone>> {
+        None
+    }
+}
+
+/// An archived generation with a snapshot and NO chain: 1,000 records is
+/// under one 64 KiB segment, so nothing has sealed above the frontier and
+/// `Manifest::segments` is empty. The bucket then holds no archived FRAME at
+/// any seq, which is one of the two ways a destination can be unrelated.
+fn archived_db_without_a_chain() -> (Db, SimObjectStore) {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records_emitting(&mut db, 0, 1_000);
+    step_until_idle(&mut arc, &db, &store);
+    (db, store)
+}
+
+fn run_restore(
+    store: &dyn ObjectStore,
+    sim: &Sim,
+    opts: RestoreOpts,
+) -> io::Result<charpente::archive::restore::RestoreReport> {
+    restore(
+        store,
+        Box::new(sim.disk()),
+        restore_cfg(),
+        restore_schema(),
+        opts,
+        &mut |_| {},
+    )
+}
+
+/// C-1. Spec §6 says a failed restore "says so in the failure's own text".
+/// Every failure raised AFTER `Seeder::new` has discarded the destination
+/// must therefore name what it left behind — because the state it leaves is
+/// a database that opens and serves stale or empty state, and the operator's
+/// next act is decided by this sentence.
+///
+/// Both post-discard sites, because the review measured both: a snapshot
+/// batch missing during the row import, and a segment `Get` failing during
+/// the chain apply.
+#[test]
+fn a_failure_after_the_destination_is_discarded_says_what_it_left_behind() {
+    // (a) the row-import phase.
+    let (_src, store) = archived_db_with_rows(500);
+    delete_one_snapshot_batch(&store);
+    let sim = fresh_sim();
+    let t = run_restore(&store, &sim, restore_opts())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        t.contains("PARTIAL restore"),
+        "must name the state it left behind: {t}"
+    );
+    assert!(
+        t.contains("Do not start") || t.contains("DO NOT START"),
+        "must tell the operator not to start a node on it: {t}"
+    );
+    assert!(
+        t.contains("Re-run restore") || t.contains("re-run restore"),
+        "must name the remedy: {t}"
+    );
+    assert!(
+        !t.contains("has been touched"),
+        "the destination HAS been touched — this text promises the opposite: {t}"
+    );
+    // The claim is about a real hazard, not a hypothetical one.
+    assert!(
+        Db::open(Box::new(sim.disk()), restore_cfg(), restore_schema()).is_ok(),
+        "the destination does not open, so the warning would be describing nothing"
+    );
+
+    // (b) the chain-apply phase. Cut the store after the row import, which
+    // `a_crashed_restore_converges_on_re_run` measures at 11 operations for
+    // this fixture, so a cut at 10 lands inside the apply pass.
+    let sim = fresh_sim();
+    let cut = CutStore::planted_from(&store, 10);
+    let t = run_restore(&cut, &sim, restore_opts())
+        .unwrap_err()
+        .to_string();
+    assert!(t.contains("PARTIAL restore"), "{t}");
+    assert!(!t.contains("has been touched"), "{t}");
+}
+
+/// The other half of the same contract: a refusal raised BEFORE anything is
+/// written must say so, and must not carry the partial-restore warning. The
+/// two texts have to be distinguishable, because they ask the operator for
+/// opposite things.
+#[test]
+fn a_refusal_before_any_write_promises_an_untouched_destination() {
+    let (_src, store) = archived_db_with_rows(500);
+    corrupt_one_segment_object(&store);
+    let sim = fresh_sim();
+    let t = run_restore(&store, &sim, restore_opts())
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        t.contains("Nothing in the destination has been touched"),
+        "a pre-write refusal must promise an untouched destination: {t}"
+    );
+    assert!(
+        !t.contains("PARTIAL restore"),
+        "nothing was discarded, so this must not warn about a partial one: {t}"
+    );
+    assert!(
+        sim.disk().list("").unwrap().is_empty(),
+        "and the promise must be TRUE: {:?}",
+        sim.disk().list("").unwrap()
+    );
+}
+
+/// `verify_segment`'s string is shared between the pre-write verify pass and
+/// the post-discard apply pass. At the second site "corruption is never
+/// imported" is false — rows were imported minutes earlier. A message that
+/// names a contract the code does not keep at that site is worse than
+/// silence (hard rule 5).
+#[test]
+fn the_never_imported_claim_is_absent_where_rows_were_already_imported() {
+    let (_src, store) = archived_db_with_rows(500);
+    let flipping = SecondGetCorrupts::planted_from(&store, "/segments/");
+    let sim = fresh_sim();
+
+    let t = run_restore(&flipping, &sim, restore_opts())
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        t.contains("fails frame verification"),
+        "this must be the segment-verification refusal, not some other failure: {t}"
+    );
+    assert!(
+        !t.contains("never imported"),
+        "rows were imported before this fired: {t}"
+    );
+    assert!(
+        t.contains("PARTIAL restore"),
+        "and it must say what it left behind: {t}"
+    );
+}
+
+/// I-2. `Verdict::Ahead` is new operator-facing text with no oracle, and it
+/// is the COMMON case for an in-place restore: the live tail never ships, so
+/// a node's own dead data directory is always ahead of the archive.
+#[test]
+fn a_destination_ahead_of_the_archive_is_refused_and_names_what_it_would_lose() {
+    let (_src, store) = archived_db_with_rows(1_000);
+    let f = archived_frontier(&store);
+    let sim = fresh_sim();
+    run_restore(&store, &sim, restore_opts()).unwrap();
+
+    // The restored node comes up and commits ten more records — the ordinary
+    // shape of a node that ran for a while after a restore.
+    let mut db = Db::open(Box::new(sim.disk()), restore_cfg(), restore_schema()).unwrap();
+    write_records_at(&mut db, 90_000, 10);
+    let local = db.last_applied().unwrap();
+    drop(db);
+    assert_eq!(local, f + 10);
+
+    let t = run_restore(&store, &sim, restore_opts())
+        .unwrap_err()
+        .to_string();
+    assert!(t.contains("ahead of the archive"), "{t}");
+    assert!(t.contains("--force"), "must name the fix: {t}");
+    assert!(
+        t.contains(&local.to_string()),
+        "must name both frontiers: {t}"
+    );
+    assert!(t.contains(&f.to_string()), "must name both frontiers: {t}");
+    assert!(
+        t.contains("10 record(s)"),
+        "must name exactly what --force would destroy: {t}"
+    );
+}
+
+/// I-2, the other refusal. A generation with no chain holds no archived frame
+/// at any seq, so a destination that holds frames cannot be compared against
+/// it in either direction — neither shown diverged nor shown to be this
+/// timeline.
+#[test]
+fn a_destination_that_cannot_be_compared_is_refused_and_says_why() {
+    let (_src, store) = archived_db_without_a_chain();
+    assert!(
+        read_manifest(&store)
+            .expect("a manifest")
+            .segments
+            .is_empty(),
+        "the fixture must produce a chainless generation, or this tests the wrong branch"
+    );
+    let sim = fresh_sim();
+    plant_diverged_timeline(&sim, 50);
+
+    let t = run_restore(&store, &sim, restore_opts())
+        .unwrap_err()
+        .to_string();
+    assert!(t.contains("cannot compare itself against"), "{t}");
+    assert!(t.contains("--force"), "must name the fix: {t}");
+    assert!(
+        t.contains("50 record(s)"),
+        "must name exactly what --force would destroy: {t}"
+    );
+    assert!(
+        t.contains("no chain yet"),
+        "must say WHY there is nothing to compare against: {t}"
+    );
+    assert_eq!(
+        run_restore(
+            &store,
+            &sim,
+            RestoreOpts {
+                force: true,
+                ..restore_opts()
+            }
+        )
+        .unwrap()
+        .applied_seq,
+        read_manifest(&store).expect("a manifest").applied_seq,
+        "--force must still be able to restore a chainless generation"
+    );
+}
+
+/// I-1. `ObjectStore::poll` returning `None` means "still in flight"; a store
+/// that never completes is a broken store. The sim's own drain
+/// (`charpente-sim/src/object.rs`) bounds its loop for exactly this reason,
+/// and its comment says an unbounded one "would silently hang the instant a
+/// future task adds latency". A restore that hangs under Task 12's fault
+/// matrix fails with no seed and no repro line, which is the worst possible
+/// hard-rule-5 outcome.
+#[test]
+fn a_store_that_never_completes_is_refused_rather_than_spun_on() {
+    let sim = fresh_sim();
+    let t = run_restore(&StalledStore, &sim, restore_opts())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        t.contains("never completed"),
+        "must name the liveness contract it gave up on: {t}"
+    );
+    assert!(
+        t.contains(&manifest_key(PREFIX)),
+        "must name the operation it was waiting for: {t}"
+    );
+}

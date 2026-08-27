@@ -605,6 +605,57 @@ fn put_step(
     }
 }
 
+/// `frame_crc` of the record AT `frontier` — `SnapshotMeta::frontier_crc`,
+/// and the fourth argument restore hands `Seeder::finish`.
+///
+/// The ladder is `repl/session.rs::begin_seeding`'s, verbatim and for the
+/// same reason, because it is answering the identical question about the
+/// identical value: normally the frame is retained and `read_log` returns
+/// it (`Db::checkpoint`'s gc removes a segment only when the NEXT segment's
+/// base is at or below `keep_from <= applied + 1`, so the segment holding
+/// the current frontier is never its own checkpoint's victim); a node that
+/// was itself seeded or restored and has committed nothing since holds no
+/// frame at `frontier` at all, and chains through the frontier its builder
+/// vouched. A node that can do neither cannot vouch a frontier, and the
+/// refusal propagates by name rather than being papered over with a zero —
+/// a generation whose `frontier_crc` was invented is a generation whose
+/// restore would hand a replication peer a claim nothing backs.
+fn frontier_crc(db: &Db, frontier: u64) -> io::Result<u32> {
+    match db.read_log(frontier, 1) {
+        // An empty non-refusing read is unreachable in the tree as it stands
+        // (`Wal::append` rotates lazily, so the frontier's record is always
+        // in the tail segment, and `Wal::gc` never takes the tail), and it
+        // is returned as an ERROR rather than asserted anyway. The reason is
+        // narrow and specific to this call site: this runs on the archive
+        // ARM, where `Kernel::step` absorbs every `Err` and there is no
+        // `catch_unwind` anywhere in `crates/charpente/src` — so a panic
+        // here unwinds straight out of the kernel loop, on the one arm Task
+        // 9 spent a commit proving only ever degrades. Its oracle,
+        // `an_archive_io_failure_degrades_the_arm_and_never_the_kernel`,
+        // injects an `io::Error` and structurally cannot catch a panic.
+        // `begin_seeding` asserts the same invariant, correctly: it runs on
+        // a path that may kill the session anyway.
+        Ok(frames) => match frames.first() {
+            Some((s, p)) => Ok(frame_crc(*s, p)),
+            None => Err(io::Error::other(format!(
+                "archive: read_log({frontier}, 1) returned no frame without refusing, so this \
+                 generation's snapshot cannot record the checksum of its own frontier — the \
+                 log's base is {} and its end is {:?}. The archive stops rather than shipping \
+                 a snapshot a restore could not vouch a frontier from",
+                db.log_base(),
+                db.last_applied()
+            ))),
+        },
+        Err(e) if e.kind() == io::ErrorKind::InvalidData && frontier < db.log_base() => {
+            match db.seed_frontier()? {
+                Some((seed_seq, crc)) if seed_seq == frontier => Ok(crc),
+                _ => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// The seq a generation's chain starts at, given the frontier `F` its one
 /// snapshot was taken at. SPEC §2 — the chain CONTINUES the snapshot — and
 /// spec §3, which is what makes a snapshot worth taking: it is what lets the
@@ -624,37 +675,6 @@ fn put_step(
 /// rather than by search, since `Manifest::applied_seq` is the seq a restore
 /// replays from. What ruling 53 removes is the UNBOUNDED part: every segment
 /// lying wholly below `F`, which is the whole log at a fresh generation.
-/// `frame_crc` of the record AT `frontier` — `SnapshotMeta::frontier_crc`,
-/// and the fourth argument restore hands `Seeder::finish`.
-///
-/// The ladder is `repl/session.rs::begin_seeding`'s, verbatim and for the
-/// same reason, because it is answering the identical question about the
-/// identical value: normally the frame is retained and `read_log` returns
-/// it (`Db::checkpoint`'s gc removes a segment only when the NEXT segment's
-/// base is at or below `keep_from <= applied + 1`, so the segment holding
-/// the current frontier is never its own checkpoint's victim); a node that
-/// was itself seeded or restored and has committed nothing since holds no
-/// frame at `frontier` at all, and chains through the frontier its builder
-/// vouched. A node that can do neither cannot vouch a frontier, and the
-/// refusal propagates by name rather than being papered over with a zero —
-/// a generation whose `frontier_crc` was invented is a generation whose
-/// restore would hand a replication peer a claim nothing backs.
-fn frontier_crc(db: &Db, frontier: u64) -> io::Result<u32> {
-    match db.read_log(frontier, 1) {
-        Ok(frames) => Ok(frames
-            .first()
-            .map(|(s, p)| frame_crc(*s, p))
-            .expect("read_log(frontier, 1) returns that frame when it does not refuse")),
-        Err(e) if e.kind() == io::ErrorKind::InvalidData && frontier < db.log_base() => {
-            match db.seed_frontier()? {
-                Some((seed_seq, crc)) if seed_seq == frontier => Ok(crc),
-                _ => Err(e),
-            }
-        }
-        Err(e) => Err(e),
-    }
-}
-
 fn chain_start(db: &Db, frontier: u64) -> io::Result<u64> {
     // `F + 1`, never `F`: `applied_seq` is INCLUSIVE, so a frontier landing
     // exactly on a `layout_end` belongs wholly to the snapshot and the chain

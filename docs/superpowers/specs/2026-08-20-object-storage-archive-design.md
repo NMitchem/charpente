@@ -377,6 +377,12 @@ be able to halt the thing it derives from.
    refused, never imported" a fact rather than an intention. It costs a second `Get` per
    segment (verify, then fetch again to apply); a chain is unbounded in length, so holding
    it instead would put an O(generation) allocation on a machine already having a bad day.
+4b. Every `ObjectStore` operation is driven by a BOUNDED `start`/`poll` loop. `poll`'s
+   `None` means "still in flight", so a store answering `None` 10,000 times running is one
+   that will never answer; the bound's exhaustion is a refusal naming the operation it gave
+   up on. A liveness assertion, not a tuning constant — the same number and reasoning as the
+   two bounded drains already in this subsystem. Restore is the production path, and a hang
+   under §9's fault matrix fails with no seed and no repro line.
 5. Apply the chain's frames through `Db::apply_shipped` — the follower's own
    append-and-apply path — from `applied_seq + 1`, dropping the below-frontier residue
    §2 calls structural by arithmetic rather than by search. **Amended Task 10**: this step
@@ -446,7 +452,17 @@ so a retry's divergence check passes and `Seeder::new` discards it — the crash
 converges rather than resuming. It is NOT protected against being started as a database: a
 half-restored directory opens and serves stale reads, and closing that would mean teaching
 `Db::open` about a restore-in-progress marker. Restore says so in the failure's own text
-instead.
+instead — **on every path that produces the state, which is a structural requirement, not a
+per-message one.** Restore is split at the discard: one function does everything before the
+destination is touched and one does everything after, and each maps its errors through a
+single wrapper carrying that phase's clause. Pre-discard failures promise an untouched
+destination and it is true by construction; post-discard failures name the partial restore,
+say not to start a node on it, and name the re-run as the remedy. Any refusal text that is
+true at one call site and false at another must be parameterised by site rather than shared
+— `verify_segment` is called from both phases and its "corruption is never imported" clause
+is the pre-discard one only. This paragraph is binding: a claim here that the text does not
+make is a hard-rule-5 defect, which is what a review found the first time this was
+written (Task 10 C-1).
 
 ## §7 Failure semantics and error text
 
