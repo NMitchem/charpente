@@ -861,6 +861,50 @@ mod tests {
         std::fs::remove_dir_all(&dest).unwrap();
     }
 
+    /// I-3's other direction — the one that destroys something. The cleanup
+    /// removes a destination directory THIS call created; it must never
+    /// remove one the OPERATOR created. Nothing saw that until this test:
+    /// forcing `dest_was_absent = true` is green across both suites while it
+    /// silently deletes an operator's empty `--to` and prints "Nothing in
+    /// the destination has been touched" on the way out. Same class of miss
+    /// as the parent-dir fsync — a destructive step whose failure mode no
+    /// oracle could see.
+    ///
+    /// It pins the BEHAVIOUR, not the flag: an empty directory the operator
+    /// made themselves is still there after a refusal. The empty case is the
+    /// dangerous one — `remove_dir` would succeed on it, where a directory
+    /// holding anything is refused by the kernel as well as by our own
+    /// check.
+    #[test]
+    fn a_refusal_never_removes_a_destination_the_operator_created() {
+        let dest = tmp_dir("operator-made");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let (code, out, err) = run_restore_verb(&[
+            "restore",
+            "--from",
+            "/does/not/exist/charpente-no-such-bucket",
+            "--to",
+            dest.to_str().unwrap(),
+            "--prefix",
+            BUCKET_PREFIX,
+        ]);
+
+        assert_eq!(code, 1, "stdout: {out}");
+        assert!(
+            err.to_lowercase()
+                .contains("nothing in the destination has been touched"),
+            "{err}"
+        );
+        assert!(
+            dest.exists(),
+            "the refusal deleted a directory the OPERATOR created, while telling them \
+             nothing had been touched: {}",
+            dest.display()
+        );
+        std::fs::remove_dir_all(&dest).unwrap();
+    }
+
     #[test]
     fn restore_without_from_returns_two_and_pins_the_error_text() {
         let (code, out, err) = run_restore_verb(&["restore", "--prefix", BUCKET_PREFIX]);
