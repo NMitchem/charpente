@@ -1165,21 +1165,36 @@ impl Archive {
     }
 
     /// True when this archive's CURRENT generation has objects in the
-    /// bucket: a snapshot (which is what sets `frontier`) or any segment in
-    /// its chain.
+    /// bucket. Two of the three answers are on `self`: `frontier` is set
+    /// when a snapshot's manifest swap LANDS, and `segments` holds the
+    /// chain. The third cannot be — hence the argument.
     ///
-    /// Both refusal notices below are raised from two sites whose answer
-    /// here is OPPOSITE, and each of them used to state one site's answer
-    /// unconditionally — which made it false at the other. `adopt` refuses
-    /// before anything is uploaded (a fresh open and a post-gap re-open both
-    /// reach it with no frontier and an empty chain, since `roll_generation`
-    /// clears both); `step_checking_owner` refuses part-way through a
-    /// generation that already has objects under it. Hard rule 5's third
+    /// `snapshot_awaiting_swap` is the window between the opening snapshot's
+    /// last object landing and the manifest swap that commits it: every
+    /// object of that snapshot is in the bucket and `frontier` is still
+    /// `None`, because `step_uploading_manifest` sets it only once the PUT
+    /// lands (spec §2 — the swap is the commit point). It is not a race but
+    /// EVERY generation's first swap, and a `&self` predicate cannot see it:
+    /// `step`'s `mem::replace` leaves `self.state` as `Idle` for the whole
+    /// of `step_checking_owner`, so the state machine's own record of it
+    /// (`CheckingOwner { commits: Some(_) }`) is not on `self` while the
+    /// notice is being built. Passing it means a site that raises a refusal
+    /// must ANSWER this question — a new one cannot inherit the wrong
+    /// default, because omitting the argument is a compile error.
+    ///
+    /// Both refusal notices below are raised from sites whose answer here is
+    /// OPPOSITE, and each of them used to state one site's answer
+    /// unconditionally — which made it false at the others. `adopt` and
+    /// `step_opening` refuse before anything is uploaded (a fresh open and a
+    /// post-gap re-open both reach them with no frontier and an empty chain,
+    /// since `roll_generation` clears both); `step_checking_owner` refuses
+    /// part-way through a generation that already has objects under it, at
+    /// the first swap as much as at any later one. Hard rule 5's third
     /// element is THE FIX, and the fix genuinely differs: at `adopt` the
     /// operator can act freely, while at `CheckingOwner` "remove that
     /// manifest" is the step that strands a partial generation for good.
-    fn uploaded_this_generation(&self) -> bool {
-        self.frontier.is_some() || !self.segments.is_empty()
+    fn uploaded_this_generation(&self, snapshot_awaiting_swap: bool) -> bool {
+        self.frontier.is_some() || !self.segments.is_empty() || snapshot_awaiting_swap
     }
 
     /// HARD RULE 5 / spec §7's row ("operator notice naming both identities,
@@ -1188,12 +1203,21 @@ impl Archive {
     /// configuration change no amount of retrying reaches.
     ///
     /// What it says about the BUCKET is conditional on
-    /// `uploaded_this_generation`. At `adopt` on a fresh open
-    /// `self.generation` is 0, so an unconditional "objects under generation
-    /// 0 are orphaned" names the generation the manifest points at — the
-    /// LIVE one, intact — and tells the operator their good data is garbage.
-    fn foreign_writer_notice(&self, theirs: &str, their_generation: u64) -> io::Error {
-        let (left_behind, strands) = if self.uploaded_this_generation() {
+    /// `uploaded_this_generation`, whose `snapshot_awaiting_swap` argument
+    /// this one forwards. At `adopt` on a fresh open `self.generation` is 0,
+    /// so an unconditional "objects under generation 0 are orphaned" names
+    /// the generation the manifest points at — the LIVE one, intact — and
+    /// tells the operator their good data is garbage. At the opening
+    /// snapshot's swap the opposite sentence is the false one: "left nothing
+    /// of its own under this prefix" is said over a complete snapshot that
+    /// no manifest will ever name once this archive stops.
+    fn foreign_writer_notice(
+        &self,
+        theirs: &str,
+        their_generation: u64,
+        snapshot_awaiting_swap: bool,
+    ) -> io::Error {
+        let (left_behind, strands) = if self.uploaded_this_generation(snapshot_awaiting_swap) {
             (
                 format!(
                     "Detection, not prevention: the objects this archive wrote under its own \
@@ -1255,14 +1279,20 @@ impl Archive {
     /// actions and only the decoder can tell them apart.
     ///
     /// Like `foreign_writer_notice`, what it says about the bucket is
-    /// conditional on `uploaded_this_generation`: this is raised from
-    /// `step_opening`, where nothing has been uploaded, AND from
-    /// `step_checking_owner`, where a snapshot and part of a chain are
-    /// already sitting under the prefix. Telling that second operator
-    /// "nothing was uploaded" and then offering to remove the manifest is
-    /// the pair of sentences that strands a whole generation.
-    fn unreadable_manifest_notice(&self, source: &io::Error) -> io::Error {
-        let (left_behind, strands) = if self.uploaded_this_generation() {
+    /// conditional on `uploaded_this_generation`, whose
+    /// `snapshot_awaiting_swap` argument this one forwards: it is raised
+    /// from `step_opening`, where nothing has been uploaded, AND from
+    /// `step_checking_owner`, where a snapshot — and at any swap past the
+    /// first, part of a chain — is already sitting under the prefix.
+    /// Telling that second operator "nothing was uploaded" and then offering
+    /// to remove the manifest is the pair of sentences that strands a whole
+    /// generation.
+    fn unreadable_manifest_notice(
+        &self,
+        source: &io::Error,
+        snapshot_awaiting_swap: bool,
+    ) -> io::Error {
+        let (left_behind, strands) = if self.uploaded_this_generation(snapshot_awaiting_swap) {
             (
                 format!(
                     "the objects it has already written under generation {} stay in the bucket, \
@@ -1384,7 +1414,10 @@ impl Archive {
                     // F5. Untrusted bytes that will not decode: refuse, do
                     // not retry. See `unreadable_manifest_notice` for why
                     // this is terminal rather than a bounded retry.
-                    let notice = self.unreadable_manifest_notice(&e);
+                    //
+                    // `false`: `Opening` is in front of everything, so this
+                    // generation has uploaded nothing whatsoever.
+                    let notice = self.unreadable_manifest_notice(&e, false);
                     Err(self.stop(notice))
                 }
             },
@@ -1419,7 +1452,9 @@ impl Archive {
         if let Some(m) = &found
             && m.writer != self.cfg.writer
         {
-            let notice = self.foreign_writer_notice(&m.writer, m.generation);
+            // `false`: `adopt` runs before this archive has uploaded
+            // anything at all — no snapshot is in flight to a swap here.
+            let notice = self.foreign_writer_notice(&m.writer, m.generation, false);
             return Err(self.stop(notice));
         }
         // The resume decision reads the segment layout (`chain_start`) and
@@ -2009,8 +2044,15 @@ impl Archive {
                 Ok(())
             }
             Some(Ok(ObjectDone::Get(found))) => match Manifest::decode(&found) {
+                // `commits.is_some()` is the evidence `&self` does not
+                // carry: this is the swap committing the OPENING SNAPSHOT,
+                // so every one of its objects is already in the bucket
+                // while `self.frontier` is still `None`. A `commits: None`
+                // swap is a segment's, and `self.segments` is non-empty by
+                // then, so the predicate's other disjuncts answer it.
                 Ok(m) if m.writer != self.cfg.writer => {
-                    let notice = self.foreign_writer_notice(&m.writer, m.generation);
+                    let notice =
+                        self.foreign_writer_notice(&m.writer, m.generation, commits.is_some());
                     Err(self.stop(notice))
                 }
                 Ok(_) => {
@@ -2028,7 +2070,7 @@ impl Archive {
                 // its own, and must not resolve that by overwriting the
                 // evidence.
                 Err(e) => {
-                    let notice = self.unreadable_manifest_notice(&e);
+                    let notice = self.unreadable_manifest_notice(&e, commits.is_some());
                     Err(self.stop(notice))
                 }
             },
