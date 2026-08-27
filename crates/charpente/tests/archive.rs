@@ -112,7 +112,7 @@ struct FlakyStore {
     /// GETs left to fail (Task 12). The fourth switch, and the only one
     /// aimed at RESTORE rather than at the archive: `restore` reads the
     /// bucket and writes the destination, so cutting it off part-way is how
-    /// spec Â§9's "crash mid-restore â re-run from scratch converges" axis
+    /// spec §9's "crash mid-restore → re-run from scratch converges" axis
     /// is reached at all. `SimObjectStore`'s own `object_get_error` cannot
     /// stand in: it is a per-op probability fixed at construction, so a rate
     /// high enough to cut a restore reliably also stops the RETRY that is
@@ -148,7 +148,7 @@ impl FlakyStore {
     }
 
     /// The next `n` GETs fail at `start`, before the inner store sees them
-    /// â so no op goes in flight and the next attempt is a clean first one,
+    /// — so no op goes in flight and the next attempt is a clean first one,
     /// the same contract `reachable` carries. `0` clears the switch.
     fn set_failing_gets(&self, n: u64) {
         self.fail_next_gets.set(n);
@@ -7329,9 +7329,9 @@ fn no_media_corruption_on_either_side(cfg: &mut FaultConfig) {
 ///
 /// **The seed that taught this property what it was actually checking.**
 /// Hard rule 3 — recorded here because the frozen runner exposes no public
-/// single-seed replay (`run_universe` is `pub(crate)`, `splitmix64`/`Rng`
-/// private) and reconstructing the seed->config mapping in a test would fork
-/// a contract whose own doc says "do not reorder anything":
+/// single-seed replay (`run_universe` is `pub(crate)`) and reconstructing the
+/// seed->config mapping in a test would fork a contract whose own doc says
+/// "do not reorder anything":
 ///
 /// ```text
 /// CHARPENTE_SEED=0xb803ea7cab19d08c cargo test -p charpente --test archive -- --nocapture
