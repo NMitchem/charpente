@@ -14,8 +14,9 @@ use charpente::archive::manifest::{
     Manifest, SnapshotMeta, TableBatches, decode_snapshot_batch, manifest_key, segment_key,
     snapshot_batch_key, snapshot_meta_key,
 };
+use charpente::archive::restore::{RestoreOpts, restore};
 use charpente::archive::{Archive, ArchiveConfig};
-use charpente::{Db, DbConfig, Id, Schema, table};
+use charpente::{Db, DbConfig, Id, Schema, job, table};
 use charpente_core::crc::crc32;
 use charpente_core::io::{ObjectDone, ObjectOp, ObjectStore};
 use charpente_core::table::Row;
@@ -4775,5 +4776,529 @@ fn the_snapshot_meta_carries_the_event_counter_and_the_frontier_crc() {
     assert_eq!(
         meta.next_job_id,
         db.snapshot().unwrap().next_job_id().unwrap()
+    );
+}
+
+// ------------------------------------------- Task 10: restore, and its refusals
+//
+// Every test here calls `charpente::archive::restore::restore` itself — the
+// same function `charpente restore` will call (Task 11) and the same one the
+// convergence property will drive (Task 12). There is no test-only variant.
+
+/// A destination `DbConfig`. `wal.segment_bytes` matches the source fixtures'
+/// 64 KiB so a restored chain lays out in comparable segments; everything
+/// else is the production default, including `checkpoint_every` — a restore
+/// that only worked with GC disabled would be a restore that does not work.
+fn restore_cfg() -> DbConfig {
+    let mut cfg = DbConfig::default();
+    cfg.wal.segment_bytes = 64 << 10;
+    cfg
+}
+
+fn restore_opts() -> RestoreOpts {
+    RestoreOpts {
+        prefix: PREFIX.to_string(),
+        force: false,
+    }
+}
+
+fn restore_schema() -> Schema {
+    Schema::new().table::<Rec>()
+}
+
+/// A world for the DESTINATION, separate from every source fixture's own.
+fn fresh_sim() -> Sim {
+    Sim::with_faults(0x7265_7374_6f72_6500, FaultConfig::none())
+}
+
+/// Records committed above the opening snapshot, so the generation really
+/// has a chain rather than a snapshot alone. Two segments' worth: a
+/// single-segment chain would leave `verify_chain`'s loop unexercised.
+const RESTORE_CHAIN_RECORDS: u64 = 2 * RECORDS_PER_SEGMENT;
+
+/// A source `Db` archived to a COMPLETE generation — an opening snapshot at
+/// `rows` records, then a chain of sealed segments continuing it.
+///
+/// `write_records_at` for the second phase, never `write_records`: the second
+/// call has to write FRESH ids so that the i-th committed record is the one
+/// that writes `Rec { id: i }`. That coincidence is what makes "the source's
+/// state at seq F" computable, and every test below asserts it holds rather
+/// than assuming it.
+fn archived_db_with_rows(rows: u64) -> (Db, SimObjectStore) {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, rows);
+    step_until_idle(&mut arc, &db, &store);
+    write_records_at(&mut db, rows, RESTORE_CHAIN_RECORDS);
+    step_until_idle(&mut arc, &db, &store);
+    (db, store)
+}
+
+/// The newest recoverable point in the bucket: the chain's end when the
+/// generation has one, its snapshot's frontier when it does not.
+fn archived_frontier(store: &dyn ObjectStore) -> u64 {
+    let m = read_manifest(store).expect("an archived generation");
+    m.segments.last().map_or(m.applied_seq, |s| s.end_seq)
+}
+
+/// One table's raw rows as a restore comparison sees them.
+type TableRows = (String, Vec<(u64, Vec<u8>)>);
+
+/// Every registered table's raw rows, paged. The comparison unit for "a
+/// restored Db is logically equal to the source at the archived frontier"
+/// (spec §9) — logical, not byte-identical.
+fn logical_rows(db: &Db) -> Vec<TableRows> {
+    let snap = db.snapshot().unwrap();
+    db.table_names()
+        .into_iter()
+        .map(|t| {
+            let mut rows: Vec<(u64, Vec<u8>)> = Vec::new();
+            let mut after = None;
+            loop {
+                let batch = snap.scan_raw_from(t, after, 1_000).unwrap();
+                let Some(last) = batch.last() else { break };
+                after = Some(last.0);
+                rows.extend(batch);
+            }
+            (t.to_string(), rows)
+        })
+        .collect()
+}
+
+/// The source's logical state AT seq `f`. Exact rather than approximate
+/// because of the fixture's one-record-per-row, `Rec { id: i }`-on-record-`i`
+/// construction — which every caller pins with an explicit `last_applied`
+/// assertion before relying on this.
+fn source_at(db: &Db, f: u64) -> Vec<TableRows> {
+    logical_rows(db)
+        .into_iter()
+        .map(|(name, rows)| {
+            if name == Rec::TABLE {
+                (name, rows.into_iter().filter(|(id, _)| *id <= f).collect())
+            } else {
+                (name, rows)
+            }
+        })
+        .collect()
+}
+
+/// A destination holding a DIFFERENT timeline at the same seqs: same schema,
+/// same record count, different values, so every frame's checksum differs
+/// from the archive's at the same seq.
+///
+/// `checkpoint_every: 0` so the log retains every frame — the comparison seq
+/// is the archive's chain end, and a destination that had GC'd past it would
+/// make this fixture test "cannot compare" instead of "diverged".
+fn plant_diverged_timeline(sim: &Sim, records: u64) {
+    let mut cfg = restore_cfg();
+    cfg.checkpoint_every = 0;
+    let mut db = Db::open(Box::new(sim.disk()), cfg, restore_schema()).unwrap();
+    for i in 0..records {
+        db.transact(|tx| -> Result<(), std::convert::Infallible> {
+            tx.put(&Rec {
+                id: Id::from_raw(i),
+                // `+ 7`, not `i`: the frame payload at every seq differs from
+                // the source's, which is what makes this diverged rather
+                // than merely behind.
+                value: i + 7,
+            });
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
+fn put_object(store: &SimObjectStore, key: &str, data: Vec<u8>) {
+    store
+        .start(ObjectOp::Put {
+            key: key.to_string(),
+            data,
+        })
+        .unwrap();
+    drain(store).unwrap();
+}
+
+fn delete_object(store: &SimObjectStore, key: &str) {
+    store
+        .start(ObjectOp::Delete {
+            key: key.to_string(),
+        })
+        .unwrap();
+    drain(store).unwrap();
+}
+
+/// Flips a byte inside the last chain segment's FIRST frame payload, leaving
+/// the frame's stored CRC naming bytes that are no longer there.
+fn corrupt_one_segment_object(store: &SimObjectStore) -> String {
+    let m = read_manifest(store).expect("a manifest");
+    let s = *m.segments.last().expect("a chain to corrupt");
+    let key = segment_key(PREFIX, m.generation, s.base_seq);
+    let mut bytes = get_object(store, &key).expect("the segment object");
+    assert!(
+        bytes.len() > 20,
+        "the segment object is too small to hold a frame payload at offset 20: {}",
+        bytes.len()
+    );
+    bytes[20] ^= 0xff;
+    put_object(store, &key, bytes);
+    key
+}
+
+fn delete_one_snapshot_batch(store: &SimObjectStore) -> String {
+    let m = read_manifest(store).expect("a manifest");
+    let meta = read_snapshot_meta(store, m.generation).expect("a snapshot meta");
+    let t = meta
+        .tables
+        .iter()
+        .find(|t| t.batches > 0)
+        .expect("a table with at least one batch object");
+    let key = snapshot_batch_key(PREFIX, m.generation, &t.name, 0);
+    delete_object(store, &key);
+    key
+}
+
+/// A bucket that dies after `cut` operations — the crash a restore has to
+/// converge from. It OWNS its store (planted from the real one) because
+/// `SimObjectStore` is not `Sync`, so a wrapper cannot borrow one and still
+/// satisfy `ObjectStore`'s `Send`.
+struct CutStore {
+    inner: SimObjectStore,
+    left: Cell<usize>,
+    used: Cell<usize>,
+}
+
+impl CutStore {
+    fn planted_from(source: &SimObjectStore, cut: usize) -> CutStore {
+        let inner = SimObjectStore::new();
+        plant(&inner, &store_contents(source));
+        CutStore {
+            inner,
+            left: Cell::new(cut),
+            used: Cell::new(0),
+        }
+    }
+
+    /// Operations this store served — how many a whole restore takes, which
+    /// is what the cut points below are derived from rather than guessed.
+    fn used(&self) -> usize {
+        self.used.get()
+    }
+}
+
+impl ObjectStore for CutStore {
+    fn start(&self, op: ObjectOp) -> io::Result<()> {
+        if self.left.get() == 0 {
+            return Err(io::Error::other(
+                "simulated CutStore crash: the restore was cut off mid-run",
+            ));
+        }
+        self.left.set(self.left.get() - 1);
+        self.used.set(self.used.get() + 1);
+        self.inner.start(op)
+    }
+
+    fn poll(&self) -> Option<io::Result<ObjectDone>> {
+        self.inner.poll()
+    }
+}
+
+#[job]
+struct Resurrect {
+    slot: u64,
+}
+
+impl Resurrect {
+    fn run(self, _tx: &mut charpente::Tx) -> Result<(), charpente::kernel::JobError> {
+        Ok(())
+    }
+}
+
+/// A source archived with `n` jobs still Pending in `charpente.jobs`.
+fn archived_db_with_pending_jobs(n: u64) -> (Db, SimObjectStore) {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, 200);
+    for slot in 0..n {
+        db.transact(|tx| -> Result<(), std::convert::Infallible> {
+            tx.enqueue(Resurrect { slot });
+            Ok(())
+        })
+        .unwrap();
+    }
+    step_until_idle(&mut arc, &db, &store);
+    write_records_at(&mut db, 200 + n, RESTORE_CHAIN_RECORDS);
+    step_until_idle(&mut arc, &db, &store);
+    (db, store)
+}
+
+#[test]
+fn restore_reproduces_the_source_at_the_archived_frontier() {
+    let rows = 1_000;
+    let (src, store) = archived_db_with_rows(rows);
+    let total = rows + RESTORE_CHAIN_RECORDS;
+    assert_eq!(
+        src.last_applied(),
+        Some(total - 1),
+        "the fixture must commit exactly one record per row, or `source_at` is not the \
+         source's state at a seq"
+    );
+
+    let f = archived_frontier(&store);
+    assert!(
+        f < total - 1,
+        "the archived frontier must sit BELOW the source's — the live tail never ships \
+         (spec §3) — or this test compares two identical Dbs and proves nothing: f={f}, \
+         last_applied={:?}",
+        src.last_applied()
+    );
+
+    let sim = fresh_sim();
+    let report = restore(
+        &store,
+        Box::new(sim.disk()),
+        restore_cfg(),
+        restore_schema(),
+        restore_opts(),
+        &mut |_| {},
+    )
+    .unwrap();
+
+    assert_eq!(report.applied_seq, f);
+    assert!(
+        report.segments >= 2,
+        "the generation must have a multi-segment chain, or the chain loop is unexercised: \
+         {report:?}"
+    );
+
+    let dst = Db::open(Box::new(sim.disk()), restore_cfg(), restore_schema()).unwrap();
+    assert_eq!(dst.last_applied(), Some(f));
+    assert_eq!(
+        logical_rows(&dst),
+        source_at(&src, f),
+        "the restored Db is not logically equal to the source at the archived frontier"
+    );
+}
+
+#[test]
+fn restore_refuses_a_diverged_local_timeline_and_names_both_frontiers() {
+    let (_src, store) = archived_db_with_rows(1_000);
+    let local_records = 1_000 + RESTORE_CHAIN_RECORDS;
+    let sim = fresh_sim();
+    plant_diverged_timeline(&sim, local_records);
+    let before = sim.disk().list("").unwrap();
+
+    let e = restore(
+        &store,
+        Box::new(sim.disk()),
+        restore_cfg(),
+        restore_schema(),
+        restore_opts(),
+        &mut |m| panic!("a refusal must emit no operator notice, got: {m}"),
+    )
+    .unwrap_err();
+    let t = e.to_string();
+
+    assert!(t.contains("diverged"), "{t}");
+    assert!(t.contains("--force"), "must name the fix: {t}");
+    let f = archived_frontier(&store);
+    assert!(
+        t.contains(&f.to_string()),
+        "must name the archive's frontier {f}: {t}"
+    );
+    assert!(
+        t.contains(&(local_records - 1).to_string()),
+        "must name the destination's frontier {}: {t}",
+        local_records - 1
+    );
+    assert_eq!(
+        sim.disk().list("").unwrap(),
+        before,
+        "a refusal must not have touched the destination"
+    );
+}
+
+#[test]
+fn force_discards_and_names_what_it_destroys_before_acting() {
+    let (_src, store) = archived_db_with_rows(1_000);
+    let local_records = 1_000 + RESTORE_CHAIN_RECORDS;
+    let sim = fresh_sim();
+    plant_diverged_timeline(&sim, local_records);
+    let before = sim.disk().list("").unwrap();
+    let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+
+    let report = restore(
+        &store,
+        Box::new(sim.disk()),
+        restore_cfg(),
+        restore_schema(),
+        RestoreOpts {
+            force: true,
+            ..restore_opts()
+        },
+        &mut |m| {
+            if m.contains("discard") {
+                // THE ORDERING ORACLE. A divergence check that ran after
+                // `Seeder::new` would find an emptied data directory here,
+                // and naming what you destroyed after destroying it is not
+                // what spec §6 requires.
+                assert_eq!(
+                    sim.disk().list("").unwrap(),
+                    before,
+                    "the destructive notice fired AFTER the destination was discarded: {m}"
+                );
+            }
+            seen.borrow_mut().push(m.to_string());
+        },
+    )
+    .unwrap();
+
+    let notice = seen
+        .borrow()
+        .iter()
+        .find(|m| m.contains("discard"))
+        .cloned()
+        .expect("--force must emit a destructive notice");
+    assert!(notice.contains("diverged"), "{notice}");
+    assert!(
+        notice.contains(&(local_records - 1).to_string()),
+        "the notice must name the frontier it destroys: {notice}"
+    );
+    assert!(report.applied_seq > 0);
+    assert_eq!(report.applied_seq, archived_frontier(&store));
+}
+
+#[test]
+fn a_corrupt_segment_object_is_refused_never_imported() {
+    let (_src, store) = archived_db_with_rows(500);
+    let key = corrupt_one_segment_object(&store);
+    let sim = fresh_sim();
+
+    let e = restore(
+        &store,
+        Box::new(sim.disk()),
+        restore_cfg(),
+        restore_schema(),
+        restore_opts(),
+        &mut |_| {},
+    )
+    .unwrap_err();
+    let t = e.to_string();
+
+    assert!(t.contains("CRC"), "{t}");
+    assert!(t.contains(&key), "must name the object: {t}");
+    assert!(
+        sim.disk().list("").unwrap().is_empty(),
+        "corruption was partially imported: {:?}",
+        sim.disk().list("").unwrap()
+    );
+}
+
+#[test]
+fn a_missing_object_named_by_the_manifest_is_refused() {
+    let (_src, store) = archived_db_with_rows(500);
+    let key = delete_one_snapshot_batch(&store);
+    let sim = fresh_sim();
+
+    let e = restore(
+        &store,
+        Box::new(sim.disk()),
+        restore_cfg(),
+        restore_schema(),
+        restore_opts(),
+        &mut |_| {},
+    )
+    .unwrap_err();
+    let t = e.to_string();
+
+    assert!(t.contains("missing"), "{t}");
+    assert!(t.contains(&key), "must name the object: {t}");
+}
+
+#[test]
+fn a_crashed_restore_converges_on_re_run() {
+    let (src, store) = archived_db_with_rows(500);
+    let f = archived_frontier(&store);
+    let sim = fresh_sim();
+
+    // The plan named the cuts 3, 11 and 29. MEASURED against this fixture,
+    // a whole restore takes 8 object operations, so two of those three sat
+    // past the end and would have cut nothing while looking like coverage.
+    // Derived from the measurement instead, on a throwaway destination so
+    // the counting run does not itself seed the one under test.
+    let ops = {
+        let counter = CutStore::planted_from(&store, usize::MAX);
+        let throwaway = fresh_sim();
+        restore(
+            &counter,
+            Box::new(throwaway.disk()),
+            restore_cfg(),
+            restore_schema(),
+            restore_opts(),
+            &mut |_| {},
+        )
+        .unwrap();
+        counter.used()
+    };
+    assert!(
+        ops >= 8,
+        "a whole restore takes {ops} object operations — too few to cut through the manifest \
+         read, the verify pass, the row import and the chain apply"
+    );
+    let mut cuts: Vec<usize> = vec![1, ops / 4, ops / 2, (3 * ops) / 4, ops - 1];
+    cuts.sort_unstable();
+    cuts.dedup();
+    for cut in cuts {
+        let cut_store = CutStore::planted_from(&store, cut);
+        let e = restore(
+            &cut_store,
+            Box::new(sim.disk()),
+            restore_cfg(),
+            restore_schema(),
+            restore_opts(),
+            &mut |_| {},
+        );
+        assert!(
+            e.is_err(),
+            "cut {cut} of {ops} did not actually cut the restore off"
+        );
+    }
+
+    let report = restore(
+        &store,
+        Box::new(sim.disk()),
+        restore_cfg(),
+        restore_schema(),
+        restore_opts(),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(report.applied_seq, f);
+
+    let dst = Db::open(Box::new(sim.disk()), restore_cfg(), restore_schema()).unwrap();
+    assert_eq!(logical_rows(&dst), source_at(&src, f));
+}
+
+#[test]
+fn the_report_names_the_jobs_restore_is_about_to_resurrect() {
+    let (_src, store) = archived_db_with_pending_jobs(7);
+    let sim = fresh_sim();
+    let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+
+    let report = restore(
+        &store,
+        Box::new(sim.disk()),
+        restore_cfg(),
+        restore_schema(),
+        restore_opts(),
+        &mut |m| seen.borrow_mut().push(m.to_string()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        report.pending_jobs, 7,
+        "operators must be told restore can re-fire effects (spec §6): {report:?}"
+    );
+    assert!(
+        seen.borrow().iter().any(|m| m.contains("pending job")),
+        "the consequence belongs in the command's own output too (spec §6): {:?}",
+        seen.borrow()
     );
 }

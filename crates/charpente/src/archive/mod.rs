@@ -270,6 +270,7 @@ use charpente_core::log::frame_crc;
 use charpente_core::table::Snapshot;
 
 pub mod manifest;
+pub mod restore;
 
 use manifest::{
     Manifest, SegmentRef, SnapshotMeta, TableBatches, encode_snapshot_batch, manifest_key,
