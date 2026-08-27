@@ -7283,9 +7283,12 @@ fn no_media_corruption_on_either_side(cfg: &mut FaultConfig) {
 /// spec §8's first bullet now says so and states the residual. `conv_step`
 /// counts it (`archive:step_discovered_disk_fault`) instead of failing on it.
 /// The key is reported and deliberately NOT in `require:`: it is 0 in 256 at
-/// this base and 1 in 768 across three fresh bases, so requiring it would
+/// this base and 2 in 768 across three fresh bases (`0xD9E3_0001`,
+/// `0x5B71_0001`, `0x3C0D_0001` — both at the first), so requiring it would
 /// make a permanent property flake on a rare fault (`floor:`'s own argument,
-/// run backwards).
+/// run backwards). The earlier reading of 1 in 768 was a LOWER BOUND: while
+/// the latch was still fatal the batch stopped at the first occurrence and
+/// never counted the second.
 ///
 /// **What `conv_step` still asserts across every step — `last_applied`, the
 /// write gate, engine poison — no fault in this property can fire either.**
