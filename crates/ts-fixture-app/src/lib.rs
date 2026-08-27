@@ -192,6 +192,21 @@ pub struct InvoiceView {
     /// walker `undefined`, not `null` (A1's second landmine shape).
     #[serde(skip_serializing_if = "is_zero_i64")]
     pub late_fee_cents: WireI64,
+    /// `Seq(Int64)` (fix round 1, F6): before this field, that shape had
+    /// coverage only from a Rust-mechanical test asserting on GENERATED
+    /// SOURCE TEXT (`seq_of_int64_maps_every_element`), never compiled by
+    /// `tsc` nor executed by any real client call.
+    pub installment_cents: Vec<WireI64>,
+    /// `Map` value `= Int64` (fix round 1, F6): same gap as
+    /// `installment_cents` above, for `map_value_of_int64_converts_every_value_not_the_string_keys`.
+    /// `BTreeMap` only, matching `labels` above.
+    pub fees_by_category: BTreeMap<String, WireI64>,
+    /// `Option(Seq(Int64))` (fix round 1, F6): same gap, for
+    /// `option_of_seq_of_int64_guards_null_around_the_map`.
+    pub refund_batches_cents: Option<Vec<WireI64>>,
+    /// `Seq(Option(Int64))` (fix round 1, F6): same gap, for
+    /// `seq_of_option_of_int64_guards_null_inside_each_element`.
+    pub disputed_line_cents: Vec<Option<WireI64>>,
 }
 
 /// The `skip_serializing_if` predicate for `InvoiceView::late_fee_cents` —
@@ -231,6 +246,12 @@ pub enum FeedItem {
 }
 
 /// `#[serde(tag = "...")]`: the variant name merges into the payload object.
+///
+/// `Card`'s `limit_cents` (fix round 1, F6) is `EnumRepr::Internal` carrying
+/// an `Int64` — before it existed, that shape had coverage only from a
+/// Rust-mechanical test on generated source text
+/// (`internal_tagged_enum_converts_the_merged_field`), never compiled or
+/// executed anywhere.
 #[derive(WireDerive, Serialize)]
 #[serde(crate = "::charpente::serde")]
 #[serde(tag = "type")]
@@ -239,18 +260,54 @@ pub enum Payment {
     Card {
         #[serde(rename = "card-number")]
         card_number: String,
+        limit_cents: WireI64,
     },
 }
 
 /// `#[serde(tag = "...", content = "...")]`, with a kebab-case tag key — an
 /// arbitrary string literal is legal there, so this needs no `rename_all` to
 /// reach the quoting path.
+///
+/// `Progress`'s `bytes_done` (fix round 1, F6) is `EnumRepr::Adjacent`
+/// carrying an `Int64` — same gap as `Payment::Card` above, for
+/// `adjacent_tagged_enum_converts_the_content_key`.
 #[derive(WireDerive, Serialize)]
 #[serde(crate = "::charpente::serde")]
 #[serde(tag = "kind-of", content = "payload")]
 pub enum Notification {
     Started,
-    Progress { percent: u32 },
+    Progress { percent: u32, bytes_done: WireU64 },
+}
+
+/// A small `Int64`-bearing named type, used TWICE as a sibling field on
+/// `CostNode` below (fix round 1, F6) — the shape
+/// `sibling_fields_of_the_same_ref_type_are_both_converted` proves
+/// mechanically (the SAME `Ref` name must independently convert at EACH
+/// occurrence, not once for the type as a whole), but which had no
+/// executing counterpart anywhere before this.
+#[derive(WireDerive, Serialize)]
+#[serde(crate = "::charpente::serde")]
+#[serde(rename_all = "camelCase")]
+pub struct Money {
+    pub cents: WireI64,
+}
+
+/// Self-referential (`children: Vec<CostNode>`) on purpose (fix round 1,
+/// F6): a `Ref` cycle back to its own type is the shape both
+/// `contains_int64` and `collect_needed_types` guard against looping
+/// forever on (`a_self_referential_type_terminates_and_still_converts`),
+/// which before this route existed had coverage only from a Rust-mechanical
+/// test, never a real recursive document compiled or walked at runtime.
+/// `price`/`discount` are the sibling-`Ref` half `Money`'s doc comment
+/// describes.
+#[derive(WireDerive, Serialize)]
+#[serde(crate = "::charpente::serde")]
+#[serde(rename_all = "camelCase")]
+pub struct CostNode {
+    pub label: String,
+    pub price: Money,
+    pub discount: Money,
+    pub children: Vec<CostNode>,
 }
 
 // ------------------------------------------------------------------ events
@@ -328,6 +385,31 @@ pub fn withdraw_invoice(tx: &mut Tx, id: Id<Invoice>) -> Result<InvoiceView, Lim
     Ok(samples::invoice_view(id, Id::<Customer>::from_raw(0)))
 }
 
+/// A BARE `FeedItem` response (fix round 1, F6) — every other route reaches
+/// `FeedItem` only nested inside `InvoiceView.lastItem`, always constructed
+/// as the `Message` variant (`samples::invoice_view`), so nothing before
+/// this route ever executed `reviveFeedItem`'s two dangerous branches: the
+/// `Int64`-carrying `Ack` newtype variant, and the coexisting `Ping` unit
+/// variant the `EnumRepr::External` revive's `typeof v === "object"` guard
+/// exists to avoid throwing on (`"X" in v` throws when `v` is a bare
+/// string). The handler is a stub like its neighbours — what matters is the
+/// SCHEMA this route declares, since every `*.test.ts` stubs `fetch()`
+/// rather than invoking it.
+#[route(GET "/invoices/:id/last-item")]
+pub fn last_item(tx: &mut Tx, id: Id<Invoice>) -> Result<FeedItem, ApiError> {
+    let _ = (tx, id);
+    Ok(FeedItem::Ping)
+}
+
+/// `CostNode` (fix round 1, F6): see its own doc comment for the two shapes
+/// (`Ref` cycle, sibling `Ref`) this route exists to execute, not just
+/// compile.
+#[route(GET "/cost-tree")]
+pub fn cost_tree(tx: &mut Tx) -> Result<CostNode, ApiError> {
+    let _ = tx;
+    Ok(samples::cost_tree())
+}
+
 /// `-> Result<(), ApiError>`: the response schema is `Null`, the JSON
 /// literal `null`, which is a different document from `{}`. Also the one
 /// route whose `Id<Widget>` never appears in any registered wire type.
@@ -374,6 +456,8 @@ pub fn build_app(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> std::io::Res
             list_invoices,
             adjust_invoice,
             withdraw_invoice,
+            last_item,
+            cost_tree,
             delete_widget,
             feed,
             raw_feed,

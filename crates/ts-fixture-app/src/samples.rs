@@ -34,8 +34,9 @@ use charpente::serde::Serialize;
 use charpente::wire::{WireI64, WireU64};
 
 use crate::{
-    AdjustInvoiceBody, CreateCustomerBody, Customer, CustomerView, FeedItem, Invoice, InvoicePaid,
-    InvoiceView, InvoiceVoided, LimitExceeded, LineItem, Notification, Payment, Status,
+    AdjustInvoiceBody, CostNode, CreateCustomerBody, Customer, CustomerView, FeedItem, Invoice,
+    InvoicePaid, InvoiceView, InvoiceVoided, LimitExceeded, LineItem, Money, Notification, Payment,
+    Status,
 };
 
 /// The relative path this file is rendered to, named once so the generator,
@@ -104,8 +105,12 @@ pub fn invoice_view(id: Id<Invoice>, customer: Id<Customer>) -> InvoiceView {
         ushort: 16,
         payment: Payment::Card {
             card_number: "4242".to_string(),
+            limit_cents: WireI64(9_007_199_254_740_993),
         },
-        notice: Notification::Progress { percent: 42 },
+        notice: Notification::Progress {
+            percent: 42,
+            bytes_done: WireU64(9_007_199_254_740_993),
+        },
         last_item: FeedItem::Message {
             body: "hello".to_string(),
         },
@@ -116,6 +121,47 @@ pub fn invoice_view(id: Id<Invoice>, customer: Id<Customer>) -> InvoiceView {
         // shared everywhere rather than a one-off.
         adjustment_cents: None,
         late_fee_cents: WireI64(0),
+        // The four collection shapes below (fix round 1, F6) all carry the
+        // same precision-breaking value already used elsewhere in this
+        // specimen, plus at least one element that exercises the OTHER half
+        // of each shape (a negative signed value, an absent map key never
+        // applies here since `Map`'s key is always `string`, a `None`
+        // element in the `Seq(Option(_))` case) -- present, not absent,
+        // since the null/absent halves of `Option`/`Field.optional` are
+        // already the dedicated point of `late_fee_cents`/`adjustment_cents`
+        // above and their own Rust-mechanical tests; this specimen's job is
+        // to prove the PRESENT case executes correctly end to end.
+        installment_cents: vec![WireI64(9_007_199_254_740_993), WireI64(-500)],
+        fees_by_category: BTreeMap::from([("late".to_string(), WireI64(9_007_199_254_740_993))]),
+        refund_batches_cents: Some(vec![WireI64(9_007_199_254_740_993)]),
+        disputed_line_cents: vec![Some(WireI64(9_007_199_254_740_993)), None],
+    }
+}
+
+/// A small recursive tree (fix round 1, F6): `children` reaches `CostNode`
+/// itself (the `Ref` cycle), and each node's `price`/`discount` are two
+/// SIBLING fields of the same `Int64`-bearing `Ref` type (`Money`). One
+/// child, not zero, so the recursive case is a real document a test can
+/// assert on, not just a leaf.
+pub fn cost_tree() -> CostNode {
+    CostNode {
+        label: "root".to_string(),
+        price: Money {
+            cents: WireI64(9_007_199_254_740_993),
+        },
+        discount: Money {
+            cents: WireI64(-500),
+        },
+        children: vec![CostNode {
+            label: "child".to_string(),
+            price: Money {
+                cents: WireI64(1_000),
+            },
+            discount: Money {
+                cents: WireI64(-100),
+            },
+            children: vec![],
+        }],
     }
 }
 
@@ -209,6 +255,7 @@ fn specimens() -> Vec<Specimen> {
             "Payment",
             &Payment::Card {
                 card_number: "4242".to_string(),
+                limit_cents: WireI64(9_007_199_254_740_993),
             },
         ),
         specimen(
@@ -219,7 +266,10 @@ fn specimens() -> Vec<Specimen> {
         specimen(
             "notificationProgress",
             "Notification",
-            &Notification::Progress { percent: 42 },
+            &Notification::Progress {
+                percent: 42,
+                bytes_done: WireU64(9_007_199_254_740_993),
+            },
         ),
         specimen(
             "invoicePaid",
@@ -242,6 +292,9 @@ fn specimens() -> Vec<Specimen> {
                 max_cents: WireI64(9_007_199_254_740_993),
             },
         ),
+        // Fix round 1, F6: the `Ref`-cycle and sibling-`Ref` standing oracle
+        // -- see `cost_tree`'s and `CostNode`'s own doc comments.
+        specimen("costTree", "CostNode", &cost_tree()),
     ]
 }
 

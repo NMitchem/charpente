@@ -13,7 +13,7 @@
 // correcting it here (b0-review Minor 4) rather than in the generated output,
 // which regenerates from this string.
 
-import type { AdjustInvoiceBody, CreateCustomerBody, CustomerView, FeedItem, InvoicePaid, InvoiceView, InvoiceVoided, LimitExceeded, LineItem, Notification, Payment, Status } from "./client";
+import type { AdjustInvoiceBody, CostNode, CreateCustomerBody, CustomerView, FeedItem, InvoicePaid, InvoiceView, InvoiceVoided, LimitExceeded, LineItem, Notification, Payment, Status } from "./client";
 
 /**
  * The wire view of a generated type: what `JSON.parse` of the server's own
@@ -47,15 +47,16 @@ export const statusActive = "active" satisfies WireOf<Status>;
 export const statusOnHold = "on-hold" satisfies WireOf<Status>;
 export const lineItemWithNote = {"unitAmountCents":"1000","quantity":1,"note":"rush"} satisfies WireOf<LineItem>;
 export const lineItemWithoutNote = {"unitAmountCents":"-250","quantity":3} satisfies WireOf<LineItem>;
-export const invoiceView = {"id":"7","customer":"9007199254740993","totalCents":"9007199254740993","sequence":"18446744073709551615","lineItems":[{"unitAmountCents":"-250","quantity":3},{"unitAmountCents":"1000","quantity":1,"note":"rush"}],"tags":["urgent",null],"labels":{"region":"eu"},"paid":true,"ratio":0.5,"ratio32":0.25,"tiny":-8,"small":-16,"medium":-32,"ubyte":8,"ushort":16,"payment":{"type":"Card","card-number":"4242"},"notice":{"kind-of":"Progress","payload":{"percent":42}},"lastItem":{"Message":{"body":"hello"}},"adjustmentCents":null} satisfies WireOf<InvoiceView>;
+export const invoiceView = {"id":"7","customer":"9007199254740993","totalCents":"9007199254740993","sequence":"18446744073709551615","lineItems":[{"unitAmountCents":"-250","quantity":3},{"unitAmountCents":"1000","quantity":1,"note":"rush"}],"tags":["urgent",null],"labels":{"region":"eu"},"paid":true,"ratio":0.5,"ratio32":0.25,"tiny":-8,"small":-16,"medium":-32,"ubyte":8,"ushort":16,"payment":{"type":"Card","card-number":"4242","limit_cents":"9007199254740993"},"notice":{"kind-of":"Progress","payload":{"percent":42,"bytes_done":"9007199254740993"}},"lastItem":{"Message":{"body":"hello"}},"adjustmentCents":null,"installmentCents":["9007199254740993","-500"],"feesByCategory":{"late":"9007199254740993"},"refundBatchesCents":["9007199254740993"],"disputedLineCents":["9007199254740993",null]} satisfies WireOf<InvoiceView>;
 export const feedItemPing = "Ping" satisfies WireOf<FeedItem>;
 export const feedItemAck = {"Ack":"9007199254740993"} satisfies WireOf<FeedItem>;
 export const feedItemMessage = {"Message":{"body":"hello"}} satisfies WireOf<FeedItem>;
 export const feedItemInProgress = {"in-progress":{}} satisfies WireOf<FeedItem>;
 export const paymentCash = {"type":"Cash"} satisfies WireOf<Payment>;
-export const paymentCard = {"type":"Card","card-number":"4242"} satisfies WireOf<Payment>;
+export const paymentCard = {"type":"Card","card-number":"4242","limit_cents":"9007199254740993"} satisfies WireOf<Payment>;
 export const notificationStarted = {"kind-of":"Started"} satisfies WireOf<Notification>;
-export const notificationProgress = {"kind-of":"Progress","payload":{"percent":42}} satisfies WireOf<Notification>;
+export const notificationProgress = {"kind-of":"Progress","payload":{"percent":42,"bytes_done":"9007199254740993"}} satisfies WireOf<Notification>;
 export const invoicePaid = {"invoice":"7","amount_cents":"9007199254740993"} satisfies WireOf<InvoicePaid>;
 export const invoiceVoided = {"invoice":"7"} satisfies WireOf<InvoiceVoided>;
 export const limitExceeded = {"maxCents":"9007199254740993"} satisfies WireOf<LimitExceeded>;
+export const costTree = {"label":"root","price":{"cents":"9007199254740993"},"discount":{"cents":"-500"},"children":[{"label":"child","price":{"cents":"1000"},"discount":{"cents":"-100"},"children":[]}]} satisfies WireOf<CostNode>;

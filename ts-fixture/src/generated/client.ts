@@ -14,6 +14,13 @@ export interface ApiError {
   error: string;
 }
 
+export interface CostNode {
+  label: string;
+  price: Money;
+  discount: Money;
+  children: (CostNode)[];
+}
+
 export interface CreateCustomerBody {
   displayName: string;
   emailAddress: string | null;
@@ -58,6 +65,10 @@ export interface InvoiceView {
   lastItem: FeedItem;
   adjustmentCents: bigint | null;
   lateFeeCents?: bigint;
+  installmentCents: (bigint)[];
+  feesByCategory: Record<string, bigint>;
+  refundBatchesCents: (bigint)[] | null;
+  disputedLineCents: (bigint | null)[];
 }
 
 export interface InvoiceVoided {
@@ -74,13 +85,17 @@ export interface LineItem {
   note?: string | null;
 }
 
+export interface Money {
+  cents: bigint;
+}
+
 export type Notification =
   | { "kind-of": "Started" }
-  | { "kind-of": "Progress"; payload: { percent: number } };
+  | { "kind-of": "Progress"; payload: { percent: number; bytes_done: bigint } };
 
 export type Payment =
   | { type: "Cash" }
-  | { type: "Card"; "card-number": string };
+  | { type: "Card"; "card-number": string; limit_cents: bigint };
 
 export type Status = "active" | "on-hold";
 
@@ -390,13 +405,17 @@ export type FeedEvent =
   | { event: "invoice_paid"; data: InvoicePaid }
   | { event: "invoice_voided"; data: InvoiceVoided };
 
+function reviveCostNode(v: CostNode): CostNode {
+  return { ...v, price: reviveMoney(v.price), discount: reviveMoney(v.discount), children: (v.children).map((x0) => reviveCostNode(x0)) };
+}
+
 function reviveFeedItem(v: FeedItem): FeedItem {
   if (v != null && typeof v === "object" && "Ack" in v) return { ...v, Ack: reviveInt64(v.Ack) };
   return v;
 }
 
 function reviveInvoiceView(v: InvoiceView): InvoiceView {
-  return { ...v, totalCents: reviveInt64(v.totalCents), sequence: reviveInt64(v.sequence), lineItems: (v.lineItems).map((x0) => reviveLineItem(x0)), lastItem: reviveFeedItem(v.lastItem), adjustmentCents: (v.adjustmentCents) == null ? null : (reviveInt64(v.adjustmentCents)), lateFeeCents: (v.lateFeeCents) == null ? (v.lateFeeCents) : (reviveInt64(v.lateFeeCents)) };
+  return { ...v, totalCents: reviveInt64(v.totalCents), sequence: reviveInt64(v.sequence), lineItems: (v.lineItems).map((x0) => reviveLineItem(x0)), payment: revivePayment(v.payment), notice: reviveNotification(v.notice), lastItem: reviveFeedItem(v.lastItem), adjustmentCents: (v.adjustmentCents) == null ? null : (reviveInt64(v.adjustmentCents)), lateFeeCents: (v.lateFeeCents) == null ? (v.lateFeeCents) : (reviveInt64(v.lateFeeCents)), installmentCents: (v.installmentCents).map((x0) => reviveInt64(x0)), feesByCategory: Object.fromEntries(Object.entries(v.feesByCategory).map(([k0, x0]) => [k0, reviveInt64(x0)])), refundBatchesCents: (v.refundBatchesCents) == null ? null : ((v.refundBatchesCents).map((x0) => reviveInt64(x0))), disputedLineCents: (v.disputedLineCents).map((x0) => (x0) == null ? null : (reviveInt64(x0))) };
 }
 
 function reviveLimitExceeded(v: LimitExceeded): LimitExceeded {
@@ -405,6 +424,20 @@ function reviveLimitExceeded(v: LimitExceeded): LimitExceeded {
 
 function reviveLineItem(v: LineItem): LineItem {
   return { ...v, unitAmountCents: reviveInt64(v.unitAmountCents) };
+}
+
+function reviveMoney(v: Money): Money {
+  return { ...v, cents: reviveInt64(v.cents) };
+}
+
+function reviveNotification(v: Notification): Notification {
+  if (v["kind-of"] === "Progress") return { ...v, payload: { ...v.payload, bytes_done: reviveInt64(v.payload.bytes_done) } };
+  return v;
+}
+
+function revivePayment(v: Payment): Payment {
+  if (v.type === "Card") return { ...v, limit_cents: reviveInt64(v.limit_cents) };
+  return v;
 }
 
 export class Api extends ApiBase {
@@ -431,6 +464,16 @@ export class Api extends ApiBase {
   async withdrawInvoice(id: InvoiceId): Promise<Result<InvoiceView, LimitExceeded>> {
     const r = await this.request<InvoiceView, LimitExceeded>("POST", `/invoices/${encodeURIComponent(id)}/withdraw`);
     return r.ok ? { ok: true, data: reviveInvoiceView(r.data) } : { ok: false, error: reviveLimitExceeded(r.error) };
+  }
+
+  async lastItem(id: InvoiceId): Promise<Result<FeedItem, ApiError>> {
+    const r = await this.request<FeedItem, ApiError>("GET", `/invoices/${encodeURIComponent(id)}/last-item`);
+    return r.ok ? { ok: true, data: reviveFeedItem(r.data) } : { ok: false, error: r.error };
+  }
+
+  async costTree(): Promise<Result<CostNode, ApiError>> {
+    const r = await this.request<CostNode, ApiError>("GET", "/cost-tree");
+    return r.ok ? { ok: true, data: reviveCostNode(r.data) } : { ok: false, error: r.error };
   }
 
   async deleteWidget(id: WidgetId): Promise<Result<null, ApiError>> {
