@@ -6043,6 +6043,50 @@ mod fs_object_store {
         });
     }
 
+    /// Step 4 of the atomic PUT — the fsync of the parent directory that
+    /// makes the rename durable — has a cheap oracle for its PRESENCE even
+    /// though its durability has none. `File::open(dir, O_RDONLY)` needs
+    /// read permission on the directory, so a parent at `0o333` (write and
+    /// traverse, no read) fails that one call and only that one: creating
+    /// `<key>.tmp` needs w+x, writing it needs neither, and the rename needs
+    /// w+x. Removing the fsync is otherwise a GREEN mutation — measured, at
+    /// review: the rest of this module stays 11/0 with it gone.
+    ///
+    /// It pins presence and call site, not durability. That is exactly the
+    /// mutation the next author is likeliest to make ("why are we opening a
+    /// directory?"), which is the same argument that put
+    /// `every_op_completes_on_the_first_poll` in this file.
+    #[test]
+    fn a_put_that_cannot_fsync_its_directory_reports_the_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tmp("dirsync");
+        let s = FsObjectStore::new(root.clone());
+        put(&s, "k", &[1; 16]).unwrap(); // creates the bucket directory
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o333)).unwrap();
+        let result = put(&s, "k", &[2; 16]);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let e = result.expect_err(
+            "a PUT whose directory fsync fails must report it — an acked PUT whose new \
+             directory entry is not durable is an object that can vanish across a crash",
+        );
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+
+        // The THIRD outcome the trait's two-outcome sentence does not list:
+        // this PUT failed and the key holds the NEW value. Benign, and
+        // exactly archive spec §7's "PUT lands but the ack is lost" row —
+        // the archive's retry is idempotent. Pinned so it is a known
+        // property of this impl rather than a surprise.
+        assert_eq!(
+            get(&s, "k").unwrap(),
+            vec![2; 16],
+            "the rename had already happened; only the directory fsync failed"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// Spec §4b bounds every `ObjectStore` drive loop at 10,000 polls. That
     /// bound is an ITERATION COUNT, not a timeout, and it is harmless only
     /// while stores complete on the first poll. This store does — pinned
