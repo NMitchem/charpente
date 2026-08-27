@@ -460,7 +460,11 @@ destination and it is true by construction; post-discard failures name the parti
 say not to start a node on it, and name the re-run as the remedy. Any refusal text that is
 true at one call site and false at another must be parameterised by site rather than shared
 — `verify_segment` is called from both phases and its "corruption is never imported" clause
-is the pre-discard one only. This paragraph is binding: a claim here that the text does not
+is the pre-discard one only. And no message inside either phase may RE-STATE its wrapper's
+clause: the wrapper appends it, so a refusal that also hardcodes it doubles the sentence in
+real operator output — measured at Task 11 in `check_generation`'s two refusals, which
+produced "…Refusing; nothing in the destination has been touched. Nothing in the destination
+has been touched". True twice is still a hard-rule-5 defect. This paragraph is binding: a claim here that the text does not
 make is a hard-rule-5 defect, which is what a review found the first time this was
 written (Task 10 C-1).
 

@@ -122,7 +122,14 @@ pub fn restore(
     opts: RestoreOpts,
     notice: &mut dyn FnMut(&str),
 ) -> io::Result<RestoreReport> {
-    // THE ONE PLACE EITHER CLAIM IS MADE. Every failure below reaches the
+    // THE ONE PLACE EITHER CLAIM IS MADE, and no message below may repeat
+    // either clause — measured at Task 11: `check_generation` hardcoded
+    // "nothing in the destination has been touched" at both of its refusals,
+    // so the wrapper DOUBLED the sentence in real operator output ("…Refusing;
+    // nothing in the destination has been touched. Nothing in the destination
+    // has been touched"). Still true, so not a correctness bug; still a
+    // hard-rule-5 defect, because a sentence an operator reads twice reads as
+    // a program that lost its place. Every failure below reaches the
     // operator through exactly one of these two wrappers, so "nothing was
     // touched" and "a partial restore is sitting there" cannot drift apart
     // per message — which is how this defect arrived (Task 8's R-1, its
@@ -429,8 +436,7 @@ fn check_generation(m: &Manifest, meta: &SnapshotMeta, meta_key: &str) -> io::Re
             io::ErrorKind::InvalidData,
             format!(
                 "restore: generation {} disagrees with itself on the {disagreement} — \
-                 \"{meta_key}\" is not the snapshot this manifest names. Refusing; nothing in \
-                 the destination has been touched",
+                 \"{meta_key}\" is not the snapshot this manifest names. Refusing",
                 m.generation
             ),
         ));
@@ -447,9 +453,8 @@ fn check_generation(m: &Manifest, meta: &SnapshotMeta, meta_key: &str) -> io::Re
             format!(
                 "restore: generation {}'s chain starts at base_seq {} but its snapshot's \
                  frontier is {} — records {}..={} are in neither the snapshot nor the chain, \
-                 so this generation has a hole and cannot be restored from. Refusing; nothing \
-                 in the destination has been touched. Restore an earlier generation, or \
-                 archive a fresh one from a live node",
+                 so this generation has a hole and cannot be restored from. Refusing. \
+                 Restore an earlier generation, or archive a fresh one from a live node",
                 m.generation,
                 first.base_seq,
                 meta.applied_seq,

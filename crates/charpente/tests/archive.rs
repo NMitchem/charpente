@@ -5702,6 +5702,97 @@ fn a_store_that_never_completes_is_refused_rather_than_spun_on() {
     );
 }
 
+// ------------- Task 11 / N-1: the refusal sentence, said exactly once
+
+/// Overwrites the bucket's manifest with `m` — the shape a bucket takes when
+/// the two objects describing one generation stop agreeing.
+fn put_manifest(store: &SimObjectStore, m: &Manifest) {
+    store
+        .start(ObjectOp::Put {
+            key: manifest_key(PREFIX),
+            data: m.encode(),
+        })
+        .unwrap();
+    drain(store).unwrap();
+}
+
+/// How many times the pre-write promise appears in one operator-facing
+/// error. The answer is always 1: `untouched` is the only place it is said.
+fn untouched_claims(text: &str) -> usize {
+    text.to_lowercase()
+        .matches("nothing in the destination has been touched")
+        .count()
+}
+
+/// N-1. `restore.rs`'s wrapper comment claims to be "THE ONE PLACE EITHER
+/// CLAIM IS MADE"; `check_generation` hardcoded the same promise at both of
+/// its refusals, so real output carried it twice — measured verbatim:
+///
+/// > …Refusing; nothing in the destination has been touched. Nothing in the
+/// > destination has been touched
+///
+/// True both times, which is why no test caught it: the defect is that an
+/// operator reads the same sentence twice at the moment they are deciding
+/// what to do. Pinned at both sites, because a wrapper that is the single
+/// source of a claim is only single as long as nobody re-states it.
+#[test]
+fn a_generation_that_disagrees_with_itself_makes_the_untouched_claim_once() {
+    let (_src, store) = archived_db_with_rows(500);
+    let mut m = read_manifest(&store).expect("a manifest");
+    m.applied_seq += 1; // the meta still holds the real frontier
+    put_manifest(&store, &m);
+
+    let sim = fresh_sim();
+    let t = run_restore(&store, &sim, restore_opts())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        t.contains("disagrees with itself"),
+        "must name the contract: {t}"
+    );
+    assert!(
+        t.contains(&snapshot_meta_key(PREFIX, m.generation)),
+        "must name the site — the object that is not the snapshot named: {t}"
+    );
+    assert_eq!(
+        untouched_claims(&t),
+        1,
+        "the pre-write promise must be made exactly once: {t}"
+    );
+}
+
+#[test]
+fn a_generation_with_a_hole_makes_the_untouched_claim_once() {
+    let (_src, store) = archived_db_with_rows(500);
+    let m = read_manifest(&store).expect("a manifest");
+    let meta = read_snapshot_meta(&store, m.generation).expect("a snapshot meta");
+    let mut m = m;
+    assert!(
+        !m.segments.is_empty(),
+        "fixture must archive a chain, or this branch is unreachable"
+    );
+    m.segments[0].base_seq = meta.applied_seq + 5; // records the generation now holds nowhere
+    put_manifest(&store, &m);
+
+    let sim = fresh_sim();
+    let t = run_restore(&store, &sim, restore_opts())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        t.contains("has a hole and cannot be restored from"),
+        "must name the contract: {t}"
+    );
+    assert!(
+        t.contains("archive a fresh one from a live node"),
+        "must name the fix: {t}"
+    );
+    assert_eq!(
+        untouched_claims(&t),
+        1,
+        "the pre-write promise must be made exactly once: {t}"
+    );
+}
+
 // ------------------------------- Task 11: the filesystem `ObjectStore`
 //
 // The same contract `charpente-sim/src/object.rs`'s test module pins for
