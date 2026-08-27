@@ -128,6 +128,9 @@ pub const RESTORE_USAGE: &str = "usage: <app> restore --from BUCKET --prefix PRE
        --to DIR         the data directory to rebuild (default: this app's own data directory)\n\
        --force          discard a destination timeline the archive cannot prove is its own\n\
 \n\
+Stop the node before restoring into its data directory. Restore discards the store file and\n\
+the WAL outright, and nothing detects a process still serving from them.\n\
+\n\
 Restore REPLACES a data directory; it never merges into one. Restoring IN PLACE over a node\n\
 that has run since its last restore is the ordinary case, not an edge case, and it needs\n\
 --force: the destination is then ahead of the archive, and --force destroys every record it\n\
@@ -792,6 +795,14 @@ mod tests {
         assert!(
             RESTORE_USAGE.contains("job queue") || RESTORE_USAGE.contains("pending jobs"),
             "the help must say the job queue comes back: {RESTORE_USAGE}"
+        );
+        // The one way this verb leaves an operator worse off that nothing in
+        // the code detects: restore discards the store file and the WAL of a
+        // directory a node may still be serving from. No lock exists, so the
+        // help text is the whole mitigation.
+        assert!(
+            RESTORE_USAGE.contains("Stop the node"),
+            "the help must say to stop the node first: {RESTORE_USAGE}"
         );
         assert!(
             LAUNCH_USAGE.contains("restore"),

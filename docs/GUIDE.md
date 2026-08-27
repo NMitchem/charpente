@@ -3781,6 +3781,13 @@ restored generation 7 into "./data"
   exactly-once-observable)
 ```
 
+### Stop the node first
+
+Restore discards the destination's store file and its whole `wal/` directory before it
+writes anything, and **nothing detects a process still serving from them** — there is no
+lock, and `restore` cannot tell a live data directory from a dead one. Stop the node, then
+restore.
+
 ### Restoring in place needs `--force`, and `--force` destroys records
 
 Read this before you need it.
