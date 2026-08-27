@@ -12,6 +12,7 @@
 //! 4. `class Api extends ApiBase` — one member per route, in mount order.
 
 mod events;
+mod revive;
 mod routes;
 mod runtime;
 mod types;
@@ -39,6 +40,7 @@ pub fn emit_client(c: &Contract) -> String {
     out.push_str(runtime::RUNTIME);
     out.push('\n');
     out.push_str(&events::emit_unions(c));
+    out.push_str(&revive::emit_revivers(c));
     out.push_str(CLASS_DECL);
     let mut body = routes::emit_methods(c);
     body.push_str(&events::emit_methods(c));

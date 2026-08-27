@@ -182,6 +182,7 @@ pub(crate) fn path_expr(r: &RouteInfo) -> String {
 
 /// One `async` method per non-stream route, in mount order.
 pub(crate) fn emit_methods(c: &Contract) -> String {
+    let types = crate::revive::type_map(c);
     let mut out = String::new();
     for r in c.routes.iter().filter(|r| !r.stream) {
         let ok = ts_type(&r.response, &format!("response of route `{}`", r.name));
@@ -204,12 +205,36 @@ pub(crate) fn emit_methods(c: &Contract) -> String {
             camel(r.name),
             args.join(", ")
         );
-        let _ = writeln!(
-            out,
-            "    return this.request<{ok}, {err}>({:?}, {}{body});",
-            r.method,
-            path_expr(r)
-        );
+        // Chunk B1b: a route whose response or error transitively contains
+        // an `Int64` (chunk-b1a-brief.md's decision, restated in
+        // chunk-b1b-brief.md A2) gets its result revived HERE, in the
+        // generated method — `request()` itself keeps its plain
+        // `parsed as T` / `parsed as E` verbatim, unchanged since B1a. The
+        // common case (no `Int64` anywhere in either half) stays the exact
+        // one-line `return this.request(...)` it always was (A5).
+        let ok_expr = crate::revive::revive_expr(&r.response, "r.data", &types, 0);
+        let err_expr = crate::revive::revive_expr(&r.error, "r.error", &types, 0);
+        if ok_expr.is_none() && err_expr.is_none() {
+            let _ = writeln!(
+                out,
+                "    return this.request<{ok}, {err}>({:?}, {}{body});",
+                r.method,
+                path_expr(r)
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "    const r = await this.request<{ok}, {err}>({:?}, {}{body});",
+                r.method,
+                path_expr(r)
+            );
+            let data = ok_expr.unwrap_or_else(|| "r.data".to_string());
+            let error = err_expr.unwrap_or_else(|| "r.error".to_string());
+            let _ = writeln!(
+                out,
+                "    return r.ok ? {{ ok: true, data: {data} }} : {{ ok: false, error: {error} }};"
+            );
+        }
         out.push_str("  }\n\n");
     }
     out

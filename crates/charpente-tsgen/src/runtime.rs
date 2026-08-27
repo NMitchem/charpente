@@ -36,6 +36,7 @@ pub const RESERVED: &[&str] = &[
     "SubscribeOptions",
     "UndeclaredEvent",
     "UnknownEvent",
+    "reviveInt64",
     "sseValue",
 ];
 
@@ -298,5 +299,39 @@ export class ApiBase {
 function sseValue(line: string, at: number): string {
   const v = line.slice(at);
   return v.startsWith(" ") ? v.slice(1) : v;
+}
+
+/**
+ * The one `Int64` revive primitive every generated walker calls (chunk B1b):
+ * `JSON.parse` hands back a decimal STRING wherever the schema says `Int64`
+ * (a `bigint` in the generated types), because `BigInt(str)` is lossless and
+ * a JSON number is not (spec §1) — this is the other half of that trade.
+ *
+ * Converts ONLY when `v` really is a string. `BigInt(null)` and
+ * `BigInt(undefined)` both THROW ("Cannot convert null/undefined to a
+ * BigInt", measured) — and null/undefined is exactly what an absent
+ * `Option<Int64>` or a `skip_serializing_if`-omitted `Int64` field hands
+ * this function, on a document the server was correct to send. Every
+ * generated call site already guards those two cases with its own
+ * null-check before ever reaching here (an `Option` position never even
+ * calls this on `null`), so this `typeof` check is normally a formality —
+ * it is written anyway because it is the one place A1's "convert only
+ * strings, never throw on null/undefined" rule can be stated once instead
+ * of trusted to every call site that wraps it.
+ *
+ * `""` and a hex-looking string are NOT special-cased: `BigInt("")` is `0n`
+ * and `BigInt("0x10")` is `16n`. Guarding either would be validating the
+ * server's document rather than narrowly converting it — the same line
+ * `request()`'s own doc comment already draws for the payload as a whole.
+ *
+ * The `as bigint` in the untaken branch is the same kind of boundary cast
+ * `request()`'s `parsed as T` already is: every REACHABLE call in generated
+ * code only takes this branch when `v` is not a string (a value some outer
+ * null-check has already let through unchanged, e.g. `null`), so the static
+ * type here is a promise about how this is called, not a runtime guarantee
+ * — exactly the gap spec §1 exists to name elsewhere in this file.
+ */
+function reviveInt64(v: unknown): bigint {
+  return typeof v === "string" ? BigInt(v) : (v as bigint);
 }
 "##;
