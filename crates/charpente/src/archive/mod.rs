@@ -425,6 +425,13 @@ struct SnapshotWalk {
     /// manifest's frontier has to be the one the rows came from.
     applied_seq: u64,
     next_job_id: u64,
+    /// Read off the same MVCC view as `next_job_id`, and shipped for the
+    /// same reason: `Seeder::finish` takes it and restore cannot derive it
+    /// from the rows (`SnapshotMeta::next_event_id`).
+    next_event_id: u64,
+    /// `frame_crc` of the record AT `applied_seq` — see
+    /// `SnapshotMeta::frontier_crc` for why the chain cannot supply it.
+    frontier_crc: u32,
     /// `Db::table_names()`, schema-sorted, including the platform-owned
     /// tables (jobs, events, schema versions) whose rows restore needs.
     tables: Vec<&'static str>,
@@ -616,6 +623,37 @@ fn put_step(
 /// rather than by search, since `Manifest::applied_seq` is the seq a restore
 /// replays from. What ruling 53 removes is the UNBOUNDED part: every segment
 /// lying wholly below `F`, which is the whole log at a fresh generation.
+/// `frame_crc` of the record AT `frontier` — `SnapshotMeta::frontier_crc`,
+/// and the fourth argument restore hands `Seeder::finish`.
+///
+/// The ladder is `repl/session.rs::begin_seeding`'s, verbatim and for the
+/// same reason, because it is answering the identical question about the
+/// identical value: normally the frame is retained and `read_log` returns
+/// it (`Db::checkpoint`'s gc removes a segment only when the NEXT segment's
+/// base is at or below `keep_from <= applied + 1`, so the segment holding
+/// the current frontier is never its own checkpoint's victim); a node that
+/// was itself seeded or restored and has committed nothing since holds no
+/// frame at `frontier` at all, and chains through the frontier its builder
+/// vouched. A node that can do neither cannot vouch a frontier, and the
+/// refusal propagates by name rather than being papered over with a zero —
+/// a generation whose `frontier_crc` was invented is a generation whose
+/// restore would hand a replication peer a claim nothing backs.
+fn frontier_crc(db: &Db, frontier: u64) -> io::Result<u32> {
+    match db.read_log(frontier, 1) {
+        Ok(frames) => Ok(frames
+            .first()
+            .map(|(s, p)| frame_crc(*s, p))
+            .expect("read_log(frontier, 1) returns that frame when it does not refuse")),
+        Err(e) if e.kind() == io::ErrorKind::InvalidData && frontier < db.log_base() => {
+            match db.seed_frontier()? {
+                Some((seed_seq, crc)) if seed_seq == frontier => Ok(crc),
+                _ => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn chain_start(db: &Db, frontier: u64) -> io::Result<u64> {
     // `F + 1`, never `F`: `applied_seq` is INCLUSIVE, so a frontier landing
     // exactly on a `layout_end` belongs wholly to the snapshot and the chain
@@ -1691,6 +1729,8 @@ impl Archive {
             return Ok(false);
         };
         let next_job_id = snapshot.next_job_id()?;
+        let next_event_id = snapshot.next_event_id()?;
+        let frontier_crc = frontier_crc(db, applied_seq)?;
         // RULING 53 / spec §2: the chain this generation is about to build
         // CONTINUES this snapshot rather than overlapping it. Sited here,
         // before the walk is committed to `self.state`, for two reasons: the
@@ -1712,6 +1752,8 @@ impl Archive {
                 snapshot,
                 applied_seq,
                 next_job_id,
+                next_event_id,
+                frontier_crc,
                 tables: db.table_names(),
                 table: 0,
                 after_id: None,
@@ -1734,6 +1776,8 @@ impl Archive {
             let meta = SnapshotMeta {
                 applied_seq: walk.applied_seq,
                 next_job_id: walk.next_job_id,
+                next_event_id: walk.next_event_id,
+                frontier_crc: walk.frontier_crc,
                 tables: walk.done,
             };
             // The walk (and with it the redb read transaction) is dropped

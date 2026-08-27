@@ -4734,3 +4734,46 @@ fn a_failing_archive_still_lets_the_kernel_park() {
          measures an archive that was never scheduled rather than one that failed"
     );
 }
+
+// ------------- T10 prerequisite: the snapshot meta carries what Seeder needs
+
+/// `Seeder::finish` takes FOUR values (`applied_seq`, `next_job_id`,
+/// `next_event_id`, `frontier_crc`) and until this task the generation's
+/// snapshot meta carried two of them. Neither missing value is derivable
+/// from the bucket — see `SnapshotMeta`'s own docs — so restore would have
+/// had to invent them. This is the oracle that they are READ off the same
+/// MVCC view the rows came from, not invented here either.
+#[test]
+fn the_snapshot_meta_carries_the_event_counter_and_the_frontier_crc() {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
+    snapshot_then_chain(&mut arc, &mut db, &store, RECORDS_PER_SEGMENT);
+
+    let m = read_manifest(&store).expect("a manifest");
+    let meta = read_snapshot_meta(&store, m.generation).expect("a snapshot meta");
+
+    // The frame at the snapshot's frontier, read back out of the SOURCE's own
+    // log and re-checksummed here — so this compares two independent
+    // computations of the same value, not the archive's against itself.
+    let frame = db
+        .read_log(meta.applied_seq, 1)
+        .expect("the frontier frame is retained")
+        .into_iter()
+        .next()
+        .expect("read_log returns the frame it does not refuse");
+    assert_eq!(frame.0, meta.applied_seq);
+    assert_eq!(
+        meta.frontier_crc,
+        charpente_core::log::frame_crc(frame.0, &frame.1),
+        "the meta's frontier_crc is not the checksum of the record at its own frontier"
+    );
+
+    // `next_event_id` is a meta counter, not a row property: the fixture
+    // emits no events, so the honest oracle is that the archive shipped the
+    // Db's own counter rather than a zero it happened to match.
+    assert_eq!(meta.next_event_id, db.next_event_id().unwrap());
+    assert_eq!(
+        meta.next_job_id,
+        db.snapshot().unwrap().next_job_id().unwrap()
+    );
+}

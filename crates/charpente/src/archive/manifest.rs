@@ -61,9 +61,11 @@ use charpente_core::crc::crc32;
 pub(crate) const MANIFEST_MAX_BYTES: usize = 16 << 20;
 
 /// Upper bound on a `<gen>/snapshot/meta` object, same reasoning and same
-/// per-table figures as `MANIFEST_MAX_BYTES`: fixed fields (8 + 8 + 4 + 4)
-/// = 24, plus 4,096 tables x (4 + 255-byte name + 8-byte batch count) =
-/// 1,093,632, = 1,093,656 bytes. 2 MiB clears that with room to spare.
+/// per-table figures as `MANIFEST_MAX_BYTES`: fixed fields (applied_seq 8 +
+/// next_job_id 8 + next_event_id 8 + frontier_crc 4 + table count 4 +
+/// trailing CRC 4) = 36, plus 4,096 tables x (4 + 255-byte name + 8-byte
+/// batch count) = 1,093,632, = 1,093,668 bytes. 2 MiB clears that with room
+/// to spare.
 ///
 /// The `<table>/<n>` batch objects get no such constant on purpose: their
 /// size is a property of the rows in them, not of the schema, so no honest
@@ -539,6 +541,28 @@ pub struct SnapshotMeta {
     /// `applied_seq + 1`.
     pub applied_seq: u64,
     pub next_job_id: u64,
+    /// The event id counter at `applied_seq`. Carried for the same reason
+    /// `next_job_id` is: `Seeder::finish` takes it, `Store::apply` assigns
+    /// event ids from it, and it is NOT derivable from the rows this
+    /// generation ships — `Db::checkpoint`'s event GC deletes every row
+    /// below `next_event_id - DbConfig::event_retention`, so an
+    /// `event_retention` of 0 leaves an empty `charpente.events` table
+    /// beside a non-zero counter. A restore that guessed `max(id) + 1`
+    /// would re-issue ids that already existed (Task 10, R-3).
+    pub next_event_id: u64,
+    /// `frame_crc` of the WAL record AT `applied_seq` — the same value
+    /// `Msg::SnapshotStart` carries for a network seed, and the fourth
+    /// argument `Seeder::finish` takes. It is what lets a restored node
+    /// prove its own frontier to a replication peer (`Db::seed_frontier`),
+    /// and it is unrecoverable from the bucket without this field: the
+    /// generation's chain starts at the segment holding `applied_seq + 1`,
+    /// so when that boundary falls exactly on a segment base — or when
+    /// nothing has sealed above the snapshot yet — the frame at
+    /// `applied_seq` lies wholly below the frontier and ruling 53 says the
+    /// archive never ships it. That is precisely the case where the value
+    /// is consulted, since a non-empty chain replays the restored node past
+    /// `applied_seq` and both `seed_frontier` readers ignore it then.
+    pub frontier_crc: u32,
     /// Every registered table, in `Db::table_names()` (schema-sorted) order.
     pub tables: Vec<TableBatches>,
 }
@@ -548,6 +572,8 @@ impl SnapshotMeta {
         let mut buf = Vec::new();
         buf.extend_from_slice(&self.applied_seq.to_le_bytes());
         buf.extend_from_slice(&self.next_job_id.to_le_bytes());
+        buf.extend_from_slice(&self.next_event_id.to_le_bytes());
+        buf.extend_from_slice(&self.frontier_crc.to_le_bytes());
         buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
         for t in &self.tables {
             // F6, negative space (hard rule 4): `snapshot_batch_key` already
@@ -591,6 +617,8 @@ impl SnapshotMeta {
         let mut r = Reader::new(body, "snapshot meta");
         let applied_seq = r.u64()?;
         let next_job_id = r.u64()?;
+        let next_event_id = r.u64()?;
+        let frontier_crc = r.u32()?;
         // 12 = the 4-byte name length prefix plus the 8-byte batch count; a
         // zero-length name is refused below, so this is the true minimum.
         let count = expect_count(&mut r, 12, "tables")?;
@@ -613,6 +641,8 @@ impl SnapshotMeta {
         Ok(SnapshotMeta {
             applied_seq,
             next_job_id,
+            next_event_id,
+            frontier_crc,
             tables,
         })
     }
@@ -1179,6 +1209,8 @@ mod tests {
         SnapshotMeta {
             applied_seq: 4_094,
             next_job_id: 17,
+            next_event_id: 23,
+            frontier_crc: 0xdead_beef,
             tables: vec![
                 TableBatches {
                     name: "Rec".to_string(),
@@ -1254,6 +1286,8 @@ mod tests {
         SnapshotMeta {
             applied_seq: 1,
             next_job_id: 0,
+            next_event_id: 0,
+            frontier_crc: 0,
             tables: vec![TableBatches {
                 name: "a/b".to_string(),
                 // Zero rows: the case that never builds a batch key, and so
@@ -1270,6 +1304,8 @@ mod tests {
         SnapshotMeta {
             applied_seq: 1,
             next_job_id: 0,
+            next_event_id: 0,
+            frontier_crc: 0,
             tables: vec![TableBatches {
                 name: String::new(),
                 batches: 0,

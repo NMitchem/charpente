@@ -144,7 +144,8 @@ being explicit rather than assumed.
 
 ```
 <prefix>/manifest                            — generation pointer, CRC'd
-<prefix>/<gen>/snapshot/meta                 — applied_seq, next_job_id, table list, CRC
+<prefix>/<gen>/snapshot/meta                 — applied_seq, next_job_id, next_event_id,
+                                               frontier_crc, table list, CRC
 <prefix>/<gen>/snapshot/<table>/<n>          — batched raw (id, bytes), scan_raw_from
 <prefix>/<gen>/segments/<base_seq:020>.log   — sealed WAL segments, verbatim
 ```
@@ -362,7 +363,14 @@ be able to halt the thing it derives from.
 
 1. `Get` the manifest, verify CRC, read the newest generation.
 2. `Get` the snapshot meta and every table's row batches.
-3. Drive `Seeder`: `rows` per table, `set_import_meta`, `finish` at horizon+1.
+3. Drive `Seeder`: `rows` per table, then `finish` at horizon+1 (there is no
+   separate `Seeder::set_import_meta` — `finish` folds it in, and takes all four of
+   `applied_seq`, `next_job_id`, `next_event_id` and `frontier_crc`). The last two are
+   why `snapshot/meta` carries them: neither is derivable from the objects a generation
+   ships. `next_event_id` is a meta counter whose rows `Db::checkpoint`'s event GC can
+   have deleted entirely, and the frame at `applied_seq` lies *below* the chain whenever
+   the frontier falls on a segment boundary — which is exactly when a restored node's
+   `seed_frontier` is the value a replication peer reads. Added Task 10.
 4. `Get` the segment chain and lay it into `wal/`, verifying each frame CRC.
 5. Hand off to ordinary `Db::open`, which replays from `applied_seq + 1`.
 
