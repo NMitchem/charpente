@@ -329,3 +329,51 @@ fn an_app_crate_with_no_binary_exits_two_not_one() {
         stderr(&result)
     );
 }
+
+/// Fix-round-2 finding: A3's `--bin` plumbing had no permanent test, and the
+/// reviewer showed it can be severed by accident — passing `None`
+/// unconditionally at `client_for`'s two call sites, instead of
+/// `parsed.bin.as_deref()` — with the entire suite staying green, because no
+/// existing test forces `--bin` to pick a DIFFERENT binary than the default
+/// would resolve to on its own.
+///
+/// `examples/invoicing` already has two binaries in tree (read-only, per
+/// this file's header comment): `invoicing` (what `--bin`'s omission
+/// resolves to, via `describe.rs`'s package-name fallback, since the
+/// package is also named "invoicing") and `node` (the edge-harness process-
+/// control binary — it does not call `charpente::launch` and does not
+/// implement `describe` at all). That difference is exactly the lever this
+/// test needs: if `--bin node` reaches `describe::contract_json`, the child
+/// process is `node describe --format json`, and `node`'s own argv parser
+/// rejects `"describe"` as an unknown flag and exits 2 — a specific,
+/// reproducible failure that only happens when the flag actually arrives.
+/// If `--bin` were dropped between `parse` and `client_for`, this would
+/// silently resolve to `invoicing` instead (the same as passing no `--bin`
+/// at all) and exit 0, and this test would catch that with a green-vs-red
+/// flip rather than requiring a new fixture crate.
+#[test]
+fn the_bin_flag_reaches_the_actual_binary_choice_for_both_verbs() {
+    for verb in ["gen-client", "check-client"] {
+        let out = out_path(&format!("bin-thread-{verb}"));
+        let result = run(&[
+            verb,
+            "--dir",
+            &invoicing_dir(),
+            "--bin",
+            "node",
+            "--out",
+            out.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "{verb}: --bin must reach describe's binary choice, not be parsed and dropped\nstderr: {}",
+            stderr(&result)
+        );
+        assert!(
+            stderr(&result).contains("node"),
+            "{verb}: must name the binary that failed: {}",
+            stderr(&result)
+        );
+    }
+}
