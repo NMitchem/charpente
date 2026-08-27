@@ -181,7 +181,22 @@ export class ApiBase {
     const res = await fetch(this.baseUrl + path, {
       method,
       headers: this.headers(body !== undefined),
-      body: body === undefined ? undefined : JSON.stringify(body),
+      // A replacer, not a schema walk: it sees each value BEFORE
+      // serialization, so converting every bigint it meets is sound with no
+      // knowledge of which field is `Int64` -- unlike the INBOUND direction
+      // (`parsed as T` below), where `JSON.parse` has already thrown the
+      // precision away by the time anything could revive it, which is why
+      // that direction needs a schema-directed walk and this one does not.
+      // A type-checked call site can only ever hand this a bigint where the
+      // schema put one, so "convert every bigint" and "convert only Int64
+      // positions" agree in practice; this is wider in principle but checks
+      // and rejects nothing, so it is not the validator A3 forbids.
+      body:
+        body === undefined
+          ? undefined
+          : JSON.stringify(body, (_k, v) =>
+              typeof v === "bigint" ? v.toString() : v,
+            ),
     });
     const text = await res.text();
     // A non-JSON body is a protocol violation, not an `E`: this throws rather

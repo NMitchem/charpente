@@ -73,6 +73,18 @@ pub struct CreateCustomerBody {
     pub email_address: Option<String>,
 }
 
+/// A request body carrying an `Int64` (chunk B1a, A2 of `chunk-b1-brief.md`):
+/// before this route existed, the fixture's only request body
+/// (`CreateCustomerBody` above) had no `bigint` position, so nothing exercised
+/// the generated client's outbound serialization of one. `JSON.stringify` on
+/// a bigint throws — see `charpente-tsgen/src/runtime.rs`'s replacer comment.
+#[derive(WireDerive, Serialize, Deserialize)]
+#[serde(crate = "::charpente::serde")]
+#[serde(rename_all = "camelCase")]
+pub struct AdjustInvoiceBody {
+    pub delta_cents: WireI64,
+}
+
 #[derive(WireDerive, Serialize, Deserialize)]
 #[serde(crate = "::charpente::serde")]
 #[serde(rename_all = "camelCase")]
@@ -232,6 +244,20 @@ pub fn list_invoices(tx: &mut Tx) -> Result<Vec<InvoiceView>, ApiError> {
         .collect())
 }
 
+/// The route that reaches an `Int64` in a REQUEST body (chunk B1a's coverage
+/// gap, A2). The handler is a stub like its neighbours — nothing here is
+/// executed in anger — so `body` is unused past being deserialized.
+#[route(POST "/invoices/:id/adjust")]
+pub fn adjust_invoice(
+    tx: &mut Tx,
+    id: Id<Invoice>,
+    body: AdjustInvoiceBody,
+) -> Result<InvoiceView, ApiError> {
+    let inv = tx.get(id)?.ok_or(ApiError::NotFound)?;
+    let _ = body;
+    Ok(samples::invoice_view(inv.id, inv.customer))
+}
+
 /// `-> Result<(), ApiError>`: the response schema is `Null`, the JSON
 /// literal `null`, which is a different document from `{}`. Also the one
 /// route whose `Id<Widget>` never appears in any registered wire type.
@@ -276,6 +302,7 @@ pub fn build_app(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> std::io::Res
             create_customer,
             get_invoice,
             list_invoices,
+            adjust_invoice,
             delete_widget,
             feed,
             raw_feed,

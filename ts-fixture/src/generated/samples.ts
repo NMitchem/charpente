@@ -6,9 +6,14 @@
 // so a serde rename the type IR missed is a `tsc` error here rather than a
 // generated type that is wrong and compiles (TS-codegen spec §5).
 //
-// Nothing here is imported by application code; existing is the whole job.
+// Nothing in APPLICATION code imports this file directly — but as of chunk
+// B0, the `*.test.ts` files DO import these literals as runtime values, to
+// feed the fetch stub real serde documents end to end. "Existing is the whole
+// job" stopped being true the moment a test started running against it;
+// correcting it here (b0-review Minor 4) rather than in the generated output,
+// which regenerates from this string.
 
-import type { CreateCustomerBody, CustomerView, FeedItem, InvoicePaid, InvoiceView, InvoiceVoided, LineItem, Notification, Payment, Status } from "./client";
+import type { AdjustInvoiceBody, CreateCustomerBody, CustomerView, FeedItem, InvoicePaid, InvoiceView, InvoiceVoided, LineItem, Notification, Payment, Status } from "./client";
 
 /**
  * The wire view of a generated type: what `JSON.parse` of the server's own
@@ -32,6 +37,7 @@ type WireOf<T> =
   : T;
 
 export const createCustomerBody = {"displayName":"Ada","emailAddress":"ada@example.com"} satisfies WireOf<CreateCustomerBody>;
+export const adjustInvoiceBody = {"deltaCents":"9007199254740993"} satisfies WireOf<AdjustInvoiceBody>;
 export const customerView = {"id":"9007199254740993","displayName":"Ada","emailAddress":null,"status":"on-hold"} satisfies WireOf<CustomerView>;
 export const statusActive = "active" satisfies WireOf<Status>;
 export const statusOnHold = "on-hold" satisfies WireOf<Status>;
