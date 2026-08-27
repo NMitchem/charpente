@@ -122,11 +122,11 @@ pub(crate) fn dispatch(
 /// `restore`'s own help. Long on purpose: an operator meets `--force` here
 /// or in an incident, and archive spec §6 makes two consequences of running
 /// this command things they must know BEFORE they run it, not after.
-pub const RESTORE_USAGE: &str = "usage: <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]\n\
-       --from BUCKET    the archive's root directory (the bucket an archive wrote)\n\
-       --prefix PREFIX  the key prefix that archive owned — ArchiveConfig::prefix, verbatim\n\
-       --to DIR         the data directory to rebuild (default: this app's own data directory)\n\
-       --force          discard a destination timeline the archive cannot prove is its own\n\
+pub const RESTORE_USAGE: &str = "usage: <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]\n       \
+--from BUCKET    the archive's root directory (the bucket an archive wrote)\n       \
+--prefix PREFIX  the key prefix that archive owned — ArchiveConfig::prefix, verbatim\n       \
+--to DIR         the data directory to rebuild (default: this app's own data directory)\n       \
+--force          discard a destination timeline the archive cannot prove is its own\n\
 \n\
 Stop the node before restoring into its data directory. Restore discards the store file and\n\
 the WAL outright, and nothing detects a process still serving from them.\n\
@@ -511,9 +511,20 @@ mod tests {
             "docs/GUIDE.md no longer quotes LAUNCH_USAGE verbatim — the doc is the spec, so \
              update the quoted block to:\n{LAUNCH_USAGE}"
         );
+        // Against the CONSTANT, never a copy of it. A hardcoded literal here
+        // was blind in exactly the direction I-1 came from — the constant
+        // moving underneath the quote — and verified blind: renaming a word
+        // in RESTORE_USAGE left this green. GUIDE §14 quotes the usage line
+        // and the flag list, which is RESTORE_USAGE up to its first blank
+        // line; the prose below that is the GUIDE's own.
+        let flags = RESTORE_USAGE
+            .split("\n\n")
+            .next()
+            .expect("split yields at least one part");
         assert!(
-            GUIDE.contains("--force          discard a destination timeline"),
-            "docs/GUIDE.md must quote restore's flag list as RESTORE_USAGE states it"
+            GUIDE.contains(flags),
+            "docs/GUIDE.md no longer quotes RESTORE_USAGE's flag list verbatim — update the \
+             quoted block in §14 to:\n{flags}"
         );
     }
 

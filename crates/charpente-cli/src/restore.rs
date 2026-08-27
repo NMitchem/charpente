@@ -15,17 +15,18 @@ use crate::describe::{build_and_locate, exit_code_for};
 
 const KNOWN_FLAGS: &[&str] = &["--dir", "--bin", "--from", "--to", "--prefix"];
 
-pub const USAGE: &str = "usage: charpente restore --from BUCKET --prefix PREFIX [--to DIR] [--dir PATH] [--bin NAME] [--force]\n\
-       --from BUCKET    the archive's root directory (the bucket an archive wrote)\n\
-       --prefix PREFIX  the key prefix that archive owned — ArchiveConfig::prefix, verbatim\n\
-       --to DIR         the data directory to rebuild (default: the app's own data directory)\n\
-       --dir PATH       the app crate to build and run the restore with (default: .)\n\
-       --force          discard a destination timeline the archive cannot prove is its own\n\
-       Stop the node before restoring into its data directory: restore discards the store\n\
-       file and the WAL, and nothing detects a process still serving from them.\n\
-       Restore REPLACES a data directory. Restoring IN PLACE over a node that has run since\n\
-       its last restore needs --force, which destroys every record above the archive's\n\
-       frontier — those exist nowhere else. A restored node's pending jobs WILL dispatch.";
+pub const USAGE: &str = "usage: charpente restore --from BUCKET --prefix PREFIX [--to DIR] [--dir PATH] [--bin NAME] [--force]\n       \
+--from BUCKET    the archive's root directory (the bucket an archive wrote)\n       \
+--prefix PREFIX  the key prefix that archive owned — ArchiveConfig::prefix, verbatim\n       \
+--to DIR         the data directory to rebuild (default: the app's own data directory)\n       \
+--dir PATH       the app crate to build and run the restore with (default: .)\n       \
+--force          discard a destination timeline the archive cannot prove is its own\n\
+\n\
+Stop the node before restoring into its data directory: restore discards the store file and\n\
+the WAL, and nothing detects a process still serving from them.\n\
+Restore REPLACES a data directory. Restoring IN PLACE over a node that has run since its last\n\
+restore needs --force, which destroys every record above the archive's frontier — those exist\n\
+nowhere else. A restored node's pending jobs WILL dispatch.";
 
 /// Runs `restore`'s own args (everything after the `restore` verb).
 /// Returns the process exit code: the app binary's own, or 2 for a usage or
