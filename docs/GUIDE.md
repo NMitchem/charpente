@@ -3839,7 +3839,9 @@ is a consequence of running the command, which is why the command prints the cou
 
 **A restore that fails part-way leaves a partial rebuild, not the old directory.** Reading
 the bucket, verifying every segment's frames, and judging the destination all happen
-before anything is written, and failures in that phase promise an untouched destination.
+before anything is written, and failures in that phase promise an untouched destination —
+including the directory itself: if `--to` did not exist, the CLI removes what it created
+rather than leaving you a directory you never had.
 Past that point the old timeline is already discarded, and a failure says so:
 
 ```text

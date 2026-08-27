@@ -212,6 +212,14 @@ fn restore_verb(
     let _ = std::fs::remove_dir_all(&probe);
 
     let store = FsObjectStore::new(&from);
+    // I-3. `ProdDisk::new` creates the destination root unconditionally, and
+    // it does so before `restore` has read a byte of the bucket — so a
+    // refusal would leave behind a directory the operator never had, and
+    // "nothing in the destination has been touched" would be true about the
+    // content and incomplete about the filesystem. Remembered here, undone
+    // on the error path below.
+    #[allow(clippy::disallowed_methods)]
+    let dest_was_absent = !std::path::Path::new(&to).exists();
     let disk = ProdDisk::new(&to)?;
     let opts = RestoreOpts { prefix, force };
     // `notice` is how `--force` says what it destroys BEFORE it acts; it goes
@@ -227,6 +235,18 @@ fn restore_verb(
         // in different words, which is the defect this task also fixed.
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
+            // Only a directory THIS call created, and only while it is still
+            // empty. A failure past the discard point has written a partial
+            // restore there and the error above tells the operator to re-run
+            // against it — removing that would destroy the thing the message
+            // just told them to keep. `remove_dir` rather than
+            // `remove_dir_all` so the emptiness check is enforced twice, once
+            // by us and once by the kernel.
+            #[allow(clippy::disallowed_methods)]
+            if dest_was_absent && std::fs::read_dir(&to).is_ok_and(|mut d| d.next().is_none()) {
+                #[allow(clippy::disallowed_methods)]
+                let _ = std::fs::remove_dir(&to);
+            }
             return Ok(1);
         }
     };
@@ -769,15 +789,76 @@ mod tests {
                 .contains("nothing in the destination has been touched"),
             "{err}"
         );
-        // `ProdDisk::new` creates the destination root before `restore` can
-        // read a byte of the bucket, so "untouched" is precisely: no content
-        // written. The directory itself may exist and must be empty.
+        // I-3. `ProdDisk::new` creates the destination root before `restore`
+        // can read a byte of the bucket, so a refusal used to leave behind a
+        // directory the operator did not have — making "nothing in the
+        // destination has been touched" true about content and incomplete
+        // about the filesystem. `restore_verb` now removes what it created
+        // when it is still empty, so the promise is literally true and this
+        // asserts the strong form.
         assert!(
-            !dest.exists() || std::fs::read_dir(&dest).unwrap().next().is_none(),
-            "a failed restore must leave the destination empty: {}",
+            !dest.exists(),
+            "a refused restore must not leave a directory the operator did not have: {}",
             dest.display()
         );
-        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// I-3's negative space (hard rule 4). The cleanup above removes a
+    /// destination directory THIS call created — and it must never remove one
+    /// holding a partial restore, because the failure's own text tells the
+    /// operator to re-run against exactly that directory. The guard is the
+    /// emptiness check: a post-discard failure leaves a rebuilt store there,
+    /// so the directory is not empty and survives.
+    #[test]
+    fn a_failure_after_the_discard_leaves_the_partial_restore_in_place() {
+        let bucket = archived_bucket("partial", 1);
+        let dest = tmp_dir("partial-dest");
+
+        // Delete one snapshot batch object: restore verifies the manifest,
+        // the meta and the whole chain first, so this fails only once the
+        // destination has already been discarded and is being rebuilt.
+        let m = std::fs::read_dir(bucket.join(BUCKET_PREFIX))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.is_dir())
+            .expect("the generation directory");
+        let batch = std::fs::read_dir(m.join("snapshot"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.is_dir())
+            .expect("a table's batch directory");
+        let victim = std::fs::read_dir(&batch)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .next()
+            .expect("a batch object");
+        std::fs::remove_file(&victim).unwrap();
+
+        let (code, _, err) = run_restore_verb(&[
+            "restore",
+            "--from",
+            bucket.to_str().unwrap(),
+            "--to",
+            dest.to_str().unwrap(),
+            "--prefix",
+            BUCKET_PREFIX,
+        ]);
+        assert_eq!(code, 1);
+        assert!(
+            err.contains("PARTIAL restore"),
+            "fixture must reach the post-discard phase, or this proves nothing: {err}"
+        );
+        assert!(
+            dest.exists() && std::fs::read_dir(&dest).unwrap().next().is_some(),
+            "the cleanup ate the partial restore the error just told the operator to \
+             re-run against: {}",
+            dest.display()
+        );
+        std::fs::remove_dir_all(&bucket).unwrap();
+        std::fs::remove_dir_all(&dest).unwrap();
     }
 
     #[test]
