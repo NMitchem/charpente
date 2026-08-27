@@ -6158,6 +6158,29 @@ fn conv_engine_poisoned(db: &Db) -> bool {
     db.poisoned() && !db.store_failed()
 }
 
+/// The disk-error axes that can latch `Store::failed`, summed. Read across a
+/// single `arc.step()` so the excusal below is STEP-scoped — the same
+/// doctrine as `checks::durable_corruption_fired` and
+/// `checks::dir_entry_loss_fired` ("excuse an outcome only when the axis that
+/// could cause it actually fired"), narrowed from their universe-wide gate to
+/// the one step that has to have caused it.
+///
+/// These three and no others: the latch is redb's
+/// `CheckedBackend.io_failed`, which fires only when a backend call returns
+/// `Err`, and in this property's matrix nothing else makes one do that. The
+/// corruption axes return `Ok` (that is their whole treachery) and are off
+/// here anyway (`no_media_corruption_on_either_side`), `dir_entry_loss`
+/// gaps a directory rather than failing a call, and no universe here crashes
+/// a disk — `Sim::crash_disk_*` is never called, so `disk_op`'s crashed-world
+/// `Err` cannot happen with no coverage to show for it.
+fn conv_disk_faults(sim: &Sim) -> u64 {
+    let coverage = sim.coverage();
+    ["fault:read_error", "fault:write_error", "fault:sync_error"]
+        .iter()
+        .map(|key| coverage.get(*key).copied().unwrap_or(0))
+        .sum()
+}
+
 /// One archive step, plus the negative space that must hold on EVERY one of
 /// them.
 ///
@@ -6178,6 +6201,7 @@ fn conv_step(
     let gate_before = db.writes_allowed();
     let engine_poisoned_before = conv_engine_poisoned(db);
     let store_failed_before = db.store_failed();
+    let disk_faults_before = conv_disk_faults(sim);
     let generation_before = arc.pin_floor();
     let r = arc.step(db, store);
 
@@ -6225,17 +6249,41 @@ fn conv_step(
              returned {r:?}"
         ));
     }
-    // A STORE LATCH is not a violation, and it is counted rather than
-    // asserted on. `Store::failed` is redb's `CheckedBackend.io_failed`,
-    // latched by ANY backend read returning `Err` — including a read only the
-    // archive issued (`db.snapshot()`, then `scan_raw_from` per batch). So an
-    // archiving node can DISCOVER a failing local disk sooner than a
-    // non-archiving one; it never causes one, and durability is not
-    // implicated (`Store::failed`'s own doc: the WAL is intact and committed
-    // records are durable). Spec §8 states that residual in the same terms.
-    // Counted so its frequency is a number instead of an argument — seed
-    // 0xb803ea7cab19d08c is the universe that made it concrete.
+    // A STORE LATCH the disk caused is not a violation, and it is counted
+    // rather than asserted on. `Store::failed` is redb's
+    // `CheckedBackend.io_failed`, latched by ANY backend read returning `Err`
+    // — including a read only the archive issued (`db.snapshot()`, then
+    // `scan_raw_from` per batch). So an archiving node can DISCOVER a failing
+    // local disk sooner than a non-archiving one; it never causes one, and
+    // durability is not implicated (`Store::failed`'s own doc: the WAL is
+    // intact and committed records are durable). Spec §8 states that residual
+    // in the same terms. Counted so its frequency is a number instead of an
+    // argument — seed 0xb803ea7cab19d08c is the universe that made it
+    // concrete.
+    //
+    // **A latch with NO disk error injected during the step is still a
+    // violation**, and that narrowing is the whole point of reading the
+    // counts across `arc.step()` rather than excusing the outcome outright.
+    // This is the fourth path into `Db::poisoned()` — a write to the Db's own
+    // redb store — and it is the one the three guards above do not cover: an
+    // archive that acquired a write path could latch it without moving
+    // `last_applied`, without touching the gate and without poisoning the
+    // engine. Excused unconditionally it would tick a key carrying no
+    // `require:` and no `floor:`, which nobody watches.
     if !store_failed_before && db.store_failed() {
+        if conv_disk_faults(sim) == disk_faults_before {
+            return Err(format!(
+                "Archive::step latched the Db's store (`Store::failed` false -> true) with no \
+                 disk error injected during the step (spec §8: an archive failure is not a \
+                 database failure). The latch is redb's `CheckedBackend.io_failed`, set only by \
+                 a backend call returning `Err`, and the archive is a READER of that store \
+                 (`db.snapshot()`, then `scan_raw_from` per batch) — so a latch with \
+                 fault:read_error/write_error/sync_error unmoved at {disk_faults_before} means \
+                 the archive has a WRITE path into the Db's own store, which is what makes §8's \
+                 first bullet false. That is a design change to take to §8, not a test to \
+                 update. The step returned {r:?}"
+            ));
+        }
         sim.cover("archive:step_discovered_disk_fault");
     }
     // The archive's two operator notices are `Err`s it returns ON PURPOSE,
@@ -7300,22 +7348,26 @@ fn no_media_corruption_on_either_side(cfg: &mut FaultConfig) {
 ///
 /// That is the archive DISCOVERING a failing local disk, not causing one, and
 /// spec §8's first bullet now says so and states the residual. `conv_step`
-/// counts it (`archive:step_discovered_disk_fault`) instead of failing on it.
-/// The key is reported and deliberately NOT in `require:`: it is 0 in 256 at
-/// this base and 2 in 768 across three fresh bases (`0xD9E3_0001`,
-/// `0x5B71_0001`, `0x3C0D_0001` — both at the first), so requiring it would
-/// make a permanent property flake on a rare fault (`floor:`'s own argument,
-/// run backwards). The earlier reading of 1 in 768 was a LOWER BOUND: while
-/// the latch was still fatal the batch stopped at the first occurrence and
-/// never counted the second.
+/// counts it (`archive:step_discovered_disk_fault`) instead of failing on it
+/// — **but only when a disk-error axis actually fired during that step**
+/// (`conv_disk_faults`), which is `checks::durable_corruption_fired`'s
+/// doctrine narrowed from the universe to the step. A latch with the disk
+/// quiet is the fourth path into `Db::poisoned()` and stays a violation. The
+/// key is reported and deliberately NOT in `require:`: it is 0 in 256 at this
+/// base and 2 in 768 across three fresh bases (`0xD9E3_0001`, `0x5B71_0001`,
+/// `0x3C0D_0001` — both at the first), so requiring it would make a permanent
+/// property flake on a rare fault (`floor:`'s own argument, run backwards).
+/// The earlier reading of 1 in 768 was a LOWER BOUND: while the latch was
+/// still fatal the batch stopped at the first occurrence and never counted
+/// the second.
 ///
-/// **What `conv_step` still asserts across every step — `last_applied`, the
-/// write gate, engine poison — no fault in this property can fire either.**
-/// `Archive::step` takes `&Db`, so those are regression guards on the
-/// read-only-ness that makes §8 true, and they go red on a `&mut Db` in the
-/// archive's signature rather than on any universe. Labelled, at the site and
-/// here, because anyone counting this property's fault-injection oracles will
-/// otherwise count three that cannot fire.
+/// **What `conv_step` asserts across every step — `last_applied`, the write
+/// gate, engine poison, and a disk-quiet store latch — no fault in this
+/// property can fire any of them.** `Archive::step` takes `&Db`, so those are
+/// regression guards on the read-only-ness that makes §8 true, and they go
+/// red on a `&mut Db` in the archive's signature rather than on any universe.
+/// Labelled, at the site and here, because anyone counting this property's
+/// fault-injection oracles will otherwise count four that cannot fire.
 /// `an_archive_io_failure_never_poisons_the_db` is the same kind of guard and
 /// carries the same label.
 #[test]

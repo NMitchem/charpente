@@ -545,6 +545,17 @@ test:
   fault, it issued the read that found it, and an archive that swallowed a local read error
   would ship unread-or-corrupt bytes to the bucket instead. Measured, not assumed: the
   convergence property counts the discoveries (`archive:step_discovered_disk_fault`).
+
+  **The residual is scoped to a disk that actually failed, and the property enforces the
+  scope.** A `store_failed` latch across an `Archive::step` is excused ONLY when a disk-error
+  axis fired during that same step; with the disk quiet it stays a violation and is named as
+  one. This is the tree's standing discipline for a fault-excused outcome
+  (`checks::durable_corruption_fired`, `checks::dir_entry_loss_fired` — excuse an outcome only
+  when the axis that could cause it actually fired), narrowed here from the universe to the
+  step. It matters because a write to the `Db`'s own store is the fourth path into
+  `Db::poisoned()` and the only one the negative-space guards on `last_applied`, the write gate
+  and engine poison do not cover: an archive that acquired a write path could reach it while
+  leaving all three of those quiet.
 - The archive **never** ships an unsealed segment or bytes above `last_applied`.
 - `start` is **never** called with an operation already in flight (assert, don't handle).
 - The manifest **never** points at a generation whose objects are not all uploaded.
