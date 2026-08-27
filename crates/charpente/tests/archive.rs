@@ -14,7 +14,7 @@ use charpente::archive::manifest::{
     Manifest, SnapshotMeta, TableBatches, decode_snapshot_batch, manifest_key, segment_key,
     snapshot_batch_key, snapshot_meta_key,
 };
-use charpente::archive::restore::{RestoreOpts, restore};
+use charpente::archive::restore::{RestoreOpts, RestoreReport, restore};
 use charpente::archive::{Archive, ArchiveConfig};
 use charpente::{Db, DbConfig, Id, Schema, event, job, table};
 use charpente_core::crc::crc32;
@@ -109,6 +109,16 @@ struct FlakyStore {
     start_errors: Cell<bool>,
     in_flight_put: RefCell<Option<String>>,
     lost_ack_for: RefCell<Option<String>>,
+    /// GETs left to fail (Task 12). The fourth switch, and the only one
+    /// aimed at RESTORE rather than at the archive: `restore` reads the
+    /// bucket and writes the destination, so cutting it off part-way is how
+    /// spec Â§9's "crash mid-restore â re-run from scratch converges" axis
+    /// is reached at all. `SimObjectStore`'s own `object_get_error` cannot
+    /// stand in: it is a per-op probability fixed at construction, so a rate
+    /// high enough to cut a restore reliably also stops the RETRY that is
+    /// the property, and one low enough to let the retry through cuts almost
+    /// nothing. A COUNT is the aimable version of the same fault.
+    fail_next_gets: Cell<u64>,
 }
 
 impl FlakyStore {
@@ -119,6 +129,7 @@ impl FlakyStore {
             start_errors: Cell::new(false),
             in_flight_put: RefCell::new(None),
             lost_ack_for: RefCell::new(None),
+            fail_next_gets: Cell::new(0),
         }
     }
 
@@ -134,6 +145,13 @@ impl FlakyStore {
     /// then reported as failed. `None` clears the switch.
     fn set_lost_ack_for(&self, needle: Option<&str>) {
         *self.lost_ack_for.borrow_mut() = needle.map(|s| s.to_string());
+    }
+
+    /// The next `n` GETs fail at `start`, before the inner store sees them
+    /// â so no op goes in flight and the next attempt is a clean first one,
+    /// the same contract `reachable` carries. `0` clears the switch.
+    fn set_failing_gets(&self, n: u64) {
+        self.fail_next_gets.set(n);
     }
 
     /// Test-only inspection, delegated straight through — same contract as
@@ -156,6 +174,14 @@ impl ObjectStore for FlakyStore {
                 "simulated FlakyStore start failure: start refused by the test's start_errors \
                  switch",
             ));
+        }
+        if let ObjectOp::Get { key } = &op
+            && self.fail_next_gets.get() > 0
+        {
+            self.fail_next_gets.set(self.fail_next_gets.get() - 1);
+            return Err(io::Error::other(format!(
+                "simulated FlakyStore GET failure for \"{key}\" (test-local counted switch)"
+            )));
         }
         *self.in_flight_put.borrow_mut() = match &op {
             ObjectOp::Put { key, .. } => Some(key.clone()),
@@ -4885,21 +4911,29 @@ type TableRows = (String, Vec<(u64, Vec<u8>)>);
 /// restored Db is logically equal to the source at the archived frontier"
 /// (spec §9) — logical, not byte-identical.
 fn logical_rows(db: &Db) -> Vec<TableRows> {
-    let snap = db.snapshot().unwrap();
-    db.table_names()
-        .into_iter()
-        .map(|t| {
-            let mut rows: Vec<(u64, Vec<u8>)> = Vec::new();
-            let mut after = None;
-            loop {
-                let batch = snap.scan_raw_from(t, after, 1_000).unwrap();
-                let Some(last) = batch.last() else { break };
-                after = Some(last.0);
-                rows.extend(batch);
-            }
-            (t.to_string(), rows)
-        })
-        .collect()
+    logical_rows_checked(db).unwrap()
+}
+
+/// `logical_rows`, fallible. The walk is disk IO like any other, so under a
+/// fault matrix an injected read error inside it is the matrix landing on
+/// the CHECKER rather than a convergence violation — and a helper that
+/// panics cannot be told apart from one. `logical_rows` is the unwrapping
+/// entry point the fault-free tests use; there is one walker.
+fn logical_rows_checked(db: &Db) -> io::Result<Vec<TableRows>> {
+    let snap = db.snapshot()?;
+    let mut out = Vec::new();
+    for t in db.table_names() {
+        let mut rows: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut after = None;
+        loop {
+            let batch = snap.scan_raw_from(t, after, 1_000)?;
+            let Some(last) = batch.last() else { break };
+            after = Some(last.0);
+            rows.extend(batch);
+        }
+        out.push((t.to_string(), rows));
+    }
+    Ok(out)
 }
 
 /// The source's logical state AT seq `f`. Exact rather than approximate
@@ -5805,6 +5839,1378 @@ fn a_generation_with_a_hole_makes_the_untouched_claim_once() {
 // exercise the production filesystem impl, and setting up a failed rename or
 // planting crash residue means touching the filesystem directly. Nothing
 // here is inside the deterministic boundary.
+// ==================== Task 12: the convergence property ====================
+//
+// THE flagship oracle (spec §9): a `Db` restored from the archive is
+// logically equal to the source at the archived frontier, over N seeded
+// universes with faults. Everything Tasks 1-11 built is machinery; this is
+// the evidence, and Task 12.5's delete path is gated on it — deletion must
+// not ship before the property proving what it deletes is recoverable.
+//
+// **The oracle's expectation is the WORKLOAD's, never the archive's.** The
+// whole hazard of a convergence property is that it is a self-comparison: it
+// restores a `Db` from the archive and compares it to the source, and if
+// both sides are read through the same snapshot walk / segment decode /
+// materialisation, a mutation in that shared path moves both sides equally
+// and the equality assertion is structurally incapable of reddening
+// (task-12-hazard-note.md; Task 7.5's I-1 was the same failure one scale
+// down). So the universe keeps its OWN record of what it committed —
+// `model[i]` is the WAL seq of the record that wrote `Rec { id: i, value: i
+// }`, emitted `Ping { n: i }` and, when `jobs[i]`, enqueued one job — built
+// from what `Db::transact` returned and from nothing else. Every anchor
+// below is a range fixed by the fixture before the archive existed. The
+// structural comparison against the source runs LAST, after the anchors,
+// and only ever adds to them.
+//
+// **What is faulted and what is not.** The object store carries the faults
+// this property is about — that is where every one of spec §9's eleven axes
+// lives — plus the disk fault matrix the swarm samples, which reaches the
+// source `Db`. What the universe never does is `Sim::restart` the SOURCE: a
+// power cycle cuts the WAL's unsynced tail, and a cut re-frees seqs the
+// model has already spent, so the seq↔id correspondence that makes the
+// expectation independent would have to be repaired by reading
+// `Db::last_applied` back — i.e. by asking the code under test what the
+// answer is. The source's own crash recovery is `charpente-sim`'s
+// `wal.rs`/`crash_recovery.rs` property over 512 universes each, and is not
+// re-litigated here. The archive's OWN restart path (`State::Opening`'s
+// resume-or-open, ruling 43) is reached instead by dropping the `Archive`
+// and opening a fresh one over the same `Db` and bucket, which is the same
+// transition without touching the log.
+
+use charpente::TxError;
+use charpente_core::io::Entropy;
+use charpente_sim::checks::is_fault_fallout;
+use charpente_sim::run_universes_swarm_with;
+
+/// Segment size for the convergence universes. The file's other fixtures use
+/// 64 KiB, which seals a segment every `RECORDS_PER_SEGMENT` = 1,365
+/// commits. A universe has to seal SEVERAL segments before a generation has
+/// a chain at all, and the commits it takes to get there are not free in two
+/// different ways: they are redb write transactions spent on nothing the
+/// property can see, and — the reason this is 1 KiB rather than merely
+/// small — every one of them is another roll of `write_error`/`sync_error`
+/// against a `Db` those axes can kill outright. MEASURED at 4 KiB first: 129
+/// of 256 universes lost their source permanently, because the number of
+/// commits the shape needed was larger than the number the matrix allowed.
+const CONV_SEGMENT_BYTES: u64 = 1 << 10;
+
+/// MEASURED, not assumed — `conv_segment_layout_is_what_the_budget_assumes`
+/// is the pin, and it asserts against a freshly built fixture rather than
+/// against a transcription of this number. Every budget below that is
+/// expressed in segments (the pin bound, the outage length) is computed from
+/// it, so if the frame size moves the pin fails rather than the property
+/// quietly stopping to seal anything.
+const CONV_RECORDS_PER_SEGMENT: u64 = 14;
+
+/// Rounds per universe, and the writes and archive steps each round gets.
+/// Sized so a universe reaches a chain of several segments AND crosses a
+/// snapshot cadence: `CONV_ROUNDS * CONV_WRITES_PER_ROUND / 2` averages ~700
+/// records, ~8 segments.
+const CONV_ROUNDS: u64 = 10;
+const CONV_WRITES_PER_ROUND: u64 = 60;
+const CONV_STEPS_PER_ROUND: u64 = 600;
+
+/// One archive step per this many records inside the write loop. The archive
+/// reads the log through the `Db`, so a source the matrix kills mid-round
+/// takes the archive with it — an archive that had not stepped yet has
+/// published nothing at all, and the oracle has nothing to read.
+const CONV_WRITES_PER_STEP: u64 = 4;
+
+/// Steps taken at each of those points, or until the archive is caught up —
+/// DRAWN PER UNIVERSE, because there is no single right answer and the two
+/// ends buy opposite things.
+///
+/// Opening a generation takes one step per snapshot batch plus the meta plus
+/// the manifest swap, so an archive stepped once per few records never
+/// finishes its first generation before the matrix kills the source:
+/// measured at 1, 108 of 256 universes published nothing at all. But an
+/// archive that keeps up perfectly is an archive with nothing outstanding,
+/// and the fault axes this property exists to reach are all about what
+/// happens to work in flight: measured at 24, `archive:lost_ack_retried`
+/// fell from 85 to 31, `archive:gap_closed_generation` from 301 to 125, and
+/// the write-gate oracle — which only counts a window where the archive HAD
+/// work — from 169 to 20. So the universes draw a lag instead of picking
+/// one, the same way they draw `snapshot_every` and `pin_segments`.
+const CONV_INTERLEAVE_CHOICES: [u64; 4] = [1, 2, 8, 24];
+
+/// Steps taken against a write-gated archive. A FIXED count, never
+/// step-until-idle: `Archive::idle`'s own doc records that a gated archive
+/// answers `true` immediately, so a loop keyed on `idle` exits after one
+/// step and proves nothing.
+const CONV_GATED_STEPS: u64 = 60;
+
+/// The quiesce budget before the oracle runs, and the budget for the
+/// foreign-writer probe after it.
+const CONV_FINAL_STEPS: u64 = 8_000;
+const CONV_FOREIGN_STEPS: u64 = 4_000;
+
+/// Attempts at opening the source `Db`, and source restarts allowed per
+/// universe.
+///
+/// A `Db` whose WAL poisoned is a DEAD NODE: it accepts no further commits,
+/// and — because the archive reads the log through it — the archive ships
+/// nothing more either. Measured before this existed: 92 of 256 universes
+/// published no manifest at all and **every one of them had `poisoned ==
+/// true`**, so the fault axis that stopped the property reaching its own
+/// oracle was the source's disk, which is not what this property is about.
+/// The fix is the universe generator, not the key (the brief's step 2): a
+/// real node restarts, so this one does.
+/// A LIVENESS BOUND, not a tuning constant — the same shape as
+/// `restore.rs`'s `POLLS_PER_OP`. `write_error` and `sync_error` are
+/// per-operation probabilities and `Db::open` is many operations, so at the
+/// top of the swarm's range a single attempt succeeds a few percent of the
+/// time; a disk that refuses this many consecutive opens is a disk that will
+/// not open, and a universe with no node in it is not a verdict. Measured at
+/// 16 first: 129 of 256 universes gave up here, which made the SOURCE's disk
+/// the property's dominant reason for reaching no verdict — the failure mode
+/// this task is most exposed to.
+const CONV_OPEN_ATTEMPTS: u32 = 16;
+const CONV_MAX_RESTARTS: u32 = 64;
+
+/// Restore attempts into the SAME destination before the universe gives up.
+/// A failed `restore` leaves a discarded-and-partially-rebuilt destination
+/// and does NOT clean it up — Task 11 put the destination cleanup in the CLI
+/// verb, and a direct caller owns the `Disk` it passed. So the remedy this
+/// property exercises is the one `restore`'s own failure text names: re-run
+/// against the same directory, which converges because `Seeder::new`
+/// discards rather than resumes.
+const CONV_RESTORE_ATTEMPTS: u32 = 32;
+
+/// Attempts at reading the verdict off a destination that is already
+/// restored. Separate from `CONV_RESTORE_ATTEMPTS` because it answers a
+/// different question: not "did restore complete" but "did the CHECKER get a
+/// clean read", and the fault it retries is `read_error`, which the axis's
+/// own doc calls transient.
+const CONV_VERIFY_ATTEMPTS: u32 = 8;
+
+/// The base seed `archive_converges` runs from. Explicit, like
+/// `replication.rs`'s `0x2EB1_*` family.
+const ARCHIVE_CONVERGENCE_BASE: u64 = 0xA2C0_0001;
+
+/// Measured rates over the 256 universes at `ARCHIVE_CONVERGENCE_BASE` — see
+/// task-12-report.md §4 for the run they were read off.
+///
+/// `require:` has a floor of one, which catches an oracle that stopped firing
+/// entirely and misses one that decayed to a token handful. These are the
+/// same check at the measured rate, and each names a different way this
+/// property can go quietly decorative:
+///
+/// - `archive:restored` — universes that reached the oracle AT ALL. The
+///   number the whole task turns on.
+/// - `archive:restored_substantial` — universes whose restored `Db` was
+///   `CONV_SUBSTANTIAL_ROWS` rows or larger. A property that only ever
+///   compares eleven-row databases is not comparing databases.
+/// - `archive:chained` — universes whose generation had a SEGMENT CHAIN, not
+///   a snapshot alone. Without this the segment path — the half of the
+///   archive Tasks 5 and 7.5 are about — could stop being exercised without
+///   a single key going to zero.
+///
+/// **A drop is a finding, not a number to lower** (the wording is
+/// `replication.rs`'s `FINGERPRINT_FLOOR` and the rule is the same one):
+/// it means the universes reach that state less often than when the numbers
+/// were taken, and why is the finding.
+const CONV_RESTORED_FLOOR: u64 = 1;
+const CONV_SUBSTANTIAL_FLOOR: u64 = 1;
+const CONV_CHAINED_FLOOR: u64 = 1;
+
+/// A restored `Db` this size or larger counts as a substantial verdict.
+/// `require:`'s floor is one occurrence, which catches an oracle that
+/// stopped firing and misses one that decayed to a token handful of rows —
+/// this is the measured-rate companion, reported per batch.
+const CONV_SUBSTANTIAL_ROWS: u64 = 200;
+
+fn conv_schema() -> Schema {
+    Schema::new().table::<Rec>()
+}
+
+fn conv_db_config() -> DbConfig {
+    let mut cfg = DbConfig::default();
+    cfg.wal.segment_bytes = CONV_SEGMENT_BYTES;
+    cfg
+}
+
+fn conv_restore_opts(force: bool) -> RestoreOpts {
+    RestoreOpts {
+        prefix: PREFIX.to_string(),
+        force,
+    }
+}
+
+/// A per-universe object-store fault rate: off in most universes, drawn from
+/// a range in the rest — `sample_extended_fields`' own shape.
+///
+/// Drawn HERE rather than read off the universe's sampled `FaultConfig`
+/// because `Sim` exposes `seed()` and `subscriber_stall()` and nothing else
+/// about it, and re-deriving the swarm draw inside a test would duplicate a
+/// frozen replay contract in a second place where a future reorder drifts
+/// silently. Drawn from the sim's own entropy, so it is still a pure
+/// function of the seed.
+fn conv_rate(entropy: &dyn Entropy, on_in_percent: u64, max_per_mille: u64) -> f64 {
+    if entropy.next_u64() % 100 >= on_in_percent {
+        return 0.0;
+    }
+    (entropy.next_u64() % max_per_mille) as f64 / 1000.0
+}
+
+/// Everything one universe accumulates: the MODEL, and the observations that
+/// are edges rather than states.
+///
+/// The model is the whole reason this property is not a self-comparison:
+/// `model[i]` is the WAL seq of the record that wrote `Rec { id: i, value: i
+/// }`, emitted `Ping { n: i }` and — when `jobs[i]` — enqueued one job, and
+/// every entry in it comes from what `Db::transact` returned and from
+/// nothing else. Nothing here is ever read back out of the archive.
+///
+/// The observations are carried rather than recomputed because they are
+/// EDGES: a gap and an ownership stop are each raised once, at the step that
+/// causes them (task-9-report.md T-6), and an edge is not visible in a final
+/// state.
+#[derive(Default)]
+struct ConvState {
+    model: Vec<u64>,
+    jobs: Vec<bool>,
+    /// The commit that was rejected but may be durable anyway
+    /// (`TxError::Io`'s doc), carried until a restart resolves it.
+    unacked: Option<(u64, bool)>,
+    restarts: u32,
+    gapped: bool,
+    /// The key of a PUT whose ack was lost, still awaiting proof that the
+    /// retry landed at the SAME key.
+    lost_ack_key: Option<String>,
+    rolled_generation: bool,
+}
+
+/// One archive step, plus the two things that must hold on EVERY one of
+/// them.
+///
+/// Returns `Err` only for something that is not fault fallout: the archive's
+/// two named notices (the gap and the ownership stop) are `Err` at the step
+/// that raises them by design (spec §7), and every store fault surfaces as
+/// `Err` too, so an unclassified error is the only one that is a finding.
+fn conv_step(
+    sim: &Sim,
+    arc: &mut Archive,
+    db: &Db,
+    store: &FlakyStore,
+    st: &mut ConvState,
+) -> Result<(), String> {
+    let was_gapped = arc.gapped();
+    let was_stopped = arc.stopped();
+    let poisoned_before = db.poisoned();
+    let generation_before = arc.pin_floor();
+    let r = arc.step(db, store);
+
+    // NEGATIVE SPACE, every step (spec §8, and the brief's
+    // `archive:never_poisons`): "the archive never advances `last_applied`,
+    // acks a write, gates a transaction, or affects `Db::poisoned()`. An
+    // archive failure is not a database failure." Checked as an EDGE across
+    // the step rather than as `!db.poisoned() || something_else()`, because
+    // the source `Db` can legitimately poison itself on its own disk faults
+    // and the two are otherwise indistinguishable at the end of a universe.
+    if !poisoned_before && db.poisoned() {
+        return Err(format!(
+            "Archive::step poisoned the Db (spec §8: an archive failure is not a database \
+             failure). The step returned {r:?}"
+        ));
+    }
+    // The archive's two operator notices are `Err`s it returns ON PURPOSE,
+    // once, at the step that raises them (spec §7; task-9-report.md T-6), so
+    // they have to be told apart from a real failure. Recognized by the
+    // STATE TRANSITION that accompanies them and never by matching their
+    // prose — `step_until_notice` above records why: a notice test that
+    // matches a substring finds the words it is about to assert are there.
+    let gap_notice = !was_gapped && arc.gapped();
+    let stop_notice = !was_stopped && arc.stopped();
+    if gap_notice {
+        sim.cover("archive:gap_closed_generation");
+        st.gapped = true;
+    }
+    if arc.pin_floor() > generation_before {
+        st.rolled_generation = true;
+    }
+    let Err(e) = r else { return Ok(()) };
+    let text = e.to_string();
+    if let Some(key) = conv_lost_ack_key(&text) {
+        st.lost_ack_key = Some(key);
+    }
+    if is_fault_fallout(&text) || gap_notice || stop_notice {
+        return Ok(());
+    }
+    Err(format!(
+        "Archive::step failed with an unclassified error: {e}"
+    ))
+}
+
+/// The key named by a lost-ack error, from either of the two stores that
+/// produce one (`SimObjectStore`'s `object_lost_ack` axis and `FlakyStore`'s
+/// aimed switch). Both texts are `... PUT "<key>" landed but the ack was
+/// lost ...`, and the KEY is what the property needs: retry-idempotence
+/// (spec §9.2) is the claim that the retry goes to the SAME key.
+fn conv_lost_ack_key(text: &str) -> Option<String> {
+    if !text.contains("landed but the ack was lost") {
+        return None;
+    }
+    let start = text.find('"')? + 1;
+    let end = start + text[start..].find('"')?;
+    Some(text[start..end].to_string())
+}
+
+/// Clears whatever operation the archive left in flight.
+///
+/// `ObjectStore::start` asserts against a second op while one is in flight
+/// (spec §1), and `SimObjectStore` holds a started op until something polls
+/// it — so an `Archive` REPLACED part-way through an upload leaves one
+/// sitting there and the next thing to touch the store trips the assert.
+/// That is this workload's problem and not the archive's: `Archive::step`
+/// always polls what it started, and nothing in the shipped tree swaps a
+/// live `Archive` out from under a store it shares. This universe does swap
+/// one — that is how it reaches `State::Opening`'s resume-or-open path
+/// (ruling 43) — and it also drives the store directly to read the manifest,
+/// plant a foreign one, and restore. So it settles the store first, at every
+/// one of those seams. Found by seed 0x8304b6d7b52cbe01.
+fn conv_settle(store: &FlakyStore) {
+    let _ = store.poll();
+}
+
+/// Reads the manifest through a store that may be injecting GET errors.
+/// `None` only after `tries` consecutive failures, so "nothing is published"
+/// is a fact about the bucket rather than about one unlucky roll.
+fn conv_read_manifest(store: &FlakyStore, tries: u32) -> Option<Manifest> {
+    for _ in 0..tries {
+        if let Some(m) = read_manifest(store) {
+            return Some(m);
+        }
+    }
+    None
+}
+
+/// The newest recoverable point the manifest names: the chain's end when the
+/// generation has one, its snapshot's frontier when it does not. NOT
+/// `Manifest::applied_seq`, which is the SNAPSHOT's frontier and equals the
+/// restored frontier only for a chainless generation (`RestoreReport::
+/// applied_seq`'s own doc).
+fn conv_frontier(m: &Manifest) -> u64 {
+    m.segments.last().map_or(m.applied_seq, |s| s.end_seq)
+}
+
+/// A verification failure, split by whether it is the property's VERDICT or
+/// the fault matrix landing on the checker's own reads.
+///
+/// The checker reads the destination through `Disk` like everything else, so
+/// an injected read error inside it is not a convergence violation — and a
+/// checker that cannot say which it hit turns every such roll into a false
+/// RED. `kernel.rs`'s workload takes exactly this care with its
+/// `exactly_once_holds` call, and its comment records the bug that taught it
+/// to (seed 0x348270b38f166529, then 0xe653f43924f17fe8).
+enum ConvFail {
+    /// Retryable: the matrix hit the checker. Recognized by
+    /// `checks::is_fault_fallout`, never by this file's own substring list.
+    /// Carries no text on purpose — nothing fails on this path, so a message
+    /// here would be a message nothing ever reads.
+    Fallout,
+    /// The verdict. Fails the universe.
+    Violation(String),
+}
+
+/// Classifies an error the checker RAISED WHILE READING. Never used on a
+/// message the property composes itself — those are `Violation` by
+/// construction, and routing one through here would let a violation whose
+/// text happened to quote an injected error excuse itself.
+fn conv_read_fail(what: &str, e: io::Error) -> ConvFail {
+    if is_fault_fallout(&e.to_string()) {
+        ConvFail::Fallout
+    } else {
+        ConvFail::Violation(format!("{what}: {e}"))
+    }
+}
+
+/// Every `Rec` row a `Db` holds, as `(id, value)`, decoded — not compared as
+/// opaque bytes, because the fixture's expectation is about the VALUES.
+fn conv_rec_rows(db: &Db) -> Result<Vec<(u64, u64)>, ConvFail> {
+    let snap = db.snapshot().map_err(|e| conv_read_fail("snapshot", e))?;
+    let mut out = Vec::new();
+    let mut after = None;
+    loop {
+        let batch = snap
+            .scan_raw_from(Rec::TABLE, after, 1_000)
+            .map_err(|e| conv_read_fail("scanning the restored rows", e))?;
+        let Some(last) = batch.last() else { break };
+        after = Some(last.0);
+        for (id, bytes) in batch {
+            // A row that will not decode is a VIOLATION, never fallout: the
+            // bytes came back through the archive and the store, and "the
+            // restored row does not decode" is the verdict.
+            let r = Rec::decode_row(&bytes).map_err(|e| {
+                ConvFail::Violation(format!(
+                    "restored row {id} of {} does not decode: {e}",
+                    Rec::TABLE
+                ))
+            })?;
+            out.push((r.id.raw(), r.value));
+        }
+    }
+    Ok(out)
+}
+
+/// THE ANCHORS. Every expectation here is the workload's, computed from
+/// `records` — the count of committed records at or below the archived
+/// frontier — and nothing here reads the archive, the manifest, or the
+/// source `Db`. Asserted BEFORE the structural comparison, which is what
+/// keeps a mutation inside the shared snapshot/decode path from moving both
+/// sides of that comparison together.
+///
+/// Each clause names the mutation it exists to redden:
+///  - the row map: `Seeder::rows` importing nothing, a snapshot batch
+///    silently dropped, a decode that returns the wrong field.
+///  - the exact COUNT: an import that stops early, and — the direction a
+///    set comparison misses — one that imports rows the frontier excludes.
+///  - `charpente.events`: a restore that seeds `next_event_id` from the row
+///    count instead of the meta, which re-issues ids the snapshot carries.
+///  - pending jobs: the same for `next_job_id`, and the operator-facing
+///    count `RestoreReport` promises.
+fn conv_check_anchors(db: &Db, records: u64, pending_jobs: u64) -> Result<(), ConvFail> {
+    let rows = conv_rec_rows(db)?;
+    if rows.len() as u64 != records {
+        return Err(ConvFail::Violation(format!(
+            "the restored Db holds {} `{}` rows; the workload committed {records} at or below \
+             the archived frontier",
+            rows.len(),
+            Rec::TABLE
+        )));
+    }
+    for (i, (id, value)) in rows.iter().enumerate() {
+        let i = i as u64;
+        if (*id, *value) != (i, i) {
+            return Err(ConvFail::Violation(format!(
+                "restored `{}` row {i} came back as (id {id}, value {value}); the workload \
+                 wrote `Rec {{ id: {i}, value: {i} }}`",
+                Rec::TABLE
+            )));
+        }
+    }
+    let snap = db.snapshot().map_err(|e| conv_read_fail("snapshot", e))?;
+    let events = snap
+        .scan_raw_from("charpente.events", None, usize::MAX)
+        .map_err(|e| conv_read_fail("scanning charpente.events", e))?;
+    if events.len() as u64 != records {
+        return Err(ConvFail::Violation(format!(
+            "the restored Db holds {} event row(s); the workload emitted exactly one per \
+             committed record and {records} are at or below the archived frontier",
+            events.len()
+        )));
+    }
+    for (i, (id, _)) in events.iter().enumerate() {
+        if *id != i as u64 {
+            return Err(ConvFail::Violation(format!(
+                "restored event row {i} has id {id}: the event counter came back wrong, so a \
+                 restored node would re-issue ids the snapshot already carries"
+            )));
+        }
+    }
+    let pending = snap
+        .scan_raw_from("charpente.jobs", None, usize::MAX)
+        .map_err(|e| conv_read_fail("scanning charpente.jobs", e))?;
+    if pending.len() as u64 != pending_jobs {
+        return Err(ConvFail::Violation(format!(
+            "the restored Db holds {} job row(s); the workload enqueued {pending_jobs} at or \
+             below the archived frontier",
+            pending.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Restores into `host`, re-running into the SAME destination while the
+/// failure is fault fallout. Returns the report, or `None` if every attempt
+/// was cut off.
+///
+/// This is spec §9.5 ("crash mid-restore → re-run from scratch converges")
+/// and it is also the answer to what these universes do with a destination a
+/// failed `restore` left behind: nothing. `restore` does not clean up after
+/// itself — the cleanup Task 11 added lives in the CLI verb, and a caller
+/// driving `restore` directly owns whatever `Disk` it passed. The partial
+/// state is a contiguous prefix of the archived timeline, so the re-run's
+/// own divergence check passes and `Seeder::new` discards it (task-10-report
+/// D-2). If that were ever false, the re-run would come back as an
+/// `InvalidData` refusal, which is not fault fallout and fails the universe
+/// by name.
+fn conv_restore_into(
+    sim: &Sim,
+    store: &FlakyStore,
+    host: &str,
+    force: bool,
+) -> Result<Option<RestoreReport>, String> {
+    let mut cut = false;
+    for attempt in 0..CONV_RESTORE_ATTEMPTS {
+        match restore(
+            store,
+            Box::new(sim.host(host).disk()),
+            conv_db_config(),
+            conv_schema(),
+            conv_restore_opts(force),
+            &mut |_| {},
+        ) {
+            Ok(report) => {
+                if cut {
+                    sim.cover("archive:restore_retry_converged");
+                }
+                return Ok(Some(report));
+            }
+            Err(e) if is_fault_fallout(&e.to_string()) => {
+                cut = true;
+                sim.cover("archive:restore_faulted");
+                let _ = attempt;
+            }
+            Err(e) => {
+                return Err(format!(
+                    "restore into \"{host}\" failed with an unclassified error: {e}"
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// A destination holding a DIFFERENT timeline at the same seqs — same
+/// schema, same shape, `value = id + 7` so every frame's checksum differs
+/// from the archive's at the same seq. `checkpoint_every: 0` so the log
+/// retains every frame: the comparison seq is the archive's chain end, and a
+/// destination that had GC'd past it would make this "cannot compare"
+/// instead of "diverged".
+fn conv_plant_diverged(sim: &Sim, host: &str, records: u64) -> Result<bool, String> {
+    let mut cfg = conv_db_config();
+    cfg.checkpoint_every = 0;
+    let mut db = match Db::open(Box::new(sim.host(host).disk()), cfg, conv_schema()) {
+        Ok(db) => db,
+        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(false),
+        Err(e) => return Err(format!("planting a diverged timeline: open: {e}")),
+    };
+    for i in 0..records {
+        match db.transact(|tx| -> Result<(), std::convert::Infallible> {
+            tx.put(&Rec {
+                id: Id::from_raw(i),
+                value: i + 7,
+            });
+            Ok(())
+        }) {
+            Ok(()) => {}
+            // A plant the matrix cut short is not a diverged timeline: the
+            // destination has to hold a frame at a seq the archive's chain
+            // also covers, or the refusal under test would be "cannot
+            // compare" rather than "diverged".
+            Err(TxError::Io(e)) if is_fault_fallout(&e.to_string()) => return Ok(false),
+            Err(other) => {
+                return Err(format!(
+                    "planting a diverged timeline: commit {i} rejected: {other:?}"
+                ));
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// The whole verdict on one restored destination: it opens, it opens AT the
+/// archived frontier, the fixture's own anchors hold, and only then the
+/// structural comparison against the source.
+///
+/// The order is the point. Every anchor is the WORKLOAD's expectation, fixed
+/// before the archive existed; the structural comparison is the only clause
+/// with the source on the other side of it, and it runs last so that a
+/// mutation inside the shared snapshot/decode path — which would move both
+/// sides of it together — has already been caught by an anchor that does not
+/// move (task-12-hazard-note.md).
+/// Plants a manifest naming another writer, retrying past injected PUT
+/// failures. `write_foreign_manifest` unwraps — right in a fault-free test,
+/// fatal under this matrix — and a lost ack retries onto the same fixed key
+/// with the same bytes, so the retry is idempotent by construction.
+/// `false` means the plant never landed and the probe cannot run.
+fn conv_plant_foreign_manifest(store: &FlakyStore, generation: u64) -> bool {
+    let bytes = Manifest {
+        generation,
+        writer: FOREIGN_WRITER.to_string(),
+        applied_seq: 0,
+        next_job_id: 0,
+        tables: Vec::new(),
+        segments: Vec::new(),
+        closed: false,
+    }
+    .encode();
+    for _ in 0..64 {
+        if store
+            .start(ObjectOp::Put {
+                key: manifest_key(PREFIX),
+                data: bytes.clone(),
+            })
+            .is_err()
+        {
+            continue;
+        }
+        if drain(store).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+fn conv_verify_restored(
+    src: Option<&Db>,
+    host: &str,
+    sim: &Sim,
+    records: u64,
+    pending_jobs: u64,
+    f: u64,
+) -> Result<(), ConvFail> {
+    let dst = Db::open(
+        Box::new(sim.host(host).disk()),
+        conv_db_config(),
+        conv_schema(),
+    )
+    .map_err(|e| conv_read_fail("the restored destination will not open", e))?;
+    if dst.last_applied() != Some(f) {
+        return Err(ConvFail::Violation(format!(
+            "the restored Db opens at {:?}, not at the archived frontier {f}",
+            dst.last_applied()
+        )));
+    }
+    conv_check_anchors(&dst, records, pending_jobs)?;
+
+    // The source's state AT the archived frontier. Each of the three tables
+    // that grows with the workload is cut by its own WORKLOAD-side counter:
+    // `Rec` and `charpente.events` get one row per committed record
+    // (`records`), `charpente.jobs` one per enqueue (`pending_jobs`).
+    // `charpente.schema_versions` does not grow.
+    // The structural comparison is the only clause with the SOURCE on the
+    // other side of it, so it is also the only one a destroyed source can
+    // take away. Everything above this line still ran.
+    let Some(src) = src else {
+        sim.cover("archive:compared_without_source");
+        return Ok(());
+    };
+    let dst_rows =
+        logical_rows_checked(&dst).map_err(|e| conv_read_fail("reading the restored Db", e))?;
+    let src_rows: Vec<TableRows> = logical_rows_checked(src)
+        .map_err(|e| conv_read_fail("reading the source Db", e))?
+        .into_iter()
+        .map(|(name, rows)| {
+            let cut = match name.as_str() {
+                n if n == Rec::TABLE => Some(records),
+                "charpente.events" => Some(records),
+                "charpente.jobs" => Some(pending_jobs),
+                _ => None,
+            };
+            match cut {
+                Some(cut) => (name, rows.into_iter().filter(|(id, _)| *id < cut).collect()),
+                None => (name, rows),
+            }
+        })
+        .collect();
+    if dst_rows != src_rows {
+        let names = |v: &[TableRows]| {
+            v.iter()
+                .map(|(n, r)| format!("{n}:{}", r.len()))
+                .collect::<Vec<_>>()
+        };
+        return Err(ConvFail::Violation(format!(
+            "the restored Db is not logically equal to the source at the archived frontier \
+             {f}: restored {:?} vs source {:?}",
+            names(&dst_rows),
+            names(&src_rows)
+        )));
+    }
+    Ok(())
+}
+
+/// Opens (or reopens) the source `Db`, retrying past injected IO. `None`
+/// means the matrix never let it open, which is not a violation — it is a
+/// universe with no node in it.
+fn conv_open_source(sim: &Sim) -> Result<Option<Db>, String> {
+    for _ in 0..CONV_OPEN_ATTEMPTS {
+        match Db::open(
+            Box::new(sim.host("src").disk()),
+            conv_db_config(),
+            conv_schema(),
+        ) {
+            Ok(db) => return Ok(Some(db)),
+            Err(e) if is_fault_fallout(&e.to_string()) => continue,
+            Err(e) => return Err(format!("source Db::open failed non-injected: {e}")),
+        }
+    }
+    Ok(None)
+}
+
+/// Reconciles the model with what recovery brought back, after the source
+/// was reopened.
+///
+/// **No `Sim::restart` is involved** (see the section header), so nothing
+/// synced is collapsed: every record whose `transact` returned `Ok` was
+/// appended AND synced before it answered, and those bytes are still on the
+/// disk. Exactly one record can legitimately appear that the model does not
+/// have — `TxError::Io`'s own doc: "Io after the WAL sync means the record
+/// is durable but unacknowledged and will resurface on recovery" — and it is
+/// the record the failing commit was writing, whose content this workload
+/// therefore knows. Anything else recovery does to the frontier is a finding
+/// and is named as one rather than absorbed, which is the difference between
+/// repairing a model and reading the answer out of the thing under test.
+fn conv_reconcile(db: &Db, st: &mut ConvState) -> Result<(), String> {
+    let unacked = st.unacked.take();
+    let acked = st.model.len() as u64;
+    match db.last_applied() {
+        None if acked == 0 => Ok(()),
+        None => Err(format!(
+            "recovery came back with an empty log after {acked} acknowledged commit(s): a \
+             synced, acknowledged record was lost without a power cycle"
+        )),
+        Some(l) if l + 1 == acked => Ok(()),
+        Some(l) if l == acked => {
+            // The durable-but-unacknowledged record resurfaced. It is the
+            // one the LAST rejected commit was writing, wherever in the
+            // universe that happened — not necessarily the one that
+            // triggered this restart, since a rejected commit poisons the
+            // `Db` and a later phase can be the first to notice. Getting
+            // that wrong is a real defect this property found in its own
+            // model: seed 0x7280605429586c42, where an outage-window commit
+            // (never a job) resurfaced and the restart carried the NEXT
+            // round's job flag onto it, so the model expected 29 pending
+            // jobs against the restored 28.
+            let Some((id, with_job)) = unacked else {
+                return Err(format!(
+                    "recovery came back at seq {l} with {acked} acknowledged commit(s) and no \
+                     commit outstanding: a record appeared that nothing ever wrote"
+                ));
+            };
+            if id != l {
+                return Err(format!(
+                    "recovery came back at seq {l}, but the outstanding commit was writing id \
+                     {id}"
+                ));
+            }
+            st.model.push(l);
+            st.jobs.push(with_job);
+            Ok(())
+        }
+        Some(l) if l + 1 < acked => Err(format!(
+            "recovery came back at seq {l} after {acked} acknowledged commit(s): {} \
+             synced, acknowledged record(s) were lost without a power cycle",
+            acked - (l + 1)
+        )),
+        Some(l) => Err(format!(
+            "recovery came back at seq {l} after {acked} acknowledged commit(s) and one \
+             unacknowledged one: it invented {} record(s) nothing ever wrote",
+            l - acked
+        )),
+    }
+}
+
+fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
+    let entropy = sim.entropy();
+
+    // `Option` because the matrix can destroy the source past reopening, and
+    // that is NOT a reason to skip the oracle: the anchors are the
+    // workload's own and need no source at all, and "the node is gone and
+    // the bucket is what is left" is the case the archive exists for. Only
+    // the structural comparison — the one clause with the source on the
+    // other side of it — is skipped there.
+    let src0 = match conv_open_source(sim)? {
+        Some(db) => db,
+        None => {
+            sim.cover("archive:source_never_opened");
+            return Ok(());
+        }
+    };
+    // The fixture pin the whole expectation rests on: a fresh `Db` has
+    // committed nothing, so the i-th record this workload commits takes seq
+    // `i` and writes `Rec { id: i }`. Asserted rather than assumed — if
+    // anything ever commits a record during `Db::open`, every anchor below
+    // is off by one and this is where it says so.
+    if src0.last_applied().is_some() {
+        return Err(format!(
+            "a freshly opened Db reports last_applied {:?}: the seq-to-id correspondence every \
+             anchor in this property rests on is not established by construction any more",
+            src0.last_applied()
+        ));
+    }
+    let mut src = Some(src0);
+
+    let object_faults = FaultConfig {
+        object_put_error: conv_rate(&entropy, 40, 50),
+        object_get_error: conv_rate(&entropy, 30, 10),
+        object_lost_ack: conv_rate(&entropy, 30, 30),
+        ..FaultConfig::none()
+    };
+    let store = FlakyStore::new(SimObjectStore::with_faults(sim.seed(), object_faults));
+
+    let snapshot_every = [0u64, 40, 120][(entropy.next_u64() % 3) as usize];
+    let pin_segments = 1 + (entropy.next_u64() % 6) as usize;
+    let interleave = CONV_INTERLEAVE_CHOICES[(entropy.next_u64() % 4) as usize];
+    let archive_cfg = archive_config_bounded(snapshot_every, 8 << 20, pin_segments);
+    let mut arc = Archive::open(archive_cfg.clone(), src.as_mut().expect("just opened"))
+        .map_err(|e| format!("Archive::open: {e}"))?;
+
+    let mut st = ConvState::default();
+
+    'rounds: for _round in 0..CONV_ROUNDS {
+        // ---- writes, with archive steps INTERLEAVED rather than batched
+        // after them. Not cosmetic: the archive reads the log through the
+        // `Db`, so a source the matrix kills mid-round takes the archive
+        // with it, and an archive that had not stepped yet has published
+        // nothing for the oracle to read. Measured — before the interleave,
+        // universes that lost their source published nothing at all.
+        let want = 1 + entropy.next_u64() % CONV_WRITES_PER_ROUND;
+        for w in 0..want {
+            let id = st.model.len() as u64;
+            let with_job = entropy.next_u64().is_multiple_of(24);
+            let committed = {
+                let Some(db) = src.as_mut() else {
+                    break 'rounds;
+                };
+                db.transact(|tx| -> Result<(), std::convert::Infallible> {
+                    tx.put(&Rec {
+                        id: Id::from_raw(id),
+                        value: id,
+                    });
+                    tx.emit(Ping { n: id });
+                    if with_job {
+                        tx.enqueue(Resurrect { slot: id });
+                    }
+                    Ok(())
+                })
+            };
+            match committed {
+                Ok(()) => {
+                    let seq = src
+                        .as_ref()
+                        .and_then(|db| db.last_applied())
+                        .ok_or("a committed record left last_applied None")?;
+                    if seq != id {
+                        return Err(format!(
+                            "the {id}-th committed record landed at seq {seq}: the seq-to-id \
+                             correspondence every anchor in this property rests on is broken"
+                        ));
+                    }
+                    st.model.push(seq);
+                    st.jobs.push(with_job);
+                }
+                Err(TxError::Io(e)) => {
+                    if !is_fault_fallout(&e.to_string()) {
+                        return Err(format!("source commit failed non-injected: {e}"));
+                    }
+                    sim.cover("archive:source_write_faulted");
+                    // `get_or_insert`, never an assignment: the FIRST
+                    // rejected commit is the one that may be durable anyway
+                    // (`TxError::Io`'s doc), and every rejection after it
+                    // hits a poisoned WAL and writes nothing at all.
+                    // Overwriting here is the seed-0x7280605429586c42 defect
+                    // in `conv_reconcile`'s doc.
+                    st.unacked.get_or_insert((id, with_job));
+                    if st.restarts >= CONV_MAX_RESTARTS {
+                        break 'rounds;
+                    }
+                    st.restarts += 1;
+                    // The node restarts. A poisoned `Db` accepts nothing
+                    // further and the archive, which reads the log through
+                    // it, ships nothing further either. The old handle goes
+                    // FIRST — the store file is opened again, not twice.
+                    src = None;
+                    match conv_open_source(sim)? {
+                        Some(mut fresh) => {
+                            conv_reconcile(&fresh, &mut st)?;
+                            conv_settle(&store);
+                            arc = Archive::open(archive_cfg.clone(), &mut fresh).map_err(|e| {
+                                format!("Archive::open after a source restart: {e}")
+                            })?;
+                            src = Some(fresh);
+                            sim.cover("archive:source_restarted");
+                        }
+                        None => {
+                            sim.cover("archive:source_unrecoverable");
+                            break 'rounds;
+                        }
+                    }
+                }
+                Err(other) => {
+                    return Err(format!("impossible source rejection: {other:?}"));
+                }
+            }
+            if w % CONV_WRITES_PER_STEP == 0 {
+                for _ in 0..interleave {
+                    let Some(db) = src.as_ref() else {
+                        break 'rounds;
+                    };
+                    conv_step(sim, &mut arc, db, &store, &mut st)?;
+                    if arc.idle() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ---- one decorated phase per round.
+        match entropy.next_u64() % 6 {
+            // The write gate (spec §9.11, §4 rule 1, §8's negative space): a
+            // `Verifying` node uploads NOTHING. An oracle rather than a
+            // scenario — the bucket is compared across the gated window.
+            //
+            // Covered only when the archive HAD work at the moment the gate
+            // closed. Gating an archive that is already caught up proves
+            // nothing: no writes are accepted while the gate is shut, so no
+            // work can appear behind it either, and a key that counts those
+            // windows counts something that would hold against an archive
+            // that did nothing at all.
+            0 => {
+                let Some(db) = src.as_mut() else {
+                    break 'rounds;
+                };
+                // ONE step first, then read `idle()`: the flag is the last
+                // step's answer and nothing else, so reading it after a
+                // round of writes reports what the archive knew BEFORE
+                // them. That staleness is the same one Task 9's ready
+                // predicate had to pair `idle()` with a watermark to
+                // survive (task-9-report.md §2).
+                conv_step(sim, &mut arc, db, &store, &mut st)?;
+                let had_work = !arc.idle();
+                let before = store.keys();
+                db.verify_writes(vec!["witness-a".to_string()]);
+                for _ in 0..CONV_GATED_STEPS {
+                    conv_step(sim, &mut arc, db, &store, &mut st)?;
+                }
+                let after = store.keys();
+                if after != before {
+                    return Err(format!(
+                        "a Verifying node uploaded: the bucket went from {} object(s) to {} \
+                         while the write gate was closed (spec §4 rule 1)",
+                        before.len(),
+                        after.len()
+                    ));
+                }
+                if had_work {
+                    sim.cover("archive:verifying_gated");
+                }
+                db.allow_writes();
+            }
+            // A SUSTAINED store outage past the pin bound (spec §9.3/§9.4,
+            // ruling 3). Per-op probabilities cannot produce one: the gap
+            // needs the store down for as long as it takes `pin_segments`
+            // segments to seal, so the outage is a WINDOW, and the records
+            // written inside it are counted in segments rather than picked.
+            1 => {
+                store.set_reachable(false);
+                let inside = (pin_segments as u64 + 2) * CONV_RECORDS_PER_SEGMENT;
+                for _ in 0..inside {
+                    let id = st.model.len() as u64;
+                    let Some(db) = src.as_mut() else {
+                        break 'rounds;
+                    };
+                    match db.transact(|tx| -> Result<(), std::convert::Infallible> {
+                        tx.put(&Rec {
+                            id: Id::from_raw(id),
+                            value: id,
+                        });
+                        tx.emit(Ping { n: id });
+                        Ok(())
+                    }) {
+                        Ok(()) => {
+                            st.model.push(id);
+                            st.jobs.push(false);
+                        }
+                        Err(TxError::Io(e)) if is_fault_fallout(&e.to_string()) => {
+                            st.unacked.get_or_insert((id, false));
+                            break;
+                        }
+                        Err(other) => {
+                            return Err(format!("outage-window commit rejected: {other:?}"));
+                        }
+                    }
+                    let Some(db) = src.as_ref() else {
+                        break 'rounds;
+                    };
+                    conv_step(sim, &mut arc, db, &store, &mut st)?;
+                }
+                store.set_reachable(true);
+            }
+            // A lost ack aimed at a key the archive is actually about to
+            // write (spec §9.2). `SimObjectStore`'s own axis cannot be
+            // aimed, and at any rate that fires reliably it loses the FIRST
+            // object's ack so the archive never reaches a manifest at all —
+            // the same reason Task 5's re-review added `FlakyStore`'s
+            // needle.
+            2 => {
+                let needle =
+                    ["/manifest", "/segments/", "/snapshot/"][(entropy.next_u64() % 3) as usize];
+                store.set_lost_ack_for(Some(needle));
+                for _ in 0..CONV_STEPS_PER_ROUND {
+                    let Some(db) = src.as_ref() else {
+                        break 'rounds;
+                    };
+                    conv_step(sim, &mut arc, db, &store, &mut st)?;
+                    if st.lost_ack_key.is_some() {
+                        break;
+                    }
+                }
+                store.set_lost_ack_for(None);
+            }
+            // The archive's own restart: `State::Opening`'s resume-or-open
+            // (ruling 43). Dropping the old `Archive` releases its pin (F4);
+            // the fresh one has to read the bucket and decide whether to
+            // resume the generation the manifest names.
+            3 => {
+                let Some(db) = src.as_mut() else {
+                    break 'rounds;
+                };
+                conv_settle(&store);
+                arc = Archive::open(archive_cfg.clone(), db)
+                    .map_err(|e| format!("Archive::open on restart: {e}"))?;
+                sim.cover("archive:reopened");
+            }
+            _ => {}
+        }
+
+        // ---- drive the archive.
+        for _ in 0..CONV_STEPS_PER_ROUND {
+            let Some(db) = src.as_ref() else {
+                break 'rounds;
+            };
+            conv_step(sim, &mut arc, db, &store, &mut st)?;
+            if arc.idle() {
+                break;
+            }
+        }
+    }
+
+    // ---- quiesce. Every test-local switch off; the object axes the
+    // universe drew stay on, so this is "the outage ended", not "the faults
+    // stopped".
+    store.set_reachable(true);
+    store.set_lost_ack_for(None);
+    store.set_failing_gets(0);
+    if let Some(db) = src.as_mut()
+        && db.verifying()
+    {
+        db.allow_writes();
+    }
+    if let Some(db) = src.as_ref() {
+        for _ in 0..CONV_FINAL_STEPS {
+            conv_step(sim, &mut arc, db, &store, &mut st)?;
+            if arc.idle() {
+                break;
+            }
+        }
+    }
+
+    // ---- retry-idempotence (spec §9.2): a lost ack's retry goes to the
+    // SAME key, so the object is there under the key the failure named.
+    // `keys()` is the store's own inventory and takes no fault roll, so this
+    // cannot be excused by an unlucky GET.
+    if let Some(key) = st.lost_ack_key.clone() {
+        if store.keys().contains(&key) {
+            sim.cover("archive:lost_ack_retried");
+        } else if !arc.stopped() && !st.gapped && src.is_some() {
+            return Err(format!(
+                "a PUT to \"{key}\" landed and its ack was lost, and the object is not in the \
+                 bucket under that key afterwards — the retry did not go to the same key \
+                 (spec §9.2)"
+            ));
+        }
+    }
+    if st.rolled_generation {
+        sim.cover("archive:generation_rolled");
+    }
+    if src.is_none() {
+        sim.cover("archive:source_destroyed");
+    }
+
+    // ---- THE ORACLE. The store is the workload's from here on.
+    conv_settle(&store);
+    let Some(m) = conv_read_manifest(&store, 16) else {
+        sim.cover("archive:nothing_published");
+        return Ok(());
+    };
+    let f = conv_frontier(&m);
+    if !m.segments.is_empty() {
+        sim.cover("archive:chained");
+    }
+
+    // ANCHOR 0, before one byte is restored: the frontier the archive
+    // published is a seq this SOURCE actually committed. It is the anchor
+    // that makes the rest of them anchors — every expectation below is
+    // computed AT `f`, so a wrong `f` moves both sides of all of them
+    // together (the self-comparison shape task-12-hazard-note.md is about).
+    // `model[i] == i` is pinned at every commit, so this is exact.
+    if f as usize >= st.model.len() {
+        return Err(format!(
+            "the manifest publishes frontier {f}, above the {} record(s) this source ever \
+             committed — the archive named a frontier nothing backs",
+            st.model.len()
+        ));
+    }
+    let records = f + 1;
+    let pending_jobs = st.jobs[..records as usize].iter().filter(|j| **j).count() as u64;
+    if records >= CONV_SUBSTANTIAL_ROWS {
+        sim.cover("archive:restored_substantial");
+    }
+
+    let Some(report) = conv_restore_into(sim, &store, "dst", false)? else {
+        sim.cover("archive:restore_never_completed");
+        return Ok(());
+    };
+    if report.applied_seq != f {
+        return Err(format!(
+            "restore came up at {} but the manifest's newest recoverable point is {f} \
+             (generation {}, {} segment(s))",
+            report.applied_seq, report.generation, report.segments
+        ));
+    }
+    if report.generation != m.generation {
+        return Err(format!(
+            "restore reports generation {} for a manifest naming {}",
+            report.generation, m.generation
+        ));
+    }
+    if report.pending_jobs != pending_jobs {
+        return Err(format!(
+            "restore reports {} pending job(s); the workload enqueued {pending_jobs} at or \
+             below seq {f}",
+            report.pending_jobs
+        ));
+    }
+
+    // Injected read errors are transient by design (`FaultConfig::read_error`:
+    // "the next read of the same bytes may succeed") and the verification
+    // below is disk IO like anything else, so it is retried on fallout and
+    // only on fallout. A universe that never gets a clean read of its own
+    // destination reaches no verdict, and says so with a coverage key rather
+    // than passing quietly.
+    let mut verified = false;
+    for _ in 0..CONV_VERIFY_ATTEMPTS {
+        match conv_verify_restored(src.as_ref(), "dst", sim, records, pending_jobs, f) {
+            Ok(()) => {
+                verified = true;
+                break;
+            }
+            Err(ConvFail::Fallout) => continue,
+            Err(ConvFail::Violation(msg)) => return Err(msg),
+        }
+    }
+    if !verified {
+        sim.cover("archive:verify_never_read_cleanly");
+        return Ok(());
+    }
+    sim.cover("archive:restored");
+
+    // ---- spec §9.8: restore onto a DIVERGED local timeline refuses, and
+    // `--force` takes it and converges to the same place.
+    if entropy.next_u64().is_multiple_of(3) && conv_plant_diverged(sim, "div", records + 1)? {
+        match restore(
+            &store,
+            Box::new(sim.host("div").disk()),
+            conv_db_config(),
+            conv_schema(),
+            conv_restore_opts(false),
+            &mut |_| {},
+        ) {
+            Ok(r) => {
+                return Err(format!(
+                    "restore replaced a diverged local timeline without --force: {r:?}"
+                ));
+            }
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                let text = e.to_string();
+                if !text.contains("--force") || !text.contains("Nothing in the destination has") {
+                    return Err(format!(
+                        "the divergence refusal must name --force and promise the destination \
+                         is untouched (hard rule 5): {text}"
+                    ));
+                }
+                sim.cover("archive:diverged_refused");
+                // `--force` takes it, and lands at the same place: the same
+                // verdict, on a destination that held a different timeline
+                // a moment ago.
+                if let Some(forced) = conv_restore_into(sim, &store, "div", true)? {
+                    if forced.applied_seq != f {
+                        return Err(format!(
+                            "--force restored to {} rather than the archived frontier {f}",
+                            forced.applied_seq
+                        ));
+                    }
+                    for _ in 0..CONV_VERIFY_ATTEMPTS {
+                        match conv_verify_restored(
+                            src.as_ref(),
+                            "div",
+                            sim,
+                            records,
+                            pending_jobs,
+                            f,
+                        ) {
+                            Ok(()) => {
+                                sim.cover("archive:diverged_forced_converged");
+                                break;
+                            }
+                            Err(ConvFail::Fallout) => continue,
+                            Err(ConvFail::Violation(msg)) => return Err(msg),
+                        }
+                    }
+                }
+            }
+            Err(e) if is_fault_fallout(&e.to_string()) => {
+                sim.cover("archive:diverged_probe_faulted");
+            }
+            Err(e) => {
+                return Err(format!(
+                    "restore onto a diverged timeline failed for an unexpected reason: {e}"
+                ));
+            }
+        }
+    }
+
+    // ---- spec §9.10 / §4 rule 2: a second writer on one prefix stops
+    // rather than interleaving. LAST, because planting the foreign manifest
+    // replaces the generation pointer every oracle above reads.
+    let Some(db) = src.as_mut() else {
+        return Ok(());
+    };
+    conv_settle(&store);
+    if !arc.stopped() && conv_plant_foreign_manifest(&store, m.generation + 1) {
+        for _ in 0..CONV_FOREIGN_STEPS {
+            let id = st.model.len() as u64;
+            if db
+                .transact(|tx| -> Result<(), std::convert::Infallible> {
+                    tx.put(&Rec {
+                        id: Id::from_raw(id),
+                        value: id,
+                    });
+                    Ok(())
+                })
+                .is_ok()
+            {
+                st.model.push(id);
+                st.jobs.push(false);
+            }
+            conv_step(sim, &mut arc, db, &store, &mut st)?;
+            if arc.stopped() {
+                break;
+            }
+        }
+        if arc.stopped() {
+            sim.cover("archive:foreign_writer_stopped");
+        }
+        // The claim that does not depend on the archive NOTICING: it never
+        // advances a manifest it does not own. Checked either way.
+        conv_settle(&store);
+        match conv_read_manifest(&store, 16) {
+            Some(now) if now.writer == FOREIGN_WRITER => {}
+            Some(now) => {
+                return Err(format!(
+                    "this archive advanced a manifest owned by \"{FOREIGN_WRITER}\": it now \
+                     names \"{}\" at generation {} (spec §4 rule 2)",
+                    now.writer, now.generation
+                ));
+            }
+            None => {
+                return Err("the manifest is unreadable after the foreign-writer probe".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The durable-media-corruption axes are off here, and the reason is not the
+/// one `replication.rs`'s `no_media_corruption` gives — it is narrower and
+/// specific to what this property compares.
+///
+/// `bit_flip` and `misdirected_write` model bitrot of the ONLY LOCAL COPY
+/// (`checks::durable_corruption_fired`: "unrecoverable by design; v0's answer
+/// is M1 replication"). On the SOURCE that is a fine thing to fault and this
+/// property tolerates it — the archive is the second copy, and it refuses to
+/// ship a frame that fails verification rather than shipping corruption. On
+/// the RESTORE DESTINATION it is something else: `restore` writes the whole
+/// chain through `Db::apply_shipped`, so at a per-`write_at` rate these axes
+/// silently corrupt the destination's own WAL, and the restored `Db` then
+/// opens short, or not at all, for a reason that has nothing to do with the
+/// archive. Both hosts write under `corruption_scope: "wal/"` and the scope
+/// is a PATH prefix, not a host, so there is no way to fault one and not the
+/// other. Faulting the disk a verdict is read off makes the verdict
+/// unreadable, so the axes come off; the rest of the matrix — write, sync
+/// and read errors, entry loss, the latency ranges — stays hot on both.
+fn no_media_corruption_on_either_side(cfg: &mut FaultConfig) {
+    cfg.bit_flip = 0.0;
+    cfg.misdirected_write = 0.0;
+}
+
+/// The flagship oracle (spec §9, §11).
+///
+/// Fixed base, 256 universes, the same shape `replication.rs`'s own
+/// convergence property uses and for the same two reasons: a permanent
+/// always-in-the-suite property must not flake batch to batch, and `floor:`
+/// — a MEASURED rate rather than `require:`'s floor of one — is only
+/// meaningful against a base that does not move. The evidence bar's "N fresh
+/// seeds" is satisfied by running fresh bases and recording them (see
+/// task-12-report.md §4), not by moving this one.
+#[test]
+fn archive_converges() {
+    run_universes_swarm_with!(
+        ARCHIVE_CONVERGENCE_BASE,
+        256,
+        no_media_corruption_on_either_side,
+        archive_convergence_universe,
+        require: [
+            "archive:restored",
+            "archive:gap_closed_generation",
+            "archive:lost_ack_retried",
+            "archive:diverged_refused",
+            "archive:verifying_gated",
+            "archive:foreign_writer_stopped",
+        ],
+        floor: [
+            ("archive:restored", CONV_RESTORED_FLOOR),
+            ("archive:restored_substantial", CONV_SUBSTANTIAL_FLOOR),
+            ("archive:chained", CONV_CHAINED_FLOOR),
+        ]
+    );
+}
+
+/// The budget pin. `CONV_RECORDS_PER_SEGMENT` is what the outage window and
+/// the pin bound are counted in, so a frame-size change that stopped the
+/// universes sealing anything would otherwise leave the property green and
+/// empty. Asserted against a freshly built fixture — the thing — never
+/// against a transcription of the number.
+#[test]
+fn conv_segment_layout_is_what_the_budget_assumes() {
+    let sim = Sim::with_faults(0x636f_6e76_5f6c_6179, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.host("src").disk()),
+        conv_db_config(),
+        conv_schema(),
+    )
+    .unwrap();
+    assert_eq!(db.last_applied(), None, "a fresh Db has committed nothing");
+    for i in 0..8 * CONV_RECORDS_PER_SEGMENT {
+        db.transact(|tx| -> Result<(), std::convert::Infallible> {
+            tx.put(&Rec {
+                id: Id::from_raw(i),
+                value: i,
+            });
+            tx.emit(Ping { n: i });
+            Ok(())
+        })
+        .unwrap();
+    }
+    let sealed = db.sealed_segments().unwrap();
+    assert!(
+        sealed.len() >= 6,
+        "8 * CONV_RECORDS_PER_SEGMENT commits sealed only {} segment(s): the constant is \
+         stale and every budget counted in segments is wrong. Sealed: {sealed:?}",
+        sealed.len()
+    );
+    // Steady state, skipping segment 0 (schema adoption folds an extra
+    // effect into the first commit, so it holds one fewer — the same
+    // asymmetry FIRST_SEGMENT_RECORDS records at 64 KiB).
+    let steady = sealed[1].layout_end - sealed[1].base_seq + 1;
+    assert_eq!(
+        steady, CONV_RECORDS_PER_SEGMENT,
+        "a steady-state segment holds {steady} records, not the \
+         CONV_RECORDS_PER_SEGMENT this file budgets in"
+    );
+}
+
 mod fs_object_store {
     #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
