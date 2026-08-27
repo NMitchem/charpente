@@ -524,8 +524,27 @@ Hard rule 5: name the contract, the site, and the fix.
 Negative space first, since these are the properties that can be violated without failing a
 test:
 
-- The archive **never** advances `last_applied`, acks a write, gates a transaction, or
-  affects `Db::poisoned()`. An archive failure is not a database failure.
+- The archive **never** advances `last_applied`, acks a write, or gates a transaction, and no
+  failure of the archive's external dependency — the `ObjectStore` — **ever** affects
+  `Db::poisoned()`. An archive failure is not a database failure. That last clause holds
+  *because* the archive is read-only on the `Db`, not because something checks it:
+  `Archive::step` takes `db: &Db` while `Db::transact` takes `&mut self`, both
+  `Engine::poisoned` sites are apply-path failure arms, and the `ObjectStore` is a separate IO
+  path with no route into the `Db`'s own store. It is a consequence of the architecture, so the
+  thing to protect is the architecture — a `&mut Db` in the archive's signature is what would
+  make this bullet false.
+
+  **The residual, stated rather than hidden.** An archiving node adds a *reader* of the local
+  store, and a reader can DISCOVER a failing local disk. `Db::poisoned()` is
+  `engine.poisoned() || store_failed()`, and `Store::failed` is redb's `CheckedBackend.io_failed`
+  latch, which fires on any backend operation returning `Err` — including a read only the
+  archive issued (`db.snapshot()`, then `scan_raw_from` per batch). So an archiving node may
+  latch `store_failed` on a local disk fault marginally sooner than a non-archiving one would
+  have. **Durability is not implicated**: `Store::failed`'s own doc — "the WAL is intact and
+  committed records are durable. Only this handle is unusable." The archive did not cause that
+  fault, it issued the read that found it, and an archive that swallowed a local read error
+  would ship unread-or-corrupt bytes to the bucket instead. Measured, not assumed: the
+  convergence property counts the discoveries (`archive:step_discovered_disk_fault`).
 - The archive **never** ships an unsealed segment or bytes above `last_applied`.
 - `start` is **never** called with an operation already in flight (assert, don't handle).
 - The manifest **never** points at a generation whose objects are not all uploaded.

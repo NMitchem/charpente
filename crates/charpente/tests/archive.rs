@@ -1035,6 +1035,19 @@ fn an_archive_opened_on_a_compacted_log_never_reaches_below_the_logs_base() {
     );
 }
 
+/// A regression guard on an ARCHITECTURAL property, not coverage of a fault
+/// path — read the label before counting this test as either.
+///
+/// The store is unreachable and every step below fails, but no `ObjectStore`
+/// failure can reach `Db::poisoned()` by any route: `Archive::step` takes
+/// `db: &Db` while `Db::transact` takes `&mut self`, both `Engine::poisoned`
+/// sites are apply-path failure arms, and the `ObjectStore` is a separate IO
+/// path with no route into the Db's own store. So this passes BY
+/// CONSTRUCTION today, and it is worth keeping for what it does catch: the
+/// day the archive is given a write path — a `&mut Db` in its signature —
+/// this is where spec §8's first bullet stops being true. What it is not is
+/// evidence that the guarantee survives an injected fault, because no
+/// injected fault was ever in a position to break it.
 #[test]
 fn an_archive_io_failure_never_poisons_the_db() {
     let (mut db, store, mut arc) = archive_fixture_with_unreachable_store();
@@ -6117,7 +6130,16 @@ struct ConvState {
     rolled_generation: bool,
 }
 
-/// One archive step, plus the two things that must hold on EVERY one of
+/// Engine/WAL poison ALONE. `Db::poisoned()` is `engine.poisoned() ||
+/// store_failed()` and exposes no accessor for the first half, so it is
+/// derived — exact until the store latches, and false for every step after
+/// that. That bound is why the guard below is written as an edge and why it
+/// is not the property's evidence for anything.
+fn conv_engine_poisoned(db: &Db) -> bool {
+    db.poisoned() && !db.store_failed()
+}
+
+/// One archive step, plus the negative space that must hold on EVERY one of
 /// them.
 ///
 /// Returns `Err` only for something that is not fault fallout: the archive's
@@ -6133,22 +6155,69 @@ fn conv_step(
 ) -> Result<(), String> {
     let was_gapped = arc.gapped();
     let was_stopped = arc.stopped();
-    let poisoned_before = db.poisoned();
+    let applied_before = db.last_applied();
+    let gate_before = db.writes_allowed();
+    let engine_poisoned_before = conv_engine_poisoned(db);
+    let store_failed_before = db.store_failed();
     let generation_before = arc.pin_floor();
     let r = arc.step(db, store);
 
-    // NEGATIVE SPACE, every step (spec §8, and the brief's
-    // `archive:never_poisons`): "the archive never advances `last_applied`,
-    // acks a write, gates a transaction, or affects `Db::poisoned()`. An
-    // archive failure is not a database failure." Checked as an EDGE across
-    // the step rather than as `!db.poisoned() || something_else()`, because
-    // the source `Db` can legitimately poison itself on its own disk faults
-    // and the two are otherwise indistinguishable at the end of a universe.
-    if !poisoned_before && db.poisoned() {
+    // NEGATIVE SPACE, every step (spec §8's first bullet): "the archive never
+    // advances `last_applied`, acks a write, or gates a transaction."
+    // Checked as EDGES across the step, because the source `Db` legitimately
+    // does all three on its own and only the transition is attributable to
+    // `Archive::step`.
+    //
+    // **These are ARCHITECTURAL REGRESSION GUARDS, not fault coverage**, and
+    // the distinction is the whole reason they are labelled here. No fault
+    // this property injects can fire any of them: `Archive::step` takes
+    // `db: &Db` (archive/mod.rs) while `Db::transact` takes `&mut self`
+    // (db.rs) and both `Engine::poisoned` sites are apply-path failure arms
+    // (engine.rs), so the archive has no path to commit, ack, gate or poison
+    // anything. They go red the day the archive is given a write path — a
+    // `&mut Db` in its signature — which is exactly the change that would
+    // make §8's first bullet false, and they say so at the step rather than
+    // leaving the convergence oracle to notice a symptom later. Counting
+    // them as evidence that the guarantee survives faults would overcount
+    // this property's oracles by three.
+    if db.last_applied() != applied_before {
         return Err(format!(
-            "Archive::step poisoned the Db (spec §8: an archive failure is not a database \
-             failure). The step returned {r:?}"
+            "Archive::step advanced last_applied from {applied_before:?} to {:?} (spec §8: the \
+             archive never advances `last_applied` or acks a write). The archive is a READER of \
+             the Db and holds it as `&Db`; if it now needs to commit, that is a design change to \
+             take to §8, not a test to update. The step returned {r:?}",
+            db.last_applied()
         ));
+    }
+    if db.writes_allowed() != gate_before {
+        return Err(format!(
+            "Archive::step changed the Db's write gate (writes_allowed {gate_before} -> {}) \
+             (spec §8: the archive never gates a transaction). The archive READS the gate — it \
+             uploads nothing while `verifying()` — and never sets it; if it now needs to, that \
+             is a design change to take to §8. The step returned {r:?}",
+            db.writes_allowed()
+        ));
+    }
+    if !engine_poisoned_before && conv_engine_poisoned(db) {
+        return Err(format!(
+            "Archive::step poisoned the engine (spec §8: an archive failure is not a database \
+             failure). Engine poison is set only in `Engine::apply_batch`'s failure arms, a path \
+             `&Db` cannot reach, so this is a write path the archive should not have. The step \
+             returned {r:?}"
+        ));
+    }
+    // A STORE LATCH is not a violation, and it is counted rather than
+    // asserted on. `Store::failed` is redb's `CheckedBackend.io_failed`,
+    // latched by ANY backend read returning `Err` — including a read only the
+    // archive issued (`db.snapshot()`, then `scan_raw_from` per batch). So an
+    // archiving node can DISCOVER a failing local disk sooner than a
+    // non-archiving one; it never causes one, and durability is not
+    // implicated (`Store::failed`'s own doc: the WAL is intact and committed
+    // records are durable). Spec §8 states that residual in the same terms.
+    // Counted so its frequency is a number instead of an argument — seed
+    // 0xb803ea7cab19d08c is the universe that made it concrete.
+    if !store_failed_before && db.store_failed() {
+        sim.cover("archive:step_discovered_disk_fault");
     }
     // The archive's two operator notices are `Err`s it returns ON PURPOSE,
     // once, at the step that raises them (spec §7; task-9-report.md T-6), so
@@ -7183,6 +7252,50 @@ fn no_media_corruption_on_either_side(cfg: &mut FaultConfig) {
 /// meaningful against a base that does not move. The evidence bar's "N fresh
 /// seeds" is satisfied by running fresh bases and recording them (see
 /// task-12-report.md §4), not by moving this one.
+///
+/// **The seed that taught this property what it was actually checking.**
+/// Hard rule 3 — recorded here because the frozen runner exposes no public
+/// single-seed replay (`run_universe` is `pub(crate)`, `splitmix64`/`Rng`
+/// private) and reconstructing the seed->config mapping in a test would fork
+/// a contract whose own doc says "do not reorder anything":
+///
+/// ```text
+/// CHARPENTE_SEED=0xb803ea7cab19d08c cargo test -p charpente --test archive -- --nocapture
+/// ```
+///
+/// Found at base `0xD9E3_0001`; the env var overrides the base, so it
+/// replays against THIS committed base in 0.02s. It used to fail the
+/// negative-space edge in `conv_step`:
+///
+///   `Archive::step poisoned the Db` ... `"table store (redb): I/O error:
+///   injected read error"`
+///
+/// Mechanism, measured rather than argued (`store_failed=true`,
+/// `engine_poison=false`, `last_applied=Some(137)`): the archive's snapshot
+/// path reads the Db's redb store (`db.snapshot()`, then `scan_raw_from` per
+/// batch). redb latches `CheckedBackend.io_failed` on ANY backend read `Err`,
+/// `Store::failed` is that latch, and `Db::poisoned` is
+/// `engine.poisoned() || store_failed()`. So an injected read error on a read
+/// only the archive issued latched the Db's store handle while the WAL was
+/// intact.
+///
+/// That is the archive DISCOVERING a failing local disk, not causing one, and
+/// spec §8's first bullet now says so and states the residual. `conv_step`
+/// counts it (`archive:step_discovered_disk_fault`) instead of failing on it.
+/// The key is reported and deliberately NOT in `require:`: it is 0 in 256 at
+/// this base and 1 in 768 across three fresh bases, so requiring it would
+/// make a permanent property flake on a rare fault (`floor:`'s own argument,
+/// run backwards).
+///
+/// **What `conv_step` still asserts across every step — `last_applied`, the
+/// write gate, engine poison — no fault in this property can fire either.**
+/// `Archive::step` takes `&Db`, so those are regression guards on the
+/// read-only-ness that makes §8 true, and they go red on a `&mut Db` in the
+/// archive's signature rather than on any universe. Labelled, at the site and
+/// here, because anyone counting this property's fault-injection oracles will
+/// otherwise count three that cannot fire.
+/// `an_archive_io_failure_never_poisons_the_db` is the same kind of guard and
+/// carries the same label.
 #[test]
 fn archive_converges() {
     run_universes_swarm_with!(
