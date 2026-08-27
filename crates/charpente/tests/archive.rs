@@ -4216,6 +4216,11 @@ fn the_archive_arm_ticks_without_starving_requests() {
         "the archive arm starved the request arm"
     );
     assert!(served.archive_steps > 0, "the archive arm never ran");
+    // WEAKER THAN IT READS, and kept only as a cheap upper bound: a
+    // drain-to-completion arm empties the archive and is then held by the
+    // data watermark, so this stays green under exactly the mutation it looks
+    // like it guards. `the_archive_arm_does_one_step_per_kernel_iteration` is
+    // the real oracle for that property.
     assert!(
         served.archive_steps <= 1_000,
         "{} archive steps over 1,000 kernel iterations: the arm ran more than once per \

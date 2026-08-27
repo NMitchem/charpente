@@ -742,15 +742,28 @@ pub struct Archive {
 /// `Archive`, so dropping a `Kernel` drops one, including every test that
 /// builds a kernel and lets it fall out of scope.
 ///
-/// Releases exactly the way `stop` does (RULING 49): clear `Pin::holding`
-/// and leave `floor` where it is, so `set_floor`'s monotonic assert stays
-/// unreachable in the one path whose whole job is releasing. The closure
-/// itself stays registered and now reports `u64::MAX` —
-/// `Db::retention_floor`'s identity element, which constrains nothing.
+/// Releases the way `stop` does (RULING 49): clear `Pin::holding` and leave
+/// `floor` untouched, so `set_floor`'s monotonic assert stays unreachable in
+/// the one path whose whole job is releasing. The closure itself stays
+/// registered and now reports `u64::MAX` — `Db::retention_floor`'s identity
+/// element, which constrains nothing.
+///
+/// Writes the field directly rather than going through `pin_floor` /
+/// `yield_pin`, and NEVER `expect`s the lock. `set_floor` holds the
+/// `MutexGuard` across its monotonic assert, so if that assert ever fires the
+/// mutex is left poisoned — and this destructor then runs during the unwind.
+/// An `expect` here would be a panic inside a destructor during a panic,
+/// which ABORTS: the process dies without unwinding, the assert's own
+/// diagnosis is the last thing anyone sees, and a test run loses every other
+/// test's result. An abort is a strictly worse outcome than the leak F4 fixed,
+/// so the recovery is not defensive tidiness. Recovering the inner value is
+/// also correct rather than merely safe: the poisoned state is a floor the
+/// assert refused to move, which is exactly the floor that must stop being
+/// reported.
 impl Drop for Archive {
     fn drop(&mut self) {
-        let floor = self.pin_floor();
-        self.yield_pin(floor);
+        let mut pin = self.pin.lock().unwrap_or_else(|e| e.into_inner());
+        pin.holding = false;
     }
 }
 
