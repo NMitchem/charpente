@@ -8,16 +8,19 @@
 //! names the command that fixes it, and prints the FIRST differing line — CI
 //! must show what drifted without dumping a generated file into the log.
 
-const KNOWN_FLAGS: &[&str] = &["--dir", "--out"];
+const KNOWN_FLAGS: &[&str] = &["--dir", "--out", "--bin"];
 
-pub const USAGE: &str = "usage: charpente gen-client [--dir PATH] [--out PATH]\n\
-       charpente check-client [--dir PATH] [--out PATH]\n\
+pub const USAGE: &str = "usage: charpente gen-client [--dir PATH] [--out PATH] [--bin NAME]\n\
+       charpente check-client [--dir PATH] [--out PATH] [--bin NAME]\n\
        --dir PATH   the app crate directory to build and read the contract from (default: .)\n\
-       --out PATH   the generated TypeScript client, committed to the repo (default: ./client.ts)";
+       --out PATH   the generated TypeScript client, committed to the repo (default: ./client.ts)\n\
+       --bin NAME   which binary to read the contract from when the crate has several \
+(default: the sole binary, else the one named like the package)";
 
 struct Parsed {
     dir: String,
     out: String,
+    bin: Option<String>,
 }
 
 /// Both verbs take the same flags, so they share one parser; `verb` is only
@@ -25,6 +28,7 @@ struct Parsed {
 fn parse(verb: &str, args: &[String]) -> Result<Parsed, i32> {
     let mut dir = ".".to_string();
     let mut out = "./client.ts".to_string();
+    let mut bin = None;
 
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
@@ -42,22 +46,27 @@ fn parse(verb: &str, args: &[String]) -> Result<Parsed, i32> {
         match flag.as_str() {
             "--dir" => dir = value.clone(),
             "--out" => out = value.clone(),
+            "--bin" => bin = Some(value.clone()),
             _ => unreachable!("KNOWN_FLAGS and this match must stay in sync"),
         }
     }
 
-    Ok(Parsed { dir, out })
+    Ok(Parsed { dir, out, bin })
 }
 
 /// Builds the app at `--dir`, generates its client, writes it to `--out`.
-/// 0 on success, 2 on any build/launch/write fault. There is no failure
-/// verdict to report, so 1 is not among this verb's codes.
+/// 0 on success, 2 on any build/launch/write fault, 101 if
+/// `charpente_tsgen::emit_client` panics on a contract it refuses to
+/// represent (Rust's default panic exit code — the panic message names the
+/// Rust route or type and the fix, hard rules 4 and 5; there is no `Result`
+/// to map to a code of our own choosing here). There is no failure verdict
+/// to report, so 1 is not among this verb's codes.
 pub fn generate(args: &[String]) -> i32 {
     let parsed = match parse("gen-client", args) {
         Ok(p) => p,
         Err(code) => return code,
     };
-    let ts = match client_for(&parsed.dir) {
+    let ts = match client_for("gen-client", &parsed.dir, parsed.bin.as_deref()) {
         Ok(ts) => ts,
         Err(code) => return code,
     };
@@ -83,7 +92,9 @@ pub fn generate(args: &[String]) -> i32 {
 
 /// Regenerates the client for the app at `--dir` and compares it against the
 /// committed file at `--out`. 0 identical, 1 stale or missing, 2 build or
-/// launch fault.
+/// launch fault, 101 if `charpente_tsgen::emit_client` panics on a contract
+/// it refuses to represent (same as `generate` — a fresh client is generated
+/// here too, before the comparison).
 ///
 /// The 1-vs-2 split is the whole point: 1 means "the committed client does
 /// not match this app's contract", 2 means "nothing could be built to
@@ -94,7 +105,7 @@ pub fn check(args: &[String]) -> i32 {
         Ok(p) => p,
         Err(code) => return code,
     };
-    let fresh = match client_for(&parsed.dir) {
+    let fresh = match client_for("check-client", &parsed.dir, parsed.bin.as_deref()) {
         Ok(ts) => ts,
         Err(code) => return code,
     };
@@ -117,9 +128,9 @@ pub fn check(args: &[String]) -> i32 {
         return 0;
     }
     eprintln!(
-        "error: charpente check-client: {} is stale — it is not what this app's contract \
-         generates, i.e. a Rust route or wire type changed and the client was not \
-         regenerated\n  fix: charpente gen-client --dir {} --out {}\n  then commit the result.",
+        "error: charpente check-client: {} is stale — it does not match what this app's \
+         contract generates right now\n  fix: charpente gen-client --dir {} --out {}\n  then \
+         commit the result.",
         parsed.out, parsed.dir, parsed.out
     );
     for line in first_difference(&committed, &fresh) {
@@ -129,16 +140,17 @@ pub fn check(args: &[String]) -> i32 {
 }
 
 /// Build the app, read its contract, emit the client. Every error is already
-/// reported when this returns `Err`.
-fn client_for(dir: &str) -> Result<String, i32> {
-    let json = crate::describe::contract_json(dir, None)?;
+/// reported when this returns `Err`. `verb` is only in the diagnostics, same
+/// reason as `parse`'s.
+fn client_for(verb: &str, dir: &str, bin: Option<&str>) -> Result<String, i32> {
+    let json = crate::describe::contract_json(dir, bin)?;
     let contract = match contract::parse(&json) {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "error: charpente gen-client: the contract `{dir}` printed is not one this \
-                 charpente understands: {e} — the app and this CLI must be built from the same \
-                 charpente version"
+                "error: charpente {verb}: the contract the app at `{dir}` printed is not one \
+                 this charpente understands: {e} — the app and this CLI must be built from the \
+                 same charpente version"
             );
             return Err(2);
         }
@@ -148,8 +160,21 @@ fn client_for(dir: &str) -> Result<String, i32> {
 
 /// The first differing line with both sides — enough to see WHAT drifted
 /// without printing an entire generated file into a CI log.
+///
+/// Splits on `\n` via `split_terminator`, NOT `str::lines()`. `lines()`
+/// strips a trailing `\r` from every element, so a CRLF file and an LF file
+/// with otherwise identical content compare equal line-by-line and this
+/// function falls through to the length branch — which then reports the
+/// same line count for both sides, a self-contradiction (F1). Comparing the
+/// unstripped segments makes a CRLF-vs-LF drift a real per-line difference
+/// instead of an invisible one; `split_terminator` (rather than `split`)
+/// still avoids counting a shared trailing newline as an extra empty line,
+/// matching `lines()` in every other respect.
 fn first_difference(a: &str, b: &str) -> Vec<String> {
-    let (av, bv): (Vec<&str>, Vec<&str>) = (a.lines().collect(), b.lines().collect());
+    let (av, bv): (Vec<&str>, Vec<&str>) = (
+        a.split_terminator('\n').collect(),
+        b.split_terminator('\n').collect(),
+    );
     for (i, (x, y)) in av.iter().zip(bv.iter()).enumerate() {
         if x != y {
             return vec![
@@ -685,11 +710,33 @@ mod tests {
         );
     }
 
+    /// F1: `str::lines()` splits on `\n` and strips a trailing `\r`, so a
+    /// CRLF file and an LF file with the same content used to compare equal
+    /// line-by-line, falling through to a length branch that then printed
+    /// "committed 2 lines, generated 2 lines" — the same number twice. This
+    /// pins that the drift is now a real difference AT the first line, not
+    /// an invisible one that surfaces as a self-contradiction two branches
+    /// later.
+    #[test]
+    fn first_difference_is_not_blind_to_a_crlf_vs_lf_drift() {
+        let crlf = "a\r\nb\r\n";
+        let lf = "a\nb\n";
+        assert_eq!(
+            first_difference(crlf, lf),
+            vec![
+                "  first difference at line 1:".to_string(),
+                "    committed: a\r".to_string(),
+                "    generated: a".to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn parse_defaults_dir_and_out() {
         let p = parse("gen-client", &[]).unwrap();
         assert_eq!(p.dir, ".");
         assert_eq!(p.out, "./client.ts");
+        assert_eq!(p.bin, None);
     }
 
     #[test]
@@ -698,6 +745,17 @@ mod tests {
         let p = parse("gen-client", &args).unwrap();
         assert_eq!(p.dir, "/app");
         assert_eq!(p.out, "web/client.ts");
+    }
+
+    /// F2: the plumbing a two-binary crate needs. `describe.rs`'s ambiguous-
+    /// binary error names `--bin NAME` as the fix; before this, `gen-client`
+    /// and `check-client` had no such flag, so that named fix did not exist
+    /// for either verb's own user (only `charpente describe` had `--bin`).
+    #[test]
+    fn parse_reads_the_bin_flag() {
+        let args = ["--bin", "worker"].map(String::from);
+        let p = parse("gen-client", &args).unwrap();
+        assert_eq!(p.bin, Some("worker".to_string()));
     }
 
     #[test]

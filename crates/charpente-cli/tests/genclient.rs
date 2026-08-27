@@ -89,8 +89,9 @@ fn stderr(out: &Output) -> String {
 /// holds. An assert cannot catch a mutation of the thing it is derived from.
 ///
 /// Every anchor below is a LITERAL. None is produced by calling into
-/// `charpente_tsgen` (this crate does not import it), and each is pinned
-/// either to text the runtime declares verbatim or to something
+/// `charpente_tsgen` from this file (only `src/genclient.rs` does, to build
+/// the real client this file checks against these anchors), and each is
+/// pinned either to text the runtime declares verbatim or to something
 /// `examples/invoicing` declares in Rust — `create_customer` and
 /// `list_invoices` are two of its `#[route]` handlers, `CustomerView` is one
 /// of its `#[derive(Wire)]` types, and `Customer` is one of its `#[table]`s,
@@ -265,6 +266,16 @@ fn check_client_on_a_missing_file_exits_one_and_names_the_fix() {
         "the failure must name the fix (hard rule 5): {err}"
     );
 }
+
+// F5 (task-10-review): at the commit that introduced these three tests, `gen-client`/
+// `check-client` were not yet wired into main.rs's dispatch, so an unrecognized verb also
+// fell through to a generic exit-2 usage message — the assert_eq! below happened to pass
+// for that unrelated reason, and only the later message assertion produced the RED. Both
+// verbs are wired in now, so the code path each `assert_eq!` exercises really is this
+// file's own flag/binary validation, not a coincidence — reverting each of these three
+// specific error-code returns to `1` (`crates/charpente-cli/src/genclient.rs`'s unknown-flag
+// and valueless-flag branches, `crates/charpente-cli/src/describe.rs`'s `choose_bin`
+// mapping) and rerunning confirmed each test panics at its `assert_eq!`, not downstream.
 
 #[test]
 fn an_unknown_flag_exits_two_and_names_the_valid_flags() {
