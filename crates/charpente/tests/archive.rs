@@ -5981,14 +5981,51 @@ const CONV_RESTORE_ATTEMPTS: u32 = 32;
 /// different question: not "did restore complete" but "did the CHECKER get a
 /// clean read", and the fault it retries is `read_error`, which the axis's
 /// own doc calls transient.
-const CONV_VERIFY_ATTEMPTS: u32 = 8;
+const CONV_VERIFY_ATTEMPTS: u32 = 32;
 
 /// The base seed `archive_converges` runs from. Explicit, like
 /// `replication.rs`'s `0x2EB1_*` family.
 const ARCHIVE_CONVERGENCE_BASE: u64 = 0xA2C0_0001;
 
-/// Measured rates over the 256 universes at `ARCHIVE_CONVERGENCE_BASE` — see
-/// task-12-report.md §4 for the run they were read off.
+/// `write_error` and `sync_error` are drawn per DISK OPERATION, from a range
+/// calibrated against universes that commit tens of records —
+/// `crash_recovery.rs`'s four rounds of at most twelve appends,
+/// `replication.rs`'s forty commits. This one commits several hundred,
+/// because a generation needs a snapshot AND a chain of sealed segments
+/// above it before there is anything to converge, so at the same per-op rate
+/// its per-universe exposure is nearly an order of magnitude higher. Divided
+/// by the length ratio, it is back in the range the numbers were drawn for.
+///
+/// This is not a knob that makes a red property green — it decides how many
+/// universes have a NODE in them at all, and MEASURED at 1 the source's own
+/// disk was the property's dominant reason for reaching no verdict:
+///
+/// | divisor | reached the oracle | published nothing | source restarts |
+/// |---|---|---|---|
+/// | 1 | 130 / 256 | 97 | 1,839 |
+/// | 4 | 177 / 256 | 64 | 1,033 |
+/// | 8 | 197 / 256 | 38 | 1,000 |
+/// | 16 | 206 / 256 | 28 | 764 |
+///
+/// The length ratio argues for about 8 and the measurement puts the knee
+/// there too; 16 is the next step and buys the last nine verdicts without
+/// collapsing the path the axis exists to drive — three source restarts per
+/// universe, still. Past it there is nothing left to buy: what remains is
+/// universes whose source is destroyed outright, and those are answered by
+/// running the oracle WITHOUT a source
+/// (`archive:compared_without_source`) rather than by turning the axis down
+/// until they stop happening. **The axis stays ON**, which is the difference
+/// between scaling a fault and disabling one.
+const CONV_DISK_ERROR_DIVISOR: f64 = 16.0;
+
+/// Measured rates over the 256 universes at `ARCHIVE_CONVERGENCE_BASE`, read
+/// off a batch reproduced identically twice (task-12-report.md §4). The other
+/// 40 universes reach no verdict and say which kind: 28 never published a
+/// generation at all (`archive:nothing_published`) and 12 never got a clean
+/// read of their own restored destination
+/// (`archive:verify_never_read_cleanly`). Those two plus
+/// `archive:restored` account for all 256, which is the arithmetic that
+/// makes "no verdict" a measured quantity here rather than an unknown one.
 ///
 /// `require:` has a floor of one, which catches an oracle that stopped firing
 /// entirely and misses one that decayed to a token handful. These are the
@@ -6009,9 +6046,9 @@ const ARCHIVE_CONVERGENCE_BASE: u64 = 0xA2C0_0001;
 /// `replication.rs`'s `FINGERPRINT_FLOOR` and the rule is the same one):
 /// it means the universes reach that state less often than when the numbers
 /// were taken, and why is the finding.
-const CONV_RESTORED_FLOOR: u64 = 1;
-const CONV_SUBSTANTIAL_FLOOR: u64 = 1;
-const CONV_CHAINED_FLOOR: u64 = 1;
+const CONV_RESTORED_FLOOR: u64 = 216;
+const CONV_SUBSTANTIAL_FLOOR: u64 = 181;
+const CONV_CHAINED_FLOOR: u64 = 168;
 
 /// A restored `Db` this size or larger counts as a substantial verdict.
 /// `require:`'s floor is one occurrence, which catches an oracle that
@@ -7133,6 +7170,8 @@ fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
 fn no_media_corruption_on_either_side(cfg: &mut FaultConfig) {
     cfg.bit_flip = 0.0;
     cfg.misdirected_write = 0.0;
+    cfg.write_error /= CONV_DISK_ERROR_DIVISOR;
+    cfg.sync_error /= CONV_DISK_ERROR_DIVISOR;
 }
 
 /// The flagship oracle (spec §9, §11).
