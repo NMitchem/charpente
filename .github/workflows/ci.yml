@@ -136,3 +136,25 @@ jobs:
       - run: cargo test -p ts-fixture-app --test samples
       - run: npx tsc --noEmit
         working-directory: ts-fixture
+      # The RUNTIME oracle (chunk B0, ts-client-codegen): `tsc --noEmit` above can only
+      # prove a call site type-checks, never that a runtime VALUE matches its declared
+      # type — so it cannot catch "the declared type is `bigint` and the value is a
+      # string", which is exactly how the Int64 bug (task 11 finding 1) shipped through
+      # a green gate. `npm run test` compiles `src/**/*.test.ts` to a gitignored `dist/`
+      # (`tsconfig.test.json`, `noEmit: false`) and runs it with Node's built-in test
+      # runner against real `generated/samples.ts` documents through a stubbed `fetch`
+      # (`src/testing/fetch-stub.ts`) — never a hand-written stand-in. `npm run test`
+      # rather than `npx tsc`/`npx` anything, for the reason given above `npx tsc`.
+      #
+      # `int64.test.ts` is EXPECTED to fail here until chunk B1 revives `Int64` in the
+      # runtime: it is the RED this oracle exists to produce, not a broken step. Do not
+      # "fix" this job by skipping or loosening that test — fixing runtime.rs is chunk
+      # B1's job, tracked in chunk-b1-brief.md.
+      #
+      # NOT yet exercised on a runner, same caveat as the block above: verified locally
+      # (macOS, Node v24.13.1) only. What could still differ on a clean Ubuntu runner —
+      # Node's module resolution, the working directory `npm run test` resolves `dist/`
+      # relative to, and whether a not-yet-existing `dist/` changes step ordering — is
+      # unconfirmed until this runs once for real.
+      - run: npm run test
+        working-directory: ts-fixture
