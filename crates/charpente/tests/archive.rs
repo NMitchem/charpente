@@ -5347,3 +5347,44 @@ fn the_report_names_the_jobs_restore_is_about_to_resurrect() {
         seen.borrow()
     );
 }
+
+/// The reason `SnapshotMeta` carries a `frontier_crc` at all: a restored node
+/// has to be able to PROVE its position to a replication peer
+/// (`Db::seed_frontier`, `repl/follower.rs`'s Hello, `repl/session.rs`'s
+/// vouch). The value it comes up with must be the one the SOURCE would have
+/// computed for that same record — checked here against the source's own log,
+/// not against the object restore read it out of.
+#[test]
+fn a_restored_node_can_vouch_the_frontier_its_snapshot_came_from() {
+    let (src, store) = archived_db_with_rows(1_000);
+    let m = read_manifest(&store).expect("a manifest");
+    let sim = fresh_sim();
+    restore(
+        &store,
+        Box::new(sim.disk()),
+        restore_cfg(),
+        restore_schema(),
+        restore_opts(),
+        &mut |_| {},
+    )
+    .unwrap();
+
+    let frame = src
+        .read_log(m.applied_seq, 1)
+        .expect("the source still retains its snapshot's frontier frame")
+        .into_iter()
+        .next()
+        .expect("read_log returns the frame it does not refuse");
+    let expected = charpente_core::log::frame_crc(frame.0, &frame.1);
+    assert_ne!(
+        expected, 0,
+        "a zero checksum would make this indistinguishable from an unset field"
+    );
+
+    let dst = Db::open(Box::new(sim.disk()), restore_cfg(), restore_schema()).unwrap();
+    assert_eq!(
+        dst.seed_frontier().unwrap(),
+        Some((m.applied_seq, expected)),
+        "a restored node cannot prove its position to a replication peer"
+    );
+}
