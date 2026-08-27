@@ -3882,6 +3882,15 @@ archive, which never lists the bucket; not `restore`, which reads only what a ma
 names; and not reclamation, which deletes only what a manifest *did* name. The bucket grows
 for as long as the deployment lives.
 
+**One thing the rule does not cover, said plainly.** An archive that abandons a generation
+before writing its manifest — a gap past the pin bound, or a permanent ownership refusal —
+leaves behind whole, completed objects for a generation nothing will ever name. Those are
+not incomplete uploads, so the lifecycle rule above does not reach them, and neither does
+anything else: they are orphaned for the same reason, in that no manifest recorded them.
+They are bounded by how often those events happen rather than by a mechanism, and both
+print an operator notice when they do. If you see those notices repeatedly, the bucket is
+accumulating and the cause is worth fixing at the source.
+
 **Why no code closes this.** An object left by a failed upload is orphaned *precisely in
 that no manifest ever recorded it*. Nothing but a LIST of the prefix could find one, and a
 periodic list-and-sweep is deliberately not built: a sweep whose arithmetic is wrong deletes
