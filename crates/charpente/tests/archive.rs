@@ -4053,6 +4053,25 @@ impl RequestSource for EndlessSource {
     }
 }
 
+/// SATURATING READ-ONLY LOAD — the load C-2 was found under, and the one the
+/// original four-case re-arm analysis missed. Every poll hands back a request
+/// that 404s, so `Ready::Request` is in the ready set on every iteration (the
+/// kernel therefore NEVER parks) while nothing is ever staged (so
+/// `db.last_applied()` never moves). An ordinary state for a read-heavy
+/// primary, and the exact intersection where a re-arm keyed on "a commit or a
+/// park" fires neither trigger.
+struct ReadOnlySource;
+
+impl RequestSource for ReadOnlySource {
+    fn poll(&mut self) -> Option<(Request, Reply)> {
+        Some((Request::new(Method::Get, "/nope"), Box::new(CountingReply)))
+    }
+
+    fn wait_until(&mut self, _deadline: Option<Instant>) -> Wake {
+        Wake::Ready
+    }
+}
+
 /// The shape `serve::archive` runs against (`serve.rs`'s `EmptySource`): no
 /// request ever arrives. `wait_until` is never called by these tests — they
 /// drive `Kernel::step` so they can SEE `Step::Idle` instead of having a
@@ -4594,5 +4613,68 @@ fn an_archive_recovers_on_its_own_when_a_store_outage_heals() {
         "the store healed and the archive never came back. Its failure re-arm stopped firing, \
          so one transient PUT error is a permanent, silent archive outage — no crash, no \
          notice, and a bucket that quietly stopped growing"
+    );
+}
+
+/// C-2. The same recovery property under SATURATING READ-ONLY LOAD — the
+/// fifth case the `a359356` re-arm analysis enumerated four of and missed.
+///
+/// The failure re-arm had exactly two triggers: `db.last_applied()` moving,
+/// or the ready set emptying (a park). A flood of requests that stage no
+/// record fires NEITHER — `pending.is_some()` on every iteration means the
+/// kernel never parks, and nothing committing means the watermark never
+/// differs. Probed on the shipped code: six archive steps, then nothing ever
+/// again, including 5,000 iterations after the store had healed, with 4,096
+/// records of committed data left unarchived.
+///
+/// This is an ordinary state for a read-heavy primary, which is what makes
+/// it the worst failure shape this subsystem can have (hard rule 5): the
+/// operator's only symptom is a bucket that silently stopped growing.
+///
+/// The re-arm this pins is not the data watermark. A retry's precondition is
+/// ATTEMPTS PASSING, not new data — a healthy archive with no commits has
+/// nothing to do, but a FAILED archive with no commits has a whole backlog
+/// to retry, and conflating the two is exactly what broke here.
+#[test]
+fn a_read_only_flood_still_lets_a_failed_archive_retry() {
+    let (sim, mut app) = kernel_app(0x746b_3961_0000_0008);
+    write_records(app.db_for_tests(), 3 * RECORDS_PER_SEGMENT);
+    let arc = Archive::open(archive_config(0, 8 << 20), app.db_for_tests()).unwrap();
+    let store = SharedStore::new();
+    store.set_puts_fail(true);
+    let mut k = Kernel::with_archive(
+        app,
+        Box::new(sim.clock()),
+        arc,
+        Box::new(store.clone()) as Box<dyn ObjectStore>,
+    )
+    .unwrap();
+    let mut source = ReadOnlySource;
+
+    let outage = run_kernel_steps(&mut k, &mut source, 500);
+    let applied = k.app().db().last_applied();
+    assert!(
+        outage.requests > 0 && store.keys().is_empty(),
+        "the load or the outage did not hold ({} requests, bucket {:?}), so nothing below is \
+         being measured",
+        outage.requests,
+        store.keys()
+    );
+
+    store.set_puts_fail(false);
+    run_kernel_steps(&mut k, &mut source, 2_000);
+
+    assert_eq!(
+        k.app().db().last_applied(),
+        applied,
+        "the read-only source committed something, so this is no longer the no-commit case \
+         C-2 lives in and a green result would prove nothing"
+    );
+    assert!(
+        !store.keys().is_empty(),
+        "the store healed 2,000 iterations ago and the archive never retried. Under a flood of \
+         non-committing requests the kernel never parks and `last_applied` never moves, so a \
+         re-arm keyed on 'a commit or a park' fires neither trigger and the archive stops \
+         forever — silently, with a backlog it can still see"
     );
 }

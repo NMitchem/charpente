@@ -258,9 +258,13 @@ Because `serve::backup` runs the same kernel against an `EmptySource`, an archiv
 hot standby compose for free: archiving *from* the standby leaves the primary's loop
 entirely untouched, which is the deployment most operators should choose. New edge:
 `serve::archive`, plus archive config on the existing replicated edges. IMPLEMENTED as of
-T9: `serve::archive(app, store, cfg)` only. The `Kernel` supports the archive/replication
-pair (`build` takes both), but no edge constructs both yet, so the archiving-standby
-deployment this paragraph recommends is not reachable through `serve` today.
+T9: `serve::archive(app, store, cfg)` only. The archiving-standby deployment this paragraph
+recommends is **not constructible through any public API** — `Kernel::build` takes both but
+is private, and all three public constructors (`new`, `with_replication`, `with_archive`)
+pass one of them `None`. Wiring it needs a new public constructor, not just a new `serve`
+function; budget for that rather than for an edge. The design is otherwise ready: the
+archive arm gates on `Db::verifying()`, not `Db::writes_allowed()`, so a follower archives
+normally.
 
 ### Archive ownership — who may write a prefix
 

@@ -160,6 +160,12 @@ pub fn backup(app: App, repl_disk: Box<dyn Disk>, repl_cfg: repl::ReplConfig) ->
 /// the retention pin on the `Db`, which must happen before `Kernel` consumes
 /// the `App`.
 ///
+/// NOT a sidecar. There is no `Repl` here, so `Db::writes_allowed()` is true
+/// and this node is a primary in every respect but its edges: it runs the
+/// app's JOBS and CRON while it archives, and it will accept writes from
+/// anything that reaches its `Db`. It is "a primary whose only edge is the
+/// archive", not "an archiver attached to someone else's database".
+///
 /// **`cfg.writer` is taken verbatim, and nothing here defaults, derives, or
 /// synthesises it.** `ArchiveConfig::writer` is a stability contract, not a
 /// label: the manifest comparison is identity ALONE, so a `writer` derived
@@ -172,12 +178,14 @@ pub fn backup(app: App, repl_disk: Box<dyn Disk>, repl_cfg: repl::ReplConfig) ->
 /// default here would convert an availability event into that, and the
 /// failure would appear only on the second deployment.
 ///
-/// NOT YET WIRED: an archive that also replicates. Spec §4 calls archiving
-/// from a standby the deployment most operators should choose, and the
-/// `Kernel` supports the pair (`build` takes both), but no edge here
-/// constructs both — `with_archive` and `with_replication` are separate
-/// constructors. The composed edge is a later task's; this one is the
-/// archive-only node.
+/// NOT CONSTRUCTIBLE: an archive that also replicates. Spec §4 calls
+/// archiving from a standby the deployment most operators should choose, and
+/// `Kernel::build` does take both — but `build` is PRIVATE, and all three
+/// public constructors pass one of them `None`. So this is not merely
+/// un-wired at the `serve` layer: reaching that deployment needs a new
+/// public constructor, not just a new function here. The design is otherwise
+/// ready for it — the archive arm gates on `Db::verifying()` rather than
+/// `writes_allowed()`, so a follower archives normally.
 pub fn archive(app: App, store: Box<dyn ObjectStore>, cfg: ArchiveConfig) -> io::Result<()> {
     let clock = crate::prod::ProdClock::new();
     let mut app = app;

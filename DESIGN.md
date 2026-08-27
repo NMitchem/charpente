@@ -172,9 +172,12 @@ seed replays unchanged. One unit of `Ready::Tail` work is a bounded table read
 (`TAIL_BATCH_EVENTS` rows), serviced round-robin across live tails so one deep resume never
 starves the rest of the ready set (§6). The object-storage archive (M2) adds a **sixth**
 ready source, `Archive` — `ObjectStore` is the fifth IO *trait*, which is not the same
-count. Like `Tail` it carries no timer, and deliberately so: spec §8 states the archive arm
-never reads wall-clock time, directly or transitively, which is also why its snapshot
-cadence counts records rather than seconds. Its readiness is therefore derived from data,
+count. Like `Tail` it carries no timer: spec §8 states the archive arm never
+reads wall-clock time, directly or transitively, which is also why its snapshot cadence
+counts records rather than seconds. §8 PERMITS the data-and-attempts scheduling below
+rather than forcing it — a counter-based backoff would be clock-free too; what rules a
+counter out is that it would need a tuning constant no measurement in `docs/BENCH.md` can
+justify. Its readiness is therefore derived from data,
 and the derivation is the subtle part. `Archive::idle()` cannot be it — `idle` answers true
 in five states, four of which still hide un-archived data, and it is a snapshot that only
 updates when you step, so "skip while idle" is self-sealing: a write-gated archive resumes
@@ -185,9 +188,17 @@ requires it to advance. Three further clauses gate the set: `Archive::stopped()`
 a stopped archive answers `idle() == true` forever, so an arm that watched only idle would
 drive a dead archive for the life of the process and present it as healthy), `Db::verifying()`
 re-read every iteration (spec §4 rule 1: a write-gated node uploads nothing, and the gate
-opening must re-arm the arm with no step in between), and a one-retry-per-PARK backoff after
-a failed store operation, since a failed `start` leaves the archive in a non-idle state
-permanently and would otherwise peg the loop for the length of an outage. One unit of
+opening must re-arm the arm with no step in between), and a RETRY HOLD after a failed store
+operation, since a failed `start` leaves the archive in a non-idle state permanently and
+would otherwise peg the loop for the length of an outage. The hold is deliberately NOT
+released by the data watermark: "new work can exist" and "a failed operation should be
+retried" are different questions, and conflating them strands the archive exactly where it
+hurts — under a flood of requests that stage no record the ready set is never empty (so the
+kernel never parks) and `last_applied` never moves (so no commit fires either), and an
+archive that hit one PUT error there stopped shipping permanently and silently. A retry's
+precondition is ATTEMPTS PASSING, so the hold is released by any kernel iteration the
+archive arm did not itself consume — one rule covering a parked kernel, a committing kernel
+and a saturated read-only one. One unit of
 `Ready::Archive` work is exactly one `Archive::step` — start one upload, poll one in flight,
 or read one `read_budget_bytes` bite — never a loop to completion. An archive error is
 absorbed, never bubbled: an archive failure is not a database failure (spec §8), and a `?`

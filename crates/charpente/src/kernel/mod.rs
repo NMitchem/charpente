@@ -146,22 +146,28 @@ pub struct Kernel {
     /// that unrepresentable instead of merely unhandled, which is hard rule
     /// 4's negative space applied to a type.
     archive: Option<(Archive, Box<dyn ObjectStore>)>,
-    /// The archive's RE-ARM WATERMARK: `Some(L)` means "do not schedule the
-    /// archive arm again until `db.last_applied()` differs from `L`".
+    /// THE DATA WATERMARK. `Some(L)` means the last archive step found
+    /// nothing it could do against a `Db` whose `last_applied` was `L`, so
+    /// the arm must not be scheduled again until that number differs;
+    /// `None` means the last step left work pending and the arm is due
+    /// immediately. See the ready-set build for why `Archive::idle()` alone
+    /// cannot be this.
     ///
-    /// Set after every archive step — to the `Db` that step actually saw
-    /// when the step left the archive idle or returned an error, and to
-    /// `None` (re-arm on the next iteration) when it left work pending and
-    /// succeeded. The ready predicate's whole state; see the ready-set build
-    /// for why `Archive::idle()` alone cannot be it.
-    archive_waiting_at: Option<Option<u64>>,
-    /// Whether `archive_waiting_at` was set by a FAILED step rather than by
-    /// an idle one. A failure is a retry, and a retry needs a second way to
-    /// be re-armed: an archive-only node's `Db` never moves at all, so the
-    /// watermark alone would strand it forever after one transient error.
-    /// Parking clears it; an idle watermark is left alone, because a
-    /// caught-up archive genuinely has nothing to re-check.
-    archive_waiting_on_failure: bool,
+    /// Answers exactly one question — CAN NEW WORK EXIST — and is written
+    /// only by a step that left the archive idle.
+    archive_idle_at: Option<Option<u64>>,
+    /// THE RETRY HOLD. True while the archive's last step FAILED and the
+    /// loop has not moved on since.
+    ///
+    /// Answers the OTHER question — SHOULD A FAILED OPERATION BE RETRIED —
+    /// and the two must not be conflated, which is the bug this pair
+    /// replaces. A retry's precondition is ATTEMPTS PASSING, not new data: a
+    /// healthy archive with no commits genuinely has nothing to do, while a
+    /// FAILED archive with no commits has a whole backlog to retry. Keying
+    /// the retry on the data watermark made the second look like the first,
+    /// and an archive that hit one PUT error under a flood of non-committing
+    /// requests then stopped shipping permanently and silently.
+    archive_retry_held: bool,
     /// `gapped()`/`stopped()` as of the last archive step, so the arm can
     /// raise spec §7's two operator notices on the EDGE rather than once per
     /// retry.
@@ -252,8 +258,8 @@ impl Kernel {
             // `None`, not `Some(db.last_applied())`: the archive has never
             // been stepped, so it has never had a chance to find nothing to
             // do, and its opening manifest GET is real work.
-            archive_waiting_at: None,
-            archive_waiting_on_failure: false,
+            archive_idle_at: None,
+            archive_retry_held: false,
             archive_gapped: false,
             archive_stopped: false,
             archive_notice: None,
@@ -379,24 +385,34 @@ impl Kernel {
         // which is what makes the gate OPENING re-arm the arm with no step
         // in between (spec §4 rule 1).
         //
-        // A FAILED step sets the same watermark, which is what keeps an
-        // object-store outage from pegging the loop: a failed `start` leaves
-        // the archive in a non-`Idle` state permanently, so a watermark set
-        // only on `idle` would leave the arm ready forever — retrying at
-        // loop speed, with a `Disk::list` inside `yield_or_bound` on every
-        // one of those iterations. Under load the retry rate is then the
-        // COMMIT rate, which is also the rate the archive's work arrives at,
-        // so a failing archive costs no more scheduling than a healthy one.
-        // `archive_waiting_on_failure` is the second re-arm, for the node
-        // whose `Db` never moves at all (`serve::archive`): parking clears
-        // it, so the retry falls back to one per park. Not a timer,
-        // deliberately — spec §8 states the archive arm never reads
-        // wall-clock time, directly or transitively, which is also why
-        // `snapshot_every` counts records rather than seconds.
+        // `archive_retry_held` is the SEPARATE question, and keeping it
+        // separate is the point. A failed `start` leaves the archive in a
+        // non-`Idle` state permanently, so without a hold the arm would be
+        // ready forever and retry at loop speed, doing a `Disk::list` inside
+        // `yield_or_bound` on every one of those iterations. But the hold
+        // must not be released by the DATA watermark: that conflates "new
+        // work can exist" with "a failed operation should be retried", and
+        // the two come apart exactly where it hurts — a flood of requests
+        // that stage no record leaves the ready set non-empty on every
+        // iteration (so the kernel never parks) and `last_applied` where it
+        // was (so no commit fires either). An archive that hit one PUT error
+        // there stopped shipping forever, silently, with a backlog it could
+        // still see. So the hold is released by ATTEMPTS PASSING — any
+        // kernel iteration the archive arm did not itself consume — which
+        // covers a parked kernel, a committing kernel and a saturated
+        // read-only kernel under one rule instead of three special cases.
+        //
+        // No clock and no constant. Spec §8 PERMITS this shape rather than
+        // forcing it: it forbids reading wall-clock time (which is also why
+        // `snapshot_every` counts records rather than seconds), and a
+        // counter-based backoff would be clock-free too. What rules a
+        // counter out is that it would need a tuning constant nothing in
+        // `docs/BENCH.md` can justify.
         if let Some((archive, _)) = &self.archive
             && !archive.stopped()
             && !self.app.db().verifying()
-            && self.archive_waiting_at != Some(self.app.db().last_applied())
+            && !self.archive_retry_held
+            && self.archive_idle_at != Some(self.app.db().last_applied())
         {
             ready.push(Ready::Archive);
         }
@@ -413,16 +429,13 @@ impl Kernel {
             }
         }
         if ready.is_empty() {
-            // The loop is about to park, and that park is the archive's
-            // SECOND re-arm: whatever `wait_until` does with the deadline
-            // below separates one failed store attempt from the next on a
-            // node whose `Db` is not moving. An IDLE watermark is left
-            // alone — a caught-up archive has nothing to re-check, and
-            // clearing it here would cost one archive step per park forever.
-            if self.archive_waiting_on_failure {
-                self.archive_waiting_at = None;
-                self.archive_waiting_on_failure = false;
-            }
+            // An iteration that services nothing is still an iteration
+            // the archive arm did not consume, so it releases the retry hold
+            // by the same rule as the site below. The DATA watermark is
+            // deliberately untouched: a caught-up archive has nothing to
+            // re-check, and clearing it here would cost one archive step per
+            // park forever.
+            self.archive_retry_held = false;
             // Gate the job/cron deadlines on `writable` too: a node with a
             // due-but-gated job must not busy-spin on a deadline already in the
             // past — the park tick (below) is what wakes it to re-check.
@@ -452,6 +465,15 @@ impl Kernel {
         } else {
             ready[(self.app.entropy().next_u64() % ready.len() as u64) as usize]
         };
+        // ATTEMPTS PASSING — the retry hold's one release rule (with the
+        // `ready.is_empty()` site above, which is the same rule for an
+        // iteration that services nothing). Sited BEFORE the `match` rather
+        // than after it, so the arms that return early — a poisoned engine, a
+        // commit failure, a `begin_group` that could not open — cannot skip
+        // it.
+        if !matches!(choice, Ready::Archive) {
+            self.archive_retry_held = false;
+        }
         match choice {
             Ready::Request => {
                 // Drain into ONE group, commit once, then reply (spec §1).
@@ -775,13 +797,11 @@ impl Kernel {
                 let outcome = archive.step(self.app.db(), &**store);
                 let (idle, gapped, stopped) = (archive.idle(), archive.gapped(), archive.stopped());
                 self.stats.archive_steps += 1;
-                let failed = outcome.is_err();
-                // The watermark the ready predicate reads. Taken AFTER the
-                // step, against the `Db` the step actually saw. An error
-                // sets it for the same reason an idle step does: neither
-                // makes progress possible again until something changes.
-                self.archive_waiting_at = (idle || failed).then(|| self.app.db().last_applied());
-                self.archive_waiting_on_failure = failed;
+                // The two pieces of predicate state, written apart because
+                // they answer different questions (see their docs). Both
+                // taken AFTER the step, against the `Db` it actually saw.
+                self.archive_idle_at = idle.then(|| self.app.db().last_applied());
+                self.archive_retry_held = outcome.is_err();
                 // Spec §7's last row and §8's first invariant: an archive
                 // failure is NOT a database failure. A `?` here would kill a
                 // serving node over a transient PUT, which is precisely the
