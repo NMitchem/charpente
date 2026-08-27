@@ -16,7 +16,7 @@ use charpente::archive::manifest::{
 };
 use charpente::archive::restore::{RestoreOpts, restore};
 use charpente::archive::{Archive, ArchiveConfig};
-use charpente::{Db, DbConfig, Id, Schema, job, table};
+use charpente::{Db, DbConfig, Id, Schema, event, job, table};
 use charpente_core::crc::crc32;
 use charpente_core::io::{ObjectDone, ObjectOp, ObjectStore};
 use charpente_core::table::Row;
@@ -25,6 +25,16 @@ use charpente_sim::{FaultConfig, Sim};
 
 const PREFIX: &str = "archive-test-prefix";
 const WRITER: &str = "node-a:9000";
+
+/// Emitted by the restore fixtures so `charpente.events` and the
+/// `next_event_id` meta counter are non-trivial. Without one, "the archive
+/// ships the Db's event counter" and "the archive ships a zero" are the same
+/// assertion — measured: a `next_event_id: 0` mutation survived a fully green
+/// suite until this existed.
+#[event]
+struct Ping {
+    n: u64,
+}
 
 /// A fixed-width row: every commit produces an identically-sized WAL frame,
 /// which is what makes `RECORDS_PER_SEGMENT` an exact, reusable constant
@@ -345,6 +355,23 @@ fn write_records_at(db: &mut Db, from: u64, n: u64) {
                 id: Id::from_raw(i),
                 value: i,
             });
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
+/// `write_records_at`, but every commit also EMITS. Still exactly one record
+/// per row, so the seq <-> id coincidence `source_at` leans on holds
+/// unchanged — the events simply ride along inside the same transaction.
+fn write_records_emitting(db: &mut Db, from: u64, n: u64) {
+    for i in from..from + n {
+        db.transact(|tx| -> Result<(), std::convert::Infallible> {
+            tx.put(&Rec {
+                id: Id::from_raw(i),
+                value: i,
+            });
+            tx.emit(Ping { n: i });
             Ok(())
         })
         .unwrap();
@@ -4747,8 +4774,10 @@ fn a_failing_archive_still_lets_the_kernel_park() {
 #[test]
 fn the_snapshot_meta_carries_the_event_counter_and_the_frontier_crc() {
     let (mut db, store, mut arc) = archive_fixture();
-    write_records(&mut db, 3 * RECORDS_PER_SEGMENT);
-    snapshot_then_chain(&mut arc, &mut db, &store, RECORDS_PER_SEGMENT);
+    write_records_emitting(&mut db, 0, 3 * RECORDS_PER_SEGMENT);
+    step_until_idle(&mut arc, &db, &store);
+    write_records_emitting(&mut db, 3 * RECORDS_PER_SEGMENT, RECORDS_PER_SEGMENT);
+    step_until_idle(&mut arc, &db, &store);
 
     let m = read_manifest(&store).expect("a manifest");
     let meta = read_snapshot_meta(&store, m.generation).expect("a snapshot meta");
@@ -4769,14 +4798,23 @@ fn the_snapshot_meta_carries_the_event_counter_and_the_frontier_crc() {
         "the meta's frontier_crc is not the checksum of the record at its own frontier"
     );
 
-    // `next_event_id` is a meta counter, not a row property: the fixture
-    // emits no events, so the honest oracle is that the archive shipped the
-    // Db's own counter rather than a zero it happened to match.
-    assert_eq!(meta.next_event_id, db.next_event_id().unwrap());
-    assert_eq!(
-        meta.next_job_id,
-        db.snapshot().unwrap().next_job_id().unwrap()
+    // `next_event_id` is a meta counter, not a row property. The fixture
+    // emits on every commit precisely so this is not vacuous: a suite whose
+    // event counter is always 0 cannot tell "shipped the Db's counter" from
+    // "shipped a zero", and a `next_event_id: 0` mutation survived it.
+    // The counter belongs to the SNAPSHOT's frontier, not to the live Db —
+    // which has committed a whole chain since. The fixture emits exactly one
+    // event per record, so the counter at frontier F is F + 1, computed here
+    // from the frontier rather than read back off the same accessor the
+    // archive used.
+    let live = db.next_event_id().unwrap();
+    assert!(
+        meta.next_event_id > 0 && live > meta.next_event_id,
+        "the fixture must emit, and must go on emitting after the snapshot, or this cannot \
+         tell a shipped counter from a shipped zero: meta={}, live={live}",
+        meta.next_event_id
     );
+    assert_eq!(meta.next_event_id, meta.applied_seq + 1);
 }
 
 // ------------------------------------------- Task 10: restore, and its refusals
@@ -4826,9 +4864,9 @@ const RESTORE_CHAIN_RECORDS: u64 = 2 * RECORDS_PER_SEGMENT;
 /// than assuming it.
 fn archived_db_with_rows(rows: u64) -> (Db, SimObjectStore) {
     let (mut db, store, mut arc) = archive_fixture();
-    write_records(&mut db, rows);
+    write_records_emitting(&mut db, 0, rows);
     step_until_idle(&mut arc, &db, &store);
-    write_records_at(&mut db, rows, RESTORE_CHAIN_RECORDS);
+    write_records_emitting(&mut db, rows, RESTORE_CHAIN_RECORDS);
     step_until_idle(&mut arc, &db, &store);
     (db, store)
 }
@@ -4872,7 +4910,14 @@ fn source_at(db: &Db, f: u64) -> Vec<TableRows> {
     logical_rows(db)
         .into_iter()
         .map(|(name, rows)| {
-            if name == Rec::TABLE {
+            // `charpente.events` is filtered on the same rule and for the
+            // same reason: the fixture emits exactly one event per record, so
+            // event id i is the one record i materialized. That makes the
+            // events table a REAL participant in this comparison rather than
+            // an always-empty one — which is what catches a restore that
+            // seeds `next_event_id` wrong, since a wrong counter re-issues
+            // ids the snapshot already carries.
+            if name == Rec::TABLE || name == "charpente.events" {
                 (name, rows.into_iter().filter(|(id, _)| *id <= f).collect())
             } else {
                 (name, rows)
