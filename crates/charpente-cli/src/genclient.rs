@@ -161,20 +161,29 @@ fn client_for(verb: &str, dir: &str, bin: Option<&str>) -> Result<String, i32> {
 /// The first differing line with both sides — enough to see WHAT drifted
 /// without printing an entire generated file into a CI log.
 ///
-/// Splits on `\n` via `split_terminator`, NOT `str::lines()`. `lines()`
-/// strips a trailing `\r` from every element, so a CRLF file and an LF file
-/// with otherwise identical content compare equal line-by-line and this
-/// function falls through to the length branch — which then reports the
-/// same line count for both sides, a self-contradiction (F1). Comparing the
-/// unstripped segments makes a CRLF-vs-LF drift a real per-line difference
-/// instead of an invisible one; `split_terminator` (rather than `split`)
-/// still avoids counting a shared trailing newline as an extra empty line,
-/// matching `lines()` in every other respect.
+/// Splits on `\n` via plain `split`, NOT `str::lines()` or
+/// `split_terminator`. Both of those normalize away a difference that can be
+/// the ONLY difference between two byte-distinct strings, which reopens F1's
+/// self-contradiction under a different input each time:
+/// - `lines()` strips a trailing `\r`, so CRLF vs LF with the same content
+///   compares equal line-by-line (round 1 of this fix).
+/// - `split_terminator` still treats "ends with one `\n`" and "does not end
+///   with `\n`" as the same split, so `"a\nb"` and `"a\nb\n"` ALSO compare
+///   equal line-by-line (round 2 — caught in review of round 1).
+///
+/// Both then fall through to the length branch, which reports the SAME
+/// count for both sides — a self-contradiction, since the inputs are
+/// guaranteed different whenever this function is called (every caller
+/// checks `a != b` first).
+///
+/// Plain `split('\n')` closes every door at once rather than one input at a
+/// time: `v.join("\n") == original` holds for ANY string's `split('\n')`
+/// result, with no normalization. So if `a != b`, their split vectors cannot
+/// be equal (equal vectors would join back to equal strings) — the
+/// self-contradiction becomes unreachable by construction, not by patching
+/// the next input someone thinks of.
 fn first_difference(a: &str, b: &str) -> Vec<String> {
-    let (av, bv): (Vec<&str>, Vec<&str>) = (
-        a.split_terminator('\n').collect(),
-        b.split_terminator('\n').collect(),
-    );
+    let (av, bv): (Vec<&str>, Vec<&str>) = (a.split('\n').collect(), b.split('\n').collect());
     for (i, (x, y)) in av.iter().zip(bv.iter()).enumerate() {
         if x != y {
             return vec![
@@ -701,22 +710,29 @@ mod tests {
         );
     }
 
+    /// Neither input ends with `\n`, so plain `split('\n')` and the old
+    /// `split_terminator('\n')` agree here — this exercises the length
+    /// branch on a genuine difference (a real third line was appended), not
+    /// on a trailing-newline artifact. `first_difference_is_not_blind_to_a_
+    /// trailing_newline_only_drift` below covers the case where a trailing
+    /// `\n` IS the only difference, which used to reach this same branch
+    /// with a self-contradicting message.
     #[test]
     fn a_common_prefix_of_different_lengths_reports_the_lengths() {
-        let out = first_difference("a\nb\n", "a\nb\nc\n");
+        let out = first_difference("a\nb", "a\nb\nc");
         assert_eq!(
             out,
             vec!["  same prefix, different length: committed 2 lines, generated 3 lines"]
         );
     }
 
-    /// F1: `str::lines()` splits on `\n` and strips a trailing `\r`, so a
-    /// CRLF file and an LF file with the same content used to compare equal
-    /// line-by-line, falling through to a length branch that then printed
-    /// "committed 2 lines, generated 2 lines" — the same number twice. This
-    /// pins that the drift is now a real difference AT the first line, not
-    /// an invisible one that surfaces as a self-contradiction two branches
-    /// later.
+    /// F1 round 1: `str::lines()` splits on `\n` and strips a trailing `\r`,
+    /// so a CRLF file and an LF file with the same content used to compare
+    /// equal line-by-line, falling through to a length branch that then
+    /// printed "committed 2 lines, generated 2 lines" — the same number
+    /// twice. This pins that the drift is now a real difference AT the
+    /// first line, not an invisible one that surfaces as a self-
+    /// contradiction two branches later.
     #[test]
     fn first_difference_is_not_blind_to_a_crlf_vs_lf_drift() {
         let crlf = "a\r\nb\r\n";
@@ -728,6 +744,25 @@ mod tests {
                 "    committed: a\r".to_string(),
                 "    generated: a".to_string(),
             ]
+        );
+    }
+
+    /// F1 round 2 (review of round 1): `split_terminator('\n')` fixed CRLF
+    /// but shares the exact property that caused the original bug —
+    /// `"a\nb"` and `"a\nb\n"` both split to `["a", "b"]`, so a
+    /// trailing-newline-only drift STILL compared equal line-by-line and
+    /// STILL fell through to the length branch, printing "committed 2
+    /// lines, generated 2 lines" for inputs that are not the same length in
+    /// bytes. Plain `split('\n')` does not normalize this away: `"a\nb\n"`
+    /// splits to `["a", "b", ""]` (3 elements), so the length branch now
+    /// reports 2 vs 3 — different numbers, no contradiction.
+    #[test]
+    fn first_difference_is_not_blind_to_a_trailing_newline_only_drift() {
+        let without_trailing_newline = "a\nb";
+        let with_trailing_newline = "a\nb\n";
+        assert_eq!(
+            first_difference(without_trailing_newline, with_trailing_newline),
+            vec!["  same prefix, different length: committed 2 lines, generated 3 lines"]
         );
     }
 

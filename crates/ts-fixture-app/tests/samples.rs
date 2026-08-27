@@ -20,15 +20,28 @@ use ts_fixture_app::samples::{OUT_PATH, REGEN_CMD, render};
 /// crate for two call sites is the helper-function sprawl CLAUDE.md's Style
 /// section forbids.
 ///
-/// Splits on `\n` via `split_terminator`, NOT `str::lines()`. `lines()` strips
-/// a trailing `\r` from every element, so a CRLF-vs-LF drift with otherwise
-/// identical content compared equal line-by-line and fell through to the
-/// length branch, which then reported the SAME line count for both sides —
-/// a self-contradiction (task-10-review F1, copied into this file).
+/// Splits on `\n` via plain `split`, NOT `str::lines()` or
+/// `split_terminator` — both normalize away a difference that can be the
+/// ONLY difference between two byte-distinct strings, reopening the same
+/// self-contradiction under a different input each time:
+/// - `lines()` strips a trailing `\r`, so CRLF vs LF with the same content
+///   compares equal line-by-line (task-10-review F1, copied into this file).
+/// - `split_terminator` still treats "ends with one `\n`" and "does not end
+///   with `\n`" as the same split, so `"a\nb"` and `"a\nb\n"` ALSO compare
+///   equal line-by-line (caught in review of the first fix round).
+///
+/// Both then fall through to the length branch, which reports the SAME
+/// count for both sides even though the inputs are guaranteed different
+/// whenever this is called (the caller checks `committed != fresh` first).
+///
+/// Plain `split('\n')` closes every door at once: `v.join("\n") ==
+/// original` holds for ANY string's `split('\n')` result, with no
+/// normalization, so two different strings cannot produce equal split
+/// vectors — the self-contradiction is unreachable by construction.
 fn stale_diff(committed: &str, fresh: &str) -> String {
     committed
-        .split_terminator('\n')
-        .zip(fresh.split_terminator('\n'))
+        .split('\n')
+        .zip(fresh.split('\n'))
         .enumerate()
         .find(|(_, (a, b))| a != b)
         .map(|(i, (a, b))| {
@@ -40,8 +53,8 @@ fn stale_diff(committed: &str, fresh: &str) -> String {
         .unwrap_or_else(|| {
             format!(
                 "  same prefix, different length: committed {} lines, generated {} lines",
-                committed.split_terminator('\n').count(),
-                fresh.split_terminator('\n').count()
+                committed.split('\n').count(),
+                fresh.split('\n').count()
             )
         })
 }
@@ -86,5 +99,21 @@ fn stale_diff_is_not_blind_to_a_crlf_vs_lf_drift() {
     assert_eq!(
         stale_diff(crlf, lf),
         "  first difference at line 1:\n    committed: a\r\n    generated: a"
+    );
+}
+
+/// F1, round 2 (review of round 1): `split_terminator` fixed CRLF but
+/// shares the property that caused the original bug — `"a\nb"` and
+/// `"a\nb\n"` both split to `["a", "b"]`, so this drift also compared equal
+/// line-by-line and also fell through to the length branch, self-
+/// contradicting ("committed 2 lines, generated 2 lines" for inputs that
+/// are not the same length in bytes).
+#[test]
+fn stale_diff_is_not_blind_to_a_trailing_newline_only_drift() {
+    let without_trailing_newline = "a\nb";
+    let with_trailing_newline = "a\nb\n";
+    assert_eq!(
+        stale_diff(without_trailing_newline, with_trailing_newline),
+        "  same prefix, different length: committed 2 lines, generated 3 lines"
     );
 }
