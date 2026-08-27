@@ -3605,3 +3605,133 @@ fn the_unreadable_manifest_refusal_mid_run_does_not_claim_nothing_was_uploaded()
          is the fix, and the fix is what differs between the two sites: {t}"
     );
 }
+
+// ---------------------------------------- the FIRST swap's `CheckingOwner`
+
+/// Steps one at a time and stops at the FIRST `CheckingOwner` of generation
+/// 0 — the one guarding the OPENING SNAPSHOT's manifest swap. Returns the
+/// bucket's keys as they stand there.
+///
+/// Recognised from the BUCKET, never from the archive's internal state: the
+/// snapshot's `meta` object is uploaded LAST of the snapshot (spec §2's
+/// ordering, `step_uploading_snapshot_meta`) and the manifest key does not
+/// exist yet, a combination true at exactly this moment and nowhere else in
+/// the generation. Reading it off `Archive` would need a state accessor this
+/// crate does not expose, and would make the oracle depend on the same
+/// internals the notice does.
+///
+/// Every earlier notice oracle in this file reaches its site through
+/// `adopt` (planting before the first step) or through a LATER swap
+/// (stepping to idle first, so `frontier` is set). Neither can see this one,
+/// which is how NEW-1 survived a review and a fix round.
+///
+/// Safe to plant into the store the instant this returns: `SimObjectStore`
+/// takes `in_flight` on `poll`, and the step that made `meta` visible is the
+/// step that polled its PUT to completion, so nothing is in flight.
+fn step_to_first_swap(arc: &mut Archive, db: &Db, store: &SimObjectStore) -> Vec<String> {
+    for _ in 0..10_000 {
+        let keys = store.keys();
+        if keys.iter().any(|k| *k == snapshot_meta_key(PREFIX, 0))
+            && !keys.iter().any(|k| *k == manifest_key(PREFIX))
+        {
+            return keys;
+        }
+        arc.step(db, store)
+            .expect("no faults are configured on this fixture, so no step may fail");
+    }
+    panic!(
+        "step_to_first_swap: 10,000 steps without reaching the opening snapshot's manifest swap"
+    );
+}
+
+/// Asserts the bucket really does hold this archive's own generation-0
+/// snapshot and no manifest — the anti-vacuity guard both first-swap oracles
+/// below stand on. Taken from `store.keys()`, so what the notices are
+/// checked against is the bucket's actual contents rather than other words
+/// in the notice string.
+fn assert_first_swap_bucket(landed: &[String]) {
+    assert!(
+        landed.contains(&snapshot_meta_key(PREFIX, 0)),
+        "not at the opening snapshot's swap: its meta object is not in the bucket: {landed:?}"
+    );
+    assert!(
+        !landed.contains(&manifest_key(PREFIX)),
+        "past the opening swap already — a manifest exists, so `frontier` may be set and the \
+         site under test is not the one reached: {landed:?}"
+    );
+    assert!(
+        landed.len() > 1,
+        "the opening snapshot is meta-only, so 'this archive has objects in the bucket' is not \
+         being measured against anything here: {landed:?}"
+    );
+}
+
+/// HARD RULE 5 at the site NEITHER earlier foreign-writer oracle reaches
+/// (NEW-1, `task-8-rereview-r1.md`). `self.frontier` is set only when the
+/// manifest swap LANDS, so at every generation's first swap it is `None`
+/// and the chain is empty while that generation's whole snapshot is already
+/// in the bucket.
+///
+/// The notice must not tell an operator it "left nothing of its own under
+/// this prefix" and then offer to remove the manifest: those objects are
+/// orphaned the moment this archive stops, and nothing in this design
+/// collects them.
+///
+/// The foreign manifest is planted at generation 7, away from this
+/// archive's own generation 0, so "generation 0 is orphaned" is
+/// unambiguous — at generation 0 the two writers would be naming the same
+/// keys, which is the interleave the refusal exists to detect, not a claim
+/// the notice can untangle.
+#[test]
+fn the_foreign_writer_refusal_at_the_first_swap_names_the_snapshot_it_stranded() {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, 500);
+    let landed = step_to_first_swap(&mut arc, &db, &store);
+    assert_first_swap_bucket(&landed);
+    write_foreign_manifest(&store, FOREIGN_WRITER, 7);
+
+    let notice = step_until_error(&mut arc, &db, &store);
+    let t = notice.to_string();
+    assert!(
+        !t.contains("left nothing of its own under this prefix"),
+        "the refusal tells the operator this archive left nothing behind while {} of its own \
+         generation-0 objects sit under this prefix: {landed:?}\n{t}",
+        landed.len()
+    );
+    assert!(
+        t.contains("orphaned in the bucket"),
+        "the refusal must name what this archive stranded here — the operator's next act is \
+         deciding what to delete, and these objects no manifest names: {landed:?}\n{t}"
+    );
+}
+
+/// The same site for the OTHER notice (NEW-1's first half: R-1 was never
+/// fixed here). `the_unreadable_manifest_refusal_mid_run_does_not_claim_
+/// nothing_was_uploaded` steps to idle first, so it only ever reaches a
+/// LATER swap, where `frontier` is already set.
+///
+/// "Nothing was uploaded" plus "remove it so the next start opens a fresh
+/// generation" is the sentence pair that strands a whole snapshot.
+#[test]
+fn the_unreadable_manifest_refusal_at_the_first_swap_does_not_claim_nothing_was_uploaded() {
+    let (mut db, store, mut arc) = archive_fixture();
+    write_records(&mut db, 500);
+    let landed = step_to_first_swap(&mut arc, &db, &store);
+    assert_first_swap_bucket(&landed);
+    plant_corrupt_manifest(&store);
+
+    let notice = step_until_error(&mut arc, &db, &store);
+    let t = notice.to_string();
+    assert!(
+        !t.contains("nothing was uploaded"),
+        "the refusal tells the operator nothing was uploaded while {} objects of its own \
+         generation-0 snapshot sit under this prefix, and then offers to remove the manifest — \
+         which strands every one of them: {landed:?}\n{t}",
+        landed.len()
+    );
+    assert!(
+        t.contains("stay in the bucket"),
+        "the refusal must name what it left behind at this site: hard rule 5's third element \
+         is the fix, and the fix is what differs between the two sites: {landed:?}\n{t}"
+    );
+}
