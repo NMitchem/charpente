@@ -834,10 +834,15 @@ impl Archive {
     /// reached the store, and never that anything is well. `gapped()` and
     /// `stopped()` are the two accessors that answer "is something wrong",
     /// and an arm that renders only `idle` presents a permanently dead
-    /// archive as a healthy one. In THREE of the five — no generation open,
-    /// write-gated, stopped — there is un-archived data behind the `true`,
-    /// so a caller that reads `idle` as "everything is shipped" is wrong
-    /// more often than it is right.
+    /// archive as a healthy one. In FOUR of the five — waiting, no
+    /// generation open, write-gated, stopped — there is un-archived data
+    /// behind the `true`, so a caller that reads `idle` as "everything is
+    /// shipped" is wrong far more often than it is right. `Waiting` belongs
+    /// in that list BY CONSTRUCTION and was missed twice: `step_idle`
+    /// reaches it only after finding a sealed segment at `next` and
+    /// declining it because `layout_end > last_applied`, so a sealed,
+    /// un-archived segment provably exists whenever it answers true. Only
+    /// **caught up** has nothing behind the `true`.
     pub fn idle(&self) -> bool {
         self.idle
     }
