@@ -11,12 +11,13 @@ use std::io;
 
 use charpente_core::io::{Disk, Entropy};
 
+use crate::archive::restore::{RestoreOpts, restore};
 use crate::describe::{to_human, to_json};
 use crate::http::App;
-use crate::prod::{ProdDisk, ProdEntropy};
+use crate::prod::{FsObjectStore, ProdDisk, ProdEntropy};
 
-pub const LAUNCH_USAGE: &str =
-    "usage: <app> [describe [--format json|human]]  — no verb serves the app";
+pub const LAUNCH_USAGE: &str = "usage: <app> [describe [--format json|human]]\n       \
+       <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]  — no verb serves the app";
 
 /// The standard app entry (spec §1.1): argv dispatch owned by charpente so
 /// `describe` is free for every app. `build` runs against the disk THIS
@@ -77,6 +78,10 @@ pub(crate) fn dispatch(
         }
     };
 
+    if verb == "restore" {
+        return restore_verb(&args[1..], data_dir, build, out, err);
+    }
+
     if verb != "describe" {
         let _ = writeln!(err, "error: unknown verb '{verb}'\n\n{LAUNCH_USAGE}");
         return Ok(2);
@@ -114,6 +119,133 @@ pub(crate) fn dispatch(
     describe(build, format, out)
 }
 
+/// `restore`'s own help. Long on purpose: an operator meets `--force` here
+/// or in an incident, and archive spec §6 makes two consequences of running
+/// this command things they must know BEFORE they run it, not after.
+pub const RESTORE_USAGE: &str = "usage: <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]\n\
+       --from BUCKET    the archive's root directory (the bucket an archive wrote)\n\
+       --prefix PREFIX  the key prefix that archive owned — ArchiveConfig::prefix, verbatim\n\
+       --to DIR         the data directory to rebuild (default: this app's own data directory)\n\
+       --force          discard a destination timeline the archive cannot prove is its own\n\
+\n\
+Restore REPLACES a data directory; it never merges into one. Restoring IN PLACE over a node\n\
+that has run since its last restore is the ordinary case, not an edge case, and it needs\n\
+--force: the destination is then ahead of the archive, and --force destroys every record it\n\
+holds above the archive's frontier. Those records exist nowhere else. Without --force restore\n\
+refuses and touches nothing.\n\
+\n\
+A restored node comes back with its job queue. Pending jobs WILL dispatch when it starts, so\n\
+restore can re-fire mail and third-party calls that already ran; idempotency keys are what\n\
+make that exactly-once-observable.";
+
+/// `restore` (archive spec §6), run against the app's OWN schema — which is
+/// the whole reason this lives here rather than in `charpente-cli`. A
+/// `Seeder` applies rows through typed table ops, so restoring an app's
+/// tables needs the app's `#[table]` types; the CLI links `charpente`, never
+/// the operator's crate, and `charpente restore --dir` therefore builds the
+/// app and execs this, exactly as `charpente describe --dir` does.
+fn restore_verb(
+    args: &[String],
+    data_dir: &str,
+    build: impl Fn(Box<dyn Disk>, Box<dyn Entropy>) -> io::Result<App>,
+    out: &mut dyn io::Write,
+    err: &mut dyn io::Write,
+) -> io::Result<i32> {
+    let mut from = None;
+    let mut to = None;
+    let mut prefix = None;
+    let mut force = false;
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        if flag == "--force" {
+            force = true;
+            i += 1;
+            continue;
+        }
+        if !matches!(flag, "--from" | "--to" | "--prefix") {
+            let _ = writeln!(err, "error: unknown flag '{flag}'\n\n{RESTORE_USAGE}");
+            return Ok(2);
+        }
+        let Some(value) = args.get(i + 1) else {
+            let _ = writeln!(err, "error: {flag} needs a value\n\n{RESTORE_USAGE}");
+            return Ok(2);
+        };
+        match flag {
+            "--from" => from = Some(value.clone()),
+            "--to" => to = Some(value.clone()),
+            _ => prefix = Some(value.clone()),
+        }
+        i += 2;
+    }
+    let (Some(from), Some(prefix)) = (from, prefix) else {
+        let _ = writeln!(
+            err,
+            "error: restore needs --from and --prefix\n\n{RESTORE_USAGE}"
+        );
+        return Ok(2);
+    };
+    let to = to.unwrap_or_else(|| data_dir.to_string());
+
+    // The app is built on an EPHEMERAL directory, never on `--to`: the only
+    // thing wanted from it is the schema and the `DbConfig`, and building it
+    // on the destination would open a `Db` on exactly the directory restore
+    // is about to discard — and `Db::open` fails on the directories an
+    // operator restores. Same trick, and the same reason, as `describe`.
+    let entropy = ProdEntropy::new()?;
+    let mut suffix = [0u8; 8];
+    entropy.fill(&mut suffix);
+    let probe = std::env::temp_dir().join(format!(
+        "charpente-restore-schema-{:016x}",
+        u64::from_le_bytes(suffix)
+    ));
+    let app = build(Box::new(ProdDisk::new(&probe)?), Box::new(entropy))?;
+    let schema = app.db().seed_schema();
+    let db_cfg = app.config().db.clone();
+    drop(app);
+    // Best-effort, exactly as `describe`'s is: failing to remove a scratch
+    // directory must not fail a restore.
+    #[allow(clippy::disallowed_methods)]
+    let _ = std::fs::remove_dir_all(&probe);
+
+    let store = FsObjectStore::new(&from);
+    let disk = ProdDisk::new(&to)?;
+    let opts = RestoreOpts { prefix, force };
+    // `notice` is how `--force` says what it destroys BEFORE it acts; it goes
+    // to stdout because it is not an error, and it must reach the operator
+    // even on the path that then succeeds.
+    let report = match restore(&store, Box::new(disk), db_cfg, schema, opts, &mut |m| {
+        let _ = writeln!(out, "{m}");
+    }) {
+        Ok(report) => report,
+        // The whole error, unabridged: `restore` already names the contract,
+        // the site and the fix, and says whether the destination was touched.
+        // A paraphrase here would be a second sentence saying the same thing
+        // in different words, which is the defect this task also fixed.
+        Err(e) => {
+            let _ = writeln!(err, "error: {e}");
+            return Ok(1);
+        }
+    };
+
+    let jobs = if report.pending_jobs == 0 {
+        "  pending jobs  0".to_string()
+    } else {
+        format!(
+            "  pending jobs  {} — these WILL dispatch when this node starts, so restore can \
+             re-fire mail and third-party calls that already ran (idempotency keys are what \
+             make that exactly-once-observable)",
+            report.pending_jobs
+        )
+    };
+    let _ = writeln!(
+        out,
+        "restored generation {} into \"{to}\"\n  frontier      seq {}\n  segments      {}\n{jobs}",
+        report.generation, report.applied_seq, report.segments
+    );
+    Ok(0)
+}
+
 /// Ephemeral-disk describe (spec §1.2, ruling 7): a temp directory this
 /// function creates and destroys itself — `data_dir` is never touched, so
 /// `describe` is safe to run against a live server's data directory.
@@ -146,6 +278,9 @@ fn describe(
 }
 
 #[cfg(test)]
+// The restore fixtures below build real buckets and real data directories,
+// so they create and remove real directories — see the section comment.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::Schema;
@@ -233,7 +368,9 @@ mod tests {
         assert_eq!(
             String::from_utf8(err).unwrap(),
             "error: --format must be json or human — got 'yaml'\n\n\
-             usage: <app> [describe [--format json|human]]  — no verb serves the app\n"
+             usage: <app> [describe [--format json|human]]\n       \
+             <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]  \
+             — no verb serves the app\n"
         );
     }
 
@@ -258,7 +395,9 @@ mod tests {
         assert_eq!(
             String::from_utf8(err).unwrap(),
             "error: unknown verb 'frobnicate'\n\n\
-             usage: <app> [describe [--format json|human]]  — no verb serves the app\n"
+             usage: <app> [describe [--format json|human]]\n       \
+             <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]  \
+             — no verb serves the app\n"
         );
     }
 
@@ -288,7 +427,9 @@ mod tests {
         assert_eq!(
             String::from_utf8(err).unwrap(),
             "error: unknown verb 'describe --format'\n\n\
-             usage: <app> [describe [--format json|human]]  — no verb serves the app\n"
+             usage: <app> [describe [--format json|human]]\n       \
+             <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]  \
+             — no verb serves the app\n"
         );
     }
 
@@ -327,6 +468,329 @@ mod tests {
             !data_dir.exists(),
             "describe must never create data_dir: {}",
             data_dir.display()
+        );
+    }
+
+    // ------------------------------------- Task 11: the `restore` verb
+    //
+    // Deny-list opt-out for this section's fixtures only, same rationale as
+    // `prod.rs`'s module-wide one: `restore` is a production edge path over
+    // real directories, so proving it means creating and removing real
+    // directories. Nothing here is inside the deterministic boundary.
+    //
+    // Driven through `dispatch` with synthetic argv and `Vec<u8>` sinks —
+    // this file's own convention, and what makes an operator verb testable
+    // without spawning `cargo` inside a test. The bucket underneath is real:
+    // a real `Db` on a real `ProdDisk`, archived by the real `Archive`
+    // engine through a real `FsObjectStore`. Nothing here is simulated, so
+    // these are also the first end-to-end exercise of Task 11's store.
+
+    use crate::archive::{Archive, ArchiveConfig};
+    use crate::prod::FsObjectStore;
+    use crate::{Db, Id, Tx, job, table};
+    use std::path::PathBuf;
+
+    const BUCKET_PREFIX: &str = "node-a-archive";
+
+    #[table]
+    struct RestoreItem {
+        id: Id<RestoreItem>,
+        value: u64,
+    }
+
+    #[job]
+    struct RestoreDeliver {
+        slot: u64,
+    }
+
+    impl RestoreDeliver {
+        fn run(self, _tx: &mut Tx) -> Result<(), crate::kernel::JobError> {
+            Ok(())
+        }
+    }
+
+    /// The app every restore test builds. `segment_bytes` is 4 KiB so a few
+    /// dozen records seal several segments — a real chain, at the cost of a
+    /// few dozen real fsyncs rather than a few thousand.
+    fn restore_app(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> io::Result<App> {
+        let mut config = AppConfig::default();
+        config.db.wal.segment_bytes = 4 << 10;
+        App::open(disk, Schema::new().table::<RestoreItem>(), entropy, config)
+    }
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let mut suffix = [0u8; 8];
+        ProdEntropy::new().unwrap().fill(&mut suffix);
+        std::env::temp_dir().join(format!(
+            "charpente-restore-{tag}-{:016x}",
+            u64::from_le_bytes(suffix)
+        ))
+    }
+
+    fn write_items(db: &mut Db, from: u64, n: u64) {
+        for i in from..from + n {
+            db.transact(|tx| -> Result<(), std::convert::Infallible> {
+                tx.put(&RestoreItem {
+                    id: Id::from_raw(i),
+                    value: i,
+                });
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    fn enqueue_jobs(db: &mut Db, n: u64) {
+        for slot in 0..n {
+            db.transact(|tx| -> Result<(), std::convert::Infallible> {
+                tx.enqueue(RestoreDeliver { slot });
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    fn step_to_idle(arc: &mut Archive, db: &Db, store: &FsObjectStore) {
+        for _ in 0..10_000 {
+            arc.step(db, store).unwrap();
+            if arc.idle() {
+                return;
+            }
+        }
+        panic!("archive never went idle");
+    }
+
+    /// A bucket holding one complete generation — an opening snapshot and a
+    /// chain of sealed segments continuing it — plus `jobs` rows still
+    /// Pending, so the restored queue is not vacuously empty.
+    fn archived_bucket(tag: &str, jobs: u64) -> PathBuf {
+        let src = tmp_dir(&format!("{tag}-src"));
+        let bucket = tmp_dir(&format!("{tag}-bucket"));
+        let store = FsObjectStore::new(&bucket);
+        let mut app = restore_app(
+            Box::new(ProdDisk::new(&src).unwrap()),
+            Box::new(ProdEntropy::new().unwrap()),
+        )
+        .unwrap();
+        let mut arc = Archive::open(
+            ArchiveConfig {
+                prefix: BUCKET_PREFIX.to_string(),
+                writer: "node-a".to_string(),
+                snapshot_every: 0,
+                pin_segments: 64,
+                read_budget_bytes: 8 << 20,
+            },
+            app.db_mut(),
+        )
+        .unwrap();
+        // Before the generation's snapshot: the jobs table rides the
+        // snapshot, and an enqueue after the last SEALED segment sits in the
+        // unsealed tail, which no archive ever ships.
+        enqueue_jobs(app.db_mut(), jobs);
+        write_items(app.db_mut(), 0, 60);
+        step_to_idle(&mut arc, app.db(), &store);
+        write_items(app.db_mut(), 60, 120);
+        step_to_idle(&mut arc, app.db(), &store);
+        drop(app);
+        std::fs::remove_dir_all(&src).unwrap();
+        bucket
+    }
+
+    fn run_restore_verb(args: &[&str]) -> (i32, String, String) {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let code = dispatch(
+            &argv,
+            "127.0.0.1:0",
+            MISSING_DATA_DIR,
+            restore_app,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    /// Spec §6: "Restore resurrects the job queue, and operators must be told
+    /// BEFORE they run it." A restored node comes back with pending jobs that
+    /// will dispatch, so restore can re-fire mail and third-party calls that
+    /// already ran. That belongs in the command's own output.
+    #[test]
+    fn restore_reports_pending_jobs_and_exits_zero() {
+        let bucket = archived_bucket("pending", 3);
+        let dest = tmp_dir("pending-dest");
+        let (code, out, err) = run_restore_verb(&[
+            "restore",
+            "--from",
+            bucket.to_str().unwrap(),
+            "--to",
+            dest.to_str().unwrap(),
+            "--prefix",
+            BUCKET_PREFIX,
+        ]);
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(
+            out.contains("pending job"),
+            "operators must be warned: {out}"
+        );
+        assert!(
+            out.contains("pending jobs  3"),
+            "the count must be the real one, or a zero passes this test: {out}"
+        );
+        assert!(
+            out.contains("WILL dispatch"),
+            "the count alone does not say what happens when the node starts: {out}"
+        );
+        std::fs::remove_dir_all(&bucket).unwrap();
+        std::fs::remove_dir_all(&dest).unwrap();
+    }
+
+    /// M-5. `Verdict::Ahead` makes `--force` the NORMAL path for an in-place
+    /// restore — restore, run on, restore again — not an edge case. This is
+    /// that exact sequence, run through the verb an operator types.
+    #[test]
+    fn restore_refuses_a_dirty_target_without_force_and_names_it() {
+        let bucket = archived_bucket("dirty", 1);
+        let dest = tmp_dir("dirty-dest");
+        let args = [
+            "restore",
+            "--from",
+            bucket.to_str().unwrap(),
+            "--to",
+            dest.to_str().unwrap(),
+            "--prefix",
+            BUCKET_PREFIX,
+        ];
+        let (code, _, err) = run_restore_verb(&args);
+        assert_eq!(code, 0, "the first restore into a fresh dir: {err}");
+
+        // The node runs on: records above the archive's frontier, which
+        // exist nowhere else.
+        let mut app = restore_app(
+            Box::new(ProdDisk::new(&dest).unwrap()),
+            Box::new(ProdEntropy::new().unwrap()),
+        )
+        .unwrap();
+        write_items(app.db_mut(), 10_000, 5);
+        drop(app);
+
+        let (code, out, err) = run_restore_verb(&args);
+        assert_eq!(code, 1, "a refused restore must not exit 0");
+        assert!(err.contains("--force"), "must name the way through: {err}");
+        assert!(
+            err.contains("ahead of the archive"),
+            "must name what it found: {err}"
+        );
+        assert!(
+            err.to_lowercase()
+                .contains("nothing in the destination has been touched"),
+            "a refusal before any write must promise exactly that: {err}"
+        );
+        assert!(
+            out.is_empty(),
+            "a refused restore must print nothing to stdout: {out}"
+        );
+
+        // ...and `--force` is the way through, naming the loss BEFORE acting.
+        let mut forced: Vec<&str> = args.to_vec();
+        forced.push("--force");
+        let (code, out, err) = run_restore_verb(&forced);
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(
+            out.contains("about to discard the destination's timeline"),
+            "--force must say what it destroys before it acts: {out}"
+        );
+        assert!(
+            out.contains("record(s) above"),
+            "--force must name the count it destroys: {out}"
+        );
+        std::fs::remove_dir_all(&bucket).unwrap();
+        std::fs::remove_dir_all(&dest).unwrap();
+    }
+
+    /// The failure an operator hits by mistyping `--from`: nothing landed,
+    /// and the message says so rather than leaving them to wonder.
+    #[test]
+    fn restore_from_an_absent_bucket_exits_one_and_touches_nothing() {
+        let dest = tmp_dir("absent-dest");
+        let (code, out, err) = run_restore_verb(&[
+            "restore",
+            "--from",
+            "/does/not/exist/charpente-no-such-bucket",
+            "--to",
+            dest.to_str().unwrap(),
+            "--prefix",
+            BUCKET_PREFIX,
+        ]);
+        assert_eq!(code, 1);
+        assert!(out.is_empty(), "{out}");
+        assert!(
+            err.contains("manifest"),
+            "must name the object it could not read: {err}"
+        );
+        assert!(
+            err.to_lowercase()
+                .contains("nothing in the destination has been touched"),
+            "{err}"
+        );
+        // `ProdDisk::new` creates the destination root before `restore` can
+        // read a byte of the bucket, so "untouched" is precisely: no content
+        // written. The directory itself may exist and must be empty.
+        assert!(
+            !dest.exists() || std::fs::read_dir(&dest).unwrap().next().is_none(),
+            "a failed restore must leave the destination empty: {}",
+            dest.display()
+        );
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn restore_without_from_returns_two_and_pins_the_error_text() {
+        let (code, out, err) = run_restore_verb(&["restore", "--prefix", BUCKET_PREFIX]);
+        assert_eq!(code, 2);
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(
+            err,
+            format!("error: restore needs --from and --prefix\n\n{RESTORE_USAGE}\n")
+        );
+    }
+
+    #[test]
+    fn restore_with_an_unknown_flag_returns_two_and_pins_the_error_text() {
+        let (code, out, err) = run_restore_verb(&["restore", "--bucket", "b"]);
+        assert_eq!(code, 2);
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(
+            err,
+            format!("error: unknown flag '--bucket'\n\n{RESTORE_USAGE}\n")
+        );
+    }
+
+    /// M-5, in the help text itself: an operator who has never read the spec
+    /// must learn from `--help` that re-restoring in place needs `--force`
+    /// and what `--force` destroys. Not buried.
+    #[test]
+    fn the_usage_text_says_in_place_re_restore_needs_force_and_what_it_destroys() {
+        assert!(
+            RESTORE_USAGE.contains("IN PLACE") && RESTORE_USAGE.contains("--force"),
+            "{RESTORE_USAGE}"
+        );
+        assert!(
+            RESTORE_USAGE.contains("exist nowhere else"),
+            "the help must say what --force destroys: {RESTORE_USAGE}"
+        );
+        assert!(
+            RESTORE_USAGE.contains("job queue") || RESTORE_USAGE.contains("pending jobs"),
+            "the help must say the job queue comes back: {RESTORE_USAGE}"
+        );
+        assert!(
+            LAUNCH_USAGE.contains("restore"),
+            "the verb list must name it: {LAUNCH_USAGE}"
         );
     }
 }

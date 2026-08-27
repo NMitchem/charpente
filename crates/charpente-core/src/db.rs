@@ -2116,16 +2116,29 @@ impl Db {
     /// all three on the way in); `Schema::remove` strips them back off so
     /// `Seeder::new` doesn't double-register any.
     pub fn into_seeder(self) -> io::Result<Seeder> {
+        let schema = self.seed_schema();
         let (wal, machine) = self.engine.into_parts();
         let disk = wal.into_disk();
-        let TableMachine {
-            store, mut schema, ..
-        } = machine;
-        drop(store); // Seeder::new discards the store file itself; nothing to save
+        drop(machine.store); // Seeder::new discards the store file itself; nothing to save
+        Seeder::new(disk, self.cfg, schema)
+    }
+
+    /// This `Db`'s schema as a `Seeder` wants it: the caller's registrations,
+    /// with the three the platform adds at `open` (`JobRow`, `EventRow`,
+    /// `SchemaVersion`) stripped, because `Seeder::new` re-adds all three
+    /// itself and `Schema::table` asserts on a duplicate.
+    ///
+    /// Public because a `Seeder` is not always built from the `Db` that owns
+    /// the schema: `charpente restore` rebuilds a directory from an archive,
+    /// and the only place the app's typed table ops exist is a `Db` the app
+    /// itself built. Without this the CLI cannot name the app's tables at
+    /// all, and `Seeder::rows` refuses every one of them by name.
+    pub fn seed_schema(&self) -> Schema {
+        let mut schema = self.engine.machine().schema.clone();
         schema.remove(JobRow::TABLE);
         schema.remove(EventRow::TABLE);
         schema.remove(crate::migration::SchemaVersion::TABLE);
-        Seeder::new(disk, self.cfg, schema)
+        schema
     }
 }
 
