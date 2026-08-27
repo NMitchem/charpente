@@ -247,7 +247,9 @@ an assertion in §9, not a hope.
 
 ## §4 Where it runs
 
-A fifth `Ready` arm in the kernel. `Archive::step()` does one unit of work per call — start
+A sixth `Ready` arm in the kernel — `Ready` already carried Request, Job, Cron, Repl and
+Tail before this design; `ObjectStore` is the fifth IO *trait*, and the two counts were
+conflated when this was written. `Archive::step()` does one unit of work per call — start
 one upload, poll one in flight, seal one generation — exactly the shape `Repl` already has
 (DESIGN §5, "driven kernel-shaped"). No threads: hard rule 1 forbids spawning from core, and
 a background uploader thread would make the upload schedule nondeterministic and unreplayable.
@@ -255,7 +257,10 @@ a background uploader thread would make the upload schedule nondeterministic and
 Because `serve::backup` runs the same kernel against an `EmptySource`, an archive arm and a
 hot standby compose for free: archiving *from* the standby leaves the primary's loop
 entirely untouched, which is the deployment most operators should choose. New edge:
-`serve::archive`, plus archive config on the existing replicated edges.
+`serve::archive`, plus archive config on the existing replicated edges. IMPLEMENTED as of
+T9: `serve::archive(app, store, cfg)` only. The `Kernel` supports the archive/replication
+pair (`build` takes both), but no edge constructs both yet, so the archiving-standby
+deployment this paragraph recommends is not reachable through `serve` today.
 
 ### Archive ownership — who may write a prefix
 

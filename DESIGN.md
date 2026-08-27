@@ -170,7 +170,28 @@ the per-step read that checks this is skipped entirely whenever no tail is regis
 kernel that never sees an SSE subscribe does zero extra IO and every pre-existing pinned
 seed replays unchanged. One unit of `Ready::Tail` work is a bounded table read
 (`TAIL_BATCH_EVENTS` rows), serviced round-robin across live tails so one deep resume never
-starves the rest of the ready set (§6).
+starves the rest of the ready set (§6). The object-storage archive (M2) adds a **sixth**
+ready source, `Archive` — `ObjectStore` is the fifth IO *trait*, which is not the same
+count. Like `Tail` it carries no timer, and deliberately so: spec §8 states the archive arm
+never reads wall-clock time, directly or transitively, which is also why its snapshot
+cadence counts records rather than seconds. Its readiness is therefore derived from data,
+and the derivation is the subtle part. `Archive::idle()` cannot be it — `idle` answers true
+in five states, four of which still hide un-archived data, and it is a snapshot that only
+updates when you step, so "skip while idle" is self-sealing: a write-gated archive resumes
+when the gate opens only if something keeps stepping it. The kernel instead remembers
+`db.last_applied()` as of the last step that found nothing to do and re-arms the arm when a
+freshly read `last_applied` differs, which is sound because every source of new archive work
+requires it to advance. Three further clauses gate the set: `Archive::stopped()` (terminal —
+a stopped archive answers `idle() == true` forever, so an arm that watched only idle would
+drive a dead archive for the life of the process and present it as healthy), `Db::verifying()`
+re-read every iteration (spec §4 rule 1: a write-gated node uploads nothing, and the gate
+opening must re-arm the arm with no step in between), and a one-retry-per-PARK backoff after
+a failed store operation, since a failed `start` leaves the archive in a non-idle state
+permanently and would otherwise peg the loop for the length of an outage. One unit of
+`Ready::Archive` work is exactly one `Archive::step` — start one upload, poll one in flight,
+or read one `read_budget_bytes` bite — never a loop to completion. An archive error is
+absorbed, never bubbled: an archive failure is not a database failure (spec §8), and a `?`
+there would let a transient PUT kill a serving node.
 
 That round-robin is fairness *among* tails; it is not protection *from* the request arm.
 `Ready::Tail` sits in the same ready set as every other source and is picked by the same
@@ -701,11 +722,17 @@ after every table has landed.
 - **Stance (fixed):** one primary, no sharding, no multi-master. See MANIFESTO §7.
 - **Deploy:** one binary + one data directory. Upgrades: new binary replays/attaches to the
   same log (schema versions in-log make this well-defined).
-- **Backup (M2, not built):** log segments + periodic snapshot to object storage,
-  Litestream-style, built in — not an add-on. What exists today is `serve::backup`
-  (`crates/charpente/src/serve.rs`): a replication-only node with no HTTP edge that keeps
-  its own durable copy and can be promoted. That is a hot standby, not an off-site
-  snapshot shipper — there is no object-storage code path anywhere in the tree.
+- **Backup (M2, in progress):** log segments + periodic snapshot to object storage,
+  Litestream-style, built in — not an add-on. Two distinct things now exist. `serve::backup`
+  (`crates/charpente/src/serve.rs`) is a replication-only node with no HTTP edge that keeps
+  its own durable copy and can be promoted: a hot standby, not an off-site snapshot shipper.
+  The archive proper (`crates/charpente/src/archive/`) is the shipper — a generation model
+  over `<prefix>/manifest`, a full logical snapshot plus the sealed WAL segments that
+  continue it, a bounded retention pin that yields rather than letting an object-store
+  outage halt the primary, and a sixth kernel arm (§1) driving it one step at a time.
+  `serve::archive(app, store, cfg)` is the archive-only edge. Restore is not built yet, and
+  no edge yet constructs an archiving standby, which spec §4 calls the deployment most
+  operators should choose.
 
 **Seeding (v1, implemented).** `Db::into_seeder`/`Seeder` builds a follower's (or a fresh
 backup's) entire state from a primary's logical snapshot stream, no log replay involved
@@ -920,7 +947,13 @@ and runs `with_replication` — a follower answers writes with 421 and reads fro
 replicated copy, a primary ships; a startup role/config mismatch prints to stderr, config
 never overriding the durable role. `backup(app, repl_disk, repl_cfg)` runs the same kernel
 on the current thread against an `EmptySource` (no HTTP edge, no requests) — a node that
-only follows and keeps a promotable copy. The reseed swap that `Repl::run_seed` needs lands
+only follows and keeps a promotable copy. `archive(app, store, cfg)` (M2) runs against the
+same `EmptySource` with `Kernel::with_archive(app, clock, archive, store)` instead — FOUR
+arguments, because `Archive::step` takes the store on every call and the `Archive` never
+holds it, so the `Kernel` keeps the pair. It defaults nothing about `cfg.writer`: the
+manifest's ownership comparison is identity alone, so a writer derived from anything a
+redeploy moves would make an ordinary redeployment a permanent refusal on a bucket the node
+genuinely owns. The reseed swap that `Repl::run_seed` needs lands
 in `App`: the `Db` sits behind an `Option` so the `Ready::Repl` arm can `take` it, hand it
 to `run_seed`, and `put` the rebuilt one back, adjacent so no other code observes the empty
 slot.

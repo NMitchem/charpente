@@ -17,8 +17,9 @@ use hyper::body::{Bytes, Frame, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 
-use charpente_core::io::{Clock, Disk, Instant};
+use charpente_core::io::{Clock, Disk, Instant, ObjectStore};
 
+use crate::archive::{Archive, ArchiveConfig};
 use crate::http::{App, Method, Request, Response};
 use crate::kernel;
 use crate::repl::{self, Repl};
@@ -146,6 +147,43 @@ pub fn backup(app: App, repl_disk: Box<dyn Disk>, repl_cfg: repl::ReplConfig) ->
     }
     let mut kernel =
         kernel::Kernel::with_replication(app, Box::new(crate::prod::ProdClock::new()), repl)?;
+    let mut source = EmptySource { clock };
+    kernel.run(&mut source)
+}
+
+/// An archive node (archive spec §4): no HTTP edge, no replication — the
+/// kernel runs on the CURRENT thread against `EmptySource`, exactly as
+/// `backup` does, so the archive arm and a hot standby are the same shape
+/// and compose. Blocks until the kernel returns.
+///
+/// `Archive::open` runs here rather than in the caller because it registers
+/// the retention pin on the `Db`, which must happen before `Kernel` consumes
+/// the `App`.
+///
+/// **`cfg.writer` is taken verbatim, and nothing here defaults, derives, or
+/// synthesises it.** `ArchiveConfig::writer` is a stability contract, not a
+/// label: the manifest comparison is identity ALONE, so a `writer` derived
+/// from anything a redeploy moves — a bind address, a port, a pod name, a
+/// container id, a PID — turns an ordinary redeployment into a PERMANENT
+/// refusal on a bucket this node genuinely owns. The archive latches
+/// `stopped()` at `adopt`, before uploading anything, for the life of the
+/// process; the only recovery is the operator action `foreign_writer_notice`
+/// names, which abandons the live generation's objects. A helpful-looking
+/// default here would convert an availability event into that, and the
+/// failure would appear only on the second deployment.
+///
+/// NOT YET WIRED: an archive that also replicates. Spec §4 calls archiving
+/// from a standby the deployment most operators should choose, and the
+/// `Kernel` supports the pair (`build` takes both), but no edge here
+/// constructs both — `with_archive` and `with_replication` are separate
+/// constructors. The composed edge is a later task's; this one is the
+/// archive-only node.
+pub fn archive(app: App, store: Box<dyn ObjectStore>, cfg: ArchiveConfig) -> io::Result<()> {
+    let clock = crate::prod::ProdClock::new();
+    let mut app = app;
+    let archive = Archive::open(cfg, app.db_mut())?;
+    let mut kernel =
+        kernel::Kernel::with_archive(app, Box::new(crate::prod::ProdClock::new()), archive, store)?;
     let mut source = EmptySource { clock };
     kernel.run(&mut source)
 }
@@ -364,10 +402,18 @@ impl hyper::body::Body for SseBody {
     }
 }
 
-/// The `RequestSource` for a backup node: no requests ever arrive, so `poll`
-/// is always `None` and `wait_until` just sleeps to the deadline. The repl park
-/// tick guarantees `Kernel::step` always hands back a `Some(deadline)`, so this
-/// wakes every `REPL_TICK_NANOS` to pump replication IO.
+/// The `RequestSource` for a node with no HTTP edge — `backup` and
+/// `archive` both run against it. No request ever arrives, so `poll` is
+/// always `None` and `wait_until` just sleeps to the deadline.
+///
+/// Under `backup` the repl park tick guarantees `Kernel::step` always hands
+/// back a `Some(deadline)`, so it wakes every `REPL_TICK_NANOS` to pump
+/// replication IO. Under `archive` there is no park tick and no
+/// timer-carrying source at all — the archive arm is deliberately clock-free
+/// (spec §8: "the archive arm never reads wall-clock time, directly or
+/// transitively"), so `None` is its ORDINARY deadline rather than an
+/// impossible one, and the 5 ms floor below is load-bearing: it is the park
+/// that paces the kernel's archive retry after a failed store operation.
 struct EmptySource {
     clock: crate::prod::ProdClock,
 }
@@ -385,8 +431,9 @@ impl kernel::RequestSource for EmptySource {
                     self.clock.sleep(deadline.duration_since(now));
                 }
             }
-            // A repl-configured kernel always sets a deadline (the park tick);
-            // guard the impossible None so a backup never busy-spins.
+            // The ordinary case for `archive` and the impossible one for
+            // `backup` (the park tick); either way this is what keeps a
+            // request-less node from busy-spinning.
             None => self.clock.sleep(Duration::from_millis(5)),
         }
         kernel::Wake::Deadline
