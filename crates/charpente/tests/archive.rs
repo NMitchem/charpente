@@ -3563,6 +3563,23 @@ fn the_unreadable_manifest_refusal_names_the_key_the_prefix_and_the_fix() {
     for needle in [PREFIX, &manifest_key(PREFIX), "CRC", "remove", "restart"] {
         assert!(t.contains(needle), "the refusal must name {needle}: {t}");
     }
+    // The OTHER direction of the same conditional, which nothing pinned
+    // until now: at `Opening` "nothing was uploaded" is the true sentence,
+    // and a predicate stuck at "uploaded" would tell an operator with an
+    // empty bucket that removing the manifest strands objects they do not
+    // have — sending them looking for orphans instead of re-fetching.
+    // Checked against the bucket, not against other words in the notice.
+    assert_eq!(
+        store.keys(),
+        vec![manifest_key(PREFIX)],
+        "this archive uploaded something before it refused, so 'nothing was uploaded' is not the \
+         fact the notice should be stating here"
+    );
+    assert!(
+        t.contains("nothing was uploaded"),
+        "the refusal must say what it left behind at this site too — hard rule 5's third element \
+         is the fix, and here the fix is re-fetch or restore, with nothing to clean up: {t}"
+    );
 }
 
 /// HARD RULE 5 at the OTHER site, which the test above does not reach: it
