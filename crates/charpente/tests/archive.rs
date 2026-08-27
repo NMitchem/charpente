@@ -4105,6 +4105,12 @@ fn the_archive_arm_ticks_without_starving_requests() {
     );
     assert!(served.archive_steps > 0, "the archive arm never ran");
     assert!(
+        served.archive_steps <= 1_000,
+        "{} archive steps over 1,000 kernel iterations: the arm ran more than once per \
+         iteration, so `read_budget_bytes` no longer bounds what one loop pass costs",
+        served.archive_steps
+    );
+    assert!(
         !store.keys().is_empty(),
         "the arm ran {} times and put nothing in the bucket, so 'it ran' is a counter moving \
          rather than an archive working",
@@ -4120,6 +4126,39 @@ fn a_kernel_without_an_archive_never_gates_on_one() {
 
     assert_eq!(served.archive_steps, 0);
     assert!(served.requests > 0);
+}
+
+/// One `Archive::step` per kernel iteration, never a loop to completion.
+///
+/// `Archive::step`'s own `read_budget_bytes` exists precisely so that no
+/// single call reads a whole 64 MiB segment — and that bound is worth
+/// nothing if the arm drains the archive before returning. Measured against
+/// a SILENT source and a three-segment backlog, so the archive arm is the
+/// only ready source and the count is exact rather than probabilistic: five
+/// iterations, five steps, with plenty left to do.
+///
+/// The `!idle()` assertion is the non-vacuity guard. Without it the same
+/// numbers would pass against an archive that had already finished, which
+/// would make "it stopped at five" a statement about the archive rather than
+/// about the arm.
+#[test]
+fn the_archive_arm_does_one_step_per_kernel_iteration() {
+    let (_sim, mut k, _store) = kernel_with_archive(0x746b_3961_0000_0005, 3 * RECORDS_PER_SEGMENT);
+    let mut source = SilentSource;
+
+    let served = run_kernel_steps(&mut k, &mut source, 5);
+
+    assert!(
+        !k.archive_for_tests().expect("built with an archive").idle(),
+        "the archive ran out of work inside five steps, so a count of five proves nothing \
+         about the arm"
+    );
+    assert_eq!(
+        served.archive_steps, 5,
+        "five kernel iterations cost {} archive steps: the arm loops inside one iteration \
+         instead of taking one unit of work and returning",
+        served.archive_steps
+    );
 }
 
 /// RULING 57, first half. A caught-up archive must let the loop go quiet.
