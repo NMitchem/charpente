@@ -3892,3 +3892,378 @@ fn dropping_an_archive_releases_its_retention_pin() {
          seq again and the WAL grows forever, with no archive left to release it"
     );
 }
+
+// ------------------------------- T9: the archive as the SIXTH kernel arm
+//
+// `Ready` already had five variants before this task (Request, Job, Cron,
+// Repl, Tail) — `ObjectStore` is the fifth IO TRAIT, which is where the
+// plan's "fifth kernel arm" title came from. Everything below drives
+// `Kernel::step` directly rather than `Kernel::run`, because the property
+// under test is which SOURCE the loop decides is ready, and `run` absorbs
+// exactly that into a park.
+
+use charpente::http::{ApiError, App, AppConfig, Method, Request, Response};
+use charpente::kernel::{
+    EventFrame, EventSink, Kernel, KernelStats, Reply, RequestSource, Respond, SinkStatus, Step,
+    Wake,
+};
+use charpente::{Tx, route, routes};
+use charpente_core::io::Instant;
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
+
+#[derive(Serialize, Deserialize)]
+struct RecBody {
+    n: u64,
+}
+
+/// A writing route, deliberately: an archive with a `Db` that never moves
+/// goes caught-up and stays there, and every "does the arm keep up under
+/// load" question would then be asked of an archive with nothing to do.
+#[route(POST "/rec")]
+fn put_rec(tx: &mut Tx, body: RecBody) -> Result<u64, ApiError> {
+    tx.put(&Rec {
+        id: Id::from_raw(body.n),
+        value: body.n,
+    });
+    Ok(body.n)
+}
+
+/// `SimObjectStore` behind a handle the test keeps after the `Kernel` has
+/// taken ownership of the `Box<dyn ObjectStore>`.
+///
+/// `Arc<Mutex<_>>` rather than `Arc<_>`: `SimObjectStore` holds a
+/// `RefCell<Rng>` and so is `Send` but not `Sync`, which makes `Arc<SimObject
+/// Store>` not `Send` and therefore not an `ObjectStore` at all. `Mutex<T>`
+/// is `Sync` whenever `T: Send`, so wrapping restores it. Never contended —
+/// the kernel loop is single-threaded and so is every test here.
+#[derive(Clone)]
+struct SharedStore(Arc<Mutex<SimObjectStore>>);
+
+impl SharedStore {
+    fn new() -> SharedStore {
+        SharedStore(Arc::new(Mutex::new(SimObjectStore::new())))
+    }
+
+    fn keys(&self) -> Vec<String> {
+        self.lock().keys()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SimObjectStore> {
+        self.0.lock().expect("SharedStore lock poisoned by a panic")
+    }
+}
+
+impl ObjectStore for SharedStore {
+    fn start(&self, op: ObjectOp) -> io::Result<()> {
+        self.lock().start(op)
+    }
+
+    fn poll(&self) -> Option<io::Result<ObjectDone>> {
+        self.lock().poll()
+    }
+}
+
+/// A `RequestSource` that never runs dry: `poll` always hands back one more
+/// `POST /rec`, so `Ready::Request` is in the ready set on EVERY iteration
+/// and the only way `stats.requests` can stay 0 is an arm that starves it.
+struct EndlessSource {
+    next: u64,
+}
+
+struct CountingReply;
+
+impl Respond for CountingReply {
+    fn send(self: Box<Self>, _response: Response) {}
+
+    fn stream(self: Box<Self>, _response: Response) -> Box<dyn EventSink> {
+        Box::new(SilentSink)
+    }
+}
+
+struct SilentSink;
+
+impl EventSink for SilentSink {
+    fn send(&mut self, _frame: &EventFrame) -> SinkStatus {
+        SinkStatus::Ok
+    }
+}
+
+impl RequestSource for EndlessSource {
+    fn poll(&mut self) -> Option<(Request, Reply)> {
+        self.next += 1;
+        let request = Request::new(Method::Post, "/rec").json(&RecBody { n: self.next });
+        Some((request, Box::new(CountingReply)))
+    }
+
+    fn wait_until(&mut self, _deadline: Option<Instant>) -> Wake {
+        Wake::Ready
+    }
+}
+
+/// The shape `serve::archive` runs against (`serve.rs`'s `EmptySource`): no
+/// request ever arrives. `wait_until` is never called by these tests — they
+/// drive `Kernel::step` so they can SEE `Step::Idle` instead of having a
+/// driver absorb it into a park.
+struct SilentSource;
+
+impl RequestSource for SilentSource {
+    fn poll(&mut self) -> Option<(Request, Reply)> {
+        None
+    }
+
+    fn wait_until(&mut self, _deadline: Option<Instant>) -> Wake {
+        Wake::Deadline
+    }
+}
+
+fn kernel_app(seed: u64) -> (Sim, App) {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let mut cfg = AppConfig::default();
+    // Same 64 KiB as every other fixture in this file, so `RECORDS_PER_
+    // SEGMENT` keeps its measured meaning here too.
+    cfg.db.wal.segment_bytes = 64 << 10;
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Rec>(),
+        Box::new(sim.entropy()),
+        cfg,
+    )
+    .unwrap()
+    .mount(routes![put_rec]);
+    (sim, app)
+}
+
+/// A kernel whose archive already has a backlog: `records` are committed
+/// BEFORE `Archive::open`, so the arm has real work from its first
+/// iteration rather than only whatever the requests below commit.
+fn kernel_with_archive(seed: u64, records: u64) -> (Sim, Kernel, SharedStore) {
+    let (sim, mut app) = kernel_app(seed);
+    if records > 0 {
+        write_records(app.db_for_tests(), records);
+    }
+    let arc = Archive::open(archive_config(0, 8 << 20), app.db_for_tests()).unwrap();
+    let store = SharedStore::new();
+    let kernel = Kernel::with_archive(
+        app,
+        Box::new(sim.clock()),
+        arc,
+        Box::new(store.clone()) as Box<dyn ObjectStore>,
+    )
+    .unwrap();
+    (sim, kernel, store)
+}
+
+fn kernel_with_archive_and_requests() -> (Sim, Kernel, SharedStore, EndlessSource) {
+    let (sim, kernel, store) = kernel_with_archive(0x746b_3961_0000_0001, 3 * RECORDS_PER_SEGMENT);
+    (sim, kernel, store, EndlessSource { next: 0 })
+}
+
+fn kernel_without_archive() -> (Sim, Kernel, EndlessSource) {
+    let (sim, app) = kernel_app(0x746b_3961_0000_0002);
+    let kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    (sim, kernel, EndlessSource { next: 0 })
+}
+
+/// Runs exactly `n` iterations of the loop's DECISION (`Kernel::step`) and
+/// hands back the counters. Never parks: a park is what a driver does with
+/// `Step::Idle`, and these tests want to observe that value, not consume it.
+fn run_kernel_steps(k: &mut Kernel, source: &mut dyn RequestSource, n: usize) -> KernelStats {
+    for _ in 0..n {
+        k.step(source).expect("the kernel must not stop");
+    }
+    k.stats()
+}
+
+/// Steps until `Kernel::step` reports `Idle`, or gives up after `bound`.
+/// `None` means the loop never went quiet — which is the failure mode a
+/// spinning ready predicate produces, so it is a verdict, not a timeout.
+fn steps_to_kernel_idle(
+    k: &mut Kernel,
+    source: &mut dyn RequestSource,
+    bound: usize,
+) -> Option<usize> {
+    for n in 0..bound {
+        if let Step::Idle { .. } = k.step(source).expect("the kernel must not stop") {
+            return Some(n + 1);
+        }
+    }
+    None
+}
+
+/// The plan's step-1 test. Two counters, and neither may be zero: an arm
+/// that never runs is not an arm, and an arm that runs to completion inside
+/// one iteration has taken the loop over.
+#[test]
+fn the_archive_arm_ticks_without_starving_requests() {
+    let (_sim, mut k, store, mut source) = kernel_with_archive_and_requests();
+    let served = run_kernel_steps(&mut k, &mut source, 1_000);
+
+    assert!(
+        served.requests > 0,
+        "the archive arm starved the request arm"
+    );
+    assert!(served.archive_steps > 0, "the archive arm never ran");
+    assert!(
+        !store.keys().is_empty(),
+        "the arm ran {} times and put nothing in the bucket, so 'it ran' is a counter moving \
+         rather than an archive working",
+        served.archive_steps
+    );
+}
+
+/// The plan's step-1 test, second half.
+#[test]
+fn a_kernel_without_an_archive_never_gates_on_one() {
+    let (_sim, mut k, mut source) = kernel_without_archive();
+    let served = run_kernel_steps(&mut k, &mut source, 100);
+
+    assert_eq!(served.archive_steps, 0);
+    assert!(served.requests > 0);
+}
+
+/// RULING 57, first half. A caught-up archive must let the loop go quiet.
+///
+/// This is a CORRECTNESS property, not a tidiness one: `Kernel::step` that
+/// returns `Worked` forever never reaches `Step::Idle`, so `RequestSource::
+/// wait_until` is never called — a production core pegged at 100% on an
+/// archive with nothing to do, and under the simulator virtual time that
+/// never advances at all.
+///
+/// The second assertion is the one that would survive a lucky first: after
+/// the loop goes quiet, running it a thousand more times against a `Db` that
+/// is not moving must cost ZERO further archive steps. Phrased against a
+/// counter read BEFORE the second run rather than against any expression the
+/// predicate itself uses (T7.5's I-1).
+#[test]
+fn a_caught_up_archive_still_lets_the_kernel_reach_idle() {
+    let (_sim, mut k, store, _source) = kernel_with_archive_and_requests();
+    let mut source = SilentSource;
+
+    let steps = steps_to_kernel_idle(&mut k, &mut source, 10_000)
+        .expect("the kernel never went idle: the archive arm spins the loop");
+    assert!(
+        !store.keys().is_empty(),
+        "the kernel idled after {steps} steps having archived nothing, so 'it went quiet' is an \
+         archive that never started rather than one that finished"
+    );
+
+    let quiet = k.stats().archive_steps;
+    let after = run_kernel_steps(&mut k, &mut source, 1_000);
+    assert_eq!(
+        after.archive_steps,
+        quiet,
+        "the archive arm ran {} more times over a Db that committed nothing — the ready \
+         predicate is not asking whether there is work",
+        after.archive_steps - quiet
+    );
+}
+
+/// RULING 57, second half, and the trap the whole ruling exists for.
+///
+/// A write-gated archive (`db.verifying()`) reports `idle() == true` and
+/// returns `Ok(())` — the same answer a caught-up archive gives. `step`
+/// re-reads the gate every call and "resumes by itself when the gate opens"
+/// ONLY IF something keeps stepping it, so a ready predicate that skips on
+/// `idle` parks the archive permanently: the gate opening is never observed,
+/// because observing it requires the step the predicate is refusing.
+///
+/// The first assertion is not scenery. Without it a predicate that never
+/// gated at all would pass the second one, and the test would be measuring
+/// nothing.
+#[test]
+fn a_write_gated_archive_resumes_archiving_after_the_gate_opens() {
+    let (_sim, mut k, store) = kernel_with_archive(0x746b_3961_0000_0003, RECORDS_PER_SEGMENT);
+    let mut source = SilentSource;
+
+    k.app_mut_for_tests()
+        .db_for_tests()
+        .verify_writes(vec!["witness-a:9000".into()]);
+    run_kernel_steps(&mut k, &mut source, 500);
+    assert!(
+        store.keys().is_empty(),
+        "the gate did not hold, so 'it resumed' below proves nothing: {:?}",
+        store.keys()
+    );
+
+    k.app_mut_for_tests().db_for_tests().allow_writes();
+    run_kernel_steps(&mut k, &mut source, 500);
+
+    assert!(
+        !store.keys().is_empty(),
+        "the archive never resumed after the gate opened: the ready predicate read `idle` as \
+         'nothing to do' and stopped scheduling the very steps that would have noticed the gate \
+         open. A transient verification became a permanent archive outage that reports itself \
+         as the healthy steady state"
+    );
+}
+
+/// A stopped archive reports `idle() == true` and returns `Ok(())` FOREVER
+/// (Task 8's `idle()`/`stopped()` split, ruled correct on re-review). An arm
+/// that watches only idle-and-errors therefore runs a dead archive
+/// indefinitely and presents it as the healthy steady state — a failure with
+/// no natural symptom, which is what hard rule 4 asks for an assertion
+/// against.
+///
+/// The oracle is phrased against WORK ARRIVING: commits keep coming after
+/// the archive stops, and every one of them is a fresh reason a
+/// data-watermark predicate would re-arm the arm. A predicate that does not
+/// consult `stopped()` therefore keeps stepping, and `archive_steps` keeps
+/// climbing, while the bucket never changes.
+#[test]
+fn the_kernel_stops_stepping_a_stopped_archive() {
+    let (_sim, mut k, store, mut source) =
+        kernel_with_archive_and_requests_over(0x746b_3961_0000_0004, FOREIGN_WRITER);
+
+    let stopped_at = (0..2_000)
+        .find_map(|_| {
+            k.step(&mut source).expect("the kernel must not stop");
+            k.archive_for_tests()
+                .expect("built with an archive")
+                .stopped()
+                .then(|| k.stats().archive_steps)
+        })
+        .expect("the planted foreign manifest never stopped the archive");
+    let bucket = store.keys();
+
+    let after = run_kernel_steps(&mut k, &mut source, 1_000);
+    assert!(
+        after.requests > 0,
+        "no request was served over the second run, so 'the archive stopped being stepped' \
+         could be a kernel that stopped doing anything"
+    );
+    assert_eq!(
+        after.archive_steps,
+        stopped_at,
+        "the kernel drove a permanently stopped archive {} more times: it never asked \
+         `stopped()`, and a dead archive is being presented as the healthy steady state",
+        after.archive_steps - stopped_at
+    );
+    assert_eq!(
+        store.keys(),
+        bucket,
+        "a stopped archive wrote to the bucket it refused to own"
+    );
+}
+
+/// `kernel_with_archive_and_requests`, but over a bucket a DIFFERENT writer
+/// already owns — so `adopt` refuses and latches `State::Stopped` (spec §4
+/// rule 2).
+fn kernel_with_archive_and_requests_over(
+    seed: u64,
+    writer: &str,
+) -> (Sim, Kernel, SharedStore, EndlessSource) {
+    let (sim, mut app) = kernel_app(seed);
+    write_records(app.db_for_tests(), RECORDS_PER_SEGMENT);
+    let arc = Archive::open(archive_config(0, 8 << 20), app.db_for_tests()).unwrap();
+    let store = SharedStore::new();
+    write_foreign_manifest(&store.lock(), writer, 3);
+    let kernel = Kernel::with_archive(
+        app,
+        Box::new(sim.clock()),
+        arc,
+        Box::new(store.clone()) as Box<dyn ObjectStore>,
+    )
+    .unwrap();
+    (sim, kernel, store, EndlessSource { next: 0 })
+}

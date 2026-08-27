@@ -16,9 +16,10 @@ use std::sync::{Arc, Mutex};
 
 use charpente_core::db::{Db, MAX_BATCH};
 use charpente_core::event::EventRow;
-use charpente_core::io::{Clock, Instant};
+use charpente_core::io::{Clock, Instant, ObjectStore};
 use charpente_core::table::View;
 
+use crate::archive::Archive;
 use crate::http::{App, Cursor, Handled, Request, Response, io_failure_response};
 use crate::kernel::tail::Tail;
 use crate::repl::{REPL_TICK_NANOS, Repl};
@@ -84,6 +85,9 @@ pub struct KernelStats {
     pub jobs_dead: u64,
     pub cron_ticks: u64,
     pub cron_catchups: u64,
+    /// `Archive::step` calls the arm has made — including the ones that
+    /// returned `Err`, since a retry is still a step the loop spent.
+    pub archive_steps: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -93,6 +97,7 @@ enum Ready {
     Cron,
     Repl,
     Tail,
+    Archive,
 }
 
 /// The deterministic kernel: one `App`, one due-heap, one cron schedule, one
@@ -129,6 +134,36 @@ pub struct Kernel {
     /// Round-robin start index into `tails` for the next `Ready::Tail`
     /// service — bounds one slow tail from starving the others.
     tail_cursor: usize,
+    /// The archive and the store it ships to, together or not at all
+    /// (`None` for a node that does not archive — the ready set then never
+    /// gates on one).
+    ///
+    /// ONE `Option` over the PAIR rather than two independent `Option`s.
+    /// `Archive::step(&mut self, db, store)` takes the store on every call
+    /// and the `Archive` never holds it (ruling 32), so the kernel has to
+    /// keep it; and an archive without a store — or a store without an
+    /// archive — is not a state this arm could act on. Pairing them makes
+    /// that unrepresentable instead of merely unhandled, which is hard rule
+    /// 4's negative space applied to a type.
+    archive: Option<(Archive, Box<dyn ObjectStore>)>,
+    /// What the archive knew last time it found nothing to do:
+    /// `Some(last_applied)` if the previous `Archive::step` left it idle,
+    /// `None` if it left work pending. The ready predicate's watermark —
+    /// see the ready-set build for why `idle()` alone cannot be it.
+    archive_idle_at: Option<Option<u64>>,
+    /// Set when the last `Archive::step` returned `Err`, cleared when the
+    /// loop parks. Paces a retry at one per PARK rather than one per
+    /// iteration; see the ready-set build.
+    archive_retry_parked: bool,
+    /// `gapped()`/`stopped()` as of the last archive step, so the arm can
+    /// raise spec §7's two operator notices on the EDGE rather than once per
+    /// retry.
+    archive_gapped: bool,
+    archive_stopped: bool,
+    /// The last notice the archive raised, left for a driver that would
+    /// rather route it than read stderr (`Repl::take_witness_notice`'s
+    /// precedent).
+    archive_notice: Option<String>,
 }
 
 impl Kernel {
@@ -136,7 +171,7 @@ impl Kernel {
     /// from Pending rows. `now` for the cron phase comes from `clock`. The
     /// single-node constructor — no replication.
     pub fn new(app: App, clock: Box<dyn Clock>) -> io::Result<Kernel> {
-        Kernel::build(app, clock, None)
+        Kernel::build(app, clock, None, None)
     }
 
     /// The replicated constructor: same setup, plus a `Repl` whose role gates
@@ -144,10 +179,31 @@ impl Kernel {
     /// and whose park tick (`REPL_TICK_NANOS`) bounds every idle wait so
     /// in-flight replication IO is polled promptly.
     pub fn with_replication(app: App, clock: Box<dyn Clock>, repl: Repl) -> io::Result<Kernel> {
-        Kernel::build(app, clock, Some(repl))
+        Kernel::build(app, clock, Some(repl), None)
     }
 
-    fn build(mut app: App, clock: Box<dyn Clock>, repl: Option<Repl>) -> io::Result<Kernel> {
+    /// The archiving constructor (archive spec §4): same setup, plus the
+    /// `Archive` and the `ObjectStore` it ships to. FOUR arguments, not
+    /// three, because `Archive::step` takes the store on every call and the
+    /// `Archive` never holds it — see the `archive` field.
+    ///
+    /// `Archive::open` registers the retention pin, so it must already have
+    /// run against this `App`'s `Db` before the `App` is consumed here.
+    pub fn with_archive(
+        app: App,
+        clock: Box<dyn Clock>,
+        archive: Archive,
+        store: Box<dyn ObjectStore>,
+    ) -> io::Result<Kernel> {
+        Kernel::build(app, clock, None, Some((archive, store)))
+    }
+
+    fn build(
+        mut app: App,
+        clock: Box<dyn Clock>,
+        repl: Option<Repl>,
+        archive: Option<(Archive, Box<dyn ObjectStore>)>,
+    ) -> io::Result<Kernel> {
         let mut dispatcher = Dispatcher::new(app.take_job_defs());
         let mut cron = CronScheduler::new(app.take_cron_entries());
         let now = clock.now().as_nanos();
@@ -185,6 +241,15 @@ impl Kernel {
             was_writable,
             tails: Vec::new(),
             tail_cursor: 0,
+            archive,
+            // `None`, not `Some(db.last_applied())`: the archive has never
+            // been stepped, so it has never had a chance to find nothing to
+            // do, and its opening manifest GET is real work.
+            archive_idle_at: None,
+            archive_retry_parked: false,
+            archive_gapped: false,
+            archive_stopped: false,
+            archive_notice: None,
         })
     }
 
@@ -240,7 +305,7 @@ impl Kernel {
         // (DESIGN §5). The guard is the write gate, not the role — see
         // `was_writable`.
         let writable = self.app.db().writes_allowed();
-        let mut ready = Vec::with_capacity(4);
+        let mut ready = Vec::with_capacity(6);
         if self.pending.is_some() {
             ready.push(Ready::Request);
         }
@@ -257,6 +322,73 @@ impl Kernel {
         {
             ready.push(Ready::Repl);
         }
+        // THE ARCHIVE ARM'S READY PREDICATE (archive spec §4; ruling 57).
+        // Four clauses, and none of them is optional — each rules out a
+        // different way of getting this wrong, and three of the four were
+        // reached for first and are WRONG:
+        //
+        // The store cannot be asked. `ObjectStore` is exactly `start` and
+        // `poll`, and `poll` CONSUMES the completion ("the two are
+        // deliberately indistinguishable", io.rs) — there is no
+        // non-destructive readiness peek anywhere on it or on `Archive`.
+        //
+        // `archive.is_some()` alone spins the core. `step` would return
+        // `Worked` every iteration, `Step::Idle` would never be reached, and
+        // `wait_until` would never be called: 100% CPU on a caught-up
+        // archive in production, and virtual time that never advances under
+        // the sim. A `has_work`-shaped predicate is a CORRECTNESS
+        // requirement here, exactly as it is for `Repl`.
+        //
+        // `!archive.idle()` parks a live archive forever. `idle` answers
+        // true in FIVE states (see `Archive::idle`) and four of them still
+        // have un-archived data behind the `true`; worse, `idle` is a
+        // SNAPSHOT that only updates when you step, so "skip while idle"
+        // is self-sealing — a write-gated archive "resumes by itself when
+        // the gate opens" only if something keeps stepping it, and the step
+        // is what the predicate is refusing.
+        //
+        // What works is `idle` PAIRED WITH THE WATERMARK IT WAS TAKEN AT.
+        // `archive_idle_at` is `Some(L)` when the last step found nothing to
+        // do against a `Db` whose `last_applied` was `L`, and comparing it
+        // to a freshly read `last_applied` asks "has the world moved since
+        // the archive last looked", which is never stale. That is sound
+        // because every source of new archive work requires `last_applied`
+        // to advance: the snapshot cadence (`cadence_due`) and
+        // `open_snapshot` are both functions of it, the "waiting" arm clears
+        // only when it reaches `layout_end`, and a new segment seals only
+        // during a WAL append, which advances it in the same call.
+        // `Wal::gc` only ever removes segments, which never creates work.
+        //
+        // `last_applied()` is a plain field read (engine.rs), which is what
+        // makes it admissible here. `sealed_segments()` is a `Disk::list`
+        // and must never appear in a per-iteration predicate (F2).
+        //
+        // `stopped()` is the ONE state that must be skipped outright: a
+        // stopped archive answers `idle() == true` and `Ok(())` forever, so
+        // without this clause the kernel drives a dead archive for the life
+        // of the process and reports it as the healthy steady state.
+        //
+        // `verifying()` is re-read every iteration rather than remembered,
+        // which is what makes the gate OPENING re-arm the arm with no step
+        // in between (spec §4 rule 1).
+        //
+        // `archive_retry_parked` paces a FAILED store op at one retry per
+        // kernel PARK instead of one per iteration. Without it an object
+        // store outage pegs the loop: a failed `start` leaves the archive in
+        // a non-`Idle` state permanently, so `archive_idle_at` stays `None`
+        // and the arm is ready forever — and `Archive::step`'s
+        // `yield_or_bound` does a `Disk::list` on every one of those
+        // iterations. Not a timer, deliberately: spec §8 states the archive
+        // arm never reads wall-clock time, directly or transitively, which
+        // is also why `snapshot_every` counts records rather than seconds.
+        if let Some((archive, _)) = &self.archive
+            && !archive.stopped()
+            && !self.app.db().verifying()
+            && !self.archive_retry_parked
+            && self.archive_idle_at != Some(self.app.db().last_applied())
+        {
+            ready.push(Ready::Archive);
+        }
         // The Tail source only ever joins via data state, never a timer: a
         // tail becomes eligible the instant some commit moves
         // `next_event_id` past it, and the guard here skips the read
@@ -270,6 +402,10 @@ impl Kernel {
             }
         }
         if ready.is_empty() {
+            // The loop is about to park, which is the archive's retry
+            // pacing: whatever `wait_until` does with the deadline below is
+            // what separates one failed store attempt from the next.
+            self.archive_retry_parked = false;
             // Gate the job/cron deadlines on `writable` too: a node with a
             // due-but-gated job must not busy-spin on a deadline already in the
             // past — the park tick (below) is what wakes it to re-check.
@@ -593,6 +729,56 @@ impl Kernel {
                     self.tails.swap_remove(idx);
                 }
             }
+            Ready::Archive => {
+                let (archive, store) = self
+                    .archive
+                    .as_mut()
+                    .expect("Archive arm only pushed when Some");
+                // ONE `step` per iteration, never a loop to completion.
+                // `Archive::step`'s own `read_budget_bytes` exists precisely
+                // so no single call reads a whole 64 MiB segment, and that
+                // bound is worth nothing if the arm drains the archive here.
+                let outcome = archive.step(self.app.db(), &**store);
+                let (idle, gapped, stopped) = (archive.idle(), archive.gapped(), archive.stopped());
+                self.stats.archive_steps += 1;
+                // The watermark the ready predicate reads. Taken AFTER the
+                // step, against the `Db` the step actually saw.
+                self.archive_idle_at = idle.then(|| self.app.db().last_applied());
+                // Spec §7's last row and §8's first invariant: an archive
+                // failure is NOT a database failure. A `?` here would kill a
+                // serving node over a transient PUT, which is precisely the
+                // power spec §5 says a derived artifact must not have over
+                // the thing it derives from. So the arm absorbs every error
+                // — and the archive itself retries the same key with the
+                // same bytes, so absorbing loses nothing.
+                //
+                // The two conditions spec §7 says DO produce an operator
+                // notice — a gap, and a permanent ownership refusal — are
+                // raised on the false->true EDGE of `gapped()`/`stopped()`,
+                // which is exact: both flags are set by the very step that
+                // returns the notice as its `Err`. Edge-triggering is what
+                // makes it "one notice" in the two cases that matter: the
+                // gap churn described in `yield_or_bound` (measured at 750
+                // notices over 3,000 steps) collapses to one, and a
+                // within-bound retry storm produces none at all, which is
+                // what §7's first row asks for.
+                if let Err(e) = outcome {
+                    if (gapped && !self.archive_gapped) || (stopped && !self.archive_stopped) {
+                        // Written from inside the loop for the reason
+                        // `Repl::emit_witness_notice` gives for the same
+                        // choice: it is produced mid-run and no driver polls
+                        // the kernel while it is looping, so an operator
+                        // would otherwise have nothing to read. The string
+                        // is also left on `archive_notice` for a driver that
+                        // would rather route it.
+                        eprintln!("charpente archive: {e}");
+                        self.archive_notice = Some(e.to_string());
+                    }
+                    self.archive_retry_parked = true;
+                }
+                self.archive_gapped = gapped;
+                self.archive_stopped = stopped;
+            }
         }
         // Any serviced source may have enqueued (handlers can enqueue too), so
         // this runs after every branch above. A follower's shipped applies also
@@ -642,11 +828,33 @@ impl Kernel {
         self.stats
     }
 
+    /// The last notice the archive arm raised (a gap, or a permanent
+    /// ownership refusal), taken. `None` forever on a kernel with no
+    /// archive, and `None` between notices. Mirrors
+    /// `Repl::take_witness_notice`.
+    pub fn take_archive_notice(&mut self) -> Option<String> {
+        self.archive_notice.take()
+    }
+
     /// Borrows the mounted App — tests read `db().last_applied()`/snapshots
     /// without consuming the kernel (`into_app` is the consuming form).
     #[doc(hidden)]
     pub fn app(&self) -> &App {
         &self.app
+    }
+
+    /// Tests that drive the write gate or write records mid-run need the
+    /// `Db` mutably; `app()` is the read-only form.
+    #[doc(hidden)]
+    pub fn app_mut_for_tests(&mut self) -> &mut App {
+        &mut self.app
+    }
+
+    /// Lets a test ask the archive itself (`gapped()`, `stopped()`,
+    /// `pin_floor()`) without consuming the kernel.
+    #[doc(hidden)]
+    pub fn archive_for_tests(&self) -> Option<&Archive> {
+        self.archive.as_ref().map(|(a, _)| a)
     }
 
     /// True for a live primary — `false` on a follower or a draining primary.
