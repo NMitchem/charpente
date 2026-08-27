@@ -3923,8 +3923,10 @@ use charpente::kernel::{
     Wake,
 };
 use charpente::{Tx, route, routes};
-use charpente_core::io::Instant;
+use charpente_core::io::{Disk, Instant};
+use charpente_sim::SimDisk;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Serialize, Deserialize)]
@@ -4032,21 +4034,62 @@ impl RequestSource for SilentSource {
     }
 }
 
+/// Counts `Disk::list` calls and delegates everything else, so F2 can be
+/// MEASURED rather than argued. `Archive::step`'s `yield_or_bound` does one
+/// `Db::sealed_segments` — a `Disk::list` — per step where the archive holds
+/// and nothing is in flight, and the question Task 9 had to answer is
+/// whether wiring the archive into the kernel turns that into one per KERNEL
+/// ITERATION. Same delegate-and-switch idiom as `FlakyStore` above and the
+/// `Disk` wrappers in tests/group_commit.rs.
+struct ListCountingDisk {
+    inner: SimDisk,
+    lists: Arc<AtomicU64>,
+}
+
+impl Disk for ListCountingDisk {
+    fn open(&self, path: &str) -> io::Result<Box<dyn charpente_core::io::File>> {
+        self.inner.open(path)
+    }
+
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.lists.fetch_add(1, Ordering::Relaxed);
+        self.inner.list(prefix)
+    }
+
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
 fn kernel_app(seed: u64) -> (Sim, App) {
+    let (sim, app, _) = kernel_app_counting_lists(seed);
+    (sim, app)
+}
+
+fn kernel_app_counting_lists(seed: u64) -> (Sim, App, Arc<AtomicU64>) {
     let sim = Sim::with_faults(seed, FaultConfig::none());
     let mut cfg = AppConfig::default();
     // Same 64 KiB as every other fixture in this file, so `RECORDS_PER_
     // SEGMENT` keeps its measured meaning here too.
     cfg.db.wal.segment_bytes = 64 << 10;
+    let lists = Arc::new(AtomicU64::new(0));
+    let disk = ListCountingDisk {
+        inner: sim.disk(),
+        lists: Arc::clone(&lists),
+    };
     let app = App::open(
-        Box::new(sim.disk()),
+        Box::new(disk),
         Schema::new().table::<Rec>(),
         Box::new(sim.entropy()),
         cfg,
     )
     .unwrap()
     .mount(routes![put_rec]);
-    (sim, app)
+    (sim, app, lists)
 }
 
 /// A kernel whose archive already has a backlog: `records` are committed
@@ -4210,6 +4253,59 @@ fn a_caught_up_archive_still_lets_the_kernel_reach_idle() {
         "the archive arm ran {} more times over a Db that committed nothing — the ready \
          predicate is not asking whether there is work",
         after.archive_steps - quiet
+    );
+}
+
+/// F2, MEASURED. The finding routed to this task was that the bounded pin
+/// costs a `Disk::list` per `Archive::step` — one syscall in a loop the
+/// operator controlled while the archive was standalone, but "a `list` per
+/// kernel iteration, on the same thread that serves requests" once it
+/// becomes an arm.
+///
+/// That second half is what the ready predicate makes false. The arm is
+/// scheduled only when `db.last_applied()` has moved or a transition is
+/// pending, so a caught-up archive over a `Db` that is not committing costs
+/// ZERO archive steps and therefore zero `Disk::list`s, however long the
+/// kernel loops. Counted at the `Disk` boundary rather than inferred from
+/// `archive_steps`, so it is a measurement of the thing itself.
+#[test]
+fn a_caught_up_archive_costs_no_disk_list_per_kernel_iteration() {
+    let (sim, mut app, lists) = kernel_app_counting_lists(0x746b_3961_0000_0006);
+    write_records(app.db_for_tests(), 3 * RECORDS_PER_SEGMENT);
+    let arc = Archive::open(archive_config(0, 8 << 20), app.db_for_tests()).unwrap();
+    let store = SharedStore::new();
+    let mut k = Kernel::with_archive(
+        app,
+        Box::new(sim.clock()),
+        arc,
+        Box::new(store.clone()) as Box<dyn ObjectStore>,
+    )
+    .unwrap();
+    let mut source = SilentSource;
+
+    steps_to_kernel_idle(&mut k, &mut source, 10_000)
+        .expect("the kernel never went idle: the archive arm spins the loop");
+    assert!(
+        !store.keys().is_empty(),
+        "the archive shipped nothing, so a listing count of zero below would be a statement \
+         about an archive that never started"
+    );
+
+    let caught_up = lists.load(Ordering::Relaxed);
+    assert!(
+        caught_up > 0,
+        "the counter never incremented, so the wrapper is not on the Db's disk and a delta \
+         of zero below would measure nothing"
+    );
+    run_kernel_steps(&mut k, &mut source, 1_000);
+
+    assert_eq!(
+        lists.load(Ordering::Relaxed),
+        caught_up,
+        "1,000 kernel iterations over a Db that committed nothing cost {} Disk::list calls: \
+         the archive's bound check is running once per LOOP PASS, on the same thread that \
+         serves requests",
+        lists.load(Ordering::Relaxed) - caught_up
     );
 }
 
