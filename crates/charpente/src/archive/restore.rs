@@ -162,7 +162,26 @@ fn prepare(
     let prefix = opts.prefix.as_str();
 
     // ---- 1. the generation pointer, and the snapshot it names.
-    let manifest_bytes = get(store, &manifest_key(prefix), prefix)?;
+    // The manifest gets its own absence text. `get`'s NotFound says "the
+    // manifest names it, so this generation is incomplete", which is true of
+    // every object a manifest names and false of the manifest itself — and
+    // the manifest is the one an operator reaches by mistyping `--from` or
+    // `--prefix`, which is the likeliest way to see this message at all
+    // (measured end-to-end at Task 11 through `charpente restore`).
+    let manifest_bytes = get(store, &manifest_key(prefix), prefix).map_err(|e| {
+        if e.kind() != io::ErrorKind::NotFound {
+            return e;
+        }
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "restore: there is no manifest at \"{}\" — prefix \"{prefix}\" holds no \
+                 archive, so there is nothing here to restore from. Check the bucket and the \
+                 prefix against the ArchiveConfig the node archived with",
+                manifest_key(prefix)
+            ),
+        )
+    })?;
     let m = Manifest::decode(&manifest_bytes).map_err(|e| {
         io::Error::new(
             e.kind(),

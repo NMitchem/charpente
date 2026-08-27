@@ -730,8 +730,13 @@ mod tests {
         assert_eq!(code, 1);
         assert!(out.is_empty(), "{out}");
         assert!(
-            err.contains("manifest"),
+            err.contains("there is no manifest at"),
             "must name the object it could not read: {err}"
+        );
+        assert!(
+            !err.contains("the manifest names it"),
+            "an absent manifest is not a manifest naming a missing object — that text \
+             misdirects the operator who mistyped --from: {err}"
         );
         assert!(
             err.to_lowercase()
