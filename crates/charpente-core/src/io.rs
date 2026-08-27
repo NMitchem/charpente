@@ -180,8 +180,20 @@ pub enum ObjectDone {
 /// **A PUT is atomic.** A failed PUT leaves the key absent or holding its
 /// previous value, never half of the new one — the precise opposite of
 /// `File`'s torn-write contract, and the reason this is not `Disk` reuse.
-/// There is no `sync_dir` analogue: there is no directory entry to persist.
+/// Those are the two outcomes a CALLER may assume; an impl may additionally
+/// fail *after* the new value has landed, which is the archive design's
+/// "PUT lands but the ack is lost" case and is why every retry in this
+/// codebase re-PUTs the same key with the same bytes.
 /// Ordering between distinct keys is NOT guaranteed.
+///
+/// **There is no `sync_dir` analogue, and that is a statement about this
+/// trait's surface, not a discharge of the obligation.** Whole-object PUTs
+/// give a caller nothing to barrier, so no method is offered. An impl over a
+/// real namespace — a filesystem, where the key IS a directory entry — still
+/// owes whatever its own substrate needs to make an acked PUT survive a
+/// crash, and owes it silently, because this trait has no method through
+/// which a caller could ask. Read `charpente::prod::FsObjectStore` before
+/// writing a second impl: it says what that cost turned out to be.
 ///
 /// `Send` for the same reason as `Disk`: `App` crosses into the kernel thread.
 pub trait ObjectStore: Send {

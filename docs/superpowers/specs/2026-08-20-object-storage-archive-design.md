@@ -136,7 +136,14 @@ all, in any combination", io.rs), and it is why reusing `Disk` was rejected: fau
 torn writes against a store that cannot tear would manufacture failures the real thing can
 never produce, and the fault matrix would be testing a fiction.
 
-There is no `sync_dir` analogue and none is needed — no directory entry to persist.
+There is no `sync_dir` analogue — whole-object PUTs give a caller nothing to barrier, so no
+method is offered. **Amended Task 11:** that is a statement about the trait's surface, not a
+discharge of the obligation. An impl over a real namespace still owes whatever its substrate
+needs to make an acked PUT survive a crash, and owes it silently. `FsObjectStore` (the first
+non-sim impl) pays it as two fsyncs the trait names nowhere: the temp file before the rename,
+the parent directory after it. Dropping the first resurrects the key holding zeros; dropping
+the second loses an acked object outright.
+
 Ordering between distinct keys is **not** guaranteed; §2's write ordering depends on that
 being explicit rather than assumed.
 
@@ -444,6 +451,29 @@ because a value returned in `RestoreReport` cannot say anything BEFORE the fact 
 section requires `--force` to name what it destroys before acting. `RestoreReport` carries
 the generation, the frontier restored to, the segment count and the pending-job count.
 
+**Where the verb actually lives, and the third forced argument (Task 11).** `charpente
+restore --from <store> --to <dir>` above reads as if the CLI calls `restore` itself. It
+cannot: `restore` takes a `Schema`, a `Schema` is the app's `#[table]` types, `Seeder::rows`
+applies rows through their typed ops and refuses an unregistered table by name — and
+`charpente-cli` links `charpente`, never the operator's crate. So the verb lives in
+`charpente::launch::dispatch`, where the app has just been built and its schema is in hand
+(on an EPHEMERAL directory, never `--to`); every app binary gets `restore` for free exactly
+as it gets `describe`, and `charpente restore --dir PATH …` is the build-and-exec wrapper,
+`describe`'s own established shape. Full flag set: `--from BUCKET --prefix PREFIX
+[--to DIR] [--force]`, `--to` defaulting to the app's own data directory.
+
+That forced one public accessor in core: `Db::seed_schema()`, the caller's schema with
+`JobRow`/`EventRow`/`SchemaVersion` stripped — precisely what `Db::into_seeder` already did
+inline, which now calls it, so the strip list has one home. Minimal by construction rather
+than by preference: `Schema::remove` is `pub(crate)` and `TableMachine.schema` is private, so
+handing back a `&Schema` or a plain `Clone` would be a WIDER surface, not a narrower one.
+
+One filesystem consequence the CLI owns rather than `restore`: `ProdDisk::new(--to)` creates
+the destination root before `restore` reads a byte, so a refusal would leave behind a
+directory the operator never had. `restore_verb` removes what it created while it is still
+empty — never when it holds a partial restore, which the failure text tells the operator to
+re-run against.
+
 **What a failed restore leaves behind, stated so nobody assumes atomicity.** Steps 1, 2, 4
 and the divergence check leave the destination untouched. Past that, a failure leaves a
 discarded-and-partially-rebuilt directory: a store seeded at the snapshot's frontier plus a
@@ -463,8 +493,9 @@ true at one call site and false at another must be parameterised by site rather 
 is the pre-discard one only. And no message inside either phase may RE-STATE its wrapper's
 clause: the wrapper appends it, so a refusal that also hardcodes it doubles the sentence in
 real operator output — measured at Task 11 in `check_generation`'s two refusals, which
-produced "…Refusing; nothing in the destination has been touched. Nothing in the destination
-has been touched". True twice is still a hard-rule-5 defect. This paragraph is binding: a claim here that the text does not
+produced "…Refusing; nothing in the destination has been touched. Nothing in the
+destination has been touched". True twice is still a hard-rule-5 defect.
+This paragraph is binding: a claim here that the text does not
 make is a hard-rule-5 defect, which is what a review found the first time this was
 written (Task 10 C-1).
 

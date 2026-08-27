@@ -425,6 +425,14 @@ impl FsObjectStore {
     /// order, the same rule `Disk::list` follows. A missing root is an empty
     /// bucket, not an error. Temp files a crashed PUT left behind are not
     /// objects and are never listed.
+    ///
+    /// **Walks the whole bucket; `prefix` is a post-filter on the assembled
+    /// key, not a descent.** So one LIST is O(objects in the bucket) while
+    /// both callers LIST per generation. Correct, and deliberate for v1 — a
+    /// prefix here is an arbitrary key substring, not a path component, so
+    /// descending into `root.join(prefix)` would answer a different question
+    /// — but it is a known property rather than a surprise, and it is the
+    /// first thing to change if a bucket ever holds many generations.
     fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
         let mut keys = Vec::new();
         let mut stack = vec![self.root.clone()];
