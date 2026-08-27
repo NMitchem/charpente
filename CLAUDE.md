@@ -50,7 +50,7 @@ roadmap; do not reorder a milestone's dependency sequence.
   (carries the nondeterminism deny-list), `cargo test --workspace`.
 - One test file: `cargo test -p charpente --test kernel` — property suites live in each
   crate's `tests/` (charpente: http/kernel/replication/transactions/typed_tables,
-  plus auth/describe/group_commit/realtime; charpente-sim:
+  plus archive/auth/describe/group_commit/realtime; charpente-sim:
   crash_recovery/determinism/net_partition/wal; charpente-core:
   describe_tables/engine/group_commit/materialize/migrate_apply/migration_gate/
   migrations/store_latch). All three lists are exhaustive as written — if a name
