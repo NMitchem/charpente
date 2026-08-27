@@ -6071,11 +6071,18 @@ const CONV_DISK_ERROR_DIVISOR: f64 = 16.0;
 /// | `0x3C0D_0001` | 225 | 169 | 178 |
 ///
 /// A fresh-base run panicking `restored_substantial: 180 of 181` or
-/// `chained: 164 of 168` is therefore CORRECT, not a finding: a rate against a
-/// moving base is not a rate, which is why the base is pinned. This table is
-/// here rather than in a run report because the evidence bar ASKS for
-/// fresh-base runs, so whoever performs one meets these panics — and a report
-/// is not in the tree they will be reading. Note the difference from
+/// `chained: 164 of 168` is therefore reporting a MISSING PRECONDITION rather
+/// than a decayed oracle: a rate against a moving base is not a rate, which is
+/// why the base is pinned. **The runner's own advice at that panic —
+/// "Investigate before touching it" — is generic text addressed to a floor
+/// evaluated where it was measured, so if you moved the base deliberately it
+/// is not addressed to your run.** Spec §11's convergence criterion carries
+/// that scope: universes green is what a fresh base establishes, floors are
+/// pinned-base instruments, and the numbers below do not move to accommodate a
+/// fresh base. At THIS base a shortfall is exactly what the runner says it is.
+/// The table is here rather than in a run report because the evidence bar ASKS
+/// for fresh-base runs, so whoever performs one meets these panics — and a
+/// report is not in the tree they will be reading. Note the difference from
 /// `replication.rs`'s `FINGERPRINT_FLOOR`, whose value was corroborated on
 /// unpinned runs: these deliberately are not, and the spread above is why.
 const CONV_RESTORED_FLOOR: u64 = 216;

@@ -643,6 +643,18 @@ swap on 9 days uptime; memory, not cores, is the binding constraint here.
   corruption case in §7 by name.
 - Convergence property green over N fresh seeds (N stated in the commit, per CLAUDE.md's
   evidence bar), plus the recorded seed for any bug found.
+
+  **"Green" here is universe-level, and the scope is stated because a floor-carrying property has
+  two instruments that answer different questions.** "Green over N fresh seeds" asks whether the
+  property still HOLDS as the base moves — a per-universe verdict, and the only one a fresh base
+  can render. A `floor:` asks whether the property still EXERCISES what it claims, which is a
+  *rate*, and a rate is only meaningful against a fixed base. So this criterion is satisfied when
+  every universe is green at whatever base was run, and a `floor:` shortfall on a **deliberately
+  moved** base does not count against it: the floor's precondition — the pinned base it was
+  measured at — no longer holds, so the runner's generic "investigate before touching it" is not
+  addressed to that run. Floors are evaluated at the pinned base, where a shortfall IS a finding
+  and that advice applies verbatim. Recorded here rather than left to a test-file doc comment,
+  because a redefinition of "green" that lives only next to the constant is drift (hard rule 6).
 - **Every assertion mutation-proven.** House practice (LEDGER: "an 8-mutation table, 8/8 RED";
   "its own mutation burden"), and it matters more here than usual: this design's oracles are
   mostly *negative* — the archive never uploads while verifying, never advances a manifest it
