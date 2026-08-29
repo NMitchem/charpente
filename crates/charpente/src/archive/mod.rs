@@ -142,10 +142,15 @@
 //!   drops its key and moves on — no retry, and no state anywhere waits on
 //!   one. An archive whose deletes fail forever stays correct and keeps
 //!   rolling generations; its bucket simply grows, exactly as it did before
-//!   this existed. The drain is bounded by `yield_or_bound`, which runs
-//!   before these transitions like any other: a reclamation long enough to
-//!   leave the archive `pin_segments` behind yields, gaps, and abandons what
-//!   is left.
+//!   this existed. **The drain is bounded by the KEY SET, not by
+//!   `yield_or_bound`** (fix round 1 / F2): the chain comes off a manifest
+//!   whose decoder refuses past `MANIFEST_MAX_BYTES`, and the batch count is
+//!   checked against `RECLAIM_MAX_BATCH_OBJECTS` where it is decoded.
+//!   `yield_or_bound` runs before these transitions like any other and does
+//!   gap a reclamation that leaves the archive `pin_segments` behind — but
+//!   it counts SEALED SEGMENTS, so on a quiescent `Db` nothing seals,
+//!   `behind` never grows, and it never fires. It bounds a reclamation that
+//!   is competing with writes; it does not bound one at all.
 //!
 //! What reclamation CANNOT reach, by construction: a generation the archive
 //! began and abandoned without ever writing its manifest. Its objects are
@@ -323,8 +328,8 @@ pub mod manifest;
 pub mod restore;
 
 use manifest::{
-    Manifest, SegmentRef, SnapshotMeta, TableBatches, encode_snapshot_batch, manifest_key,
-    segment_key, snapshot_batch_key, snapshot_meta_key,
+    MANIFEST_MAX_BYTES, Manifest, SegmentRef, SnapshotMeta, TableBatches, encode_snapshot_batch,
+    manifest_key, segment_key, snapshot_batch_key, snapshot_meta_key,
 };
 
 /// Rows per `<gen>/snapshot/<table>/<n>` object, and with it the archive's
@@ -339,6 +344,46 @@ use manifest::{
 /// identically at another, because `SnapshotMeta` records how many objects
 /// each table was actually paged into.
 const SNAPSHOT_BATCH_ROWS: usize = 1_000;
+
+/// TASK 12.5 FIX ROUND 1 / F2, spec §3. The most `<gen>/snapshot/<table>/<n>`
+/// objects reclamation will enumerate out of ONE retired generation's
+/// `snapshot/meta`.
+///
+/// `TableBatches::batches` is a `u64` read back out of the bucket, and
+/// nothing in the meta's own bytes bounds it the way `expect_count` bounds
+/// the table count — twelve bytes of meta can claim `u64::MAX` objects.
+/// Restore trusts the same field and survives it, because restore GETs each
+/// batch and refuses on the first absent key, so it terminates and names the
+/// key. Reclamation DELETES, and deleting a key that is not there SUCCEEDS
+/// (`ObjectStore::delete`'s contract, and `FsObjectStore` maps `NotFound` to
+/// `Ok`) — so an absurd count is a delete loop with no terminating
+/// condition. Trusting a field is safe in proportion to what you do with it.
+///
+/// `yield_or_bound` does NOT close this, which is what made the first
+/// analysis wrong: its bound counts SEALED SEGMENTS at or above
+/// `next_needed`, so on a quiescent `Db` nothing seals, `behind` never
+/// grows, and the archive never returns to `Idle` — never re-holding its pin
+/// at the new floor, so `Wal::gc` stays blocked at the old one, one real
+/// bucket DELETE per kernel step, silently.
+///
+/// DERIVED, not picked, and the derivation is `MANIFEST_MAX_BYTES`'s own: a
+/// retired generation cannot hold more objects than the archive wrote for
+/// it, and that constant already fixes the largest object count one
+/// generation may NAME — 16 MiB of manifest at 16 bytes per `SegmentRef`,
+/// which its doc calls "far past anything one box writes between two
+/// snapshots". Reclamation pays per OBJECT and does not care which kind, so
+/// the snapshot side takes the chain side's ceiling. At
+/// `SNAPSHOT_BATCH_ROWS` rows per object that is a billion-row generation.
+///
+/// It is checked where the count is DECODED rather than at each delete, for
+/// `expect_count`'s reason (ruling 35): a cap a caller must remember to
+/// apply is a cap that will be forgotten. And it is checked HERE rather than
+/// in `SnapshotMeta::decode`, because the two readers of this field do not
+/// have the same exposure — over-tightening costs reclamation one
+/// generation's bucket space, the residual class spec §3 already documents,
+/// while over-tightening a decoder restore shares would refuse a legitimate
+/// RESTORE, which costs the database.
+const RECLAIM_MAX_BATCH_OBJECTS: u64 = (MANIFEST_MAX_BYTES / 16) as u64;
 
 /// Archive engine configuration (spec §3, §4, §5).
 #[derive(Clone, Debug)]
@@ -538,7 +583,9 @@ struct Retired {
     /// records how many objects each table was paged into — `Manifest`
     /// carries the table NAMES and no counts, so the batch keys cannot be
     /// named without it. Empty until that GET completes, and empty FOREVER
-    /// if it fails: reclamation does not retry.
+    /// if it fails — or if what comes back claims more batch objects than
+    /// `RECLAIM_MAX_BATCH_OBJECTS` (fix round 1 / F2), which is routed to
+    /// the same outcome deliberately: reclamation does not retry.
     tables: Vec<TableBatches>,
     /// Cursor into `segments`.
     segment: usize,
@@ -1627,6 +1674,33 @@ impl Archive {
         ))
     }
 
+    /// HARD RULE 5, and the second operator-facing notice this arm can
+    /// raise: reclamation refused to enumerate a retired generation's
+    /// snapshot because its `snapshot/meta` claims more batch objects than
+    /// `RECLAIM_MAX_BATCH_OBJECTS`. Names the contract (the bound, and the
+    /// claim that exceeded it), the site (the prefix, the generation, the
+    /// key) and the fix. Raised once per roll that meets it, like the gap
+    /// notice, and terminal in nothing: the archive advances.
+    fn reclaim_bound_notice(&self, generation: u64, claimed: u64) -> io::Error {
+        io::Error::other(format!(
+            "Archive: reclamation of generation {generation} at prefix \"{}\" left that \
+             generation's snapshot alone — \"{}\" claims {claimed} batch objects, past the \
+             bound of {RECLAIM_MAX_BATCH_OBJECTS} this archive will enumerate out of one \
+             generation. Nothing is lost and nothing stops: the retired chain is still \
+             reclaimed, the snapshot objects stay in the bucket, and that is the same outcome \
+             as a retired meta whose GET fails (spec §7). Enumerating the claim instead would \
+             be one bucket DELETE per kernel step with no terminating condition, holding this \
+             archive's retention pin at the old floor for as long as it ran. Fix: a generation \
+             this archive wrote cannot hold that many objects, so treat that meta as one this \
+             archive did not write — confirm ArchiveConfig::writer is unique to this node and \
+             that nothing else can write \"{}\" (spec §4) — then remove generation \
+             {generation}'s leftover objects by hand if the bucket growth matters.",
+            self.cfg.prefix,
+            snapshot_meta_key(&self.cfg.prefix, generation),
+            self.cfg.prefix
+        ))
+    }
+
     /// Closes this generation and opens the next. The ONE path behind both
     /// triggers that need it — a `snapshot_every` crossing and a gap —
     /// because they differ only in what provoked them and in whether the pin
@@ -2352,12 +2426,33 @@ impl Archive {
                     // reclamation can ever name come out of a manifest this
                     // writer wrote.
                     //
-                    // CHECKED rather than asserted, for `resume_point`'s
-                    // reason: these bytes crossed the network. A manifest at
-                    // or above this generation retires nothing — the first
-                    // swap of any generation is its opening snapshot's, so
-                    // that is every within-generation segment swap.
-                    let retiring = (m.generation < self.generation).then(|| Retired::new(m));
+                    // CHECKED rather than asserted — BOTH conjuncts, for
+                    // `resume_point`'s reason: these bytes crossed the
+                    // network. A manifest at or above this generation
+                    // retires nothing, and neither does a swap that commits
+                    // no snapshot: a generation's first manifest is its
+                    // opening snapshot's, so a swap that retires a
+                    // predecessor is always one that opens a successor
+                    // (spec §2), and every within-generation segment swap is
+                    // therefore one that retires nothing.
+                    //
+                    // FIX ROUND 1 / F1. The second conjunct used to be an
+                    // ASSERT downstream, and its trigger is this decoded
+                    // manifest: an operator rolling the manifest object back
+                    // during recovery reaches it, and so does a peer sharing
+                    // `ArchiveConfig::writer` (spec §4). There is no
+                    // `catch_unwind` in production, so that assert took a
+                    // serving node down out of the one kernel arm that
+                    // exists to absorb every archive error. Retiring NOTHING
+                    // is the conservative answer rather than `stop()`: the
+                    // dangerous act is the DELETE and this removes it, the
+                    // swap itself was harmless before Task 12.5, and a
+                    // permanent operator-visible halt would obstruct exactly
+                    // the recovery it matters most not to obstruct. The cost
+                    // is one generation's bucket space, which is the
+                    // residual class spec §3 already documents.
+                    let retiring = (m.generation < self.generation && commits.is_some())
+                        .then(|| Retired::new(m));
                     self.state = State::UploadingManifest {
                         bytes,
                         started: false,
@@ -2439,15 +2534,21 @@ impl Archive {
             // generation is still the only complete generation in the
             // bucket, and a restore reads it.
             if let Some(retired) = retiring {
-                // REGRESSION GUARDS, not fault coverage (hard rule 4): no
-                // store fault can reach either. `Retired` is constructed
-                // under the first condition, and `self.generation` only ever
-                // rises between there and here; the second holds because a
-                // generation's FIRST swap is always its opening snapshot's,
-                // so a swap that retires a predecessor is always one that
-                // commits a successor. They go red on a code change that
-                // moved the construction or the transition, which is exactly
-                // the change that would make this ordering false.
+                // REGRESSION GUARDS (hard rule 4), and what makes them
+                // guards rather than checks is that `step_checking_owner`
+                // has already CHECKED both against the decoded manifest
+                // before a `Retired` exists at all: the first because
+                // `self.generation` only ever rises between there and here,
+                // the second because `commits` is carried across unchanged.
+                // No bucket bytes reach either. They go red on a code change
+                // that moved the construction or the transition, which is
+                // exactly the change that would make this ordering false.
+                //
+                // FIX ROUND 1 / F1: the second one used to be the only place
+                // the `commits` condition was tested at all, which made an
+                // assertion out of a condition on content that crossed the
+                // network — and an assertion is a `?` the kernel's archive
+                // arm cannot absorb.
                 assert!(
                     retired.generation < self.generation,
                     "Archive: about to reclaim generation {} while this archive's own generation \
@@ -2493,6 +2594,12 @@ impl Archive {
     /// meta will not come back has its chain reclaimed and its batches left,
     /// which is the pre-Task-12.5 outcome for that one generation and
     /// nothing worse.
+    ///
+    /// FIX ROUND 1 / F2: a meta that comes back and claims more batch
+    /// objects than `RECLAIM_MAX_BATCH_OBJECTS` ends the same way, with a
+    /// named notice. Routed to the existing outcome rather than a new one
+    /// because it IS the existing outcome — the meta did not answer the
+    /// question reclamation asked it.
     fn step_reading_retired_meta(
         &mut self,
         store: &dyn ObjectStore,
@@ -2521,9 +2628,26 @@ impl Archive {
             }
             Some(Ok(ObjectDone::Get(bytes))) => {
                 let out = match SnapshotMeta::decode(&bytes) {
+                    // FIX ROUND 1 / F2. The one axis of the drain that
+                    // nothing else bounds: `segments` came off a manifest
+                    // whose own decoder refuses past `MANIFEST_MAX_BYTES`,
+                    // and the meta key is one object, but these counts are
+                    // `u64`s with the bucket's word for it. Refusing the
+                    // whole claim rather than truncating it, so the outcome
+                    // is one this design already has a row for: the chain is
+                    // reclaimed and the snapshot objects are LEFT, exactly
+                    // as when the meta's GET fails (spec §7).
                     Ok(meta) => {
-                        retired.tables = meta.tables;
-                        Ok(())
+                        let claimed = meta
+                            .tables
+                            .iter()
+                            .fold(0u64, |n, t| n.saturating_add(t.batches));
+                        if claimed > RECLAIM_MAX_BATCH_OBJECTS {
+                            Err(self.reclaim_bound_notice(retired.generation, claimed))
+                        } else {
+                            retired.tables = meta.tables;
+                            Ok(())
+                        }
                     }
                     Err(e) => Err(e),
                 };
@@ -2552,11 +2676,16 @@ impl Archive {
     /// object and nothing else. Nothing here waits on a delete, and no state
     /// the archive can reach depends on one having succeeded.
     ///
-    /// The drain is bounded by the same thing everything else here is
-    /// bounded by: `yield_or_bound` runs before this transition like any
-    /// other, so a reclamation long enough to leave the archive
-    /// `pin_segments` segments behind yields, gaps, and abandons what is
-    /// left. Reclamation can therefore never wedge the archive, only cost it.
+    /// **What bounds the drain is the KEY SET** (fix round 1 / F2), not
+    /// `yield_or_bound`: `Retired::segments` came off a manifest whose own
+    /// decoder refuses past `MANIFEST_MAX_BYTES`, the meta key is one
+    /// object, and the batch counts — the only `u64`s here the bucket gets
+    /// to choose — are checked against `RECLAIM_MAX_BATCH_OBJECTS` in
+    /// `step_reading_retired_meta`. `yield_or_bound` does run before this
+    /// transition like any other, and it does gap a reclamation that leaves
+    /// the archive `pin_segments` segments behind; but it measures SEALED
+    /// SEGMENTS, so a drain against a quiescent `Db` never moves it. Only
+    /// the key set makes reclamation terminate.
     fn step_deleting_retired(
         &mut self,
         store: &dyn ObjectStore,

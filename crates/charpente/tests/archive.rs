@@ -6444,6 +6444,243 @@ fn a_gap_that_lands_mid_reclaim_never_abandons_an_operation_in_flight() {
         );
     }
 }
+// ------------- Task 12.5 fix round 1: the two majors, driven from CONTENT
+//
+// Both of these reach reclamation with bytes that crossed the network, and
+// both were red before the fix in this commit. Fixture seed
+// `0x6172_6368_5f74_3500` (`build_fixture_with_cadence`), faults off: the
+// input is bucket CONTENT, not a fault, so the axis that would inject it
+// does not exist and could not.
+
+/// F1 (task-12.5-review.md). A manifest naming THIS writer at a generation
+/// BELOW the archive's own, met at a within-generation SEGMENT swap
+/// (`commits: None`). That is content — an operator rolling the manifest
+/// object back during recovery, or a peer sharing `ArchiveConfig::writer` —
+/// and before the fix it fired the `opened_generation` assert and PANICKED
+/// the process out of the kernel arm that exists to absorb every archive
+/// error.
+///
+/// The archive must retire NOTHING here: the dangerous act is the DELETE,
+/// the swap itself was harmless before Task 12.5, and a permanent
+/// `stop()` would punish a legitimate manifest rollback during recovery.
+/// One generation's bucket space is the documented residual (spec §3).
+#[test]
+fn a_lower_generation_manifest_at_a_segment_swap_retires_nothing_and_never_panics() {
+    let (mut db, store, mut arc) = archive_fixture_with_delete_watch(RECLAIM_CADENCE);
+    let mut at = 0;
+    reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CADENCE);
+    reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CHAIN);
+    reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CADENCE);
+    assert_eq!(
+        read_manifest(&store).expect("a manifest").generation,
+        1,
+        "the cadence crossing must have rolled the generation, or the swap below is the \
+         opening snapshot's and carries `commits: Some`"
+    );
+    let deleted_before = store.deleted().len();
+    assert!(
+        deleted_before > 0,
+        "generation 0 was never reclaimed, so this test is not measuring a delete ledger \
+         that reclamation actually writes to"
+    );
+    let live_before = generation_keys(&store, 1);
+
+    // The manifest object is rolled back to one this writer wrote at a
+    // LOWER generation. Nothing about it is malformed and nothing about it
+    // is foreign: it is this archive's own identity at generation 0.
+    write_foreign_manifest(&store, WRITER, 0);
+
+    // A segment swap, NOT a cadence crossing: `commits` is `None`, which is
+    // the parity the `opened_generation` assert was about.
+    reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CHAIN);
+
+    assert!(
+        !arc.stopped(),
+        "the archive stopped permanently over a manifest rollback. The swap is harmless — it \
+         was harmless before Task 12.5 — and a terminal refusal is the worst answer available \
+         during a recovery"
+    );
+    assert_eq!(
+        store.deleted().len(),
+        deleted_before,
+        "a segment swap issued {} new DELETE(s) after the manifest was rolled back to \
+         generation 0. A swap that commits no snapshot opens no successor, so it retires \
+         nothing (spec §3)",
+        store.deleted().len() - deleted_before
+    );
+    assert_eq!(
+        read_manifest(&store).expect("a manifest").generation,
+        1,
+        "the swap itself must still land — the fix removes the DELETE, not the swap"
+    );
+    // Not equality: the swap SHIPS a segment, so the live generation gains
+    // an object. What must not happen is losing one.
+    let live_after = generation_keys(&store, 1);
+    for key in &live_before {
+        assert!(
+            live_after.contains(key),
+            "the live generation lost \"{key}\" to a swap that should have retired nothing"
+        );
+    }
+    assert!(
+        live_after.len() > live_before.len(),
+        "the segment swap shipped nothing, so this test never reached a `commits: None` swap"
+    );
+    assert_no_dangling_reference(
+        &store,
+        "A manifest rollback must not cost the live generation an object.",
+    );
+}
+
+/// The value `Archive::reclaim_bound_notice` prints, restated here so that
+/// moving the constant without re-reading the notice fails a test rather
+/// than passing one: `MANIFEST_MAX_BYTES` (16 MiB) / 16 bytes per
+/// `SegmentRef`. The archive's copy is private, and duplicating the NUMBER
+/// is the point — a test that recomputed it from the same expression could
+/// not notice the expression changing.
+const RECLAIM_BOUND_IN_NOTICE: &str = "1048576";
+
+/// F2 (task-12.5-review.md). `SnapshotMeta::batches` is a `u64` read back out
+/// of the bucket and `Retired::next_key` emits one key per batch, one DELETE
+/// per step. `yield_or_bound` does not bound it: its bound counts SEALED
+/// SEGMENTS above `next_needed`, so with the `Db` quiescent nothing seals,
+/// `behind` never grows, and at `u64::MAX` the archive never returns to
+/// `Idle` again — never re-holding its pin at the new floor, so `Wal::gc`
+/// stays blocked, one real bucket DELETE per kernel step, silently
+/// (`ObjectStore::delete` is idempotent, so every one of them succeeds).
+///
+/// Before the fix this test never reached `arc.idle()`.
+#[test]
+fn a_retired_metas_absurd_batch_count_is_refused_rather_than_enumerated() {
+    let (mut db, store, mut arc) = archive_fixture_with_delete_watch(RECLAIM_CADENCE);
+    let mut at = 0;
+    reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CADENCE);
+    reclaim_round(&mut arc, &mut db, &store, &mut at, RECLAIM_CHAIN);
+    let doomed = read_manifest(&store).expect("a manifest");
+    assert_eq!(doomed.generation, 0, "the opening generation is 0");
+    let real_meta = get_object(&store, &snapshot_meta_key(PREFIX, 0)).expect("a snapshot meta");
+    let real = SnapshotMeta::decode(&real_meta).expect("the archive's own meta decodes");
+    let batch_keys = generation_keys(&store, 0)
+        .into_iter()
+        .filter(|k| k.contains("/snapshot/") && !k.ends_with("/meta"))
+        .count();
+    assert!(
+        batch_keys > 0,
+        "generation 0 has no snapshot batch objects, so an absurd count has nothing to lie about"
+    );
+
+    // A CRC-valid meta for the generation about to be retired, claiming the
+    // largest batch count the field can hold. Everything else is the
+    // archive's own.
+    let absurd = SnapshotMeta {
+        applied_seq: real.applied_seq,
+        next_job_id: real.next_job_id,
+        next_event_id: real.next_event_id,
+        frontier_crc: real.frontier_crc,
+        tables: real
+            .tables
+            .iter()
+            .map(|t| TableBatches {
+                name: t.name.clone(),
+                batches: u64::MAX,
+            })
+            .collect(),
+    };
+    store
+        .start(ObjectOp::Put {
+            key: snapshot_meta_key(PREFIX, 0),
+            data: absurd.encode(),
+        })
+        .unwrap();
+    drain(&store).unwrap();
+
+    // Roll, and collect every error the drain raises on the way.
+    write_records_emitting(&mut db, at, RECLAIM_CADENCE);
+    let mut errors = Vec::new();
+    for _ in 0..10_000 {
+        if let Err(e) = arc.step(&db, &store) {
+            errors.push(e.to_string());
+        }
+        if arc.idle() {
+            break;
+        }
+    }
+
+    assert!(
+        arc.idle(),
+        "the archive never returned to Idle in 10,000 steps: an absurd batch count is being \
+         ENUMERATED, one DELETE per step, and until it finishes the pin is never re-held at \
+         the new floor and Wal::gc stays blocked"
+    );
+    assert_eq!(
+        read_manifest(&store).expect("a manifest").generation,
+        1,
+        "the roll must still complete — an unreadable retired generation is not a reason to \
+         stop archiving"
+    );
+    assert!(
+        !arc.stopped(),
+        "reclamation is an optimisation; a meta it will not enumerate must not stop the archive"
+    );
+
+    // HARD RULE 5: the notice names the contract, the site and the fix.
+    let notice = errors
+        .iter()
+        .find(|e| e.contains("reclamation of generation"))
+        .unwrap_or_else(|| {
+            panic!(
+                "reclamation refused an absurd batch count SILENTLY. The errors raised were: \
+                 {errors:?}"
+            )
+        });
+    let meta_key = snapshot_meta_key(PREFIX, 0);
+    for needle in [
+        RECLAIM_BOUND_IN_NOTICE,
+        PREFIX,
+        meta_key.as_str(),
+        "ArchiveConfig::writer",
+    ] {
+        assert!(
+            notice.contains(needle),
+            "the notice must name {needle:?}: {notice}"
+        );
+    }
+
+    // The `\<newline>` idiom every sibling notice in `archive/mod.rs` uses
+    // collapses to a single space; a literal written without it keeps the
+    // next line's indentation INSIDE the message. `cargo fmt` cannot see
+    // into a string literal and the needles above match either way, so this
+    // is the only thing standing between an operator and a notice with
+    // fourteen spaces in the middle of a sentence (hard rule 5).
+    assert!(
+        !notice.contains("  "),
+        "the notice carries a run of spaces from an un-continued string literal: {notice}"
+    );
+
+    // The chain is still reclaimed; the snapshot side is left, which is what
+    // spec §7 already says a retired generation whose meta will not answer
+    // costs (the batch objects stay, because the meta is the only document
+    // that names them).
+    let left = generation_keys(&store, 0);
+    assert!(
+        !left.iter().any(|k| k.contains("/segments/")),
+        "generation 0's chain is named by its MANIFEST, which decoded fine, so it must still \
+         be reclaimed: {left:?}"
+    );
+    assert!(
+        left.iter().any(|k| k.contains("/snapshot/")),
+        "the batch objects the archive refused to enumerate should have been LEFT, not deleted"
+    );
+    assert_no_dangling_reference(
+        &store,
+        "A refused retired meta must not cost the live generation an object.",
+    );
+    assert_bucket_restores(
+        &store,
+        &db,
+        "The live generation must still restore after a retired meta was refused.",
+    );
+}
 
 // ------------------------------- Task 11: the filesystem `ObjectStore`
 //

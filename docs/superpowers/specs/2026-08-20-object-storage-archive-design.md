@@ -243,9 +243,19 @@ Four properties carry it:
   write.
 - **An optimisation, never a correctness dependency.** A failed delete drops its key: no retry,
   and no state anywhere waits on one. An archive whose deletes fail forever stays correct and
-  keeps rolling generations, and its bucket simply grows as it did before. The drain is bounded
-  by the pin bound (§5) like every other transition, so reclamation can cost the archive steps
-  but can never wedge it.
+  keeps rolling generations, and its bucket simply grows as it did before. **What bounds the
+  drain is the key set, not the pin bound.** Every axis of it is bounded where it is decoded: the
+  chain comes off a manifest whose decoder refuses past `MANIFEST_MAX_BYTES`, the meta is one
+  object, and the per-table batch counts — the only numbers here the bucket chooses — are checked
+  against a derived ceiling in `step_reading_retired_meta`, which refuses the claim, leaves that
+  generation's snapshot objects in place and raises a named notice. The pin bound (§5) does run
+  before these transitions like every other, but it counts **sealed segments**, so a drain
+  against a quiescent `Db` never moves it: it bounds a reclamation that is competing with writes
+  and does not bound one that is not. Stated the other way round, as it was until fix round 1,
+  the sentence is true for well-formed input and false for exactly the untrusted input this
+  bullet exists to survive — an absurd `SnapshotMeta::batches` was a delete loop with no
+  terminating condition, silent because deleting a key that is not there succeeds, and one that
+  held the retention pin at the old floor for as long as it ran.
 - **It costs steps, and the bound has to cover them.** Reclaiming a generation is one step per
   retired object, paid immediately after the successor's own snapshot upload — so a roll's step
   cost is roughly doubled, and `archive_pin_segments` (§14 item 1) has to cover both. A restore
@@ -270,6 +280,17 @@ Note what that rule must NOT be pointed at: an age-based expiry over `<prefix>/<
 themselves would delete objects a valid restore still needs, because age is uncorrelated with
 supersession. The lifecycle rule covers incomplete uploads; supersession is reclamation's job and
 is done by name.
+
+**A third class, which reclamation itself creates and which announces nothing.** `Retired` is
+built only from the manifest the swap immediately superseded, so a drain that does not finish —
+a gap, a restart, process death, or a `snapshot/meta` GET that will not answer — leaves that
+generation's un-reached objects behind permanently. The next roll retires N+1 and never looks
+back at N. Unlike the two classes above, this one prints **no operator notice at all**: each of
+its causes is an ordinary event that already reports itself, and the residue is a silent
+consequence rather than a failure with a site to name. After Task 12.5 it is the most common
+orphan source, because every gap that lands mid-drain makes one. It is bounded the same way the
+abandoned-generation class is — by how often those events happen, not by a mechanism — and it is
+reachable only by the LIST sweep this design refuses.
 
 **One operation in flight is a bound, not a free choice.** Serial uploads mean the archive
 falls behind whenever segments seal faster than they upload — and a permanently-behind archive
@@ -334,6 +355,22 @@ Two rules, both following precedent already in this codebase:
    identity stops archiving and reports, rather than interleaving generations into a bucket
    two nodes each believe they own. Detection, not prevention — the same honest posture the
    promote path takes toward its bounded-loss window.
+
+   **What Task 12.5 changed about the stakes of that, stated because "detection, not
+   prevention" is easy to read as unchanged.** Ownership is decided by string equality on one
+   field, and until reclamation existed the worst a shared `writer` could do was interleave
+   manifests: two writers taking turns at the pointer, with every object either still there or
+   still nameable. **Reclamation makes the same window authorise a DELETE.** Two nodes
+   configured with the same identity each recognise the other's manifest as their own, so on a
+   snapshot swap the archive reclaims a generation the peer may consider live and a restore may
+   be reading — and the objects are gone, not stale. The ownership check cannot see this: it
+   asks "is this manifest mine", the answer is yes, and it is wrong for a reason no byte in the
+   bucket records. The one case Task 12.5 does close is the lower-generation manifest met at a
+   segment swap, where the archive now retires nothing at all (§3); the snapshot-swap case is
+   open and is not closable by detection. **Preventing it needs a lease or a fence — an
+   identity that a second holder can invalidate — which is a design change and is not built.**
+   Until it is, §4's operational consequence below is not a deployment nicety: a `writer` that
+   is not unique per node is now a way to lose objects, not only a way to interleave them.
 
    **The check is asked at two places and neither subsumes the other** (Task 8, implemented):
    once when the archive first reads the bucket, *before it uploads anything*, and again before
@@ -557,6 +594,7 @@ Hard rule 5: name the contract, the site, and the fix.
 | manifest fails CRC or will not decode **on the archive arm** | stop archiving permanently, releasing the retention pin; one operator notice wrapping the decode failure and naming the key, the prefix and both fixes (re-fetch or restore the object and restart; or remove it once no other writer is confirmed), and stating what restart costs: the archive is an arm of the same single process, so recovering a stopped archive is a **database** restart and there is no in-process re-open. Conditional on the site for the same reason as the row above — at `Opening` nothing was uploaded, while at **every** swap, the opening snapshot's first one included, this generation's objects are already in the bucket and "remove it" strands them too. Never open a fresh generation over it: the manifest is the only evidence of who owns the prefix, so an archive that cannot read it cannot know the objects there are its own. **Not a bounded retry** — the retry this replaces held the WAL at the archive's pin for as long as it lasted, which is forever, and never reached a verdict (Task 8) |
 | DELETE of a superseded object fails | the key is DROPPED, never retried: the object stays in the bucket and the archive advances. The error bubbles from `step` and the kernel arm absorbs it — there is no operator notice, because a single failed delete names no operator action. A bucket where deletes fail *systematically* (a policy denying `DeleteObject`, say) shows up as growth, which is the same condition as before reclamation existed and never as a correctness fault. Reclamation is an optimisation, never a correctness dependency (§3) |
 | GET of a retired generation's `snapshot/meta` fails | one attempt, no retry: that generation's chain is still reclaimed and its snapshot batch objects are left, because the meta is the only document that names them. A retry loop here would be a state that waits on reclamation |
+| a retired generation's `snapshot/meta` claims more batch objects than reclamation will enumerate | refuse the claim, and take the same outcome as the row above: the chain is reclaimed, that generation's snapshot objects are left, and the archive advances. **One operator notice**, unlike the row above, naming the bound, the claim, the prefix, the generation, the key and the fix — a `snapshot/meta` claiming more objects than a generation this archive wrote can hold is evidence about who is writing the prefix, which is an operator action, where a single failed delete is not. The alternative is not a slower drain but an unterminating one: `batches` is a `u64` the bucket chooses, and deleting a key that is not there succeeds |
 | `ObjectStore` IO error on the archive arm | archive arm degrades; **never poisons the Db** — see §8 |
 
 ## §8 Invariants (assert these, TigerBeetle style — hard rule 4)
@@ -609,7 +647,10 @@ test:
 - An archive that cannot establish ownership of a prefix — the manifest names another writer, or
   will not decode — **never** writes to it. Ownership is decided before anything is uploaded, not
   after. **A DELETE is a write**, so this covers reclamation: the only keys reclamation can ever
-  name come out of a manifest read back and found to name this writer.
+  name come out of a manifest read back and found to name this writer — which is
+  identity by string equality on `ArchiveConfig::writer`, so this invariant reaches exactly as
+  far as §4's precondition that the value is unique to one node. Two nodes sharing it each read
+  the other's manifest as their own; §4 records what reclamation costs when they do.
 - The archive **never** deletes an object of the generation the manifest names, and **never**
   deletes anything at all before the manifest that superseded it has durably landed. An object
   may outlive its manifest; a manifest may never outlive its objects — the first costs bucket

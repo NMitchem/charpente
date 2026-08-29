@@ -3868,12 +3868,14 @@ archive's bucket with a rule that **aborts incomplete multipart uploads after N 
 ```text
 S3:                 lifecycle rule -> AbortIncompleteMultipartUpload, DaysAfterInitiation: N
 GCS:                lifecycle rule -> AbortIncompleteMultipartUpload, age N
-Azure Blob:         lifecycle rule -> delete uncommitted blobs after N days
+Azure Blob:         nothing to configure — uncommitted blocks are garbage-collected
+                    automatically, seven days after the last write to them
 ```
 
 Pick N larger than the longest upload the archive will ever make — a full snapshot of your
 largest table — and small enough that a few of them are not a bill. Seven days is the
-common default and is fine for most deployments.
+common default and is fine for most deployments. Azure has no N to pick: its seven days
+are fixed, which is only a problem if one upload could run longer than that.
 
 **What happens without it.** An upload that dies part-way (the process is killed, the
 network drops, the node fails over) can leave the bucket holding parts nothing will ever
@@ -3890,6 +3892,16 @@ anything else: they are orphaned for the same reason, in that no manifest record
 They are bounded by how often those events happen rather than by a mechanism, and both
 print an operator notice when they do. If you see those notices repeatedly, the bucket is
 accumulating and the cause is worth fixing at the source.
+
+**And a third class, which prints nothing.** When a generation rolls, the archive deletes the
+superseded generation's objects one per step. If that drain is interrupted — a gap, a restart,
+the process dying, or the retired generation's snapshot metadata failing to read — whatever it
+had not reached yet stays in the bucket for good. The next roll reclaims the generation it just
+superseded and never returns to an older one. Unlike the two above, **this leaves no operator
+notice**: every cause of it is an ordinary event that reports itself already, and the leftover
+objects are a silent side effect rather than a failure. In a healthy deployment it is the most
+common source of orphans. Nothing in charpente can reach them, for the same reason as the rest:
+no manifest names them.
 
 **Why no code closes this.** An object left by a failed upload is orphaned *precisely in
 that no manifest ever recorded it*. Nothing but a LIST of the prefix could find one, and a

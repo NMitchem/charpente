@@ -172,6 +172,18 @@ impl ObjectStore for SimObjectStore {
                     ))
                 }
             }
+            // NO FAULT ROLL, and that is a coverage limit worth stating
+            // where someone reading the model will meet it (Task 12.5
+            // review / F4). `FaultConfig` has no delete axis, so every
+            // DELETE in every convergence universe succeeds, and the
+            // flagship property therefore exercises reclamation on the
+            // HAPPY PATH ONLY. Task 12.5's central safety claim — that the
+            // archive stays correct and keeps advancing when every delete
+            // fails forever — rests on two hand-driven modes in one test
+            // (`charpente/tests/archive.rs`) rather than on the fault
+            // matrix. An `object_delete_error` axis is OWED. It is not
+            // added here because the seed -> config mapping is frozen;
+            // it lands at the next break of that mapping.
             ObjectOp::Delete { key } => {
                 state.objects.remove(&key);
                 Ok(ObjectDone::Delete)
