@@ -333,14 +333,16 @@ fn an_undeclared_event_name_is_refused_by_name_rather_than_cast_into_the_union()
     // `tolerated < revive` is the `onUnknown` half: an undeclared frame is
     // handed over untouched, above the walker, and never falls through to it.
     //
-    // This byte-order check is the ONLY oracle for that ordering, and that is
-    // measured rather than assumed: moving both revive lines above the guard
-    // reddens this test alone and leaves all 16 executing tests in `ts-fixture`
-    // green. It has to be that way today — the guard and the walker read the
-    // SAME map, so `get(name)` on a name `has(name)` just rejected is always
-    // `undefined`, and no frame exists that a reordered runtime would revive
-    // differently. What the order buys is that the guarantee survives the two
-    // ceasing to be one map, which no runtime test can currently observe.
+    // This byte-order check is the only oracle for ONE of the four conjuncts,
+    // and the scope is measured rather than assumed (chunk B1c review, Q2).
+    // `guard < cast` and `revive < cast` are each pinned by two executing tests
+    // in `ts-fixture`: invert either and they redden. What no runtime test can
+    // observe is `guard < revive` alone — moving the revive above the guard but
+    // still below the cast leaves all 16 green. It has to be that way today,
+    // because the guard and the walker read the SAME map, so `get(name)` on a
+    // name `has(name)` just rejected is always `undefined` and no frame exists
+    // that such a reordering would revive differently. What the byte order buys
+    // is that the guarantee survives the two ceasing to be one map.
     assert!(
         guard < revive && refusal < revive && tolerated < revive && revive < cast,
         "the walker must run after the declared-list guard and before the union cast, but \
