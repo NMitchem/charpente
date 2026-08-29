@@ -1,0 +1,5 @@
+error: `auth` given twice — write it once
+  --> tests/compile_fail/route_duplicate_auth.rs:13:25
+   |
+13 | #[route(GET "/x", auth, auth)]
+   |                         ^^^^

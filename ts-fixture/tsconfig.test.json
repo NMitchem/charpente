@@ -1,0 +1,22 @@
+{
+  // The EXECUTION config (chunk B0, ts-client-codegen). `tsconfig.json` stays the
+  // type-check-only gate (`noEmit: true`) — this one emits real JS to a gitignored
+  // `dist/` so `node --test` can run it. `npm run check` still uses the base config
+  // unchanged; this file only adds a way to also RUN the fixture.
+  //
+  // `module: commonjs` + `moduleResolution: node10` (not the base's `bundler`/ES2020)
+  // is deliberate, not a downgrade: every existing import in this fixture is
+  // extensionless (`from "./generated/client"`), which is legal under `bundler` but
+  // is NOT resolvable by Node's ESM loader at runtime (`ERR_MODULE_NOT_FOUND` —
+  // verified). CommonJS `require()` resolves extensionless specifiers the way `bundler`
+  // assumes, so switching the OUTPUT module format is what makes the existing source
+  // tree runnable without touching a single import. See
+  // `ts-fixture/scripts/mark-dist-commonjs.cjs` for the other half of this.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node10",
+    "noEmit": false,
+    "outDir": "dist"
+  }
+}

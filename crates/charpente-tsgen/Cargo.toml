@@ -1,0 +1,13 @@
+[package]
+name = "charpente-tsgen"
+description = "Contract -> TypeScript client codegen: a pure function from Contract to .ts source."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+charpente.workspace = true

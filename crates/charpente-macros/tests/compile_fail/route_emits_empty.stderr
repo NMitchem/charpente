@@ -1,0 +1,5 @@
+error: emits(...) must name at least one #[event] type — write `emits(NoteAdded, NoteRemoved)`, or drop it
+  --> tests/compile_fail/route_emits_empty.rs:14:19
+   |
+14 | #[route(SSE "/x", emits())]
+   |                   ^^^^^

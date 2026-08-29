@@ -150,7 +150,65 @@ these are two different registries for two different purposes:
   as `#[table]` already populates schema. It is read by `App::describe` and by nothing
   on the delivery path.
 
-`Contract` gains `events: Vec<EventInfo { name, payload: TypeRef, keyed: bool }>`.
+`Contract` gains `events: Vec<EventInfo { name, payload, keyed: bool }>`.
+
+**Correction (task 6 review, Ruling 37):** this line first said `payload: TypeRef`.
+`TypeRef` is a spec-level notion with no Rust type behind it — task 5 realized it two
+ways, by position: `TypeSchema` where a route's request/response/error needs a full
+shape, and a bare `&'static str` wire NAME where a name is all a consumer needs
+(`Route.response_name`). `EventInfo.payload` is the second kind and shipped as
+`&'static str` (`Wire::WIRE_NAME`, an entry in `Contract.types`). It sits right beside
+`RouteInfo.emits: Vec<&'static str>` in the rendered contract, and the two have the
+same Rust type. The code is correct; this sentence was stale — same discharge as
+Ruling 10, where the IR shipped in `charpente::wire` rather than `charpente::describe`.
+
+**Correction (task 7 review, Ruling 39):** the sentence above originally continued
+"…matching `RouteInfo.emits`, which task 7 fills with exactly this kind of value". That
+prediction was wrong, and it contradicted amendment B1, which task 7 implemented. The
+two fields carry the same Rust type but NOT the same kind of value:
+
+- `EventInfo.payload` is `Wire::WIRE_NAME` — `"WidgetAdded"` — and IS a key into
+  `Contract.types`.
+- `RouteInfo.emits[i]` is `<Ev as Event>::NAME` — `"widget_added"` — the name an SSE
+  frame's `event:` field carries. It is **not** a key into `Contract.types`.
+
+`Event::NAME` is correct and stays. §7's acceptance criterion 6 is "an `emits(...)`
+declaration that disagrees with its handler's `Subscription` fails", and a
+`Subscription`'s entries hold `Event::NAME`; filling `emits` with the same value is what
+makes that criterion a direct comparison rather than one with a lookup inside it. It is
+also the value a client must switch on, since it is what arrives on the wire. And
+because both sides of the oracle now derive from `Ev::NAME`, the check detects
+**type-set** drift while name drift becomes inexpressible rather than merely detected.
+
+**Superseded by Ruling 46 (task 9a, landed `1ac64c9`) — `RouteInfo.emits` is no longer
+`Vec<&'static str>`.** Everything above describes the shape correctly as of task 7 and is kept
+as the record of why `Event::NAME` was the right single value then. Task 9 needed the payload
+name too — the TypeScript union names payload TYPES (`InvoicePaid`), the SSE `event:` field
+carries `Event::NAME` (`invoice_paid`), and **neither computes from the other**, because
+`#[event]`'s acronym rule maps `HTTPServer` to `http_server` and nothing inverts that. So
+`emits` now carries both per declared event:
+
+```rust
+pub struct EmittedEvent { pub event: &'static str, pub payload: &'static str }
+pub emits: Vec<EmittedEvent>   // RouteInfo; &'static [EmittedEvent] on Route
+```
+
+The oracle above is unchanged in substance: it compares the `event` half, because a
+`Subscription` holds `Event::NAME` and nothing else. The `payload` half is pinned separately by
+`declared_pairs` in `crates/charpente/tests/realtime.rs` and by the describe JSON golden.
+`DESIGN.md` and `docs/GUIDE.md` are the live spec and were updated in the same commit; this
+file is the sub-project's design record, corrected here rather than rewritten. **Flagged by the
+task 9a review** — this plan has twice been bitten by a stale artifact that read as current
+(Rulings 44/47, the hand-built fixture), so the note is here rather than left implicit.
+
+**Ruling 40 (task 7 review) — the join is Task 9's to design.** The emitter must resolve
+every `emits` entry to a payload type. Nothing here prescribes how. The constraint it has
+to satisfy: a stream route may declare an event the app never passes to `mount_events`,
+and that is a supported state, not a mistake — task 7 registers a declared payload into
+`Contract.types` from the ROUTE, and
+`crates/charpente/tests/describe.rs::a_declared_emits_payload_reaches_the_closure_without_mount_events`
+pins it. So a resolution that only works for mounted events is insufficient. Task 9
+picks the mechanism with sight of the emitter.
 
 **Binding events to streams.** `RouteInfo.stream` is a bare bool; nothing records which
 events a given stream carries, so a generated client could only offer "subscribe to
@@ -175,15 +233,25 @@ runtime we own.
 
 ```ts
 const r = await api.createCustomer(id, body);
-if (!r.ok) { /* r.error : the typed ApiError union */ }
+if (!r.ok) { /* r.error : { error: string } — the ApiError envelope, not a per-variant union */ }
 ```
 
-The route's error type is part of its declared Rust signature, so it belongs in the
-return type. Throwing erases it — `catch` binds `unknown`, discarding precisely the
-information this project exists to carry. The cost is verbosity at every call site; the
-purchase is that `tsc` refuses to let a caller ignore a failure the server declares.
-Transport-level faults (socket died, body did not parse) still throw: those are not in
-the contract.
+**Correction (task 5 fix round 1, F1):** `r.error` is the fixed `ApiError` envelope
+`{ error: string }`, not a discriminated union of `ApiError`'s Rust variants.
+`ApiError::response()` always emits that one shape regardless of which variant a
+handler returned — the variant distinction never reaches the wire — so `Contract.types["ApiError"]`
+describes the envelope (a hand-written `Wire` impl, not the derive), and this emitter
+must type every route's error branch from it. The status code (which the fetch response
+already carries) is what discriminates 400/401/404/500 for a caller that needs to, not
+the error body's shape.
+
+The route's error type is still part of its declared Rust signature, so the ENVELOPE
+belongs in the return type even though it is not itself a per-variant type — a caller
+still cannot silently ignore a failure the server declares. Throwing would erase it
+entirely — `catch` binds `unknown`, discarding even the message. The cost is verbosity
+at every call site; the purchase is that `tsc` refuses to let a caller skip past `!r.ok`
+before reading `r.error`. Transport-level faults (socket died, body did not parse) still
+throw: those are not in the contract.
 
 **The client runtime uses fetch-based SSE, not `EventSource`.** `EventSource` is
 browser-native and handles `Last-Event-ID` resume for free, but **it cannot set request
@@ -275,7 +343,7 @@ identical contract — is already a property of the introspection sub-project.
 | file | change |
 |---|---|
 | `crates/charpente/src/wire.rs` **(new)** | `TypeSchema`, `TypeDef`, `Field`, `EnumRepr`, `TypeRegistry`, the `Wire` trait and its primitive impls |
-| `crates/charpente/src/describe.rs` | `Contract.types`; `Contract.events`; `RouteInfo` gains request/response/error `TypeRef`s and `emits`. Stays the assembly point only. |
+| `crates/charpente/src/describe.rs` | `Contract.types`; `Contract.events`; `RouteInfo` gains request/response/error `TypeSchema`s and `emits`. Stays the assembly point only. |
 | `crates/charpente-core/src/table.rs` | `Id<T>`: serde impls (string-encoded) |
 | `crates/charpente-macros` | `#[derive(Wire)]`; `#[route]` type capture + `emits(...)`; `#[event]` describe-time registration; the bare-`u64` diagnostic |
 | new codegen crate | `Contract` -> TypeScript emitter (pure, deterministic) |

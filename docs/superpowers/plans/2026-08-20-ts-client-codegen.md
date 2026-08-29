@@ -14,14 +14,67 @@
 
 - **Read `CLAUDE.md` before writing code.** Its hard rules override default behavior.
 - **No ambient nondeterminism.** The emitter is a pure function of `Contract`. No clocks, no RNG, no filesystem reads inside it, no `HashMap` iteration order — `BTreeMap`/sorted `Vec` only. Generation must be byte-identical across runs and machines (spec §4).
-- **No new dependency inside the deterministic boundary.** `charpente-core` gains no dependency in this plan. The emitter crate may depend only on `serde`/`serde_json` and `charpente` (for `Contract`).
+- **No new dependency inside the deterministic boundary** — meaning CLAUDE.md's rule: nothing
+  that does its own IO, threading, or time. **AMENDED at Task 2 (Ruling 13):** `charpente-core`
+  gains `serde` (no `derive` feature). Rust's orphan rule forces `Serialize`/`Deserialize` for
+  `Id<T>` into the crate that owns `Id<T>`, and serde's traits are pure computation — no IO, no
+  threading, no time. serde is already in this workspace's build graph (`charpente/Cargo.toml:11`,
+  `Cargo.lock:528`), so this adds a manifest line, not third-party code. `Codec` stays hand-rolled:
+  serde must never become the on-disk format, and a test pins the 8-byte little-endian encoding
+  so that stays mechanical. No OTHER core dependency is in scope.
+  **Correction (Task 2 review):** the `default-features = false` / no-`derive` declaration is NOT
+  a fence — cargo unifies features and `charpente/Cargo.toml:11` asks for `serde/derive`, so a
+  `#[derive(Serialize)]` inside core builds fine under `--workspace`, which is all CI ran. The
+  fence is the CI line `cargo check -p charpente-core`, added in Task 2's fix round. Hard rule 1
+  says mechanically, not by manifest comment.
+  **Nearest prior art, which does NOT bind but should be cited rather than missed:**
+  `DESIGN.md:1097-1098` — "the crypto is RustCrypto (`sha2`, `rsa`, `base64ct`) ... and lives in
+  `charpente`, never inside the deterministic `charpente-core`." That is about libraries with an
+  ambient surface (`rsa` draws randomness); serde's traits execute no IO, threading, or time, and
+  `cargo tree -p charpente-core` resolves to `redb` + `serde`/`serde_core` with no proc-macro and
+  no build script. Distinguished on the mechanism, not waved past. The emitter crate may depend only on `serde`/`serde_json` and `charpente` (for `Contract`).
 - **Error messages are product surface** (hard rule 5). Every diagnostic names the contract, the site, and the fix, and is pinned by a test against its exact text.
 - **Public-API changes update docs in the same commit** (hard rule 6).
 - **Assertions in the TigerBeetle style** (hard rule 4) — assert negative space in core code.
 - **Commit directly to `main`. No Co-Authored-By trailers.** `git add` named paths only, never `-A` or `.` — other sessions share this working tree.
-- **zsh:** `PIPESTATUS` does not work. Use `${pipestatus[1]}` or `set -o pipefail`. Pipe cargo through `tee`, never `tail`.
+- **zsh:** `PIPESTATUS` does not work. Use `${pipestatus[1]}` or `set -o pipefail`. Pipe cargo
+  through `tee` — **never `tail`, `grep`, or `head`.** `tail` eats the aggregate counts; `grep`
+  under `pipefail` reports failure when it simply matches nothing (a reviewer got a false
+  `fmt exit=1` on a clean `cargo fmt` that way, and discarded a good run over it). The rule is
+  not "avoid tail" — it is that **the last command in the pipe owns `$?`**, so the last command
+  must be one whose success means what you think it does.
+
 - **Full check before any task is done:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`. No `#[allow]` may be added to pass clippy.
 - **Do not kill any process.** Another repo runs test suites on this machine.
+- **A tool's DEFAULT is not a tool's LIMIT — check before building a workaround.** Three
+  separate hazards in this plan trace to one root: the Bash tool's 2-minute default timeout
+  was read as a hard ceiling. Task 5's implementer concluded `cargo test --workspace` "could
+  not run as one command" and segmented the entire suite per-package/per-file; fix round 1's
+  implementer backgrounded the same command, parked waiting on a notification a subagent never
+  receives, and returned control with 19 paths uncommitted. **The tool accepts `timeout` up to
+  600000 ms.** **CORRECTED 2026-08-26 by measurement, twice — read both numbers, because one
+  alone misleads.** `cargo test --workspace` timed as a single command:
+  - **2482.86 s wall (41.4 min)** at `1ac64c9` — cold-ish, with a concurrent session building in
+    a sibling worktree. 789 s user CPU, so 32% utilisation: mostly waiting, not computing.
+  - **568 s wall** at `af14e74` — warm target dir, machine otherwise quiet. Exit 0, 63 suites,
+    968 tests.
+
+  So the honest rule is **not** "it takes N minutes". It is: **the suite's wall time swings by
+  more than 4x with build warmth and machine contention, straddling the tool's 600 s hard
+  maximum, so it cannot be RELIED on to finish inside one Bash call.** Partition per package, or
+  background it from the top-level agent (which gets re-invoked on completion — a mechanism
+  subagents lack). Task 9a's implementer partitioned and was right to.
+  "About six minutes" was wrong in the dangerous direction: it attached a confident number to a
+  bullet whose whole point is checking limits rather than assuming them, and a later implementer
+  had to defend correct practice against it. **Do not replace it with a different confident
+  number.** Wall time here is a scheduling fact, never a benchmark — docs/BENCH.md remains the
+  only source of quotable performance figures.
+  **The generalisation below still stands, and so does its inverse: check the ceiling before
+  designing around it, AND check it before insisting the ceiling is not there.** Each workaround produced evidence that was
+  equivalent-or-worse at the cost of a whole session, plus a deviation for a reviewer to audit.
+  The rule generalizes past this one parameter: when a tool appears to refuse something, read
+  its parameters before designing around the refusal — and if you do work around it, say so in
+  the report as a deviation, which both implementers did correctly.
 - **`TRYBUILD=overwrite` blesses whatever the compiler emitted — it does not verify it.**
   The cargo test target in `charpente-macros` is `--test trybuild` (`tests/trybuild.rs`,
   fn `macro_errors`); `compile_fail/` and `compile_pass/` are fixture DIRECTORIES, not targets.
@@ -43,6 +96,32 @@
     `gen_client_is_byte_identical_on_a_second_run`.
   - **Every "never happens" assertion names the mutation that reddens it**, in a comment on the
     test. If no such mutation exists, the test is decorative — delete it or make it real.
+  - **A mutation that leaves the suite GREEN has proved nothing until you show the mutation was
+    not inert.** RED is self-proving: the mutation clearly changed behaviour. GREEN is ambiguous
+    between "the test is vacuous" and "my mutation did nothing," and those look identical from the
+    exit code alone. Learned the hard way at Task 2 (F4): a reviewer mutated `Id<T>`'s Visitor by
+    adding `visit_u64`, saw green, and filed the test as vacuous — but `serde_json`'s
+    `deserialize_str` is type-strict (`serde_json-1.0.150/src/de.rs:1524-1550`: only a `"` token
+    reaches the visitor, everything else short-circuits into `peek_invalid_type`), so `visit_u64`
+    was unreachable dead code and the mutation was a no-op. **So: when a mutation leaves the suite
+    green, print the observable behaviour under the mutation before concluding anything** — the
+    parsed value, the error text, a `dbg!` on the mutated path. An exit code is not a measurement
+    of the thing you changed.
+- **Pinning the function you fixed is not pinning the behaviour you fixed.** Four times in this
+  plan a test has covered a function while leaving the property it exists to protect uncovered:
+  Task 1's `reference()` tested in isolation while every container caller ignored it (a genuine
+  stack overflow, found two tasks later); Task 3's serde fidelity, which no test compared
+  against real `serde_json` output until a reviewer wrote a probe; Task 3's `register()`
+  recursion guard, green under `if false`; and the F4 rejection, pinned against an inert
+  mutation. **After fixing a bug, ask what the bug would have DONE, and pin that** — the
+  overflow, the wrong JSON key, the non-termination — not the function you happened to edit.
+- **A test named `fidelity_*` must read BOTH sides.** Twice now a fidelity test has asserted
+  only what `serde_json` emitted and never called `<T as Wire>::schema()` — so no edit to
+  charpente could redden it, while its own comment claimed a mutation it does not catch.
+  Task 3 fixed one; Task 4 grew another, and the one it grew was pinning the subtlest rule in
+  the new variant table (serde tests uppercase with Unicode rules but lowercases with ASCII
+  ones). A ground-truth pin on serde's behaviour is legitimate — it catches a serde upgrade —
+  but it must be **labelled as one in a comment**, never left looking like coverage.
 - **Do not touch `Cargo.toml:38-39`** (`[profile.release.package.redb] debug-assertions = true`).
 
 ## File Structure
@@ -1006,6 +1085,32 @@ the error says so."
 
 ### Task 5: `Route` carries types, and `#[route]` captures them
 
+> **SEQUENCING AMENDMENT (Ruling 14) — READ BEFORE STARTING.** This task is the one that
+> makes a bare `u64` in a wire position a compile error, because `route.response` /
+> `request` / `params` generate `<T as Wire>::reference()` and `u64` is deliberately not
+> `Wire`. **That breaks two in-repo consumers the moment it lands**, and the plan originally
+> deferred their migration to Task 12 — leaving a seven-task window where
+> `cargo test --workspace` and `cargo build -p guide-examples` could not pass, in direct
+> violation of this plan's own per-task full-check constraint.
+>
+> Migrating them is therefore **part of Task 5**, not Task 12:
+>
+> - `examples/invoicing/src/routes.rs` — bare `u64` in wire position at :19, :32, :94, :108,
+>   :109, plus `.raw()` unwrapping. `CustomerView.id`/`InvoiceView.id`/`InvoiceView.customer`
+>   become `Id<Customer>` / `Id<Invoice>`; `InvoiceFinalized.invoice` and `SendReceipt.invoice`
+>   become `Id<Invoice>`. `due_day` stays `u64` **only if** it is not a wire field — check.
+>   Leave genuine non-id `u64`s (counters, days) alone; the rule is about ids and about
+>   64-bit values crossing the wire, not about the type `u64` everywhere.
+> - `docs/GUIDE.md` — **six** route handlers return `Result<u64, ApiError>` (:606, :718,
+>   :1074, :1631, :2005, :3391), the prose at :654 instructs unwrapping "its `u64` with
+>   `.raw()`", and there are 5 `.raw()` call sites. Every ```rust block in that file is
+>   compiled by `crates/guide-examples`'s build.rs, so these are build failures, not stale
+>   prose. `cargo build -p guide-examples` is a required gate for this task.
+>
+> If the migration turns out to be larger than the mechanism, land the mechanism and the
+> migration as two commits in this same task rather than splitting the task — the invariant
+> that matters is that the workspace builds at the task boundary.
+
 **Files:**
 - Modify: `crates/charpente/src/http/router.rs:31-37` (the `Route` struct)
 - Modify: `crates/charpente-macros/src/route.rs` (both `expand` and `expand_sse`)
@@ -1792,6 +1897,21 @@ hide that."
 
 ### Task 9: The emitter — routes, the result union, and the SSE client
 
+> **AMENDMENT (2026-08-26, after execution).** The literal code below still names the 409 error
+> class `CursorDiverged`. **It shipped as `CursorRefused`** (`f2594d7`). The rename was made
+> because the class is raised for TWO conditions — a cursor below the retention floor, and a
+> cross-timeline divergence (`kernel/mod.rs:674-720`, and this sub-project's spec says "a 409
+> naming **either** the retention floor **or** a cross-timeline divergence") — so the old name
+> asserted a cause that is sometimes false, which is hard rule 5 applied to an identifier rather
+> than a message. Fix round 1 had already corrected the message text; the name carried the same
+> over-claim one level up.
+>
+> The code below is left as written: it is the record of what was dispatched, not a description
+> of what is in the tree. **Read `crates/charpente-tsgen/src/runtime.rs` for the current
+> shape.** This note exists because the plan has twice been bitten by a stale artifact that read
+> as current (Rulings 44/47).
+
+
 **Files:**
 - Create: `crates/charpente-tsgen/src/routes.rs`, `src/events.rs`, `src/runtime.rs`
 - Modify: `crates/charpente-tsgen/src/lib.rs`
@@ -2302,8 +2422,8 @@ required field — each reddening tsc, each reverted."
 ### Task 12: Migrate `examples/invoicing` off bare `u64`, and update the docs
 
 **Files:**
-- Modify: `examples/invoicing/src/routes.rs` (view types), and any other app file holding a bare `u64` in a wire position
-- Modify: `DESIGN.md` §3 and §7, `docs/GUIDE.md`, `PLAN.md`
+- Modify: `DESIGN.md` §3 and §7, `PLAN.md`, and `docs/GUIDE.md` (the client-generation workflow section only)
+- **Ruling 14 moved the `examples/invoicing` and `docs/GUIDE.md` bare-`u64` migration into Task 5**, where the compile error first appears. Do not redo it here. **Do** verify it holds: `cargo build -p guide-examples` and a grep for `.raw()` in a wire position must both come back clean, and if they do not, that is a Task 5 regression to report, not a Task 12 task.
 - Test: the existing invoicing suite plus `cargo build -p guide-examples`
 
 **Interfaces:**

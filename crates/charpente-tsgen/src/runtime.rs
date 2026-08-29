@@ -1,0 +1,370 @@
+//! The part of a generated client that never varies with the contract: the
+//! `Result` union, `ApiBase` (base URL + token, `request`, `stream`), and the
+//! two honesty conditions DESIGN §6 defines.
+//!
+//! It is a `&'static str` rather than something assembled at runtime because
+//! it has nothing to assemble from — which also makes this half of the output
+//! byte-identical by construction (spec §4).
+
+/// Every name the generated file occupies at module scope: the ones this text
+/// declares, plus `Api`, the class `emit_client` writes itself. `lib.rs`
+/// refuses a contract that would redeclare any of them, because two
+/// `export type Result` in one file is a `tsc` "Duplicate identifier" landing
+/// in an app author's build, pointing at generated code they did not write.
+///
+/// Sorted, and kept in sync by
+/// `reserved_lists_exactly_what_the_runtime_and_the_api_class_declare` in
+/// `lib.rs` — a name added to the TypeScript below without being added here
+/// would go unprotected.
+///
+/// `sseValue` is listed even though a wire type of that name could not in fact
+/// collide with it: TypeScript keeps type space and value space apart, so a
+/// plain `function sseValue` and an `export type sseValue` coexist (tsc 5.9.3,
+/// run, exit 0). It is listed because this list is checked mechanically
+/// against every module-scope declaration the fixed half makes, and one
+/// remembered exception is what makes the next one get forgotten — the same
+/// name declared as a `class` or an `enum` DOES collide (TS2300 / TS2567,
+/// both run). The cost of over-reserving is refusing a contract whose wire
+/// type is literally named `sseValue`, which a Rust type name will not be.
+pub const RESERVED: &[&str] = &[
+    "Api",
+    "ApiBase",
+    "CursorRefused",
+    "Result",
+    "StreamEnd",
+    "StreamRejected",
+    "SubscribeOptions",
+    "UndeclaredEvent",
+    "UnknownEvent",
+    "reviveInt64",
+    "sseValue",
+];
+
+/// Members `ApiBase` defines. A route whose generated method name matched one
+/// would override it — `tsc` rejects an incompatible override, and a
+/// compatible one would silently replace the transport.
+pub const APIBASE_MEMBERS: &[&str] = &["constructor", "headers", "request", "setToken", "stream"];
+
+pub const RUNTIME: &str = r##"
+// --------------------------------------------------------------------------
+// Runtime. Hand-written and identical in every generated client — nothing
+// below varies with the contract.
+// --------------------------------------------------------------------------
+
+/**
+ * A route's outcome. Routes RETURN this instead of throwing: the error type is
+ * half of the route's declared Rust signature, and `catch` binds `unknown`,
+ * which would discard exactly the information this client exists to carry.
+ */
+export type Result<T, E> =
+  | { ok: true; data: T }
+  | { ok: false; error: E };
+
+/**
+ * Why a subscribed stream stopped — the two ways the SERVER ends one.
+ *
+ * `gap` is DESIGN §6's terminal `charpente.gap` frame: the tail fell behind
+ * retention, so events the server no longer holds were skipped. It is a
+ * DELIBERATE, NAMED refusal, not a dropped socket — a client that reconnected
+ * on it would resume past the hole and deliver a history with a silent
+ * discontinuity in it.
+ *
+ * `closed` is the ordinary end of the response body.
+ *
+ * The conditions THIS CLIENT raises are deliberately not members:
+ * `CursorRefused` before a frame arrives, `UndeclaredEvent` arbitrarily far
+ * into a healthy stream. Handling a refusal in the same branch as a normal end
+ * is the mistake, and each carries a name and a fix no `kind` could. The
+ * consequence, stated because it is easy to get wrong: `onEnd` is NOT a
+ * cleanup hook. It fires only for the two members below, so teardown that must
+ * run on every exit belongs in `.finally()` on the promise `subscribe` returns,
+ * which those throws reject. Every member of this union has a producer in
+ * `ApiBase.stream` below.
+ */
+export type StreamEnd =
+  | { kind: "gap"; detail: string }
+  | { kind: "closed" };
+
+/**
+ * The server refused the cursor: HTTP 409 (DESIGN §6). TWO different causes
+ * raise this, and only the server's `detail` distinguishes them — the cursor
+ * is below this node's retention floor, or this node's history at that id is
+ * not the history the cursor came from. Both are in `validate_subscribe`.
+ * The rule is in the message on purpose — it is what a developer reads at 3am.
+ */
+export class CursorRefused extends Error {
+  constructor(readonly detail: string) {
+    super(
+      "cursor refused: " + detail + " — a client must not auto-resume across this, " +
+      "whichever cause the server names above. Past a retention floor, resuming would " +
+      "deliver a history with a silent hole in it; past a divergence, it would deliver " +
+      "another timeline's events under ids this client has already used, which is the " +
+      "misattribution the cursor's seq half exists to detect. Re-sync current state " +
+      "through reads, then reconnect without a cursor.",
+    );
+  }
+}
+
+/**
+ * A subscribe the server rejected before any frame: 401 with no credential, or
+ * 400 on a cursor it could not even parse. Distinct from `CursorRefused`,
+ * which is a parseable cursor this node cannot serve from.
+ */
+export class StreamRejected extends Error {
+  constructor(readonly status: number, readonly detail: string) {
+    super("subscribe rejected with HTTP " + status + ": " + detail);
+  }
+}
+
+/**
+ * The event shape of a stream route that declared no `emits(...)`. The
+ * contract genuinely does not know what such a route carries, so this is the
+ * honest type rather than a fabricated union. To get a discriminated union
+ * here, add `emits(...)` to that route: `#[route(SSE "/path", emits(Ev, …))]`.
+ */
+export type UnknownEvent = { event: string; data: unknown };
+
+/**
+ * A frame carrying an `event:` name the route did not declare in `emits(...)`.
+ *
+ * That declaration is NOT a filter (DESIGN §6): delivery runs off the encoders
+ * each `Subscription::of::<Ev>()` captured, so declaring `emits(Ping)` does not
+ * stop the platform sending a `pong` frame — most often because the server is
+ * newer than this generated file. Casting such a frame into the union would be
+ * a lie the type system then propagates: an exhaustive `switch` falls through
+ * and destructured fields read `undefined`. It is refused by name instead, and
+ * `onUnknown` is the way to tolerate the skew deliberately.
+ */
+export class UndeclaredEvent extends Error {
+  constructor(readonly event: string) {
+    super(
+      "the server sent an event this client's union does not declare: " + event +
+      ". `emits(...)` is a declaration, not a filter, so this is skew rather than a " +
+      "protocol violation — regenerate this client from the server's contract, or pass " +
+      "`onUnknown` to handle events it was not generated for.",
+    );
+  }
+}
+
+export interface SubscribeOptions<Ev> {
+  /** A `Cursor::wire` string from a previous `onEvent`, to resume from. */
+  cursor?: string;
+  onEvent: (ev: Ev, cursor: string) => void;
+  onEnd: (end: StreamEnd) => void;
+  /**
+   * A frame whose name is not one this route declared. Without it, such a
+   * frame raises `UndeclaredEvent` — it is never cast into `Ev`, and never
+   * dropped silently.
+   */
+  onUnknown?: (ev: UnknownEvent, cursor: string) => void;
+  signal?: AbortSignal;
+}
+
+export class ApiBase {
+  constructor(protected baseUrl: string, protected token?: string) {}
+
+  setToken(token: string | undefined) {
+    this.token = token;
+  }
+
+  protected headers(json: boolean): Record<string, string> {
+    const h: Record<string, string> = {};
+    if (json) h["content-type"] = "application/json";
+    if (this.token) h["authorization"] = "Bearer " + this.token;
+    return h;
+  }
+
+  protected async request<T, E>(
+    method: string,
+    path: string,
+    body?: unknown,
+  ): Promise<Result<T, E>> {
+    const res = await fetch(this.baseUrl + path, {
+      method,
+      headers: this.headers(body !== undefined),
+      // A replacer, not a schema walk: it sees each value BEFORE
+      // serialization, so converting every bigint it meets is sound with no
+      // knowledge of which field is `Int64` -- unlike the INBOUND direction
+      // (`parsed as T` below), where `JSON.parse` has already thrown the
+      // precision away by the time anything could revive it, which is why
+      // that direction needs a schema-directed walk and this one does not.
+      // A type-checked call site can only ever hand this a bigint where the
+      // schema put one, so "convert every bigint" and "convert only Int64
+      // positions" agree in practice; this is wider in principle but checks
+      // and rejects nothing, so it is not the validator A3 forbids.
+      body:
+        body === undefined
+          ? undefined
+          : JSON.stringify(body, (_k, v) =>
+              typeof v === "bigint" ? v.toString() : v,
+            ),
+    });
+    const text = await res.text();
+    // A non-JSON body is a protocol violation, not an `E`: this throws rather
+    // than coercing whatever arrived into the route's declared error type.
+    const parsed = text.length ? JSON.parse(text) : null;
+    return res.ok
+      ? { ok: true, data: parsed as T }
+      : { ok: false, error: parsed as E };
+  }
+
+  // Fetch-based, NOT EventSource: EventSource cannot set an Authorization
+  // header, and the alternative is a token in a query string, where it lands
+  // in logs and referrers. The cost is that reconnect is owed explicitly.
+  // `declared` is the route's `emits(...)` declaration, passed by the generated
+  // subscribe method: one entry per declared event NAME, whose value is that
+  // payload's `Int64` walker, or `null` when the payload carries none. A map
+  // rather than a list because reviving requires knowing WHICH event a frame
+  // is before knowing which walker applies — the union is discriminated by the
+  // frame's `event:` name, and each arm has its own payload type.
+  //
+  // The key set is the DECLARATION, never "the events that need reviving": an
+  // event whose payload has no `Int64` gets a null-valued entry, not an absent
+  // one, or a frame the route did declare would be refused as undeclared.
+  //
+  // A route that declared none passes NOTHING — `undefined`, not an empty map.
+  // An empty `Map` is truthy and means the opposite ("declared an empty list",
+  // i.e. refuse every name), so the two cases are an ABSENT argument and a
+  // non-empty map, never one map either way.
+  //
+  // A `Map` rather than an object literal because `name` comes off the wire and
+  // `"toString" in {}` is true through the prototype chain: an object would
+  // accept `Object.prototype`'s members as declared event names and hand their
+  // implementations back as walkers.
+  protected async stream<Ev extends { event: string; data: unknown }>(
+    path: string,
+    opts: SubscribeOptions<Ev>,
+    declared?: ReadonlyMap<string, ((data: unknown) => unknown) | null>,
+  ): Promise<void> {
+    const headers = this.headers(false);
+    if (opts.cursor) headers["last-event-id"] = opts.cursor;
+    const res = await fetch(this.baseUrl + path, { headers, signal: opts.signal });
+    if (res.status === 409) {
+      // The server refused the cursor. Surfaced, never retried: see
+      // CursorRefused.
+      throw new CursorRefused(await res.text());
+    }
+    if (!res.ok) throw new StreamRejected(res.status, await res.text());
+    if (!res.body) {
+      throw new StreamRejected(res.status, "the subscribe response carried no body");
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    // Every exit from the loop below cancels the reader: the `gap` return,
+    // an `UndeclaredEvent` throw, or a callback of the caller's that throws.
+    // charpente notices a gone client only when hyper drops the response body
+    // (serve.rs `sse_pump`), so a reader left locked and abandoned lets the
+    // kernel Tail outlive the client that stopped reading. `catch` because
+    // cancelling an already-errored body rejects, and that must not replace
+    // the reason we are leaving.
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) {
+          opts.onEnd({ kind: "closed" });
+          return;
+        }
+        buf += decoder.decode(chunk.value, { stream: true });
+        let idx: number;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const frame = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          let name = "message";
+          let id = "";
+          let data: string | undefined;
+          for (const line of frame.split("\n")) {
+            // A line starting with ':' is an SSE comment. charpente sends `:hb`
+            // every 15s on an idle connection; reading it as a field would hand
+            // JSON.parse an empty string on every heartbeat.
+            if (line.startsWith(":")) continue;
+            if (line.startsWith("event:")) name = sseValue(line, 6);
+            else if (line.startsWith("id:")) id = sseValue(line, 3);
+            else if (line.startsWith("data:")) {
+              const v = sseValue(line, 5);
+              data = data === undefined ? v : data + "\n" + v;
+            }
+          }
+          // No data field at all (a lone comment, a keepalive): nothing to
+          // dispatch, and nothing has gone wrong.
+          if (data === undefined) continue;
+          if (name === "charpente.gap") {
+            opts.onEnd({ kind: "gap", detail: data });
+            return;
+          }
+          const ev = { event: name, data: JSON.parse(data) as unknown };
+          // The declaration is checked before the cast, so `as Ev` narrows only
+          // the discriminant this client was generated for. The payload carries
+          // the same trust `request()` places in the server's JSON — that is a
+          // boundary no client can verify without a schema validator, and it is
+          // deliberately the SAME trust, not a wider one.
+          if (declared && !declared.has(name)) {
+            if (!opts.onUnknown) throw new UndeclaredEvent(name);
+            opts.onUnknown(ev, id);
+            continue;
+          }
+          // Revived only once the name is known to be declared: which walker
+          // applies is a function of WHICH event this is, so there is nothing
+          // to choose before the discriminant is trusted. The `onUnknown`
+          // frame above is handed over untouched for the same reason — the
+          // client holds no schema for an event it was not generated for,
+          // which is exactly what makes it unknown, and applying one anyway
+          // would be inventing it.
+          const revive = declared?.get(name);
+          if (revive) ev.data = revive(ev.data);
+          opts.onEvent(ev as Ev, id);
+        }
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
+  }
+}
+
+/** One SSE field value: the text after the colon, minus one optional leading space. */
+function sseValue(line: string, at: number): string {
+  const v = line.slice(at);
+  return v.startsWith(" ") ? v.slice(1) : v;
+}
+
+/**
+ * The one `Int64` revive primitive every generated walker calls (chunk B1b):
+ * `JSON.parse` hands back a decimal STRING wherever the schema says `Int64`
+ * (a `bigint` in the generated types), because `BigInt(str)` is lossless and
+ * a JSON number is not (spec §1) — this is the other half of that trade.
+ *
+ * Converts ONLY when `v` really is a string. `BigInt(null)` and
+ * `BigInt(undefined)` both THROW ("Cannot convert null/undefined to a
+ * BigInt", measured) — and null/undefined is exactly what an absent
+ * `Option<Int64>` or a `skip_serializing_if`-omitted `Int64` field hands
+ * this function, on a document the server was correct to send. Every
+ * generated call site already guards those two cases with its own
+ * null-check before ever reaching here (an `Option` position never even
+ * calls this on `null`) — so this `typeof` check and every call site's own
+ * guard are each INDEPENDENTLY sufficient (fix round 1, F2: measured by
+ * regenerating with exactly one guard removed at a time — either alone
+ * leaves `npm run test` green; only removing BOTH throws). This is written
+ * deliberately, not "just in case": it is the one place A1's "convert only
+ * strings, never throw on null/undefined" rule holds regardless of whether
+ * some future call site's own guard is ever weakened, and it is the ONLY
+ * layer a per-Contract generated-source test can never see, since this
+ * function's body is fixed text in `RUNTIME`, not emitted per contract —
+ * pinned by `lib.rs`'s
+ * `revive_int64_guards_null_and_undefined_on_its_own_not_only_via_call_sites`.
+ *
+ * `""` and a hex-looking string are NOT special-cased: `BigInt("")` is `0n`
+ * and `BigInt("0x10")` is `16n`. Guarding either would be validating the
+ * server's document rather than narrowly converting it — the same line
+ * `request()`'s own doc comment already draws for the payload as a whole.
+ *
+ * The `as bigint` in the untaken branch is the same kind of boundary cast
+ * `request()`'s `parsed as T` already is: every REACHABLE call in generated
+ * code only takes this branch when `v` is not a string (a value some outer
+ * null-check has already let through unchanged, e.g. `null`), so the static
+ * type here is a promise about how this is called, not a runtime guarantee
+ * — exactly the gap spec §1 exists to name elsewhere in this file.
+ */
+function reviveInt64(v: unknown): bigint {
+  return typeof v === "string" ? BigInt(v) : (v as bigint);
+}
+"##;

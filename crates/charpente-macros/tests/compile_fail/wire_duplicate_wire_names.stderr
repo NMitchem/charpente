@@ -1,0 +1,17 @@
+error: #[derive(Wire)] requires one wire name per field, but `x` and `y` both resolve to "a" — serde would emit that key twice on the wire ({"a":...,"a":...}, last one wins on the client) and the schema would carry two fields with the same name; rename one of the two fields, or give it its own #[serde(rename = "...")], so their resolved names differ
+  --> tests/compile_fail/wire_duplicate_wire_names.rs:20:5
+   |
+20 |     y: String,
+   |     ^
+
+error: #[derive(Wire)] requires one wire name per field, but `a_b` and `a__b` both resolve to "aB" — serde would emit that key twice on the wire ({"aB":...,"aB":...}, last one wins on the client) and the schema would carry two fields with the same name; rename one of the two fields, or give it its own #[serde(rename = "...")], so their resolved names differ
+  --> tests/compile_fail/wire_duplicate_wire_names.rs:27:5
+   |
+27 |     a__b: u32,
+   |     ^^^^
+
+error: #[derive(Wire)] requires one wire name per field, but `alpha` and `beta` both resolve to "alpha" — serde would emit that key twice on the wire ({"alpha":...,"alpha":...}, last one wins on the client) and the schema would carry two fields with the same name; rename one of the two fields, or give it its own #[serde(rename = "...")], so their resolved names differ
+  --> tests/compile_fail/wire_duplicate_wire_names.rs:34:5
+   |
+34 |     beta: u32,
+   |     ^^^^

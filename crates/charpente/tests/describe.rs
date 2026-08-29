@@ -2,14 +2,18 @@
 //! docs/superpowers/specs/2026-07-23-introspection-edge-harness-design.md
 //! §1). The fixture app mirrors tests/http.rs's App-building pattern (sim
 //! `Disk`/`Entropy`); one #[table] row with a #[index] field, one plain
-//! #[route], one SSE #[route], one #[job], one .schedule — enough surface to
-//! pin every `Contract` field without pulling in auth/OIDC.
+//! #[route] with a body and a named response (task 5: also a `Vec<T>`-
+//! returning route, to pin the container-response case), one SSE #[route],
+//! one #[job], one #[event] (task 6), one .schedule — enough surface to pin
+//! every `Contract` field without pulling in auth/OIDC.
 
 use std::time::Duration;
 
-use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, Subscription};
+use charpente::describe::ParamInfo;
+use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, EmittedEvent, Subscription};
 use charpente::kernel::JobError;
-use charpente::{Schema, Tx, event, job, jobs, route, routes, table};
+use charpente::wire::{TypeSchema, WireU64};
+use charpente::{Schema, Tx, View, Wire, event, events, job, jobs, route, routes, table};
 use charpente_core::table::Id;
 use charpente_sim::{FaultConfig, Sim};
 
@@ -20,29 +24,107 @@ struct Widget {
     org: u64,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Wire, serde::Serialize, serde::Deserialize)]
 struct CreateWidget {
-    org: u64,
+    org: WireU64,
+}
+
+#[derive(Wire, serde::Serialize)]
+struct WidgetView {
+    id: Id<Widget>,
+    org: WireU64,
 }
 
 #[route(POST "/widgets")]
-fn create_widget(tx: &mut Tx, body: CreateWidget) -> Result<u64, ApiError> {
+fn create_widget(tx: &mut Tx, body: CreateWidget) -> Result<WidgetView, ApiError> {
+    let id = Id::from_raw(body.org.0);
     tx.put(&Widget {
-        id: Id::from_raw(body.org),
-        org: body.org,
+        id,
+        org: body.org.0,
     });
-    Ok(body.org)
+    Ok(WidgetView { id, org: body.org })
 }
 
+/// A `Vec<T>`-returning route (Ruling 24): pins the container-response case
+/// — `response` must come back as `Seq(Box::new(Ref("WidgetView")))`, not
+/// `None`/inlined.
+#[route(GET "/widgets")]
+fn list_widgets(tx: &mut Tx) -> Result<Vec<WidgetView>, ApiError> {
+    Ok(tx
+        .scan::<Widget>()?
+        .into_iter()
+        .map(|w| WidgetView {
+            id: w.id,
+            org: WireU64(w.org),
+        })
+        .collect())
+}
+
+/// Two path params (fix round 1, F10): `param_schema_entries` indexes
+/// `non_ctx[i]` by param position, and no route anywhere else in the
+/// workspace has two — so nothing pinned that params come back in PATH
+/// order (not alphabetical, not declaration order of some other kind) with
+/// distinct schemas attached to the right names. `org: String` and
+/// `id: Id<Widget>` are deliberately different shapes so a mix-up (schemas
+/// swapped between names) would be visible, not just a coincidental match.
+#[route(GET "/orgs/:org/widgets/:id")]
+fn get_org_widget(tx: &mut Tx, org: String, id: Id<Widget>) -> Result<WidgetView, ApiError> {
+    let _ = org;
+    let w = tx.get(id)?.ok_or(ApiError::NotFound)?;
+    Ok(WidgetView {
+        id: w.id,
+        org: WireU64(w.org),
+    })
+}
+
+/// `org: WireU64`, not a bare `u64` (task 6): an `#[event]` payload is
+/// exactly the JSON a subscriber receives, so it is a wire type — the
+/// `Wire` derive `#[event]` emits refuses a bare 64-bit integer here for the
+/// same reason a route body's does.
 #[event]
 struct WidgetAdded {
-    org: u64,
+    org: WireU64,
 }
 
-#[route(SSE "/widgets/feed")]
+/// A second event, with a payload shape unlike `WidgetAdded`'s — the two are
+/// registered in REVERSE name order below, which is what makes
+/// `Contract.events`' sort a real assertion rather than a coincidence.
+#[event]
+struct WidgetRemoved {
+    id: Id<Widget>,
+}
+
+/// A subscribe handler that WRITES — the one shape the drift probe refuses
+/// (task 7 review, Important 4). Deliberately NOT mounted in `fixture_app`:
+/// it would change the pinned golden and it exists only for the guard's own
+/// test, which builds its own app around it. `create_session` on a subscribe
+/// path is the realistic case the guard exists for — minting a credential
+/// for the stream the client is about to open.
+#[route(SSE "/widgets/minting-feed", emits(WidgetAdded))]
+fn minting_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = ctx.create_session(tx, "probe-subject");
+    Ok(Subscription::of::<WidgetAdded>().cursor(cursor))
+}
+
+/// A subscribe handler that REJECTS the probe's synthetic request — the
+/// third of the probe's three error strings (task 7 review, Minor 3). Not
+/// mounted in `fixture_app`, for the same reason `minting_feed` is not.
+#[route(SSE "/widgets/picky-feed", emits(WidgetAdded))]
+fn picky_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx, cursor);
+    Err(ApiError::Unauthorized)
+}
+
+/// Two declared events, not one (task 7): with a single event the drift
+/// oracle below cannot tell "the declaration and the subscription agree"
+/// from "both happen to be one element long", and narrowing the declaration
+/// to prove the oracle red would have nothing to narrow to.
+#[route(SSE "/widgets/feed", emits(WidgetAdded, WidgetRemoved))]
 fn widget_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
-    Ok(Subscription::of::<WidgetAdded>().cursor(cursor))
+    Ok(Subscription::of::<WidgetAdded>()
+        .and::<WidgetRemoved>()
+        .cursor(cursor))
 }
 
 #[job]
@@ -65,8 +147,16 @@ fn fixture_app() -> App {
         AppConfig::default(),
     )
     .unwrap()
-    .mount(routes![create_widget, widget_feed])
+    .mount(routes![
+        create_widget,
+        list_widgets,
+        get_org_widget,
+        widget_feed
+    ])
     .mount_jobs(jobs![Ping])
+    // Reverse name order on purpose: `describe()` sorts events by name, so
+    // registering them sorted would leave that sort unpinned.
+    .mount_events(events![WidgetRemoved, WidgetAdded])
     .schedule("ping-hourly", Duration::from_secs(3600), || Ping { n: 0 })
 }
 
@@ -144,14 +234,191 @@ const GOLDEN: &str = r#"{
       "pattern": "/widgets",
       "name": "create_widget",
       "auth": false,
-      "stream": false
+      "stream": false,
+      "params": [],
+      "request": {
+        "Ref": "CreateWidget"
+      },
+      "response": {
+        "Ref": "WidgetView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
+    },
+    {
+      "method": "GET",
+      "pattern": "/widgets",
+      "name": "list_widgets",
+      "auth": false,
+      "stream": false,
+      "params": [],
+      "request": null,
+      "response": {
+        "Seq": {
+          "Ref": "WidgetView"
+        }
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
+    },
+    {
+      "method": "GET",
+      "pattern": "/orgs/:org/widgets/:id",
+      "name": "get_org_widget",
+      "auth": false,
+      "stream": false,
+      "params": [
+        {
+          "name": "org",
+          "schema": "String"
+        },
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Widget"
+          }
+        }
+      ],
+      "request": null,
+      "response": {
+        "Ref": "WidgetView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "GET",
       "pattern": "/widgets/feed",
       "name": "widget_feed",
       "auth": false,
-      "stream": true
+      "stream": true,
+      "params": [],
+      "request": null,
+      "response": "Null",
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": [
+        {
+          "event": "widget_added",
+          "payload": "WidgetAdded"
+        },
+        {
+          "event": "widget_removed",
+          "payload": "WidgetRemoved"
+        }
+      ]
+    }
+  ],
+  "events": [
+    {
+      "name": "widget_added",
+      "payload": "WidgetAdded",
+      "keyed": false
+    },
+    {
+      "name": "widget_removed",
+      "payload": "WidgetRemoved",
+      "keyed": false
+    }
+  ],
+  "types": [
+    {
+      "name": "ApiError",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "error",
+              "schema": "String",
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "CreateWidget",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "org",
+              "schema": {
+                "Int64": {
+                  "signed": false
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "WidgetAdded",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "org",
+              "schema": {
+                "Int64": {
+                  "signed": false
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "WidgetRemoved",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "id",
+              "schema": {
+                "Id": "Widget"
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "WidgetView",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "id",
+              "schema": {
+                "Id": "Widget"
+              },
+              "optional": false
+            },
+            {
+              "name": "org",
+              "schema": {
+                "Int64": {
+                  "signed": false
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
     }
   ],
   "jobs": [
@@ -211,6 +478,181 @@ fn describe_is_deterministic_across_runs_and_reopens() {
     let a = charpente::describe::to_json(&fixture_app().describe());
     let b = charpente::describe::to_json(&fixture_app().describe());
     assert_eq!(a, b, "two fresh constructions must render byte-identical");
+}
+
+/// Fix round 1, F9: `to_human`'s new route line (`describe.rs:288-293`) had
+/// zero test coverage — "the human golden is pinned too" (the original
+/// brief's claim, deciding the `to_human` question) was false, and neither
+/// the implementer nor the controller checked. A `contains` on one known
+/// route's exact line is enough to catch a field being dropped, reordered,
+/// or renamed, without pinning the WHOLE human dump byte-for-byte the way
+/// `contract_json_shape_is_pinned` pins the JSON.
+#[test]
+fn to_human_pins_a_known_routes_type_line() {
+    let out = charpente::describe::to_human(&fixture_app().describe());
+    assert!(
+        out.contains(
+            "  POST /widgets name=create_widget auth=false stream=false\n    \
+             params=[] request=Some(Ref(\"CreateWidget\")) response=Ref(\"WidgetView\") \
+             error=Ref(\"ApiError\") emits=[]\n"
+        ),
+        "{out}"
+    );
+}
+
+/// Task 5, Ruling 24's shape: a route with a body names its request type,
+/// and both response and error are `Ref`s into `Contract.types` (not bare
+/// names — `Vec<T>`'s `WIRE_NAME` is `""`, so a name-only field can't
+/// describe a container response; see the next test).
+///
+/// **This is the test that actually pins Ruling 24** (fix round 1, F5): the
+/// `assert_eq!(r.response, TypeSchema::Ref("WidgetView"))` below is a
+/// SCALAR response, where `reference()` and `schema()` diverge —
+/// `reference()` returns `Ref("WidgetView")`, `schema()` would inline the
+/// whole struct. Swap `reference()` for `schema()` at the response position
+/// in `crates/charpente-macros/src/route.rs` and this assertion (and
+/// `contract_json_shape_is_pinned`) reddens. The next test's container case
+/// CANNOT discriminate the two (see its own doc comment) — that discovery
+/// is F5, measured against the exact mutation the original brief asked for.
+#[test]
+fn a_route_carries_its_request_and_response_types() {
+    let app = fixture_app();
+    let c = app.describe();
+    let r = c.routes.iter().find(|r| r.name == "create_widget").unwrap();
+    assert_eq!(
+        r.request,
+        Some(TypeSchema::Ref("CreateWidget")),
+        "a route with a body must name its request type"
+    );
+    assert_eq!(r.response, TypeSchema::Ref("WidgetView"));
+    assert_eq!(r.error, TypeSchema::Ref("ApiError"));
+}
+
+/// A `Vec<T>`-returning route's response must come back as `Seq(Ref(..))`,
+/// not `None`/inlined — a name-only field (the plan's original
+/// `response_name: &'static str`) cannot express this at all, because
+/// `Vec<T>`'s own `WIRE_NAME` is `""`.
+///
+/// **This does NOT discriminate `reference()` from `schema()`** (fix round
+/// 1, F5, measured): `Vec<T>::WIRE_NAME` is `""`, so `Vec<T>::reference()`
+/// falls through to `Vec<T>::schema()` — they are the same function for
+/// every container, so swapping `reference()` for `schema()` at the
+/// response position leaves this test GREEN. The scalar assertion in
+/// `a_route_carries_its_request_and_response_types` (above) is the test
+/// that carries Ruling 24. What this test DOES catch: changing
+/// `Vec<T>::schema()` to inline `T::schema()` instead of `T::reference()`
+/// reddens it — but that property is already pinned by
+/// `crates/charpente/tests/wire.rs`'s
+/// `fidelity_nested_and_vec_wrapped_named_types_match_serde`. Kept anyway
+/// as a direct pin on the container-response shape at the `RouteInfo`
+/// level, which that fidelity test does not touch.
+#[test]
+fn a_container_response_keeps_its_element_reference() {
+    let app = fixture_app();
+    let c = app.describe();
+    let r = c.routes.iter().find(|r| r.name == "list_widgets").unwrap();
+    assert_eq!(r.request, None, "a GET route with no body has no request");
+    assert_eq!(
+        r.response,
+        TypeSchema::Seq(Box::new(TypeSchema::Ref("WidgetView")))
+    );
+    assert_eq!(r.error, TypeSchema::Ref("ApiError"));
+}
+
+/// Fix round 1, F10: `param_schema_entries` (`crates/charpente-macros/src/route.rs`)
+/// indexes `non_ctx[i]` by param position, and before this test no route
+/// anywhere in the workspace had two path params — so nothing pinned that
+/// `Route.params` comes back in PATH order (not alphabetical, e.g.) with
+/// each schema attached to the right name. `get_org_widget`'s two params
+/// have deliberately different schemas (`String` vs `Id("Widget")`) so a
+/// mix-up (schemas swapped between the two names) would show up here, not
+/// just a coincidental match.
+#[test]
+fn two_path_params_come_back_in_path_order_with_distinct_schemas() {
+    let app = fixture_app();
+    let c = app.describe();
+    let r = c
+        .routes
+        .iter()
+        .find(|r| r.name == "get_org_widget")
+        .unwrap();
+    assert_eq!(
+        r.params,
+        vec![
+            ParamInfo {
+                name: "org",
+                schema: TypeSchema::String,
+            },
+            ParamInfo {
+                name: "id",
+                schema: TypeSchema::Id("Widget"),
+            },
+        ],
+        "params must come back in the path's own order (:org before :id in \
+         \"/orgs/:org/widgets/:id\"), each with its own distinct schema"
+    );
+}
+
+/// `WidgetView`/`CreateWidget` reach the registry via `register_types`
+/// (direct: `create_widget`'s request and response) and `list_widgets`'s
+/// `register_types` reaches `WidgetView` by calling `Vec<WidgetView>::register`,
+/// which forwards into `WidgetView::register` (`Vec<T>`'s own `WIRE_NAME` is
+/// `""`, so it contributes no entry of its own) — the container wrapper
+/// does not stop the walk.
+///
+/// **`OidcReject` must NOT appear here** (fix round 1, F1): before the fix,
+/// `ApiError` derived `Wire` and its `Oidc(OidcReject)` variant put a
+/// `Ref("OidcReject")` in `ApiError::schema()`, so `ApiError::register()`
+/// recursed into it — even though no route names `OidcReject` directly, and
+/// even though the wire never actually carries that shape (see `ApiError`'s
+/// doc comment in `http/mod.rs`). `ApiError`'s hand-written schema now
+/// describes the `{"error": "<message>"}` envelope instead, which has no
+/// `Ref` to anything, so `register()` never reaches `OidcReject` and it
+/// correctly falls out of `Contract.types` entirely.
+#[test]
+fn the_contract_carries_the_transitive_type_closure() {
+    let app = fixture_app();
+    let c = app.describe();
+    let names: Vec<&str> = c.types.iter().map(|t| t.name).collect();
+    assert!(names.contains(&"WidgetView"), "types: {names:?}");
+    assert!(
+        names.contains(&"ApiError"),
+        "the error type must be described too: {names:?}"
+    );
+    assert!(
+        !names.contains(&"OidcReject"),
+        "ApiError's hand-written schema describes the envelope, which names \
+         no other type — OidcReject must not reach Contract.types: {names:?}"
+    );
+}
+
+/// A negative oracle (Global Constraints): `assert_eq!(names, sorted)` is
+/// green when `types` is empty, so this owes a floor (non-empty, contains
+/// named entries reached via the closure, not just a route's own direct
+/// response/error) as well as the sortedness check itself.
+///
+/// `into_sorted` is a `BTreeMap` walk, so sortedness holds by construction —
+/// no mutation inside `wire.rs`/`describe.rs` can redden the sortedness half
+/// without also breaking the dozens of other tests that read `TypeRegistry`
+/// output. The floor is what carries this test's teeth: swap
+/// `reg.into_sorted()` for `Vec::new()` in `describe()` (`describe.rs`) and
+/// this test catches it (empty types) where a bare sortedness check would
+/// stay green (an empty list is trivially sorted).
+#[test]
+fn the_type_list_is_sorted_so_generation_is_deterministic() {
+    let app = fixture_app();
+    let c = app.describe();
+    let names: Vec<&str> = c.types.iter().map(|t| t.name).collect();
+    assert!(
+        names.len() >= 3,
+        "the floor: at least the three types this fixture's routes reach \
+         (WidgetView, CreateWidget, ApiError — OidcReject is deliberately \
+         NOT among them since fix round 1's F1, see the previous test) — \
+         got {names:?}"
+    );
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "Contract.types must be sorted (spec §4)");
 }
 
 #[test]
@@ -274,5 +716,364 @@ fn builtin_flags_mark_exactly_the_platform_tables_jobs_and_cron() {
     assert!(
         !ping_cron.builtin,
         "the fixture's own cron schedule must not be builtin"
+    );
+}
+
+/// Task 6, Step 1: the contract enumerates every registered `#[event]` with
+/// its payload type, and that payload joins the same type closure a route's
+/// types do — a TS client cannot type a subscription without both halves.
+#[test]
+fn the_contract_enumerates_events_with_their_payload_types() {
+    let app = fixture_app();
+    let c = app.describe();
+    let e = c.events.iter().find(|e| e.name == "widget_added").unwrap();
+    assert_eq!(e.payload, "WidgetAdded");
+    assert!(
+        c.types.iter().any(|t| t.name == "WidgetAdded"),
+        "an event payload must be in the type closure too: {:?}",
+        c.types.iter().map(|t| t.name).collect::<Vec<_>>()
+    );
+}
+
+/// The events list is sorted by event name, NOT registration order — the
+/// fixture registers `events![WidgetRemoved, WidgetAdded]`, so registration
+/// order is the exact reverse of what this asserts. Delete
+/// `v.sort_unstable_by_key(...)` in `describe()` and this reddens (as does
+/// `contract_json_shape_is_pinned`); an `assert!(is_sorted)` on a
+/// one-event fixture would not.
+///
+/// `keyed` is pinned false here too, for both events: `emit` vs
+/// `emit_keyed` is a call-site choice, so nothing static can know it and
+/// the contract must not pretend otherwise.
+#[test]
+fn events_render_in_name_order_and_report_keyed_false() {
+    let c = fixture_app().describe();
+    let rendered: Vec<(&str, &str, bool)> = c
+        .events
+        .iter()
+        .map(|e| (e.name, e.payload, e.keyed))
+        .collect();
+    assert_eq!(
+        rendered,
+        vec![
+            ("widget_added", "WidgetAdded", false),
+            ("widget_removed", "WidgetRemoved", false),
+        ]
+    );
+}
+
+/// `to_human`'s events section, pinned the same way its route line is (task
+/// 5, fix round 1's F9: a new `to_human` section with no test is a section
+/// whose fields can be dropped, reordered or renamed silently).
+#[test]
+fn to_human_pins_the_events_section() {
+    let out = charpente::describe::to_human(&fixture_app().describe());
+    assert!(
+        out.contains(
+            "events:\n  widget_added payload=WidgetAdded keyed=false\n  \
+             widget_removed payload=WidgetRemoved keyed=false\n"
+        ),
+        "{out}"
+    );
+}
+
+/// The negative-space assert beside the duplicate check (hard rule 4): an
+/// `EventInfo` whose payload names nothing in `Contract.types` is a contract
+/// a client cannot resolve. `#[event]` can't produce one — its `Wire` derive
+/// always names the struct — so the only way to reach it is a hand-written
+/// `EventEntry`, which is exactly what this builds.
+///
+/// The WHOLE message is pinned, remedy included (review round 1, finding 3):
+/// hard rule 5 makes the fix half of a diagnostic product surface, and pinning
+/// only the first clause lets "make the payload a #[derive(Wire)] type" rot
+/// into something that no longer says what to do.
+#[test]
+#[should_panic(
+    expected = "event \"anonymous\" registers an empty payload name — every \
+                           Contract.events entry must name a type in Contract.types, and \
+                           \"\" is `Wire`'s \"anonymous/inline\" marker; make the payload a \
+                           #[derive(Wire)] type and pass its WIRE_NAME"
+)]
+fn mounting_an_event_whose_payload_names_no_type_panics() {
+    struct HandWritten;
+    impl charpente::describe::EventEntry for HandWritten {
+        fn def() -> charpente::describe::EventDef {
+            charpente::describe::EventDef {
+                name: "anonymous",
+                payload: "",
+                register_types: |_| {},
+            }
+        }
+    }
+    let _ = fixture_app().mount_events(events![HandWritten]);
+}
+
+/// Mount-time duplicate rejection, with its exact text (hard rule 5) —
+/// mirrors `mount_jobs`' own panic, and is why registering the same event
+/// twice can't quietly produce two `Contract.events` entries with one name.
+#[test]
+#[should_panic(
+    expected = "event \"widget_added\" registered twice — each #[event] type is \
+                           mounted once"
+)]
+fn mounting_one_event_twice_panics_at_mount_time() {
+    let _ = fixture_app().mount_events(events![WidgetAdded]);
+}
+
+/// Task 7, Step 1: a stream route names the events it carries, so a generated
+/// client can give `subscribe()` a discriminated union of exactly those
+/// payloads instead of "subscribe to anything" (`RouteInfo.stream` alone).
+///
+/// The names come from `<Ev as Event>::NAME` (amendment B1), not from a
+/// snake_case rule recomputed in `route.rs` — which is why `WidgetAdded`
+/// renders as `widget_added` here without `#[route]` knowing that rule at
+/// all. `emits` is empty on the three non-stream routes; the pinned golden
+/// (`contract_json_shape_is_pinned`) carries that half.
+#[test]
+fn a_stream_route_declares_the_events_it_carries() {
+    let app = fixture_app();
+    let c = app.describe();
+    let feed = c.routes.iter().find(|r| r.name == "widget_feed").unwrap();
+    assert!(feed.stream);
+    // Ruling 46: each element carries BOTH names, so this pins the pairing
+    // itself — a payload name silently copied from the event name (or the
+    // reverse) fails here, which is the whole reason the pair exists.
+    assert_eq!(
+        feed.emits,
+        vec![
+            EmittedEvent {
+                event: "widget_added",
+                payload: "WidgetAdded",
+            },
+            EmittedEvent {
+                event: "widget_removed",
+                payload: "WidgetRemoved",
+            },
+        ]
+    );
+    let plain: Vec<&str> = c
+        .routes
+        .iter()
+        .filter(|r| !r.stream)
+        .map(|r| r.name)
+        .collect();
+    // The floor (task 7 review, Minor 4): the loop below asserts a negative,
+    // so an empty `plain` would pass it without checking anything.
+    assert_eq!(
+        plain,
+        vec!["create_widget", "list_widgets", "get_org_widget"],
+        "the fixture's three non-stream routes, in registration order"
+    );
+    for r in c.routes.iter().filter(|r| !r.stream) {
+        assert!(
+            r.emits.is_empty(),
+            "a non-stream route carries no emits: {} -> {:?}",
+            r.name,
+            r.emits
+        );
+    }
+}
+
+/// The drift oracle (spec §2/§5): the `emits(...)` declaration and the
+/// handler's own `Subscription` must agree, or a client is generated for
+/// events the route never sends. `App::subscription_event_names` gets the
+/// second half by actually running the route's subscribe glue.
+///
+/// Order-sensitive on purpose. Declaration order is the contract's order —
+/// it is what the emitter's union order will be — so `emits(B, A)` against
+/// `of::<A>().and::<B>()` is a mismatch worth naming, not a set-equality
+/// pass. The failure prints both lists, so the diagnosis is one read.
+///
+/// Undeclared stream routes are skipped rather than failed: `emits(...)` is
+/// optional syntax, and `[]` means "not declared", not "declares nothing".
+/// That makes the loop vacuously green for an app that declares none, so it
+/// owes the floor below — proven by narrowing `widget_feed`'s declaration to
+/// one event and watching this redden (task-7 report, Step 5).
+#[test]
+fn a_declared_emits_set_matches_the_handlers_subscription() {
+    let mut app = fixture_app();
+    // Ruling 46 widened `emits`'s element to a two-field struct, so the
+    // oracle projects the `event` half — the ONLY half a `Subscription`
+    // knows, since `Subscription::of::<Ev>()` records `Event::NAME`. The
+    // payload half is pinned by `a_stream_route_declares_the_events_it_carries`
+    // and by the JSON golden; comparing it here would compare a name against
+    // a list that never contained it.
+    let declared: Vec<(&'static str, Vec<&'static str>)> = app
+        .describe()
+        .routes
+        .iter()
+        .filter(|r| r.stream && !r.emits.is_empty())
+        .map(|r| (r.name, r.emits.iter().map(|e| e.event).collect()))
+        .collect();
+    assert_eq!(
+        declared.len(),
+        1,
+        "the floor: this fixture has exactly one stream route with a declared \
+         emits(...), so an empty loop below would be a vacuous pass — got {declared:?}"
+    );
+    for (name, emits) in declared {
+        let actual = app
+            .subscription_event_names(name)
+            .expect("a stream route must expose its subscription's event names");
+        assert_eq!(
+            emits, actual,
+            "route `{name}` declares emits{emits:?} but its Subscription names {actual:?}"
+        );
+    }
+}
+
+/// `to_human`'s stream-route line, pinned the same way its plain-route line
+/// and its events section are (task 5's F9): `emits` is the one field on that
+/// line a stream route actually fills, and nothing pinned its rendering.
+#[test]
+fn to_human_pins_a_stream_routes_emits() {
+    let out = charpente::describe::to_human(&fixture_app().describe());
+    assert!(
+        out.contains(
+            "  GET /widgets/feed name=widget_feed auth=false stream=true\n    \
+             params=[] request=None response=Null error=Ref(\"ApiError\") \
+             emits=[widget_added->WidgetAdded, widget_removed->WidgetRemoved]\n"
+        ),
+        "{out}"
+    );
+}
+
+/// A declared payload joins the ROUTE's own type closure — the stream
+/// route's `register_types` walks `emits(...)` too, not just params/request/
+/// response/error — so a client can resolve the union even for an app that
+/// never calls `mount_events`.
+///
+/// Deliberately NOT `fixture_app()` (pin the behaviour, not the function):
+/// that app mounts both events, and `describe()` registers every mounted
+/// event's payload, so asserting the two names there would stay green with
+/// `#(#emit_registers)*` deleted from `expand_sse`. This app mounts none, so
+/// the route's own registration is the only path either name can take.
+///
+/// It is also the live proof that double registration is safe in the fixture
+/// app, where BOTH paths run: `TypeRegistry::insert_as` returns quietly for
+/// an identical schema under a name already present, and would panic on a
+/// genuine collision — `contract_json_shape_is_pinned` reaching its
+/// assertion at all is that half.
+#[test]
+fn a_declared_emits_payload_reaches_the_closure_without_mount_events() {
+    let sim = Sim::with_faults(0x2EC2_0007, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![widget_feed]);
+    let c = app.describe();
+    assert!(
+        c.events.is_empty(),
+        "this app registers no events on purpose: {:?}",
+        c.events.iter().map(|e| e.name).collect::<Vec<_>>()
+    );
+    let names: Vec<&str> = c.types.iter().map(|t| t.name).collect();
+    assert!(names.contains(&"WidgetAdded"), "types: {names:?}");
+    assert!(names.contains(&"WidgetRemoved"), "types: {names:?}");
+}
+
+/// Two of the probe's three "you cannot probe that" branches, pinned by
+/// their exact text (hard rule 5; task 7 review, Minor 3). The third — a
+/// handler that rejects the synthetic request — needs an unmounted route, so
+/// it has its own test below. `subscription_event_names` is `pub`, and
+/// `docs/GUIDE.md` §11 tells app authors to call it, so these are product
+/// surface — and before this test no branch was executed by anything at all.
+#[test]
+fn the_drift_probe_names_a_route_it_cannot_read() {
+    let mut app = fixture_app();
+    assert_eq!(
+        app.subscription_event_names("nope"),
+        Err("no route named `nope` is mounted".to_string())
+    );
+    assert_eq!(
+        app.subscription_event_names("create_widget"),
+        Err(
+            "route `create_widget` is not a stream route — only `#[route(SSE …)]` \
+             returns a Subscription to read event names from"
+                .to_string()
+        )
+    );
+}
+
+/// The probe's third branch (task 7 review, Minor 3): a subscribe handler
+/// that refuses the credential-free, `"0"`-for-every-param request the probe
+/// synthesizes comes back as an `Err` naming the route and quoting what the
+/// handler returned — never as a silently empty name list, which a drift
+/// test would read as "this route declares nothing".
+///
+/// The quoted value is `App(Unauthorized)`, not `Unauthorized`: the probe
+/// formats `Group::stage`'s error, which wraps a handler's `ApiError` in
+/// `App(..)`. Pinned as it actually reads, so a reword of that wrapper is a
+/// visible change rather than a silent one.
+#[test]
+fn the_drift_probe_names_a_handler_that_rejected_it() {
+    let sim = Sim::with_faults(0x2EC2_0009, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![picky_feed]);
+
+    assert_eq!(
+        app.subscription_event_names("picky_feed"),
+        Err(
+            "route `picky_feed`'s subscribe handler returned App(Unauthorized) under the \
+             emits(...) drift probe, so what it subscribes to cannot be read — a handler \
+             that rejects a credential-free request with `\"0\"` for every :param is not \
+             probeable"
+                .to_string()
+        )
+    );
+}
+
+/// The write guard (task 7 review, Important 4): a subscribe handler that
+/// stages is refused with a named error rather than having its write
+/// committed silently into the app under test.
+///
+/// The second half is what keeps this from being a string test. The guard's
+/// message asserts the write "has just committed into this app" — because
+/// `Group`'s `Drop` panics on a non-empty uncommitted group, refusing cannot
+/// mean skipping the commit. So the test reads the `Session` row back: it is
+/// there, exactly one, and that is the fact the message exists to disclose.
+/// Delete the `if wrote` guard and the first assertion reddens; make the
+/// guard skip the commit instead and the group's `Drop` panics.
+#[test]
+fn the_drift_probe_refuses_a_subscribe_handler_that_writes() {
+    let sim = Sim::with_faults(0x2EC2_0008, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![minting_feed]);
+
+    assert_eq!(
+        app.subscription_event_names("minting_feed"),
+        Err(
+            "route `minting_feed`'s subscribe handler staged a write, which the \
+             emits(...) drift probe has just committed into this app — a probe is not \
+             a request, so nothing here asked for that row; move the write out of the \
+             subscribe path, or leave this route out of the drift test"
+                .to_string()
+        )
+    );
+
+    let sessions = app
+        .db_for_tests()
+        .transact(|tx| Ok::<_, ApiError>(tx.scan::<charpente::http::Session>()?.len()))
+        .unwrap();
+    assert_eq!(
+        sessions, 1,
+        "the guard reports a committed write, so the row must really be there — \
+         refusing cannot mean skipping the commit"
     );
 }

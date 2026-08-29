@@ -513,13 +513,35 @@ platform is one dependency, not two.
 - **Jobs.** `#[job]` structs with typed payloads and typed retry policy. Enqueue sites and
   handler signatures are checked against each other.
 - **Events.** `#[event]` structs; `tx.emit(...)` is typed; subscribers (server-side and
-  client-side codegen) consume typed streams off the log.
+  client-side codegen) consume typed streams off the log. An event payload is itself a
+  wire type (it is exactly the JSON a subscriber receives), so `#[event]` derives `Wire`
+  — and `events![…]`/`App::mount_events` register the type for `describe` only.
+  Delivery deliberately has NO registry: `Subscription::of::<Ev>()` captures its encoder
+  statically at the subscribe site, which is what makes "unregistered event at delivery"
+  inexpressible rather than an error case.
 - **Wire.** `Wire` is the trait describing what a type looks like once serde has
   encoded it — the mechanism behind the client-side codegen named above and behind
-  `Id<T>`'s promise to never be a bare u64. `TypeSchema`/`TypeDef` are the IR a
-  generated client is emitted from. 64-bit integers are deliberately not wire
-  primitives: a JSON number loses precision above 2^53 in JavaScript, so they cross
-  the wire string-encoded.
+  `Id<T>`'s promise to never be a bare u64. `#[derive(Wire)]` implements it for a
+  struct by reading serde's own `rename`, `rename_all`, `skip`, `skip_serializing`,
+  and `skip_serializing_if`; any other `#[serde(...)]` attribute is a compile error
+  rather than a silent pass-through, and that supported set is pinned by tests
+  comparing the derived schema against real `serde_json` output. The one deliberate
+  exception is `#[serde(crate = "...")]`, accepted and ignored on both structs and
+  enums: it redirects serde_derive's own generated paths (`#[event]` emits it so app
+  crates stay single-dep) and changes no field, name or wire shape, so there is nothing
+  for the schema to get wrong — the `.stderr` pins list it as supported alongside
+  `rename_all`. For an enum it
+  describes whichever of serde's *tagged* representations the type actually uses
+  — a unit-only enum as a string union, otherwise external (default), internal
+  (`tag`), or adjacent (`tag` + `content`); `untagged` is refused outright, since
+  an untagged value carries no discriminator for the schema to key on. It refuses
+  at compile time any variant shape a representation still can't faithfully carry
+  (e.g. a newtype variant under internal tagging, which serde either refuses to
+  serialize at all or merges into the tag object in a way no per-variant schema
+  slot can reconstruct).
+  `TypeSchema`/`TypeDef` are the IR a generated client is emitted from. 64-bit
+  integers are deliberately not wire primitives: a JSON number loses precision
+  above 2^53 in JavaScript, so they cross the wire string-encoded.
 - **Config.** A typed struct, validated at startup, no stringly `env::var` in app code.
 - **Telemetry.** Counters, histograms, and log fields are declared as types with
   change-time checks: deleting a metric a dashboard depends on, or renaming a label, is a
@@ -1040,7 +1062,23 @@ slot.
   platform's). The platform extracts the client's cursor before the handler runs:
   `Last-Event-ID` header wins (browser-native SSE resume), else a `cursor` query
   parameter, else `None` ("from now" — only future events); an unparseable cursor is a 400
-  and the handler never runs.
+  and the handler never runs. The route may also DECLARE the event types its stream
+  carries — `#[route(SSE "/path", emits(InvoicePaid, InvoiceVoided))]` — which is what
+  lets a generated client type `subscribe()` as a discriminated union of exactly those
+  payloads instead of "anything". The declaration names Rust types, and the contract
+  records BOTH names each type has — `<Ev as Event>::NAME` (snake_case, what an SSE
+  frame's `event:` field carries) and `<Ev as Wire>::WIRE_NAME` (the payload type's key
+  into `Contract.types`, and the member a generated union writes) — so each name has one
+  source rather than a copy of `#[event]`'s snake_case rule. Both are carried instead of
+  one being derived from the other because that derivation does not exist: `#[event]`'s
+  acronym rule maps `HTTPServer` to `http_server`, and nothing inverts it. The
+  declaration is optional (an undeclared stream
+  route simply carries an empty `emits`) and it is not a filter: nothing enforces it at
+  delivery, because delivery is still the encoder each `Subscription::of::<Ev>()`
+  captured. What holds the two together is an ORACLE, not a rule — a declaration nothing
+  verifies is decorative — `App::subscription_event_names` runs a stream route's
+  subscribe glue and reports the names its `Subscription` actually holds, and a test
+  compares the two sets (TS-codegen spec §5).
 - **Kernel delivery is one path, no modes.** A validated subscribe registers a `Tail`
   (`{ subscription, sink, next_id }`) on the fifth ready source (§1) — eligible the instant
   a commit advances `next_event_id` past it, never a timer. One unit of work reads up to
@@ -1079,14 +1117,39 @@ Charpente treats the coding agent as the primary developer persona:
   walk of a mounted app's own registries — no disk writes beyond an ephemeral run's own
   temp store, no socket, no kernel loop. It returns a `Contract`: tables (name, version,
   structural fingerprint, indexes, migration chain), routes (method, pattern, name,
-  whether it requires auth, whether it's an SSE stream), jobs (name, retry policy), cron
+  whether it requires auth, whether it's an SSE stream, **plus, since the TS-client-codegen
+  work: `params` — each path param's name and wire schema (`ParamInfo { name,
+  schema: TypeSchema }`); `request` — the JSON body's schema, `None` for a bodyless route;
+  `response` and `error` — the success and `ApiError` schemas every handler's `Result<T,
+  ApiError>` carries; and `emits` — the events a stream route declares via
+  `#[route(SSE …, emits(Ev, …))]`, each an `EmittedEvent { event, payload }` holding the
+  SSE frame's name and the payload type's name, empty on every non-stream route and on a
+  stream route that has not adopted the declaration**), **`events` — every `#[event]` type
+  registered with `mount_events(events![…])` as `EventInfo { name, payload, keyed }`,
+  sorted by event name (`keyed` is always `false`: `emit` vs `emit_keyed` is a call-site
+  choice, so nothing static can know it)**, jobs (name, retry policy), cron
   (name, interval), and config, each serialized in registry order (routes/jobs/cron) or
-  sorted-name order (tables — `Db::describe_tables`'s `BTreeMap` walk); field order is
-  part of the pinned shape. A `builtin: bool` on each table/job/cron entry marks the
-  platform's own surface (`Session`, `ApiKey`, the internal job/event/schema-version
-  tables, the session-sweep job and its cron entry) apart from the app's, keyed on each
-  row's own `TABLE`/`NAME` const rather than a typed-in string list. `to_json`/`to_human`
-  render it as pretty JSON or fixed-width text. Two entry points ship it:
+  sorted-name order (tables — `Db::describe_tables`'s `BTreeMap` walk; events — by name);
+  field order is
+  part of the pinned shape. `Contract` also carries **`types: Vec<TypeDef>`** — the
+  transitive closure of every NAMED wire type a route's params/request/response/error
+  or a registered event's payload references, plus every event type a stream route
+  declares with `emits(...)` — that last one registered by the ROUTE, so a declared
+  payload is in the closure even when the event is never mounted. It is a
+  `TypeRegistry` walk, `BTreeMap`-sorted by wire name so generation stays
+  deterministic (spec §4); an anonymous type (a primitive, `Vec<T>`, `Option<T>`)
+  contributes no entry of its own, only whatever named type it wraps. `ApiError` is
+  always one such entry, and its schema describes the fixed `{"error": "<message>"}`
+  envelope `Response::error` actually emits on the wire — not `ApiError`'s own Rust
+  variant shape, which no client ever receives (a hand-written `Wire` impl, not the
+  derive `#[table]`/`#[route]` types otherwise get). A `builtin: bool` on each table/job/cron
+  entry marks the platform's own surface (`Session`, `ApiKey`, the internal
+  job/event/schema-version tables, the session-sweep job and its cron entry) apart from
+  the app's, keyed on each row's own `TABLE`/`NAME` const rather than a typed-in string
+  list. `to_json`/`to_human` render it as pretty JSON or fixed-width text (`to_human`'s
+  route line renders `params`/`request`/`response`/`error` too, via `Debug`, and `emits`
+  as `event->payload` pairs, and it has an `events:` section of its own).
+  Two entry points ship it:
   `charpente::launch(addr, data_dir, build)` is the standard app `fn main` — argv
   dispatch owned by the platform instead of hand-rolled per app, so `describe` is free
   the moment an app adopts it (no verb still serves, as a hand-rolled `main` would;
@@ -1098,11 +1161,24 @@ Charpente treats the coding agent as the primary developer persona:
   failing build) are forwarded verbatim rather than wrapped. Both paths build the app
   against a fresh, throwaway temp directory that is created and removed around the run —
   never the app's configured `data_dir` — so a describe is always safe to run next to a
-  live server's real data. Event *types* are deliberately not enumerated here in v0:
-  `tx.emit`/`tx.emit_keyed` names are compiled into each `#[route(SSE …)]` handler's
-  `Subscription` at the call site, not registered anywhere an app-wide registry walk
-  could discover ahead of time (ruling 6, sub-project 6 spec) — the contract reports only
-  whether a route streams (`stream: true`), not what it emits.
+  live server's real data. Event *types* ARE enumerated, but only through the
+  describe-time registry `events![…]`/`mount_events` fills — never by walking
+  emit sites, which is impossible for the same reason it always was: `tx.emit` and
+  `Subscription::of::<Ev>()` run inside handler bodies, not anywhere an app-wide walk can
+  observe (ruling 6, sub-project 6 spec). The BINDING between a stream route and the
+  events it carries is therefore DECLARED rather than discovered: `emits(Ev, …)` on the
+  route fills `RouteInfo.emits: Vec<EmittedEvent>`, each element pairing the
+  `Event::NAME` an SSE frame carries with the `Wire::WIRE_NAME` of its payload. The pair
+  exists because the two consumers need different names and neither is computable from
+  the other — `#[event]`'s acronym rule maps `HTTPServer` to `http_server`, so
+  snake_case -> PascalCase is not a function — and both are read off the type at
+  expansion time, where both are in hand. The drift between that declaration and the
+  handler's own `Subscription` is caught by an oracle
+  (`App::subscription_event_names`, §6) comparing the `event` half, which is the only
+  half a `Subscription` holds; the `payload` half is pinned by the contract goldens. It
+  is an oracle, not a rule the platform could enforce at delivery. An undeclared stream
+  route still reports `stream: true` with an empty `emits` — reading its handler is how
+  you find out which of the app's events it delivers.
 - **Errors are prompts.** Compile-time and sim-failure output is structured for machine
   consumption: the exact contract violated, the file/line, the seed and fault schedule for
   sim failures, and the minimal repro command. Error quality is a feature with a test suite.
@@ -1280,7 +1356,11 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
 2. **Read concurrency model** — snapshot reads on worker threads vs. everything through the
    core loop; measure before choosing.
 3. **Query combinator surface** — how far toward relational before it stops paying for its
-   type complexity.
+   type complexity. The one concrete instance so far: `#[index]` is exact-match only, so a
+   range or comparison query falls back to `scan` filtered in Rust — the overdue sweep in
+   `examples/invoicing/src/jobs.rs`, documented as the idiom under GUIDE's "`#[index]` works
+   on any `Codec` field" heading. That is the evidence DECISIONS §4's trigger asks for, and
+   one instance across one small app is not enough to read it either way.
 4. **Client codegen** — TS client from route/event types is obvious; when.
 5. **Compile latency mitigation** — platform as prebuilt dylib so app iteration recompiles
    app code only; quantify the win early, it is the adoption risk (see PLAN §Risks).

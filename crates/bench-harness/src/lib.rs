@@ -9,6 +9,7 @@
 use charpente::core::io::{Disk, Entropy};
 use charpente::http::{ApiError, App, AppConfig};
 use charpente::kernel::JobError;
+use charpente::wire::WireU64;
 use charpente::{Id, Schema, Tx, View};
 use charpente::{event, job, jobs, route, routes, table};
 
@@ -36,9 +37,12 @@ pub struct Slot {
     pub hits: u64,
 }
 
+/// `slot: WireU64`, unlike `Bump.slot` below: an `#[event]` payload crosses
+/// the wire (it IS the SSE frame body), so a bare 64-bit integer is a
+/// compile error in it; a `#[job]` payload never leaves the process.
 #[event]
 pub struct SlotBumped {
-    pub slot: u64,
+    pub slot: WireU64,
 }
 
 #[job]
@@ -56,20 +60,22 @@ impl Bump {
 
 /// The canonical write transaction, README-shaped: get + put + enqueue + emit.
 #[route(POST "/hit/:id")]
-pub fn hit(tx: &mut Tx, id: u64) -> Result<u64, ApiError> {
-    let slot_id = Id::<Slot>::from_raw(id % SLOTS);
+pub fn hit(tx: &mut Tx, id: Id<Slot>) -> Result<WireU64, ApiError> {
+    let raw = id.raw() % SLOTS;
+    let slot_id = Id::<Slot>::from_raw(raw);
     let hits = tx.get(slot_id)?.map_or(0, |s| s.hits) + 1;
     tx.put(&Slot { id: slot_id, hits });
-    tx.enqueue(Bump { slot: id % SLOTS });
-    tx.emit(SlotBumped { slot: id % SLOTS });
-    Ok(hits)
+    tx.enqueue(Bump { slot: raw });
+    tx.emit(SlotBumped { slot: WireU64(raw) });
+    Ok(WireU64(hits))
 }
 
 #[route(GET "/slot/:id")]
-pub fn read_slot(tx: &mut Tx, id: u64) -> Result<u64, ApiError> {
-    Ok(tx
-        .get(Id::<Slot>::from_raw(id % SLOTS))?
-        .map_or(0, |s| s.hits))
+pub fn read_slot(tx: &mut Tx, id: Id<Slot>) -> Result<WireU64, ApiError> {
+    Ok(WireU64(
+        tx.get(Id::<Slot>::from_raw(id.raw() % SLOTS))?
+            .map_or(0, |s| s.hits),
+    ))
 }
 
 /// The server-reported durable-sync count `wire_accounting`'s module doc has
@@ -100,14 +106,14 @@ pub static SYNC_COUNTER: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::A
     std::sync::OnceLock::new();
 
 #[route(GET "/__syncs")]
-pub fn syncs(tx: &mut Tx) -> Result<u64, ApiError> {
+pub fn syncs(tx: &mut Tx) -> Result<WireU64, ApiError> {
     // `#[route]` requires the first parameter to be named exactly `tx` — an
     // `_tx` is a compile error naming the contract, the site and the fix. This
     // handler reads no state, so the binding is discarded rather than renamed.
     let _ = tx;
-    Ok(SYNC_COUNTER
-        .get()
-        .map_or(0, |c| c.load(std::sync::atomic::Ordering::SeqCst)))
+    Ok(WireU64(SYNC_COUNTER.get().map_or(0, |c| {
+        c.load(std::sync::atomic::Ordering::SeqCst)
+    })))
 }
 
 /// The invoicing idiom (examples/invoicing/src/lib.rs:19): one free function

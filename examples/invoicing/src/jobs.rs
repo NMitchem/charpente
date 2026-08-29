@@ -7,6 +7,7 @@ use crate::model::{
     next_id,
 };
 use charpente::kernel::JobError;
+use charpente::wire::WireI64;
 use charpente::{Id, Tx, View, event, job};
 
 /// Enqueued once, in the same transaction as `finalize_invoice` (routes.rs).
@@ -17,13 +18,13 @@ use charpente::{Id, Tx, View, event, job};
 /// keyed to the same org `InvoiceFinalized` was.
 #[job]
 pub struct SendReceipt {
-    pub invoice: u64,
+    pub invoice: Id<Invoice>,
     pub org: String,
 }
 
 impl SendReceipt {
     pub fn run(self, tx: &mut Tx) -> Result<(), JobError> {
-        let invoice_id = Id::<Invoice>::from_raw(self.invoice);
+        let invoice_id = self.invoice;
         let items = LineItem::by_invoice(tx, &invoice_id)?;
         let amount_cents: i64 = items
             .iter()
@@ -37,7 +38,7 @@ impl SendReceipt {
         // once), so this is a collision-free key in Receipt's own id space
         // without needing a counter.
         tx.put(&Receipt {
-            id: Id::from_raw(self.invoice),
+            id: Id::from_raw(self.invoice.raw()),
             invoice: invoice_id,
             amount_cents,
             issued_day: day,
@@ -46,22 +47,38 @@ impl SendReceipt {
             self.org,
             ReceiptSent {
                 invoice: self.invoice,
-                amount_cents,
+                amount_cents: WireI64(amount_cents),
             },
         );
         Ok(())
     }
 }
 
+/// `invoice: Id<Invoice>` (fix round 1, F7 / Ruling 29), not a bare `u64`:
+/// `#[event]` payloads DO cross the wire (`ev_json` in `http/mod.rs`
+/// serializes them straight into the SSE frame body — unlike a `#[job]`
+/// payload, which never leaves the process), and `InvoiceFinalized`
+/// (`routes.rs`) — the other `#[event]` on this same `/events/feed` stream,
+/// also naming an `Invoice` row id — already carries `Id<Invoice>`. Before
+/// this fix the two disagreed: `invoice_finalized` frames quoted the id,
+/// `receipt_sent` frames did not, on one feed. One id, one encoding.
+///
+/// `amount_cents: WireI64` for the same reason, now enforced rather than
+/// argued: since task 6 `#[event]` derives `Wire`, so a bare `i64` here is a
+/// compile error — the money field crosses this feed exactly like
+/// `LineItemView.unit_amount_cents` crosses a route response.
 #[event]
 pub struct ReceiptSent {
-    pub invoice: u64,
-    pub amount_cents: i64,
+    pub invoice: Id<Invoice>,
+    pub amount_cents: WireI64,
 }
 
 /// One per overdue Final invoice, enqueued from `AdvanceDay`'s own
 /// transaction (below) — this is where "a reminder is a reminders-table
-/// row" (brief) actually happens.
+/// row" (brief) actually happens. `invoice` stays a bare `u64`: this is a
+/// `#[job]` payload, which never crosses HTTP (jobs run in-process; only
+/// their effects are observable), so it has no `Wire` requirement — unlike
+/// `ReceiptSent` above, which is an `#[event]` and does cross the wire.
 #[job]
 pub struct SendOverdueReminder {
     pub invoice: u64,

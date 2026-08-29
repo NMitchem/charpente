@@ -1,0 +1,29 @@
+error: #[derive(Wire)] cannot describe tuple variant `InternalNewtypeNonStruct::Wrapped` under serde's internally tagged representation (`tag = "..."`) — for anything but a single struct-shaped field serde refuses to serialize it at all ("cannot serialize tagged newtype variant"), and even a struct-shaped field has its fields merged into the tag object in a way this schema cannot reconstruct from a bare type at compile time; use a braced variant with named fields instead
+  --> tests/compile_fail/wire_enum_shape_gaps.rs:23:5
+   |
+23 |     Wrapped(u32),
+   |     ^^^^^^^^^^^^
+
+error: #[derive(Wire)] cannot describe tuple variant `InternalNewtypeStruct::Wrapped` under serde's internally tagged representation (`tag = "..."`) — for anything but a single struct-shaped field serde refuses to serialize it at all ("cannot serialize tagged newtype variant"), and even a struct-shaped field has its fields merged into the tag object in a way this schema cannot reconstruct from a bare type at compile time; use a braced variant with named fields instead
+  --> tests/compile_fail/wire_enum_shape_gaps.rs:34:5
+   |
+34 |     Wrapped(InnerForInternalTuple),
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: #[derive(Wire)] cannot describe tuple variant `ExternalZeroFieldTuple::Empty` with 0 fields — the wire IR has no tuple type yet (a JSON array would have a perfectly good TypeScript type, `[number, number]`; the gap is in this derive's IR, not in what TypeScript can express). Use a braced variant with named fields.
+  --> tests/compile_fail/wire_enum_shape_gaps.rs:39:5
+   |
+39 |     Empty(),
+   |     ^^^^^^^
+
+error: #[derive(Wire)] cannot describe tuple variant `ExternalMultiFieldTuple::Pair` with 2 fields — the wire IR has no tuple type yet (a JSON array would have a perfectly good TypeScript type, `[number, number]`; the gap is in this derive's IR, not in what TypeScript can express). Use a braced variant with named fields.
+  --> tests/compile_fail/wire_enum_shape_gaps.rs:45:5
+   |
+45 |     Pair(u32, u32),
+   |     ^^^^^^^^^^^^^^
+
+error: #[derive(Wire)] cannot describe tuple variant `AdjacentMultiFieldTuple::Pair` with 2 fields — the wire IR has no tuple type yet (a JSON array would have a perfectly good TypeScript type, `[number, number]`; the gap is in this derive's IR, not in what TypeScript can express). Use a braced variant with named fields.
+  --> tests/compile_fail/wire_enum_shape_gaps.rs:51:5
+   |
+51 |     Pair(u32, u32),
+   |     ^^^^^^^^^^^^^^

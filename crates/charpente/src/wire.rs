@@ -16,6 +16,12 @@ pub enum TypeSchema {
     F32,
     F64,
     String,
+    /// The JSON literal `null` — a genuinely different document from
+    /// `Struct { fields: [] }` (`{}`). `()`'s wire shape: measured directly
+    /// (task 5, Ruling 25 probe) via both `serde_json::to_string(&())` and
+    /// `Response::json(200, &())`, which agree (`"null"`) — the glue path an
+    /// app author's handler actually takes, not just a bare `to_string`.
+    Null,
     /// A 64-bit integer. ALWAYS string-encoded on the wire: JSON numbers lose
     /// precision above 2^53 in JavaScript, and a `JSON.parse` reviver cannot
     /// recover it (the value is already parsed when the reviver runs).
@@ -47,18 +53,36 @@ pub struct Field {
 pub enum EnumRepr {
     /// All variants are unit variants: a string union.
     Unit { variants: Vec<String> },
-    /// serde's externally-tagged default: `{ "VariantName": {...} }`.
-    External { variants: Vec<(String, TypeSchema)> },
-    /// `#[serde(tag = "...")]`: `{ "type": "VariantName", ...fields }`.
+    /// serde's externally-tagged default: `{ "VariantName": {...} }`. A
+    /// variant's schema is `None` when it carries no payload at all — a
+    /// unit variant serializes as the bare JSON string `"VariantName"`, not
+    /// an object, so there is no per-variant object shape to describe.
+    /// `Some(Struct { fields: [] })` is a DIFFERENT, genuinely distinct
+    /// document (a braced-empty variant, `{"VariantName":{}}`) — the two are
+    /// not the same case, measured against real `serde_json` (fix round 1,
+    /// F5): `None` vs `Some` carries that distinction with nothing left
+    /// over.
+    External {
+        variants: Vec<(String, Option<TypeSchema>)>,
+    },
+    /// `#[serde(tag = "...")]`: `{ "type": "VariantName", ...fields }`. No
+    /// `Option` here — a unit variant merges into the tag object exactly as
+    /// `Struct { fields: [] }` (`{"type":"VariantName"}`), so the bare
+    /// `TypeSchema` slot already carries every representable shape.
     Internal {
         tag: String,
         variants: Vec<(String, TypeSchema)>,
     },
-    /// `#[serde(tag = "...", content = "...")]`.
+    /// `#[serde(tag = "...", content = "...")]`. Same `Option` distinction as
+    /// `External`: a unit variant omits the `content` key entirely
+    /// (`{"tag":"VariantName"}`, no `content` key at all), which `None`
+    /// carries; a braced-empty variant still writes an empty `content`
+    /// object (`{"tag":"VariantName","content":{}}`), which stays
+    /// `Some(Struct { fields: [] })`.
     Adjacent {
         tag: String,
         content: String,
-        variants: Vec<(String, TypeSchema)>,
+        variants: Vec<(String, Option<TypeSchema>)>,
     },
 }
 
@@ -70,9 +94,13 @@ pub struct TypeDef {
 
 /// Collects the transitive closure of named types a contract references.
 /// `BTreeMap`, not `HashMap`: generation must be byte-deterministic (spec §4).
+///
+/// Each entry also carries the Rust type responsible for it (see `insert_as`)
+/// — not exposed through `into_sorted`, kept only so a collision panic can
+/// name the two colliding Rust types, not just the wire name they share.
 #[derive(Default)]
 pub struct TypeRegistry {
-    defs: BTreeMap<&'static str, TypeSchema>,
+    defs: BTreeMap<&'static str, (TypeSchema, &'static str)>,
 }
 
 impl TypeRegistry {
@@ -86,24 +114,41 @@ impl TypeRegistry {
     /// produce a `Contract.types` entry that matches only one of the two Rust types
     /// `Ref`-ing it, so it panics rather than silently keeping the last writer
     /// (hard rule 4 — assert negative space).
+    ///
+    /// Equivalent to `insert_as(name, schema, name)` — for a caller with no better
+    /// Rust type identity to offer than the wire name itself.
     pub fn insert(&mut self, name: &'static str, schema: TypeSchema) -> bool {
+        self.insert_as(name, schema, name)
+    }
+
+    /// Same contract as `insert`, but also records the Rust type responsible for
+    /// this entry — pass `std::any::type_name::<Self>()`. `#[derive(Wire)]` is the
+    /// first (and, so far, only) caller with real type identity to offer: it lets
+    /// a collision panic name BOTH colliding Rust types, which matters because two
+    /// types in different modules can share the same bare name.
+    pub fn insert_as(
+        &mut self,
+        name: &'static str,
+        schema: TypeSchema,
+        rust_type: &'static str,
+    ) -> bool {
         assert!(
             !name.is_empty(),
-            "TypeRegistry::insert: WIRE_NAME cannot be empty — \"\" means \
+            "TypeRegistry::insert_as: WIRE_NAME cannot be empty — \"\" means \
              \"anonymous/inline\" (what Wire::reference() checks to skip the \
              registry entirely), never a real named type"
         );
-        if let Some(prev) = self.defs.get(name) {
+        if let Some((prev_schema, prev_type)) = self.defs.get(name) {
             assert!(
-                *prev == schema,
-                "TypeRegistry::insert: wire name \"{name}\" is registered with two \
-                 different shapes — every Wire type needs a WIRE_NAME unique \
-                 wire-wide (one shape per wire name); rename one of the two \
-                 colliding Rust types so their WIRE_NAME differs"
+                *prev_schema == schema,
+                "TypeRegistry::insert_as: wire name \"{name}\" is registered with two \
+                 different shapes, by `{prev_type}` and `{rust_type}` — every Wire \
+                 type needs a WIRE_NAME unique wire-wide (one shape per wire name); \
+                 rename one of the two colliding Rust types so their WIRE_NAME differs"
             );
             return true;
         }
-        self.defs.insert(name, schema);
+        self.defs.insert(name, (schema, rust_type));
         false
     }
 
@@ -114,7 +159,7 @@ impl TypeRegistry {
     pub fn into_sorted(self) -> Vec<TypeDef> {
         self.defs
             .into_iter()
-            .map(|(name, schema)| TypeDef { name, schema })
+            .map(|(name, (schema, _))| TypeDef { name, schema })
             .collect()
     }
 }
@@ -169,12 +214,21 @@ prim! {
     u8 => TypeSchema::U8, u16 => TypeSchema::U16, u32 => TypeSchema::U32,
     f32 => TypeSchema::F32, f64 => TypeSchema::F64,
     String => TypeSchema::String,
+    () => TypeSchema::Null,
+    &'static str => TypeSchema::String,
 }
 
 impl<T: Wire> Wire for Option<T> {
     const WIRE_NAME: &'static str = "";
     fn schema() -> TypeSchema {
-        TypeSchema::Option(Box::new(T::schema()))
+        // `T::reference()`, not `T::schema()`: a named `T` must show up as
+        // `Ref(name)` here, the same as it would in a struct field — an
+        // `Option<T>` is itself always anonymous (empty WIRE_NAME), but its
+        // element is not. Using `schema()` would inline `T` instead of
+        // referencing it, and for a self-referential `T` would recurse
+        // forever at runtime (`schema()` has no base case; `reference()` is
+        // the base case for every named type).
+        TypeSchema::Option(Box::new(T::reference()))
     }
     fn register(reg: &mut TypeRegistry) {
         T::register(reg)
@@ -184,7 +238,8 @@ impl<T: Wire> Wire for Option<T> {
 impl<T: Wire> Wire for Vec<T> {
     const WIRE_NAME: &'static str = "";
     fn schema() -> TypeSchema {
-        TypeSchema::Seq(Box::new(T::schema()))
+        // See `Option<T>::schema()` above — same reasoning.
+        TypeSchema::Seq(Box::new(T::reference()))
     }
     fn register(reg: &mut TypeRegistry) {
         T::register(reg)
@@ -194,9 +249,97 @@ impl<T: Wire> Wire for Vec<T> {
 impl<V: Wire> Wire for BTreeMap<String, V> {
     const WIRE_NAME: &'static str = "";
     fn schema() -> TypeSchema {
-        TypeSchema::Map(Box::new(V::schema()))
+        // See `Option<T>::schema()` above — same reasoning.
+        TypeSchema::Map(Box::new(V::reference()))
     }
     fn register(reg: &mut TypeRegistry) {
         V::register(reg)
     }
+}
+
+// ---------------------------------------------------------------- 64-bit carriers
+
+/// Carries a `u64` across the wire as a decimal string. The generated TS type
+/// is `bigint`, parsed with `BigInt(str)` — lossless, unlike a JSON number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireU64(pub u64);
+
+/// The signed sibling of `WireU64`; same reasoning, same encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireI64(pub i64);
+
+macro_rules! wire_int {
+    ($t:ident, $inner:ty, $signed:expr, $what:expr) => {
+        impl serde::Serialize for $t {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.collect_str(&self.0)
+            }
+        }
+        impl<'de> serde::Deserialize<'de> for $t {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                // A Visitor, not `<&str as Deserialize>::deserialize`: the latter demands a
+                // BORROWED str, which serde_json can only hand back for unescaped input —
+                // every escaped JSON string and every `from_reader`/`from_value` call
+                // (nothing to borrow from) fails outright. `visit_str` takes either a
+                // borrowed or a transient owned `&str`, so it works for both. Mirrors
+                // `Id<T>`'s Visitor in charpente-core/src/table.rs — same shape on purpose.
+                struct V;
+                impl serde::de::Visitor<'_> for V {
+                    type Value = $t;
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str(concat!(
+                            $what,
+                            " as a decimal string — 64-bit integers cross the wire as \
+                             strings because a JSON number silently loses precision above \
+                             2^53 in JavaScript clients"
+                        ))
+                    }
+                    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<$t, E> {
+                        v.parse::<$inner>().map($t).map_err(|_| {
+                            E::custom(format!(
+                                concat!($what, " must be a decimal string — got {:?}"),
+                                v
+                            ))
+                        })
+                    }
+                }
+                d.deserialize_str(V)
+            }
+        }
+        impl Wire for $t {
+            const WIRE_NAME: &'static str = "";
+            fn schema() -> TypeSchema {
+                TypeSchema::Int64 { signed: $signed }
+            }
+            fn register(_reg: &mut TypeRegistry) {}
+        }
+
+        // An `#[event]` payload is BOTH log-encoded (`Codec`, the versionless
+        // byte layout under the log) and wire-encoded (serde + `Wire`), and
+        // since task 6 an event payload's 64-bit field must be one of these
+        // carriers — so they need `Codec` too, or a 64-bit value could not be
+        // carried by an event at all. The bytes are the inner integer's own,
+        // deliberately: a field that moves from `u64` to `WireU64` keeps its
+        // stored layout byte-for-byte and changes only its JSON (a number
+        // becomes a decimal string).
+        impl charpente_core::table::Codec for $t {
+            fn encode(&self, out: &mut Vec<u8>) {
+                <$inner as charpente_core::table::Codec>::encode(&self.0, out);
+            }
+            fn decode(input: &mut &[u8]) -> std::io::Result<Self> {
+                <$inner as charpente_core::table::Codec>::decode(input).map($t)
+            }
+        }
+    };
+}
+
+wire_int!(WireU64, u64, false, "a WireU64");
+wire_int!(WireI64, i64, true, "a WireI64");
+
+impl<T: charpente_core::table::Row> Wire for charpente_core::table::Id<T> {
+    const WIRE_NAME: &'static str = "";
+    fn schema() -> TypeSchema {
+        TypeSchema::Id(T::TABLE)
+    }
+    fn register(_reg: &mut TypeRegistry) {}
 }

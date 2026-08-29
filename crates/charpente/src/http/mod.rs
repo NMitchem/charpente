@@ -9,7 +9,7 @@ mod app;
 mod router;
 
 pub use app::{App, AppConfig, Ctx, Handled, Session, StagedDispatch};
-pub use router::{Glue, Route, RouteDef, RouteGlue, RouteMatch, Router, SubGlue};
+pub use router::{EmittedEvent, Glue, Route, RouteDef, RouteGlue, RouteMatch, Router, SubGlue};
 
 /// Not public API: the kernel's batched commit-failure tail needs the exact
 /// 500 the single-request path produces (group-commit T6).
@@ -112,6 +112,19 @@ fn parse_query(raw: &str) -> BTreeMap<String, String> {
 
 // ---------------------------------------------------------------- response
 
+/// The single definition of the envelope every `#[route]` error response
+/// carries (task 5 fix round 1, F1): `Response::error` serializes exactly
+/// this shape, and `<ApiError as Wire>::schema()` below describes exactly
+/// this shape — one `error: String` field, always present. Kept as one
+/// module-level type, rather than re-declared per call site, so there is a
+/// single place a reader (or a future editor) sees both sides of the
+/// envelope's contract next to each other. `fidelity_api_error_is_the_envelope_not_its_serde_shape`
+/// (below) is the mechanical check that keeps the two in sync.
+#[derive(serde::Serialize)]
+struct ErrorEnvelope<'a> {
+    error: &'a str,
+}
+
 pub struct Response {
     pub status: u16,
     pub headers: BTreeMap<String, String>,
@@ -133,11 +146,7 @@ impl Response {
     /// An error response: `{"error": "<message>"}`. The message is product
     /// surface (hard rule 5) — it names the contract and the fix.
     pub fn error(status: u16, message: &str) -> Response {
-        #[derive(serde::Serialize)]
-        struct Body<'a> {
-            error: &'a str,
-        }
-        Response::json(status, &Body { error: message })
+        Response::json(status, &ErrorEnvelope { error: message })
     }
 
     /// The 200 that opens an SSE connection (T5): `content-type:
@@ -255,6 +264,23 @@ fn ev_json<Ev: Event + serde::Serialize>(bytes: &[u8]) -> io::Result<String> {
 
 /// What a handler can reject with. `Io` failures convert via `From`, so `?`
 /// works on tx reads inside handlers.
+///
+/// **Does NOT `#[derive(Wire)]`** (task 5 fix round 1, F1 — this reverses
+/// task 5's original choice). Every route's `error: fn() -> TypeSchema` is
+/// `<E as Wire>::reference()`, generic over the handler's declared error
+/// type, so `E`'s `Wire` schema must describe what `E::response()` actually
+/// puts on the wire — not `E`'s own serde shape. A derived schema here would
+/// be faithful to `serde_json::to_string(&ApiError::BadRequest("bad"))`
+/// (`{"BadRequest":"bad"}`), which is a document `ApiError::response()`
+/// never sends: every variant instead goes through `Response::error` below
+/// and comes out as the fixed envelope `{"error": "<message>"}`. Measured,
+/// per variant: zero overlap between the derived shape and the wire bytes.
+/// The hand-written `impl Wire for ApiError` below describes the envelope
+/// instead, so `Route.error`'s generic reference is finally correct for
+/// every handler. Does not derive `Serialize` either — nothing serializes
+/// an `ApiError` directly (`Response::error` serializes `ErrorEnvelope`),
+/// and a `Serialize` impl that disagreed with the `Wire` schema is exactly
+/// what the Task 3/4 fidelity discipline forbids.
 #[derive(Debug)]
 pub enum ApiError {
     BadRequest(String),
@@ -275,6 +301,35 @@ pub enum ApiError {
     Oidc(OidcReject),
     NotFound,
     Internal(String),
+}
+
+/// Hand-written, not derived (see the doc comment above `ApiError`): the
+/// schema describes the `ErrorEnvelope` shape `Response::error` actually
+/// serializes, not `ApiError`'s own variants. `WIRE_NAME` stays `"ApiError"`
+/// — the plan's Task 9 test asserts `Promise<Result<CustomerView, ApiError>>`,
+/// and every `Route.error` reference still needs a name to point at.
+impl crate::wire::Wire for ApiError {
+    const WIRE_NAME: &'static str = "ApiError";
+
+    fn schema() -> crate::wire::TypeSchema {
+        crate::wire::TypeSchema::Struct {
+            fields: vec![crate::wire::Field {
+                name: "error".to_string(),
+                schema: crate::wire::TypeSchema::String,
+                optional: false,
+            }],
+        }
+    }
+
+    fn register(reg: &mut crate::wire::TypeRegistry) {
+        // No recursion: the envelope's one field is a bare `String`, which
+        // has nothing further to register (see `prim!` in `wire.rs`).
+        reg.insert_as(
+            Self::WIRE_NAME,
+            <Self as crate::wire::Wire>::schema(),
+            std::any::type_name::<Self>(),
+        );
+    }
 }
 
 impl From<io::Error> for ApiError {
@@ -312,6 +367,16 @@ pub trait FromParam: Sized {
     fn from_param(name: &str, raw: &str) -> Result<Self, ApiError>;
 }
 
+// Kept deliberately (task 5), even though a `u64` path param is now a
+// compile error at `#[route]` (it lacks `Wire`, which `Route.params` needs
+// alongside `FromParam`). Measured (fix round 1, F4): removing this impl
+// does NOT trade one diagnostic for the other — rustc emits BOTH errors
+// either way, a bare "`FromParam` is not satisfied" AND the `Wire`
+// `on_unimplemented` note that names the 2^53 JS-precision hazard and the
+// fix (`Id<T>`/`WireU64`). Keeping the impl keeps the `Wire` note the ONLY
+// error, so a reader isn't led to the wrong remedy (implementing
+// `FromParam`) first. Same rejection either way; this is about which
+// error a reader sees first, not what compiles.
 impl FromParam for u64 {
     fn from_param(name: &str, raw: &str) -> Result<u64, ApiError> {
         raw.parse().map_err(|_| {
@@ -375,6 +440,59 @@ mod tests {
             assert_eq!(Method::parse(m.name()), Some(m));
         }
         assert_eq!(Method::parse("BREW"), None);
+    }
+
+    /// F1 (task 5 fix round 1): `ApiError`'s `Wire` schema must describe
+    /// the envelope `Response::error` actually serializes, not `ApiError`'s
+    /// own serde shape — a derived schema would be faithful to
+    /// `serde_json::to_string(&ApiError::BadRequest("bad"))`
+    /// (`{"BadRequest":"bad"}`), a document the wire never sends. This
+    /// reads BOTH sides per the standing fidelity constraint: real bytes
+    /// from `ApiError::response().body` across every variant, AND
+    /// `<ApiError as Wire>::schema()` — and shows they agree.
+    ///
+    /// Mutation that reddens this: change `ApiError::schema()` to describe
+    /// anything other than `Struct{fields:[Field{name:"error",...}]}` (e.g.
+    /// reintroducing the derive) — the real response body still has key
+    /// "error", so the loop's key-set assertion fails against the new
+    /// schema-shaped expectation.
+    #[test]
+    fn fidelity_api_error_is_the_envelope_not_its_serde_shape() {
+        use crate::wire::{Field, TypeSchema, Wire};
+
+        assert_eq!(
+            <ApiError as Wire>::schema(),
+            TypeSchema::Struct {
+                fields: vec![Field {
+                    name: "error".to_string(),
+                    schema: TypeSchema::String,
+                    optional: false,
+                }],
+            }
+        );
+
+        let variants: Vec<ApiError> = vec![
+            ApiError::BadRequest("bad".into()),
+            ApiError::Unauthorized,
+            ApiError::UnrecognizedCredential,
+            ApiError::SessionExpired,
+            ApiError::NotFound,
+            ApiError::Internal("boom".into()),
+        ];
+        for v in variants {
+            let resp = v.response();
+            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+            let obj = body.as_object().expect("the envelope is a JSON object");
+            assert_eq!(
+                obj.keys().collect::<Vec<_>>(),
+                vec!["error"],
+                "the real wire body must have exactly the one field the schema describes: {body}"
+            );
+            assert!(
+                obj["error"].is_string(),
+                "the schema says `error` is a String: {body}"
+            );
+        }
     }
 
     #[test]

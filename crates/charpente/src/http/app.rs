@@ -16,6 +16,7 @@ use crate::auth::sweep::{self, SessionSweep};
 use crate::auth::{
     ApiKey, AuthReject, OidcConfig, OidcVerifier, Presented, Principal, Via, hash_token, resolve,
 };
+use crate::describe::EventDef;
 use crate::http::router::{RouteGlue, RouteMatch, Router};
 use crate::http::{ApiError, Cursor, Request, Response, Route, Subscription, hex};
 use crate::kernel::JobDef;
@@ -27,6 +28,25 @@ use crate::kernel::cron::{CronEntry, CronRow};
 /// `db_mut()`. One const so a reword of the message cannot drift between the
 /// two sites.
 const DB_TAKEN: &str = "db taken for reseed — a kernel bug left it out";
+
+/// What `App::subscription_event_names` feeds each `:param` of the stream
+/// route it probes. `"0"` parses for every `FromParam` the platform ships
+/// (`u64`, `String`, `Id<T>`); a hand-written one that rejects it turns the
+/// probe into a named `Err`, not a silently empty answer.
+const PROBE_CAPTURE: &str = "0";
+
+/// The `Ctx` fresh-token slot for the same probe: a fixed literal rather
+/// than an `Entropy` draw, so probing a route cannot shift the app's entropy
+/// stream and change every value drawn after it. 64 hex chars, the shape
+/// `Ctx::create_session` slices its first 16 of.
+const PROBE_TOKEN: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Negative space, at compile time (hard rule 4): `Ctx::create_session` and
+/// `create_api_key` slice `fresh_token[..16]`, so a shortened `PROBE_TOKEN`
+/// would turn a probe of a session-minting subscribe handler into a slice
+/// panic — reachable only from that one handler shape, i.e. exactly the bug
+/// a test run would not find.
+const _: () = assert!(PROBE_TOKEN.len() >= 16);
 
 // ---------------------------------------------------------------- session
 
@@ -169,6 +189,10 @@ pub struct App {
     config: AppConfig,
     router: Router,
     job_defs: Vec<JobDef>,
+    /// Describe-only (TS-codegen spec §2). Delivery reads nothing here: an
+    /// event reaches a subscriber through the encoder `Subscription::of::
+    /// <Ev>()` captured statically at the subscribe site, registered or not.
+    event_defs: Vec<EventDef>,
     cron_entries: Vec<CronEntry>,
     /// `None` until `App::with_oidc` mounts a verifier. The `Arc` is now
     /// incidental, not load-bearing: it existed so `handle_or_subscribe`
@@ -207,6 +231,8 @@ impl App {
             config,
             router: Router::new(),
             job_defs: vec![<SessionSweep as JobEntry>::def()],
+            // No platform events to seed: the built-in surface emits none.
+            event_defs: Vec::new(),
             cron_entries: vec![sweep::platform_cron_entry()],
             oidc: None,
         })
@@ -238,6 +264,38 @@ impl App {
                 def.name
             );
             self.job_defs.push(def);
+        }
+        self
+    }
+
+    /// Registers `#[event]` descriptors for `describe` (mount-time
+    /// duplicate-name panic — each event type is mounted once, like jobs).
+    ///
+    /// This registry is describe-only, and mounting is therefore optional:
+    /// an unregistered `#[event]` still emits and still delivers, it just
+    /// does not appear in `Contract.events` (nor its payload in
+    /// `Contract.types`), so a generated client cannot see it.
+    pub fn mount_events(mut self, defs: Vec<EventDef>) -> App {
+        for def in defs {
+            assert!(
+                !self.event_defs.iter().any(|d| d.name == def.name),
+                "event \"{}\" registered twice — each #[event] type is mounted once",
+                def.name
+            );
+            // Negative space: an events entry that names no type would leave
+            // a describe consumer with a payload it cannot resolve.
+            // `#[event]` always supplies a name (its `Wire` derive sets
+            // `WIRE_NAME` to the struct's name), so reaching this means a
+            // hand-written `EventEntry` impl.
+            assert!(
+                !def.payload.is_empty(),
+                "event \"{}\" registers an empty payload name — every Contract.events \
+                 entry must name a type in Contract.types, and \"\" is `Wire`'s \
+                 \"anonymous/inline\" marker; make the payload a #[derive(Wire)] type \
+                 and pass its WIRE_NAME",
+                def.name
+            );
+            self.event_defs.push(def);
         }
         self
     }
@@ -286,6 +344,13 @@ impl App {
     /// order. Never used by request handling itself.
     pub(crate) fn job_defs(&self) -> &[JobDef] {
         &self.job_defs
+    }
+
+    /// Describe-only reach: the registered event descriptors, in
+    /// registration order (`describe` sorts them by name). Never used by
+    /// request handling or by delivery — see the field's own comment.
+    pub(crate) fn event_defs(&self) -> &[EventDef] {
+        &self.event_defs
     }
 
     /// Describe-only reach: the registered cron schedules, in registration
@@ -387,6 +452,108 @@ impl App {
     #[doc(hidden)]
     pub fn put_db_for_tests(&mut self, db: Db) {
         self.put_db(db);
+    }
+
+    /// The `emits(...)` drift oracle's reach (TS-codegen spec §2/§5): runs
+    /// one stream route's subscribe glue and reports the event names the
+    /// `Subscription` it returned actually carries, so a test can compare
+    /// them against what `#[route(SSE …, emits(…))]` declared. A declaration
+    /// nothing verifies is a decorative pin; this is the "nothing" made into
+    /// something.
+    ///
+    /// It really runs the handler — it does not simulate one. The glue is
+    /// staged into its own group, the same way `handle_or_subscribe` stages
+    /// a real subscribe. It is NOT the same commit rule, deliberately: the
+    /// real path forgives a `CommitFailure` that `invalidates(0, wrote)`
+    /// says left the record durable, and this one maps every `CommitFailure`
+    /// to `Err`, because a probe has no request to answer.
+    ///
+    /// **A subscribe handler that WRITES is refused, not committed.** A
+    /// read-only subscribe handler — which is all of them in practice —
+    /// stages no record at all (`Group::stage`'s empty-effects check) and
+    /// this costs nothing. But a handler that stages (`ctx.create_session`
+    /// on the subscribe path is the realistic case) would otherwise have its
+    /// write committed into the app under test by what reads as a
+    /// describe-time query, and with `PROBE_TOKEN` fixed that write is a
+    /// FIXED, publicly derivable credential. So the probe checks
+    /// `Group::is_empty` after staging and returns a named `Err` on the
+    /// write path. The group is still committed either way — `Group`'s
+    /// `Drop` panics on a non-empty group that was never committed, so
+    /// refusing cannot mean "skip the commit"; refusing means the caller is
+    /// told rather than left to discover a row it never asked for.
+    ///
+    /// Three deliberate departures from a real request, all so the probe can
+    /// reach EVERY stream route rather than only the trivially reachable
+    /// ones: `auth` is not enforced (no credential is presented and none is
+    /// demanded, so an `auth` stream route is probeable); each `:param` is
+    /// fed the literal `"0"`, which parses for every `FromParam` the
+    /// platform ships (`u64`, `String`, `Id<T>`); and the fresh-token slot
+    /// is a fixed literal rather than an `Entropy` draw, so probing cannot
+    /// shift the app's entropy stream and perturb everything after it (hard
+    /// rule 1). A handler that rejects that synthetic input comes back as
+    /// `Err` naming the route, never as a silently empty name list.
+    #[doc(hidden)]
+    pub fn subscription_event_names(&mut self, route: &str) -> Result<Vec<&'static str>, String> {
+        let Some(found) = self.router.routes().iter().find(|r| r.name == route) else {
+            return Err(format!("no route named `{route}` is mounted"));
+        };
+        let RouteGlue::Sse(glue) = found.glue else {
+            return Err(format!(
+                "route `{route}` is not a stream route — only `#[route(SSE …)]` returns a \
+                 Subscription to read event names from"
+            ));
+        };
+        let captures: Vec<String> = found
+            .params
+            .iter()
+            .map(|_| PROBE_CAPTURE.to_string())
+            .collect();
+        let session_ttl = self.config.session_ttl;
+        let (mut group, _) = self
+            .begin_group()
+            .map_err(|e| format!("route `{route}`: the probe could not open a group: {e}"))?;
+        let staged = group.stage(|tx| {
+            let ctx = build_ctx(
+                tx,
+                &Presented::None,
+                false,
+                PROBE_TOKEN.to_string(),
+                0,
+                session_ttl,
+                None,
+            )?;
+            glue(tx, &ctx, &captures, None)
+        });
+        // Read BEFORE the commit that empties it, and used below — the same
+        // `Group::is_empty` reading `handle_or_subscribe` takes for `wrote`.
+        let wrote = !group.is_empty();
+        let names = match staged {
+            Ok(sub) => Ok(sub.entries.iter().map(|e| e.name).collect()),
+            Err(e) => Err(format!(
+                "route `{route}`'s subscribe handler returned {e:?} under the emits(...) drift \
+                 probe, so what it subscribes to cannot be read — a handler that rejects a \
+                 credential-free request with `\"0\"` for every :param is not probeable"
+            )),
+        };
+        // Unconditional, and before returning on any path: `Group`'s `Drop`
+        // panics on a non-empty group that was never committed, so the write
+        // the guard below refuses still has to be committed — the guard's job
+        // is to say so, not to pretend it did not happen.
+        group.commit().map_err(|f| {
+            format!(
+                "route `{route}`: the probe's group failed to commit: {}",
+                f.error
+            )
+        })?;
+        if wrote {
+            return Err(format!(
+                "route `{route}`'s subscribe handler staged a write, which the emits(...) \
+                 drift probe has just committed into this app — a probe is not a request, so \
+                 nothing here asked for that row; move the write out of the subscribe path, \
+                 or leave this route out of the drift test"
+            ));
+        }
+        names
     }
 
     /// The plain surface: routes to a `Response` (`handle_or_subscribe`'s

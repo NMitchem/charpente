@@ -19,6 +19,11 @@ pub type Glue = fn(&mut Tx, &Ctx, &[String], &[u8]) -> Result<Response, ApiError
 /// `Handled::Subscribe`), which has a sink to hand the tail.
 pub type SubGlue = fn(&mut Tx, &Ctx, &[String], Option<Cursor>) -> Result<Subscription, ApiError>;
 
+/// A path param's name paired with its fn-deferred wire schema (`Route::params`'s
+/// element type — factored out so the field itself stays under clippy's
+/// type-complexity threshold).
+pub type ParamSchema = (&'static str, fn() -> crate::wire::TypeSchema);
+
 /// A route's flavor-specific glue. The two flavors are dispatched
 /// differently by `App::handle_or_subscribe` — that's the only reason this
 /// wraps `Glue`/`SubGlue` instead of `Route` holding a bare `Glue`.
@@ -34,6 +39,49 @@ pub struct Route {
     pub auth: bool,
     pub name: &'static str,
     pub glue: RouteGlue,
+    /// Path params in path order, each with its wire schema. Deferred behind
+    /// a fn pointer because `TypeSchema` is not const-constructible (it owns
+    /// `Vec`s and `String`s) and `Route` is returned from a `const`-ish
+    /// `RouteDef::route()`.
+    pub params: &'static [ParamSchema],
+    /// `None` for routes with no JSON body.
+    pub request: Option<fn() -> crate::wire::TypeSchema>,
+    pub response: fn() -> crate::wire::TypeSchema,
+    pub error: fn() -> crate::wire::TypeSchema,
+    /// Registers this route's whole type closure (params, request, response,
+    /// error, and everything they transitively reference) into the contract
+    /// registry, plus every event payload this route declares via
+    /// `emits(...)` — a declared payload is registered even when the event
+    /// is never mounted (task 7).
+    pub register_types: fn(&mut crate::wire::TypeRegistry),
+    /// Event types a stream route declares via `#[route(SSE …, emits(Ev, …))]`,
+    /// in declaration order. Empty for non-stream routes, and for a stream
+    /// route that has not adopted the declaration.
+    pub emits: &'static [EmittedEvent],
+}
+
+/// One event a stream route declares with `emits(Ev, …)`, carrying BOTH names
+/// the declaration produces — because the two consumers need different ones
+/// and NEITHER can be computed from the other (ruling 46).
+///
+/// - `event` is `<Ev as Event>::NAME`, the snake_case name an SSE frame's
+///   `event:` field carries and the one the drift oracle
+///   (`App::subscription_event_names`) compares against.
+/// - `payload` is `<Ev as Wire>::WIRE_NAME`, the payload type's key into
+///   `Contract.types` and the name a generated TypeScript union writes.
+///
+/// Deriving one from the other is refused: `#[event]`'s acronym rule maps
+/// `HTTPServer` to `http_server`, so snake_case -> PascalCase is not a
+/// function, and a second case-conversion implementation would be a drift
+/// source living inside the thing that detects drift. Both are read off the
+/// type at expansion time instead, where both are already in hand.
+///
+/// A named two-field struct rather than a tuple so call sites read
+/// `e.event`/`e.payload`; still const-constructible, which `Route` requires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct EmittedEvent {
+    pub event: &'static str,
+    pub payload: &'static str,
 }
 
 /// Implemented by the marker struct `#[route]` emits next to each handler,
@@ -203,12 +251,21 @@ mod tests {
     }
 
     fn route(method: Method, pattern: &'static str, name: &'static str) -> Route {
+        // Untyped glue, not a described route: `ok` returns a `Response`
+        // directly with no typed handler, so there is no schema to give it
+        // (Amendment D, task-5-brief.md).
         Route {
             method,
             pattern,
             auth: false,
             name,
             glue: RouteGlue::Http(ok),
+            params: &[],
+            request: None,
+            response: || crate::wire::TypeSchema::Null,
+            error: || <ApiError as crate::wire::Wire>::reference(),
+            register_types: |_| {},
+            emits: &[],
         }
     }
 

@@ -10,6 +10,19 @@ workspace = true
 
 [dependencies]
 redb = "4.1.0"
+# JSON wire identity only, for Id<T>'s hand-written Serialize/Deserialize
+# (table.rs): Rust's orphan rule forces that impl into whichever crate owns
+# Id<T>, which is here. `default-features = false`, no `derive`: this
+# crate's own manifest asks for none of serde's macros, and every impl is
+# hand-written — but that is a statement of intent, NOT the guarantee.
+# Cargo unifies features workspace-wide, so a `--workspace` build compiles
+# this crate WITH `derive` anyway (charpente asks for it). The actual fence
+# is `.github/workflows/ci.yml`'s isolated `cargo check -p charpente-core`
+# step — that is what fails the moment a `#[derive(Serialize)]` (or any
+# other serde/derive use) appears in this crate. Codec (the ON-DISK row
+# format, also table.rs) stays hand-rolled and must never become serde;
+# table.rs's id_wire_tests module guards Id<T>'s encoding against that.
+serde = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 charpente-sim = { path = "../charpente-sim" }

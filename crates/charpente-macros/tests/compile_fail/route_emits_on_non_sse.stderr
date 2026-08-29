@@ -1,0 +1,5 @@
+error: emits(...) applies to SSE routes only — a plain route returns one response, not a stream of events; drop emits(...) or make this `#[route(SSE "…")]`
+  --> tests/compile_fail/route_emits_on_non_sse.rs:20:13
+   |
+20 | #[route(GET "/x", emits(NoteAdded))]
+   |             ^^^^

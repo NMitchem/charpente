@@ -4,6 +4,7 @@ use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::{Codec, Id};
 use charpente::http::{App, Cursor, Method, Request};
 use charpente::kernel::{Kernel, SimSource};
+use charpente::wire::{WireI64, WireU64};
 use charpente_sim::checks::{is_fault_fallout, replays_identically};
 use charpente_sim::{FaultConfig, Sim};
 use invoicing::model::{Customer, Invoice, InvoiceState, Receipt, Reminder};
@@ -97,12 +98,12 @@ fn acked_writes_survive_restart(sim: &mut Sim) -> Result<(), String> {
         Request::new(Method::Post, "/invoices/1")
             .header("authorization", &auth)
             .json(&CreateInvoiceBody {
-                customer: 1,
-                due_day: 30,
+                customer: Id::from_raw(1),
+                due_day: WireU64(30),
                 line_items: vec![LineItemInput {
                     description: "Widget".into(),
-                    unit_amount_cents: 500,
-                    quantity: 2,
+                    unit_amount_cents: WireI64(500),
+                    quantity: WireI64(2),
                 }],
             }),
     );
@@ -215,12 +216,12 @@ fn scripted_flow(sim: &mut Sim) -> Result<Vec<u16>, String> {
         Request::new(Method::Post, "/invoices/1")
             .header("authorization", &auth)
             .json(&CreateInvoiceBody {
-                customer: 1,
-                due_day: 5,
+                customer: Id::from_raw(1),
+                due_day: WireU64(5),
                 line_items: vec![LineItemInput {
                     description: "Widget".into(),
-                    unit_amount_cents: 500,
-                    quantity: 2,
+                    unit_amount_cents: WireI64(500),
+                    quantity: WireI64(2),
                 }],
             }),
     );
@@ -269,12 +270,12 @@ fn receipts_exactly_once(sim: &mut Sim) -> Result<(), String> {
             Request::new(Method::Post, format!("/invoices/{i}"))
                 .header("authorization", &auth)
                 .json(&CreateInvoiceBody {
-                    customer: 1,
-                    due_day: 1000,
+                    customer: Id::from_raw(1),
+                    due_day: WireU64(1000),
                     line_items: vec![LineItemInput {
                         description: "Item".into(),
-                        unit_amount_cents: 100 * (i as i64 + 1),
-                        quantity: 1,
+                        unit_amount_cents: WireI64(100 * (i as i64 + 1)),
+                        quantity: WireI64(1),
                     }],
                 }),
         );
@@ -399,12 +400,12 @@ fn overdue_reminders_over_months(sim: &mut Sim) -> Result<(), String> {
             Request::new(Method::Post, format!("/invoices/{i}"))
                 .header("authorization", &auth)
                 .json(&CreateInvoiceBody {
-                    customer: 1,
-                    due_day: *due,
+                    customer: Id::from_raw(1),
+                    due_day: WireU64(*due),
                     line_items: vec![LineItemInput {
                         description: "Item".into(),
-                        unit_amount_cents: 1000,
-                        quantity: 1,
+                        unit_amount_cents: WireI64(1000),
+                        quantity: WireI64(1),
                     }],
                 }),
         );
@@ -498,12 +499,12 @@ fn illegal_transitions_are_rejected(sim: &mut Sim) -> Result<(), String> {
         Request::new(Method::Post, "/invoices/1")
             .header("authorization", &auth)
             .json(&CreateInvoiceBody {
-                customer: 1,
-                due_day: 0,
+                customer: Id::from_raw(1),
+                due_day: WireU64(0),
                 line_items: vec![LineItemInput {
                     description: "Item".into(),
-                    unit_amount_cents: 100,
-                    quantity: 1,
+                    unit_amount_cents: WireI64(100),
+                    quantity: WireI64(1),
                 }],
             }),
     );
@@ -557,7 +558,10 @@ fn illegal_transitions_are_rejected(sim: &mut Sim) -> Result<(), String> {
             "expected final GET to show state=paid, got {paid_view}"
         ));
     }
-    if paid_view["total_cents"] != 100 {
+    // total_cents is WireI64 (task 5): a 64-bit integer is always
+    // string-encoded on the wire, so the JSON value is the string "100",
+    // not the bare number 100.
+    if paid_view["total_cents"] != "100" {
         return Err(format!(
             "expected total_cents=100, got {}",
             paid_view["total_cents"]
@@ -605,12 +609,12 @@ fn events_feed_resumes_across_restart(sim: &mut Sim) -> Result<(), String> {
         Request::new(Method::Post, "/invoices/1")
             .header("authorization", &auth)
             .json(&CreateInvoiceBody {
-                customer: 1,
-                due_day: 30,
+                customer: Id::from_raw(1),
+                due_day: WireU64(30),
                 line_items: vec![LineItemInput {
                     description: "Widget".into(),
-                    unit_amount_cents: 500,
-                    quantity: 2,
+                    unit_amount_cents: WireI64(500),
+                    quantity: WireI64(2),
                 }],
             }),
     );
@@ -670,12 +674,12 @@ fn events_feed_resumes_across_restart(sim: &mut Sim) -> Result<(), String> {
         Request::new(Method::Post, "/invoices/2")
             .header("authorization", &auth)
             .json(&CreateInvoiceBody {
-                customer: 1,
-                due_day: 30,
+                customer: Id::from_raw(1),
+                due_day: WireU64(30),
                 line_items: vec![LineItemInput {
                     description: "Gadget".into(),
-                    unit_amount_cents: 1000,
-                    quantity: 1,
+                    unit_amount_cents: WireI64(1000),
+                    quantity: WireI64(1),
                 }],
             }),
     );

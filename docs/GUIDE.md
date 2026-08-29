@@ -431,7 +431,7 @@ impl Job for SendReceipt {
 
 #[event]
 struct InvoiceFinalized {
-    invoice: u64,
+    invoice: Id<Invoice>,
 }
 
 /// The row update, the receipt job, and the realtime event all commit in
@@ -447,7 +447,9 @@ fn finalize(db: &mut Db, id: u64) -> Result<(), TxError<io::Error>> {
         inv.paid = true;
         tx.put(&inv);
         tx.enqueue(SendReceipt { invoice: id });
-        tx.emit(InvoiceFinalized { invoice: id });
+        tx.emit(InvoiceFinalized {
+            invoice: Id::from_raw(id),
+        });
         Ok(())
     })
 }
@@ -457,8 +459,14 @@ fn finalize(db: &mut Db, id: u64) -> Result<(), TxError<io::Error>> {
 derives the rest of a job's registration for you (a later section).
 `#[event]` derives everything an event needs in one step: `Codec` (the log
 format), `Event` (`NAME` is the snake_case of the type name — §11 has the
-exact splitting rule), and `Serialize` (the wire format `#[route(SSE …)]`
-subscribers receive, §11). `tx.put` and `tx.delete` cannot fail — they only
+exact splitting rule), `Serialize` (the wire format `#[route(SSE …)]`
+subscribers receive, §11), `Wire` (that wire format's schema, so the contract
+can name it), and an `EventEntry` impl so `events![...]` can register it (§11).
+Because the payload IS what a subscriber receives, it obeys the wire rules a
+route's types obey — which is why `InvoiceFinalized.invoice` above is
+`Id<Invoice>` and not the bare `u64` the `SendReceipt` *job* beside it carries:
+a job payload never leaves the process, an event payload is a JSON document
+someone parses. `tx.put` and `tx.delete` cannot fail — they only
 buffer a write into the transaction's overlay; `tx.get`/`scan`/`scan_by`
 return `io::Result` because they read through the snapshot. A transaction
 that never calls `put`/`delete`/`enqueue`/`emit` writes nothing and consumes
@@ -574,22 +582,29 @@ decodes, and dispatches to it:
 - The first argument must be named exactly `tx`, typed `&mut Tx`.
 - Then one argument per `:param` in the path, **in path order**, each named
   exactly like its param (`:id` needs an argument named `id`). Its type
-  must implement `FromParam` — `u64`, `String`, and `Id<T>` (any `T`) are
-  provided; a bad path segment fails as a named 400, not a panic.
-- Then at most one JSON body argument, of any owned deserializable type
-  (`serde::de::DeserializeOwned` — the glue's actual bound); a type
-  borrowing from the input won't compile.
+  must implement **both** `FromParam` (parses the path segment; a bad one
+  fails as a named 400, not a panic) **and** `Wire` (§13 — the client needs
+  a schema for it too). `String` and `Id<T>` (any `T`) satisfy both. `u64`
+  implements `FromParam` but not `Wire` — a bare `u64` path param is a
+  compile error naming the fix (`Id<T>` for a row id, or `WireU64`); use
+  `Id<T>` for a row id.
+- Then at most one JSON body argument, of any type that is both an owned
+  deserializable AND `Wire` (`serde::de::DeserializeOwned + Wire` — the
+  glue's actual bound); a type borrowing from the input won't compile, and
+  neither will one missing `#[derive(Wire)]`.
 - Then, optionally, a trailing argument named exactly `ctx`, typed `&Ctx`
   (session access — see Sessions below).
 
-The handler returns `Result<T, ApiError>` where `T: serde::Serialize`; on
-`Ok`, the glue emits `Response::json(200, &value)`.
+The handler returns `Result<T, ApiError>` where `T: serde::Serialize + Wire`
+— the `Result<_, _>` shape itself is enforced too, and named (a bare return
+value is a compile error naming the fix, `-> Result<YourResponseType,
+ApiError>`); on `Ok`, the glue emits `Response::json(200, &value)`.
 
 ```rust
 use charpente::core::table::Id;
 use charpente::http::{ApiError, App, AppConfig, Ctx};
 use charpente::prod::{ProdDisk, ProdEntropy};
-use charpente::{Schema, Tx, View, route, routes, table};
+use charpente::{Schema, Tx, View, Wire, route, routes, table};
 use serde::Deserialize;
 
 #[table]
@@ -598,17 +613,20 @@ struct Note {
     text: String,
 }
 
-#[derive(Deserialize)]
+// A route's request body must be `Wire` too (§13) — `#[derive(Wire)]` sits
+// alongside `Deserialize`, one for the schema, one for the actual parse.
+#[derive(Wire, Deserialize)]
 struct NoteBody {
     text: String,
 }
 
-// tx, then :id (named `id`, path order), then the JSON body, then `ctx`.
+// tx, then :id (named `id`, path order), then the JSON body, then `ctx`. A
+// path param is a wire position too, so it is `Id<Note>`, not a bare `u64`.
 #[route(POST "/notes/:id")]
-fn create_note(tx: &mut Tx, id: u64, body: NoteBody, ctx: &Ctx) -> Result<u64, ApiError> {
+fn create_note(tx: &mut Tx, id: Id<Note>, body: NoteBody, ctx: &Ctx) -> Result<Id<Note>, ApiError> {
     let _ = ctx; // available; this route just doesn't need a session
     tx.put(&Note {
-        id: Id::from_raw(id),
+        id,
         text: body.text,
     });
     Ok(id)
@@ -641,24 +659,25 @@ identifiers in scope — `routes![handlers::create_note]` works exactly like
 `#[route]` handler still has no argument-convention access to it (only
 `#[route(SSE ...)]`'s platform-extracted resume cursor reads it today).
 
-### Returning rows from a route: `Id<T>` isn't serializable
+### Returning rows from a route: storage shape vs. wire shape
 
-A handler's return type only needs `T: serde::Serialize` (above) — nothing
-requires `T` to be a `#[table]` row, and in practice it can't be one
-directly: `Id<T>` implements charpente's own `Codec` (§2), deliberately
-not serde, so it does not implement `serde::Serialize` or `Deserialize`.
-A route that tries to return a row whose type has an `Id<T>` field fails
-to compile with a missing-trait-bound error on `Id`, not a runtime
-surprise.
+A handler's return type only needs `T: serde::Serialize + Wire` (above) —
+nothing requires `T` to be a `#[table]` row, and `#[table]` does not derive
+`Serialize` or `Wire` for you: a row's storage shape (`Id<T>`'s own `Codec`, §2) and
+its wire shape are separate concerns on purpose, kept apart even though
+`Id<T>` also implements `Serialize`/`Deserialize` — as a decimal string,
+never a JSON number, because `u64` values above 2^53 lose precision
+silently in JavaScript clients.
 
 The fix is the one every other example in this guide already uses without
-saying so: convert to a plain response type first, pulling `Id<T>` down to
-its `u64` with `.raw()`.
+saying so: convert to a plain response type first. `Id<T>` belongs directly
+in that view type — there's no need to unwrap it to a bare `u64` with
+`.raw()` to make it serializable.
 
 ```rust
 use charpente::http::{ApiError, App, AppConfig};
 use charpente::prod::{ProdDisk, ProdEntropy};
-use charpente::{Id, Schema, Tx, View, route, routes, table};
+use charpente::{Id, Schema, Tx, View, Wire, route, routes, table};
 use serde::Serialize;
 
 #[table]
@@ -667,18 +686,19 @@ struct Note {
     text: String,
 }
 
-/// The wire shape: plain, `Serialize`-able fields only — `Id<Note>` never
-/// appears in it directly.
-#[derive(Serialize)]
+/// The wire shape: `Id<Note>` crosses as a decimal string, so it appears
+/// directly here — no `.raw()` unwrap, no separate id type. `#[derive(Wire)]`
+/// is what lets this type appear in a route's response schema (§13).
+#[derive(Wire, Serialize)]
 struct NoteView {
-    id: u64,
+    id: Id<Note>,
     text: String,
 }
 
 impl From<Note> for NoteView {
     fn from(row: Note) -> Self {
         NoteView {
-            id: row.id.raw(),
+            id: row.id,
             text: row.text,
         }
     }
@@ -714,10 +734,16 @@ sequence of literal-vs-`:param` segments, so both could match one real path
 
 ```rust
 use charpente::http::{ApiError, App};
-use charpente::{Tx, route, routes};
+use charpente::{Id, Tx, route, routes, table};
 
+#[table]
+struct Note {
+    id: Id<Note>,
+}
+
+// A path param is a wire position too — `Id<Note>`, not a bare `u64`.
 #[route(GET "/notes/:id")]
-fn by_id(tx: &mut Tx, id: u64) -> Result<u64, ApiError> {
+fn by_id(tx: &mut Tx, id: Id<Note>) -> Result<Id<Note>, ApiError> {
     let _ = tx;
     Ok(id)
 }
@@ -1058,7 +1084,7 @@ process owns the server for as long as it runs.
 use charpente::core::table::Id;
 use charpente::http::{ApiError, App, AppConfig};
 use charpente::prod::{ProdDisk, ProdEntropy};
-use charpente::{Schema, Tx, View, route, routes, table};
+use charpente::{Schema, Tx, View, Wire, route, routes, table};
 use serde::Deserialize;
 
 #[table]
@@ -1067,15 +1093,15 @@ struct Note {
     text: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Wire, Deserialize)]
 struct NoteBody {
     text: String,
 }
 
 #[route(POST "/notes/:id")]
-fn create_note(tx: &mut Tx, id: u64, body: NoteBody) -> Result<u64, ApiError> {
+fn create_note(tx: &mut Tx, id: Id<Note>, body: NoteBody) -> Result<Id<Note>, ApiError> {
     tx.put(&Note {
-        id: Id::from_raw(id),
+        id,
         text: body.text,
     });
     Ok(id)
@@ -1313,13 +1339,17 @@ impl SendReminder {
 }
 
 #[route(POST "/invoices/:id/remind")]
-fn remind(tx: &mut Tx, id: u64) -> Result<(), ApiError> {
-    let mut inv = tx
-        .get(Id::<Invoice>::from_raw(id))?
-        .ok_or(ApiError::NotFound)?;
+fn remind(tx: &mut Tx, id: Id<Invoice>) -> Result<(), ApiError> {
+    let mut inv = tx.get(id)?.ok_or(ApiError::NotFound)?;
     inv.finalized = true;
     tx.put(&inv);
-    tx.enqueue_keyed(format!("reminder:{id}"), SendReminder { invoice: id });
+    // `SendReminder.invoice` stays a bare `u64`: a job payload is never
+    // itself a wire type (it never crosses HTTP), so it has no `Wire`
+    // requirement — only `#[route]` params/bodies/responses/errors do.
+    tx.enqueue_keyed(
+        format!("reminder:{}", id.raw()),
+        SendReminder { invoice: id.raw() },
+    );
     Ok(())
 }
 ```
@@ -1594,7 +1624,7 @@ use charpente::core::table::Id;
 use charpente::http::{ApiError, App, AppConfig, Ctx};
 use charpente::kernel::JobError;
 use charpente::prod::{ProdDisk, ProdEntropy};
-use charpente::{Schema, Tx, View, job, jobs, route, routes, table};
+use charpente::{Schema, Tx, View, Wire, job, jobs, route, routes, table};
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -1610,7 +1640,7 @@ struct DigestState {
     sent: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Wire, Deserialize)]
 struct NoteBody {
     text: String,
 }
@@ -1630,10 +1660,10 @@ impl SendDigest {
 }
 
 #[route(POST "/notes/:id")]
-fn create_note(tx: &mut Tx, id: u64, body: NoteBody, ctx: &Ctx) -> Result<u64, ApiError> {
+fn create_note(tx: &mut Tx, id: Id<Note>, body: NoteBody, ctx: &Ctx) -> Result<Id<Note>, ApiError> {
     let _ = ctx;
     tx.put(&Note {
-        id: Id::from_raw(id),
+        id,
         text: body.text,
     });
     Ok(id)
@@ -1967,7 +1997,8 @@ use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::{Codec, Id};
 use charpente::http::{ApiError, App, AppConfig, Method, Request};
 use charpente::kernel::{JobError, Kernel, SimSource};
-use charpente::{Schema, Tx, View, job, jobs, route, routes, table};
+use charpente::wire::WireU64;
+use charpente::{Schema, Tx, View, Wire, job, jobs, route, routes, table};
 use charpente_sim::Sim;
 use charpente_sim::checks::is_fault_fallout;
 use serde::{Deserialize, Serialize};
@@ -1982,6 +2013,8 @@ struct Counter {
     hits: u64,
 }
 
+// A job payload never crosses HTTP, so it has no `Wire` requirement — this
+// stays a bare `u64`.
 #[job]
 struct CountUp {
     slot: u64,
@@ -1998,14 +2031,16 @@ impl CountUp {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+// A route body IS a wire type, so `slot` is `WireU64` here even though the
+// job payload above carries the same value as a bare `u64`.
+#[derive(Wire, Serialize, Deserialize)]
 struct HitBody {
-    slot: u64,
+    slot: WireU64,
 }
 
 #[route(POST "/hit")]
-fn hit(tx: &mut Tx, body: HitBody) -> Result<u64, ApiError> {
-    tx.enqueue(CountUp { slot: body.slot });
+fn hit(tx: &mut Tx, body: HitBody) -> Result<WireU64, ApiError> {
+    tx.enqueue(CountUp { slot: body.slot.0 });
     Ok(body.slot)
 }
 
@@ -2082,7 +2117,7 @@ fn whole_app(sim: &mut Sim) -> Result<(), String> {
     for slot in 0..3u64 {
         source.push_at(
             slot * SEC,
-            Request::new(Method::Post, "/hit").json(&HitBody { slot }),
+            Request::new(Method::Post, "/hit").json(&HitBody { slot: WireU64(slot) }),
         );
     }
     let responses = source.responses();
@@ -2283,7 +2318,13 @@ this argument must be named `id` to match :id in "/notes/:id" — got `key`
 route path must start with '/' — got "notes"
 unknown method PUSH — one of GET, POST, PUT, PATCH, DELETE, SSE
 the route path must be a string literal — e.g. #[route(GET "/notes/:id")]
-the only route flag is `auth` — write `#[route(GET "/path", auth)]`
+a route flag is `auth` or `emits(Ev, …)` — write `#[route(GET "/path", auth)]`, or `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`
+emits(...) applies to SSE routes only — a plain route returns one response, not a stream of events; drop emits(...) or make this `#[route(SSE "…")]`
+emits(...) must name at least one #[event] type — write `emits(NoteAdded, NoteRemoved)`, or drop it
+emits takes a parenthesized list of #[event] types — write `emits(NoteAdded, NoteRemoved)`
+`auth` given twice — write it once
+`emits(...)` given twice — a route declares one set, so name every event in one list: `emits(NoteAdded, NoteRemoved)`
+`NoteAdded` is named twice in emits(...) — a stream declares each event type once, and a repeat would put the same member in a generated client's union twice; write it once
 #[route] handlers are free functions — no `self`
 empty :param name in "/notes/:"
 write `#[route(METHOD "/path")]` — e.g. #[route(GET "/notes/:id")]
@@ -2292,8 +2333,14 @@ write `#[route(METHOD "/path")]` — e.g. #[route(GET "/notes/:id")]
 §5's "What `#[route]` rejects" walks through the first three with full
 examples. The rest, in order: the path literal doesn't start with `/`; the
 method name isn't one of `GET`/`POST`/`PUT`/`PATCH`/`DELETE`/`SSE`; the path
-isn't a string literal at all (e.g. a `const`); the trailing flag after the
-path isn't `auth`; the handler takes `self` (route handlers are free
+isn't a string literal at all (e.g. a `const`); a flag after the path is
+neither `auth` nor `emits(...)`; `emits(...)` is on a route that isn't a
+stream (only an SSE route has events to declare — see §11); `emits()` names
+nothing at all; `emits` was written without its parentheses; `auth` or
+`emits(...)` appears twice on the same route (a flag is a yes/no and a route
+declares one set, so a repeat is always a typo or a bad merge); the same
+event type appears twice inside one `emits(...)` list; the handler takes
+`self` (route handlers are free
 functions); a `:` segment has nothing after it; and the macro's own
 argument list didn't parse as `METHOD "/path"` to begin with. Every one of
 these is a compile error at the `#[route]` call site — fix the signature or
@@ -2856,6 +2903,7 @@ dispatcher reads `charpente.jobs`.
 ### `#[event]`
 
 ```rust
+use charpente::wire::WireU64;
 use charpente::{Event, event};
 
 #[event]
@@ -2865,7 +2913,7 @@ struct HTTPEvent {
 
 #[event]
 struct InvoicePDFSent {
-    invoice: u64,
+    invoice: WireU64,
 }
 
 fn names() -> (&'static str, &'static str) {
@@ -2873,9 +2921,15 @@ fn names() -> (&'static str, &'static str) {
 }
 ```
 
-`#[event]` derives three things a plain struct doesn't have: `Codec` (the log/table
+`#[event]` derives five things a plain struct doesn't have: `Codec` (the log/table
 format — the same machinery `#[table]`/`#[job]` use), `impl Event` (`NAME`, the wire
-and delivery-filter name), and `serde::Serialize` (the JSON a subscriber receives).
+and delivery-filter name), `serde::Serialize` (the JSON a subscriber receives),
+`Wire` (that JSON's schema, so `charpente describe` and a generated client can name
+the payload type — which is also why a bare `u64`/`i64` field is a compile error
+here, exactly as in a route's request or response: use `Id<T>` for a row id, or
+`WireU64`/`WireI64`), and an `EventEntry` impl so `events![...]` can collect the type
+(next section). A `#[job]` payload has no `Wire` requirement, because it never leaves
+the process — only an event's payload is itself a wire document.
 `NAME` is the snake_case of the type name, computed at compile time — not a name you
 choose, so it can never drift from the type. The splitting rule inserts `_` before an
 uppercase letter that follows a lowercase letter or digit, and before the *last*
@@ -2884,6 +2938,50 @@ one — so a whole acronym run stays one word except right at its boundary with 
 next word: `NoteAdded` → `note_added`; `HTTPEvent` → `http_event` (the run `HTTP`
 stays together, splitting only where the trailing `E` turns out to start `Event`);
 `InvoicePDFSent` → `invoice_pdf_sent` (`PDF` stays together, `S` starts `Sent`).
+
+### Registering events: `events![...]` and `mount_events`
+
+Like `jobs![...]`, `events![...]` collects descriptors explicitly and
+`App::mount_events(...)` registers them — but for a different purpose. This
+registry is read by `charpente describe` (and by the client generator
+downstream of it) and by **nothing on the delivery path**: emitting and
+subscribing work exactly the same whether or not an event is registered,
+because a `Subscription::of::<Ev>()` captures its encoder at the subscribe
+site. What registration buys is that the event, and its payload type, appear
+in the contract at all:
+
+```rust
+use charpente::http::{App, AppConfig};
+use charpente::prod::{ProdDisk, ProdEntropy};
+use charpente::wire::WireU64;
+use charpente::{Schema, event, events};
+
+#[event]
+struct NoteAdded {
+    note: WireU64,
+}
+
+fn build_app(data_dir: &str) -> std::io::Result<App> {
+    Ok(App::open(
+        Box::new(ProdDisk::new(data_dir)?),
+        Schema::new(),
+        Box::new(ProdEntropy::new()?),
+        AppConfig::default(),
+    )?
+    .mount_events(events![NoteAdded]))
+}
+```
+
+That app's `Contract.events` carries one entry — `{"name": "note_added",
+"payload": "NoteAdded", "keyed": false}` — and `NoteAdded`'s own field schema
+joins `"types"` beside the route types (§13). `keyed` is always `false`, and
+honestly so: `tx.emit` versus `tx.emit_keyed` is a *call-site* choice, not a
+property of the event type, so nothing static can know it.
+
+Mounting the same event type twice — in one `mount_events` call, or across
+several — panics at mount time: `"event \"note_added\" registered twice —
+each #[event] type is mounted once"`. The name in that message is the event's
+`NAME` (snake_case), not the Rust type name.
 
 ### Emitting: `tx.emit` and `tx.emit_keyed`
 
@@ -2931,18 +3029,22 @@ fn handler(tx: &mut Tx, [captures,] ctx: &Ctx, cursor: Option<Cursor>)
 use charpente::event;
 use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, Method, Request, Subscription};
 use charpente::kernel::{Kernel, SimSource};
-use charpente::{Schema, Tx, route, routes};
+use charpente::wire::WireU64;
+use charpente::{Schema, Tx, Wire, route, routes};
 use charpente_sim::Sim;
 use serde::{Deserialize, Serialize};
 
+// An `#[event]` payload IS a wire type — it is exactly the JSON a
+// subscriber receives — so `#[event]` derives `Wire` and `n` needs the same
+// `WireU64` a route body would.
 #[event]
 struct Ping {
-    n: u64,
+    n: WireU64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Wire, Serialize, Deserialize)]
 struct PingBody {
-    n: u64,
+    n: WireU64,
 }
 
 #[route(POST "/ping")]
@@ -2954,7 +3056,10 @@ fn send_ping(tx: &mut Tx, body: PingBody) -> Result<(), ApiError> {
 /// A real handler would narrow `.key(...)` to the caller's own org, read off
 /// `ctx.session()` exactly like any other route's access control — the
 /// platform enforces nothing about the key beyond the exact-match filter.
-#[route(SSE "/feed")]
+///
+/// `emits(Ping)` declares what this stream carries, for the contract and the
+/// generated client — see "Declaring what a stream carries" below.
+#[route(SSE "/feed", emits(Ping))]
 fn feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<Ping>().cursor(cursor))
@@ -2986,6 +3091,75 @@ second type to the same tail; `.key(...)` narrows delivery to one exact-match va
 `.cursor(...)` takes the resume point the platform already extracted (next) — the
 handler can pass it straight through, as `feed` does above, or clamp it to some
 app-level boundary.
+
+### Declaring what a stream carries
+
+`Subscription::of::<Ping>()` runs inside the handler's body, so nothing outside the
+handler can see it — not `App::describe`, and therefore not a generated client, which
+would otherwise have to offer "subscribe to anything". A stream route says so on the
+attribute instead:
+
+```rust,ignore
+#[route(SSE "/feed", emits(Ping, Pong))]
+```
+
+The names inside `emits(...)` are the `#[event]` TYPES, exactly like `Subscription::of`
+— a typo is a compile error, and a type that isn't an `#[event]` fails with an
+unsatisfied `Event` bound naming it. The contract records BOTH names each type has, so
+`Ping` shows up in `RouteInfo.emits` as
+`EmittedEvent { event: "ping", payload: "Ping" }` (`charpente::http::EmittedEvent`)
+without you repeating the snake_case rule anywhere. `event` is the `Event::NAME` an SSE
+frame's `event:` field carries; `payload` is the `Wire::WIRE_NAME` a generated client's
+union member uses. Both are recorded because neither derives from the other —
+`#[event]`'s acronym rule maps `HTTPServer` to `http_server`, and nothing inverts that.
+Their payload types join `Contract.types` too, so a client can resolve the union even in
+an app that never calls `mount_events`.
+
+Three things it deliberately is not:
+
+- **Not a filter.** Delivery still runs off the encoders `Subscription::of::<Ev>()`
+  captured. Declaring `emits(Ping)` does not stop a handler subscribing to `Pong`, and
+  it does not make the platform drop a `Pong` frame.
+- **Not required.** Leave it off and the route's `emits` is `[]` — `stream: true` with
+  no binding, exactly as before this existed. Combine it with `auth` in either order —
+  `#[route(SSE "/feed", auth, emits(Ping))]` and `#[route(SSE "/feed", emits(Ping), auth)]`
+  both parse, and both are pinned by
+  `crates/charpente-macros/tests/compile_pass/route_emits_on_sse.rs`.
+- **Not the key.** `.key(...)` narrows which *rows* reach the tail, and that value is a
+  per-emit call-site choice the contract cannot know. `emits(...)` names event TYPES, so
+  a keyed feed declares the same types an unkeyed one does.
+
+Since it is a declaration rather than a rule, it can drift from the handler. That is
+handled with an oracle: `App::subscription_event_names(route_name)` runs the route's
+subscribe glue and reports the names the returned `Subscription` actually holds, and a
+test compares the two. It takes `&mut self`, because reaching a live `Tx` means opening
+a transaction group:
+
+```rust,ignore
+let mut app = build_app(&sim)?;                 // &mut — the probe runs the handler
+let feed = app.describe().routes.iter().find(|r| r.name == "feed").unwrap().emits.clone();
+// A `Subscription` holds `Event::NAME`s and nothing else, so the `event` half is
+// the half this compares; the `payload` half is pinned by your contract golden.
+let declared: Vec<&str> = feed.iter().map(|e| e.event).collect();
+let actual = app.subscription_event_names("feed").unwrap();
+assert_eq!(declared, actual);
+```
+
+Order counts — the declaration's order is the contract's order — so write `emits(...)`
+in the same order the handler chains `of`/`and`. `crates/charpente/tests/describe.rs`
+and `crates/charpente/tests/realtime.rs` both carry this check; copy one into your own
+app's tests and every stream route you declare stays honest for free.
+
+**One thing to know before you copy it: the probe really runs your handler**, inside a
+transaction group it then commits. A read-only subscribe handler stages nothing and this
+costs nothing, which covers essentially every handler. But if yours writes on the
+subscribe path — minting a stream credential with `ctx.create_session` is the case that
+comes up — the probe refuses it with an error naming the route, *after* the write has
+committed: a group holding a staged record cannot be dropped uncommitted, so refusing
+means telling you, not undoing it. And because the probe feeds a fixed token rather than
+drawing entropy (it must not perturb your app's entropy stream), a credential minted
+that way is the same one every run. Move the write off the subscribe path, or leave that
+route out of the drift test.
 
 ### Cursor semantics
 
@@ -3075,11 +3249,11 @@ which is why every case above ends the same way: re-sync, then reconnect.
 ```text
 id: 0.0
 event: ping
-data: {"n":1}
+data: {"n":"1"}
 
 id: 1.1
 event: ping
-data: {"n":2}
+data: {"n":"2"}
 
 ```
 
@@ -3102,20 +3276,24 @@ one-shot reply, recorded as a `SimSinkHandle`:
 use charpente::event;
 use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, Method, Request, Subscription};
 use charpente::kernel::{Kernel, SimSource};
-use charpente::{Schema, Tx, route, routes};
+use charpente::wire::WireU64;
+use charpente::{Schema, Tx, Wire, route, routes};
 use charpente_sim::Sim;
 use serde::{Deserialize, Serialize};
 
 const SEC: u64 = 1_000_000_000;
 
+// An `#[event]` payload IS a wire type — it is exactly the JSON a
+// subscriber receives — so `#[event]` derives `Wire` and `n` needs the same
+// `WireU64` a route body would.
 #[event]
 struct Ping {
-    n: u64,
+    n: WireU64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Wire, Serialize, Deserialize)]
 struct PingBody {
-    n: u64,
+    n: WireU64,
 }
 
 #[route(POST "/ping")]
@@ -3124,7 +3302,7 @@ fn send_ping(tx: &mut Tx, body: PingBody) -> Result<(), ApiError> {
     Ok(())
 }
 
-#[route(SSE "/feed")]
+#[route(SSE "/feed", emits(Ping))]
 fn feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<Ping>().cursor(cursor))
@@ -3150,7 +3328,7 @@ fn tail_resumes_after_reconnect(sim: &mut Sim) -> Result<(), String> {
     for n in 0..3u64 {
         source.push_at(
             (n + 1) * SEC,
-            Request::new(Method::Post, "/ping").json(&PingBody { n }),
+            Request::new(Method::Post, "/ping").json(&PingBody { n: WireU64(n) }),
         );
     }
     let sinks = source.sinks();
@@ -3174,7 +3352,7 @@ fn tail_resumes_after_reconnect(sim: &mut Sim) -> Result<(), String> {
     );
     source.push_at(
         5 * SEC,
-        Request::new(Method::Post, "/ping").json(&PingBody { n: 3 }),
+        Request::new(Method::Post, "/ping").json(&PingBody { n: WireU64(3) }),
     );
     kernel.run(&mut source).map_err(|e| e.to_string())?;
 
@@ -3350,9 +3528,9 @@ opts that table out of drift protection. Use `#[table]`.
 
 `charpente describe` renders the full shape of a mounted `App` — every table (with its
 version, structural fingerprint, indexes, and migration chain), every route (method,
-pattern, name, whether it requires auth, whether it's an SSE stream), every job (name,
-retry policy), every cron entry (name, interval), and the app's config — as one JSON (or
-human-readable) document. It is a pure walk of the app's own registries (DESIGN §7): no
+pattern, name, whether it requires auth, whether it's an SSE stream), every registered
+event (name, payload type — §11), every job (name, retry policy), every cron entry
+(name, interval), and the app's config — as one JSON (or human-readable) document. It is a pure walk of the app's own registries (DESIGN §7): no
 disk writes beyond the ephemeral describe run itself, no socket, no kernel loop. This is
 the "what exists" query an agent would otherwise burn context reconstructing by reading
 every `#[table]`/`#[route]`/`#[job]` item across the crate by hand.
@@ -3375,7 +3553,7 @@ one function this migration asks you to factor `fn main`'s body into.
 use charpente::core::io::{Disk, Entropy};
 use charpente::core::table::Id;
 use charpente::http::{ApiError, App, AppConfig};
-use charpente::{Schema, Tx, View, route, routes, table};
+use charpente::{Schema, Tx, View, Wire, route, routes, table};
 use serde::Deserialize;
 
 #[table]
@@ -3384,15 +3562,15 @@ struct Note {
     text: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Wire, Deserialize)]
 struct NoteBody {
     text: String,
 }
 
 #[route(POST "/notes/:id")]
-fn create_note(tx: &mut Tx, id: u64, body: NoteBody) -> Result<u64, ApiError> {
+fn create_note(tx: &mut Tx, id: Id<Note>, body: NoteBody) -> Result<Id<Note>, ApiError> {
     tx.put(&Note {
-        id: Id::from_raw(id),
+        id,
         text: body.text,
     });
     Ok(id)
@@ -3449,13 +3627,24 @@ never wrapped in a framework message.
 ### The invoicing contract
 
 The full JSON `examples/invoicing` renders — 12 routes across customers, invoices, and
-API keys; 4 jobs (3 of the app's own plus the platform's built-in session sweep); 2 cron
-entries (the app's daily overdue-check plus the platform's built-in session sweep
-schedule); 13 tables (7 of the app's own plus 6 platform tables: `Session`, `ApiKey`,
-`CronRow`, and the three untyped internal tables backing jobs, events, and schema
-versions). Every `"builtin": true` entry above is a table, job, or cron entry the
-platform itself registers, not app code — this is how an agent tells its own surface
-apart from the platform's without memorizing a list:
+API keys; 2 registered events (`invoice_finalized` and `receipt_sent`, the two payloads
+`/events/feed` delivers, in event-name order rather than registration order); 9 named
+types reachable from those routes' params, request, and response schemas and from those
+two event payloads (`ApiError`, `CreateCustomerBody`, `CreateInvoiceBody`,
+`CustomerView`, `InvoiceFinalized`, `InvoiceView`, `LineItemInput`, `LineItemView`,
+`ReceiptSent`, alphabetized in `"types"` regardless of registration order — §5's
+`register_types` walk). `ApiError`'s own
+schema is the fixed `{"error": "<message>"}` envelope every route's error response
+actually carries — not a per-variant union of its Rust shape, and not `OidcReject`
+(which `ApiError::Oidc` wraps at the Rust level but never puts on the wire, so it does
+not appear in `"types"` at all; see "`ApiError` and status mapping" below); 4 jobs (3 of the
+app's own plus the platform's built-in session sweep); 2 cron entries (the app's daily
+overdue-check plus the platform's built-in session sweep schedule); 13 tables (7 of the
+app's own plus 6 platform tables: `Session`, `ApiKey`, `CronRow`, and the three untyped
+internal tables backing jobs, events, and schema versions). Every `"builtin": true`
+entry above is a table, job, or cron entry the platform itself registers, not app
+code — this is how an agent tells its own surface apart from the platform's without
+memorizing a list:
 
 ```json
 {
@@ -3591,84 +3780,508 @@ apart from the platform's without memorizing a list:
       "pattern": "/login",
       "name": "login",
       "auth": false,
-      "stream": false
+      "stream": false,
+      "params": [],
+      "request": "String",
+      "response": "String",
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "POST",
       "pattern": "/customers/:id",
       "name": "create_customer",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Customer"
+          }
+        }
+      ],
+      "request": {
+        "Ref": "CreateCustomerBody"
+      },
+      "response": {
+        "Ref": "CustomerView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "GET",
       "pattern": "/customers/:id",
       "name": "get_customer",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Customer"
+          }
+        }
+      ],
+      "request": null,
+      "response": {
+        "Ref": "CustomerView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "GET",
       "pattern": "/customers",
       "name": "list_customers",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [],
+      "request": null,
+      "response": {
+        "Seq": {
+          "Ref": "CustomerView"
+        }
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "POST",
       "pattern": "/invoices/:id",
       "name": "create_invoice",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Invoice"
+          }
+        }
+      ],
+      "request": {
+        "Ref": "CreateInvoiceBody"
+      },
+      "response": {
+        "Ref": "InvoiceView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "GET",
       "pattern": "/invoices/:id",
       "name": "get_invoice",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Invoice"
+          }
+        }
+      ],
+      "request": null,
+      "response": {
+        "Ref": "InvoiceView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "GET",
       "pattern": "/invoices",
       "name": "list_invoices",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [],
+      "request": null,
+      "response": {
+        "Seq": {
+          "Ref": "InvoiceView"
+        }
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "POST",
       "pattern": "/invoices/:id/finalize",
       "name": "finalize_invoice",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Invoice"
+          }
+        }
+      ],
+      "request": null,
+      "response": {
+        "Ref": "InvoiceView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "POST",
       "pattern": "/invoices/:id/record-payment",
       "name": "record_payment",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "Invoice"
+          }
+        }
+      ],
+      "request": null,
+      "response": {
+        "Ref": "InvoiceView"
+      },
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "GET",
       "pattern": "/events/feed",
       "name": "events_feed",
       "auth": true,
-      "stream": true
+      "stream": true,
+      "params": [],
+      "request": null,
+      "response": "Null",
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "POST",
       "pattern": "/keys",
       "name": "create_key",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [],
+      "request": null,
+      "response": "String",
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
     },
     {
       "method": "DELETE",
       "pattern": "/keys/:id",
       "name": "revoke_key",
       "auth": true,
-      "stream": false
+      "stream": false,
+      "params": [
+        {
+          "name": "id",
+          "schema": {
+            "Id": "ApiKey"
+          }
+        }
+      ],
+      "request": null,
+      "response": "String",
+      "error": {
+        "Ref": "ApiError"
+      },
+      "emits": []
+    }
+  ],
+  "events": [
+    {
+      "name": "invoice_finalized",
+      "payload": "InvoiceFinalized",
+      "keyed": false
+    },
+    {
+      "name": "receipt_sent",
+      "payload": "ReceiptSent",
+      "keyed": false
+    }
+  ],
+  "types": [
+    {
+      "name": "ApiError",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "error",
+              "schema": "String",
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "CreateCustomerBody",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "name",
+              "schema": "String",
+              "optional": false
+            },
+            {
+              "name": "email",
+              "schema": "String",
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "CreateInvoiceBody",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "customer",
+              "schema": {
+                "Id": "Customer"
+              },
+              "optional": false
+            },
+            {
+              "name": "due_day",
+              "schema": {
+                "Int64": {
+                  "signed": false
+                }
+              },
+              "optional": false
+            },
+            {
+              "name": "line_items",
+              "schema": {
+                "Seq": {
+                  "Ref": "LineItemInput"
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "CustomerView",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "id",
+              "schema": {
+                "Id": "Customer"
+              },
+              "optional": false
+            },
+            {
+              "name": "name",
+              "schema": "String",
+              "optional": false
+            },
+            {
+              "name": "email",
+              "schema": "String",
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "InvoiceFinalized",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "invoice",
+              "schema": {
+                "Id": "Invoice"
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "InvoiceView",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "id",
+              "schema": {
+                "Id": "Invoice"
+              },
+              "optional": false
+            },
+            {
+              "name": "customer",
+              "schema": {
+                "Id": "Customer"
+              },
+              "optional": false
+            },
+            {
+              "name": "state",
+              "schema": "String",
+              "optional": false
+            },
+            {
+              "name": "due_day",
+              "schema": {
+                "Int64": {
+                  "signed": false
+                }
+              },
+              "optional": false
+            },
+            {
+              "name": "line_items",
+              "schema": {
+                "Seq": {
+                  "Ref": "LineItemView"
+                }
+              },
+              "optional": false
+            },
+            {
+              "name": "total_cents",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "LineItemInput",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "description",
+              "schema": "String",
+              "optional": false
+            },
+            {
+              "name": "unit_amount_cents",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            },
+            {
+              "name": "quantity",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "LineItemView",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "description",
+              "schema": "String",
+              "optional": false
+            },
+            {
+              "name": "unit_amount_cents",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            },
+            {
+              "name": "quantity",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "ReceiptSent",
+      "schema": {
+        "Struct": {
+          "fields": [
+            {
+              "name": "invoice",
+              "schema": {
+                "Id": "Invoice"
+              },
+              "optional": false
+            },
+            {
+              "name": "amount_cents",
+              "schema": {
+                "Int64": {
+                  "signed": true
+                }
+              },
+              "optional": false
+            }
+          ]
+        }
+      }
     }
   ],
   "jobs": [
@@ -3742,12 +4355,15 @@ starting with a `tables:` header.)
 Two honesty notes. First: a `describe` run never touches the app's real data
 directory — it builds and opens the app against a fresh, throwaway temp directory the
 CLI verb (or `launch`, when invoked with the `describe` verb) creates and removes around
-the run, so it is always safe to run against a live server's data dir. Second: emitted
-event *types* are not enumerated here in v0 — `tx.emit`/`tx.emit_keyed` names are compiled
-into each `#[route(SSE …)]` handler's `Subscription`, not registered anywhere an app-wide
-walk could discover ahead of time (spec ruling 6). The only trace of realtime in the
-contract above is `"stream": true` on `events_feed` — the fact that a route serves SSE at
-all, not what it emits. Reading a route's handler is still how you find that out.
+the run, so it is always safe to run against a live server's data dir. Second: everything
+in the contract is *declared*, never discovered by walking bodies. That shows up twice
+here. `events_feed`'s entry above carries `"stream": true` and an empty `"emits": []`
+because this example has not adopted `emits(...)` yet (§11, "Declaring what a stream
+carries") — `Subscription::of::<Ev>()` runs inside the handler's body, where no app-wide
+walk can see it, so an undeclared feed tells you nothing about which events it delivers
+and reading the handler is the only way to find out. Likewise an event never passed to
+`mount_events` is absent from `events` entirely: registration is what puts an event in
+the contract, and it still emits and delivers either way.
 
 ## 14. The archive
 

@@ -136,7 +136,10 @@ fn create_customer(http: &mut Http, id: u64) -> Result<(), String> {
 /// same transaction) — this is what makes the invoice id ledger this oracle
 /// checks trustworthy without reading anything back first.
 fn create_and_finalize_invoice(http: &mut Http, id: u64, customer: u64) -> Result<(), String> {
-    let create_body = format!(r#"{{"customer":{customer},"due_day":0,"line_items":[]}}"#);
+    // `customer` is `Id<Customer>` and `due_day` is `WireU64` (task 5): both
+    // are 64-bit values, so both cross the wire as quoted decimal strings,
+    // never bare JSON numbers.
+    let create_body = format!(r#"{{"customer":"{customer}","due_day":"0","line_items":[]}}"#);
     let create = http
         .post(&format!("/invoices/{id}"), &create_body)
         .map_err(|e| format!("create_invoice({id}) request failed: {e}"))?;
@@ -162,18 +165,22 @@ fn create_and_finalize_invoice(http: &mut Http, id: u64, customer: u64) -> Resul
 
 // ------------------------------------------------------------- pure parsing
 
-/// Extracts a `u64` field from a compact JSON object body (`InvoiceFinalized`/
-/// `ReceiptSent`'s wire shape is always `{"invoice":N}` or
-/// `{"invoice":N,"amount_cents":M}` — field order and presence never in
-/// doubt here, so a bare digit scan after the key is enough; this crate has
-/// no JSON dependency, matching `acked_durable.rs`'s `extract_field`).
+/// Extracts a `u64` field from a compact JSON object body. Both
+/// `InvoiceFinalized` and `ReceiptSent` (task 5 fix round 1, F7 — the two
+/// disagreed before this fix) name their `invoice` field `Id<Invoice>`,
+/// which always crosses the wire as a quoted decimal string, so the shape
+/// this scans is `{"invoice":"N", ...}` — one optional leading `"` is
+/// stripped before the digit scan (kept optional so this also tolerates a
+/// bare-number shape, matching this function's pre-task-5 behavior and any
+/// other bare-`u64` field a caller might point it at). Field order and
+/// presence are never in doubt here, so this stays a scan, not a parser.
+/// This crate has no JSON dependency, matching `acked_durable.rs`'s
+/// `extract_field`.
 fn extract_u64_field(json: &str, key: &str) -> Option<u64> {
     let pattern = format!("\"{key}\":");
     let start = json.find(&pattern)? + pattern.len();
-    let digits: String = json[start..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
+    let rest = json[start..].strip_prefix('"').unwrap_or(&json[start..]);
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     if digits.is_empty() {
         None
     } else {
@@ -865,6 +872,17 @@ fn extract_u64_field_reads_the_invoice_id() {
         Some(7)
     );
     assert_eq!(extract_u64_field(r#"{"other":1}"#, "invoice"), None);
+}
+
+/// `InvoiceFinalized.invoice` is `Id<Invoice>` (task 5): it crosses as a
+/// quoted decimal string, e.g. `{"invoice":"42"}` — this is the shape the
+/// real `invoice_finalized` frames this file scans actually carry.
+#[test]
+fn extract_u64_field_reads_a_quoted_id_string() {
+    assert_eq!(
+        extract_u64_field(r#"{"invoice":"42"}"#, "invoice"),
+        Some(42)
+    );
 }
 
 /// Hand-built to match exactly what `Response::error(400, ...)` (compact

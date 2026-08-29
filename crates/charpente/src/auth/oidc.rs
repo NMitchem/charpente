@@ -68,6 +68,14 @@ impl fmt::Display for OidcConfigError {
 
 /// Why `OidcVerifier::verify` rejected a presented JWT (spec §6): one named
 /// variant per check, each naming the check and the fix.
+///
+/// No longer derives `Wire`/`Serialize` (task 5 fix round 1, F1): `ApiError`
+/// itself no longer derives `Wire` either — it has a hand-written impl
+/// describing the fixed `{"error": "<message>"}` envelope `Response::error`
+/// actually emits, which never contains a `Ref("OidcReject")`. Its message
+/// is flattened into that envelope string by
+/// `ApiError::Oidc(reject) => Response::error(401, &reject.to_string())`
+/// (`http/mod.rs`), so it never needed its own wire schema.
 #[derive(Debug)]
 pub enum OidcReject {
     Malformed(String),

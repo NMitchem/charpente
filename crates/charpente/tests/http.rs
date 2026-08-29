@@ -8,7 +8,8 @@ use charpente::http::{
     ApiError, App, AppConfig, Ctx, Cursor, Handled, Method, Request, Response, Route, Session,
     Subscription,
 };
-use charpente::{Schema, Tx, event, route, routes, table};
+use charpente::wire::WireU64;
+use charpente::{Schema, Tx, Wire as WireDerive, event, route, routes, table};
 use charpente_core::table::Id;
 use charpente_sim::{FaultConfig, Sim};
 use rsa::traits::PublicKeyParts;
@@ -24,20 +25,20 @@ struct Note {
     text: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(WireDerive, Serialize, Deserialize)]
 struct CreateNote {
-    id: u64,
+    id: Id<Note>,
     text: String,
 }
 
 #[route(POST "/notes")]
-fn create_note(tx: &mut Tx, body: CreateNote, ctx: &Ctx) -> Result<u64, ApiError> {
+fn create_note(tx: &mut Tx, body: CreateNote, ctx: &Ctx) -> Result<Id<Note>, ApiError> {
     let owner = ctx
         .session()
         .and_then(|s| s.subject.parse().ok())
         .unwrap_or(0);
     tx.put(&Note {
-        id: Id::from_raw(body.id),
+        id: body.id,
         owner,
         text: body.text,
     });
@@ -145,7 +146,7 @@ fn error_text(response: &Response) -> String {
 fn create_then_get_roundtrip() {
     let (_sim, mut app) = quiet_app(0x477);
     let created = app.handle(Request::new(Method::Post, "/notes").json(&CreateNote {
-        id: 7,
+        id: Id::from_raw(7),
         text: "hi".into(),
     }));
     assert_eq!(created.status, 200, "{}", body_text(&created));
@@ -164,7 +165,7 @@ fn create_then_get_roundtrip() {
 fn read_only_requests_consume_no_seq() {
     let (_sim, mut app) = quiet_app(0x478);
     app.handle(Request::new(Method::Post, "/notes").json(&CreateNote {
-        id: 1,
+        id: Id::from_raw(1),
         text: "x".into(),
     }));
     let before = app.db().last_applied();
@@ -243,7 +244,7 @@ fn body_cap_is_a_413_before_decoding() {
 fn writes_on_a_follower_get_421_naming_the_primary() {
     let (_sim, mut app) = quiet_app(0x9012_0005);
     let created = app.handle(Request::new(Method::Post, "/notes").json(&CreateNote {
-        id: 1,
+        id: Id::from_raw(1),
         text: "hi".into(),
     }));
     assert_eq!(created.status, 200, "{}", body_text(&created));
@@ -251,7 +252,7 @@ fn writes_on_a_follower_get_421_naming_the_primary() {
     app.db_for_tests().forbid_writes("primary-1:9000".into());
 
     let resp = app.handle(Request::new(Method::Post, "/notes").json(&CreateNote {
-        id: 2,
+        id: Id::from_raw(2),
         text: "bye".into(),
     }));
     assert_eq!(resp.status, 421, "{}", body_text(&resp));
@@ -280,7 +281,7 @@ fn a_verifying_node_refuses_writes_with_503_and_names_the_unreached_witnesses() 
     const SEED: u64 = 0x9012_0007;
     let (_sim, mut app) = quiet_app(SEED);
     let created = app.handle(Request::new(Method::Post, "/notes").json(&CreateNote {
-        id: 1,
+        id: Id::from_raw(1),
         text: "hi".into(),
     }));
     assert_eq!(created.status, 200, "{}", body_text(&created));
@@ -289,7 +290,7 @@ fn a_verifying_node_refuses_writes_with_503_and_names_the_unreached_witnesses() 
         .verify_writes(vec!["127.0.0.1:7001".into()]);
 
     let resp = app.handle(Request::new(Method::Post, "/notes").json(&CreateNote {
-        id: 2,
+        id: Id::from_raw(2),
         text: "bye".into(),
     }));
     assert_eq!(resp.status, 503, "{}", body_text(&resp));
@@ -321,7 +322,7 @@ fn a_verifying_node_pluralizes_the_503_body_for_multiple_unreached_witnesses() {
     ]);
 
     let resp = app.handle(Request::new(Method::Post, "/notes").json(&CreateNote {
-        id: 1,
+        id: Id::from_raw(1),
         text: "hi".into(),
     }));
     assert_eq!(resp.status, 503, "{}", body_text(&resp));
@@ -353,7 +354,7 @@ fn a_verifying_node_bounds_the_witness_list_it_renders_in_the_503_body() {
     app.db_for_tests().verify_writes(witnesses);
 
     let resp = app.handle(Request::new(Method::Post, "/notes").json(&CreateNote {
-        id: 1,
+        id: Id::from_raw(1),
         text: "hi".into(),
     }));
     assert_eq!(resp.status, 503, "{}", body_text(&resp));
@@ -1036,7 +1037,7 @@ fn routes_macro_collects_descriptors() {
 
 #[event]
 struct NoteAdded {
-    note: u64,
+    note: WireU64,
 }
 
 #[route(SSE "/feed")]
@@ -1120,9 +1121,9 @@ struct Item {
     content: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(WireDerive, Serialize, Deserialize)]
 struct PutItem {
-    i: u64,
+    i: WireU64,
 }
 
 struct Ping {
@@ -1145,12 +1146,12 @@ impl Job for Ping {
 }
 
 #[route(POST "/items")]
-fn put_item(tx: &mut Tx, body: PutItem) -> Result<u64, ApiError> {
+fn put_item(tx: &mut Tx, body: PutItem) -> Result<WireU64, ApiError> {
     tx.put(&Item {
-        id: Id::from_raw(body.i),
-        content: body.i * 7,
+        id: Id::from_raw(body.i.0),
+        content: body.i.0 * 7,
     });
-    tx.enqueue(Ping { i: body.i });
+    tx.enqueue(Ping { i: body.i.0 });
     Ok(body.i)
 }
 
@@ -1298,7 +1299,8 @@ fn http_workload_traced(sim: &mut Sim) -> Result<Vec<(u16, Vec<u8>)>, String> {
                     return Err("an unrouted request consumed a seq".to_string());
                 }
             }
-            let resp = app.handle(Request::new(Method::Post, "/items").json(&PutItem { i: acked }));
+            let resp = app
+                .handle(Request::new(Method::Post, "/items").json(&PutItem { i: WireU64(acked) }));
             responses.push((resp.status, resp.body.clone()));
             match resp.status {
                 200 => acked += 1,

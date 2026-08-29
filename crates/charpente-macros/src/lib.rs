@@ -11,6 +11,7 @@ mod job;
 mod route;
 mod row_shape;
 mod table;
+mod wire;
 
 use proc_macro::TokenStream;
 use syn::{DeriveInput, Error, ItemFn, parse_macro_input};
@@ -116,4 +117,12 @@ pub fn event(args: TokenStream, input: TokenStream) -> TokenStream {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }
+}
+
+#[proc_macro_derive(Wire, attributes(serde))]
+pub fn wire(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    wire::expand(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
 }

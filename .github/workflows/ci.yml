@@ -20,6 +20,17 @@ jobs:
       - run: cargo fmt --all --check
       # Carries the nondeterminism deny-list (clippy.toml) — hard rule 1.
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Isolates charpente-core's own feature resolution — hard rule 1's mechanical
+      # enforcement for the serde dependency added in 87d209b. Cargo unifies features
+      # across the whole workspace, so `cargo build/test --workspace` compiles
+      # charpente-core with charpente's `serde/derive` feature turned on regardless of
+      # what charpente-core's own Cargo.toml asks for: a `#[derive(Serialize)]` (or any
+      # other serde/derive macro) inside the deterministic core compiles clean under
+      # every command above and would ship green forever without this line. Built alone,
+      # charpente-core reverts to its own manifest (no `derive` feature), so the same
+      # derive fails here. Task 2 fix round 1 confirmed both directions: FAILS (101) with
+      # a `#[derive(serde::Serialize)]` probe present, PASSES (0) with it removed.
+      - run: cargo check -p charpente-core
       - run: cargo test --workspace
       # Cross-build-mode seed replay (the mode-skew regression, seed 0xff159ed76d2806e4).
       - run: CHARPENTE_SEED=0x8bee1752811ae873 cargo test --release -p charpente-sim --test crash_recovery
@@ -62,3 +73,88 @@ jobs:
       # If this proves flaky on a shared runner, tighten `known_noisy` at the test site rather
       # than deleting the line; a guard removed for noise is a guard that never fires.
       - run: cargo test -p bench-harness --lib -- kernel_bench::tests::passthrough_records_nothing_and_recording_records_something --exact --ignored
+
+  # The TypeScript client gate (TS-codegen spec §4/§7). Three checks, each of which
+  # fails for a different reason, and none of which the Rust suite above can perform.
+  #
+  # `check-client` is the STALENESS oracle: it rebuilds the fixture app, regenerates its
+  # client, and compares against the committed file. A Rust route or wire type that
+  # changed without the client being regenerated exits 1 and prints the first differing
+  # line, so the log shows WHAT drifted without a generated file being dumped into it.
+  # Its codes are 0 green / 1 stale-or-missing / 2 usage-or-launch fault / 101 a contract
+  # the emitter refuses by name (a duplicate identifier, a shadowed transport member) —
+  # the 1-vs-2 split matters, because collapsing them would tell CI a client is stale
+  # when the truth is that the build broke.
+  #
+  # `tsc --noEmit` is the TYPE oracle, and it is what makes the whole sub-project an
+  # oracle rather than a code generator. It checks the generated client against
+  # hand-written call sites (`calls.ts`), against `@ts-expect-error` brand negatives that
+  # fail if a wrong-id assignment COMPILES (`negatives.ts`), and against generated
+  # serde-fidelity literals — real serde_json documents checked with `satisfies`, so a
+  # serde rename the type IR missed is a compile error here rather than a generated type
+  # that is wrong and type-checks (`generated/samples.ts`).
+  #
+  # `cargo test -p ts-fixture-app --test samples` is `samples.ts`'s own staleness oracle,
+  # the counterpart of `check-client` for the file `gen-client` does not write. It is
+  # also reached by `cargo test --workspace` in the `check` job above; it is repeated
+  # here so this gate stands on its own rather than depending on another job's coverage.
+  #
+  # Proved to have teeth locally, per case, on 2026-08-26 (task 11 step 5): renaming a
+  # field, changing a `u32` to a `String`, and adding a required field each made
+  # `check-client` exit 1 naming the drifted line, and each made `tsc` exit 2 naming the
+  # changed field once the client was regenerated. Rewriting the generated `CustomerId`
+  # to a plain `string` turned both brand negatives into "Unused '@ts-expect-error'
+  # directive". Every mutation was reverted and both gates confirmed green in between.
+  # NOT yet exercised on a runner — this file was written under a commit-locally,
+  # do-not-push instruction, so the runner path (Node install, `npm ci` in a clean
+  # checkout, working directories) has never executed.
+  #
+  # `typescript` is pinned as a devDependency with a committed lockfile rather than left
+  # to `npx tsc`. Measured: `npx tsc` resolves to the npm package literally named "tsc",
+  # a deprecated 2016 stub at version 2.0.4 — not to TypeScript. Type-checking with a
+  # nine-year-old compiler is worse than having no gate.
+  #
+  # The CLI is built and then invoked directly rather than through `cargo run -p
+  # charpente-cli --`, matching how charpente-cli's own tests invoke it
+  # (`CARGO_BIN_EXE_charpente`): `check-client` shells out to `cargo build` itself, and
+  # a cargo inside a cargo shares one target directory and one build lock.
+  ts-client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ts-fixture/package-lock.json
+      - run: npm ci
+        working-directory: ts-fixture
+      - run: cargo build -p charpente-cli
+      - run: ./target/debug/charpente check-client --dir crates/ts-fixture-app --out ts-fixture/src/generated/client.ts
+      - run: cargo test -p ts-fixture-app --test samples
+      - run: npx tsc --noEmit
+        working-directory: ts-fixture
+      # The RUNTIME oracle (chunk B0, ts-client-codegen): `tsc --noEmit` above can only
+      # prove a call site type-checks, never that a runtime VALUE matches its declared
+      # type — so it cannot catch "the declared type is `bigint` and the value is a
+      # string", which is exactly how the Int64 bug (task 11 finding 1) shipped through
+      # a green gate. `npm run test` compiles `src/**/*.test.ts` to a gitignored `dist/`
+      # (`tsconfig.test.json`, `noEmit: false`) and runs it with Node's built-in test
+      # runner against real `generated/samples.ts` documents through a stubbed `fetch`
+      # (`src/testing/fetch-stub.ts`) — never a hand-written stand-in. `npm run test`
+      # rather than `npx tsc`/`npx` anything, for the reason given above `npx tsc`.
+      #
+      # `int64.test.ts` is EXPECTED to fail here until chunk B1 revives `Int64` in the
+      # runtime: it is the RED this oracle exists to produce, not a broken step. Do not
+      # "fix" this job by skipping or loosening that test — fixing runtime.rs is chunk
+      # B1's job, tracked in chunk-b1-brief.md.
+      #
+      # NOT yet exercised on a runner, same caveat as the block above: verified locally
+      # (macOS, Node v24.13.1) only. What could still differ on a clean Ubuntu runner —
+      # Node's module resolution, the working directory `npm run test` resolves `dist/`
+      # relative to, and whether a not-yet-existing `dist/` changes step ordering — is
+      # unconfirmed until this runs once for real.
+      - run: npm run test
+        working-directory: ts-fixture

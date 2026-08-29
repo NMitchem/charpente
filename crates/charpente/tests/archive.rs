@@ -16,7 +16,8 @@ use charpente::archive::manifest::{
 };
 use charpente::archive::restore::{RestoreOpts, RestoreReport, restore};
 use charpente::archive::{Archive, ArchiveConfig};
-use charpente::{Db, DbConfig, Id, Schema, event, job, table};
+use charpente::wire::WireU64;
+use charpente::{Db, DbConfig, Id, Schema, Wire, event, job, table};
 use charpente_core::crc::crc32;
 use charpente_core::io::{ObjectDone, ObjectOp, ObjectStore};
 use charpente_core::table::Row;
@@ -33,7 +34,12 @@ const WRITER: &str = "node-a:9000";
 /// suite until this existed.
 #[event]
 struct Ping {
-    n: u64,
+    // `WireU64`, not a bare `u64`, since main's `Wire` bound landed: an event
+    // payload IS the JSON a client sees, and a u64 above 2^53 loses precision
+    // in JavaScript silently. Nothing here reads `n` — it exists so
+    // `next_event_id` is non-trivial — so the wrapper costs the fixture
+    // nothing.
+    n: WireU64,
 }
 
 /// A fixed-width row: every commit produces an identically-sized WAL frame,
@@ -577,7 +583,7 @@ fn write_records_emitting(db: &mut Db, from: u64, n: u64) {
                 id: Id::from_raw(i),
                 value: i,
             });
-            tx.emit(Ping { n: i });
+            tx.emit(Ping { n: WireU64(i) });
             Ok(())
         })
         .unwrap();
@@ -4199,19 +4205,19 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Wire)]
 struct RecBody {
-    n: u64,
+    n: WireU64,
 }
 
 /// A writing route, deliberately: an archive with a `Db` that never moves
 /// goes caught-up and stays there, and every "does the arm keep up under
 /// load" question would then be asked of an archive with nothing to do.
 #[route(POST "/rec")]
-fn put_rec(tx: &mut Tx, body: RecBody) -> Result<u64, ApiError> {
+fn put_rec(tx: &mut Tx, body: RecBody) -> Result<WireU64, ApiError> {
     tx.put(&Rec {
-        id: Id::from_raw(body.n),
-        value: body.n,
+        id: Id::from_raw(body.n.0),
+        value: body.n.0,
     });
     Ok(body.n)
 }
@@ -4314,7 +4320,9 @@ impl EventSink for SilentSink {
 impl RequestSource for EndlessSource {
     fn poll(&mut self) -> Option<(Request, Reply)> {
         self.next += 1;
-        let request = Request::new(Method::Post, "/rec").json(&RecBody { n: self.next });
+        let request = Request::new(Method::Post, "/rec").json(&RecBody {
+            n: WireU64(self.next),
+        });
         Some((request, Box::new(CountingReply)))
     }
 
@@ -7725,7 +7733,7 @@ fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
                         id: Id::from_raw(id),
                         value: id,
                     });
-                    tx.emit(Ping { n: id });
+                    tx.emit(Ping { n: WireU64(id) });
                     if with_job {
                         tx.enqueue(Resurrect { slot: id });
                     }
@@ -7862,7 +7870,7 @@ fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
                             id: Id::from_raw(id),
                             value: id,
                         });
-                        tx.emit(Ping { n: id });
+                        tx.emit(Ping { n: WireU64(id) });
                         Ok(())
                     }) {
                         Ok(()) => {
@@ -8319,7 +8327,7 @@ fn conv_segment_layout_is_what_the_budget_assumes() {
                 id: Id::from_raw(i),
                 value: i,
             });
-            tx.emit(Ping { n: i });
+            tx.emit(Ping { n: WireU64(i) });
             Ok(())
         })
         .unwrap();

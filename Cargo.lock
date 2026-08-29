@@ -72,6 +72,9 @@ name = "charpente-cli"
 version = "0.0.0"
 dependencies = [
  "charpente",
+ "charpente-tsgen",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -80,6 +83,7 @@ version = "0.0.0"
 dependencies = [
  "charpente-sim",
  "redb",
+ "serde",
 ]
 
 [[package]]
@@ -89,6 +93,7 @@ dependencies = [
  "charpente",
  "proc-macro2",
  "quote",
+ "serde",
  "syn",
  "trybuild",
 ]
@@ -98,6 +103,13 @@ name = "charpente-sim"
 version = "0.0.0"
 dependencies = [
  "charpente-core",
+]
+
+[[package]]
+name = "charpente-tsgen"
+version = "0.0.0"
+dependencies = [
+ "charpente",
 ]
 
 [[package]]
@@ -734,6 +746,16 @@ dependencies = [
  "target-triple",
  "termcolor",
  "toml",
+]
+
+[[package]]
+name = "ts-fixture-app"
+version = "0.0.0"
+dependencies = [
+ "charpente",
+ "charpente-sim",
+ "charpente-tsgen",
+ "serde_json",
 ]
 
 [[package]]

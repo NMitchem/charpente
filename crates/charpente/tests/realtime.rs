@@ -10,14 +10,15 @@ use std::time::Duration;
 
 use charpente::event;
 use charpente::http::{
-    ApiError, App, AppConfig, Ctx, Cursor, Method, Request, Route, RouteDef, RouteGlue, SubEntry,
-    Subscription,
+    ApiError, App, AppConfig, Ctx, Cursor, EmittedEvent, Method, Request, Route, RouteDef,
+    RouteGlue, SubEntry, Subscription,
 };
 use charpente::kernel::{Kernel, RecordedResponses, SimSinkHandle, SimSource, SinkHandles, Step};
 use charpente::repl::protocol::{Msg, decode, encode};
 use charpente::repl::role::Role;
 use charpente::repl::{MAX_MESSAGE_BYTES, Repl, ReplConfig};
-use charpente::{DbConfig, Schema, Tx, route, routes};
+use charpente::wire::{TypeSchema, Wire, WireU64};
+use charpente::{DbConfig, Schema, Tx, Wire as WireDerive, route, routes};
 use charpente_core::db::Db;
 use charpente_core::event::EventRow;
 use charpente_core::io::{Clock, Conn, Disk, Entropy, Net};
@@ -31,19 +32,23 @@ const SEC: u64 = 1_000_000_000;
 
 // ------------------------------------------------------------------ events
 
+// `n: WireU64`, not a bare `u64` (task 6): `#[event]` derives `Wire`, and a
+// 64-bit integer only crosses the wire as a string. The stored `Codec` bytes
+// are unchanged — `WireU64`'s codec IS `u64`'s — so only the frame JSON
+// differs ({"n":"3"} rather than {"n":3}).
 #[event]
 struct Ping {
-    n: u64,
+    n: WireU64,
 }
 
 #[event]
 struct Pong {
-    n: u64,
+    n: WireU64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(WireDerive, Serialize, Deserialize)]
 struct EmitBody {
-    n: u64,
+    n: WireU64,
     key: Option<String>,
 }
 
@@ -69,19 +74,23 @@ fn emit_pong(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
 /// key filter branches, not just "everything, unfiltered" (T5 left both
 /// unexercised) — one mode, deterministically chosen per universe from the
 /// seed, drives every (re)subscribe within that universe.
-#[route(SSE "/feed-both")]
+#[route(SSE "/feed-both", emits(Ping, Pong))]
 fn feed_both(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<Ping>().and::<Pong>().cursor(cursor))
 }
 
-#[route(SSE "/feed-ping")]
+#[route(SSE "/feed-ping", emits(Ping))]
 fn feed_ping(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<Ping>().cursor(cursor))
 }
 
-#[route(SSE "/feed-keyed")]
+/// `emits(...)` describes WHICH event types reach the stream, not which rows
+/// pass `.key(...)` — the key is a per-emit call-site value the contract
+/// cannot know (same reason `EventInfo.keyed` is always false), so a keyed
+/// feed declares the same two types the unkeyed one does.
+#[route(SSE "/feed-keyed", emits(Ping, Pong))]
 fn feed_keyed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<Ping>()
@@ -146,7 +155,7 @@ fn pick_emit(sim: &Sim) -> (&'static str, EmitBody) {
         1 => Some("org-a".to_string()),
         _ => Some("org-b".to_string()),
     };
-    let n = sim.entropy().next_u64() % 1000;
+    let n = WireU64(sim.entropy().next_u64() % 1000);
     if is_ping {
         ("/ping", EmitBody { n, key })
     } else {
@@ -951,7 +960,7 @@ fn the_harness_catches_a_resume_that_replays_the_cursor_event() {
     for n in 0..4u64 {
         app.db_for_tests()
             .transact(|tx| {
-                tx.emit(Ping { n });
+                tx.emit(Ping { n: WireU64(n) });
                 Ok::<(), std::io::Error>(())
             })
             .unwrap();
@@ -1007,7 +1016,7 @@ fn the_harness_catches_a_resume_that_skips_the_successor_event() {
     for n in 0..6u64 {
         app.db_for_tests()
             .transact(|tx| {
-                tx.emit(Ping { n });
+                tx.emit(Ping { n: WireU64(n) });
                 Ok::<(), std::io::Error>(())
             })
             .unwrap();
@@ -1084,7 +1093,7 @@ fn the_below_floor_confirm_resolves_only_received_frames() {
     for n in 0..8u64 {
         app.db_for_tests()
             .transact(|tx| {
-                tx.emit(Ping { n });
+                tx.emit(Ping { n: WireU64(n) });
                 Ok::<(), std::io::Error>(())
             })
             .unwrap();
@@ -1102,7 +1111,7 @@ fn the_below_floor_confirm_resolves_only_received_frames() {
         (
             id,
             "ping",
-            serde_json::to_string(&Ping { n: id }).expect("Ping serializes"),
+            serde_json::to_string(&Ping { n: WireU64(id) }).expect("Ping serializes"),
         )
     };
 
@@ -1210,7 +1219,10 @@ fn a_subscribe_still_sees_an_emit_that_arrives_with_it() {
     source.push_at(t, Request::new(Method::Get, "/feed-ping"));
     source.push_at(
         t,
-        Request::new(Method::Post, "/ping").json(&EmitBody { n: 7, key: None }),
+        Request::new(Method::Post, "/ping").json(&EmitBody {
+            n: WireU64(7),
+            key: None,
+        }),
     );
     let sinks = source.sinks();
 
@@ -1237,10 +1249,55 @@ fn a_subscribe_still_sees_an_emit_that_arrives_with_it() {
         frames.iter().map(|f| (f.name, &f.json)).collect::<Vec<_>>()
     );
     assert_eq!(frames[0].name, "ping", "the Ping event, not a gap frame");
-    assert!(
-        frames[0].json.contains('7'),
-        "carrying the emitted payload n=7: {}",
-        frames[0].json
+    // Exact, not `contains('7')` (review round 1, finding 4): a substring test
+    // for one digit also passes on `{"n":17}`, on `{"n":7}`, and on any other
+    // encoding of the field — including the one this event does NOT use.
+    assert_eq!(
+        frames[0].json, r#"{"n":"7"}"#,
+        "carrying the emitted payload n=7"
+    );
+}
+
+/// The literal bytes a subscriber receives, pinned as bytes (review round 1,
+/// finding 4). Task 6 moved `Ping.n` from a bare `u64` to `WireU64`, which
+/// changed this document: the frame body is now `{"n":"7"}`, a decimal STRING,
+/// not `{"n":7}`. That is the most product-visible thing task 6 changed, and
+/// every other assertion around it holds only by COMPOSITION —
+/// `serde_json::to_string(&Ping { .. })` on both sides agrees with itself no
+/// matter what the encoding is, so all of them would stay green if the wire
+/// form silently reverted. This one asserts the delivered frame directly, at
+/// the boundary a browser's `JSON.parse` reads.
+#[test]
+fn a_delivered_frame_carries_its_64_bit_field_as_a_decimal_string() {
+    let sim = Sim::with_faults(0x2EB2_D511, FaultConfig::none());
+    let app = realtime_app(&sim).unwrap();
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+
+    let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 10 * SEC);
+    let t = sim.now().as_nanos();
+    source.push_at(t, Request::new(Method::Get, "/feed-ping"));
+    source.push_at(
+        t,
+        Request::new(Method::Post, "/ping").json(&EmitBody {
+            // Above 2^53: the exact value a JSON number would have corrupted,
+            // which is why the carrier exists at all.
+            n: WireU64(9_007_199_254_740_993),
+            key: None,
+        }),
+    );
+    let sinks = source.sinks();
+    for _ in 0..8 {
+        kernel.step(&mut source).expect("no step may fail here");
+    }
+
+    let handles = sinks.lock().expect("sinks lock");
+    let frames = handles[0].frames();
+    assert_eq!(frames.len(), 1, "exactly one delivered frame");
+    assert_eq!(frames[0].name, "ping");
+    assert_eq!(
+        frames[0].json, r#"{"n":"9007199254740993"}"#,
+        "the frame body is the decimal STRING form — a JSON number here would \
+         reach a JavaScript client as 9007199254740992"
     );
 }
 
@@ -1274,24 +1331,32 @@ fn failing_feed_glue(
 
 impl RouteDef for FailingFeed {
     fn route() -> Route {
+        // Untyped glue, not a described route: a hand-written `RouteDef`
+        // with no typed handler (Amendment D, task-5-brief.md).
         Route {
             method: Method::Get,
             pattern: "/feed-failing",
             auth: false,
             name: "FailingFeed",
             glue: RouteGlue::Sse(failing_feed_glue),
+            params: &[],
+            request: None,
+            response: || TypeSchema::Null,
+            error: || <ApiError as Wire>::reference(),
+            register_types: |_| {},
+            emits: &[],
         }
     }
 }
 
 #[event]
 struct NoteAdded {
-    n: u64,
+    n: WireU64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(WireDerive, Serialize, Deserialize)]
 struct NoteBody {
-    n: u64,
+    n: WireU64,
 }
 
 #[route(POST "/note")]
@@ -1319,7 +1384,7 @@ fn tail_encode_error_is_whole_node_fatal() {
     source.push_at(t, Request::new(Method::Get, "/feed-failing"));
     source.push_at(
         t,
-        Request::new(Method::Post, "/note").json(&NoteBody { n: 1 }),
+        Request::new(Method::Post, "/note").json(&NoteBody { n: WireU64(1) }),
     );
 
     // Step 1: the subscribe registers the tail (no events exist yet, so it is
@@ -2137,7 +2202,10 @@ fn follower_ids_match_a_batched_primarys() {
     for n in 0..4u64 {
         p.source.push_at(
             now,
-            Request::new(Method::Post, "/ping").json(&EmitBody { n, key: None }),
+            Request::new(Method::Post, "/ping").json(&EmitBody {
+                n: WireU64(n),
+                key: None,
+            }),
         );
     }
     let requests_before = p.kernel.as_ref().expect("primary alive").stats().requests;
@@ -2238,4 +2306,119 @@ fn follower_ids_match_a_batched_primarys() {
             "table {table} diverged between the batched primary and the follower's replay"
         );
     }
+}
+
+/// Task 7's drift oracle on the app that actually delivers events: three
+/// stream routes, two distinct declared sets, and one of them keyed — so an
+/// `emits(...)` that quietly followed `.key(...)`, or that collapsed every
+/// feed to the same set, shows up here rather than in the describe fixture's
+/// single feed.
+///
+/// The declaration is the THIRD place these names are written in this file:
+/// `Subscription::of/and` in each handler, `PING_ONLY`/`BOTH` in `mode_for`
+/// (which the flagship workload uses as data — it subscribes by path and
+/// checks the frames it receives against those names), and now `emits(...)`.
+/// Task 7 deletes neither of the first two, so the cross-check at the end is
+/// what keeps a future edit from moving one without the others.
+#[test]
+fn every_stream_routes_declared_emits_matches_its_subscription() {
+    let sim = Sim::with_faults(0x2EB7_0007, FaultConfig::none());
+    let mut app = realtime_app(&sim).expect("the realtime fixture app must open");
+    // Ruling 46: `emits` elements now carry (event name, payload name). The
+    // oracle compares the event half — the only half a `Subscription` holds
+    // — and the payload half rides along in `declared_pairs` below, so
+    // widening the type did not quietly drop it from this file's coverage.
+    let declared: Vec<(&'static str, Vec<&'static str>)> = app
+        .describe()
+        .routes
+        .iter()
+        .filter(|r| r.stream)
+        .map(|r| (r.name, r.emits.iter().map(|e| e.event).collect()))
+        .collect();
+    // The floor for the loop below (an empty one would pass vacuously), and
+    // the pin on registration order, which is the contract's route order.
+    assert_eq!(
+        declared,
+        vec![
+            ("feed_both", vec!["ping", "pong"]),
+            ("feed_ping", vec!["ping"]),
+            ("feed_keyed", vec!["ping", "pong"]),
+        ]
+    );
+    for (name, emits) in declared {
+        let actual = app
+            .subscription_event_names(name)
+            .expect("a stream route must expose its subscription's event names");
+        assert_eq!(
+            emits, actual,
+            "route `{name}` declares emits{emits:?} but its Subscription names {actual:?}"
+        );
+    }
+    for seed in 0..3u64 {
+        let (path, names, _) = mode_for(seed);
+        let emits: Vec<&str> = app
+            .describe()
+            .routes
+            .iter()
+            .find(|r| r.pattern == path)
+            .map(|r| r.emits.iter().map(|e| e.event).collect())
+            .expect("mode_for names a mounted route");
+        assert_eq!(
+            emits,
+            names.to_vec(),
+            "mode_for(\"{path}\") and that route's emits(...) must name the same events"
+        );
+    }
+
+    // The payload half of the pair (ruling 46), which the loops above do not
+    // touch: `Ping`/`Pong` are the `Wire::WIRE_NAME`s a generated TypeScript
+    // union writes, and they must line up with the event names one-for-one
+    // in declaration order. Both names come off the same type in the macro,
+    // so a mismatch here means the pairing itself broke — the one failure
+    // the projected-to-`event` comparisons above are blind to.
+    let declared_pairs: Vec<(&'static str, Vec<EmittedEvent>)> = app
+        .describe()
+        .routes
+        .iter()
+        .filter(|r| r.stream)
+        .map(|r| (r.name, r.emits.clone()))
+        .collect();
+    assert_eq!(
+        declared_pairs,
+        vec![
+            (
+                "feed_both",
+                vec![
+                    EmittedEvent {
+                        event: "ping",
+                        payload: "Ping"
+                    },
+                    EmittedEvent {
+                        event: "pong",
+                        payload: "Pong"
+                    },
+                ]
+            ),
+            (
+                "feed_ping",
+                vec![EmittedEvent {
+                    event: "ping",
+                    payload: "Ping"
+                }]
+            ),
+            (
+                "feed_keyed",
+                vec![
+                    EmittedEvent {
+                        event: "ping",
+                        payload: "Ping"
+                    },
+                    EmittedEvent {
+                        event: "pong",
+                        payload: "Pong"
+                    },
+                ]
+            ),
+        ]
+    );
 }

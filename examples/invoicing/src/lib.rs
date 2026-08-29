@@ -8,11 +8,11 @@ pub mod routes;
 
 use charpente::core::io::{Disk, Entropy};
 use charpente::http::{App, AppConfig};
-use charpente::{Schema, jobs as jobs_macro, routes as routes_macro};
-use jobs::{AdvanceDay, SendOverdueReminder, SendReceipt};
+use charpente::{Schema, events as events_macro, jobs as jobs_macro, routes as routes_macro};
+use jobs::{AdvanceDay, ReceiptSent, SendOverdueReminder, SendReceipt};
 use routes::{
-    create_customer, create_invoice, create_key, events_feed, finalize_invoice, get_customer,
-    get_invoice, list_customers, list_invoices, login, record_payment, revoke_key,
+    InvoiceFinalized, create_customer, create_invoice, create_key, events_feed, finalize_invoice,
+    get_customer, get_invoice, list_customers, list_invoices, login, record_payment, revoke_key,
 };
 use std::time::Duration;
 
@@ -49,5 +49,9 @@ pub fn build_app(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> std::io::Res
             revoke_key,
         ])
         .mount_jobs(jobs_macro![SendReceipt, SendOverdueReminder, AdvanceDay])
+        // Both events this app emits, so `charpente describe` (and the TS
+        // client generated from it) can name the two payload shapes
+        // `/events/feed` delivers. Describe-only: delivery works either way.
+        .mount_events(events_macro![InvoiceFinalized, ReceiptSent])
         .schedule("daily-overdue-check", DAILY_TICK, || AdvanceDay {}))
 }

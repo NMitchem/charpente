@@ -1,0 +1,32 @@
+[package]
+name = "ts-fixture-app"
+description = "The dogfood app the TypeScript client is generated from and type-checked against."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+charpente.workspace = true
+# The specimen serializer (src/samples.rs) — the sample literals are only an
+# oracle because SERDE produced them, so this crate needs a serde writer of its
+# own. Deliberately NOT a direct `serde` dependency: every derive here goes
+# through the `::charpente::serde` re-export, so this crate still pins macro
+# path expansion the way `crates/sim-fixture` does.
+serde_json = "1"
+
+[dev-dependencies]
+# `tests/drift.rs` needs a Disk and an Entropy to open an App; the sim's are
+# the deterministic ones. Same dev-dependency, for the same reason, as
+# `crates/sim-fixture` and `examples/invoicing`.
+charpente-sim = { path = "../charpente-sim" }
+# `tests/drift.rs`'s SSE dispatch-map coverage floor (chunk B1c) asks what the
+# emitter ACTUALLY WROTE for this app's contract, rather than re-deciding
+# "does this payload carry an Int64" with a second traversal of its own that
+# could quietly drift from the emitter's and report a floor as covered when it
+# is not. A workspace-internal, test-only edge; `charpente-tsgen` depends on
+# `charpente` alone, so there is no cycle back to this crate.
+charpente-tsgen = { path = "../charpente-tsgen", version = "0.0.0" }

@@ -1,0 +1,23 @@
+error: #[derive(Wire)] requires one wire name per variant, but `First` and `Second` both resolve to "a" — two variants sharing a wire name are indistinguishable on the wire, whether as a string-union member, an externally-tagged object key, or an internally/adjacently-tagged discriminant value; rename one of the two variants, or give it its own #[serde(rename = "...")], so their resolved names differ
+  --> tests/compile_fail/wire_enum_duplicate_names.rs:34:5
+   |
+34 |     Second,
+   |     ^^^^^^
+
+error: #[derive(Wire)] requires one wire name per variant, but `Foo` and `foo` both resolve to "foo" — two variants sharing a wire name are indistinguishable on the wire, whether as a string-union member, an externally-tagged object key, or an internally/adjacently-tagged discriminant value; rename one of the two variants, or give it its own #[serde(rename = "...")], so their resolved names differ
+  --> tests/compile_fail/wire_enum_duplicate_names.rs:42:5
+   |
+42 |     foo,
+   |     ^^^
+
+error: #[derive(Wire)] requires one wire name per variant, but `Alpha` and `Beta` both resolve to "Alpha" — two variants sharing a wire name are indistinguishable on the wire, whether as a string-union member, an externally-tagged object key, or an internally/adjacently-tagged discriminant value; rename one of the two variants, or give it its own #[serde(rename = "...")], so their resolved names differ
+  --> tests/compile_fail/wire_enum_duplicate_names.rs:49:5
+   |
+49 |     Beta,
+   |     ^^^^
+
+error: #[derive(Wire)] requires one wire name per field, but `x` and `y` in variant `DuplicateFieldNamesWithinOneVariant::Only` both resolve to "a" — serde would emit that key twice on the wire and the schema would carry two fields with the same name; rename one of the two fields, or give it its own #[serde(rename = "...")], so their resolved names differ
+  --> tests/compile_fail/wire_enum_duplicate_names.rs:58:9
+   |
+58 |         y: u32,
+   |         ^

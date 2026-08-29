@@ -1,0 +1,5 @@
+error: `emits(...)` given twice — a route declares one set, so name every event in one list: `emits(NoteAdded, NoteRemoved)`
+  --> tests/compile_fail/route_duplicate_emits_clause.rs:26:37
+   |
+26 | #[route(SSE "/x", emits(NoteAdded), emits(NoteRemoved))]
+   |                                     ^^^^^

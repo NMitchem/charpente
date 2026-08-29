@@ -46,7 +46,7 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
         .transact(|tx| {
             let id = Id::<FixtureCounter>::from_raw(7);
             tx.put(&FixtureCounter { id, hits: 1 });
-            tx.emit(NoteAdded { note: id.raw() });
+            tx.emit(NoteAdded { note: id });
             Ok::<_, std::io::Error>(())
         })
         .is_ok();

@@ -1,0 +1,5 @@
+error: #[derive(Wire)] does not know serde's rename_all = "PascalCase" — the generated TypeScript would carry the wrong field names. Supported: camelCase, snake_case, SCREAMING_SNAKE_CASE, kebab-case
+ --> tests/compile_fail/wire_unknown_rename_all.rs:2:22
+  |
+2 | #[serde(rename_all = "PascalCase")]
+  |                      ^^^^^^^^^^^^
