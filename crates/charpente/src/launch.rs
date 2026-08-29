@@ -514,7 +514,7 @@ mod tests {
         // Against the CONSTANT, never a copy of it. A hardcoded literal here
         // was blind in exactly the direction I-1 came from — the constant
         // moving underneath the quote — and verified blind: renaming a word
-        // in RESTORE_USAGE left this green. GUIDE §14 quotes the usage line
+        // in RESTORE_USAGE left this green. GUIDE §15 quotes the usage line
         // and the flag list, which is RESTORE_USAGE up to its first blank
         // line; the prose below that is the GUIDE's own.
         let flags = RESTORE_USAGE
@@ -524,7 +524,7 @@ mod tests {
         assert!(
             GUIDE.contains(flags),
             "docs/GUIDE.md no longer quotes RESTORE_USAGE's flag list verbatim — update the \
-             quoted block in §14 to:\n{flags}"
+             quoted block in §15 to:\n{flags}"
         );
     }
 

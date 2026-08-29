@@ -11,8 +11,10 @@ message you're staring at. Section 10 covers replication; section 11
 covers realtime SSE subscriptions; section 12 covers migrations —
 evolving a `#[table]` row's shape safely; section 13 covers `describe` —
 the machine-readable contract of a mounted app; section 14 covers the
-archive — configuring one, the notices it raises, and restoring a data
-directory from a bucket.)*
+generated TypeScript client — deriving `Wire`, 64-bit integers, and
+`gen-client`/`check-client`; section 15 covers the archive — configuring
+one, the notices it raises, and restoring a data directory from a
+bucket.)*
 
 ## 1. Project setup
 
@@ -3588,7 +3590,7 @@ fn main() -> std::io::Result<()> {
 
 That's the whole migration: no verb still serves on `"0.0.0.0:8080"` against `./data`
 exactly as a hand-rolled `main` would; `myapp describe` and `myapp describe --format json`
-are new, for free — and so is `restore` (§14). An unrecognized verb or a bad `--format`
+are new, for free — and so is `restore` (§15). An unrecognized verb or a bad `--format`
 value exits 2 with a pinned usage message:
 
 ```text
@@ -3598,7 +3600,7 @@ usage: <app> [describe [--format json|human]]
 
 (`launch.rs`'s `the_guide_quotes_the_usage_text_the_binary_actually_prints` `include_str!`s
 this file and asserts the block above is the constant verbatim, so the two cannot drift
-apart silently again — they did once, when §14 was added.)
+apart silently again — they did once, when §15 was added.)
 
 ### `charpente describe` — the CLI verb
 
@@ -4365,7 +4367,223 @@ and reading the handler is the only way to find out. Likewise an event never pas
 `mount_events` is absent from `events` entirely: registration is what puts an event in
 the contract, and it still emits and delivers either way.
 
-## 14. The archive
+## 14. The TypeScript client
+
+`crates/charpente-tsgen` turns one mounted app's `describe` contract (§13) into a
+TypeScript client: branded id types and an interface for every wire type, a discriminated
+`Result<T, E>` per route, and per-event dispatch for every SSE route that declared
+`emits(...)`. Nothing here is hand-written per app — the emitter is a pure function of the
+contract — so getting the generated client right is entirely a matter of getting the WIRE
+right.
+
+### Deriving `Wire`
+
+Every type that reaches a route's params, request body, response, or error, and every
+`#[event]` payload, must implement `Wire` — the trait describing what a value looks like
+once serde has encoded it, not what its Rust shape merely suggests. `#[derive(Wire)]`
+reads serde's OWN attributes, so the schema matches what serde actually emits, and it
+rejects, by name, any attribute it has no logic for — a schema that silently disagreed
+with the wire would be worse than a compile error.
+
+Read faithfully: `rename`, `rename_all` (`camelCase`, `snake_case`, `SCREAMING_SNAKE_CASE`,
+`kebab-case`), `skip`/`skip_serializing` (the field never appears in the schema at all, not
+merely marked optional), `skip_serializing_if` (marks the field `optional` — see "64-bit
+integers" below for what that means at an `Int64` position), and `#[serde(crate = "...")]`
+(accepted and ignored: it only redirects serde_derive's own generated paths, and changes no
+field, name, or shape).
+
+Rejected, with the fix named in the message: `flatten` (hoists the inner type's fields in a
+way the wire IR cannot express); `default` (changes whether a field may be absent — say
+`Option<T>` or `skip_serializing_if` instead, so the wire semantics are explicit);
+`skip_deserializing` (the field IS still emitted on the wire; only reads are affected);
+`untagged` (an untagged value carries no discriminator for the schema to key on); a
+struct-level `tag` (tagging is an enum concern, resolved on the enum itself); and the split
+`rename(serialize = ..., deserialize = ...)` form (a wire schema is one shape, and
+divergent serialize/deserialize names can't be represented).
+
+```rust
+use charpente::wire::{WireI64, WireU64};
+use charpente::Wire;
+use serde::{Deserialize, Serialize};
+
+#[derive(Wire, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LineItemView {
+    #[serde(rename = "sku")]
+    item_code: String,
+    unit_amount_cents: WireI64,
+    quantity: WireU64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+```
+
+An enum derives `Wire` too, and describes whichever of serde's *tagged* representations it
+actually uses — a unit-only enum as a TypeScript string union, otherwise externally
+(serde's default), internally (`tag = "..."`), or adjacently (`tag` + `content`) tagged;
+`untagged` is refused for the same reason it is on a struct.
+
+### 64-bit integers: `bigint` on both sides of the wire
+
+A bare `u64`/`i64` at any wire position is a compile error naming the fix — above 2^53 a
+JSON number silently loses precision in JavaScript, so `Wire` has no impl for either type
+(DESIGN §3). `WireU64`/`WireI64` are the sanctioned carriers: they serialize as decimal
+strings, and the generated TypeScript type is `bigint`:
+
+```ts
+export interface LimitExceeded {
+  maxCents: bigint;
+}
+```
+
+**Outbound (client to server)** needs no schema knowledge: `request()`'s `JSON.stringify`
+runs a replacer that converts every `bigint` it meets to its decimal string BEFORE
+serialization, unconditionally —
+
+```ts
+JSON.stringify(body, (_k, v) =>
+  typeof v === "bigint" ? v.toString() : v,
+)
+```
+
+— which is sound because a type-checked call site can only ever hand this a `bigint`
+where the schema put one.
+
+**Inbound (server to client)** needs a schema-directed walk instead, because `JSON.parse`
+has already parsed the string into a JavaScript value by the time anything could revive
+it. The one primitive every generated walker calls:
+
+```ts
+function reviveInt64(v: unknown): bigint {
+  return typeof v === "string" ? BigInt(v) : (v as bigint);
+}
+```
+
+A generated method wraps `this.request(...)` for a route whose response or error
+transitively contains an `Int64`, and calls a per-type revive function that converts just
+those positions back to `bigint`:
+
+```ts
+async getInvoice(id: InvoiceId): Promise<Result<InvoiceView, ApiError>> {
+  const r = await this.request<InvoiceView, ApiError>("GET", `/invoices/${encodeURIComponent(id)}`);
+  return r.ok ? { ok: true, data: reviveInvoiceView(r.data) } : { ok: false, error: r.error };
+}
+```
+
+A route whose response and error carry no `Int64` anywhere keeps the plain one-line
+`return this.request(...)` — nothing extra is emitted for the common case:
+
+```ts
+async createCustomer(id: CustomerId, body: CreateCustomerBody): Promise<Result<CustomerView, ApiError>> {
+  return this.request<CustomerView, ApiError>("POST", `/customers/${encodeURIComponent(id)}`, body);
+}
+```
+
+**Absence is two different shapes, and the emitter answers them differently.** An
+`Option<WireI64>` field the server always writes a key for sends an explicit `null` when
+absent, and the walker guards it the same way:
+
+```ts
+adjustmentCents: (v.adjustmentCents) == null ? null : (reviveInt64(v.adjustmentCents)),
+```
+
+A bare `WireI64` behind `#[serde(skip_serializing_if = ...)]` never writes `null` — the key
+is OMITTED entirely — so its TypeScript type is `?: bigint`, never `?: bigint | undefined`
+(under `exactOptionalPropertyTypes`, which `ts-fixture/tsconfig.json` turns on, those are
+different declarations, and only the first is a document the server can actually send), and
+the walker omits the key with a conditional spread rather than materializing it as
+`undefined`:
+
+```ts
+...(v.lateFeeCents === undefined ? {} : { lateFeeCents: reviveInt64(v.lateFeeCents) }),
+```
+
+The opposite call goes the opposite way, deliberately, for an INPUT type an app author
+builds rather than a wire type the server sends: every member of `SubscribeOptions` is
+`?: T | undefined`, because there absence and `undefined` mean the same thing (neither is
+serialized) and `?: T` alone would refuse the ordinary pass-through
+`function tail(api: Api, cursor?: string) { return api.feed({ cursor, … }); }`.
+
+### `#[route]`'s `emits(...)`: per-event dispatch
+
+A stream route that declares `emits(NoteAdded, NoteRemoved)` (§11) gets a generated
+subscribe method whose runtime dispatch is keyed by a `Map` from the SSE frame's `event:`
+name to that event's revive function, or `null` when its payload carries no `Int64` (shown
+here reflowed for width; the generated file emits the `Map` on one line):
+
+```ts
+feed(opts: SubscribeOptions<FeedEvent>): Promise<void> {
+  return this.stream<FeedEvent>("/feed", opts, new Map([
+    ["invoice_paid", (d: unknown) => reviveInvoicePaid(d as InvoicePaid)],
+    ["invoice_voided", null],
+  ]));
+}
+```
+
+A frame whose name is not a key in that map raises `UndeclaredEvent` by name — skew
+between this generated file and a server that has since shipped a new event — unless the
+caller passed `onUnknown`, which is handed the frame untouched: un-revived, since the
+client holds no schema for a payload it wasn't generated for. A route that declared no
+`emits(...)` at all passes no map — not an empty one, which the runtime would read as
+"refuse every name" — so every frame it sees is accepted and surfaced as the honest
+`UnknownEvent` shape instead of a fabricated union:
+
+```ts
+rawFeed(opts: SubscribeOptions<UnknownEvent>): Promise<void> {
+  return this.stream<UnknownEvent>("/raw-feed", opts);
+}
+```
+
+### Generating and checking the client
+
+```bash
+charpente gen-client --dir ./myapp --out ./myapp-web/src/generated/client.ts
+```
+
+builds the app crate, reads its `describe` contract, and writes the client — commit the
+result, the same as any other generated, checked-in file a human doesn't hand-edit. CI
+runs
+
+```bash
+charpente check-client --dir ./myapp --out ./myapp-web/src/generated/client.ts
+```
+
+instead: it regenerates the client the same way and compares it against what's committed,
+printing the first differing line rather than dumping a generated file into the log.
+`check-client` exits (matching `charpente-cli/src/genclient.rs`'s own doc comments):
+
+- **0** — the committed client matches this app's contract exactly.
+- **1** — the committed client is stale, or was never generated at all: a Rust wire type
+  or route changed without `gen-client` being re-run.
+- **2** — a usage error (an unknown or valueless flag), a build or launch fault (the app
+  crate would not build, or its binary would not run), or a contract this CLI's own
+  version cannot parse.
+- **101** — `charpente_tsgen::emit_client` panicked on a contract it refuses to
+  represent — a duplicate identifier, a wire type colliding with a runtime declaration, an
+  unsubstitutable `:param` — Rust's own default panic exit code, naming the offending Rust
+  route or type and the fix (hard rules 4 and 5) rather than a `Result` this CLI would have
+  to invent a code for.
+
+`gen-client` shares 0/2/101 with `check-client` (plus 2 for a failure to write `--out`) but
+has no code **1**: there is nothing for it to compare against, so it has no failure verdict
+to report. The 1-vs-2 split on `check-client` is the whole point of running it in CI: 1
+says the committed client does not match this app's contract; 2 says nothing could even be
+built to compare it against, which is a different thing to fix.
+
+A type-check alone is half a gate: `tsc --noEmit` proves a call site type-checks against
+the generated types, never that a runtime value actually matches its declared type — which
+is exactly how an `Int64` shipping as a plain string past a `bigint` declaration got
+through a green gate before this sub-project's own executing suite existed. `ts-fixture/`'s
+Node-native tests run the generated client against real `serde_json` documents through a
+stubbed `fetch`, which is what catches that class of bug; an app adopting this workflow
+wants both the type-check and the executing suite, not the type-check alone.
+
+**Transport is SSE only.** The generated `stream()` method is `fetch`-based (not
+`EventSource`, which cannot set an `Authorization` header) and no WebSocket client ships
+anywhere in this tree — see PLAN.md's M2 list for what a transport swap behind the same
+generated API would still owe.
+
+## 15. The archive
 
 The archive ships a bucket copy of the database, one **generation** at a time. A generation
 is a full logical snapshot plus the sealed WAL segments that continue it, written under a

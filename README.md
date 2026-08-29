@@ -120,10 +120,11 @@ carries nothing about it. It ships one generation at a time to a bucket: a full
 logical snapshot plus the sealed WAL segments that continue it, held by a
 retention pin that yields to the primary rather than growing the log until it
 fills the disk, and `charpente restore` rebuilds a data directory from what is
-there ([docs/GUIDE.md](docs/GUIDE.md) §14). `serve::backup` is still a different
-thing — a promotable hot standby, not a snapshot shipper. What is *not* built,
-so you don't have to go looking: no blob store, no WebSockets, no TS client
-codegen, and no tenant scoping as typed key prefixes.
+there ([docs/GUIDE.md](docs/GUIDE.md) §15). `serve::backup` is still a different
+thing — a promotable hot standby, not a snapshot shipper. A TypeScript client
+generator has since shipped too ([docs/GUIDE.md](docs/GUIDE.md) §14) — SSE only, no
+WebSocket transport. What is *not* built, so you don't have to go looking: no blob
+store, no WebSockets, and no tenant scoping as typed key prefixes.
 
 | Doc | What it is |
 |---|---|
