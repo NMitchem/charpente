@@ -1276,7 +1276,11 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
 2. **Read concurrency model** — snapshot reads on worker threads vs. everything through the
    core loop; measure before choosing.
 3. **Query combinator surface** — how far toward relational before it stops paying for its
-   type complexity.
+   type complexity. The one concrete instance so far: `#[index]` is exact-match only, so a
+   range or comparison query falls back to `scan` filtered in Rust — the overdue sweep in
+   `examples/invoicing/src/jobs.rs`, documented as the idiom under GUIDE's "`#[index]` works
+   on any `Codec` field" heading. That is the evidence DECISIONS §4's trigger asks for, and
+   one instance across one small app is not enough to read it either way.
 4. **Client codegen** — TS client from route/event types is obvious; when.
 5. **Compile latency mitigation** — platform as prebuilt dylib so app iteration recompiles
    app code only; quantify the win early, it is the adoption risk (see PLAN §Risks).
