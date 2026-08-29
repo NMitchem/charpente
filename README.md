@@ -115,10 +115,15 @@ the headline figure. Group commit closes the *amortization* half of that gap
 and none of the device-speed half — one fsync for a whole batch, worth up to
 ~31x where the queue is deep enough to fill one and nothing at all at one
 connection — and the bare-metal Linux numbers that would resize it do not
-exist yet. What is *not* built, so you don't have to go looking: no blob
-store, no object-storage backup (`serve::backup` is a promotable hot standby,
-not a snapshot shipper), no WebSockets, no TS client codegen, and no tenant
-scoping as typed key prefixes.
+exist yet. The object-storage archive has since shipped, unmeasured — BENCH.md
+carries nothing about it. It ships one generation at a time to a bucket: a full
+logical snapshot plus the sealed WAL segments that continue it, held by a
+retention pin that yields to the primary rather than growing the log until it
+fills the disk, and `charpente restore` rebuilds a data directory from what is
+there ([docs/GUIDE.md](docs/GUIDE.md) §14). `serve::backup` is still a different
+thing — a promotable hot standby, not a snapshot shipper. What is *not* built,
+so you don't have to go looking: no blob store, no WebSockets, no TS client
+codegen, and no tenant scoping as typed key prefixes.
 
 | Doc | What it is |
 |---|---|

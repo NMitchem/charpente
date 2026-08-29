@@ -10,7 +10,9 @@ replaying a failure's seed. Section 9 is an error index: look up the
 message you're staring at. Section 10 covers replication; section 11
 covers realtime SSE subscriptions; section 12 covers migrations —
 evolving a `#[table]` row's shape safely; section 13 covers `describe` —
-the machine-readable contract of a mounted app.)*
+the machine-readable contract of a mounted app; section 14 covers the
+archive — configuring one, the notices it raises, and restoring a data
+directory from a bucket.)*
 
 ## 1. Project setup
 
@@ -3747,7 +3749,145 @@ walk could discover ahead of time (spec ruling 6). The only trace of realtime in
 contract above is `"stream": true` on `events_feed` — the fact that a route serves SSE at
 all, not what it emits. Reading a route's handler is still how you find that out.
 
-## 14. Restoring from an archive
+## 14. The archive
+
+The archive ships a bucket copy of the database, one **generation** at a time. A generation
+is a full logical snapshot plus the sealed WAL segments that continue it, written under a
+key prefix the archive owns; `<prefix>/manifest` is the pointer to the newest one, and
+writing that manifest is the commit point. Nothing is readable until a manifest names it,
+and nothing is deleted until the *next* manifest is durable.
+
+Three things it is not. It is not `serve::backup`, which is a promotable hot standby holding
+its own data directory — the archive holds objects, and getting a node back from them means
+running `restore`. It is not incremental at the object level: every generation carries a
+whole snapshot, so the snapshot cadence is what bounds restore time. And it is not a
+background thread — hard rule 1 forbids the core spawning one, and an upload schedule off a
+thread would not replay. `Archive::step` is a kernel arm doing one unit of work per call
+(start one upload, poll one in flight, roll one generation), so archive work is interleaved
+with requests, jobs and cron in the one kernel loop rather than racing them.
+
+### Turning it on
+
+`serve::archive` runs an archiving node on the current thread: no HTTP edge, no replication,
+exactly the shape `serve::backup` has.
+
+```rust
+use charpente::archive::ArchiveConfig;
+use charpente::http::App;
+use charpente::prod::FsObjectStore;
+use charpente::serve;
+
+fn run_archive(app: App) -> std::io::Result<()> {
+    let cfg = ArchiveConfig {
+        // The key prefix this archive owns inside the bucket.
+        prefix: "node-a".to_string(),
+        // This node's identity, recorded in every manifest it writes.
+        // A stability contract, not a label — see below.
+        writer: "node-a".to_string(),
+        // Roll a new generation every 100_000 committed records.
+        snapshot_every: 100_000,
+        // Sealed WAL segments this archive may pin before it yields.
+        pin_segments: 8,
+        // Payload budget for one segment-shipping step.
+        read_budget_bytes: 8 << 20,
+    };
+    // Blocks: the kernel runs on this thread until it returns.
+    serve::archive(app, Box::new(FsObjectStore::new("/mnt/archive")), cfg)
+}
+```
+
+`ArchiveConfig` has no `Default`: every field is a deployment decision, and two of them
+behave in ways worth reading before you pick a value.
+
+- **`writer` must be unique per node and stable across a redeploy.** Ownership of a prefix
+  is decided by string equality on this one field, checked when the archive first reads the
+  bucket and again before every manifest swap. Two nodes sharing a `writer` each recognise
+  the other's manifest as their own; one node whose `writer` *changes* refuses permanently
+  on a bucket it genuinely owns. So do not derive it from anything a redeploy moves — a bind
+  address, a port, a pod name, a container id, an ephemeral IP. A port change would become a
+  permanent archive outage.
+- **`snapshot_every` counts committed records, never seconds.** A time-driven cadence would
+  put a wall clock inside the archive's decisions and make replay depend on it. It also
+  gates the *first* upload: the archive writes nothing at all until that many records have
+  committed, because a manifest with no snapshot behind it names a generation that does not
+  exist. `0` means "no cadence configured" — snapshot as soon as there is a frontier to name,
+  and never roll on a record count.
+
+`pin_segments` is the archive's retention-pin bound, in sealed WAL segments. While the
+archive is behind, it holds the log above the segment it still needs; past this many, it
+releases and lets `Wal::gc` proceed. That is the direction the trade always runs — **on an
+object-store outage the archive yields, never the primary** — and it is why the number is
+not a correctness knob: too small costs wasted uploads and gap churn, too large costs held
+WAL on disk. Size it for the longer of the two waits it covers: an object-store outage you
+want to ride out, and the time one full snapshot takes to upload, during which no segment
+ships at all. `read_budget_bytes` bounds the payload one segment-shipping step reads
+(8 MiB against the 64 MiB production segment size is eight steps per segment); it exists so
+one kernel step is never a 64 MiB read.
+
+Two things to know before you deploy this:
+
+**`FsObjectStore` is the only production `ObjectStore` that ships.** It writes objects as
+files under a root directory, atomically (temp file, sync, rename, sync the parent). A real
+bucket — S3, GCS, Azure Blob — needs an `ObjectStore` implementation you write against the
+trait in `charpente::core::io`; there is no cloud client in the tree. Read `FsObjectStore`
+first: whole-object PUTs give a caller nothing to barrier, so the trait has no `sync`
+method, and an implementation still owes whatever its own substrate needs to make an acked
+PUT survive a crash — silently, because nothing in the trait can ask for it.
+
+**`serve::archive` is not a sidecar.** There is no `Repl` in it, so the node it runs is a
+primary in every respect except its edges: it runs the app's jobs and cron while it
+archives, and it will accept writes from anything that reaches its `Db`. It is "a primary
+whose only edge is the archive", not "an archiver attached to someone else's database". The
+deployment you probably want instead — archiving *from* a replication standby, leaving the
+primary's loop untouched — is not constructible yet: `Kernel` takes replication and an
+archive together only through a private constructor, and every public one passes at least one
+of them `None`.
+
+### The notices an archive raises
+
+An archive failure is never a database failure. The kernel arm absorbs every error `step`
+returns — a `?` there would kill a serving node over a transient PUT — and the archive
+retries the same key with the same bytes, so absorbing loses nothing. A PUT that fails
+inside the pin bound therefore produces **no notice at all**, on purpose: it is the expected
+shape of an object store having a bad minute.
+
+Three conditions do print, on stderr, prefixed `charpente archive:`. Under `serve::archive`
+that is the entire operator surface — the kernel owns the `Archive`, and there is no handle
+to poll — so this is what to watch.
+
+**A gap.** The archive fell more than `pin_segments` behind, released its pin so `Wal::gc`
+could proceed, and abandoned the generation it was building. The notice names the bound, how
+many sealed segments were un-archived, the prefix and the generation, and both fixes: raise
+`pin_segments` if the WAL can afford to hold more, or accept the new generation and the gap
+it leaves. It is raised **once, on the edge into the gap**, never once per step, so the churn
+a long outage produces collapses to a single line. What a gap costs is continuity: whatever
+the log reclaims while the pin is released is in no archived generation at all, and the next
+successful contact opens a fresh generation with a full snapshot rather than resuming the old
+one. Recoverable, and the archive recovers on its own.
+
+**A foreign manifest, or one that will not decode.** Either way the archive releases its pin
+and **stops permanently** — `stopped()` is terminal, and because the archive is an arm of the
+same single process, recovering it costs a *database* restart; there is no in-process
+re-open. A foreign manifest is one naming a different `writer`, and the notice gives both
+identities and both generations. An unreadable one wraps the decode failure — a CRC mismatch,
+a truncated object and a malformed body call for different operator actions, and only the
+decoder can tell them apart — and refuses rather than opening a fresh generation over objects
+it cannot prove are its own. Both name the manifest key, the prefix and the fix, and both say
+what is in the bucket conditionally on which check site raised them: at open this archive has
+uploaded nothing and the generation the manifest names is the live, untouched one, while at a
+swap its own objects are already there and the "remove that manifest object" remedy abandons
+them. Neither retries — two writers on one prefix is a configuration fact no amount of
+retrying reaches, and a silent forever-retry is how an archive stops shipping without ever
+saying so.
+
+**Reclamation refusing a retired generation's snapshot.** A superseded generation's
+`snapshot/meta` claimed more batch objects than the archive will enumerate out of one
+generation. Nothing is lost and nothing stops — the retired chain is still reclaimed, that
+generation's snapshot objects stay in the bucket, and the archive advances — but the claim is
+evidence about who is writing the prefix, so the notice names the bound, the claim, the key,
+the prefix and the generation.
+
+### Restoring from an archive
 
 An archive is worth exactly what can be read back from it. `restore` is the reading-back:
 it rebuilds a data directory from a bucket an archive wrote, to the newest recoverable

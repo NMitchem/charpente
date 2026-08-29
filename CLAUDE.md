@@ -95,9 +95,10 @@ roadmap; do not reorder a milestone's dependency sequence.
 
 1. **No ambient nondeterminism inside the core.** Zero direct calls to wall clocks, OS
    randomness, raw filesystem/network APIs, or thread/task spawning from core code — all IO
-   goes through the `Clock`/`Entropy`/`Disk`/`Net` traits (DESIGN §1). Enforce mechanically
-   (clippy `disallowed_methods`/`disallowed_types` deny-list in CI from the first commit),
-   not by review.
+   goes through the `Clock`/`Entropy`/`Disk`/`Net`/`ObjectStore` traits (DESIGN §1) — every
+   top-level trait in `io.rs`, since `File`/`Listener`/`Conn` are handed out by `Disk`/`Net`.
+   Enforce mechanically (clippy `disallowed_methods`/`disallowed_types` deny-list in CI from
+   the first commit), not by review.
 2. **No escape hatches on guarantees.** No "fast mode" bypassing the log, no network awaits
    inside transactions, no optional determinism, no feature flags on correctness
    (MANIFESTO §8). If a feature seems to need one, the design is wrong — stop and redesign.

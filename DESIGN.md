@@ -115,6 +115,17 @@ rolled at `Conn::send` on the global fault stream (a connection spans two hosts;
 belongs to neither): `FaultConfig.conn_drop` kills the live connection — the sender gets
 `ConnectionReset`, the peer reads EOF, in-flight messages in both directions drop — and
 `FaultConfig.net_spike` multiplies one message's drawn latency ×64 (delayed, never lost).
+Three object-store axes landed with the M2 archive, sampled from the same field-keyed
+sub-streams but rolled off the store's own `keyed_stream(seed, "object_store")`, so an
+archive's rolls never perturb — and are never perturbed by — the disk and wire faults drawn
+from the same seed: `FaultConfig.object_put_error` (the PUT does not land, and the prior
+value stays — a PUT is atomic, never torn), `object_get_error` (a GET or LIST fails), and
+`object_lost_ack` (the object lands durably and the caller is told it failed, which is the
+axis that makes a same-key/same-bytes re-PUT load-bearing rather than merely safe).
+`ObjectOp::Delete` has no axis yet, so every simulated DELETE succeeds and reclamation's
+delete-fails-forever behaviour is pinned by hand-driven tests rather than by the matrix; and
+`SimObjectStore` completes each operation in the `poll` that takes it, so object-store
+latency is not modelled at all.
 
 **Per-host worlds** (landed with M1 replication's first task): `Sim::host(name)` gives a
 named simulated host its own disk (`DiskWorld`, unchanged — the same crash/countdown/epoch
@@ -733,17 +744,34 @@ after every table has landed.
 - **Stance (fixed):** one primary, no sharding, no multi-master. See MANIFESTO §7.
 - **Deploy:** one binary + one data directory. Upgrades: new binary replays/attaches to the
   same log (schema versions in-log make this well-defined).
-- **Backup (M2, in progress):** log segments + periodic snapshot to object storage,
-  Litestream-style, built in — not an add-on. Two distinct things now exist. `serve::backup`
-  (`crates/charpente/src/serve.rs`) is a replication-only node with no HTTP edge that keeps
-  its own durable copy and can be promoted: a hot standby, not an off-site snapshot shipper.
+- **Backup (M2, built):** log segments + periodic snapshot to object storage,
+  Litestream-style, built in — not an add-on. Two distinct things exist and stay distinct.
+  `serve::backup` (`crates/charpente/src/serve.rs`) is a replication-only node with no HTTP
+  edge that keeps its own durable copy and can be promoted: a hot standby, not an off-site
+  snapshot shipper.
   The archive proper (`crates/charpente/src/archive/`) is the shipper — a generation model
   over `<prefix>/manifest`, a full logical snapshot plus the sealed WAL segments that
   continue it, a bounded retention pin that yields rather than letting an object-store
   outage halt the primary, and a sixth kernel arm (§1) driving it one step at a time.
-  `serve::archive(app, store, cfg)` is the archive-only edge. Restore is not built yet, and
-  no edge yet constructs an archiving standby, which spec §4 calls the deployment most
-  operators should choose.
+  `serve::archive(app, store, cfg)` is the archive-only edge, and `ArchiveConfig::writer` is
+  the identity every manifest records: an archive that meets a manifest written under a
+  different identity — at open, or before any swap — stops permanently and reports, rather
+  than interleaving two writers' generations into one prefix. Detection, not prevention, so
+  the identity has to be unique per node *and* stable across a redeploy.
+  Reading it back is `charpente::archive::restore`, behind the `restore` verb every
+  `charpente::launch` binary carries (`charpente restore --dir` builds and execs it, as
+  `describe` does): it rebuilds a data directory from the newest generation in a bucket, and
+  refuses a destination it cannot prove is on that timeline — diverged, ahead, or unrelated
+  — rather than merging, with `--force` naming the records it is about to destroy before it
+  acts.
+  A generation that rolls reclaims its predecessor's objects **by name**, out of the manifest
+  and snapshot metadata this writer wrote and only after the successor's manifest is durable;
+  the bucket is never listed, so what no manifest ever named is unreachable by design and is
+  the operator's to expire (GUIDE §14 states the required lifecycle rule). What is still not
+  built is the archiving standby: `Kernel::build` takes a `Repl` and an `Archive` together but
+  is private, and every public constructor passes at least one of them `None`, so the
+  deployment most operators should choose — archiving *from* the standby, leaving the
+  primary's loop untouched — has no public constructor yet.
 
 **Seeding (v1, implemented).** `Db::into_seeder`/`Seeder` builds a follower's (or a fresh
 backup's) entire state from a primary's logical snapshot stream, no log replay involved
