@@ -95,14 +95,34 @@ is why the milestone closed with them outstanding rather than silently absorbing
   scheduling artifact, not part of the log (DESIGN §1, ruled 2026-08-20). Numbers and the
   provenance rules that constrain how they may be quoted are in
   [docs/BENCH.md](docs/BENCH.md).
+- **Object-storage backup** (deferred from M1) — log segments and seq-cadenced snapshots
+  shipped off-site, Litestream-style. *Shipped 2026-08-29.* `ObjectStore` joins
+  `charpente-core::io` as the seventh trait behind hard rule 1, with `FsObjectStore` in
+  `prod` and a seeded `SimObjectStore`; the archive runs as a kernel arm, so it ships from
+  the same log the primary commits to and holds a **bounded** retention pin that composes
+  with replication's. `charpente restore` rebuilds a Db from a bucket and refuses a diverged
+  timeline, an unreadable manifest and every §7 corruption case **by name** rather than
+  guessing. Generations are committed by a manifest swap, and a manifest names its writer:
+  an archive that finds another writer's manifest stops rather than interleaving. Bucket
+  reclamation deletes a superseded generation's objects **by name, out of the manifest it
+  just replaced** — never a LIST-and-sweep, which was refused because a sweep whose
+  arithmetic is wrong deletes what a restore needs. The flagship oracle is a convergence
+  property over 256 universes on each of four pinned bases: what the archive holds restores
+  to what the Db held.
+  **Two limits travel with it, both documented rather than engineered around.** Objects
+  orphaned by an interrupted upload, an abandoned generation, or a drain cut short are
+  unreachable by any code — an object is orphaned precisely in that no manifest names it —
+  so operators MUST configure a bucket lifecycle rule; `docs/GUIDE.md` §14 states it as a
+  requirement, not a footnote. And the simulator has **no delete-fault axis**, so the
+  convergence property exercises reclamation on the happy path only: "correct when every
+  delete fails forever" currently rests on hand-driven modes in one test rather than on the
+  fault matrix. That axis is owed (see below).
 
 - **Own LSM storage engine**, proven under the (by now battle-hardened) sim harness before
   it replaces redb. The harness is what makes this safe to attempt. **Deferred behind
   measurement** (ruled 2026-08-06): the build triggers live in DECISIONS §7, and the
   benchmark harness above is what reads them.
 - **Blob store** (content-addressed, spill-over columns, direct streaming).
-- **Object-storage backup** (deferred from M1): log segments + periodic snapshots
-  off-site, Litestream-style.
 - **WebSockets + TS client codegen** (deferred from M1).
 - **Tenant scoping as typed key prefixes** (deferred from M1; DESIGN §9).
 - **Typed telemetry with change-time checks** — the observability contract as a lockfile;
