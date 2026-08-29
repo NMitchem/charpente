@@ -4564,11 +4564,12 @@ printing the first differing line rather than dumping a generated file into the 
   route or type and the fix (hard rules 4 and 5) rather than a `Result` this CLI would have
   to invent a code for.
 
-`gen-client` shares 0/2/101 with `check-client` (plus 2 for a failure to write `--out`) but
-has no code **1**: there is nothing for it to compare against, so it has no failure verdict
-to report. The 1-vs-2 split on `check-client` is the whole point of running it in CI: 1
-says the committed client does not match this app's contract; 2 says nothing could even be
-built to compare it against, which is a different thing to fix.
+`gen-client` shares 0, 2, and 101 with `check-client` — its own 2 additionally covers a
+failure to write `--out` — but has no code **1**: there is nothing for it to compare
+against, so it has no failure verdict to report. The 1-vs-2 split on `check-client` is the
+whole point of running it in CI: 1 says the committed client does not match this app's
+contract; 2 says nothing could even be built to compare it against, which is a different
+thing to fix.
 
 A type-check alone is half a gate: `tsc --noEmit` proves a call site type-checks against
 the generated types, never that a runtime value actually matches its declared type — which
