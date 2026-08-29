@@ -181,9 +181,17 @@ impl ObjectStore for SimObjectStore {
             // archive stays correct and keeps advancing when every delete
             // fails forever — rests on two hand-driven modes in one test
             // (`charpente/tests/archive.rs`) rather than on the fault
-            // matrix. An `object_delete_error` axis is OWED. It is not
-            // added here because the seed -> config mapping is frozen;
-            // it lands at the next break of that mapping.
+            // matrix. An `object_delete_error` axis is OWED, and the
+            // obstacle is NOT the seed -> config mapping: `sample_extended_fields`
+            // draws each axis from its own `keyed_stream(seed, name)`, so a
+            // new field survives it. It is `Rng::chance`, which calls
+            // `next_u64()` BEFORE comparing and so consumes a draw even at
+            // `p == 0.0` (`rng.rs:59`). A roll on this arm therefore shifts
+            // every later object-fault draw in the stream: every pinned
+            // universe re-rolls, and the three recorded floors and both
+            // recorded seeds go with them. That is the real cost to
+            // schedule against, and it also rules out the cheap escape of
+            // declaring the axis at 0.0 now and using it later.
             ObjectOp::Delete { key } => {
                 state.objects.remove(&key);
                 Ok(ObjectDone::Delete)

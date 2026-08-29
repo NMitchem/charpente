@@ -150,7 +150,7 @@
 //!   gap a reclamation that leaves the archive `pin_segments` behind — but
 //!   it counts SEALED SEGMENTS, so on a quiescent `Db` nothing seals,
 //!   `behind` never grows, and it never fires. It bounds a reclamation that
-//!   is competing with writes; it does not bound one at all.
+//!   is competing with writes; it does not bound one that is not.
 //!
 //! What reclamation CANNOT reach, by construction: a generation the archive
 //! began and abandoned without ever writing its manifest. Its objects are

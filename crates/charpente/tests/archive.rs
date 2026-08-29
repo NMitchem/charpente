@@ -6572,6 +6572,17 @@ fn a_retired_metas_absurd_batch_count_is_refused_rather_than_enumerated() {
     // A CRC-valid meta for the generation about to be retired, claiming the
     // largest batch count the field can hold. Everything else is the
     // archive's own.
+    // The fold in `step_reading_retired_meta` uses `saturating_add`, and
+    // that choice is load-bearing rather than defensive: crafted so the
+    // per-table counts SATURATE to `u64::MAX` and WRAP to 0. Under
+    // `wrapping_add` the claim reads as zero, passes the bound, and the
+    // delete loop this whole test exists to catch re-opens silently.
+    assert!(
+        real.tables.len() >= 2,
+        "this test crafts a claim that wraps to zero across two tables; with {} table(s) it \
+         cannot tell `saturating_add` from `wrapping_add` and has stopped pinning the fold",
+        real.tables.len()
+    );
     let absurd = SnapshotMeta {
         applied_seq: real.applied_seq,
         next_job_id: real.next_job_id,
@@ -6580,9 +6591,14 @@ fn a_retired_metas_absurd_batch_count_is_refused_rather_than_enumerated() {
         tables: real
             .tables
             .iter()
-            .map(|t| TableBatches {
+            .enumerate()
+            .map(|(i, t)| TableBatches {
                 name: t.name.clone(),
-                batches: u64::MAX,
+                batches: match i {
+                    0 => u64::MAX,
+                    1 => 1,
+                    _ => 0,
+                },
             })
             .collect(),
     };
