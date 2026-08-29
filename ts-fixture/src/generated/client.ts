@@ -201,9 +201,28 @@ export class UndeclaredEvent extends Error {
   }
 }
 
+/**
+ * Every optional member is `?: T | undefined`, not `?: T`. This is an INPUT
+ * option bag a caller builds, and under `exactOptionalPropertyTypes` those
+ * two declarations differ: `?: T` refuses an explicitly-`undefined` value,
+ * so the ordinary pass-through
+ *
+ *     function tail(api: Api, cursor?: string) { return api.feed({ cursor, … }); }
+ *
+ * would not compile, and every such caller would have to write a conditional
+ * spread of its own. Absent and `undefined` mean the SAME thing here —
+ * `stream()` below reads `cursor` for truthiness and `onUnknown`/`signal`
+ * for presence, and none of the three is serialized — so there is no
+ * distinction for `?: T` to protect, only ergonomics to cost.
+ *
+ * The opposite call goes the opposite way, deliberately: a generated WIRE
+ * type keeps `?: T`, because there absence is a fact about the document the
+ * server sent, and the walker is what must omit the key (`revive.rs`).
+ * `ts-fixture/src/negatives.ts` pins both halves.
+ */
 export interface SubscribeOptions<Ev> {
   /** A `Cursor::wire` string from a previous `onEvent`, to resume from. */
-  cursor?: string;
+  cursor?: string | undefined;
   onEvent: (ev: Ev, cursor: string) => void;
   onEnd: (end: StreamEnd) => void;
   /**
@@ -211,8 +230,8 @@ export interface SubscribeOptions<Ev> {
    * frame raises `UndeclaredEvent` — it is never cast into `Ev`, and never
    * dropped silently.
    */
-  onUnknown?: (ev: UnknownEvent, cursor: string) => void;
-  signal?: AbortSignal;
+  onUnknown?: ((ev: UnknownEvent, cursor: string) => void) | undefined;
+  signal?: AbortSignal | undefined;
 }
 
 export class ApiBase {
@@ -237,22 +256,35 @@ export class ApiBase {
     const res = await fetch(this.baseUrl + path, {
       method,
       headers: this.headers(body !== undefined),
-      // A replacer, not a schema walk: it sees each value BEFORE
-      // serialization, so converting every bigint it meets is sound with no
-      // knowledge of which field is `Int64` -- unlike the INBOUND direction
-      // (`parsed as T` below), where `JSON.parse` has already thrown the
-      // precision away by the time anything could revive it, which is why
-      // that direction needs a schema-directed walk and this one does not.
-      // A type-checked call site can only ever hand this a bigint where the
-      // schema put one, so "convert every bigint" and "convert only Int64
-      // positions" agree in practice; this is wider in principle but checks
-      // and rejects nothing, so it is not the validator A3 forbids.
-      body:
-        body === undefined
-          ? undefined
-          : JSON.stringify(body, (_k, v) =>
+      // A conditional spread rather than `body: body === undefined ?
+      // undefined : …`. `RequestInit.body` is declared `?: BodyInit | null`,
+      // and under `exactOptionalPropertyTypes` a `?:` member refuses an
+      // explicitly-`undefined` value -- so the ternary form does not compile
+      // for anyone type-checking a generated client at that strictness
+      // (`tsc` TS2379). Behaviour is unchanged: `RequestInit` is a WebIDL
+      // dictionary, whose conversion drops an `undefined` member before
+      // `fetch` reads it, so the two forms build the SAME request
+      // (`new Request(url, { body: undefined }).body` and the same with no
+      // `body` key are both `null` -- Node v24.13.1, run).
+      //
+      // The replacer below is a replacer, not a schema walk: it sees each
+      // value BEFORE serialization, so converting every bigint it meets is
+      // sound with no knowledge of which field is `Int64` -- unlike the
+      // INBOUND direction (`parsed as T` below), where `JSON.parse` has
+      // already thrown the precision away by the time anything could revive
+      // it, which is why that direction needs a schema-directed walk and
+      // this one does not. A type-checked call site can only ever hand this
+      // a bigint where the schema put one, so "convert every bigint" and
+      // "convert only Int64 positions" agree in practice; this is wider in
+      // principle but checks and rejects nothing, so it is not the validator
+      // A3 forbids.
+      ...(body === undefined
+        ? {}
+        : {
+            body: JSON.stringify(body, (_k, v) =>
               typeof v === "bigint" ? v.toString() : v,
             ),
+          }),
     });
     const text = await res.text();
     // A non-JSON body is a protocol violation, not an `E`: this throws rather
@@ -293,7 +325,16 @@ export class ApiBase {
   ): Promise<void> {
     const headers = this.headers(false);
     if (opts.cursor) headers["last-event-id"] = opts.cursor;
-    const res = await fetch(this.baseUrl + path, { headers, signal: opts.signal });
+    // A conditional spread for the same reason `request()` uses one:
+    // `RequestInit.signal` is `?: AbortSignal | null`, which under
+    // `exactOptionalPropertyTypes` refuses an explicitly-`undefined` value.
+    // Same dictionary-conversion argument, so the same request either way
+    // (`new Request(url, { signal: undefined })` yields an un-aborted signal,
+    // exactly as passing none does -- Node v24.13.1, run).
+    const res = await fetch(this.baseUrl + path, {
+      headers,
+      ...(opts.signal === undefined ? {} : { signal: opts.signal }),
+    });
     if (res.status === 409) {
       // The server refused the cursor. Surfaced, never retried: see
       // CursorRefused.
@@ -446,7 +487,7 @@ function reviveInvoicePaid(v: InvoicePaid): InvoicePaid {
 }
 
 function reviveInvoiceView(v: InvoiceView): InvoiceView {
-  return { ...v, totalCents: reviveInt64(v.totalCents), sequence: reviveInt64(v.sequence), lineItems: (v.lineItems).map((x0) => reviveLineItem(x0)), payment: revivePayment(v.payment), notice: reviveNotification(v.notice), lastItem: reviveFeedItem(v.lastItem), adjustmentCents: (v.adjustmentCents) == null ? null : (reviveInt64(v.adjustmentCents)), lateFeeCents: (v.lateFeeCents) == null ? (v.lateFeeCents) : (reviveInt64(v.lateFeeCents)), installmentCents: (v.installmentCents).map((x0) => reviveInt64(x0)), feesByCategory: Object.fromEntries(Object.entries(v.feesByCategory).map(([k0, x0]) => [k0, reviveInt64(x0)])), refundBatchesCents: (v.refundBatchesCents) == null ? null : ((v.refundBatchesCents).map((x0) => reviveInt64(x0))), disputedLineCents: (v.disputedLineCents).map((x0) => (x0) == null ? null : (reviveInt64(x0))), ...(v.creditNoteCents === undefined ? {} : { creditNoteCents: (v.creditNoteCents) == null ? null : (reviveInt64(v.creditNoteCents)) }) };
+  return { ...v, totalCents: reviveInt64(v.totalCents), sequence: reviveInt64(v.sequence), lineItems: (v.lineItems).map((x0) => reviveLineItem(x0)), payment: revivePayment(v.payment), notice: reviveNotification(v.notice), lastItem: reviveFeedItem(v.lastItem), adjustmentCents: (v.adjustmentCents) == null ? null : (reviveInt64(v.adjustmentCents)), ...(v.lateFeeCents === undefined ? {} : { lateFeeCents: reviveInt64(v.lateFeeCents) }), installmentCents: (v.installmentCents).map((x0) => reviveInt64(x0)), feesByCategory: Object.fromEntries(Object.entries(v.feesByCategory).map(([k0, x0]) => [k0, reviveInt64(x0)])), refundBatchesCents: (v.refundBatchesCents) == null ? null : ((v.refundBatchesCents).map((x0) => reviveInt64(x0))), disputedLineCents: (v.disputedLineCents).map((x0) => (x0) == null ? null : (reviveInt64(x0))), ...(v.creditNoteCents === undefined ? {} : { creditNoteCents: (v.creditNoteCents) == null ? null : (reviveInt64(v.creditNoteCents)) }) };
 }
 
 function reviveLimitExceeded(v: LimitExceeded): LimitExceeded {
