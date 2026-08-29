@@ -23,3 +23,10 @@ serde_json = "1"
 # the deterministic ones. Same dev-dependency, for the same reason, as
 # `crates/sim-fixture` and `examples/invoicing`.
 charpente-sim = { path = "../charpente-sim" }
+# `tests/drift.rs`'s SSE dispatch-map coverage floor (chunk B1c) asks what the
+# emitter ACTUALLY WROTE for this app's contract, rather than re-deciding
+# "does this payload carry an Int64" with a second traversal of its own that
+# could quietly drift from the emitter's and report a floor as covered when it
+# is not. A workspace-internal, test-only edge; `charpente-tsgen` depends on
+# `charpente` alone, so there is no cycle back to this crate.
+charpente-tsgen = { path = "../charpente-tsgen", version = "0.0.0" }

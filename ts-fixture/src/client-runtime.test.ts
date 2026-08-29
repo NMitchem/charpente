@@ -6,8 +6,13 @@
 // caught here rather than surfacing as a confusing failure in int64.test.ts.
 //
 // Neither test here does bigint arithmetic, so neither observes the Int64 gap
-// int64.test.ts pins — a wire STRING compared to itself is true whether or not
-// the type lies about it being a bigint.
+// int64.test.ts (request path) and int64-sse.test.ts (stream path) pin — those
+// two do the arithmetic that only a real bigint survives. What the SSE round
+// trip below adds is the CONVERSION at the boundary: `amount_cents` comes off
+// the wire as a decimal string and must reach the caller as `BigInt(that)`, so
+// it is compared against the sample's own value converted, never against the
+// raw literal (which is what it was before chunk B1c revived this path, and
+// what would silently be true again if the revive were dropped).
 //
 // The JSON round trip also asserts on the stub's recorded call (`calls[0]`) —
 // proof that request-body capture itself works, on a real body
@@ -67,7 +72,7 @@ test("SSE round trip: real sample frames dispatch through stream()", async () =>
         seen.push(ev.event);
         if (ev.event === "invoice_paid") {
           assert.equal(ev.data.invoice, invoicePaid.invoice);
-          assert.equal(ev.data.amount_cents, invoicePaid.amount_cents);
+          assert.equal(ev.data.amount_cents, BigInt(invoicePaid.amount_cents));
         } else {
           assert.equal(ev.data.invoice, invoiceVoided.invoice);
         }

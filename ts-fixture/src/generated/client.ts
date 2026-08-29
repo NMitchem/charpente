@@ -266,13 +266,30 @@ export class ApiBase {
   // Fetch-based, NOT EventSource: EventSource cannot set an Authorization
   // header, and the alternative is a token in a query string, where it lands
   // in logs and referrers. The cost is that reconnect is owed explicitly.
-  // `declared` is the route's `emits(...)` names, passed by the generated
-  // subscribe method; a route that declared none passes nothing and takes
-  // every frame as the honest `UnknownEvent`.
+  // `declared` is the route's `emits(...)` declaration, passed by the generated
+  // subscribe method: one entry per declared event NAME, whose value is that
+  // payload's `Int64` walker, or `null` when the payload carries none. A map
+  // rather than a list because reviving requires knowing WHICH event a frame
+  // is before knowing which walker applies — the union is discriminated by the
+  // frame's `event:` name, and each arm has its own payload type.
+  //
+  // The key set is the DECLARATION, never "the events that need reviving": an
+  // event whose payload has no `Int64` gets a null-valued entry, not an absent
+  // one, or a frame the route did declare would be refused as undeclared.
+  //
+  // A route that declared none passes NOTHING — `undefined`, not an empty map.
+  // An empty `Map` is truthy and means the opposite ("declared an empty list",
+  // i.e. refuse every name), so the two cases are an ABSENT argument and a
+  // non-empty map, never one map either way.
+  //
+  // A `Map` rather than an object literal because `name` comes off the wire and
+  // `"toString" in {}` is true through the prototype chain: an object would
+  // accept `Object.prototype`'s members as declared event names and hand their
+  // implementations back as walkers.
   protected async stream<Ev extends { event: string; data: unknown }>(
     path: string,
     opts: SubscribeOptions<Ev>,
-    declared?: readonly string[],
+    declared?: ReadonlyMap<string, ((data: unknown) => unknown) | null>,
   ): Promise<void> {
     const headers = this.headers(false);
     if (opts.cursor) headers["last-event-id"] = opts.cursor;
@@ -336,11 +353,20 @@ export class ApiBase {
           // the same trust `request()` places in the server's JSON — that is a
           // boundary no client can verify without a schema validator, and it is
           // deliberately the SAME trust, not a wider one.
-          if (declared && !declared.includes(name)) {
+          if (declared && !declared.has(name)) {
             if (!opts.onUnknown) throw new UndeclaredEvent(name);
             opts.onUnknown(ev, id);
             continue;
           }
+          // Revived only once the name is known to be declared: which walker
+          // applies is a function of WHICH event this is, so there is nothing
+          // to choose before the discriminant is trusted. The `onUnknown`
+          // frame above is handed over untouched for the same reason — the
+          // client holds no schema for an event it was not generated for,
+          // which is exactly what makes it unknown, and applying one anyway
+          // would be inventing it.
+          const revive = declared?.get(name);
+          if (revive) ev.data = revive(ev.data);
           opts.onEvent(ev as Ev, id);
         }
       }
@@ -415,6 +441,10 @@ function reviveFeedItem(v: FeedItem): FeedItem {
   return v;
 }
 
+function reviveInvoicePaid(v: InvoicePaid): InvoicePaid {
+  return { ...v, amount_cents: reviveInt64(v.amount_cents) };
+}
+
 function reviveInvoiceView(v: InvoiceView): InvoiceView {
   return { ...v, totalCents: reviveInt64(v.totalCents), sequence: reviveInt64(v.sequence), lineItems: (v.lineItems).map((x0) => reviveLineItem(x0)), payment: revivePayment(v.payment), notice: reviveNotification(v.notice), lastItem: reviveFeedItem(v.lastItem), adjustmentCents: (v.adjustmentCents) == null ? null : (reviveInt64(v.adjustmentCents)), lateFeeCents: (v.lateFeeCents) == null ? (v.lateFeeCents) : (reviveInt64(v.lateFeeCents)), installmentCents: (v.installmentCents).map((x0) => reviveInt64(x0)), feesByCategory: Object.fromEntries(Object.entries(v.feesByCategory).map(([k0, x0]) => [k0, reviveInt64(x0)])), refundBatchesCents: (v.refundBatchesCents) == null ? null : ((v.refundBatchesCents).map((x0) => reviveInt64(x0))), disputedLineCents: (v.disputedLineCents).map((x0) => (x0) == null ? null : (reviveInt64(x0))), ...(v.creditNoteCents === undefined ? {} : { creditNoteCents: (v.creditNoteCents) == null ? null : (reviveInt64(v.creditNoteCents)) }) };
 }
@@ -483,7 +513,7 @@ export class Api extends ApiBase {
 
   /** Requires a session token: call `setToken` first. */
   feed(opts: SubscribeOptions<FeedEvent>): Promise<void> {
-    return this.stream<FeedEvent>("/feed", opts, ["invoice_paid", "invoice_voided"]);
+    return this.stream<FeedEvent>("/feed", opts, new Map([["invoice_paid", (d: unknown) => reviveInvoicePaid(d as InvoicePaid)], ["invoice_voided", null]]));
   }
 
   rawFeed(opts: SubscribeOptions<UnknownEvent>): Promise<void> {

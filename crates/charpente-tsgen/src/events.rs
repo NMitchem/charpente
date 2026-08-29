@@ -12,7 +12,9 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use charpente::describe::{Contract, RouteInfo};
+use charpente::wire::TypeSchema;
 
+use crate::revive::{revive_expr, type_map};
 use crate::routes::{AUTH_DOC, camel, param_args, pascal, path_expr};
 use crate::runtime::RESERVED;
 
@@ -108,6 +110,7 @@ pub(crate) fn emit_unions(c: &Contract) -> String {
 /// hands back `ApiBase.stream`'s promise, which resolves when the stream ends
 /// and rejects with `CursorRefused`/`StreamRejected`.
 pub(crate) fn emit_methods(c: &Contract) -> String {
+    let types = type_map(c);
     let mut out = String::new();
     for r in c.routes.iter().filter(|r| r.stream) {
         let ev = event_type(r);
@@ -126,11 +129,35 @@ pub(crate) fn emit_methods(c: &Contract) -> String {
         // platform does not drop a frame the route never declared, so the
         // names go to the runtime, which refuses to cast anything outside
         // them into this union (task 9a review, finding A).
+        //
+        // Chunk B1c: each name now carries its payload's `Int64` walker,
+        // because a frame cannot be revived before its `event:` name says
+        // which schema it has. The KEY SET is still exactly the declaration —
+        // a payload carrying no `Int64` gets a `null` walker, NEVER an absent
+        // entry, or the runtime's `has(name)` guard would refuse a declared
+        // event as undeclared. And a route that declared nothing still passes
+        // no third argument at all, which the runtime distinguishes from an
+        // empty map ("declared an empty list"): that is the `is_empty` branch
+        // below, and it is the representation of the distinction.
         let declared = if r.emits.is_empty() {
             String::new()
         } else {
-            let names: Vec<String> = r.emits.iter().map(|e| format!("{:?}", e.event)).collect();
-            format!(", [{}]", names.join(", "))
+            let entries: Vec<String> = r
+                .emits
+                .iter()
+                .map(|e| {
+                    // `d as <Payload>` is the same boundary cast `request()`'s
+                    // `parsed as T` already is: the map holds one walker per
+                    // arm of a union, so its value type is over `unknown` and
+                    // each entry narrows to its own arm.
+                    let arg = format!("d as {}", e.payload);
+                    match revive_expr(&TypeSchema::Ref(e.payload), &arg, &types, 0) {
+                        Some(call) => format!("[{:?}, (d: unknown) => {call}]", e.event),
+                        None => format!("[{:?}, null]", e.event),
+                    }
+                })
+                .collect();
+            format!(", new Map([{}])", entries.join(", "))
         };
         let _ = writeln!(
             out,

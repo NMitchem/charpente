@@ -252,9 +252,20 @@ fn an_undeclared_stream_route_gets_the_honest_unknown_shape() {
 #[test]
 fn a_declared_stream_hands_the_runtime_the_names_it_was_generated_for() {
     let ts = emit_client(&fixture_contract());
+    // Chunk B1c: the names are now the KEYS of a name->walker map, because a
+    // frame cannot be revived before its `event:` name says which arm of the
+    // union — and so which payload type — it carries. The guarantee this test
+    // has always pinned is unchanged; only the shape carrying it moved.
+    //
+    // The whole argument list is compared byte for byte, which is what makes
+    // A1 mechanical here: `InvoiceVoided` carries no `Int64`, and its entry is
+    // PRESENT with a `null` walker rather than absent. An emitter that dropped
+    // entries for payloads with nothing to revive would turn a declared event
+    // into an undeclared one at the runtime's `has(name)` guard and raise
+    // `UndeclaredEvent` on a frame the route declared.
     assert!(
         ts.contains(
-            r#"return this.stream<FeedEvent>("/feed", opts, ["invoice_paid", "invoice_voided"]);"#
+            r#"return this.stream<FeedEvent>("/feed", opts, new Map([["invoice_paid", (d: unknown) => reviveInvoicePaid(d as InvoicePaid)], ["invoice_voided", null]]));"#
         ),
         "{ts}"
     );
@@ -263,6 +274,16 @@ fn a_declared_stream_hands_the_runtime_the_names_it_was_generated_for() {
     assert!(
         ts.contains(r#"return this.stream<UnknownEvent>("/raw-feed", opts);"#),
         "{ts}"
+    );
+    // Asserted negative space (hard rule 4): "declared nothing" is an ABSENT
+    // third argument, never an empty map. `new Map()` is truthy where
+    // `undefined` is not, so an empty one would flip a route that declared
+    // nothing from accepting every frame to refusing every frame — the
+    // runtime's guard would run and no name would ever be in it.
+    assert!(
+        !ts.contains("new Map([])"),
+        "an undeclared stream route must pass no map at all, not an empty one — an empty \
+         map is truthy and refuses every frame: {ts}"
     );
 }
 
@@ -278,12 +299,22 @@ fn an_undeclared_event_name_is_refused_by_name_rather_than_cast_into_the_union()
     // commit exists to prevent. Positions are compared, and each anchor is
     // `expect`ed so a missing one fails by name instead of making `None` sort
     // first and pass.
+    //
+    // The cast being protected is `ev as Ev`, the NARROWING into the route's
+    // declared union — not the `as unknown` on the parse above it, which is a
+    // widening that deliberately runs first and would pin nothing.
     let guard = ts
-        .find("declared.includes(name)")
+        .find("declared.has(name)")
         .expect("the runtime must check the declared list");
     let refusal = ts
         .find("throw new UndeclaredEvent(name)")
         .expect("an undeclared name must be refused by name");
+    let tolerated = ts
+        .find("opts.onUnknown(ev, id)")
+        .expect("an undeclared name must reach onUnknown when the caller supplied one");
+    let revive = ts
+        .find("if (revive) ev.data = revive(ev.data)")
+        .expect("a declared frame's payload must be revived before it is dispatched");
     let cast = ts
         .find("opts.onEvent(ev as Ev")
         .expect("declared frames must reach onEvent through the union cast");
@@ -291,6 +322,30 @@ fn an_undeclared_event_name_is_refused_by_name_rather_than_cast_into_the_union()
         guard < cast && refusal < cast,
         "the discriminant must be checked BEFORE the cast, but the guard is at byte {guard}, \
          the refusal at {refusal}, and `as Ev` at {cast}: {ts}"
+    );
+    // Chunk B1c inserts a third position BETWEEN those two, and it belongs to
+    // the same guarantee. The revive cannot precede the guard: which walker
+    // applies is a function of which event a frame is, so choosing one before
+    // the name is trusted would be reviving an undeclared frame against a
+    // schema this client does not have for it. And it cannot follow the cast,
+    // or `onEvent` receives an unrevived payload under a type saying `bigint`.
+    //
+    // `tolerated < revive` is the `onUnknown` half: an undeclared frame is
+    // handed over untouched, above the walker, and never falls through to it.
+    //
+    // This byte-order check is the ONLY oracle for that ordering, and that is
+    // measured rather than assumed: moving both revive lines above the guard
+    // reddens this test alone and leaves all 16 executing tests in `ts-fixture`
+    // green. It has to be that way today — the guard and the walker read the
+    // SAME map, so `get(name)` on a name `has(name)` just rejected is always
+    // `undefined`, and no frame exists that a reordered runtime would revive
+    // differently. What the order buys is that the guarantee survives the two
+    // ceasing to be one map, which no runtime test can currently observe.
+    assert!(
+        guard < revive && refusal < revive && tolerated < revive && revive < cast,
+        "the walker must run after the declared-list guard and before the union cast, but \
+         the guard is at byte {guard}, the refusal at {refusal}, the onUnknown handoff at \
+         {tolerated}, the revive at {revive}, and `as Ev` at {cast}: {ts}"
     );
 }
 
@@ -332,6 +387,13 @@ fn both_early_exits_sit_inside_the_try_whose_finally_cancels_the_reader() {
 /// and its path is substituted exactly as a request method's is: the two
 /// emitters share one `param_args`/`path_expr` pair precisely so they cannot
 /// drift into two path formats.
+///
+/// The dispatch map is the third argument and stays behind `opts` (chunk
+/// B1c): argument ORDER is what this test pins, so the map's arrival must not
+/// have pushed `opts` out of last place among the caller-facing arguments.
+/// `InvoicePaid` is declared by two routes here — the fixture's `feed` and
+/// this one — so it also pins that a payload reached twice still gets exactly
+/// one `reviveInvoicePaid`, which is what `needed` being a set buys.
 #[test]
 fn a_stream_route_with_a_path_param_takes_it_before_opts() {
     let mut c = fixture_contract();
@@ -360,9 +422,16 @@ fn a_stream_route_with_a_path_param_takes_it_before_opts() {
     );
     assert!(
         ts.contains(
-            r#"return this.stream<OrgFeedEvent>(`/orgs/${encodeURIComponent(orgId)}/feed`, opts, ["invoice_paid"]);"#
+            r#"return this.stream<OrgFeedEvent>(`/orgs/${encodeURIComponent(orgId)}/feed`, opts, new Map([["invoice_paid", (d: unknown) => reviveInvoicePaid(d as InvoicePaid)]]));"#
         ),
         "{ts}"
+    );
+    assert_eq!(
+        ts.matches("function reviveInvoicePaid(").count(),
+        1,
+        "`InvoicePaid` is declared by two stream routes here, and a payload reached twice \
+         must still get exactly one walker — two would be a `tsc` duplicate function \
+         implementation: {ts}"
     );
 }
 

@@ -335,10 +335,11 @@ const WIRE_OF: &str = r#"
  *    without this a correct document would fail to satisfy a correct type.
  * 2. An `Int64` field is typed `bigint` and carried as a decimal STRING,
  *    because a JSON number loses precision above 2^53. This rewrite
- *    describes the WIRE shape, not what the client hands back: chunk B1b's
- *    generated client revives an Int64 position to a real `bigint` at
- *    runtime, but that conversion happens in `request()`'s caller, after
- *    `JSON.parse` -- these literals are the server's raw `serde_json`
+ *    describes the WIRE shape, not what the client hands back: the generated
+ *    client revives an Int64 position to a real `bigint` at runtime, after
+ *    `JSON.parse` -- in `request()`'s caller for a route response or error
+ *    (chunk B1b), and in `stream()`'s per-event dispatch for an SSE payload
+ *    (chunk B1c). These literals are the server's raw `serde_json`
  *    documents, exactly the string this rewrite still describes, and that
  *    is unchanged by anything the CLIENT does with them afterward.
  */

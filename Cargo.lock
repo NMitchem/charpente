@@ -754,6 +754,7 @@ version = "0.0.0"
 dependencies = [
  "charpente",
  "charpente-sim",
+ "charpente-tsgen",
  "serde_json",
 ]
 

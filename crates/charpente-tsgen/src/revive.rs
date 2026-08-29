@@ -9,11 +9,14 @@
 //! `&TypeSchema` — a route position or a field's — as its entry point, and
 //! named types sharing a walker beneath it each get exactly one module-scope
 //! function, discovered by [`collect_needed_types`] walking every non-stream
-//! route's response/error and built once each by [`emit_revivers`]. This
+//! route's response/error and every stream route's `emits(...)` payload
+//! (chunk B1c wired that last one, and `events.rs` calls the resulting
+//! walkers from the per-event SSE dispatch map), and built once each by
+//! [`emit_revivers`]. This
 //! MUST be reachability, not "every type in `Contract.types` that contains
 //! an `Int64`": `ts-fixture/tsconfig.json` sets `noUnusedLocals`, so an
-//! Int64-bearing type reachable only through an `#[event]` payload (not
-//! wired into anything yet — that is chunk B1c's SSE dispatch) would emit an
+//! Int64-bearing type registered but reached from nowhere — an `#[event]`
+//! payload no route declares in `emits(...)` — would emit an
 //! unused top-level `function`, a `tsc` ERROR (TS6133, measured against this
 //! exact shape before settling on reachability) — not a warning this chunk
 //! could shrug off.
@@ -460,17 +463,20 @@ fn revive_body(schema: &TypeSchema, types: &BTreeMap<&str, &TypeSchema>) -> Opti
 }
 
 /// Which named types actually need a `reviveXxx` function, reached from
-/// every non-stream route's response/error (`Contract.types` on its own
-/// carries no notion of "used by a route" — a type can be registered and
-/// never reached from anywhere `emit_client` walks). This is NOT optional
-/// bookkeeping: `ts-fixture/tsconfig.json` sets `noUnusedLocals`, which
-/// makes an unused top-level `function` a `tsc` ERROR (TS6133, measured), so
-/// emitting one for every type that merely CONTAINS an `Int64` — regardless
-/// of whether any route/field this file's `class Api` methods actually
-/// build ever calls it — would break every contract with an Int64-bearing
-/// type reachable ONLY through, say, an `#[event]` payload (chunk B1c's
-/// territory, not built yet). `needed`/`stack` accumulate across every
-/// route's response AND error, and across the fixed-point pass over each
+/// every non-stream route's response/error and every stream route's
+/// `emits(...)` payload (`Contract.types` on its own carries no notion of
+/// "used by a route" — a type can be registered and never reached from
+/// anywhere `emit_client` walks). This is NOT optional bookkeeping:
+/// `ts-fixture/tsconfig.json` sets `noUnusedLocals`, which makes an unused
+/// top-level `function` a `tsc` ERROR (TS6133, measured), so emitting one
+/// for every type that merely CONTAINS an `Int64` — regardless of whether
+/// any route/field/stream this file's `class Api` methods actually build
+/// ever calls it — would break every contract with an Int64-bearing type
+/// registered but unreferenced (an `#[event]` payload that no route
+/// declares in `emits(...)` is exactly that shape).
+/// `needed`/`stack` accumulate across every
+/// route's response AND error AND declared payload, and across the
+/// fixed-point pass over each
 /// newly-needed type's OWN fields (`Order` needing `LineItem`), so a type
 /// used by two different routes still gets exactly one function.
 ///
@@ -533,7 +539,8 @@ fn collect_needed_types<'a>(
 
 /// One `function revive<Name>(v: <Name>): <Name> { ... }` per named type
 /// [`collect_needed_types`] finds reachable (transitively, through `Ref`)
-/// from some non-stream route's response or error — sorted (`needed` is a
+/// from some non-stream route's response or error, or from some stream
+/// route's `emits(...)` payload (chunk B1c) — sorted (`needed` is a
 /// `BTreeSet`), so the output is a function of the contract alone regardless
 /// of route order (spec §4), and never duplicated: a type reached from two
 /// different routes, or from two different fields of the same type, still
@@ -571,11 +578,33 @@ fn collect_needed_types<'a>(
 /// anyway, per hard rule 4, rather than left as an argument nothing checks).
 pub(crate) fn emit_revivers(c: &Contract) -> String {
     let types = type_map(c);
+    // A stream route's `emits(...)` payload is reached by NAME
+    // (`EmittedEvent.payload`), never as a `TypeSchema` position the way a
+    // response or an error is — so it enters the ONE walk below as a
+    // synthetic `Ref`, rather than through a second copy of the `Ref` arm's
+    // scheduling logic that could drift from it (chunk B1c). Declared before
+    // `needed` so it outlives every borrow taken from it.
+    //
+    // Without this the SSE dispatch had nothing to call: `InvoicePaid`
+    // carries a real `Int64` in a real SSE payload and got no function,
+    // because `collect_needed_types` was never asked about `r.emits`. The
+    // `!r.stream` filter below is NOT what excluded it — a stream route's
+    // `response` is `Null` and its `error` is the `ApiError` envelope, so
+    // that filter changes nothing either way.
+    let emitted: Vec<TypeSchema> = c
+        .routes
+        .iter()
+        .filter(|r| r.stream)
+        .flat_map(|r| r.emits.iter().map(|e| TypeSchema::Ref(e.payload)))
+        .collect();
     let mut needed: BTreeSet<&str> = BTreeSet::new();
     let mut stack: BTreeSet<String> = BTreeSet::new();
     for r in c.routes.iter().filter(|r| !r.stream) {
         collect_needed_types(&r.response, &types, &mut needed, &mut stack);
         collect_needed_types(&r.error, &types, &mut needed, &mut stack);
+    }
+    for payload in &emitted {
+        collect_needed_types(payload, &types, &mut needed, &mut stack);
     }
     let mut out = String::new();
     let mut taken: BTreeSet<String> = runtime::RESERVED.iter().map(|s| s.to_string()).collect();

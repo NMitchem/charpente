@@ -8,6 +8,7 @@
 //! "something in the shared fixture changed").
 
 use charpente::describe::{ConfigInfo, Contract, RouteInfo, TelemetryInfo};
+use charpente::http::EmittedEvent;
 use charpente::wire::{EnumRepr, Field, TypeDef, TypeSchema};
 use charpente_tsgen::emit_client;
 
@@ -758,10 +759,14 @@ fn a_type_with_no_int64_anywhere_gets_the_plain_one_line_return() {
 
 // ---------------------------------------------------------------------
 // `noUnusedLocals` regression: an Int64-bearing type in `Contract.types`
-// that NO non-stream route's response/error reaches (the shape an
-// `#[event]`-only payload has today, before chunk B1c wires SSE dispatch)
-// must NOT get a function -- `ts-fixture/tsconfig.json` makes an unused
-// top-level `function` a `tsc` ERROR (measured), not a lint warning.
+// that nothing `emit_client` walks reaches -- no non-stream route's
+// response/error, and (since chunk B1c) no stream route's `emits(...)`
+// payload either -- must NOT get a function. `ts-fixture/tsconfig.json`
+// makes an unused top-level `function` a `tsc` ERROR (measured), not a lint
+// warning. The shape below is an `#[event]` payload REGISTERED by
+// `mount_events` but declared by no route's `emits(...)`, which is still
+// reached from nowhere after B1c; a payload a route DOES declare is now
+// reachable, and gets its walker.
 // ---------------------------------------------------------------------
 
 #[test]
@@ -790,6 +795,63 @@ fn an_int64_bearing_type_unreachable_from_any_route_gets_no_function() {
         !ts.contains("function reviveInvoicePaid"),
         "an Int64-bearing type unreached by any route method must emit no function, or \
          `noUnusedLocals` fails the real generated client with TS6133: {ts}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// The other side of that same line (chunk B1c). `emit_revivers` used to walk
+// only `r.response` and `r.error`, never `r.emits` -- so an Int64 in an SSE
+// payload had no walker at all and the per-event dispatch had nothing to
+// call. `InvoicePaid.amount_cents` is exactly that shape in the real fixture.
+//
+// Both halves are asserted together on purpose, because either alone ships a
+// build that fails in an app author's `tsc` rather than here: a walker that
+// is DEFINED and never called is `noUnusedLocals` TS6133, and one CALLED but
+// never defined is TS2304. The definition lives in `revive.rs`'s reachability
+// walk and the call in `events.rs`'s dispatch map, so nothing but a test
+// spanning both holds them together.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_payload_reached_only_through_a_stream_routes_emits_gets_a_function_and_a_call() {
+    let mut c = Contract {
+        types: vec![
+            api_error_typedef(),
+            TypeDef {
+                name: "InvoicePaid",
+                schema: TypeSchema::Struct {
+                    fields: vec![Field {
+                        name: "amountCents".to_string(),
+                        schema: TypeSchema::Int64 { signed: false },
+                        optional: false,
+                    }],
+                },
+            },
+        ],
+        // The ONLY thing referencing InvoicePaid is the stream route's
+        // `emits(...)` below: no response, no error, no field of another type.
+        routes: vec![route("ping", TypeSchema::Null, api_error())],
+        ..base()
+    };
+    c.routes.push(RouteInfo {
+        stream: true,
+        emits: vec![EmittedEvent {
+            event: "invoice_paid",
+            payload: "InvoicePaid",
+        }],
+        ..route("feed", TypeSchema::Null, api_error())
+    });
+    let ts = emit_client(&c);
+    assert!(
+        ts.contains("function reviveInvoicePaid(v: InvoicePaid): InvoicePaid {"),
+        "a payload a stream route declares is reachable, and must get a walker: {ts}"
+    );
+    assert!(
+        ts.contains(
+            r#"new Map([["invoice_paid", (d: unknown) => reviveInvoicePaid(d as InvoicePaid)]])"#
+        ),
+        "the subscribe method must hand that walker to the runtime, keyed by the frame's \
+         `event:` name: {ts}"
     );
 }
 
