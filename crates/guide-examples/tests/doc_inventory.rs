@@ -8,8 +8,28 @@
 //! Scope, so the coverage is not read wider than it is: this checks that every
 //! member, every member that HAS tests, and every test file IS named. It does
 //! not check that a name is filed under the right crate, and it deliberately
-//! does not fail on a documented name that no longer exists on disk — a
-//! deleted test file should redden the build at its own use site first.
+//! does not fail on a documented name that no longer exists on disk.
+//!
+//! That last exemption is a COST judgement, not — as this comment first
+//! claimed — because "a deleted test reddens at its own use site first."
+//! That rationale is false for 42 of the 47 test files: cargo auto-discovers
+//! `tests/*.rs`, so nothing anywhere references them by name. Deleting
+//! `crates/charpente/tests/wire.rs` was measured to leave this gate green and
+//! `cargo build --workspace --tests` at exit 0 — nothing reddens, ever.
+//!
+//! The five exceptions are why the wrong sentence survived review: they are
+//! the files the repo leans on hardest, so anyone spot-checking the claim
+//! would find it holds. `sim-fixture` and `invoicing` each pin `sim` with an
+//! explicit `[[test]] name = "sim"`/`harness = false` (deleting it fails
+//! manifest parse: "can't find `sim` test at `tests/sim.rs`"), and CI names
+//! `crash_recovery`, `replication`, `kernel` and `samples` on the command
+//! line for its pinned-seed replays. A rule that is true only of the files
+//! nobody deletes casually is worse than no rule.
+//!
+//! The real reason to stay quiet is asymmetric cost: a name MISSING from the
+//! list hides an entire suite from an agent that trusts the list's own
+//! exhaustiveness claim, while a name left behind after a deletion costs one
+//! wasted `cargo test` invocation and an obvious error.
 //!
 //! The crate set is taken from `Cargo.toml`'s `members`, NOT from the prose.
 //! Deriving it from the prose was the original hole: a crate the sentence

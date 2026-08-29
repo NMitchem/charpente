@@ -1,6 +1,6 @@
 # Plan: `object_delete_error` — the fault axis reclamation shipped without
 
-**Status:** not started. **Sequencing: AFTER the `archive` branch merges to `main`** — see
+**Status:** not started. Amended 2026-08-29 (see Task 1 step 3: the constructor count was wrong and `validate()` was missing). **Sequencing: AFTER the `archive` branch merges to `main`** — see
 "When to run this" below; do not start it on `archive`.
 
 ## Why this exists
@@ -100,7 +100,15 @@ design change and remains explicitly unbuilt.
       (`~:6926`). Write it against today's numbers, so it can only pass by being true.
 - [ ] **Step 2: run to verify failure.**
 - [ ] **Step 3: implement.** `object_delete_error: f64` on `FaultConfig` (`lib.rs:34`),
-      `0.0` in **both** constructors (`~:117-119` and `~:141-143` — the second is `none()`);
+      `0.0` in **all THREE constructors** — `default()` (`:117`), `none()` (`:141`) and
+      **`swarm()` (`:214`)**, which this plan originally missed. `swarm` builds its config
+      from a sequential `Rng`; the existing object axes sit there at a literal `0.0` with a
+      comment stating that zero takes no draw, so matching them is both non-perturbing and
+      the established pattern. Also add the axis to **`FaultConfig::validate()`'s table
+      (`:240`)** — likewise missed. Every other axis is range-checked into `[0, 1]` there;
+      an axis omitted from that array is silently exempt, so `object_delete_error: 5.0`
+      would construct and run. That is a negative-space assertion (hard rule 4), not
+      bookkeeping;
       sampled in `sample_extended_fields` from `keyed_stream(seed, "object_delete_error")`,
       appended AFTER the existing axes; a second roll stream on `SimObjectStore`,
       `keyed_stream(seed, "object_store_delete")`, read ONLY by the `Delete` arm.
@@ -113,6 +121,7 @@ design change and remains explicitly unbuilt.
 | 2 | put/get moved to the `"object_store_delete"` stream | the four-base identity test |
 | 3 | the axis defaults to non-zero in either constructor | the four-base identity test |
 | 4 | `sample_extended_fields` draws the new axis from the sequential stream | the four-base identity test |
+| 5 | the axis is dropped from `validate()`'s table | a config of `5.0` must still panic |
 
 Row 1 is the one that matters: it is the obvious "simplification" a later agent will make, and
 it silently re-rolls every universe. If the identity test cannot see it, the test is wrong.
