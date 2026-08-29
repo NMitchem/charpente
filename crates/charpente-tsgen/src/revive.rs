@@ -249,44 +249,55 @@ fn field_access(receiver: &str, name: &str) -> String {
 
 /// One override piece per field of `fields` that needs conversion — either a
 /// plain `key: expr` (spliced into `{ ...receiver, PIECE, ... }` as a normal
-/// property) or, for `f.optional && Option(_)` (fix round 1, F3, below), a
-/// conditional SPREAD piece that can omit the key entirely.
+/// property) or, for EVERY `f.optional` field, a conditional SPREAD piece
+/// that can omit the key entirely.
 ///
-/// Two DIFFERENT optional shapes need two DIFFERENT fixes, and conflating
-/// them was the bug:
+/// **An absent key must stay absent.** `f.optional` means the wire OMITS the
+/// key (serde's `skip_serializing_if`), so `field_access` reads back
+/// `undefined` — and a plain `k: expr` property ALWAYS materializes `k`,
+/// turning "the server sent nothing" into "the server sent something". The
+/// conditional spread `...(access === undefined ? {} : { k: inner })` is the
+/// one shape that does not: spreading `{}` adds nothing, so an omitted key
+/// survives the walk omitted; spreading `{ k: inner }` only happens once
+/// `access` is known not to be `undefined`, at which point `inner`'s own
+/// guards still apply unchanged.
 ///
+/// Both optional shapes take it, and the difference between them lives
+/// entirely in `inner`, which comes from the field's schema — this function
+/// does not re-decide it:
+///
+/// - `f.optional && Option(_)` (`#[serde(skip_serializing_if =
+///   "Option::is_none")] pub x: Option<WireI64>`, the single most idiomatic
+///   serde optional pattern): `inner` is `Option(_)`'s own
+///   `(access) == null ? null : (…)`, which still tells an explicit `null`
+///   apart from a real value INSIDE the spread. Absent and present-null are
+///   different documents and stay different. (Fix round 1, F3, which added
+///   the spread for this case; measured before it: `"skipOpt" in revived ===
+///   true` and `revived.skipOpt === null` for a document that never had the
+///   key.)
 /// - `f.optional` over a schema that is NOT already `Option(_)` (a bare
-///   `Int64` behind `skip_serializing_if`, e.g. `lateFeeCents`): the wire
-///   omits the key entirely when absent, so `field_access` reads back
-///   `undefined` (not `null`), and passing `undefined` to `BigInt` throws
-///   the same as `null` does (A1) — guarded here with an outer
-///   `(access) == null ? (access) : (inner)` (`== null` is true for
-///   `undefined` too, by loose equality). This DOES still materialize the
-///   key as an own property with value `undefined` (`"k" in result` is
-///   `true` even though the wire never sent `k`) — left as is, deliberately,
-///   because `undefined` is what `field_access` itself already reads back
-///   for an absent key: nothing about this path *introduces* a value the
-///   wire didn't already read as absent under `===` comparison, and
-///   `JSON.stringify` drops `undefined`-valued properties on the way back
-///   out, so a round trip through this client does not corrupt the
-///   distinction the way the next case does.
-/// - `f.optional && Option(_)` (e.g. `#[serde(skip_serializing_if =
-///   "Option::is_none")] pub x: Option<WireI64>` — the single most
-///   idiomatic serde optional pattern): this USED TO take the plain
-///   `k: expr` path, where `expr` is `Option(_)`'s own
-///   `(access) == null ? null : (inner)`. That guard treats `undefined`
-///   (absent) and `null` (explicit) identically, on PURPOSE, for the VALUE
-///   it computes — but a plain `k: expr` property ALWAYS materializes `k`,
-///   so an absent key came back as an explicit, present `null`: the client
-///   told the caller "the server sent null" for "the field was absent",
-///   exactly the distinction `skip_serializing_if` on an `Option` exists to
-///   express (measured: `"skipOpt" in revived === true`,
-///   `revived.skipOpt === null`, for a document that never had the key at
-///   all). Fixed with a conditional spread: `...(access === undefined ? {}
-///   : { k: inner })` — spreading `{}` adds nothing to the result, so an
-///   absent key STAYS absent; spreading `{ k: inner }` only happens when
-///   `access` is not `undefined`, at which point `inner`'s own guard still
-///   correctly tells an explicit `null` apart from a real value.
+///   `Int64` behind `skip_serializing_if`, e.g. `lateFeeCents`): `inner` is
+///   the bare `reviveInt64(access)`. This case USED TO take a plain
+///   `k: (access) == null ? (access) : (inner)` property, on the argument
+///   that materializing the key with `undefined` was harmless because
+///   `undefined` is what an absent key reads back as anyway. That argument
+///   was wrong twice over, both measured (chunk B2):
+///   - Behaviour: `"lateFeeCents" in result.data` was `true` against a real
+///     `serde_json` document that never carried the key —
+///     `ts-fixture/src/int64-null-safety.test.ts` fails on exactly that
+///     assertion with the old shape and passes with this one. `in` is not a
+///     hypothetical: it is how `Object.keys`, `JSON.stringify` of a nested
+///     position, and every "did the server send this field" check read.
+///   - Types: under `exactOptionalPropertyTypes` (which `ts-fixture` now
+///     sets), `bigint | undefined` is not assignable to a `?: bigint` slot,
+///     so the walker did not compile at all — `tsc` TS2375.
+///
+///   `inner` here carries no null guard of its own, because a bare
+///   `skip_serializing_if` field is absent-or-value on the wire and never
+///   `null` (verified against `generated/samples.ts`, where the key is
+///   simply missing). Should a server send one anyway, `reviveInt64`'s own
+///   `typeof v === "string"` check returns it unchanged rather than throwing
+///   — the independently-sufficient layer `runtime.rs` documents under F2.
 fn revive_struct_overrides(
     fields: &[Field],
     receiver: &str,
@@ -299,12 +310,10 @@ fn revive_struct_overrides(
             let access = field_access(receiver, &f.name);
             let inner = revive_expr(&f.schema, &access, types, depth)?;
             let k = key(&f.name);
-            if f.optional && matches!(f.schema, TypeSchema::Option(_)) {
+            if f.optional {
                 Some(format!(
                     "...({access} === undefined ? {{}} : {{ {k}: {inner} }})"
                 ))
-            } else if f.optional {
-                Some(format!("{k}: ({access}) == null ? ({access}) : ({inner})"))
             } else {
                 Some(format!("{k}: {inner}"))
             }

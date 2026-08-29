@@ -7,9 +7,12 @@
 
 import type {
   CustomerId,
+  FeedEvent,
   InvoiceId,
   InvoiceView,
   LineItem,
+  SubscribeOptions,
+  UnknownEvent,
 } from "./generated/client";
 
 declare const customer: CustomerId;
@@ -48,3 +51,51 @@ declare const camelCasedCard: { type: "Card"; cardNumber: string };
 // `"card-number"`, not `cardNumber` — a serde rename the emitter dropped
 // would make this line compile.
 export const wrongTaggedField: InvoiceView["payment"] = camelCasedCard;
+
+// --------------------------------------------------------------------------
+// `exactOptionalPropertyTypes` (chunk B2). The flag is ON in `tsconfig.json`,
+// and the emitter answers `?: T` versus `?: T | undefined` DIFFERENTLY on the
+// two sides of the wire. Both answers are pinned here, because both are
+// decisions a later change could quietly reverse and no other gate would say
+// so.
+// --------------------------------------------------------------------------
+
+declare const explicitlyUndefined: { lateFeeCents: undefined };
+// @ts-expect-error a WIRE type keeps `?: T`. `InvoiceView.lateFeeCents` is a
+// `skip_serializing_if` over a bare `WireI64`: the server either sends a value
+// or omits the key, and never sends `undefined` — so "present with the value
+// `undefined`" is a document that does not exist, and the type says so. This
+// is the assertion that goes red if someone ever answers the walker's TS2375
+// by widening the wire type instead of fixing the walker; the walker's own
+// half is `int64-null-safety.test.ts`'s `!("lateFeeCents" in result.data)`.
+//
+// It also pins the FLAG: with `exactOptionalPropertyTypes` off, the line below
+// compiles and `tsc` reports this directive as unused (TS2578). So turning the
+// flag back off is itself a build error, not a silent loss of the oracle.
+export const wireOptionalRefusesUndefined: Pick<InvoiceView, "lateFeeCents"> =
+  explicitlyUndefined;
+
+declare const maybeCursor: string | undefined;
+declare const maybeSignal: AbortSignal | undefined;
+declare const maybeOnUnknown:
+  | ((ev: UnknownEvent, cursor: string) => void)
+  | undefined;
+
+// The POSITIVE direction, and the opposite answer. `SubscribeOptions` is an
+// INPUT option bag, where absent and `undefined` mean the same thing (nothing
+// is serialized from the presence of a key), so every optional member is
+// `?: T | undefined` and this ordinary pass-through compiles. Under `?: T` it
+// does not — which is the shape that shipped before chunk B2, and the reason
+// `calls.ts`'s `tail(api, cursor?: string)` could not be type-checked at this
+// strictness.
+//
+// Written here rather than left to `calls.ts` because `calls.ts` passes
+// `cursor` only, and would stop exercising even that the moment someone made
+// its parameter required — a floor, not a duplicate.
+export const optionalInputsAcceptUndefined: SubscribeOptions<FeedEvent> = {
+  cursor: maybeCursor,
+  onEvent: () => {},
+  onEnd: () => {},
+  onUnknown: maybeOnUnknown,
+  signal: maybeSignal,
+};

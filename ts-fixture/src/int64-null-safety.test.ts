@@ -43,6 +43,10 @@ test("Option(Int64) and an optional bare Int64 both round-trip null/absent witho
     // `late_fee_cents: WireI64(0)` in samples.rs omits the key entirely, so
     // this reads `undefined`, not `null` and not `0n`.
     assert.equal(result.data.lateFeeCents, undefined);
+    assert.ok(
+      !("lateFeeCents" in result.data),
+      "an omitted key must stay omitted, not be materialized with the value `undefined`",
+    );
 
     // `skip_serializing_if` over an `Option<WireI64>` -- the ONE shape that
     // makes the walker emit its conditional spread, and the shape that had no

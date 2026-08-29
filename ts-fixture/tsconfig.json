@@ -7,7 +7,7 @@
     "noEmit": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "exactOptionalPropertyTypes": false,
+    "exactOptionalPropertyTypes": true,
     "lib": ["ES2020", "DOM"]
   },
   "include": ["src"]

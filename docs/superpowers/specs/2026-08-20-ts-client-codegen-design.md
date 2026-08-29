@@ -327,6 +327,18 @@ The rest:
   decorative.
 - **Emits drift** — a test asserting a stream route's declared `emits(...)` set equals
   the set its handler's `Subscription` actually names (§2).
+- **Maximal strictness** — `ts-fixture/tsconfig.json` sets `exactOptionalPropertyTypes`
+  alongside `strict`, so the standing claim is "the generated client compiles for an app
+  on the strictest TypeScript there is", not "on the default strict". It is an oracle and
+  not a preference: with it off, the emitter shipped a walker that materialized an
+  omitted key as `undefined` (chunk B2 — the type error and the behavioural bug were the
+  same bug, and the flag is what named it). It draws a line the emitter answers
+  differently on each side of the wire — a generated WIRE type keeps `?: T`, because
+  absence is a fact about the document the server sent and the walker is what must omit
+  the key; a hand-built INPUT option bag like `SubscribeOptions` uses `?: T | undefined`,
+  because there absent and `undefined` mean the same thing and `?: T` would only cost a
+  caller a conditional spread. `ts-fixture/src/negatives.ts` pins both halves, and pins
+  the flag itself: turn it off and one `@ts-expect-error` there becomes unused (TS2578).
 - **Staleness** — `check-client` in CI (§4).
 - **The dogfood target** — `ts-fixture/`: package.json, tsconfig, the checked-in
   generated client, a handful of real call sites, one event subscription. Deliberately

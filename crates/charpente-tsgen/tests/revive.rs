@@ -275,10 +275,28 @@ fn seq_of_option_of_int64_guards_null_inside_each_element() {
 // `Field.optional` — a DIFFERENT runtime shape from `Option`: the wire
 // OMITS the key entirely (property read gives `undefined`, not a present
 // `null`), which is the second half of A1's landmine.
+//
+// Chunk B2 changed what this pins. The old shape was a plain property,
+// `k: (access) == null ? (access) : (inner)`, which guarded the throw but
+// still MATERIALIZED the key with the value `undefined`. Two measurements
+// retired that:
+//
+// - `"lateFeeCents" in result.data` was `true` against a real `serde_json`
+//   document that never carried the key (`int64-null-safety.test.ts`, run
+//   RED against the old emitter, GREEN against this one).
+// - Under `exactOptionalPropertyTypes` — which `ts-fixture/tsconfig.json`
+//   now sets — `bigint | undefined` is not assignable to a `?: bigint`
+//   slot, so the old shape did not type-check at all (TS2375).
+//
+// So both optional shapes now emit the conditional spread, and the
+// bare-vs-`Option` difference lives where it belongs: in `inner`. The two
+// tests are kept SEPARATE rather than merged because that difference is
+// the thing worth pinning — this one's `inner` has no null guard, the next
+// one's does.
 // ---------------------------------------------------------------------
 
 #[test]
-fn field_optional_bare_int64_guards_the_absent_key() {
+fn field_optional_bare_int64_omits_the_key_rather_than_materializing_undefined() {
     let c = Contract {
         types: vec![
             api_error_typedef(),
@@ -300,11 +318,19 @@ fn field_optional_bare_int64_guards_the_absent_key() {
     let body = reviver_body(&ts, "Ledger");
     assert!(
         body.contains(
-            "(v.lateFeeCents) == null ? (v.lateFeeCents) : (reviveInt64(v.lateFeeCents))"
+            "...(v.lateFeeCents === undefined ? {} : { lateFeeCents: \
+             reviveInt64(v.lateFeeCents) })"
         ),
-        "an optional (skip_serializing_if) Int64 field must guard the absent-key case, not just \
-         the Option case: {body}"
+        "an optional (skip_serializing_if) bare Int64 field must be spread conditionally, so an \
+         omitted key stays omitted -- a plain property materializes it with the value \
+         `undefined`, which reports \"the server sent this field\" for a document that never \
+         carried it and does not type-check under `exactOptionalPropertyTypes`: {body}"
     );
+    // The absent-key throw A1 names is still guarded, structurally rather
+    // than by a ternary: the pinned expression only REACHES `reviveInt64`
+    // when `access` is not `undefined`, so `BigInt(undefined)` cannot be
+    // called. That is asserted by executing it, not by a second string
+    // match here — `ts-fixture/src/int64-null-safety.test.ts`.
 }
 
 // ---------------------------------------------------------------------
