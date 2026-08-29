@@ -1392,6 +1392,7 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
    `examples/invoicing/src/jobs.rs`, documented as the idiom under GUIDE's "`#[index]` works
    on any `Codec` field" heading. That is the evidence DECISIONS §4's trigger asks for, and
    one instance across one small app is not enough to read it either way.
-4. **Client codegen** — TS client from route/event types is obvious; when.
+4. **Client codegen** — answered: `crates/charpente-tsgen` shipped 2026-08-29, generating
+   a TypeScript client from route/event types (§7, GUIDE §14).
 5. **Compile latency mitigation** — platform as prebuilt dylib so app iteration recompiles
    app code only; quantify the win early, it is the adoption risk (see PLAN §Risks).

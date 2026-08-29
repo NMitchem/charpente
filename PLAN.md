@@ -129,7 +129,7 @@ is why the milestone closed with them outstanding rather than silently absorbing
   benchmark harness above is what reads them.
 - **Blob store** (content-addressed, spill-over columns, direct streaming).
 - **TypeScript client codegen** (deferred from M1). *Shipped 2026-08-29.*
-  `crates/charpente-tsgen` is a pure `Contract -> client.ts` function: branded id types, a
+  `charpente_tsgen::emit_client` is a pure `Contract -> client.ts` function: branded id types, a
   discriminated `Result<T, E>` per route, and per-event SSE dispatch for a route's
   `emits(...)`. `charpente gen-client`/`check-client` are the CLI verbs; `check-client` is
   CI's drift oracle (0 identical / 1 stale / 2 build-or-usage fault / 101 a contract the

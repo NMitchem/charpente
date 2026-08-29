@@ -4370,11 +4370,11 @@ the contract, and it still emits and delivers either way.
 ## 14. The TypeScript client
 
 `crates/charpente-tsgen` turns one mounted app's `describe` contract (§13) into a
-TypeScript client: branded id types and an interface for every wire type, a discriminated
-`Result<T, E>` per route, and per-event dispatch for every SSE route that declared
-`emits(...)`. Nothing here is hand-written per app — the emitter is a pure function of the
-contract — so getting the generated client right is entirely a matter of getting the WIRE
-right.
+TypeScript client: branded id types and a declaration for every wire type — an `interface`
+for a struct, a `type` union for an enum — a discriminated `Result<T, E>` per route, and
+per-event dispatch for every SSE route that declared `emits(...)`. Nothing here is
+hand-written per app — the emitter is a pure function of the contract — so getting the
+generated client right is entirely a matter of getting the WIRE right.
 
 ### Deriving `Wire`
 
@@ -4441,7 +4441,8 @@ export interface LimitExceeded {
 
 **Outbound (client to server)** needs no schema knowledge: `request()`'s `JSON.stringify`
 runs a replacer that converts every `bigint` it meets to its decimal string BEFORE
-serialization, unconditionally —
+serialization, unconditionally — dedented here out of the conditional spread it actually
+sits inside, `request()`'s own `body` option:
 
 ```ts
 JSON.stringify(body, (_k, v) =>
@@ -4502,14 +4503,15 @@ the walker omits the key with a conditional spread rather than materializing it 
 ```
 
 The opposite call goes the opposite way, deliberately, for an INPUT type an app author
-builds rather than a wire type the server sends: every member of `SubscribeOptions` is
-`?: T | undefined`, because there absence and `undefined` mean the same thing (neither is
-serialized) and `?: T` alone would refuse the ordinary pass-through
+builds rather than a wire type the server sends: every OPTIONAL member of `SubscribeOptions`
+is `?: T | undefined` (`onEvent` and `onEnd` are required, no `?`), because there absence and
+`undefined` mean the same thing (neither is serialized) and `?: T` alone would refuse the
+ordinary pass-through
 `function tail(api: Api, cursor?: string) { return api.feed({ cursor, … }); }`.
 
 ### `#[route]`'s `emits(...)`: per-event dispatch
 
-A stream route that declares `emits(NoteAdded, NoteRemoved)` (§11) gets a generated
+A stream route that declares `emits(Ping, Pong)` (§11) gets a generated
 subscribe method whose runtime dispatch is keyed by a `Map` from the SSE frame's `event:`
 name to that event's revive function, or `null` when its payload carries no `Int64`. Again
 from `ts-fixture/src/generated/client.ts` (shown here reflowed for width; the generated
