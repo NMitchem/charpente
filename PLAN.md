@@ -112,7 +112,7 @@ is why the milestone closed with them outstanding rather than silently absorbing
   **Two limits travel with it, both documented rather than engineered around.** Objects
   orphaned by an interrupted upload, an abandoned generation, or a drain cut short are
   unreachable by any code — an object is orphaned precisely in that no manifest names it —
-  so operators MUST configure a bucket lifecycle rule; `docs/GUIDE.md` §14 states it as a
+  so operators MUST configure a bucket lifecycle rule; `docs/GUIDE.md` §15 states it as a
   requirement, not a footnote. And the delete-fault axis, absent when reclamation shipped,
   now exists — `FaultConfig.object_delete_error`, rolled from its own
   `keyed_stream(seed, "object_store_delete")` so that declaring it perturbed no pinned
@@ -128,7 +128,20 @@ is why the milestone closed with them outstanding rather than silently absorbing
   measurement** (ruled 2026-08-06): the build triggers live in DECISIONS §7, and the
   benchmark harness above is what reads them.
 - **Blob store** (content-addressed, spill-over columns, direct streaming).
-- **WebSockets + TS client codegen** (deferred from M1).
+- **TypeScript client codegen** (deferred from M1). *Shipped 2026-08-29.*
+  `crates/charpente-tsgen` is a pure `Contract -> client.ts` function: branded id types, a
+  discriminated `Result<T, E>` per route, and per-event SSE dispatch for a route's
+  `emits(...)`. `charpente gen-client`/`check-client` are the CLI verbs; `check-client` is
+  CI's drift oracle (0 identical / 1 stale / 2 build-or-usage fault / 101 a contract the
+  emitter refuses by name). A type-check alone is half a gate — `tsc --noEmit` proves a
+  call site type-checks, never that a runtime value matches its declared type — which is
+  why `ts-fixture/`'s Node-native suite runs the generated client against real
+  `serde_json` documents through a stubbed `fetch`, not `tsc` alone. No bare `u64`/`i64`
+  reaches the wire: the `Wire` bound refuses one at compile time, and `WireU64`/`WireI64`
+  carry a 64-bit value as a decimal string, `bigint` client-side. Transport is SSE only.
+- **WebSockets** (deferred from M1) — the generated client targets SSE; a WebSocket
+  transport would be a swap behind the same generated API (routes, types, `Result<T,
+  E>`), not a second client.
 - **Tenant scoping as typed key prefixes** (deferred from M1; DESIGN §9).
 - **Typed telemetry with change-time checks** — the observability contract as a lockfile;
   instrumentation that cannot silently rot.
