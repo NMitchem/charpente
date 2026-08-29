@@ -97,7 +97,7 @@ is why the milestone closed with them outstanding rather than silently absorbing
   [docs/BENCH.md](docs/BENCH.md).
 - **Object-storage backup** (deferred from M1) — log segments and seq-cadenced snapshots
   shipped off-site, Litestream-style. *Shipped 2026-08-29.* `ObjectStore` joins
-  `charpente-core::io` as the seventh trait behind hard rule 1, with `FsObjectStore` in
+  `charpente-core::io` as the fifth top-level trait behind hard rule 1, with `FsObjectStore` in
   `prod` and a seeded `SimObjectStore`; the archive runs as a kernel arm, so it ships from
   the same log the primary commits to and holds a **bounded** retention pin that composes
   with replication's. `charpente restore` rebuilds a Db from a bucket and refuses a diverged

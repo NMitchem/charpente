@@ -1933,3 +1933,453 @@ comparison, which is a design change nobody has been asked for yet.
 clause (only the `_in`/`_with`/`_with_in` paths do); the follower batch-atomicity test never
 reads the store, and the accessor a reviewer suggested for it is the one Ruling 20 deleted,
 so closing it is its own `replication.rs` change with its own mutation burden.
+
+## 2026-08-29 — Interlude: the north-star fidelity audit, and CLAUDE.md gets an oracle
+
+**What was done.** An eight-agent read-only audit of the tree at `8a1c28f` against MANIFESTO,
+DESIGN, PLAN, DECISIONS and CLAUDE.md, run while the two sub-projects below were both in
+flight. **The machinery is clean**: zero hard-rule violations in core and all ten DECISIONS
+entries honoured with no silent override — checked, not reported: zero `[features]` sections
+anywhere in the workspace (hard rule 2), `use redb::` in exactly one file
+(`charpente-core/src/table.rs`), hyper/tokio confined to `serve.rs`, workspace lints at `deny`,
+and zero `debug_assert!` anywhere (the only `debug_assert` tokens are `cfg!(debug_assertions)`
+reads in bench-harness), so every assertion is unconditionally on (hard rule 4). **Every
+finding was in the layer with no oracle** — docs and process, never code — which is MANIFESTO
+§2's own law (output quality tracks oracle density) confirmed against the project itself;
+GUIDE.md, the one document with a mechanical gate behind it, produced zero findings while the
+ungated ones produced all of them.
+
+**So the document every agent orients from got a gate (`13fa32c`, widened `12d8def`).**
+`crates/guide-examples/tests/doc_inventory.rs` checks CLAUDE.md's workspace map against
+`Cargo.toml`'s `members` and its "exhaustive as written" per-crate test lists against
+`crates/*/tests/*.rs`. It ran RED first and named the real drift — the map had lost four crates
+(`charpente-tsgen`, `ts-fixture-app`, `edge-harness`, `bench-harness`) and the `charpente` list
+had lost `wire.rs` on the day it was added — and the same commit landed the entries that turn
+it green. The first version checked only the three crates its own sentence happened to name,
+which is a document checking itself; `12d8def` derives the crate set from `members` instead, so
+a crate nobody thought to mention still gets checked (3 crates -> all 12 with `tests/`, 47
+files), mutation-proved three ways. Its one trap is recorded at the site: the parser's sentinel
+is a literal, so reflowing the paragraph would hide the whole inventory — it fails loudly
+naming the constraint rather than passing vacuously. The gate paid for itself within hours: the
+`archive` merge's CLAUDE.md conflict was resolved toward the superset list because taking the
+other side would have reddened it (`4af81a5`).
+
+**Owed to Noah — agents must not self-approve these.** DECISIONS triggers that passed their
+dates unread: **§4** (typed indexes, due mid-M1) — censused: of the four `scan::<T>()` sites in
+app code, three are legitimate list-all routes and only `examples/invoicing/src/jobs.rs`'s
+overdue sweep is a workaround for a missing range index, so the trigger does *not* fire; but
+the chain FINDINGS.md -> still-live scan -> GUIDE.md promoting it to a sanctioned idiom is
+real, and §4 carries no annotation. **§6** (async replication vs consensus-first, "reopen at M1
+exit criteria") was never read and is a month past due. **§10** is closable with evidence,
+since the edge executor landed sync poll-shaped. And **§7**'s second reading (2026-08-20,
+above) is still invisible in the file — DECISIONS.md was last edited 2026-08-10, so a fresh
+agent sees only the first. The drift class is normalisation: a limitation becomes an idiom, a
+trigger passes its date, and nothing reddens. Read the triggers as a checklist at every
+milestone close. Technical gaps the audit listed, none new and most self-documented by the
+code: group commit's checkpoint arm gets zero fault coverage (`checkpoint_every` 4096 vs at
+most a few dozen records per universe); `gc_events` writes outside apply and skips
+`mix_schedule`, invisible to the fingerprint oracle; `overflow-checks` is unset (the
+`applied_delta` interlude above already paid for that once); CI's `crash_recovery` pin has no
+`--exact`; `env::var` is unfenced. README's staleness Noah declared acceptable on purpose — not
+a fix target.
+
+## 2026-08-29 — M2 sub-project: object-storage archive, COMPLETE
+
+**What it does.** `ObjectStore` (`start`/`poll` over `ObjectOp::{Put,Get,List,Delete}`) joins
+`charpente-core::io`, with a seeded `SimObjectStore` (`charpente-sim`) and `FsObjectStore`
+(`crates/charpente/src/prod.rs`) as the only production impl — atomic temp-file-then-rename
+PUTs, two fsyncs the trait itself doesn't require but a filesystem substrate owes silently.
+`Archive::step` (`crates/charpente/src/archive/mod.rs`) is a state machine driven one
+transition per kernel iteration as a **sixth** `Ready` arm — start one upload, poll one in
+flight, read one `read_budget_bytes` bite, never a loop to completion — so archive work
+interleaves with requests/jobs/cron rather than racing them (spec §8). A **generation** is one
+logical snapshot plus the sealed WAL segments continuing it under a key prefix; writing
+`<prefix>/manifest` is the sole commit point — nothing readable until named, nothing deleted
+until the next manifest is durable. `ArchiveConfig::writer` is the identity every manifest
+records, checked by string equality at open and before every swap, never derived from anything
+a redeploy moves; an archive meeting a foreign-identity manifest `stops` permanently rather
+than interleaving generations ("detection, not prevention," spec §4). The pin is **bounded**:
+`Archive::open` registers its floor through `Db::add_retention_pin`, composing with
+replication's pin via `retention_floor()`'s `min()` (pre-flight finding 1); past `pin_segments`
+sealed segments the archive yields rather than stalling the primary (spec pre-flight ruling 3,
+Noah's). `serve::archive(app, store, cfg)` is the archive-only edge; `charpente restore --from
+BUCKET --prefix PREFIX` rebuilds a data directory to the newest recoverable point and refuses
+three cases by name — diverged, ahead, unrelated — with `--force` naming what it destroys
+first. A rolled generation reclaims its predecessor's objects **by name**, out of the manifest
+and snapshot metadata this writer itself wrote, only after the successor's manifest is durable;
+the bucket is never listed (Task 13's grep for `ObjectOp::List` found only the two `prod.rs`
+impl arms) — LIST-and-sweep was refused because a sweep whose arithmetic is wrong deletes
+objects a restore needs (GUIDE §14, spec §3).
+
+**The oracle and its seeds.** `archive_converges` (`crates/charpente/tests/archive.rs`) runs
+256 universes at a fixed pinned base (`ARCHIVE_CONVERGENCE_BASE = 0xA2C0_0001`),
+`replication.rs`'s convergence shape for the same reason: `floor:` is a rate only meaningful
+against a base that does not move. As merged (`8acab0f`) the three floors are
+`CONV_RESTORED_FLOOR = 219`, `CONV_SUBSTANTIAL_FLOOR = 183` (a restored `Db` of ≥200 rows),
+`CONV_CHAINED_FLOOR = 169` (a segment chain, not a snapshot alone) — re-measured twice, once at
+Task 12.5 when reclamation added `ObjectStore` ops to every universe's sequence (jitter both
+directions, not decay), once when the delete axis turned on (pinned-base `restored` 215→219,
+others unchanged — floors raised, never lowered to fit a change). Measured over four bases, 256
+each: 219/183/169 (pinned), 216/178/177, 219/178/161, 223/170/168. Task 12's original close
+found **216 of 256 reach a verdict at the pinned base, and the other 40 say which kind** — 28
+`archive:nothing_published`, 12 `archive:verify_never_read_cleanly` (task-12-report.md §3-4;
+`0e46ca1`). The **store-latch discovery rate was a lower bound, not a rate**: while a
+disk-read-error latch on the archive's own snapshot read was still a fatal `Db::poisoned()`
+violation, the batch aborted at the first occurrence and undercounted; recast as a coverage
+counter, the true rate is 2 in 768 across three fresh bases, not 1 in 768 (`d8cbef5`) — the
+latch is `redb`'s `io_failed`, which `Db::poisoned()` ORs in, closing the investigation the
+2026-08-15 entry above left open. And an **unfireable check** —
+`an_archive_io_failure_never_poisons_the_db` — passes by construction: `Archive::step` takes
+`&Db`, never `&mut`, so no injected fault reaches engine poison or the store latch — a
+regression guard, labelled as such rather than live coverage (`e76fbaf`, `da8f4e3`). Seeds
+pinned in `archive.rs`, each naming what it reproduces: `0xb803ea7cab19d08c` is the store-latch
+seed above (base `0xD9E3_0001`); `0x8304b6d7b52cbe01` found a defect in the property's own
+model — it drives the store directly to read the manifest, plant a foreign one and restore, and
+must settle in-flight ops first at every one of those seams (`conv_settle`);
+`0x7280605429586c42` is another model defect, an outage-window commit (never a job) resurfacing
+so the restart carried the NEXT phase's flag; and, from Task 12.5, `0xfadf45b42f89ce91` (pinned
+base) is the retry-idempotence check needing a lost-ack object reclamation had legitimately
+deleted (fixed by excusing what `store.deleted()` names), while `0x71cec6ac14e0525a` (base
+`0xD9E3_0001`) caught the *first* fix's own bug — reading the manifest while an op could be in
+flight tripped spec §1's own assert, found only because a fresh base was run.
+
+**Review findings worth recording as patterns.** A **GREEN mutation** at Task 9 fix-round-1
+stayed green on a park-cleared retry flag; chasing it found the flag never clears on a busy
+node, so one transient store error stalls the archive for the life of the process with no
+crash, notice, or gap — C-2 Critical, +0 archive steps over 5,000 iterations, 4,096 records
+never archived, recurring at fix-round review as a **read-only-flood** costing 32–34% of
+recovery iterations to retry (`a359356`, `7b12081`; fixed with two watermarks separating "can
+new work exist" from "should a failed op retry," `91650fa`/`d297979`). A second GREEN mutation
+there (dropping the retry hold entirely) also stayed green; probing found `Step::Idle` is never
+reached during an outage without it, stalling virtual time — fixed with a threshold-free test,
+measured 659 vs. 989 iterations over a 2,000-iteration outage (`d297979`). A **poisoned pin
+mutex abort** (review M-4): `Drop for Archive` calling `.expect(..)` on an already-poisoned
+mutex would abort the whole process mid-unwind, worse than the leak being fixed — fixed with
+`unwrap_or_else(|e| e.into_inner())` (`91650fa`). Task 12.5's **`saturating_add` under a proven
+guard** (N3): a mutation proved F2's over-claim guard correctly RED, but a `wrapping_add` swap
+underneath it passed 103/103 green until a crafted two-table `SnapshotMeta` summing to 2^64
+reopened the enumeration hole the guard was meant to close. A **fix-round agent died mid-task**
+on Task 12.5 — "the seventh dispatch death on this plan, the first to leave real work stranded"
+— 403 uncommitted lines never proven red; salvaged rather than re-dispatched, verified against
+a pristine copy **restored and confirmed by sha256**. And a **notice with eleven runs of
+fourteen spaces** (N1): `reclaim_bound_notice` was missing `\`-newline continuations every
+sibling notice uses, invisible to `cargo fmt` and substring-matching tests — fixed, class
+closed with `!notice.contains("  ")`.
+
+**Retractions and limits, stated rather than engineered around.** Three orphan classes travel
+with the design (GUIDE §14, spec §3), only one with a mechanical fix: incomplete multipart
+uploads, closed by a **required** bucket-lifecycle rule. Abandoned-generation objects
+(abandoned before their manifest, from a gap past the pin bound or a permanent ownership
+refusal) print an operator notice but no rule reaches them. A third class prints **nothing**: a
+reclamation drain cut short leaves whatever it had not yet deleted, since the next roll only
+reclaims the generation it just superseded — "the most common source of orphans" in a healthy
+deployment. All three are unreachable by any code, and LIST-and-sweep was refused for the
+reason above. `pin_segments`'s default of 8 is **provisional** (ruling 53 voided its old "4×
+`retain_segments`" derivation, and its replacement is unmeasured — `docs/BENCH.md` carries no
+archive coverage at all). `delete` is idempotent by contract — `FsObjectStore::delete` maps
+`NotFound` to `Ok`, which is what made Task 12.5's delete loop silent, and whether it should
+stay so is named as open in the delete-axis section below. The larger gap at close was that
+**no `object_delete_error` fault axis existed** (`SimObjectStore` never failed a delete),
+leaving reclamation exercised on the happy path plus two hand-driven unit tests; a same-day
+sibling sub-project (`b36dc30`, `5241838` — its own ledger section) turns that axis on, not
+narrated further here. "The archiving standby is not constructible" travels unchanged to close:
+`Kernel::build` is private, every public constructor passing at least one of `repl`/`archive`
+as `None`.
+
+**The merge.** `4af81a5` ("two semantic conflicts a clean textual merge hid") is the lesson:
+both sessions' hunk-overlap analysis called DESIGN.md/GUIDE.md safe, git merged them without
+complaint, and the merged tree did not compile. Three textual conflicts resolved cleanly
+(CLAUDE.md's test inventory to archive's superset; `main.rs`'s verb union; GUIDE §13's closing
+paragraph). Two semantic ones neither analysis predicted: E0061 (`build_and_locate`'s new
+`verb` param collided with main's own new caller; the fix closed a live main defect where
+`gen-client` told two-binary crates to run `charpente describe`), and E0277×3 (main's new
+`Wire` bound made archive's bare-`u64` test fixtures illegal on the wire; fixed with `WireU64`,
+fixtures only). Gate: **924 passed / 0 failed** — charpente 532, charpente-sim 137,
+charpente-cli 88, charpente-core 81, charpente-tsgen 63, charpente-macros 14, ts-fixture-app 6,
+guide-examples 3. `d57f438`/`daa8325` are bare "merge main into archive" syncs; before this
+branch's own push to main it also picked up the delete-axis's two commits (`b36dc30`,
+`5241838`), so `8acab0f` carries both the thirteen-task project and that same-day follow-on in
+one merge against main's disjoint TS-codegen chunk. Task 13's gate (`43c76a8`, per-package due
+to the 600s tool ceiling): **803 tests passed, 0 failed**, `guide-examples` clean, no seed
+count (docs-only). CLAUDE.md's core-change evidence bar is what the property supplies for the
+project as a whole: **1,024 universes across four bases, zero universe-level violations**,
+reproduced before and after Task 12.5's re-measurement.
+
+**Plan enumerations that were wrong, and other departures.** `RECORDS_PER_SEGMENT` assumed 512,
+measured 1,365 (ruling 34); Task 10's crashed-restore cuts, planned `[3, 11, 29]`, measured at
+8 object ops, "two of which sat past the end and would have cut nothing" (`22a3253`); Task 11's
+brief named "four" `FsObjectStore` contract tests, the re-run covering all six of Task 1's
+(`f64fb78`). The sibling delete-axis plan calls its own later miscount "the fourth wrong
+enumeration" in its own numbering — that tally belongs to that section. Separately, the spec's
+four pre-flight rulings (2026-08-20, Noah) fixed the shape (a new trait, not `Disk`/`Net`
+reuse; restore to the newest recoverable point only; the archive yields on outage; v1 ships no
+S3 client); the plan's own pre-flight findings ruled, among other things, that Task 12's
+convergence property move to a new `crates/charpente/tests/archive_property.rs` since
+`charpente-sim` cannot see `charpente` — overridden **twice**: the plan's own text had first
+placed it inside `charpente-sim`, the finding then redirected it to that new file, and Task
+12's report finally landed it in the **pre-existing** `crates/charpente/tests/archive.rs`,
+reusing fixtures already defined there rather than dragging hyper/tokio/rsa/sha2 into
+`charpente-sim`'s dev-dependencies. `ObjectStore` itself was first escalated as a DESIGN §1
+amendment marked **[IRREVERSIBLE]**; reading §1's prose rather than its header showed that
+wrong — object storage is network, a source §1 already names.
+
+**Net new public API.** `ObjectStore` (`ObjectOp`/`ObjectDone`) in `charpente-core::io`;
+`SimObjectStore`; `FsObjectStore::new`; `Db::sealed_segments()`; `Db::seed_schema` ("a
+permanent API commitment made to unblock a CLI verb," per its own review); `charpente::archive`
+— `ArchiveConfig` (5 fields, no `Default`), `Archive` (`open`, `pin_floor`, `step`, plus
+`Drop`), the `manifest` and `restore` modules; `serve::archive`; `Kernel::with_archive`;
+`KernelStats::archive_steps`; the `charpente-cli` `restore` verb. `io.rs` now declares eight
+`pub trait`s, five of them top-level (`Clock`/`Entropy`/`Disk`/`Net`/`ObjectStore`;
+`File`/`Listener`/`Conn` are handed out by `Disk`/`Net`), so DESIGN §1's "fifth IO trait" is
+the right count and PLAN.md's "seventh" was drift, fixed in the commit that lands this entry.
+
+**Tree housekeeping, 2026-08-29 evening.** With the merge landed, the `archive` branch and its
+worktree (`.claude/worktrees/archive`) were retired, and the sub-project's gitignored SDD
+record — the 4,037-line `progress.md`, every task brief, report, review and review diff, 115
+files — was moved intact into the main tree at
+`.superpowers/sdd/2026-08-20-object-storage-archive/` before the worktree was removed
+(byte-compared before deletion; `progress.md`'s header still names the old worktree path, which
+is now history rather than a location). Also retired: the detached `t9a-review` worktree, a
+2026-08-12 stash holding group commit's T6 pre-flight (its `io_failure_response` and `pub
+MAX_BATCH` shipped through the normal path on 2026-08-15, so the stash was a duplicate, not a
+branch), and an orphaned 372 MB cargo target directory left beside the repo by an earlier
+baseline run. One worktree, one branch, no stash.
+
+## 2026-08-29 — Interlude: the object-delete fault axis, COMPLETE
+
+**What it closes.** Reclamation shipped in the archive's Task 12.5 as its only destructive
+operation — the one place the derived artifact can destroy what it derives from — with **no
+delete-fault axis in the simulator**: `SimObjectStore`'s `Delete` arm took no roll and
+`FaultConfig` had no delete field, so every DELETE in all 256 universes on all four pinned
+bases succeeded, and the central safety claim ("correct and still advancing when every delete
+fails forever") rested on two hand-driven modes in one unit test. The Task 12.5 re-review
+routed it as "owed at the next seed-map break" — a requirement conditioned on an event nobody
+had scheduled, owned by nobody, the same routing gap that task had already had to fix once —
+and the controller raised it to Noah as hard-rule-3 debt against MANIFESTO §9's wager ("every
+path … executed, under fault, thousands of times, and here is the seed") rather than as a
+comment-sized one. Noah ruled it its own plan
+(`docs/superpowers/plans/2026-08-29-object-delete-fault-axis.md`), sequenced after the
+`archive` merge so it would not widen a divergence that was already the branch's largest risk;
+it landed the same afternoon as `b36dc30` (Task 1) and `5241838` (Tasks 2-3).
+
+**Both recorded cost estimates named the wrong obstacle, and the fix was an idiom already in
+the file.** Round 1 told Noah the axis would break the frozen seed -> config map. Wrong:
+`sample_extended_fields` draws each axis from its own `keyed_stream(seed, name)`, so a new
+field survives it untouched. The re-review (N4) then blamed `Rng::chance` consuming a draw
+before comparing (`rng.rs:59`) even at `p == 0.0`. Closer, but only because of the real
+obstacle: `SimObjectStore` rolled put, get and lost_ack from ONE stream, `keyed_stream(seed,
+"object_store")`, so a `Delete` roll on that stream would have shifted every later draw and
+re-rolled every pinned universe merely by *declaring* the field. The answer sat one level below
+where the crate already applies it (per subsystem, per host): the `Delete` arm draws from its
+own `keyed_stream(seed, "object_store_delete")`, everything else keeps drawing from
+`object_store` in the same order, and `chance`'s eager draw lands in a stream nothing else
+reads. Third time on the archive that the answer was an idiom already in the tree (Task 11 I-2
+and Task 12 H-1 were the others); the plan says to assume it will be again before assuming it
+is not.
+
+**Replay identity was proven, not argued (`b36dc30`).** With the axis at `0.0`, all twelve
+convergence coverage counts reproduce exactly at four bases — `0xA2C0_0001` (pinned)
+215/183/169, `0xD9E3_0001` 224/179/162, `0x5B71_0001` 224/192/168, `0x3C0D_0001` 225/169/177
+(restored / restored_substantial / chained, 256 universes each), identical to the table in
+`crates/charpente/tests/archive.rs` — and both Task 12.5 seeds (`0xfadf45b42f89ce91`,
+`0x71cec6ac14e0525a`) replay green. An identity test cannot be red before the change (it
+measures today's numbers), so its fireability is the five-row mutation table, every row RED and
+both files sha-restored after: `Delete` rolling from the shared stream; put/get moved to the
+delete stream; a non-zero default in `none()`; the axis sharing an existing axis's stream and
+drawing first; the axis dropped from `validate()`'s range table. *Row 4 was wrong on its first
+attempt and stayed GREEN*: drawing from a fresh `keyed_stream(seed, "bit_flip")` after
+`bit_flip` is assigned perturbs nothing — an inert mutation, not a weak test; green was true
+and meant nothing. The honest mutation shares an existing stream and draws first.
+
+**Then it was turned on, with non-vacuity enforced rather than hoped for (`5241838`).** The
+convergence property now draws `object_delete_error` through a fourth `conv_rate(&entropy, 40,
+40)` beside the other three object axes. At the pinned base a delete fails in **32 of 256
+universes, and all 32 still restore** — the Task 2 question (a delete failing mid-drain,
+interleaved with put/get faults and whatever gap the universe drew, never costing a restore)
+has 256 seeded answers instead of an argument. An axis that is a probability can sample to zero
+and leave the property covering the happy path while *looking* like it covers failure, so
+`archive:delete_failed` (universes whose inner store failed a DELETE) and
+`archive:restored_after_delete_failure` both sit in `require:`: a batch in which no delete ever
+failed is a RED property. The fourth draw shifted `snapshot_every`/`pin_segments`/`interleave`
+in every universe, so the floors were **re-measured at four bases, not adjusted to fit**:
+pinned 219/183/169 (delete failed in 32, restored after 32); `0xD9E3_0001` 216/178/177 (23/21);
+`0x5B71_0001` 219/178/161 (23/23); `0x3C0D_0001` 223/170/168 (32/32). Movement runs in both
+directions at fresh bases (chained 162 -> 177 at one, 168 -> 161 at another), which decay
+cannot do; at the pinned base no floor fell and `CONV_RESTORED_FLOOR` was *raised* to the new
+measurement. The 23-vs-21 shortfall at one base is not a refused restore — a refusal fails the
+universe with an unclassified error rather than reaching a floor, and that run failed on the
+floor alone. Mutation table: axis forced to 0.0 -> both required keys "never occurred", RED;
+the failure witness drops `is_err()` -> its own test RED; `roll_delete` always false -> RED.
+**Row B exists because the property cannot see it**: with `is_err()` dropped,
+`archive:delete_failed` goes 32 -> 174 and the property stays GREEN — a `require:` key is a
+floor of one, so an over-counting witness satisfies it as well as an honest one — which is why
+the counter's meaning is pinned by its own test. A first attempt at that row was confounded
+(forcing the axis to 0.0 also removes the entropy draws and trips the raised floor, so its red
+proved nothing).
+
+**The plan's enumerations were wrong four times, which is now its own pattern.** "Both
+constructors" was four — `default`, `none`, `swarm`, and `harness.rs`'s pinned-shape literal,
+which only surfaced as E0063. `validate()`'s range table was unlisted, and an axis omitted
+there is silently exempt from `[0, 1]`, so `5.0` would have constructed and run — a
+negative-space assertion under hard rule 4, not bookkeeping. Spec §9, which the plan said to
+amend, spans 31 lines and never mentions delete or axis. And `FlakyStore.deletes`'s comment
+claiming no axis could ever cover deletes was wrong on every clause. The new field then reached
+operator-facing output, caught by `human_failure_block_matches_the_pinned_shape`; the repro
+block should show it, so the pinned string grew rather than the field being hidden. Docs in the
+same commits (hard rule 6): DESIGN §1 and PLAN.md's object-storage entry now say the axis
+exists and is on; archive spec §3 is narrowed to "*reclamation* cannot reach it" and states
+that the sim exercises the path that creates interrupted-drain residue **without** claiming an
+oracle that observes the residue — Task 2 did not build one and the coverage keys must not be
+read as one; the `Delete` arm's owed-axis comment is gone, since this is what it was owed
+against.
+
+**Gate.** fmt clean, clippy `--workspace --all-targets` clean, `cargo test --workspace
+--no-fail-fast` 73 suites / 1194 passed / 0 failed / 46 ignored after Task 1 and 1196 / 0 / 46
+after Tasks 2-3. Merged to `main` at `8acab0f`: the two sides touched disjoint file sets, so
+the textual merge was clean by construction, and the message says why that does not make it
+semantically clean and that the gate on the merged tree is what does.
+
+**Open, Noah's.** (1) `Rng::chance` draws at `p == 0.0`: harmless once streams are split, but
+any FUTURE axis added to an EXISTING shared stream re-rolls that stream's universes; worth a
+numbered DECISIONS entry or a comment at `rng.rs:53`. (2) Whether `delete` should stay
+idempotent in `ObjectStore`'s contract — `FsObjectStore` maps `NotFound` to `Ok`, which is what
+made the Task 12.5 delete loop silent; not reopened here, named because the axis makes its
+consequences observable for the first time. (3) The interrupted-drain orphan class still has no
+oracle that observes its residue; the sim now creates it under fault, which is what the
+coverage keys mean and all they mean.
+
+## 2026-08-29 — M2 sub-project: TS client codegen, IN FLIGHT (chunks A-C landed, D owed)
+
+**What it does.** `Wire` (`crates/charpente/src/wire.rs`) is a compile-time wire contract:
+every type crossing HTTP or SSE derives it and produces a `TypeSchema` (19 variants — `Bool`,
+eight small numerics, `String`, `Null`, `Int64{signed}`, `Id`, `Option`/`Seq`/`Map`, `Struct`,
+`Enum(EnumRepr)`, `Ref`). A bare `u64`/`i64` is not `Wire`, so it is a compile error anywhere
+on the wire — above 2^53 a JS `Number` silently loses precision — and `WireU64`/`WireI64`
+(string-encoded, `bigint` in TypeScript) plus `Id<T>` (also string-encoded) are the sanctioned
+carriers (Task 1 `b8a7dab`; Task 2 `87d209b`). `#[derive(Wire)]`
+(`charpente-macros/src/wire.rs`) reads the serde attributes it can express faithfully and
+rejects the rest by name (Task 3 `acf4516`; Task 4 adds enums, `73889e6`). `describe()`
+assembles a `Contract{types, routes, events, …}`; `#[route]` carries
+`response`/`error`/`params` as `TypeSchema`-producing fns and `emits` as `{event, payload}`
+pairs naming both the SSE `event:` field and the payload's wire name (Tasks 5-7,
+`9e676a0`/`d141916`/`b14319d`; Ruling 46). `crates/charpente-tsgen` (new in Task 8) emits
+`client.ts`: interfaces, a discriminated result union per route, and per-event SSE dispatch
+keyed by a `Map<string, reviveFn | null>` so an `Int64`-bearing event gets a walker and an
+`Int64`-free one gets `null` (Task 9, `1ac64c9`..`af14e74`). `gen-client`/`check-client` (Task
+10, `f2594d7`..`9a2bf45`) write and re-check that output; `check-client` exits 1 naming the fix
+on drift. `crates/ts-fixture-app` + `ts-fixture/` (Task 11, `ffaf2e7`..`c5d0a15`) are the
+codegen's oracle: a minimal charpente app plus a Node-native suite executing the generated
+client against real `serde_json` documents through a stubbed `fetch`, not a hand-written
+stand-in. **Transport is SSE only** — `grep -ri websocket` over `charpente-tsgen`,
+`charpente/src` and both `ts-fixture*` trees returns nothing; PLAN.md's bullet is still one
+undifferentiated "WebSockets + TS client codegen (deferred from M1)", splitting it is chunk D's
+job below.
+
+**What is proven, with numbers.** `cargo test -p charpente-tsgen` is 2+22+21+18 = 63
+(mod/revive/routes/types, chunk C gate table); `-p ts-fixture-app` is drift 4 + samples 3 = 7.
+`npm run test` in `ts-fixture/` is 16/16, executing real arithmetic on `Int64` past 2^53 (`n =
+9_007_199_254_740_993`, pinned at Task 6 fix round 1, `2b9a657`). The `InvoiceView`
+field-coverage floor (chunk C, `1c60fc2`): of 25 fields, 8 had no TypeScript call site
+*dependent* on their declared type, closed with an annotated assignment per field plus a
+`Record<keyof InvoiceView, unknown>` floor, both mutation-proved. The floor exists because
+generated output regenerates on BOTH sides of a Rust change at once — `client.ts` declares the
+new type and `samples.ts` carries a document that satisfies it — so a `ubyte: u8 -> String`
+mutation regenerated fully and left `npm run check` green until this commit: not a weak gate, a
+gate that could not see the change at all. Ten `TypeSchema`/`EnumRepr` shapes had coverage from
+generated-source-**text** assertions only, nothing compiling or executing them (B1b review F6);
+closed by porting a 13-route synthetic contract into `ts-fixture-app` as a standing oracle
+rather than a Rust-side test (Ruling 30, `ac1a054`). `89bb7be` adopts
+`exactOptionalPropertyTypes: true`: 4 real errors at BASE, one a genuine bug the flag *found*
+rather than flagged — a `skip_serializing_if` key the walker had been materializing as an
+explicit `null` when the wire omitted it entirely, fixed with the same conditional-spread
+pattern `8a1c28f` had already proven for a sibling field. At the `4af81a5` pre-merge gate the
+full workspace was 924 passed / 0 failed across 8 packages, matching the counts above.
+
+**The rulings that changed the plan.** *Ruling 1*: `Wire::reference()` is a new provided method
+returning `Ref(WIRE_NAME)` for field/route positions while `schema()` keeps returning the
+expansion — the plan's alternative (`schema()` itself returns `Ref`) contradicted Tasks 3/4's
+own tests; cost if wrong is a loud `unreachable!` at generation time rather than a wrong
+client. *Ruling 2*: `#[event]` emits `#[derive(::charpente::Wire)]`, not
+`::charpente_macros::Wire` — the latter forces every app crate emitting an event into a second
+dependency, breaking `sim-fixture`'s single-dep build. *Ruling 3*: Task 11, not 9 or 10,
+creates `ts-fixture/app` — no task as planned created an app to generate a client from, so exit
+criteria were unreachable without it. *Rulings 21/25*: the IR gains `Null` and payload-free
+enum variants — serde's own idiomatic `enum Tree { Leaf, Node(Vec<Tree>) }` was otherwise
+unrepresentable — timed deliberately before any emitter existed to consume the old shape.
+*Ruling 27*: `ApiError`'s `#[derive(Wire)]` came off for a hand-written schema of the real
+envelope — faithful to `Serialize`, but every route's `error: Ref("ApiError")` described a
+7-variant union the server never sends (it sends `{"error": "<message>"}`), zero overlap
+measured per variant. *Ruling 29*: migrate `ReceiptSent.invoice` off bare `u64` inside Task 5
+rather than deferring, closing a split Task 5 itself created where two `#[event]`s on one feed
+disagreed on string-vs-number for an invoice id. *Ruling 46*: `Route.emits` carries BOTH the
+event name and the payload's wire name — the join from a snake_case name to a PascalCase type
+has no other source — resolving the unmounted-event gap completely rather than routing around
+it (cost if wrong: a wide but shallow change, paid regardless since Task 9 needed the diff
+anyway).
+
+**Review patterns worth recording.** Twice a "fidelity" test asserted only on serde's own
+output and could not redden under any charpente edit (Task 3 NEW-2, Task 4 N1/Ruling 22) — now
+a standing rule that a ground-truth pin on serde must be *labelled* as one. A self-referential
+type (`Vec<Node>`) genuinely stack-overflowed through Task 1's shipped `reference()` callers
+and survived a full opus review plus a scoped re-review before Task 3's implementer found it —
+both had verified `reference()` correct without checking that anything called it (Ruling 20,
+"pin the behaviour, not the function"). Task 4's "measured" fidelity table had three wrong
+cells; the reviewer actually measured and none agreed (Correction 2). B1b's conditional-spread
+fix for a materialized-null bug needed its coverage gap named THREE times before it closed for
+real (review F3 → N1 fix round → R1: each prior "fix" stayed satisfiable by deleting the field
+it guarded, passing vacuously). A `$?`-after-`head` error produced a false "silent success"
+reading of the `npx tsc` stub that agreed with what this session already believed (Ruling 39:
+"a measurement error that agrees with your prior is the one you will not go back and check").
+Standing instruction: ask of every green oracle what it is architecturally incapable of
+observing, not merely how strong it is — the question the sample oracle's `ubyte`/`String`
+blind spot (above) and B1b's thrice-named gap both answer independently.
+
+**The `npx tsc` hazard — corrected finding, quoted from the sub-project's own close-out text:**
+
+> A fresh `git worktree` has no `node_modules` (gitignored, never copied from the main
+> checkout). With none present, `npx tsc` resolves the npm package literally named `tsc` — `npm
+> view tsc version` reports 2.0.4, deprecated — not TypeScript. Measured 2026-08-29: that stub
+> reads no source file, emits no diagnostic, and exits 1 with "This is not the tsc command you
+> are looking for" plus the fix. The hazard is therefore a confusing red, not a false green: a
+> gate that dies citing a 2016 package nobody installed, on a repo that pins `typescript:
+> 5.9.3`. `ci.yml`'s own comment — "type-checking with a nine-year-old compiler is worse than
+> having no gate" — is wrong in the same direction; it never type-checks at all.
+
+Supersedes an earlier "silent false green" framing both this session and the archive session
+had stated without running the stub. Kept: CI masked the resolution purely by step ordering
+(`npm ci` before `npx tsc` gave the real binary whenever it ran), and a type-check is
+structurally half a gate — `tsc --noEmit` proves a call site type-checks, never that a runtime
+value matches its declared type, which is how the Int64 bug shipped through a green gate
+originally. Fixed at `f81d35a`: `ts-client` now runs `npm run check`, enforcing `tsconfig.json`
+(including B2's flag) by construction. **The job had never executed on a runner before
+`8acab0f`**; `cd52216` records its first result — run `33272881382`, both jobs green — retiring
+the "unconfirmed" caveats (Node resolution, `npm run test`'s cwd, `dist/`-not-yet-existing
+ordering, the last fine *by construction*) for one real residual the job cannot check: the
+runner is case-sensitive, a macOS checkout usually is not — audited (43 relative imports, 16
+files, 4 specifiers, all exact-case) and clear today, flagged to re-audit if it ever reddens.
+
+**What is owed — chunk D, per
+`.superpowers/sdd/2026-08-20-ts-client-codegen/chunk-d-brief.md`.** A1 (verify no Task 5 `u64`
+regression in `examples/invoicing`) is **done as a written finding, no code changed**: every
+wire position carries a `Wire` type; survivors are a `#[job]` payload (deliberately outside
+`Wire` — jobs never cross HTTP), five `.raw()` calls inside `format!` strings, and `#[table]`
+row types no route echoes. A2 (CLAUDE.md's workspace map) and A3 (PLAN.md/DESIGN.md contention)
+are both **void** — all twelve `Cargo.toml` members are already named in CLAUDE.md's map, and
+the archive session has released both files. **Still outstanding**: DESIGN.md §3 (typed ids
+surviving the process boundary) and §7 (`describe` carries types, not only topology);
+`docs/GUIDE.md`'s client- generation workflow as its own §14, inserted before archive's "The
+archive" (currently §14 at `docs/GUIDE.md:4368`) which chunk D must renumber to §15 including
+its cross-references; the four `check-client` exit codes (0/1/2/101) matching `genclient.rs`'s
+doc comments; and PLAN.md's M2 bullet, still one undifferentiated line (`PLAN.md:131`), split
+into a shipped codegen bullet and a still-deferred WebSockets bullet as chunk D's own last
+commit. **One item `4af81a5` flagged as owed turned out not to exist**: `describe.rs`'s
+`exit_code_for` prints "rerun charpente describe" and was believed reachable from
+`gen-client`/`check-client` via `contract_json` — verified against the shipped code,
+`contract_json` has always used its own `.output()` handling and `exit_code_for`'s only
+non-test caller is `run` (`charpente describe`'s own path), so there was never that call-graph
+edge (Ruling 38: "a claim about the call graph is a claim, not a reading"). **Net new public
+API** — `charpente::wire::{Wire, TypeSchema, WireU64, WireI64}` and `Id<T>`'s serde impls,
+`#[derive(Wire)]`, `describe::{EventDef, EventEntry, events![]}`, `#[route]`'s
+`params`/`request`/`response`/`error` fns and `emits(...)`, the `charpente-tsgen` crate,
+`gen-client`/`check-client` — is named in DESIGN.md/GUIDE.md as of Tasks 5-10's fix rounds
+except the two DESIGN.md paragraphs above. No WebSocket transport shipped anywhere in the tree.
