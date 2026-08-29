@@ -150,6 +150,9 @@ fn field_list(fields: &[Field], vname: &str, enum_name: &str) -> String {
     fields
         .iter()
         .map(|f| {
+            // Same `optional && Option(T)` -> `?: T | null` composition as
+            // `emit_def`'s `Struct` arm below; see the doc comment there for
+            // why the `| null` half is intentionally not narrowed away.
             let opt = if f.optional { "?" } else { "" };
             let ctx = format!(
                 "field `{}` of variant `{vname}` of enum `{enum_name}`",
@@ -179,6 +182,28 @@ fn emit_def(out: &mut String, name: &str, schema: &TypeSchema) {
         TypeSchema::Struct { fields } => {
             let _ = writeln!(out, "export interface {name} {{");
             for f in fields {
+                // `?` (from `f.optional`, here) and `| null` (from the
+                // schema being `TypeSchema::Option`, in `ts_type`'s `Option`
+                // arm below) are independent, orthogonal rules — the emitter
+                // never reasons about their composition. For a field that is
+                // BOTH (`optional == true` over an `Option<T>` schema, i.e.
+                // `#[serde(skip_serializing_if = "Option::is_none")]` on an
+                // `Option<T>`), that composition renders `?: T | null`, but
+                // serde only ever omits the key or writes a value for that
+                // combination — an explicit JSON `null` is not producible on
+                // the wire, so the `| null` half is unreachable for such a
+                // field on the RESPONSE path. This is deliberately not
+                // narrowed to `?: T`: `Contract.types` is one list shared by
+                // request and response positions, and on the REQUEST path
+                // serde's `Option<T>` deserializer accepts both an absent
+                // key and an explicit `null` (both decode to `None`), so
+                // `?: T | null` is exactly right there. Narrowing would mean
+                // tracking which position(s) a shared interface is used in,
+                // which the emitter does not do for any other rule and
+                // should not start doing for this one axis. (No type in the
+                // fixture crate is reused across both positions today, so
+                // this is reasoning about the emitter's generality, not an
+                // observed request-side instance of the combination.)
                 let opt = if f.optional { "?" } else { "" };
                 let ctx = format!("field `{}` of interface `{name}`", f.name);
                 let _ = writeln!(

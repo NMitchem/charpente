@@ -54,7 +54,7 @@ test("Option(Int64) and an optional bare Int64 both round-trip null/absent witho
     // exact distinction `skip_serializing_if` exists to express.
     assert.ok(
       !("creditNoteCents" in result.data),
-      "an omitted key must stay omitted, not come back as an explicit null",
+      "an omitted key must stay omitted, not be materialized on the object (as null or as undefined)",
     );
 
     // The type still promises `bigint`, so a caller doing arithmetic on the
