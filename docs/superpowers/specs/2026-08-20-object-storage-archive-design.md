@@ -289,8 +289,16 @@ back at N. Unlike the two classes above, this one prints **no operator notice at
 its causes is an ordinary event that already reports itself, and the residue is a silent
 consequence rather than a failure with a site to name. After Task 12.5 it is the most common
 orphan source, because every gap that lands mid-drain makes one. It is bounded the same way the
-abandoned-generation class is — by how often those events happen, not by a mechanism — and it is
-reachable only by the LIST sweep this design refuses.
+abandoned-generation class is — by how often those events happen, not by a mechanism — and
+**reclamation cannot reach it**: only a LIST sweep could, and this design refuses one.
+
+That last sentence used to read "reachable only by the LIST sweep this design refuses", which
+conflated two things. Since the delete-fault axis landed, the simulator does **exercise** the
+path that creates this residue — `object_delete_error` makes a delete fail mid-drain, and the
+convergence property covers `archive:delete_failed` in 32 of 256 universes at the pinned base,
+with `require:` making a batch that never fails a delete a red property. So the class is no
+longer only an argument. What is still unbuilt is an oracle that observes the RESIDUE itself
+rather than the failure that produces it; do not read the coverage keys as that oracle.
 
 **One operation in flight is a bound, not a free choice.** Serial uploads mean the archive
 falls behind whenever segments seal faster than they upload — and a permanently-behind archive

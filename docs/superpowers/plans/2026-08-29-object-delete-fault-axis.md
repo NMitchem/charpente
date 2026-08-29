@@ -1,6 +1,6 @@
 # Plan: `object_delete_error` — the fault axis reclamation shipped without
 
-**Status:** not started. Amended 2026-08-29 (see Task 1 step 3: the constructor count was wrong and `validate()` was missing). **Sequencing: AFTER the `archive` branch merges to `main`** — see
+**Status:** Tasks 1-3 DONE (Task 1 `b36dc30`; Task 2+3 in the following commit). Amended 2026-08-29 (see Task 1 step 3: the constructor count was wrong and `validate()` was missing). **Sequencing: AFTER the `archive` branch merges to `main`** — see
 "When to run this" below; do not start it on `archive`.
 
 ## Why this exists
@@ -94,12 +94,16 @@ design change and remains explicitly unbuilt.
 
 **Files:** `crates/charpente-sim/src/lib.rs`, `crates/charpente-sim/src/object.rs`
 
-- [ ] **Step 1: write the failing test.** The load-bearing one is an **identity** test, and it
+- [x] **Step 1: write the failing test.** The load-bearing one is an **identity** test, and it
       must exist before the field does: with the axis at `0.0`, every coverage count on all
       four bases equals the values recorded today in `archive.rs`'s four-base table
       (`~:6926`). Write it against today's numbers, so it can only pass by being true.
-- [ ] **Step 2: run to verify failure.**
-- [ ] **Step 3: implement.** `object_delete_error: f64` on `FaultConfig` (`lib.rs:34`),
+- [x] **Step 2: run to verify failure.** **This step was incoherent as written and was
+      replaced.** An identity test CANNOT be red before the change — it passes trivially by
+      measuring today's numbers, which is `unfireable-test-passes-by-construction`. Its
+      fireability comes only from the mutation table, so the real sequence is: baseline
+      green -> naive shared-stream implementation goes RED -> the split makes it green.
+- [x] **Step 3: implement.** `object_delete_error: f64` on `FaultConfig` (`lib.rs:34`),
       `0.0` in **all THREE constructors** — `default()` (`:117`), `none()` (`:141`) and
       **`swarm()` (`:214`)**, which this plan originally missed. `swarm` builds its config
       from a sequential `Rng`; the existing object axes sit there at a literal `0.0` with a
@@ -112,8 +116,8 @@ design change and remains explicitly unbuilt.
       sampled in `sample_extended_fields` from `keyed_stream(seed, "object_delete_error")`,
       appended AFTER the existing axes; a second roll stream on `SimObjectStore`,
       `keyed_stream(seed, "object_store_delete")`, read ONLY by the `Delete` arm.
-- [ ] **Step 4: run to verify pass.**
-- [ ] **Step 5: mutation table.**
+- [x] **Step 4: run to verify pass.**
+- [x] **Step 5: mutation table.**
 
 | # | mutation | must redden |
 |---|---|---|
@@ -126,7 +130,7 @@ design change and remains explicitly unbuilt.
 Row 1 is the one that matters: it is the obvious "simplification" a later agent will make, and
 it silently re-rolls every universe. If the identity test cannot see it, the test is wrong.
 
-- [ ] **Step 6: gate and commit.** Named paths. State in the commit message that replay
+- [x] **Step 6: gate and commit.** Named paths. State in the commit message that replay
       identity was proven, and on which four bases.
 
 ## Task 2: turn it on, scoped to interleaving
@@ -139,37 +143,39 @@ interleaving**: a delete failing *mid-drain*, alongside put/get faults, under a 
 — which is precisely the path that creates the third orphan class (interrupted-drain residue,
 archive spec §3) that today prints nothing and has no oracle.
 
-- [ ] **Step 1: write the failing tests.** At minimum: the archive returns to `Idle` and
+- [x] **Step 1: write the failing tests.** At minimum: the archive returns to `Idle` and
       re-holds its pin at the new floor when deletes fail mid-drain; the live generation never
       loses an object to a failed-delete path; a restore still succeeds after any interleaving
       of delete failures with a gap.
-- [ ] **Step 2: run to verify failure.**
-- [ ] **Step 3: enable the axis** in the convergence property's fault matrix.
-- [ ] **Step 4: run.** Any defect found gets its **seed recorded** (hard rule 3). Expect the
+- [x] **Step 2: run to verify failure.**
+- [x] **Step 3: enable the axis** in the convergence property's fault matrix.
+- [x] **Step 4: run.** Any defect found gets its **seed recorded** (hard rule 3). Expect the
       three floors to move: reclamation changes every universe's op trace once deletes can
       fail. **A floor moving DOWN is how a real regression looks** — check it the way the
       Task 12.5 review did, by running the before-tree, not by arguing about it.
-- [ ] **Step 5: re-measure and record** all three floors plus per-key hit counts across four
+- [x] **Step 5: re-measure and record** all three floors plus per-key hit counts across four
       bases, and update the four-base table in the tree (not in a report that gets deleted).
-- [ ] **Step 6: mutation table**, including a vacuity row: with the axis forced to `0.0`, the
+- [x] **Step 6: mutation table**, including a vacuity row: with the axis forced to `0.0`, the
       new interleaving assertions must go GREEN-but-unfired, and say so at the site rather than
       counting as coverage.
-- [ ] **Step 7: gate and commit**, stating N universes and the master seed.
+- [x] **Step 7: gate and commit**, stating N universes and the master seed.
 
 ## Task 3: docs — hard rule 6, same commits
 
-- [ ] `charpente-sim/src/object.rs`'s `Delete` arm carries a comment recording that the axis is
+- [x] `charpente-sim/src/object.rs`'s `Delete` arm carries a comment recording that the axis is
       absent and owed. **Delete it** — this plan is what it was owed against. Leaving it is a
       false claim about the tree, which is the exact defect class the archive plan spent three
       review rounds removing.
-- [ ] `DESIGN.md` §1's honest-limits paragraph names `ObjectOp::Delete` as having no axis.
+- [x] `DESIGN.md` §1's honest-limits paragraph names `ObjectOp::Delete` as having no axis.
       Update it. Note the *other* limit stated there — `SimObjectStore` completes in the `poll`
       that takes the op, so object-store latency is unmodelled — is still true; do not delete
       that half.
-- [ ] Archive spec §3 and §9: the orphan-class paragraph says the interrupted-drain class is
-      reachable only by the refused LIST sweep. If Task 2 gives it an oracle in sim, that
-      sentence needs narrowing to *reclamation* cannot reach it, which is the true claim.
-- [ ] `PLAN.md`: the object-storage entry states the missing axis as a live limit. Update it.
+- [x] Archive spec §3: narrowed to "**reclamation** cannot reach it", and stated that the sim
+      now EXERCISES the path that creates the residue without claiming an oracle that observes
+      the residue itself — because Task 2 did not build one, and the coverage keys must not be
+      read as one. **§9 needed nothing: it spans 31 lines and contains no mention of "delete"
+      or "axis" at all.** The plan's fourth wrong enumeration.
+- [x] `PLAN.md`: the object-storage entry states the missing axis as a live limit. Update it.
 
 ## Exit criteria
 

@@ -131,10 +131,17 @@ struct FlakyStore {
     /// and the only shape that can prove reclamation never became a
     /// correctness dependency: if the archive stays correct and keeps
     /// advancing while nothing is ever reclaimed, reclamation is the
-    /// optimisation spec §3 says it is. `SimObjectStore`'s own `Delete` arm
-    /// cannot fail at all and no `FaultConfig` axis covers it — adding one
-    /// would change the frozen seed->config mapping, so the fault lives
-    /// here.
+    /// optimisation spec §3 says it is. These stay after the delete-axis
+    /// task even though `FaultConfig.object_delete_error` now exists and
+    /// `SimObjectStore`'s `Delete` arm CAN fail: the axis is a per-op
+    /// probability, and these are aimed switches — "every delete from here
+    /// on", which is the delete-fails-forever shape a probability cannot
+    /// guarantee in any finite run. (The claim this comment used to carry —
+    /// that no axis could cover it because adding one would change the
+    /// frozen seed->config mapping — was wrong on every clause. The axis
+    /// rolls from its own `keyed_stream(seed, "object_store_delete")` and
+    /// perturbed nothing: all twelve convergence coverage counts reproduced
+    /// at four bases.)
     deletes: Cell<DeleteMode>,
     /// Every DELETE key the archive ASKED for, in order. Attempted, not
     /// necessarily applied — which is what the ownership and
@@ -146,6 +153,16 @@ struct FlakyStore {
     /// object survives the failure the archive is told about — the same "no
     /// op went in flight" contract `reachable` carries.
     refused_delete: Cell<bool>,
+    /// A DELETE forwarded to the inner store and awaiting its `poll`. Only
+    /// `DeleteMode::Pass` sets it — the two aimed modes never reach the
+    /// inner store, so their failures are not `object_delete_error`'s and
+    /// must not be counted as evidence the axis fired.
+    in_flight_delete: Cell<bool>,
+    /// DELETEs the INNER store failed, i.e. `object_delete_error` firing.
+    /// The convergence property's non-vacuity witness: without it the axis
+    /// could sample to 0.0 in every universe and the new interleaving
+    /// coverage would read as exercised while nothing ever failed.
+    delete_failures: Cell<u64>,
     /// Every PUT key the archive asked for, with the CRC of the bytes it
     /// asked to write. A generation's snapshot objects are written ONCE
     /// (spec §2), and now that reclamation DELETES a retired generation's
@@ -240,6 +257,8 @@ impl FlakyStore {
             deletes: Cell::new(DeleteMode::Pass),
             deleted: RefCell::new(Vec::new()),
             refused_delete: Cell::new(false),
+            in_flight_delete: Cell::new(false),
+            delete_failures: Cell::new(0),
             put_ledger: RefCell::new(Vec::new()),
             live_generation: Cell::new(None),
             manifest_in_flight: Cell::new(None),
@@ -283,6 +302,11 @@ impl FlakyStore {
         self.deleted.borrow().clone()
     }
 
+    /// How many forwarded DELETEs the inner store failed.
+    fn delete_failures(&self) -> u64 {
+        self.delete_failures.get()
+    }
+
     /// A mark into the PUT ledger, for `puts_since`.
     fn put_mark(&self) -> usize {
         self.put_ledger.borrow().len()
@@ -323,7 +347,7 @@ impl ObjectStore for FlakyStore {
             self.deleted.borrow_mut().push(key.clone());
             assert_deletable(key, self.live_generation.get());
             match self.deletes.get() {
-                DeleteMode::Pass => {}
+                DeleteMode::Pass => self.in_flight_delete.set(true),
                 DeleteMode::FailStart => {
                     return Err(io::Error::other(format!(
                         "simulated FlakyStore delete refusal: DELETE \"{key}\" was refused at \
@@ -369,6 +393,9 @@ impl ObjectStore for FlakyStore {
             )));
         }
         let done = self.inner.poll()?;
+        if self.in_flight_delete.replace(false) && done.is_err() {
+            self.delete_failures.set(self.delete_failures.get() + 1);
+        }
         let key = self.in_flight_put.borrow_mut().take();
         let landed = self.manifest_in_flight.replace(None);
         if let (Ok(ObjectDone::Put), Some(key)) = (&done, &key)
@@ -6260,6 +6287,54 @@ fn the_live_generations_objects_are_never_deleted() {
 /// `start`, and refused at `poll` after a clean start — and in both the
 /// object survives, which is what a bucket policy that denies deletion
 /// actually does.
+/// The non-vacuity witness itself, pinned — because the convergence property
+/// CANNOT pin it. Measured: with the axis on and `is_err()` dropped from the
+/// counter, `archive:delete_failed` goes from 32 universes to 174 and the
+/// property stays GREEN. A `require:` key is a floor of one, so an
+/// over-counting witness satisfies it just as well as an honest one, and the
+/// coverage number then overstates what was exercised by 5x with nothing
+/// red. So the counter's meaning lives here instead.
+#[test]
+fn the_delete_failure_witness_counts_failures_and_not_completions() {
+    for rate in [0.0, 1.0] {
+        let store = FlakyStore::new(SimObjectStore::with_faults(
+            0x5eed,
+            FaultConfig {
+                object_delete_error: rate,
+                ..FaultConfig::none()
+            },
+        ));
+        // Sets the store's live generation to 2, so a DELETE under
+        // generation 1 satisfies `assert_deletable`.
+        write_foreign_manifest(&store, "w", 2);
+        let key = format!("{PREFIX}/1/obj");
+        store
+            .start(ObjectOp::Put {
+                key: key.clone(),
+                data: vec![7],
+            })
+            .unwrap();
+        drain(&store).expect("the put axis is off here");
+        store.start(ObjectOp::Delete { key }).unwrap();
+        let failed = drain(&store).is_err();
+
+        assert_eq!(
+            failed,
+            rate == 1.0,
+            "object_delete_error = {rate} did not decide the DELETE"
+        );
+        assert_eq!(
+            store.delete_failures(),
+            u64::from(rate == 1.0),
+            "object_delete_error = {rate}: the witness must count DELETEs the inner store \
+             FAILED, never ones it COMPLETED. `archive:delete_failed` is a `require:` key and \
+             the convergence property's only defence against an axis that never fires; a \
+             counter that also fires on success satisfies that requirement while proving \
+             nothing, and the property cannot tell the difference."
+        );
+    }
+}
+
 #[test]
 fn an_archive_whose_deletes_all_fail_stays_correct_and_keeps_advancing() {
     for mode in [DeleteMode::FailStart, DeleteMode::FailPoll] {
@@ -6929,12 +7004,39 @@ const CONV_DISK_ERROR_DIVISOR: f64 = 16.0;
 /// **These are rates against ONE base, and fresh bases DO trip them. That is
 /// the design, not a regression.** Measured over 1,024 universes at four bases:
 ///
-/// | base | `restored` | `substantial` | `chained` |
-/// |---|---|---|---|
-/// | `0xA2C0_0001` (pinned) | 215 | 183 | 169 |
-/// | `0xD9E3_0001` | 224 | 179 | 162 |
-/// | `0x5B71_0001` | 224 | 192 | 168 |
-/// | `0x3C0D_0001` | 225 | 169 | 177 |
+/// | base | `restored` | `substantial` | `chained` | `delete_failed` | `restored_after_delete_failure` |
+/// |---|---|---|---|---|---|
+/// | `0xA2C0_0001` (pinned) | 219 | 183 | 169 | 32 | 32 |
+/// | `0xD9E3_0001` | 216 | 178 | 177 | 23 | 21 |
+/// | `0x5B71_0001` | 219 | 178 | 161 | 23 | 23 |
+/// | `0x3C0D_0001` | 223 | 170 | 168 | 32 | 32 |
+///
+/// **Re-measured again when `object_delete_error` was turned on, and again
+/// the reason they moved is not decay.** The axis is drawn by a fourth
+/// `conv_rate(&entropy, ..)` call, and `conv_rate` draws from `entropy`, so
+/// adding it shifted `snapshot_every`, `pin_segments` and `interleave` in
+/// every universe: these are different runs, not the same runs performing
+/// worse. The tell is that the movement is in BOTH directions at fresh bases
+/// — `chained` at `0xD9E3_0001` went 162 -> 177 while at `0x5B71_0001` it
+/// went 168 -> 161 — which a decaying rate cannot do. At the PINNED base no
+/// floor fell: `restored` 215 -> 219, `substantial` and `chained` unchanged,
+/// so the floors below were raised to the new pinned measurement rather than
+/// lowered to accommodate anything.
+///
+/// Two new keys, and they are what the axis bought. `archive:delete_failed`
+/// counts universes in which the INNER store failed a DELETE, and it is in
+/// `require:` — a batch where no delete ever failed is a RED property, not a
+/// quiet one, which is the only defence against an axis that samples to zero
+/// and leaves reclamation covered on the happy path while looking covered
+/// under fault. `archive:restored_after_delete_failure` counts the universes
+/// that then restored anyway: 32/32, 21/23, 23/23, 32/32. The shortfall at
+/// `0xD9E3_0001` is not a refused restore — a restore refused for a missing
+/// object carries neither "simulated" nor "injected", so `is_fault_fallout`
+/// classifies it `Unrelated` and the universe fails with an UNCLASSIFIED
+/// error rather than reaching a floor at all. That base's run failed on the
+/// floor and nothing else, so mechanically no restore was refused; the two
+/// universes reached no restore verdict (`nothing_published`,
+/// `verify_never_read_cleanly`, `source_unrecoverable`).
 ///
 /// **All twelve numbers were re-measured at Task 12.5, and the reason they
 /// moved is not decay.** Reclamation adds `ObjectStore` operations to the
@@ -6970,7 +7072,7 @@ const CONV_DISK_ERROR_DIVISOR: f64 = 16.0;
 /// report is not in the tree they will be reading. Note the difference from
 /// `replication.rs`'s `FINGERPRINT_FLOOR`, whose value was corroborated on
 /// unpinned runs: these deliberately are not, and the spread above is why.
-const CONV_RESTORED_FLOOR: u64 = 215;
+const CONV_RESTORED_FLOOR: u64 = 219;
 const CONV_SUBSTANTIAL_FLOOR: u64 = 183;
 const CONV_CHAINED_FLOOR: u64 = 169;
 
@@ -7700,6 +7802,11 @@ fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
         object_put_error: conv_rate(&entropy, 40, 50),
         object_get_error: conv_rate(&entropy, 30, 10),
         object_lost_ack: conv_rate(&entropy, 30, 30),
+        // The delete axis, on for the first time. It draws from `entropy`
+        // like its three neighbours, so ADDING it shifted `snapshot_every`,
+        // `pin_segments` and `interleave` in every universe — the floors
+        // below were re-measured at four bases, not adjusted to fit.
+        object_delete_error: conv_rate(&entropy, 40, 40),
         ..FaultConfig::none()
     };
     let store = FlakyStore::new(SimObjectStore::with_faults(sim.seed(), object_faults));
@@ -7996,6 +8103,16 @@ fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
     if !store.deleted().is_empty() {
         sim.cover("archive:generation_reclaimed");
     }
+    // NON-VACUITY. `object_delete_error` is a probability, so nothing
+    // guarantees it fires — and a delete axis that never fires leaves this
+    // property exercising reclamation on the happy path while LOOKING like
+    // it covers failure. This key is in `require:`, so a batch in which no
+    // delete ever failed is a red property rather than a quiet one. It
+    // counts only INNER failures: `DeleteMode`'s aimed switches never reach
+    // the inner store, so a hand-driven test cannot satisfy it.
+    if store.delete_failures() > 0 {
+        sim.cover("archive:delete_failed");
+    }
     if st.rolled_generation {
         sim.cover("archive:generation_rolled");
     }
@@ -8080,6 +8197,15 @@ fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
         return Ok(());
     }
     sim.cover("archive:restored");
+    // The Task 2 question, and the one a happy-path-plus-error-return axis
+    // could not have asked: a restore that succeeded in a universe where
+    // reclamation's deletes were FAILING and retrying, interleaved with the
+    // put/get faults and whatever gap this universe drew. `delete` is
+    // idempotent, so a failed delete is a retry rather than a lost object —
+    // this key is the evidence that the retry path never cost a restore.
+    if store.delete_failures() > 0 {
+        sim.cover("archive:restored_after_delete_failure");
+    }
 
     // ---- spec §9.8: restore onto a DIVERGED local timeline refuses, and
     // `--force` takes it and converges to the same place.
@@ -8297,6 +8423,8 @@ fn archive_converges() {
             "archive:verifying_gated",
             "archive:foreign_writer_stopped",
             "archive:generation_reclaimed",
+            "archive:delete_failed",
+            "archive:restored_after_delete_failure",
         ],
         floor: [
             ("archive:restored", CONV_RESTORED_FLOOR),

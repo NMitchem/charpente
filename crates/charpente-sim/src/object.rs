@@ -543,6 +543,42 @@ mod tests {
         );
     }
 
+    // The axis's own semantics, pinned directly rather than inferred from a
+    // convergence coverage count. Both halves matter: a failed DELETE must
+    // leave the object PRESENT — `delete` is contractually idempotent, so a
+    // failure is a retry rather than a lost object, and that is precisely
+    // what makes an interrupted drain reachable instead of destructive.
+    #[test]
+    fn the_delete_axis_fails_every_delete_at_one_and_none_at_zero() {
+        for (p, should_fail) in [(1.0, true), (0.0, false)] {
+            let s = SimObjectStore::with_faults(
+                0x5eed,
+                FaultConfig {
+                    object_delete_error: p,
+                    ..FaultConfig::none()
+                },
+            );
+            s.start(ObjectOp::Put {
+                key: "a".into(),
+                data: vec![1],
+            })
+            .unwrap();
+            drain(&s).expect("the put axis is off here");
+            s.start(ObjectOp::Delete { key: "a".into() }).unwrap();
+            assert_eq!(
+                drain(&s).is_err(),
+                should_fail,
+                "object_delete_error = {p} did not decide the DELETE"
+            );
+            assert_eq!(
+                s.keys().contains(&"a".to_string()),
+                should_fail,
+                "object_delete_error = {p}: a FAILED delete must leave the object present \
+                 (idempotent retry, not a loss); a SUCCEEDING one must remove it"
+            );
+        }
+    }
+
     // Mutation-table row 3: the axis must be OFF in every constructor, or
     // declaring it perturbs the universes it was split to protect.
     #[test]

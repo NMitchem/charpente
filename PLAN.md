@@ -117,9 +117,11 @@ is why the milestone closed with them outstanding rather than silently absorbing
   now exists — `FaultConfig.object_delete_error`, rolled from its own
   `keyed_stream(seed, "object_store_delete")` so that declaring it perturbed no pinned
   universe (all twelve convergence coverage counts across four bases reproduce exactly) —
-  but **the convergence property has not yet turned it on**. Until it does, "correct when
-  every delete fails forever" still rests on hand-driven modes in one test rather than on
-  the fault matrix.
+  and **the convergence property now turns it on**: a delete fails in 32 of 256 universes at
+  the pinned base, all 32 still restore, and `archive:delete_failed` is a `require:` key so a
+  batch in which no delete ever failed is a red property. "Correct when every delete fails
+  forever" keeps its two aimed hand-driven modes, which a per-op probability cannot replace,
+  but it is no longer the only evidence.
 
 - **Own LSM storage engine**, proven under the (by now battle-hardened) sim harness before
   it replaces redb. The harness is what makes this safe to attempt. **Deferred behind

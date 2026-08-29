@@ -133,10 +133,13 @@ The store draws from **two** streams, not one. Put, get, list and lost_ack roll 
 draw — re-rolling every pinned universe merely by declaring the field, and invalidating the
 convergence floors and both recorded seeds with it. Drawing it separately makes the axis
 non-perturbing at zero, which was proven rather than argued: all twelve convergence coverage
-counts across four bases reproduce exactly. **The convergence property does not yet enable
-the axis**, so reclamation's delete-fails-forever behaviour is still pinned by hand-driven
-tests rather than by the matrix. And `SimObjectStore` completes each operation in the `poll`
-that takes it, so object-store latency is not modelled at all.
+counts across four bases reproduce exactly. The convergence property now **enables** it: a
+delete fails in 32 of 256 universes at the pinned base and every one of those universes still
+restored, and `archive:delete_failed` sits in `require:` so a batch where no delete ever fails
+is a red property rather than a quiet happy-path pass. The two aimed `DeleteMode` switches stay
+alongside it — a probability cannot guarantee the delete-fails-FOREVER shape in a finite run.
+And `SimObjectStore` completes each operation in the `poll` that takes it, so object-store
+latency is not modelled at all.
 
 **Per-host worlds** (landed with M1 replication's first task): `Sim::host(name)` gives a
 named simulated host its own disk (`DiskWorld`, unchanged — the same crash/countdown/epoch
