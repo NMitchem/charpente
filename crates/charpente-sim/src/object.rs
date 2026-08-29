@@ -1,9 +1,10 @@
 //! The simulated object store: an in-memory bucket behind `ObjectStore`.
 //! Completions are immediate — no `Clock` handle, so no simulated latency.
 //! Task 2 (`with_faults`) adds seeded fault injection (`object_put_error`,
-//! `object_get_error`, `object_lost_ack`); latency stays future work.
+//! `object_get_error`, `object_lost_ack`, `object_delete_error`); latency
+//! stays future work.
 //!
-//! State lives behind a `Mutex` and the fault stream behind a `RefCell`.
+//! State lives behind a `Mutex` and the fault streams behind `RefCell`s.
 //! Neither is forced by the trait: `ObjectStore` requires only `Send`, and
 //! `RefCell<T>` is `Send` whenever `T` is, so `RefCell` would serve for both.
 //! `lib.rs`'s `World` uses a `Mutex` for a reason that does NOT transfer
@@ -30,6 +31,23 @@ struct State {
     fail_next_put: bool,
 }
 
+/// TWO roll streams, not one, and the split is load-bearing rather than
+/// tidy. `Rng::chance` draws from the stream BEFORE comparing (`rng.rs:59`),
+/// so it consumes a draw even at `p == 0.0`. Had the `Delete` arm rolled
+/// from `shared`, merely declaring `object_delete_error` would have shifted
+/// every later put/get/lost_ack draw in every universe — re-rolling the
+/// pinned convergence bases and invalidating the three floors and both
+/// recorded seeds. Drawing it from its own stream makes the axis
+/// non-perturbing at 0.0, which is what let it land without a seed-map
+/// break. Do not "simplify" these back into one.
+struct Faults {
+    /// `keyed_stream(seed, "object_store")` — put, get, list, lost_ack.
+    shared: RefCell<Rng>,
+    /// `keyed_stream(seed, "object_store_delete")` — the `Delete` arm alone.
+    delete: RefCell<Rng>,
+    cfg: FaultConfig,
+}
+
 pub struct SimObjectStore {
     state: Mutex<State>,
     // Not behind `state`'s Mutex: the roll itself never touches `objects`,
@@ -37,7 +55,7 @@ pub struct SimObjectStore {
     // bound), so a plain `RefCell` costs nothing here — same reasoning as
     // `HostWorld`'s bare `Rng` fields, just not lock-guarded because this
     // store carries no second thread-shared field to co-guard it with.
-    faults: Option<(RefCell<Rng>, FaultConfig)>,
+    faults: Option<Faults>,
 }
 
 impl SimObjectStore {
@@ -54,10 +72,13 @@ impl SimObjectStore {
     }
 
     /// Seeded fault injection (archive spec §9): `object_put_error`,
-    /// `object_get_error`, `object_lost_ack`. The internal roll stream is
-    /// `keyed_stream(seed, "object_store")` — independent of every other
-    /// fault stream in the crate, so an object store's rolls never perturb
-    /// (or are perturbed by) disk/net faults drawn from the same seed.
+    /// `object_get_error`, `object_lost_ack`, `object_delete_error`. The
+    /// roll streams are `keyed_stream(seed, "object_store")` and
+    /// `keyed_stream(seed, "object_store_delete")` — independent of every
+    /// other fault stream in the crate, so an object store's rolls never
+    /// perturb (or are perturbed by) disk/net faults drawn from the same
+    /// seed, and its delete rolls never perturb its own put/get draws. See
+    /// `Faults` for why that second stream is not an over-refinement.
     pub fn with_faults(seed: u64, cfg: FaultConfig) -> SimObjectStore {
         SimObjectStore {
             state: Mutex::new(State {
@@ -65,7 +86,11 @@ impl SimObjectStore {
                 in_flight: None,
                 fail_next_put: false,
             }),
-            faults: Some((RefCell::new(keyed_stream(seed, "object_store")), cfg)),
+            faults: Some(Faults {
+                shared: RefCell::new(keyed_stream(seed, "object_store")),
+                delete: RefCell::new(keyed_stream(seed, "object_store_delete")),
+                cfg,
+            }),
         }
     }
 
@@ -79,7 +104,18 @@ impl SimObjectStore {
     /// stream to draw from.
     fn roll(&self, p: impl FnOnce(&FaultConfig) -> f64) -> bool {
         match &self.faults {
-            Some((rng, cfg)) => rng.borrow_mut().chance(p(cfg)),
+            Some(f) => f.shared.borrow_mut().chance(p(&f.cfg)),
+            None => false,
+        }
+    }
+
+    /// The `Delete` arm's roll, drawn from `Faults::delete` and nothing
+    /// else. Separate from `roll` on purpose: a caller that could pass
+    /// `|c| c.object_delete_error` to `roll` would silently re-merge the
+    /// streams, which is the mutation the identity test exists to catch.
+    fn roll_delete(&self) -> bool {
+        match &self.faults {
+            Some(f) => f.delete.borrow_mut().chance(f.cfg.object_delete_error),
             None => false,
         }
     }
@@ -172,29 +208,23 @@ impl ObjectStore for SimObjectStore {
                     ))
                 }
             }
-            // NO FAULT ROLL, and that is a coverage limit worth stating
-            // where someone reading the model will meet it (Task 12.5
-            // review / F4). `FaultConfig` has no delete axis, so every
-            // DELETE in every convergence universe succeeds, and the
-            // flagship property therefore exercises reclamation on the
-            // HAPPY PATH ONLY. Task 12.5's central safety claim — that the
-            // archive stays correct and keeps advancing when every delete
-            // fails forever — rests on two hand-driven modes in one test
-            // (`charpente/tests/archive.rs`) rather than on the fault
-            // matrix. An `object_delete_error` axis is OWED, and the
-            // obstacle is NOT the seed -> config mapping: `sample_extended_fields`
-            // draws each axis from its own `keyed_stream(seed, name)`, so a
-            // new field survives it. It is `Rng::chance`, which calls
-            // `next_u64()` BEFORE comparing and so consumes a draw even at
-            // `p == 0.0` (`rng.rs:59`). A roll on this arm therefore shifts
-            // every later object-fault draw in the stream: every pinned
-            // universe re-rolls, and the three recorded floors and both
-            // recorded seeds go with them. That is the real cost to
-            // schedule against, and it also rules out the cheap escape of
-            // declaring the axis at 0.0 now and using it later.
+            // The archive's only destructive op, so this axis is the one
+            // that asks whether reclamation stays correct and keeps
+            // advancing when deletes fail. Rolled from `Faults::delete`,
+            // never from `shared` — see `Faults` for why that is not a
+            // stylistic choice. `delete` is contractually idempotent, so a
+            // failure here is a RETRY, not a lost object: the caller sees
+            // an error, the key is still present, and the next attempt may
+            // succeed. That is what makes an interrupted drain reachable.
             ObjectOp::Delete { key } => {
-                state.objects.remove(&key);
-                Ok(ObjectDone::Delete)
+                if self.roll_delete() {
+                    Err(io::Error::other(format!(
+                        "simulated object_delete_error: DELETE \"{key}\""
+                    )))
+                } else {
+                    state.objects.remove(&key);
+                    Ok(ObjectDone::Delete)
+                }
             }
         })
     }
@@ -446,6 +476,135 @@ mod tests {
             };
             assert_eq!(a.bit_flip, expect, "bit_flip draw moved for seed {seed:#x}");
         }
+    }
+
+    // ------------------------------------- the delete axis's stream split
+
+    // The split, stated as a property rather than trusted to a comment: with
+    // `object_delete_error` at 0.0, interleaving DELETEs into a run must not
+    // move a single put/get outcome. If the `Delete` arm ever draws from the
+    // shared `object_store` stream this goes red — and every pinned
+    // convergence universe would have silently re-rolled with it, taking the
+    // three floors and both recorded seeds along. This is the cheap standing
+    // guard; the end-to-end proof is the four-base coverage table in
+    // `charpente/tests/archive.rs`, which is what the axis was measured
+    // against when it landed.
+    #[test]
+    fn interleaved_deletes_do_not_perturb_the_shared_object_stream() {
+        let cfg = FaultConfig {
+            object_put_error: 0.3,
+            object_get_error: 0.3,
+            object_lost_ack: 0.3,
+            object_delete_error: 0.0,
+            ..Default::default()
+        };
+
+        let outcomes = |with_deletes: bool| -> Vec<String> {
+            let s = SimObjectStore::with_faults(0x5eed, cfg.clone());
+            let mut out = Vec::new();
+            for i in 0..40u8 {
+                let key = format!("k{i}");
+                s.start(ObjectOp::Put {
+                    key: key.clone(),
+                    data: vec![i],
+                })
+                .unwrap();
+                out.push(match drain(&s) {
+                    Ok(_) => "put ok".to_string(),
+                    Err(e) => format!("put {e}"),
+                });
+                s.start(ObjectOp::Get { key: key.clone() }).unwrap();
+                out.push(match drain(&s) {
+                    Ok(_) => "get ok".to_string(),
+                    Err(e) => format!("get {e}"),
+                });
+                if with_deletes {
+                    s.start(ObjectOp::Delete { key }).unwrap();
+                    drain(&s).expect("object_delete_error is 0.0 here");
+                }
+            }
+            out
+        };
+
+        let without = outcomes(false);
+        let with = outcomes(true);
+        assert_eq!(
+            without, with,
+            "interleaving DELETEs moved a put/get fault outcome, so the `Delete` arm is \
+             drawing from the shared `object_store` stream instead of \
+             `object_store_delete`. That re-rolls every pinned convergence universe: the \
+             three floors in charpente/tests/archive.rs and both Task 12.5 seeds stop \
+             meaning what they were measured to mean. Restore the split in `Faults`."
+        );
+        assert!(
+            without.iter().any(|o| o.contains("simulated")),
+            "the comparison is vacuous — no fault fired in either run, so identical \
+             outcomes prove nothing about the streams"
+        );
+    }
+
+    // The axis's own semantics, pinned directly rather than inferred from a
+    // convergence coverage count. Both halves matter: a failed DELETE must
+    // leave the object PRESENT — `delete` is contractually idempotent, so a
+    // failure is a retry rather than a lost object, and that is precisely
+    // what makes an interrupted drain reachable instead of destructive.
+    #[test]
+    fn the_delete_axis_fails_every_delete_at_one_and_none_at_zero() {
+        for (p, should_fail) in [(1.0, true), (0.0, false)] {
+            let s = SimObjectStore::with_faults(
+                0x5eed,
+                FaultConfig {
+                    object_delete_error: p,
+                    ..FaultConfig::none()
+                },
+            );
+            s.start(ObjectOp::Put {
+                key: "a".into(),
+                data: vec![1],
+            })
+            .unwrap();
+            drain(&s).expect("the put axis is off here");
+            s.start(ObjectOp::Delete { key: "a".into() }).unwrap();
+            assert_eq!(
+                drain(&s).is_err(),
+                should_fail,
+                "object_delete_error = {p} did not decide the DELETE"
+            );
+            assert_eq!(
+                s.keys().contains(&"a".to_string()),
+                should_fail,
+                "object_delete_error = {p}: a FAILED delete must leave the object present \
+                 (idempotent retry, not a loss); a SUCCEEDING one must remove it"
+            );
+        }
+    }
+
+    // Mutation-table row 3: the axis must be OFF in every constructor, or
+    // declaring it perturbs the universes it was split to protect.
+    #[test]
+    fn the_delete_axis_is_off_in_every_constructor() {
+        assert_eq!(FaultConfig::default().object_delete_error, 0.0, "default()");
+        assert_eq!(FaultConfig::none().object_delete_error, 0.0, "none()");
+        let mut r = Rng::new(0x5eed);
+        assert_eq!(
+            FaultConfig::swarm(&mut r).object_delete_error,
+            0.0,
+            "swarm() — a literal 0.0 here takes no draw; sampling it would move every \
+             later swarm field"
+        );
+    }
+
+    // Mutation-table row 5: an axis missing from `validate`'s table is
+    // silently exempt from the [0, 1] range check, so a nonsense rate
+    // constructs and runs. Negative space, per hard rule 4.
+    #[test]
+    #[should_panic(expected = "FaultConfig.object_delete_error = 5")]
+    fn an_out_of_range_delete_axis_is_refused() {
+        FaultConfig {
+            object_delete_error: 5.0,
+            ..FaultConfig::none()
+        }
+        .validate();
     }
 
     // The property the whole task rests on: same seed, same config, same op
