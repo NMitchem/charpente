@@ -115,17 +115,28 @@ rolled at `Conn::send` on the global fault stream (a connection spans two hosts;
 belongs to neither): `FaultConfig.conn_drop` kills the live connection — the sender gets
 `ConnectionReset`, the peer reads EOF, in-flight messages in both directions drop — and
 `FaultConfig.net_spike` multiplies one message's drawn latency ×64 (delayed, never lost).
-Three object-store axes landed with the M2 archive, sampled from the same field-keyed
-sub-streams but rolled off the store's own `keyed_stream(seed, "object_store")`, so an
-archive's rolls never perturb — and are never perturbed by — the disk and wire faults drawn
-from the same seed: `FaultConfig.object_put_error` (the PUT does not land, and the prior
-value stays — a PUT is atomic, never torn), `object_get_error` (a GET or LIST fails), and
-`object_lost_ack` (the object lands durably and the caller is told it failed, which is the
-axis that makes a same-key/same-bytes re-PUT load-bearing rather than merely safe).
-`ObjectOp::Delete` has no axis yet, so every simulated DELETE succeeds and reclamation's
-delete-fails-forever behaviour is pinned by hand-driven tests rather than by the matrix; and
-`SimObjectStore` completes each operation in the `poll` that takes it, so object-store
-latency is not modelled at all.
+Four object-store axes landed with the M2 archive, sampled from field-keyed sub-streams and
+rolled off the store's own streams, so an archive's rolls never perturb — and are never
+perturbed by — the disk and wire faults drawn from the same seed: `FaultConfig.object_put_error`
+(the PUT does not land, and the prior value stays — a PUT is atomic, never torn),
+`object_get_error` (a GET or LIST fails), `object_lost_ack` (the object lands durably and the
+caller is told it failed, which is the axis that makes a same-key/same-bytes re-PUT
+load-bearing rather than merely safe), and `object_delete_error` (a DELETE fails; `delete` is
+contractually idempotent, so this is a retry rather than a lost object, which is what makes an
+interrupted drain reachable).
+
+The store draws from **two** streams, not one. Put, get, list and lost_ack roll off
+`keyed_stream(seed, "object_store")`; the `Delete` arm rolls off
+`keyed_stream(seed, "object_store_delete")`. The split is load-bearing rather than tidy:
+`Rng::chance` draws from the stream *before* comparing, so it consumes a draw even at
+`p == 0.0`, and a delete roll on the shared stream would have shifted every later put/get
+draw — re-rolling every pinned universe merely by declaring the field, and invalidating the
+convergence floors and both recorded seeds with it. Drawing it separately makes the axis
+non-perturbing at zero, which was proven rather than argued: all twelve convergence coverage
+counts across four bases reproduce exactly. **The convergence property does not yet enable
+the axis**, so reclamation's delete-fails-forever behaviour is still pinned by hand-driven
+tests rather than by the matrix. And `SimObjectStore` completes each operation in the `poll`
+that takes it, so object-store latency is not modelled at all.
 
 **Per-host worlds** (landed with M1 replication's first task): `Sim::host(name)` gives a
 named simulated host its own disk (`DiskWorld`, unchanged — the same crash/countdown/epoch

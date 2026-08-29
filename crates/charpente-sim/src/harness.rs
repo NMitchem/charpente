@@ -629,6 +629,7 @@ mod tests {
             object_put_error: 0.0,
             object_get_error: 0.0,
             object_lost_ack: 0.0,
+            object_delete_error: 0.0,
             corruption_scope: "wal/".to_string(),
             conn_drop: 0.0,
             net_spike: 0.0,
@@ -650,7 +651,7 @@ mod tests {
         assert!(block.contains("  seed:   0x8bee1752811ae873"), "{block}");
         assert!(
             block.contains(
-                "  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, corruption_scope: \"wal/\", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms) }"
+                "  config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, bit_flip: 0.0, misdirected_write: 0.0, read_error: 0.0, object_put_error: 0.0, object_get_error: 0.0, object_lost_ack: 0.0, object_delete_error: 0.0, corruption_scope: \"wal/\", conn_drop: 0.0, net_spike: 0.0, subscriber_stall: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms) }"
             ),
             "{block}"
         );
