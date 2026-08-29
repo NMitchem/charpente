@@ -50,7 +50,7 @@ roadmap; do not reorder a milestone's dependency sequence.
   (carries the nondeterminism deny-list), `cargo test --workspace`.
 - One test file: `cargo test -p charpente --test kernel` — property suites live in each
   crate's `tests/` (charpente: http/kernel/replication/transactions/typed_tables,
-  plus auth/describe/group_commit/realtime; charpente-sim:
+  plus auth/describe/group_commit/realtime/wire; charpente-sim:
   crash_recovery/determinism/net_partition/wal; charpente-core:
   describe_tables/engine/group_commit/materialize/migrate_apply/migration_gate/
   migrations/store_latch). All three lists are exhaustive as written — if a name
@@ -85,9 +85,20 @@ roadmap; do not reorder a milestone's dependency sequence.
   frozen `run_universes!` runner + swarm runner, `harness` (the `charpente test --sim`
   runtime), `checks` (the public checker library).
 - `crates/charpente-cli` — the `charpente` binary; edge tooling, may spawn processes.
+- `crates/charpente-tsgen` — the TypeScript client emitter: route/event types to
+  `client.ts`, behind the CLI's `gen-client`/`check-client` verbs.
 - `crates/sim-fixture` — minimal app the CLI dogfoods against; single-dep on `charpente`,
   so it also pins macro-path expansion.
-- `crates/guide-examples` — compile gate for docs/GUIDE.md.
+- `crates/ts-fixture-app` — the app the TS client is generated from; its `tests/` are the
+  codegen's oracles (staleness diff, wire-shape drift).
+- `crates/guide-examples` — compile gate for docs/GUIDE.md, plus the CLAUDE.md inventory
+  gate (`tests/doc_inventory.rs`) that keeps this map and the test lists above honest.
+- `crates/edge-harness` — black-box wire rig outside the deterministic boundary: stock
+  binaries over real TCP, `kill -9`, TCP-proxy fault injection.
+- `crates/bench-harness` — the benchmark instrument, also outside the boundary. Each layer
+  splits measure/accounting; the accounting half carries no deny-list suppression, so hard
+  rule 1 mechanically holds it free of clocks and IO. docs/BENCH.md is its only quotable
+  output.
 - `examples/invoicing` — the M0 demo app, agent-built from docs alone (DEMO.md,
   FINDINGS.md).
 
