@@ -48,13 +48,19 @@ roadmap; do not reorder a milestone's dependency sequence.
 - Full check, same three commands as CI (.github/workflows/ci.yml):
   `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`
   (carries the nondeterminism deny-list), `cargo test --workspace`.
-- One test file: `cargo test -p charpente --test kernel` — property suites live in each
-  crate's `tests/` (charpente: http/kernel/replication/transactions/typed_tables,
-  plus archive/auth/describe/group_commit/realtime/wire; charpente-sim:
-  crash_recovery/determinism/net_partition/wal; charpente-core:
-  describe_tables/engine/group_commit/materialize/migrate_apply/migration_gate/
-  migrations/store_latch). All three lists are exhaustive as written — if a name
-  is missing, the list is stale, not selective.
+- One test file: `cargo test -p charpente --test kernel` — suites live in each workspace
+  member's `tests/` (charpente: archive/auth/describe/group_commit/http/kernel/realtime/
+  replication/transactions/typed_tables/wire; charpente-core: describe_tables/engine/
+  group_commit/materialize/migrate_apply/migration_gate/migrations/store_latch;
+  charpente-sim: crash_recovery/determinism/net_partition/wal; charpente-cli: cli/ctl/
+  describe/genclient/repro_meta/restore; charpente-tsgen: revive/routes/types;
+  charpente-macros: trybuild; edge-harness: acked_durable/failover/hunts/realtime_resume/
+  smoke; bench-harness: app/harness/phase_trace;
+  ts-fixture-app: drift/samples; guide-examples: doc_inventory; sim-fixture: sim;
+  invoicing: describe_golden/sim). Every list is exhaustive as written — if a name is
+  missing, the list is stale, not selective.
+  `guide-examples`' `doc_inventory` gate enforces that against `members`, so a NEW crate
+  with tests cannot sit outside this list either.
 - Replay one universe: `CHARPENTE_SEED=0x… cargo test -p <crate> --test <file> --
   --nocapture`. Every sim failure prints this exact repro line — paste it verbatim.
   Coverage `require:` keys are skipped under `CHARPENTE_SEED`.

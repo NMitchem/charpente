@@ -6,10 +6,16 @@
 //! charpente list lost `wire.rs` the day it was added.
 //!
 //! Scope, so the coverage is not read wider than it is: this checks that every
-//! member and every test file IS named. It does not check that a name is filed
-//! under the right crate, and it deliberately does not fail on a documented
-//! name that no longer exists on disk — a deleted test file should redden the
-//! build at its own use site first.
+//! member, every member that HAS tests, and every test file IS named. It does
+//! not check that a name is filed under the right crate, and it deliberately
+//! does not fail on a documented name that no longer exists on disk — a
+//! deleted test file should redden the build at its own use site first.
+//!
+//! The crate set is taken from `Cargo.toml`'s `members`, NOT from the prose.
+//! Deriving it from the prose was the original hole: a crate the sentence
+//! never mentioned had no test file checked at all, so `charpente-cli`'s six
+//! and `edge-harness`'s five sat outside a gate whose own sentence claimed to
+//! be exhaustive. A doc cannot be its own scope.
 
 // Reads repo docs at test time: build tooling outside the deterministic
 // boundary, the same sanctioned-edge pattern as this crate's build.rs.
@@ -58,9 +64,11 @@ fn documented_tests(claude_md: &str) -> Vec<(String, Vec<String>)> {
         .find("(charpente:")
         .expect("test-inventory parenthetical");
     let end = start
-        + claude_md[start..]
-            .find("). All three lists")
-            .expect("the exhaustiveness claim that closes the parenthetical");
+        + claude_md[start..].find("). Every list").expect(
+            "the exhaustiveness claim that closes the parenthetical — `). Every list` \
+                 must sit on ONE line in CLAUDE.md; a reflow that splits it across lines \
+                 hides the whole inventory from this gate",
+        );
     claude_md[start + 1..end]
         .split(';')
         .map(|seg| {
@@ -90,8 +98,18 @@ fn workspace_members(cargo_toml: &str) -> Vec<String> {
         .collect()
 }
 
-fn test_files(krate: &str) -> Vec<String> {
-    let dir = repo().join("crates").join(krate).join("tests");
+fn member_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Test-file stems under one member PATH (`crates/x` or `examples/x`). Empty
+/// when the member has no `tests/` at all, which is not an error — only an
+/// undocumented one is.
+fn test_files(member_path: &str) -> Vec<String> {
+    let dir = repo().join(member_path).join("tests");
+    if !dir.is_dir() {
+        return Vec::new();
+    }
     let mut stems: Vec<String> = fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
         .map(|e| e.expect("dir entry").path())
@@ -122,12 +140,17 @@ fn claude_md_workspace_map_names_every_member() {
 #[test]
 fn claude_md_test_inventory_is_exhaustive_as_it_claims() {
     let claude_md = read("CLAUDE.md");
+    let listed = documented_tests(&claude_md);
     let mut stale = Vec::new();
-    for (krate, documented) in documented_tests(&claude_md) {
-        for missing in undocumented(&documented, &test_files(&krate)) {
-            stale.push(format!(
-                "{krate}: {missing} (crates/{krate}/tests/{missing}.rs)"
-            ));
+    for member in workspace_members(&read("Cargo.toml")) {
+        let name = member_name(&member);
+        let documented = listed
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        for missing in undocumented(&documented, &test_files(&member)) {
+            stale.push(format!("{name}: {missing} ({member}/tests/{missing}.rs)"));
         }
     }
     assert!(
