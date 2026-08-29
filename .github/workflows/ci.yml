@@ -105,9 +105,10 @@ jobs:
   # changed field once the client was regenerated. Rewriting the generated `CustomerId`
   # to a plain `string` turned both brand negatives into "Unused '@ts-expect-error'
   # directive". Every mutation was reverted and both gates confirmed green in between.
-  # NOT yet exercised on a runner — this file was written under a commit-locally,
-  # do-not-push instruction, so the runner path (Node install, `npm ci` in a clean
-  # checkout, working directories) has never executed.
+  # First executed on a runner 2026-08-29 (run 33272881382, commit 8acab0f): both jobs
+  # green, every step. Until then this file had been written under a commit-locally,
+  # do-not-push instruction, so the runner path — Node install, `npm ci` in a clean
+  # checkout, working directories — had never run. It has now.
   #
   # `typescript` is pinned as a devDependency with a committed lockfile, and every
   # type-check below runs `npm run check` (which resolves to `node_modules/.bin/tsc`)
@@ -162,10 +163,20 @@ jobs:
       # known-pending RED to be waited out. Do not "fix" this job by skipping or
       # loosening a test.
       #
-      # NOT yet exercised on a runner, same caveat as the block above: verified locally
-      # (macOS, Node v24.13.1) only. What could still differ on a clean Ubuntu runner —
-      # Node's module resolution, the working directory `npm run test` resolves `dist/`
-      # relative to, and whether a not-yet-existing `dist/` changes step ordering — is
-      # unconfirmed until this runs once for real.
+      # The three things this block used to list as unconfirmed are now measured, on the
+      # first runner execution (2026-08-29, run 33272881382): Node's module resolution,
+      # the working directory `npm run test` resolves `dist/` relative to, and whether a
+      # not-yet-existing `dist/` changes step ordering. All three are fine, and the last
+      # one is fine BY CONSTRUCTION rather than by luck — `npm run test` is
+      # `tsc -p tsconfig.test.json && … && node --test 'dist/**/*.test.js'`, so the step
+      # builds `dist/` itself before anything reads it. No step here depends on state an
+      # earlier step did not create.
+      #
+      # One hazard this job is still exposed to and cannot check: the runner's filesystem
+      # is case-SENSITIVE and a developer's macOS checkout typically is not, so a
+      # wrong-case relative import type-checks locally and fails only here. Audited
+      # 2026-08-29 — 43 relative imports across 16 files, four distinct specifiers, each
+      # resolving to an exact-case match. Re-audit if that ever reddens; `tsc` on a
+      # case-insensitive filesystem cannot tell you.
       - run: npm run test
         working-directory: ts-fixture
