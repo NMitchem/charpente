@@ -33,6 +33,31 @@ import type { AdjustInvoiceBody, CostNode, CreateCustomerBody, CustomerView, Fee
  *    (chunk B1c). These literals are the server's raw `serde_json`
  *    documents, exactly the string this rewrite still describes, and that
  *    is unchanged by anything the CLIENT does with them afterward.
+ *
+ * What the two rewrites COST — the mechanism above says what they do, not
+ * what a wrong assumption would let through:
+ *
+ * 1. Erasing the brand erases brand IDENTITY with it. Every `string & {
+ *    __table: ... }` becomes `string`, so a client that dropped a brand
+ *    (`id: string`) or attached the wrong one (an invoice id branded
+ *    `__table: "Customer"`) satisfies these literals exactly as the correct
+ *    one does. Brands are pinned by `src/negatives.ts`'s `@ts-expect-error`
+ *    assignments instead; that is the gate this one hands the job to.
+ * 2. Describing the wire says nothing about the revive. These literals are
+ *    the server's raw documents, so they keep satisfying `WireOf` whatever
+ *    the client does with them afterwards — delete a walker and this file
+ *    stays green. The executing `*.test.ts` files feed these same literals
+ *    through a stubbed `fetch` for exactly that reason: `satisfies` is the
+ *    oracle for the wire, `node --test` is the oracle for the revive, and
+ *    neither stands in for the other.
+ *
+ * One further limit belongs to `satisfies` rather than to either rewrite: it
+ * checks ONE document against the type, not the type's whole domain. A type
+ * wider than the wire — `x: bigint | null` where the server never sends null,
+ * or a `?:` on a key serde always writes — is satisfied by a document that
+ * never exercises the extra case. That is why the null and absent `Int64`
+ * shapes needed specimens that actually carry `null` and actually omit the
+ * key, rather than a type that merely admits them.
  */
 type WireOf<T> =
   T extends string & { readonly __table: string } ? string
