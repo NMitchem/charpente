@@ -109,10 +109,21 @@ jobs:
   # do-not-push instruction, so the runner path (Node install, `npm ci` in a clean
   # checkout, working directories) has never executed.
   #
-  # `typescript` is pinned as a devDependency with a committed lockfile rather than left
-  # to `npx tsc`. Measured: `npx tsc` resolves to the npm package literally named "tsc",
-  # a deprecated 2016 stub at version 2.0.4 — not to TypeScript. Type-checking with a
-  # nine-year-old compiler is worse than having no gate.
+  # `typescript` is pinned as a devDependency with a committed lockfile, and every
+  # type-check below runs `npm run check` (which resolves to `node_modules/.bin/tsc`)
+  # rather than `npx tsc`. Measured 2026-08-29, offline from the npm cache: `npx tsc`
+  # resolves to the npm package literally named "tsc", a deprecated 2016 stub at
+  # version 2.0.4 — not to TypeScript. It reads no source file, reports no diagnostic,
+  # exits 1, and prints "This is not the tsc command you are looking for" together with
+  # the fix. So the hazard is a confusing red on a machine without `node_modules`, not
+  # a silent green from a nine-year-old compiler: the stub never type-checks at all.
+  # Pinning settles the resolution question outright rather than depending on npx
+  # preferring a local binary, which is an invariant nothing here states or enforces.
+  #
+  # `npm run check` is `tsc --noEmit` with no flags, so the strictness CI enforces is
+  # exactly what `ts-fixture/tsconfig.json` carries — `exactOptionalPropertyTypes`
+  # included (chunk B2). A flag passed on the command line here would be a flag the
+  # file does not have, and `npm run test` would not inherit it.
   #
   # The CLI is built and then invoked directly rather than through `cargo run -p
   # charpente-cli --`, matching how charpente-cli's own tests invoke it
@@ -134,22 +145,22 @@ jobs:
       - run: cargo build -p charpente-cli
       - run: ./target/debug/charpente check-client --dir crates/ts-fixture-app --out ts-fixture/src/generated/client.ts
       - run: cargo test -p ts-fixture-app --test samples
-      - run: npx tsc --noEmit
+      - run: npm run check
         working-directory: ts-fixture
-      # The RUNTIME oracle (chunk B0, ts-client-codegen): `tsc --noEmit` above can only
+      # The RUNTIME oracle (chunk B0, ts-client-codegen): `npm run check` above can only
       # prove a call site type-checks, never that a runtime VALUE matches its declared
       # type — so it cannot catch "the declared type is `bigint` and the value is a
       # string", which is exactly how the Int64 bug (task 11 finding 1) shipped through
       # a green gate. `npm run test` compiles `src/**/*.test.ts` to a gitignored `dist/`
       # (`tsconfig.test.json`, `noEmit: false`) and runs it with Node's built-in test
       # runner against real `generated/samples.ts` documents through a stubbed `fetch`
-      # (`src/testing/fetch-stub.ts`) — never a hand-written stand-in. `npm run test`
-      # rather than `npx tsc`/`npx` anything, for the reason given above `npx tsc`.
+      # (`src/testing/fetch-stub.ts`) — never a hand-written stand-in.
       #
-      # `int64.test.ts` is EXPECTED to fail here until chunk B1 revives `Int64` in the
-      # runtime: it is the RED this oracle exists to produce, not a broken step. Do not
-      # "fix" this job by skipping or loosening that test — fixing runtime.rs is chunk
-      # B1's job, tracked in chunk-b1-brief.md.
+      # Both steps are expected GREEN. `int64.test.ts` was written to fail until chunk
+      # B1 revived `Int64` in the runtime; B1a, B1b and B1c have all landed and it
+      # passes locally, so a red `npm run test` on this runner is a real failure, not a
+      # known-pending RED to be waited out. Do not "fix" this job by skipping or
+      # loosening a test.
       #
       # NOT yet exercised on a runner, same caveat as the block above: verified locally
       # (macOS, Node v24.13.1) only. What could still differ on a clean Ubuntu runner —
