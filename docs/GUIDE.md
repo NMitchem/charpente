@@ -4428,7 +4428,10 @@ actually uses — a unit-only enum as a TypeScript string union, otherwise exter
 A bare `u64`/`i64` at any wire position is a compile error naming the fix — above 2^53 a
 JSON number silently loses precision in JavaScript, so `Wire` has no impl for either type
 (DESIGN §3). `WireU64`/`WireI64` are the sanctioned carriers: they serialize as decimal
-strings, and the generated TypeScript type is `bigint`:
+strings, and the generated TypeScript type is `bigint`. Every TypeScript fragment below is
+copied verbatim from `ts-fixture/src/generated/client.ts` — the committed output of
+`charpente gen-client` against `crates/ts-fixture-app`'s contract — not written from
+memory:
 
 ```ts
 export interface LimitExceeded {
@@ -4508,8 +4511,9 @@ serialized) and `?: T` alone would refuse the ordinary pass-through
 
 A stream route that declares `emits(NoteAdded, NoteRemoved)` (§11) gets a generated
 subscribe method whose runtime dispatch is keyed by a `Map` from the SSE frame's `event:`
-name to that event's revive function, or `null` when its payload carries no `Int64` (shown
-here reflowed for width; the generated file emits the `Map` on one line):
+name to that event's revive function, or `null` when its payload carries no `Int64`. Again
+from `ts-fixture/src/generated/client.ts` (shown here reflowed for width; the generated
+file emits the `Map` on one line):
 
 ```ts
 feed(opts: SubscribeOptions<FeedEvent>): Promise<void> {
