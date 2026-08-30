@@ -344,13 +344,13 @@ enum Effect {
 /// (`TxEffects::overlay`, below) and a `Group`'s accumulated writes across a
 /// batch (spec §2) are this same alias — the sameness holds by compiler,
 /// not by comment, since `stage` merges one into the other. Widened from a
-/// bare `u64` key ahead of the composite-key work (design doc §2, ruling
-/// R3): once scoped tables exist, two tenants writing the same
+/// bare `u64` key ahead of the composite-key work (design doc §2): once
+/// scoped tables exist, two tenants writing the same
 /// app-minted id within one batch would otherwise alias in this map, the
 /// second write silently clobbering the first and read-your-writes
 /// surfacing the wrong tenant's row. `scope` is `UNSCOPED` (`0`) for every
-/// table today — nothing sets `Row::Scope` to anything but `Unscoped` yet,
-/// and nothing reads this slot — so this change is a pure key-width
+/// table today — nothing derives a slot from `Row::Scope` yet, and nothing
+/// reads this slot — so this change is a pure key-width
 /// refactor: every write and read still addresses slot 0.
 type GroupOverlay = BTreeMap<&'static str, BTreeMap<(u64, u64), Option<Vec<u8>>>>;
 
@@ -403,7 +403,8 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
             assert_eq!(
                 scope, UNSCOPED,
                 "record encode: table \"{table}\" id {id} carries scope {scope}, but the v0 \
-                 record format has no scope field — encoding it would silently drop the scope"
+                 record format has no scope field — encoding it would silently drop the scope \
+                 (lossy for Delete, which carries bare id; Put recovers id from row bytes)"
             );
             match entry {
                 Some(row) => {
@@ -618,6 +619,14 @@ impl View for Tx<'_> {
             merged.insert(row.id().raw(), row);
         }
         if let Some(overlay) = self.group.and_then(|g| g.get(R::TABLE)) {
+            // HAZARD: dropping the scope here is sound only while every slot is UNSCOPED
+            // (0). Under real scopes, this loop merges all tenants' writes into one
+            // id-keyed BTreeMap: because (scope, id) iterates in scope order, the
+            // highest scope's entry wins, silently overwriting lower scopes' entries
+            // and, through the tombstone arm below, silently removing other tenants'
+            // rows from other tenants' scan results. The fix is to filter by scope
+            // before merging; see docs/superpowers/plans/2026-08-30-tenant-scoping.md
+            // Task 7 Step 4b.
             for (&(_scope, id), entry) in overlay {
                 match entry {
                     Some(bytes) => {
@@ -2347,8 +2356,8 @@ impl<'a> Group<'a> {
         );
         for (table, entries) in effects.overlay {
             let group_table = self.overlay.entry(table).or_default();
-            for (id, entry) in entries {
-                group_table.insert(id, entry);
+            for (key, entry) in entries {
+                group_table.insert(key, entry);
             }
         }
         self.records.push(record);
