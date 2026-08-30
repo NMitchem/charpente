@@ -1,0 +1,5 @@
+error: #[table] takes only `version = N` and `scoped_by = <Type>` (or no arguments)
+  --> tests/compile_fail/table_unknown_arg.rs:12:9
+   |
+12 | #[table(bogus = 1)]
+   |         ^^^^^

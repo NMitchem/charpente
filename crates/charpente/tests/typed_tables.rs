@@ -693,11 +693,9 @@ impl charpente::TenantScope for Org {
 /// only coverage was a hand-written `Row` impl (`JobRow`), so the macro
 /// could emit `type Scope = ();` today and every test would still pass.
 /// This pins BOTH branches against real `#[table]`-generated types — an
-/// ordinary table stays `Unscoped`, and a `#[table(scoped_by = Org)]` one
-/// gets `Org` — as a compile-time associated-type equality, not a runtime
-/// assertion: `scope_is`'s bound only type-checks if `Scope` is EXACTLY
-/// `S`, so this would fail to compile (not silently pass) if the macro
-/// emitted some other placeholder type instead of the declared one.
+/// ordinary table stays `Unscoped`, a `scoped_by = Org` one gets `Org` —
+/// and `scope_is`'s bound only type-checks if `Scope` is EXACTLY `S`, so it
+/// fails to compile, not silently passes, if the macro emits anything else.
 #[test]
 fn table_macro_emits_the_declared_scope_type() {
     use charpente::core::table::{Row, Unscoped};

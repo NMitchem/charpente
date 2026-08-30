@@ -102,13 +102,10 @@ pub(crate) fn expand(
         quote! {}
     };
 
-    // `#[table(scoped_by = Org)]` (Task 3, tenant scoping): `type Scope` names
-    // the app's scope type instead of the `Unscoped` default, and a
-    // macro-emitted const assert forces `impl TenantScope for Org` to exist —
-    // the same shape `migration_assert` above uses to force a `TableMigration`
-    // impl on a version bump. `TenantScope`'s own `#[diagnostic::on_unimplemented]`
-    // (crates/charpente/src/tenant.rs) supplies the "no impl" message; this
-    // assert only has to make the missing impl an E0277 at the struct.
+    // `#[table(scoped_by = Org)]`: `type Scope` names the app's scope type
+    // instead of `Unscoped`, and the const assert below forces `impl
+    // TenantScope for Org` to exist — the same shape `migration_assert`
+    // above uses to force a `TableMigration` impl on a version bump.
     let scope_ty = match &scoped_by {
         Some(path) => quote! { #path },
         None => quote! { ::charpente::core::table::Unscoped },

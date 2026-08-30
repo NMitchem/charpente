@@ -1,0 +1,5 @@
+error: `scoped_by` given twice — write it once
+  --> tests/compile_fail/table_duplicate_scoped_by.rs:16:36
+   |
+16 | #[table(scoped_by = A, scoped_by = B)]
+   |                                    ^

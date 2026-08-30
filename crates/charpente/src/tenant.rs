@@ -20,11 +20,18 @@ use crate::http::ApiError;
 /// `authorize` exactly once, when a handler opens a scope (a later task);
 /// it never interprets `scope` itself (the standing `emit_keyed` ruling,
 /// DESIGN.md:1060-1062).
+///
+/// Declaration surface only, today: nothing yet reads `Row::Scope` to
+/// change how a table is stored or read, so a `scoped_by` table is not yet
+/// partitioned — the scoped read path (`ScopedTx`, the composite key) is a
+/// later task in this same sub-project.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is used as a tenant scope but has no `TenantScope` impl",
     label = "no `impl TenantScope for {Self}`",
     note = "a scoped table needs the app's own membership check; add:\n\
-            impl TenantScope for {Self} {{ fn authorize(tx, who, scope) -> Result<(), ApiError> {{ … }} }}"
+            impl TenantScope for {Self} {{\n    \
+            fn authorize(tx: &Tx, who: Option<&Principal>, scope: Id<Self>) -> Result<(), ApiError> {{ … }}\n\
+            }}"
 )]
 pub trait TenantScope: Sized {
     fn authorize(tx: &Tx, who: Option<&Principal>, scope: Id<Self>) -> Result<(), ApiError>;

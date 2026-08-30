@@ -15,6 +15,7 @@ mod wire;
 
 use proc_macro::TokenStream;
 use syn::parse::Parser;
+use syn::spanned::Spanned;
 use syn::{DeriveInput, Error, ItemFn, parse_macro_input};
 
 #[proc_macro_attribute]
@@ -32,7 +33,7 @@ pub fn table(args: TokenStream, input: TokenStream) -> TokenStream {
 
 #[proc_macro_attribute]
 pub fn row_shape(args: TokenStream, input: TokenStream) -> TokenStream {
-    let version = match parse_version(args, "row_shape", true) {
+    let version = match parse_version(args) {
         Ok(v) => v,
         Err(e) => return e.to_compile_error().into(),
     };
@@ -43,17 +44,16 @@ pub fn row_shape(args: TokenStream, input: TokenStream) -> TokenStream {
     }
 }
 
-/// `version = N`, N >= 1. `required`: `#[row_shape]` always names its
-/// version; bare `#[table]` defaults to 1 (exact today's behavior).
-fn parse_version(args: TokenStream, macro_name: &str, required: bool) -> syn::Result<u32> {
+/// `#[row_shape(version = N)]`, N >= 1 — always required (`#[row_shape]`
+/// never defaults its version, unlike bare `#[table]`). The only caller is
+/// `row_shape` above, so this no longer takes a macro name or an
+/// optionality flag — inlined rather than kept generic for one call site.
+fn parse_version(args: TokenStream) -> syn::Result<u32> {
     if args.is_empty() {
-        if required {
-            return Err(syn::Error::new(
-                proc_macro2::Span::call_site(),
-                "#[row_shape] requires `version = N` — write `#[row_shape(version = 1)]`",
-            ));
-        }
-        return Ok(1);
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[row_shape] requires `version = N` — write `#[row_shape(version = 1)]`",
+        ));
     }
     let args2: proc_macro2::TokenStream = args.into();
     struct Args(u32);
@@ -80,13 +80,14 @@ fn parse_version(args: TokenStream, macro_name: &str, required: bool) -> syn::Re
     }
     syn::parse2::<Args>(args2)
         .map(|a| a.0)
-        .map_err(|e| syn::Error::new(e.span(), format!("#[{macro_name}] {e}")))
+        .map_err(|e| syn::Error::new(e.span(), format!("#[row_shape] {e}")))
 }
 
-/// `#[table]`'s parsed argument list: `version = N` (default 1, same rule as
-/// `parse_version`) and `scoped_by = <Type>` (Task 3, tenant scoping —
-/// `#[table(scoped_by = Org)]`), either present, absent, or both, comma
-/// separated in any order.
+/// `#[table]`'s parsed argument list: `version = N` (default 1) and
+/// `scoped_by = <Type>` (`#[table(scoped_by = Org)]`), each optional, comma
+/// separated, either order — but each at most once (`route`'s
+/// `auth`/`emits` and `job`'s `max`/`backoff` refuse a repeat by name
+/// rather than last-write-wins; this follows the same precedent).
 struct TableArgs {
     version: u32,
     scoped_by: Option<syn::Path>,
@@ -94,7 +95,7 @@ struct TableArgs {
 
 enum TableArg {
     Version(u32, proc_macro2::Span),
-    ScopedBy(syn::Path),
+    ScopedBy(syn::Path, proc_macro2::Span),
 }
 
 impl syn::parse::Parse for TableArg {
@@ -107,11 +108,12 @@ impl syn::parse::Parse for TableArg {
             Ok(TableArg::Version(version, lit.span()))
         } else if ident == "scoped_by" {
             let path: syn::Path = input.parse()?;
-            Ok(TableArg::ScopedBy(path))
+            let span = path.span();
+            Ok(TableArg::ScopedBy(path, span))
         } else {
             Err(syn::Error::new(
                 ident.span(),
-                "#[table] takes only `version = N` and `scoped_by = <Type>` (or no arguments)",
+                "takes only `version = N` and `scoped_by = <Type>` (or no arguments)",
             ))
         }
     }
@@ -129,23 +131,40 @@ fn parse_table_args(args: TokenStream) -> syn::Result<TableArgs> {
         .parse2(args2)
         .map_err(|e| syn::Error::new(e.span(), format!("#[table] {e}")))?;
 
-    let mut version = 1u32;
+    let mut version = None;
     let mut scoped_by = None;
     for arg in parsed {
         match arg {
             TableArg::Version(v, span) => {
+                if version.is_some() {
+                    return Err(syn::Error::new(
+                        span,
+                        "`version` given twice — write it once",
+                    ));
+                }
                 if v == 0 {
                     return Err(syn::Error::new(
                         span,
-                        "version 0 does not exist — versions start at 1",
+                        "#[table] version 0 does not exist — versions start at 1",
                     ));
                 }
-                version = v;
+                version = Some(v);
             }
-            TableArg::ScopedBy(path) => scoped_by = Some(path),
+            TableArg::ScopedBy(path, span) => {
+                if scoped_by.is_some() {
+                    return Err(syn::Error::new(
+                        span,
+                        "`scoped_by` given twice — write it once",
+                    ));
+                }
+                scoped_by = Some(path);
+            }
         }
     }
-    Ok(TableArgs { version, scoped_by })
+    Ok(TableArgs {
+        version: version.unwrap_or(1),
+        scoped_by,
+    })
 }
 
 #[proc_macro_attribute]
