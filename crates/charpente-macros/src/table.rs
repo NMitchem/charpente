@@ -1,7 +1,11 @@
 use quote::{format_ident, quote};
 use syn::{Data, DeriveInput, Error, Fields, spanned::Spanned};
 
-pub(crate) fn expand(input: DeriveInput, version: u32) -> syn::Result<proc_macro2::TokenStream> {
+pub(crate) fn expand(
+    input: DeriveInput,
+    version: u32,
+    scoped_by: Option<syn::Path>,
+) -> syn::Result<proc_macro2::TokenStream> {
     let name = &input.ident;
     let name_str = name.to_string();
 
@@ -98,6 +102,28 @@ pub(crate) fn expand(input: DeriveInput, version: u32) -> syn::Result<proc_macro
         quote! {}
     };
 
+    // `#[table(scoped_by = Org)]` (Task 3, tenant scoping): `type Scope` names
+    // the app's scope type instead of the `Unscoped` default, and a
+    // macro-emitted const assert forces `impl TenantScope for Org` to exist —
+    // the same shape `migration_assert` above uses to force a `TableMigration`
+    // impl on a version bump. `TenantScope`'s own `#[diagnostic::on_unimplemented]`
+    // (crates/charpente/src/tenant.rs) supplies the "no impl" message; this
+    // assert only has to make the missing impl an E0277 at the struct.
+    let scope_ty = match &scoped_by {
+        Some(path) => quote! { #path },
+        None => quote! { ::charpente::core::table::Unscoped },
+    };
+    let tenant_scope_assert = if let Some(path) = &scoped_by {
+        quote! {
+            const _: () = {
+                const fn __charpente_assert_tenant_scope<T: ::charpente::TenantScope>() {}
+                __charpente_assert_tenant_scope::<#path>();
+            };
+        }
+    } else {
+        quote! {}
+    };
+
     let attrs = &input.attrs;
     let vis = &input.vis;
 
@@ -120,7 +146,7 @@ pub(crate) fn expand(input: DeriveInput, version: u32) -> syn::Result<proc_macro
         }
 
         impl ::charpente::core::table::Row for #name {
-            type Scope = ::charpente::core::table::Unscoped;
+            type Scope = #scope_ty;
             const TABLE: &'static str = #name_str;
             const VERSION: u32 = #version;
             const FINGERPRINT: ::std::option::Option<u64> =
@@ -167,6 +193,7 @@ pub(crate) fn expand(input: DeriveInput, version: u32) -> syn::Result<proc_macro
             }
         }
         #migration_assert
+        #tenant_scope_assert
 
         impl #name {
             #(

@@ -294,7 +294,12 @@ pub struct Unscoped;
 /// A table row. Implemented by `#[table]`, not by hand.
 pub trait Row: Sized + 'static {
     /// The tenant scope this row is partitioned by, or `Unscoped`.
-    /// Set by `#[table(scoped_by = …)]`; see DESIGN §8.
+    /// Set by `#[table(scoped_by = …)]`. DESIGN §8's last bullet
+    /// ("Multi-tenancy", DESIGN.md:1377) defers the mechanism to a design
+    /// of its own; that design is
+    /// docs/superpowers/specs/2026-08-30-tenant-scoping-design.md, whose §1
+    /// ("The type surface") specifies this associated type and the
+    /// attribute that sets it.
     ///
     /// Undefaulted, not `= Unscoped`: `associated_type_defaults` is
     /// unstable on this toolchain (confirmed against rustc 1.95 stable —

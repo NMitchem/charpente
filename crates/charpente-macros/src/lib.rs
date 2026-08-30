@@ -14,16 +14,17 @@ mod table;
 mod wire;
 
 use proc_macro::TokenStream;
+use syn::parse::Parser;
 use syn::{DeriveInput, Error, ItemFn, parse_macro_input};
 
 #[proc_macro_attribute]
 pub fn table(args: TokenStream, input: TokenStream) -> TokenStream {
-    let version = match parse_version(args, "table", false) {
-        Ok(v) => v,
+    let args = match parse_table_args(args) {
+        Ok(a) => a,
         Err(e) => return e.to_compile_error().into(),
     };
     let input = parse_macro_input!(input as DeriveInput);
-    match table::expand(input, version) {
+    match table::expand(input, args.version, args.scoped_by) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }
@@ -80,6 +81,71 @@ fn parse_version(args: TokenStream, macro_name: &str, required: bool) -> syn::Re
     syn::parse2::<Args>(args2)
         .map(|a| a.0)
         .map_err(|e| syn::Error::new(e.span(), format!("#[{macro_name}] {e}")))
+}
+
+/// `#[table]`'s parsed argument list: `version = N` (default 1, same rule as
+/// `parse_version`) and `scoped_by = <Type>` (Task 3, tenant scoping —
+/// `#[table(scoped_by = Org)]`), either present, absent, or both, comma
+/// separated in any order.
+struct TableArgs {
+    version: u32,
+    scoped_by: Option<syn::Path>,
+}
+
+enum TableArg {
+    Version(u32, proc_macro2::Span),
+    ScopedBy(syn::Path),
+}
+
+impl syn::parse::Parse for TableArg {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<TableArg> {
+        let ident: syn::Ident = input.parse()?;
+        input.parse::<syn::Token![=]>()?;
+        if ident == "version" {
+            let lit: syn::LitInt = input.parse()?;
+            let version: u32 = lit.base10_parse()?;
+            Ok(TableArg::Version(version, lit.span()))
+        } else if ident == "scoped_by" {
+            let path: syn::Path = input.parse()?;
+            Ok(TableArg::ScopedBy(path))
+        } else {
+            Err(syn::Error::new(
+                ident.span(),
+                "#[table] takes only `version = N` and `scoped_by = <Type>` (or no arguments)",
+            ))
+        }
+    }
+}
+
+fn parse_table_args(args: TokenStream) -> syn::Result<TableArgs> {
+    if args.is_empty() {
+        return Ok(TableArgs {
+            version: 1,
+            scoped_by: None,
+        });
+    }
+    let args2: proc_macro2::TokenStream = args.into();
+    let parsed = syn::punctuated::Punctuated::<TableArg, syn::Token![,]>::parse_terminated
+        .parse2(args2)
+        .map_err(|e| syn::Error::new(e.span(), format!("#[table] {e}")))?;
+
+    let mut version = 1u32;
+    let mut scoped_by = None;
+    for arg in parsed {
+        match arg {
+            TableArg::Version(v, span) => {
+                if v == 0 {
+                    return Err(syn::Error::new(
+                        span,
+                        "version 0 does not exist — versions start at 1",
+                    ));
+                }
+                version = v;
+            }
+            TableArg::ScopedBy(path) => scoped_by = Some(path),
+        }
+    }
+    Ok(TableArgs { version, scoped_by })
 }
 
 #[proc_macro_attribute]

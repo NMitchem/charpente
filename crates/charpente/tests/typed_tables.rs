@@ -667,6 +667,46 @@ fn bare_table_stays_version_one_and_now_fingerprinted() {
     assert!(Org::FINGERPRINT.is_some());
 }
 
+// -------------------------------------------------------- scoped_by (Task 3, tenant scoping)
+
+#[charpente::table(scoped_by = Org)]
+struct ScopedWidget {
+    id: charpente::core::table::Id<ScopedWidget>,
+    org: charpente::core::table::Id<Org>,
+}
+
+/// `#[table(scoped_by = Org)]` requires this — the app's own membership
+/// check (crates/charpente/src/tenant.rs). Trivially `Ok(())`: this file
+/// exercises the type-level wiring only — there is no `ScopedTx` yet to
+/// call it through (a later task).
+impl charpente::TenantScope for Org {
+    fn authorize(
+        _tx: &charpente::Tx,
+        _who: Option<&charpente::auth::Principal>,
+        _scope: charpente::core::table::Id<Org>,
+    ) -> Result<(), charpente::http::ApiError> {
+        Ok(())
+    }
+}
+
+/// Oracle for the macro's `Scope` emission (Task 2 review finding): Task 2's
+/// only coverage was a hand-written `Row` impl (`JobRow`), so the macro
+/// could emit `type Scope = ();` today and every test would still pass.
+/// This pins BOTH branches against real `#[table]`-generated types — an
+/// ordinary table stays `Unscoped`, and a `#[table(scoped_by = Org)]` one
+/// gets `Org` — as a compile-time associated-type equality, not a runtime
+/// assertion: `scope_is`'s bound only type-checks if `Scope` is EXACTLY
+/// `S`, so this would fail to compile (not silently pass) if the macro
+/// emitted some other placeholder type instead of the declared one.
+#[test]
+fn table_macro_emits_the_declared_scope_type() {
+    use charpente::core::table::{Row, Unscoped};
+    fn scope_is<R: Row<Scope = S>, S>() {}
+    scope_is::<Org, Unscoped>();
+    scope_is::<Invoice, Unscoped>();
+    scope_is::<ScopedWidget, Org>();
+}
+
 #[test]
 fn row_shape_roundtrips_under_its_own_codec() {
     use charpente::core::table::RowShape;
