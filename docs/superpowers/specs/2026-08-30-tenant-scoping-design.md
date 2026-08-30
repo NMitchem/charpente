@@ -157,13 +157,69 @@ both group commit and per-batch apply consume it. The ruling:
 A parallel overlay does not violate one-commit-point: both maps merge into a single log
 record. It is staging, not a second place things become true.
 
-**Unverified, and the first thing the plan must confirm.** The overlay's `(table, id)` shape
-implies the WAL effects record encodes a row write the same way, but the record encoding was
-not read during the census. If it does, scoped rows need a scope field in that record, which
-makes this a **log-format change** reaching replication and archive/restore. Task 1 of the
-plan resolves this before any code is written. If it is a log-format change, the migrations
-idiom binds: an older follower must refuse by name rather than misread a record shape it
-does not know.
+**Ruled (Task 1): three record shapes, not two, one per effect kind — neither posed world
+holds uniformly.** `Effect` has five variants (`db.rs:315-339`); only three write rows, and
+they do not agree with each other on whether the record carries a key.
+
+- **Put (tag 0) is World B.** The encoded record is `(table: String, row: Vec<u8>)` — no
+  `id` field at all (`encode_record`'s `Some(row)` arm, `db.rs:382-386`; `decode_record`
+  tag 0, `db.rs:423-426`). The row's bytes are opaque to the record schema; the key is
+  recovered downstream, never carried by the record itself. The ordinary path fully decodes
+  the row (`apply_put`, `db.rs:155-157`, via `R::decode_row`). A second, decode-free path
+  used only for pre-migration replay (`is_below_compiled`, invoked at `db.rs:849-852`) skips
+  that decode and instead reads the id as a raw 8-byte little-endian prefix of the row bytes
+  (`row_id_prefix`, `db.rs:1046-1056`), trusting the convention recorded at `db.rs:1043-1045`
+  that every `#[table]`/`#[row_shape]` struct encodes `id` first. That convention is not
+  compiler-enforced: the `#[table]` macro requires a field named `id: Id<Self>` to exist
+  somewhere and checks its type (`charpente-macros/src/table.rs:41-59`) but never checks its
+  position, and `encode_row` emits fields in struct declaration order with no reordering
+  (`charpente-macros/src/table.rs:37-73` builds `field_idents` in that order;
+  `charpente-macros/src/table.rs:138-140` emits `encode_row` from it verbatim) — an unrelated,
+  pre-existing gap this project should not need to touch, but the scoping design leans on the
+  same shortcut (see below), so it stops being purely unrelated.
+- **Delete/tombstone (tag 1) is World A, narrowed.** The record is `(table: String, id:
+  u64)` (`encode_record`'s `None` arm, `db.rs:387-391`; `decode_record` tag 1,
+  `db.rs:427-430`), consumed by `apply_delete::<R>(w, id: u64)` (`db.rs:159-161`) down to
+  `Writer::delete_raw(&mut self, table: &str, id: u64)` (`table.rs:888`). This is the brief's
+  World A shape minus the row bytes (there are none to delete) — `(table, id)`, with `id` a
+  fixed 8-byte-LE primitive baked in by `int_codec!` (`table.rs:146-158`).
+- **MigratePut (tag 4, migration-rewrite path) is World A exactly.** The record is
+  `(table: String, id: u64, row: Vec<u8>)` (`encode_record`, `db.rs:407-412`;
+  `decode_record` tag 4, `db.rs:441-445`), applied via `Writer::put_raw(&mut self, table:
+  &str, id: u64, row: &[u8])` (`table.rs:877`).
+
+**What this means for Task 4 and Task 12.**
+
+- Put needs no record-schema change. A scoped table's composite key can ride through
+  entirely inside the row bytes, because the record never looks at the key today.
+- Delete and MigratePut *do* need a record-schema change for scoped tables, and it is a
+  genuine log-format change reaching replication and archive/restore, per the brief's World
+  A consequences — just scoped to these two effect kinds, not all three. Both encode `id` as
+  a bit-for-bit `u64` at a fixed offset, and `decode_record` is not schema-aware: it calls
+  `u64::decode` for `id` unconditionally, with no way today to know from the bytes alone that
+  a given table's key is 16 bytes rather than 8. Because `id` is decoded as an ordinary
+  fixed-width field ahead of `row` in MigratePut (and is the last field in Delete), a decoder
+  that reads the old 8-byte width where 16 were written does not just get the id wrong — for
+  MigratePut it misaligns every subsequent byte, corrupting the `row` decode and (inside a
+  multi-effect record) desynchronizing every effect that follows. Task 4 must: give these two
+  variants a scope-aware width (the schema is already in scope at the one call site that
+  invokes `decode_record`, `apply_batch`, at `db.rs:784`, so the natural fix is threading
+  it in, or making `id` self-describing length-prefixed bytes the way `table` and `row`
+  already are) plus a version discriminator; and a follower on an older binary must refuse
+  that record **by name** rather than misread it (the migrations idiom, DESIGN §3). Task 12
+  owes a mixed-version replication oracle: an old follower fed a Delete or MigratePut record
+  for a scoped table must refuse by name, not desync mid-record.
+- Put's own decode-free replay path is the sharpest edge, and it is easy to miss precisely
+  because it lives outside the record schema: `row_id_prefix` recovers only the row's own
+  bare id (`Id<Invoice>`, 8 bytes) — never a scope. §1's worked example,
+  `Invoice { id: Id<Invoice>, org: Id<Org>, total: Cents }`
+  (`2026-08-30-tenant-scoping-design.md:97`), puts the scope in a *second* field, not folded
+  into `id`. The composite storage key that a below-compiled-version scoped row needs at
+  `w.put_raw` time is `(org, id)` — unrecoverable from a fixed byte prefix without decoding
+  the struct, which is exactly what this path exists to avoid. Task 4 must decide how a
+  below-compiled-version scoped row gets its storage key at replay time before this path can
+  be trusted for any table that is both `scoped_by` and ever version-bumped; until it does,
+  this is a correctness gap, not a performance one.
 
 **What provably does not change.** Unscoped tables keep `rows_def`'s `u64` definition and
 their exact stored bytes. Every pinned seed's disk image and fault schedule is untouched, and
