@@ -8,7 +8,7 @@ use charpente_core::db::{Job, TxError};
 use charpente_core::io::Entropy;
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::migration::{MigrationError, TableMigration};
-use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, View};
+use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, Unscoped, View};
 // This workload's own sequential reads (`exactly_once_holds`'s snapshot/scan
 // calls) can still hit a freshly armed crash mid-check, so all four
 // `checks::classify` families stay reachable here — unlike
@@ -2217,6 +2217,7 @@ struct GadgetV1 {
     count: u32,
 }
 impl Row for GadgetV1 {
+    type Scope = Unscoped;
     const TABLE: &'static str = "Gadget";
     const INDEXES: &'static [IndexDef<GadgetV1>] = &[];
     const VERSION: u32 = 1;

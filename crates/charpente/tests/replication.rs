@@ -26,7 +26,7 @@ use charpente_core::engine::REHELLO_MARKER;
 use charpente_core::io::{Clock, Conn, Disk, File, Net};
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::migration::{MigrationError, SchemaVersion, TableMigration, schema_version_id};
-use charpente_core::table::{Codec, IndexDef, Row, RowShape, View};
+use charpente_core::table::{Codec, IndexDef, Row, RowShape, Unscoped, View};
 use charpente_sim::checks::{dir_entry_loss_fired, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim, SimClock, SimHost, run_universes_swarm_with};
 
@@ -82,6 +82,7 @@ struct WidgetV1 {
     count: u32,
 }
 impl Row for WidgetV1 {
+    type Scope = Unscoped;
     const TABLE: &'static str = "WidgetV2";
     const INDEXES: &'static [IndexDef<WidgetV1>] = &[];
     const VERSION: u32 = 1;
@@ -2821,6 +2822,7 @@ struct GizmoV1 {
     count: u32,
 }
 impl Row for GizmoV1 {
+    type Scope = Unscoped;
     const TABLE: &'static str = "GizmoV2";
     const INDEXES: &'static [IndexDef<GizmoV1>] = &[];
     const VERSION: u32 = 1;

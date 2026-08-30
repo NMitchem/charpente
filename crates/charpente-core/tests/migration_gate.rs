@@ -6,7 +6,7 @@ use std::io;
 use charpente_core::db::{Db, DbConfig, Schema};
 use charpente_core::io::Disk;
 use charpente_core::migration::{MigrationError, SchemaVersion, TableMigration, schema_version_id};
-use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, View};
+use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, Unscoped, View};
 use charpente_sim::{FaultConfig, Sim};
 
 struct WidgetV1 {
@@ -14,6 +14,7 @@ struct WidgetV1 {
     count: u32,
 }
 impl Row for WidgetV1 {
+    type Scope = Unscoped;
     const TABLE: &'static str = "Widget";
     const INDEXES: &'static [IndexDef<WidgetV1>] = &[];
     const VERSION: u32 = 1;
@@ -49,6 +50,7 @@ struct WidgetDrifted {
     extra: bool,
 }
 impl Row for WidgetDrifted {
+    type Scope = Unscoped;
     const TABLE: &'static str = "Widget";
     const INDEXES: &'static [IndexDef<WidgetDrifted>] = &[];
     const VERSION: u32 = 1;
@@ -77,6 +79,7 @@ struct Widget2 {
     label: String,
 }
 impl Row for Widget2 {
+    type Scope = Unscoped;
     const TABLE: &'static str = "Widget";
     const INDEXES: &'static [IndexDef<Widget2>] = &[];
     const VERSION: u32 = 2;
@@ -129,6 +132,7 @@ struct WidgetUnversioned {
     count: u32,
 }
 impl Row for WidgetUnversioned {
+    type Scope = Unscoped;
     const TABLE: &'static str = "Widget";
     const INDEXES: &'static [IndexDef<WidgetUnversioned>] = &[];
     fn id(&self) -> Id<WidgetUnversioned> {
@@ -365,6 +369,7 @@ fn a_rejecting_migration_names_the_row_and_leaves_the_store_untouched() {
         count: u32,
     }
     impl Row for Widget2Rejecting {
+        type Scope = Unscoped;
         const TABLE: &'static str = "Widget";
         const INDEXES: &'static [IndexDef<Widget2Rejecting>] = &[];
         const VERSION: u32 = 2;
@@ -615,6 +620,7 @@ fn finding2_cross_fingerprint_resume_refuses_by_name() {
         label: String,
     }
     impl Row for Widget2A {
+        type Scope = Unscoped;
         const TABLE: &'static str = "Widget";
         const INDEXES: &'static [IndexDef<Widget2A>] = &[];
         const VERSION: u32 = 2;
@@ -666,6 +672,7 @@ fn finding2_cross_fingerprint_resume_refuses_by_name() {
         note: String,
     }
     impl Row for Widget2B {
+        type Scope = Unscoped;
         const TABLE: &'static str = "Widget";
         const INDEXES: &'static [IndexDef<Widget2B>] = &[];
         const VERSION: u32 = 2;

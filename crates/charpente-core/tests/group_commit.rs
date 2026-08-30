@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use charpente_core::db::{Db, DbConfig, Schema, TxError};
 use charpente_core::io::{Disk, File};
-use charpente_core::table::{Codec, Id, IndexDef, Row, View};
+use charpente_core::table::{Codec, Id, IndexDef, Row, Unscoped, View};
 use charpente_sim::{FaultConfig, Sim};
 
 #[derive(Debug, PartialEq)]
@@ -29,6 +29,7 @@ struct Widget {
 }
 
 impl Row for Widget {
+    type Scope = Unscoped;
     const TABLE: &'static str = "Widget";
     const INDEXES: &'static [IndexDef<Widget>] = &[];
 
@@ -231,6 +232,7 @@ struct Tiny {
 }
 
 impl Row for Tiny {
+    type Scope = Unscoped;
     const TABLE: &'static str = "Tiny";
     const INDEXES: &'static [IndexDef<Tiny>] = &[];
 

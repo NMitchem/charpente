@@ -20,7 +20,7 @@ use std::io;
 
 use charpente_core::db::{Db, DbConfig, Schema, Tx};
 use charpente_core::migration::{SchemaVersion, schema_version_id};
-use charpente_core::table::{Codec, Id, IndexDef, Row, View};
+use charpente_core::table::{Codec, Id, IndexDef, Row, Unscoped, View};
 use charpente_sim::{FaultConfig, Sim};
 
 // A hand-written indexed table (core cannot use its own `#[table]` macro):
@@ -35,6 +35,7 @@ fn widget_by_key(w: &Widget, out: &mut Vec<u8>) {
 }
 
 impl Row for Widget {
+    type Scope = Unscoped;
     const TABLE: &'static str = "Widget";
     const INDEXES: &'static [IndexDef<Widget>] = &[IndexDef {
         name: "by_key",

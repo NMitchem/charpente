@@ -120,6 +120,7 @@ pub(crate) fn expand(input: DeriveInput, version: u32) -> syn::Result<proc_macro
         }
 
         impl ::charpente::core::table::Row for #name {
+            type Scope = ::charpente::core::table::Unscoped;
             const TABLE: &'static str = #name_str;
             const VERSION: u32 = #version;
             const FINGERPRINT: ::std::option::Option<u64> =

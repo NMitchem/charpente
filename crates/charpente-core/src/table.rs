@@ -288,8 +288,21 @@ pub trait RowShape: Sized {
     fn decode_row(bytes: &[u8]) -> io::Result<Self>;
 }
 
+/// Marker for a table whose rows are not tenant-scoped. The default.
+pub struct Unscoped;
+
 /// A table row. Implemented by `#[table]`, not by hand.
 pub trait Row: Sized + 'static {
+    /// The tenant scope this row is partitioned by, or `Unscoped`.
+    /// Set by `#[table(scoped_by = …)]`; see DESIGN §8.
+    ///
+    /// Undefaulted, not `= Unscoped`: `associated_type_defaults` is
+    /// unstable on this toolchain (confirmed against rustc 1.95 stable —
+    /// `error[E0658]: associated type defaults are unstable`), and hard
+    /// rule 2 rules out reaching for a nightly feature to get one. Every
+    /// `Row` impl — macro-generated and hand-written alike — must name
+    /// `type Scope` explicitly.
+    type Scope;
     const TABLE: &'static str;
     const INDEXES: &'static [IndexDef<Self>];
     /// The row's schema version (`#[table(version = N)]`; `1` if omitted).

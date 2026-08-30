@@ -79,6 +79,7 @@ pub struct JobRow {
 
 // Manual impl: core cannot use the #[table] macro (macros depend on core).
 impl Row for JobRow {
+    type Scope = crate::table::Unscoped;
     const TABLE: &'static str = "charpente.jobs";
     const INDEXES: &'static [IndexDef<JobRow>] = &[];
 

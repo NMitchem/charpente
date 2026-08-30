@@ -22,6 +22,7 @@ pub struct EventRow {
 
 // Manual impl: core cannot use the #[table] macro (macros depend on core).
 impl Row for EventRow {
+    type Scope = crate::table::Unscoped;
     const TABLE: &'static str = "charpente.events";
     const INDEXES: &'static [IndexDef<EventRow>] = &[];
 

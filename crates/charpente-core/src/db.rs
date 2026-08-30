@@ -2743,6 +2743,7 @@ mod tests {
             }
         }
         impl Row for Widget {
+            type Scope = crate::table::Unscoped;
             const TABLE: &'static str = "Widget";
             const INDEXES: &'static [IndexDef<Widget>] = &[];
             const VERSION: u32 = 2;
@@ -2826,6 +2827,7 @@ mod tests {
                 }
             }
             impl Row for WidgetV2Drifted {
+                type Scope = crate::table::Unscoped;
                 const TABLE: &'static str = "Widget";
                 const INDEXES: &'static [IndexDef<WidgetV2Drifted>] = &[];
                 const VERSION: u32 = 2;

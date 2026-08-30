@@ -20,7 +20,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use charpente_core::engine::{Engine, REHELLO_MARKER, StateMachine};
 use charpente_core::io::{Disk, File};
+use charpente_core::job::JobRow;
 use charpente_core::log::{Wal, WalConfig};
+use charpente_core::table::{Row, Unscoped};
 use charpente_sim::{FaultConfig, Sim};
 
 #[derive(Default)]
@@ -445,4 +447,17 @@ fn submit_batch_advances_last_applied_to_the_last_frame_that_actually_applied() 
         "last_applied stops at the last frame that actually applied (seq 1, the \
          second of four frames at seqs 0..3)"
     );
+}
+
+/// Task 2 (tenant scoping): `Row::Scope` defaults every existing table to
+/// `Unscoped`, byte-identically. `engine.rs` has no `#[table]` type of its
+/// own to test against (`#[table]` emits `::charpente::` paths and core
+/// cannot depend on that crate), so this uses `JobRow` — one of core's own
+/// hand-written `Row` impls (DESIGN §3) — as the stand-in the brief's
+/// `Widget` comment calls for ("any existing #[table] type in the test
+/// module works here").
+#[test]
+fn an_ordinary_table_is_unscoped_by_default() {
+    fn assert_unscoped<R: Row<Scope = Unscoped>>() {}
+    assert_unscoped::<JobRow>();
 }

@@ -9,7 +9,7 @@ use std::io;
 
 use charpente_core::db::{Db, DbConfig, Schema};
 use charpente_core::migration::{MigrationError, TableMigration};
-use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape};
+use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, Unscoped};
 use charpente_sim::{FaultConfig, Sim};
 
 struct WidgetV1 {
@@ -17,6 +17,7 @@ struct WidgetV1 {
     org: u32,
 }
 impl Row for WidgetV1 {
+    type Scope = Unscoped;
     const TABLE: &'static str = "Widget";
     const INDEXES: &'static [IndexDef<WidgetV1>] = &[];
     const VERSION: u32 = 1;
@@ -52,6 +53,7 @@ struct Widget {
     label: String,
 }
 impl Row for Widget {
+    type Scope = Unscoped;
     const TABLE: &'static str = "Widget";
     const INDEXES: &'static [IndexDef<Widget>] = &[IndexDef {
         name: "by_org",

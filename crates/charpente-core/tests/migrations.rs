@@ -11,7 +11,7 @@ use std::io;
 
 use charpente_core::db::{Db, DbConfig, Schema, TxError};
 use charpente_core::migration::{MigrationError, SchemaVersion, TableMigration, schema_version_id};
-use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, View};
+use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, Unscoped, View};
 use charpente_sim::{FaultConfig, Sim, run_universes_swarm_with};
 
 struct WidgetV1 {
@@ -19,6 +19,7 @@ struct WidgetV1 {
     count: u32,
 }
 impl Row for WidgetV1 {
+    type Scope = Unscoped;
     const TABLE: &'static str = "Widget";
     const INDEXES: &'static [IndexDef<WidgetV1>] = &[];
     const VERSION: u32 = 1;
@@ -54,6 +55,7 @@ struct WidgetDrifted {
     extra: bool,
 }
 impl Row for WidgetDrifted {
+    type Scope = Unscoped;
     const TABLE: &'static str = "Widget";
     const INDEXES: &'static [IndexDef<WidgetDrifted>] = &[];
     const VERSION: u32 = 1;
@@ -82,6 +84,7 @@ struct Widget2 {
     label: String,
 }
 impl Row for Widget2 {
+    type Scope = Unscoped;
     const TABLE: &'static str = "Widget";
     const INDEXES: &'static [IndexDef<Widget2>] = &[];
     const VERSION: u32 = 2;
@@ -130,6 +133,7 @@ struct Widget3 {
     tag: u8,
 }
 impl Row for Widget3 {
+    type Scope = Unscoped;
     const TABLE: &'static str = "Widget";
     const INDEXES: &'static [IndexDef<Widget3>] = &[];
     const VERSION: u32 = 3;
@@ -572,6 +576,7 @@ fn in_flight_target_refusal_and_rejection_mid_chain_are_pinned_verbatim() {
         count: u32,
     }
     impl Row for Widget2Rejecting {
+        type Scope = Unscoped;
         const TABLE: &'static str = "Widget";
         const INDEXES: &'static [IndexDef<Widget2Rejecting>] = &[];
         const VERSION: u32 = 2;
@@ -626,6 +631,7 @@ fn in_flight_target_refusal_and_rejection_mid_chain_are_pinned_verbatim() {
         count: u32,
     }
     impl Row for Widget2OtherFingerprint {
+        type Scope = Unscoped;
         const TABLE: &'static str = "Widget";
         const INDEXES: &'static [IndexDef<Widget2OtherFingerprint>] = &[];
         const VERSION: u32 = 2;
@@ -751,6 +757,7 @@ fn migrated_index_rebuilds_and_survives_a_replayed_close_out() {
         count: u32,
     }
     impl Row for WidgetIndexedV1 {
+        type Scope = Unscoped;
         const TABLE: &'static str = "Widget";
         const INDEXES: &'static [IndexDef<WidgetIndexedV1>] = &[IndexDef {
             name: "by_count",
@@ -789,6 +796,7 @@ fn migrated_index_rebuilds_and_survives_a_replayed_close_out() {
         label: String,
     }
     impl Row for WidgetIndexedV2 {
+        type Scope = Unscoped;
         const TABLE: &'static str = "Widget";
         const INDEXES: &'static [IndexDef<WidgetIndexedV2>] = &[IndexDef {
             name: "by_count",

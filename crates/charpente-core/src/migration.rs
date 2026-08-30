@@ -87,6 +87,7 @@ pub struct SchemaVersion {
 }
 
 impl Row for SchemaVersion {
+    type Scope = crate::table::Unscoped;
     const TABLE: &'static str = "charpente.schema_versions";
     const INDEXES: &'static [IndexDef<SchemaVersion>] = &[];
 
