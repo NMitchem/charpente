@@ -452,6 +452,82 @@ git commit -m "feat(core): scoped index keys carry the scope prefix, closing the
 
 ---
 
+### Task 6b: The WAL record carries the scope, or replay collapses every tenant into one
+
+**This task exists because Task 1's ruling left a conditional dangling.** The plan said: *"World
+A — the record carries `(table, id, bytes)`. This is a log-format change. Add to this plan, as
+Task 4 steps: a scope field on the record; a version discriminator; and a follower on an older
+binary refusing by name. Add a mixed-version replication oracle to Task 12."* Task 1 then ruled a
+**third** answer — "three record shapes, not two, one per effect kind, neither posed world holds
+uniformly" — and in doing so nobody ever discharged the World A obligations. They still apply,
+because the Delete arm is World-A-shaped:
+
+- `Effect::Put` carries `[table][row]` with **no id at all** — apply recovers the key from the row
+  bytes via `row_id_prefix`. There is nowhere for a scope to live, and ruling R18 forbids deriving
+  one from a row field.
+- `Effect::Delete` carries a **bare `id: u64`**. This is exactly the lossy arm the `encode_record`
+  assert's message already names.
+
+Task 4 left `apply_put`/`apply_delete` passing `UNSCOPED` unconditionally, which is correct only
+while no scoped row can be written. **Task 7 makes scoped writes reachable.** From that moment, a
+crash-restart or a follower replay rewrites every scoped row under scope 0 — all tenants collapsed
+into one, silently, on the recovery path. That is worse than a cross-tenant read: it is durable
+corruption produced by the mechanism that exists to prevent corruption.
+
+**This task MUST land before Task 7.** Ordering is the whole point.
+
+**Files:**
+- Modify: `crates/charpente-core/src/db.rs` (the `Effect` encode/decode arms and `apply_put`/`apply_delete`)
+- Test: `crates/charpente-core/tests/engine.rs`, `crates/charpente/tests/replication.rs`
+
+**Interfaces:**
+- Consumes: `scoped_key`, `UNSCOPED`, `row_is_scoped` (Task 4).
+- Produces: a versioned record shape carrying a scope, which Task 12's oracle exercises.
+
+- [ ] **Step 1: Write the tripwire FIRST, and watch it fire**
+
+Before changing any format, make the corruption impossible to reach silently. In `apply_put` and
+`apply_delete`, assert that the target table is not scoped (hard rule 4 — assert the negative
+space). Then write a test that drives a scoped row through replay and confirm it **panics with a
+named message** rather than writing under scope 0. This test is the proof that the bug was real;
+keep it, inverted, once the format carries the scope.
+
+- [ ] **Step 2: Add the scope to both arms, behind a version discriminator**
+
+`Effect::Put` and `Effect::Delete` gain a scope for scoped tables. Follow the existing tag
+discipline in `encode_record`/`decode_record`: a new tag rather than a widened old one, so an
+older binary hits the existing unknown-tag refusal path instead of misreading a wider record.
+Confirm that refusal names the tag and suggests the fix (hard rule 5) — the unknown-tag arm is
+already there; verify it says something useful rather than assuming it does.
+
+- [ ] **Step 3: Prove the old shape still round-trips byte-identically**
+
+`record_roundtrip_is_canonical` and every pinned seed depend on unscoped records not moving. Assert
+the encoded bytes of an unscoped Put and Delete are unchanged from before this task — compare
+against the committed expected bytes, not against a fresh encode of the same value, which would
+pass even if both sides moved together.
+
+- [ ] **Step 4: The mixed-version replication oracle Task 1 assigned to Task 12**
+
+A follower on the pre-scope record shape, fed a scoped record, must **refuse by name** and stop —
+never misread it as an unscoped write. Put this in `crates/charpente/tests/replication.rs`.
+
+- [ ] **Step 5: Run the suites that consume record bytes**
+
+```bash
+cargo test -p charpente-core 2>&1 | tee /tmp/t6b.log; echo "exit=${pipestatus[1]}"
+cargo test -p charpente --test replication --test transactions --test group_commit 2>&1 | tee /tmp/t6b2.log; echo "exit=${pipestatus[1]}"
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/charpente-core/src/db.rs crates/charpente-core/tests/engine.rs crates/charpente/tests/replication.rs
+git commit -m "feat(core): the effects record carries a scope, so replay cannot collapse tenants"
+```
+
+---
+
 ### Task 7: `ScopedTx`, the `Tx` bound split, and `tx.scope()`
 
 **Files:**
