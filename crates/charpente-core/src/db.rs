@@ -626,7 +626,10 @@ impl View for Tx<'_> {
             // and, through the tombstone arm below, silently removing other tenants'
             // rows from other tenants' scan results. The fix is to filter by scope
             // before merging; see docs/superpowers/plans/2026-08-30-tenant-scoping.md
-            // Task 7 Step 4b.
+            // Task 7 Step 4b. Note the asymmetry with `get` above, which pins
+            // (UNSCOPED, id) exactly: under real scopes `get` would MISS and fall
+            // through to the snapshot, while these scan loops accept any scope and
+            // merge. One change, two different wrong behaviours.
             for (&(_scope, id), entry) in overlay {
                 match entry {
                     Some(bytes) => {
