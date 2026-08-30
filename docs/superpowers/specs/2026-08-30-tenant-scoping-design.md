@@ -158,8 +158,20 @@ A parallel overlay does not violate one-commit-point: both maps merge into a sin
 record. It is staging, not a second place things become true.
 
 **Ruled (Task 1): three record shapes, not two, one per effect kind — neither posed world
-holds uniformly.** `Effect` has five variants (`db.rs:315-339`); only three write rows, and
-they do not agree with each other on whether the record carries a key.
+holds uniformly.** `Effect` has five variants (`db.rs:315-339`); three carry app-table row
+writes, and they do not agree with each other on whether the record carries a key. (The
+other two, `Enqueue` and `Emit`, are a fourth answer worth naming rather than passing over:
+their records carry no key at all — `materialize_job`/`materialize_event` (called at
+`db.rs:876`, `db.rs:883`) land in `Writer::put` via `JobRow`/`EventRow` (`table.rs:785-800`,
+`table.rs:815-838`), with the id generated at apply time from the `next_job_id`/
+`next_event_id` meta counters rather than carried by the record at all. Neither is a scoped
+table write, so out of scope for this ruling, but `Emit`'s record already carries a
+length-prefixed `key: Option<String>` — encode `db.rs:401-406`, decode `db.rs:436-440` — and
+that is a free win for §4: `tx.emit` auto-keying with the scope inside a `ScopedTx<Org>`
+rides this existing field unchanged, World B, no format change needed there either.) The WAL
+frame itself carries no record-schema field to hang anything on — `[seq][len][crc][payload]`
+(`log.rs:4-5`) — so every finding below is about `db.rs`'s record schema, never `log.rs`'s
+framing.
 
 - **Put (tag 0) is World B.** The encoded record is `(table: String, row: Vec<u8>)` — no
   `id` field at all (`encode_record`'s `Some(row)` arm, `db.rs:382-386`; `decode_record`
@@ -171,18 +183,24 @@ they do not agree with each other on whether the record carries a key.
   (`row_id_prefix`, `db.rs:1046-1056`), trusting the convention recorded at `db.rs:1043-1045`
   that every `#[table]`/`#[row_shape]` struct encodes `id` first. That convention is not
   compiler-enforced: the `#[table]` macro requires a field named `id: Id<Self>` to exist
-  somewhere and checks its type (`charpente-macros/src/table.rs:41-59`) but never checks its
-  position, and `encode_row` emits fields in struct declaration order with no reordering
+  (enforced by the `if !has_id` check, `charpente-macros/src/table.rs:75-82`) and checks its
+  type when present (`charpente-macros/src/table.rs:41-59`) but never checks its position,
+  and `encode_row` emits fields in struct declaration order with no reordering
   (`charpente-macros/src/table.rs:37-73` builds `field_idents` in that order;
   `charpente-macros/src/table.rs:138-140` emits `encode_row` from it verbatim) — an unrelated,
   pre-existing gap this project should not need to touch, but the scoping design leans on the
   same shortcut (see below), so it stops being purely unrelated.
 - **Delete/tombstone (tag 1) is World A, narrowed.** The record is `(table: String, id:
   u64)` (`encode_record`'s `None` arm, `db.rs:387-391`; `decode_record` tag 1,
-  `db.rs:427-430`), consumed by `apply_delete::<R>(w, id: u64)` (`db.rs:159-161`) down to
-  `Writer::delete_raw(&mut self, table: &str, id: u64)` (`table.rs:888`). This is the brief's
-  World A shape minus the row bytes (there are none to delete) — `(table, id)`, with `id` a
-  fixed 8-byte-LE primitive baked in by `int_codec!` (`table.rs:146-158`).
+  `db.rs:427-430`). It has two consumers, not one, and Task 4 owes both. The ordinary path is
+  `apply_delete::<R>` (`db.rs:159-161`) → `Writer::delete<R>(Id<R>)` (`table.rs:761-780`,
+  which also removes that row's index entries, keyed by `id.raw()` at `table.rs:768-778` — a
+  second place Task 4 must widen to the composite key, not just the record). Separately, the
+  below-compiled-version branch is `db.rs:859-861` → `Writer::delete_raw(&mut self, table:
+  &str, id: u64)` (`table.rs:888`), `delete_raw`'s only caller in the workspace. Both take a
+  bare `u64`. This is the brief's World A shape minus the row bytes (there are none to
+  delete) — `(table, id)`, with `id` a fixed 8-byte-LE primitive baked in by `int_codec!`
+  (`table.rs:146-158`).
 - **MigratePut (tag 4, migration-rewrite path) is World A exactly.** The record is
   `(table: String, id: u64, row: Vec<u8>)` (`encode_record`, `db.rs:407-412`;
   `decode_record` tag 4, `db.rs:441-445`), applied via `Writer::put_raw(&mut self, table:
@@ -197,18 +215,23 @@ they do not agree with each other on whether the record carries a key.
   A consequences — just scoped to these two effect kinds, not all three. Both encode `id` as
   a bit-for-bit `u64` at a fixed offset, and `decode_record` is not schema-aware: it calls
   `u64::decode` for `id` unconditionally, with no way today to know from the bytes alone that
-  a given table's key is 16 bytes rather than 8. Because `id` is decoded as an ordinary
-  fixed-width field ahead of `row` in MigratePut (and is the last field in Delete), a decoder
-  that reads the old 8-byte width where 16 were written does not just get the id wrong — for
-  MigratePut it misaligns every subsequent byte, corrupting the `row` decode and (inside a
-  multi-effect record) desynchronizing every effect that follows. Task 4 must: give these two
-  variants a scope-aware width (the schema is already in scope at the one call site that
-  invokes `decode_record`, `apply_batch`, at `db.rs:784`, so the natural fix is threading
-  it in, or making `id` self-describing length-prefixed bytes the way `table` and `row`
-  already are) plus a version discriminator; and a follower on an older binary must refuse
-  that record **by name** rather than misread it (the migrations idiom, DESIGN §3). Task 12
-  owes a mixed-version replication oracle: an old follower fed a Delete or MigratePut record
-  for a scoped table must refuse by name, not desync mid-record.
+  a given table's key is 16 bytes rather than 8. A decoder that reads the old 8-byte width
+  where 16 were written does not just get the id wrong: for MigratePut it misaligns every
+  subsequent byte, corrupting the `row` decode; for Delete the 8 stray bytes get consumed as
+  the *next* loop iteration's tag. Either way the rest of the record's effects desynchronize,
+  or the mismatch surfaces as the trailing-bytes guard firing (`db.rs:457-461`) — Delete is
+  not the milder case, only the shorter one. But `decode_record` already refuses an unknown
+  tag by name (`db.rs:446-454`): "this log was written by a newer record format; upgrade the
+  binary or restore the old one" — the migrations idiom, already implemented, for free. That
+  makes allocating new effect tags for the scoped Delete/MigratePut shapes the cheapest
+  World-A encoding available: the tag itself is the version discriminator, and an old
+  follower's refusal comes from code that already exists, with no `Schema` threaded into
+  `decode_record` and no new machinery. **Task 4 should price that option first**, against
+  the alternative of threading `Schema` into `decode_record` (it is already in scope one call
+  site up, in `apply_batch` at `db.rs:784`) or making `id` self-describing length-prefixed
+  bytes the way `table` and `row` already are. Task 12 owes a mixed-version replication
+  oracle either way: an old follower fed a Delete or MigratePut record for a scoped table
+  must refuse by name, not desync mid-record.
 - Put's own decode-free replay path is the sharpest edge, and it is easy to miss precisely
   because it lives outside the record schema: `row_id_prefix` recovers only the row's own
   bare id (`Id<Invoice>`, 8 bytes) — never a scope. §1's worked example,
@@ -219,7 +242,7 @@ they do not agree with each other on whether the record carries a key.
   the struct, which is exactly what this path exists to avoid. Task 4 must decide how a
   below-compiled-version scoped row gets its storage key at replay time before this path can
   be trusted for any table that is both `scoped_by` and ever version-bumped; until it does,
-  this is a correctness gap, not a performance one.
+  this is a correctness gap, not a record-format one.
 
 **What provably does not change.** Unscoped tables keep `rows_def`'s `u64` definition and
 their exact stored bytes. Every pinned seed's disk image and fault schedule is untouched, and
@@ -255,9 +278,14 @@ route, `charpente describe` can enumerate every endpoint in an app able to read 
 tenants — turning "audit the cross-tenant reads" from a grep someone must remember into a
 mechanical inventory, the same move `check-client` and `doc_inventory` already make.
 
-Platform-internal crossers are unaffected. `migrate_schema()` rewrites rows through the raw
-path (`scan_raw_from`, `table.rs:1116-1144`), below the `View` API: it must learn the new key
-shape, but needs no capability. Replication and archive work at the log layer.
+Platform-internal crossers are unaffected *as capabilities* — none of them needs a new
+authorization check. `migrate_schema()` rewrites rows through the raw path (`scan_raw_from`,
+`table.rs:1116-1144`), below the `View` API: it must learn the new key shape, but needs no
+capability. Replication and archive work at the log layer, and §2's ruling narrows that
+claim rather than contradicting it: Delete and MigratePut records carry a fixed-width `id`
+that must change shape for scoped tables, so replication and archive/restore inherit that
+record-format change even though — the point of this paragraph — neither needs a new
+capability check to carry it.
 
 **On hard rule 2, argued rather than glossed.** `across_tenants` could be read as an escape
 hatch. It is not. The guarantee this feature makes is *"a scoped query cannot silently cross
