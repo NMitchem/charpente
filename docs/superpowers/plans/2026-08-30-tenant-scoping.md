@@ -510,6 +510,44 @@ impl<'a> Tx<'a> {
 
 `authorize` runs here and only here — that is the single auditable line per handler the spec's thesis rests on.
 
+- [ ] **Step 4b: Filter the overlay merge by scope — the leak Task 5's ranges do NOT close**
+
+Tasks 5 and 6 bound the *snapshot* ranges. They do nothing to the overlay merge in
+`crates/charpente-core/src/db.rs`, and `self.group` is the **batch-level** overlay shared by
+every transaction in the batch — so it holds other tenants' staged rows. All six loops
+(`scan` :621/:633, `scan_by` :660/:675, `scan_from` :700/:715) currently read
+`for (&(_scope, id), entry) in overlay` and merge into a `BTreeMap<u64, R>` keyed by the bare
+id. Under real scopes that is a silent cross-tenant read:
+
+- tenant B staging id 7 **overwrites** tenant A's id 7 in A's own scan result, and
+- tenant B's staged *tombstone* for id 7 **removes** A's id 7 from A's result.
+
+Both are endorsed by the types — the call is `ScopedTx<A>::scan` — which is the exact failure
+mode the Tasks 4-6 shipping-unit note exists to prevent, relocated to the read path.
+
+Every `ScopedTx` read must skip overlay entries whose scope is not the scope being read, and
+every `View for Tx` read (now `Scope = Unscoped`) must skip entries whose scope is not
+`UNSCOPED`. Filter before merging; do not widen the merged map and hope ordering saves you —
+`(scope, id)` iterates in scope order, so the highest scope would win.
+
+- [ ] **Step 4c: The test that would have caught it — two tenants, one id, one batch**
+
+This test must fail before Step 4b and pass after. A `BTreeMap<u64, _>` merge cannot be
+caught by a single-tenant test, which is why this one is mandatory rather than nice to have:
+
+```rust
+#[test]
+fn one_tenants_staged_row_is_invisible_to_another_in_the_same_batch() {
+    // Two transactions in ONE group batch, tenants A and B, both writing row id 7.
+    // Then, still inside the batch: A's scoped scan/get/scan_by returns A's row 7,
+    // never B's. Repeat with B staging a DELETE of id 7 and assert A's row 7 survives
+    // in A's read — the tombstone arm is a separate failure and needs its own assertion.
+}
+```
+
+Run it against the pre-Step-4b code first and paste the failure; a green run before the fix
+means the two writes are not landing in the same batch and the test proves nothing.
+
 - [ ] **Step 5: Pin the error text, and read it**
 
 ```bash
