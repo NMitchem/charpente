@@ -10,9 +10,10 @@
 //! `0x02 [job][payload][key: Option<String>]` enqueue,
 //! `0x03 [event][payload][key: Option<String>]` emit — strings and byte
 //! fields length-prefixed per the `Codec` layout.
-//! Table effects are the transaction's collapsed overlay in (table, id)
-//! order: intermediate overwrites inside a transaction are invisible to
-//! every observer and are not logged. Enqueues and emits keep call order.
+//! Table effects are the transaction's collapsed overlay in (table, scope,
+//! id) order (scope is 0 for every table today): intermediate overwrites
+//! inside a transaction are invisible to every observer and are not
+//! logged. Enqueues and emits keep call order.
 //! The enqueue key is the job's idempotency identity to the world outside
 //! the log — carried, never interpreted inside the deterministic boundary.
 
@@ -338,12 +339,26 @@ enum Effect {
     },
 }
 
-/// The shape of a collapsed table overlay: table -> id -> optional row bytes
-/// (`None` = tombstone). Both a transaction's own buffered writes
+/// The shape of a collapsed table overlay: table -> (scope, id) -> optional
+/// row bytes (`None` = tombstone). Both a transaction's own buffered writes
 /// (`TxEffects::overlay`, below) and a `Group`'s accumulated writes across a
 /// batch (spec §2) are this same alias — the sameness holds by compiler,
-/// not by comment, since `stage` merges one into the other.
-type GroupOverlay = BTreeMap<&'static str, BTreeMap<u64, Option<Vec<u8>>>>;
+/// not by comment, since `stage` merges one into the other. Widened from a
+/// bare `u64` key ahead of the composite-key work (design doc §2, ruling
+/// R3): once scoped tables exist, two tenants writing the same
+/// app-minted id within one batch would otherwise alias in this map, the
+/// second write silently clobbering the first and read-your-writes
+/// surfacing the wrong tenant's row. `scope` is `UNSCOPED` (`0`) for every
+/// table today — nothing sets `Row::Scope` to anything but `Unscoped` yet,
+/// and nothing reads this slot — so this change is a pure key-width
+/// refactor: every write and read still addresses slot 0.
+type GroupOverlay = BTreeMap<&'static str, BTreeMap<(u64, u64), Option<Vec<u8>>>>;
+
+/// The overlay key's scope slot for a table that is not tenant-scoped —
+/// every table today. Named so the sites that will eventually compute a
+/// real scope (once `#[table(scoped_by = …)]` exists) are exactly the ones
+/// that stop using this constant.
+const UNSCOPED: u64 = 0;
 
 /// A transaction's buffered effects: the collapsed per-table overlay
 /// (`None` = tombstone) plus enqueues and emits in call order.
@@ -377,7 +392,19 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
     let mut out = Vec::new();
     (u32::try_from(n).expect("transaction exceeds u32 effects")).encode(&mut out);
     for (table, entries) in &effects.overlay {
-        for (id, entry) in entries {
+        for (&(scope, id), entry) in entries {
+            // The v0 wire format has no scope field (table above); a
+            // nonzero scope reaching this point would silently vanish from
+            // the record instead of erroring, corrupting replay across
+            // tenants rather than merely this batch. Negative space: this
+            // cannot fire today (nothing produces a nonzero scope), and
+            // must be replaced by a real wire-format change, not deleted,
+            // the day something does.
+            assert_eq!(
+                scope, UNSCOPED,
+                "record encode: table \"{table}\" id {id} carries scope {scope}, but the v0 \
+                 record format has no scope field — encoding it would silently drop the scope"
+            );
             match entry {
                 Some(row) => {
                     out.push(0);
@@ -507,7 +534,7 @@ impl<'a> Tx<'a> {
             .overlay
             .entry(R::TABLE)
             .or_default()
-            .insert(row.id().raw(), Some(bytes));
+            .insert((UNSCOPED, row.id().raw()), Some(bytes));
     }
 
     pub fn delete<R: Row>(&mut self, id: Id<R>) {
@@ -515,7 +542,7 @@ impl<'a> Tx<'a> {
             .overlay
             .entry(R::TABLE)
             .or_default()
-            .insert(id.raw(), None);
+            .insert((UNSCOPED, id.raw()), None);
     }
 
     /// Buffers one decode-free migration write (spec §3). `row` must
@@ -569,14 +596,14 @@ impl View for Tx<'_> {
             .effects
             .overlay
             .get(R::TABLE)
-            .and_then(|t| t.get(&id.raw()))
+            .and_then(|t| t.get(&(UNSCOPED, id.raw())))
         {
             Some(Some(bytes)) => Ok(Some(R::decode_row(bytes)?)),
             Some(None) => Ok(None),
             None => match self
                 .group
                 .and_then(|g| g.get(R::TABLE))
-                .and_then(|t| t.get(&id.raw()))
+                .and_then(|t| t.get(&(UNSCOPED, id.raw())))
             {
                 Some(Some(bytes)) => Ok(Some(R::decode_row(bytes)?)),
                 Some(None) => Ok(None),
@@ -591,7 +618,7 @@ impl View for Tx<'_> {
             merged.insert(row.id().raw(), row);
         }
         if let Some(overlay) = self.group.and_then(|g| g.get(R::TABLE)) {
-            for (&id, entry) in overlay {
+            for (&(_scope, id), entry) in overlay {
                 match entry {
                     Some(bytes) => {
                         merged.insert(id, R::decode_row(bytes)?);
@@ -603,7 +630,7 @@ impl View for Tx<'_> {
             }
         }
         if let Some(overlay) = self.effects.overlay.get(R::TABLE) {
-            for (&id, entry) in overlay {
+            for (&(_scope, id), entry) in overlay {
                 match entry {
                     Some(bytes) => {
                         merged.insert(id, R::decode_row(bytes)?);
@@ -630,7 +657,7 @@ impl View for Tx<'_> {
             merged.insert(row.id().raw(), row);
         }
         if let Some(overlay) = self.group.and_then(|g| g.get(R::TABLE)) {
-            for (&id, entry) in overlay {
+            for (&(_scope, id), entry) in overlay {
                 // The overlay overrides the snapshot for this id either way:
                 // a tombstone, or a row whose key may no longer match.
                 merged.remove(&id);
@@ -645,7 +672,7 @@ impl View for Tx<'_> {
             }
         }
         if let Some(overlay) = self.effects.overlay.get(R::TABLE) {
-            for (&id, entry) in overlay {
+            for (&(_scope, id), entry) in overlay {
                 // The overlay overrides the snapshot for this id either way:
                 // a tombstone, or a row whose key may no longer match.
                 merged.remove(&id);
@@ -670,7 +697,7 @@ impl View for Tx<'_> {
             }
         }
         if let Some(overlay) = self.group.and_then(|g| g.get(R::TABLE)) {
-            for (&id, entry) in overlay {
+            for (&(_scope, id), entry) in overlay {
                 if id < from_id {
                     continue;
                 }
@@ -685,7 +712,7 @@ impl View for Tx<'_> {
             }
         }
         if let Some(overlay) = self.effects.overlay.get(R::TABLE) {
-            for (&id, entry) in overlay {
+            for (&(_scope, id), entry) in overlay {
                 if id < from_id {
                     continue;
                 }
@@ -2291,7 +2318,7 @@ impl<'a> Group<'a> {
             let already = effects
                 .overlay
                 .get(crate::migration::SchemaVersion::TABLE)
-                .is_some_and(|m| m.contains_key(&vid.raw()));
+                .is_some_and(|m| m.contains_key(&(UNSCOPED, vid.raw())));
             if already {
                 continue;
             }
@@ -2309,7 +2336,7 @@ impl<'a> Group<'a> {
                 .overlay
                 .entry(crate::migration::SchemaVersion::TABLE)
                 .or_default()
-                .insert(vid.raw(), Some(bytes));
+                .insert((UNSCOPED, vid.raw()), Some(bytes));
         }
         let record = encode_record(&effects);
         assert!(
@@ -2572,13 +2599,13 @@ mod tests {
     fn effects_fixture() -> TxEffects {
         let mut effects = TxEffects::default();
         let invoices = effects.overlay.entry("invoice").or_default();
-        invoices.insert(10, Some(vec![1, 2, 3]));
-        invoices.insert(11, None);
+        invoices.insert((UNSCOPED, 10), Some(vec![1, 2, 3]));
+        invoices.insert((UNSCOPED, 11), None);
         effects
             .overlay
             .entry("org")
             .or_default()
-            .insert(1, Some(vec![9]));
+            .insert((UNSCOPED, 1), Some(vec![9]));
         effects.enqueues.push(("send_receipt", vec![10, 0], None));
         effects.emits.push(("invoice_finalized", vec![7], None));
         effects
