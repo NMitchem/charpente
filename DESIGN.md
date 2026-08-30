@@ -1203,13 +1203,14 @@ Charpente treats the coding agent as the primary developer persona:
   you find out which of the app's events it delivers.
 - **The generated TypeScript client (v0, implemented; `crates/charpente-tsgen`).**
   `charpente_tsgen::emit_client` is a pure `Contract -> client.ts` function: branded id
-  types and an interface per named `Wire` schema in `types`, a discriminated `Result<T,
-  E>` per route keyed off `response`/`error`, and per-event dispatch — a `Map` from an
-  SSE frame's `event:` name to that payload's revive function, or `null` — for a stream
-  route's `emits(...)`. `charpente gen-client` writes the file; `charpente check-client`
-  is the drift oracle CI runs, regenerating and comparing against the committed file
-  rather than trusting that a Rust change was remembered to be followed by a re-run
-  (docs/GUIDE.md §14). Transport is SSE only; no WebSocket client ships.
+  types and a declaration per named `Wire` schema in `types` (an `interface` for a
+  struct, a `type` union for an enum), a discriminated `Result<T, E>` per route keyed
+  off `response`/`error`, and per-event dispatch — a `Map` from an SSE frame's `event:`
+  name to that payload's revive function, or `null` — for a stream route's `emits(...)`.
+  `charpente gen-client` writes the file; `charpente check-client` is the drift oracle
+  CI runs, regenerating and comparing against the committed file rather than trusting
+  that a Rust change was remembered to be followed by a re-run (docs/GUIDE.md §14).
+  Transport is SSE only; no WebSocket client ships.
 - **Errors are prompts.** Compile-time and sim-failure output is structured for machine
   consumption: the exact contract violated, the file/line, the seed and fault schedule for
   sim failures, and the minimal repro command. Error quality is a feature with a test suite.
