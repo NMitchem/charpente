@@ -20,9 +20,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use charpente_core::engine::{Engine, REHELLO_MARKER, StateMachine};
 use charpente_core::io::{Disk, File};
-use charpente_core::job::JobRow;
+use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::log::{Wal, WalConfig};
-use charpente_core::table::{Row, Unscoped};
+use charpente_core::table::{Codec, Id, IndexDef, Row, Store, UNSCOPED, Unscoped, scoped_key};
 use charpente_sim::{FaultConfig, Sim};
 
 #[derive(Default)]
@@ -460,4 +460,191 @@ fn submit_batch_advances_last_applied_to_the_last_frame_that_actually_applied() 
 fn an_ordinary_table_is_unscoped_by_default() {
     fn assert_unscoped<R: Row<Scope = Unscoped>>() {}
     assert_unscoped::<JobRow>();
+}
+
+/// Task 4 (tenant scoping), Step 2: `scoped_key`'s ordering property. Verbatim
+/// from the task brief.
+#[test]
+fn a_scoped_key_orders_by_scope_then_id() {
+    // Big-endian is load-bearing: lexicographic byte order must agree with
+    // (scope, id) numeric order, or a prefix range is not contiguous and the
+    // whole scan guarantee collapses into a filter.
+    let a = scoped_key(1, u64::MAX);
+    let b = scoped_key(2, 0);
+    assert!(
+        a < b,
+        "tenant 1's last row must sort before tenant 2's first"
+    );
+
+    let c = scoped_key(1, 5);
+    let d = scoped_key(1, 6);
+    assert!(c < d, "within a tenant, ids must stay ordered");
+}
+
+/// Task 4 (tenant scoping), Step 5: the pinned-seed guarantee rests on
+/// unscoped tables staying byte-identical after this change — every pinned
+/// simulation seed depends on the stored bytes, and if an unscoped table's
+/// key encoding shifted, every existing universe would shift with it.
+///
+/// Asserts against the STORED bytes read back through `Snapshot::scan_raw`,
+/// not a round trip through `encode_row`/`decode_row`: a round trip would
+/// pass unchanged even if the key shape had moved, because decoding never
+/// looks at the key at all. `scan_raw` itself is part of the proof here —
+/// it opens the table as `TableDefinition<u64, &[u8]>` (unchanged by this
+/// task), so it would fail with a `TableTypeMismatch` if an unscoped row's
+/// physical key shape had shifted to the composite 16 bytes, exactly as
+/// `a_scoped_table_stores_under_the_composite_key_not_a_bare_u64` below
+/// demonstrates it does for a genuinely scoped table.
+#[test]
+fn an_unscoped_table_still_writes_a_bare_u64_key() {
+    let sim = Sim::with_faults(0x7A2E_0007, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    let row = JobRow {
+        id: Id::from_raw(7),
+        name: "send-receipt".to_string(),
+        payload: b"payload".to_vec(),
+        key: None,
+        status: JobStatus::Pending,
+        attempts: 0,
+        due_at: 0,
+        last_error: None,
+    };
+    let mut expected_bytes = Vec::new();
+    row.encode_row(&mut expected_bytes);
+
+    store.apply(0, |w| w.put(UNSCOPED, &row)).unwrap();
+
+    let snap = store.snapshot().unwrap();
+    let raw = snap.scan_raw(JobRow::TABLE).unwrap();
+    assert_eq!(
+        raw,
+        vec![(7u64, expected_bytes)],
+        "an unscoped table's stored key must still be the bare u64 id and its stored value \
+         must still be exactly Row::encode_row's bytes"
+    );
+}
+
+/// Task 4 (tenant scoping): a scoped Row (`Row::Scope != Unscoped`) really is
+/// stored under `scoped_key`'s composite `(scope, id)`, not the bare `u64`
+/// key the test above pins for the unscoped case. `engine.rs` cannot use
+/// `#[table(scoped_by = …)]` — the macro emits `::charpente::` paths, and
+/// core cannot depend on that crate (same reason `JobRow` stands in for a
+/// macro-generated type above) — so this hand-writes a `Row` impl the same
+/// way `JobRow`/`EventRow` do (DESIGN §3), with `type Scope` set to a local
+/// marker distinct from `Unscoped`.
+///
+/// What this test can and cannot observe, stated honestly: `Snapshot::get`/
+/// `scan` stay unscoped-only until Task 7's `ScopedTx`, and `Snapshot::
+/// scan_raw` still assumes the bare-`u64` `TableDefinition` (Task 5 teaches
+/// it the scoped shape) — so there is no sanctioned way, yet, to decode a
+/// scoped row's bytes back from outside `table.rs`. What IS observable
+/// without any of that: a scoped `put`/`delete` must not error, two tenants
+/// writing the SAME id must not collide, and the table `scoped_key` writes
+/// into must be a PHYSICALLY DIFFERENT redb table — `scan_raw` must fail to
+/// open it with `TableTypeMismatch` naming the `[u8;16]` key, not silently
+/// read it back empty. Silent-empty is exactly what a bug that routed a
+/// scoped row through the old bare-`u64` path regardless of `Row::Scope`
+/// would produce, which is why this checks the failure's shape, not just
+/// its presence.
+#[test]
+fn a_scoped_table_stores_under_the_composite_key_not_a_bare_u64() {
+    struct TestOrg;
+
+    struct Ticket {
+        id: Id<Ticket>,
+        n: u32,
+    }
+
+    impl Row for Ticket {
+        type Scope = TestOrg;
+        const TABLE: &'static str = "test.ticket";
+        const INDEXES: &'static [IndexDef<Ticket>] = &[];
+
+        fn id(&self) -> Id<Ticket> {
+            self.id
+        }
+        fn encode_row(&self, out: &mut Vec<u8>) {
+            self.id.encode(out);
+            self.n.encode(out);
+        }
+        fn decode_row(bytes: &[u8]) -> io::Result<Ticket> {
+            let input = &mut &bytes[..];
+            let id = Id::decode(input)?;
+            let n = u32::decode(input)?;
+            Ok(Ticket { id, n })
+        }
+    }
+
+    let sim = Sim::with_faults(0x7A2E_0008, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    // Two tenants writing the SAME id — the exact case the composite key
+    // exists to keep apart (hard rule 4: exercise the negative space, not
+    // just the happy path).
+    store
+        .apply(0, |w| {
+            w.put(
+                10,
+                &Ticket {
+                    id: Id::from_raw(5),
+                    n: 1,
+                },
+            )?;
+            w.put(
+                20,
+                &Ticket {
+                    id: Id::from_raw(5),
+                    n: 2,
+                },
+            )
+        })
+        .expect("two tenants writing the same id must not collide or error");
+    store
+        .apply(1, |w| w.delete::<Ticket>(10, Id::from_raw(5)))
+        .expect("deleting tenant 10's row must not error");
+
+    let snap = store.snapshot().unwrap();
+    let err = snap
+        .scan_raw(Ticket::TABLE)
+        .expect_err(
+            "a scoped table's physical redb table must be [u8; 16]-keyed — scan_raw, still \
+             typed TableDefinition<u64, &[u8]>, must fail to open it rather than silently \
+             reading nothing, which is what a bug routing a scoped row through the unscoped \
+             path regardless of Row::Scope would look like",
+        )
+        .to_string();
+    assert!(
+        err.contains("[u8;16]") || err.contains("[u8; 16]"),
+        "scan_raw's failure must be exactly a key-type mismatch against a [u8;16]-keyed \
+         table, not some other error: {err}"
+    );
+}
+
+/// Hard rule 4, negative space: `Writer::put`'s required `scope` parameter
+/// is asserted, not merely ignored, on an unscoped table. A caller passing a
+/// nonzero scope there is a bug the bare-`u64` key path would otherwise
+/// silently swallow — the write would land at plain `id`, indistinguishable
+/// from `UNSCOPED`, and the caller's mistaken belief that the row is
+/// isolated by tenant would go uncaught.
+#[test]
+#[should_panic(expected = "is not tenant-scoped")]
+fn an_unscoped_put_with_a_nonzero_scope_panics() {
+    let sim = Sim::with_faults(0x7A2E_0009, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+    let _ = store.apply(0, |w| {
+        w.put(
+            7,
+            &JobRow {
+                id: Id::from_raw(1),
+                name: "x".to_string(),
+                payload: vec![],
+                key: None,
+                status: JobStatus::Pending,
+                attempts: 0,
+                due_at: 0,
+                last_error: None,
+            },
+        )
+    });
 }

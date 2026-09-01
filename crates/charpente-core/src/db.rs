@@ -153,12 +153,19 @@ struct TableOps {
     index_names: Vec<&'static str>,
 }
 
+// `crate::table::UNSCOPED` (the store's row-key scope slot), not this
+// module's own `UNSCOPED` (the overlay's key slot, below) — Effect::Put and
+// Effect::Delete carry no scope field yet (v0 record format; see the
+// GroupOverlay doc comment), so replay has nothing but the unscoped value to
+// pass here regardless. A scoped table reaching this path is future work
+// (spec §2's Task 4/12 note), not something either UNSCOPED constant papers
+// over.
 fn apply_put<R: Row>(w: &mut Writer<'_>, row: &[u8]) -> io::Result<()> {
-    w.put(&R::decode_row(row)?)
+    w.put(crate::table::UNSCOPED, &R::decode_row(row)?)
 }
 
 fn apply_delete<R: Row>(w: &mut Writer<'_>, id: u64) -> io::Result<()> {
-    w.delete::<R>(Id::from_raw(id))
+    w.delete::<R>(crate::table::UNSCOPED, Id::from_raw(id))
 }
 
 fn rebuild_indexes<R: Row>(w: &mut Writer<'_>) -> io::Result<()> {

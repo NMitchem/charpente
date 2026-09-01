@@ -307,7 +307,16 @@ pub trait Row: Sized + 'static {
     /// rule 2 rules out reaching for a nightly feature to get one. Every
     /// `Row` impl — macro-generated and hand-written alike — must name
     /// `type Scope` explicitly.
-    type Scope;
+    ///
+    /// `: 'static` (Task 4): `row_is_scoped` below distinguishes a scoped
+    /// table from an unscoped one by comparing `TypeId::of::<R::Scope>()`
+    /// against `TypeId::of::<Unscoped>()` — a pure, deterministic function
+    /// of the type itself (no ambient state, hard rule 1), and one that
+    /// cannot drift out of sync with the very type `#[table(scoped_by =
+    /// …)]` sets, unlike a second, independently-set bool the macro could
+    /// forget to flip. `TypeId::of` requires `'static`; every real Scope
+    /// marker (`Unscoped`, an app's `Org`) satisfies it trivially.
+    type Scope: 'static;
     const TABLE: &'static str;
     const INDEXES: &'static [IndexDef<Self>];
     /// The row's schema version (`#[table(version = N)]`; `1` if omitted).
@@ -363,6 +372,65 @@ const META: TableDefinition<&str, u64> = TableDefinition::new("charpente.meta");
 
 fn rows_def(table: &str) -> TableDefinition<'_, u64, &'static [u8]> {
     TableDefinition::new(table)
+}
+
+/// A scoped table's row key: scope then id, both big-endian, so that
+/// lexicographic byte order matches (scope, id) numeric order and one
+/// tenant's rows form a contiguous range. Same reason `index_entry` encodes
+/// its trailing id big-endian. `pub`, not `pub(crate)`: exercised directly by
+/// `charpente-core/tests/engine.rs`, which — like every file under `tests/`
+/// — compiles as a separate crate seeing only this crate's public API.
+///
+/// Verified against redb 4.1.0's own `Key`/`Value` impls
+/// (`~/.cargo/registry/.../redb-4.1.0/src/types.rs`) before choosing this
+/// over `&[u8]`: `[u8; 16]` gets `Key`/`Value` via the blanket
+/// `impl<const N, T: Key> Key for [T; N]` / `impl<const N, T: Value> Value
+/// for [T; N]` with `T = u8` (`u8: Key + Value` via the `le_impl!` macro,
+/// `fixed_width() == Some(1)`). That blanket `Key::compare` walks the array
+/// element by element and, since each element is a single byte, reduces to
+/// exactly `data1.cmp(data2)` — plain lexicographic order over the 16 raw
+/// bytes, which is what big-endian encoding above depends on. `[u8; 16]` is
+/// also `fixed_width() == Some(16)`, which `&[u8]` (variable-width) is not —
+/// a fixed-width key is the better fit for a key redb can compare without an
+/// extra length probe.
+pub fn scoped_key(scope: u64, id: u64) -> [u8; 16] {
+    let mut k = [0u8; 16];
+    k[..8].copy_from_slice(&scope.to_be_bytes());
+    k[8..].copy_from_slice(&id.to_be_bytes());
+    k
+}
+
+fn scoped_rows_def(table: &str) -> TableDefinition<'_, [u8; 16], &'static [u8]> {
+    TableDefinition::new(table)
+}
+
+/// The row-key scope slot for a table that is not tenant-scoped — every
+/// table today. `pub`, not `pub(crate)`: `Writer::put`/`Writer::delete` now
+/// take an explicit, required scope (RULING, tenant-scoping Task 4 dispatch
+/// — deriving it from a row's own field, e.g. the spec's example `Invoice.
+/// org`, was refused: the platform never interprets the scoping key, and
+/// picking a field by name is the same unenforced-convention hazard
+/// `row_id_prefix`'s own comment warns about), so every existing caller
+/// outside this crate (`crates/charpente/tests/typed_tables.rs` drives
+/// `Writer` directly) must be able to name this constant rather than reach
+/// for a bare `0` whose meaning isn't visible at the call site. Deliberately
+/// a DIFFERENT constant from `db.rs`'s own private `UNSCOPED` (the overlay's
+/// scope slot) — same value, different layer, and conflating the two would
+/// blur "the overlay's staged-write key" with "the store's on-disk row key".
+/// Task 7's `tx.scope()` is the only thing that ever produces a value other
+/// than this one.
+pub const UNSCOPED: u64 = 0;
+
+/// Whether `R`'s rows use the composite `(scope, id)` key rather than a bare
+/// `id`. A pure function of the type `R::Scope` the (already-landed)
+/// `#[table(scoped_by = …)]` macro sets — not a second, independently
+/// tracked flag that could disagree with it. `TypeId::of` is deterministic
+/// and ambient-state-free (hard rule 1): it depends on nothing but the
+/// monomorphized type, so this same call always resolves to the same
+/// compile-time-knowable answer for a given `R`, and optimizes to a constant
+/// in release builds exactly as `R::VERSION`/`R::FINGERPRINT` do.
+fn row_is_scoped<R: Row>() -> bool {
+    std::any::TypeId::of::<R::Scope>() != std::any::TypeId::of::<Unscoped>()
 }
 
 fn index_table_name<R: Row>(index: &IndexDef<R>) -> String {
@@ -693,7 +761,7 @@ impl Store {
                 events_materialized: 0,
             };
             for id in ids {
-                writer.delete::<crate::event::EventRow>(Id::from_raw(id))?;
+                writer.delete::<crate::event::EventRow>(UNSCOPED, Id::from_raw(id))?;
             }
         }
         txn.commit().map_err(redb_err)?;
@@ -752,9 +820,19 @@ pub struct Writer<'txn> {
 }
 
 impl Writer<'_> {
-    pub fn put<R: Row>(&mut self, row: &R) -> io::Result<()> {
+    /// `scope` is required, not optional/defaulted (RULING, tenant-scoping
+    /// Task 4 dispatch — see `UNSCOPED`'s doc comment): a forgotten scope
+    /// must be a compile error at every call site, not a silently-defaulted
+    /// zero. Every existing caller — inside this crate and
+    /// `crates/charpente/tests/typed_tables.rs`, which drives `Writer`
+    /// directly — passes `UNSCOPED` explicitly; Task 7's `tx.scope()` is the
+    /// only thing that will ever produce another value. For an unscoped `R`,
+    /// `scope` is asserted rather than merely ignored (hard rule 4): a
+    /// caller passing a nonzero scope to an unscoped table is a bug the
+    /// bare-`u64` key path would otherwise silently swallow.
+    pub fn put<R: Row>(&mut self, scope: u64, row: &R) -> io::Result<()> {
         let id = row.id().raw();
-        let old = self.replace_row(row, id)?;
+        let old = self.replace_row(scope, row, id)?;
         for index in R::INDEXES {
             let mut table = self
                 .txn
@@ -776,13 +854,34 @@ impl Writer<'_> {
         Ok(())
     }
 
-    pub fn delete<R: Row>(&mut self, id: Id<R>) -> io::Result<()> {
-        let mut rows = self.txn.open_table(rows_def(R::TABLE)).map_err(redb_err)?;
-        let old = match rows.remove(id.raw()).map_err(redb_err)? {
-            Some(guard) => R::decode_row(guard.value())?,
-            None => return Ok(()), // deleting an absent row is a no-op
+    /// See `put`'s doc comment for why `scope` is required rather than
+    /// optional. Index entries are not yet scope-prefixed (Task 6) — that is
+    /// unchanged by this task, deliberately: the composite row key and the
+    /// index prefix are separate steps in the same shipping unit.
+    pub fn delete<R: Row>(&mut self, scope: u64, id: Id<R>) -> io::Result<()> {
+        let old = if row_is_scoped::<R>() {
+            let mut rows = self
+                .txn
+                .open_table(scoped_rows_def(R::TABLE))
+                .map_err(redb_err)?;
+            match rows.remove(scoped_key(scope, id.raw())).map_err(redb_err)? {
+                Some(guard) => R::decode_row(guard.value())?,
+                None => return Ok(()), // deleting an absent row is a no-op
+            }
+        } else {
+            assert_eq!(
+                scope,
+                UNSCOPED,
+                "Writer::delete: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) but \
+                 was called with scope {scope} — pass table::UNSCOPED for an unscoped table",
+                R::TABLE
+            );
+            let mut rows = self.txn.open_table(rows_def(R::TABLE)).map_err(redb_err)?;
+            match rows.remove(id.raw()).map_err(redb_err)? {
+                Some(guard) => R::decode_row(guard.value())?,
+                None => return Ok(()), // deleting an absent row is a no-op
+            }
         };
-        drop(rows);
         for index in R::INDEXES {
             let mut table = self
                 .txn
@@ -814,16 +913,19 @@ impl Writer<'_> {
         meta.insert("next_job_id", id + 1).map_err(redb_err)?;
         drop(meta);
         self.jobs_materialized += 1;
-        self.put(&crate::job::JobRow {
-            id: crate::table::Id::from_raw(id),
-            name: name.to_string(),
-            payload: payload.to_vec(),
-            key: key.map(str::to_string),
-            status: crate::job::JobStatus::Pending,
-            attempts: 0,
-            due_at: 0,
-            last_error: None,
-        })?;
+        self.put(
+            UNSCOPED,
+            &crate::job::JobRow {
+                id: crate::table::Id::from_raw(id),
+                name: name.to_string(),
+                payload: payload.to_vec(),
+                key: key.map(str::to_string),
+                status: crate::job::JobStatus::Pending,
+                attempts: 0,
+                due_at: 0,
+                last_error: None,
+            },
+        )?;
         Ok(id)
     }
 
@@ -845,13 +947,16 @@ impl Writer<'_> {
         meta.insert("next_event_id", id + 1).map_err(redb_err)?;
         drop(meta);
         self.events_materialized += 1;
-        self.put(&crate::event::EventRow {
-            id: crate::table::Id::from_raw(id),
-            seq,
-            name: name.to_string(),
-            key: key.map(str::to_string),
-            payload: payload.to_vec(),
-        })?;
+        self.put(
+            UNSCOPED,
+            &crate::event::EventRow {
+                id: crate::table::Id::from_raw(id),
+                seq,
+                name: name.to_string(),
+                key: key.map(str::to_string),
+                payload: payload.to_vec(),
+            },
+        )?;
         Ok(id)
     }
 
@@ -936,16 +1041,37 @@ impl Writer<'_> {
         }
     }
 
-    fn replace_row<R: Row>(&mut self, row: &R, id: u64) -> io::Result<Option<R>> {
-        let mut rows = self.txn.open_table(rows_def(R::TABLE)).map_err(redb_err)?;
-        let old = match rows.get(id).map_err(redb_err)? {
-            Some(guard) => Some(R::decode_row(guard.value())?),
-            None => None,
-        };
+    fn replace_row<R: Row>(&mut self, scope: u64, row: &R, id: u64) -> io::Result<Option<R>> {
         let mut encoded = Vec::new();
         row.encode_row(&mut encoded);
-        rows.insert(id, encoded.as_slice()).map_err(redb_err)?;
-        Ok(old)
+        if row_is_scoped::<R>() {
+            let mut rows = self
+                .txn
+                .open_table(scoped_rows_def(R::TABLE))
+                .map_err(redb_err)?;
+            let key = scoped_key(scope, id);
+            let old = match rows.get(key).map_err(redb_err)? {
+                Some(guard) => Some(R::decode_row(guard.value())?),
+                None => None,
+            };
+            rows.insert(key, encoded.as_slice()).map_err(redb_err)?;
+            Ok(old)
+        } else {
+            assert_eq!(
+                scope,
+                UNSCOPED,
+                "Writer::put: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) but was \
+                 called with scope {scope} — pass table::UNSCOPED for an unscoped table",
+                R::TABLE
+            );
+            let mut rows = self.txn.open_table(rows_def(R::TABLE)).map_err(redb_err)?;
+            let old = match rows.get(id).map_err(redb_err)? {
+                Some(guard) => Some(R::decode_row(guard.value())?),
+                None => None,
+            };
+            rows.insert(id, encoded.as_slice()).map_err(redb_err)?;
+            Ok(old)
+        }
     }
 }
 

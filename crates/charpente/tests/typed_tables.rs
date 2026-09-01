@@ -15,7 +15,7 @@ use charpente_core::engine::{Engine, StateMachine};
 use charpente_core::io::{Disk, Entropy, File};
 use charpente_core::job::JobRow;
 use charpente_core::log::WalConfig;
-use charpente_core::table::{Codec, Id, Snapshot, Store, View};
+use charpente_core::table::{Codec, Id, Snapshot, Store, UNSCOPED, View};
 use charpente_sim::checks::is_fault_fallout;
 use charpente_sim::{FaultConfig, Sim, run_universes_swarm};
 
@@ -150,12 +150,15 @@ fn typed_roundtrip_and_scan() {
     let (_sim, store) = quiet_store();
     store
         .apply(0, |w| {
-            w.put(&Org {
-                id: Id::from_raw(1),
-                name: "acme".into(),
-            })?;
-            w.put(&invoice(10, 1, 5000))?;
-            w.put(&invoice(11, 1, 200))
+            w.put(
+                UNSCOPED,
+                &Org {
+                    id: Id::from_raw(1),
+                    name: "acme".into(),
+                },
+            )?;
+            w.put(UNSCOPED, &invoice(10, 1, 5000))?;
+            w.put(UNSCOPED, &invoice(11, 1, 200))
         })
         .unwrap();
 
@@ -180,9 +183,9 @@ fn secondary_index_follows_updates_and_deletes() {
     let (acme, globex) = (Id::<Org>::from_raw(1), Id::<Org>::from_raw(2));
     store
         .apply(0, |w| {
-            w.put(&invoice(10, 1, 100))?;
-            w.put(&invoice(11, 1, 200))?;
-            w.put(&invoice(12, 2, 300))
+            w.put(UNSCOPED, &invoice(10, 1, 100))?;
+            w.put(UNSCOPED, &invoice(11, 1, 200))?;
+            w.put(UNSCOPED, &invoice(12, 2, 300))
         })
         .unwrap();
 
@@ -195,10 +198,12 @@ fn secondary_index_follows_updates_and_deletes() {
     assert_eq!(Invoice::by_org(&snap, &globex).unwrap().len(), 1);
 
     // Move invoice 11 to globex: the acme entry must disappear.
-    store.apply(1, |w| w.put(&invoice(11, 2, 200))).unwrap();
+    store
+        .apply(1, |w| w.put(UNSCOPED, &invoice(11, 2, 200)))
+        .unwrap();
     // Delete invoice 12: its globex entry must disappear.
     store
-        .apply(2, |w| w.delete::<Invoice>(Id::from_raw(12)))
+        .apply(2, |w| w.delete::<Invoice>(UNSCOPED, Id::from_raw(12)))
         .unwrap();
 
     let snap = store.snapshot().unwrap();
@@ -223,10 +228,14 @@ fn secondary_index_follows_updates_and_deletes() {
 #[test]
 fn snapshots_are_mvcc() {
     let (_sim, store) = quiet_store();
-    store.apply(0, |w| w.put(&invoice(1, 1, 100))).unwrap();
+    store
+        .apply(0, |w| w.put(UNSCOPED, &invoice(1, 1, 100)))
+        .unwrap();
 
     let before = store.snapshot().unwrap();
-    store.apply(1, |w| w.put(&invoice(2, 1, 200))).unwrap();
+    store
+        .apply(1, |w| w.put(UNSCOPED, &invoice(2, 1, 200)))
+        .unwrap();
 
     assert_eq!(
         before.scan::<Invoice>().unwrap().len(),
@@ -243,8 +252,12 @@ fn snapshots_are_mvcc() {
 fn applied_seq_tracks_and_must_be_gapless() {
     let (_sim, store) = quiet_store();
     assert_eq!(store.applied_seq().unwrap(), None);
-    store.apply(0, |w| w.put(&invoice(1, 1, 1))).unwrap();
-    store.apply(1, |w| w.put(&invoice(2, 1, 2))).unwrap();
+    store
+        .apply(0, |w| w.put(UNSCOPED, &invoice(1, 1, 1)))
+        .unwrap();
+    store
+        .apply(1, |w| w.put(UNSCOPED, &invoice(2, 1, 2)))
+        .unwrap();
     assert_eq!(store.applied_seq().unwrap(), Some(1));
 }
 
@@ -252,8 +265,10 @@ fn applied_seq_tracks_and_must_be_gapless() {
 #[should_panic(expected = "must be gapless")]
 fn applying_out_of_order_is_a_contract_violation() {
     let (_sim, store) = quiet_store();
-    store.apply(0, |w| w.put(&invoice(1, 1, 1))).unwrap();
-    let _ = store.apply(5, |w| w.put(&invoice(2, 1, 2)));
+    store
+        .apply(0, |w| w.put(UNSCOPED, &invoice(1, 1, 1)))
+        .unwrap();
+    let _ = store.apply(5, |w| w.put(UNSCOPED, &invoice(2, 1, 2)));
 }
 
 /// The durability model itself: un-checkpointed applies vanish in a crash
@@ -265,10 +280,16 @@ fn applying_out_of_order_is_a_contract_violation() {
 fn crash_reverts_to_the_last_checkpoint() {
     let sim = Sim::with_faults(0xC4A5, FaultConfig::none());
     let store = Store::open(&sim.disk(), "tables.redb").unwrap();
-    store.apply(0, |w| w.put(&invoice(1, 1, 100))).unwrap();
-    store.apply(1, |w| w.put(&invoice(2, 1, 200))).unwrap();
+    store
+        .apply(0, |w| w.put(UNSCOPED, &invoice(1, 1, 100)))
+        .unwrap();
+    store
+        .apply(1, |w| w.put(UNSCOPED, &invoice(2, 1, 200)))
+        .unwrap();
     store.checkpoint().unwrap();
-    store.apply(2, |w| w.put(&invoice(3, 1, 300))).unwrap(); // never checkpointed
+    store
+        .apply(2, |w| w.put(UNSCOPED, &invoice(3, 1, 300)))
+        .unwrap(); // never checkpointed
 
     sim.restart(); // crash with the database open — no graceful close
     drop(store); // its close attempts hit dead handles, harmlessly
@@ -491,8 +512,8 @@ fn tables_workload(sim: &mut Sim) -> Result<(), String> {
             let op = Op::decode(payload);
             if store
                 .apply(seq, |w| match &op {
-                    Op::Put(row) => w.put(row),
-                    Op::Delete(id) => w.delete::<Kv>(Id::from_raw(*id)),
+                    Op::Put(row) => w.put(UNSCOPED, row),
+                    Op::Delete(id) => w.delete::<Kv>(UNSCOPED, Id::from_raw(*id)),
                 })
                 .is_err()
             {
@@ -549,8 +570,8 @@ fn tables_workload(sim: &mut Sim) -> Result<(), String> {
             acked += 1;
             if store
                 .apply(seq, |w| match &op {
-                    Op::Put(row) => w.put(row),
-                    Op::Delete(id) => w.delete::<Kv>(Id::from_raw(*id)),
+                    Op::Put(row) => w.put(UNSCOPED, row),
+                    Op::Delete(id) => w.delete::<Kv>(UNSCOPED, Id::from_raw(*id)),
                 })
                 .is_err()
             {
@@ -705,6 +726,50 @@ fn table_macro_emits_the_declared_scope_type() {
     scope_is::<ScopedWidget, Org>();
 }
 
+/// Task 4 (tenant scoping): the composite-key wiring through the REAL
+/// `#[table(scoped_by = …)]` macro output, not just a hand-written stand-in
+/// (`charpente-core/tests/engine.rs` has one of those too, since `core`
+/// cannot depend on `charpente` to use the macro itself). Same shape as that
+/// test: a scoped put/delete must not error, and the resulting physical
+/// table must diverge from the bare-`u64`-keyed shape `scan_raw` still
+/// assumes (Task 5 teaches it the scoped shape) — proven by `scan_raw`
+/// failing with a `[u8;16]` key-type mismatch rather than silently reading
+/// nothing back, which is what a bug routing a scoped row through the
+/// unscoped path regardless of `Row::Scope` would look like.
+#[test]
+fn scoped_by_macro_output_stores_under_the_composite_key() {
+    use charpente::core::table::Row;
+
+    let (_sim, store) = quiet_store();
+    store
+        .apply(0, |w| {
+            w.put(
+                7,
+                &ScopedWidget {
+                    id: Id::from_raw(1),
+                    org: Id::from_raw(9),
+                },
+            )
+        })
+        .expect("a scoped put through the macro-generated Row impl must not error");
+    store
+        .apply(1, |w| w.delete::<ScopedWidget>(7, Id::from_raw(1)))
+        .expect("a scoped delete through the macro-generated Row impl must not error");
+
+    let snap = store.snapshot().unwrap();
+    let err = snap
+        .scan_raw(ScopedWidget::TABLE)
+        .expect_err(
+            "a scoped table's physical redb table must be [u8; 16]-keyed, same as \
+             charpente-core/tests/engine.rs's hand-written case",
+        )
+        .to_string();
+    assert!(
+        err.contains("[u8;16]") || err.contains("[u8; 16]"),
+        "expected a [u8;16] key-type mismatch, got: {err}"
+    );
+}
+
 #[test]
 fn row_shape_roundtrips_under_its_own_codec() {
     use charpente::core::table::RowShape;
@@ -719,7 +784,9 @@ fn row_shape_roundtrips_under_its_own_codec() {
 #[test]
 fn apply_batch_rolls_back_every_record_when_one_fails() {
     let (_sim, store) = quiet_store();
-    store.apply(0, |w| w.put(&invoice(1, 1, 100))).unwrap();
+    store
+        .apply(0, |w| w.put(UNSCOPED, &invoice(1, 1, 100)))
+        .unwrap();
 
     let records: Vec<(u64, &[u8])> = vec![(1, b"a"), (2, b"b"), (3, b"c")];
     let err = store
@@ -727,7 +794,7 @@ fn apply_batch_rolls_back_every_record_when_one_fails() {
             if seq == 3 {
                 return Err(io::Error::other("the third record refuses"));
             }
-            w.put(&invoice(seq + 10, 1, 500))
+            w.put(UNSCOPED, &invoice(seq + 10, 1, 500))
         })
         .expect_err("the third record's failure must fail the whole batch");
     assert_eq!(err.to_string(), "the third record refuses");
@@ -754,7 +821,7 @@ fn apply_batch_commits_every_record_and_ends_at_the_last_seq() {
     let records: Vec<(u64, &[u8])> = vec![(0, b"a"), (1, b"b"), (2, b"c")];
     store
         .apply_batch(&records, |w, seq, _payload| {
-            w.put(&invoice(seq + 1, 1, 100))
+            w.put(UNSCOPED, &invoice(seq + 1, 1, 100))
         })
         .expect("all three records apply");
 
@@ -773,7 +840,7 @@ fn apply_batch_commits_every_record_and_ends_at_the_last_seq() {
 fn apply_batch_rejects_a_wrong_first_seq() {
     let (_sim, store) = quiet_store();
     let records: Vec<(u64, &[u8])> = vec![(7, b"a")];
-    let _ = store.apply_batch(&records, |w, _seq, _p| w.put(&invoice(1, 1, 1)));
+    let _ = store.apply_batch(&records, |w, _seq, _p| w.put(UNSCOPED, &invoice(1, 1, 1)));
 }
 
 #[test]
@@ -781,7 +848,9 @@ fn apply_batch_rejects_a_wrong_first_seq() {
 fn apply_batch_rejects_a_gap_in_the_middle_of_a_batch() {
     let (_sim, store) = quiet_store();
     let records: Vec<(u64, &[u8])> = vec![(0, b"a"), (1, b"b"), (3, b"c")];
-    let _ = store.apply_batch(&records, |w, seq, _p| w.put(&invoice(seq + 1, 1, 1)));
+    let _ = store.apply_batch(&records, |w, seq, _p| {
+        w.put(UNSCOPED, &invoice(seq + 1, 1, 1))
+    });
 }
 
 /// Spec §3's new invariant, from the reader's side: a read taken through the
@@ -797,7 +866,7 @@ fn a_read_through_the_writer_inside_a_batch_sees_the_batch_so_far() {
     store
         .apply_batch(&records, |w, seq, _payload| {
             seen.push(w.applied_seq()?);
-            w.put(&invoice(seq + 1, 1, 100))
+            w.put(UNSCOPED, &invoice(seq + 1, 1, 100))
         })
         .expect("both records apply");
 
@@ -820,7 +889,7 @@ fn apply_batch_of_nothing_is_a_no_op() {
     let (_sim, store, counts) = counting_store();
     let before = counts.total();
     store
-        .apply_batch(&[], |w, _s, _p| w.put(&invoice(1, 1, 1)))
+        .apply_batch(&[], |w, _s, _p| w.put(UNSCOPED, &invoice(1, 1, 1)))
         .expect("an empty batch is a no-op");
     let after = counts.total();
     assert_eq!(store.applied_seq().unwrap(), None);
