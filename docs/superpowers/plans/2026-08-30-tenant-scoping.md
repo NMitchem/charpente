@@ -528,6 +528,95 @@ git commit -m "feat(core): the effects record carries a scope, so replay cannot 
 
 ---
 
+### Task 6c: The raw path carries the scope, or seeding and restore merge every tenant into tenant 0
+
+**This task exists because ruling R22's owed sweep found three more instances of its own bug.** Task 4 widened the **typed** write path. Every **decode-free** primitive in the store layer — and everything built on them: migration replay, snapshot export, follower seeding, archive restore — was left on the bare `u64` key by every task in this plan. I-1 (the overlay) and R22 (the WAL record) were this same mistake found twice; these are the third, fourth and fifth. The census is `scope-carrier-sweep.md`; the ruling is R24.
+
+**Ordered after Task 6b and before Task 7**, for the same reason 6b is: Task 7 makes scoped writes reachable by an app, and from that commit onward each of these is a live corruption or a hard break.
+
+**Seam against Task 6b:** 6b owns the **typed** record path (`Effect::Put`/`Effect::Delete`, which flow into the `Writer::put(scope, ..)`/`delete(scope, ..)` Task 4 already widened). 6c owns the **raw** path. `Effect::MigratePut` is here, not in 6b, because its apply calls `put_raw` — a 6b that added a scope to MigratePut would have nowhere to put it.
+
+**Files:**
+- Modify: `crates/charpente-core/src/table.rs:1000-1020` (`put_raw`/`delete_raw`/`get_raw`), `:1243-1255` (`scan_raw`)
+- Modify: `crates/charpente-core/src/db.rs:342` + `:476` + `:913` (`Effect::MigratePut` shape, tag, apply), `:2566-2574` (`Seeder::rows`)
+- Modify: `crates/charpente/src/repl/protocol.rs:51` + `:191` (`Msg::SnapshotRows`), `crates/charpente/src/repl/session.rs:449-470` (`begin_seeding`)
+- Modify: `crates/charpente/src/archive/restore.rs:276`
+- Test: `crates/charpente-core/tests/engine.rs`, `crates/charpente/tests/replication.rs`, `crates/charpente-sim/tests/crash_recovery.rs`
+
+**Interfaces:**
+- Consumes: `scoped_key`, `scoped_rows_def`, `UNSCOPED` (Task 4); the record-shape precedent 6b sets (new tag, not a widened one).
+- Produces: a raw path that round-trips a scope, which Task 12's two-tenant wire oracle exercises end to end.
+
+- [ ] **Step 1: Re-census before believing any of this**
+
+The sweep ran against the working tree before Task 6b landed, and 6b may have incidentally fixed some of it — widening the shared `apply_put` function-pointer signature would reach `Seeder::rows` for free. **Do not implement from the list above without re-checking it.**
+
+```bash
+sed -n '2560,2580p' crates/charpente-core/src/db.rs      # does Seeder::rows still discard the id?
+sed -n '998,1022p' crates/charpente-core/src/table.rs    # do the raw primitives still open rows_def?
+sed -n '1240,1258p' crates/charpente-core/src/table.rs   # does scan_raw still open rows_def?
+```
+
+Report which of the three are still open. Implement only those; say so explicitly for any that 6b already closed.
+
+- [ ] **Step 2: The tripwire — prove the corruption before fixing it**
+
+Two tests, both of which must FAIL first. Assert against **stored bytes**, not a round-trip through the same broken encoder — a round-trip passes while both ends are wrong.
+
+```rust
+#[test]
+fn a_scoped_row_survives_a_snapshot_seed_with_its_scope_intact() {
+    // Tenant 2 writes id 7. Export via Snapshot::scan_raw, re-import via
+    // Seeder::rows, then read the follower's stored key bytes directly.
+    // Expected today: either TableTypeMismatch on the export (scan_raw opens
+    // the bare rows_def), or a row landing under scope 0 on the import
+    // (Seeder::rows does `let _ = id` and apply_put has no scope source).
+}
+
+#[test]
+fn a_scoped_row_survives_archive_restore_with_its_scope_intact() {
+    // Same property through crates/charpente/src/archive/restore.rs:276.
+}
+```
+
+Run them, paste the failure output into the report, and only then continue. A fix landed against a test that never failed is the failure mode this repo has already been bitten by ([[green-mutation-proves-nothing]]).
+
+- [ ] **Step 3: Widen the raw primitives**
+
+`put_raw`/`delete_raw`/`get_raw`/`scan_raw` take a scope and select `scoped_rows_def` vs `rows_def` on the same rule Task 4 established. `scan_raw` returns the scope alongside the id — its signature becomes `Vec<(u64, u64, Vec<u8>)>` or a named struct; pick one and say why in the report. Unscoped tables keep the exact bare-`u64` key and the exact existing `scan_raw` shape where that is achievable, because the pinned-seed guarantee rests on it.
+
+- [ ] **Step 4: `Effect::MigratePut` carries the scope**
+
+Follow the precedent Task 6b sets: **a new tag, not a widened one**, so a follower on an older binary hits the existing unknown-tag refusal by name instead of misreading a longer record as a shorter one. Then prove unscoped `MigratePut` records did not move, byte-for-byte, against **committed expected bytes** — not against a fresh encode of the same value, which would agree with itself no matter what the encoder does.
+
+- [ ] **Step 5: The seed transport stops discarding what it carries**
+
+`Msg::SnapshotRows`'s `rows: Vec<(u64, Vec<u8>)>` gains the scope. `Seeder::rows` loses its `let _ = id;` — and note that that line has a comment actively justifying the discard (*"not because `apply_put` needs it"*), which is true today and false the moment a scoped table exists. **Correct the comment in the same commit**; a stale rationale comment is how the next reader re-derives the same wrong conclusion.
+
+- [ ] **Step 6: Run the suites, then a seeded sim sweep**
+
+```bash
+cargo test -p charpente-core 2>&1 | tee /tmp/t6c-core.log; echo "exit=${pipestatus[1]}"
+cargo test -p charpente 2>&1 | tee /tmp/t6c-plat.log; echo "exit=${pipestatus[1]}"
+cargo test -p charpente-sim 2>&1 | tee /tmp/t6c-sim.log; echo "exit=${pipestatus[1]}"
+```
+
+Hard rule 3: this touches crash recovery and follower seeding, so it lands with seeded fault-injection coverage and **the commit states the seed count**. Partition per package — the workspace suite does not reliably finish inside one Bash call.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add crates/charpente-core/src/table.rs crates/charpente-core/src/db.rs \
+        crates/charpente/src/repl/protocol.rs crates/charpente/src/repl/session.rs \
+        crates/charpente/src/archive/restore.rs \
+        crates/charpente-core/tests/engine.rs crates/charpente/tests/replication.rs \
+        crates/charpente-sim/tests/crash_recovery.rs
+git commit -m "feat(core): the raw path carries the scope, so seeding and restore keep tenants apart"
+```
+
+Named paths only, never `git add -A`.
+
+---
 ### Task 7: `ScopedTx`, the `Tx` bound split, and `tx.scope()`
 
 **Files:**
