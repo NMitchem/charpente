@@ -537,7 +537,7 @@ git commit -m "feat(core): the effects record carries a scope, so replay cannot 
 **Seam against Task 6b:** 6b owns the **typed** record path (`Effect::Put`/`Effect::Delete`, which flow into the `Writer::put(scope, ..)`/`delete(scope, ..)` Task 4 already widened). 6c owns the **raw** path. `Effect::MigratePut` is here, not in 6b, because its apply calls `put_raw` — a 6b that added a scope to MigratePut would have nowhere to put it.
 
 **Files:**
-- Modify: `crates/charpente-core/src/table.rs:1000-1020` (`put_raw`/`delete_raw`/`get_raw`), `:1243-1255` (`scan_raw`)
+- Modify: `crates/charpente-core/src/table.rs:1000-1020` (`put_raw`/`delete_raw`/`get_raw`), `:1243-1255` (`scan_raw`), `:969-991` (`rebuild_indexes_for`)
 - Modify: `crates/charpente-core/src/db.rs:342` + `:476` + `:913` (`Effect::MigratePut` shape, tag, apply), `:2566-2574` (`Seeder::rows`)
 - Modify: `crates/charpente/src/repl/protocol.rs:51` + `:191` (`Msg::SnapshotRows`), `crates/charpente/src/repl/session.rs:449-470` (`begin_seeding`)
 - Modify: `crates/charpente/src/archive/restore.rs:276`
@@ -555,9 +555,12 @@ The sweep ran against the working tree before Task 6b landed, and 6b may have in
 sed -n '2560,2580p' crates/charpente-core/src/db.rs      # does Seeder::rows still discard the id?
 sed -n '998,1022p' crates/charpente-core/src/table.rs    # do the raw primitives still open rows_def?
 sed -n '1240,1258p' crates/charpente-core/src/table.rs   # does scan_raw still open rows_def?
+sed -n '965,995p' crates/charpente-core/src/table.rs     # does rebuild_indexes_for still open rows_def?
 ```
 
-Report which of the three are still open. Implement only those; say so explicitly for any that 6b already closed.
+Report which are still open. Implement only those; say so explicitly for any that 6b already closed.
+
+**`rebuild_indexes_for` was added to this list by Task 4's reviewer, not by the original sweep.** It opens `rows_def(R::TABLE)` unconditionally, so any scoped table with a non-empty `INDEXES` fails with `TableTypeMismatch` at migration close-out (`TableOps::rebuild_indexes`). Loud rather than silent, which is why it ranks below the seeding and restore gaps — but it was on no task's list at all until the review caught it, which is the sixth instance of this plan's recurring mistake and the reason this step exists.
 
 - [ ] **Step 2: The tripwire — prove the corruption before fixing it**
 
