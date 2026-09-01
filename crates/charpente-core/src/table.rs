@@ -377,9 +377,12 @@ fn rows_def(table: &str) -> TableDefinition<'_, u64, &'static [u8]> {
 /// A scoped table's row key: scope then id, both big-endian, so that
 /// lexicographic byte order matches (scope, id) numeric order and one
 /// tenant's rows form a contiguous range. Same reason `index_entry` encodes
-/// its trailing id big-endian. `pub`, not `pub(crate)`: exercised directly by
-/// `charpente-core/tests/engine.rs`, which — like every file under `tests/`
-/// — compiles as a separate crate seeing only this crate's public API.
+/// its trailing id big-endian. `pub(crate)`, deliberately: this is an
+/// internal key encoding, and `charpente-core`'s public surface is re-exported
+/// wholesale through `charpente` (officially load-bearing), so anything `pub`
+/// here is a compatibility promise. Nothing forces it wider — the ordering
+/// property is pinned by `scoped_key_tests` below, in this crate, and that
+/// test needs neither a `Store` nor a `Sim`.
 ///
 /// Verified against redb 4.1.0's own `Key`/`Value` impls
 /// (`~/.cargo/registry/.../redb-4.1.0/src/types.rs`) before choosing this
@@ -393,7 +396,7 @@ fn rows_def(table: &str) -> TableDefinition<'_, u64, &'static [u8]> {
 /// also `fixed_width() == Some(16)`, which `&[u8]` (variable-width) is not —
 /// a fixed-width key is the better fit for a key redb can compare without an
 /// extra length probe.
-pub fn scoped_key(scope: u64, id: u64) -> [u8; 16] {
+pub(crate) fn scoped_key(scope: u64, id: u64) -> [u8; 16] {
     let mut k = [0u8; 16];
     k[..8].copy_from_slice(&scope.to_be_bytes());
     k[8..].copy_from_slice(&id.to_be_bytes());
@@ -429,8 +432,38 @@ pub const UNSCOPED: u64 = 0;
 /// monomorphized type, so this same call always resolves to the same
 /// compile-time-knowable answer for a given `R`, and optimizes to a constant
 /// in release builds exactly as `R::VERSION`/`R::FINGERPRINT` do.
-fn row_is_scoped<R: Row>() -> bool {
+pub(crate) fn row_is_scoped<R: Row>() -> bool {
     std::any::TypeId::of::<R::Scope>() != std::any::TypeId::of::<Unscoped>()
+}
+
+#[cfg(test)]
+mod scoped_key_tests {
+    use super::*;
+
+    /// Task 4 (tenant scoping), Step 2: `scoped_key`'s ordering property.
+    ///
+    /// A unit test, not an integration one: it needs no `Store` and no `Sim`,
+    /// so it does not pay the price `engine.rs`'s module doc explains (a
+    /// `#[cfg(test)]` build of this crate is a distinct compilation unit from
+    /// the one `charpente-sim` links against, so anything touching a `Disk`
+    /// has to live under `tests/`). Keeping it here is what lets `scoped_key`
+    /// stay `pub(crate)`.
+    #[test]
+    fn a_scoped_key_orders_by_scope_then_id() {
+        // Big-endian is load-bearing: lexicographic byte order must agree with
+        // (scope, id) numeric order, or a prefix range is not contiguous and
+        // the whole scan guarantee collapses into a filter.
+        let a = scoped_key(1, u64::MAX);
+        let b = scoped_key(2, 0);
+        assert!(
+            a < b,
+            "tenant 1's last row must sort before tenant 2's first"
+        );
+
+        let c = scoped_key(1, 5);
+        let d = scoped_key(1, 6);
+        assert!(c < d, "within a tenant, ids must stay ordered");
+    }
 }
 
 fn index_table_name<R: Row>(index: &IndexDef<R>) -> String {

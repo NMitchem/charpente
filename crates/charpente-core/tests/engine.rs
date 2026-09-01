@@ -22,7 +22,7 @@ use charpente_core::engine::{Engine, REHELLO_MARKER, StateMachine};
 use charpente_core::io::{Disk, File};
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::log::{Wal, WalConfig};
-use charpente_core::table::{Codec, Id, IndexDef, Row, Store, UNSCOPED, Unscoped, scoped_key};
+use charpente_core::table::{Codec, Id, IndexDef, Row, Snapshot, Store, UNSCOPED, Unscoped, View};
 use charpente_sim::{FaultConfig, Sim};
 
 #[derive(Default)]
@@ -462,24 +462,10 @@ fn an_ordinary_table_is_unscoped_by_default() {
     assert_unscoped::<JobRow>();
 }
 
-/// Task 4 (tenant scoping), Step 2: `scoped_key`'s ordering property. Verbatim
-/// from the task brief.
-#[test]
-fn a_scoped_key_orders_by_scope_then_id() {
-    // Big-endian is load-bearing: lexicographic byte order must agree with
-    // (scope, id) numeric order, or a prefix range is not contiguous and the
-    // whole scan guarantee collapses into a filter.
-    let a = scoped_key(1, u64::MAX);
-    let b = scoped_key(2, 0);
-    assert!(
-        a < b,
-        "tenant 1's last row must sort before tenant 2's first"
-    );
-
-    let c = scoped_key(1, 5);
-    let d = scoped_key(1, 6);
-    assert!(c < d, "within a tenant, ids must stay ordered");
-}
+// `scoped_key`'s ordering property is pinned by `table.rs`'s own
+// `scoped_key_tests` unit module — it needs no `Store`, so it does not need
+// to be out here, and keeping it there is what lets `scoped_key` stay
+// `pub(crate)`.
 
 /// Task 4 (tenant scoping), Step 5: the pinned-seed guarantee rests on
 /// unscoped tables staying byte-identical after this change — every pinned
@@ -525,63 +511,149 @@ fn an_unscoped_table_still_writes_a_bare_u64_key() {
     );
 }
 
-/// Task 4 (tenant scoping): a scoped Row (`Row::Scope != Unscoped`) really is
-/// stored under `scoped_key`'s composite `(scope, id)`, not the bare `u64`
-/// key the test above pins for the unscoped case. `engine.rs` cannot use
-/// `#[table(scoped_by = …)]` — the macro emits `::charpente::` paths, and
-/// core cannot depend on that crate (same reason `JobRow` stands in for a
-/// macro-generated type above) — so this hand-writes a `Row` impl the same
-/// way `JobRow`/`EventRow` do (DESIGN §3), with `type Scope` set to a local
+struct TestOrg;
+
+/// A hand-written scoped `Row` for the two tests below. `engine.rs` cannot use
+/// `#[table(scoped_by = …)]` — the macro emits `::charpente::` paths, and core
+/// cannot depend on that crate (same reason `JobRow` stands in for a
+/// macro-generated type elsewhere in this file) — so this hand-writes the impl
+/// the way `JobRow`/`EventRow` do (DESIGN §3), with `type Scope` set to a
 /// marker distinct from `Unscoped`.
 ///
-/// What this test can and cannot observe, stated honestly: `Snapshot::get`/
-/// `scan` stay unscoped-only until Task 7's `ScopedTx`, and `Snapshot::
-/// scan_raw` still assumes the bare-`u64` `TableDefinition` (Task 5 teaches
-/// it the scoped shape) — so there is no sanctioned way, yet, to decode a
-/// scoped row's bytes back from outside `table.rs`. What IS observable
-/// without any of that: a scoped `put`/`delete` must not error, two tenants
-/// writing the SAME id must not collide, and the table `scoped_key` writes
-/// into must be a PHYSICALLY DIFFERENT redb table — `scan_raw` must fail to
-/// open it with `TableTypeMismatch` naming the `[u8;16]` key, not silently
-/// read it back empty. Silent-empty is exactly what a bug that routed a
-/// scoped row through the old bare-`u64` path regardless of `Row::Scope`
-/// would produce, which is why this checks the failure's shape, not just
-/// its presence.
+/// The secondary index is not decoration: it is the only handle an integration
+/// test has on a scoped table's contents before Task 5/Task 7 land. See
+/// `ticket_index_entry_survives`.
+struct Ticket {
+    id: Id<Ticket>,
+    n: u32,
+}
+
+impl Row for Ticket {
+    type Scope = TestOrg;
+    const TABLE: &'static str = "test.ticket";
+    const INDEXES: &'static [IndexDef<Ticket>] = &[IndexDef {
+        name: "by_n",
+        key: |t, out| t.n.encode(out),
+    }];
+
+    fn id(&self) -> Id<Ticket> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.n.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<Ticket> {
+        let input = &mut &bytes[..];
+        let id = Id::decode(input)?;
+        let n = u32::decode(input)?;
+        Ok(Ticket { id, n })
+    }
+}
+
+/// Whether `Ticket`'s `by_n` index still holds an entry for `n`.
+///
+/// What `scan_by` can and cannot see on a scoped table, exactly: it walks the
+/// index range FIRST and only reaches `Snapshot::get` if that range is
+/// non-empty — and `get` is still bare-`u64` keyed until Task 7, so on a
+/// `[u8; 16]`-keyed table it fails with redb's key-type mismatch. So an entry
+/// that EXISTS makes `scan_by` return that mismatch, and an entry that is GONE
+/// makes it return `Ok(vec![])` without ever opening the rows table. That
+/// Err/Ok split is the observable — indirect, but exact, and the only one
+/// available from outside `table.rs` until Task 5's prefix scan lands. The
+/// error's shape is checked, not just its presence, so an unrelated failure
+/// cannot masquerade as a surviving entry.
+fn ticket_index_entry_survives(snap: &Snapshot, n: u32) -> bool {
+    match snap.scan_by::<Ticket>("by_n", &n) {
+        Ok(rows) => {
+            assert!(
+                rows.is_empty(),
+                "scan_by cannot decode a scoped row yet — a non-empty Ok means Snapshot::get \
+                 started reading scoped tables and this helper's Err/Ok observable is no longer \
+                 valid"
+            );
+            false
+        }
+        Err(e) => {
+            let e = e.to_string();
+            assert!(
+                e.contains("[u8;16]") || e.contains("[u8; 16]"),
+                "the only Err this helper treats as \"index entry present\" is the [u8;16] \
+                 key-type mismatch from Snapshot::get; got: {e}"
+            );
+            true
+        }
+    }
+}
+
+/// Task 4 (tenant scoping): a scoped Row (`Row::Scope != Unscoped`) is stored
+/// in a PHYSICALLY DIFFERENT redb table from the bare-`u64`-keyed one the test
+/// above pins for the unscoped case — `scan_raw`, still typed
+/// `TableDefinition<u64, &[u8]>` (Task 5 teaches it the scoped shape), must
+/// fail to open it with `TableTypeMismatch` naming the `[u8;16]` key rather
+/// than silently reading it back empty. Silent-empty is exactly what a bug
+/// routing a scoped row through the old bare-`u64` path regardless of
+/// `Row::Scope` would produce, which is why this checks the failure's shape,
+/// not just its presence.
+///
+/// What this test does NOT observe: the scope's *value*. It passes unchanged
+/// if `scoped_key(scope, id)` becomes `scoped_key(UNSCOPED, id)`, because the
+/// key stays 16 bytes wide either way. That property is
+/// `two_tenants_rows_survive_each_other_under_the_composite_key`'s job.
 #[test]
 fn a_scoped_table_stores_under_the_composite_key_not_a_bare_u64() {
-    struct TestOrg;
-
-    struct Ticket {
-        id: Id<Ticket>,
-        n: u32,
-    }
-
-    impl Row for Ticket {
-        type Scope = TestOrg;
-        const TABLE: &'static str = "test.ticket";
-        const INDEXES: &'static [IndexDef<Ticket>] = &[];
-
-        fn id(&self) -> Id<Ticket> {
-            self.id
-        }
-        fn encode_row(&self, out: &mut Vec<u8>) {
-            self.id.encode(out);
-            self.n.encode(out);
-        }
-        fn decode_row(bytes: &[u8]) -> io::Result<Ticket> {
-            let input = &mut &bytes[..];
-            let id = Id::decode(input)?;
-            let n = u32::decode(input)?;
-            Ok(Ticket { id, n })
-        }
-    }
-
     let sim = Sim::with_faults(0x7A2E_0008, FaultConfig::none());
     let store = Store::open(&sim.disk(), "store.redb").unwrap();
 
-    // Two tenants writing the SAME id — the exact case the composite key
-    // exists to keep apart (hard rule 4: exercise the negative space, not
-    // just the happy path).
+    store
+        .apply(0, |w| {
+            w.put(
+                10,
+                &Ticket {
+                    id: Id::from_raw(5),
+                    n: 1,
+                },
+            )
+        })
+        .expect("a scoped put must not error");
+
+    let snap = store.snapshot().unwrap();
+    let err = snap
+        .scan_raw(Ticket::TABLE)
+        .expect_err(
+            "a scoped table's physical redb table must be [u8; 16]-keyed — scan_raw, still \
+             typed TableDefinition<u64, &[u8]>, must fail to open it rather than silently \
+             reading nothing, which is what a bug routing a scoped row through the unscoped \
+             path regardless of Row::Scope would look like",
+        )
+        .to_string();
+    assert!(
+        err.contains("[u8;16]") || err.contains("[u8; 16]"),
+        "scan_raw's failure must be exactly a key-type mismatch against a [u8;16]-keyed \
+         table, not some other error: {err}"
+    );
+}
+
+/// Task 4's central claim, and the only test that goes red when it stops
+/// being true: the SCOPE reaches the stored key. A 16-byte key alone proves
+/// nothing — `scoped_key(UNSCOPED, id)` is also 16 bytes — so this pins the
+/// consequence of dropping the scope instead of the key's width.
+///
+/// The mechanism that makes the value observable without Task 5's prefix scan
+/// or Task 7's `ScopedTx`: two tenants write the SAME id. Under a correct
+/// composite key those are two distinct rows, so both index entries stand.
+/// Under a scope-dropping key they are one row, so tenant 20's `put` reads
+/// tenant 10's row back as `old` in `replace_row` and REMOVES tenant 10's
+/// index entry — a silent overwrite that no "did it error?" assertion can
+/// see. Symmetrically, `Writer::delete`'s own `scoped_key` call is pinned by
+/// the second half: deleting tenant 10's row must retire tenant 10's index
+/// entry and leave tenant 20's alone; a scope-dropping delete finds nothing at
+/// `(0, 5)`, returns its absent-row no-op, and leaves BOTH entries standing.
+#[test]
+fn two_tenants_rows_survive_each_other_under_the_composite_key() {
+    let sim = Sim::with_faults(0x7A2E_000A, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
     store
         .apply(0, |w| {
             w.put(
@@ -599,25 +671,33 @@ fn a_scoped_table_stores_under_the_composite_key_not_a_bare_u64() {
                 },
             )
         })
-        .expect("two tenants writing the same id must not collide or error");
+        .expect("two tenants writing the same id must not error");
+
+    let snap = store.snapshot().unwrap();
+    assert!(
+        ticket_index_entry_survives(&snap, 1),
+        "tenant 10's row must survive tenant 20's put of the same id — its index entry is gone, \
+         which means the second put overwrote the first: the scope is not reaching the row key"
+    );
+    assert!(
+        ticket_index_entry_survives(&snap, 2),
+        "tenant 20's own put must be indexed"
+    );
+    drop(snap);
+
     store
         .apply(1, |w| w.delete::<Ticket>(10, Id::from_raw(5)))
         .expect("deleting tenant 10's row must not error");
 
     let snap = store.snapshot().unwrap();
-    let err = snap
-        .scan_raw(Ticket::TABLE)
-        .expect_err(
-            "a scoped table's physical redb table must be [u8; 16]-keyed — scan_raw, still \
-             typed TableDefinition<u64, &[u8]>, must fail to open it rather than silently \
-             reading nothing, which is what a bug routing a scoped row through the unscoped \
-             path regardless of Row::Scope would look like",
-        )
-        .to_string();
     assert!(
-        err.contains("[u8;16]") || err.contains("[u8; 16]"),
-        "scan_raw's failure must be exactly a key-type mismatch against a [u8;16]-keyed \
-         table, not some other error: {err}"
+        !ticket_index_entry_survives(&snap, 1),
+        "deleting tenant 10's row must retire tenant 10's index entry — an entry left standing \
+         means the delete looked for the row under a different scope and found nothing"
+    );
+    assert!(
+        ticket_index_entry_survives(&snap, 2),
+        "deleting tenant 10's id 5 must NOT touch tenant 20's id 5"
     );
 }
 
@@ -647,4 +727,18 @@ fn an_unscoped_put_with_a_nonzero_scope_panics() {
             },
         )
     });
+}
+
+/// `Writer::delete` carries a second, separately-worded copy of the assertion
+/// above; deleting it left every test green. Same hard-rule-4 reasoning, and
+/// the `expected` string names `Writer::delete` specifically so this cannot
+/// pass on `put`'s message instead.
+#[test]
+#[should_panic(expected = "Writer::delete: table \"charpente.jobs\" is not tenant-scoped")]
+fn an_unscoped_delete_with_a_nonzero_scope_panics() {
+    let sim = Sim::with_faults(0x7A2E_000B, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+    // Deleting an ABSENT row: the assertion must fire before the lookup, or a
+    // caller's mistaken scope is swallowed by the absent-row no-op.
+    let _ = store.apply(0, |w| w.delete::<JobRow>(7, Id::from_raw(1)));
 }

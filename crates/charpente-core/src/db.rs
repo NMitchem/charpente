@@ -157,14 +157,38 @@ struct TableOps {
 // module's own `UNSCOPED` (the overlay's key slot, below) — Effect::Put and
 // Effect::Delete carry no scope field yet (v0 record format; see the
 // GroupOverlay doc comment), so replay has nothing but the unscoped value to
-// pass here regardless. A scoped table reaching this path is future work
-// (spec §2's Task 4/12 note), not something either UNSCOPED constant papers
-// over.
+// pass here regardless.
+//
+// Hard rule 4, negative space: that is safe ONLY while no scoped table is
+// registered, so both functions assert it rather than leaving it as a
+// comment. `Writer::put`/`Writer::delete` panic on the mirror-image mistake
+// (a bogus scope on an unscoped table); this is the far more dangerous
+// direction — a REAL scope silently replaced by 0 on the effect path, which
+// is the only path production writes take, primary and follower replay
+// alike — so it gets an oracle, not a note. Task 6b puts the scope in the
+// record and removes both assertions.
 fn apply_put<R: Row>(w: &mut Writer<'_>, row: &[u8]) -> io::Result<()> {
+    assert!(
+        !crate::table::row_is_scoped::<R>(),
+        "Schema::table: \"{}\" is tenant-scoped (Row::Scope != Unscoped), but Effect::Put \
+         carries no scope field (v0 record format), so db.rs's apply_put would replay every \
+         tenant's rows under scope 0 and merge them — registering a scoped table is blocked \
+         until tenant-scoping Task 6b adds the scope to the record and lifts this assertion",
+        R::TABLE
+    );
     w.put(crate::table::UNSCOPED, &R::decode_row(row)?)
 }
 
 fn apply_delete<R: Row>(w: &mut Writer<'_>, id: u64) -> io::Result<()> {
+    assert!(
+        !crate::table::row_is_scoped::<R>(),
+        "Schema::table: \"{}\" is tenant-scoped (Row::Scope != Unscoped), but Effect::Delete \
+         carries no scope field (v0 record format), so db.rs's apply_delete would replay every \
+         tenant's deletes against scope 0 and hit the wrong tenant's row — registering a scoped \
+         table is blocked until tenant-scoping Task 6b adds the scope to the record and lifts \
+         this assertion",
+        R::TABLE
+    );
     w.delete::<R>(crate::table::UNSCOPED, Id::from_raw(id))
 }
 
