@@ -62,7 +62,7 @@ field" heading at line 131) promoting scan-then-filter to a sanctioned idiom; DE
 item 3 already records the same evidence informally. One gap in one small app is not a
 pattern; the trigger does not fire. What reopens it: a second app, or a second forced
 scan-filter in invoicing, that needs a range/comparison index — at which point `#[index]`
-grows an order-preserving encoding (DESIGN §4, line 689: "exact-match lookups only until a
+grows an order-preserving encoding (DESIGN §4, line 692-693: "exact-match lookups only until a
 real query pattern demands order-preserving key encoding").
 
 ## 5. Compiled-in Rust app code, not a WASM plugin model
@@ -91,9 +91,9 @@ follower promoted mid-write-load loses nothing and serves reads throughout" — 
 (PLAN.md M1 exit criteria). The non-converged tail is exactly the §6 loss window, reported
 separately rather than hidden: `charpente promote`'s `CtrlOk` names `last_applied`, and
 "records the dead primary acked but had not shipped are the DECISIONS §6 window, lost
-honestly and named" (DESIGN.md §5, line 930-931). Since then, the dual-primary boot gate
-(spec 2026-07-31, DESIGN.md §5 "The boot gate", line 945) and the verifying-peer policy
-(spec 2026-08-06, DESIGN.md §5, line 973-974) closed the split-brain shapes a promote could
+honestly and named" (DESIGN.md §5, line 934-935). Since then, the dual-primary boot gate
+(spec 2026-07-31, DESIGN.md §5 "The boot gate", line 949) and the verifying-peer policy
+(spec 2026-08-06, DESIGN.md §5, line 977-978) closed the split-brain shapes a promote could
 create. Consensus-elected promotion remains addable behind the same log format, per this
 entry's own text above. Async stands for M2; the loss window is bounded, named, and tested
 rather than hidden. What reopens it: the hosted control plane (PLAN.md M2) needing automatic
@@ -143,7 +143,8 @@ finer attribution needs per-phase profiling the instrument does not do. The foll
 opens is group commit, not an engine swap.
 
 **Trigger (a) re-read 2026-08-20 after group commit and per-batch apply; it still does not
-fire.** (Recorded at Noah's direction; a status-quo reading, not Noah's own hand — revisable.)
+fire.** (Recorded at Noah's direction, on 2026-09-02; a status-quo reading, not Noah's own
+hand — revisable.)
 The 2026-08-10 reading above pre-dates group commit (shipped 2026-08-15) and per-batch apply
 (shipped 2026-08-20), which is precisely what removes the one-fsync-per-transaction ceiling
 the first reading rested on, so the trigger was owed a re-read (PLAN.md, M2 "Honest benchmark
@@ -205,7 +206,7 @@ never blocks, reporting a deadline for its caller to park on (`Step::Worked`/`St
 lines 58-61); `Repl::pump_io`/`Repl::step`
 (`crates/charpente/src/repl/mod.rs:385,503`), the `Ready::Tail` arm and the `Ready::Archive`
 arm (`crates/charpente/src/kernel/mod.rs:758,771`) are all polls — DESIGN.md §1 (lines
-180-229) and §5 (line 841, "Both are driven kernel-shaped") describe them as such. `hyper`/
+181-232) and §5 (line 845, "Both are driven kernel-shaped") describe them as such. `hyper`/
 `tokio` appear only in `crates/charpente/src/serve.rs` (verified: no other file under
 `crates/charpente/src` imports either), translating wire↔struct at the edge. No core trait
 became awaitable — `crates/charpente-core/src/io.rs` has no `async fn`. Keep the entry; this
