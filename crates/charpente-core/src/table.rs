@@ -8,9 +8,12 @@
 //! MVCC snapshots (redb read transactions): consistent, non-blocking.
 //!
 //! Index entries are `[key len: u32 le][key bytes][id: u64 be]` — the length
-//! prefix makes exact-match lookups unambiguous (no prefix collisions).
-//! Range scans over indexes arrive when a real query pattern demands an
-//! order-preserving key encoding.
+//! prefix makes exact-match lookups unambiguous (no prefix collisions). A
+//! scoped table's entries carry a `[scope: u64 be]` prefix ahead of that
+//! (tenant-scoping Task 6), so one tenant's slice of a shared index table is
+//! a contiguous byte range — the same reasoning as `scoped_key`'s row-key
+//! prefix. Range scans over indexes arrive when a real query pattern
+//! demands an order-preserving key encoding.
 
 use std::fmt;
 use std::io;
@@ -479,6 +482,20 @@ fn index_entry(mut key: Vec<u8>, id: u64) -> Vec<u8> {
     entry
 }
 
+/// A scoped table's index entry: `index_entry`'s layout with `scope`
+/// prefixed, big-endian, so that (as with `scoped_key`) lexicographic byte
+/// order matches (scope, key, id) order and one tenant's entries for a
+/// given key form a contiguous range — what `Snapshot::scan_by_scoped`'s
+/// bound depends on. Unscoped tables never call this: `index_entry` above
+/// keeps writing their entries byte-identically to before this prefix
+/// existed (pinned by `an_unscoped_index_entry_stays_byte_identical`,
+/// engine.rs).
+fn scoped_index_entry(scope: u64, key: Vec<u8>, id: u64) -> Vec<u8> {
+    let mut entry = scope.to_be_bytes().to_vec();
+    entry.extend_from_slice(&index_entry(key, id));
+    entry
+}
+
 fn redb_err(e: impl fmt::Display) -> io::Error {
     io::Error::other(format!("table store (redb): {e}"))
 }
@@ -866,6 +883,7 @@ impl Writer<'_> {
     pub fn put<R: Row>(&mut self, scope: u64, row: &R) -> io::Result<()> {
         let id = row.id().raw();
         let old = self.replace_row(scope, row, id)?;
+        let scoped = row_is_scoped::<R>();
         for index in R::INDEXES {
             let mut table = self
                 .txn
@@ -874,25 +892,34 @@ impl Writer<'_> {
             if let Some(old_row) = &old {
                 let mut old_key = Vec::new();
                 (index.key)(old_row, &mut old_key);
-                table
-                    .remove(index_entry(old_key, id).as_slice())
-                    .map_err(redb_err)?;
+                let old_entry = if scoped {
+                    scoped_index_entry(scope, old_key, id)
+                } else {
+                    index_entry(old_key, id)
+                };
+                table.remove(old_entry.as_slice()).map_err(redb_err)?;
             }
             let mut new_key = Vec::new();
             (index.key)(row, &mut new_key);
-            table
-                .insert(index_entry(new_key, id).as_slice(), ())
-                .map_err(redb_err)?;
+            let new_entry = if scoped {
+                scoped_index_entry(scope, new_key, id)
+            } else {
+                index_entry(new_key, id)
+            };
+            table.insert(new_entry.as_slice(), ()).map_err(redb_err)?;
         }
         Ok(())
     }
 
     /// See `put`'s doc comment for why `scope` is required rather than
-    /// optional. Index entries are not yet scope-prefixed (Task 6) — that is
-    /// unchanged by this task, deliberately: the composite row key and the
-    /// index prefix are separate steps in the same shipping unit.
+    /// optional. Index entries carry the same scope prefix `put` writes
+    /// (Task 6, tenant scoping): removing an entry under the wrong scope
+    /// would not error — redb's `remove` is a no-op on an absent key — it
+    /// would just strand the real entry, so the scope must reach this
+    /// removal exactly as it reaches `put`'s.
     pub fn delete<R: Row>(&mut self, scope: u64, id: Id<R>) -> io::Result<()> {
-        let old = if row_is_scoped::<R>() {
+        let scoped = row_is_scoped::<R>();
+        let old = if scoped {
             let mut rows = self
                 .txn
                 .open_table(scoped_rows_def(R::TABLE))
@@ -922,9 +949,12 @@ impl Writer<'_> {
                 .map_err(redb_err)?;
             let mut key = Vec::new();
             (index.key)(&old, &mut key);
-            table
-                .remove(index_entry(key, id.raw()).as_slice())
-                .map_err(redb_err)?;
+            let entry = if scoped {
+                scoped_index_entry(scope, key, id.raw())
+            } else {
+                index_entry(key, id.raw())
+            };
+            table.remove(entry.as_slice()).map_err(redb_err)?;
         }
         Ok(())
     }
@@ -1298,6 +1328,93 @@ impl Snapshot {
         {
             let (_, value) = entry.map_err(redb_err)?;
             out.push(R::decode_row(value.value())?);
+        }
+        Ok(out)
+    }
+
+    /// `scan_by`'s scope-taking counterpart — the fourth scope-taking
+    /// primitive beside `get_scoped`/`scan_scoped`/`scan_from_scoped` above
+    /// (see their shared doc comment on `get_scoped` for why these are
+    /// inherent methods rather than `View` trait ones). Exact-match
+    /// secondary index lookup bounded to one tenant's slice of the shared
+    /// index table: `scoped_index_entry` prefixes every scoped row's
+    /// entries with `scope` big-endian, so
+    /// `scoped_index_entry(scope, k, 0)..=scoped_index_entry(scope, k,
+    /// u64::MAX)` is precisely that tenant's entries for key `k` and no
+    /// other tenant's — same range-is-a-tenant's-slice reasoning as
+    /// `scoped_key`/`scan_scoped`. `View::scan_by` is unchanged and stays
+    /// the read path for an unscoped table's index.
+    pub fn scan_by_scoped<R: Row>(
+        &self,
+        scope: u64,
+        index_name: &str,
+        key: &impl Codec,
+    ) -> io::Result<Vec<R>> {
+        assert!(
+            row_is_scoped::<R>(),
+            "Snapshot::scan_by_scoped: table \"{}\" is not tenant-scoped (Row::Scope = \
+             Unscoped) — use View::scan_by for an unscoped table",
+            R::TABLE
+        );
+        let index = R::INDEXES
+            .iter()
+            .find(|i| i.name == index_name)
+            .unwrap_or_else(|| panic!("no index named \"{index_name}\" on table {}", R::TABLE));
+        let table = match self.txn.open_table(index_def(&index_table_name(index))) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(redb_err(e)),
+        };
+        let mut encoded = Vec::new();
+        key.encode(&mut encoded);
+        let lo = scoped_index_entry(scope, encoded.clone(), 0);
+        let hi = scoped_index_entry(scope, encoded, u64::MAX);
+        let mut out = Vec::new();
+        for entry in table
+            .range(lo.as_slice()..=hi.as_slice())
+            .map_err(redb_err)?
+        {
+            let (entry_key, _) = entry.map_err(redb_err)?;
+            let bytes = entry_key.value();
+            let id_bytes: [u8; 8] = bytes[bytes.len() - 8..]
+                .try_into()
+                .expect("entry carries an id");
+            let id = Id::<R>::from_raw(u64::from_be_bytes(id_bytes));
+            let row = self.get_scoped(scope, id)?.unwrap_or_else(|| {
+                panic!(
+                    "index \"{}\" entry points at missing {} row {id:?} in scope {scope} — \
+                     index corruption",
+                    index.name,
+                    R::TABLE
+                )
+            });
+            out.push(row);
+        }
+        Ok(out)
+    }
+
+    /// Every entry's raw key bytes for one index table, in stored
+    /// (byte-lexicographic) order — `scan_raw`'s counterpart for a
+    /// secondary index rather than a table's primary rows, and for the
+    /// identical reason (see `scan_raw`'s own doc comment): `scan_by`/
+    /// `scan_by_scoped` decode a row back out through `get`/`get_scoped` and
+    /// never look at the key that pointed at it, so a round trip through
+    /// them proves nothing about the key's own byte layout. `table` is the
+    /// physical index table name, `"{Row::TABLE}.{index name}"` —
+    /// `index_table_name`'s own format, not itself `pub`; this takes the
+    /// already-formatted string the same way `scan_raw` takes a raw row
+    /// table name. Empty, not an error, when the index table has never been
+    /// created.
+    pub fn scan_index_raw(&self, table: &str) -> io::Result<Vec<Vec<u8>>> {
+        let index = match self.txn.open_table(index_def(table)) {
+            Ok(index) => index,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(redb_err(e)),
+        };
+        let mut out = Vec::new();
+        for entry in index.iter().map_err(redb_err)? {
+            let (key, _) = entry.map_err(redb_err)?;
+            out.push(key.value().to_vec());
         }
         Ok(out)
     }

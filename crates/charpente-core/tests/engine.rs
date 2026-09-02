@@ -22,7 +22,7 @@ use charpente_core::engine::{Engine, REHELLO_MARKER, StateMachine};
 use charpente_core::io::{Disk, File};
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::log::{Wal, WalConfig};
-use charpente_core::table::{Codec, Id, IndexDef, Row, Snapshot, Store, UNSCOPED, Unscoped, View};
+use charpente_core::table::{Codec, Id, IndexDef, Row, Snapshot, Store, UNSCOPED, Unscoped};
 use charpente_sim::{FaultConfig, Sim};
 
 #[derive(Default)]
@@ -551,39 +551,22 @@ impl Row for Ticket {
     }
 }
 
-/// Whether `Ticket`'s `by_n` index still holds an entry for `n`.
+/// Whether `Ticket`'s `by_n` index still holds an entry for `n` under
+/// `scope`.
 ///
-/// What `scan_by` can and cannot see on a scoped table, exactly: it walks the
-/// index range FIRST and only reaches `Snapshot::get` if that range is
-/// non-empty — and `get` is still bare-`u64` keyed until Task 7, so on a
-/// `[u8; 16]`-keyed table it fails with redb's key-type mismatch. So an entry
-/// that EXISTS makes `scan_by` return that mismatch, and an entry that is GONE
-/// makes it return `Ok(vec![])` without ever opening the rows table. That
-/// Err/Ok split is the observable — indirect, but exact, and the only one
-/// available from outside `table.rs` until Task 5's prefix scan lands. The
-/// error's shape is checked, not just its presence, so an unrelated failure
-/// cannot masquerade as a surviving entry.
-fn ticket_index_entry_survives(snap: &Snapshot, n: u32) -> bool {
-    match snap.scan_by::<Ticket>("by_n", &n) {
-        Ok(rows) => {
-            assert!(
-                rows.is_empty(),
-                "scan_by cannot decode a scoped row yet — a non-empty Ok means Snapshot::get \
-                 started reading scoped tables and this helper's Err/Ok observable is no longer \
-                 valid"
-            );
-            false
-        }
-        Err(e) => {
-            let e = e.to_string();
-            assert!(
-                e.contains("[u8;16]") || e.contains("[u8; 16]"),
-                "the only Err this helper treats as \"index entry present\" is the [u8;16] \
-                 key-type mismatch from Snapshot::get; got: {e}"
-            );
-            true
-        }
-    }
+/// Before Task 6, a scoped table's index entries had no scope prefix, so
+/// this had only an indirect observable: `scan_by` walks the index range
+/// first and only reaches `Snapshot::get` if that range is non-empty, and
+/// `get` was still bare-`u64` keyed, so an entry that EXISTED made it fail
+/// with redb's `[u8; 16]` key-type mismatch. Task 6 gives this a direct
+/// oracle instead — `scan_by_scoped` resolves hits through `get_scoped`,
+/// which understands the composite key — so presence is just whether the
+/// scoped lookup comes back non-empty.
+fn ticket_index_entry_survives(snap: &Snapshot, scope: u64, n: u32) -> bool {
+    !snap
+        .scan_by_scoped::<Ticket>(scope, "by_n", &n)
+        .expect("scan_by_scoped must not error for a scoped table")
+        .is_empty()
 }
 
 /// Task 4 (tenant scoping): a scoped Row (`Row::Scope != Unscoped`) is stored
@@ -639,9 +622,10 @@ fn a_scoped_table_stores_under_the_composite_key_not_a_bare_u64() {
 /// nothing — `scoped_key(UNSCOPED, id)` is also 16 bytes — so this pins the
 /// consequence of dropping the scope instead of the key's width.
 ///
-/// The mechanism that makes the value observable without Task 5's prefix scan
-/// or Task 7's `ScopedTx`: two tenants write the SAME id. Under a correct
-/// composite key those are two distinct rows, so both index entries stand.
+/// The mechanism that makes the value observable (via `ticket_index_entry_survives`,
+/// now backed by Task 6's `scan_by_scoped`): two tenants write the SAME id.
+/// Under a correct composite key those are two distinct rows, so both index
+/// entries stand.
 /// Under a scope-dropping key they are one row, so tenant 20's `put` reads
 /// tenant 10's row back as `old` in `replace_row` and REMOVES tenant 10's
 /// index entry — a silent overwrite that no "did it error?" assertion can
@@ -675,12 +659,12 @@ fn two_tenants_rows_survive_each_other_under_the_composite_key() {
 
     let snap = store.snapshot().unwrap();
     assert!(
-        ticket_index_entry_survives(&snap, 1),
+        ticket_index_entry_survives(&snap, 10, 1),
         "tenant 10's row must survive tenant 20's put of the same id — its index entry is gone, \
          which means the second put overwrote the first: the scope is not reaching the row key"
     );
     assert!(
-        ticket_index_entry_survives(&snap, 2),
+        ticket_index_entry_survives(&snap, 20, 2),
         "tenant 20's own put must be indexed"
     );
     drop(snap);
@@ -691,12 +675,12 @@ fn two_tenants_rows_survive_each_other_under_the_composite_key() {
 
     let snap = store.snapshot().unwrap();
     assert!(
-        !ticket_index_entry_survives(&snap, 1),
+        !ticket_index_entry_survives(&snap, 10, 1),
         "deleting tenant 10's row must retire tenant 10's index entry — an entry left standing \
          means the delete looked for the row under a different scope and found nothing"
     );
     assert!(
-        ticket_index_entry_survives(&snap, 2),
+        ticket_index_entry_survives(&snap, 20, 2),
         "deleting tenant 10's id 5 must NOT touch tenant 20's id 5"
     );
 }
@@ -1202,4 +1186,298 @@ fn scan_from_scoped_on_an_unscoped_table_panics() {
     let store = Store::open(&sim.disk(), "store.redb").unwrap();
     let snap = store.snapshot().unwrap();
     let _ = snap.scan_from_scoped::<JobRow>(0, 0, 10);
+}
+
+/// Task 6 (tenant scoping)'s central claim, and the leak this task closes:
+/// a scoped index lookup must not cross tenants — even when both tenants
+/// index the SAME key value. Distinct keys would pass by accident with no
+/// scope prefix at all (each tenant's row would be the only match for its
+/// own key); the SAME key is the case that actually exercises the prefix.
+#[test]
+fn a_scoped_index_lookup_cannot_see_another_tenants_rows() {
+    let sim = Sim::with_faults(0x7A2E_0016, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    store
+        .apply(0, |w| {
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(5),
+                    n: 42,
+                },
+            )?;
+            w.put(
+                2,
+                &Ticket {
+                    id: Id::from_raw(6),
+                    n: 42,
+                },
+            )
+        })
+        .expect("two tenants indexing the same key must not error");
+
+    let snap = store.snapshot().unwrap();
+    let tenant1: Vec<Id<Ticket>> = snap
+        .scan_by_scoped::<Ticket>(1, "by_n", &42u32)
+        .expect("scan_by_scoped must not error")
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    assert_eq!(
+        tenant1,
+        vec![Id::from_raw(5)],
+        "scan_by_scoped(scope=1, \"by_n\", 42) must return exactly tenant 1's row, not tenant \
+         2's"
+    );
+
+    let tenant2: Vec<Id<Ticket>> = snap
+        .scan_by_scoped::<Ticket>(2, "by_n", &42u32)
+        .expect("scan_by_scoped must not error")
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    assert_eq!(
+        tenant2,
+        vec![Id::from_raw(6)],
+        "scan_by_scoped(scope=2, \"by_n\", 42) must return exactly tenant 2's row, not tenant \
+         1's"
+    );
+}
+
+/// A hand-written UNSCOPED `Row` with one secondary index — the
+/// byte-identity fixture for `an_unscoped_index_entry_stays_byte_identical`.
+/// Needs its own type because core's other hand-written `Row` impls
+/// (`JobRow`, `EventRow`) both declare `INDEXES: &[]`.
+struct Widget {
+    id: Id<Widget>,
+    n: u32,
+}
+
+impl Row for Widget {
+    type Scope = Unscoped;
+    const TABLE: &'static str = "test.widget";
+    const INDEXES: &'static [IndexDef<Widget>] = &[IndexDef {
+        name: "by_n",
+        key: |w, out| w.n.encode(out),
+    }];
+
+    fn id(&self) -> Id<Widget> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.n.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<Widget> {
+        let input = &mut &bytes[..];
+        let id = Id::decode(input)?;
+        let n = u32::decode(input)?;
+        Ok(Widget { id, n })
+    }
+}
+
+/// Task 6 (tenant scoping): the index-entry counterpart to
+/// `an_unscoped_table_still_writes_a_bare_u64_key` — an unscoped table's
+/// index entries must stay byte-identical to before the scope prefix
+/// existed: `[key len: u32 le][key bytes][id: u64 be]`, no scope prefix.
+/// Every pinned simulation seed depends on these bytes.
+///
+/// Reads the entry through `scan_index_raw`, the raw on-disk bytes — not a
+/// round trip through `scan_by`, which decodes a row back out via `get` and
+/// never looks at the key that pointed at it (same reasoning as
+/// `an_unscoped_table_still_writes_a_bare_u64_key`'s own doc comment).
+#[test]
+fn an_unscoped_index_entry_stays_byte_identical() {
+    let sim = Sim::with_faults(0x7A2E_0017, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    store
+        .apply(0, |w| {
+            w.put(
+                UNSCOPED,
+                &Widget {
+                    id: Id::from_raw(9),
+                    n: 42,
+                },
+            )
+        })
+        .unwrap();
+
+    let mut expected = 4u32.to_le_bytes().to_vec(); // keylen: the u32 key is 4 bytes
+    expected.extend_from_slice(&42u32.to_le_bytes()); // key bytes, u32's own LE codec
+    expected.extend_from_slice(&9u64.to_be_bytes()); // id, big-endian
+
+    let snap = store.snapshot().unwrap();
+    let raw = snap.scan_index_raw("test.widget.by_n").unwrap();
+    assert_eq!(
+        raw,
+        vec![expected],
+        "an unscoped table's index entry must stay [keylen u32 le][key][id u64 be], with no \
+         scope prefix"
+    );
+}
+
+/// See `get_scoped_on_an_unscoped_table_panics`; same reasoning,
+/// `scan_by_scoped`.
+#[test]
+#[should_panic(
+    expected = "Snapshot::scan_by_scoped: table \"charpente.jobs\" is not tenant-scoped \
+                (Row::Scope = Unscoped) — use View::scan_by for an unscoped table"
+)]
+fn scan_by_scoped_on_an_unscoped_table_panics() {
+    let sim = Sim::with_faults(0x7A2E_0018, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+    let snap = store.snapshot().unwrap();
+    let _ = snap.scan_by_scoped::<JobRow>(0, "by_status", &0u32);
+}
+
+/// `Writer::put`'s old-entry retirement must carry the scope too — an
+/// update (`put` over an existing scoped row) must retire the OLD entry
+/// under the CORRECT tenant only, never spilling into (or missing) another
+/// tenant's row that happens to share the same old key value.
+#[test]
+fn a_scoped_put_over_an_existing_row_retires_the_old_entry_under_the_right_scope() {
+    let sim = Sim::with_faults(0x7A2E_0019, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    store
+        .apply(0, |w| {
+            // Tenant 1's ticket starts at n=1. Tenant 2 independently holds
+            // a DIFFERENT row already indexed at n=1 too — the value tenant
+            // 1 is about to retire, under a different scope.
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(5),
+                    n: 1,
+                },
+            )?;
+            w.put(
+                2,
+                &Ticket {
+                    id: Id::from_raw(6),
+                    n: 1,
+                },
+            )
+        })
+        .expect("initial puts must not error");
+
+    store
+        .apply(1, |w| {
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(5),
+                    n: 2,
+                },
+            )
+        })
+        .expect("the update put must not error");
+
+    let snap = store.snapshot().unwrap();
+    assert!(
+        !ticket_index_entry_survives(&snap, 1, 1),
+        "tenant 1's OLD index entry (n=1) must be retired by the update put"
+    );
+    assert_eq!(
+        snap.scan_by_scoped::<Ticket>(1, "by_n", &2u32)
+            .expect("scan_by_scoped must not error")
+            .iter()
+            .map(|t| t.id)
+            .collect::<Vec<_>>(),
+        vec![Id::from_raw(5)],
+        "tenant 1's NEW index entry (n=2) must be present after the update put"
+    );
+    assert!(
+        ticket_index_entry_survives(&snap, 2, 1),
+        "tenant 1's update must NOT touch tenant 2's n=1 entry — a different row, under a \
+         different scope"
+    );
+}
+
+/// `Writer::delete`'s index-entry removal must carry the scope too: two
+/// tenants indexing the SAME key, deleting one must retire only that
+/// tenant's entry and leave the other tenant's standing.
+#[test]
+fn a_scoped_delete_retires_only_that_tenants_index_entry() {
+    let sim = Sim::with_faults(0x7A2E_001A, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    store
+        .apply(0, |w| {
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(5),
+                    n: 42,
+                },
+            )?;
+            w.put(
+                2,
+                &Ticket {
+                    id: Id::from_raw(6),
+                    n: 42,
+                },
+            )
+        })
+        .expect("two tenants indexing the same key must not error");
+
+    store
+        .apply(1, |w| w.delete::<Ticket>(1, Id::from_raw(5)))
+        .expect("deleting tenant 1's row must not error");
+
+    let snap = store.snapshot().unwrap();
+    assert!(
+        !ticket_index_entry_survives(&snap, 1, 42),
+        "deleting tenant 1's row must retire tenant 1's index entry"
+    );
+    assert!(
+        ticket_index_entry_survives(&snap, 2, 42),
+        "deleting tenant 1's row must NOT touch tenant 2's index entry for the same key"
+    );
+}
+
+/// `scan_by_scoped`'s id bound is INCLUSIVE on both ends — `0` and
+/// `u64::MAX` are real, reachable row ids, not sentinels, so excluding
+/// either would silently drop a legitimate row from an index lookup. Same
+/// reasoning as `scan_from_scoped`'s own inclusive-upper-bound test
+/// (`a_scoped_scan_from_includes_the_row_at_u64_max`, above).
+#[test]
+fn scan_by_scoped_bounds_are_inclusive_of_id_0_and_id_max() {
+    let sim = Sim::with_faults(0x7A2E_001B, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    store
+        .apply(0, |w| {
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(0),
+                    n: 9,
+                },
+            )?;
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(u64::MAX),
+                    n: 9,
+                },
+            )
+        })
+        .expect("puts at the id extremes must not error");
+
+    let snap = store.snapshot().unwrap();
+    let mut ids: Vec<u64> = snap
+        .scan_by_scoped::<Ticket>(1, "by_n", &9u32)
+        .expect("scan_by_scoped must not error")
+        .iter()
+        .map(|t| t.id.raw())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![0, u64::MAX],
+        "scan_by_scoped's id bound must include both id 0 and id u64::MAX"
+    );
 }
