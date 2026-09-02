@@ -18,11 +18,12 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use charpente_core::db::{Db, DbConfig, Schema};
+use charpente_core::db::{Db, DbConfig, Schema, Seeder};
 use charpente_core::engine::{Engine, REHELLO_MARKER, StateMachine};
 use charpente_core::io::{Disk, File};
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::log::{Wal, WalConfig};
+use charpente_core::migration::{SchemaVersion, schema_version_id};
 use charpente_core::table::{Codec, Id, IndexDef, Row, Snapshot, Store, UNSCOPED, Unscoped};
 use charpente_sim::{FaultConfig, Sim};
 
@@ -1497,12 +1498,11 @@ fn scan_by_scoped_bounds_are_inclusive_of_id_0_and_id_max() {
 /// Written at scope 0 (`Tx::put` always uses the overlay's default slot
 /// until Task 7's `tx.scope()` lands) — R35's tenant-0 pin: 0 is a legal
 /// tenant for a scoped table, not "no scope", so this must replay through
-/// the SCOPED tag (`0x05`) and land in the composite-keyed physical table,
-/// never silently through the unscoped definition. `scan_raw` (still typed
-/// `<u64, &[u8]>`) failing with a `[u8;16]` key-type mismatch is the same
-/// oracle `a_scoped_table_stores_under_the_composite_key_not_a_bare_u64`
-/// uses at the `Writer` level — here it proves the WAL-replay path, not
-/// just a direct `Writer::put` call, took the scoped route.
+/// the SCOPED tag (`0x05`), which `Db::open`'s successful return already
+/// implies: `resolve_effect_scope` refuses `Db::open` outright had the
+/// record instead carried the unscoped `0x00` tag for this scoped table
+/// (`db::tests::resolve_effect_scope_refuses_a_scoped_table_with_an_
+/// unscoped_tag` pins that refusal at the unit level).
 #[test]
 fn a_scoped_write_survives_crash_restart_replay_under_its_own_scope() {
     let sim = Sim::with_faults(0x6B00_0001, FaultConfig::none());
@@ -1535,17 +1535,6 @@ fn a_scoped_write_survives_crash_restart_replay_under_its_own_scope() {
              legal tenant (R35), not \"no tenant\"",
         );
     assert_eq!(row.n, 42);
-
-    let err = snap
-        .scan_raw(Ticket::TABLE)
-        .expect_err(
-            "a replayed scoped row must land in the composite-keyed physical table, not the \
-             bare-u64 one — scan_raw (still typed <u64, &[u8]>) failing to open it here is what \
-             proves apply_put replayed it through the scoped tag (0x05), not silently through \
-             the unscoped definition (0x00)",
-        )
-        .to_string();
-    assert!(err.contains("[u8;16]") || err.contains("[u8; 16]"), "{err}");
 }
 
 /// The other replay path Task 6b's format change must cover: a follower's
@@ -1591,15 +1580,8 @@ fn a_followers_apply_shipped_lands_a_scoped_write_under_its_own_scope() {
     assert_eq!(row.n, 7);
 }
 
-/// Every reachable write today lands at scope 0 (`Tx::put` always uses the
-/// overlay's default slot; Task 7's `tx.scope()` is what will let a caller
-/// choose otherwise), so no test above can tell a correctly-threaded scope
-/// apart from `apply_put` silently substituting `table::UNSCOPED` for it —
-/// both are the value 0. This test closes that gap by hand-encoding a
-/// `0x05` (scoped Put) record at a genuinely nonzero scope, the same way
-/// `charpente/tests/replication.rs`'s atomicity tests hand-encode a bad tag,
-/// and driving it through the real `apply_shipped` path: the row must land
-/// under scope 7, and must NOT be visible under scope 0.
+/// `[len: u32 le][bytes]` — the length-prefixed shape `db.rs`'s own
+/// `encode_bytes` produces, for hand-encoding record bytes by hand below.
 fn encode_len_prefixed(bytes: &[u8], out: &mut Vec<u8>) {
     (bytes.len() as u32).encode(out);
     out.extend_from_slice(bytes);
@@ -1700,4 +1682,207 @@ fn a_hand_encoded_scoped_delete_at_a_nonzero_scope_retires_that_scopes_row() {
         "a hand-encoded scope-7 delete must retire the scope-7 row — apply_delete must use \
          the decoded scope, not silently substitute table::UNSCOPED for it"
     );
+}
+
+// ------------------------------------------ fix round 1: below-compiled scope
+
+/// A scoped, VERSIONED `Row` — `Ticket` above has `FINGERPRINT: None` (the
+/// default for a hand-written type), which opts it out of the versioning
+/// gate entirely (`is_below_compiled` always returns `false` for it). The
+/// below-compiled-version replay branches below need a table that IS
+/// subject to the gate, so this sets `VERSION: 2`/`FINGERPRINT: Some(_)`
+/// and reuses `Ticket`'s own `TestOrg` scope marker.
+struct VersionedTicket {
+    id: Id<VersionedTicket>,
+    n: u32,
+}
+
+impl Row for VersionedTicket {
+    type Scope = TestOrg;
+    const TABLE: &'static str = "test.versioned_ticket";
+    const INDEXES: &'static [IndexDef<VersionedTicket>] = &[];
+    const VERSION: u32 = 2;
+    const FINGERPRINT: Option<u64> = Some(0x6B00_F1F1);
+
+    fn id(&self) -> Id<VersionedTicket> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.n.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<VersionedTicket> {
+        let input = &mut &bytes[..];
+        Ok(VersionedTicket {
+            id: Id::decode(input)?,
+            n: u32::decode(input)?,
+        })
+    }
+}
+
+/// A hand-encoded unscoped (`0x00`) Put record for `SchemaVersion`,
+/// declaring `table`'s persisted version — what seeds the replay-time
+/// version map (`db.rs`'s `versions`) so a later record for `table` takes
+/// the decode-free `is_below_compiled` branch instead of the ordinary one.
+fn schema_version_put_record(table: &str, version: u32, fingerprint: u64) -> Vec<u8> {
+    let row = SchemaVersion {
+        id: schema_version_id(table),
+        table: table.to_string(),
+        version,
+        fingerprint,
+        migrating_through: None,
+        migrating_to: None,
+    };
+    let mut row_bytes = Vec::new();
+    row.encode_row(&mut row_bytes);
+    let mut record = Vec::new();
+    1u32.encode(&mut record); // n = 1 effect
+    record.push(0); // tag 0x00: SchemaVersion is itself unscoped
+    encode_len_prefixed(SchemaVersion::TABLE.as_bytes(), &mut record);
+    encode_len_prefixed(&row_bytes, &mut record);
+    record
+}
+
+/// A hand-encoded one-effect `0x05` (scoped Put) record for `VersionedTicket`.
+fn versioned_scoped_put_record(scope: u64, id: u64, n: u32) -> Vec<u8> {
+    let mut row_bytes = Vec::new();
+    VersionedTicket {
+        id: Id::from_raw(id),
+        n,
+    }
+    .encode_row(&mut row_bytes);
+    let mut record = Vec::new();
+    1u32.encode(&mut record); // n = 1 effect
+    record.push(5); // tag 0x05: scoped Put
+    encode_len_prefixed(VersionedTicket::TABLE.as_bytes(), &mut record);
+    scope.encode(&mut record);
+    encode_len_prefixed(&row_bytes, &mut record);
+    record
+}
+
+/// A hand-encoded one-effect `0x06` (scoped Delete) record for `VersionedTicket`.
+fn versioned_scoped_delete_record(scope: u64, id: u64) -> Vec<u8> {
+    let mut record = Vec::new();
+    1u32.encode(&mut record); // n = 1 effect
+    record.push(6); // tag 0x06: scoped Delete
+    encode_len_prefixed(VersionedTicket::TABLE.as_bytes(), &mut record);
+    scope.encode(&mut record);
+    id.encode(&mut record);
+    record
+}
+
+/// Fix round 1, Important 1: `apply_batch`'s `is_below_compiled` branches
+/// (a full rebuild-from-WAL replaying a table's pre-migration history)
+/// apply DECODE-FREE via `put_raw`/`delete_raw`, which carry no scope. A
+/// scoped table could never reach this branch before this task (the R25
+/// asserts blocked registering one at all); lifting those asserts and
+/// making nonzero scopes representable on the wire means a scoped table
+/// WITH pre-migration history now can, and would silently drop the scope
+/// `resolve_effect_scope` already proved the record carries. Pins the Put
+/// arm's guard: a below-compiled scoped record refuses by name instead.
+#[test]
+fn a_below_compiled_scoped_put_refuses_by_name_rather_than_dropping_the_scope() {
+    let sim = Sim::with_faults(0x6B00_0006, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<VersionedTicket>(),
+    )
+    .unwrap();
+    // Declares VersionedTicket's persisted version (1) behind its compiled
+    // one (2), so the next record for it takes the decode-free branch.
+    db.apply_shipped(&[(
+        0,
+        schema_version_put_record(VersionedTicket::TABLE, 1, 0x6B00_F1F1),
+    )])
+    .unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = db.apply_shipped(&[(1, versioned_scoped_put_record(7, 3, 99))]);
+    }));
+    let panic = result.expect_err("a below-compiled scoped Put must panic, not silently apply");
+    let message = panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+        .expect("panic payload must be a string");
+    assert!(
+        message.contains(&format!(
+            "table \"{}\" is tenant-scoped (Row::Scope != Unscoped)",
+            VersionedTicket::TABLE
+        )),
+        "{message}"
+    );
+    assert!(message.contains("put_raw"), "{message}");
+    assert!(
+        message.contains("tenant-scoping Task 6c teaches the raw path the scope"),
+        "{message}"
+    );
+}
+
+/// See the Put test's doc comment; this pins `apply_delete`'s identical
+/// guard.
+#[test]
+fn a_below_compiled_scoped_delete_refuses_by_name_rather_than_dropping_the_scope() {
+    let sim = Sim::with_faults(0x6B00_0007, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<VersionedTicket>(),
+    )
+    .unwrap();
+    db.apply_shipped(&[(
+        0,
+        schema_version_put_record(VersionedTicket::TABLE, 1, 0x6B00_F1F1),
+    )])
+    .unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = db.apply_shipped(&[(1, versioned_scoped_delete_record(7, 3))]);
+    }));
+    let panic = result.expect_err("a below-compiled scoped Delete must panic, not silently apply");
+    let message = panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+        .expect("panic payload must be a string");
+    assert!(
+        message.contains(&format!(
+            "table \"{}\" is tenant-scoped (Row::Scope != Unscoped)",
+            VersionedTicket::TABLE
+        )),
+        "{message}"
+    );
+    assert!(message.contains("delete_raw"), "{message}");
+    assert!(
+        message.contains("tenant-scoping Task 6c teaches the raw path the scope"),
+        "{message}"
+    );
+}
+
+/// Fix round 1, Minor 7: `Seeder::rows`' own negative-space assert
+/// (mirroring the below-compiled guards above, and for the identical
+/// reason — seed/restore export carries no per-row scope yet) was unpinned.
+#[test]
+#[should_panic(
+    expected = "Seeder::rows: table \"test.ticket\" is tenant-scoped (Row::Scope \
+                            != Unscoped), but seed/restore export carries no per-row scope \
+                            yet — seeding a scoped table is blocked until tenant-scoping \
+                            Task 6c teaches the raw export/import path the scope"
+)]
+fn seeder_rows_refuses_a_scoped_table_by_name() {
+    let sim = Sim::with_faults(0x6B00_0008, FaultConfig::none());
+    let mut seeder = Seeder::new(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Ticket>(),
+    )
+    .unwrap();
+    let mut row_bytes = Vec::new();
+    Ticket {
+        id: Id::from_raw(1),
+        n: 1,
+    }
+    .encode_row(&mut row_bytes);
+    let _ = seeder.rows(Ticket::TABLE, &[(1, row_bytes)]);
 }

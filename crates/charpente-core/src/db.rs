@@ -9,15 +9,16 @@
 //! `0x00 [table][row]` put, `0x01 [table][id: u64 le]` delete,
 //! `0x02 [job][payload][key: Option<String>]` enqueue,
 //! `0x03 [event][payload][key: Option<String>]` emit,
+//! `0x04 [table][id: u64 le][row]` migrate-put,
 //! `0x05 [table][scope: u64 le][row]` scoped put,
 //! `0x06 [table][scope: u64 le][id: u64 le]` scoped delete — strings and
-//! byte fields length-prefixed per the `Codec` layout. `0x05`/`0x06` are the
-//! ONLY tags that carry a scope, chosen by the table's own `Row::Scope`, not
-//! by the scope value (tenant 0 is a legal tenant, so a scoped table's
-//! records always use `0x05`/`0x06`, never `0x00`/`0x01`, even at scope 0).
-//! A binary that does not know a tag refuses it by name
-//! (`decode_record`'s unknown-tag error) rather than misreading a wider
-//! record.
+//! byte fields length-prefixed per the `Codec` layout; `0x07` is the next
+//! free tag. `0x05`/`0x06` are the ONLY tags that carry a scope, chosen by
+//! the table's own `Row::Scope`, not by the scope value (tenant 0 is a
+//! legal tenant, so a scoped table's records always use `0x05`/`0x06`,
+//! never `0x00`/`0x01`, even at scope 0). A binary that does not know a tag
+//! refuses it by name (`decode_record`'s unknown-tag error) rather than
+//! misreading a wider record.
 //! Table effects are the transaction's collapsed overlay in (table, scope,
 //! id) order: intermediate overwrites inside a transaction are invisible to
 //! every observer and are not logged. Enqueues and emits keep call order.
@@ -948,6 +949,20 @@ impl StateMachine for TableMachine {
                         // rebuilds indexes; if the table never reaches compiled
                         // the post-replay barrier fires (saw_below).
                         if is_below_compiled(schema, versions, table) {
+                            // `put_raw` (Task 6c's raw path) carries no scope —
+                            // negative space, the mirror of `Seeder::rows`'
+                            // guard: a scoped table's pre-migration history
+                            // reaching this decode-free branch would silently
+                            // drop the scope `resolved` above already proved
+                            // this record carries.
+                            assert!(
+                                !ops.scoped,
+                                "table \"{table}\" is tenant-scoped (Row::Scope != Unscoped), \
+                                 but a below-compiled-version record replays decode-free \
+                                 through put_raw, which carries no scope — replaying a scoped \
+                                 table's pre-migration history is blocked until \
+                                 tenant-scoping Task 6c teaches the raw path the scope"
+                            );
                             let id = row_id_prefix(row)?;
                             saw_below.insert(table.clone());
                             w.put_raw(table, id, row)?;
@@ -960,6 +975,15 @@ impl StateMachine for TableMachine {
                         let ops = schema.ops(table)?;
                         let resolved = resolve_effect_scope(table, ops.scoped, *scope, "Delete")?;
                         if is_below_compiled(schema, versions, table) {
+                            // See the Put arm's identical guard above.
+                            assert!(
+                                !ops.scoped,
+                                "table \"{table}\" is tenant-scoped (Row::Scope != Unscoped), \
+                                 but a below-compiled-version record replays decode-free \
+                                 through delete_raw, which carries no scope — replaying a \
+                                 scoped table's pre-migration history is blocked until \
+                                 tenant-scoping Task 6c teaches the raw path the scope"
+                            );
                             saw_below.insert(table.clone());
                             w.delete_raw(table, *id)?;
                         } else {
@@ -2936,6 +2960,13 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("carries no scope"), "{err}");
+        assert!(
+            err.to_string().contains(
+                "restore from a replica or backup, or replay under the schema that \
+                            wrote it"
+            ),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2947,6 +2978,13 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("carries scope 3"), "{err}");
+        assert!(
+            err.to_string().contains(
+                "restore from a replica or backup, or replay under the schema that \
+                            wrote it"
+            ),
+            "{err}"
+        );
     }
 
     #[test]
