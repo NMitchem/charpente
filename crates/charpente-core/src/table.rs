@@ -1201,6 +1201,114 @@ impl View for Snapshot {
 }
 
 impl Snapshot {
+    /// Task 5 (tenant scoping), ruling R28: `View`'s own `get`/`scan`/
+    /// `scan_from` above keep their unscoped signatures unchanged — Task 7
+    /// narrows `impl View for Tx` to `R: Row<Scope = Unscoped>` rather than
+    /// widening the trait, and gives its `ScopedTx` its own `get`/`scan`/
+    /// `scan_from`/`scan_by` that thread a real scope through. These three
+    /// methods are the scope-taking primitives those build on: inherent
+    /// methods on `Snapshot`, not trait methods, so they sit beside `get`/
+    /// `scan`/`scan_from` without touching the trait `ScopedTx` (in the
+    /// `charpente` crate, per ruling R2) has to keep compiling against.
+    ///
+    /// `pub`, not `pub(crate)`: `scoped_key`'s own doc comment argues
+    /// `pub(crate)` because its ordering property has a unit test that needs
+    /// neither `Store` nor `Sim` and can live inside this module. These three
+    /// do not have that option — `charpente-core/tests/engine.rs` is a
+    /// separate compilation unit (this file's own module doc explains why:
+    /// a `Disk`-backed test cannot live in a `#[cfg(test)]` unit-test module),
+    /// so it sees only this crate's `pub` surface, and the tenant-isolation
+    /// property Task 5 exists to prove (`a_scoped_scan_cannot_see_another_
+    /// tenants_rows`, `engine.rs`) has nowhere else to call these from. Task
+    /// 7's `ScopedTx` (a different crate again) needs the same reach.
+    ///
+    /// Each asserts `row_is_scoped::<R>()` (hard rule 4, negative space):
+    /// calling one of these against an UNSCOPED table would open
+    /// `scoped_rows_def`, a physical redb table the unscoped write path
+    /// never creates, and silently read back empty instead of erroring —
+    /// the wrong-answer-not-error shape `Writer::put`/`delete`'s own scope
+    /// assertions exist to convert into a loud panic on the write side.
+    pub fn get_scoped<R: Row>(&self, scope: u64, id: Id<R>) -> io::Result<Option<R>> {
+        assert!(
+            row_is_scoped::<R>(),
+            "Snapshot::get_scoped: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) — \
+             use View::get for an unscoped table",
+            R::TABLE
+        );
+        let rows = match self.txn.open_table(scoped_rows_def(R::TABLE)) {
+            Ok(rows) => rows,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(redb_err(e)),
+        };
+        match rows.get(scoped_key(scope, id.raw())).map_err(redb_err)? {
+            Some(guard) => Ok(Some(R::decode_row(guard.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every row for ONE scope, in id order — `scan`'s prefix-bounded
+    /// counterpart. The bound is exactly `scoped_key(scope, 0)..=
+    /// scoped_key(scope, u64::MAX)`: since `scoped_key` orders by scope then
+    /// id (pinned by `scoped_key_tests`), that range is precisely one
+    /// tenant's contiguous slice of the composite-keyed table, and no other
+    /// scope's row can fall inside it.
+    pub fn scan_scoped<R: Row>(&self, scope: u64) -> io::Result<Vec<R>> {
+        assert!(
+            row_is_scoped::<R>(),
+            "Snapshot::scan_scoped: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) \
+             — use View::scan for an unscoped table",
+            R::TABLE
+        );
+        let rows = match self.txn.open_table(scoped_rows_def(R::TABLE)) {
+            Ok(rows) => rows,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(redb_err(e)),
+        };
+        let mut out = Vec::new();
+        for entry in rows
+            .range(scoped_key(scope, 0)..=scoped_key(scope, u64::MAX))
+            .map_err(redb_err)?
+        {
+            let (_, value) = entry.map_err(redb_err)?;
+            out.push(R::decode_row(value.value())?);
+        }
+        Ok(out)
+    }
+
+    /// Rows with `id >= from_id` for ONE scope, in id order, at most
+    /// `limit` — `scan_from`'s prefix-bounded counterpart. Same silent-gap
+    /// semantics as `View::scan_from` (see its doc comment): a GC'd
+    /// `from_id` starts at the next surviving row in THIS scope rather than
+    /// erroring or spilling into another tenant's range.
+    pub fn scan_from_scoped<R: Row>(
+        &self,
+        scope: u64,
+        from_id: u64,
+        limit: usize,
+    ) -> io::Result<Vec<R>> {
+        assert!(
+            row_is_scoped::<R>(),
+            "Snapshot::scan_from_scoped: table \"{}\" is not tenant-scoped (Row::Scope = \
+             Unscoped) — use View::scan_from for an unscoped table",
+            R::TABLE
+        );
+        let rows = match self.txn.open_table(scoped_rows_def(R::TABLE)) {
+            Ok(rows) => rows,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(redb_err(e)),
+        };
+        let mut out = Vec::new();
+        for entry in rows
+            .range(scoped_key(scope, from_id)..=scoped_key(scope, u64::MAX))
+            .map_err(redb_err)?
+            .take(limit)
+        {
+            let (_, value) = entry.map_err(redb_err)?;
+            out.push(R::decode_row(value.value())?);
+        }
+        Ok(out)
+    }
+
     /// The log position this snapshot's rows correspond to — read off THIS
     /// snapshot's own transaction, unlike `Store::applied_seq` (which opens a
     /// fresh one): consistent with the rows a caller is about to export
@@ -1290,6 +1398,29 @@ impl Snapshot {
     /// Raw rows with `id > after_id` (all rows when `None`), ascending, at
     /// most `limit` — the migration executor's bounded batch read (spec
     /// §3: batching must bound memory, not just record size).
+    ///
+    /// Task 5 (tenant scoping): learns the composite `[u8; 16]` key shape
+    /// but stays scope-agnostic ON PURPOSE — unlike `get_scoped`/
+    /// `scan_scoped`/`scan_from_scoped` above, this takes no scope and
+    /// never will. `migrate_schema()` rewrites every row of a table
+    /// through this function (spec §3), so it must keep seeing every
+    /// tenant's rows in one pass; the tenant-scoping design doc's §3 says
+    /// so explicitly ("migrate_schema() rewrites rows through the raw
+    /// path … it must learn the new key shape, but needs no capability").
+    /// `id` is recovered from the composite key's trailing 8 bytes, the
+    /// same convention `index_entry`'s trailing id already uses.
+    ///
+    /// Accepted limitation, not this task's to fix: for a genuinely
+    /// multi-tenant scoped table, ids are NOT globally ascending across a
+    /// scope boundary (rows sort by `(scope, id)`, so tenant 2's id 0 can
+    /// follow tenant 1's id `u64::MAX`) — `after_id` filters on the bare id
+    /// portion only, so a caller paging with the last returned id as the
+    /// next watermark can revisit or skip across scopes. Unreachable
+    /// today: `db.rs`'s `apply_put`/`apply_delete` assert `!row_is_scoped`,
+    /// so no scoped table can hold rows reached through `Db`/`Schema` (and
+    /// therefore through `migrate_schema`) before Task 6b lifts that
+    /// assert; per-scope migration ordering is Task 6b/6c's raw-path work,
+    /// not this one's.
     pub fn scan_raw_from(
         &self,
         table: &str,
@@ -1303,21 +1434,52 @@ impl Snapshot {
         if after_id == Some(u64::MAX) {
             return Ok(Vec::new());
         }
-        let rows = match self.txn.open_table(rows_def(table)) {
-            Ok(rows) => rows,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(e) => return Err(redb_err(e)),
-        };
         let from = after_id.map_or(0, |a| a.saturating_add(1));
-        let mut out = Vec::new();
-        for item in rows.range(from..).map_err(redb_err)? {
-            if out.len() == limit {
-                break;
+        match self.txn.open_table(rows_def(table)) {
+            Ok(rows) => {
+                let mut out = Vec::new();
+                for item in rows.range(from..).map_err(redb_err)? {
+                    if out.len() == limit {
+                        break;
+                    }
+                    let (k, v) = item.map_err(redb_err)?;
+                    out.push((k.value(), v.value().to_vec()));
+                }
+                Ok(out)
             }
-            let (k, v) = item.map_err(redb_err)?;
-            out.push((k.value(), v.value().to_vec()));
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
+            // The table's physical key is the composite [u8; 16] `(scope,
+            // id)` (Task 4) — a different redb table shape from the bare
+            // u64 one just tried, so redb refuses to open it as such
+            // (TableTypeMismatch) rather than silently reading nothing.
+            // Retry under the composite definition and walk every scope.
+            Err(redb::TableError::TableTypeMismatch { .. }) => {
+                let rows = self
+                    .txn
+                    .open_table(scoped_rows_def(table))
+                    .map_err(redb_err)?;
+                let mut out = Vec::new();
+                for item in rows
+                    .range(scoped_key(0, 0)..=scoped_key(u64::MAX, u64::MAX))
+                    .map_err(redb_err)?
+                {
+                    let (k, v) = item.map_err(redb_err)?;
+                    let id_bytes: [u8; 8] = k.value()[8..]
+                        .try_into()
+                        .expect("scoped key carries a trailing 8-byte id");
+                    let id = u64::from_be_bytes(id_bytes);
+                    if id < from {
+                        continue;
+                    }
+                    if out.len() == limit {
+                        break;
+                    }
+                    out.push((id, v.value().to_vec()));
+                }
+                Ok(out)
+            }
+            Err(e) => Err(redb_err(e)),
         }
-        Ok(out)
     }
 }
 

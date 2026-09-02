@@ -742,3 +742,453 @@ fn an_unscoped_delete_with_a_nonzero_scope_panics() {
     // caller's mistaken scope is swallowed by the absent-row no-op.
     let _ = store.apply(0, |w| w.delete::<JobRow>(7, Id::from_raw(1)));
 }
+
+// ---------------------------------------------------------------- Task 5
+
+/// Task 5 (tenant scoping)'s central claim: `Snapshot::scan_scoped` is
+/// prefix-bounded to exactly one tenant. Tenant 1 writes ids 1, 3, 5 and
+/// tenant 2 writes 2, 4, 6 — INTERLEAVED on purpose, so an off-by-one in
+/// either range bound (`scoped_key(scope, 0)..=scoped_key(scope,
+/// u64::MAX)`) would pull in a neighboring id from the other tenant rather
+/// than hiding behind some other tenant's untouched, contiguous block.
+#[test]
+fn a_scoped_scan_cannot_see_another_tenants_rows() {
+    let sim = Sim::with_faults(0x7A2E_000C, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    store
+        .apply(0, |w| {
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(1),
+                    n: 10,
+                },
+            )?;
+            w.put(
+                2,
+                &Ticket {
+                    id: Id::from_raw(2),
+                    n: 20,
+                },
+            )?;
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(3),
+                    n: 30,
+                },
+            )?;
+            w.put(
+                2,
+                &Ticket {
+                    id: Id::from_raw(4),
+                    n: 40,
+                },
+            )?;
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(5),
+                    n: 50,
+                },
+            )?;
+            w.put(
+                2,
+                &Ticket {
+                    id: Id::from_raw(6),
+                    n: 60,
+                },
+            )
+        })
+        .expect("interleaved tenant writes must not error");
+
+    let snap = store.snapshot().unwrap();
+    let mut ids: Vec<u64> = snap
+        .scan_scoped::<Ticket>(1)
+        .expect("tenant 1's scan must not error")
+        .into_iter()
+        .map(|t| t.id.raw())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![1, 3, 5],
+        "tenant 1's scan must return EXACTLY its own ids — an off-by-one range bound would \
+         pull in 2, 4, or 6 from tenant 2"
+    );
+
+    let mut ids2: Vec<u64> = snap
+        .scan_scoped::<Ticket>(2)
+        .expect("tenant 2's scan must not error")
+        .into_iter()
+        .map(|t| t.id.raw())
+        .collect();
+    ids2.sort_unstable();
+    assert_eq!(
+        ids2,
+        vec![2, 4, 6],
+        "tenant 2's scan must return EXACTLY its own ids, symmetrically"
+    );
+}
+
+/// The boundary ids the interleaving above does not exercise: 0 and
+/// `u64::MAX` within a single tenant. The range is `..=` (inclusive) at
+/// both ends — an exclusive upper bound would drop `u64::MAX`, and a lower
+/// bound starting above 0 (e.g. `scoped_key(scope, 1)`) would drop id 0.
+#[test]
+fn a_scoped_scan_includes_id_zero_and_u64_max_within_one_tenant() {
+    let sim = Sim::with_faults(0x7A2E_000D, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    store
+        .apply(0, |w| {
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(0),
+                    n: 1,
+                },
+            )?;
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(u64::MAX),
+                    n: 2,
+                },
+            )
+        })
+        .expect("writing the id-space boundaries must not error");
+
+    let snap = store.snapshot().unwrap();
+    let mut ids: Vec<u64> = snap
+        .scan_scoped::<Ticket>(1)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.id.raw())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![0, u64::MAX],
+        "the scan's range must be INCLUSIVE at both ends of the id space"
+    );
+}
+
+/// The other boundary the interleaving does not exercise: adjacency between
+/// the LAST id of one tenant and the FIRST id of the next. `scoped_key(1,
+/// u64::MAX)` and `scoped_key(2, 0)` sort immediately next to each other
+/// with nothing between them (`scoped_key_tests` in `table.rs` pins that
+/// ordering) — this pins that the READ side never crosses it either.
+#[test]
+fn a_scoped_scan_stays_inside_its_tenant_at_the_composite_key_boundary() {
+    let sim = Sim::with_faults(0x7A2E_000E, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    store
+        .apply(0, |w| {
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(u64::MAX),
+                    n: 1,
+                },
+            )?;
+            w.put(
+                2,
+                &Ticket {
+                    id: Id::from_raw(0),
+                    n: 2,
+                },
+            )
+        })
+        .expect("adjacent-boundary tenant writes must not error");
+
+    let snap = store.snapshot().unwrap();
+    let tenant1: Vec<u64> = snap
+        .scan_scoped::<Ticket>(1)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.id.raw())
+        .collect();
+    let tenant2: Vec<u64> = snap
+        .scan_scoped::<Ticket>(2)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.id.raw())
+        .collect();
+    assert_eq!(
+        tenant1,
+        vec![u64::MAX],
+        "tenant 1's scan must see its own u64::MAX row and nothing from tenant 2"
+    );
+    assert_eq!(
+        tenant2,
+        vec![0],
+        "tenant 2's scan must see its own id-0 row and nothing from tenant 1"
+    );
+}
+
+/// `Snapshot::get_scoped`: two tenants holding the SAME id must not read
+/// back each other's row, and a tenant that never wrote that id sees
+/// nothing (not a stale row from a third tenant's write).
+#[test]
+fn a_scoped_get_cannot_see_another_tenants_row_at_the_same_id() {
+    let sim = Sim::with_faults(0x7A2E_000F, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    store
+        .apply(0, |w| {
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(5),
+                    n: 111,
+                },
+            )?;
+            w.put(
+                2,
+                &Ticket {
+                    id: Id::from_raw(5),
+                    n: 222,
+                },
+            )
+        })
+        .expect("two tenants writing the same id must not error");
+
+    let snap = store.snapshot().unwrap();
+    let t1 = snap
+        .get_scoped::<Ticket>(1, Id::from_raw(5))
+        .unwrap()
+        .expect("tenant 1's row must exist");
+    let t2 = snap
+        .get_scoped::<Ticket>(2, Id::from_raw(5))
+        .unwrap()
+        .expect("tenant 2's row must exist");
+    assert_eq!(
+        t1.n, 111,
+        "get_scoped(1, 5) must return tenant 1's row, not tenant 2's"
+    );
+    assert_eq!(
+        t2.n, 222,
+        "get_scoped(2, 5) must return tenant 2's row, not tenant 1's"
+    );
+    assert!(
+        snap.get_scoped::<Ticket>(3, Id::from_raw(5))
+            .unwrap()
+            .is_none(),
+        "a third tenant that never wrote id 5 must see nothing"
+    );
+}
+
+/// `Snapshot::scan_from_scoped`: bounded by BOTH the tenant (never see
+/// another tenant's rows regardless of cursor) and the cursor (never see
+/// this tenant's own ids below `from_id`).
+#[test]
+fn a_scoped_scan_from_is_bounded_to_its_tenant_and_its_cursor() {
+    let sim = Sim::with_faults(0x7A2E_0010, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    store
+        .apply(0, |w| {
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(1),
+                    n: 1,
+                },
+            )?;
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(3),
+                    n: 3,
+                },
+            )?;
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(5),
+                    n: 5,
+                },
+            )?;
+            w.put(
+                2,
+                &Ticket {
+                    id: Id::from_raw(2),
+                    n: 2,
+                },
+            )?;
+            w.put(
+                2,
+                &Ticket {
+                    id: Id::from_raw(4),
+                    n: 4,
+                },
+            )
+        })
+        .expect("setup writes must not error");
+
+    let snap = store.snapshot().unwrap();
+    let ids: Vec<u64> = snap
+        .scan_from_scoped::<Ticket>(1, 3, 10)
+        .expect("scan_from_scoped must not error")
+        .into_iter()
+        .map(|t| t.id.raw())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![3, 5],
+        "scan_from_scoped(scope=1, from_id=3) must return tenant 1's ids >= 3 — id 1 is \
+         excluded by the cursor, and tenant 2's 2/4 must never appear regardless of the cursor"
+    );
+}
+
+/// `scan_from_scoped`'s upper bound is INCLUSIVE (`..=scoped_key(scope,
+/// u64::MAX)`), and `u64::MAX` is the only id where `..=` and `..` diverge —
+/// a row there is visible only if the range is closed, not half-open.
+#[test]
+fn a_scoped_scan_from_includes_the_row_at_u64_max() {
+    let sim = Sim::with_faults(0x7A2E_0015, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    store
+        .apply(0, |w| {
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(5),
+                    n: 5,
+                },
+            )?;
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(u64::MAX - 1),
+                    n: 1,
+                },
+            )?;
+            w.put(
+                1,
+                &Ticket {
+                    id: Id::from_raw(u64::MAX),
+                    n: 2,
+                },
+            )?;
+            w.put(
+                2,
+                &Ticket {
+                    id: Id::from_raw(u64::MAX),
+                    n: 3,
+                },
+            )
+        })
+        .expect("setup writes must not error");
+
+    let snap = store.snapshot().unwrap();
+    let ids: Vec<u64> = snap
+        .scan_from_scoped::<Ticket>(1, u64::MAX - 1, 10)
+        .expect("scan_from_scoped must not error")
+        .into_iter()
+        .map(|t| t.id.raw())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![u64::MAX - 1, u64::MAX],
+        "scan_from_scoped's upper bound must be INCLUSIVE of u64::MAX, not stop short of it"
+    );
+
+    let ids_at_max: Vec<u64> = snap
+        .scan_from_scoped::<Ticket>(1, u64::MAX, 10)
+        .expect("scan_from_scoped must not error")
+        .into_iter()
+        .map(|t| t.id.raw())
+        .collect();
+    assert_eq!(
+        ids_at_max,
+        vec![u64::MAX],
+        "a cursor positioned AT u64::MAX must still see the row there"
+    );
+}
+
+/// `Snapshot::scan_raw_from` (the migration path) must learn the composite
+/// `[u8; 16]` key shape rather than erroring with `TableTypeMismatch`, and
+/// must stay scope-agnostic: `migrate_schema()` rewrites every tenant's
+/// rows in one pass, so it must see all of them, not just one scope's.
+#[test]
+fn scan_raw_from_learns_the_composite_key_shape_and_sees_every_tenant() {
+    let sim = Sim::with_faults(0x7A2E_0011, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    store
+        .apply(0, |w| {
+            w.put(
+                10,
+                &Ticket {
+                    id: Id::from_raw(1),
+                    n: 100,
+                },
+            )?;
+            w.put(
+                20,
+                &Ticket {
+                    id: Id::from_raw(1),
+                    n: 200,
+                },
+            )
+        })
+        .expect("two tenants writing the same id on a scoped table must not error");
+
+    let snap = store.snapshot().unwrap();
+    let rows = snap.scan_raw_from(Ticket::TABLE, None, 10).expect(
+        "scan_raw_from must learn the [u8;16] key shape rather than erroring with \
+         TableTypeMismatch — migrate_schema() has to be able to walk a scoped table too",
+    );
+    let mut ns: Vec<u32> = rows
+        .iter()
+        .map(|(_, bytes)| Ticket::decode_row(bytes).unwrap().n)
+        .collect();
+    ns.sort_unstable();
+    assert_eq!(
+        ns,
+        vec![100, 200],
+        "scan_raw_from must return BOTH tenants' rows — it stays scope-agnostic on purpose, \
+         because migrate_schema() rewrites every tenant's rows in one pass"
+    );
+}
+
+/// Hard rule 4, negative space: each of the three scope-taking read
+/// primitives asserts `row_is_scoped::<R>()` rather than silently opening
+/// the WRONG physical redb table (`scoped_rows_def`, which the unscoped
+/// write path never creates) and reading back an empty, misleadingly
+/// "successful" result for a table that actually has rows.
+#[test]
+#[should_panic(expected = "Snapshot::get_scoped: table \"charpente.jobs\" is not tenant-scoped")]
+fn get_scoped_on_an_unscoped_table_panics() {
+    let sim = Sim::with_faults(0x7A2E_0012, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+    let snap = store.snapshot().unwrap();
+    let _ = snap.get_scoped::<JobRow>(0, Id::from_raw(1));
+}
+
+/// See `get_scoped_on_an_unscoped_table_panics`; same reasoning, `scan_scoped`.
+#[test]
+#[should_panic(expected = "Snapshot::scan_scoped: table \"charpente.jobs\" is not tenant-scoped")]
+fn scan_scoped_on_an_unscoped_table_panics() {
+    let sim = Sim::with_faults(0x7A2E_0013, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+    let snap = store.snapshot().unwrap();
+    let _ = snap.scan_scoped::<JobRow>(0);
+}
+
+/// See `get_scoped_on_an_unscoped_table_panics`; same reasoning, `scan_from_scoped`.
+#[test]
+#[should_panic(
+    expected = "Snapshot::scan_from_scoped: table \"charpente.jobs\" is not tenant-scoped"
+)]
+fn scan_from_scoped_on_an_unscoped_table_panics() {
+    let sim = Sim::with_faults(0x7A2E_0014, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+    let snap = store.snapshot().unwrap();
+    let _ = snap.scan_from_scoped::<JobRow>(0, 0, 10);
+}
