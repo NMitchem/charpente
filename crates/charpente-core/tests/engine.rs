@@ -551,17 +551,9 @@ impl Row for Ticket {
     }
 }
 
-/// Whether `Ticket`'s `by_n` index still holds an entry for `n` under
-/// `scope`.
-///
-/// Before Task 6, a scoped table's index entries had no scope prefix, so
-/// this had only an indirect observable: `scan_by` walks the index range
-/// first and only reaches `Snapshot::get` if that range is non-empty, and
-/// `get` was still bare-`u64` keyed, so an entry that EXISTED made it fail
-/// with redb's `[u8; 16]` key-type mismatch. Task 6 gives this a direct
-/// oracle instead — `scan_by_scoped` resolves hits through `get_scoped`,
-/// which understands the composite key — so presence is just whether the
-/// scoped lookup comes back non-empty.
+/// Whether `Ticket`'s `by_n` index holds an entry for `n` under `scope`.
+/// Resolves through `get_scoped`, so an entry that points at a row which no
+/// longer exists panics (index corruption) rather than reading as absent.
 fn ticket_index_entry_survives(snap: &Snapshot, scope: u64, n: u32) -> bool {
     !snap
         .scan_by_scoped::<Ticket>(scope, "by_n", &n)
@@ -1309,7 +1301,7 @@ fn an_unscoped_index_entry_stays_byte_identical() {
     expected.extend_from_slice(&9u64.to_be_bytes()); // id, big-endian
 
     let snap = store.snapshot().unwrap();
-    let raw = snap.scan_index_raw("test.widget.by_n").unwrap();
+    let raw = snap.scan_index_raw::<Widget>("by_n").unwrap();
     assert_eq!(
         raw,
         vec![expected],
@@ -1406,6 +1398,11 @@ fn a_scoped_delete_retires_only_that_tenants_index_entry() {
 
     store
         .apply(0, |w| {
+            // SAME id, not just the same key: a wrong-scope removal that
+            // happens to land on tenant 2's entry needs tenant 2's entry to
+            // actually be at the bytes the mutated removal would compute
+            // (scope, key, id) — a mismatched id would make that removal a
+            // harmless no-op instead of a cross-tenant destructive write.
             w.put(
                 1,
                 &Ticket {
@@ -1416,12 +1413,12 @@ fn a_scoped_delete_retires_only_that_tenants_index_entry() {
             w.put(
                 2,
                 &Ticket {
-                    id: Id::from_raw(6),
+                    id: Id::from_raw(5),
                     n: 42,
                 },
             )
         })
-        .expect("two tenants indexing the same key must not error");
+        .expect("two tenants indexing the same key at the same id must not error");
 
     store
         .apply(1, |w| w.delete::<Ticket>(1, Id::from_raw(5)))

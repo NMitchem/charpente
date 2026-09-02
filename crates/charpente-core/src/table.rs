@@ -9,11 +9,11 @@
 //!
 //! Index entries are `[key len: u32 le][key bytes][id: u64 be]` — the length
 //! prefix makes exact-match lookups unambiguous (no prefix collisions). A
-//! scoped table's entries carry a `[scope: u64 be]` prefix ahead of that
-//! (tenant-scoping Task 6), so one tenant's slice of a shared index table is
-//! a contiguous byte range — the same reasoning as `scoped_key`'s row-key
-//! prefix. Range scans over indexes arrive when a real query pattern
-//! demands an order-preserving key encoding.
+//! scoped table's entries carry a `[scope: u64 be]` prefix ahead of that, so
+//! one tenant's slice of a shared index table is a contiguous byte range —
+//! the same reasoning as `scoped_key`'s row-key prefix. Range scans over
+//! indexes arrive when a real query pattern demands an order-preserving key
+//! encoding.
 
 use std::fmt;
 use std::io;
@@ -467,6 +467,52 @@ mod scoped_key_tests {
         let d = scoped_key(1, 6);
         assert!(c < d, "within a tenant, ids must stay ordered");
     }
+
+    /// `scoped_index_entry`'s exact byte layout: `[scope u64 be][keylen u32
+    /// le][key][id u64 be]`. Every integration test that exercises a scoped
+    /// index observes this only through `scan_by_scoped`, which bounds
+    /// itself with the same encoder — writer and reader agree under a
+    /// coordinated re-encoding (little-endian scope, or scope moved after
+    /// the key), so a round trip alone proves nothing about the bytes on
+    /// disk, which every pinned simulation seed depends on. A unit test, not
+    /// an integration one, for the same reason `a_scoped_key_orders_by_
+    /// scope_then_id` above is: it needs no `Store`.
+    #[test]
+    fn scoped_index_entry_layout_is_scope_be_then_keylen_le_then_key_then_id_be() {
+        let entry = scoped_index_entry(
+            0x0102_0304_0506_0708,
+            vec![0xAA, 0xBB],
+            0x1112_1314_1516_1718,
+        );
+        let mut expected = 0x0102_0304_0506_0708u64.to_be_bytes().to_vec();
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[0xAA, 0xBB]);
+        expected.extend_from_slice(&0x1112_1314_1516_1718u64.to_be_bytes());
+        assert_eq!(entry, expected);
+    }
+
+    /// `scoped_index_entry`'s ordering claim, its own doc comment's: scope
+    /// dominates key, which dominates id. Lexicographic byte order over the
+    /// entry must agree with (scope, key, id) order, or `scan_by_scoped`'s
+    /// tenant-bounded range is not contiguous and collapses into a filter —
+    /// same reasoning as `a_scoped_key_orders_by_scope_then_id` above, one
+    /// level up.
+    #[test]
+    fn scoped_index_entry_orders_by_scope_then_key_then_id() {
+        let k = vec![9u8];
+        assert!(
+            scoped_index_entry(1, k.clone(), u64::MAX) < scoped_index_entry(2, k.clone(), 0),
+            "scope must be the most significant field: tenant 1's last entry must sort before \
+             tenant 2's first, regardless of key or id"
+        );
+
+        let k1 = vec![1u8];
+        let k2 = vec![2u8];
+        assert!(
+            scoped_index_entry(1, k1, 9) < scoped_index_entry(1, k2, 9),
+            "within one scope, entries must still order by key"
+        );
+    }
 }
 
 fn index_table_name<R: Row>(index: &IndexDef<R>) -> String {
@@ -912,11 +958,11 @@ impl Writer<'_> {
     }
 
     /// See `put`'s doc comment for why `scope` is required rather than
-    /// optional. Index entries carry the same scope prefix `put` writes
-    /// (Task 6, tenant scoping): removing an entry under the wrong scope
-    /// would not error — redb's `remove` is a no-op on an absent key — it
-    /// would just strand the real entry, so the scope must reach this
-    /// removal exactly as it reaches `put`'s.
+    /// optional. Index entries carry the same scope prefix `put` writes:
+    /// removing an entry under the wrong scope would not error — redb's
+    /// `remove` is a no-op on an absent key — it would just strand the real
+    /// entry, so the scope must reach this removal exactly as it reaches
+    /// `put`'s.
     pub fn delete<R: Row>(&mut self, scope: u64, id: Id<R>) -> io::Result<()> {
         let scoped = row_is_scoped::<R>();
         let old = if scoped {
@@ -1359,7 +1405,13 @@ impl Snapshot {
         let index = R::INDEXES
             .iter()
             .find(|i| i.name == index_name)
-            .unwrap_or_else(|| panic!("no index named \"{index_name}\" on table {}", R::TABLE));
+            .unwrap_or_else(|| {
+                panic!(
+                    "no index named \"{index_name}\" on table {} — declare it with #[index] (check \
+                 the field's index name)",
+                    R::TABLE
+                )
+            });
         let table = match self.txn.open_table(index_def(&index_table_name(index))) {
             Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1393,26 +1445,35 @@ impl Snapshot {
         Ok(out)
     }
 
-    /// Every entry's raw key bytes for one index table, in stored
+    /// Every entry's raw key bytes for one table's named index, in stored
     /// (byte-lexicographic) order — `scan_raw`'s counterpart for a
     /// secondary index rather than a table's primary rows, and for the
     /// identical reason (see `scan_raw`'s own doc comment): `scan_by`/
     /// `scan_by_scoped` decode a row back out through `get`/`get_scoped` and
     /// never look at the key that pointed at it, so a round trip through
-    /// them proves nothing about the key's own byte layout. `table` is the
-    /// physical index table name, `"{Row::TABLE}.{index name}"` —
-    /// `index_table_name`'s own format, not itself `pub`; this takes the
-    /// already-formatted string the same way `scan_raw` takes a raw row
-    /// table name. Empty, not an error, when the index table has never been
-    /// created.
-    pub fn scan_index_raw(&self, table: &str) -> io::Result<Vec<Vec<u8>>> {
-        let index = match self.txn.open_table(index_def(table)) {
-            Ok(index) => index,
+    /// them proves nothing about the key's own byte layout. Takes `R` and
+    /// an index name rather than a raw table-name string, so
+    /// `index_table_name`'s `"{TABLE}.{index}"` format stays a private
+    /// convention rather than part of the public contract. Empty, not an
+    /// error, when the index table has never been created.
+    pub fn scan_index_raw<R: Row>(&self, index_name: &str) -> io::Result<Vec<Vec<u8>>> {
+        let index = R::INDEXES
+            .iter()
+            .find(|i| i.name == index_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no index named \"{index_name}\" on table {} — declare it with #[index] (check \
+                 the field's index name)",
+                    R::TABLE
+                )
+            });
+        let table = match self.txn.open_table(index_def(&index_table_name(index))) {
+            Ok(table) => table,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
             Err(e) => return Err(redb_err(e)),
         };
         let mut out = Vec::new();
-        for entry in index.iter().map_err(redb_err)? {
+        for entry in table.iter().map_err(redb_err)? {
             let (key, _) = entry.map_err(redb_err)?;
             out.push(key.value().to_vec());
         }
