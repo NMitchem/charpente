@@ -1600,27 +1600,52 @@ fn a_followers_apply_shipped_lands_a_scoped_write_under_its_own_scope() {
 /// `charpente/tests/replication.rs`'s atomicity tests hand-encode a bad tag,
 /// and driving it through the real `apply_shipped` path: the row must land
 /// under scope 7, and must NOT be visible under scope 0.
-#[test]
-fn a_hand_encoded_scoped_record_at_a_nonzero_scope_lands_under_that_scope() {
-    fn encode_len_prefixed(bytes: &[u8], out: &mut Vec<u8>) {
-        (bytes.len() as u32).encode(out);
-        out.extend_from_slice(bytes);
-    }
+fn encode_len_prefixed(bytes: &[u8], out: &mut Vec<u8>) {
+    (bytes.len() as u32).encode(out);
+    out.extend_from_slice(bytes);
+}
 
-    let ticket = Ticket {
-        id: Id::from_raw(3),
-        n: 99,
-    };
+/// A hand-encoded one-effect `0x05` (scoped Put) record for `Ticket` — same
+/// wire shape `db.rs`'s own `encode_record` produces, built by hand because
+/// `Tx::put` cannot express a nonzero scope yet (Task 7).
+fn scoped_put_record(scope: u64, id: u64, n: u32) -> Vec<u8> {
     let mut row_bytes = Vec::new();
-    ticket.encode_row(&mut row_bytes);
-
+    Ticket {
+        id: Id::from_raw(id),
+        n,
+    }
+    .encode_row(&mut row_bytes);
     let mut record = Vec::new();
     1u32.encode(&mut record); // n = 1 effect
     record.push(5); // tag 0x05: scoped Put
     encode_len_prefixed(Ticket::TABLE.as_bytes(), &mut record);
-    7u64.encode(&mut record); // scope
+    scope.encode(&mut record);
     encode_len_prefixed(&row_bytes, &mut record);
+    record
+}
 
+/// A hand-encoded one-effect `0x06` (scoped Delete) record for `Ticket`.
+fn scoped_delete_record(scope: u64, id: u64) -> Vec<u8> {
+    let mut record = Vec::new();
+    1u32.encode(&mut record); // n = 1 effect
+    record.push(6); // tag 0x06: scoped Delete
+    encode_len_prefixed(Ticket::TABLE.as_bytes(), &mut record);
+    scope.encode(&mut record);
+    id.encode(&mut record);
+    record
+}
+
+/// Every reachable write today lands at scope 0 (`Tx::put` always uses the
+/// overlay's default slot; Task 7's `tx.scope()` is what will let a caller
+/// choose otherwise), so no test above can tell a correctly-threaded scope
+/// apart from `apply_put` silently substituting `table::UNSCOPED` for it —
+/// both are the value 0. This test closes that gap by hand-encoding a
+/// `0x05` (scoped Put) record at a genuinely nonzero scope, the same way
+/// `charpente/tests/replication.rs`'s atomicity tests hand-encode a bad tag,
+/// and driving it through the real `apply_shipped` path: the row must land
+/// under scope 7, and must NOT be visible under scope 0.
+#[test]
+fn a_hand_encoded_scoped_record_at_a_nonzero_scope_lands_under_that_scope() {
     let sim = Sim::with_faults(0x6B00_0003, FaultConfig::none());
     let mut db = Db::open(
         Box::new(sim.disk()),
@@ -1628,7 +1653,8 @@ fn a_hand_encoded_scoped_record_at_a_nonzero_scope_lands_under_that_scope() {
         Schema::new().table::<Ticket>(),
     )
     .unwrap();
-    db.apply_shipped(&[(0, record)]).unwrap();
+    db.apply_shipped(&[(0, scoped_put_record(7, 3, 99))])
+        .unwrap();
 
     let snap = db.snapshot().unwrap();
     assert!(
@@ -1643,5 +1669,35 @@ fn a_hand_encoded_scoped_record_at_a_nonzero_scope_lands_under_that_scope() {
             .is_none(),
         "a scope-7 write must not be visible under scope 0 — apply_put must use the decoded \
          scope, not silently substitute table::UNSCOPED for it"
+    );
+}
+
+/// `apply_delete`'s own counterpart to the Put test above, same reasoning:
+/// a scope-7 hand-encoded `0x06` delete must retire the scope-7 row, which
+/// `Writer::delete`'s absent-row no-op makes an oracle by itself — if
+/// `apply_delete` silently substituted `table::UNSCOPED` for the decoded
+/// scope, it would look for (and find nothing at) scope 0 and quietly no-op,
+/// leaving the scope-7 row standing.
+#[test]
+fn a_hand_encoded_scoped_delete_at_a_nonzero_scope_retires_that_scopes_row() {
+    let sim = Sim::with_faults(0x6B00_0005, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Ticket>(),
+    )
+    .unwrap();
+    db.apply_shipped(&[(0, scoped_put_record(7, 3, 99))])
+        .unwrap();
+    db.apply_shipped(&[(1, scoped_delete_record(7, 3))])
+        .unwrap();
+
+    let snap = db.snapshot().unwrap();
+    assert!(
+        snap.get_scoped::<Ticket>(7, Id::from_raw(3))
+            .unwrap()
+            .is_none(),
+        "a hand-encoded scope-7 delete must retire the scope-7 row — apply_delete must use \
+         the decoded scope, not silently substitute table::UNSCOPED for it"
     );
 }
