@@ -47,6 +47,24 @@ of SQL tooling against the primary API; ad-hoc analytics deferred to the read-on
 Postgres-wire endpoint (M2). Reopen if: typed combinators prove insufficient for real app
 query patterns by mid-M1.
 
+**Trigger read 2026-09-02; it does not fire, and the deferral stands.** (Recorded at Noah's
+direction; a status-quo reading, not Noah's own hand — revisable.) `examples/invoicing` is
+still the only app in the tree. `examples/invoicing/src` has three `scan::<T>()` call sites:
+`list_customers` and `list_invoices` in `routes.rs` (lines 89, 222) are legitimate list-all
+routes; the overdue sweep in `jobs.rs` (line 121) is a filtered full scan standing in for a
+missing range index. Typed indexes ARE used where they fit: `LineItem::by_invoice` (twice —
+`routes.rs:134`, `jobs.rs:28`) and `ApiKey::by_key_hash` (used by the platform's own auth
+ladder, `crates/charpente/src/auth/ladder.rs:111`, which `examples/invoicing`'s `auth` routes
+exercise). The chain that normalized the one gap:
+`examples/invoicing/FINDINGS.md` (79-87, "`#[index]` is only demonstrated on `Id<T>` and
+`String` fields") → `docs/GUIDE.md` (188-191, under the "`#[index]` works on any `Codec`
+field" heading at line 131) promoting scan-then-filter to a sanctioned idiom; DESIGN.md §9
+item 3 already records the same evidence informally. One gap in one small app is not a
+pattern; the trigger does not fire. What reopens it: a second app, or a second forced
+scan-filter in invoicing, that needs a range/comparison index — at which point `#[index]`
+grows an order-preserving encoding (DESIGN §4, line 689: "exact-match lookups only until a
+real query pattern demands order-preserving key encoding").
+
 ## 5. Compiled-in Rust app code, not a WASM plugin model
 
 SpacetimeDB chose WASM reducers (host-language flexibility, sandboxing, hot swap). Rejected
@@ -65,6 +83,24 @@ component-model toolchain ever gives *zero-copy, compile-time-checked* host/gues
 - Async replication with possible failover loss-window in v1, rather than consensus-first:
   consensus can be added *behind the same log format* later; shipping M0 cannot wait on it.
   Reopen at M1 exit criteria.
+
+**Trigger read 2026-09-02; it does not fire, and the deferral stands.** (Recorded at Noah's
+direction; a status-quo reading, not Noah's own hand — revisable.) M1's exit criterion — "a
+follower promoted mid-write-load loses nothing and serves reads throughout" — was discharged
+2026-07-27 with an oracle at two layers, an in-sim property plus an edge-harness wire oracle
+(PLAN.md M1 exit criteria). The non-converged tail is exactly the §6 loss window, reported
+separately rather than hidden: `charpente promote`'s `CtrlOk` names `last_applied`, and
+"records the dead primary acked but had not shipped are the DECISIONS §6 window, lost
+honestly and named" (DESIGN.md §5, line 930-931). Since then, the dual-primary boot gate
+(spec 2026-07-31, DESIGN.md §5 "The boot gate", line 945) and the verifying-peer policy
+(spec 2026-08-06, DESIGN.md §5, line 973-974) closed the split-brain shapes a promote could
+create. Consensus-elected promotion remains addable behind the same log format, per this
+entry's own text above. Async stands for M2; the loss window is bounded, named, and tested
+rather than hidden. What reopens it: the hosted control plane (PLAN.md M2) needing automatic
+election, or an edge-harness/production finding where the bounded window is unacceptable —
+at which point consensus lands behind the log format, not as a data-plane change. Design C
+(a durable timeline epoch on `Hello`) is in the M2 follow-up backlog (docs/LEDGER.md, line
+1734 "M2 follow-up backlog") as the sharpening step short of consensus.
 
 ## 7. redb first, own LSM second
 
@@ -106,6 +142,23 @@ isolation, and says nothing about a workload whose store cost is not swamped by 
 finer attribution needs per-phase profiling the instrument does not do. The follow-up this
 opens is group commit, not an engine swap.
 
+**Trigger (a) re-read 2026-08-20 after group commit and per-batch apply; it still does not
+fire.** (Recorded at Noah's direction; a status-quo reading, not Noah's own hand — revisable.)
+The 2026-08-10 reading above pre-dates group commit (shipped 2026-08-15) and per-batch apply
+(shipped 2026-08-20), which is precisely what removes the one-fsync-per-transaction ceiling
+the first reading rested on, so the trigger was owed a re-read (PLAN.md, M2 "Honest benchmark
+harness" bullet). The per-phase attribution sub-project delivered it on the same instrument
+and protocol with a fresh interleaved baseline: trigger (a) "does not fire under any reading"
+of "largest single non-idle phase" — "the field reading leads by 71-73 points, and the two
+readings that would previously have fired now decline" (PLAN.md, same bullet). Numbers and
+method are in [docs/BENCH.md](docs/BENCH.md) ("Where a batched commit's time goes — per-phase
+attribution (2026-08-20)"); the corresponding entry is docs/LEDGER.md's "2026-08-20 — M2
+sub-project: per-batch apply (store commit point), COMPLETE" section (and the per-phase
+attribution sub-project entry immediately above it, also dated 2026-08-20). This §7 remains
+untouched and Noah's to sign off — what changed is that the ambiguity which made it a
+judgment call is gone, so the deferral simply stands. Triggers (b) and (c) are untouched by
+this re-read.
+
 ## 8. Name
 
 `charpente` (French: the load-bearing timber frame of a building). Chosen by Noah after
@@ -143,3 +196,17 @@ interleaving exploration comes from crash-time write-buffer collapse, not async 
 shuffling. Costs accepted: concurrency at the edges needs its own deterministic executor
 when HTTP/queue land (M0 steps 5–6); tokio-flavored async stays outside the deterministic
 boundary. Reopen if: the edge executor proves the core traits must be awaitable.
+
+**Trigger read 2026-09-02; it does not fire — closed.** (Recorded at Noah's direction; a
+status-quo reading, not Noah's own hand — revisable.) The edge executor landed and is
+poll-shaped, the evidence this trigger asked for: `Kernel::step`
+(`crates/charpente/src/kernel/mod.rs:305`) services exactly one ready source per call and
+never blocks, reporting a deadline for its caller to park on (`Step::Worked`/`Step::Idle`,
+lines 58-61); `Repl::pump_io`/`Repl::step`
+(`crates/charpente/src/repl/mod.rs:385,503`), the `Ready::Tail` arm and the `Ready::Archive`
+arm (`crates/charpente/src/kernel/mod.rs:758,771`) are all polls — DESIGN.md §1 (lines
+180-229) and §5 (line 841, "Both are driven kernel-shaped") describe them as such. `hyper`/
+`tokio` appear only in `crates/charpente/src/serve.rs` (verified: no other file under
+`crates/charpente/src` imports either), translating wire↔struct at the edge. No core trait
+became awaitable — `crates/charpente-core/src/io.rs` has no `async fn`. Keep the entry; this
+is the closing paragraph.
