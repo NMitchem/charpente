@@ -403,12 +403,20 @@ loud again).
 `[n: u32]` then n tagged effects — put `0x00 [table][row]`, delete
 `0x01 [table][id]`, enqueue `0x02 [job][payload][key: Option<String>]`, emit
 `0x03 [event][payload][key: Option<String>]`, strings and byte fields
-length-prefixed per the row codec. Table effects are the transaction's
-collapsed write set in (table, id)
-order — intermediate overwrites inside a transaction are observable by no one
-and are not logged; enqueues and emits keep call order. Replay resolves table
-names through the `Schema` registry passed to `Db::open`. The enqueue key is
-the job's stable external identity — carried, never interpreted inside the
+length-prefixed per the row codec. A tenant-scoped table's (`Row::Scope !=
+Unscoped`, tenant-scoping Task 4) put and delete carry the scope instead:
+`0x05 [table][scope: u64][row]`, `0x06 [table][scope: u64][id]` — chosen by
+the table's own scopedness, never by the scope's value, so a scoped table
+still uses `0x05`/`0x06` at scope 0 (tenant 0 is a legal tenant, not "no
+scope"); every other table's put/delete stays exactly the `0x00`/`0x01`
+shape above, byte-identical to before tenant scoping. A binary that does not
+know a tag (older, or a later one it hasn't caught up to) refuses it by
+name rather than misreading a wider record. Table effects are the
+transaction's collapsed write set in (table, scope, id) order — intermediate
+overwrites inside a transaction are observable by no one and are not
+logged; enqueues and emits keep call order. Replay resolves table names
+through the `Schema` registry passed to `Db::open`. The enqueue key is the
+job's stable external identity — carried, never interpreted inside the
 deterministic boundary in v0; M1's external-IO surface is what consumes it.
 
 **Group commit (M2 sub-project 2, 2026-08-15).** The commit point is a *group*, not a

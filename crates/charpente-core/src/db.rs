@@ -8,12 +8,19 @@
 //! Record payload v0: `[n: u32 le]` then n tagged effects —
 //! `0x00 [table][row]` put, `0x01 [table][id: u64 le]` delete,
 //! `0x02 [job][payload][key: Option<String>]` enqueue,
-//! `0x03 [event][payload][key: Option<String>]` emit — strings and byte
-//! fields length-prefixed per the `Codec` layout.
+//! `0x03 [event][payload][key: Option<String>]` emit,
+//! `0x05 [table][scope: u64 le][row]` scoped put,
+//! `0x06 [table][scope: u64 le][id: u64 le]` scoped delete — strings and
+//! byte fields length-prefixed per the `Codec` layout. `0x05`/`0x06` are the
+//! ONLY tags that carry a scope, chosen by the table's own `Row::Scope`, not
+//! by the scope value (tenant 0 is a legal tenant, so a scoped table's
+//! records always use `0x05`/`0x06`, never `0x00`/`0x01`, even at scope 0).
+//! A binary that does not know a tag refuses it by name
+//! (`decode_record`'s unknown-tag error) rather than misreading a wider
+//! record.
 //! Table effects are the transaction's collapsed overlay in (table, scope,
-//! id) order (scope is 0 for every table today): intermediate overwrites
-//! inside a transaction are invisible to every observer and are not
-//! logged. Enqueues and emits keep call order.
+//! id) order: intermediate overwrites inside a transaction are invisible to
+//! every observer and are not logged. Enqueues and emits keep call order.
 //! The enqueue key is the job's idempotency identity to the world outside
 //! the log — carried, never interpreted inside the deterministic boundary.
 
@@ -141,55 +148,31 @@ fn tx_err_to_io<E: fmt::Debug>(e: TxError<E>) -> io::Error {
 
 #[derive(Clone)]
 struct TableOps {
-    apply_put: fn(&mut Writer<'_>, &[u8]) -> io::Result<()>,
-    apply_delete: fn(&mut Writer<'_>, u64) -> io::Result<()>,
+    // `scope` is `table::UNSCOPED` for an unscoped table, the record's own
+    // decoded scope for a scoped one — `apply_batch`'s effect dispatch
+    // resolves which (`resolve_effect_scope`, below), the one place that
+    // holds both the record's tag and the table's own `scoped` bit.
+    apply_put: fn(&mut Writer<'_>, u64, &[u8]) -> io::Result<()>,
+    apply_delete: fn(&mut Writer<'_>, u64, u64) -> io::Result<()>,
     // Rebuilds every one of the table's secondary indexes from its rows;
     // invoked by the migration close-out trigger in `TableMachine::apply`.
     rebuild_indexes: fn(&mut Writer<'_>) -> io::Result<()>,
     version: u32,
     fingerprint: Option<u64>,
+    // `Row::Scope != Unscoped` — which wire tag (`0x00`/`0x01` vs
+    // `0x05`/`0x06`) this table's Put/Delete effects must carry.
+    scoped: bool,
     // `IndexDef<R>` is generic per-`Row`, so no `&'static [&'static str]` of
     // names exists to borrow — projected once at registration time instead.
     index_names: Vec<&'static str>,
 }
 
-// `crate::table::UNSCOPED` (the store's row-key scope slot), not this
-// module's own `UNSCOPED` (the overlay's key slot, below) — Effect::Put and
-// Effect::Delete carry no scope field yet (v0 record format; see the
-// GroupOverlay doc comment), so replay has nothing but the unscoped value to
-// pass here regardless.
-//
-// Hard rule 4, negative space: that is safe ONLY while no scoped table is
-// registered, so both functions assert it rather than leaving it as a
-// comment. `Writer::put`/`Writer::delete` panic on the mirror-image mistake
-// (a bogus scope on an unscoped table); this is the far more dangerous
-// direction — a REAL scope silently replaced by 0 on the effect path, which
-// is the only path production writes take, primary and follower replay
-// alike — so it gets an oracle, not a note. Task 6b puts the scope in the
-// record and removes both assertions.
-fn apply_put<R: Row>(w: &mut Writer<'_>, row: &[u8]) -> io::Result<()> {
-    assert!(
-        !crate::table::row_is_scoped::<R>(),
-        "Schema::table: \"{}\" is tenant-scoped (Row::Scope != Unscoped), but Effect::Put \
-         carries no scope field (v0 record format), so db.rs's apply_put would replay every \
-         tenant's rows under scope 0 and merge them — registering a scoped table is blocked \
-         until tenant-scoping Task 6b adds the scope to the record and lifts this assertion",
-        R::TABLE
-    );
-    w.put(crate::table::UNSCOPED, &R::decode_row(row)?)
+fn apply_put<R: Row>(w: &mut Writer<'_>, scope: u64, row: &[u8]) -> io::Result<()> {
+    w.put(scope, &R::decode_row(row)?)
 }
 
-fn apply_delete<R: Row>(w: &mut Writer<'_>, id: u64) -> io::Result<()> {
-    assert!(
-        !crate::table::row_is_scoped::<R>(),
-        "Schema::table: \"{}\" is tenant-scoped (Row::Scope != Unscoped), but Effect::Delete \
-         carries no scope field (v0 record format), so db.rs's apply_delete would replay every \
-         tenant's deletes against scope 0 and hit the wrong tenant's row — registering a scoped \
-         table is blocked until tenant-scoping Task 6b adds the scope to the record and lifts \
-         this assertion",
-        R::TABLE
-    );
-    w.delete::<R>(crate::table::UNSCOPED, Id::from_raw(id))
+fn apply_delete<R: Row>(w: &mut Writer<'_>, scope: u64, id: u64) -> io::Result<()> {
+    w.delete::<R>(scope, Id::from_raw(id))
 }
 
 fn rebuild_indexes<R: Row>(w: &mut Writer<'_>) -> io::Result<()> {
@@ -245,6 +228,7 @@ impl Schema {
                 rebuild_indexes: rebuild_indexes::<R>,
                 version: R::VERSION,
                 fingerprint: R::FINGERPRINT,
+                scoped: crate::table::row_is_scoped::<R>(),
                 index_names: R::INDEXES.iter().map(|d| d.name).collect(),
             },
         );
@@ -345,12 +329,19 @@ pub(crate) fn schema_digest_of(schema: &Schema) -> u64 {
 
 #[derive(Debug, PartialEq)]
 enum Effect {
+    // `scope` is `None` for the `0x00`/`0x01` (unscoped) tag, `Some` for the
+    // `0x05`/`0x06` (scoped) tag — the wire presence, not the value, is what
+    // `resolve_effect_scope` checks against the table's own `TableOps::
+    // scoped`: scope 0 is a legal tenant, indistinguishable by value alone
+    // from "no scope field" (R35).
     Put {
         table: String,
+        scope: Option<u64>,
         row: Vec<u8>,
     },
     Delete {
         table: String,
+        scope: Option<u64>,
         id: u64,
     },
     Enqueue {
@@ -380,9 +371,10 @@ enum Effect {
 /// app-minted id within one batch would otherwise alias in this map, the
 /// second write silently clobbering the first and read-your-writes
 /// surfacing the wrong tenant's row. `scope` is `UNSCOPED` (`0`) for every
-/// table today — nothing derives a slot from `Row::Scope` yet, and nothing
-/// reads this slot — so this change is a pure key-width
-/// refactor: every write and read still addresses slot 0.
+/// table today, until a caller sets otherwise (Task 7's `tx.scope()` is the
+/// only thing that will) — but `encode_record` already reads it to build a
+/// scoped table's record: a scoped table's default-`0` slot is tenant 0, a
+/// real tenant (R35), not an unset marker.
 type GroupOverlay = BTreeMap<&'static str, BTreeMap<(u64, u64), Option<Vec<u8>>>>;
 
 /// The overlay key's scope slot for a table that is not tenant-scoped —
@@ -392,10 +384,15 @@ type GroupOverlay = BTreeMap<&'static str, BTreeMap<(u64, u64), Option<Vec<u8>>>
 const UNSCOPED: u64 = 0;
 
 /// A transaction's buffered effects: the collapsed per-table overlay
-/// (`None` = tombstone) plus enqueues and emits in call order.
+/// (`None` = tombstone) plus enqueues and emits in call order. `scoped_tables`
+/// names which of `overlay`'s tables `encode_record` must tag `0x05`/`0x06`
+/// (scoped) rather than `0x00`/`0x01` — `Tx::put`/`Tx::delete` populate both
+/// together, from `row_is_scoped::<R>()`, since the overlay's `(scope, id)`
+/// key alone cannot tell "scope 0" apart from "no scope" (R35).
 #[derive(Default)]
 struct TxEffects {
     overlay: GroupOverlay,
+    scoped_tables: BTreeSet<&'static str>,
     enqueues: Vec<(&'static str, Vec<u8>, Option<String>)>,
     emits: Vec<(&'static str, Vec<u8>, Option<String>)>,
     migrate_puts: Vec<(&'static str, u64, Vec<u8>)>,
@@ -423,29 +420,41 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
     let mut out = Vec::new();
     (u32::try_from(n).expect("transaction exceeds u32 effects")).encode(&mut out);
     for (table, entries) in &effects.overlay {
+        let scoped = effects.scoped_tables.contains(table);
         for (&(scope, id), entry) in entries {
-            // The v0 wire format has no scope field (table above); a
-            // nonzero scope reaching this point would silently vanish from
-            // the record instead of erroring, corrupting replay across
-            // tenants rather than merely this batch. Negative space: this
-            // cannot fire today (nothing produces a nonzero scope), and
-            // must be replaced by a real wire-format change, not deleted,
-            // the day something does.
-            assert_eq!(
-                scope, UNSCOPED,
-                "record encode: table \"{table}\" id {id} carries scope {scope}, but the v0 \
-                 record format has no scope field — encoding it would silently drop the scope \
-                 (lossy for Delete, which carries bare id; Put recovers id from row bytes)"
-            );
+            if !scoped {
+                // `Tx::put`/`Tx::delete` are the overlay's only writers
+                // (besides the SchemaVersion adoption row, always UNSCOPED)
+                // and populate `scoped_tables` in lockstep with the overlay
+                // — negative space, not a resolvable input.
+                assert_eq!(
+                    scope, UNSCOPED,
+                    "record encode: table \"{table}\" id {id} carries scope {scope} but is not \
+                     in TxEffects::scoped_tables — Tx::put/Tx::delete populate both together; \
+                     this is an encode_record bug, not a resolvable input"
+                );
+            }
             match entry {
                 Some(row) => {
-                    out.push(0);
-                    encode_bytes(table.as_bytes(), &mut out);
+                    if scoped {
+                        out.push(5);
+                        encode_bytes(table.as_bytes(), &mut out);
+                        scope.encode(&mut out);
+                    } else {
+                        out.push(0);
+                        encode_bytes(table.as_bytes(), &mut out);
+                    }
                     encode_bytes(row, &mut out);
                 }
                 None => {
-                    out.push(1);
-                    encode_bytes(table.as_bytes(), &mut out);
+                    if scoped {
+                        out.push(6);
+                        encode_bytes(table.as_bytes(), &mut out);
+                        scope.encode(&mut out);
+                    } else {
+                        out.push(1);
+                        encode_bytes(table.as_bytes(), &mut out);
+                    }
                     id.encode(&mut out);
                 }
             }
@@ -481,10 +490,12 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
         effects.push(match tag {
             0 => Effect::Put {
                 table: String::decode(input)?,
+                scope: None,
                 row: Vec::<u8>::decode(input)?,
             },
             1 => Effect::Delete {
                 table: String::decode(input)?,
+                scope: None,
                 id: u64::decode(input)?,
             },
             2 => Effect::Enqueue {
@@ -501,6 +512,16 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 table: String::decode(input)?,
                 id: u64::decode(input)?,
                 row: Vec::<u8>::decode(input)?,
+            },
+            5 => Effect::Put {
+                table: String::decode(input)?,
+                scope: Some(u64::decode(input)?),
+                row: Vec::<u8>::decode(input)?,
+            },
+            6 => Effect::Delete {
+                table: String::decode(input)?,
+                scope: Some(u64::decode(input)?),
+                id: u64::decode(input)?,
             },
             other => {
                 return Err(io::Error::new(
@@ -562,6 +583,9 @@ impl<'a> Tx<'a> {
     pub fn put<R: Row>(&mut self, row: &R) {
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
+        if crate::table::row_is_scoped::<R>() {
+            self.effects.scoped_tables.insert(R::TABLE);
+        }
         self.effects
             .overlay
             .entry(R::TABLE)
@@ -570,6 +594,9 @@ impl<'a> Tx<'a> {
     }
 
     pub fn delete<R: Row>(&mut self, id: Id<R>) {
+        if crate::table::row_is_scoped::<R>() {
+            self.effects.scoped_tables.insert(R::TABLE);
+        }
         self.effects
             .overlay
             .entry(R::TABLE)
@@ -856,7 +883,7 @@ impl StateMachine for TableMachine {
             // adopts a table and writes its first rows has declared the
             // table's version by the time pass 2 checks it.
             for effect in &effects {
-                if let Effect::Put { table, row } = effect
+                if let Effect::Put { table, scope, row } = effect
                     && table == crate::migration::SchemaVersion::TABLE
                 {
                     // Close-out detection (spec §3): a version transition
@@ -869,7 +896,9 @@ impl StateMachine for TableMachine {
                         .get_raw(table, new.id.raw())?
                         .map(|b| crate::migration::SchemaVersion::decode_row(&b))
                         .transpose()?;
-                    (schema.ops(table)?.apply_put)(w, row)?;
+                    let ops = schema.ops(table)?;
+                    let resolved = resolve_effect_scope(table, ops.scoped, *scope, "Put")?;
+                    (ops.apply_put)(w, resolved, row)?;
                     let closed_out = old.as_ref().is_some_and(|o| {
                         o.migrating_to.is_some()
                             && new.migrating_to.is_none()
@@ -901,10 +930,12 @@ impl StateMachine for TableMachine {
             // decodes.
             for effect in &effects {
                 match effect {
-                    Effect::Put { table, row } => {
+                    Effect::Put { table, scope, row } => {
                         if table == crate::migration::SchemaVersion::TABLE {
                             continue; // pass 1 applied it
                         }
+                        let ops = schema.ops(table)?;
+                        let resolved = resolve_effect_scope(table, ops.scoped, *scope, "Put")?;
                         // A below-compiled-version ordinary record (a full
                         // rebuild-from-WAL replaying history that predates a
                         // version bump) is applied DECODE-FREE: its bytes are at
@@ -922,16 +953,18 @@ impl StateMachine for TableMachine {
                             w.put_raw(table, id, row)?;
                         } else {
                             check_replay_version(schema, versions, table)?;
-                            (schema.ops(table)?.apply_put)(w, row)?;
+                            (ops.apply_put)(w, resolved, row)?;
                         }
                     }
-                    Effect::Delete { table, id } => {
+                    Effect::Delete { table, scope, id } => {
+                        let ops = schema.ops(table)?;
+                        let resolved = resolve_effect_scope(table, ops.scoped, *scope, "Delete")?;
                         if is_below_compiled(schema, versions, table) {
                             saw_below.insert(table.clone());
                             w.delete_raw(table, *id)?;
                         } else {
                             check_replay_version(schema, versions, table)?;
-                            (schema.ops(table)?.apply_delete)(w, *id)?;
+                            (ops.apply_delete)(w, resolved, *id)?;
                         }
                     }
                     Effect::MigratePut { table, id, row } => {
@@ -1084,6 +1117,47 @@ fn downgrade_msg(table: &str, persisted: u32, compiled: u32) -> String {
          version {compiled} — the binary is older than the data; run a binary built for at \
          least version {persisted}"
     )
+}
+
+/// Resolves a decoded Put/Delete effect's scope against the table's own
+/// registered scopedness (`TableOps::scoped`, from `Row::Scope`). The wire
+/// tag (`0x00`/`0x01` vs `0x05`/`0x06`, carried here as `tag_scope`'s
+/// `None`/`Some`) must agree with it — an unscoped table's record must
+/// never carry a scope field, and a scoped table's record must always carry
+/// one, even at scope 0 (R35: tenant 0 is a legal tenant, not "no scope",
+/// so the check is on the tag's PRESENCE, never the scope's value). A
+/// disagreement is a schema/log mismatch: the record was written for a
+/// different shape of this table than the one this binary has registered,
+/// and applying it anyway would silently write under the wrong scope (or
+/// none) rather than refuse (hard rule 5).
+fn resolve_effect_scope(
+    table: &str,
+    table_scoped: bool,
+    tag_scope: Option<u64>,
+    kind: &str,
+) -> io::Result<u64> {
+    match (table_scoped, tag_scope) {
+        (false, None) => Ok(crate::table::UNSCOPED),
+        (true, Some(scope)) => Ok(scope),
+        (true, None) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "record decode: table \"{table}\" is tenant-scoped (Row::Scope != Unscoped) \
+                 but this {kind} effect carries no scope (tag 0x00/0x01) — the record was \
+                 written for an unscoped shape of this table; restore from a replica or \
+                 backup, or replay under the schema that wrote it"
+            ),
+        )),
+        (false, Some(scope)) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "record decode: table \"{table}\" is not tenant-scoped (Row::Scope = \
+                 Unscoped) but this {kind} effect carries scope {scope} (tag 0x05/0x06) — \
+                 the record was written for a scoped shape of this table; restore from a \
+                 replica or backup, or replay under the schema that wrote it"
+            ),
+        )),
+    }
 }
 
 /// Refuses, by name, replaying an ordinary record for a table whose
@@ -2591,7 +2665,20 @@ impl Seeder {
         self.store.import(|w| {
             for (id, bytes) in rows {
                 let _ = id;
-                (self.import_schema.ops(table)?.apply_put)(w, bytes)?;
+                let ops = self.import_schema.ops(table)?;
+                // `apply_put` requires a scope (tenant-scoping Task 6b), but
+                // seed/restore export carries no per-row scope yet (Task 6c
+                // owns that), so this path can only ever pass `UNSCOPED`.
+                // Assert the negative space (hard rule 4) rather than
+                // silently seeding every tenant's rows under scope 0.
+                assert!(
+                    !ops.scoped,
+                    "Seeder::rows: table \"{table}\" is tenant-scoped (Row::Scope != \
+                     Unscoped), but seed/restore export carries no per-row scope yet — \
+                     seeding a scoped table is blocked until tenant-scoping Task 6c teaches \
+                     the raw export/import path the scope"
+                );
+                (ops.apply_put)(w, crate::table::UNSCOPED, bytes)?;
             }
             Ok(())
         })
@@ -2662,14 +2749,17 @@ mod tests {
             vec![
                 Effect::Put {
                     table: "invoice".into(),
+                    scope: None,
                     row: vec![1, 2, 3]
                 },
                 Effect::Delete {
                     table: "invoice".into(),
+                    scope: None,
                     id: 11
                 },
                 Effect::Put {
                     table: "org".into(),
+                    scope: None,
                     row: vec![9]
                 },
                 Effect::Enqueue {
@@ -2683,6 +2773,45 @@ mod tests {
                     key: None
                 },
             ]
+        );
+    }
+
+    /// Task 6b: an unscoped table's Put/Delete tags (`0x00`/`0x01`) must stay
+    /// byte-identical to what this repo committed before the scoped tags
+    /// (`0x05`/`0x06`) existed — every pinned simulation seed depends on it.
+    /// Pinned against the literal COMMITTED bytes (captured from `HEAD`
+    /// before this task touched `encode_record`), not a fresh encode of the
+    /// same value on both sides of the comparison, which would pass even if
+    /// both moved together.
+    #[test]
+    fn unscoped_put_and_delete_bytes_are_pinned_to_the_committed_v0_shape() {
+        let mut put_effects = TxEffects::default();
+        put_effects
+            .overlay
+            .entry("invoice")
+            .or_default()
+            .insert((UNSCOPED, 10), Some(vec![1, 2, 3]));
+        assert_eq!(
+            encode_record(&put_effects),
+            vec![
+                1, 0, 0, 0, 0, 7, 0, 0, 0, 105, 110, 118, 111, 105, 99, 101, 3, 0, 0, 0, 1, 2, 3
+            ],
+            "an unscoped Put's encoded bytes must not move"
+        );
+
+        let mut delete_effects = TxEffects::default();
+        delete_effects
+            .overlay
+            .entry("invoice")
+            .or_default()
+            .insert((UNSCOPED, 11), None);
+        assert_eq!(
+            encode_record(&delete_effects),
+            vec![
+                1, 0, 0, 0, 1, 7, 0, 0, 0, 105, 110, 118, 111, 105, 99, 101, 11, 0, 0, 0, 0, 0, 0,
+                0
+            ],
+            "an unscoped Delete's encoded bytes must not move"
         );
     }
 
@@ -2749,6 +2878,75 @@ mod tests {
                 row: vec![1, 2, 3],
             }]
         );
+    }
+
+    /// Task 6b: a table `Tx::put`/`Tx::delete` marked in `scoped_tables`
+    /// encodes `0x05`/`0x06` and carries the overlay's own scope, including
+    /// scope 0 (R35 — tenant 0 is a legal tenant, so a scoped table's
+    /// records use the scoped tags even at scope 0, never the unscoped
+    /// `0x00`/`0x01` shape `record_roundtrip_is_canonical` pins).
+    #[test]
+    fn a_scoped_tables_put_and_delete_carry_the_scope_field() {
+        let mut effects = TxEffects::default();
+        effects.scoped_tables.insert("ticket");
+        effects
+            .overlay
+            .entry("ticket")
+            .or_default()
+            .insert((0, 5), Some(vec![9, 9]));
+        effects
+            .overlay
+            .entry("ticket")
+            .or_default()
+            .insert((7, 6), None);
+        let decoded = decode_record(&encode_record(&effects)).unwrap();
+        assert_eq!(
+            decoded,
+            vec![
+                Effect::Put {
+                    table: "ticket".into(),
+                    scope: Some(0),
+                    row: vec![9, 9],
+                },
+                Effect::Delete {
+                    table: "ticket".into(),
+                    scope: Some(7),
+                    id: 6,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_effect_scope_accepts_matching_tag_and_table() {
+        assert_eq!(
+            resolve_effect_scope("t", false, None, "Put").unwrap(),
+            crate::table::UNSCOPED
+        );
+        assert_eq!(resolve_effect_scope("t", true, Some(3), "Put").unwrap(), 3);
+        assert_eq!(resolve_effect_scope("t", true, Some(0), "Put").unwrap(), 0);
+    }
+
+    #[test]
+    fn resolve_effect_scope_refuses_a_scoped_table_with_an_unscoped_tag() {
+        let err = resolve_effect_scope("ticket", true, None, "Put").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("table \"ticket\" is tenant-scoped (Row::Scope != Unscoped)"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("carries no scope"), "{err}");
+    }
+
+    #[test]
+    fn resolve_effect_scope_refuses_an_unscoped_table_with_a_scoped_tag() {
+        let err = resolve_effect_scope("widget", false, Some(3), "Delete").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("table \"widget\" is not tenant-scoped (Row::Scope = Unscoped)"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("carries scope 3"), "{err}");
     }
 
     #[test]

@@ -18,6 +18,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use charpente_core::db::{Db, DbConfig, Schema};
 use charpente_core::engine::{Engine, REHELLO_MARKER, StateMachine};
 use charpente_core::io::{Disk, File};
 use charpente_core::job::{JobRow, JobStatus};
@@ -1476,5 +1477,171 @@ fn scan_by_scoped_bounds_are_inclusive_of_id_0_and_id_max() {
         ids,
         vec![0, u64::MAX],
         "scan_by_scoped's id bound must include both id 0 and id u64::MAX"
+    );
+}
+
+// ------------------------------------------------------ Task 6b: WAL scope
+
+/// Task 6b's central claim, inverted from its own tripwire: before the WAL
+/// record carried a scope, registering `Ticket` (a scoped `Row`) and writing
+/// through `Db::transact` panicked on db.rs's R25 assert at apply (the R25
+/// assert's exact message, pinned while it was proven real:
+/// `"Schema::table: \"test.ticket\" is tenant-scoped (Row::Scope != \
+/// Unscoped), but Effect::Put carries no scope field (v0 record format), \
+/// so db.rs's apply_put would replay every tenant's rows under scope 0 and \
+/// merge them — registering a scoped table is blocked until \
+/// tenant-scoping Task 6b adds the scope to the record and lifts this \
+/// assertion"`). Now that the record's `0x05`/`0x06` tags carry the scope,
+/// the same write survives a crash-restart replay under its own scope.
+///
+/// Written at scope 0 (`Tx::put` always uses the overlay's default slot
+/// until Task 7's `tx.scope()` lands) — R35's tenant-0 pin: 0 is a legal
+/// tenant for a scoped table, not "no scope", so this must replay through
+/// the SCOPED tag (`0x05`) and land in the composite-keyed physical table,
+/// never silently through the unscoped definition. `scan_raw` (still typed
+/// `<u64, &[u8]>`) failing with a `[u8;16]` key-type mismatch is the same
+/// oracle `a_scoped_table_stores_under_the_composite_key_not_a_bare_u64`
+/// uses at the `Writer` level — here it proves the WAL-replay path, not
+/// just a direct `Writer::put` call, took the scoped route.
+#[test]
+fn a_scoped_write_survives_crash_restart_replay_under_its_own_scope() {
+    let sim = Sim::with_faults(0x6B00_0001, FaultConfig::none());
+    let cfg = DbConfig::default();
+    let schema = || Schema::new().table::<Ticket>();
+
+    let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), schema()).unwrap();
+    db.transact(|tx| -> Result<(), ()> {
+        tx.put(&Ticket {
+            id: Id::from_raw(5),
+            n: 42,
+        });
+        Ok(())
+    })
+    .unwrap();
+
+    // Crash-restart, not a clean shutdown: no checkpoint before the
+    // restart, so reopening replays the record from the WAL rather than
+    // reading it back from the already-materialized store.
+    sim.restart();
+    drop(db);
+    let db2 = Db::open(Box::new(sim.disk()), cfg, schema()).unwrap();
+
+    let snap = db2.snapshot().unwrap();
+    let row = snap
+        .get_scoped::<Ticket>(0, Id::from_raw(5))
+        .expect("get_scoped must not error for a scoped table")
+        .expect(
+            "the scoped row must survive crash-restart replay under scope 0 — tenant 0 is a \
+             legal tenant (R35), not \"no tenant\"",
+        );
+    assert_eq!(row.n, 42);
+
+    let err = snap
+        .scan_raw(Ticket::TABLE)
+        .expect_err(
+            "a replayed scoped row must land in the composite-keyed physical table, not the \
+             bare-u64 one — scan_raw (still typed <u64, &[u8]>) failing to open it here is what \
+             proves apply_put replayed it through the scoped tag (0x05), not silently through \
+             the unscoped definition (0x00)",
+        )
+        .to_string();
+    assert!(err.contains("[u8;16]") || err.contains("[u8; 16]"), "{err}");
+}
+
+/// The other replay path Task 6b's format change must cover: a follower's
+/// `apply_shipped` (DESIGN §5's write path for every non-primary node) is
+/// the exact same `TableMachine::apply_batch` a crash-restart replays
+/// through, so a scoped row shipped from a primary lands under its own
+/// scope on the follower too — never collapsed to scope 0 of a different
+/// (unscoped) definition. Drives `apply_shipped` directly rather than
+/// through the wire protocol, same idiom `charpente/tests/replication.rs`'s
+/// `a_shipped_batch_that_fails_mid_apply_rolls_back_whole` uses.
+#[test]
+fn a_followers_apply_shipped_lands_a_scoped_write_under_its_own_scope() {
+    let sim = Sim::with_faults(0x6B00_0002, FaultConfig::none());
+    let schema = || Schema::new().table::<Ticket>();
+
+    let mut primary = Db::open(Box::new(sim.disk()), DbConfig::default(), schema()).unwrap();
+    primary
+        .transact(|tx| -> Result<(), ()> {
+            tx.put(&Ticket {
+                id: Id::from_raw(9),
+                n: 7,
+            });
+            Ok(())
+        })
+        .unwrap();
+    let frames = primary.read_log(0, usize::MAX).unwrap();
+    assert_eq!(frames.len(), 1);
+
+    let mut follower = Db::open(
+        Box::new(sim.host("follower").disk()),
+        DbConfig::default(),
+        schema(),
+    )
+    .unwrap();
+    follower.apply_shipped(&frames).unwrap();
+
+    let row = follower
+        .snapshot()
+        .unwrap()
+        .get_scoped::<Ticket>(0, Id::from_raw(9))
+        .expect("get_scoped must not error for a scoped table")
+        .expect("a scoped write shipped to a follower must land under its own scope (0)");
+    assert_eq!(row.n, 7);
+}
+
+/// Every reachable write today lands at scope 0 (`Tx::put` always uses the
+/// overlay's default slot; Task 7's `tx.scope()` is what will let a caller
+/// choose otherwise), so no test above can tell a correctly-threaded scope
+/// apart from `apply_put` silently substituting `table::UNSCOPED` for it —
+/// both are the value 0. This test closes that gap by hand-encoding a
+/// `0x05` (scoped Put) record at a genuinely nonzero scope, the same way
+/// `charpente/tests/replication.rs`'s atomicity tests hand-encode a bad tag,
+/// and driving it through the real `apply_shipped` path: the row must land
+/// under scope 7, and must NOT be visible under scope 0.
+#[test]
+fn a_hand_encoded_scoped_record_at_a_nonzero_scope_lands_under_that_scope() {
+    fn encode_len_prefixed(bytes: &[u8], out: &mut Vec<u8>) {
+        (bytes.len() as u32).encode(out);
+        out.extend_from_slice(bytes);
+    }
+
+    let ticket = Ticket {
+        id: Id::from_raw(3),
+        n: 99,
+    };
+    let mut row_bytes = Vec::new();
+    ticket.encode_row(&mut row_bytes);
+
+    let mut record = Vec::new();
+    1u32.encode(&mut record); // n = 1 effect
+    record.push(5); // tag 0x05: scoped Put
+    encode_len_prefixed(Ticket::TABLE.as_bytes(), &mut record);
+    7u64.encode(&mut record); // scope
+    encode_len_prefixed(&row_bytes, &mut record);
+
+    let sim = Sim::with_faults(0x6B00_0003, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Ticket>(),
+    )
+    .unwrap();
+    db.apply_shipped(&[(0, record)]).unwrap();
+
+    let snap = db.snapshot().unwrap();
+    assert!(
+        snap.get_scoped::<Ticket>(7, Id::from_raw(3))
+            .unwrap()
+            .is_some(),
+        "a hand-encoded scope-7 record must land under scope 7"
+    );
+    assert!(
+        snap.get_scoped::<Ticket>(0, Id::from_raw(3))
+            .unwrap()
+            .is_none(),
+        "a scope-7 write must not be visible under scope 0 — apply_put must use the decoded \
+         scope, not silently substitute table::UNSCOPED for it"
     );
 }

@@ -2319,6 +2319,52 @@ fn a_shipped_batch_that_fails_mid_apply_rolls_back_whole() {
     );
 }
 
+// -------------------------------------- property: mixed-version tag refusal
+
+/// Task 1's dangling World-A obligation, discharged (tenant-scoping Task 6b,
+/// Step 4): "a follower on an older binary refuses [a wider record] by
+/// name." No genuinely older binary runs in-process, so the oracle is a
+/// follower fed a tag THIS binary does not know either — tag 7, one past
+/// Task 6b's own `0x05`/`0x06` (scoped Put/Delete), so this stays true
+/// whichever tag a later task (6c or beyond) claims next. Proves the
+/// unknown-tag refusal is wired through the REAL `apply_shipped` path, not
+/// just `decode_record`'s own unit test (`db::tests::decode_refuses_
+/// unknown_tags`) — and, like the sibling test above, that it refuses the
+/// WHOLE batch: two good records ship in the same `Frames` batch ahead of
+/// the tag-7 one, and neither must land.
+#[test]
+fn a_shipped_record_with_a_scope_era_tag_this_binary_does_not_know_refuses_by_name() {
+    let sim = Sim::with_faults(0x6B00_0004, FaultConfig::none());
+    let host_a = sim.host("a");
+    let host_b = sim.host("b");
+
+    let mut db_a = Db::open(Box::new(host_a.disk()), DbConfig::default(), make_schema()).unwrap();
+    for i in 0..2u64 {
+        db_a.transact(|tx| {
+            tx.put(&Widget {
+                id: Id::from_raw(i),
+                kind: 0,
+                weight: i as i64,
+            });
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+    }
+    let mut frames = db_a.read_log(0, usize::MAX).unwrap();
+    assert_eq!(frames.len(), 2);
+    frames.push((2, vec![1u8, 0, 0, 0, 7]));
+
+    let mut db_b = Db::open(Box::new(host_b.disk()), DbConfig::default(), make_schema()).unwrap();
+    let err = db_b.apply_shipped(&frames).unwrap_err();
+    assert!(err.to_string().contains("unknown effect tag 7"), "{err}");
+    assert_eq!(
+        db_b.last_applied(),
+        None,
+        "an unknown-tag record must refuse the WHOLE shipped batch — no partial apply of the \
+         two good records ahead of it"
+    );
+}
+
 // ----------------------------------------------------- meta-test: ack<sync
 
 /// Victim: a follower that acks a WAL append BEFORE syncing it (`bug` true),
