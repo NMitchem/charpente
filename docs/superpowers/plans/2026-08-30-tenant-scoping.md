@@ -538,6 +538,7 @@ git commit -m "feat(core): the effects record carries a scope, so replay cannot 
 
 **Files:**
 - Modify: `crates/charpente-core/src/table.rs:1000-1020` (`put_raw`/`delete_raw`/`get_raw`), `:1243-1255` (`scan_raw`), `:969-991` (`rebuild_indexes_for`)
+- Modify: `crates/charpente-core/src/table.rs` `scan_raw_from` (its Task 5 composite branch walks every scope and returns bare ids that are neither ascending nor unique across tenants), and the two consumers that assert ascending ids on it: the archive export walk in `crates/charpente/src/archive/mod.rs` (`last_id > prev`, near `:2083`) and the restore-side check in `crates/charpente/src/archive/manifest.rs` (near `:690`) — the export half of the archive, which Task 5's review found owned by no task
 - Modify: `crates/charpente-core/src/db.rs:342` + `:476` + `:913` (`Effect::MigratePut` shape, tag, apply), `:2566-2574` (`Seeder::rows`)
 - Modify: `crates/charpente/src/repl/protocol.rs:51` + `:191` (`Msg::SnapshotRows`), `crates/charpente/src/repl/session.rs:449-470` (`begin_seeding`)
 - Modify: `crates/charpente/src/archive/restore.rs:276`
@@ -559,6 +560,8 @@ sed -n '965,995p' crates/charpente-core/src/table.rs     # does rebuild_indexes_
 ```
 
 Report which are still open. Implement only those; say so explicitly for any that 6b already closed.
+
+The re-census MUST also cover `scan_raw_from`'s composite branch and the archive export walk that pages it (`archive/mod.rs` `SNAPSHOT_BATCH_ROWS`): the branch full-scans `scoped_key(0,0)..=scoped_key(MAX,MAX)` and filters by bare id, so paged export is quadratic and its ids are not ascending across scopes. A raw export of a scoped table has to carry the scope in its cursor as well as in its rows.
 
 **`rebuild_indexes_for` was added to this list by Task 4's reviewer, not by the original sweep.** It opens `rows_def(R::TABLE)` unconditionally, so any scoped table with a non-empty `INDEXES` fails with `TableTypeMismatch` at migration close-out (`TableOps::rebuild_indexes`). Loud rather than silent, which is why it ranks below the seeding and restore gaps — but it was on no task's list at all until the review caught it, which is the sixth instance of this plan's recurring mistake and the reason this step exists.
 
