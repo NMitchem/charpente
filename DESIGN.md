@@ -1,8 +1,10 @@
 # Charpente — Architecture & Design
 
-Status: design phase. This document records the load-bearing decisions and their
-rationale. Decisions marked **[IRREVERSIBLE]** cannot be retrofitted and are argued in
-detail; everything else is chosen for speed with a clear upgrade path.
+Status: M0 and M1 shipped, M2 in progress. This document records the load-bearing decisions
+and their rationale. Decisions marked **[IRREVERSIBLE]** cannot be retrofitted and are argued
+in detail; everything else is chosen for speed with a clear upgrade path. Sections marked
+"(v0/v1, implemented)" describe the tree as it stands; the rest is design intent, not yet
+built. docs/LEDGER.md is the chronological record of what shipped when.
 
 ## 0. System overview
 
@@ -564,11 +566,13 @@ platform is one dependency, not two.
   position, naming the fix, because a JSON number silently loses precision above 2^53 in
   JavaScript — and they cross the wire the same way `Id<T>` does: as decimal strings,
   surfacing in the generated client as `bigint`.
-- **Config.** A typed struct, validated at startup, no stringly `env::var` in app code.
-- **Telemetry.** Counters, histograms, and log fields are declared as types with
-  change-time checks: deleting a metric a dashboard depends on, or renaming a label, is a
-  detectable breaking change against a lockfile of the observability contract, the same way
-  Cargo.lock pins dependencies. Instrumentation that cannot silently rot.
+- **Config.** A typed struct, no stringly `env::var` in app code. Startup validation is not
+  built yet — there is no `fn validate` on `AppConfig`/`DbConfig` today.
+- **Telemetry (M2, not built).** Counters, histograms, and log fields are declared as types
+  with change-time checks: deleting a metric a dashboard depends on, or renaming a label, is
+  a detectable breaking change against a lockfile of the observability contract, the same
+  way Cargo.lock pins dependencies. Instrumentation that cannot silently rot. Nothing in this
+  bullet exists today — `describe.rs`'s `TelemetryInfo` is an empty struct.
 
 **Migrations (v1, implemented; spec `docs/superpowers/specs/2026-07-16-migrations-design.md`).**
 The organizing rule: no code path ever decodes row bytes under any version other than the
