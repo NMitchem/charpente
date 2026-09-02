@@ -732,7 +732,8 @@ fn table_macro_emits_the_declared_scope_type() {
 /// cannot depend on `charpente` to use the macro itself). Same shape as that
 /// test: a scoped put/delete must not error, and the resulting physical
 /// table must diverge from the bare-`u64`-keyed shape `scan_raw` still
-/// assumes (Task 5 teaches it the scoped shape) — proven by `scan_raw`
+/// assumes (`scan_raw_from` learns the composite shape in Task 5; `scan_raw`
+/// itself is Task 6c's) — proven by `scan_raw`
 /// failing with a `[u8;16]` key-type mismatch rather than silently reading
 /// nothing back, which is what a bug routing a scoped row through the
 /// unscoped path regardless of `Row::Scope` would look like.

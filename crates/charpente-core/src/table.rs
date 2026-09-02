@@ -1202,25 +1202,18 @@ impl View for Snapshot {
 
 impl Snapshot {
     /// Task 5 (tenant scoping), ruling R28: `View`'s own `get`/`scan`/
-    /// `scan_from` above keep their unscoped signatures unchanged — Task 7
-    /// narrows `impl View for Tx` to `R: Row<Scope = Unscoped>` rather than
-    /// widening the trait, and gives its `ScopedTx` its own `get`/`scan`/
-    /// `scan_from`/`scan_by` that thread a real scope through. These three
-    /// methods are the scope-taking primitives those build on: inherent
-    /// methods on `Snapshot`, not trait methods, so they sit beside `get`/
-    /// `scan`/`scan_from` without touching the trait `ScopedTx` (in the
+    /// `scan_from` above keep their unscoped signatures unchanged. These
+    /// three methods are the scope-taking primitives a tenant-scoped read
+    /// path builds on, owned by Task 7's `ScopedTx`: inherent methods on
+    /// `Snapshot`, not trait methods, so they sit beside `get`/`scan`/
+    /// `scan_from` without touching the trait `ScopedTx` (in the
     /// `charpente` crate, per ruling R2) has to keep compiling against.
     ///
-    /// `pub`, not `pub(crate)`: `scoped_key`'s own doc comment argues
-    /// `pub(crate)` because its ordering property has a unit test that needs
-    /// neither `Store` nor `Sim` and can live inside this module. These three
-    /// do not have that option — `charpente-core/tests/engine.rs` is a
-    /// separate compilation unit (this file's own module doc explains why:
-    /// a `Disk`-backed test cannot live in a `#[cfg(test)]` unit-test module),
-    /// so it sees only this crate's `pub` surface, and the tenant-isolation
-    /// property Task 5 exists to prove (`a_scoped_scan_cannot_see_another_
-    /// tenants_rows`, `engine.rs`) has nowhere else to call these from. Task
-    /// 7's `ScopedTx` (a different crate again) needs the same reach.
+    /// `pub`, not `pub(crate)`, for the same reason `UNSCOPED` above is:
+    /// `charpente-core/tests/engine.rs` is a separate compilation unit (see
+    /// its own module doc, `:9-15`) that sees only this crate's `pub`
+    /// surface, and the tenant-isolation property these methods exist to
+    /// prove has nowhere else to call them from.
     ///
     /// Each asserts `row_is_scoped::<R>()` (hard rule 4, negative space):
     /// calling one of these against an UNSCOPED table would open
@@ -1410,17 +1403,25 @@ impl Snapshot {
     /// `id` is recovered from the composite key's trailing 8 bytes, the
     /// same convention `index_entry`'s trailing id already uses.
     ///
-    /// Accepted limitation, not this task's to fix: for a genuinely
-    /// multi-tenant scoped table, ids are NOT globally ascending across a
-    /// scope boundary (rows sort by `(scope, id)`, so tenant 2's id 0 can
-    /// follow tenant 1's id `u64::MAX`) — `after_id` filters on the bare id
-    /// portion only, so a caller paging with the last returned id as the
-    /// next watermark can revisit or skip across scopes. Unreachable
-    /// today: `db.rs`'s `apply_put`/`apply_delete` assert `!row_is_scoped`,
-    /// so no scoped table can hold rows reached through `Db`/`Schema` (and
-    /// therefore through `migrate_schema`) before Task 6b lifts that
-    /// assert; per-scope migration ordering is Task 6b/6c's raw-path work,
-    /// not this one's.
+    /// Accepted limitation, owned by Task 6c: for a genuinely multi-tenant
+    /// scoped table, ids are NOT globally ascending across a scope boundary
+    /// (rows sort by `(scope, id)`, so tenant 2's id 0 can follow tenant
+    /// 1's id `u64::MAX`) — `after_id` filters on the bare id portion only,
+    /// so a caller paging with the last returned id as the next watermark
+    /// can revisit or skip across scopes. Two live assertions depend on the
+    /// opposite: the archive export walk's `last_id > prev`
+    /// (`crates/charpente/src/archive/mod.rs`, near `:2083`) and the
+    /// restore-side strictly-ascending check
+    /// (`crates/charpente/src/archive/manifest.rs`, near `:690`). The
+    /// composite branch also full-scans `scoped_key(0, 0)..=
+    /// scoped_key(u64::MAX, u64::MAX)` and discards `id < from` rather than
+    /// seeking to it, so a paged export at `SNAPSHOT_BATCH_ROWS` rows per
+    /// batch costs O(N²/batch) on an N-row scoped table. `db.rs`'s
+    /// `apply_put`/`apply_delete` assert `!row_is_scoped` today, so no
+    /// scoped table can hold rows reached through `Db`/`Schema` (and
+    /// therefore through `migrate_schema`) yet — lifting that assert, the
+    /// per-scope migration ordering it unblocks, and both fixes above are
+    /// owned by Task 6c.
     pub fn scan_raw_from(
         &self,
         table: &str,

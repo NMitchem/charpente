@@ -804,31 +804,29 @@ fn a_scoped_scan_cannot_see_another_tenants_rows() {
         .expect("interleaved tenant writes must not error");
 
     let snap = store.snapshot().unwrap();
-    let mut ids: Vec<u64> = snap
+    let ids: Vec<u64> = snap
         .scan_scoped::<Ticket>(1)
         .expect("tenant 1's scan must not error")
         .into_iter()
         .map(|t| t.id.raw())
         .collect();
-    ids.sort_unstable();
     assert_eq!(
         ids,
         vec![1, 3, 5],
-        "tenant 1's scan must return EXACTLY its own ids — an off-by-one range bound would \
-         pull in 2, 4, or 6 from tenant 2"
+        "tenant 1's scan must return EXACTLY its own ids, in id order — an off-by-one range \
+         bound would pull in 2, 4, or 6 from tenant 2"
     );
 
-    let mut ids2: Vec<u64> = snap
+    let ids2: Vec<u64> = snap
         .scan_scoped::<Ticket>(2)
         .expect("tenant 2's scan must not error")
         .into_iter()
         .map(|t| t.id.raw())
         .collect();
-    ids2.sort_unstable();
     assert_eq!(
         ids2,
         vec![2, 4, 6],
-        "tenant 2's scan must return EXACTLY its own ids, symmetrically"
+        "tenant 2's scan must return EXACTLY its own ids, in id order, symmetrically"
     );
 }
 
@@ -861,17 +859,16 @@ fn a_scoped_scan_includes_id_zero_and_u64_max_within_one_tenant() {
         .expect("writing the id-space boundaries must not error");
 
     let snap = store.snapshot().unwrap();
-    let mut ids: Vec<u64> = snap
+    let ids: Vec<u64> = snap
         .scan_scoped::<Ticket>(1)
         .unwrap()
         .into_iter()
         .map(|t| t.id.raw())
         .collect();
-    ids.sort_unstable();
     assert_eq!(
         ids,
         vec![0, u64::MAX],
-        "the scan's range must be INCLUSIVE at both ends of the id space"
+        "the scan's range must be INCLUSIVE at both ends of the id space, in id order"
     );
 }
 
@@ -1115,6 +1112,15 @@ fn a_scoped_scan_from_includes_the_row_at_u64_max() {
 /// `[u8; 16]` key shape rather than erroring with `TableTypeMismatch`, and
 /// must stay scope-agnostic: `migrate_schema()` rewrites every tenant's
 /// rows in one pass, so it must see all of them, not just one scope's.
+///
+/// Tenant 10 writes id 5, tenant 20 writes id 1 — chosen so `(scope, id)`
+/// order and bare `id` order DISAGREE. The composite branch walks the
+/// table in `(scope, id)` key order and returns the bare id, so it comes
+/// back `[5, 1]`: DESCENDING. That is the accepted limitation `table.rs`'s
+/// `scan_raw_from` doc comment names (ids are not globally ascending across
+/// a scope boundary, owned by Task 6c) — asserting the raw, unsorted `Vec`
+/// pins it; sorting before comparing (as an earlier version of this test
+/// did) would hide it.
 #[test]
 fn scan_raw_from_learns_the_composite_key_shape_and_sees_every_tenant() {
     let sim = Sim::with_faults(0x7A2E_0011, FaultConfig::none());
@@ -1125,7 +1131,7 @@ fn scan_raw_from_learns_the_composite_key_shape_and_sees_every_tenant() {
             w.put(
                 10,
                 &Ticket {
-                    id: Id::from_raw(1),
+                    id: Id::from_raw(5),
                     n: 100,
                 },
             )?;
@@ -1137,23 +1143,21 @@ fn scan_raw_from_learns_the_composite_key_shape_and_sees_every_tenant() {
                 },
             )
         })
-        .expect("two tenants writing the same id on a scoped table must not error");
+        .expect("two tenants writing distinct ids on a scoped table must not error");
 
     let snap = store.snapshot().unwrap();
     let rows = snap.scan_raw_from(Ticket::TABLE, None, 10).expect(
         "scan_raw_from must learn the [u8;16] key shape rather than erroring with \
          TableTypeMismatch — migrate_schema() has to be able to walk a scoped table too",
     );
-    let mut ns: Vec<u32> = rows
-        .iter()
-        .map(|(_, bytes)| Ticket::decode_row(bytes).unwrap().n)
-        .collect();
-    ns.sort_unstable();
+    let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
     assert_eq!(
-        ns,
-        vec![100, 200],
-        "scan_raw_from must return BOTH tenants' rows — it stays scope-agnostic on purpose, \
-         because migrate_schema() rewrites every tenant's rows in one pass"
+        ids,
+        vec![5, 1],
+        "scan_raw_from walks the composite key in (scope, id) order and returns the bare id: \
+         tenant 10's id 5 sorts before tenant 20's id 1, so the ids come back DESCENDING, not \
+         ascending — the accepted limitation table.rs's scan_raw_from doc comment names, owned \
+         by Task 6c"
     );
 }
 
@@ -1163,7 +1167,10 @@ fn scan_raw_from_learns_the_composite_key_shape_and_sees_every_tenant() {
 /// write path never creates) and reading back an empty, misleadingly
 /// "successful" result for a table that actually has rows.
 #[test]
-#[should_panic(expected = "Snapshot::get_scoped: table \"charpente.jobs\" is not tenant-scoped")]
+#[should_panic(
+    expected = "Snapshot::get_scoped: table \"charpente.jobs\" is not tenant-scoped \
+                (Row::Scope = Unscoped) — use View::get for an unscoped table"
+)]
 fn get_scoped_on_an_unscoped_table_panics() {
     let sim = Sim::with_faults(0x7A2E_0012, FaultConfig::none());
     let store = Store::open(&sim.disk(), "store.redb").unwrap();
@@ -1173,7 +1180,10 @@ fn get_scoped_on_an_unscoped_table_panics() {
 
 /// See `get_scoped_on_an_unscoped_table_panics`; same reasoning, `scan_scoped`.
 #[test]
-#[should_panic(expected = "Snapshot::scan_scoped: table \"charpente.jobs\" is not tenant-scoped")]
+#[should_panic(
+    expected = "Snapshot::scan_scoped: table \"charpente.jobs\" is not tenant-scoped \
+                (Row::Scope = Unscoped) — use View::scan for an unscoped table"
+)]
 fn scan_scoped_on_an_unscoped_table_panics() {
     let sim = Sim::with_faults(0x7A2E_0013, FaultConfig::none());
     let store = Store::open(&sim.disk(), "store.redb").unwrap();
@@ -1184,7 +1194,8 @@ fn scan_scoped_on_an_unscoped_table_panics() {
 /// See `get_scoped_on_an_unscoped_table_panics`; same reasoning, `scan_from_scoped`.
 #[test]
 #[should_panic(
-    expected = "Snapshot::scan_from_scoped: table \"charpente.jobs\" is not tenant-scoped"
+    expected = "Snapshot::scan_from_scoped: table \"charpente.jobs\" is not tenant-scoped \
+                (Row::Scope = Unscoped) — use View::scan_from for an unscoped table"
 )]
 fn scan_from_scoped_on_an_unscoped_table_panics() {
     let sim = Sim::with_faults(0x7A2E_0014, FaultConfig::none());
