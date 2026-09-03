@@ -7200,6 +7200,40 @@ const CONV_RESTORED_FLOOR: u64 = 219;
 const CONV_SUBSTANTIAL_FLOOR: u64 = 183;
 const CONV_CHAINED_FLOOR: u64 = 169;
 
+/// `archive_converges_with_a_scoped_table`'s own base and floors. Separate
+/// numbers because they are rates against a different workload — one extra row
+/// and one scoped index entry per record — not a re-baselining of the three
+/// above, which stay exactly where they were measured.
+///
+/// Pinned to the counts measured on this property's first run at this base,
+/// with NO margin subtracted — the same discipline the three above follow.
+/// `CONV_RESTORED_FLOOR`'s own history is the statement of it: "the floors
+/// below were raised to the new pinned measurement rather than lowered to
+/// accommodate anything." A floor here equals the measurement, so a later
+/// shortfall of even one universe is a finding rather than noise absorbed by
+/// slack, and a fresh base will trip these exactly as it trips the originals.
+///
+/// Measured at `0xA2C0_5C09`, 256 universes:
+///
+/// | key | measured | floor |
+/// |---|---|---|
+/// | `archive:restored` | 214 | 214 |
+/// | `archive:restored_substantial` | 164 | 164 |
+/// | `archive:chained` | 158 | 158 |
+///
+/// The 42 universes that reach no restore verdict say which kind:
+/// `archive:nothing_published` 31, `archive:verify_never_read_cleanly` 10,
+/// `archive:restore_never_completed` 1. Those three plus `archive:restored`
+/// account for all 256, which is what makes "no verdict" a measured quantity
+/// here rather than an unknown one — the same arithmetic
+/// `CONV_RESTORED_FLOOR`'s doc performs for the unscoped base.
+/// `tenant:restored-multi-tenant` fired 244 times, so the `require:` key is a
+/// real floor rather than a decoration.
+const ARCHIVE_SCOPED_CONVERGENCE_BASE: u64 = 0xA2C0_5C09;
+const CONV_SCOPED_RESTORED_FLOOR: u64 = 214;
+const CONV_SCOPED_SUBSTANTIAL_FLOOR: u64 = 164;
+const CONV_SCOPED_CHAINED_FLOOR: u64 = 158;
+
 /// A restored `Db` this size or larger counts as a substantial verdict.
 /// `require:`'s floor is one occurrence, which catches an oracle that
 /// stopped firing and misses one that decayed to a token handful of rows —
@@ -7292,8 +7326,37 @@ fn conv_ledger_writer(scope: u64, id: u64) -> u64 {
     id * 2 + slot
 }
 
+/// The original property's schema, byte-for-byte what it has always been.
+/// `ConvLedger` is deliberately absent: registering it costs one universe on
+/// `archive:restored` (218 of 219, measured), and these floors are rates
+/// against this exact workload (R56).
 fn conv_schema() -> Schema {
-    Schema::new().table::<Rec>().table::<ConvLedger>()
+    Schema::new().table::<Rec>()
+}
+
+/// The sibling property's schema. Same everything, plus the scoped table.
+fn conv_scoped_schema() -> Schema {
+    conv_schema().table::<ConvLedger>()
+}
+
+/// Which of the two convergence properties a universe is running. The whole
+/// workload below is shared; this picks the schema, the one scoped write per
+/// record, and the restored-tenant oracle. It draws no entropy, so the
+/// unscoped mode's fault schedule is identical to what it was before the
+/// scoped sibling existed.
+#[derive(Clone, Copy, PartialEq)]
+enum ConvMode {
+    Unscoped,
+    Scoped,
+}
+
+impl ConvMode {
+    fn schema(self) -> Schema {
+        match self {
+            ConvMode::Unscoped => conv_schema(),
+            ConvMode::Scoped => conv_scoped_schema(),
+        }
+    }
 }
 
 fn conv_db_config() -> DbConfig {
@@ -7716,6 +7779,7 @@ fn conv_restore_into(
     store: &FlakyStore,
     host: &str,
     force: bool,
+    mode: ConvMode,
 ) -> Result<Option<RestoreReport>, String> {
     let mut cut = false;
     for attempt in 0..CONV_RESTORE_ATTEMPTS {
@@ -7723,7 +7787,7 @@ fn conv_restore_into(
             store,
             Box::new(sim.host(host).disk()),
             conv_db_config(),
-            conv_schema(),
+            mode.schema(),
             conv_restore_opts(force),
             &mut |_| {},
         ) {
@@ -7754,10 +7818,15 @@ fn conv_restore_into(
 /// retains every frame: the comparison seq is the archive's chain end, and a
 /// destination that had GC'd past it would make this "cannot compare"
 /// instead of "diverged".
-fn conv_plant_diverged(sim: &Sim, host: &str, records: u64) -> Result<bool, String> {
+fn conv_plant_diverged(
+    sim: &Sim,
+    host: &str,
+    records: u64,
+    mode: ConvMode,
+) -> Result<bool, String> {
     let mut cfg = conv_db_config();
     cfg.checkpoint_every = 0;
-    let mut db = match Db::open(Box::new(sim.host(host).disk()), cfg, conv_schema()) {
+    let mut db = match Db::open(Box::new(sim.host(host).disk()), cfg, mode.schema()) {
         Ok(db) => db,
         Err(e) if is_fault_fallout(&e.to_string()) => return Ok(false),
         Err(e) => return Err(format!("planting a diverged timeline: open: {e}")),
@@ -7836,11 +7905,12 @@ fn conv_verify_restored(
     records: u64,
     pending_jobs: u64,
     f: u64,
+    mode: ConvMode,
 ) -> Result<(), ConvFail> {
     let dst = Db::open(
         Box::new(sim.host(host).disk()),
         conv_db_config(),
-        conv_schema(),
+        mode.schema(),
     )
     .map_err(|e| conv_read_fail("the restored destination will not open", e))?;
     if dst.last_applied() != Some(f) {
@@ -7850,7 +7920,9 @@ fn conv_verify_restored(
         )));
     }
     conv_check_anchors(&dst, records, pending_jobs)?;
-    conv_check_tenants(&dst, sim)?;
+    if mode == ConvMode::Scoped {
+        conv_check_tenants(&dst, sim)?;
+    }
 
     // The source's state AT the archived frontier. Each of the three tables
     // that grows with the workload is cut by its own WORKLOAD-side counter:
@@ -7961,12 +8033,12 @@ fn conv_check_tenants(dst: &Db, sim: &Sim) -> Result<(), ConvFail> {
 /// Opens (or reopens) the source `Db`, retrying past injected IO. `None`
 /// means the matrix never let it open, which is not a violation — it is a
 /// universe with no node in it.
-fn conv_open_source(sim: &Sim) -> Result<Option<Db>, String> {
+fn conv_open_source(sim: &Sim, mode: ConvMode) -> Result<Option<Db>, String> {
     for _ in 0..CONV_OPEN_ATTEMPTS {
         match Db::open(
             Box::new(sim.host("src").disk()),
             conv_db_config(),
-            conv_schema(),
+            mode.schema(),
         ) {
             Ok(db) => return Ok(Some(db)),
             Err(e) if is_fault_fallout(&e.to_string()) => continue,
@@ -8039,7 +8111,7 @@ fn conv_reconcile(db: &Db, st: &mut ConvState) -> Result<(), String> {
     }
 }
 
-fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
+fn archive_convergence_universe(sim: &mut Sim, mode: ConvMode) -> Result<(), String> {
     let entropy = sim.entropy();
 
     // `Option` because the matrix can destroy the source past reopening, and
@@ -8048,7 +8120,7 @@ fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
     // the bucket is what is left" is the case the archive exists for. Only
     // the structural comparison — the one clause with the source on the
     // other side of it — is skipped there.
-    let src0 = match conv_open_source(sim)? {
+    let src0 = match conv_open_source(sim, mode)? {
         Some(db) => db,
         None => {
             sim.cover("archive:source_never_opened");
@@ -8115,13 +8187,15 @@ fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
                     // shared ledger id. One scope per transaction (spec §8),
                     // and one record per commit either way, so the workload's
                     // seq-to-id correspondence is untouched.
-                    let tenant = CONV_TENANTS[(id % 2) as usize];
-                    tx.open_scope(Id::<ConvOrg>::from_raw(tenant), None)?
-                        .put(&ConvLedger {
-                            id: Id::from_raw(id / 2),
-                            bucket: ((id / 2) % 3) as u32,
-                            marker: conv_marker(tenant, id / 2),
-                        });
+                    if mode == ConvMode::Scoped {
+                        let tenant = CONV_TENANTS[(id % 2) as usize];
+                        tx.open_scope(Id::<ConvOrg>::from_raw(tenant), None)?
+                            .put(&ConvLedger {
+                                id: Id::from_raw(id / 2),
+                                bucket: ((id / 2) % 3) as u32,
+                                marker: conv_marker(tenant, id / 2),
+                            });
+                    }
                     tx.emit(Ping { n: WireU64(id) });
                     if with_job {
                         tx.enqueue(Resurrect { slot: id });
@@ -8165,7 +8239,7 @@ fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
                     // it, ships nothing further either. The old handle goes
                     // FIRST — the store file is opened again, not twice.
                     src = None;
-                    match conv_open_source(sim)? {
+                    match conv_open_source(sim, mode)? {
                         Some(mut fresh) => {
                             conv_reconcile(&fresh, &mut st)?;
                             conv_settle(&store);
@@ -8432,7 +8506,7 @@ fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
         sim.cover("archive:restored_substantial");
     }
 
-    let Some(report) = conv_restore_into(sim, &store, "dst", false)? else {
+    let Some(report) = conv_restore_into(sim, &store, "dst", false, mode)? else {
         sim.cover("archive:restore_never_completed");
         return Ok(());
     };
@@ -8465,7 +8539,7 @@ fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
     // than passing quietly.
     let mut verified = false;
     for _ in 0..CONV_VERIFY_ATTEMPTS {
-        match conv_verify_restored(src.as_ref(), "dst", sim, records, pending_jobs, f) {
+        match conv_verify_restored(src.as_ref(), "dst", sim, records, pending_jobs, f, mode) {
             Ok(()) => {
                 verified = true;
                 break;
@@ -8491,12 +8565,12 @@ fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
 
     // ---- spec §9.8: restore onto a DIVERGED local timeline refuses, and
     // `--force` takes it and converges to the same place.
-    if entropy.next_u64().is_multiple_of(3) && conv_plant_diverged(sim, "div", records + 1)? {
+    if entropy.next_u64().is_multiple_of(3) && conv_plant_diverged(sim, "div", records + 1, mode)? {
         match restore(
             &store,
             Box::new(sim.host("div").disk()),
             conv_db_config(),
-            conv_schema(),
+            mode.schema(),
             conv_restore_opts(false),
             &mut |_| {},
         ) {
@@ -8517,7 +8591,7 @@ fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
                 // `--force` takes it, and lands at the same place: the same
                 // verdict, on a destination that held a different timeline
                 // a moment ago.
-                if let Some(forced) = conv_restore_into(sim, &store, "div", true)? {
+                if let Some(forced) = conv_restore_into(sim, &store, "div", true, mode)? {
                     if forced.applied_seq != f {
                         return Err(format!(
                             "--force restored to {} rather than the archived frontier {f}",
@@ -8532,6 +8606,7 @@ fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
                             records,
                             pending_jobs,
                             f,
+                            mode,
                         ) {
                             Ok(()) => {
                                 sim.cover("archive:diverged_forced_converged");
@@ -8696,7 +8771,55 @@ fn archive_converges() {
         ARCHIVE_CONVERGENCE_BASE,
         256,
         no_media_corruption_on_either_side,
-        archive_convergence_universe,
+        |sim: &mut Sim| archive_convergence_universe(sim, ConvMode::Unscoped),
+        require: [
+            "archive:restored",
+            "archive:gap_closed_generation",
+            "archive:lost_ack_retried",
+            "archive:diverged_refused",
+            "archive:verifying_gated",
+            "archive:foreign_writer_stopped",
+            "archive:generation_reclaimed",
+            "archive:delete_failed",
+            "archive:restored_after_delete_failure",
+        ],
+        floor: [
+            ("archive:restored", CONV_RESTORED_FLOOR),
+            ("archive:restored_substantial", CONV_SUBSTANTIAL_FLOOR),
+            ("archive:chained", CONV_CHAINED_FLOOR),
+        ]
+    );
+}
+
+/// The same property over a schema that carries a tenant-scoped,
+/// secondary-indexed table, two tenants sharing every ledger id (hard rule 3:
+/// Task 6c changed the archive's batch shape and `charpente restore` to carry
+/// a scope, and no swarm could express a restore that drops one).
+///
+/// A SIBLING rather than a widening of `archive_converges` (R56). Registering
+/// one more table costs one universe on `archive:restored` there — 218 of 219,
+/// measured — because `logical_rows_checked` sweeps `db.table_names()` and one
+/// more `scan_raw_from` per verification is one more chance for the matrix to
+/// hit a read. The writes cost more: an extra row and a scoped index entry per
+/// record means the archive ships more bytes at unchanged per-operation fault
+/// rates, so the published frontier lands lower and both frontier-derived
+/// floors fall with it. Those floors are rates against ONE workload, so the
+/// scoped workload gets its own base and its own three numbers rather than
+/// re-baselining numbers that are not decaying.
+///
+/// Its floors follow the same discipline as the original three: pinned to
+/// EXACTLY the count measured at this property's own base, no margin
+/// subtracted (`CONV_RESTORED_FLOOR`'s own history — "the floors below were
+/// raised to the new pinned measurement rather than lowered to accommodate
+/// anything"). A drop is a finding, not a number to lower; a fresh base will
+/// trip them, and that is the design.
+#[test]
+fn archive_converges_with_a_scoped_table() {
+    run_universes_swarm_with!(
+        ARCHIVE_SCOPED_CONVERGENCE_BASE,
+        256,
+        no_media_corruption_on_either_side,
+        |sim: &mut Sim| archive_convergence_universe(sim, ConvMode::Scoped),
         require: [
             "archive:restored",
             "archive:gap_closed_generation",
@@ -8710,9 +8833,9 @@ fn archive_converges() {
             "tenant:restored-multi-tenant",
         ],
         floor: [
-            ("archive:restored", CONV_RESTORED_FLOOR),
-            ("archive:restored_substantial", CONV_SUBSTANTIAL_FLOOR),
-            ("archive:chained", CONV_CHAINED_FLOOR),
+            ("archive:restored", CONV_SCOPED_RESTORED_FLOOR),
+            ("archive:restored_substantial", CONV_SCOPED_SUBSTANTIAL_FLOOR),
+            ("archive:chained", CONV_SCOPED_CHAINED_FLOOR),
         ]
     );
 }
