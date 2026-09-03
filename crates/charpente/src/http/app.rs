@@ -324,6 +324,16 @@ impl App {
 
     /// Snapshot/checkpoint access for the kernel loop and tests — handlers
     /// never see it.
+    ///
+    /// The app's own `main` does, though, because the app builds the `App` it
+    /// hands `launch`. That is the trust boundary (ruling R48): a `Db` reaches
+    /// every tenant through `Db::snapshot`, whose scoped and raw reads take a
+    /// scope on the caller's word with no `Tenant::authorize` anywhere on the
+    /// path. The tenancy guarantee covers the typed surface the framework
+    /// hands app logic — `Tx` in handlers and jobs, where a scoped table is
+    /// unreachable without `tx.scope::<Org>(org, ctx)?` — and whoever holds
+    /// the `App` is trusted as the operator, the same standing as whoever
+    /// holds the data directory.
     pub fn db(&self) -> &Db {
         self.db
             .as_ref()
@@ -436,7 +446,9 @@ impl App {
     }
 
     /// Test-only equivalent of `db_mut` — integration tests cannot see
-    /// `pub(crate)`; the kernel itself uses `db_mut`.
+    /// `pub(crate)`; the kernel itself uses `db_mut`. On `db`'s trust
+    /// boundary, and mutably: a `&mut Db` reaches every tenant, for reads and
+    /// writes alike, with no `Tenant::authorize` on the path (ruling R48).
     #[doc(hidden)]
     pub fn db_for_tests(&mut self) -> &mut Db {
         self.db_mut()

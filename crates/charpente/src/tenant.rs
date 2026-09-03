@@ -11,6 +11,25 @@
 //! (`crate::http::ApiError`) and `Ctx`, none of which `charpente-core` may
 //! depend on (ruling R2, amended by R45; DESIGN.md §8's deferred
 //! multi-tenancy note, DESIGN.md:1377).
+//!
+//! # What the guarantee covers (ruling R48)
+//!
+//! The guarantee is about the typed surface the framework hands app logic. A
+//! handler and a job receive a `Tx`; through a `Tx`, a scoped table is
+//! unreachable without `tx.scope::<Org>(org, ctx)?`, which runs that tenant's
+//! own `authorize` before it hands back anything that can read or write. That
+//! is the property a reviewer can check by reading one line per handler, and
+//! it is enforced by the compiler rather than by convention.
+//!
+//! It is not a sandbox around the process. An app's own `main` builds the
+//! `App` it hands `launch`, so it holds `App::db()`, and a `Db` reaches every
+//! tenant — `Db::snapshot` yields scoped and raw reads that take a scope on
+//! the caller's word with no `authorize` on the path, and those reads stay
+//! public because replication seeding and the archive are built on them.
+//! Whoever holds the `Db` holds the store, with the same standing as whoever
+//! holds the data directory: an operator, not a request. Code outside a
+//! handler that wants the guarantee should go through a transaction and
+//! `tx.scope::<Org>(org, ctx)?` like a handler does.
 
 use charpente_core::db::{ScopedTx, Tenant, Tx};
 use charpente_core::table::Id;
@@ -22,6 +41,11 @@ use crate::http::{ApiError, Ctx};
 /// platform's two types filled in. Blanket-implemented, so implementing
 /// `Tenant` for a scope type is what earns it — there is nothing to write
 /// here directly.
+///
+/// `who` is `None` for an unauthenticated request and for a direct
+/// `Tx::open_scope(scope, None)` call — an `authorize` that admits `None` has
+/// declared anonymous access to that scope; refuse it unless that is
+/// intended.
 ///
 /// It is a named trait rather than the bound spelled out at each use because
 /// `#[table(scoped_by = Org)]`'s const assert names it

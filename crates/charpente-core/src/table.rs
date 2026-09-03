@@ -1454,11 +1454,19 @@ impl Snapshot {
     /// inherent methods on `Snapshot`, not trait methods, so they sit beside
     /// `get`/`scan`/`scan_from` without touching the `View` trait.
     ///
-    /// `pub`, not `pub(crate)`, for the same reason `UNSCOPED` above is:
-    /// `charpente-core/tests/engine.rs` is a separate compilation unit (see
-    /// its own module doc, `:9-15`) that sees only this crate's `pub`
-    /// surface, and the tenant-isolation property these methods exist to
-    /// prove has nowhere else to call them from.
+    /// # Trust boundary (ruling R48)
+    ///
+    /// These four read under a scope the CALLER supplies, with no
+    /// authorization: there is no `Tenant::authorize` on this path and no
+    /// hook to put one on, since a `Snapshot` carries no principal. The
+    /// tenancy guarantee rests on what the framework hands app logic — a
+    /// handler and a job receive a `Tx`, where a scoped table is unreachable
+    /// without `Tx::open_scope` (`tx.scope::<Org>(org, ctx)?`) and the
+    /// tenant's own check. Whoever holds a `Db` or a `Snapshot` is trusted as
+    /// the operator, the same standing as whoever holds the redb file:
+    /// `scan_raw`/`scan_raw_from`/`scan_index_raw` below read every tenant's
+    /// bytes for the same holder, and stay `pub` because replication seeding
+    /// and the archive need them.
     ///
     /// Each asserts `row_is_scoped::<R>()` (hard rule 4, negative space):
     /// calling one of these against an UNSCOPED table would open
@@ -1489,7 +1497,8 @@ impl Snapshot {
     /// scoped_key(scope, u64::MAX)`: since `scoped_key` orders by scope then
     /// id (pinned by `scoped_key_tests`), that range is precisely one
     /// tenant's contiguous slice of the composite-keyed table, and no other
-    /// scope's row can fall inside it.
+    /// scope's row can fall inside it. The scope is the caller's word and
+    /// nothing authorizes it — see `get_scoped`'s trust-boundary section.
     pub fn scan_scoped<R: Row>(&self, scope: u64) -> io::Result<Vec<R>> {
         assert!(
             row_is_scoped::<R>(),
@@ -1517,7 +1526,9 @@ impl Snapshot {
     /// `limit` — `scan_from`'s prefix-bounded counterpart. Same silent-gap
     /// semantics as `View::scan_from` (see its doc comment): a GC'd
     /// `from_id` starts at the next surviving row in THIS scope rather than
-    /// erroring or spilling into another tenant's range.
+    /// erroring or spilling into another tenant's range. The scope is the
+    /// caller's word and nothing authorizes it — see `get_scoped`'s
+    /// trust-boundary section.
     pub fn scan_from_scoped<R: Row>(
         &self,
         scope: u64,
@@ -1558,7 +1569,9 @@ impl Snapshot {
     /// u64::MAX)` is precisely that tenant's entries for key `k` and no
     /// other tenant's — same range-is-a-tenant's-slice reasoning as
     /// `scoped_key`/`scan_scoped`. `View::scan_by` is unchanged and stays
-    /// the read path for an unscoped table's index.
+    /// the read path for an unscoped table's index. The scope is the caller's
+    /// word and nothing authorizes it — see `get_scoped`'s trust-boundary
+    /// section.
     pub fn scan_by_scoped<R: Row>(
         &self,
         scope: u64,
@@ -1625,6 +1638,11 @@ impl Snapshot {
     /// `index_table_name`'s `"{TABLE}.{index}"` format stays a private
     /// convention rather than part of the public contract. Empty, not an
     /// error, when the index table has never been created.
+    ///
+    /// Reads every tenant's entries, with no authorization and no scope
+    /// argument to constrain it (ruling R48): the tenancy guarantee covers
+    /// the typed surface the framework hands app logic — `Tx` in handlers and
+    /// jobs — and a holder of `Db` or `Snapshot` is trusted as the operator.
     pub fn scan_index_raw<R: Row>(&self, index_name: &str) -> io::Result<Vec<Vec<u8>>> {
         let index = R::INDEXES
             .iter()
@@ -1733,6 +1751,14 @@ impl Snapshot {
     /// direction — `scoped = true` names the scope-flip contract and its
     /// fix; `scoped = false` names both shapes so the operator knows what
     /// disagreed.
+    ///
+    /// Reads every tenant's bytes at once, with no authorization (ruling
+    /// R48): the tenancy guarantee covers the typed surface the framework
+    /// hands app logic — `Tx` in handlers and jobs, where a scoped table is
+    /// unreachable without `Tx::open_scope` and the tenant's own check — and
+    /// a holder of `Db` or `Snapshot` is trusted as the operator. This method
+    /// stays `pub` because replication seeding and the archive read the whole
+    /// store by definition.
     pub fn scan_raw(&self, table: &str, scoped: bool) -> io::Result<Vec<(u64, u64, Vec<u8>)>> {
         if scoped {
             match self.txn.open_table(scoped_rows_def(table)) {
@@ -1782,7 +1808,9 @@ impl Snapshot {
     ///
     /// `scoped` (see `scan_raw`) picks which physical shape to open, and a
     /// `TableTypeMismatch` is refused by name exactly as `scan_raw`
-    /// refuses one — never tolerated, either direction.
+    /// refuses one — never tolerated, either direction. It also walks every
+    /// tenant with no authorization, on `scan_raw`'s trust boundary and for
+    /// the same reason (ruling R48).
     pub fn scan_raw_from(
         &self,
         table: &str,

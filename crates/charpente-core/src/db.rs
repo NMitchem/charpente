@@ -1114,6 +1114,10 @@ pub trait Tenant: Sized + 'static {
     /// The refusal an app returns; `open_scope` returns it unchanged.
     type Error;
 
+    /// `who` is `None` for an unauthenticated request and for a direct
+    /// `open_scope(scope, None)` call — an `authorize` that admits `None` has
+    /// declared anonymous access to that scope; refuse it unless that is
+    /// intended.
     fn authorize(tx: &Tx<'_>, who: Option<&Self::Who>, scope: Id<Self>) -> Result<(), Self::Error>;
 }
 
@@ -1129,6 +1133,12 @@ impl<'a> Tx<'a> {
     /// maps `ctx.principal()` to `who` and delegates here. The name differs
     /// because an inherent method shadows an extension trait's method of the
     /// same name, and the app-facing spelling is the one with the `Ctx`.
+    ///
+    /// `who` is `None` for an unauthenticated request and for a direct
+    /// `open_scope(scope, None)` call — an `authorize` that admits `None` has
+    /// declared anonymous access to that scope; refuse it unless that is
+    /// intended. `None` is not a bypass: `S::authorize` runs either way, and
+    /// what it does with `None` is the app's own policy.
     ///
     /// # Panics
     ///
@@ -2132,6 +2142,16 @@ impl Db {
     }
 
     /// A consistent read-only view for queries outside transactions.
+    ///
+    /// Handing one out hands out every tenant (ruling R48). A `Snapshot`
+    /// carries no principal, so its scope-taking reads
+    /// (`get_scoped`/`scan_scoped`/`scan_from_scoped`/`scan_by_scoped`) and
+    /// its raw reads name a tenant on the caller's word, with no
+    /// `Tenant::authorize` anywhere on the path. The tenancy guarantee covers
+    /// the typed surface the framework hands app logic — a handler and a job
+    /// receive a `Tx`, and reaching a scoped table through one requires
+    /// `Tx::open_scope` and the tenant's own check. Whoever holds a `Db`
+    /// holds the store, with the operator's standing.
     pub fn snapshot(&self) -> io::Result<Snapshot> {
         self.engine.machine().store.snapshot()
     }
