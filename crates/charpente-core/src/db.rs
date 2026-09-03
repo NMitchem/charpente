@@ -39,7 +39,9 @@ use crate::event::EventRow;
 use crate::io::{Disk, File};
 use crate::job::JobRow;
 use crate::log::{MAX_RECORD_BYTES, WalConfig, parse_segment_name, segment_name};
-use crate::table::{Codec, Id, Row, RowShape, Snapshot, Store, View, Writer};
+use crate::table::{
+    Codec, Id, IndexDef, Row, RowShape, Snapshot, Store, UnscopedRow, View, Writer,
+};
 
 // ---------------------------------------------------------------- config
 
@@ -615,12 +617,14 @@ impl<'a> Tx<'a> {
         }
     }
 
-    pub fn put<R: Row>(&mut self, row: &R) {
+    /// Stages a row on an UNSCOPED table. `R: UnscopedRow` is the write
+    /// half of spec §1's compile-time property: a scoped row cannot be
+    /// staged under `UNSCOPED` because it cannot reach this method at all,
+    /// which is a stronger statement than any assertion here could make.
+    /// Scoped writes go through `put_in` (or, in an app, `ScopedTx::put`).
+    pub fn put<R: UnscopedRow>(&mut self, row: &R) {
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
-        if crate::table::row_is_scoped::<R>() {
-            self.effects.scoped_tables.insert(R::TABLE);
-        }
         self.effects
             .overlay
             .entry(R::TABLE)
@@ -628,15 +632,57 @@ impl<'a> Tx<'a> {
             .insert((UNSCOPED, row.id().raw()), Some(bytes));
     }
 
-    pub fn delete<R: Row>(&mut self, id: Id<R>) {
-        if crate::table::row_is_scoped::<R>() {
-            self.effects.scoped_tables.insert(R::TABLE);
-        }
+    pub fn delete<R: UnscopedRow>(&mut self, id: Id<R>) {
         self.effects
             .overlay
             .entry(R::TABLE)
             .or_default()
             .insert((UNSCOPED, id.raw()), None);
+    }
+
+    /// Stages a row on a SCOPED table under `scope` — the primitive
+    /// `charpente::ScopedTx::put` delegates to once `TenantScope::authorize`
+    /// has passed (ruling R2: `ScopedTx` cannot live here, because
+    /// `Principal`/`ApiError`/`Ctx` are platform-edge types with no reverse
+    /// dependency into the core).
+    ///
+    /// `scope: Id<S>` with `R: Row<Scope = S>`, not a bare `u64`: it makes
+    /// "this scope value belongs to this table's tenant type" a compile
+    /// error at the seam an app can reach directly, not only inside
+    /// `ScopedTx`'s wrapper. `S` carries no trait bound — `Row::Scope`
+    /// carries none in the core (R2), and `TenantScope` is not nameable
+    /// from here.
+    pub fn put_in<S: 'static, R: Row<Scope = S>>(&mut self, scope: Id<S>, row: &R) {
+        assert!(
+            crate::table::row_is_scoped::<R>(),
+            "Tx::put_in: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) — use Tx::put \
+             for an unscoped table",
+            R::TABLE
+        );
+        let mut bytes = Vec::new();
+        row.encode_row(&mut bytes);
+        self.effects.scoped_tables.insert(R::TABLE);
+        self.effects
+            .overlay
+            .entry(R::TABLE)
+            .or_default()
+            .insert((scope.raw(), row.id().raw()), Some(bytes));
+    }
+
+    /// `delete`'s scope-taking counterpart; see `put_in`.
+    pub fn delete_in<S: 'static, R: Row<Scope = S>>(&mut self, scope: Id<S>, id: Id<R>) {
+        assert!(
+            crate::table::row_is_scoped::<R>(),
+            "Tx::delete_in: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) — use \
+             Tx::delete for an unscoped table",
+            R::TABLE
+        );
+        self.effects.scoped_tables.insert(R::TABLE);
+        self.effects
+            .overlay
+            .entry(R::TABLE)
+            .or_default()
+            .insert((scope.raw(), id.raw()), None);
     }
 
     /// Buffers one decode-free migration write (spec §3). `row` must
@@ -695,8 +741,129 @@ impl<'a> Tx<'a> {
     }
 }
 
+/// One table's staged writes, as both overlay levels hold them.
+type TableOverlay = BTreeMap<(u64, u64), Option<Vec<u8>>>;
+
+/// Applies one overlay level's entries for ONE scope onto a merged read,
+/// keyed by bare id. The `entry_scope != scope` skip is the whole of spec
+/// §2's overlay rule on the read side: `self.group` is the BATCH-level
+/// overlay, shared by every transaction in the batch, so it holds other
+/// tenants' staged rows and tombstones. Merging it by bare id makes tenant
+/// B's row 7 overwrite tenant A's row 7 in A's own scan, and B's tombstone
+/// for row 7 delete A's row 7 out of A's own scan — both endorsed by the
+/// types, since the call is `ScopedTx<A>::scan`. Filtering has to happen
+/// BEFORE the merge: `(scope, id)` iterates in scope order, so the highest
+/// scope would win a merge-then-hope-ordering-saves-you.
+///
+/// One function rather than a loop per call site because the six call sites
+/// (txn overlay and group overlay, for `scan`/`scan_from`, scoped and not)
+/// differ only in their inputs — and a copy of this loop that forgot the
+/// filter is a silent cross-tenant read, which is exactly the drift a
+/// shared function makes unrepresentable.
+fn merge_overlay_rows<R: Row>(
+    merged: &mut BTreeMap<u64, R>,
+    overlay: Option<&TableOverlay>,
+    scope: u64,
+    from_id: u64,
+) -> io::Result<()> {
+    let Some(overlay) = overlay else {
+        return Ok(());
+    };
+    let scoped = crate::table::row_is_scoped::<R>();
+    for (&(entry_scope, id), entry) in overlay {
+        if scoped {
+            if entry_scope != scope {
+                continue;
+            }
+        } else {
+            // Negative space (hard rule 4): an unscoped table's overlay is
+            // written only by `Tx::put`/`Tx::delete` (both `R: UnscopedRow`)
+            // and by the SchemaVersion adoption row, all of which stage
+            // `UNSCOPED`. A skip here would turn a staging bug into a
+            // silently missing row instead of a loud one.
+            assert_eq!(
+                entry_scope,
+                UNSCOPED,
+                "table \"{}\" is not tenant-scoped but its overlay holds id {id} under scope \
+                 {entry_scope} — Tx::put/Tx::delete stage UNSCOPED only",
+                R::TABLE
+            );
+        }
+        if id < from_id {
+            continue;
+        }
+        match entry {
+            Some(bytes) => {
+                merged.insert(id, R::decode_row(bytes)?);
+            }
+            None => {
+                merged.remove(&id);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `merge_overlay_rows` for an index read: the overlay overrides the
+/// snapshot for an id either way — a tombstone, or a row whose indexed key
+/// may no longer match — so every surviving entry is removed first and
+/// re-inserted only if it still matches `wanted`. Same scope filter, same
+/// reason.
+fn merge_overlay_by_index<R: Row>(
+    merged: &mut BTreeMap<u64, R>,
+    overlay: Option<&TableOverlay>,
+    scope: u64,
+    index: &IndexDef<R>,
+    wanted: &[u8],
+) -> io::Result<()> {
+    let Some(overlay) = overlay else {
+        return Ok(());
+    };
+    let scoped = crate::table::row_is_scoped::<R>();
+    for (&(entry_scope, id), entry) in overlay {
+        if scoped {
+            if entry_scope != scope {
+                continue;
+            }
+        } else {
+            assert_eq!(
+                entry_scope,
+                UNSCOPED,
+                "table \"{}\" is not tenant-scoped but its overlay holds id {id} under scope \
+                 {entry_scope} — Tx::put/Tx::delete stage UNSCOPED only",
+                R::TABLE
+            );
+        }
+        merged.remove(&id);
+        if let Some(bytes) = entry {
+            let row = R::decode_row(bytes)?;
+            let mut row_key = Vec::new();
+            (index.key)(&row, &mut row_key);
+            if row_key == wanted {
+                merged.insert(id, row);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The named index on `R`, or a panic naming the table and the fix — the
+/// lookup `scan_by`/`scan_by_in` share.
+fn index_on<R: Row>(index_name: &str) -> &'static IndexDef<R> {
+    R::INDEXES
+        .iter()
+        .find(|i| i.name == index_name)
+        .unwrap_or_else(|| {
+            panic!(
+                "no index named \"{index_name}\" on table {} — declare it with #[index] (check \
+                 the field's index name)",
+                R::TABLE
+            )
+        })
+}
+
 impl View for Tx<'_> {
-    fn get<R: Row>(&self, id: Id<R>) -> io::Result<Option<R>> {
+    fn get<R: UnscopedRow>(&self, id: Id<R>) -> io::Result<Option<R>> {
         match self
             .effects
             .overlay
@@ -717,54 +884,23 @@ impl View for Tx<'_> {
         }
     }
 
-    fn scan<R: Row>(&self) -> io::Result<Vec<R>> {
+    fn scan<R: UnscopedRow>(&self) -> io::Result<Vec<R>> {
         let mut merged: BTreeMap<u64, R> = BTreeMap::new();
         for row in self.snapshot.scan::<R>()? {
             merged.insert(row.id().raw(), row);
         }
-        if let Some(overlay) = self.group.and_then(|g| g.get(R::TABLE)) {
-            // HAZARD: dropping the scope here is sound only while every slot is UNSCOPED
-            // (0). Under real scopes, this loop merges all tenants' writes into one
-            // id-keyed BTreeMap: because (scope, id) iterates in scope order, the
-            // highest scope's entry wins, silently overwriting lower scopes' entries
-            // and, through the tombstone arm below, silently removing other tenants'
-            // rows from other tenants' scan results. The fix is to filter by scope
-            // before merging; see docs/superpowers/plans/2026-08-30-tenant-scoping.md
-            // Task 7 Step 4b. Note the asymmetry with `get` above, which pins
-            // (UNSCOPED, id) exactly: under real scopes `get` would MISS and fall
-            // through to the snapshot, while these scan loops accept any scope and
-            // merge. One change, two different wrong behaviours.
-            for (&(_scope, id), entry) in overlay {
-                match entry {
-                    Some(bytes) => {
-                        merged.insert(id, R::decode_row(bytes)?);
-                    }
-                    None => {
-                        merged.remove(&id);
-                    }
-                }
-            }
-        }
-        if let Some(overlay) = self.effects.overlay.get(R::TABLE) {
-            for (&(_scope, id), entry) in overlay {
-                match entry {
-                    Some(bytes) => {
-                        merged.insert(id, R::decode_row(bytes)?);
-                    }
-                    None => {
-                        merged.remove(&id);
-                    }
-                }
-            }
-        }
+        merge_overlay_rows(
+            &mut merged,
+            self.group.and_then(|g| g.get(R::TABLE)),
+            UNSCOPED,
+            0,
+        )?;
+        merge_overlay_rows(&mut merged, self.effects.overlay.get(R::TABLE), UNSCOPED, 0)?;
         Ok(merged.into_values().collect())
     }
 
-    fn scan_by<R: Row>(&self, index_name: &str, key: &impl Codec) -> io::Result<Vec<R>> {
-        let index = R::INDEXES
-            .iter()
-            .find(|i| i.name == index_name)
-            .unwrap_or_else(|| panic!("no index named \"{index_name}\" on table {}", R::TABLE));
+    fn scan_by<R: UnscopedRow>(&self, index_name: &str, key: &impl Codec) -> io::Result<Vec<R>> {
+        let index = index_on::<R>(index_name);
         let mut wanted = Vec::new();
         key.encode(&mut wanted);
 
@@ -772,78 +908,174 @@ impl View for Tx<'_> {
         for row in self.snapshot.scan_by::<R>(index_name, key)? {
             merged.insert(row.id().raw(), row);
         }
-        if let Some(overlay) = self.group.and_then(|g| g.get(R::TABLE)) {
-            for (&(_scope, id), entry) in overlay {
-                // The overlay overrides the snapshot for this id either way:
-                // a tombstone, or a row whose key may no longer match.
-                merged.remove(&id);
-                if let Some(bytes) = entry {
-                    let row = R::decode_row(bytes)?;
-                    let mut row_key = Vec::new();
-                    (index.key)(&row, &mut row_key);
-                    if row_key == wanted {
-                        merged.insert(id, row);
-                    }
-                }
-            }
-        }
-        if let Some(overlay) = self.effects.overlay.get(R::TABLE) {
-            for (&(_scope, id), entry) in overlay {
-                // The overlay overrides the snapshot for this id either way:
-                // a tombstone, or a row whose key may no longer match.
-                merged.remove(&id);
-                if let Some(bytes) = entry {
-                    let row = R::decode_row(bytes)?;
-                    let mut row_key = Vec::new();
-                    (index.key)(&row, &mut row_key);
-                    if row_key == wanted {
-                        merged.insert(id, row);
-                    }
-                }
-            }
-        }
+        merge_overlay_by_index(
+            &mut merged,
+            self.group.and_then(|g| g.get(R::TABLE)),
+            UNSCOPED,
+            index,
+            &wanted,
+        )?;
+        merge_overlay_by_index(
+            &mut merged,
+            self.effects.overlay.get(R::TABLE),
+            UNSCOPED,
+            index,
+            &wanted,
+        )?;
         Ok(merged.into_values().collect())
     }
 
-    fn scan_from<R: Row>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>> {
+    fn scan_from<R: UnscopedRow>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>> {
         let mut merged: BTreeMap<u64, R> = BTreeMap::new();
         for row in self.snapshot.scan::<R>()? {
             if row.id().raw() >= from_id {
                 merged.insert(row.id().raw(), row);
             }
         }
-        if let Some(overlay) = self.group.and_then(|g| g.get(R::TABLE)) {
-            for (&(_scope, id), entry) in overlay {
-                if id < from_id {
-                    continue;
-                }
-                match entry {
-                    Some(bytes) => {
-                        merged.insert(id, R::decode_row(bytes)?);
-                    }
-                    None => {
-                        merged.remove(&id);
-                    }
-                }
-            }
-        }
-        if let Some(overlay) = self.effects.overlay.get(R::TABLE) {
-            for (&(_scope, id), entry) in overlay {
-                if id < from_id {
-                    continue;
-                }
-                match entry {
-                    Some(bytes) => {
-                        merged.insert(id, R::decode_row(bytes)?);
-                    }
-                    None => {
-                        merged.remove(&id);
-                    }
-                }
-            }
-        }
+        merge_overlay_rows(
+            &mut merged,
+            self.group.and_then(|g| g.get(R::TABLE)),
+            UNSCOPED,
+            from_id,
+        )?;
+        merge_overlay_rows(
+            &mut merged,
+            self.effects.overlay.get(R::TABLE),
+            UNSCOPED,
+            from_id,
+        )?;
         Ok(merged.into_values().take(limit).collect())
     }
+}
+
+/// The scope-taking reads: `View`'s four methods, bounded to ONE tenant of
+/// ONE scoped table, over the same txn -> group -> snapshot order. `pub`
+/// because `charpente::ScopedTx` (ruling R2) lives in another crate and the
+/// overlay these merge is private to this one, so there is no other seam
+/// for it to cross. `Id<S>` with `R: Row<Scope = S>` — see `put_in`.
+///
+/// Each asserts `row_is_scoped::<R>()` for the same reason
+/// `Snapshot::get_scoped` does (hard rule 4): the type system rules out a
+/// scope/table mismatch but not `S = Unscoped`, and an unscoped table read
+/// through here would find no overlay entries and then open a physical
+/// table the unscoped write path never creates — a wrong answer, not an
+/// error.
+impl Tx<'_> {
+    pub fn get_in<S: 'static, R: Row<Scope = S>>(
+        &self,
+        scope: Id<S>,
+        id: Id<R>,
+    ) -> io::Result<Option<R>> {
+        assert_scoped::<R>("get_in", "View::get");
+        let key = (scope.raw(), id.raw());
+        match self.effects.overlay.get(R::TABLE).and_then(|t| t.get(&key)) {
+            Some(Some(bytes)) => Ok(Some(R::decode_row(bytes)?)),
+            Some(None) => Ok(None),
+            None => match self
+                .group
+                .and_then(|g| g.get(R::TABLE))
+                .and_then(|t| t.get(&key))
+            {
+                Some(Some(bytes)) => Ok(Some(R::decode_row(bytes)?)),
+                Some(None) => Ok(None),
+                None => self.snapshot.get_scoped(scope.raw(), id),
+            },
+        }
+    }
+
+    pub fn scan_in<S: 'static, R: Row<Scope = S>>(&self, scope: Id<S>) -> io::Result<Vec<R>> {
+        assert_scoped::<R>("scan_in", "View::scan");
+        let mut merged: BTreeMap<u64, R> = BTreeMap::new();
+        for row in self.snapshot.scan_scoped::<R>(scope.raw())? {
+            merged.insert(row.id().raw(), row);
+        }
+        merge_overlay_rows(
+            &mut merged,
+            self.group.and_then(|g| g.get(R::TABLE)),
+            scope.raw(),
+            0,
+        )?;
+        merge_overlay_rows(
+            &mut merged,
+            self.effects.overlay.get(R::TABLE),
+            scope.raw(),
+            0,
+        )?;
+        Ok(merged.into_values().collect())
+    }
+
+    pub fn scan_by_in<S: 'static, R: Row<Scope = S>>(
+        &self,
+        scope: Id<S>,
+        index_name: &str,
+        key: &impl Codec,
+    ) -> io::Result<Vec<R>> {
+        assert_scoped::<R>("scan_by_in", "View::scan_by");
+        let index = index_on::<R>(index_name);
+        let mut wanted = Vec::new();
+        key.encode(&mut wanted);
+
+        let mut merged: BTreeMap<u64, R> = BTreeMap::new();
+        for row in self
+            .snapshot
+            .scan_by_scoped::<R>(scope.raw(), index_name, key)?
+        {
+            merged.insert(row.id().raw(), row);
+        }
+        merge_overlay_by_index(
+            &mut merged,
+            self.group.and_then(|g| g.get(R::TABLE)),
+            scope.raw(),
+            index,
+            &wanted,
+        )?;
+        merge_overlay_by_index(
+            &mut merged,
+            self.effects.overlay.get(R::TABLE),
+            scope.raw(),
+            index,
+            &wanted,
+        )?;
+        Ok(merged.into_values().collect())
+    }
+
+    pub fn scan_from_in<S: 'static, R: Row<Scope = S>>(
+        &self,
+        scope: Id<S>,
+        from_id: u64,
+        limit: usize,
+    ) -> io::Result<Vec<R>> {
+        assert_scoped::<R>("scan_from_in", "View::scan_from");
+        let mut merged: BTreeMap<u64, R> = BTreeMap::new();
+        for row in self.snapshot.scan_scoped::<R>(scope.raw())? {
+            if row.id().raw() >= from_id {
+                merged.insert(row.id().raw(), row);
+            }
+        }
+        merge_overlay_rows(
+            &mut merged,
+            self.group.and_then(|g| g.get(R::TABLE)),
+            scope.raw(),
+            from_id,
+        )?;
+        merge_overlay_rows(
+            &mut merged,
+            self.effects.overlay.get(R::TABLE),
+            scope.raw(),
+            from_id,
+        )?;
+        Ok(merged.into_values().take(limit).collect())
+    }
+}
+
+/// The shared body of the four scope-taking reads' `row_is_scoped` guard.
+fn assert_scoped<R: Row>(method: &str, unscoped_alternative: &str) {
+    assert!(
+        crate::table::row_is_scoped::<R>(),
+        "Tx::{method}: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) — use \
+         {unscoped_alternative} for an unscoped table",
+        R::TABLE
+    );
 }
 
 // ---------------------------------------------------------------- machine

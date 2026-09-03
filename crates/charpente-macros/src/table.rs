@@ -136,6 +136,34 @@ pub(crate) fn expand(
         .map(|(ident, _)| format_ident!("by_{ident}"))
         .collect();
 
+    // The typed index accessor reads through whichever surface can address
+    // this table: `View` (a `Snapshot` or a `Tx`) for an unscoped table,
+    // `ScopedTx` for a scoped one, whose `scan_by` is already bounded to one
+    // tenant. Emitting the `View` form for a scoped table would not merely
+    // be a cross-tenant read — `View`'s bound is `UnscopedRow`, so it would
+    // not compile at all, and `#[table(scoped_by = …)]` with an `#[index]`
+    // would be unusable.
+    let (by_fn_receiver, by_fn_docs): (proc_macro2::TokenStream, proc_macro2::TokenStream) =
+        match &scoped_by {
+            Some(path) => (
+                quote! { view: &::charpente::ScopedTx<'_, '_, #path> },
+                quote! {
+                    /// Exact-match lookup on the `#[index]` field within ONE
+                    /// tenant, in id order. Takes the `ScopedTx` that
+                    /// `tx.scope::<…>(scope, ctx)?` hands back: this table is
+                    /// scoped, so there is no tenant-free way to ask.
+                },
+            ),
+            None => (
+                quote! { view: &impl ::charpente::core::table::View },
+                quote! {
+                    /// Exact-match lookup on the `#[index]` field, in id order.
+                    /// Works on any `View`: a `Snapshot` outside transactions or
+                    /// a `Tx` inside one.
+                },
+            ),
+        };
+
     Ok(quote! {
         #(#attrs)*
         #vis struct #name {
@@ -199,11 +227,9 @@ pub(crate) fn expand(
                     ::charpente::core::table::Codec::encode(&row.#index_field_idents, out);
                 }
 
-                /// Exact-match lookup on the `#[index]` field, in id order.
-                /// Works on any `View`: a `Snapshot` outside transactions or
-                /// a `Tx` inside one.
+                #by_fn_docs
                 #vis fn #by_fn_idents(
-                    view: &impl ::charpente::core::table::View,
+                    #by_fn_receiver,
                     key: &#index_field_types,
                 ) -> ::std::io::Result<::std::vec::Vec<Self>> {
                     view.scan_by::<Self>(#index_names, key)

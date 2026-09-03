@@ -1,9 +1,10 @@
 //! Kernel-layer tests (PLAN M0 step 6): #[job] surface, dispatcher, cron,
 //! the event loop, and the step-6 swarm properties.
 
+use charpente::auth::Principal;
 use charpente::http::{App, AppConfig, Session};
 use charpente::kernel::{Dispatcher, JobDef, JobEntry, JobError, JobOutcome};
-use charpente::{Db, DbConfig, Schema, Tx, job, jobs, table};
+use charpente::{Db, DbConfig, Schema, Scoped, TenantScope, Tx, job, jobs, table};
 use charpente_core::db::{Job, TxError};
 use charpente_core::io::Entropy;
 use charpente_core::job::{JobRow, JobStatus};
@@ -1317,14 +1318,170 @@ impl Flaky {
     }
 }
 
+/// The scope type for the swarm's tenant-scoped table. A bare marker, not a
+/// `#[table]`: `TenantScope` asks nothing of a scope type but `authorize`,
+/// and the platform never interprets the scope itself (the standing
+/// `emit_keyed` ruling, DESIGN.md:1060-1062).
+struct Tenant;
+
+impl TenantScope for Tenant {
+    /// Always allows: this property is about the platform's isolation
+    /// guarantee, not the app's membership check. The check that matters
+    /// here is that reaching a scoped row required coming through this
+    /// function at all.
+    fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<Tenant>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+/// A tenant-scoped table WITH a secondary index, registered in the kernel
+/// swarm below. Until this task nothing could write a scoped table through
+/// `Tx` at all, so the scoped WAL tags (`0x05`/`0x06`), the composite row
+/// key, the scoped index entry and the scope-filtered overlay merge had zero
+/// fault-matrix coverage — every scoped test ran `FaultConfig::none()` at a
+/// fixed seed (carried from Task 6b's review; hard rule 3).
+///
+/// `marker` is derived from the tenant, so a leaked row is detectable by its
+/// CONTENT and not only by the key it was found under: a read path that
+/// returned the right key range but the wrong bytes would still be caught.
+#[table(scoped_by = Tenant)]
+struct Ledger {
+    id: Id<Ledger>,
+    #[index]
+    bucket: u8,
+    marker: u64,
+}
+
+/// Tenants in the swarm's id space, and the stride that keeps a tenant
+/// recoverable from a row's `marker`. Ids deliberately COLLIDE across
+/// tenants (`id % LEDGER_IDS`): a leak is only expressible when two tenants
+/// hold the same id, which is exactly why a single-tenant property proves
+/// nothing.
+const TENANTS: u64 = 4;
+const LEDGER_IDS: u64 = 6;
+const MARKER_STRIDE: u64 = 1_000_000;
+
+fn ledger_marker(tenant: u64, id: u64) -> u64 {
+    tenant * MARKER_STRIDE + id
+}
+
+#[derive(WireDerive, Serialize, Deserialize)]
+struct Post {
+    tenant: WireU64,
+    id: WireU64,
+}
+
+/// The only scoped write in the swarm, and the shape spec §1 prescribes:
+/// one `scope()` line, every table access below it bounded to that tenant by
+/// construction.
+#[route(POST "/post")]
+fn post(tx: &mut Tx, body: Post, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let tenant = body.tenant.0;
+    let id = body.id.0;
+    let mut tx = tx.scope::<Tenant>(Id::from_raw(tenant), ctx)?;
+    // Read-your-own-writes inside the scope, so the request path exercises
+    // the scope-filtered overlay merge and not only the write.
+    let before = tx.scan::<Ledger>()?.len() as u64;
+    tx.put(&Ledger {
+        id: Id::from_raw(id),
+        bucket: (id % 4) as u8,
+        marker: ledger_marker(tenant, id),
+    });
+    if id.is_multiple_of(5) {
+        tx.delete::<Ledger>(Id::from_raw((id + 1) % LEDGER_IDS));
+    }
+    Ok(WireU64(before))
+}
+
+/// The tenant-isolation invariant, checked on the durable image after every
+/// crash: no read bounded to one tenant may return another tenant's row,
+/// through any of the four read paths, however the universe crashed. Each
+/// path is checked separately because each has its own key bound —
+/// `scan_by_scoped` above all, which is what catches a forgotten index
+/// prefix (spec §5's worst failure mode).
+fn tenants_never_see_each_other(app: &mut App) -> Result<(), String> {
+    let snap = app.db_for_tests().snapshot().map_err(|e| e.to_string())?;
+    for tenant in 0..TENANTS {
+        let rows = snap
+            .scan_scoped::<Ledger>(tenant)
+            .map_err(|e| format!("scan_scoped: {e}"))?;
+        for row in &rows {
+            if row.marker / MARKER_STRIDE != tenant {
+                return Err(format!(
+                    "tenant {tenant}'s scan returned id {} marked for tenant {}",
+                    row.id.raw(),
+                    row.marker / MARKER_STRIDE
+                ));
+            }
+        }
+        for row in &rows {
+            let got = snap
+                .get_scoped::<Ledger>(tenant, row.id)
+                .map_err(|e| format!("get_scoped: {e}"))?
+                .ok_or_else(|| {
+                    format!(
+                        "tenant {tenant} id {} scanned but not gettable",
+                        row.id.raw()
+                    )
+                })?;
+            if got.marker != row.marker {
+                return Err(format!(
+                    "tenant {tenant} id {}: get_scoped says marker {} but scan_scoped says {}",
+                    row.id.raw(),
+                    got.marker,
+                    row.marker
+                ));
+            }
+        }
+        let cursor = snap
+            .scan_from_scoped::<Ledger>(tenant, 0, 64)
+            .map_err(|e| format!("scan_from_scoped: {e}"))?;
+        let want: Vec<u64> = rows.iter().map(|r| r.id.raw()).collect();
+        let got: Vec<u64> = cursor.iter().map(|r| r.id.raw()).collect();
+        if got != want {
+            return Err(format!(
+                "tenant {tenant}: scan_from_scoped(0) {got:?} disagrees with scan_scoped {want:?}"
+            ));
+        }
+        for bucket in 0..4u8 {
+            let by_index = snap
+                .scan_by_scoped::<Ledger>(tenant, "bucket", &bucket)
+                .map_err(|e| format!("scan_by_scoped: {e}"))?;
+            for row in &by_index {
+                if row.marker / MARKER_STRIDE != tenant {
+                    return Err(format!(
+                        "tenant {tenant}'s index bucket {bucket} returned id {} marked for \
+                         tenant {}",
+                        row.id.raw(),
+                        row.marker / MARKER_STRIDE
+                    ));
+                }
+            }
+            let want: Vec<u64> = rows
+                .iter()
+                .filter(|r| r.bucket == bucket)
+                .map(|r| r.id.raw())
+                .collect();
+            let got: Vec<u64> = by_index.iter().map(|r| r.id.raw()).collect();
+            if got != want {
+                return Err(format!(
+                    "tenant {tenant} index bucket {bucket}: {got:?} != {want:?} — the index and \
+                     the rows disagree about who owns which id"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn kernel_crash_app(sim: &Sim) -> std::io::Result<App> {
     Ok(App::open(
         Box::new(sim.disk()),
-        Schema::new().table::<Counter>(),
+        Schema::new().table::<Counter>().table::<Ledger>(),
         Box::new(sim.entropy()),
         crash_config(),
     )?
-    .mount(routes![hit])
+    .mount(routes![hit, post])
     .mount_jobs(jobs![CountUp, Flaky])
     .schedule("minutely", Duration::from_secs(60), || CountUp {
         slot: 999,
@@ -1403,7 +1560,7 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
         // old seed is kept: it is still this suite's CHARPENTE_SEED replay pin
         // in .github/workflows/ci.yml, and it still exercises Kernel::build's
         // drain-id fix (dispatch.rs's "job in the heap is not Pending" assert).
-        match exactly_once_holds(&mut app) {
+        match exactly_once_holds(&mut app).and_then(|()| tenants_never_see_each_other(&mut app)) {
             Ok(()) => {}
             Err(msg) => {
                 if !is_fault_fallout(&msg) {
@@ -1417,6 +1574,7 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
         let horizon = sim.now().as_nanos() + 400 * SEC;
         let mut source = SimSource::new(Box::new(sim.clock()), horizon);
         let base = sim.now().as_nanos();
+        let mut tenants_written: std::collections::BTreeSet<u64> = Default::default();
         for i in 0..(1 + entropy.next_u64() % 6) {
             let slot = entropy.next_u64() % 8;
             source.push_at(
@@ -1425,6 +1583,24 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
                     slot: WireU64(slot),
                 }),
             );
+            // A scoped write beside every unscoped one, so the scoped tags
+            // ride the same crash schedule the rest of the swarm does.
+            let tenant = entropy.next_u64() % TENANTS;
+            let id = entropy.next_u64() % LEDGER_IDS;
+            tenants_written.insert(tenant);
+            source.push_at(
+                base + i * SEC,
+                Request::new(Method::Post, "/post").json(&Post {
+                    tenant: WireU64(tenant),
+                    id: WireU64(id),
+                }),
+            );
+        }
+        if tenants_written.len() > 1 {
+            // Spec §5's load-bearing key: a single-tenant universe cannot
+            // detect a leak at all, because every row legitimately belongs
+            // to the only tenant, so the property passes vacuously.
+            sim.cover("tenant:multi_tenant_write");
         }
         // A couple of Flaky jobs enqueued directly (retry path under faults).
         // A fault here can poison the Db (the WAL marks itself poisoned on a
@@ -1501,7 +1677,9 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
         match kernel_crash_app(sim) {
             // Same classify-and-reopen treatment as the round loop above: the
             // checker's own reads can hit an armed crash too.
-            Ok(mut app) => match exactly_once_holds(&mut app) {
+            Ok(mut app) => match exactly_once_holds(&mut app)
+                .and_then(|()| tenants_never_see_each_other(&mut app))
+            {
                 Ok(()) => return Ok(()),
                 Err(msg) => {
                     if !is_fault_fallout(&msg) {
@@ -1526,6 +1704,7 @@ fn kernel_jobs_are_exactly_once_under_the_fault_matrix() {
         "fault:crash",
         "crash:torn",
         "restart",
+        "tenant:multi_tenant_write",
     ]);
 }
 

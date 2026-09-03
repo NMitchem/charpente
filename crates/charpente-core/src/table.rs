@@ -337,25 +337,74 @@ pub trait Row: Sized + 'static {
 
 // ---------------------------------------------------------------- View
 
-/// Read access to table state — implemented by `Snapshot` (reads outside
-/// transactions) and `Tx` (reads inside one, which also see the
+/// The scope marker of a table with no tenant: `Unscoped` implements it for
+/// every row type, and no other scope type implements it at all.
+///
+/// It exists to carry the error text below, and its shape is that text's
+/// shape. `#[diagnostic::on_unimplemented]` fires for an UNIMPLEMENTED
+/// TRAIT and never for an associated-type mismatch, so bounding `View`
+/// directly on `R: Row<Scope = Unscoped>` reports `type mismatch resolving
+/// <Invoice as Row>::Scope == Unscoped` and stops: no contract, no fix. A
+/// blanket `impl<R: Row<Scope = Unscoped>> UnscopedRow for R` does no
+/// better — the failure is then a nested obligation of the blanket impl and
+/// rustc reports that same mismatch. Hanging the message on a trait the
+/// SCOPE type either implements or does not is what makes it fire.
+///
+/// The otherwise-unused `R` parameter is what puts BOTH names in the
+/// message: `{Self}` is the scope type and `{R}` the row, so the suggested
+/// fix is the literal line to type — real scope, real table, nothing left
+/// to substitute. That is the whole of its job; it is not an extension
+/// point.
+#[diagnostic::on_unimplemented(
+    message = "`{R}` is a tenant-scoped table (`#[table(scoped_by = {Self})]`) and a bare `Tx` \
+               names no tenant",
+    label = "`{R}` is scoped by `{Self}`",
+    note = "open the tenant scope first; `{Self}`'s own `TenantScope::authorize` runs there, \
+            once per handler:\n    \
+            let tx = tx.scope::<{Self}>(scope, ctx)?;\n    \
+            tx.scan::<{R}>()?"
+)]
+pub trait NoTenant<R> {}
+
+impl<R> NoTenant<R> for Unscoped {}
+
+/// A table with no tenant scope, and so one an `Id<R>` alone can address.
+/// Implemented for exactly the `Row`s whose `Scope` is `Unscoped`, derived
+/// from `Row::Scope` itself rather than set a second time — the same
+/// no-drift reasoning `row_is_scoped` is built on. This is `View`'s bound,
+/// which is what makes a scoped read from a bare `Tx` an unsatisfied trait
+/// bound rather than a runtime refusal (spec §1, §7 exit criterion 1).
+pub trait UnscopedRow: Row {}
+
+impl<R: Row> UnscopedRow for R where R::Scope: NoTenant<R> {}
+
+/// Read access to UNSCOPED table state — implemented by `Snapshot` (reads
+/// outside transactions) and `Tx` (reads inside one, which also see the
 /// transaction's own writes). The `#[table]` accessors are generated
 /// against this trait.
+///
+/// Every method bounds `R: UnscopedRow`, so this trait is the whole read
+/// surface for tables that have no tenant, and none of the surface for
+/// tables that do. A scoped table is read through `Snapshot`'s
+/// `get_scoped`/`scan_scoped`/`scan_from_scoped`/`scan_by_scoped`,
+/// `Tx`'s `get_in`/`scan_in`/`scan_from_in`/`scan_by_in`, or — the one an
+/// app writes — `charpente::ScopedTx`, which `Tx::scope` hands back once
+/// the app's own `TenantScope::authorize` has passed.
 pub trait View {
-    fn get<R: Row>(&self, id: Id<R>) -> io::Result<Option<R>>;
+    fn get<R: UnscopedRow>(&self, id: Id<R>) -> io::Result<Option<R>>;
 
     /// Every row, in id order. A `Vec` for now; iterators when a real
     /// workload shows the allocation matters.
-    fn scan<R: Row>(&self) -> io::Result<Vec<R>>;
+    fn scan<R: UnscopedRow>(&self) -> io::Result<Vec<R>>;
 
     /// Exact-match secondary index lookup, in id order. Called through the
     /// typed accessors `#[table]` generates (`Invoice::by_org(...)`).
-    fn scan_by<R: Row>(&self, index_name: &str, key: &impl Codec) -> io::Result<Vec<R>>;
+    fn scan_by<R: UnscopedRow>(&self, index_name: &str, key: &impl Codec) -> io::Result<Vec<R>>;
 
     /// Rows with `id >= from_id`, in id order, at most `limit` — the
     /// realtime cursor read (`charpente.events`, but usable on any table). A
     /// `Vec` for now; see `scan`'s note.
-    fn scan_from<R: Row>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>>;
+    fn scan_from<R: UnscopedRow>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>>;
 }
 
 // ---------------------------------------------------------------- Store
@@ -1316,7 +1365,7 @@ pub struct Snapshot {
 }
 
 impl View for Snapshot {
-    fn get<R: Row>(&self, id: Id<R>) -> io::Result<Option<R>> {
+    fn get<R: UnscopedRow>(&self, id: Id<R>) -> io::Result<Option<R>> {
         let rows = match self.txn.open_table(rows_def(R::TABLE)) {
             Ok(rows) => rows,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -1328,7 +1377,7 @@ impl View for Snapshot {
         }
     }
 
-    fn scan<R: Row>(&self) -> io::Result<Vec<R>> {
+    fn scan<R: UnscopedRow>(&self) -> io::Result<Vec<R>> {
         let rows = match self.txn.open_table(rows_def(R::TABLE)) {
             Ok(rows) => rows,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1342,7 +1391,7 @@ impl View for Snapshot {
         Ok(out)
     }
 
-    fn scan_by<R: Row>(&self, index_name: &str, key: &impl Codec) -> io::Result<Vec<R>> {
+    fn scan_by<R: UnscopedRow>(&self, index_name: &str, key: &impl Codec) -> io::Result<Vec<R>> {
         let index = R::INDEXES
             .iter()
             .find(|i| i.name == index_name)
@@ -1382,7 +1431,7 @@ impl View for Snapshot {
     /// Silent gap semantics: if `from_id` was GC'd, this starts at the next
     /// surviving row instead of erroring — callers needing gap detection
     /// must check contiguity themselves.
-    fn scan_from<R: Row>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>> {
+    fn scan_from<R: UnscopedRow>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>> {
         let rows = match self.txn.open_table(rows_def(R::TABLE)) {
             Ok(rows) => rows,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),

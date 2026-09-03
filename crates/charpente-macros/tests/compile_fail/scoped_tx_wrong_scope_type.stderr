@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/compile_fail/scoped_tx_wrong_scope_type.rs:45:13
+   |
+45 |     billing(&tx)
+   |     ------- ^^^ expected `&ScopedTx<'_, '_, OrgB>`, found `&ScopedTx<'_, '_, OrgA>`
+   |     |
+   |     arguments to this function are incorrect
+   |
+   = note: expected reference `&ScopedTx<'_, '_, OrgB>`
+              found reference `&ScopedTx<'_, '_, OrgA>`
+note: function defined here
+  --> tests/compile_fail/scoped_tx_wrong_scope_type.rs:39:4
+   |
+39 | fn billing(tx: &ScopedTx<'_, '_, OrgB>) -> Result<Vec<Invoice>, ApiError> {
+   |    ^^^^^^^ ---------------------------

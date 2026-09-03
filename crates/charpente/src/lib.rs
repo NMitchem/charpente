@@ -31,4 +31,4 @@ pub use launch::launch;
 // Re-exported at the root so the `#[table(scoped_by = …)]` const assert
 // `charpente-macros` emits can name it as `::charpente::TenantScope`, the
 // same flat-path convention `Wire` (from `charpente-macros`) already gets.
-pub use tenant::TenantScope;
+pub use tenant::{Scoped, ScopedTx, TenantScope};
