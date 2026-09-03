@@ -1,0 +1,15 @@
+[package]
+name = "helpdesk"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+charpente = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+charpente-sim = { path = "../../crates/charpente-sim", version = "0.0.0" }
+
+[[test]]
+name = "sim"
+harness = false

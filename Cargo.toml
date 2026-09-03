@@ -13,6 +13,7 @@ members = [
     "crates/edge-harness",
     "crates/bench-harness",
     "examples/invoicing",
+    "examples/helpdesk",
 ]
 
 [workspace.package]
