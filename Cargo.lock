@@ -234,6 +234,7 @@ dependencies = [
  "charpente",
  "charpente-sim",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

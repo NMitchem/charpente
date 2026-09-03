@@ -287,7 +287,7 @@ impl From<Org> for OrgView {
     }
 }
 
-#[derive(Wire, Deserialize)]
+#[derive(Wire, Serialize, Deserialize)]
 pub struct CreateOrgBody {
     pub name: String,
 }
@@ -309,7 +309,7 @@ impl From<Agent> for AgentView {
     }
 }
 
-#[derive(Wire, Deserialize)]
+#[derive(Wire, Serialize, Deserialize)]
 pub struct CreateAgentBody {
     pub org: Id<Org>,
     pub subject: String,
@@ -336,13 +336,13 @@ impl From<Ticket> for TicketView {
     }
 }
 
-#[derive(Wire, Deserialize)]
+#[derive(Wire, Serialize, Deserialize)]
 pub struct CreateTicketBody {
     pub title: String,
     pub body: String,
 }
 
-#[derive(Wire, Deserialize)]
+#[derive(Wire, Serialize, Deserialize)]
 pub struct TransitionBody {
     pub to: String,
 }
@@ -366,7 +366,7 @@ impl From<Comment> for CommentView {
     }
 }
 
-#[derive(Wire, Deserialize)]
+#[derive(Wire, Serialize, Deserialize)]
 pub struct CreateCommentBody {
     pub body: String,
 }
