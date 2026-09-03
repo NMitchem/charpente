@@ -297,12 +297,16 @@ impl Schema {
         self.tables.remove(table);
     }
 
-    fn ops(&self, table: &str) -> io::Result<&TableOps> {
+    /// `site` names the caller for the refusal below — this lookup runs
+    /// from log-record apply, `Db`/`Seeder::table_scoped` (archive export,
+    /// repl seeding, archive restore) and `Seeder::rows` (seed/restore
+    /// import), none of which share one honest description.
+    fn ops(&self, table: &str, site: &str) -> io::Result<&TableOps> {
         self.tables.get(table).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "log record references table \"{table}\" but the Schema does not include \
+                    "{site} references table \"{table}\" but the Schema does not include \
                      it — register it in the Schema passed to Db::open, or migrate the log"
                 ),
             )
@@ -934,7 +938,7 @@ impl StateMachine for TableMachine {
                     // replay, and followers rebuild at the same log
                     // position.
                     let new = crate::migration::SchemaVersion::decode_row(row)?;
-                    let ops = schema.ops(table)?;
+                    let ops = schema.ops(table, "a log record")?;
                     let old = w
                         // SchemaVersion is always unscoped — literal None, not a
                         // computed scoped/UNSCOPED pair that reads as if it could
@@ -966,7 +970,7 @@ impl StateMachine for TableMachine {
                              the rewritten rows",
                             new.table
                         );
-                        (schema.ops(&new.table)?.rebuild_indexes)(w)?;
+                        (schema.ops(&new.table, "a log record")?.rebuild_indexes)(w)?;
                     }
                     versions.insert(new.table.clone(), (new.version, new.fingerprint));
                 }
@@ -979,7 +983,7 @@ impl StateMachine for TableMachine {
                         if table == crate::migration::SchemaVersion::TABLE {
                             continue; // pass 1 applied it
                         }
-                        let ops = schema.ops(table)?;
+                        let ops = schema.ops(table, "a log record")?;
                         let resolved = resolve_effect_scope(table, ops.scoped, *scope, "Put")?;
                         // A below-compiled-version ordinary record (a full
                         // rebuild-from-WAL replaying history that predates a
@@ -1005,7 +1009,7 @@ impl StateMachine for TableMachine {
                         }
                     }
                     Effect::Delete { table, scope, id } => {
-                        let ops = schema.ops(table)?;
+                        let ops = schema.ops(table, "a log record")?;
                         let resolved = resolve_effect_scope(table, ops.scoped, *scope, "Delete")?;
                         if is_below_compiled(schema, versions, table) {
                             // `delete_raw` carries the resolved scope; see the
@@ -1027,7 +1031,7 @@ impl StateMachine for TableMachine {
                         // equality check (its whole point is bytes at the
                         // target version over rows at the old one), still
                         // registered-table-checked, still decode-free.
-                        let ops = schema.ops(table)?;
+                        let ops = schema.ops(table, "a log record")?;
                         let resolved =
                             resolve_effect_scope(table, ops.scoped, *scope, "MigratePut")?;
                         w.put_raw(table, ops.scoped.then_some(resolved), *id, row)?;
@@ -2062,7 +2066,12 @@ impl Db {
     /// pick a physical shape or a wire shape (`scan_raw`/`scan_raw_from`'s
     /// `scoped` parameter; the archive's export walk; seeding).
     pub fn table_scoped(&self, table: &str) -> io::Result<bool> {
-        Ok(self.engine.machine().schema.ops(table)?.scoped)
+        Ok(self
+            .engine
+            .machine()
+            .schema
+            .ops(table, "Db::table_scoped")?
+            .scoped)
     }
 
     /// Every registered table in schema (sorted-name) order — the describe
@@ -2131,7 +2140,12 @@ impl Db {
             let persisted: Option<crate::migration::SchemaVersion> =
                 snap.get(crate::migration::schema_version_id(table))?;
             let rows_exist = !snap
-                .scan_raw_from(table, schema.ops(table)?.scoped, None, 1)?
+                .scan_raw_from(
+                    table,
+                    schema.ops(table, "Db::check_schema_gate")?.scoped,
+                    None,
+                    1,
+                )?
                 .is_empty();
             match gate_status(
                 table,
@@ -2206,7 +2220,12 @@ impl Db {
                 continue;
             };
             let vid = crate::migration::schema_version_id(table);
-            let table_scoped = self.engine.machine().schema.ops(table)?.scoped;
+            let table_scoped = self
+                .engine
+                .machine()
+                .schema
+                .ops(table, "Db::migrate_schema")?
+                .scoped;
             let snap = self.snapshot()?;
             let persisted: Option<crate::migration::SchemaVersion> = snap.get(vid)?;
             let rows_exist = !snap.scan_raw_from(table, table_scoped, None, 1)?.is_empty();
@@ -2738,7 +2757,10 @@ impl Seeder {
     /// a snapshot batch object, decided the same way `Db::table_scoped`
     /// decides it for export, before any row is read.
     pub fn table_scoped(&self, table: &str) -> io::Result<bool> {
-        Ok(self.import_schema.ops(table)?.scoped)
+        Ok(self
+            .import_schema
+            .ops(table, "Seeder::table_scoped")?
+            .scoped)
     }
 
     /// One table's worth of exported rows, applied through the schema's
@@ -2756,7 +2778,7 @@ impl Seeder {
         self.store.import(|w| {
             for (scope, id, bytes) in rows {
                 let _ = id;
-                let ops = self.import_schema.ops(table)?;
+                let ops = self.import_schema.ops(table, "Seeder::rows")?;
                 (ops.apply_put)(w, *scope, bytes)?;
             }
             Ok(())

@@ -427,13 +427,28 @@ fn scoped_rows_def(table: &str) -> TableDefinition<'_, [u8; 16], &'static [u8]> 
     TableDefinition::new(table)
 }
 
-/// `scan_raw`/`scan_raw_from`'s scoped branch tried both physical shapes
-/// (composite, then bare) and neither opened — names both, not just the
-/// second attempt's raw redb error.
-fn scan_raw_shape_error(table: &str, second_attempt: redb::TableError) -> io::Error {
+/// `scan_raw`/`scan_raw_from`'s unscoped branch opened the wrong physical
+/// shape — names both known shapes (composite, bare), not just the raw
+/// redb error naming whichever one it actually found.
+fn scan_raw_shape_error(table: &str, attempt: redb::TableError) -> io::Error {
     io::Error::other(format!(
         "table \"{table}\": neither the scoped composite-key shape nor the bare-u64 shape \
-         opened it ({second_attempt})"
+         opened it ({attempt})"
+    ))
+}
+
+/// `scan_raw`/`scan_raw_from`'s scoped branch found the table's rows
+/// physically bare-`u64`-keyed. Scoping is opt-in per table and never
+/// retrofitted onto an existing one (spec §8's non-goal, "Retrofitting
+/// existing tables"): a table cannot gain a scope in place, so this is
+/// always a schema/disk disagreement, never a state to tolerate — proven,
+/// not assumed, by `migrate_table`'s own `MigratePut` dying on the exact
+/// same physical shape with an unnamed redb type error the moment it tries
+/// to write the row back under a scope.
+fn scope_flip_error(table: &str) -> io::Error {
+    io::Error::other(format!(
+        "table \"{table}\" is declared scoped_by but its rows are keyed unscoped: a table \
+         cannot gain a scope in place; create a new scoped table and copy rows through a job"
     ))
 }
 
@@ -1661,14 +1676,15 @@ impl Snapshot {
     /// row of an unscoped table.
     ///
     /// `scoped` (from `TableOps.scoped`, i.e. the compiled schema) picks
-    /// which physical shape to open first. A scoped table whose rows have
-    /// never been touched since it gained a scope is still physically
-    /// bare-`u64`-keyed — `migrate_table`'s own resume walk depends on
-    /// reading exactly that state — so on `TableTypeMismatch` a `scoped`
-    /// caller retries the bare shape (below-compiled tolerance kept).
-    /// `scoped = false` has no such legitimate other shape (a table is
-    /// never un-scoped once scoped), so a mismatch there is refused by
-    /// name rather than silently retried.
+    /// which physical shape to open. Scoping is opt-in per table and never
+    /// retrofitted onto an existing one (spec §8's non-goal): a table's
+    /// physical shape is fixed at its first write and stays that shape for
+    /// the table's whole life, so `scoped` and the physical shape must
+    /// agree. A `TableTypeMismatch` (the schema says one shape, the disk
+    /// holds the other) is refused by name rather than tolerated either
+    /// direction — `scoped = true` names the scope-flip contract and its
+    /// fix; `scoped = false` names both shapes so the operator knows what
+    /// disagreed.
     pub fn scan_raw(&self, table: &str, scoped: bool) -> io::Result<Vec<(u64, u64, Vec<u8>)>> {
         if scoped {
             match self.txn.open_table(scoped_rows_def(table)) {
@@ -1685,20 +1701,7 @@ impl Snapshot {
                     Ok(out)
                 }
                 Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
-                Err(redb::TableError::TableTypeMismatch { .. }) => {
-                    match self.txn.open_table(rows_def(table)) {
-                        Ok(rows) => {
-                            let mut out = Vec::new();
-                            for entry in rows.range(0u64..=u64::MAX).map_err(redb_err)? {
-                                let (key, value) = entry.map_err(redb_err)?;
-                                out.push((UNSCOPED, key.value(), value.value().to_vec()));
-                            }
-                            Ok(out)
-                        }
-                        Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
-                        Err(e) => Err(scan_raw_shape_error(table, e)),
-                    }
-                }
+                Err(redb::TableError::TableTypeMismatch { .. }) => Err(scope_flip_error(table)),
                 Err(e) => Err(redb_err(e)),
             }
         } else {
@@ -1712,7 +1715,7 @@ impl Snapshot {
                     Ok(out)
                 }
                 Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
-                Err(e) => Err(redb_err(e)),
+                Err(e) => Err(scan_raw_shape_error(table, e)),
             }
         }
     }
@@ -1729,10 +1732,9 @@ impl Snapshot {
     /// or skip rows across scopes. Both branches SEEK (an exclusive
     /// `redb::Bound`, not a full scan filtered post-hoc).
     ///
-    /// `scoped` (see `scan_raw`) picks which physical shape to open first
-    /// and, for `scoped = true`, tolerates the not-yet-migrated bare-`u64`
-    /// shape via the same fallback; `scoped = false` refuses a mismatch by
-    /// name.
+    /// `scoped` (see `scan_raw`) picks which physical shape to open, and a
+    /// `TableTypeMismatch` is refused by name exactly as `scan_raw`
+    /// refuses one — never tolerated, either direction.
     pub fn scan_raw_from(
         &self,
         table: &str,
@@ -1760,27 +1762,7 @@ impl Snapshot {
                     Ok(out)
                 }
                 Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
-                Err(redb::TableError::TableTypeMismatch { .. }) => {
-                    match self.txn.open_table(rows_def(table)) {
-                        Ok(rows) => {
-                            let lo = match after {
-                                None => Bound::Unbounded,
-                                Some((_, id)) => Bound::Excluded(id),
-                            };
-                            let mut out = Vec::new();
-                            for item in rows.range((lo, Bound::Unbounded)).map_err(redb_err)? {
-                                if out.len() == limit {
-                                    break;
-                                }
-                                let (k, v) = item.map_err(redb_err)?;
-                                out.push((UNSCOPED, k.value(), v.value().to_vec()));
-                            }
-                            Ok(out)
-                        }
-                        Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
-                        Err(e) => Err(scan_raw_shape_error(table, e)),
-                    }
-                }
+                Err(redb::TableError::TableTypeMismatch { .. }) => Err(scope_flip_error(table)),
                 Err(e) => Err(redb_err(e)),
             }
         } else {
@@ -1809,7 +1791,7 @@ impl Snapshot {
                     Ok(out)
                 }
                 Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
-                Err(e) => Err(redb_err(e)),
+                Err(e) => Err(scan_raw_shape_error(table, e)),
             }
         }
     }

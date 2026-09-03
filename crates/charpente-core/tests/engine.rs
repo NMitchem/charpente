@@ -567,19 +567,14 @@ fn ticket_index_entry_survives(snap: &Snapshot, scope: u64, n: u32) -> bool {
 }
 
 /// Task 4 (tenant scoping): a scoped Row (`Row::Scope != Unscoped`) is stored
-/// in a PHYSICALLY DIFFERENT redb table from the bare-`u64`-keyed one the test
-/// above pins for the unscoped case. Through Task 6, `scan_raw` still tried
-/// the unscoped `TableDefinition<u64, &[u8]>` first and failed with
-/// `TableTypeMismatch` on a scoped table's `[u8;16]` key — silent-empty is
-/// what a bug routing a scoped row through the old bare-`u64` path
-/// regardless of `Row::Scope` would have produced instead. Task 6c teaches
-/// `scan_raw` the same fallback `scan_raw_from` already had: retry under the
-/// composite key shape and recover `(scope, id)` from it, so this now
-/// asserts the SUCCESSFUL read carries the real scope rather than asserting
-/// the mismatch — the mismatch, still the FIRST branch tried, is what
-/// distinguishes a scoped table's physical shape from an unscoped one at
-/// all (proven by `an_unscoped_table_still_writes_a_bare_u64_key` reading
-/// back `UNSCOPED` for the table that does NOT take this fallback).
+/// in a PHYSICALLY DIFFERENT redb table (`[u8;16]`-keyed) from the
+/// bare-`u64`-keyed one the test above pins for the unscoped case.
+/// `Writer::put` routes a scoped row to that composite table directly, so
+/// `scan_raw(Ticket::TABLE, true)`'s only attempt — the composite shape —
+/// opens on the first try and this asserts the read carries the real scope,
+/// not `UNSCOPED` (proven distinct from the unscoped case by
+/// `an_unscoped_table_still_writes_a_bare_u64_key`, which reads back
+/// `UNSCOPED` for a table whose rows are physically bare).
 #[test]
 fn a_scoped_table_stores_under_the_composite_key_not_a_bare_u64() {
     let sim = Sim::with_faults(0x7A2E_0008, FaultConfig::none());
@@ -598,10 +593,9 @@ fn a_scoped_table_stores_under_the_composite_key_not_a_bare_u64() {
         .expect("a scoped put must not error");
 
     let snap = store.snapshot().unwrap();
-    let raw = snap.scan_raw(Ticket::TABLE, true).expect(
-        "scan_raw must learn the [u8;16] key shape rather than erroring — the scoped \
-                 table's composite key is a fallback, not a refusal, as of Task 6c",
-    );
+    let raw = snap
+        .scan_raw(Ticket::TABLE, true)
+        .expect("a scoped table's rows are always composite-keyed once written");
     assert_eq!(
         raw,
         vec![(10u64, 5u64, {
@@ -614,6 +608,47 @@ fn a_scoped_table_stores_under_the_composite_key_not_a_bare_u64() {
             b
         })],
         "scan_raw must recover the real (scope, id) from the composite key, not UNSCOPED"
+    );
+}
+
+/// Fix round 2, M-1 under ruling R42: scoping is opt-in per table and never
+/// retrofitted onto an existing one (spec §8's non-goal). If a table's rows
+/// are physically bare-`u64`-keyed — written before the table ever declared
+/// `scoped_by`, or by a schema that never scoped it — `scan_raw`/
+/// `scan_raw_from` must refuse the flip by name, not silently read the rows
+/// back at a fabricated scope 0. Built with `put_raw(None, …)`, the exact
+/// decode-free primitive the WAL replay and migration paths use, so this is
+/// not a contrived construction — it is the shape any of those paths would
+/// leave behind on a table before it ever gained a scope.
+#[test]
+fn a_scoped_read_over_a_physically_bare_table_refuses_the_scope_flip_by_name() {
+    let sim = Sim::with_faults(0x7A2E_0009, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    store
+        .apply(0, |w| w.put_raw(Ticket::TABLE, None, 5, b"old"))
+        .expect("a bare put must not error");
+
+    let snap = store.snapshot().unwrap();
+    let err = snap.scan_raw(Ticket::TABLE, true).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("is declared scoped_by but its rows are keyed unscoped"),
+        "{err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("a table cannot gain a scope in place"),
+        "{err}"
+    );
+
+    let err2 = snap
+        .scan_raw_from(Ticket::TABLE, true, None, 10)
+        .unwrap_err();
+    assert!(
+        err2.to_string()
+            .contains("is declared scoped_by but its rows are keyed unscoped"),
+        "{err2}"
     );
 }
 

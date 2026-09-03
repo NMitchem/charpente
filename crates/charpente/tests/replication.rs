@@ -1031,6 +1031,159 @@ fn seed_lands_at_horizon_plus_one() {
     );
 }
 
+// -------------------------------------- fix round 2, N-3 / owed 1(a) fixture
+
+struct SeedOrg;
+
+struct ScopedSeedItem {
+    id: Id<ScopedSeedItem>,
+    n: u32,
+}
+impl Row for ScopedSeedItem {
+    type Scope = SeedOrg;
+    const TABLE: &'static str = "ScopedSeedItem";
+    const INDEXES: &'static [IndexDef<ScopedSeedItem>] = &[];
+    fn id(&self) -> Id<ScopedSeedItem> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.n.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<ScopedSeedItem> {
+        let input = &mut &bytes[..];
+        Ok(ScopedSeedItem {
+            id: Id::decode(input)?,
+            n: u32::decode(input)?,
+        })
+    }
+}
+
+fn scoped_seed_item_schema() -> Schema {
+    Schema::new().table::<ScopedSeedItem>()
+}
+
+fn scoped_len_prefixed(bytes: &[u8], out: &mut Vec<u8>) {
+    (bytes.len() as u32).encode(out);
+    out.extend_from_slice(bytes);
+}
+
+/// A hand-encoded one-effect `0x05` (scoped Put) record for `ScopedSeedItem`
+/// — `ScopedSeedItem` is unversioned (`FINGERPRINT: None`, the default for
+/// a hand-written `Row`), so unlike `charpente-core`'s versioned fault-matrix
+/// fixtures this needs no `SchemaVersion` adoption row first.
+fn scoped_seed_item_put_record(scope: u64, id: u64, n: u32) -> Vec<u8> {
+    let mut row_bytes = Vec::new();
+    Row::encode_row(
+        &ScopedSeedItem {
+            id: Id::from_raw(id),
+            n,
+        },
+        &mut row_bytes,
+    );
+    let mut record = Vec::new();
+    1u32.encode(&mut record);
+    record.push(5);
+    scoped_len_prefixed(ScopedSeedItem::TABLE.as_bytes(), &mut record);
+    scope.encode(&mut record);
+    scoped_len_prefixed(&row_bytes, &mut record);
+    record
+}
+
+/// Fix round 2, owed 1(a) (N-3): a real follower seeds a genuinely SCOPED
+/// table from a primary over the wire — the exact path the re-review's
+/// mutation 3 found untested (forcing `begin_seeding` to send tag 5 for
+/// every table left `replication` 58/58 green, because no schema anywhere
+/// in this file registered a scoped table). Tenant 0 (R35: a tenant, not
+/// "no tenant") and tenant 2 are both in the primary's log before the
+/// follower ever connects; the assertion reads the FOLLOWER's own stored
+/// composite key bytes back through `scan_raw`, not a round trip through
+/// the same encoder that wrote them.
+#[test]
+fn a_follower_seeds_a_scoped_table_and_stores_both_tenants_under_their_own_scope() {
+    let sim = Sim::with_faults(0x6C02_0003, FaultConfig::none());
+    let mut p = spawn_node_with_schema(
+        &sim,
+        "p",
+        primary_cfg("p:1"),
+        seeding_db_cfg(),
+        scoped_seed_item_schema(),
+    )
+    .unwrap();
+    {
+        let db = p.db.as_mut().unwrap();
+        let mut seq = db.last_applied().map_or(0, |s| s + 1);
+        // Pad the log past several segment/checkpoint boundaries first — a
+        // fresh (`None`-position) follower only snapshot-seeds against a
+        // COMPACTED log (DESIGN §5's ladder); an uncompacted one just ships
+        // ordinary `Frames`, and this test needs the real seed path.
+        let mut records: Vec<(u64, Vec<u8>)> = (0..80)
+            .map(|i| {
+                let r = (seq, scoped_seed_item_put_record(1, 100 + i, i as u32));
+                seq += 1;
+                r
+            })
+            .collect();
+        records.push((seq, scoped_seed_item_put_record(0, 5, 50)));
+        seq += 1;
+        records.push((seq, scoped_seed_item_put_record(2, 9, 90)));
+        db.apply_shipped(&records).unwrap();
+        db.checkpoint().unwrap();
+        assert!(
+            db.log_base() > 0,
+            "the padding above must move GC's base for the snapshot-seed path to trigger"
+        );
+    }
+
+    let mut f = spawn_node_with_schema(
+        &sim,
+        "f",
+        follower_cfg("f:1", "p:1"),
+        seeding_db_cfg(),
+        scoped_seed_item_schema(),
+    )
+    .unwrap();
+    run_until(
+        &sim,
+        &mut [&mut p, &mut f],
+        |ns| ns[1].repl.stats().seeds >= 1,
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+
+    let fdb = f.db.as_ref().unwrap();
+    let rows = fdb
+        .snapshot()
+        .unwrap()
+        .scan_raw(ScopedSeedItem::TABLE, true)
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        82,
+        "80 padding rows plus tenant 0's and tenant 2's"
+    );
+    let mut expect_0 = Vec::new();
+    ScopedSeedItem {
+        id: Id::from_raw(5),
+        n: 50,
+    }
+    .encode_row(&mut expect_0);
+    let mut expect_2 = Vec::new();
+    ScopedSeedItem {
+        id: Id::from_raw(9),
+        n: 90,
+    }
+    .encode_row(&mut expect_2);
+    assert!(
+        rows.contains(&(0u64, 5u64, expect_0)),
+        "tenant 0's row must be stored under its own scope, not dropped or collapsed"
+    );
+    assert!(
+        rows.contains(&(2u64, 9u64, expect_2)),
+        "tenant 2's row must be stored under its own scope, not dropped or collapsed"
+    );
+}
+
 // -------------------------------------------------- property: pin holds GC
 
 #[test]

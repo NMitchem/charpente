@@ -803,15 +803,21 @@ error, for a table that was never created). `scope` is `table::UNSCOPED` for eve
 an unscoped table; a scoped table's physical redb table is composite-`[u8;16]`-keyed, so
 `scan_raw` and `scan_raw_from` (the migration/archive-export paged read) take `scoped: bool`
 from the caller's own `TableOps.scoped` — the schema's word, never guessed by probing —
-and open that shape first. Only `scoped = true` tolerates a second attempt: a scoped table
-whose rows have never been touched since it gained a scope is still physically
-bare-`u64`-keyed (`migrate_table`'s own resume walk depends on reading exactly that
-state), so a `TableTypeMismatch` there retries the bare shape and reports every row at
-`UNSCOPED`. `scoped = false` has no legitimate other shape — a table is never un-scoped
-once scoped — so a mismatch there is refused by name naming both shapes tried, not
-silently retried. `scan_raw_from`'s cursor is `(scope, id)`: a bare-id watermark cannot
-resume a composite-keyed table correctly, since ids are not globally ascending across a
-scope boundary (tenant 2's id 0 can follow tenant 1's id `u64::MAX`).
+and open that shape. Scoping is opt-in per table and never retrofitted onto an existing one
+(spec §8's non-goal, "Retrofitting existing tables"): a table's physical shape is fixed at
+its first write for the table's whole life, so a `TableTypeMismatch` is always a
+schema/disk disagreement, never a state to tolerate, and both directions are refused by
+name rather than silently resolved — `scoped = true` over a physically bare table names the
+scope-flip contract and its fix ("create a new scoped table and copy rows through a job");
+`scoped = false` over a physically composite table names both known shapes. (An earlier
+build of this fallback tolerated the `scoped = true` case, reasoning that `migrate_table`'s
+resume walk depended on reading it; it does not — the very next `MigratePut` for such a row
+dies on redb's own unnamed type error the moment it tries to write the row back under a
+scope, so the tolerance only ever bought a silent scope-0 collapse in the three paths that
+complete through it: `Seeder::rows`, the archive export walk, and replication seeding.)
+`scan_raw_from`'s cursor is `(scope, id)`: a bare-id watermark cannot resume a
+composite-keyed table correctly, since ids are not globally ascending across a scope
+boundary (tenant 2's id 0 can follow tenant 1's id `u64::MAX`).
 `Store::import`/`set_import_meta` are the write-side counterpart:
 `import` commits typed rows through the same `Writer` (and so the same index maintenance)
 as ordinary `apply`, but with no seq or `next_job_id` bookkeeping of its own — a logical

@@ -483,11 +483,30 @@ mod tests {
     /// tag) rather than misreading it as a wider `SnapshotRows`.
     #[test]
     fn tag_14_is_unknown_to_a_pre_scoped_tables_peer() {
+        // Fix round 2, N-6: the full bytes, not just `bytes[0] == 14` — a
+        // pin on the leading byte alone would still pass if the REST of the
+        // encoding drifted to look like some other message's shape past the
+        // tag, which is exactly the ambiguity a version bump exists to rule
+        // out. `decode`'s own `other => refused by name` arm (below) is
+        // what a pre-round-1 peer's tag registry (0..=13) enforces for real.
         let bytes = encode(&Msg::ScopedSnapshotRows {
             table: "t".to_string(),
             rows: vec![(1, 2, vec![3])],
         });
-        assert_eq!(bytes[0], 14);
+        let expected: &[u8] = &[
+            14, // tag — the highest a pre-round-1 (0..=13) peer recognizes is 13
+            1, 0, 0, 0, b't', // table
+            1, 0, 0, 0, // rows.len() = 1
+            1, 0, 0, 0, 0, 0, 0, 0, // scope = 1
+            2, 0, 0, 0, 0, 0, 0, 0, // id = 2
+            1, 0, 0, 0, 3, // row
+        ];
+        assert_eq!(bytes, expected);
+        let err = decode(&[15]).unwrap_err();
+        assert!(
+            err.to_string().contains("15"),
+            "a peer that does not know a tag refuses it by name, not silently: {err}"
+        );
     }
 
     #[test]

@@ -629,4 +629,134 @@ mod tests {
                 .expect_err("an unmarked refusal must remain node-fatal");
         }
     }
+
+    // ---------------------------------------------- fix round 2, N-3 / owed 1(b)
+
+    struct FlipOrg;
+
+    struct ScopedFlip {
+        id: charpente_core::table::Id<ScopedFlip>,
+        n: u32,
+    }
+    impl charpente_core::table::Row for ScopedFlip {
+        type Scope = FlipOrg;
+        const TABLE: &'static str = "Flip";
+        const INDEXES: &'static [charpente_core::table::IndexDef<ScopedFlip>] = &[];
+        fn id(&self) -> charpente_core::table::Id<ScopedFlip> {
+            self.id
+        }
+        fn encode_row(&self, out: &mut Vec<u8>) {
+            use charpente_core::table::Codec;
+            self.id.encode(out);
+            self.n.encode(out);
+        }
+        fn decode_row(bytes: &[u8]) -> io::Result<ScopedFlip> {
+            use charpente_core::table::Codec;
+            let input = &mut &bytes[..];
+            Ok(ScopedFlip {
+                id: charpente_core::table::Id::decode(input)?,
+                n: u32::decode(input)?,
+            })
+        }
+    }
+
+    struct UnscopedFlip {
+        id: charpente_core::table::Id<UnscopedFlip>,
+        n: u32,
+    }
+    impl charpente_core::table::Row for UnscopedFlip {
+        type Scope = charpente_core::table::Unscoped;
+        const TABLE: &'static str = "Flip";
+        const INDEXES: &'static [charpente_core::table::IndexDef<UnscopedFlip>] = &[];
+        fn id(&self) -> charpente_core::table::Id<UnscopedFlip> {
+            self.id
+        }
+        fn encode_row(&self, out: &mut Vec<u8>) {
+            use charpente_core::table::Codec;
+            self.id.encode(out);
+            self.n.encode(out);
+        }
+        fn decode_row(bytes: &[u8]) -> io::Result<UnscopedFlip> {
+            use charpente_core::table::Codec;
+            let input = &mut &bytes[..];
+            Ok(UnscopedFlip {
+                id: charpente_core::table::Id::decode(input)?,
+                n: u32::decode(input)?,
+            })
+        }
+    }
+
+    /// Fix round 2, owed 1(b): a follower whose schema declares "Flip"
+    /// tenant-scoped refuses a tag-5 `SnapshotRows` for it by name, driven
+    /// through the real decode/apply path (`step`), not a unit check on the
+    /// message shape alone — the re-review's mutation 3 found this arm
+    /// UNREACHABLE from every existing test (no schema anywhere registered
+    /// a scoped table), so `replication` staying 58/58 green proved
+    /// nothing about it.
+    #[test]
+    fn a_tag_5_snapshot_for_a_scoped_table_is_refused_by_name() {
+        let sim = Sim::with_faults(0x6C02_0001, FaultConfig::none());
+        let mut db = Db::open(
+            Box::new(sim.disk()),
+            DbConfig::default(),
+            Schema::new().table::<ScopedFlip>(),
+        )
+        .expect("Db::open with Flip declared scoped");
+        let net = sim.host("f").net();
+        let mut f = Follower::new("p:1".to_string(), Some("f:1".to_string()), None);
+        f.inbox.push_back(encode(&Msg::SnapshotRows {
+            table: "Flip".to_string(),
+            rows: vec![(5, vec![1, 2, 3])],
+        }));
+        let err = f
+            .step(&net, &mut db, 0)
+            .expect_err("a tag-5 SnapshotRows for a scoped table must refuse, not apply");
+        let msg = err.to_string();
+        assert!(msg.contains("Flip"), "{msg}");
+        assert!(msg.contains("tenant-scoped"), "{msg}");
+        assert!(
+            msg.contains("the primary sent the unscoped shape (tag 5)"),
+            "{msg}"
+        );
+        assert!(msg.contains("ScopedSnapshotRows (tag 14)"), "{msg}");
+        assert!(
+            msg.contains("reconnect once both sides run a schema"),
+            "{msg}"
+        );
+    }
+
+    /// Fix round 2, owed 1(b), the mirror direction: a follower whose
+    /// schema declares "Flip" NOT scoped refuses a tag-14
+    /// `ScopedSnapshotRows` for it by name.
+    #[test]
+    fn a_tag_14_scoped_snapshot_for_an_unscoped_table_is_refused_by_name() {
+        let sim = Sim::with_faults(0x6C02_0002, FaultConfig::none());
+        let mut db = Db::open(
+            Box::new(sim.disk()),
+            DbConfig::default(),
+            Schema::new().table::<UnscopedFlip>(),
+        )
+        .expect("Db::open with Flip declared unscoped");
+        let net = sim.host("f").net();
+        let mut f = Follower::new("p:1".to_string(), Some("f:1".to_string()), None);
+        f.inbox.push_back(encode(&Msg::ScopedSnapshotRows {
+            table: "Flip".to_string(),
+            rows: vec![(9, 5, vec![1, 2, 3])],
+        }));
+        let err = f
+            .step(&net, &mut db, 0)
+            .expect_err("a tag-14 ScopedSnapshotRows for an unscoped table must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("Flip"), "{msg}");
+        assert!(msg.contains("NOT tenant-scoped"), "{msg}");
+        assert!(
+            msg.contains("the primary sent the scoped shape (tag 14)"),
+            "{msg}"
+        );
+        assert!(msg.contains("SnapshotRows (tag 5)"), "{msg}");
+        assert!(
+            msg.contains("reconnect once both sides run a schema"),
+            "{msg}"
+        );
+    }
 }

@@ -1279,3 +1279,122 @@ fn migration_survives_the_fault_matrix_for_a_scoped_table_and_equals_the_uninter
         require: ["migrations:scoped-resumed-to-completion"]
     );
 }
+
+/// Fix round 2, I-2 owed (termination was pinned; exactly-once was not):
+/// counts `MigratePut` effects (tag `0x04` unscoped, `0x07` scoped) for
+/// `table` across every record in `frames`. Every effect in every record is
+/// decoded, not skipped by width guess — a tag this test does not expect at
+/// all is a hard `panic`, so a mis-aligned read surfaces as a loud failure
+/// rather than a silent under/overcount from misreading a field boundary.
+fn count_migrate_puts(frames: &[(u64, Vec<u8>)], table: &str) -> usize {
+    let mut count = 0usize;
+    for (_seq, payload) in frames {
+        let input = &mut &payload[..];
+        let n = u32::decode(input).unwrap();
+        for _ in 0..n {
+            let tag = u8::decode(input).unwrap();
+            match tag {
+                0x00 => {
+                    let _table = String::decode(input).unwrap();
+                    let _row = Vec::<u8>::decode(input).unwrap();
+                }
+                0x01 => {
+                    let _table = String::decode(input).unwrap();
+                    let _id = u64::decode(input).unwrap();
+                }
+                0x02 | 0x03 => {
+                    let _name = String::decode(input).unwrap();
+                    let _payload = Vec::<u8>::decode(input).unwrap();
+                    let _key = Option::<String>::decode(input).unwrap();
+                }
+                0x04 => {
+                    let t = String::decode(input).unwrap();
+                    let _id = u64::decode(input).unwrap();
+                    let _row = Vec::<u8>::decode(input).unwrap();
+                    if t == table {
+                        count += 1;
+                    }
+                }
+                0x05 => {
+                    let _table = String::decode(input).unwrap();
+                    let _scope = u64::decode(input).unwrap();
+                    let _row = Vec::<u8>::decode(input).unwrap();
+                }
+                0x06 => {
+                    let _table = String::decode(input).unwrap();
+                    let _scope = u64::decode(input).unwrap();
+                    let _id = u64::decode(input).unwrap();
+                }
+                0x07 => {
+                    let t = String::decode(input).unwrap();
+                    let _scope = u64::decode(input).unwrap();
+                    let _id = u64::decode(input).unwrap();
+                    let _row = Vec::<u8>::decode(input).unwrap();
+                    if t == table {
+                        count += 1;
+                    }
+                }
+                other => panic!("count_migrate_puts: unknown effect tag {other} in record"),
+            }
+        }
+        assert!(
+            input.is_empty(),
+            "count_migrate_puts: {} bytes left over after decoding {n} effects — a tag's \
+             field layout above disagrees with db.rs's actual wire format",
+            input.len()
+        );
+    }
+    count
+}
+
+/// Fix round 2, I-2 owed: scopes 0, 1 AND 2 (R35 — tenant 0 is a tenant, so
+/// it must be present in the fixture, not implied by its absence), ids 0..4
+/// overlapping across every scope (id 0 exists at scope 0, at scope 1, AND
+/// at scope 2), `migration_batch_size` well below the 12-row total. After
+/// `migrate_schema` returns, the log holds exactly one `MigratePut` per row
+/// — not fewer (a row silently skipped) and not more (re-migration
+/// re-applying the step chain over a row already at the target version).
+#[test]
+fn migration_commits_exactly_one_migrate_put_per_row_across_overlapping_scopes() {
+    let sim = Sim::with_faults(0x2EB7_6000, FaultConfig::none());
+    seed_scoped_v1(&sim, 4, &[0, 1, 2]);
+    let schema = Schema::new()
+        .table::<ScopedWidgetV2>()
+        .migration::<ScopedWidgetV2>("ScopedWidget");
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig {
+            migration_batch_size: 5,
+            ..cfg()
+        },
+        schema,
+    )
+    .unwrap();
+    let before = db.last_applied().map_or(0, |s| s + 1);
+    db.migrate_schema().unwrap();
+
+    let frames = db.read_log(before, usize::MAX).unwrap();
+    let count = count_migrate_puts(&frames, "ScopedWidget");
+    assert_eq!(
+        count,
+        12,
+        "12 rows (4 ids x 3 scopes, including scope 0) must each get exactly one MigratePut; \
+         got {count} across {} migration-only records",
+        frames.len()
+    );
+
+    let rows = db
+        .snapshot()
+        .unwrap()
+        .scan_raw(ScopedWidgetV2::TABLE, true)
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        12,
+        "every row must have reached the target shape"
+    );
+    for (_scope, _id, bytes) in &rows {
+        let r = <ScopedWidgetV2 as Row>::decode_row(bytes).unwrap();
+        assert_eq!(r.label, "migrated");
+    }
+}

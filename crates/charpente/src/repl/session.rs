@@ -480,7 +480,13 @@ impl Session {
                 let mut batch: Vec<(u64, Vec<u8>)> = Vec::new();
                 let mut bytes = 0usize;
                 for (scope, id, row) in rows {
-                    debug_assert_eq!(scope, charpente_core::table::UNSCOPED);
+                    assert_eq!(
+                        scope,
+                        charpente_core::table::UNSCOPED,
+                        "begin_seeding: table \"{table}\" is not tenant-scoped, but \
+                         scan_raw returned a row at scope {scope} — an unscoped table's \
+                         rows are always UNSCOPED"
+                    );
                     bytes += row.len() + 12;
                     batch.push((id, row));
                     if bytes >= SNAPSHOT_BATCH_BYTES {
