@@ -429,6 +429,14 @@ impl<'a> Reader<'a> {
 /// untrusted bytes, which is precisely what this decoder promises never to do.
 fn expect_count(r: &mut Reader, min_each: usize, what: &str) -> io::Result<usize> {
     let count = r.u32()? as usize;
+    expect_count_given(r, count, min_each, what)
+}
+
+/// `expect_count`'s validation half, for a count already read off the wire
+/// (the snapshot-batch decoder reads its leading `u32` itself, to tell a
+/// scoped-batch sentinel from an ordinary count before deciding which to
+/// validate).
+fn expect_count_given(r: &Reader, count: usize, min_each: usize, what: &str) -> io::Result<usize> {
     if count.saturating_mul(min_each) > r.remaining() {
         return Err(malformed_error(
             r.kind,
@@ -648,18 +656,28 @@ impl SnapshotMeta {
     }
 }
 
+/// Leads a scoped table's `<gen>/snapshot/<table>/<n>` object in place of an
+/// ordinary row count. No unscoped (v1) batch can ever carry this as its
+/// leading 4 bytes: `expect_count` refuses any declared count whose rows
+/// could not fit the bytes present, and a real batch never exceeds a few
+/// thousand rows, so a v1 object's leading `u32` is always far below
+/// `u32::MAX`. A scoped batch's REAL count follows this sentinel.
+const SCOPED_BATCH_SENTINEL: u32 = u32::MAX;
+
 /// One `<gen>/snapshot/<table>/<n>` object: raw `(scope, id, bytes)` rows
 /// exactly as `Snapshot::scan_raw_from` produced them, ascending by
 /// `(scope, id)`, CRC'd like every other object here. The archive pages
 /// these out one batch at a time and never holds a whole table (spec §10),
 /// so the batch — not the table — is the unit that has to encode.
-/// Tenant-scoping Task 6c widened this from `(id, bytes)`: a scoped
-/// table's rows were never exportable before (`Seeder::rows` refused them
-/// by name), so there is no prior on-disk shape to keep byte-identical for
-/// them — but the wire format changed for EVERY table, unscoped included
-/// (an 8-byte scope now precedes every row), reported loudly per the task
-/// brief rather than kept hidden behind a per-batch flag.
-pub fn encode_snapshot_batch(rows: &[(u64, u64, Vec<u8>)]) -> Vec<u8> {
+///
+/// `scoped` (the table's own, from the schema — never inferred from a row's
+/// scope value) picks the shape: an unscoped table's bytes are exactly
+/// `[count: u32][id: u64, row]*[crc32]`, unchanged from before tenant
+/// scoping; a scoped table's are `[SCOPED_BATCH_SENTINEL][count: u32]
+/// [scope: u64, id: u64, row]*[crc32]` — a discriminated shape, not a
+/// silent widening, so an old (unscoped-shaped) reader can never decode a
+/// scoped batch into the wrong tenant.
+pub fn encode_snapshot_batch(scoped: bool, rows: &[(u64, u64, Vec<u8>)]) -> Vec<u8> {
     // Negative space (hard rule 4): an empty batch is never written — the
     // walk stops a table the moment `scan_raw_from` comes back empty, so an
     // empty object in the bucket would mean a batch count that overstates
@@ -672,38 +690,101 @@ pub fn encode_snapshot_batch(rows: &[(u64, u64, Vec<u8>)]) -> Vec<u8> {
          claiming an object that carries nothing"
     );
     let mut buf = Vec::new();
-    buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-    for (scope, id, bytes) in rows {
-        buf.extend_from_slice(&scope.to_le_bytes());
-        buf.extend_from_slice(&id.to_le_bytes());
-        put_field(&mut buf, bytes);
+    if scoped {
+        buf.extend_from_slice(&SCOPED_BATCH_SENTINEL.to_le_bytes());
+        buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+        for (scope, id, bytes) in rows {
+            buf.extend_from_slice(&scope.to_le_bytes());
+            buf.extend_from_slice(&id.to_le_bytes());
+            put_field(&mut buf, bytes);
+        }
+    } else {
+        buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+        for (scope, id, bytes) in rows {
+            assert_eq!(
+                *scope,
+                charpente_core::table::UNSCOPED,
+                "encode_snapshot_batch: an unscoped batch's row carries scope {scope}, not \
+                 table::UNSCOPED — the table's own scopedness must drive this shape choice, \
+                 not a per-row value"
+            );
+            buf.extend_from_slice(&id.to_le_bytes());
+            put_field(&mut buf, bytes);
+        }
     }
     buf.extend_from_slice(&crc32(&buf).to_le_bytes());
     buf
 }
 
-pub fn decode_snapshot_batch(bytes: &[u8]) -> io::Result<Vec<(u64, u64, Vec<u8>)>> {
+/// `scoped`: the RESTORING binary's schema word for this table, never
+/// inferred from the bytes — a shape-vs-schema mismatch is refused by name
+/// in both directions rather than silently reinterpreted (fix round 1,
+/// Important 3). `table` names the mismatch in the refusal.
+pub fn decode_snapshot_batch(
+    table: &str,
+    scoped: bool,
+    bytes: &[u8],
+) -> io::Result<Vec<(u64, u64, Vec<u8>)>> {
     let body = check_crc("snapshot batch", bytes)?;
     let mut r = Reader::new(body, "snapshot batch");
-    // 20 = the 8-byte scope, 8-byte id, plus the 4-byte length prefix of a
-    // zero-length row.
-    let count = expect_count(&mut r, 20, "rows")?;
-    let mut rows: Vec<(u64, u64, Vec<u8>)> = Vec::with_capacity(count);
-    for _ in 0..count {
-        let scope = r.u64()?;
-        let id = r.u64()?;
-        let len = r.u32()? as usize;
-        let row = r.take(len)?.to_vec();
-        // Ascending, strictly, by (scope, id): `scan_raw_from` walks a redb
-        // range in composite key order, so anything else is corruption or a
-        // hand-built object, and restore must not import rows it cannot
-        // trust the order of. Widened from a bare id (Task 6c) — never
-        // weakened: an unscoped batch still has every row at scope
-        // `UNSCOPED`, so the check collapses back to the old bare-id
-        // comparison for it.
-        if let Some((prev_scope, prev_id, _)) = rows.last()
-            && (*prev_scope, *prev_id) >= (scope, id)
-        {
+    let leading = r.u32()?;
+    let is_scoped_shape = leading == SCOPED_BATCH_SENTINEL;
+    if scoped && !is_scoped_shape {
+        return Err(malformed_error(
+            "snapshot batch",
+            &format!(
+                "table \"{table}\" is tenant-scoped in this binary's schema, but this archive's \
+                 batch is the unscoped shape — the archive predates the table's scope; restore \
+                 under the binary that wrote it, or re-archive from a live primary"
+            ),
+        ));
+    }
+    if !scoped && is_scoped_shape {
+        return Err(malformed_error(
+            "snapshot batch",
+            &format!(
+                "table \"{table}\" is not tenant-scoped in this binary's schema, but this \
+                 archive's batch is the scoped shape — restore under a binary whose schema \
+                 matches the archive, or re-archive from a live primary running this schema"
+            ),
+        ));
+    }
+    let rows: Vec<(u64, u64, Vec<u8>)> = if is_scoped_shape {
+        // 20 = the 8-byte scope, 8-byte id, plus the 4-byte length prefix of
+        // a zero-length row.
+        let count = expect_count(&mut r, 20, "rows")?;
+        let mut rows = Vec::with_capacity(count);
+        for _ in 0..count {
+            let scope = r.u64()?;
+            let id = r.u64()?;
+            let len = r.u32()? as usize;
+            let row = r.take(len)?.to_vec();
+            rows.push((scope, id, row));
+        }
+        rows
+    } else {
+        // 12 = the 8-byte id plus the 4-byte length prefix of a zero-length
+        // row. `leading` is already this shape's count (read above, before
+        // the sentinel check).
+        let count = expect_count_given(&r, leading as usize, 12, "rows")?;
+        let mut rows = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id = r.u64()?;
+            let len = r.u32()? as usize;
+            let row = r.take(len)?.to_vec();
+            rows.push((charpente_core::table::UNSCOPED, id, row));
+        }
+        rows
+    };
+    // Ascending, strictly, by (scope, id): `scan_raw_from` walks a redb
+    // range in composite key order, so anything else is corruption or a
+    // hand-built object, and restore must not import rows it cannot trust
+    // the order of. An unscoped batch's rows are all at `UNSCOPED`, so this
+    // collapses to the old bare-id comparison for it.
+    for i in 1..rows.len() {
+        let (prev_scope, prev_id, _) = &rows[i - 1];
+        let (scope, id, _) = &rows[i];
+        if (*prev_scope, *prev_id) >= (*scope, *id) {
             return Err(malformed_error(
                 "snapshot batch",
                 &format!(
@@ -712,7 +793,6 @@ pub fn decode_snapshot_batch(bytes: &[u8]) -> io::Result<Vec<(u64, u64, Vec<u8>)
                 ),
             ));
         }
-        rows.push((scope, id, row));
     }
     r.finish()?;
     Ok(rows)
@@ -1340,16 +1420,106 @@ mod tests {
             (5, u64::MAX, vec![9]),
         ];
         assert_eq!(
-            decode_snapshot_batch(&encode_snapshot_batch(&rows)).unwrap(),
+            decode_snapshot_batch("t", true, &encode_snapshot_batch(true, &rows)).unwrap(),
             rows
         );
     }
 
     #[test]
+    fn an_unscoped_snapshot_batch_roundtrips() {
+        let rows = vec![
+            (charpente_core::table::UNSCOPED, 0u64, vec![1u8, 2, 3]),
+            (charpente_core::table::UNSCOPED, 7, Vec::new()),
+            (charpente_core::table::UNSCOPED, u64::MAX, vec![9]),
+        ];
+        assert_eq!(
+            decode_snapshot_batch("t", false, &encode_snapshot_batch(false, &rows)).unwrap(),
+            rows
+        );
+    }
+
+    /// Fix round 1, Important 3: an unscoped table's batch bytes are
+    /// byte-identical to what `a2d8bbb` (before this fix round) produced —
+    /// derived by hand from that commit's encoder, not from the live one.
+    /// `[count: u32 le][id: u64 le, len: u32 le, bytes]*[crc32 le]`.
+    #[test]
+    fn an_unscoped_snapshot_batch_matches_the_a2d8bbb_literal_bytes() {
+        let rows = vec![(charpente_core::table::UNSCOPED, 7u64, vec![4u8, 5])];
+        let bytes = encode_snapshot_batch(false, &rows);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&1u32.to_le_bytes()); // count
+        expected.extend_from_slice(&7u64.to_le_bytes()); // id
+        expected.extend_from_slice(&2u32.to_le_bytes()); // row len
+        expected.extend_from_slice(&[4, 5]); // row bytes
+        expected.extend_from_slice(&crc32(&expected).to_le_bytes());
+        assert_eq!(bytes, expected);
+    }
+
+    /// Fix round 1, Important 3: a scoped table's batch bytes lead with the
+    /// sentinel, never producible by an `a2d8bbb` (v1) encoder.
+    #[test]
+    fn a_scoped_snapshot_batch_leads_with_the_sentinel_then_the_real_count() {
+        let rows = vec![(9u64, 7u64, vec![4u8, 5])];
+        let bytes = encode_snapshot_batch(true, &rows);
+        assert_eq!(&bytes[..4], &u32::MAX.to_le_bytes());
+        assert_eq!(&bytes[4..8], &1u32.to_le_bytes()); // real count
+        assert_eq!(&bytes[8..16], &9u64.to_le_bytes()); // scope
+        assert_eq!(&bytes[16..24], &7u64.to_le_bytes()); // id
+    }
+
+    /// Fix round 1, Important 3 (review case (c)): a v1 (unscoped-shaped)
+    /// batch whose old id 7 happens to sit where a scoped decode would read
+    /// a scope must still decode as id 7 at `UNSCOPED` when the schema says
+    /// this table is unscoped — never as "tenant 7". Literal a2d8bbb-shaped
+    /// bytes, not a round trip through the current encoder.
+    #[test]
+    fn an_old_v1_batch_decodes_the_old_id_never_as_a_fabricated_tenant() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes()); // count
+        buf.extend_from_slice(&7u64.to_le_bytes()); // id (v1 shape: no scope)
+        buf.extend_from_slice(&8u32.to_le_bytes()); // row len
+        buf.extend_from_slice(&[8u8, 9, 10, 11, 12, 13, 14, 15]); // row bytes
+        buf.extend_from_slice(&crc32(&buf).to_le_bytes());
+        let rows = decode_snapshot_batch("t", false, &buf).unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                charpente_core::table::UNSCOPED,
+                7u64,
+                vec![8u8, 9, 10, 11, 12, 13, 14, 15]
+            )]
+        );
+    }
+
+    /// Fix round 1, Important 3: this binary's schema says `table` is
+    /// scoped, but the archive object is the v1 (unscoped) shape — refused
+    /// by name, not silently read as every row at scope 0.
+    #[test]
+    fn a_v1_batch_read_as_scoped_is_refused_by_name() {
+        let bytes = encode_snapshot_batch(false, &[(charpente_core::table::UNSCOPED, 7, vec![1])]);
+        let e = decode_snapshot_batch("Ticket", true, &bytes).unwrap_err();
+        let t = e.to_string();
+        assert!(t.contains("Ticket"), "{t}");
+        assert!(t.contains("archive predates the table's scope"), "{t}");
+    }
+
+    /// The reverse mismatch: the archive object is the scoped shape but
+    /// this binary's schema says the table is unscoped — also refused by
+    /// name, not misread.
+    #[test]
+    fn a_scoped_batch_read_as_unscoped_is_refused_by_name() {
+        let bytes = encode_snapshot_batch(true, &[(9, 7, vec![1])]);
+        let e = decode_snapshot_batch("Ticket", false, &bytes).unwrap_err();
+        let t = e.to_string();
+        assert!(t.contains("Ticket"), "{t}");
+        assert!(t.contains("is not tenant-scoped"), "{t}");
+    }
+
+    #[test]
     fn a_corrupt_snapshot_batch_is_refused_by_name() {
-        let mut bytes = encode_snapshot_batch(&[(0u64, 1u64, vec![4, 5])]);
+        let mut bytes = encode_snapshot_batch(false, &[(0u64, 1u64, vec![4, 5])]);
         bytes[0] ^= 0xFF;
-        let e = decode_snapshot_batch(&bytes).unwrap_err();
+        let e = decode_snapshot_batch("t", false, &bytes).unwrap_err();
         let t = e.to_string();
         assert!(t.contains("snapshot batch"), "must name the object: {t}");
         assert!(t.contains("CRC"), "must name what failed: {t}");
@@ -1361,6 +1531,7 @@ mod tests {
     #[test]
     fn a_snapshot_batch_whose_rows_are_not_ascending_is_refused() {
         let mut buf = Vec::new();
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
         buf.extend_from_slice(&2u32.to_le_bytes());
         for (scope, id) in [(0u64, 9u64), (0u64, 4u64)] {
             buf.extend_from_slice(&scope.to_le_bytes());
@@ -1368,7 +1539,7 @@ mod tests {
             buf.extend_from_slice(&0u32.to_le_bytes());
         }
         buf.extend_from_slice(&crc32(&buf).to_le_bytes());
-        let e = decode_snapshot_batch(&buf).unwrap_err();
+        let e = decode_snapshot_batch("t", true, &buf).unwrap_err();
         let t = e.to_string();
         assert!(
             t.contains("not strictly ascending by (scope, id) ((0, 9) then (0, 4))"),
@@ -1381,6 +1552,7 @@ mod tests {
     #[test]
     fn a_snapshot_batch_whose_scope_regresses_is_refused_even_with_an_ascending_id() {
         let mut buf = Vec::new();
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
         buf.extend_from_slice(&2u32.to_le_bytes());
         for (scope, id) in [(5u64, 0u64), (1u64, 9u64)] {
             buf.extend_from_slice(&scope.to_le_bytes());
@@ -1388,7 +1560,7 @@ mod tests {
             buf.extend_from_slice(&0u32.to_le_bytes());
         }
         buf.extend_from_slice(&crc32(&buf).to_le_bytes());
-        let e = decode_snapshot_batch(&buf).unwrap_err();
+        let e = decode_snapshot_batch("t", true, &buf).unwrap_err();
         let t = e.to_string();
         assert!(
             t.contains("not strictly ascending by (scope, id) ((5, 0) then (1, 9))"),
@@ -1399,7 +1571,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "refusing to encode an empty batch")]
     fn encode_snapshot_batch_refuses_an_empty_batch() {
-        let _ = encode_snapshot_batch(&[]);
+        let _ = encode_snapshot_batch(false, &[]);
     }
 
     #[test]

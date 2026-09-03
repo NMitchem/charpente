@@ -936,7 +936,10 @@ impl StateMachine for TableMachine {
                     let new = crate::migration::SchemaVersion::decode_row(row)?;
                     let ops = schema.ops(table)?;
                     let old = w
-                        .get_raw(table, ops.scoped, crate::table::UNSCOPED, new.id.raw())?
+                        // SchemaVersion is always unscoped — literal None, not a
+                        // computed scoped/UNSCOPED pair that reads as if it could
+                        // ever disagree.
+                        .get_raw(table, None, new.id.raw())?
                         .map(|b| crate::migration::SchemaVersion::decode_row(&b))
                         .transpose()?;
                     let resolved = resolve_effect_scope(table, ops.scoped, *scope, "Put")?;
@@ -990,23 +993,12 @@ impl StateMachine for TableMachine {
                         // rebuilds indexes; if the table never reaches compiled
                         // the post-replay barrier fires (saw_below).
                         if is_below_compiled(schema, versions, table) {
-                            // `put_raw` (Task 6c's raw path) carries no scope —
-                            // negative space, the mirror of `Seeder::rows`'
-                            // guard: a scoped table's pre-migration history
-                            // reaching this decode-free branch would silently
-                            // drop the scope `resolved` above already proved
-                            // this record carries.
-                            assert!(
-                                !ops.scoped,
-                                "table \"{table}\" is tenant-scoped (Row::Scope != Unscoped), \
-                                 but a below-compiled-version record replays decode-free \
-                                 through put_raw, which carries no scope — replaying a scoped \
-                                 table's pre-migration history is blocked until \
-                                 tenant-scoping Task 6c teaches the raw path the scope"
-                            );
+                            // `put_raw` carries the resolved scope, so a scoped
+                            // table's pre-migration history replays under its
+                            // own scope even decode-free.
                             let id = row_id_prefix(row)?;
                             saw_below.insert(table.clone());
-                            w.put_raw(table, ops.scoped, resolved, id, row)?;
+                            w.put_raw(table, ops.scoped.then_some(resolved), id, row)?;
                         } else {
                             check_replay_version(schema, versions, table)?;
                             (ops.apply_put)(w, resolved, row)?;
@@ -1016,17 +1008,10 @@ impl StateMachine for TableMachine {
                         let ops = schema.ops(table)?;
                         let resolved = resolve_effect_scope(table, ops.scoped, *scope, "Delete")?;
                         if is_below_compiled(schema, versions, table) {
-                            // See the Put arm's identical guard above.
-                            assert!(
-                                !ops.scoped,
-                                "table \"{table}\" is tenant-scoped (Row::Scope != Unscoped), \
-                                 but a below-compiled-version record replays decode-free \
-                                 through delete_raw, which carries no scope — replaying a \
-                                 scoped table's pre-migration history is blocked until \
-                                 tenant-scoping Task 6c teaches the raw path the scope"
-                            );
+                            // `delete_raw` carries the resolved scope; see the
+                            // Put arm above.
                             saw_below.insert(table.clone());
-                            w.delete_raw(table, ops.scoped, resolved, *id)?;
+                            w.delete_raw(table, ops.scoped.then_some(resolved), *id)?;
                         } else {
                             check_replay_version(schema, versions, table)?;
                             (ops.apply_delete)(w, resolved, *id)?;
@@ -1045,7 +1030,7 @@ impl StateMachine for TableMachine {
                         let ops = schema.ops(table)?;
                         let resolved =
                             resolve_effect_scope(table, ops.scoped, *scope, "MigratePut")?;
-                        w.put_raw(table, ops.scoped, resolved, *id, row)?;
+                        w.put_raw(table, ops.scoped.then_some(resolved), *id, row)?;
                     }
                     Effect::Enqueue { job, payload, key } => {
                         new_ids.push(w.materialize_job(job, payload, key.as_deref())?);
@@ -1115,15 +1100,15 @@ pub fn gate_status(
         }
         return GateStatus::Adopt;
     };
-    if let (Some(through), Some(to)) = (row.migrating_through, row.migrating_to)
+    if let (Some((through_scope, through_id)), Some(to)) = (row.migrating_through, row.migrating_to)
         && to != compiled_version
     {
         return GateStatus::Refuse(format!(
             "table \"{table}\" has an interrupted migration to version {to} in flight \
-             (resumable watermark at row id {through}) but this binary is compiled for \
-             version {compiled_version} — rows on either side of the watermark are at \
-             different versions and no single chain start covers both; finish the \
-             interrupted migration with the binary that started it, or restore"
+             (resumable watermark at scope {through_scope} row id {through_id}) but this \
+             binary is compiled for version {compiled_version} — rows on either side of the \
+             watermark are at different versions and no single chain start covers both; \
+             finish the interrupted migration with the binary that started it, or restore"
         ));
     }
     // In-flight-target FINGERPRINT refusal (spec §2/§5): a migration TO the
@@ -1136,16 +1121,17 @@ pub fn gate_status(
     // fingerprint mechanism exists to prevent. The version-equality drift arm
     // below never runs mid-resume (row.version stays at `from` until
     // close-out), so the check must live here.
-    if let (Some(through), Some(to)) = (row.migrating_through, row.migrating_to)
+    if let (Some((through_scope, through_id)), Some(to)) = (row.migrating_through, row.migrating_to)
         && to == compiled_version
         && !crate::migration::fingerprint_matches(Some(row.fingerprint), compiled_fingerprint)
     {
         return GateStatus::Refuse(format!(
             "table \"{table}\" has an interrupted migration to version {to} in flight \
-             (resumable watermark at row id {through}) begun by a binary whose target shape \
-             (fingerprint {:#x}) differs from this binary's (fingerprint {compiled_fingerprint:#x}) \
-             — resuming would mix two shapes in one table; finish the interrupted migration \
-             with the binary that started it, or restore",
+             (resumable watermark at scope {through_scope} row id {through_id}) begun by a \
+             binary whose target shape (fingerprint {:#x}) differs from this binary's \
+             (fingerprint {compiled_fingerprint:#x}) — resuming would mix two shapes in one \
+             table; finish the interrupted migration with the binary that started it, or \
+             restore",
             row.fingerprint
         ));
     }
@@ -2071,6 +2057,14 @@ impl Db {
         self.engine.machine().schema.table_names()
     }
 
+    /// Whether `table` is tenant-scoped (`Row::Scope != Unscoped`) — the
+    /// registry's own word, for callers outside this crate that need it to
+    /// pick a physical shape or a wire shape (`scan_raw`/`scan_raw_from`'s
+    /// `scoped` parameter; the archive's export walk; seeding).
+    pub fn table_scoped(&self, table: &str) -> io::Result<bool> {
+        Ok(self.engine.machine().schema.ops(table)?.scoped)
+    }
+
     /// Every registered table in schema (sorted-name) order — the describe
     /// walk (spec §1). Like `table_names`, this is a read of registry state
     /// only; it never touches rows.
@@ -2136,7 +2130,9 @@ impl Db {
             };
             let persisted: Option<crate::migration::SchemaVersion> =
                 snap.get(crate::migration::schema_version_id(table))?;
-            let rows_exist = !snap.scan_raw_from(table, None, 1)?.is_empty();
+            let rows_exist = !snap
+                .scan_raw_from(table, schema.ops(table)?.scoped, None, 1)?
+                .is_empty();
             match gate_status(
                 table,
                 (version, fingerprint),
@@ -2210,9 +2206,10 @@ impl Db {
                 continue;
             };
             let vid = crate::migration::schema_version_id(table);
+            let table_scoped = self.engine.machine().schema.ops(table)?.scoped;
             let snap = self.snapshot()?;
             let persisted: Option<crate::migration::SchemaVersion> = snap.get(vid)?;
-            let rows_exist = !snap.scan_raw_from(table, None, 1)?.is_empty();
+            let rows_exist = !snap.scan_raw_from(table, table_scoped, None, 1)?.is_empty();
             drop(snap);
             let from = match gate_status(
                 table,
@@ -2239,13 +2236,12 @@ impl Db {
                 };
                 cursor = step.to_version;
             }
-            let scoped = self.engine.machine().schema.ops(table)?.scoped;
             self.migrate_table(
                 table,
                 from,
                 compiled_version,
                 compiled_fingerprint,
-                scoped,
+                table_scoped,
                 &steps,
             )?;
         }
@@ -2279,20 +2275,10 @@ impl Db {
         let batch_size = self.cfg.migration_batch_size as usize;
         loop {
             let snap = self.snapshot()?;
-            let watermark: Option<u64> = snap
+            let watermark: Option<(u64, u64)> = snap
                 .get::<crate::migration::SchemaVersion>(vid)?
                 .and_then(|v| v.migrating_through);
-            // `SchemaVersion.migrating_through` stays a bare `u64` (out of
-            // this task's file list), so a scoped table's resume always
-            // seeks from `(UNSCOPED, watermark)` — see `scan_raw_from`'s own
-            // doc comment for the narrower, still-open limitation this
-            // leaves for a crash mid-migration on a genuinely multi-tenant
-            // scoped table.
-            let batch = snap.scan_raw_from(
-                table,
-                watermark.map(|id| (crate::table::UNSCOPED, id)),
-                batch_size,
-            )?;
+            let batch = snap.scan_raw_from(table, scoped, watermark, batch_size)?;
             drop(snap);
             if batch.is_empty() {
                 self.transact(|tx| -> Result<(), io::Error> {
@@ -2309,7 +2295,7 @@ impl Db {
                 .map_err(tx_err_to_io)?;
                 return Ok(());
             }
-            let new_watermark = batch.last().map(|(_, id, _)| *id);
+            let new_watermark = batch.last().map(|(scope, id, _)| (*scope, *id));
             let mut migrated: Vec<(u64, u64, Vec<u8>)> = Vec::with_capacity(batch.len());
             for (scope, id, bytes) in batch {
                 let mut version = from;
@@ -2745,6 +2731,14 @@ impl Seeder {
             import_schema,
             store,
         })
+    }
+
+    /// Whether `table` is tenant-scoped, per the schema this `Seeder` will
+    /// import through — the archive restore path's shape discriminator for
+    /// a snapshot batch object, decided the same way `Db::table_scoped`
+    /// decides it for export, before any row is read.
+    pub fn table_scoped(&self, table: &str) -> io::Result<bool> {
+        Ok(self.import_schema.ops(table)?.scoped)
     }
 
     /// One table's worth of exported rows, applied through the schema's

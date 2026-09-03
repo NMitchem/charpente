@@ -102,7 +102,7 @@ fn migrate_put_overwrites_without_indexing_then_close_out_rebuilds() {
             table: "Widget".to_string(),
             version: 1,
             fingerprint: 0,
-            migrating_through: Some(7),
+            migrating_through: Some((0, 7)),
             migrating_to: Some(2),
         });
         Ok::<(), ()>(())
@@ -196,10 +196,13 @@ fn scan_raw_from_at_u64_max_watermark_returns_empty() {
 
     let snap = db.snapshot().unwrap();
     // Sanity: the row is really there and a `None` watermark sees it.
-    assert_eq!(snap.scan_raw_from("Widget", None, 10).unwrap().len(), 1);
+    assert_eq!(
+        snap.scan_raw_from("Widget", false, None, 10).unwrap().len(),
+        1
+    );
     // The watermark past every id must not re-include it.
     assert!(
-        snap.scan_raw_from("Widget", Some((0, u64::MAX)), 10)
+        snap.scan_raw_from("Widget", false, Some((0, u64::MAX)), 10)
             .unwrap()
             .is_empty(),
         "a watermark at u64::MAX must see no further rows — otherwise the row at \

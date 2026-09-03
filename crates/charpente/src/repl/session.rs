@@ -447,27 +447,55 @@ impl Session {
             frontier_crc,
         });
         for table in db.table_names() {
-            let rows = snap.scan_raw(table)?;
-            let mut batch: Vec<(u64, u64, Vec<u8>)> = Vec::new();
-            let mut bytes = 0usize;
-            for (scope, id, row) in rows {
-                bytes += row.len() + 20;
-                batch.push((scope, id, row));
-                if bytes >= SNAPSHOT_BATCH_BYTES {
-                    pending.push_back(Msg::SnapshotRows {
-                        table: table.to_string(),
-                        rows: std::mem::take(&mut batch),
-                    });
-                    bytes = 0;
+            let table_scoped = db.table_scoped(table)?;
+            let rows = snap.scan_raw(table, table_scoped)?;
+            // The message shape follows the table's own scopedness, never a
+            // row's value (R35) — an unscoped table's rows travel as the
+            // `a2d8bbb`-shaped `SnapshotRows` (tag 5, byte-identical);
+            // a scoped table's travel as `ScopedSnapshotRows` (tag 14),
+            // since a batch can span more than one tenant.
+            if table_scoped {
+                let mut batch: Vec<(u64, u64, Vec<u8>)> = Vec::new();
+                let mut bytes = 0usize;
+                for (scope, id, row) in rows {
+                    bytes += row.len() + 20;
+                    batch.push((scope, id, row));
+                    if bytes >= SNAPSHOT_BATCH_BYTES {
+                        pending.push_back(Msg::ScopedSnapshotRows {
+                            table: table.to_string(),
+                            rows: std::mem::take(&mut batch),
+                        });
+                        bytes = 0;
+                    }
                 }
+                // One message per table, even when empty: the follower's
+                // importer walks the same table list and a no-op keeps the
+                // two sides' message counts in lockstep with the schema
+                // order.
+                pending.push_back(Msg::ScopedSnapshotRows {
+                    table: table.to_string(),
+                    rows: batch,
+                });
+            } else {
+                let mut batch: Vec<(u64, Vec<u8>)> = Vec::new();
+                let mut bytes = 0usize;
+                for (scope, id, row) in rows {
+                    debug_assert_eq!(scope, charpente_core::table::UNSCOPED);
+                    bytes += row.len() + 12;
+                    batch.push((id, row));
+                    if bytes >= SNAPSHOT_BATCH_BYTES {
+                        pending.push_back(Msg::SnapshotRows {
+                            table: table.to_string(),
+                            rows: std::mem::take(&mut batch),
+                        });
+                        bytes = 0;
+                    }
+                }
+                pending.push_back(Msg::SnapshotRows {
+                    table: table.to_string(),
+                    rows: batch,
+                });
             }
-            // One message per table, even when empty: the follower's importer
-            // walks the same table list and a no-op keeps the two sides'
-            // message counts in lockstep with the schema order.
-            pending.push_back(Msg::SnapshotRows {
-                table: table.to_string(),
-                rows: batch,
-            });
         }
         pending.push_back(Msg::SnapshotEnd);
         self.cursor = applied_seq + 1;

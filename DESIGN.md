@@ -613,8 +613,10 @@ before serving anything, on a node that is writable (single node or primary); a 
 runs it only at promote (resuming any in-flight watermark the dead primary left). An
 ordinary follower never runs it — it receives the rewrite only through shipped
 `MigratePut` records (below). Ordinary WAL-tail records for a
-table below its compiled version replay decode-free (a row's id is a version-independent
-leading prefix, so no foreign-version decode is needed); the authoritative decision runs
+table below its compiled version replay decode-free (a row's id — or, for a scoped table,
+its `(scope, id)` composite — is a version-independent leading prefix, so no
+foreign-version decode is needed, and a scoped table's below-compiled Put/Delete carries
+its scope through this path exactly as its compiled-version replay does); the authoritative decision runs
 once replay completes, admitting a table whose history reached the compiled version or is a
 resumable in-flight migration, and refusing everything else by name. Seven named refusals
 cover the space: fingerprint drift under an unchanged version; version downgrade; the
@@ -639,7 +641,16 @@ range read, committing each batch's rewrites and its watermark advance
 closing transaction clears the watermark and bumps `(version, fingerprint)` to the target —
 the single moment a table is considered migrated, and the moment its apply trigger rebuilds
 that table's secondary indexes wholesale (deterministic, idempotent, so primary and
-followers rebuild at the same log position with no separate mechanism).
+followers rebuild at the same log position with no separate mechanism). `migrating_through`
+is `Option<(u64, u64)>` — `(scope, id)` — for every table, scoped or not, since a bare-id
+watermark cannot resume a composite-keyed table's bounded range read correctly (ids are not
+globally ascending across a scope boundary, so a scoped table's migration walks the same
+`(scope, id)`-ordered cursor `scan_raw_from` does). The persisted row tells an old
+mid-migration watermark from the current shape by LENGTH, never by guessing: encoded as
+`[1][scope: u64 le][id: u64 le]` (`migrating_to` is always `Some` exactly when
+`migrating_through` is), the two shapes' possible byte counts are disjoint, so a binary from
+before scoped tables existed is refused by name rather than misread as a fabricated scope —
+an idle row (`[0]`, no in-flight migration) is byte-identical either way.
 
 **Migrations: replication.** Followers never migrate locally: the primary's migration is
 ordinary log records, received through the existing shipping path unchanged, applying
@@ -790,12 +801,18 @@ which opens a fresh one and so could observe a later write — and `scan_raw` ha
 table's raw `(scope, id, bytes)` triples, undecoded, in stored key order (empty, not an
 error, for a table that was never created). `scope` is `table::UNSCOPED` for every row of
 an unscoped table; a scoped table's physical redb table is composite-`[u8;16]`-keyed, so
-`scan_raw` (and `scan_raw_from`, the migration/archive-export paged read) try the bare-`u64`
-shape first and, on `TableTypeMismatch`, retry under the composite shape and recover
-`(scope, id)` from it (tenant-scoping Task 6c — widened from a bare `id`, since a scoped
-table couldn't be exported at all before, and a bare-id migration/export cursor cannot
-resume a composite-keyed table correctly: ids are not globally ascending across a scope
-boundary). `Store::import`/`set_import_meta` are the write-side counterpart:
+`scan_raw` and `scan_raw_from` (the migration/archive-export paged read) take `scoped: bool`
+from the caller's own `TableOps.scoped` — the schema's word, never guessed by probing —
+and open that shape first. Only `scoped = true` tolerates a second attempt: a scoped table
+whose rows have never been touched since it gained a scope is still physically
+bare-`u64`-keyed (`migrate_table`'s own resume walk depends on reading exactly that
+state), so a `TableTypeMismatch` there retries the bare shape and reports every row at
+`UNSCOPED`. `scoped = false` has no legitimate other shape — a table is never un-scoped
+once scoped — so a mismatch there is refused by name naming both shapes tried, not
+silently retried. `scan_raw_from`'s cursor is `(scope, id)`: a bare-id watermark cannot
+resume a composite-keyed table correctly, since ids are not globally ascending across a
+scope boundary (tenant 2's id 0 can follow tenant 1's id `u64::MAX`).
+`Store::import`/`set_import_meta` are the write-side counterpart:
 `import` commits typed rows through the same `Writer` (and so the same index maintenance)
 as ordinary `apply`, but with no seq or `next_job_id` bookkeeping of its own — a logical
 snapshot has no log position — and `set_import_meta` sets both meta keys explicitly, once,
@@ -817,7 +834,15 @@ after every table has landed.
   The archive proper (`crates/charpente/src/archive/`) is the shipper — a generation model
   over `<prefix>/manifest`, a full logical snapshot plus the sealed WAL segments that
   continue it, a bounded retention pin that yields rather than letting an object-store
-  outage halt the primary, and a sixth kernel arm (§1) driving it one step at a time.
+  outage halt the primary, and a sixth kernel arm (§1) driving it one step at a time. A
+  snapshot batch object's bytes are its table's own scopedness: an unscoped table's batch
+  is unchanged from before tenant scoping (`[count][id, row]*[crc]`); a scoped table's
+  batch leads with a `u32::MAX` count sentinel that no unscoped batch can ever produce
+  (`SNAPSHOT_BATCH_ROWS` bounds a real count far below it), then the real count, then
+  `(scope, id, row)` triples. The export walk carries each table's scopedness alongside
+  its name, and restore decodes a batch against the destination schema's word for that
+  table — a scoped table found unscoped in the archive (or the reverse) is refused by
+  name naming the fix, never silently imported under the wrong shape.
   `serve::archive(app, store, cfg)` is the archive-only edge, and `ArchiveConfig::writer` is
   the identity every manifest records: an archive that meets a manifest written under a
   different identity — at open, or before any swap — stops permanently and reports, rather
@@ -898,7 +923,15 @@ the heartbeat deadline) fires for one that never sends its first message — `He
 control verb — so a peer that opens the replication port and never speaks cannot hold GC
 at the base forever.
 Seeding streams `SnapshotStart`/`SnapshotRows`/`SnapshotEnd` out of ONE MVCC snapshot
-(batches near `SNAPSHOT_BATCH_BYTES`, one message per step); the follower buffers the
+(batches near `SNAPSHOT_BATCH_BYTES`, one message per step); a table's own scopedness
+picks the row message — an unscoped table batches into `SnapshotRows { table, rows:
+Vec<(u64, Vec<u8>)> }` (tag 5, unchanged since before tenant scoping), a scoped table into
+`ScopedSnapshotRows { table, rows: Vec<(u64, u64, Vec<u8>)> }` (tag 14, a new message
+rather than a widened tag 5, so tag 5's bytes for an unscoped table stay exactly what an
+older binary already expects); the receiving side checks the message against its own
+schema's word for that table and refuses a mismatch by name rather than importing a row
+under the wrong scope. `PROTO_VERSION` is 2 — a message body's shape changing is what
+bumps it, and a `Hello` declaring 1 is refused by name. The follower buffers the
 stream and, at `SnapshotEnd`, latches `db_needs_reseed` — `Repl::step` cannot replace a
 `Db` it only borrows, so the CALLER (the kernel arm, T8) runs `Repl::run_seed(db, clock)`,
 which consumes the `Db` through `into_seeder`, replays the buffer, `finish`es at the

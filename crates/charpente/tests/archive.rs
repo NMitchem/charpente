@@ -962,13 +962,14 @@ fn read_snapshot_rows(
     store: &dyn ObjectStore,
     generation: u64,
     t: &TableBatches,
+    scoped: bool,
 ) -> Vec<(u64, u64, Vec<u8>)> {
     let mut out = Vec::new();
     for n in 0..t.batches {
         let key = snapshot_batch_key(PREFIX, generation, &t.name, n);
         let bytes = get_object(store, &key)
             .unwrap_or_else(|| panic!("the meta declares batch {key}, which is not in the store"));
-        out.extend(decode_snapshot_batch(&bytes).expect("a valid snapshot batch"));
+        out.extend(decode_snapshot_batch(&t.name, scoped, &bytes).expect("a valid snapshot batch"));
     }
     out
 }
@@ -2072,15 +2073,20 @@ fn the_snapshot_objects_hold_exactly_the_rows_the_db_held() {
     // against what this test itself put in, decoded through the row's own
     // decoder — not against a re-read of the same `scan_raw_from` the
     // archive used to produce them.
-    let archived = read_snapshot_rows(&store, m.generation, rec);
+    let archived = read_snapshot_rows(&store, m.generation, rec, db.table_scoped("Rec").unwrap());
     assert_eq!(
         archived.len() as u64,
         rows,
         "the snapshot carries {} of the {rows} rows written",
         archived.len()
     );
-    for (i, (_, id, bytes)) in archived.iter().enumerate() {
+    for (i, (scope, id, bytes)) in archived.iter().enumerate() {
         let i = i as u64;
+        assert_eq!(
+            *scope,
+            charpente::core::table::UNSCOPED,
+            "Rec is not tenant-scoped, so every archived row's scope must be UNSCOPED"
+        );
         assert_eq!(
             *id, i,
             "snapshot rows must be complete and in ascending id order; row {i} of the \
@@ -2103,8 +2109,11 @@ fn the_snapshot_objects_hold_exactly_the_rows_the_db_held() {
     // they are checked against the Db view at the snapshot's own frontier.
     let mut tables_checked = 0;
     for t in &meta.tables {
-        let archived = read_snapshot_rows(&store, m.generation, t);
-        let live = snap.scan_raw_from(&t.name, None, usize::MAX).unwrap();
+        let table_scoped = db.table_scoped(&t.name).unwrap();
+        let archived = read_snapshot_rows(&store, m.generation, t, table_scoped);
+        let live = snap
+            .scan_raw_from(&t.name, table_scoped, None, usize::MAX)
+            .unwrap();
         assert_eq!(
             archived,
             live,
@@ -5214,7 +5223,11 @@ fn a_scoped_row_survives_archive_restore_with_its_scope_intact() {
         Schema::new().table::<ScopedRec>(),
     )
     .unwrap();
-    let restored = dst.snapshot().unwrap().scan_raw(ScopedRec::TABLE).unwrap();
+    let restored = dst
+        .snapshot()
+        .unwrap()
+        .scan_raw(ScopedRec::TABLE, true)
+        .unwrap();
     let mut expected_bytes = Vec::new();
     ScopedRec {
         id: Id::from_raw(7),
@@ -5278,10 +5291,11 @@ fn logical_rows_checked(db: &Db) -> io::Result<Vec<TableRows>> {
     let snap = db.snapshot()?;
     let mut out = Vec::new();
     for t in db.table_names() {
+        let table_scoped = db.table_scoped(t)?;
         let mut rows: Vec<(u64, u64, Vec<u8>)> = Vec::new();
         let mut after = None;
         loop {
-            let batch = snap.scan_raw_from(t, after, 1_000)?;
+            let batch = snap.scan_raw_from(t, table_scoped, after, 1_000)?;
             let Some(last) = batch.last() else { break };
             after = Some((last.0, last.1));
             rows.extend(batch);
@@ -7506,7 +7520,7 @@ fn conv_rec_rows(db: &Db) -> Result<Vec<(u64, u64)>, ConvFail> {
     let mut after = None;
     loop {
         let batch = snap
-            .scan_raw_from(Rec::TABLE, after, 1_000)
+            .scan_raw_from(Rec::TABLE, false, after, 1_000)
             .map_err(|e| conv_read_fail("scanning the restored rows", e))?;
         let Some(last) = batch.last() else { break };
         after = Some((last.0, last.1));
@@ -7564,7 +7578,7 @@ fn conv_check_anchors(db: &Db, records: u64, pending_jobs: u64) -> Result<(), Co
     }
     let snap = db.snapshot().map_err(|e| conv_read_fail("snapshot", e))?;
     let events = snap
-        .scan_raw_from("charpente.events", None, usize::MAX)
+        .scan_raw_from("charpente.events", false, None, usize::MAX)
         .map_err(|e| conv_read_fail("scanning charpente.events", e))?;
     if events.len() as u64 != records {
         return Err(ConvFail::Violation(format!(
@@ -7582,7 +7596,7 @@ fn conv_check_anchors(db: &Db, records: u64, pending_jobs: u64) -> Result<(), Co
         }
     }
     let pending = snap
-        .scan_raw_from("charpente.jobs", None, usize::MAX)
+        .scan_raw_from("charpente.jobs", false, None, usize::MAX)
         .map_err(|e| conv_read_fail("scanning charpente.jobs", e))?;
     if pending.len() as u64 != pending_jobs {
         return Err(ConvFail::Violation(format!(

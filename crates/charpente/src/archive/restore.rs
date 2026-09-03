@@ -267,12 +267,13 @@ fn rebuild(
         for n in 0..t.batches {
             let key = snapshot_batch_key(prefix, m.generation, &t.name, n);
             let bytes = get(store, &key, prefix)?;
-            let rows = decode_snapshot_batch(&bytes).map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("restore: snapshot batch \"{key}\" will not decode ({e})"),
-                )
-            })?;
+            let rows = decode_snapshot_batch(&t.name, seeder.table_scoped(&t.name)?, &bytes)
+                .map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("restore: snapshot batch \"{key}\" will not decode ({e})"),
+                    )
+                })?;
             seeder.rows(&t.name, &rows)?;
         }
     }

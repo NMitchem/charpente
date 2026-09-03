@@ -749,8 +749,9 @@ fn finding2_cross_fingerprint_resume_refuses_by_name() {
     assert_eq!(
         err.to_string(),
         "table \"Widget\" has an interrupted migration to version 2 in flight (resumable \
-         watermark at row id 1) begun by a binary whose target shape (fingerprint 0x2a2a) \
-         differs from this binary's (fingerprint 0x2b2b) — resuming would mix two shapes in \
-         one table; finish the interrupted migration with the binary that started it, or restore"
+         watermark at scope 0 row id 1) begun by a binary whose target shape (fingerprint \
+         0x2a2a) differs from this binary's (fingerprint 0x2b2b) — resuming would mix two \
+         shapes in one table; finish the interrupted migration with the binary that started \
+         it, or restore"
     );
 }

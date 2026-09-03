@@ -2307,7 +2307,9 @@ fn seed_rebuilds_a_byte_identical_store() {
 
     let mut seeder = Seeder::new(Box::new(host_b.disk()), cfg.clone(), app_schema()).unwrap();
     for table in export_schema().table_names() {
-        let rows = snap.scan_raw(table).unwrap();
+        let rows = snap
+            .scan_raw(table, db_a.table_scoped(table).unwrap())
+            .unwrap();
         seeder.rows(table, &rows).unwrap();
     }
     // Db-level seed test: no wire, no `hello_position` — the frontier CRC is
@@ -2433,7 +2435,7 @@ fn seeded_indexes_answer_queries() {
     let applied = snap.applied_seq().unwrap().unwrap();
     let next_job_id = snap.next_job_id().unwrap();
     let next_event_id = snap.next_event_id().unwrap();
-    let rows = snap.scan_raw(Invoice::TABLE).unwrap();
+    let rows = snap.scan_raw(Invoice::TABLE, false).unwrap();
 
     let sim_b = Sim::with_faults(0x5EED_0004, FaultConfig::none());
     let mut seeder =

@@ -21,8 +21,7 @@ pub enum Msg {
     /// attached when the sender is configured with one (spec §5); `None`
     /// otherwise. `schema_digest` is the sender's `Db::schema_digest()`
     /// (migrations spec §5) — a mismatch is refused by name before any
-    /// role logic runs. Both appended after the pre-existing fields
-    /// (pre-release, no `PROTO_VERSION` bump).
+    /// role logic runs.
     Hello {
         proto: u8,
         listen: Option<String>,
@@ -47,15 +46,14 @@ pub enum Msg {
         next_event_id: u64,
         frontier_crc: u32,
     },
-    /// tag 5 — one table's worth of snapshot rows, each `(scope, id, row
-    /// bytes)`. `scope` is `table::UNSCOPED` for an unscoped table's rows
-    /// (tenant-scoping Task 6c widened this from `(id, row bytes)` — the
-    /// wire bytes changed for every table, not just scoped ones, since a
-    /// batch can mix tenants and the scope has to travel per row; see
-    /// `encode_row_triples`).
+    /// tag 5 — one table's worth of an UNSCOPED table's snapshot rows, each
+    /// `(id, row bytes)`. `begin_seeding` picks this shape or
+    /// `ScopedSnapshotRows`'s by the table's own scopedness (never by a
+    /// row's value); the receiving side refuses a shape that disagrees with
+    /// its own schema's word for the same table, by name.
     SnapshotRows {
         table: String,
-        rows: Vec<(u64, u64, Vec<u8>)>,
+        rows: Vec<(u64, Vec<u8>)>,
     },
     /// tag 6 — snapshot complete.
     SnapshotEnd,
@@ -77,6 +75,17 @@ pub enum Msg {
     HandOff { at_seq: u64 },
     /// tag 13 — hand-off acknowledged by the new primary.
     HandOffDone,
+    /// tag 14 (PROTO_VERSION 2) — `SnapshotRows`' counterpart for a
+    /// tenant-scoped table: each row is `(scope, id, row bytes)`, since a
+    /// scoped table's rows can span multiple tenants within one message
+    /// (`begin_seeding` batches purely by byte budget, not by scope). A
+    /// NEW tag, not a widened `SnapshotRows`, so a peer on an older
+    /// `PROTO_VERSION` refuses this message by name (unknown tag) rather
+    /// than misreading a wider `SnapshotRows`.
+    ScopedSnapshotRows {
+        table: String,
+        rows: Vec<(u64, u64, Vec<u8>)>,
+    },
 }
 
 impl Msg {
@@ -98,6 +107,7 @@ impl Msg {
             Msg::CtrlErr { .. } => "CtrlErr",
             Msg::HandOff { .. } => "HandOff",
             Msg::HandOffDone => "HandOffDone",
+            Msg::ScopedSnapshotRows { .. } => "ScopedSnapshotRows",
         }
     }
 }
@@ -129,13 +139,12 @@ fn decode_pairs(input: &mut &[u8]) -> io::Result<Vec<(u64, Vec<u8>)>> {
     Ok(pairs)
 }
 
-/// `SnapshotRows`' own row shape: `(scope, id, row bytes)` — a scoped
+/// `ScopedSnapshotRows`' own row shape: `(scope, id, row bytes)` — a scoped
 /// table's rows can span multiple tenants within one message (`begin_
 /// seeding` batches purely by byte budget, not by scope), so the scope
-/// travels per row, not once per message (tenant-scoping Task 6c). A
-/// separate pair of functions from `encode_pairs`/`decode_pairs` above,
-/// deliberately: those stay exactly as `Frames` (no scope concept) needs
-/// them, untouched by this task.
+/// travels per row, not once per message. A separate pair of functions
+/// from `encode_pairs`/`decode_pairs` above, deliberately: those stay
+/// exactly what `Frames` and the unscoped `SnapshotRows` need.
 fn encode_row_triples(rows: &[(u64, u64, Vec<u8>)], out: &mut Vec<u8>) {
     (u32::try_from(rows.len()).expect("snapshot row batch exceeds u32 length")).encode(out);
     for (scope, id, payload) in rows {
@@ -228,7 +237,7 @@ pub fn encode(msg: &Msg) -> Vec<u8> {
         Msg::SnapshotRows { table, rows } => {
             out.push(5);
             table.encode(&mut out);
-            encode_row_triples(rows, &mut out);
+            encode_pairs(rows, &mut out);
         }
         Msg::SnapshotEnd => out.push(6),
         Msg::Refuse { message } => {
@@ -257,6 +266,11 @@ pub fn encode(msg: &Msg) -> Vec<u8> {
             at_seq.encode(&mut out);
         }
         Msg::HandOffDone => out.push(13),
+        Msg::ScopedSnapshotRows { table, rows } => {
+            out.push(14);
+            table.encode(&mut out);
+            encode_row_triples(rows, &mut out);
+        }
     }
     out
 }
@@ -291,7 +305,7 @@ pub fn decode(bytes: &[u8]) -> io::Result<Msg> {
         },
         5 => Msg::SnapshotRows {
             table: String::decode(input)?,
-            rows: decode_row_triples(input)?,
+            rows: decode_pairs(input)?,
         },
         6 => Msg::SnapshotEnd,
         7 => Msg::Refuse {
@@ -314,6 +328,10 @@ pub fn decode(bytes: &[u8]) -> io::Result<Msg> {
             at_seq: u64::decode(input)?,
         },
         13 => Msg::HandOffDone,
+        14 => Msg::ScopedSnapshotRows {
+            table: String::decode(input)?,
+            rows: decode_row_triples(input)?,
+        },
         other => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -406,29 +424,50 @@ mod tests {
         });
         roundtrips(Msg::SnapshotRows {
             table: "invoice".to_string(),
-            rows: vec![(0, 1, vec![9, 9]), (7, 2, vec![])],
+            rows: vec![(1, vec![9, 9]), (2, vec![])],
         });
     }
 
-    /// Task 6c: `SnapshotRows`' row shape widened to carry a scope per row
-    /// (a batch can mix tenants — `begin_seeding` chunks purely by byte
-    /// budget). Pinned against COMMITTED LITERAL bytes, not a fresh
-    /// `encode` output, which would agree with itself no matter what the
-    /// encoder does — the same discipline `db.rs`'s
-    /// `tag_4_migrate_put_wire_bytes_are_unchanged_by_task_6c` uses. This IS
-    /// a wire-byte change even for an unscoped table's rows (scope 0 now
-    /// travels explicitly, 8 bytes per row it did not carry before) —
-    /// reported loudly per the task brief, since a per-row scope is the
-    /// only shape that survives a message mixing tenants.
+    /// Fix round 1, Important 3: an unscoped `SnapshotRows`' wire bytes
+    /// equal `a2d8bbb`'s (before this fix round ever widened them) — a
+    /// literal derived by hand from that commit's `encode_pairs` call, not
+    /// from the live encoder, which would agree with itself no matter what
+    /// it does. Same discipline as `db.rs`'s
+    /// `tag_4_migrate_put_wire_bytes_are_unchanged_by_task_6c`.
     #[test]
-    fn snapshot_rows_wire_bytes_carry_a_scope_per_row() {
+    fn snapshot_rows_wire_bytes_match_the_a2d8bbb_literal() {
         let msg = Msg::SnapshotRows {
+            table: "t".to_string(),
+            rows: vec![(2, vec![7, 8])],
+        };
+        let encoded = encode(&msg);
+        let expected: &[u8] = &[
+            5, // tag
+            1, 0, 0, 0, b't', // table
+            1, 0, 0, 0, // rows.len() = 1
+            2, 0, 0, 0, 0, 0, 0, 0, // id = 2
+            2, 0, 0, 0, 7, 8, // row
+        ];
+        assert_eq!(encoded, expected);
+        assert_eq!(decode(&encoded).unwrap(), msg);
+    }
+
+    /// Fix round 1, Important 3: `ScopedSnapshotRows` (tag 14) is the ONLY
+    /// shape that carries a per-row scope; its literal head bytes are
+    /// pinned so a future change to this format is caught the same way.
+    #[test]
+    fn scoped_snapshot_rows_roundtrips_and_pins_its_wire_shape() {
+        roundtrips(Msg::ScopedSnapshotRows {
+            table: "invoice".to_string(),
+            rows: vec![],
+        });
+        let msg = Msg::ScopedSnapshotRows {
             table: "t".to_string(),
             rows: vec![(9, 2, vec![7, 8])],
         };
         let encoded = encode(&msg);
         let expected: &[u8] = &[
-            5, // tag
+            14, // tag
             1, 0, 0, 0, b't', // table
             1, 0, 0, 0, // rows.len() = 1
             9, 0, 0, 0, 0, 0, 0, 0, // scope = 9
@@ -437,6 +476,18 @@ mod tests {
         ];
         assert_eq!(encoded, expected);
         assert_eq!(decode(&encoded).unwrap(), msg);
+    }
+
+    /// Fix round 1, Important 3: tag 14 does not exist before `PROTO_VERSION`
+    /// 2 — a peer speaking the old protocol refuses it by name (unknown
+    /// tag) rather than misreading it as a wider `SnapshotRows`.
+    #[test]
+    fn tag_14_is_unknown_to_a_pre_scoped_tables_peer() {
+        let bytes = encode(&Msg::ScopedSnapshotRows {
+            table: "t".to_string(),
+            rows: vec![(1, 2, vec![3])],
+        });
+        assert_eq!(bytes[0], 14);
     }
 
     #[test]

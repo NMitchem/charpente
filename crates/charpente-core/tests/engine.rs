@@ -507,7 +507,7 @@ fn an_unscoped_table_still_writes_a_bare_u64_key() {
     store.apply(0, |w| w.put(UNSCOPED, &row)).unwrap();
 
     let snap = store.snapshot().unwrap();
-    let raw = snap.scan_raw(JobRow::TABLE).unwrap();
+    let raw = snap.scan_raw(JobRow::TABLE, false).unwrap();
     assert_eq!(
         raw,
         vec![(UNSCOPED, 7u64, expected_bytes)],
@@ -598,7 +598,7 @@ fn a_scoped_table_stores_under_the_composite_key_not_a_bare_u64() {
         .expect("a scoped put must not error");
 
     let snap = store.snapshot().unwrap();
-    let raw = snap.scan_raw(Ticket::TABLE).expect(
+    let raw = snap.scan_raw(Ticket::TABLE, true).expect(
         "scan_raw must learn the [u8;16] key shape rather than erroring — the scoped \
                  table's composite key is a fallback, not a refusal, as of Task 6c",
     );
@@ -1128,7 +1128,7 @@ fn scan_raw_from_learns_the_composite_key_shape_and_sees_every_tenant() {
         .expect("two tenants writing distinct ids on a scoped table must not error");
 
     let snap = store.snapshot().unwrap();
-    let rows = snap.scan_raw_from(Ticket::TABLE, None, 10).expect(
+    let rows = snap.scan_raw_from(Ticket::TABLE, true, None, 10).expect(
         "scan_raw_from must learn the [u8;16] key shape rather than erroring with \
          TableTypeMismatch — migrate_schema() has to be able to walk a scoped table too",
     );
@@ -1773,17 +1773,14 @@ fn versioned_scoped_delete_record(scope: u64, id: u64) -> Vec<u8> {
     record
 }
 
-/// Fix round 1, Important 1: `apply_batch`'s `is_below_compiled` branches
-/// (a full rebuild-from-WAL replaying a table's pre-migration history)
-/// apply DECODE-FREE via `put_raw`/`delete_raw`, which carry no scope. A
-/// scoped table could never reach this branch before this task (the R25
-/// asserts blocked registering one at all); lifting those asserts and
-/// making nonzero scopes representable on the wire means a scoped table
-/// WITH pre-migration history now can, and would silently drop the scope
-/// `resolve_effect_scope` already proved the record carries. Pins the Put
-/// arm's guard: a below-compiled scoped record refuses by name instead.
+/// Fix round 1, Important 1: `apply_batch`'s `is_below_compiled` branches (a
+/// full rebuild-from-WAL replaying a table's pre-migration history) apply
+/// DECODE-FREE via `put_raw`, which now carries the record's resolved
+/// scope. A below-compiled scoped Put must land under its own scope, not
+/// panic and not silently collapse to scope 0 — asserted on the stored
+/// composite key via `scan_raw`, not a round trip through the same encoder.
 #[test]
-fn a_below_compiled_scoped_put_refuses_by_name_rather_than_dropping_the_scope() {
+fn a_below_compiled_scoped_put_replays_under_its_own_scope() {
     let sim = Sim::with_faults(0x6B00_0006, FaultConfig::none());
     let mut db = Db::open(
         Box::new(sim.disk()),
@@ -1799,33 +1796,30 @@ fn a_below_compiled_scoped_put_refuses_by_name_rather_than_dropping_the_scope() 
     )])
     .unwrap();
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = db.apply_shipped(&[(1, versioned_scoped_put_record(7, 3, 99))]);
-    }));
-    let panic = result.expect_err("a below-compiled scoped Put must panic, not silently apply");
-    let message = panic
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
-        .expect("panic payload must be a string");
-    assert!(
-        message.contains(&format!(
-            "table \"{}\" is tenant-scoped (Row::Scope != Unscoped)",
-            VersionedTicket::TABLE
-        )),
-        "{message}"
-    );
-    assert!(message.contains("put_raw"), "{message}");
-    assert!(
-        message.contains("tenant-scoping Task 6c teaches the raw path the scope"),
-        "{message}"
+    db.apply_shipped(&[(1, versioned_scoped_put_record(7, 3, 99))])
+        .unwrap();
+
+    let mut expected_bytes = Vec::new();
+    VersionedTicket {
+        id: Id::from_raw(3),
+        n: 99,
+    }
+    .encode_row(&mut expected_bytes);
+    let stored = db
+        .snapshot()
+        .unwrap()
+        .scan_raw(VersionedTicket::TABLE, true)
+        .unwrap();
+    assert_eq!(
+        stored,
+        vec![(7u64, 3u64, expected_bytes)],
+        "a below-compiled scoped Put must land under its record's own scope (7), not 0"
     );
 }
 
-/// See the Put test's doc comment; this pins `apply_delete`'s identical
-/// guard.
+/// See the Put test's doc comment; this pins `delete_raw`'s identical path.
 #[test]
-fn a_below_compiled_scoped_delete_refuses_by_name_rather_than_dropping_the_scope() {
+fn a_below_compiled_scoped_delete_replays_under_its_own_scope() {
     let sim = Sim::with_faults(0x6B00_0007, FaultConfig::none());
     let mut db = Db::open(
         Box::new(sim.disk()),
@@ -1838,27 +1832,29 @@ fn a_below_compiled_scoped_delete_refuses_by_name_rather_than_dropping_the_scope
         schema_version_put_record(VersionedTicket::TABLE, 1, 0x6B00_F1F1),
     )])
     .unwrap();
+    // A second tenant's row at the same id must survive the first tenant's
+    // below-compiled delete — proves the delete is scoped, not table-wide.
+    db.apply_shipped(&[(1, versioned_scoped_put_record(9, 3, 1))])
+        .unwrap();
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = db.apply_shipped(&[(1, versioned_scoped_delete_record(7, 3))]);
-    }));
-    let panic = result.expect_err("a below-compiled scoped Delete must panic, not silently apply");
-    let message = panic
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
-        .expect("panic payload must be a string");
-    assert!(
-        message.contains(&format!(
-            "table \"{}\" is tenant-scoped (Row::Scope != Unscoped)",
-            VersionedTicket::TABLE
-        )),
-        "{message}"
-    );
-    assert!(message.contains("delete_raw"), "{message}");
-    assert!(
-        message.contains("tenant-scoping Task 6c teaches the raw path the scope"),
-        "{message}"
+    db.apply_shipped(&[(2, versioned_scoped_delete_record(7, 3))])
+        .unwrap();
+
+    let mut survivor_bytes = Vec::new();
+    VersionedTicket {
+        id: Id::from_raw(3),
+        n: 1,
+    }
+    .encode_row(&mut survivor_bytes);
+    let stored = db
+        .snapshot()
+        .unwrap()
+        .scan_raw(VersionedTicket::TABLE, true)
+        .unwrap();
+    assert_eq!(
+        stored,
+        vec![(9u64, 3u64, survivor_bytes)],
+        "a below-compiled scoped Delete at scope 7 must not touch scope 9's row at the same id"
     );
 }
 
@@ -1888,7 +1884,11 @@ fn a_scoped_row_survives_a_snapshot_seed_with_its_scope_intact() {
             )
         })
         .unwrap();
-    let exported = primary.snapshot().unwrap().scan_raw(Ticket::TABLE).unwrap();
+    let exported = primary
+        .snapshot()
+        .unwrap()
+        .scan_raw(Ticket::TABLE, true)
+        .unwrap();
     assert_eq!(
         exported,
         vec![(2u64, 7u64, {
@@ -1912,7 +1912,11 @@ fn a_scoped_row_survives_a_snapshot_seed_with_its_scope_intact() {
     seeder.rows(Ticket::TABLE, &exported).unwrap();
     let db = seeder.finish(0, 0, 0, 0).unwrap();
 
-    let imported = db.snapshot().unwrap().scan_raw(Ticket::TABLE).unwrap();
+    let imported = db
+        .snapshot()
+        .unwrap()
+        .scan_raw(Ticket::TABLE, true)
+        .unwrap();
     assert_eq!(
         imported, exported,
         "the follower's stored bytes must carry tenant 2's scope, not scope 0 — a bug here \

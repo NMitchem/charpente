@@ -77,9 +77,11 @@ pub struct SchemaVersion {
     pub table: String,
     pub version: u32,
     pub fingerprint: u64,
-    /// `None` idle; `Some(last_row_id_done)` mid-migration — the
-    /// resumable watermark (spec §3).
-    pub migrating_through: Option<u64>,
+    /// `None` idle; `Some((scope, id))` mid-migration — the resumable
+    /// composite watermark (spec §3). `scope` is `crate::table::UNSCOPED`
+    /// for an unscoped table. Always `Some` exactly when `migrating_to` is
+    /// (`encode_row` asserts it) — a torn pair never reaches the wire.
+    pub migrating_through: Option<(u64, u64)>,
     /// `None` idle; `Some(target_version)` mid-migration. Recorded so an
     /// interrupted migration resumed by a binary compiled for a DIFFERENT
     /// target is a named refusal, not a mixed-version rewrite (spec §2).
@@ -96,11 +98,25 @@ impl Row for SchemaVersion {
     }
 
     fn encode_row(&self, out: &mut Vec<u8>) {
+        assert_eq!(
+            self.migrating_through.is_some(),
+            self.migrating_to.is_some(),
+            "SchemaVersion for table \"{}\": migrating_through and migrating_to must be Some \
+             together or None together, never a torn pair",
+            self.table
+        );
         self.id.encode(out);
         self.table.encode(out);
         self.version.encode(out);
         self.fingerprint.encode(out);
-        self.migrating_through.encode(out);
+        match self.migrating_through {
+            None => out.push(0),
+            Some((scope, id)) => {
+                out.push(1);
+                scope.encode(out);
+                id.encode(out);
+            }
+        }
         self.migrating_to.encode(out);
     }
 
@@ -110,8 +126,62 @@ impl Row for SchemaVersion {
         let table = String::decode(input)?;
         let version = u32::decode(input)?;
         let fingerprint = u64::decode(input)?;
-        let migrating_through = Option::<u64>::decode(input)?;
+        if input.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "row decode: unexpected end of input reading a SchemaVersion row's \
+                 migrating_through tag",
+            ));
+        }
+        let migrating_through_tag = input[0];
+        *input = &input[1..];
+        let migrating_through = match migrating_through_tag {
+            0 => None,
+            1 => {
+                // Before scoped tables, this field was a bare `id: u64` (8
+                // bytes); it is now `(scope, id)` (16 bytes). `migrating_to`
+                // (the only field after this one) is 1 byte idle or 5 bytes
+                // in-flight, so the four combinations (old+idle, old+in-
+                // flight, new+idle, new+in-flight) leave exactly 9, 13, 17
+                // or 21 bytes remaining here — four distinct counts, so the
+                // remaining length alone tells old from new; nothing is
+                // guessed or speculatively decoded.
+                match input.len() {
+                    9 | 13 => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "schema version row for table \"{table}\" was written \
+                                 mid-migration by a binary before scoped tables; finish or \
+                                 restart that migration under the binary that started it"
+                            ),
+                        ));
+                    }
+                    _ => {
+                        let scope = u64::decode(input)?;
+                        let id = u64::decode(input)?;
+                        Some((scope, id))
+                    }
+                }
+            }
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("row decode: option tag was {other}, must be 0 or 1"),
+                ));
+            }
+        };
         let migrating_to = Option::<u32>::decode(input)?;
+        if migrating_through.is_some() != migrating_to.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "schema version row for table \"{table}\" carries migrating_through and \
+                     migrating_to as a torn pair (one Some, one None) — corruption, not a \
+                     shape this binary ever wrote"
+                ),
+            ));
+        }
         if !input.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -169,12 +239,59 @@ mod tests {
             table: "Invoice".to_string(),
             version: 1,
             fingerprint: 0xdead_beef,
-            migrating_through: Some(41),
+            migrating_through: Some((7, 41)),
             migrating_to: Some(3),
         };
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
         assert_eq!(SchemaVersion::decode_row(&bytes).unwrap(), row);
+    }
+
+    /// Fix round 1, Important 2: idle rows ([0]) are byte-identical in both
+    /// the pre-scoped-tables and the composite-watermark shape — no format
+    /// change touches a table that was never mid-migration.
+    #[test]
+    fn schema_version_idle_row_bytes_are_unchanged_by_the_composite_watermark() {
+        let row = SchemaVersion {
+            id: schema_version_id("Invoice"),
+            table: "Invoice".to_string(),
+            version: 1,
+            fingerprint: 0xdead_beef,
+            migrating_through: None,
+            migrating_to: None,
+        };
+        let mut bytes = Vec::new();
+        row.encode_row(&mut bytes);
+        // id (Invoice's schema_version_id, 8 bytes) + "Invoice" (4-byte len
+        // + 7 bytes) + version (4) + fingerprint (8) + migrating_through
+        // tag (1, = 0) + migrating_to tag (1, = 0).
+        assert_eq!(bytes[bytes.len() - 2..], [0, 0]);
+        assert_eq!(SchemaVersion::decode_row(&bytes).unwrap(), row);
+    }
+
+    /// Fix round 1, Important 2: a mid-migration row written by a binary
+    /// before scoped tables (a bare `id: u64` watermark) is refused by
+    /// name, not misdecoded as a composite `(scope, id)` — the length-based
+    /// discriminator in `decode_row`. Literal bytes, not a round trip
+    /// through the current encoder (which can no longer produce this
+    /// shape).
+    #[test]
+    fn an_old_shape_mid_migration_row_is_refused_by_name() {
+        let mut bytes = Vec::new();
+        schema_version_id("Invoice").encode(&mut bytes);
+        "Invoice".to_string().encode(&mut bytes);
+        1u32.encode(&mut bytes); // version
+        0xdead_beefu64.encode(&mut bytes); // fingerprint
+        bytes.push(1); // migrating_through tag: Some
+        41u64.encode(&mut bytes); // the OLD shape: a bare id, no scope
+        Some(3u32).encode(&mut bytes); // migrating_to
+        let err = SchemaVersion::decode_row(&bytes).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("written mid-migration by a binary before scoped tables"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("Invoice"), "{err}");
     }
 
     #[test]

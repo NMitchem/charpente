@@ -616,8 +616,13 @@ fn converged_read(p: &Node, f: &Node) -> Result<(), String> {
     let ps = pdb.snapshot().map_err(|e| format!("p: {e}"))?;
     let fs = fdb.snapshot().map_err(|e| format!("f: {e}"))?;
     for table in pdb.table_names() {
-        let pr = ps.scan_raw(table).map_err(|e| format!("p: {e}"))?;
-        let fr = fs.scan_raw(table).map_err(|e| format!("f: {e}"))?;
+        let table_scoped = pdb.table_scoped(table).map_err(|e| format!("p: {e}"))?;
+        let pr = ps
+            .scan_raw(table, table_scoped)
+            .map_err(|e| format!("p: {e}"))?;
+        let fr = fs
+            .scan_raw(table, table_scoped)
+            .map_err(|e| format!("f: {e}"))?;
         if pr != fr {
             return Err(format!(
                 "table {table} diverged: p has {} rows, f has {}",
@@ -1944,6 +1949,44 @@ fn hello_with_a_future_protocol_version_is_refused_naming_both_versions() {
     }
 }
 
+/// Fix round 1, ruling R39: `PROTO_VERSION` is now 2 (tag 14,
+/// `ScopedSnapshotRows`) — a peer still on 1 (a binary before tenant
+/// scoping's wire changes) is refused by name, the same equality check as
+/// the "future version" direction above, exercised concretely rather than
+/// trusted by symmetry.
+#[test]
+fn hello_declaring_protocol_version_1_is_refused_by_name() {
+    let sim = Sim::with_faults(0x2EB1_0006 ^ 1, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let reply = exchange_hello(
+        &sim,
+        &mut p,
+        "p:1",
+        Msg::Hello {
+            proto: 1,
+            listen: None,
+            position: None,
+            secret: None,
+            schema_digest: 0,
+        },
+    )
+    .unwrap();
+    match reply {
+        Msg::Refuse { message } => {
+            assert_eq!(
+                message,
+                format!(
+                    "replication protocol version mismatch: this node speaks protocol version \
+                     {0}, but the peer's Hello declared version 1 — upgrade the older binary so \
+                     both speak the expected version {0}",
+                    charpente::repl::PROTO_VERSION
+                )
+            );
+        }
+        other => panic!("expected Refuse, got {other:?}"),
+    }
+}
+
 #[test]
 fn hello_to_a_follower_is_refused_naming_the_not_a_primary_state() {
     let sim = Sim::with_faults(0x2EB1_0007, FaultConfig::none());
@@ -2566,7 +2609,10 @@ fn table_scans(db: &Db) -> io::Result<RawTables> {
     let snap = db.snapshot()?;
     let mut out = Vec::new();
     for table in db.table_names() {
-        out.push((table.to_string(), snap.scan_raw(table)?));
+        out.push((
+            table.to_string(),
+            snap.scan_raw(table, db.table_scoped(table)?)?,
+        ));
     }
     Ok(out)
 }
@@ -3011,7 +3057,7 @@ fn promote_mid_migration_resumes_from_the_shipped_watermark() {
         if let Some(sv) = sv
             && sv.migrating_to.is_some()
         {
-            mid_through = Some(sv.migrating_through.unwrap_or(0));
+            mid_through = Some(sv.migrating_through.map(|(_, id)| id).unwrap_or(0));
             break;
         }
     }
@@ -3233,7 +3279,9 @@ fn assert_all_present(sim: &Sim, node: &mut Node, ids: &[u64], who: &str) -> Res
     retry_read_reopen(sim, node, recover_node, |node| {
         let db = node.db.as_ref().ok_or_else(|| format!("{who} has no db"))?;
         let snap = db.snapshot().map_err(|e| e.to_string())?;
-        let rows = snap.scan_raw(Widget::TABLE).map_err(|e| e.to_string())?;
+        let rows = snap
+            .scan_raw(Widget::TABLE, false)
+            .map_err(|e| e.to_string())?;
         for id in ids {
             if !rows.iter().any(|(_, rid, _)| rid == id) {
                 return Err(format!(
@@ -4431,8 +4479,8 @@ fn follower_kernel_serves_reads_never_jobs_or_cron() {
     {
         let ps = p.kernel.as_ref().unwrap().app().db().snapshot().unwrap();
         let fs = f.kernel.as_ref().unwrap().app().db().snapshot().unwrap();
-        let pj = ps.scan_raw(JobRow::TABLE).unwrap();
-        let fj = fs.scan_raw(JobRow::TABLE).unwrap();
+        let pj = ps.scan_raw(JobRow::TABLE, false).unwrap();
+        let fj = fs.scan_raw(JobRow::TABLE, false).unwrap();
         assert!(!pj.is_empty(), "there were jobs to replicate");
         assert_eq!(pj, fj, "f's jobs table mirrors p's (Done marks replicated)");
     }
@@ -4610,7 +4658,9 @@ fn horizon_db_cfg() -> DbConfig {
 fn ids_present(node: &KNode, ids: &[u64]) -> Result<Vec<u64>, String> {
     let db = node.kernel.as_ref().ok_or("node has no kernel")?.app().db();
     let snap = db.snapshot().map_err(|e| e.to_string())?;
-    let rows = snap.scan_raw(Widget::TABLE).map_err(|e| e.to_string())?;
+    let rows = snap
+        .scan_raw(Widget::TABLE, false)
+        .map_err(|e| e.to_string())?;
     Ok(ids
         .iter()
         .copied()
@@ -4630,7 +4680,9 @@ fn assert_survivor_holds(sim: &Sim, node: &mut KNode, ids: &[u64]) -> Result<(),
             .app()
             .db();
         let snap = db.snapshot().map_err(|e| e.to_string())?;
-        let rows = snap.scan_raw(Widget::TABLE).map_err(|e| e.to_string())?;
+        let rows = snap
+            .scan_raw(Widget::TABLE, false)
+            .map_err(|e| e.to_string())?;
         for id in ids {
             if !rows.iter().any(|(_, rid, _)| rid == id) {
                 return Err(format!(

@@ -407,8 +407,34 @@ pub(crate) fn scoped_key(scope: u64, id: u64) -> [u8; 16] {
     k
 }
 
+/// The inverse of `scoped_key`: recover `(scope, id)` from a stored
+/// composite key.
+fn split_scoped_key(key: [u8; 16]) -> (u64, u64) {
+    let scope = u64::from_be_bytes(
+        key[..8]
+            .try_into()
+            .expect("scoped key carries a leading 8-byte scope"),
+    );
+    let id = u64::from_be_bytes(
+        key[8..]
+            .try_into()
+            .expect("scoped key carries a trailing 8-byte id"),
+    );
+    (scope, id)
+}
+
 fn scoped_rows_def(table: &str) -> TableDefinition<'_, [u8; 16], &'static [u8]> {
     TableDefinition::new(table)
+}
+
+/// `scan_raw`/`scan_raw_from`'s scoped branch tried both physical shapes
+/// (composite, then bare) and neither opened — names both, not just the
+/// second attempt's raw redb error.
+fn scan_raw_shape_error(table: &str, second_attempt: redb::TableError) -> io::Error {
+    io::Error::other(format!(
+        "table \"{table}\": neither the scoped composite-key shape nor the bare-u64 shape \
+         opened it ({second_attempt})"
+    ))
 }
 
 /// The row-key scope slot for a table that is not tenant-scoped — every
@@ -1129,33 +1155,33 @@ impl Writer<'_> {
     /// is never interpreted (it is one version older — decoding it under
     /// the compiled type is exactly the bug this path exists to avoid),
     /// and indexes are deliberately untouched: they are rebuilt wholesale
-    /// by the close-out trigger. `scoped` picks `scoped_rows_def` (composite
-    /// key) vs `rows_def` (bare `u64`) — the `table: &str`-keyed primitives
-    /// below have no `Row` type to ask `row_is_scoped::<R>()` of, so the
-    /// caller (which already looked the table up in `Schema` for other
-    /// reasons at every call site) passes it in from registration.
+    /// by the close-out trigger. `scope`: `Some(s)` picks `scoped_rows_def`
+    /// (composite key `(s, id)`); `None` picks `rows_def` (bare `id`) — the
+    /// `table: &str`-keyed primitives below have no `Row` type to ask
+    /// `row_is_scoped::<R>()` of, so the caller (which already looked the
+    /// table up in `Schema` for other reasons at every call site) resolves
+    /// it from registration. `Option<u64>` makes "scoped but called with no
+    /// scope" and "unscoped but called with a scope" unrepresentable rather
+    /// than caught by an assert after the fact.
     pub fn put_raw(
         &mut self,
         table: &str,
-        scoped: bool,
-        scope: u64,
+        scope: Option<u64>,
         id: u64,
         row: &[u8],
     ) -> io::Result<()> {
-        if scoped {
-            let mut rows = self
-                .txn
-                .open_table(scoped_rows_def(table))
-                .map_err(redb_err)?;
-            rows.insert(scoped_key(scope, id), row).map_err(redb_err)?;
-        } else {
-            assert_eq!(
-                scope, UNSCOPED,
-                "put_raw: table \"{table}\" is not tenant-scoped, but was called with scope \
-                 {scope} — pass table::UNSCOPED, or scoped=true with the record's own scope"
-            );
-            let mut rows = self.txn.open_table(rows_def(table)).map_err(redb_err)?;
-            rows.insert(id, row).map_err(redb_err)?;
+        match scope {
+            Some(scope) => {
+                let mut rows = self
+                    .txn
+                    .open_table(scoped_rows_def(table))
+                    .map_err(redb_err)?;
+                rows.insert(scoped_key(scope, id), row).map_err(redb_err)?;
+            }
+            None => {
+                let mut rows = self.txn.open_table(rows_def(table)).map_err(redb_err)?;
+                rows.insert(id, row).map_err(redb_err)?;
+            }
         }
         Ok(())
     }
@@ -1165,57 +1191,52 @@ impl Writer<'_> {
     /// via `put_raw` and carries no index entries, so removing the primary row
     /// is sufficient — the old value is never decoded (decoding it under the
     /// compiled type is exactly the misdecode this path exists to avoid).
-    /// `scoped`/`scope`: see `put_raw`.
-    pub fn delete_raw(&mut self, table: &str, scoped: bool, scope: u64, id: u64) -> io::Result<()> {
-        if scoped {
-            let mut rows = self
-                .txn
-                .open_table(scoped_rows_def(table))
-                .map_err(redb_err)?;
-            rows.remove(scoped_key(scope, id)).map_err(redb_err)?;
-        } else {
-            assert_eq!(
-                scope, UNSCOPED,
-                "delete_raw: table \"{table}\" is not tenant-scoped, but was called with scope \
-                 {scope} — pass table::UNSCOPED, or scoped=true with the record's own scope"
-            );
-            let mut rows = self.txn.open_table(rows_def(table)).map_err(redb_err)?;
-            rows.remove(id).map_err(redb_err)?;
+    /// `scope`: see `put_raw`.
+    pub fn delete_raw(&mut self, table: &str, scope: Option<u64>, id: u64) -> io::Result<()> {
+        match scope {
+            Some(scope) => {
+                let mut rows = self
+                    .txn
+                    .open_table(scoped_rows_def(table))
+                    .map_err(redb_err)?;
+                rows.remove(scoped_key(scope, id)).map_err(redb_err)?;
+            }
+            None => {
+                let mut rows = self.txn.open_table(rows_def(table)).map_err(redb_err)?;
+                rows.remove(id).map_err(redb_err)?;
+            }
         }
         Ok(())
     }
 
     /// Raw read of one row's stored bytes (apply-side helper for the
-    /// close-out trigger's old-row peek). `scoped`/`scope`: see `put_raw`.
+    /// close-out trigger's old-row peek). `scope`: see `put_raw`.
     pub fn get_raw(
         &mut self,
         table: &str,
-        scoped: bool,
-        scope: u64,
+        scope: Option<u64>,
         id: u64,
     ) -> io::Result<Option<Vec<u8>>> {
-        if scoped {
-            let rows = match self.txn.open_table(scoped_rows_def(table)) {
-                Ok(rows) => rows,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-                Err(e) => return Err(redb_err(e)),
-            };
-            Ok(rows
-                .get(scoped_key(scope, id))
-                .map_err(redb_err)?
-                .map(|g| g.value().to_vec()))
-        } else {
-            assert_eq!(
-                scope, UNSCOPED,
-                "get_raw: table \"{table}\" is not tenant-scoped, but was called with scope \
-                 {scope} — pass table::UNSCOPED, or scoped=true with the record's own scope"
-            );
-            let rows = match self.txn.open_table(rows_def(table)) {
-                Ok(rows) => rows,
-                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-                Err(e) => return Err(redb_err(e)),
-            };
-            Ok(rows.get(id).map_err(redb_err)?.map(|g| g.value().to_vec()))
+        match scope {
+            Some(scope) => {
+                let rows = match self.txn.open_table(scoped_rows_def(table)) {
+                    Ok(rows) => rows,
+                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                    Err(e) => return Err(redb_err(e)),
+                };
+                Ok(rows
+                    .get(scoped_key(scope, id))
+                    .map_err(redb_err)?
+                    .map(|g| g.value().to_vec()))
+            }
+            None => {
+                let rows = match self.txn.open_table(rows_def(table)) {
+                    Ok(rows) => rows,
+                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                    Err(e) => return Err(redb_err(e)),
+                };
+                Ok(rows.get(id).map_err(redb_err)?.map(|g| g.value().to_vec()))
+            }
         }
     }
 
@@ -1637,49 +1658,62 @@ impl Snapshot {
     /// the logical export primitive (`Seeder::rows` re-applies them through
     /// the typed ops on the import side). Empty, not an error, when the
     /// table has never been created. `scope` is `table::UNSCOPED` for every
-    /// row of an unscoped table (same dynamic dispatch as `scan_raw_from`:
-    /// a scoped table's physical redb table is composite-`[u8;16]`-keyed, so
-    /// opening it as the bare-`u64` shape fails `TableTypeMismatch` rather
-    /// than silently reading nothing, and the retry recovers `(scope, id)`
-    /// from the composite key's leading/trailing 8 bytes).
-    pub fn scan_raw(&self, table: &str) -> io::Result<Vec<(u64, u64, Vec<u8>)>> {
-        match self.txn.open_table(rows_def(table)) {
-            Ok(rows) => {
-                let mut out = Vec::new();
-                for entry in rows.range(0u64..=u64::MAX).map_err(redb_err)? {
-                    let (key, value) = entry.map_err(redb_err)?;
-                    out.push((UNSCOPED, key.value(), value.value().to_vec()));
+    /// row of an unscoped table.
+    ///
+    /// `scoped` (from `TableOps.scoped`, i.e. the compiled schema) picks
+    /// which physical shape to open first. A scoped table whose rows have
+    /// never been touched since it gained a scope is still physically
+    /// bare-`u64`-keyed — `migrate_table`'s own resume walk depends on
+    /// reading exactly that state — so on `TableTypeMismatch` a `scoped`
+    /// caller retries the bare shape (below-compiled tolerance kept).
+    /// `scoped = false` has no such legitimate other shape (a table is
+    /// never un-scoped once scoped), so a mismatch there is refused by
+    /// name rather than silently retried.
+    pub fn scan_raw(&self, table: &str, scoped: bool) -> io::Result<Vec<(u64, u64, Vec<u8>)>> {
+        if scoped {
+            match self.txn.open_table(scoped_rows_def(table)) {
+                Ok(rows) => {
+                    let mut out = Vec::new();
+                    for entry in rows
+                        .range(scoped_key(0, 0)..=scoped_key(u64::MAX, u64::MAX))
+                        .map_err(redb_err)?
+                    {
+                        let (key, value) = entry.map_err(redb_err)?;
+                        let (scope, id) = split_scoped_key(key.value());
+                        out.push((scope, id, value.value().to_vec()));
+                    }
+                    Ok(out)
                 }
-                Ok(out)
-            }
-            Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
-            Err(redb::TableError::TableTypeMismatch { .. }) => {
-                let rows = self
-                    .txn
-                    .open_table(scoped_rows_def(table))
-                    .map_err(redb_err)?;
-                let mut out = Vec::new();
-                for entry in rows
-                    .range(scoped_key(0, 0)..=scoped_key(u64::MAX, u64::MAX))
-                    .map_err(redb_err)?
-                {
-                    let (key, value) = entry.map_err(redb_err)?;
-                    let key_bytes = key.value();
-                    let scope = u64::from_be_bytes(
-                        key_bytes[..8]
-                            .try_into()
-                            .expect("scoped key carries a leading 8-byte scope"),
-                    );
-                    let id = u64::from_be_bytes(
-                        key_bytes[8..]
-                            .try_into()
-                            .expect("scoped key carries a trailing 8-byte id"),
-                    );
-                    out.push((scope, id, value.value().to_vec()));
+                Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
+                Err(redb::TableError::TableTypeMismatch { .. }) => {
+                    match self.txn.open_table(rows_def(table)) {
+                        Ok(rows) => {
+                            let mut out = Vec::new();
+                            for entry in rows.range(0u64..=u64::MAX).map_err(redb_err)? {
+                                let (key, value) = entry.map_err(redb_err)?;
+                                out.push((UNSCOPED, key.value(), value.value().to_vec()));
+                            }
+                            Ok(out)
+                        }
+                        Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
+                        Err(e) => Err(scan_raw_shape_error(table, e)),
+                    }
                 }
-                Ok(out)
+                Err(e) => Err(redb_err(e)),
             }
-            Err(e) => Err(redb_err(e)),
+        } else {
+            match self.txn.open_table(rows_def(table)) {
+                Ok(rows) => {
+                    let mut out = Vec::new();
+                    for entry in rows.range(0u64..=u64::MAX).map_err(redb_err)? {
+                        let (key, value) = entry.map_err(redb_err)?;
+                        out.push((UNSCOPED, key.value(), value.value().to_vec()));
+                    }
+                    Ok(out)
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
+                Err(e) => Err(redb_err(e)),
+            }
         }
     }
 
@@ -1692,81 +1726,91 @@ impl Snapshot {
     /// keyed table correctly, since ids are NOT globally ascending across a
     /// scope boundary (rows sort by `(scope, id)`, so tenant 2's id 0 can
     /// follow tenant 1's id `u64::MAX`) — a bare-id watermark would revisit
-    /// or skip rows across scopes. Both branches below SEEK (an exclusive
-    /// `redb::Bound`, not a full scan filtered post-hoc): fixed by Task 6c,
-    /// which also lifted `db.rs`'s `apply_put`/`apply_delete` assert against
-    /// scoped tables, the thing that made a scoped table unreachable through
-    /// `Db`/`Schema` (and so through `migrate_schema`) in the first place.
-    /// `migrate_schema()`'s own persisted resume watermark
-    /// (`SchemaVersion.migrating_through`) stays a bare `u64` — out of this
-    /// task's file list — so `migrate_table` always resumes a scoped table's
-    /// migration at `(UNSCOPED, watermark)`; within one uninterrupted run
-    /// every row's own returned scope is threaded correctly to
-    /// `MigratePut`, but a crash mid-migration on a genuinely multi-tenant
-    /// scoped table restarts the walk from scope 0 rather than where a
-    /// higher-scoped batch left off. No such table exists yet (scoped tables
-    /// are new in this sub-project), so nothing exercises this narrower,
-    /// still-open limitation today.
+    /// or skip rows across scopes. Both branches SEEK (an exclusive
+    /// `redb::Bound`, not a full scan filtered post-hoc).
+    ///
+    /// `scoped` (see `scan_raw`) picks which physical shape to open first
+    /// and, for `scoped = true`, tolerates the not-yet-migrated bare-`u64`
+    /// shape via the same fallback; `scoped = false` refuses a mismatch by
+    /// name.
     pub fn scan_raw_from(
         &self,
         table: &str,
+        scoped: bool,
         after: Option<(u64, u64)>,
         limit: usize,
     ) -> io::Result<Vec<(u64, u64, Vec<u8>)>> {
-        match self.txn.open_table(rows_def(table)) {
-            Ok(rows) => {
-                let lo = match after {
-                    None => Bound::Unbounded,
-                    Some((_, id)) => Bound::Excluded(id),
-                };
-                let mut out = Vec::new();
-                for item in rows.range((lo, Bound::Unbounded)).map_err(redb_err)? {
-                    if out.len() == limit {
-                        break;
+        if scoped {
+            match self.txn.open_table(scoped_rows_def(table)) {
+                Ok(rows) => {
+                    let lo = match after {
+                        None => Bound::Unbounded,
+                        Some((scope, id)) => Bound::Excluded(scoped_key(scope, id)),
+                    };
+                    let hi = Bound::Included(scoped_key(u64::MAX, u64::MAX));
+                    let mut out = Vec::new();
+                    for item in rows.range((lo, hi)).map_err(redb_err)? {
+                        if out.len() == limit {
+                            break;
+                        }
+                        let (k, v) = item.map_err(redb_err)?;
+                        let (scope, id) = split_scoped_key(k.value());
+                        out.push((scope, id, v.value().to_vec()));
                     }
-                    let (k, v) = item.map_err(redb_err)?;
-                    out.push((UNSCOPED, k.value(), v.value().to_vec()));
+                    Ok(out)
                 }
-                Ok(out)
-            }
-            Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
-            // The table's physical key is the composite [u8; 16] `(scope,
-            // id)` (Task 4) — a different redb table shape from the bare
-            // u64 one just tried, so redb refuses to open it as such
-            // (TableTypeMismatch) rather than silently reading nothing.
-            // Retry under the composite definition, seeking past `after`.
-            Err(redb::TableError::TableTypeMismatch { .. }) => {
-                let rows = self
-                    .txn
-                    .open_table(scoped_rows_def(table))
-                    .map_err(redb_err)?;
-                let lo = match after {
-                    None => Bound::Unbounded,
-                    Some((scope, id)) => Bound::Excluded(scoped_key(scope, id)),
-                };
-                let hi = Bound::Included(scoped_key(u64::MAX, u64::MAX));
-                let mut out = Vec::new();
-                for item in rows.range((lo, hi)).map_err(redb_err)? {
-                    if out.len() == limit {
-                        break;
+                Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
+                Err(redb::TableError::TableTypeMismatch { .. }) => {
+                    match self.txn.open_table(rows_def(table)) {
+                        Ok(rows) => {
+                            let lo = match after {
+                                None => Bound::Unbounded,
+                                Some((_, id)) => Bound::Excluded(id),
+                            };
+                            let mut out = Vec::new();
+                            for item in rows.range((lo, Bound::Unbounded)).map_err(redb_err)? {
+                                if out.len() == limit {
+                                    break;
+                                }
+                                let (k, v) = item.map_err(redb_err)?;
+                                out.push((UNSCOPED, k.value(), v.value().to_vec()));
+                            }
+                            Ok(out)
+                        }
+                        Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
+                        Err(e) => Err(scan_raw_shape_error(table, e)),
                     }
-                    let (k, v) = item.map_err(redb_err)?;
-                    let key_bytes = k.value();
-                    let scope = u64::from_be_bytes(
-                        key_bytes[..8]
-                            .try_into()
-                            .expect("scoped key carries a leading 8-byte scope"),
-                    );
-                    let id = u64::from_be_bytes(
-                        key_bytes[8..]
-                            .try_into()
-                            .expect("scoped key carries a trailing 8-byte id"),
-                    );
-                    out.push((scope, id, v.value().to_vec()));
                 }
-                Ok(out)
+                Err(e) => Err(redb_err(e)),
             }
-            Err(e) => Err(redb_err(e)),
+        } else {
+            match self.txn.open_table(rows_def(table)) {
+                Ok(rows) => {
+                    let lo = match after {
+                        None => Bound::Unbounded,
+                        Some((scope, id)) => {
+                            assert_eq!(
+                                scope, UNSCOPED,
+                                "scan_raw_from: table \"{table}\" is not tenant-scoped, but the \
+                                 cursor carries scope {scope} — a cursor this function returns \
+                                 for an unscoped table always carries table::UNSCOPED"
+                            );
+                            Bound::Excluded(id)
+                        }
+                    };
+                    let mut out = Vec::new();
+                    for item in rows.range((lo, Bound::Unbounded)).map_err(redb_err)? {
+                        if out.len() == limit {
+                            break;
+                        }
+                        let (k, v) = item.map_err(redb_err)?;
+                        out.push((UNSCOPED, k.value(), v.value().to_vec()));
+                    }
+                    Ok(out)
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
+                Err(e) => Err(redb_err(e)),
+            }
         }
     }
 }

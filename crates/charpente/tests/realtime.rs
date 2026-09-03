@@ -2282,7 +2282,7 @@ fn follower_ids_match_a_batched_primarys() {
          batch and an oracle that proves nothing about batching"
     );
     assert_eq!(
-        psnap.scan_raw(EventRow::TABLE).unwrap().len(),
+        psnap.scan_raw(EventRow::TABLE, false).unwrap().len(),
         4,
         "four emits must materialize four event rows on the primary"
     );
@@ -2299,8 +2299,9 @@ fn follower_ids_match_a_batched_primarys() {
     // multi-node test in this file; job-id continuity under replication is
     // proven by the seeder work instead.
     for table in pdb.table_names() {
-        let pr = psnap.scan_raw(table).unwrap();
-        let fr = fsnap.scan_raw(table).unwrap();
+        let table_scoped = pdb.table_scoped(table).unwrap();
+        let pr = psnap.scan_raw(table, table_scoped).unwrap();
+        let fr = fsnap.scan_raw(table, table_scoped).unwrap();
         assert_eq!(
             pr, fr,
             "table {table} diverged between the batched primary and the follower's replay"

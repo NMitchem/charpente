@@ -530,17 +530,18 @@ struct SnapshotWalk {
     /// `SnapshotMeta::frontier_crc` for why the chain cannot supply it.
     frontier_crc: u32,
     /// `Db::table_names()`, schema-sorted, including the platform-owned
-    /// tables (jobs, events, schema versions) whose rows restore needs.
-    tables: Vec<&'static str>,
+    /// tables (jobs, events, schema versions) whose rows restore needs,
+    /// paired with each table's own scopedness — `scan_raw_from`'s shape
+    /// discriminator, and (once a table is scoped) the snapshot-batch
+    /// object's own discriminator too.
+    tables: Vec<(&'static str, bool)>,
     /// Index into `tables`; `== tables.len()` once every one is paged, at
     /// which point only `snapshot/meta` is left.
     table: usize,
     /// `scan_raw_from`'s cursor within `tables[table]`: `(scope, id)` of
     /// the last row exported, so a paged export SEEKS rather than
     /// full-scanning, and ids paged within one scope stay ascending across
-    /// a scope boundary too (tenant-scoping Task 6c — the cursor was a bare
-    /// `u64` before, which could not resume a composite-keyed table
-    /// correctly).
+    /// a scope boundary too.
     after: Option<(u64, u64)>,
     /// Next batch index `n` for `tables[table]`.
     batch: u64,
@@ -2021,7 +2022,11 @@ impl Archive {
                 next_job_id,
                 next_event_id,
                 frontier_crc,
-                tables: db.table_names(),
+                tables: db
+                    .table_names()
+                    .into_iter()
+                    .map(|name| Ok((name, db.table_scoped(name)?)))
+                    .collect::<io::Result<Vec<_>>>()?,
                 table: 0,
                 after: None,
                 batch: 0,
@@ -2059,17 +2064,18 @@ impl Archive {
             };
             return Ok(());
         }
-        let table = walk.tables[walk.table];
-        let rows = match walk
-            .snapshot
-            .scan_raw_from(table, walk.after, SNAPSHOT_BATCH_ROWS)
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                self.state = State::Snapshotting { walk };
-                return Err(e);
-            }
-        };
+        let (table, table_scoped) = walk.tables[walk.table];
+        let rows =
+            match walk
+                .snapshot
+                .scan_raw_from(table, table_scoped, walk.after, SNAPSHOT_BATCH_ROWS)
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    self.state = State::Snapshotting { walk };
+                    return Err(e);
+                }
+            };
         if rows.is_empty() {
             walk.done.push(TableBatches {
                 name: table.to_string(),
@@ -2086,11 +2092,11 @@ impl Archive {
         // above `after` in (scope, id) order, so the cursor advances on
         // every batch. If it ever did not, this walk would re-upload the
         // same batch under ever-increasing `n` forever and the meta would
-        // claim objects that duplicate each other. Widened from a bare id
-        // to the (scope, id) pair (tenant-scoping Task 6c): a bare-id
-        // comparison would falsely fire the moment the walk crossed a scope
-        // boundary with a lower id (tenant 2's id 0 after tenant 1's
-        // u64::MAX), which is exactly the ordering `scan_raw_from`'s real
+        // claim objects that duplicate each other. Compared as the (scope,
+        // id) pair, not the bare id: a bare-id comparison would falsely
+        // fire the moment the walk crossed a scope boundary with a lower
+        // id (tenant 2's id 0 after tenant 1's u64::MAX), which is exactly
+        // the ordering `scan_raw_from`'s real
         // seek now guarantees never happens in (scope, id) terms.
         assert!(
             walk.after.is_none_or(|prev| (last_scope, last_id) > prev),
@@ -2098,7 +2104,7 @@ impl Archive {
              {last_id})); scan_raw_from returns only rows strictly above its cursor",
             walk.after
         );
-        let bytes = encode_snapshot_batch(&rows);
+        let bytes = encode_snapshot_batch(table_scoped, &rows);
         let key = snapshot_batch_key(&self.cfg.prefix, self.generation, table, walk.batch);
         walk.after = Some((last_scope, last_id));
         walk.batch += 1;

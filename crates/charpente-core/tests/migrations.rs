@@ -475,7 +475,7 @@ fn the_real_gate_refuses_drift_the_naive_gate_would_misdecode() {
     let raw = db
         .snapshot()
         .unwrap()
-        .scan_raw_from("Widget", None, 1)
+        .scan_raw_from("Widget", false, None, 1)
         .unwrap();
     drop(db);
 
@@ -707,7 +707,7 @@ fn in_flight_target_refusal_and_rejection_mid_chain_are_pinned_verbatim() {
     assert_eq!(
         err.to_string(),
         "table \"Widget\" has an interrupted migration to version 2 in flight (resumable \
-         watermark at row id 1) but this binary is compiled for version 1 — rows on either \
+         watermark at scope 0 row id 1) but this binary is compiled for version 1 — rows on either \
          side of the watermark are at different versions and no single chain start covers \
          both; finish the interrupted migration with the binary that started it, or restore"
     );
@@ -741,7 +741,7 @@ fn in_flight_target_refusal_and_rejection_mid_chain_are_pinned_verbatim() {
     assert_eq!(
         err.to_string(),
         "table \"Widget\" has an interrupted migration to version 2 in flight (resumable \
-         watermark at row id 1) begun by a binary whose target shape (fingerprint 0x6666) \
+         watermark at scope 0 row id 1) begun by a binary whose target shape (fingerprint 0x6666) \
          differs from this binary's (fingerprint 0x7777) — resuming would mix two shapes in \
          one table; finish the interrupted migration with the binary that started it, or \
          restore"
@@ -929,4 +929,353 @@ fn migration_workload_replays_identically() {
         )
     })
     .unwrap();
+}
+
+// ------------------------------------------------------- Fix round 1 (I-2)
+//
+// A scoped table's migration, under the SAME fault matrix as
+// `migration_survives_the_fault_matrix_and_equals_the_uninterrupted_twin`
+// above, so `SchemaVersion.migrating_through`'s composite `(scope, id)`
+// watermark is exercised under crashes, not just a clean single-shot run.
+// Seeded through `Db::apply_shipped` with hand-encoded scoped Put records
+// (tag 0x05), never a raw `Store::apply` — `apply_shipped` is WAL-backed,
+// so a fault mid-seed recovers by WAL replay on retry exactly like every
+// other seed step in this file; a raw `Store::apply` would not have that
+// recovery path (there is no WAL record to replay).
+
+struct MigOrg;
+
+struct ScopedWidgetV1 {
+    id: Id<ScopedWidgetV1>,
+    count: u32,
+}
+impl Row for ScopedWidgetV1 {
+    type Scope = MigOrg;
+    const TABLE: &'static str = "ScopedWidget";
+    const INDEXES: &'static [IndexDef<ScopedWidgetV1>] = &[];
+    const VERSION: u32 = 1;
+    const FINGERPRINT: Option<u64> = Some(0x8181);
+    fn id(&self) -> Id<ScopedWidgetV1> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.count.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<ScopedWidgetV1> {
+        let input = &mut &bytes[..];
+        Ok(ScopedWidgetV1 {
+            id: Id::decode(input)?,
+            count: u32::decode(input)?,
+        })
+    }
+}
+impl RowShape for ScopedWidgetV1 {
+    const VERSION: u32 = 1;
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        Row::encode_row(self, out)
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<ScopedWidgetV1> {
+        <ScopedWidgetV1 as Row>::decode_row(bytes)
+    }
+}
+
+struct ScopedWidgetV2 {
+    id: Id<ScopedWidgetV2>,
+    count: u32,
+    label: String,
+}
+impl Row for ScopedWidgetV2 {
+    type Scope = MigOrg;
+    const TABLE: &'static str = "ScopedWidget";
+    const INDEXES: &'static [IndexDef<ScopedWidgetV2>] = &[IndexDef {
+        name: "by_count",
+        key: |r, out| r.count.encode(out),
+    }];
+    const VERSION: u32 = 2;
+    const FINGERPRINT: Option<u64> = Some(0x8282);
+    fn id(&self) -> Id<ScopedWidgetV2> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.count.encode(out);
+        self.label.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<ScopedWidgetV2> {
+        let input = &mut &bytes[..];
+        Ok(ScopedWidgetV2 {
+            id: Id::decode(input)?,
+            count: u32::decode(input)?,
+            label: String::decode(input)?,
+        })
+    }
+}
+impl RowShape for ScopedWidgetV2 {
+    const VERSION: u32 = 2;
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        Row::encode_row(self, out)
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<ScopedWidgetV2> {
+        <ScopedWidgetV2 as Row>::decode_row(bytes)
+    }
+}
+impl TableMigration for ScopedWidgetV2 {
+    type Prev = ScopedWidgetV1;
+    fn migrate(prev: ScopedWidgetV1) -> Result<ScopedWidgetV2, MigrationError> {
+        Ok(ScopedWidgetV2 {
+            id: Id::from_raw(prev.id.raw()),
+            count: prev.count,
+            label: "migrated".to_string(),
+        })
+    }
+}
+
+fn scoped_len_prefixed(bytes: &[u8], out: &mut Vec<u8>) {
+    (bytes.len() as u32).encode(out);
+    out.extend_from_slice(bytes);
+}
+
+/// A hand-encoded one-effect `0x05` (scoped Put) record for `ScopedWidgetV1`.
+fn scoped_widget_v1_put_record(scope: u64, id: u64, count: u32) -> Vec<u8> {
+    let mut row_bytes = Vec::new();
+    Row::encode_row(
+        &ScopedWidgetV1 {
+            id: Id::from_raw(id),
+            count,
+        },
+        &mut row_bytes,
+    );
+    let mut record = Vec::new();
+    1u32.encode(&mut record);
+    record.push(5);
+    scoped_len_prefixed(ScopedWidgetV1::TABLE.as_bytes(), &mut record);
+    scope.encode(&mut record);
+    scoped_len_prefixed(&row_bytes, &mut record);
+    record
+}
+
+/// A hand-encoded unscoped (`0x00`) Put record for `SchemaVersion`, the
+/// first-write adoption row `Tx::put` would normally add automatically —
+/// required because a versioned table's records are refused with "no
+/// adoption row on record" otherwise, and the raw `apply_shipped` records
+/// below bypass `Tx`'s bookkeeping entirely.
+fn scoped_widget_adoption_record(version: u32, fingerprint: u64) -> Vec<u8> {
+    let row = SchemaVersion {
+        id: schema_version_id("ScopedWidget"),
+        table: "ScopedWidget".to_string(),
+        version,
+        fingerprint,
+        migrating_through: None,
+        migrating_to: None,
+    };
+    let mut row_bytes = Vec::new();
+    Row::encode_row(&row, &mut row_bytes);
+    let mut record = Vec::new();
+    1u32.encode(&mut record);
+    record.push(0);
+    scoped_len_prefixed(SchemaVersion::TABLE.as_bytes(), &mut record);
+    scoped_len_prefixed(&row_bytes, &mut record);
+    record
+}
+
+fn scoped_seed_records(rows_per_scope: u64, scopes: &[u64]) -> Vec<(u64, Vec<u8>)> {
+    let mut records = vec![(0u64, scoped_widget_adoption_record(1, 0x8181))];
+    let mut seq = 1u64;
+    for &scope in scopes {
+        for i in 0..rows_per_scope {
+            records.push((seq, scoped_widget_v1_put_record(scope, i, i as u32)));
+            seq += 1;
+        }
+    }
+    records
+}
+
+fn seed_scoped_v1(sim: &Sim, rows_per_scope: u64, scopes: &[u64]) {
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        cfg(),
+        Schema::new().table::<ScopedWidgetV1>(),
+    )
+    .unwrap();
+    db.apply_shipped(&scoped_seed_records(rows_per_scope, scopes))
+        .unwrap();
+    db.checkpoint().unwrap();
+}
+
+/// `seed_scoped_v1` retried through the fault matrix, same shape as
+/// `seed_v1_result` — except `apply_shipped` streams records and can
+/// commit a PREFIX of them before a fault interrupts a later one (it is
+/// not one atomic unit the way `Db::transact` is), so a retry resends only
+/// the records past `db.last_applied()`, never restarting the whole batch
+/// at seq 0 (which the log correctly refuses as out of order).
+fn seed_scoped_v1_result(sim: &Sim, rows_per_scope: u64, scopes: &[u64]) -> Result<bool, String> {
+    let all_records = scoped_seed_records(rows_per_scope, scopes);
+    for _round in 0..64 {
+        let attempt: io::Result<()> = (|| {
+            let mut db = Db::open(
+                Box::new(sim.disk()),
+                cfg(),
+                Schema::new().table::<ScopedWidgetV1>(),
+            )?;
+            let next = db.last_applied().map_or(0, |l| l + 1);
+            let remaining: Vec<(u64, Vec<u8>)> = all_records
+                .iter()
+                .filter(|(seq, _)| *seq >= next)
+                .cloned()
+                .collect();
+            db.apply_shipped(&remaining)?;
+            db.checkpoint()
+        })();
+        match attempt {
+            Ok(()) => return Ok(true),
+            Err(e) => {
+                let msg = e.to_string();
+                if !charpente_sim::checks::is_fault_fallout(&msg) {
+                    return Err(format!("non-injected failure while seeding: {msg}"));
+                }
+                sim.restart();
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// `open_and_migrate_with_remedy`, scoped: same barrier-remedy shape.
+fn open_and_migrate_scoped_with_remedy(sim: &Sim, db_cfg: DbConfig) -> Result<Option<Db>, String> {
+    let mut remedy_pending = false;
+    for _round in 0..128 {
+        if remedy_pending {
+            match Db::open(
+                Box::new(sim.disk()),
+                cfg(),
+                Schema::new().table::<ScopedWidgetV1>(),
+            ) {
+                Ok(remedy_db) => {
+                    drop(remedy_db);
+                    remedy_pending = false;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !charpente_sim::checks::is_fault_fallout(&msg) {
+                        return Err(format!("non-injected failure during barrier remedy: {msg}"));
+                    }
+                    sim.restart();
+                }
+            }
+            continue;
+        }
+        let schema = Schema::new()
+            .table::<ScopedWidgetV2>()
+            .migration::<ScopedWidgetV2>("ScopedWidget");
+        match Db::open(Box::new(sim.disk()), db_cfg.clone(), schema)
+            .and_then(|mut d| d.migrate_schema().map(|()| d))
+        {
+            Ok(d) => return Ok(Some(d)),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("unrecovered writes from the previous binary") {
+                    sim.cover("migrations:scoped-barrier-remedied");
+                    remedy_pending = true;
+                    continue;
+                }
+                if !charpente_sim::checks::is_fault_fallout(&msg) {
+                    return Err(format!("non-injected failure: {msg}"));
+                }
+                sim.restart();
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn migrated_scoped_twin(rows_per_scope: u64, scopes: &[u64]) -> Vec<(u64, u64, u32, String)> {
+    let sim = Sim::with_faults(0x2EB7_4000, FaultConfig::none());
+    seed_scoped_v1(&sim, rows_per_scope, scopes);
+    let schema = Schema::new()
+        .table::<ScopedWidgetV2>()
+        .migration::<ScopedWidgetV2>("ScopedWidget");
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig {
+            migration_batch_size: 3,
+            ..cfg()
+        },
+        schema,
+    )
+    .unwrap();
+    db.migrate_schema().unwrap();
+    let mut rows = db
+        .snapshot()
+        .unwrap()
+        .scan_raw(ScopedWidgetV2::TABLE, true)
+        .unwrap();
+    rows.sort();
+    rows.into_iter()
+        .map(|(scope, id, bytes)| {
+            let r = <ScopedWidgetV2 as Row>::decode_row(&bytes).unwrap();
+            (scope, id, r.count, r.label)
+        })
+        .collect()
+}
+
+/// Fix round 1, ruling R40 (Important 2): the composite watermark, exercised
+/// under the fault matrix — a scoped table with rows at THREE scopes (same
+/// ids repeated per scope, so a bare-id watermark would be indistinguishable
+/// from correct even if it silently collapsed tenants), a batch size smaller
+/// than the row count so more than one batch and one crash point falls
+/// inside the table, and the terminating property this same round's fix
+/// makes true again (`db8f825`'s regression made it non-terminating for any
+/// scope >= 1 row).
+#[test]
+fn migration_survives_the_fault_matrix_for_a_scoped_table_and_equals_the_uninterrupted_twin() {
+    let scopes = [1u64, 2, 3];
+    let rows_per_scope = 4u64;
+    let twin = migrated_scoped_twin(rows_per_scope, &scopes);
+    run_universes_swarm_with!(
+        0x2EB7_5000,
+        128,
+        |_cfg: &mut FaultConfig| {},
+        |sim: &mut Sim| {
+            if !seed_scoped_v1_result(sim, rows_per_scope, &scopes)? {
+                sim.cover("migrations:scoped-inconclusive");
+                return Ok(());
+            }
+            let db_cfg = DbConfig {
+                migration_batch_size: 3,
+                ..cfg()
+            };
+            let Some(db) = open_and_migrate_scoped_with_remedy(sim, db_cfg)? else {
+                sim.cover("migrations:scoped-inconclusive");
+                return Ok(());
+            };
+            sim.cover("migrations:scoped-resumed-to-completion");
+            let mut rows = db
+                .snapshot()
+                .map_err(|e| e.to_string())?
+                .scan_raw(ScopedWidgetV2::TABLE, true)
+                .map_err(|e| e.to_string())?;
+            rows.sort();
+            let got: Vec<(u64, u64, u32, String)> = rows
+                .into_iter()
+                .map(|(scope, id, bytes)| {
+                    let r = <ScopedWidgetV2 as Row>::decode_row(&bytes).map_err(|e| e.to_string())?;
+                    Ok::<_, String>((scope, id, r.count, r.label))
+                })
+                .collect::<Result<_, String>>()?;
+            if got != twin {
+                let corruption_fired = charpente_sim::checks::durable_corruption_fired(sim);
+                if corruption_fired && got.iter().all(|row| twin.contains(row)) {
+                    sim.cover("migrations:scoped-corruption-excused");
+                    return Ok(());
+                }
+                return Err(format!(
+                    "faulted universe's migrated scoped store diverged from the uninterrupted \
+                     twin: got {got:?}"
+                ));
+            }
+            Ok(())
+        },
+        require: ["migrations:scoped-resumed-to-completion"]
+    );
 }

@@ -756,7 +756,7 @@ fn scoped_by_macro_output_stores_under_the_composite_key() {
 
     let snap = store.snapshot().unwrap();
     let rows = snap
-        .scan_raw(ScopedWidget::TABLE)
+        .scan_raw(ScopedWidget::TABLE, true)
         .expect("scan_raw must learn the [u8;16] key shape rather than erroring");
     let scopes_and_ids: Vec<(u64, u64)> = rows.iter().map(|(s, id, _)| (*s, *id)).collect();
     assert_eq!(
@@ -770,7 +770,7 @@ fn scoped_by_macro_output_stores_under_the_composite_key() {
         .apply(1, |w| w.delete::<ScopedWidget>(7, Id::from_raw(1)))
         .expect("a scoped delete through the macro-generated Row impl must not error");
     let snap = store.snapshot().unwrap();
-    let rows = snap.scan_raw(ScopedWidget::TABLE).unwrap();
+    let rows = snap.scan_raw(ScopedWidget::TABLE, true).unwrap();
     assert!(
         rows.is_empty(),
         "the deleted row must not survive the scan: {rows:?}"

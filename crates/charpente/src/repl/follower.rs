@@ -30,8 +30,10 @@ pub(crate) struct SeedStart {
 }
 
 /// The buffered snapshot stream: one `(table, rows)` entry per
-/// `SnapshotRows` message, in arrival (= schema walk) order. Each row is
-/// `(scope, id, row bytes)` (tenant-scoping Task 6c).
+/// `SnapshotRows`/`ScopedSnapshotRows` message, in arrival (= schema walk)
+/// order. Each row is `(scope, id, row bytes)` — `scope` is
+/// `table::UNSCOPED` for a row that arrived on the unscoped `SnapshotRows`
+/// wire shape.
 pub(crate) type SeedRows = Vec<(String, Vec<(u64, u64, Vec<u8>)>)>;
 
 /// The follower's replication client.
@@ -271,12 +273,52 @@ impl Follower {
                 Ok(())
             }
             Msg::SnapshotRows { table, rows } => {
+                if db.table_scoped(&table)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "SnapshotRows arrived for table \"{table}\", which this node's \
+                             schema says is tenant-scoped — the primary sent the unscoped \
+                             shape (tag 5) for a table this binary expects as \
+                             ScopedSnapshotRows (tag 14); reconnect once both sides run a \
+                             schema that agrees on this table's scope"
+                        ),
+                    ));
+                }
+                let rows: Vec<(u64, u64, Vec<u8>)> = rows
+                    .into_iter()
+                    .map(|(id, bytes)| (charpente_core::table::UNSCOPED, id, bytes))
+                    .collect();
                 match self.seed.as_mut() {
                     Some(seed) if !seed.complete => seed.rows.push((table, rows)),
                     _ => {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "SnapshotRows arrived with no open seed — protocol drift",
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Msg::ScopedSnapshotRows { table, rows } => {
+                if !db.table_scoped(&table)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "ScopedSnapshotRows arrived for table \"{table}\", which this \
+                             node's schema says is NOT tenant-scoped — the primary sent the \
+                             scoped shape (tag 14) for a table this binary expects as \
+                             SnapshotRows (tag 5); reconnect once both sides run a schema \
+                             that agrees on this table's scope"
+                        ),
+                    ));
+                }
+                match self.seed.as_mut() {
+                    Some(seed) if !seed.complete => seed.rows.push((table, rows)),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "ScopedSnapshotRows arrived with no open seed — protocol drift",
                         ));
                     }
                 }
