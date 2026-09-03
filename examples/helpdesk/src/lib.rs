@@ -4,10 +4,13 @@
 
 use charpente::auth::ApiKey;
 use charpente::core::io::{Disk, Entropy};
+use charpente::core::migration::{MigrationError, TableMigration};
 use charpente::core::table::Codec;
 use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, Subscription};
 use charpente::kernel::JobError;
-use charpente::{Id, Schema, Tx, View, Wire, event, events, job, jobs, route, routes, table};
+use charpente::{
+    Id, Schema, Tx, View, Wire, event, events, job, jobs, route, routes, row_shape, table,
+};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::time::Duration;
@@ -70,7 +73,65 @@ impl Codec for TicketState {
     }
 }
 
-#[table]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TicketPriority {
+    Low,
+    Normal,
+    High,
+    Urgent,
+}
+
+impl TicketPriority {
+    fn as_str(&self) -> &'static str {
+        match self {
+            TicketPriority::Low => "Low",
+            TicketPriority::Normal => "Normal",
+            TicketPriority::High => "High",
+            TicketPriority::Urgent => "Urgent",
+        }
+    }
+}
+
+impl Codec for TicketPriority {
+    fn encode(&self, out: &mut Vec<u8>) {
+        let tag: u8 = match self {
+            TicketPriority::Low => 0,
+            TicketPriority::Normal => 1,
+            TicketPriority::High => 2,
+            TicketPriority::Urgent => 3,
+        };
+        tag.encode(out);
+    }
+
+    fn decode(input: &mut &[u8]) -> io::Result<Self> {
+        match u8::decode(input)? {
+            0 => Ok(TicketPriority::Low),
+            1 => Ok(TicketPriority::Normal),
+            2 => Ok(TicketPriority::High),
+            3 => Ok(TicketPriority::Urgent),
+            other => Err(io::Error::other(format!(
+                "invalid TicketPriority tag {other} — schema drift or corruption"
+            ))),
+        }
+    }
+}
+
+/// The superseded shape (GUIDE §12) — kept only so `TableMigration::migrate`
+/// can decode bytes an older binary wrote. No `#[index]`, no redb
+/// registration: `Ticket` shipped at this exact shape as its own, separate
+/// commit before `priority` existed.
+#[row_shape(version = 1)]
+pub struct TicketV1 {
+    pub id: Id<TicketV1>,
+    pub org: Id<Org>,
+    pub state: TicketState,
+    pub opener_subject: String,
+    pub title: String,
+    pub body: String,
+    pub pending_since_hour: Option<u64>,
+}
+
+#[table(version = 2)]
 pub struct Ticket {
     pub id: Id<Ticket>,
     #[index]
@@ -84,6 +145,23 @@ pub struct Ticket {
     /// moment this ticket last became Pending — there is no wall clock in v0,
     /// so "older than 4 hours" is measured against this counter, not real time.
     pub pending_since_hour: Option<u64>,
+    pub priority: TicketPriority,
+}
+
+impl TableMigration for Ticket {
+    type Prev = TicketV1;
+    fn migrate(prev: TicketV1) -> Result<Ticket, MigrationError> {
+        Ok(Ticket {
+            id: Id::from_raw(prev.id.raw()),
+            org: prev.org,
+            state: prev.state,
+            opener_subject: prev.opener_subject,
+            title: prev.title,
+            body: prev.body,
+            pending_since_hour: prev.pending_since_hour,
+            priority: TicketPriority::Normal, // the field's required default
+        })
+    }
 }
 
 #[table]
@@ -322,6 +400,7 @@ pub struct TicketView {
     pub state: String,
     pub title: String,
     pub body: String,
+    pub priority: String,
 }
 
 impl From<Ticket> for TicketView {
@@ -332,6 +411,7 @@ impl From<Ticket> for TicketView {
             state: row.state.as_str().to_string(),
             title: row.title,
             body: row.body,
+            priority: row.priority.as_str().to_string(),
         }
     }
 }
@@ -470,6 +550,7 @@ fn create_ticket(
         title: body.title,
         body: body.body,
         pending_since_hour: None,
+        priority: TicketPriority::Normal,
     };
     tx.put(&ticket);
     tx.emit_keyed(org.raw().to_string(), TicketOpened { ticket: id });
@@ -616,6 +697,7 @@ pub fn build_app(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> io::Result<A
             .table::<Org>()
             .table::<Agent>()
             .table::<Ticket>()
+            .migration::<Ticket>("Ticket")
             .table::<Comment>()
             .table::<Survey>()
             .table::<SlaReminder>()

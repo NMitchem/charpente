@@ -111,6 +111,7 @@ fn drive_tickets() -> impl FnMut(&mut Sim) -> Result<Vec<String>, String> {
                     title: "t".to_string(),
                     body: "b".to_string(),
                     pending_since_hour: None,
+                    priority: helpdesk::TicketPriority::Normal,
                 });
                 Ok::<_, std::io::Error>(())
             })
