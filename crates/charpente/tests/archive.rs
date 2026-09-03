@@ -20,7 +20,7 @@ use charpente::wire::WireU64;
 use charpente::{Db, DbConfig, Id, Schema, Seeder, Wire, event, job, table};
 use charpente_core::crc::crc32;
 use charpente_core::io::{ObjectDone, ObjectOp, ObjectStore};
-use charpente_core::table::Row;
+use charpente_core::table::{Codec, IndexDef, Row};
 use charpente_sim::object::SimObjectStore;
 use charpente_sim::{FaultConfig, Sim};
 
@@ -7206,8 +7206,94 @@ const CONV_CHAINED_FLOOR: u64 = 169;
 /// this is the measured-rate companion, reported per batch.
 const CONV_SUBSTANTIAL_ROWS: u64 = 200;
 
+/// The convergence swarm's tenant-scoped, secondary-indexed table (hard rule
+/// 3). Task 6c changed the archive's batch shape and `charpente restore` to
+/// carry a scope; under an unscoped schema no universe here can express a
+/// restore that drops one, so this table rides the swarm's own object-fault
+/// and crash schedule.
+///
+/// Hand-written rather than `#[table(scoped_by = …)]` for its scope type's
+/// `Error`: the workload's transactions return `Infallible`, which is what
+/// makes "the app never rejects" a type-level fact in this property, and the
+/// macro's const assert wants the platform's `ApiError` shape.
+///
+/// `marker` derives from the tenant, so a collapsed row is detectable by its
+/// CONTENT and not only by the key it was found under.
+struct ConvOrg;
+
+struct ConvLedger {
+    id: Id<ConvLedger>,
+    bucket: u32,
+    marker: u64,
+}
+
+impl Row for ConvLedger {
+    type Scope = ConvOrg;
+    const TABLE: &'static str = "ConvLedger";
+    const INDEXES: &'static [IndexDef<ConvLedger>] = &[IndexDef {
+        name: "bucket",
+        key: |r, out| r.bucket.encode(out),
+    }];
+    fn id(&self) -> Id<ConvLedger> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.bucket.encode(out);
+        self.marker.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<ConvLedger> {
+        let input = &mut &bytes[..];
+        Ok(ConvLedger {
+            id: Id::decode(input)?,
+            bucket: u32::decode(input)?,
+            marker: u64::decode(input)?,
+        })
+    }
+}
+
+impl charpente::Tenant for ConvOrg {
+    type Who = str;
+    type Error = std::convert::Infallible;
+
+    /// Always allows: this property is about the archive and restore paths
+    /// carrying the scope, not about the app's membership check —
+    /// `charpente/tests/tenant.rs` owns the refusing case.
+    fn authorize(
+        _tx: &charpente::Tx,
+        _who: Option<&str>,
+        _scope: Id<ConvOrg>,
+    ) -> Result<(), std::convert::Infallible> {
+        Ok(())
+    }
+}
+
+/// The two tenants, and the ledger id they SHARE. Record `2k` writes tenant
+/// 1's ledger id `k` and record `2k + 1` writes tenant 2's — so every ledger
+/// id is held by both tenants, and each `(tenant, id)` pair is written exactly
+/// once, which keeps the workload's append-only "row `n` came from record `n`"
+/// correspondence that every anchor in this property rests on.
+const CONV_TENANTS: [u64; 2] = [1, 2];
+const CONV_MARKER_STRIDE: u64 = 1_000_000;
+
+fn conv_marker(tenant: u64, id: u64) -> u64 {
+    tenant * CONV_MARKER_STRIDE + id
+}
+
+/// The record that wrote ledger row `(scope, id)` — the cut `conv_verify_
+/// restored` applies to the source, since the source may have committed past
+/// the archived frontier.
+///
+/// A scope that is not one of the two tenants answers `0`, which KEEPS the row
+/// in the comparison rather than cutting it: a collapsed scope is the failure
+/// this property exists to catch, and a cut that swallowed it would hide it.
+fn conv_ledger_writer(scope: u64, id: u64) -> u64 {
+    let slot = CONV_TENANTS.iter().position(|&t| t == scope).unwrap_or(0) as u64;
+    id * 2 + slot
+}
+
 fn conv_schema() -> Schema {
-    Schema::new().table::<Rec>()
+    Schema::new().table::<Rec>().table::<ConvLedger>()
 }
 
 fn conv_db_config() -> DbConfig {
@@ -7764,6 +7850,7 @@ fn conv_verify_restored(
         )));
     }
     conv_check_anchors(&dst, records, pending_jobs)?;
+    conv_check_tenants(&dst, sim)?;
 
     // The source's state AT the archived frontier. Each of the three tables
     // that grows with the workload is cut by its own WORKLOAD-side counter:
@@ -7783,19 +7870,25 @@ fn conv_verify_restored(
         .map_err(|e| conv_read_fail("reading the source Db", e))?
         .into_iter()
         .map(|(name, rows)| {
-            let cut = match name.as_str() {
-                n if n == Rec::TABLE => Some(records),
-                "charpente.events" => Some(records),
-                "charpente.jobs" => Some(pending_jobs),
-                _ => None,
+            // `ConvLedger` is cut by the RECORD that wrote each row, not by
+            // the row's own id: its ids are shared between two tenants, so
+            // `(scope, id)` and not `id` alone says which record produced it.
+            let rows = match name.as_str() {
+                n if n == Rec::TABLE || n == "charpente.events" => rows
+                    .into_iter()
+                    .filter(|(_, id, _)| *id < records)
+                    .collect(),
+                "charpente.jobs" => rows
+                    .into_iter()
+                    .filter(|(_, id, _)| *id < pending_jobs)
+                    .collect(),
+                n if n == ConvLedger::TABLE => rows
+                    .into_iter()
+                    .filter(|(scope, id, _)| conv_ledger_writer(*scope, *id) < records)
+                    .collect(),
+                _ => rows,
             };
-            match cut {
-                Some(cut) => (
-                    name,
-                    rows.into_iter().filter(|(_, id, _)| *id < cut).collect(),
-                ),
-                None => (name, rows),
-            }
+            (name, rows)
         })
         .collect();
     if dst_rows != src_rows {
@@ -7810,6 +7903,57 @@ fn conv_verify_restored(
             names(&dst_rows),
             names(&src_rows)
         )));
+    }
+    Ok(())
+}
+
+/// The restored destination's own tenant oracle, on stored composite keys:
+/// each tenant's slice holds only its own rows, through the row range and
+/// through the scoped index. The structural comparison above catches a
+/// restore that collapses one side only; this catches a collapse that is
+/// symmetric between source and destination, and it names the tenant that
+/// lost its rows rather than a row count.
+fn conv_check_tenants(dst: &Db, sim: &Sim) -> Result<(), ConvFail> {
+    let snap = dst
+        .snapshot()
+        .map_err(|e| conv_read_fail("snapshotting the restored Db", e))?;
+    let mut populated = 0;
+    for tenant in CONV_TENANTS {
+        let rows = snap
+            .scan_scoped::<ConvLedger>(tenant)
+            .map_err(|e| conv_read_fail("reading a restored tenant", e))?;
+        if !rows.is_empty() {
+            populated += 1;
+        }
+        for row in &rows {
+            if row.marker / CONV_MARKER_STRIDE != tenant {
+                return Err(ConvFail::Violation(format!(
+                    "the restored Db's tenant {tenant} holds id {} marked for tenant {}",
+                    row.id.raw(),
+                    row.marker / CONV_MARKER_STRIDE
+                )));
+            }
+        }
+        for bucket in 0..3u32 {
+            for row in snap
+                .scan_by_scoped::<ConvLedger>(tenant, "bucket", &bucket)
+                .map_err(|e| conv_read_fail("reading a restored tenant's index", e))?
+            {
+                if row.marker / CONV_MARKER_STRIDE != tenant {
+                    return Err(ConvFail::Violation(format!(
+                        "the restored Db's tenant {tenant} index bucket {bucket} returned id {} \
+                         marked for tenant {}",
+                        row.id.raw(),
+                        row.marker / CONV_MARKER_STRIDE
+                    )));
+                }
+            }
+        }
+    }
+    if populated > 1 {
+        // A single-tenant restore cannot express a collapse at all — every
+        // row legitimately belongs to the only tenant.
+        sim.cover("tenant:restored-multi-tenant");
     }
     Ok(())
 }
@@ -7967,6 +8111,17 @@ fn archive_convergence_universe(sim: &mut Sim) -> Result<(), String> {
                         id: Id::from_raw(id),
                         value: id,
                     });
+                    // One scoped write per record, alternating tenants over a
+                    // shared ledger id. One scope per transaction (spec §8),
+                    // and one record per commit either way, so the workload's
+                    // seq-to-id correspondence is untouched.
+                    let tenant = CONV_TENANTS[(id % 2) as usize];
+                    tx.open_scope(Id::<ConvOrg>::from_raw(tenant), None)?
+                        .put(&ConvLedger {
+                            id: Id::from_raw(id / 2),
+                            bucket: ((id / 2) % 3) as u32,
+                            marker: conv_marker(tenant, id / 2),
+                        });
                     tx.emit(Ping { n: WireU64(id) });
                     if with_job {
                         tx.enqueue(Resurrect { slot: id });
@@ -8552,6 +8707,7 @@ fn archive_converges() {
             "archive:generation_reclaimed",
             "archive:delete_failed",
             "archive:restored_after_delete_failure",
+            "tenant:restored-multi-tenant",
         ],
         floor: [
             ("archive:restored", CONV_RESTORED_FLOOR),

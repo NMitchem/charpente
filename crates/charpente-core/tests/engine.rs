@@ -744,7 +744,7 @@ fn two_tenants_rows_survive_each_other_under_the_composite_key() {
 /// from `UNSCOPED`, and the caller's mistaken belief that the row is
 /// isolated by tenant would go uncaught.
 #[test]
-#[should_panic(expected = "is not tenant-scoped")]
+#[should_panic(expected = "Writer::put: table \"charpente.jobs\" is not tenant-scoped")]
 fn an_unscoped_put_with_a_nonzero_scope_panics() {
     let sim = Sim::with_faults(0x7A2E_0009, FaultConfig::none());
     let store = Store::open(&sim.disk(), "store.redb").unwrap();

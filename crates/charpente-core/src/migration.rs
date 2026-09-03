@@ -247,9 +247,9 @@ mod tests {
         assert_eq!(SchemaVersion::decode_row(&bytes).unwrap(), row);
     }
 
-    /// Fix round 1, Important 2: idle rows ([0]) are byte-identical in both
-    /// the pre-scoped-tables and the composite-watermark shape — no format
-    /// change touches a table that was never mid-migration.
+    /// Idle rows ([0]) are byte-identical in both the pre-scoped-tables and
+    /// the composite-watermark shape — no format change touches a table that
+    /// was never mid-migration.
     #[test]
     fn schema_version_idle_row_bytes_are_unchanged_by_the_composite_watermark() {
         let row = SchemaVersion {
@@ -269,12 +269,11 @@ mod tests {
         assert_eq!(SchemaVersion::decode_row(&bytes).unwrap(), row);
     }
 
-    /// Fix round 1, Important 2: a mid-migration row written by a binary
-    /// before scoped tables (a bare `id: u64` watermark) is refused by
-    /// name, not misdecoded as a composite `(scope, id)` — the length-based
-    /// discriminator in `decode_row`. Literal bytes, not a round trip
-    /// through the current encoder (which can no longer produce this
-    /// shape).
+    /// A mid-migration row written by a binary before scoped tables (a bare
+    /// `id: u64` watermark) is refused by name, not misdecoded as a composite
+    /// `(scope, id)` — the length-based discriminator in `decode_row`. Literal
+    /// bytes, not a round trip through the current encoder (which can no
+    /// longer produce this shape).
     #[test]
     fn an_old_shape_mid_migration_row_is_refused_by_name() {
         let mut bytes = Vec::new();

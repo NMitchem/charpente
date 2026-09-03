@@ -1438,9 +1438,9 @@ mod tests {
         );
     }
 
-    /// Fix round 1, Important 3: an unscoped table's batch bytes are
-    /// byte-identical to what `a2d8bbb` (before this fix round) produced —
-    /// derived by hand from that commit's encoder, not from the live one.
+    /// An unscoped table's batch bytes are byte-identical to what the v1
+    /// encoder (`a2d8bbb`) produced — derived by hand from that commit's
+    /// encoder, not from the live one.
     /// `[count: u32 le][id: u64 le, len: u32 le, bytes]*[crc32 le]`.
     #[test]
     fn an_unscoped_snapshot_batch_matches_the_a2d8bbb_literal_bytes() {
@@ -1455,8 +1455,8 @@ mod tests {
         assert_eq!(bytes, expected);
     }
 
-    /// Fix round 1, Important 3: a scoped table's batch bytes lead with the
-    /// sentinel, never producible by an `a2d8bbb` (v1) encoder.
+    /// A scoped table's batch bytes lead with the sentinel, never producible
+    /// by an `a2d8bbb` (v1) encoder.
     #[test]
     fn a_scoped_snapshot_batch_leads_with_the_sentinel_then_the_real_count() {
         let rows = vec![(9u64, 7u64, vec![4u8, 5])];
@@ -1467,10 +1467,10 @@ mod tests {
         assert_eq!(&bytes[16..24], &7u64.to_le_bytes()); // id
     }
 
-    /// Fix round 1, Important 3 (review case (c)): a v1 (unscoped-shaped)
-    /// batch whose old id 7 happens to sit where a scoped decode would read
-    /// a scope must still decode as id 7 at `UNSCOPED` when the schema says
-    /// this table is unscoped — never as "tenant 7". Literal a2d8bbb-shaped
+    /// A v1 (unscoped-shaped) batch whose old id 7 happens to sit where a
+    /// scoped decode would read a scope must still decode as id 7 at
+    /// `UNSCOPED` when the schema says this table is unscoped — never as
+    /// "tenant 7". Literal a2d8bbb-shaped
     /// bytes, not a round trip through the current encoder.
     #[test]
     fn an_old_v1_batch_decodes_the_old_id_never_as_a_fabricated_tenant() {
@@ -1491,9 +1491,9 @@ mod tests {
         );
     }
 
-    /// Fix round 1, Important 3: this binary's schema says `table` is
-    /// scoped, but the archive object is the v1 (unscoped) shape — refused
-    /// by name, not silently read as every row at scope 0.
+    /// This binary's schema says `table` is scoped, but the archive object is
+    /// the v1 (unscoped) shape — refused by name, not silently read as every
+    /// row at scope 0.
     #[test]
     fn a_v1_batch_read_as_scoped_is_refused_by_name() {
         let bytes = encode_snapshot_batch(false, &[(charpente_core::table::UNSCOPED, 7, vec![1])]);

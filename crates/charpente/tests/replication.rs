@@ -899,6 +899,175 @@ fn convergence_universe(sim: &mut Sim) -> Result<(), String> {
 
 // ------------------------------------------------------- property: seed
 
+/// The seeding swarm's tenant-scoped, secondary-indexed table (hard rule 3).
+/// Task 6c's carrier paths — `Seeder::rows`, `Msg::ScopedSnapshotRows` (tag
+/// 14) and both follower refusals — move a scope across the wire, and a
+/// follower that dropped it merges every tenant into tenant 0. Under an
+/// unscoped schema no universe here can express that, so this table rides the
+/// seeding property's own fault schedule.
+///
+/// Hand-written rather than `#[table(scoped_by = …)]`, matching
+/// `ScopedSeedItem` above: this file's fixtures are hand-written `Row` impls,
+/// and the macro's const assert wants the platform's `Principal`/`ApiError`
+/// shape while these nodes drive `Db` directly with no `Ctx`.
+///
+/// `marker` derives from the tenant, so a leaked or collapsed row is
+/// detectable by its CONTENT and not only by the key it was found under.
+struct SeedLedger {
+    id: Id<SeedLedger>,
+    bucket: u32,
+    marker: u64,
+}
+
+impl Row for SeedLedger {
+    type Scope = SeedOrg;
+    const TABLE: &'static str = "SeedLedger";
+    const INDEXES: &'static [IndexDef<SeedLedger>] = &[IndexDef {
+        name: "bucket",
+        key: |r, out| r.bucket.encode(out),
+    }];
+    fn id(&self) -> Id<SeedLedger> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.bucket.encode(out);
+        self.marker.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<SeedLedger> {
+        let input = &mut &bytes[..];
+        Ok(SeedLedger {
+            id: Id::decode(input)?,
+            bucket: u32::decode(input)?,
+            marker: u64::decode(input)?,
+        })
+    }
+}
+
+impl charpente::Tenant for SeedOrg {
+    type Who = str;
+    type Error = io::Error;
+
+    /// Always allows: this property is about the seed path carrying the
+    /// scope, not about the app's membership check —
+    /// `charpente/tests/tenant.rs` owns the refusing case.
+    fn authorize(
+        _tx: &charpente::Tx,
+        _who: Option<&str>,
+        _scope: Id<SeedOrg>,
+    ) -> Result<(), io::Error> {
+        Ok(())
+    }
+}
+
+/// The two tenants, and the id space they SHARE. Ids collide across tenants
+/// on purpose: a collapse to one scope is only expressible when two tenants
+/// hold the same id, which is exactly why a single-tenant seed proves nothing.
+const SEED_TENANTS: [u64; 2] = [1, 2];
+const SEED_LEDGER_IDS: u64 = 5;
+const SEED_MARKER_STRIDE: u64 = 1_000_000;
+
+fn seed_marker(tenant: u64, id: u64) -> u64 {
+    tenant * SEED_MARKER_STRIDE + id
+}
+
+fn seeding_schema() -> Schema {
+    make_schema().table::<SeedLedger>()
+}
+
+/// `commit_widget`'s scoped counterpart, same best-effort contract: the two
+/// tenants write the SAME id, one transaction each, so every seed the follower
+/// takes carries two scopes for one id — and a crash can land between them.
+/// One transaction per tenant because a transaction opens one scope (spec §8).
+fn commit_scoped(sim: &Sim, node: &mut Node, i: u64) -> Result<(), String> {
+    let id = i % SEED_LEDGER_IDS;
+    for tenant in SEED_TENANTS {
+        let Some(db) = node.db.as_mut() else {
+            return Ok(());
+        };
+        let r = db.transact(|tx| {
+            tx.open_scope(Id::<SeedOrg>::from_raw(tenant), None)?
+                .put(&SeedLedger {
+                    id: Id::from_raw(id),
+                    bucket: (id % 3) as u32,
+                    marker: seed_marker(tenant, id),
+                });
+            Ok::<(), io::Error>(())
+        });
+        match r {
+            Ok(()) => {}
+            Err(TxError::App(e)) => return Err(format!("scoped commit rejected: {e}")),
+            Err(e) => {
+                let msg = format!("{e:?}");
+                if !is_fault_fallout(&msg) {
+                    return Err(format!("scoped commit failed non-injected: {msg}"));
+                }
+                recover_node(sim, node)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The tenant oracle on the FOLLOWER's own store, after it converged through
+/// the snapshot path: each tenant's slice holds its own rows under its own
+/// scope. `assert_converged` already proves p and f agree byte for byte on
+/// `scan_raw`, which catches a follower-only collapse; this catches the case
+/// that check cannot see — a scope the seed path drops on both sides, or a
+/// tenant that lands whole under another's key.
+fn follower_kept_its_tenants(sim: &Sim, f: &Node) -> Result<(), String> {
+    let fdb = f.db.as_ref().ok_or("f has no db")?;
+    let snap = fdb.snapshot().map_err(|e| format!("f: {e}"))?;
+    let mut seen_any = false;
+    for tenant in SEED_TENANTS {
+        let rows = snap
+            .scan_scoped::<SeedLedger>(tenant)
+            .map_err(|e| format!("f: {e}"))?;
+        for row in &rows {
+            seen_any = true;
+            if row.marker / SEED_MARKER_STRIDE != tenant {
+                return Err(format!(
+                    "follower's tenant {tenant} holds id {} marked for tenant {}",
+                    row.id.raw(),
+                    row.marker / SEED_MARKER_STRIDE
+                ));
+            }
+        }
+        // The index carries the scope prefix too (spec §5's worst failure
+        // mode is a forgotten index prefix, and the seed rebuilds indexes).
+        for bucket in 0..3u32 {
+            for row in snap
+                .scan_by_scoped::<SeedLedger>(tenant, "bucket", &bucket)
+                .map_err(|e| format!("f: {e}"))?
+            {
+                if row.marker / SEED_MARKER_STRIDE != tenant {
+                    return Err(format!(
+                        "follower's tenant {tenant} index bucket {bucket} returned id {} marked \
+                         for tenant {}",
+                        row.id.raw(),
+                        row.marker / SEED_MARKER_STRIDE
+                    ));
+                }
+            }
+        }
+    }
+    if seen_any {
+        // Both tenants present at once is what makes the collapse expressible;
+        // a universe whose faults left the ledger empty proves nothing here.
+        let populated = SEED_TENANTS
+            .iter()
+            .filter(|&&t| {
+                snap.scan_scoped::<SeedLedger>(t)
+                    .is_ok_and(|rows| !rows.is_empty())
+            })
+            .count();
+        if populated > 1 {
+            sim.cover("tenant:seeded-multi-tenant");
+        }
+    }
+    Ok(())
+}
+
 fn seeding_db_cfg() -> DbConfig {
     DbConfig {
         wal: WalConfig {
@@ -915,17 +1084,32 @@ fn seeding_db_cfg() -> DbConfig {
 
 #[test]
 fn late_follower_seeds_below_the_gcd_base_and_converges() {
-    run_universes_swarm_with!(0x2EB1_0002, 256, no_media_corruption, |sim: &mut Sim| {
-        let r = seeding_universe(sim);
-        finish_universe(sim, r)
-    });
+    run_universes_swarm_with!(
+        0x2EB1_0002,
+        256,
+        no_media_corruption,
+        |sim: &mut Sim| {
+            let r = seeding_universe(sim);
+            finish_universe(sim, r)
+        },
+        require: ["tenant:seeded-multi-tenant"]
+    );
 }
 
 fn seeding_universe(sim: &mut Sim) -> Result<(), String> {
-    let mut p = spawn_node(sim, "p", primary_cfg("p:1"), seeding_db_cfg())?;
+    let mut p = spawn_node_with_schema(
+        sim,
+        "p",
+        primary_cfg("p:1"),
+        seeding_db_cfg(),
+        seeding_schema(),
+    )?;
     // Commit far enough that checkpoint-driven GC moves the base past 0.
     for i in 0..60u64 {
         commit_widget(sim, &mut p, i)?;
+        // A two-tenant scoped write beside every unscoped one, so the scope
+        // rides the same crash schedule the rest of the seed does.
+        commit_scoped(sim, &mut p, i)?;
     }
     let base = p.db.as_ref().map_or(0, |d| d.log_base());
     if base == 0 {
@@ -937,7 +1121,13 @@ fn seeding_universe(sim: &mut Sim) -> Result<(), String> {
 
     // A fresh, empty follower: its next needed seq (0) is below p's base, so
     // the session must take the snapshot path.
-    let mut f = spawn_node(sim, "f", follower_cfg("f:1", "p:1"), seeding_db_cfg())?;
+    let mut f = spawn_node_with_schema(
+        sim,
+        "f",
+        follower_cfg("f:1", "p:1"),
+        seeding_db_cfg(),
+        seeding_schema(),
+    )?;
     run_until(sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET)?;
 
     if total_seeds(&f) == 0 {
@@ -947,7 +1137,8 @@ fn seeding_universe(sim: &mut Sim) -> Result<(), String> {
     if f.db.as_ref().map_or(0, |d| d.log_base()) == 0 {
         return Err("a seeded follower's WAL base must be above 0".to_string());
     }
-    assert_converged(sim, &mut p, &mut f)
+    assert_converged(sim, &mut p, &mut f)?;
+    follower_kept_its_tenants(sim, &f)
 }
 
 /// Sim-found bug, seed 0xcaef83b2feb5edf5 (this file's seeding property):

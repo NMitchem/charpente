@@ -1,0 +1,25 @@
+error[E0277]: the trait bound `Org: table::sealed::NotATenant` is not satisfied
+  --> tests/compile_fail/no_tenant_impl_from_an_app.rs:32:28
+   |
+32 | impl NoTenant<Invoice> for Org {}
+   |                            ^^^ unsatisfied trait bound
+   |
+help: the trait `table::sealed::NotATenant` is not implemented for `Org`
+  --> tests/compile_fail/no_tenant_impl_from_an_app.rs:12:1
+   |
+12 | #[table]
+   | ^^^^^^^^
+help: the trait `table::sealed::NotATenant` is implemented for `Unscoped`
+  --> $WORKSPACE/crates/charpente-core/src/table.rs
+   |
+   | impl sealed::NotATenant for Unscoped {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `NoTenant`
+  --> $WORKSPACE/crates/charpente-core/src/table.rs
+   |
+   | pub trait NoTenant<R>: sealed::NotATenant {}
+   |                        ^^^^^^^^^^^^^^^^^^ required by this bound in `NoTenant`
+   = note: `NoTenant` is a "sealed trait", because to implement it you also need to implement `charpente::charpente_core::table::sealed::NotATenant`, which is not accessible; this is usually done to force you to use one of the provided types that already implement it
+   = help: the following type implements the trait:
+             charpente::charpente_core::table::Unscoped
+   = note: this error originates in the attribute macro `table` (in Nightly builds, run with -Z macro-backtrace for more info)

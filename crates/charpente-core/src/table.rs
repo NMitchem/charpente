@@ -355,6 +355,13 @@ pub trait Row: Sized + 'static {
 /// fix is the literal line to type — real scope, real table, nothing left
 /// to substitute. That is the whole of its job; it is not an extension
 /// point.
+///
+/// SEALED, by a supertrait no other crate can name. Without the seal an app
+/// writes one safe line — `impl NoTenant<Invoice> for Org {}`, legal under
+/// the orphan rules because `Org` is local — and `Invoice: UnscopedRow`
+/// holds, `View`'s bound is satisfied, and a scoped read compiles on a bare
+/// `Tx`. Spec §7's exit criterion 1 is a compile error, so the marker that
+/// carries it cannot be an opt-out.
 #[diagnostic::on_unimplemented(
     message = "`{R}` is a tenant-scoped table (`#[table(scoped_by = {Self})]`) and a bare `Tx` \
                names no tenant",
@@ -364,9 +371,18 @@ pub trait Row: Sized + 'static {
             let tx = tx.scope::<{Self}>(scope, ctx)?;\n    \
             tx.scan::<{R}>()?"
 )]
-pub trait NoTenant<R> {}
+pub trait NoTenant<R>: sealed::NotATenant {}
 
 impl<R> NoTenant<R> for Unscoped {}
+
+/// The seal. Private, so `NoTenant`'s supertrait obligation is unsatisfiable
+/// outside this crate however the orphan rules fall — the only scope type
+/// that will ever carry it is `Unscoped`.
+mod sealed {
+    pub trait NotATenant {}
+}
+
+impl sealed::NotATenant for Unscoped {}
 
 /// A table with no tenant scope, and so one an `Id<R>` alone can address.
 /// Implemented for exactly the `Row`s whose `Scope` is `Unscoped`, derived
@@ -1012,8 +1028,8 @@ impl Writer<'_> {
     /// must be a compile error at every call site, not a silently-defaulted
     /// zero. Every existing caller — inside this crate and
     /// `crates/charpente/tests/typed_tables.rs`, which drives `Writer`
-    /// directly — passes `UNSCOPED` explicitly; Task 7's `tx.scope()` is the
-    /// only thing that will ever produce another value. For an unscoped `R`,
+    /// directly — passes `UNSCOPED` explicitly; a scoped write reaches here
+    /// only through `ScopedTx`, which carries its tenant. For an unscoped `R`,
     /// `scope` is asserted rather than merely ignored (hard rule 4): a
     /// caller passing a nonzero scope to an unscoped table is a bug the
     /// bare-`u64` key path would otherwise silently swallow.
@@ -1449,7 +1465,7 @@ impl View for Snapshot {
 impl Snapshot {
     /// Task 5 (tenant scoping), ruling R28: `View`'s own `get`/`scan`/
     /// `scan_from` above keep their unscoped signatures unchanged. These
-    /// three methods are the scope-taking primitives a tenant-scoped read
+    /// four methods are the scope-taking primitives a tenant-scoped read
     /// path builds on, and the snapshot level `ScopedTx` reads through:
     /// inherent methods on `Snapshot`, not trait methods, so they sit beside
     /// `get`/`scan`/`scan_from` without touching the `View` trait.

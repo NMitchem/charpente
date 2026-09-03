@@ -386,17 +386,16 @@ enum Effect {
 /// scoped tables exist, two tenants writing the same
 /// app-minted id within one batch would otherwise alias in this map, the
 /// second write silently clobbering the first and read-your-writes
-/// surfacing the wrong tenant's row. `scope` is `UNSCOPED` (`0`) for every
-/// table today, until a caller sets otherwise (Task 7's `tx.scope()` is the
-/// only thing that will) — but `encode_record` already reads it to build a
-/// scoped table's record: a scoped table's default-`0` slot is tenant 0, a
-/// real tenant (R35), not an unset marker.
+/// surfacing the wrong tenant's row. `scope` is `UNSCOPED` (`0`) for an
+/// unscoped table and the tenant `ScopedTx` carries for a scoped one, and
+/// `encode_record` reads it to build a scoped table's record: a scoped
+/// table's `0` slot is tenant 0, a real tenant (R35), not an unset marker.
 type GroupOverlay = BTreeMap<&'static str, BTreeMap<(u64, u64), Option<Vec<u8>>>>;
 
-/// The overlay key's scope slot for a table that is not tenant-scoped —
-/// every table today. Named so the sites that will eventually compute a
-/// real scope (once `#[table(scoped_by = …)]` exists) are exactly the ones
-/// that stop using this constant.
+/// The overlay key's scope slot for a table that is not tenant-scoped.
+/// Named rather than a bare `0` so the sites that compute a real scope for a
+/// `#[table(scoped_by = …)]` table are exactly the ones that do not use this
+/// constant.
 const UNSCOPED: u64 = 0;
 
 /// A transaction's buffered effects: the collapsed per-table overlay
@@ -1124,7 +1123,7 @@ pub trait Tenant: Sized + 'static {
 impl<'a> Tx<'a> {
     /// Opens a tenant scope: the ONLY constructor of `ScopedTx`, and the only
     /// route to the six scope-taking primitives above, which are private.
-    /// `S::authorize` runs first, always — a handler cannot reach a tenant's
+    /// `S::authorize` gates every handle, always — a handler cannot reach a tenant's
     /// rows without the app's own membership check having passed, which is
     /// what makes "one auditable line per handler" structural rather than
     /// conventional (spec §1).
@@ -1151,7 +1150,11 @@ impl<'a> Tx<'a> {
         scope: Id<S>,
         who: Option<&S::Who>,
     ) -> Result<ScopedTx<'_, 'a, S>, S::Error> {
-        S::authorize(self, who, scope)?;
+        // The contract check precedes `authorize`, because it is decidable
+        // without asking the app: a second tenant on this transaction gets no
+        // handle whatever the app would answer, so the app's `authorize` — and
+        // any audit entry or side effect it performs — is never invoked for a
+        // scope no handle is issued for.
         let opening = (TypeId::of::<S>(), std::any::type_name::<S>(), scope.raw());
         if let Some(prev) = self.opened_scope {
             assert!(
@@ -1165,6 +1168,7 @@ impl<'a> Tx<'a> {
                 opening.2
             );
         }
+        S::authorize(self, who, scope)?;
         self.opened_scope = Some(opening);
         Ok(ScopedTx { tx: self, scope })
     }
@@ -1172,9 +1176,9 @@ impl<'a> Tx<'a> {
 
 /// A transaction narrowed to one tenant of one scope type — the only handle
 /// an app has on a scoped table (spec §1). `Tx::open_scope` is the only
-/// constructor and it runs `S::authorize` first, so there is no second way
-/// to reach a scoped row and no way to reach one without the app's own
-/// membership check having run.
+/// constructor and it runs `S::authorize` before it hands one back, so there
+/// is no second way to reach a scoped row and no way to reach one without the
+/// app's own membership check having run.
 ///
 /// Two lifetimes, not one. `'t` is the borrow of the transaction; `'a` is
 /// the transaction's own borrow of the snapshot it reads from. They cannot
