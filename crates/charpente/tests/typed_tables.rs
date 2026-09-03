@@ -731,12 +731,12 @@ fn table_macro_emits_the_declared_scope_type() {
 /// (`charpente-core/tests/engine.rs` has one of those too, since `core`
 /// cannot depend on `charpente` to use the macro itself). Same shape as that
 /// test: a scoped put/delete must not error, and the resulting physical
-/// table must diverge from the bare-`u64`-keyed shape `scan_raw` still
-/// assumes (`scan_raw_from` learns the composite shape in Task 5; `scan_raw`
-/// itself is Task 6c's) — proven by `scan_raw`
-/// failing with a `[u8;16]` key-type mismatch rather than silently reading
-/// nothing back, which is what a bug routing a scoped row through the
-/// unscoped path regardless of `Row::Scope` would look like.
+/// table diverges from the bare-`u64`-keyed shape `scan_raw` tries FIRST —
+/// through Task 6, that meant a `[u8;16]` key-type mismatch; Task 6c teaches
+/// `scan_raw` the same composite-key fallback `scan_raw_from` already had,
+/// so this now proves the divergence by the SUCCESSFUL read carrying the
+/// real `(scope, id)` rather than by the mismatch, and that the row is gone
+/// (not merely unscanned) once deleted.
 #[test]
 fn scoped_by_macro_output_stores_under_the_composite_key() {
     use charpente::core::table::Row;
@@ -753,21 +753,27 @@ fn scoped_by_macro_output_stores_under_the_composite_key() {
             )
         })
         .expect("a scoped put through the macro-generated Row impl must not error");
+
+    let snap = store.snapshot().unwrap();
+    let rows = snap
+        .scan_raw(ScopedWidget::TABLE)
+        .expect("scan_raw must learn the [u8;16] key shape rather than erroring");
+    let scopes_and_ids: Vec<(u64, u64)> = rows.iter().map(|(s, id, _)| (*s, *id)).collect();
+    assert_eq!(
+        scopes_and_ids,
+        vec![(7, 1)],
+        "scan_raw must recover the real (scope, id) from the composite key the macro-generated \
+         Row produces, not UNSCOPED"
+    );
+
     store
         .apply(1, |w| w.delete::<ScopedWidget>(7, Id::from_raw(1)))
         .expect("a scoped delete through the macro-generated Row impl must not error");
-
     let snap = store.snapshot().unwrap();
-    let err = snap
-        .scan_raw(ScopedWidget::TABLE)
-        .expect_err(
-            "a scoped table's physical redb table must be [u8; 16]-keyed, same as \
-             charpente-core/tests/engine.rs's hand-written case",
-        )
-        .to_string();
+    let rows = snap.scan_raw(ScopedWidget::TABLE).unwrap();
     assert!(
-        err.contains("[u8;16]") || err.contains("[u8; 16]"),
-        "expected a [u8;16] key-type mismatch, got: {err}"
+        rows.is_empty(),
+        "the deleted row must not survive the scan: {rows:?}"
     );
 }
 

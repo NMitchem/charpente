@@ -11,14 +11,19 @@
 //! `0x03 [event][payload][key: Option<String>]` emit,
 //! `0x04 [table][id: u64 le][row]` migrate-put,
 //! `0x05 [table][scope: u64 le][row]` scoped put,
-//! `0x06 [table][scope: u64 le][id: u64 le]` scoped delete — strings and
-//! byte fields length-prefixed per the `Codec` layout; `0x07` is the next
-//! free tag. `0x05`/`0x06` are the ONLY tags that carry a scope, chosen by
-//! the table's own `Row::Scope`, not by the scope value (tenant 0 is a
-//! legal tenant, so a scoped table's records always use `0x05`/`0x06`,
-//! never `0x00`/`0x01`, even at scope 0). A binary that does not know a tag
-//! refuses it by name (`decode_record`'s unknown-tag error) rather than
-//! misreading a wider record.
+//! `0x06 [table][scope: u64 le][id: u64 le]` scoped delete,
+//! `0x07 [table][scope: u64 le][id: u64 le][row]` scoped migrate-put —
+//! strings and byte fields length-prefixed per the `Codec` layout; `0x08` is
+//! the next free tag. `0x05`/`0x06`/`0x07` are the ONLY tags that carry a
+//! scope, chosen by the table's own `Row::Scope`, not by the scope value
+//! (tenant 0 is a legal tenant, so a scoped table's records always use
+//! `0x05`/`0x06`/`0x07`, never `0x00`/`0x01`/`0x04`, even at scope 0). A
+//! binary that does not know a tag refuses it by name (`decode_record`'s
+//! unknown-tag error) rather than misreading a wider record. `0x07` is a
+//! NEW tag rather than a widened `0x04`, the same choice `0x05`/`0x06` made
+//! over `0x00`/`0x01` (tenant-scoping Task 6b): a follower on an older
+//! binary must refuse an unrecognized tag by name, not misread a longer
+//! record as a shorter one.
 //! Table effects are the transaction's collapsed overlay in (table, scope,
 //! id) order: intermediate overwrites inside a transaction are invisible to
 //! every observer and are not logged. Enqueues and emits keep call order.
@@ -355,8 +360,11 @@ enum Effect {
         payload: Vec<u8>,
         key: Option<String>,
     },
+    // `scope`: same presence-not-value convention as `Put`/`Delete` above —
+    // `None` for tag `0x04` (unscoped), `Some` for tag `0x07` (scoped).
     MigratePut {
         table: String,
+        scope: Option<u64>,
         id: u64,
         row: Vec<u8>,
     },
@@ -390,13 +398,19 @@ const UNSCOPED: u64 = 0;
 /// (scoped) rather than `0x00`/`0x01` — `Tx::put`/`Tx::delete` populate both
 /// together, from `row_is_scoped::<R>()`, since the overlay's `(scope, id)`
 /// key alone cannot tell "scope 0" apart from "no scope" (R35).
+/// `migrate_puts`' own scope slot is `Option<u64>` directly (`Some` tags
+/// `0x07`, `None` tags `0x04`) rather than a parallel set: `Tx::migrate_put`
+/// is not generic over a `Row` type (spec §3's whole point — it is the
+/// decode-free path), so it cannot compute `row_is_scoped::<R>()` itself;
+/// its caller (`Db::migrate_table`, which has the `Schema`) passes the
+/// table's own scoped-ness in per call, already resolved.
 #[derive(Default)]
 struct TxEffects {
     overlay: GroupOverlay,
     scoped_tables: BTreeSet<&'static str>,
     enqueues: Vec<(&'static str, Vec<u8>, Option<String>)>,
     emits: Vec<(&'static str, Vec<u8>, Option<String>)>,
-    migrate_puts: Vec<(&'static str, u64, Vec<u8>)>,
+    migrate_puts: Vec<(&'static str, Option<u64>, u64, Vec<u8>)>,
 }
 
 impl TxEffects {
@@ -473,9 +487,18 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
         encode_bytes(payload, &mut out);
         key.encode(&mut out);
     }
-    for (table, id, row) in &effects.migrate_puts {
-        out.push(4);
-        encode_bytes(table.as_bytes(), &mut out);
+    for (table, scope, id, row) in &effects.migrate_puts {
+        match scope {
+            None => {
+                out.push(4);
+                encode_bytes(table.as_bytes(), &mut out);
+            }
+            Some(scope) => {
+                out.push(7);
+                encode_bytes(table.as_bytes(), &mut out);
+                scope.encode(&mut out);
+            }
+        }
         id.encode(&mut out);
         encode_bytes(row, &mut out);
     }
@@ -511,6 +534,7 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
             },
             4 => Effect::MigratePut {
                 table: String::decode(input)?,
+                scope: None,
                 id: u64::decode(input)?,
                 row: Vec::<u8>::decode(input)?,
             },
@@ -523,6 +547,12 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 table: String::decode(input)?,
                 scope: Some(u64::decode(input)?),
                 id: u64::decode(input)?,
+            },
+            7 => Effect::MigratePut {
+                table: String::decode(input)?,
+                scope: Some(u64::decode(input)?),
+                id: u64::decode(input)?,
+                row: Vec::<u8>::decode(input)?,
             },
             other => {
                 return Err(io::Error::new(
@@ -606,10 +636,21 @@ impl<'a> Tx<'a> {
     }
 
     /// Buffers one decode-free migration write (spec §3). `row` must
-    /// already be encoded under the table's TARGET version. Used only by
+    /// already be encoded under the table's TARGET version. `scope` is
+    /// `None` for an unscoped table (tag `0x04`), `Some` for a scoped one
+    /// (tag `0x07`) — the caller (`Db::migrate_table`) already knows the
+    /// table's own scoped-ness from `Schema`, since this method is not
+    /// generic over a `Row` type and cannot ask `row_is_scoped::<R>()`
+    /// itself (spec §3: this is the decode-free path). Used only by
     /// `Db::migrate_schema`'s executor — deliberately not `pub`.
-    pub(crate) fn migrate_put(&mut self, table: &'static str, id: u64, row: Vec<u8>) {
-        self.effects.migrate_puts.push((table, id, row));
+    pub(crate) fn migrate_put(
+        &mut self,
+        table: &'static str,
+        scope: Option<u64>,
+        id: u64,
+        row: Vec<u8>,
+    ) {
+        self.effects.migrate_puts.push((table, scope, id, row));
     }
 
     pub fn enqueue<J: Job>(&mut self, job: J) {
@@ -893,11 +934,11 @@ impl StateMachine for TableMachine {
                     // replay, and followers rebuild at the same log
                     // position.
                     let new = crate::migration::SchemaVersion::decode_row(row)?;
+                    let ops = schema.ops(table)?;
                     let old = w
-                        .get_raw(table, new.id.raw())?
+                        .get_raw(table, ops.scoped, crate::table::UNSCOPED, new.id.raw())?
                         .map(|b| crate::migration::SchemaVersion::decode_row(&b))
                         .transpose()?;
-                    let ops = schema.ops(table)?;
                     let resolved = resolve_effect_scope(table, ops.scoped, *scope, "Put")?;
                     (ops.apply_put)(w, resolved, row)?;
                     let closed_out = old.as_ref().is_some_and(|o| {
@@ -965,7 +1006,7 @@ impl StateMachine for TableMachine {
                             );
                             let id = row_id_prefix(row)?;
                             saw_below.insert(table.clone());
-                            w.put_raw(table, id, row)?;
+                            w.put_raw(table, ops.scoped, resolved, id, row)?;
                         } else {
                             check_replay_version(schema, versions, table)?;
                             (ops.apply_put)(w, resolved, row)?;
@@ -985,19 +1026,26 @@ impl StateMachine for TableMachine {
                                  tenant-scoping Task 6c teaches the raw path the scope"
                             );
                             saw_below.insert(table.clone());
-                            w.delete_raw(table, *id)?;
+                            w.delete_raw(table, ops.scoped, resolved, *id)?;
                         } else {
                             check_replay_version(schema, versions, table)?;
                             (ops.apply_delete)(w, resolved, *id)?;
                         }
                     }
-                    Effect::MigratePut { table, id, row } => {
+                    Effect::MigratePut {
+                        table,
+                        scope,
+                        id,
+                        row,
+                    } => {
                         // The rewrite itself: exempt from the version
                         // equality check (its whole point is bytes at the
                         // target version over rows at the old one), still
                         // registered-table-checked, still decode-free.
-                        schema.ops(table)?;
-                        w.put_raw(table, *id, row)?;
+                        let ops = schema.ops(table)?;
+                        let resolved =
+                            resolve_effect_scope(table, ops.scoped, *scope, "MigratePut")?;
+                        w.put_raw(table, ops.scoped, resolved, *id, row)?;
                     }
                     Effect::Enqueue { job, payload, key } => {
                         new_ids.push(w.materialize_job(job, payload, key.as_deref())?);
@@ -2191,7 +2239,15 @@ impl Db {
                 };
                 cursor = step.to_version;
             }
-            self.migrate_table(table, from, compiled_version, compiled_fingerprint, &steps)?;
+            let scoped = self.engine.machine().schema.ops(table)?.scoped;
+            self.migrate_table(
+                table,
+                from,
+                compiled_version,
+                compiled_fingerprint,
+                scoped,
+                &steps,
+            )?;
         }
         Ok(())
     }
@@ -2216,6 +2272,7 @@ impl Db {
         from: u32,
         to: u32,
         fingerprint: u64,
+        scoped: bool,
         steps: &[crate::migration::MigrationStep],
     ) -> io::Result<()> {
         let vid = crate::migration::schema_version_id(table);
@@ -2225,7 +2282,17 @@ impl Db {
             let watermark: Option<u64> = snap
                 .get::<crate::migration::SchemaVersion>(vid)?
                 .and_then(|v| v.migrating_through);
-            let batch = snap.scan_raw_from(table, watermark, batch_size)?;
+            // `SchemaVersion.migrating_through` stays a bare `u64` (out of
+            // this task's file list), so a scoped table's resume always
+            // seeks from `(UNSCOPED, watermark)` — see `scan_raw_from`'s own
+            // doc comment for the narrower, still-open limitation this
+            // leaves for a crash mid-migration on a genuinely multi-tenant
+            // scoped table.
+            let batch = snap.scan_raw_from(
+                table,
+                watermark.map(|id| (crate::table::UNSCOPED, id)),
+                batch_size,
+            )?;
             drop(snap);
             if batch.is_empty() {
                 self.transact(|tx| -> Result<(), io::Error> {
@@ -2242,9 +2309,9 @@ impl Db {
                 .map_err(tx_err_to_io)?;
                 return Ok(());
             }
-            let new_watermark = batch.last().map(|(id, _)| *id);
-            let mut migrated: Vec<(u64, Vec<u8>)> = Vec::with_capacity(batch.len());
-            for (id, bytes) in batch {
+            let new_watermark = batch.last().map(|(_, id, _)| *id);
+            let mut migrated: Vec<(u64, u64, Vec<u8>)> = Vec::with_capacity(batch.len());
+            for (scope, id, bytes) in batch {
                 let mut version = from;
                 let mut bytes = bytes;
                 while version != to {
@@ -2257,11 +2324,11 @@ impl Db {
                     })?;
                     version = step.to_version;
                 }
-                migrated.push((id, bytes));
+                migrated.push((scope, id, bytes));
             }
             self.transact(|tx| -> Result<(), io::Error> {
-                for (id, bytes) in migrated {
-                    tx.migrate_put(table, id, bytes);
+                for (scope, id, bytes) in migrated {
+                    tx.migrate_put(table, scoped.then_some(scope), id, bytes);
                 }
                 tx.put(&crate::migration::SchemaVersion {
                     id: vid,
@@ -2683,26 +2750,20 @@ impl Seeder {
     /// One table's worth of exported rows, applied through the schema's
     /// typed ops — indexes rebuilt exactly as the live apply path maintains
     /// them. The id inside each row's own encoded bytes is what `put`
-    /// re-derives the key from; the tuple's `u64` travels for
-    /// debuggability and future delta use, not because `apply_put` needs it.
-    pub fn rows(&mut self, table: &str, rows: &[(u64, Vec<u8>)]) -> io::Result<()> {
+    /// re-derives the key from; the tuple's `u64` id travels for
+    /// debuggability and future delta use, not because `apply_put` needs
+    /// it. The scope DOES travel because `apply_put` needs it (tenant-
+    /// scoping Task 6b widened its signature): every row's own scope, as
+    /// `scan_raw`/`scan_raw_from` read it back off the store, threads
+    /// straight through to the typed put — `Writer::put`'s own
+    /// `row_is_scoped::<R>()` assert (not this method) is the negative-space
+    /// check that a mismatched scope/table pairing cannot silently apply.
+    pub fn rows(&mut self, table: &str, rows: &[(u64, u64, Vec<u8>)]) -> io::Result<()> {
         self.store.import(|w| {
-            for (id, bytes) in rows {
+            for (scope, id, bytes) in rows {
                 let _ = id;
                 let ops = self.import_schema.ops(table)?;
-                // `apply_put` requires a scope (tenant-scoping Task 6b), but
-                // seed/restore export carries no per-row scope yet (Task 6c
-                // owns that), so this path can only ever pass `UNSCOPED`.
-                // Assert the negative space (hard rule 4) rather than
-                // silently seeding every tenant's rows under scope 0.
-                assert!(
-                    !ops.scoped,
-                    "Seeder::rows: table \"{table}\" is tenant-scoped (Row::Scope != \
-                     Unscoped), but seed/restore export carries no per-row scope yet — \
-                     seeding a scoped table is blocked until tenant-scoping Task 6c teaches \
-                     the raw export/import path the scope"
-                );
-                (ops.apply_put)(w, crate::table::UNSCOPED, bytes)?;
+                (ops.apply_put)(w, *scope, bytes)?;
             }
             Ok(())
         })
@@ -2892,12 +2953,70 @@ mod tests {
     #[test]
     fn migrate_put_roundtrips_through_the_record_format() {
         let mut effects = TxEffects::default();
-        effects.migrate_puts.push(("Widget", 7, vec![1, 2, 3]));
+        effects
+            .migrate_puts
+            .push(("Widget", None, 7, vec![1, 2, 3]));
         let decoded = decode_record(&encode_record(&effects)).unwrap();
         assert_eq!(
             decoded,
             vec![Effect::MigratePut {
                 table: "Widget".to_string(),
+                scope: None,
+                id: 7,
+                row: vec![1, 2, 3],
+            }]
+        );
+    }
+
+    /// Task 6c, brief Step 4: the unscoped `MigratePut` record must not move
+    /// byte-for-byte — pinned against COMMITTED LITERAL bytes (this array),
+    /// not a fresh `encode_record` output, which would agree with itself no
+    /// matter what the encoder does. Same frozen shape
+    /// `charpente-core/tests/migrate_apply.rs`'s `migrate_put_record` helper
+    /// hand-encodes and drives through `Db::apply_shipped`: `[n=1: u32
+    /// le][tag=4][table: u32 len + bytes][id: u64 le][row: u32 len +
+    /// bytes]`.
+    #[test]
+    fn tag_4_migrate_put_wire_bytes_are_unchanged_by_task_6c() {
+        let mut effects = TxEffects::default();
+        effects
+            .migrate_puts
+            .push(("Widget", None, 7, vec![1, 2, 3]));
+        let encoded = encode_record(&effects);
+        let expected: &[u8] = &[
+            1, 0, 0, 0, // n = 1
+            4, // tag
+            6, 0, 0, 0, b'W', b'i', b'd', b'g', b'e', b't', // table
+            7, 0, 0, 0, 0, 0, 0, 0, // id = 7
+            3, 0, 0, 0, 1, 2, 3, // row
+        ];
+        assert_eq!(encoded, expected);
+    }
+
+    /// Task 6c: the NEW scoped `MigratePut` tag, `0x07` — a new tag rather
+    /// than a widened `0x04` (6b's precedent), so an older binary refuses it
+    /// by name. Layout: `[table][scope: u64 le][id: u64 le][row]`.
+    #[test]
+    fn tag_7_scoped_migrate_put_roundtrips_and_has_the_documented_wire_shape() {
+        let mut effects = TxEffects::default();
+        effects
+            .migrate_puts
+            .push(("Ticket", Some(9), 7, vec![1, 2, 3]));
+        let encoded = encode_record(&effects);
+        let expected: &[u8] = &[
+            1, 0, 0, 0, // n = 1
+            7, // tag
+            6, 0, 0, 0, b'T', b'i', b'c', b'k', b'e', b't', // table
+            9, 0, 0, 0, 0, 0, 0, 0, // scope = 9
+            7, 0, 0, 0, 0, 0, 0, 0, // id = 7
+            3, 0, 0, 0, 1, 2, 3, // row
+        ];
+        assert_eq!(encoded, expected);
+        assert_eq!(
+            decode_record(&encoded).unwrap(),
+            vec![Effect::MigratePut {
+                table: "Ticket".to_string(),
+                scope: Some(9),
                 id: 7,
                 row: vec![1, 2, 3],
             }]

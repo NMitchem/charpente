@@ -47,10 +47,15 @@ pub enum Msg {
         next_event_id: u64,
         frontier_crc: u32,
     },
-    /// tag 5 — one table's worth of snapshot rows, each `(id, row bytes)`.
+    /// tag 5 — one table's worth of snapshot rows, each `(scope, id, row
+    /// bytes)`. `scope` is `table::UNSCOPED` for an unscoped table's rows
+    /// (tenant-scoping Task 6c widened this from `(id, row bytes)` — the
+    /// wire bytes changed for every table, not just scoped ones, since a
+    /// batch can mix tenants and the scope has to travel per row; see
+    /// `encode_row_triples`).
     SnapshotRows {
         table: String,
-        rows: Vec<(u64, Vec<u8>)>,
+        rows: Vec<(u64, u64, Vec<u8>)>,
     },
     /// tag 6 — snapshot complete.
     SnapshotEnd,
@@ -124,6 +129,38 @@ fn decode_pairs(input: &mut &[u8]) -> io::Result<Vec<(u64, Vec<u8>)>> {
     Ok(pairs)
 }
 
+/// `SnapshotRows`' own row shape: `(scope, id, row bytes)` — a scoped
+/// table's rows can span multiple tenants within one message (`begin_
+/// seeding` batches purely by byte budget, not by scope), so the scope
+/// travels per row, not once per message (tenant-scoping Task 6c). A
+/// separate pair of functions from `encode_pairs`/`decode_pairs` above,
+/// deliberately: those stay exactly as `Frames` (no scope concept) needs
+/// them, untouched by this task.
+fn encode_row_triples(rows: &[(u64, u64, Vec<u8>)], out: &mut Vec<u8>) {
+    (u32::try_from(rows.len()).expect("snapshot row batch exceeds u32 length")).encode(out);
+    for (scope, id, payload) in rows {
+        scope.encode(out);
+        id.encode(out);
+        payload.encode(out);
+    }
+}
+
+fn decode_row_triples(input: &mut &[u8]) -> io::Result<Vec<(u64, u64, Vec<u8>)>> {
+    let n = u32::decode(input)?;
+    // Same untrusted-count reasoning as `decode_pairs`: the smallest
+    // possible row is 20 bytes (two u64s + a zero-length `Vec<u8>`'s 4-byte
+    // length prefix).
+    let cap = (n as usize).min(input.len() / 20);
+    let mut rows = Vec::with_capacity(cap);
+    for _ in 0..n {
+        let scope = u64::decode(input)?;
+        let id = u64::decode(input)?;
+        let payload = Vec::<u8>::decode(input)?;
+        rows.push((scope, id, payload));
+    }
+    Ok(rows)
+}
+
 fn encode_position(position: &Option<(u64, u32)>, out: &mut Vec<u8>) {
     match position {
         None => out.push(0),
@@ -191,7 +228,7 @@ pub fn encode(msg: &Msg) -> Vec<u8> {
         Msg::SnapshotRows { table, rows } => {
             out.push(5);
             table.encode(&mut out);
-            encode_pairs(rows, &mut out);
+            encode_row_triples(rows, &mut out);
         }
         Msg::SnapshotEnd => out.push(6),
         Msg::Refuse { message } => {
@@ -254,7 +291,7 @@ pub fn decode(bytes: &[u8]) -> io::Result<Msg> {
         },
         5 => Msg::SnapshotRows {
             table: String::decode(input)?,
-            rows: decode_pairs(input)?,
+            rows: decode_row_triples(input)?,
         },
         6 => Msg::SnapshotEnd,
         7 => Msg::Refuse {
@@ -369,8 +406,37 @@ mod tests {
         });
         roundtrips(Msg::SnapshotRows {
             table: "invoice".to_string(),
-            rows: vec![(1, vec![9, 9]), (2, vec![])],
+            rows: vec![(0, 1, vec![9, 9]), (7, 2, vec![])],
         });
+    }
+
+    /// Task 6c: `SnapshotRows`' row shape widened to carry a scope per row
+    /// (a batch can mix tenants — `begin_seeding` chunks purely by byte
+    /// budget). Pinned against COMMITTED LITERAL bytes, not a fresh
+    /// `encode` output, which would agree with itself no matter what the
+    /// encoder does — the same discipline `db.rs`'s
+    /// `tag_4_migrate_put_wire_bytes_are_unchanged_by_task_6c` uses. This IS
+    /// a wire-byte change even for an unscoped table's rows (scope 0 now
+    /// travels explicitly, 8 bytes per row it did not carry before) —
+    /// reported loudly per the task brief, since a per-row scope is the
+    /// only shape that survives a message mixing tenants.
+    #[test]
+    fn snapshot_rows_wire_bytes_carry_a_scope_per_row() {
+        let msg = Msg::SnapshotRows {
+            table: "t".to_string(),
+            rows: vec![(9, 2, vec![7, 8])],
+        };
+        let encoded = encode(&msg);
+        let expected: &[u8] = &[
+            5, // tag
+            1, 0, 0, 0, b't', // table
+            1, 0, 0, 0, // rows.len() = 1
+            9, 0, 0, 0, 0, 0, 0, 0, // scope = 9
+            2, 0, 0, 0, 0, 0, 0, 0, // id = 2
+            2, 0, 0, 0, 7, 8, // row
+        ];
+        assert_eq!(encoded, expected);
+        assert_eq!(decode(&encoded).unwrap(), msg);
     }
 
     #[test]

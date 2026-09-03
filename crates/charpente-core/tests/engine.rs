@@ -478,11 +478,14 @@ fn an_ordinary_table_is_unscoped_by_default() {
 /// not a round trip through `encode_row`/`decode_row`: a round trip would
 /// pass unchanged even if the key shape had moved, because decoding never
 /// looks at the key at all. `scan_raw` itself is part of the proof here —
-/// it opens the table as `TableDefinition<u64, &[u8]>` (unchanged by this
-/// task), so it would fail with a `TableTypeMismatch` if an unscoped row's
-/// physical key shape had shifted to the composite 16 bytes, exactly as
+/// it STILL tries opening the table as `TableDefinition<u64, &[u8]>` first
+/// (unchanged by this task), so an unscoped row's physical key shifting to
+/// the composite 16 bytes would surface as a `scope` that is never
+/// `UNSCOPED`, since only the `[u8;16]`-keyed fallback branch (Task 6c) can
+/// produce a nonzero one — this test's `UNSCOPED` in the expected tuple is
+/// that half of the proof, the same property
 /// `a_scoped_table_stores_under_the_composite_key_not_a_bare_u64` below
-/// demonstrates it does for a genuinely scoped table.
+/// demonstrates from the scoped side (a real, distinguishable scope value).
 #[test]
 fn an_unscoped_table_still_writes_a_bare_u64_key() {
     let sim = Sim::with_faults(0x7A2E_0007, FaultConfig::none());
@@ -507,7 +510,7 @@ fn an_unscoped_table_still_writes_a_bare_u64_key() {
     let raw = snap.scan_raw(JobRow::TABLE).unwrap();
     assert_eq!(
         raw,
-        vec![(7u64, expected_bytes)],
+        vec![(UNSCOPED, 7u64, expected_bytes)],
         "an unscoped table's stored key must still be the bare u64 id and its stored value \
          must still be exactly Row::encode_row's bytes"
     );
@@ -565,18 +568,18 @@ fn ticket_index_entry_survives(snap: &Snapshot, scope: u64, n: u32) -> bool {
 
 /// Task 4 (tenant scoping): a scoped Row (`Row::Scope != Unscoped`) is stored
 /// in a PHYSICALLY DIFFERENT redb table from the bare-`u64`-keyed one the test
-/// above pins for the unscoped case — `scan_raw`, still typed
-/// `TableDefinition<u64, &[u8]>` (Task 5 teaches it the scoped shape), must
-/// fail to open it with `TableTypeMismatch` naming the `[u8;16]` key rather
-/// than silently reading it back empty. Silent-empty is exactly what a bug
-/// routing a scoped row through the old bare-`u64` path regardless of
-/// `Row::Scope` would produce, which is why this checks the failure's shape,
-/// not just its presence.
-///
-/// What this test does NOT observe: the scope's *value*. It passes unchanged
-/// if `scoped_key(scope, id)` becomes `scoped_key(UNSCOPED, id)`, because the
-/// key stays 16 bytes wide either way. That property is
-/// `two_tenants_rows_survive_each_other_under_the_composite_key`'s job.
+/// above pins for the unscoped case. Through Task 6, `scan_raw` still tried
+/// the unscoped `TableDefinition<u64, &[u8]>` first and failed with
+/// `TableTypeMismatch` on a scoped table's `[u8;16]` key — silent-empty is
+/// what a bug routing a scoped row through the old bare-`u64` path
+/// regardless of `Row::Scope` would have produced instead. Task 6c teaches
+/// `scan_raw` the same fallback `scan_raw_from` already had: retry under the
+/// composite key shape and recover `(scope, id)` from it, so this now
+/// asserts the SUCCESSFUL read carries the real scope rather than asserting
+/// the mismatch — the mismatch, still the FIRST branch tried, is what
+/// distinguishes a scoped table's physical shape from an unscoped one at
+/// all (proven by `an_unscoped_table_still_writes_a_bare_u64_key` reading
+/// back `UNSCOPED` for the table that does NOT take this fallback).
 #[test]
 fn a_scoped_table_stores_under_the_composite_key_not_a_bare_u64() {
     let sim = Sim::with_faults(0x7A2E_0008, FaultConfig::none());
@@ -595,19 +598,22 @@ fn a_scoped_table_stores_under_the_composite_key_not_a_bare_u64() {
         .expect("a scoped put must not error");
 
     let snap = store.snapshot().unwrap();
-    let err = snap
-        .scan_raw(Ticket::TABLE)
-        .expect_err(
-            "a scoped table's physical redb table must be [u8; 16]-keyed — scan_raw, still \
-             typed TableDefinition<u64, &[u8]>, must fail to open it rather than silently \
-             reading nothing, which is what a bug routing a scoped row through the unscoped \
-             path regardless of Row::Scope would look like",
-        )
-        .to_string();
-    assert!(
-        err.contains("[u8;16]") || err.contains("[u8; 16]"),
-        "scan_raw's failure must be exactly a key-type mismatch against a [u8;16]-keyed \
-         table, not some other error: {err}"
+    let raw = snap.scan_raw(Ticket::TABLE).expect(
+        "scan_raw must learn the [u8;16] key shape rather than erroring — the scoped \
+                 table's composite key is a fallback, not a refusal, as of Task 6c",
+    );
+    assert_eq!(
+        raw,
+        vec![(10u64, 5u64, {
+            let mut b = Vec::new();
+            Ticket {
+                id: Id::from_raw(5),
+                n: 1,
+            }
+            .encode_row(&mut b);
+            b
+        })],
+        "scan_raw must recover the real (scope, id) from the composite key, not UNSCOPED"
     );
 }
 
@@ -1086,19 +1092,17 @@ fn a_scoped_scan_from_includes_the_row_at_u64_max() {
     );
 }
 
-/// `Snapshot::scan_raw_from` (the migration path) must learn the composite
-/// `[u8; 16]` key shape rather than erroring with `TableTypeMismatch`, and
-/// must stay scope-agnostic: `migrate_schema()` rewrites every tenant's
-/// rows in one pass, so it must see all of them, not just one scope's.
+/// `Snapshot::scan_raw_from` (the migration/archive-export path) must learn
+/// the composite `[u8; 16]` key shape rather than erroring with
+/// `TableTypeMismatch`, and must see every tenant's rows, in `(scope, id)`
+/// order — Task 6c's fix returns the scope alongside each row, so this now
+/// pins BOTH: which tenant a row belongs to, and the real ascending order.
 ///
 /// Tenant 10 writes id 5, tenant 20 writes id 1 — chosen so `(scope, id)`
-/// order and bare `id` order DISAGREE. The composite branch walks the
-/// table in `(scope, id)` key order and returns the bare id, so it comes
-/// back `[5, 1]`: DESCENDING. That is the accepted limitation `table.rs`'s
-/// `scan_raw_from` doc comment names (ids are not globally ascending across
-/// a scope boundary, owned by Task 6c) — asserting the raw, unsorted `Vec`
-/// pins it; sorting before comparing (as an earlier version of this test
-/// did) would hide it.
+/// order and bare `id` order DISAGREE. Composite order sorts by scope
+/// first, so the bare ids still come back `[5, 1]` — not because ids are
+/// unordered (Task 6c's real seek fixed that), but because scope 10 sorts
+/// before scope 20 regardless of which id each tenant chose.
 #[test]
 fn scan_raw_from_learns_the_composite_key_shape_and_sees_every_tenant() {
     let sim = Sim::with_faults(0x7A2E_0011, FaultConfig::none());
@@ -1128,14 +1132,12 @@ fn scan_raw_from_learns_the_composite_key_shape_and_sees_every_tenant() {
         "scan_raw_from must learn the [u8;16] key shape rather than erroring with \
          TableTypeMismatch — migrate_schema() has to be able to walk a scoped table too",
     );
-    let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
+    let scopes_and_ids: Vec<(u64, u64)> = rows.iter().map(|(scope, id, _)| (*scope, *id)).collect();
     assert_eq!(
-        ids,
-        vec![5, 1],
-        "scan_raw_from walks the composite key in (scope, id) order and returns the bare id: \
-         tenant 10's id 5 sorts before tenant 20's id 1, so the ids come back DESCENDING, not \
-         ascending — the accepted limitation table.rs's scan_raw_from doc comment names, owned \
-         by Task 6c"
+        scopes_and_ids,
+        vec![(10, 5), (20, 1)],
+        "scan_raw_from must walk the composite key in ascending (scope, id) order and return \
+         each row's real scope, not UNSCOPED"
     );
 }
 
@@ -1860,29 +1862,61 @@ fn a_below_compiled_scoped_delete_refuses_by_name_rather_than_dropping_the_scope
     );
 }
 
-/// Fix round 1, Minor 7: `Seeder::rows`' own negative-space assert
-/// (mirroring the below-compiled guards above, and for the identical
-/// reason — seed/restore export carries no per-row scope yet) was unpinned.
+/// Task 6c tripwire (must FAIL FIRST against stored bytes, per the task
+/// brief's Step 2): tenant 2 writes id 7 on a scoped table. Export via
+/// `Snapshot::scan_raw`, re-import via `Seeder::rows`, then read the
+/// follower's stored key bytes directly through `Snapshot::scan_raw` again
+/// — never a round trip through the same broken encoder, which would pass
+/// while both ends are wrong. Before this task: `Seeder::rows` refused a
+/// scoped table by name (the guard `seeder_rows_refuses_a_scoped_table_by_
+/// name` used to pin, fix round 1 Minor 7) — this test proves the
+/// replacement behavior, that the row survives seeding with scope 2 intact,
+/// not scope 0.
 #[test]
-#[should_panic(
-    expected = "Seeder::rows: table \"test.ticket\" is tenant-scoped (Row::Scope \
-                            != Unscoped), but seed/restore export carries no per-row scope \
-                            yet — seeding a scoped table is blocked until tenant-scoping \
-                            Task 6c teaches the raw export/import path the scope"
-)]
-fn seeder_rows_refuses_a_scoped_table_by_name() {
+fn a_scoped_row_survives_a_snapshot_seed_with_its_scope_intact() {
     let sim = Sim::with_faults(0x6B00_0008, FaultConfig::none());
+
+    let primary = Store::open(&sim.disk(), "primary.redb").unwrap();
+    primary
+        .apply(0, |w| {
+            w.put(
+                2,
+                &Ticket {
+                    id: Id::from_raw(7),
+                    n: 42,
+                },
+            )
+        })
+        .unwrap();
+    let exported = primary.snapshot().unwrap().scan_raw(Ticket::TABLE).unwrap();
+    assert_eq!(
+        exported,
+        vec![(2u64, 7u64, {
+            let mut b = Vec::new();
+            Ticket {
+                id: Id::from_raw(7),
+                n: 42,
+            }
+            .encode_row(&mut b);
+            b
+        })],
+        "sanity: the primary's own export must already carry scope 2"
+    );
+
     let mut seeder = Seeder::new(
         Box::new(sim.disk()),
         DbConfig::default(),
         Schema::new().table::<Ticket>(),
     )
     .unwrap();
-    let mut row_bytes = Vec::new();
-    Ticket {
-        id: Id::from_raw(1),
-        n: 1,
-    }
-    .encode_row(&mut row_bytes);
-    let _ = seeder.rows(Ticket::TABLE, &[(1, row_bytes)]);
+    seeder.rows(Ticket::TABLE, &exported).unwrap();
+    let db = seeder.finish(0, 0, 0, 0).unwrap();
+
+    let imported = db.snapshot().unwrap().scan_raw(Ticket::TABLE).unwrap();
+    assert_eq!(
+        imported, exported,
+        "the follower's stored bytes must carry tenant 2's scope, not scope 0 — a bug here \
+         would either misdecode with TableTypeMismatch on export or land the row under scope \
+         0 on import (Seeder::rows discarding the scope, or apply_put with no scope source)"
+    );
 }

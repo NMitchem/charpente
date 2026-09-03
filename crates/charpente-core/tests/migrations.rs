@@ -506,7 +506,7 @@ fn the_real_gate_refuses_drift_the_naive_gate_would_misdecode() {
 
     // And proceeding is not hypothetical damage: the drifted compiled
     // type MISDECODES the real stored bytes the naive gate just admitted.
-    let (_, bytes) = &raw[0];
+    let (_, _, bytes) = &raw[0];
     assert!(
         <WidgetDrifted as Row>::decode_row(bytes).is_err(),
         "WidgetV1 bytes must not decode under WidgetDrifted — if they ever do, this \

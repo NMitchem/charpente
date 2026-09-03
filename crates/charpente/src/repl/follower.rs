@@ -30,8 +30,9 @@ pub(crate) struct SeedStart {
 }
 
 /// The buffered snapshot stream: one `(table, rows)` entry per
-/// `SnapshotRows` message, in arrival (= schema walk) order.
-pub(crate) type SeedRows = Vec<(String, Vec<(u64, Vec<u8>)>)>;
+/// `SnapshotRows` message, in arrival (= schema walk) order. Each row is
+/// `(scope, id, row bytes)` (tenant-scoping Task 6c).
+pub(crate) type SeedRows = Vec<(String, Vec<(u64, u64, Vec<u8>)>)>;
 
 /// The follower's replication client.
 pub(crate) struct Follower {

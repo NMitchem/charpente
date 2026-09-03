@@ -199,7 +199,7 @@ fn scan_raw_from_at_u64_max_watermark_returns_empty() {
     assert_eq!(snap.scan_raw_from("Widget", None, 10).unwrap().len(), 1);
     // The watermark past every id must not re-include it.
     assert!(
-        snap.scan_raw_from("Widget", Some(u64::MAX), 10)
+        snap.scan_raw_from("Widget", Some((0, u64::MAX)), 10)
             .unwrap()
             .is_empty(),
         "a watermark at u64::MAX must see no further rows — otherwise the row at \

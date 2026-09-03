@@ -2324,14 +2324,17 @@ fn a_shipped_batch_that_fails_mid_apply_rolls_back_whole() {
 /// Task 1's dangling World-A obligation, discharged (tenant-scoping Task 6b,
 /// Step 4): "a follower on an older binary refuses [a wider record] by
 /// name." No genuinely older binary runs in-process, so the oracle is a
-/// follower fed a tag THIS binary does not know either — tag 7, one past
-/// Task 6b's own `0x05`/`0x06` (scoped Put/Delete), so this stays true
-/// whichever tag a later task (6c or beyond) claims next. Proves the
-/// unknown-tag refusal is wired through the REAL `apply_shipped` path, not
-/// just `decode_record`'s own unit test (`db::tests::decode_refuses_
-/// unknown_tags`) — and, like the sibling test above, that it refuses the
-/// WHOLE batch: two good records ship in the same `Frames` batch ahead of
-/// the tag-7 one, and neither must land.
+/// follower fed a tag THIS binary does not know either — tag 8, one past
+/// Task 6c's own `0x07` (scoped MigratePut), so this stays true whichever
+/// tag a later task claims next. This test's own doc comment predicted
+/// exactly this collision when it was written against tag 7 (Task 6b): "so
+/// this stays true whichever tag a later task (6c or beyond) claims next"
+/// — Task 6c claimed 7, so this moved to 8. Proves the unknown-tag refusal
+/// is wired through the REAL `apply_shipped` path, not just
+/// `decode_record`'s own unit test (`db::tests::decode_refuses_unknown_
+/// tags`) — and, like the sibling test above, that it refuses the WHOLE
+/// batch: two good records ship in the same `Frames` batch ahead of the
+/// tag-8 one, and neither must land.
 #[test]
 fn a_shipped_record_with_a_scope_era_tag_this_binary_does_not_know_refuses_by_name() {
     let sim = Sim::with_faults(0x6B00_0004, FaultConfig::none());
@@ -2352,11 +2355,11 @@ fn a_shipped_record_with_a_scope_era_tag_this_binary_does_not_know_refuses_by_na
     }
     let mut frames = db_a.read_log(0, usize::MAX).unwrap();
     assert_eq!(frames.len(), 2);
-    frames.push((2, vec![1u8, 0, 0, 0, 7]));
+    frames.push((2, vec![1u8, 0, 0, 0, 8]));
 
     let mut db_b = Db::open(Box::new(host_b.disk()), DbConfig::default(), make_schema()).unwrap();
     let err = db_b.apply_shipped(&frames).unwrap_err();
-    assert!(err.to_string().contains("unknown effect tag 7"), "{err}");
+    assert!(err.to_string().contains("unknown effect tag 8"), "{err}");
     assert_eq!(
         db_b.last_applied(),
         None,
@@ -2557,7 +2560,7 @@ fn skip_crc_workload(sim: &mut Sim, bug: bool) -> Result<(), String> {
 }
 
 /// Every table's raw rows, in schema order — the content-equality oracle.
-type RawTables = Vec<(String, Vec<(u64, Vec<u8>)>)>;
+type RawTables = Vec<(String, Vec<(u64, u64, Vec<u8>)>)>;
 
 fn table_scans(db: &Db) -> io::Result<RawTables> {
     let snap = db.snapshot()?;
@@ -3232,7 +3235,7 @@ fn assert_all_present(sim: &Sim, node: &mut Node, ids: &[u64], who: &str) -> Res
         let snap = db.snapshot().map_err(|e| e.to_string())?;
         let rows = snap.scan_raw(Widget::TABLE).map_err(|e| e.to_string())?;
         for id in ids {
-            if !rows.iter().any(|(rid, _)| rid == id) {
+            if !rows.iter().any(|(_, rid, _)| rid == id) {
                 return Err(format!(
                     "acked widget {id} is missing on {who} — the zero-loss oracle caught a lost \
                      record"
@@ -4611,7 +4614,7 @@ fn ids_present(node: &KNode, ids: &[u64]) -> Result<Vec<u64>, String> {
     Ok(ids
         .iter()
         .copied()
-        .filter(|id| rows.iter().any(|(rid, _)| rid == id))
+        .filter(|id| rows.iter().any(|(_, rid, _)| rid == id))
         .collect())
 }
 
@@ -4629,7 +4632,7 @@ fn assert_survivor_holds(sim: &Sim, node: &mut KNode, ids: &[u64]) -> Result<(),
         let snap = db.snapshot().map_err(|e| e.to_string())?;
         let rows = snap.scan_raw(Widget::TABLE).map_err(|e| e.to_string())?;
         for id in ids {
-            if !rows.iter().any(|(rid, _)| rid == id) {
+            if !rows.iter().any(|(_, rid, _)| rid == id) {
                 return Err(format!(
                     "acked+converged widget {id} vanished from the survivor — the above-horizon \
                      promise broke: media corruption on the primary lost a record the follower \

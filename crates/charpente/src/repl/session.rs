@@ -448,11 +448,11 @@ impl Session {
         });
         for table in db.table_names() {
             let rows = snap.scan_raw(table)?;
-            let mut batch: Vec<(u64, Vec<u8>)> = Vec::new();
+            let mut batch: Vec<(u64, u64, Vec<u8>)> = Vec::new();
             let mut bytes = 0usize;
-            for (id, row) in rows {
-                bytes += row.len() + 12;
-                batch.push((id, row));
+            for (scope, id, row) in rows {
+                bytes += row.len() + 20;
+                batch.push((scope, id, row));
                 if bytes >= SNAPSHOT_BATCH_BYTES {
                     pending.push_back(Msg::SnapshotRows {
                         table: table.to_string(),

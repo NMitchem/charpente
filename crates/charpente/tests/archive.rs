@@ -17,7 +17,7 @@ use charpente::archive::manifest::{
 use charpente::archive::restore::{RestoreOpts, RestoreReport, restore};
 use charpente::archive::{Archive, ArchiveConfig};
 use charpente::wire::WireU64;
-use charpente::{Db, DbConfig, Id, Schema, Wire, event, job, table};
+use charpente::{Db, DbConfig, Id, Schema, Seeder, Wire, event, job, table};
 use charpente_core::crc::crc32;
 use charpente_core::io::{ObjectDone, ObjectOp, ObjectStore};
 use charpente_core::table::Row;
@@ -48,6 +48,32 @@ struct Ping {
 #[table]
 struct Rec {
     id: Id<Rec>,
+    value: u64,
+}
+
+/// Task 6c's archive-restore tripwire needs a genuinely scoped table — the
+/// scope marker (`#[table(scoped_by = …)]` requires the app's own
+/// `TenantScope` impl, trivial here since there is no `ScopedTx` yet to
+/// call it through, same as `charpente/tests/typed_tables.rs`'s `Org`).
+#[table]
+struct ScopedOrg {
+    id: Id<ScopedOrg>,
+    name: String,
+}
+
+impl charpente::TenantScope for ScopedOrg {
+    fn authorize(
+        _tx: &charpente::Tx,
+        _who: Option<&charpente::auth::Principal>,
+        _scope: Id<ScopedOrg>,
+    ) -> Result<(), charpente::http::ApiError> {
+        Ok(())
+    }
+}
+
+#[table(scoped_by = ScopedOrg)]
+struct ScopedRec {
+    id: Id<ScopedRec>,
     value: u64,
 }
 
@@ -936,7 +962,7 @@ fn read_snapshot_rows(
     store: &dyn ObjectStore,
     generation: u64,
     t: &TableBatches,
-) -> Vec<(u64, Vec<u8>)> {
+) -> Vec<(u64, u64, Vec<u8>)> {
     let mut out = Vec::new();
     for n in 0..t.batches {
         let key = snapshot_batch_key(PREFIX, generation, &t.name, n);
@@ -2053,7 +2079,7 @@ fn the_snapshot_objects_hold_exactly_the_rows_the_db_held() {
         "the snapshot carries {} of the {rows} rows written",
         archived.len()
     );
-    for (i, (id, bytes)) in archived.iter().enumerate() {
+    for (i, (_, id, bytes)) in archived.iter().enumerate() {
         let i = i as u64;
         assert_eq!(
             *id, i,
@@ -5126,6 +5152,84 @@ fn fresh_sim() -> Sim {
     Sim::with_faults(0x7265_7374_6f72_6500, FaultConfig::none())
 }
 
+/// Task 6c tripwire (must FAIL FIRST against stored bytes, per the task
+/// brief's Step 2): the same property `charpente-core/tests/engine.rs`'s
+/// `a_scoped_row_survives_a_snapshot_seed_with_its_scope_intact` proves for
+/// replication seeding, through `crates/charpente/src/archive/restore.rs:
+/// 276` instead. Tenant 2 writes id 7 on a scoped table; the source `Db` is
+/// built through `Seeder` (not `Tx::put`, which always writes scope
+/// `UNSCOPED` until Task 7's `tx.scope()` lands — this is the only route to
+/// a genuinely nonzero-scope row today), archived, restored into a fresh
+/// destination, then read back through `Snapshot::scan_raw` directly —
+/// never a round trip through the same broken encoder.
+#[test]
+fn a_scoped_row_survives_archive_restore_with_its_scope_intact() {
+    let src_sim = Sim::with_faults(0x6B00_0009, FaultConfig::none());
+    let mut src_cfg = DbConfig::default();
+    src_cfg.wal.segment_bytes = 64 << 10;
+
+    let mut row_bytes = Vec::new();
+    ScopedRec {
+        id: Id::from_raw(7),
+        value: 42,
+    }
+    .encode_row(&mut row_bytes);
+
+    let mut seeder = Seeder::new(
+        Box::new(src_sim.disk()),
+        src_cfg,
+        Schema::new().table::<ScopedRec>(),
+    )
+    .unwrap();
+    seeder.rows(ScopedRec::TABLE, &[(2, 7, row_bytes)]).unwrap();
+    let mut src = seeder.finish(0, 0, 0, 0).unwrap();
+
+    let mut arc = Archive::open(archive_config(0, 8 << 20), &mut src).unwrap();
+    let store = SimObjectStore::new();
+    step_until_idle(&mut arc, &src, &store);
+    assert!(
+        read_manifest(&store).is_some(),
+        "sanity: the archive must have written a generation to restore from"
+    );
+
+    let dst_sim = Sim::with_faults(0x6B00_000A, FaultConfig::none());
+    let mut dst_cfg = DbConfig::default();
+    dst_cfg.wal.segment_bytes = 64 << 10;
+    restore(
+        &store,
+        Box::new(dst_sim.disk()),
+        dst_cfg.clone(),
+        Schema::new().table::<ScopedRec>(),
+        RestoreOpts {
+            prefix: PREFIX.to_string(),
+            force: false,
+        },
+        &mut |_| {},
+    )
+    .unwrap();
+
+    let dst = Db::open(
+        Box::new(dst_sim.disk()),
+        dst_cfg,
+        Schema::new().table::<ScopedRec>(),
+    )
+    .unwrap();
+    let restored = dst.snapshot().unwrap().scan_raw(ScopedRec::TABLE).unwrap();
+    let mut expected_bytes = Vec::new();
+    ScopedRec {
+        id: Id::from_raw(7),
+        value: 42,
+    }
+    .encode_row(&mut expected_bytes);
+    assert_eq!(
+        restored,
+        vec![(2u64, 7u64, expected_bytes)],
+        "the restored row must carry tenant 2's scope, not scope 0 — a bug here would either \
+         misdecode the export (scan_raw_from opening the bare rows_def) or land the row under \
+         scope 0 on restore (Seeder::rows discarding the scope)"
+    );
+}
+
 /// Records committed above the opening snapshot, so the generation really
 /// has a chain rather than a snapshot alone. Two segments' worth: a
 /// single-segment chain would leave `verify_chain`'s loop unexercised.
@@ -5156,7 +5260,7 @@ fn archived_frontier(store: &dyn ObjectStore) -> u64 {
 }
 
 /// One table's raw rows as a restore comparison sees them.
-type TableRows = (String, Vec<(u64, Vec<u8>)>);
+type TableRows = (String, Vec<(u64, u64, Vec<u8>)>);
 
 /// Every registered table's raw rows, paged. The comparison unit for "a
 /// restored Db is logically equal to the source at the archived frontier"
@@ -5174,12 +5278,12 @@ fn logical_rows_checked(db: &Db) -> io::Result<Vec<TableRows>> {
     let snap = db.snapshot()?;
     let mut out = Vec::new();
     for t in db.table_names() {
-        let mut rows: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut rows: Vec<(u64, u64, Vec<u8>)> = Vec::new();
         let mut after = None;
         loop {
             let batch = snap.scan_raw_from(t, after, 1_000)?;
             let Some(last) = batch.last() else { break };
-            after = Some(last.0);
+            after = Some((last.0, last.1));
             rows.extend(batch);
         }
         out.push((t.to_string(), rows));
@@ -5203,7 +5307,10 @@ fn source_at(db: &Db, f: u64) -> Vec<TableRows> {
             // seeds `next_event_id` wrong, since a wrong counter re-issues
             // ids the snapshot already carries.
             if name == Rec::TABLE || name == "charpente.events" {
-                (name, rows.into_iter().filter(|(id, _)| *id <= f).collect())
+                (
+                    name,
+                    rows.into_iter().filter(|(_, id, _)| *id <= f).collect(),
+                )
             } else {
                 (name, rows)
             }
@@ -7402,8 +7509,8 @@ fn conv_rec_rows(db: &Db) -> Result<Vec<(u64, u64)>, ConvFail> {
             .scan_raw_from(Rec::TABLE, after, 1_000)
             .map_err(|e| conv_read_fail("scanning the restored rows", e))?;
         let Some(last) = batch.last() else { break };
-        after = Some(last.0);
-        for (id, bytes) in batch {
+        after = Some((last.0, last.1));
+        for (_, id, bytes) in batch {
             // A row that will not decode is a VIOLATION, never fallout: the
             // bytes came back through the archive and the store, and "the
             // restored row does not decode" is the verdict.
@@ -7466,7 +7573,7 @@ fn conv_check_anchors(db: &Db, records: u64, pending_jobs: u64) -> Result<(), Co
             events.len()
         )));
     }
-    for (i, (id, _)) in events.iter().enumerate() {
+    for (i, (_, id, _)) in events.iter().enumerate() {
         if *id != i as u64 {
             return Err(ConvFail::Violation(format!(
                 "restored event row {i} has id {id}: the event counter came back wrong, so a \
@@ -7666,7 +7773,10 @@ fn conv_verify_restored(
                 _ => None,
             };
             match cut {
-                Some(cut) => (name, rows.into_iter().filter(|(id, _)| *id < cut).collect()),
+                Some(cut) => (
+                    name,
+                    rows.into_iter().filter(|(_, id, _)| *id < cut).collect(),
+                ),
                 None => (name, rows),
             }
         })

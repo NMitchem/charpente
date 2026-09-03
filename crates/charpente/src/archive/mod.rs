@@ -535,8 +535,13 @@ struct SnapshotWalk {
     /// Index into `tables`; `== tables.len()` once every one is paged, at
     /// which point only `snapshot/meta` is left.
     table: usize,
-    /// `scan_raw_from`'s cursor within `tables[table]`.
-    after_id: Option<u64>,
+    /// `scan_raw_from`'s cursor within `tables[table]`: `(scope, id)` of
+    /// the last row exported, so a paged export SEEKS rather than
+    /// full-scanning, and ids paged within one scope stay ascending across
+    /// a scope boundary too (tenant-scoping Task 6c — the cursor was a bare
+    /// `u64` before, which could not resume a composite-keyed table
+    /// correctly).
+    after: Option<(u64, u64)>,
     /// Next batch index `n` for `tables[table]`.
     batch: u64,
     /// Batch counts for the tables already walked, in walk order — becomes
@@ -2018,7 +2023,7 @@ impl Archive {
                 frontier_crc,
                 tables: db.table_names(),
                 table: 0,
-                after_id: None,
+                after: None,
                 batch: 0,
                 done: Vec::new(),
             },
@@ -2057,7 +2062,7 @@ impl Archive {
         let table = walk.tables[walk.table];
         let rows = match walk
             .snapshot
-            .scan_raw_from(table, walk.after_id, SNAPSHOT_BATCH_ROWS)
+            .scan_raw_from(table, walk.after, SNAPSHOT_BATCH_ROWS)
         {
             Ok(rows) => rows,
             Err(e) => {
@@ -2071,26 +2076,31 @@ impl Archive {
                 batches: walk.batch,
             });
             walk.table += 1;
-            walk.after_id = None;
+            walk.after = None;
             walk.batch = 0;
             self.state = State::Snapshotting { walk };
             return Ok(());
         }
-        let last_id = rows.last().expect("checked non-empty").0;
-        // Negative space (hard rule 4): `scan_raw_from` returns ids strictly
-        // above `after_id`, so the cursor advances on every batch. If it
-        // ever did not, this walk would re-upload the same batch under
-        // ever-increasing `n` forever and the meta would claim objects that
-        // duplicate each other.
+        let (last_scope, last_id, _) = *rows.last().expect("checked non-empty");
+        // Negative space (hard rule 4): `scan_raw_from` returns rows strictly
+        // above `after` in (scope, id) order, so the cursor advances on
+        // every batch. If it ever did not, this walk would re-upload the
+        // same batch under ever-increasing `n` forever and the meta would
+        // claim objects that duplicate each other. Widened from a bare id
+        // to the (scope, id) pair (tenant-scoping Task 6c): a bare-id
+        // comparison would falsely fire the moment the walk crossed a scope
+        // boundary with a lower id (tenant 2's id 0 after tenant 1's
+        // u64::MAX), which is exactly the ordering `scan_raw_from`'s real
+        // seek now guarantees never happens in (scope, id) terms.
         assert!(
-            walk.after_id.is_none_or(|prev| last_id > prev),
-            "Archive: snapshot cursor for table {table} did not advance ({:?} -> {last_id}); \
-             scan_raw_from returns only ids strictly above its cursor",
-            walk.after_id
+            walk.after.is_none_or(|prev| (last_scope, last_id) > prev),
+            "Archive: snapshot cursor for table {table} did not advance ({:?} -> ({last_scope}, \
+             {last_id})); scan_raw_from returns only rows strictly above its cursor",
+            walk.after
         );
         let bytes = encode_snapshot_batch(&rows);
         let key = snapshot_batch_key(&self.cfg.prefix, self.generation, table, walk.batch);
-        walk.after_id = Some(last_id);
+        walk.after = Some((last_scope, last_id));
         walk.batch += 1;
         self.state = State::UploadingSnapshotBatch {
             walk,

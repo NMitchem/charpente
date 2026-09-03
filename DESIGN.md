@@ -410,12 +410,16 @@ scope instead: `0x05 [table][scope: u64][row]`, `0x06 [table][scope:
 u64][id]` — chosen by the table's own scopedness, never by the scope's
 value, so a scoped table still uses `0x05`/`0x06` at scope 0 (tenant 0 is a
 legal tenant, not "no scope"); every other table's put/delete stays exactly
-the `0x00`/`0x01` shape above, byte-identical to before tenant scoping.
-`0x07` is the next free tag. A binary that does not know a tag (older, or a
-later one it hasn't caught up to) refuses it by name rather than misreading
-a wider record. Table effects are the transaction's collapsed write set in
-(table, scope, id) order — intermediate overwrites inside a transaction are
-observable by no one and are not
+the `0x00`/`0x01` shape above, byte-identical to before tenant scoping. A
+scoped table's `MigratePut` (tenant-scoping Task 6c) is `0x07 [table][scope:
+u64][id: u64][row]` — a NEW tag rather than a widened `0x04`, the same
+choice `0x05`/`0x06` made over `0x00`/`0x01`, so `0x04`'s bytes for an
+unscoped table stay exactly as above. `0x08` is the next free tag. A binary
+that does not know a tag (older, or a later one it hasn't caught up to)
+refuses it by name rather than misreading a wider record. Table effects are
+the transaction's collapsed write set in (table, scope, id) order —
+intermediate overwrites inside a transaction are observable by no one and
+are not
 logged; enqueues and emits keep call order. Replay resolves table names
 through the `Schema` registry passed to `Db::open`. The enqueue key is the
 job's stable external identity — carried, never interpreted inside the
@@ -783,8 +787,15 @@ no spill threshold, and no streaming path; a large value is simply bytes in a ro
 surface (M1 replication T4): `applied_seq`/`next_job_id` read META off the snapshot's own
 transaction — consistent with the rows it is about to hand out, unlike `Store::applied_seq`,
 which opens a fresh one and so could observe a later write — and `scan_raw` hands back a
-table's raw `(id, bytes)` pairs, undecoded, in id order (empty, not an error, for a table
-that was never created). `Store::import`/`set_import_meta` are the write-side counterpart:
+table's raw `(scope, id, bytes)` triples, undecoded, in stored key order (empty, not an
+error, for a table that was never created). `scope` is `table::UNSCOPED` for every row of
+an unscoped table; a scoped table's physical redb table is composite-`[u8;16]`-keyed, so
+`scan_raw` (and `scan_raw_from`, the migration/archive-export paged read) try the bare-`u64`
+shape first and, on `TableTypeMismatch`, retry under the composite shape and recover
+`(scope, id)` from it (tenant-scoping Task 6c — widened from a bare `id`, since a scoped
+table couldn't be exported at all before, and a bare-id migration/export cursor cannot
+resume a composite-keyed table correctly: ids are not globally ascending across a scope
+boundary). `Store::import`/`set_import_meta` are the write-side counterpart:
 `import` commits typed rows through the same `Writer` (and so the same index maintenance)
 as ordinary `apply`, but with no seq or `next_job_id` bookkeeping of its own — a logical
 snapshot has no log position — and `set_import_meta` sets both meta keys explicitly, once,
@@ -831,8 +842,11 @@ after every table has landed.
 backup's) entire state from a primary's logical snapshot stream, no log replay involved
 (M1 replication T4). `Seeder::new` first discards any store file and `wal/` segments
 already at the target disk, dir-barriered — seeding always replaces a timeline, never
-merges into one; `rows` applies one table's exported `(id, bytes)` pairs through the
-schema's typed ops exactly as the live apply path does, indexes rebuilt as a side effect;
+merges into one; `rows` applies one table's exported `(scope, id, bytes)` triples through
+the schema's typed ops exactly as the live apply path does, indexes rebuilt as a side
+effect — each row's own scope threads straight to the typed put (tenant-scoping Task 6c;
+before it, `rows` refused a scoped table by name, since seed/restore export carried no
+per-row scope);
 `finish` pins `applied_seq`/`next_job_id`, checkpoints, and lays a single empty WAL segment
 at `applied_seq + 1` before handing the result through the ordinary `Db::open` — precisely
 the base = horizon + 1 boundary the recovery-horizon rule (§2) already accepts, so open

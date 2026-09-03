@@ -18,6 +18,7 @@
 use std::fmt;
 use std::io;
 use std::marker::PhantomData;
+use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -1082,7 +1083,30 @@ impl Writer<'_> {
                 .delete_table(index_def(&name))
                 .map_err(|e| io::Error::other(format!("rebuild_indexes: dropping {name}: {e}")))?;
             let mut entries: Vec<Vec<u8>> = Vec::new();
-            {
+            if row_is_scoped::<R>() {
+                let rows = self
+                    .txn
+                    .open_table(scoped_rows_def(R::TABLE))
+                    .map_err(redb_err)?;
+                for item in rows.iter().map_err(redb_err)? {
+                    let (k, v) = item.map_err(redb_err)?;
+                    let row = R::decode_row(v.value())?;
+                    let key_bytes = k.value();
+                    let scope = u64::from_be_bytes(
+                        key_bytes[..8]
+                            .try_into()
+                            .expect("scoped key carries a leading 8-byte scope"),
+                    );
+                    let id = u64::from_be_bytes(
+                        key_bytes[8..]
+                            .try_into()
+                            .expect("scoped key carries a trailing 8-byte id"),
+                    );
+                    let mut key = Vec::new();
+                    (index.key)(&row, &mut key);
+                    entries.push(scoped_index_entry(scope, key, id));
+                }
+            } else {
                 let rows = self.txn.open_table(rows_def(R::TABLE)).map_err(redb_err)?;
                 for item in rows.iter().map_err(redb_err)? {
                     let (k, v) = item.map_err(redb_err)?;
@@ -1105,10 +1129,34 @@ impl Writer<'_> {
     /// is never interpreted (it is one version older — decoding it under
     /// the compiled type is exactly the bug this path exists to avoid),
     /// and indexes are deliberately untouched: they are rebuilt wholesale
-    /// by the close-out trigger.
-    pub fn put_raw(&mut self, table: &str, id: u64, row: &[u8]) -> io::Result<()> {
-        let mut rows = self.txn.open_table(rows_def(table)).map_err(redb_err)?;
-        rows.insert(id, row).map_err(redb_err)?;
+    /// by the close-out trigger. `scoped` picks `scoped_rows_def` (composite
+    /// key) vs `rows_def` (bare `u64`) — the `table: &str`-keyed primitives
+    /// below have no `Row` type to ask `row_is_scoped::<R>()` of, so the
+    /// caller (which already looked the table up in `Schema` for other
+    /// reasons at every call site) passes it in from registration.
+    pub fn put_raw(
+        &mut self,
+        table: &str,
+        scoped: bool,
+        scope: u64,
+        id: u64,
+        row: &[u8],
+    ) -> io::Result<()> {
+        if scoped {
+            let mut rows = self
+                .txn
+                .open_table(scoped_rows_def(table))
+                .map_err(redb_err)?;
+            rows.insert(scoped_key(scope, id), row).map_err(redb_err)?;
+        } else {
+            assert_eq!(
+                scope, UNSCOPED,
+                "put_raw: table \"{table}\" is not tenant-scoped, but was called with scope \
+                 {scope} — pass table::UNSCOPED, or scoped=true with the record's own scope"
+            );
+            let mut rows = self.txn.open_table(rows_def(table)).map_err(redb_err)?;
+            rows.insert(id, row).map_err(redb_err)?;
+        }
         Ok(())
     }
 
@@ -1117,21 +1165,58 @@ impl Writer<'_> {
     /// via `put_raw` and carries no index entries, so removing the primary row
     /// is sufficient — the old value is never decoded (decoding it under the
     /// compiled type is exactly the misdecode this path exists to avoid).
-    pub fn delete_raw(&mut self, table: &str, id: u64) -> io::Result<()> {
-        let mut rows = self.txn.open_table(rows_def(table)).map_err(redb_err)?;
-        rows.remove(id).map_err(redb_err)?;
+    /// `scoped`/`scope`: see `put_raw`.
+    pub fn delete_raw(&mut self, table: &str, scoped: bool, scope: u64, id: u64) -> io::Result<()> {
+        if scoped {
+            let mut rows = self
+                .txn
+                .open_table(scoped_rows_def(table))
+                .map_err(redb_err)?;
+            rows.remove(scoped_key(scope, id)).map_err(redb_err)?;
+        } else {
+            assert_eq!(
+                scope, UNSCOPED,
+                "delete_raw: table \"{table}\" is not tenant-scoped, but was called with scope \
+                 {scope} — pass table::UNSCOPED, or scoped=true with the record's own scope"
+            );
+            let mut rows = self.txn.open_table(rows_def(table)).map_err(redb_err)?;
+            rows.remove(id).map_err(redb_err)?;
+        }
         Ok(())
     }
 
     /// Raw read of one row's stored bytes (apply-side helper for the
-    /// close-out trigger's old-row peek).
-    pub fn get_raw(&mut self, table: &str, id: u64) -> io::Result<Option<Vec<u8>>> {
-        let rows = match self.txn.open_table(rows_def(table)) {
-            Ok(rows) => rows,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(e) => return Err(redb_err(e)),
-        };
-        Ok(rows.get(id).map_err(redb_err)?.map(|g| g.value().to_vec()))
+    /// close-out trigger's old-row peek). `scoped`/`scope`: see `put_raw`.
+    pub fn get_raw(
+        &mut self,
+        table: &str,
+        scoped: bool,
+        scope: u64,
+        id: u64,
+    ) -> io::Result<Option<Vec<u8>>> {
+        if scoped {
+            let rows = match self.txn.open_table(scoped_rows_def(table)) {
+                Ok(rows) => rows,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(e) => return Err(redb_err(e)),
+            };
+            Ok(rows
+                .get(scoped_key(scope, id))
+                .map_err(redb_err)?
+                .map(|g| g.value().to_vec()))
+        } else {
+            assert_eq!(
+                scope, UNSCOPED,
+                "get_raw: table \"{table}\" is not tenant-scoped, but was called with scope \
+                 {scope} — pass table::UNSCOPED, or scoped=true with the record's own scope"
+            );
+            let rows = match self.txn.open_table(rows_def(table)) {
+                Ok(rows) => rows,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(e) => return Err(redb_err(e)),
+            };
+            Ok(rows.get(id).map_err(redb_err)?.map(|g| g.value().to_vec()))
+        }
     }
 
     /// The log position visible through THIS write transaction so far — same
@@ -1548,81 +1633,99 @@ impl Snapshot {
         }
     }
 
-    /// Every row's id and raw encoded bytes, in id order — the logical
-    /// export primitive (`Seeder::rows` re-applies them through the typed
-    /// ops on the import side). Empty, not an error, when the table has
-    /// never been created.
-    pub fn scan_raw(&self, table: &str) -> io::Result<Vec<(u64, Vec<u8>)>> {
-        let rows = match self.txn.open_table(rows_def(table)) {
-            Ok(rows) => rows,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(e) => return Err(redb_err(e)),
-        };
-        let mut out = Vec::new();
-        for entry in rows.range(0u64..=u64::MAX).map_err(redb_err)? {
-            let (key, value) = entry.map_err(redb_err)?;
-            out.push((key.value(), value.value().to_vec()));
-        }
-        Ok(out)
-    }
-
-    /// Raw rows with `id > after_id` (all rows when `None`), ascending, at
-    /// most `limit` — the migration executor's bounded batch read (spec
-    /// §3: batching must bound memory, not just record size).
-    ///
-    /// Task 5 (tenant scoping): learns the composite `[u8; 16]` key shape
-    /// but stays scope-agnostic ON PURPOSE — unlike `get_scoped`/
-    /// `scan_scoped`/`scan_from_scoped` above, this takes no scope and
-    /// never will. `migrate_schema()` rewrites every row of a table
-    /// through this function (spec §3), so it must keep seeing every
-    /// tenant's rows in one pass; the tenant-scoping design doc's §3 says
-    /// so explicitly ("migrate_schema() rewrites rows through the raw
-    /// path … it must learn the new key shape, but needs no capability").
-    /// `id` is recovered from the composite key's trailing 8 bytes, the
-    /// same convention `index_entry`'s trailing id already uses.
-    ///
-    /// Accepted limitation, owned by Task 6c: for a genuinely multi-tenant
-    /// scoped table, ids are NOT globally ascending across a scope boundary
-    /// (rows sort by `(scope, id)`, so tenant 2's id 0 can follow tenant
-    /// 1's id `u64::MAX`) — `after_id` filters on the bare id portion only,
-    /// so a caller paging with the last returned id as the next watermark
-    /// can revisit or skip across scopes. Two live assertions depend on the
-    /// opposite: the archive export walk's `last_id > prev`
-    /// (`crates/charpente/src/archive/mod.rs`, near `:2083`) and the
-    /// restore-side strictly-ascending check
-    /// (`crates/charpente/src/archive/manifest.rs`, near `:690`). The
-    /// composite branch also full-scans `scoped_key(0, 0)..=
-    /// scoped_key(u64::MAX, u64::MAX)` and discards `id < from` rather than
-    /// seeking to it, so a paged export at `SNAPSHOT_BATCH_ROWS` rows per
-    /// batch costs O(N²/batch) on an N-row scoped table. `db.rs`'s
-    /// `apply_put`/`apply_delete` assert `!row_is_scoped` today, so no
-    /// scoped table can hold rows reached through `Db`/`Schema` (and
-    /// therefore through `migrate_schema`) yet — lifting that assert, the
-    /// per-scope migration ordering it unblocks, and both fixes above are
-    /// owned by Task 6c.
-    pub fn scan_raw_from(
-        &self,
-        table: &str,
-        after_id: Option<u64>,
-        limit: usize,
-    ) -> io::Result<Vec<(u64, Vec<u8>)>> {
-        // A watermark at u64::MAX is past every possible id: `saturating_add(1)`
-        // below would otherwise stay at u64::MAX forever, so `from..` never
-        // advances and the row at u64::MAX re-enters every batch (permanent
-        // brick for a table with a row at that id).
-        if after_id == Some(u64::MAX) {
-            return Ok(Vec::new());
-        }
-        let from = after_id.map_or(0, |a| a.saturating_add(1));
+    /// Every row's scope, id and raw encoded bytes, in stored key order —
+    /// the logical export primitive (`Seeder::rows` re-applies them through
+    /// the typed ops on the import side). Empty, not an error, when the
+    /// table has never been created. `scope` is `table::UNSCOPED` for every
+    /// row of an unscoped table (same dynamic dispatch as `scan_raw_from`:
+    /// a scoped table's physical redb table is composite-`[u8;16]`-keyed, so
+    /// opening it as the bare-`u64` shape fails `TableTypeMismatch` rather
+    /// than silently reading nothing, and the retry recovers `(scope, id)`
+    /// from the composite key's leading/trailing 8 bytes).
+    pub fn scan_raw(&self, table: &str) -> io::Result<Vec<(u64, u64, Vec<u8>)>> {
         match self.txn.open_table(rows_def(table)) {
             Ok(rows) => {
                 let mut out = Vec::new();
-                for item in rows.range(from..).map_err(redb_err)? {
+                for entry in rows.range(0u64..=u64::MAX).map_err(redb_err)? {
+                    let (key, value) = entry.map_err(redb_err)?;
+                    out.push((UNSCOPED, key.value(), value.value().to_vec()));
+                }
+                Ok(out)
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(Vec::new()),
+            Err(redb::TableError::TableTypeMismatch { .. }) => {
+                let rows = self
+                    .txn
+                    .open_table(scoped_rows_def(table))
+                    .map_err(redb_err)?;
+                let mut out = Vec::new();
+                for entry in rows
+                    .range(scoped_key(0, 0)..=scoped_key(u64::MAX, u64::MAX))
+                    .map_err(redb_err)?
+                {
+                    let (key, value) = entry.map_err(redb_err)?;
+                    let key_bytes = key.value();
+                    let scope = u64::from_be_bytes(
+                        key_bytes[..8]
+                            .try_into()
+                            .expect("scoped key carries a leading 8-byte scope"),
+                    );
+                    let id = u64::from_be_bytes(
+                        key_bytes[8..]
+                            .try_into()
+                            .expect("scoped key carries a trailing 8-byte id"),
+                    );
+                    out.push((scope, id, value.value().to_vec()));
+                }
+                Ok(out)
+            }
+            Err(e) => Err(redb_err(e)),
+        }
+    }
+
+    /// Raw rows strictly after `after` (all rows when `None`), ascending by
+    /// stored key, at most `limit` — the migration executor's bounded batch
+    /// read (spec §3: batching must bound memory, not just record size) and
+    /// the archive export walk's paged read (`Archive::step_snapshotting`).
+    ///
+    /// `after` is `(scope, id)`: a bare id cursor cannot resume a composite-
+    /// keyed table correctly, since ids are NOT globally ascending across a
+    /// scope boundary (rows sort by `(scope, id)`, so tenant 2's id 0 can
+    /// follow tenant 1's id `u64::MAX`) — a bare-id watermark would revisit
+    /// or skip rows across scopes. Both branches below SEEK (an exclusive
+    /// `redb::Bound`, not a full scan filtered post-hoc): fixed by Task 6c,
+    /// which also lifted `db.rs`'s `apply_put`/`apply_delete` assert against
+    /// scoped tables, the thing that made a scoped table unreachable through
+    /// `Db`/`Schema` (and so through `migrate_schema`) in the first place.
+    /// `migrate_schema()`'s own persisted resume watermark
+    /// (`SchemaVersion.migrating_through`) stays a bare `u64` — out of this
+    /// task's file list — so `migrate_table` always resumes a scoped table's
+    /// migration at `(UNSCOPED, watermark)`; within one uninterrupted run
+    /// every row's own returned scope is threaded correctly to
+    /// `MigratePut`, but a crash mid-migration on a genuinely multi-tenant
+    /// scoped table restarts the walk from scope 0 rather than where a
+    /// higher-scoped batch left off. No such table exists yet (scoped tables
+    /// are new in this sub-project), so nothing exercises this narrower,
+    /// still-open limitation today.
+    pub fn scan_raw_from(
+        &self,
+        table: &str,
+        after: Option<(u64, u64)>,
+        limit: usize,
+    ) -> io::Result<Vec<(u64, u64, Vec<u8>)>> {
+        match self.txn.open_table(rows_def(table)) {
+            Ok(rows) => {
+                let lo = match after {
+                    None => Bound::Unbounded,
+                    Some((_, id)) => Bound::Excluded(id),
+                };
+                let mut out = Vec::new();
+                for item in rows.range((lo, Bound::Unbounded)).map_err(redb_err)? {
                     if out.len() == limit {
                         break;
                     }
                     let (k, v) = item.map_err(redb_err)?;
-                    out.push((k.value(), v.value().to_vec()));
+                    out.push((UNSCOPED, k.value(), v.value().to_vec()));
                 }
                 Ok(out)
             }
@@ -1631,29 +1734,35 @@ impl Snapshot {
             // id)` (Task 4) — a different redb table shape from the bare
             // u64 one just tried, so redb refuses to open it as such
             // (TableTypeMismatch) rather than silently reading nothing.
-            // Retry under the composite definition and walk every scope.
+            // Retry under the composite definition, seeking past `after`.
             Err(redb::TableError::TableTypeMismatch { .. }) => {
                 let rows = self
                     .txn
                     .open_table(scoped_rows_def(table))
                     .map_err(redb_err)?;
+                let lo = match after {
+                    None => Bound::Unbounded,
+                    Some((scope, id)) => Bound::Excluded(scoped_key(scope, id)),
+                };
+                let hi = Bound::Included(scoped_key(u64::MAX, u64::MAX));
                 let mut out = Vec::new();
-                for item in rows
-                    .range(scoped_key(0, 0)..=scoped_key(u64::MAX, u64::MAX))
-                    .map_err(redb_err)?
-                {
-                    let (k, v) = item.map_err(redb_err)?;
-                    let id_bytes: [u8; 8] = k.value()[8..]
-                        .try_into()
-                        .expect("scoped key carries a trailing 8-byte id");
-                    let id = u64::from_be_bytes(id_bytes);
-                    if id < from {
-                        continue;
-                    }
+                for item in rows.range((lo, hi)).map_err(redb_err)? {
                     if out.len() == limit {
                         break;
                     }
-                    out.push((id, v.value().to_vec()));
+                    let (k, v) = item.map_err(redb_err)?;
+                    let key_bytes = k.value();
+                    let scope = u64::from_be_bytes(
+                        key_bytes[..8]
+                            .try_into()
+                            .expect("scoped key carries a leading 8-byte scope"),
+                    );
+                    let id = u64::from_be_bytes(
+                        key_bytes[8..]
+                            .try_into()
+                            .expect("scoped key carries a trailing 8-byte id"),
+                    );
+                    out.push((scope, id, v.value().to_vec()));
                 }
                 Ok(out)
             }

@@ -648,12 +648,18 @@ impl SnapshotMeta {
     }
 }
 
-/// One `<gen>/snapshot/<table>/<n>` object: raw `(id, bytes)` rows exactly as
-/// `Snapshot::scan_raw_from` produced them, ascending by id, CRC'd like every
-/// other object here. The archive pages these out one batch at a time and
-/// never holds a whole table (spec §10), so the batch — not the table — is
-/// the unit that has to encode.
-pub fn encode_snapshot_batch(rows: &[(u64, Vec<u8>)]) -> Vec<u8> {
+/// One `<gen>/snapshot/<table>/<n>` object: raw `(scope, id, bytes)` rows
+/// exactly as `Snapshot::scan_raw_from` produced them, ascending by
+/// `(scope, id)`, CRC'd like every other object here. The archive pages
+/// these out one batch at a time and never holds a whole table (spec §10),
+/// so the batch — not the table — is the unit that has to encode.
+/// Tenant-scoping Task 6c widened this from `(id, bytes)`: a scoped
+/// table's rows were never exportable before (`Seeder::rows` refused them
+/// by name), so there is no prior on-disk shape to keep byte-identical for
+/// them — but the wire format changed for EVERY table, unscoped included
+/// (an 8-byte scope now precedes every row), reported loudly per the task
+/// brief rather than kept hidden behind a per-batch flag.
+pub fn encode_snapshot_batch(rows: &[(u64, u64, Vec<u8>)]) -> Vec<u8> {
     // Negative space (hard rule 4): an empty batch is never written — the
     // walk stops a table the moment `scan_raw_from` comes back empty, so an
     // empty object in the bucket would mean a batch count that overstates
@@ -667,7 +673,8 @@ pub fn encode_snapshot_batch(rows: &[(u64, Vec<u8>)]) -> Vec<u8> {
     );
     let mut buf = Vec::new();
     buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-    for (id, bytes) in rows {
+    for (scope, id, bytes) in rows {
+        buf.extend_from_slice(&scope.to_le_bytes());
         buf.extend_from_slice(&id.to_le_bytes());
         put_field(&mut buf, bytes);
     }
@@ -675,28 +682,37 @@ pub fn encode_snapshot_batch(rows: &[(u64, Vec<u8>)]) -> Vec<u8> {
     buf
 }
 
-pub fn decode_snapshot_batch(bytes: &[u8]) -> io::Result<Vec<(u64, Vec<u8>)>> {
+pub fn decode_snapshot_batch(bytes: &[u8]) -> io::Result<Vec<(u64, u64, Vec<u8>)>> {
     let body = check_crc("snapshot batch", bytes)?;
     let mut r = Reader::new(body, "snapshot batch");
-    // 12 = the 8-byte id plus the 4-byte length prefix of a zero-length row.
-    let count = expect_count(&mut r, 12, "rows")?;
-    let mut rows: Vec<(u64, Vec<u8>)> = Vec::with_capacity(count);
+    // 20 = the 8-byte scope, 8-byte id, plus the 4-byte length prefix of a
+    // zero-length row.
+    let count = expect_count(&mut r, 20, "rows")?;
+    let mut rows: Vec<(u64, u64, Vec<u8>)> = Vec::with_capacity(count);
     for _ in 0..count {
+        let scope = r.u64()?;
         let id = r.u64()?;
         let len = r.u32()? as usize;
         let row = r.take(len)?.to_vec();
-        // Ascending, strictly: `scan_raw_from` walks a redb range in key
-        // order, so anything else is corruption or a hand-built object, and
-        // restore must not import rows it cannot trust the order of.
-        if let Some((prev, _)) = rows.last()
-            && *prev >= id
+        // Ascending, strictly, by (scope, id): `scan_raw_from` walks a redb
+        // range in composite key order, so anything else is corruption or a
+        // hand-built object, and restore must not import rows it cannot
+        // trust the order of. Widened from a bare id (Task 6c) — never
+        // weakened: an unscoped batch still has every row at scope
+        // `UNSCOPED`, so the check collapses back to the old bare-id
+        // comparison for it.
+        if let Some((prev_scope, prev_id, _)) = rows.last()
+            && (*prev_scope, *prev_id) >= (scope, id)
         {
             return Err(malformed_error(
                 "snapshot batch",
-                &format!("row ids are not strictly ascending ({prev} then {id})"),
+                &format!(
+                    "rows are not strictly ascending by (scope, id) (({prev_scope}, \
+                     {prev_id}) then ({scope}, {id}))"
+                ),
             ));
         }
-        rows.push((id, row));
+        rows.push((scope, id, row));
     }
     r.finish()?;
     Ok(rows)
@@ -1319,9 +1335,9 @@ mod tests {
     #[test]
     fn snapshot_batches_roundtrip() {
         let rows = vec![
-            (0u64, vec![1u8, 2, 3]),
-            (7, Vec::new()),
-            (u64::MAX, vec![9]),
+            (0u64, 0u64, vec![1u8, 2, 3]),
+            (0, 7, Vec::new()),
+            (5, u64::MAX, vec![9]),
         ];
         assert_eq!(
             decode_snapshot_batch(&encode_snapshot_batch(&rows)).unwrap(),
@@ -1331,7 +1347,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_snapshot_batch_is_refused_by_name() {
-        let mut bytes = encode_snapshot_batch(&[(1u64, vec![4, 5])]);
+        let mut bytes = encode_snapshot_batch(&[(0u64, 1u64, vec![4, 5])]);
         bytes[0] ^= 0xFF;
         let e = decode_snapshot_batch(&bytes).unwrap_err();
         let t = e.to_string();
@@ -1339,14 +1355,15 @@ mod tests {
         assert!(t.contains("CRC"), "must name what failed: {t}");
     }
 
-    // Hand-built so the CRC is valid over out-of-order ids: only the ordering
-    // check can catch this, which is what makes it a test of that check
-    // rather than a second CRC test.
+    // Hand-built so the CRC is valid over out-of-order (scope, id) pairs:
+    // only the ordering check can catch this, which is what makes it a test
+    // of that check rather than a second CRC test.
     #[test]
-    fn a_snapshot_batch_whose_ids_are_not_ascending_is_refused() {
+    fn a_snapshot_batch_whose_rows_are_not_ascending_is_refused() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&2u32.to_le_bytes());
-        for id in [9u64, 4] {
+        for (scope, id) in [(0u64, 9u64), (0u64, 4u64)] {
+            buf.extend_from_slice(&scope.to_le_bytes());
             buf.extend_from_slice(&id.to_le_bytes());
             buf.extend_from_slice(&0u32.to_le_bytes());
         }
@@ -1354,8 +1371,28 @@ mod tests {
         let e = decode_snapshot_batch(&buf).unwrap_err();
         let t = e.to_string();
         assert!(
-            t.contains("not strictly ascending (9 then 4)"),
-            "must name both ids: {t}"
+            t.contains("not strictly ascending by (scope, id) ((0, 9) then (0, 4))"),
+            "must name both (scope, id) pairs: {t}"
+        );
+    }
+
+    // A scope regression with an ASCENDING id must still refuse: the check
+    // is on the (scope, id) pair, not the id alone.
+    #[test]
+    fn a_snapshot_batch_whose_scope_regresses_is_refused_even_with_an_ascending_id() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        for (scope, id) in [(5u64, 0u64), (1u64, 9u64)] {
+            buf.extend_from_slice(&scope.to_le_bytes());
+            buf.extend_from_slice(&id.to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+        }
+        buf.extend_from_slice(&crc32(&buf).to_le_bytes());
+        let e = decode_snapshot_batch(&buf).unwrap_err();
+        let t = e.to_string();
+        assert!(
+            t.contains("not strictly ascending by (scope, id) ((5, 0) then (1, 9))"),
+            "{t}"
         );
     }
 

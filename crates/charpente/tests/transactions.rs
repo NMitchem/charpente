@@ -1756,7 +1756,7 @@ fn seeder_finish_writes_the_breadcrumb_so_a_reseeded_node_is_protected_too() {
     let mut seeder = Seeder::new(Box::new(sim.disk()), cfg.clone(), app_schema()).unwrap();
     let mut bytes = Vec::new();
     invoice(1, 1, 100).encode_row(&mut bytes);
-    seeder.rows(Invoice::TABLE, &[(1, bytes)]).unwrap();
+    seeder.rows(Invoice::TABLE, &[(0, 1, bytes)]).unwrap();
     let mut db = seeder.finish(0, 0, 0, 0).unwrap(); // seeded at applied_seq = 0
 
     // More traffic on top, then checkpoint again -- breadcrumb advances.
@@ -2386,7 +2386,7 @@ fn into_seeder_discards_the_old_timeline() {
     for i in 0..5u64 {
         let mut bytes = Vec::new();
         invoice(i, 0, i as i64).encode_row(&mut bytes);
-        rows.push((i, bytes));
+        rows.push((0, i, bytes));
     }
 
     let mut seeder = db.into_seeder().unwrap();
