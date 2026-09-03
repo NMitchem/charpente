@@ -1,8 +1,8 @@
-error[E0277]: `Org` is used as a tenant scope but has no `TenantScope` impl
+error[E0277]: `Org` is used as a tenant scope but has no `Tenant` impl
  --> tests/compile_fail/table_scoped_by_missing_tenant_scope.rs:9:21
   |
 9 | #[table(scoped_by = Org)]
-  |                     ^^^ no `impl TenantScope for Org`
+  |                     ^^^ no `impl Tenant for Org`
   |
 help: the trait `TenantScope` is not implemented for `Org`
  --> tests/compile_fail/table_scoped_by_missing_tenant_scope.rs:3:1
@@ -10,7 +10,9 @@ help: the trait `TenantScope` is not implemented for `Org`
 3 | #[table]
   | ^^^^^^^^
   = note: a scoped table needs the app's own membership check; add:
-          impl TenantScope for Org {
+          impl Tenant for Org {
+              type Who = Principal;
+              type Error = ApiError;
               fn authorize(tx: &Tx, who: Option<&Principal>, scope: Id<Self>) -> Result<(), ApiError> { … }
           }
 note: required by a bound in `__charpente_assert_tenant_scope`

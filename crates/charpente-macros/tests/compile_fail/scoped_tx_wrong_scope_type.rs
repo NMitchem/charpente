@@ -2,9 +2,14 @@
 // matrix: a `ScopedTx` opened on one scope type cannot stand in for another.
 // Without this, `scope()` would only prove that SOME tenant was authorized,
 // not that it was the one the callee reads.
+//
+// The `.stderr` is a stock `E0308`, not the house diagnostic the sibling case
+// carries: `#[diagnostic::on_unimplemented]` fires only on an unimplemented
+// TRAIT obligation, and this is a generic-parameter mismatch between two
+// concrete `ScopedTx` types, which names both tenants by itself.
 use charpente::auth::Principal;
 use charpente::http::{ApiError, Ctx};
-use charpente::{Id, Scoped, ScopedTx, TenantScope, Tx, table};
+use charpente::{Id, Scoped, ScopedTx, Tenant, Tx, table};
 
 #[table]
 struct OrgA {
@@ -18,13 +23,17 @@ struct OrgB {
     name: String,
 }
 
-impl TenantScope for OrgA {
+impl Tenant for OrgA {
+    type Who = Principal;
+    type Error = ApiError;
     fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<OrgA>) -> Result<(), ApiError> {
         Ok(())
     }
 }
 
-impl TenantScope for OrgB {
+impl Tenant for OrgB {
+    type Who = Principal;
+    type Error = ApiError;
     fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<OrgB>) -> Result<(), ApiError> {
         Ok(())
     }

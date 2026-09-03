@@ -4,7 +4,7 @@
 use charpente::auth::Principal;
 use charpente::http::{App, AppConfig, Session};
 use charpente::kernel::{Dispatcher, JobDef, JobEntry, JobError, JobOutcome};
-use charpente::{Db, DbConfig, Schema, Scoped, TenantScope, Tx, job, jobs, table};
+use charpente::{Db, DbConfig, Schema, Scoped, Tenant, Tx, job, jobs, table};
 use charpente_core::db::{Job, TxError};
 use charpente_core::io::Entropy;
 use charpente_core::job::{JobRow, JobStatus};
@@ -475,7 +475,7 @@ use charpente::routes;
 use charpente::wire::WireU64;
 use charpente_core::io::Instant;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1319,17 +1319,20 @@ impl Flaky {
 }
 
 /// The scope type for the swarm's tenant-scoped table. A bare marker, not a
-/// `#[table]`: `TenantScope` asks nothing of a scope type but `authorize`,
-/// and the platform never interprets the scope itself (the standing
-/// `emit_keyed` ruling, DESIGN.md:1060-1062).
-struct Tenant;
+/// `#[table]`: a scope type owes nothing but `authorize`, and the platform
+/// never interprets the scope itself (the standing `emit_keyed` ruling,
+/// DESIGN.md:1060-1062).
+struct Org;
 
-impl TenantScope for Tenant {
+impl Tenant for Org {
+    type Who = Principal;
+    type Error = ApiError;
+
     /// Always allows: this property is about the platform's isolation
-    /// guarantee, not the app's membership check. The check that matters
-    /// here is that reaching a scoped row required coming through this
-    /// function at all.
-    fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<Tenant>) -> Result<(), ApiError> {
+    /// guarantee, not the app's membership check — `charpente/tests/tenant.rs`
+    /// owns the refusing case. The check that matters here is that reaching a
+    /// scoped row required coming through this function at all.
+    fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<Org>) -> Result<(), ApiError> {
         Ok(())
     }
 }
@@ -1344,7 +1347,7 @@ impl TenantScope for Tenant {
 /// `marker` is derived from the tenant, so a leaked row is detectable by its
 /// CONTENT and not only by the key it was found under: a read path that
 /// returned the right key range but the wrong bytes would still be caught.
-#[table(scoped_by = Tenant)]
+#[table(scoped_by = Org)]
 struct Ledger {
     id: Id<Ledger>,
     #[index]
@@ -1378,7 +1381,7 @@ struct Post {
 fn post(tx: &mut Tx, body: Post, ctx: &Ctx) -> Result<WireU64, ApiError> {
     let tenant = body.tenant.0;
     let id = body.id.0;
-    let mut tx = tx.scope::<Tenant>(Id::from_raw(tenant), ctx)?;
+    let mut tx = tx.scope::<Org>(Id::from_raw(tenant), ctx)?;
     // Read-your-own-writes inside the scope, so the request path exercises
     // the scope-filtered overlay merge and not only the write.
     let before = tx.scan::<Ledger>()?.len() as u64;
@@ -1399,12 +1402,22 @@ fn post(tx: &mut Tx, body: Post, ctx: &Ctx) -> Result<WireU64, ApiError> {
 /// path is checked separately because each has its own key bound —
 /// `scan_by_scoped` above all, which is what catches a forgotten index
 /// prefix (spec §5's worst failure mode).
-fn tenants_never_see_each_other(app: &mut App) -> Result<(), String> {
+///
+/// Returns the tenants that actually hold rows on the durable image. That set
+/// is what `tenant:multi_tenant_write` gates on: an OBSERVED outcome, like
+/// every other `cover()` in this file, rather than what the workload
+/// scheduled — a universe whose faults crash the kernel before it processes
+/// the queued `/post` requests scheduled two tenants and wrote neither.
+fn tenants_never_see_each_other(app: &mut App) -> Result<BTreeSet<u64>, String> {
     let snap = app.db_for_tests().snapshot().map_err(|e| e.to_string())?;
+    let mut populated = BTreeSet::new();
     for tenant in 0..TENANTS {
         let rows = snap
             .scan_scoped::<Ledger>(tenant)
             .map_err(|e| format!("scan_scoped: {e}"))?;
+        if !rows.is_empty() {
+            populated.insert(tenant);
+        }
         for row in &rows {
             if row.marker / MARKER_STRIDE != tenant {
                 return Err(format!(
@@ -1471,7 +1484,19 @@ fn tenants_never_see_each_other(app: &mut App) -> Result<(), String> {
             }
         }
     }
-    Ok(())
+    Ok(populated)
+}
+
+/// Two tenants with rows on disk is a real multi-tenant write, and — since
+/// tenant ids run `0..TENANTS` — necessarily includes a nonzero scope, so the
+/// key also witnesses that the composite key is not collapsing to scope 0.
+fn cover_multi_tenant(sim: &mut Sim, populated: &BTreeSet<u64>) {
+    if populated.len() > 1 {
+        // Spec §5's load-bearing key: a single-tenant universe cannot detect a
+        // leak at all, because every row legitimately belongs to the only
+        // tenant, so the property passes vacuously.
+        sim.cover("tenant:multi_tenant_write");
+    }
 }
 
 fn kernel_crash_app(sim: &Sim) -> std::io::Result<App> {
@@ -1561,7 +1586,7 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
         // in .github/workflows/ci.yml, and it still exercises Kernel::build's
         // drain-id fix (dispatch.rs's "job in the heap is not Pending" assert).
         match exactly_once_holds(&mut app).and_then(|()| tenants_never_see_each_other(&mut app)) {
-            Ok(()) => {}
+            Ok(populated) => cover_multi_tenant(sim, &populated),
             Err(msg) => {
                 if !is_fault_fallout(&msg) {
                     return Err(msg);
@@ -1574,7 +1599,6 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
         let horizon = sim.now().as_nanos() + 400 * SEC;
         let mut source = SimSource::new(Box::new(sim.clock()), horizon);
         let base = sim.now().as_nanos();
-        let mut tenants_written: std::collections::BTreeSet<u64> = Default::default();
         for i in 0..(1 + entropy.next_u64() % 6) {
             let slot = entropy.next_u64() % 8;
             source.push_at(
@@ -1587,7 +1611,6 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
             // ride the same crash schedule the rest of the swarm does.
             let tenant = entropy.next_u64() % TENANTS;
             let id = entropy.next_u64() % LEDGER_IDS;
-            tenants_written.insert(tenant);
             source.push_at(
                 base + i * SEC,
                 Request::new(Method::Post, "/post").json(&Post {
@@ -1595,12 +1618,6 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
                     id: WireU64(id),
                 }),
             );
-        }
-        if tenants_written.len() > 1 {
-            // Spec §5's load-bearing key: a single-tenant universe cannot
-            // detect a leak at all, because every row legitimately belongs
-            // to the only tenant, so the property passes vacuously.
-            sim.cover("tenant:multi_tenant_write");
         }
         // A couple of Flaky jobs enqueued directly (retry path under faults).
         // A fault here can poison the Db (the WAL marks itself poisoned on a
@@ -1680,7 +1697,10 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
             Ok(mut app) => match exactly_once_holds(&mut app)
                 .and_then(|()| tenants_never_see_each_other(&mut app))
             {
-                Ok(()) => return Ok(()),
+                Ok(populated) => {
+                    cover_multi_tenant(sim, &populated);
+                    return Ok(());
+                }
                 Err(msg) => {
                     if !is_fault_fallout(&msg) {
                         return Err(msg);

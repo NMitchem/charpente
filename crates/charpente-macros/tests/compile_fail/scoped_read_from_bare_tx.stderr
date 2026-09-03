@@ -1,7 +1,7 @@
 error[E0277]: `Invoice` is a tenant-scoped table (`#[table(scoped_by = Org)]`) and a bare `Tx` names no tenant
-  --> tests/compile_fail/scoped_read_from_bare_tx.rs:29:18
+  --> tests/compile_fail/scoped_read_from_bare_tx.rs:31:18
    |
-29 |     Ok(tx.scan::<Invoice>()?)
+31 |     Ok(tx.scan::<Invoice>()?)
    |           ----   ^^^^^^^ `Invoice` is scoped by `Org`
    |           |
    |           required by a bound introduced by this call
@@ -11,7 +11,7 @@ help: the trait `NoTenant<Invoice>` is not implemented for `Org`
    |
  9 | #[table]
    | ^^^^^^^^
-   = note: open the tenant scope first; `Org`'s own `TenantScope::authorize` runs there, once per handler:
+   = note: open the tenant scope first; `Org`'s own `Tenant::authorize` runs there, once per handler:
                let tx = tx.scope::<Org>(scope, ctx)?;
                tx.scan::<Invoice>()?
 help: the trait `NoTenant<R>` is implemented for `Unscoped`

@@ -4,7 +4,7 @@
 // no tenant filter — and it must not compile.
 use charpente::auth::Principal;
 use charpente::http::ApiError;
-use charpente::{Id, TenantScope, Tx, View, table};
+use charpente::{Id, Tenant, Tx, View, table};
 
 #[table]
 struct Org {
@@ -19,7 +19,9 @@ struct Invoice {
     total: u32,
 }
 
-impl TenantScope for Org {
+impl Tenant for Org {
+    type Who = Principal;
+    type Error = ApiError;
     fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<Org>) -> Result<(), ApiError> {
         Ok(())
     }

@@ -1,0 +1,79 @@
+error[E0624]: method `get_in` is private
+  --> tests/compile_fail/scoped_seam_from_bare_tx.rs:34:16
+   |
+34 |       let _ = tx.get_in(other, Id::<Invoice>::from_raw(7))?;
+   |                  ^^^^^^ private method
+   |
+  ::: $WORKSPACE/crates/charpente-core/src/db.rs
+   |
+   | /     fn get_in<S: 'static, R: Row<Scope = S>>(
+   | |         &self,
+   | |         scope: Id<S>,
+   | |         id: Id<R>,
+   | |     ) -> io::Result<Option<R>> {
+   | |______________________________- private method defined here
+
+error[E0624]: method `scan_by_in` is private
+  --> tests/compile_fail/scoped_seam_from_bare_tx.rs:35:16
+   |
+35 |       let _ = tx.scan_by_in::<Org, Invoice>(other, "by_total", &1u32)?;
+   |                  ^^^^^^^^^^ private method
+   |
+  ::: $WORKSPACE/crates/charpente-core/src/db.rs
+   |
+   | /     fn scan_by_in<S: 'static, R: Row<Scope = S>>(
+   | |         &self,
+   | |         scope: Id<S>,
+   | |         index_name: &str,
+   | |         key: &impl Codec,
+   | |     ) -> io::Result<Vec<R>> {
+   | |___________________________- private method defined here
+
+error[E0624]: method `scan_from_in` is private
+  --> tests/compile_fail/scoped_seam_from_bare_tx.rs:36:16
+   |
+36 |       let _ = tx.scan_from_in::<Org, Invoice>(other, 0, 10)?;
+   |                  ^^^^^^^^^^^^ private method
+   |
+  ::: $WORKSPACE/crates/charpente-core/src/db.rs
+   |
+   | /     fn scan_from_in<S: 'static, R: Row<Scope = S>>(
+   | |         &self,
+   | |         scope: Id<S>,
+   | |         from_id: u64,
+   | |         limit: usize,
+   | |     ) -> io::Result<Vec<R>> {
+   | |___________________________- private method defined here
+
+error[E0624]: method `scan_in` is private
+  --> tests/compile_fail/scoped_seam_from_bare_tx.rs:37:11
+   |
+37 |     Ok(tx.scan_in::<Org, Invoice>(other)?)
+   |           ^^^^^^^ private method
+   |
+  ::: $WORKSPACE/crates/charpente-core/src/db.rs
+   |
+   |     fn scan_in<S: 'static, R: Row<Scope = S>>(&self, scope: Id<S>) -> io::Result<Vec<R>> {
+   |     ------------------------------------------------------------------------------------ private method defined here
+
+error[E0624]: method `put_in` is private
+  --> tests/compile_fail/scoped_seam_from_bare_tx.rs:41:8
+   |
+41 |     tx.put_in(
+   |        ^^^^^^ private method
+   |
+  ::: $WORKSPACE/crates/charpente-core/src/db.rs
+   |
+   |     fn put_in<S: 'static, R: Row<Scope = S>>(&mut self, scope: Id<S>, row: &R) {
+   |     -------------------------------------------------------------------------- private method defined here
+
+error[E0624]: method `delete_in` is private
+  --> tests/compile_fail/scoped_seam_from_bare_tx.rs:48:8
+   |
+48 |     tx.delete_in(other, Id::<Invoice>::from_raw(7));
+   |        ^^^^^^^^^ private method
+   |
+  ::: $WORKSPACE/crates/charpente-core/src/db.rs
+   |
+   |     fn delete_in<S: 'static, R: Row<Scope = S>>(&mut self, scope: Id<S>, id: Id<R>) {
+   |     ------------------------------------------------------------------------------- private method defined here

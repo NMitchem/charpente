@@ -359,7 +359,7 @@ pub trait Row: Sized + 'static {
     message = "`{R}` is a tenant-scoped table (`#[table(scoped_by = {Self})]`) and a bare `Tx` \
                names no tenant",
     label = "`{R}` is scoped by `{Self}`",
-    note = "open the tenant scope first; `{Self}`'s own `TenantScope::authorize` runs there, \
+    note = "open the tenant scope first; `{Self}`'s own `Tenant::authorize` runs there, \
             once per handler:\n    \
             let tx = tx.scope::<{Self}>(scope, ctx)?;\n    \
             tx.scan::<{R}>()?"
@@ -386,10 +386,10 @@ impl<R: Row> UnscopedRow for R where R::Scope: NoTenant<R> {}
 /// Every method bounds `R: UnscopedRow`, so this trait is the whole read
 /// surface for tables that have no tenant, and none of the surface for
 /// tables that do. A scoped table is read through `Snapshot`'s
-/// `get_scoped`/`scan_scoped`/`scan_from_scoped`/`scan_by_scoped`,
-/// `Tx`'s `get_in`/`scan_in`/`scan_from_in`/`scan_by_in`, or — the one an
-/// app writes — `charpente::ScopedTx`, which `Tx::scope` hands back once
-/// the app's own `TenantScope::authorize` has passed.
+/// `get_scoped`/`scan_scoped`/`scan_from_scoped`/`scan_by_scoped`, or — the
+/// one an app writes — `ScopedTx`, which `Tx::open_scope` hands back once the
+/// app's own `Tenant::authorize` has passed. `Tx`'s own scope-taking
+/// primitives are private to `db.rs`; `ScopedTx` is their only caller.
 pub trait View {
     fn get<R: UnscopedRow>(&self, id: Id<R>) -> io::Result<Option<R>>;
 
@@ -1450,10 +1450,9 @@ impl Snapshot {
     /// Task 5 (tenant scoping), ruling R28: `View`'s own `get`/`scan`/
     /// `scan_from` above keep their unscoped signatures unchanged. These
     /// three methods are the scope-taking primitives a tenant-scoped read
-    /// path builds on, owned by Task 7's `ScopedTx`: inherent methods on
-    /// `Snapshot`, not trait methods, so they sit beside `get`/`scan`/
-    /// `scan_from` without touching the trait `ScopedTx` (in the
-    /// `charpente` crate, per ruling R2) has to keep compiling against.
+    /// path builds on, and the snapshot level `ScopedTx` reads through:
+    /// inherent methods on `Snapshot`, not trait methods, so they sit beside
+    /// `get`/`scan`/`scan_from` without touching the `View` trait.
     ///
     /// `pub`, not `pub(crate)`, for the same reason `UNSCOPED` above is:
     /// `charpente-core/tests/engine.rs` is a separate compilation unit (see

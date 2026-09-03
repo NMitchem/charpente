@@ -30,6 +30,7 @@
 //! The enqueue key is the job's idempotency identity to the world outside
 //! the log — carried, never interpreted inside the deterministic boundary.
 
+use std::any::TypeId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
@@ -600,6 +601,10 @@ pub struct Tx<'a> {
     /// fall through txn overlay -> group overlay -> snapshot (spec §2).
     group: Option<&'a GroupOverlay>,
     effects: TxEffects,
+    /// The tenant scope this transaction opened, as
+    /// `(TypeId::of::<S>(), type_name::<S>(), scope.raw())`. A transaction
+    /// opens ONE scope (spec §8); `open_scope` asserts against this.
+    opened_scope: Option<(TypeId, &'static str, u64)>,
 }
 
 impl<'a> Tx<'a> {
@@ -614,6 +619,7 @@ impl<'a> Tx<'a> {
             snapshot,
             group: None,
             effects: TxEffects::default(),
+            opened_scope: None,
         }
     }
 
@@ -641,18 +647,22 @@ impl<'a> Tx<'a> {
     }
 
     /// Stages a row on a SCOPED table under `scope` — the primitive
-    /// `charpente::ScopedTx::put` delegates to once `TenantScope::authorize`
-    /// has passed (ruling R2: `ScopedTx` cannot live here, because
-    /// `Principal`/`ApiError`/`Ctx` are platform-edge types with no reverse
-    /// dependency into the core).
+    /// `ScopedTx::put` delegates to once `Tenant::authorize` has passed.
     ///
-    /// `scope: Id<S>` with `R: Row<Scope = S>`, not a bare `u64`: it makes
-    /// "this scope value belongs to this table's tenant type" a compile
-    /// error at the seam an app can reach directly, not only inside
-    /// `ScopedTx`'s wrapper. `S` carries no trait bound — `Row::Scope`
-    /// carries none in the core (R2), and `TenantScope` is not nameable
-    /// from here.
-    pub fn put_in<S: 'static, R: Row<Scope = S>>(&mut self, scope: Id<S>, row: &R) {
+    /// PRIVATE, and the whole seam is: `ScopedTx` is the only caller and
+    /// `Tx::open_scope` is `ScopedTx`'s only constructor, so naming a tenant
+    /// requires that tenant's own check to have run. A `pub` version of this
+    /// method is reachable from every handler holding a bare `&mut Tx`, which
+    /// makes spec §7's exit criterion 1 false however the wrappers are
+    /// written.
+    ///
+    /// `scope: Id<S>` with `R: Row<Scope = S>`, not a bare `u64`: "this scope
+    /// value belongs to this table's tenant type" stays a compile error at the
+    /// primitive itself, not only at `ScopedTx`'s wrapper. `S` is bounded only
+    /// `'static` here rather than `Tenant`, because the migration and replay
+    /// paths address a scoped table by scope value with no tenant hook in
+    /// hand.
+    fn put_in<S: 'static, R: Row<Scope = S>>(&mut self, scope: Id<S>, row: &R) {
         assert!(
             crate::table::row_is_scoped::<R>(),
             "Tx::put_in: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) — use Tx::put \
@@ -670,7 +680,7 @@ impl<'a> Tx<'a> {
     }
 
     /// `delete`'s scope-taking counterpart; see `put_in`.
-    pub fn delete_in<S: 'static, R: Row<Scope = S>>(&mut self, scope: Id<S>, id: Id<R>) {
+    fn delete_in<S: 'static, R: Row<Scope = S>>(&mut self, scope: Id<S>, id: Id<R>) {
         assert!(
             crate::table::row_is_scoped::<R>(),
             "Tx::delete_in: table \"{}\" is not tenant-scoped (Row::Scope = Unscoped) — use \
@@ -949,10 +959,11 @@ impl View for Tx<'_> {
 }
 
 /// The scope-taking reads: `View`'s four methods, bounded to ONE tenant of
-/// ONE scoped table, over the same txn -> group -> snapshot order. `pub`
-/// because `charpente::ScopedTx` (ruling R2) lives in another crate and the
-/// overlay these merge is private to this one, so there is no other seam
-/// for it to cross. `Id<S>` with `R: Row<Scope = S>` — see `put_in`.
+/// ONE scoped table, over the same txn -> group -> snapshot order. PRIVATE,
+/// like `put_in`/`delete_in`: `ScopedTx` below is the only caller, and
+/// `Tx::open_scope` is `ScopedTx`'s only constructor, so naming a tenant
+/// requires that tenant's own `Tenant::authorize` to have passed. `Id<S>`
+/// with `R: Row<Scope = S>` — see `put_in`.
 ///
 /// Each asserts `row_is_scoped::<R>()` for the same reason
 /// `Snapshot::get_scoped` does (hard rule 4): the type system rules out a
@@ -961,7 +972,7 @@ impl View for Tx<'_> {
 /// table the unscoped write path never creates — a wrong answer, not an
 /// error.
 impl Tx<'_> {
-    pub fn get_in<S: 'static, R: Row<Scope = S>>(
+    fn get_in<S: 'static, R: Row<Scope = S>>(
         &self,
         scope: Id<S>,
         id: Id<R>,
@@ -983,7 +994,7 @@ impl Tx<'_> {
         }
     }
 
-    pub fn scan_in<S: 'static, R: Row<Scope = S>>(&self, scope: Id<S>) -> io::Result<Vec<R>> {
+    fn scan_in<S: 'static, R: Row<Scope = S>>(&self, scope: Id<S>) -> io::Result<Vec<R>> {
         assert_scoped::<R>("scan_in", "View::scan");
         let mut merged: BTreeMap<u64, R> = BTreeMap::new();
         for row in self.snapshot.scan_scoped::<R>(scope.raw())? {
@@ -1004,7 +1015,7 @@ impl Tx<'_> {
         Ok(merged.into_values().collect())
     }
 
-    pub fn scan_by_in<S: 'static, R: Row<Scope = S>>(
+    fn scan_by_in<S: 'static, R: Row<Scope = S>>(
         &self,
         scope: Id<S>,
         index_name: &str,
@@ -1039,7 +1050,7 @@ impl Tx<'_> {
         Ok(merged.into_values().collect())
     }
 
-    pub fn scan_from_in<S: 'static, R: Row<Scope = S>>(
+    fn scan_from_in<S: 'static, R: Row<Scope = S>>(
         &self,
         scope: Id<S>,
         from_id: u64,
@@ -1076,6 +1087,167 @@ fn assert_scoped<R: Row>(method: &str, unscoped_alternative: &str) {
          {unscoped_alternative} for an unscoped table",
         R::TABLE
     );
+}
+
+// ---------------------------------------------------------------- scopes
+
+/// The app's own membership check for a tenant scope: "may this caller act
+/// as this tenant?" (spec §1). `#[table(scoped_by = Org)]` requires an impl
+/// for `Org` — enforced by a macro-emitted const assert, the same shape
+/// `#[table(version = …)]` uses to require a `TableMigration` impl
+/// (DESIGN §3).
+///
+/// Generic over `Who` and `Error` because the deterministic core cannot name
+/// `charpente::auth::Principal` or `charpente::http::ApiError` — DESIGN §8
+/// keeps auth at the platform edge and there is no reverse dependency
+/// (ruling R2, amended by R45). An app writes the platform's specialization,
+/// `charpente::TenantScope` (`Who = Principal`, `Error = ApiError`), which is
+/// blanket-implemented for every such impl and carries the house diagnostic.
+///
+/// The platform calls `authorize` in exactly one place — `Tx::open_scope`,
+/// below — and never interprets `scope` itself (the standing `emit_keyed`
+/// ruling, DESIGN.md:1060-1062).
+pub trait Tenant: Sized + 'static {
+    /// Whoever is asking. `?Sized` so an app can key membership on an
+    /// unsized witness (a `str` subject) as readily as on a struct.
+    type Who: ?Sized;
+    /// The refusal an app returns; `open_scope` returns it unchanged.
+    type Error;
+
+    fn authorize(tx: &Tx<'_>, who: Option<&Self::Who>, scope: Id<Self>) -> Result<(), Self::Error>;
+}
+
+impl<'a> Tx<'a> {
+    /// Opens a tenant scope: the ONLY constructor of `ScopedTx`, and the only
+    /// route to the six scope-taking primitives above, which are private.
+    /// `S::authorize` runs first, always — a handler cannot reach a tenant's
+    /// rows without the app's own membership check having passed, which is
+    /// what makes "one auditable line per handler" structural rather than
+    /// conventional (spec §1).
+    ///
+    /// Apps call `tx.scope::<Org>(org, ctx)?` (`charpente::Scoped`), which
+    /// maps `ctx.principal()` to `who` and delegates here. The name differs
+    /// because an inherent method shadows an extension trait's method of the
+    /// same name, and the app-facing spelling is the one with the `Ctx`.
+    ///
+    /// # Panics
+    ///
+    /// A transaction opens ONE scope (spec §8). A second `open_scope` naming
+    /// a different tenant — including one reached through `ScopedTx`'s
+    /// `DerefMut` — is a contract violation, not a cross-tenant write.
+    /// Re-opening the SAME scope is a no-op.
+    pub fn open_scope<S: Tenant>(
+        &mut self,
+        scope: Id<S>,
+        who: Option<&S::Who>,
+    ) -> Result<ScopedTx<'_, 'a, S>, S::Error> {
+        S::authorize(self, who, scope)?;
+        let opening = (TypeId::of::<S>(), std::any::type_name::<S>(), scope.raw());
+        if let Some(prev) = self.opened_scope {
+            assert!(
+                (prev.0, prev.2) == (opening.0, opening.2),
+                "contract: a transaction opens ONE tenant scope (spec §8) — this one already \
+                 opened {}({}) and is now asked for {}({}); run the second tenant's work in its \
+                 own transaction",
+                prev.1,
+                prev.2,
+                opening.1,
+                opening.2
+            );
+        }
+        self.opened_scope = Some(opening);
+        Ok(ScopedTx { tx: self, scope })
+    }
+}
+
+/// A transaction narrowed to one tenant of one scope type — the only handle
+/// an app has on a scoped table (spec §1). `Tx::open_scope` is the only
+/// constructor and it runs `S::authorize` first, so there is no second way
+/// to reach a scoped row and no way to reach one without the app's own
+/// membership check having run.
+///
+/// Two lifetimes, not one. `'t` is the borrow of the transaction; `'a` is
+/// the transaction's own borrow of the snapshot it reads from. They cannot
+/// be collapsed: `&'t mut Tx<'a>` is invariant in `'a`, so a handler holding
+/// `&'t mut Tx<'a>` (with `'a` strictly longer, since the snapshot outlives
+/// the transaction) can never produce the `&'t mut Tx<'t>` a single-lifetime
+/// `ScopedTx<'t>` would need. Handlers write `tx.scope::<Org>(org, ctx)?`
+/// and never name either.
+///
+/// `Deref`/`DerefMut` to `Tx` are required, not conveniences: opening a
+/// scope must not lock a handler out of unscoped tables (spec §1). Method
+/// resolution does NOT fall through the deref when an inherent method of the
+/// same name exists but its bound fails, so an unscoped access from inside a
+/// scope is written through an explicit deref:
+///
+/// ```ignore
+/// let tx = tx.scope::<Org>(org, ctx)?;
+/// tx.scan::<Invoice>()?;      // scoped:   Invoice is scoped_by = Org
+/// (*tx).scan::<Region>()?;    // unscoped: Region has no tenant
+/// ```
+///
+/// What the deref does NOT reopen is the seam: `put_in`/`delete_in`/
+/// `get_in`/`scan_in`/`scan_by_in`/`scan_from_in` are private to this
+/// module, so `(*tx)` reaches unscoped tables and a second `open_scope`
+/// (which authorizes, and which the one-scope assert bounds) — never another
+/// tenant's rows.
+pub struct ScopedTx<'t, 'a, S> {
+    tx: &'t mut Tx<'a>,
+    scope: Id<S>,
+}
+
+impl<'a, S: 'static> ScopedTx<'_, 'a, S> {
+    /// The tenant every read and write on this handle is bounded to (R18:
+    /// the scope is explicit, and this field is its source). Also the reason
+    /// a scope cannot be nested: this shadows the `Scoped::scope` the deref
+    /// would otherwise reach, and spec §8 rules nested scopes out.
+    pub fn scope(&self) -> Id<S> {
+        self.scope
+    }
+
+    pub fn get<R: Row<Scope = S>>(&self, id: Id<R>) -> io::Result<Option<R>> {
+        self.tx.get_in(self.scope, id)
+    }
+
+    /// Every row of `R` belonging to this tenant, in id order.
+    pub fn scan<R: Row<Scope = S>>(&self) -> io::Result<Vec<R>> {
+        self.tx.scan_in(self.scope)
+    }
+
+    /// Exact-match secondary index lookup within this tenant, in id order.
+    pub fn scan_by<R: Row<Scope = S>>(
+        &self,
+        index_name: &str,
+        key: &impl Codec,
+    ) -> io::Result<Vec<R>> {
+        self.tx.scan_by_in(self.scope, index_name, key)
+    }
+
+    /// This tenant's rows with `id >= from_id`, in id order, at most `limit`.
+    pub fn scan_from<R: Row<Scope = S>>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>> {
+        self.tx.scan_from_in(self.scope, from_id, limit)
+    }
+
+    pub fn put<R: Row<Scope = S>>(&mut self, row: &R) {
+        self.tx.put_in(self.scope, row)
+    }
+
+    pub fn delete<R: Row<Scope = S>>(&mut self, id: Id<R>) {
+        self.tx.delete_in(self.scope, id)
+    }
+}
+
+impl<'a, S> std::ops::Deref for ScopedTx<'_, 'a, S> {
+    type Target = Tx<'a>;
+    fn deref(&self) -> &Tx<'a> {
+        self.tx
+    }
+}
+
+impl<'a, S> std::ops::DerefMut for ScopedTx<'_, 'a, S> {
+    fn deref_mut(&mut self) -> &mut Tx<'a> {
+        self.tx
+    }
 }
 
 // ---------------------------------------------------------------- machine

@@ -103,9 +103,12 @@ pub(crate) fn expand(
     };
 
     // `#[table(scoped_by = Org)]`: `type Scope` names the app's scope type
-    // instead of `Unscoped`, and the const assert below forces `impl
-    // TenantScope for Org` to exist — the same shape `migration_assert`
-    // above uses to force a `TableMigration` impl on a version bump.
+    // instead of `Unscoped`, and the const assert below forces `Org` to carry
+    // the app's own membership check — the same shape `migration_assert` above
+    // uses to force a `TableMigration` impl on a version bump. The bound is
+    // `::charpente::TenantScope`, the platform's blanket-implemented alias for
+    // `Tenant<Who = Principal, Error = ApiError>`, because it is the one that
+    // carries the house diagnostic.
     let scope_ty = match &scoped_by {
         Some(path) => quote! { #path },
         None => quote! { ::charpente::core::table::Unscoped },

@@ -52,16 +52,19 @@ struct Rec {
 }
 
 /// Task 6c's archive-restore tripwire needs a genuinely scoped table — the
-/// scope marker (`#[table(scoped_by = …)]` requires the app's own
-/// `TenantScope` impl, trivial here since there is no `ScopedTx` yet to
-/// call it through, same as `charpente/tests/typed_tables.rs`'s `Org`).
+/// scope marker (`#[table(scoped_by = …)]` requires the app's own `Tenant`
+/// impl, trivial here because this file reads the archived bytes rather than
+/// going through a scope, same as `charpente/tests/typed_tables.rs`'s `Org`).
 #[table]
 struct ScopedOrg {
     id: Id<ScopedOrg>,
     name: String,
 }
 
-impl charpente::TenantScope for ScopedOrg {
+impl charpente::Tenant for ScopedOrg {
+    type Who = charpente::auth::Principal;
+    type Error = charpente::http::ApiError;
+
     fn authorize(
         _tx: &charpente::Tx,
         _who: Option<&charpente::auth::Principal>,

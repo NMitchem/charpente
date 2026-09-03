@@ -7,7 +7,7 @@
 // the deref back out to an unscoped table.
 use charpente::auth::Principal;
 use charpente::http::{ApiError, Ctx};
-use charpente::{Id, Scoped, TenantScope, Tx, View, table};
+use charpente::{Id, Scoped, Tenant, Tx, View, table};
 
 #[table]
 struct Org {
@@ -21,7 +21,9 @@ struct Region {
     name: String,
 }
 
-impl TenantScope for Org {
+impl Tenant for Org {
+    type Who = Principal;
+    type Error = ApiError;
     fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<Org>) -> Result<(), ApiError> {
         Ok(())
     }

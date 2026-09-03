@@ -18,7 +18,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use charpente_core::db::{Db, DbConfig, Schema, Seeder};
+use charpente_core::db::{Db, DbConfig, Schema, Seeder, Tenant, Tx, TxError};
 use charpente_core::engine::{Engine, REHELLO_MARKER, StateMachine};
 use charpente_core::io::{Disk, File};
 use charpente_core::job::{JobRow, JobStatus};
@@ -517,6 +517,23 @@ fn an_unscoped_table_still_writes_a_bare_u64_key() {
 }
 
 struct TestOrg;
+
+/// The scope's membership check, as core sees it: `Tenant` is the hook, and
+/// `Tx::open_scope` is the only route to a scoped row. `Who = str` rather
+/// than a struct so the associated type's `?Sized` is exercised somewhere;
+/// `Error = io::Error` so a refusal composes with the `?` the staged
+/// closures below already use.
+impl Tenant for TestOrg {
+    type Who = str;
+    type Error = io::Error;
+
+    fn authorize(_tx: &Tx, who: Option<&str>, _scope: Id<TestOrg>) -> Result<(), io::Error> {
+        match who {
+            Some("stranger") => Err(io::Error::other("not a member of this org")),
+            _ => Ok(()),
+        }
+    }
+}
 
 /// A hand-written scoped `Row` for the two tests below. `engine.rs` cannot use
 /// `#[table(scoped_by = …)]` — the macro emits `::charpente::` paths, and core
@@ -1532,8 +1549,8 @@ fn scan_by_scoped_bounds_are_inclusive_of_id_0_and_id_max() {
 /// assertion"`). Now that the record's `0x05`/`0x06` tags carry the scope,
 /// the same write survives a crash-restart replay under its own scope.
 ///
-/// Written at scope 0 through `Tx::put_in`, the scope-taking write
-/// `ScopedTx::put` delegates to — R35's tenant-0 pin: 0 is a legal
+/// Written at scope 0 through `ScopedTx::put`, the only scope-taking write
+/// an app has — R35's tenant-0 pin: 0 is a legal
 /// tenant for a scoped table, not "no scope", so this must replay through
 /// the SCOPED tag (`0x05`), which `Db::open`'s successful return already
 /// implies: `resolve_effect_scope` refuses `Db::open` outright had the
@@ -1547,14 +1564,12 @@ fn a_scoped_write_survives_crash_restart_replay_under_its_own_scope() {
     let schema = || Schema::new().table::<Ticket>();
 
     let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), schema()).unwrap();
-    db.transact(|tx| -> Result<(), ()> {
-        tx.put_in(
-            Id::<TestOrg>::from_raw(0),
-            &Ticket {
+    db.transact(|tx| -> Result<(), io::Error> {
+        tx.open_scope(Id::<TestOrg>::from_raw(0), None)?
+            .put(&Ticket {
                 id: Id::from_raw(5),
                 n: 42,
-            },
-        );
+            });
         Ok(())
     })
     .unwrap();
@@ -1592,14 +1607,12 @@ fn a_followers_apply_shipped_lands_a_scoped_write_under_its_own_scope() {
 
     let mut primary = Db::open(Box::new(sim.disk()), DbConfig::default(), schema()).unwrap();
     primary
-        .transact(|tx| -> Result<(), ()> {
-            tx.put_in(
-                Id::<TestOrg>::from_raw(0),
-                &Ticket {
+        .transact(|tx| -> Result<(), io::Error> {
+            tx.open_scope(Id::<TestOrg>::from_raw(0), None)?
+                .put(&Ticket {
                     id: Id::from_raw(9),
                     n: 7,
-                },
-            );
+                });
             Ok(())
         })
         .unwrap();
@@ -1968,19 +1981,23 @@ fn a_scoped_row_survives_a_snapshot_seed_with_its_scope_intact() {
 
 // ------------------------------------------------- Task 7: the group overlay
 
-/// Task 7 Step 4c. Tasks 5 and 6 bound the SNAPSHOT ranges; they say nothing
-/// about the overlay, and `Tx::group` is the BATCH-level overlay shared by
-/// every transaction in the batch — so it holds other tenants' staged rows.
-/// Merged by bare id (the shape every read loop had before this task), tenant
-/// B's staged id 7 overwrites tenant A's id 7 inside A's own scan, and the
-/// call that returns it is `scan_in(a)`: endorsed by the types, invisible to
-/// any single-tenant test, which is why this one drives two tenants through
-/// ONE `Group`.
+/// Tasks 5 and 6 bound the SNAPSHOT ranges; they say nothing about the
+/// overlay, and `Tx::group` is the BATCH-level overlay shared by every
+/// transaction in the batch — so it holds other tenants' staged rows. Merged
+/// by bare id (the shape every read loop had before Task 7), tenant B's staged
+/// id 7 overwrites tenant A's id 7 inside A's own scan, and the call that
+/// returns it is `ScopedTx<A>::scan`: endorsed by the types, invisible to any
+/// single-tenant test, which is why this one drives two tenants through ONE
+/// `Group`.
 ///
-/// `get_in` is asserted alongside the scans deliberately even though it pins
-/// `(scope, id)` exactly and was never leaky: `get`'s exactness and the
-/// scans' merge are one change with two different wrong behaviours (the
-/// hazard note this task deleted from `db.rs` named both), so both belong in
+/// Three staged transactions, not two, because a transaction opens ONE scope
+/// (spec §8): the cross-tenant read has to come from a third transaction that
+/// opened A, by which point BOTH tenants' rows are in the group overlay — the
+/// exact state the merge conflates.
+///
+/// `get` is asserted alongside the scans deliberately even though it pins
+/// `(scope, id)` exactly and was never leaky: `get`'s exactness and the scans'
+/// merge are one change with two different wrong behaviours, so both belong in
 /// the pin.
 #[test]
 fn one_tenants_staged_row_is_invisible_to_another_in_the_same_batch() {
@@ -1997,76 +2014,71 @@ fn one_tenants_staged_row_is_invisible_to_another_in_the_same_batch() {
     let mut group = db.begin_group().unwrap();
     group
         .stage(|tx| -> Result<(), io::Error> {
-            tx.put_in(
-                a,
-                &Ticket {
-                    id: Id::from_raw(7),
-                    n: 11,
-                },
-            );
+            tx.open_scope(a, None)?.put(&Ticket {
+                id: Id::from_raw(7),
+                n: 11,
+            });
             Ok(())
         })
         .unwrap();
-    // A second transaction in the SAME batch: tenant A's row 7 now reaches
-    // this one through the group overlay, tenant B's own through its txn
-    // overlay — the two levels the merge conflates.
+    // A second transaction in the SAME batch: tenant A's row 7 reaches this
+    // one through the group overlay, tenant B's own through its txn overlay —
+    // the two levels the merge conflates, read here from B's side.
     group
         .stage(|tx| -> Result<(), io::Error> {
-            tx.put_in(
-                b,
-                &Ticket {
-                    id: Id::from_raw(7),
-                    n: 22,
-                },
-            );
-
+            let mut tx = tx.open_scope(b, None)?;
+            tx.put(&Ticket {
+                id: Id::from_raw(7),
+                n: 22,
+            });
             assert_eq!(
-                tx.get_in(b, Id::<Ticket>::from_raw(7))?.map(|t| t.n),
+                tx.get(Id::<Ticket>::from_raw(7))?.map(|t| t.n),
                 Some(22),
                 "read-your-own-writes still holds inside a scope"
             );
             assert_eq!(
-                tx.get_in(a, Id::<Ticket>::from_raw(7))?.map(|t| t.n),
+                tx.scan::<Ticket>()?.iter().map(|t| t.n).collect::<Vec<_>>(),
+                vec![22],
+                "B's scan must return B's row 7, not A's from the group overlay"
+            );
+            Ok(())
+        })
+        .unwrap();
+    // And from A's side, with both tenants' rows now in the group overlay.
+    group
+        .stage(|tx| -> Result<(), io::Error> {
+            let tx = tx.open_scope(a, None)?;
+            assert_eq!(
+                tx.get(Id::<Ticket>::from_raw(7))?.map(|t| t.n),
                 Some(11),
                 "tenant A's id 7 must still read as A's row, not B's"
             );
             assert_eq!(
-                tx.scan_in::<TestOrg, Ticket>(a)?
-                    .iter()
-                    .map(|t| t.n)
-                    .collect::<Vec<_>>(),
+                tx.scan::<Ticket>()?.iter().map(|t| t.n).collect::<Vec<_>>(),
                 vec![11],
-                "scan_in(A) must return A's row 7 — a bare-id overlay merge returns B's, \
+                "A's scan must return A's row 7 — a bare-id overlay merge returns B's, \
                  because (scope, id) iterates in scope order and B's scope is the higher one"
             );
             assert_eq!(
-                tx.scan_in::<TestOrg, Ticket>(b)?
-                    .iter()
-                    .map(|t| t.n)
-                    .collect::<Vec<_>>(),
-                vec![22],
-                "scan_in(B) must return B's row 7"
-            );
-            assert_eq!(
-                tx.scan_from_in::<TestOrg, Ticket>(a, 0, 10)?
+                tx.scan_from::<Ticket>(0, 10)?
                     .iter()
                     .map(|t| t.n)
                     .collect::<Vec<_>>(),
                 vec![11],
-                "scan_from_in(A) must return A's row 7"
+                "A's scan_from must return A's row 7"
             );
             assert_eq!(
-                tx.scan_by_in::<TestOrg, Ticket>(a, "by_n", &11u32)?
+                tx.scan_by::<Ticket>("by_n", &11u32)?
                     .iter()
                     .map(|t| t.n)
                     .collect::<Vec<_>>(),
                 vec![11],
-                "scan_by_in(A, by_n = 11) must find A's row — the index read merges the same \
-                 overlay, so a forgotten filter there is the same leak through a second door"
+                "A's index read on by_n = 11 must find A's row — the index read merges the \
+                 same overlay, so a forgotten filter there is the same leak through a second \
+                 door"
             );
             assert!(
-                tx.scan_by_in::<TestOrg, Ticket>(a, "by_n", &22u32)?
-                    .is_empty(),
+                tx.scan_by::<Ticket>("by_n", &22u32)?.is_empty(),
                 "B's key 22 must not surface under A's index read"
             );
             Ok(())
@@ -2111,44 +2123,45 @@ fn one_tenants_staged_tombstone_cannot_delete_another_tenants_row_from_its_read(
     let mut group = db.begin_group().unwrap();
     group
         .stage(|tx| -> Result<(), io::Error> {
-            tx.put_in(
-                a,
-                &Ticket {
-                    id: Id::from_raw(7),
-                    n: 11,
-                },
+            tx.open_scope(a, None)?.put(&Ticket {
+                id: Id::from_raw(7),
+                n: 11,
+            });
+            Ok(())
+        })
+        .unwrap();
+    group
+        .stage(|tx| -> Result<(), io::Error> {
+            let mut tx = tx.open_scope(b, None)?;
+            tx.delete::<Ticket>(Id::from_raw(7));
+            assert!(
+                tx.scan::<Ticket>()?.is_empty(),
+                "B's own tombstone still applies to B — and A's row 7, in the group overlay, \
+                 must not surface here either"
             );
             Ok(())
         })
         .unwrap();
     group
         .stage(|tx| -> Result<(), io::Error> {
-            tx.delete_in(b, Id::<Ticket>::from_raw(7));
-
+            let tx = tx.open_scope(a, None)?;
             assert_eq!(
-                tx.get_in(a, Id::<Ticket>::from_raw(7))?.map(|t| t.n),
+                tx.get(Id::<Ticket>::from_raw(7))?.map(|t| t.n),
                 Some(11),
                 "B's tombstone must not make A's row 7 read as absent"
             );
             assert_eq!(
-                tx.scan_in::<TestOrg, Ticket>(a)?
-                    .iter()
-                    .map(|t| t.n)
-                    .collect::<Vec<_>>(),
+                tx.scan::<Ticket>()?.iter().map(|t| t.n).collect::<Vec<_>>(),
                 vec![11],
                 "B's tombstone for id 7 must not remove A's row 7 from A's scan"
             );
             assert_eq!(
-                tx.scan_by_in::<TestOrg, Ticket>(a, "by_n", &11u32)?
+                tx.scan_by::<Ticket>("by_n", &11u32)?
                     .iter()
                     .map(|t| t.n)
                     .collect::<Vec<_>>(),
                 vec![11],
                 "nor from A's index read, whose overlay pass removes before it re-inserts"
-            );
-            assert!(
-                tx.scan_in::<TestOrg, Ticket>(b)?.is_empty(),
-                "B's own tombstone still applies to B"
             );
             Ok(())
         })
@@ -2163,4 +2176,111 @@ fn one_tenants_staged_tombstone_cannot_delete_another_tenants_row_from_its_read(
         Some(11),
         "and the tombstone applied to B's key only, so A's row is still on disk"
     );
+}
+
+// ----------------------------------------------- Task 7: opening the scope
+
+/// `open_scope` runs the app's own `authorize` and returns its refusal
+/// unchanged — the core half of the contract `charpente/tests/tenant.rs` pins
+/// through a real request. Deleting the `S::authorize(...)?` call turns this
+/// test RED here, at the one place it runs.
+#[test]
+fn a_refused_scope_hands_back_the_apps_own_error_and_no_handle() {
+    let sim = Sim::with_faults(0x7F00_0001, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Ticket>(),
+    )
+    .unwrap();
+
+    let refused = db
+        .transact(|tx| {
+            tx.open_scope(Id::<TestOrg>::from_raw(1), Some("stranger"))?
+                .put(&Ticket {
+                    id: Id::from_raw(7),
+                    n: 11,
+                });
+            Ok::<(), io::Error>(())
+        })
+        .expect_err("a refusing authorize must refuse the scope");
+    let TxError::App(refused) = refused else {
+        panic!("a refusing authorize is the APP's error, not a platform one");
+    };
+    assert!(
+        refused.to_string().contains("not a member of this org"),
+        "the app's own refusal reaches the caller unchanged: {refused}"
+    );
+
+    // Nothing was written: no handle existed to write through.
+    let snap = db.snapshot().unwrap();
+    assert!(
+        snap.get_scoped::<Ticket>(1, Id::from_raw(7))
+            .unwrap()
+            .is_none(),
+        "a refused scope must leave the tenant untouched"
+    );
+}
+
+/// Spec §8: a transaction opens ONE scope. Reaching a second tenant through
+/// `ScopedTx`'s `DerefMut` is the bypass the private seam no longer allows and
+/// this assert closes — the only remaining way to name two tenants in one
+/// transaction, and it is a contract violation rather than a cross-tenant
+/// write.
+#[test]
+#[should_panic(expected = "a transaction opens ONE tenant scope")]
+fn a_second_scope_on_one_transaction_is_a_contract_violation() {
+    let sim = Sim::with_faults(0x7F00_0002, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Ticket>(),
+    )
+    .unwrap();
+
+    let _ = db.transact(|tx| {
+        // The first handle's borrow of `tx` ends with this block, which is
+        // what lets a second `open_scope` be reached at all.
+        {
+            tx.open_scope(Id::<TestOrg>::from_raw(1), None)?
+                .put(&Ticket {
+                    id: Id::from_raw(7),
+                    n: 11,
+                });
+        }
+        let _second = tx.open_scope(Id::<TestOrg>::from_raw(2), None)?;
+        Ok::<(), io::Error>(())
+    });
+}
+
+/// The same scope twice is not the violation — a handler that opens its
+/// tenant, drops the handle, and opens it again is doing nothing dangerous,
+/// and an assert that fired here would make the negative space above a
+/// tripwire on ordinary code.
+#[test]
+fn reopening_the_same_scope_is_allowed() {
+    let sim = Sim::with_faults(0x7F00_0003, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Ticket>(),
+    )
+    .unwrap();
+
+    db.transact(|tx| {
+        let scope = Id::<TestOrg>::from_raw(1);
+        tx.open_scope(scope, None)?.put(&Ticket {
+            id: Id::from_raw(7),
+            n: 11,
+        });
+        assert_eq!(
+            tx.open_scope(scope, None)?
+                .get(Id::<Ticket>::from_raw(7))?
+                .map(|t| t.n),
+            Some(11),
+            "the second handle on the same scope reads the first one's write"
+        );
+        Ok::<(), io::Error>(())
+    })
+    .unwrap();
 }

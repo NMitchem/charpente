@@ -7,7 +7,9 @@
 extern crate self as charpente;
 
 pub use charpente_core as core;
-pub use charpente_core::db::{Db, DbConfig, Event, Job, Schema, Seeder, Tx, TxError};
+pub use charpente_core::db::{
+    Db, DbConfig, Event, Job, Schema, ScopedTx, Seeder, Tenant, Tx, TxError,
+};
 pub use charpente_core::table::{Id, Snapshot, View};
 pub use charpente_macros::{Wire, event, job, route, row_shape, table};
 // Re-exported so `#[event]`'s emitted `Serialize` derive resolves through
@@ -31,4 +33,4 @@ pub use launch::launch;
 // Re-exported at the root so the `#[table(scoped_by = …)]` const assert
 // `charpente-macros` emits can name it as `::charpente::TenantScope`, the
 // same flat-path convention `Wire` (from `charpente-macros`) already gets.
-pub use tenant::{Scoped, ScopedTx, TenantScope};
+pub use tenant::{Scoped, TenantScope};

@@ -698,9 +698,12 @@ struct ScopedWidget {
 
 /// `#[table(scoped_by = Org)]` requires this — the app's own membership
 /// check (crates/charpente/src/tenant.rs). Trivially `Ok(())`: this file
-/// exercises the type-level wiring only — there is no `ScopedTx` yet to
-/// call it through (a later task).
-impl charpente::TenantScope for Org {
+/// exercises the type-level wiring only; the refusing case lives in
+/// `charpente/tests/tenant.rs`.
+impl charpente::Tenant for Org {
+    type Who = charpente::auth::Principal;
+    type Error = charpente::http::ApiError;
+
     fn authorize(
         _tx: &charpente::Tx,
         _who: Option<&charpente::auth::Principal>,
