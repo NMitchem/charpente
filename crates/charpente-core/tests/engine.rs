@@ -15,8 +15,8 @@
 //! two. Integration tests share the one normal build both crates see.
 
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use charpente_core::db::{Db, DbConfig, Schema, Seeder, Tenant, Tx, TxError};
 use charpente_core::engine::{Engine, REHELLO_MARKER, StateMachine};
@@ -2251,6 +2251,69 @@ fn a_second_scope_on_one_transaction_is_a_contract_violation() {
         let _second = tx.open_scope(Id::<TestOrg>::from_raw(2), None)?;
         Ok::<(), io::Error>(())
     });
+}
+
+/// Every scope `AuditOrg::authorize` is asked about, in order. A recording
+/// scope type rather than `TestOrg`'s, so the ordering pin below observes only
+/// its own transaction.
+static AUDITED_SCOPES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+struct AuditOrg;
+
+impl Tenant for AuditOrg {
+    type Who = str;
+    type Error = io::Error;
+
+    fn authorize(_tx: &Tx, _who: Option<&str>, scope: Id<AuditOrg>) -> Result<(), io::Error> {
+        AUDITED_SCOPES.lock().unwrap().push(scope.raw());
+        Ok(())
+    }
+}
+
+/// `open_scope` decides the one-scope contract BEFORE it asks the app. The
+/// violation is decidable without an answer, so a second tenant on this
+/// transaction gets no handle whatever the app would say — and the app's
+/// `authorize`, with any audit entry or side effect it performs, is never
+/// invoked for a scope no handle is issued for.
+///
+/// The refusal alone does not pin the order: the assert fires either way, so
+/// the test above stays green with `authorize` moved back in front of it. What
+/// discriminates is WHAT AUTHORIZE SAW — tenant 2 must never reach it.
+#[test]
+fn a_refused_second_scope_never_reaches_the_apps_authorize() {
+    let sim = Sim::with_faults(0x7F00_0004, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Ticket>(),
+    )
+    .unwrap();
+
+    AUDITED_SCOPES.lock().unwrap().clear();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = db.transact(|tx| {
+            {
+                let _first = tx.open_scope(Id::<AuditOrg>::from_raw(1), None)?;
+            }
+            let _second = tx.open_scope(Id::<AuditOrg>::from_raw(2), None)?;
+            Ok::<(), io::Error>(())
+        });
+    }))
+    .expect_err("a second tenant on one transaction is a contract violation");
+    let msg = panicked
+        .downcast_ref::<String>()
+        .map_or_else(String::new, String::clone);
+    assert!(
+        msg.contains("a transaction opens ONE tenant scope"),
+        "the refusal must name the contract it broke, not some other panic: {msg}"
+    );
+
+    assert_eq!(
+        *AUDITED_SCOPES.lock().unwrap(),
+        vec![1],
+        "authorize must have been asked about tenant 1 and NEVER about tenant 2 — a scope no \
+         handle is issued for is not the app's question to answer"
+    );
 }
 
 /// The same scope twice is not the violation — a handler that opens its

@@ -356,12 +356,14 @@ pub trait Row: Sized + 'static {
 /// to substitute. That is the whole of its job; it is not an extension
 /// point.
 ///
-/// SEALED, by a supertrait no other crate can name. Without the seal an app
-/// writes one safe line — `impl NoTenant<Invoice> for Org {}`, legal under
-/// the orphan rules because `Org` is local — and `Invoice: UnscopedRow`
-/// holds, `View`'s bound is satisfied, and a scoped read compiles on a bare
-/// `Tx`. Spec §7's exit criterion 1 is a compile error, so the marker that
-/// carries it cannot be an opt-out.
+/// SEALED, by a supertrait no other crate can name — and so is `UnscopedRow`
+/// below, because sealing either one alone leaves the other as the same
+/// one-line opt-out. Without both seals an app writes one safe, orphan-legal
+/// line (`impl NoTenant<Invoice> for Org {}`, or `impl UnscopedRow for
+/// Invoice {}` one level up), `View`'s bound is satisfied, and a scoped read
+/// compiles on a bare `Tx`. Spec §7's exit criterion 1 is a compile error, so
+/// neither the marker that carries it nor the bound that names it can be an
+/// opt-out.
 #[diagnostic::on_unimplemented(
     message = "`{R}` is a tenant-scoped table (`#[table(scoped_by = {Self})]`) and a bare `Tx` \
                names no tenant",
@@ -375,14 +377,21 @@ pub trait NoTenant<R>: sealed::NotATenant {}
 
 impl<R> NoTenant<R> for Unscoped {}
 
-/// The seal. Private, so `NoTenant`'s supertrait obligation is unsatisfiable
-/// outside this crate however the orphan rules fall — the only scope type
-/// that will ever carry it is `Unscoped`.
+/// The seals. Private, so both supertrait obligations are unsatisfiable
+/// outside this crate however the orphan rules fall: the only scope type that
+/// will ever carry `NotATenant` is `Unscoped`, and the only rows that will
+/// ever carry `NotScoped` are the ones whose own `Row::Scope` earns it.
 mod sealed {
     pub trait NotATenant {}
+    pub trait NotScoped {}
 }
 
 impl sealed::NotATenant for Unscoped {}
+
+/// `UnscopedRow`'s seal, derived from `Row::Scope` by the same blanket
+/// condition `UnscopedRow` itself uses — so the seal admits exactly the rows
+/// the bound admits and adds no second source of truth.
+impl<R: Row> sealed::NotScoped for R where R::Scope: NoTenant<R> {}
 
 /// A table with no tenant scope, and so one an `Id<R>` alone can address.
 /// Implemented for exactly the `Row`s whose `Scope` is `Unscoped`, derived
@@ -390,7 +399,12 @@ impl sealed::NotATenant for Unscoped {}
 /// no-drift reasoning `row_is_scoped` is built on. This is `View`'s bound,
 /// which is what makes a scoped read from a bare `Tx` an unsatisfied trait
 /// bound rather than a runtime refusal (spec §1, §7 exit criterion 1).
-pub trait UnscopedRow: Row {}
+///
+/// SEALED for that reason, and separately from `NoTenant`: this is the trait
+/// `View` actually names, so an app that implements it directly
+/// (`impl UnscopedRow for Invoice {}` — orphan-legal, one line) reaches a
+/// scoped table from a bare `Tx` without ever touching the marker.
+pub trait UnscopedRow: Row + sealed::NotScoped {}
 
 impl<R: Row> UnscopedRow for R where R::Scope: NoTenant<R> {}
 
