@@ -2600,3 +2600,59 @@ than accepted from the implementer's report. That caught one misreported figure:
 report claimed `charpente-core --test engine` at 56 passed; it is 46, and `engine.rs` is not in
 that commit at all, so the number could not have moved. Green either way and nothing hidden,
 but not reproducible as written.
+
+## 2026-09-04 — Task 12, and the wire layer is not in CI
+
+**Task 12 (`fef12f6`) — two tenants over real TCP.** `crates/edge-harness/tests/tenant_wire.rs`
+plus `examples/invoicing/src/bin/tenant_node.rs` as the vehicle: invoicing's own tables predate
+`scoped_by`, so the rig needed a sibling of `node.rs` whose `Doc` is
+`#[table(scoped_by = Org)]`, with routes covering scoped scan, scoped `#[index]` lookup, and a
+scope-keyed SSE feed. `--legacy-unscoped` serves the pre-scoping shape of the same table for the
+mixed-version arm alone. Both tenants deliberately use the SAME document ids and the SAME index
+tag, and every assertion is two-sided, so Task 11's fail-closed vacuity cannot pass here.
+CLAUDE.md's edge-harness inventory updated in the same commit — required, since
+`doc_inventory` enumerates `tests/*.rs` by `read_dir` and would otherwise go red.
+
+**R60 discharged — the mixed-version arm exists and refuses by name.** A primary with a scoped
+`Doc` ships to two followers; the control converges, the legacy follower prints byte for byte:
+
+> charpente kernel stopped on a platform IO failure — restart to recover: record decode: table
+> "Doc" is not tenant-scoped (Row::Scope = Unscoped) but this Put effect carries scope 1 (tag
+> 0x05/0x06) — the record was written for a scoped shape of this table; restore from a replica
+> or backup, or replay under the schema that wrote it
+
+and holds no misread row afterwards. **The reason this pairing is reachable at all is the
+finding inside the finding:** the handshake's schema digest covers a table's fields and version
+but NOT its scopedness (`schema_digest_of`), so a legacy follower is admitted and only the
+record-level refusal stops it. A genuinely older `PROTO_VERSION` peer never reaches a record —
+it is refused at the handshake, covered by `charpente/tests/replication.rs` and `protocol.rs`'s
+tag-14 pins. Three mutation proofs, each with a revert-and-rerun control: constant `scoped_key`
+reddened the HTTP oracle, `event_key` returning "0" reddened the SSE oracle, and
+`resolve_effect_scope`'s `(false, Some)` arm returning `Ok(scope)` produced a raw `Writer::put`
+assertion instead of the named refusal — exactly the distinction hard rule 5 draws. The
+inventory gate was proved fireable too, by removing `tenant_wire` from CLAUDE.md.
+
+**FINDING — the entire wire layer is outside CI.** `#[ignore]` is the edge-harness convention
+(every file in the crate uses it; the line is drawn at syscalls), and Task 12 followed it
+correctly. The consequence, counted rather than estimated: **15 `#[ignore]`d tests across
+`acked_durable` (2), `failover` (3), `hunts` (5), `realtime_resume` (1), `smoke` (1) and
+`tenant_wire` (3) never execute in CI.** `.github/workflows/ci.yml:34` runs
+`cargo test --workspace`, which skips ignored tests, and the workflow's ONLY `--ignored`
+invocation is `:75`, the bench-harness passthrough guard, named `--exact`.
+
+This is pre-existing and already sat in the follow-up list as "`#[ignore]`d real-disk guard
+tests are not run by CI". What is new is the consequence: **M1's exit criteria were discharged
+with "an oracle at two layers — an in-sim property plus a wire oracle", and the second layer
+has never run automatically.** It is a local-only gate. Task 12 has now put tenancy's wire
+oracle in the same position, which is correct convention and still means the guarantee is
+guarded by a human remembering to run it. Deciding this is Noah's; the honest options are a CI
+job that runs edge-harness with `--include-ignored` (cost: real process spawns and TCP on a
+metered runner) or an explicit written statement that the wire layer is a local gate, so the
+exit-criteria claim stops implying otherwise.
+
+**Three instances of one shape in this branch alone, worth naming.** A `require:` key whose
+state is unreachable by construction (R58). An oracle that validates against the row whose own
+field is the thing in question, so it agrees with the bug (the realtime sibling). And a test
+suite that exists, passes, and never runs (this). All three are green-looking coverage that
+cannot fail, and none is caught by reading the test — only by asking what single change should
+make it red, and then making that change.
