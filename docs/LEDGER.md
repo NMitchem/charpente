@@ -2383,3 +2383,95 @@ API** — `charpente::wire::{Wire, TypeSchema, WireU64, WireI64}` and `Id<T>`'s 
 `params`/`request`/`response`/`error` fns and `emits(...)`, the `charpente-tsgen` crate,
 `gen-client`/`check-client` — is named in DESIGN.md/GUIDE.md as of Tasks 5-10's fix rounds
 except the two DESIGN.md paragraphs above. No WebSocket transport shipped anywhere in the tree.
+
+## 2026-09-03 — tenant-scoping: the checkpoint is held, not merged; three items discharged
+
+**The branch is not mergeable and the reason is hard rule 3, not a defect.** Tasks
+1-7/6b/6c/9 landed the whole tenant mechanism across 31 commits; Task 8 — the flagship sim
+property, its two naive victims, and the `require:` keys — does not exist. The final review
+already caught this class once (Important 2, labelled hard rule 3: the scoped seed path and
+scoped archive/restore had zero fault-matrix coverage, mutation M3 caught by exactly one
+deterministic test) and R52/R56 back-filled two 256-universe swarms. What remains uncovered
+is the four-read-path property itself: `get`/`scan`/`scan_from`/`scan_by` under the full
+fault matrix with two tenants, including both tenants indexing the SAME key value — the case
+the plan names as the one that catches a forgotten prefix, "without it the property certifies
+less than it appears to." Until it exists the branch's headline claim is asserted, not proven.
+
+**On R3's reorder, for the record.** R3 moved the overlay widening (plan Task 9) ahead of the
+key/scan/index tasks and argued the plan's "instrument before the risky edit" intent was
+"preserved in substance by the existing suites and the existing BENCH.md baseline." That
+argument is sound *for Task 9*, which at that point was a pure slot-0 refactor with no scoped
+table in existence. It was never extended to Task 8 also landing after 4/5/6/6b/6c/7, which
+are the substantive scoping edits, and that lapse was not re-ruled. This is not a finding
+against the landed work — it is why Task 8 is a debt being discharged rather than the next
+item on a list.
+
+**Ruling R58 — `tenant:crash_mid_batch` is reachable; it stays, scoped to the two states that
+exist.** Read from `engine.rs::submit_all`, one group batch is exactly: N x `wal.append` ->
+ONE `wal.sync()` -> ONE `machine.apply_batch`. Therefore:
+- **State 1, crash between two appends, pre-sync — REACHABLE.** Nothing is acked (ack is
+  strictly after durable), and recovery takes whatever survived the tail.
+- **State 2, crash after sync and before apply — REACHABLE.** All N records durable, store
+  `applied_seq` N behind. This is the staging/apply boundary the plan's comment names.
+- **State 3, a partial apply inside `apply_batch` — UNREACHABLE by construction.** Per-batch
+  apply (M2, 2026-08-20) commits the contiguous run's row effects atomically with
+  `applied_seq` in ONE redb write transaction; a crash mid-transaction rolls back to a state
+  indistinguishable from state 2. **The key must not be written to require state 3** — a
+  `require:` key whose state is architecturally unreachable either reds every batch forever
+  or gets quietly dropped, and either way certifies nothing.
+
+  The obstruction the final fix wave hit was never reachability. It is that every existing
+  swarm writes through `Db::transact`, documented at `db.rs:2092` as "a group of one
+  (spec §1)" — with N=1 there is no *between*. Task 8 therefore builds the batch itself:
+  `Db::begin_group` and `Group::stage` are both `pub`, so the property stages N >= 2
+  transactions from two tenants **sharing an id inside one batch** — precisely the aliasing
+  defect R3 predicted — and crosses a fault point inside it.
+
+  **No `KernelStats` change is needed.** The fix wave's note that "`KernelStats` has no batch
+  composition" is accurate but not binding: `Sim::cover` is `pub` and properties credit keys
+  directly (`auth.rs:542`, `archive.rs:7554`). The property owns the batch construction, so it
+  owns the observability.
+
+**Docs-only helpdesk build — findings carried over.** The Step 4 Half A experiment
+(branch `docs-only-helpdesk`, 5 commits, 10k universes green, master seed
+`0x12124e6ebd9cf8b9`) is durable: its objects always lived in the main repo's shared `.git`,
+and the branch is now pushed. Its four findings, F1 first because it is a product defect:
+- **F1 (hard rule 5, confirmed by controller replay).** The July `catch_unwind` fence around
+  `Store::open` (redb `page_manager` :231/:257, commit `1c439d5`) lets the DEFAULT PANIC HOOK
+  print `panicked at ...page_manager.rs` before the panic is caught: **134 such lines on a
+  fully green 10k-universe batch.** The docs-only agent read them as failure and discarded a
+  correct full-App-stack property. DESIGN §7 and hard rule 5 make the fast, precise *no* the
+  product; this is the inverse — a false alarm that cost a competent agent good work. The
+  fence should silence the hook for that scope or print one named line. Repro: that master
+  seed.
+- **F2.** `require: ["restart"]` never credited on a property built over
+  `acked_implies_durable` — whether the checker's restart path bypasses `Sim::restart`'s cover
+  call is unresolved. Same class as R58: a coverage key that cannot fire. Two independent
+  sightings is a pattern, not a coincidence.
+- **F3.** GUIDE has no tenancy section; the app derived org from the session subject and
+  filtered by hand everywhere. Expected — Task 13 owns it.
+- **F4.** Route bodies need `serde::Serialize` for the TS client and no GUIDE example shows
+  it.
+
+**R57's bypass proof, completed.** The R57 seal (`UnscopedRow: Row + sealed::NotScoped`, so an
+app cannot re-open a scoped table with a one-line orphan-legal `impl`) shipped with implementer
+testing but its INDEPENDENT mutation proof was killed mid-run — between applying the mutation
+and running the check — leaving the bypass re-opened in the working tree with a green-looking
+HEAD. Reverted, and both mutations have now been run to completion, foreground, with the
+restore verified against HEAD's blob rather than a dirty-count:
+- **Mutation A**, unseal `UnscopedRow`. Baseline
+  `compile_fail/unscoped_row_impl_from_an_app.rs [should fail to compile] ... ok`, exit 0.
+  Mutated: *"Expected test case to fail to compile, but it succeeded"*, `macro_errors FAILED`,
+  exit 101. **RED.**
+- **Mutation B**, move `S::authorize` ABOVE the one-scope guard in `Tx::open_scope`. Baseline
+  `a_refused_second_scope_never_reaches_the_apps_authorize ... ok`, 46/0. Mutated: FAILED at
+  `engine.rs:2311` with `left: [1, 2]` / `right: [1]` — the values PREDICTED before the run,
+  matched exactly. **RED.**
+Both restores verified byte-equal to HEAD. The seal and the check order are load-bearing, not
+decorative.
+
+**Housekeeping.** `main` (5 doc commits), `tenant-scoping` and `docs-only-helpdesk` are pushed
+to `origin` for the first time. The helpdesk worktree's objects were never actually at risk —
+worktrees share the main repo's `.git` — but the branch was single-copy and unpushed, and its
+untracked `HELPDESK-BRIEF.md` was genuinely perishable; it is copied to
+`.superpowers/sdd/2026-08-30-tenant-scoping/`, keeping R54's "not to be committed" ruling.
