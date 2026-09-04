@@ -2579,3 +2579,565 @@ fn a_subscription_keyed_to_one_tenant_never_sees_another_tenants_event() {
          ScopedTx<Org>(1) emit produced — the scope's key encoding, pinned"
     );
 }
+
+// ======================= the scoped sibling under the full fault matrix
+//
+// Hard rule 3 for `ScopedTx::emit`/`ScopedTx::event_key`. The unit property
+// above runs one kernel under `FaultConfig::none()`, and the key those two
+// functions derive is DURABLE — `db.rs` stores it in `EventRow.key`, ships it
+// by replication, and exact-matches it when a subscriber resumes. A crash
+// between emit and durability, a WAL replay, a retention gap and a dropped
+// tail must all preserve it, and none of those happen in a universe with no
+// faults in it.
+//
+// A SIBLING of `reconnecting_client_misses_nothing_under_the_fault_matrix`
+// rather than a widening of it — the ruling R56 already settled for
+// `archive_converges_with_a_scoped_table`. Putting a scoped emit into the
+// flagship workload moves what its pinned base seed does, and its seeds are
+// pinned; so the flagship keeps its exact bytes and everything below gets its
+// own base seed, its own workload, and floors MEASURED at that base.
+//
+// **What this sibling can prove that the flagship structurally cannot.** The
+// flagship's `Client` checks every delivered frame against `charpente.events`
+// — the very row whose `key` column is the thing in question — so an emit
+// that writes the WRONG key writes it into the oracle's own ground truth and
+// the oracle agrees with it. That is not hypothetical: `event_key` returning
+// a constant (Task 11's own mutation) makes every tenant's event carry tenant
+// A's key, and a `Client` keyed to A then expects them all, receives them all
+// and settles. The discriminator added here is that each event's payload
+// carries the tenant that emitted it, independently of the key
+// (`SCOPED_N_STRIDE`), so `scoped_key_oracle` can compare the durable key
+// against the emitting scope instead of against itself.
+
+/// The sibling's own base seed (R56: its own base, not the flagship's).
+const SCOPED_REALTIME_BASE: u64 = 0x2EB2_5C09;
+
+/// The subscribing tenant, and the other one that must also be emitting —
+/// with one tenant the whole property passes vacuously, which is what
+/// `tenant:both-tenants-emitted` is required for.
+const SCOPED_TENANT_A: u64 = 1;
+const SCOPED_TENANT_B: u64 = 2;
+/// `ScopedTx::event_key`'s encoding for `SCOPED_TENANT_A`, written out
+/// literally rather than derived — the same reason `literal_feed` exists.
+const SCOPED_TENANT_A_KEY: &str = "1";
+const SCOPED_FEED_A: &str = "/scoped-feed/1";
+
+/// Each event's payload declares its own emitting tenant: `Ping.n` is
+/// `org * SCOPED_N_STRIDE + r`. This is the entire reason the property has
+/// teeth — see the section header. The stride is far above any `r` so the
+/// division is exact.
+const SCOPED_N_STRIDE: u64 = 1_000_000;
+
+/// `Client::ledger`'s shape — event id to (event name, subscription key,
+/// the exact JSON a delivery would carry) — and `Client::trace`'s, the
+/// frames a subscriber actually received. Named because the twin helper
+/// below hands both back at once.
+type ScopedLedger = BTreeMap<u64, (&'static str, Option<String>, String)>;
+type ScopedTrace = Vec<(u64, &'static str, String)>;
+
+/// The tenant a delivered/stored `ping` payload declares, read back out of
+/// the JSON the subscriber actually received rather than out of the key.
+fn declared_org(json: &str) -> Result<u64, String> {
+    let v: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| format!("ping payload {json:?} is not JSON: {e}"))?;
+    let n = v
+        .get("n")
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| format!("ping payload {json:?} has no string field `n`"))?;
+    let n: u64 = n
+        .parse()
+        .map_err(|e| format!("ping payload {json:?} field `n` is not a u64: {e}"))?;
+    Ok(n / SCOPED_N_STRIDE)
+}
+
+/// The sibling's own oracle, on top of everything `Client` already checks
+/// (strictly-increasing ids, no missing own-tenant backlog, no over-delivery
+/// against the ledger's own key). Both arms compare the durable key against
+/// the tenant the PAYLOAD declares, which is the only thing in this file that
+/// does not take `EventRow.key` at its word.
+///
+/// Delivery first, because that is the leak the property is named for; the
+/// ledger arm behind it catches the same corruption one layer earlier, at the
+/// row, including for events the subscriber never asked for. The meta-test
+/// fires both arms separately.
+fn scoped_key_oracle(
+    ledger: &ScopedLedger,
+    trace: &[(u64, &'static str, String)],
+    subscriber_key: &str,
+) -> Result<(), String> {
+    for (id, name, json) in trace {
+        if *name == "charpente.gap" {
+            continue;
+        }
+        let org = declared_org(json)?;
+        if org.to_string() != subscriber_key {
+            return Err(format!(
+                "cross-tenant delivery: a subscriber keyed to tenant {subscriber_key:?} \
+                 received event id {id}, which was emitted inside ScopedTx<Org>({org})"
+            ));
+        }
+    }
+    for (id, (name, key, json)) in ledger {
+        if *name != "ping" {
+            continue;
+        }
+        let org = declared_org(json)?;
+        let expected = org.to_string();
+        if key.as_deref() != Some(expected.as_str()) {
+            return Err(format!(
+                "event id {id} was emitted inside ScopedTx<Org>({org}) but its durable \
+                 EventRow.key reads {key:?}, not {expected:?} — the scope did not survive \
+                 commit, replay and readback, so a subscriber resuming on an exact key match \
+                 gets another tenant's backlog or loses its own"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The naive victim, as a route rather than a core mutation so it can sit in
+/// the suite permanently. It opens the scope exactly as `emit_scoped_ping`
+/// does — `authorize` still runs, the row-level tenant bound still holds —
+/// and then reaches past `ScopedTx::emit` through the `DerefMut` to
+/// `Tx::emit_keyed` with a FIXED key. That is precisely what `event_key`
+/// returning a constant produces, and it is the direction that LEAKS: the
+/// unkeyed `(*tx).emit(…)` naive fix fails closed instead (Task 11's commit
+/// message), so it is not the interesting victim.
+#[route(POST "/leaky-ping")]
+fn emit_leaky_ping(tx: &mut Tx, body: ScopedEmitBody, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(Id::from_raw(body.org.0), ctx)?;
+    tx.emit_keyed(SCOPED_TENANT_A_KEY.to_string(), Ping { n: body.n });
+    Ok(())
+}
+
+/// The scoped workload's app. Same `DbConfig` as `realtime_app` — small
+/// retention on purpose, so a client falls behind it inside a modest number
+/// of emits — over the scoped routes. A separate function rather than a
+/// parameter on `realtime_app` so the flagship's bytes are untouched (R56).
+fn scoped_realtime_app(sim: &Sim) -> io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig {
+            body_cap: 1 << 20,
+            db: charpente::DbConfig {
+                wal: WalConfig {
+                    dir: "wal".to_string(),
+                    segment_bytes: 4096,
+                },
+                store_path: "tables.redb".to_string(),
+                event_retention: 4,
+                checkpoint_every: 2,
+                ..charpente::DbConfig::default()
+            },
+            ..AppConfig::default()
+        },
+    )?
+    .mount(routes![emit_scoped_ping, emit_leaky_ping, scoped_feed]))
+}
+
+/// One emit: whichever tenant this draw picks, with the tenant folded into
+/// the payload (`SCOPED_N_STRIDE`) so the oracle has a source of truth that
+/// is not the key.
+fn pick_scoped_emit(sim: &Sim) -> ScopedEmitBody {
+    let e = sim.entropy();
+    let org = if e.next_u64().is_multiple_of(2) {
+        SCOPED_TENANT_A
+    } else {
+        SCOPED_TENANT_B
+    };
+    let n = org * SCOPED_N_STRIDE + sim.entropy().next_u64() % SCOPED_N_STRIDE;
+    ScopedEmitBody {
+        org: WireU64(org),
+        n: WireU64(n),
+    }
+}
+
+/// `settle_boot` over `scoped_realtime_app`. Copied rather than parameterized
+/// deliberately: threading an app constructor through `settle_boot` would
+/// edit a function the flagship calls, and R56's whole point is that the
+/// pinned property's bytes do not move for the sibling's benefit. Every word
+/// of `settle_boot`'s rationale applies here unchanged.
+fn scoped_settle_boot(sim: &Sim) -> Result<Option<Kernel>, String> {
+    for try_n in 0..SETTLE_BOOT_TRIES {
+        if try_n > 0 && try_n.is_multiple_of(SETTLE_CYCLE_EVERY) {
+            sim.restart();
+        }
+        let app = match scoped_realtime_app(sim) {
+            Ok(app) => app,
+            Err(e) => {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("settle open failed non-injected: {e}"));
+                }
+                continue;
+            }
+        };
+        match Kernel::new(app, Box::new(sim.clock())) {
+            Ok(kernel) => return Ok(Some(kernel)),
+            Err(e) => {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("settle Kernel::new failed non-injected: {e}"));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// One universe of the scoped sibling: same epoch/round/settle shape as
+/// `realtime_workload`, with two tenants emitting into one node and one
+/// subscriber keyed to tenant A. `Client` is reused verbatim — keyed to
+/// `SCOPED_TENANT_A_KEY`, its `matches`/`first_unaccounted` already demand
+/// every A-keyed ledger row above the floor be received, and its `try_match`
+/// already rejects a delivered row whose key is not A's — and
+/// `scoped_key_oracle` adds the payload-versus-key arms `Client` cannot have.
+/// Returns the frame trace, so the replay check has an oracle.
+fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
+    let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
+
+    for _epoch in 0..EPOCHS {
+        let entropy = sim.entropy();
+        sim.crash_disk_after(64 + entropy.next_u64() % 512);
+        let app = match scoped_realtime_app(sim) {
+            Ok(app) => app,
+            Err(e) => {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("open failed non-injected: {e}"));
+                }
+                sim.restart();
+                continue;
+            }
+        };
+        let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
+            Ok(k) => k,
+            Err(e) => {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("Kernel::new failed non-injected: {e}"));
+                }
+                sim.restart();
+                continue;
+            }
+        };
+        client.need_subscribe = true;
+        client.current_handle = None;
+
+        let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 2000 * SEC);
+        let sinks = source.sinks();
+        let responses = source.responses();
+        let mut resp_idx = 0usize;
+        let mut t = sim.now().as_nanos();
+
+        for _round in 0..ROUNDS_PER_EPOCH {
+            let mut subscribe = None;
+            if client.need_subscribe {
+                match push_subscribe(sim, &kernel, &mut source, SCOPED_FEED_A, client.cursor, t) {
+                    Ok(info) => {
+                        subscribe = Some(info);
+                        t += SEC;
+                    }
+                    Err(e) if is_fault_fallout(&e) => {
+                        sim.restart();
+                        client.need_subscribe = true;
+                        client.current_handle = None;
+                        break;
+                    }
+                    Err(e) => return Err(format!("push_subscribe failed non-injected: {e}")),
+                }
+            }
+
+            let n_emits = 1 + sim.entropy().next_u64() % 3;
+            for _ in 0..n_emits {
+                let body = pick_scoped_emit(sim);
+                source.push_at(t, Request::new(Method::Post, "/scoped-ping").json(&body));
+                t += SEC;
+            }
+
+            let run_result = kernel.run(&mut source);
+
+            let new_responses = {
+                let guard = responses
+                    .lock()
+                    .expect("responses lock poisoned by an earlier panic");
+                guard[resp_idx..].to_vec()
+            };
+            resp_idx += new_responses.len();
+            client.absorb(sim, kernel.app().db(), &new_responses, subscribe, &sinks)?;
+
+            if let Err(e) = run_result {
+                if !is_fault_fallout(&e.to_string()) {
+                    return Err(format!("kernel.run failed non-injected: {e}"));
+                }
+                sim.restart();
+                client.need_subscribe = true;
+                client.current_handle = None;
+                break;
+            }
+        }
+    }
+
+    // Settle, identical in shape and rationale to the flagship's: no new
+    // emits, boot a node through the remaining faults, let the client
+    // reconnect and catch up on its own tenant's backlog.
+    for _attempt in 0..SETTLE_ATTEMPTS {
+        if client.settled() {
+            break;
+        }
+        let Some(mut kernel) = scoped_settle_boot(sim)? else {
+            sim.restart();
+            continue;
+        };
+        client.need_subscribe = true;
+        client.current_handle = None;
+
+        let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 2000 * SEC);
+        let sinks = source.sinks();
+        let responses = source.responses();
+        let t = sim.now().as_nanos();
+
+        let subscribe =
+            match push_subscribe(sim, &kernel, &mut source, SCOPED_FEED_A, client.cursor, t) {
+                Ok(info) => info,
+                Err(e) if is_fault_fallout(&e) => {
+                    sim.restart();
+                    continue;
+                }
+                Err(e) => return Err(format!("settle push_subscribe failed non-injected: {e}")),
+            };
+
+        let run_result = kernel.run(&mut source);
+        let new_responses = responses
+            .lock()
+            .expect("responses lock poisoned by an earlier panic")
+            .clone();
+        client.absorb(
+            sim,
+            kernel.app().db(),
+            &new_responses,
+            Some(subscribe),
+            &sinks,
+        )?;
+        if let Err(e) = run_result {
+            if !is_fault_fallout(&e.to_string()) {
+                return Err(format!("settle kernel.run failed non-injected: {e}"));
+            }
+            sim.restart();
+            client.need_subscribe = true;
+            client.current_handle = None;
+        }
+    }
+
+    if !client.settled() {
+        return Err(client.unsettled_report());
+    }
+    scoped_key_oracle(&client.ledger, &client.trace, SCOPED_TENANT_A_KEY)?;
+
+    // Coverage. Every key here is a way this property can go quietly
+    // vacuous, which is why each is a `require:` and a measured `floor:`
+    // rather than a report.
+    let mut saw_a = false;
+    let mut saw_b = false;
+    for (id, (_, key, _)) in &client.ledger {
+        match key.as_deref() {
+            None => {
+                return Err(format!(
+                    "event id {id} carries no subscription key at all — every emit in this \
+                     workload goes through `ScopedTx::emit`, so an unkeyed row means the \
+                     scope was dropped on the way to the log"
+                ));
+            }
+            Some(k) if k == SCOPED_TENANT_A_KEY => saw_a = true,
+            Some(_) => saw_b = true,
+        }
+    }
+    if saw_a && saw_b {
+        sim.cover("tenant:both-tenants-emitted");
+    }
+    if !client.verified.is_empty() {
+        sim.cover("tenant:own-backlog-verified");
+    }
+    // The "and none of tenant B's" half, made non-vacuous: a B-keyed row sat
+    // in the very window `settled()` scanned and was never delivered. Without
+    // this the property could settle over universes where B's rows all aged
+    // out before the subscriber was ever exposed to them.
+    let received: BTreeSet<u64> = client.trace.iter().map(|&(id, ..)| id).collect();
+    let lo = client.floor.min(client.next_scan_id);
+    if client
+        .ledger
+        .range(lo..client.next_scan_id)
+        .any(|(id, (_, key, _))| {
+            key.as_deref() != Some(SCOPED_TENANT_A_KEY) && !received.contains(id)
+        })
+    {
+        sim.cover("tenant:foreign-backlog-not-delivered");
+    }
+
+    Ok(client.trace)
+}
+
+/// The sibling. Same oracle shape as
+/// `reconnecting_client_misses_nothing_under_the_fault_matrix`, same universe
+/// count, its own base seed — and floors pinned to EXACTLY the counts
+/// measured at that base on the first run, no margin subtracted, which is the
+/// discipline `CONV_SCOPED_*_FLOOR` states: a drop is a finding, not a number
+/// to lower.
+///
+/// Measured over the 128 universes at `SCOPED_REALTIME_BASE`, read off a
+/// batch reproduced identically twice: `tenant:both-tenants-emitted` 77,
+/// `tenant:own-backlog-verified` 79,
+/// `tenant:foreign-backlog-not-delivered` 85, `realtime:resume-backlog` 128,
+/// `fault:subscriber_stall` 30, `realtime:stall-drop` 30, `realtime:gap` 8.
+/// `realtime:resume-backlog` is floored because a batch that stopped
+/// reconnecting with backlog waiting would still settle, vacuously — this
+/// property is about what a RESUME carries. `realtime:stall-drop` and
+/// `fault:subscriber_stall` are required but not floored: their rate is a
+/// fault axis's, already pinned in effect by the flagship, and a second exact
+/// pin on it would turn one finding into two properties' failures.
+///
+/// **The base is pinned, and here that is load-bearing in a way worth
+/// stating.** The settle budget these workloads share (`SETTLE_ATTEMPTS`,
+/// `SETTLE_BOOT_TRIES`) is not enough for every swarm config, and that is a
+/// property of the FLAGSHIP's workload, not of the scope: run
+/// `realtime_workload` from this very invocation — one runner, one universe
+/// count, so the comparison is like for like — and it fails "client never
+/// caught up" at fresh bases `0x9F3A_0001` and `0x41D7_0001`, passes at
+/// `0xC58E_0001`, and fails at THIS property's own base, where the scoped
+/// workload below is green. The scoped workload's verdicts at those same
+/// three fresh bases are identical — fail, fail, pass. Per-SEED comparison is
+/// not available and should not be attempted: the two workloads draw
+/// different numbers of entropy values per round, so one seed hands them the
+/// same `FaultConfig` and two different fault schedules. The base-level
+/// verdicts are the like-for-like reading, and they say this sibling is
+/// exactly as fresh-base-robust as the property it is a sibling of. Raising
+/// the budget is not this task's to do: it would move the flagship's pinned
+/// coverage.
+#[test]
+fn a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing() {
+    run_universes_swarm_with!(
+        SCOPED_REALTIME_BASE,
+        128,
+        |_cfg: &mut FaultConfig| {},
+        |sim: &mut Sim| scoped_realtime_workload(sim).map(|_trace| ()),
+        require: [
+            "tenant:both-tenants-emitted",
+            "tenant:own-backlog-verified",
+            "tenant:foreign-backlog-not-delivered",
+            "realtime:resume-backlog",
+            "realtime:stall-drop",
+            "fault:subscriber_stall"
+        ],
+        floor: [
+            ("tenant:both-tenants-emitted", SCOPED_BOTH_TENANTS_FLOOR),
+            ("tenant:own-backlog-verified", SCOPED_OWN_BACKLOG_FLOOR),
+            (
+                "tenant:foreign-backlog-not-delivered",
+                SCOPED_FOREIGN_SKIPPED_FLOOR
+            ),
+            ("realtime:resume-backlog", SCOPED_RESUME_BACKLOG_FLOOR)
+        ]
+    );
+}
+
+const SCOPED_BOTH_TENANTS_FLOOR: u64 = 77;
+const SCOPED_OWN_BACKLOG_FLOOR: u64 = 79;
+const SCOPED_FOREIGN_SKIPPED_FLOOR: u64 = 85;
+const SCOPED_RESUME_BACKLOG_FLOOR: u64 = 128;
+
+/// Floors pinned at an exact measurement are only meaningful if the batch is
+/// reproducible, which is the same claim the flagship's own replay check
+/// makes for its trace.
+#[test]
+fn scoped_realtime_frame_traces_replay_identically_for_the_same_seed() {
+    charpente_sim::checks::replays_identically(0x2EB2_5C0D, scoped_realtime_workload).unwrap();
+}
+
+/// One clean kernel, one subscriber keyed to tenant A, one emit per tenant
+/// through `route` — the twin the fireability proof needs, so victim and
+/// control face identical bytes and differ in nothing but which emit route
+/// ran.
+fn scoped_twin_run(route: &'static str) -> (ScopedLedger, ScopedTrace) {
+    let sim = Sim::with_faults(0x2EB1_5C09, FaultConfig::none());
+    let app = scoped_realtime_app(&sim).unwrap();
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+
+    let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 10 * SEC);
+    let t = sim.now().as_nanos();
+    source.push_at(t, Request::new(Method::Get, SCOPED_FEED_A));
+    for org in [SCOPED_TENANT_A, SCOPED_TENANT_B] {
+        source.push_at(
+            t,
+            Request::new(Method::Post, route).json(&ScopedEmitBody {
+                org: WireU64(org),
+                n: WireU64(org * SCOPED_N_STRIDE + 42),
+            }),
+        );
+    }
+    let sinks = source.sinks();
+    for _ in 0..16 {
+        kernel.step(&mut source).expect("no step may fail here");
+    }
+
+    let mut client = Client::new(PING_ONLY, Some(SCOPED_TENANT_A_KEY));
+    client.sync_ledger(kernel.app().db()).unwrap();
+    let trace = sinks.lock().expect("sinks lock")[0]
+        .frames()
+        .iter()
+        .map(|f| (f.id, f.name, f.json.clone()))
+        .collect();
+    (client.ledger, trace)
+}
+
+/// The fireability proof for `a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing`
+/// (Task 8's discipline): the property's own oracle, run over data a naive
+/// emit produced, must go RED and NAME the offence — and over the correct
+/// emit on the same bytes must pass. Without the control half, "the oracle
+/// rejected something" would not distinguish a working discriminator from an
+/// oracle that rejects everything.
+///
+/// The victim is `emit_leaky_ping`: a real `ScopedTx`, then `Tx::emit_keyed`
+/// with a fixed key through the `DerefMut` — the leak direction, and exactly
+/// the shape a constant `event_key` produces.
+#[test]
+fn the_scoped_oracle_catches_an_emit_that_drops_the_scope_key() {
+    // ---- control: the correct route, on these exact bytes ----
+    let (ledger, trace) = scoped_twin_run("/scoped-ping");
+    assert_eq!(
+        ledger.len(),
+        2,
+        "both tenants must have committed an event, or the control proves nothing: {ledger:?}"
+    );
+    assert_eq!(
+        trace.len(),
+        1,
+        "tenant A's feed must have received exactly its own event: {trace:?}"
+    );
+    scoped_key_oracle(&ledger, &trace, SCOPED_TENANT_A_KEY)
+        .expect("the correct scoped emit must pass the property's own oracle");
+
+    // ---- victim: the same bytes, the naive emit ----
+    let (ledger, trace) = scoped_twin_run("/leaky-ping");
+    assert_eq!(ledger.len(), 2, "same two events: {ledger:?}");
+    assert_eq!(
+        trace.len(),
+        2,
+        "the leak itself: tenant A's feed received BOTH tenants' events"
+    );
+
+    let err = scoped_key_oracle(&ledger, &trace, SCOPED_TENANT_A_KEY)
+        .expect_err("the delivery arm must reject a cross-tenant frame");
+    assert!(err.contains("cross-tenant delivery"), "{err}");
+    assert!(
+        err.contains(&format!("ScopedTx<Org>({SCOPED_TENANT_B})")),
+        "the failure must name the tenant whose event leaked: {err}"
+    );
+
+    // The ledger arm, fired on its own: the corruption is in the durable row
+    // whatever the subscriber happened to receive.
+    let err = scoped_key_oracle(&ledger, &[], SCOPED_TENANT_A_KEY)
+        .expect_err("the ledger arm must reject a row whose key is not its emitting scope");
+    assert!(err.contains("EventRow.key"), "{err}");
+    assert!(
+        err.contains(&format!("ScopedTx<Org>({SCOPED_TENANT_B})")),
+        "the failure must name the emitting scope: {err}"
+    );
+}
