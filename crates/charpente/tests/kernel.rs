@@ -1322,8 +1322,9 @@ impl Flaky {
 
 /// The scope type for the swarm's tenant-scoped table. A bare marker, not a
 /// `#[table]`: a scope type owes nothing but `authorize`, and the platform
-/// never interprets the scope itself (the standing `emit_keyed` ruling,
-/// DESIGN.md:1060-1062).
+/// never DERIVES a scope — it only renders one, as the subscription key
+/// `ScopedTx::emit` attaches (`ScopedTx::event_key`, spec §4; the standing
+/// `emit_keyed` ruling, DESIGN.md §6).
 struct Org;
 
 impl Tenant for Org {

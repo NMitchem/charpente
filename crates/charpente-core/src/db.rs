@@ -1104,8 +1104,12 @@ fn assert_scoped<R: Row>(method: &str, unscoped_alternative: &str) {
 /// blanket-implemented for every such impl and carries the house diagnostic.
 ///
 /// The platform calls `authorize` in exactly one place — `Tx::open_scope`,
-/// below — and never interprets `scope` itself (the standing `emit_keyed`
-/// ruling, DESIGN.md:1060-1062).
+/// below — and never DERIVES a scope: the tenant is named by the app at the
+/// one `tx.scope::<S>(…)` line and nowhere else, and no key is ever parsed
+/// back into one (the standing `emit_keyed` ruling, DESIGN.md §6). The one
+/// thing it does read off a scope is its decimal form, as the subscription
+/// key `ScopedTx::emit` attaches (`ScopedTx::event_key`, spec §4) — rendering
+/// out, never resolving in.
 pub trait Tenant: Sized + 'static {
     /// Whoever is asking. `?Sized` so an app can key membership on an
     /// unsized witness (a `str` subject) as readily as on a struct.
@@ -1248,6 +1252,39 @@ impl<'a, S: 'static> ScopedTx<'_, 'a, S> {
 
     pub fn delete<R: Row<Scope = S>>(&mut self, id: Id<R>) {
         self.tx.delete_in(self.scope, id)
+    }
+
+    /// The subscription key every event emitted on this handle carries: the
+    /// scope's decimal id. Public because it is the SAME encoding on both
+    /// sides of the exact match — an SSE handler keys its `Subscription` with
+    /// it, so emitter and subscriber cannot drift into two spellings of one
+    /// tenant (spec §4).
+    ///
+    /// Decimal rather than anything type-qualified because this key is
+    /// DURABLE: it is stored in `EventRow.key`, shipped by replication, and
+    /// exact-matched when a subscriber resumes. That rules out `type_name` and
+    /// `TypeId`, neither of which the compiler promises to keep stable across
+    /// builds — a key whose spelling moved under a binary upgrade would make
+    /// every pre-upgrade backlog event silently invisible to a reconnecting
+    /// subscriber. The consequence, stated rather than hidden: two DIFFERENT
+    /// scope types sharing a raw id share a key, so an app with more than one
+    /// scope type keys its subscriptions per scope type as well.
+    pub fn event_key(&self) -> String {
+        self.scope.raw().to_string()
+    }
+
+    /// `Tx::emit`, keyed by this tenant — spec §4's "one tenancy mechanism,
+    /// not two". A transaction that had to pass `authorize` to reach a
+    /// tenant's rows cannot then hand that tenant's event to a subscription
+    /// keyed to another one, so an app that has locked its queries down does
+    /// not leak through a subscription.
+    ///
+    /// This shadows the `Tx::emit` the `DerefMut` would otherwise reach. An
+    /// emit that genuinely belongs to no tenant is written `(*tx).emit(…)` —
+    /// the same explicit deref an unscoped table access takes.
+    pub fn emit<Ev: Event>(&mut self, event: Ev) {
+        let key = self.event_key();
+        self.tx.emit_keyed(key, event);
     }
 }
 

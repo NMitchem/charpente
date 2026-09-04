@@ -238,6 +238,11 @@ impl Subscription {
 
     /// An exact-match scoping filter (e.g. an org id) — the handler owns
     /// access control; the platform never parses the key.
+    ///
+    /// For a tenant feed, pass `ScopedTx::event_key` rather than spelling the
+    /// tenant out here: that is the same key `ScopedTx::emit` attaches, so the
+    /// subscription and the emitter cannot drift apart (spec §4, "one tenancy
+    /// mechanism, not two").
     pub fn key(mut self, key: impl Into<String>) -> Subscription {
         self.key = Some(key.into());
         self

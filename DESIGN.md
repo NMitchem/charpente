@@ -1133,10 +1133,15 @@ slot.
 - **Realtime.** `tx.emit(event)`/`tx.emit_keyed(key, event)` writes a typed event into the
   committing log record alongside the transaction's other effects — `key` is an opaque
   scoping filter (an org id, typically), carried but never interpreted inside the
-  deterministic boundary. Apply materializes each into the built-in `charpente.events`
-  table (`EventRow { id, seq, name, key, payload }`); `id` comes from a `next_event_id`
-  meta-counter bumped in call order — the `next_job_id` pattern exactly, so ids are
-  strictly monotonic, order-isomorphic to log position, and byte-identical on followers.
+  deterministic boundary. Inside a tenant scope the key is not the app's to remember:
+  `ScopedTx::emit` supplies it from the scope itself (`ScopedTx::event_key`, the scope's
+  decimal id), so tenancy has one mechanism rather than two that can disagree — an SSE
+  handler keys its `Subscription` with the same `event_key`, and a subscription keyed to
+  one tenant never receives another's event. Apply materializes each into the built-in
+  `charpente.events` table (`EventRow { id, seq, name, key, payload }`); `id` comes from a
+  `next_event_id` meta-counter bumped in call order — the `next_job_id` pattern exactly, so
+  ids are strictly monotonic, order-isomorphic to log position, and byte-identical on
+  followers.
   Retention is count-based: `DbConfig::event_retention` (default 65,536) bounds the table,
   garbage-collected at the existing checkpoint cadence; `Db::event_floor()` reports the
   smallest id still retained.

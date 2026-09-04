@@ -37,8 +37,9 @@ use charpente_sim::{FaultConfig, Sim, run_universes_swarm_with};
 /// A `#[table]` rather than a bare marker only so `Id<Org>` can be a route
 /// path parameter (`Id<R>`'s `Wire` impl is bounded on `R: Row`); nothing
 /// reads the table. A scope type owes nothing but `authorize`, and the
-/// platform never interprets the scope (the standing `emit_keyed` ruling,
-/// DESIGN.md:1060-1062).
+/// platform never DERIVES a scope — it only renders one, as the subscription
+/// key `ScopedTx::emit` attaches (`ScopedTx::event_key`, spec §4; the standing
+/// `emit_keyed` ruling, DESIGN.md §6).
 #[table]
 struct Org {
     id: Id<Org>,

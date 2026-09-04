@@ -8,6 +8,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use charpente::auth::Principal;
 use charpente::event;
 use charpente::http::{
     ApiError, App, AppConfig, Ctx, Cursor, EmittedEvent, Method, Request, Route, RouteDef,
@@ -18,7 +19,9 @@ use charpente::repl::protocol::{Msg, decode, encode};
 use charpente::repl::role::Role;
 use charpente::repl::{MAX_MESSAGE_BYTES, Repl, ReplConfig};
 use charpente::wire::{TypeSchema, Wire, WireU64};
-use charpente::{DbConfig, Schema, Tx, Wire as WireDerive, route, routes};
+use charpente::{
+    DbConfig, Id, Schema, Scoped, Tenant, Tx, Wire as WireDerive, route, routes, table,
+};
 use charpente_core::db::Db;
 use charpente_core::event::EventRow;
 use charpente_core::io::{Clock, Conn, Disk, Entropy, Net};
@@ -2422,5 +2425,157 @@ fn every_stream_routes_declared_emits_matches_its_subscription() {
                 ]
             ),
         ]
+    );
+}
+
+// ============================================= tenant-scoped event emission
+//
+// M2 tenant-scoping spec §4, "one tenancy mechanism, not two": `emit_keyed`'s
+// exact-match subscription key and `ScopedTx`'s tenant bound are the SAME
+// mechanism, so an event emitted inside `ScopedTx<Org>(B)` carries B's key and
+// a subscription keyed to tenant A never sees it (exit criterion 6). Leaving
+// the two separate is what lets an app that has locked its queries down leak
+// through a subscription anyway.
+
+/// The scope type. A `#[table]` only so `Id<Org>` can be a route path
+/// parameter (`Id<R>`'s `Wire` impl is bounded on `R: Row`); nothing reads the
+/// table and it is not registered in any `Schema`. A scope type owes nothing
+/// but `authorize`.
+#[table]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    type Who = Principal;
+    type Error = ApiError;
+
+    /// Always allows: this property is about the platform's key derivation,
+    /// not the app's membership check — `charpente/tests/tenant.rs` owns the
+    /// refusing case.
+    fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<Org>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+#[derive(WireDerive, Serialize, Deserialize)]
+struct ScopedEmitBody {
+    org: WireU64,
+    n: WireU64,
+}
+
+/// The shape spec §1 prescribes: one `scope()` line, and every effect below it
+/// — reads, writes, and now emits — bounded to that tenant.
+#[route(POST "/scoped-ping")]
+fn emit_scoped_ping(tx: &mut Tx, body: ScopedEmitBody, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(Id::from_raw(body.org.0), ctx)?;
+    tx.emit(Ping { n: body.n });
+    Ok(())
+}
+
+/// The subscriber half of the same mechanism: opening the scope both runs the
+/// app's `authorize` for the subscriber and yields the very key the emitter
+/// used, so the two sides cannot drift into two encodings.
+#[route(SSE "/scoped-feed/:org", emits(Ping))]
+fn scoped_feed(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(Subscription::of::<Ping>()
+        .key(tx.event_key())
+        .cursor(cursor))
+}
+
+/// A hand-written key, with no `ScopedTx` anywhere — the pin on the ENCODING
+/// itself. Every other assertion below holds only by composition (`event_key`
+/// agrees with itself whatever it returns), so if the scope's string form
+/// silently changed, this route is the only thing here that would notice. That
+/// is not cosmetic: the key is DURABLE (`EventRow.key`), replicated, and
+/// exact-matched on resume, so a changed encoding makes every pre-upgrade
+/// backlog event invisible to a reconnecting subscriber.
+#[route(SSE "/literal-feed/:key", emits(Ping))]
+fn literal_feed(
+    tx: &mut Tx,
+    key: String,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<Ping>().key(key).cursor(cursor))
+}
+
+/// Exit criterion 6. Three subscribers and two tenants, so the oracle is
+/// two-sided: tenant A's feed must carry A's event and ONLY A's, and tenant
+/// B's the same. A one-sided "A never sees B" assertion passes vacuously if a
+/// scoped emit reaches nobody at all — which is exactly the failure mode a
+/// naive fix produces, since a keyed subscription does not receive unkeyed
+/// events either.
+#[test]
+fn a_subscription_keyed_to_one_tenant_never_sees_another_tenants_event() {
+    let sim = Sim::with_faults(0x2EB1_1005, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![emit_scoped_ping, scoped_feed, literal_feed]);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+
+    let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 10 * SEC);
+    let t = sim.now().as_nanos();
+    source.push_at(t, Request::new(Method::Get, "/scoped-feed/1"));
+    source.push_at(t, Request::new(Method::Get, "/scoped-feed/2"));
+    source.push_at(t, Request::new(Method::Get, "/literal-feed/1"));
+    source.push_at(
+        t,
+        Request::new(Method::Post, "/scoped-ping").json(&ScopedEmitBody {
+            org: WireU64(1),
+            n: WireU64(9),
+        }),
+    );
+    source.push_at(
+        t,
+        Request::new(Method::Post, "/scoped-ping").json(&ScopedEmitBody {
+            org: WireU64(2),
+            n: WireU64(7),
+        }),
+    );
+    let sinks = source.sinks();
+
+    for _ in 0..16 {
+        kernel.step(&mut source).expect("no step may fail here");
+    }
+
+    let handles = sinks.lock().expect("sinks lock");
+    assert_eq!(handles.len(), 3, "three subscribes opened three sinks");
+    let delivered = |i: usize| {
+        handles[i]
+            .frames()
+            .iter()
+            .map(|f| (f.name, f.json.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        delivered(0),
+        vec![("ping", r#"{"n":"9"}"#.to_string())],
+        "tenant A's feed: its own emit, and NOT tenant B's n=7"
+    );
+    assert_eq!(
+        delivered(1),
+        vec![("ping", r#"{"n":"7"}"#.to_string())],
+        "tenant B's feed: its own emit, and NOT tenant A's n=9"
+    );
+    assert_eq!(
+        delivered(2),
+        vec![("ping", r#"{"n":"9"}"#.to_string())],
+        "a subscription keyed to the literal string \"1\" sees exactly what the \
+         ScopedTx<Org>(1) emit produced — the scope's key encoding, pinned"
     );
 }

@@ -3007,6 +3007,37 @@ exact match — which means a keyed subscription does **not** receive `tx.emit`
 emitting *everything* that tenant should see with `emit_keyed` and its key; reserve
 bare `tx.emit` for events only an unkeyed (global) subscription should tail.
 
+Inside a tenant scope you do not choose. `tx.emit` on a `ScopedTx` — the handle
+`tx.scope::<Org>(org, ctx)?` returns — is *itself* keyed, with the scope's own
+key, so a transaction that had to pass `authorize` to reach a tenant's rows
+cannot hand that tenant's event to another tenant's subscription:
+
+```rust,ignore
+pub fn event_key(&self) -> String   // on ScopedTx: the scope's decimal id
+pub fn emit<Ev: Event>(&mut self, event: Ev)  // == emit_keyed(event_key(), event)
+```
+
+The subscriber side uses the same `event_key`, so the two sides cannot drift
+into two spellings of one tenant:
+
+```rust,ignore
+#[route(SSE "/feed/:org", emits(NoteAdded))]
+fn feed(tx: &mut Tx, org: Id<Org>, ctx: &Ctx, cursor: Option<Cursor>)
+    -> Result<Subscription, ApiError>
+{
+    let tx = tx.scope::<Org>(org, ctx)?;   // authorizes the subscriber, too
+    Ok(Subscription::of::<NoteAdded>().key(tx.event_key()).cursor(cursor))
+}
+```
+
+An emit that genuinely belongs to no tenant is written `(*tx).emit(…)` — the
+same explicit deref an unscoped table access takes. Two notes on the key
+itself: it is a decimal id and nothing more, so two *different* scope types
+sharing a raw id share a key (an app with more than one scope type keys its
+subscriptions per scope type as well); and it is durable — stored in
+`EventRow.key` and exact-matched on resume — which is why it is not built from
+a type name that a compiler upgrade could respell.
+
 One contract rides along with the `Serialize` derive: every `#[event]` payload must
 be JSON-serializable. A value serde_json rejects — a `NaN` or infinite float, a map
 with non-string keys — is a contract violation, and it is not caught at emit time
