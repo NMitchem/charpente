@@ -2499,3 +2499,104 @@ clean tree. Because `require:` carries a floor of one, that green is itself the 
 keys fired. **Still owed before merge: Tasks 10, 11, 12, 13**, and the workspace suite +
 `cargo clippy --workspace` (Task 8 changed one test file and nothing else, so only
 `-p charpente` was run).
+
+## 2026-09-04 — tenant-scoping Tasks 10 and 11, and a finding that is not about tenancy
+
+**Task 10 (`65821f0`) — cross-tenant enumeration is a declared capability.**
+`#[route(…, cross_tenant)]` / `#[job(cross_tenant)]`, `Ctx::cap()`, and
+`Tx::across_tenants::<S>(&self, cap: &CrossTenant) -> AllTenants<'_, 'a, S>` whose `scan`
+yields `Vec<(Id<S>, R)>` — rows PAIRED WITH THEIR SCOPE, never bare `Vec<R>`, so a
+cross-tenant result cannot be handed to code expecting one tenant's data (spec §3). The flag
+joins `auth` in `charpente describe`, which is what turns an audit into an inventory.
+
+The token is unforgeable from a handler: `CrossTenant`'s field is private and
+`Group::cross_tenant_cap` is its only constructor, with `begin_group` living in `impl Db`
+(never on `Tx`). A handler holds `&mut Tx` and `&Ctx` and can therefore never mint one; a `Db`
+holder can, and R48 already classifies a `Db` holder as the operator. **This is the second
+place the R48 boundary is now load-bearing**, which is why the DECISIONS entry it is owed
+matters more than when it was first ruled.
+
+Three deviations from the plan, all recorded in the commit and all sound: `across_tenants` is
+infallible because `ApiError` cannot be named from core and a `Result` with no reachable `Err`
+would be a lie; `Ctx::cap()` alone cannot deliver a compile-time property (with `Ctx` a single
+type, an undeclared route calling `across_tenants(ctx.cap())` is a runtime `Option`, not a
+compile error), so the token arrives as a macro-filled `cap` argument with `Ctx::cap()` kept as
+the reflective accessor; and minting is gated on `Group` because Rust has no cross-crate friend
+visibility.
+
+**An oracle defect caught during the task, worth recording as a pattern.** Both compile_fail
+cases were first written into ONE file, and the `#[route]` macro error aborts the compile
+before type checking — so the token-forging attempt produced no error at all and the pinned
+`.stderr` certified nothing. Split into two files. A compile_fail case that passes for an
+unrelated reason is the compile-time twin of a vacuous property.
+
+**Task 11 (`2270c11`) — a scoped transaction's events are keyed by their scope.**
+`ScopedTx::emit` delegates to `emit_keyed` with `ScopedTx::event_key`, so spec §4's "one
+tenancy mechanism, not two" holds. The test was written first and its FAILURE DIRECTION read
+before the fix, which the plan specifically asked for and which mattered: it failed
+fail-closed — tenant A received NOTHING, not B's event, because a keyed subscription receives
+no unkeyed events. A one-sided "A never sees B" assertion would have passed vacuously, so the
+committed test is two-sided with a third subscriber pinning the literal key encoding.
+
+`event_key` is public and DECIMAL by deliberate choice. Public so emitter and subscriber cannot
+drift into two spellings of one tenant; decimal because the key is durable — stored in
+`EventRow.key`, shipped by replication, exact-matched on resume — which rules out `type_name`
+and `TypeId`, neither stable across builds. A key whose spelling moved under a binary upgrade
+would make every pre-upgrade backlog event silently invisible to a reconnecting subscriber. The
+cost, stated rather than hidden: two DIFFERENT scope types sharing a raw id share a key.
+
+**The hard-rule-3 follow-up (`3b2457f`), and why it was not optional.** Task 11 shipped its
+core change with unit coverage but no fault-matrix coverage, reasoning that adding a scoped
+emit to the flagship workload would perturb its pinned seeds. The premise is true; the
+conclusion does not follow, because **ruling R56 already settled this exact case** — when a
+scoped table moved `archive_converges`'s floors, the answer was a SIBLING property with its own
+base and measured floors, not dropped coverage and not a re-pinned original. Both siblings
+still stand at `archive.rs:8769` and `:8817`. Since the emit key is durable and resume-matched,
+a crash between emit and durability, or a follower replay, must preserve it — squarely a fault
+surface.
+
+`a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing`, base `0x2EB2_5C09`, 128
+universes, floors pinned AT the measurement with no margin: `tenant:both-tenants-emitted` 77,
+`tenant:own-backlog-verified` 79, `tenant:foreign-backlog-not-delivered` 85,
+`realtime:resume-backlog` 128. The original property's coverage block is byte-identical before
+and after, and the diff is **562 insertions, 0 deletions** — the flagship's lines were never
+touched.
+
+**The design point that decides whether the sibling is worth anything.** The flagship's
+`Client` validates every delivered frame against `charpente.events` — the very row whose `key`
+is in question — so an emit writing the WRONG key writes it into the oracle's own ground truth
+and the oracle agrees with it. Under Task 11's own constant-`event_key` mutation a naive
+sibling settles GREEN. So each event carries its emitting tenant in its PAYLOAD and the oracle
+compares the durable key against that instead. **A self-referential oracle is a vacuous
+oracle**, and this one was caught only because the victim was run before the property was
+trusted.
+
+**FINDING, pre-existing and NOT about tenancy — owed its own follow-up.** While sweeping fresh
+bases, the sibling failed at 2 of 3 with "client never caught up". Chased like-for-like by
+pointing the sibling's own invocation at the flagship's untouched workload:
+
+| base | flagship workload | scoped workload |
+|---|---|---|
+| `0x9F3A_0001` | FAIL | FAIL |
+| `0x41D7_0001` | FAIL | FAIL |
+| `0xC58E_0001` | pass | pass |
+| `0x2EB2_5C09` | **FAIL** | pass |
+
+So the fragility is the SHARED SETTLE BUDGET (`SETTLE_ATTEMPTS` = 12, `SETTLE_BOOT_TRIES` = 64
+at `realtime.rs:653/656`), not the scope: **`reconnecting_client_misses_nothing_under_the_fault_matrix`
+is green as a property of its pinned base `0x2EB2_0001`, and fails at other bases.** CLAUDE.md's
+evidence bar is "sim suite green over N fresh seeds", which this M1 flagship does not currently
+meet. The budget was NOT raised — doing so would move the flagship's pinned coverage.
+
+This is the **second instance of one class**, not an isolated bug. `RT_RECOVER_ATTEMPTS`
+(`realtime.rs:1443`) already yields `{INCONCLUSIVE}` on exhaustion (`:1637`), and the open
+"43% of the convergence property reaches no verdict" item is the same shape: a budget constant
+whose adequacy is a property of the seed rather than of the code. One fails loudly and one
+fails silently; neither is robustness. Recommend a single follow-up covering both rather than
+two point fixes.
+
+**Verification note.** Tasks 10, 11 and the sibling were each re-run by the controller rather
+than accepted from the implementer's report. That caught one misreported figure: Task 10's
+report claimed `charpente-core --test engine` at 56 passed; it is 46, and `engine.rs` is not in
+that commit at all, so the number could not have moved. Green either way and nothing hidden,
+but not reproducible as written.
