@@ -2475,3 +2475,27 @@ to `origin` for the first time. The helpdesk worktree's objects were never actua
 worktrees share the main repo's `.git` — but the branch was single-copy and unpushed, and its
 untracked `HELPDESK-BRIEF.md` was genuinely perishable; it is copied to
 `.superpowers/sdd/2026-08-30-tenant-scoping/`, keeping R54's "not to be committed" ruling.
+
+**Task 8 landed the same day (`f453a95`), and the debt above is discharged.**
+`every_scoped_read_returns_only_its_own_tenants_rows` — 256 universes at base `0x7E4A_0001`,
+plus 768 more over three fresh bases, green at every one. All four read paths, two tenants
+sharing both an id space and an index key. The two naive victims are committed in the
+auth.rs meta-test shape rather than as a feature flag (ruling R6), each paired with a control
+that proves the CORRECT read passes the same oracle on the same bytes, and each asserting
+`leaked.len() > own.len()` so an inert victim fails the meta-test instead of passing it.
+
+`tenant:crash_mid_batch` is credited exactly where R58 says it may be —
+`staged >= 2 && failure.applied == 0 && !was_poisoned` — the fault landing inside the
+append -> sync -> apply window. The checkpoint arm (`applied == n`) is excluded as
+after-the-fact, and nothing credits the unreachable partial apply. The property builds its
+batch with `Db::begin_group` + two `Group::stage` calls at the same id, per R58; no
+`KernelStats` change was needed. It uses its own scope type `Firm` rather than `Org`, forced
+rather than stylistic: `Org::authorize` admits exactly one tenant so it cannot host N >= 2
+writable ones, and `AUTHORIZE_CALLS`/`BODIES_ENTERED` are process-wide statics an existing
+unit test asserts are exactly 1, which a parallel swarm would flake.
+
+Verified by re-run rather than by reading the report: 6/6 green, exit 0, at `f453a95` with a
+clean tree. Because `require:` carries a floor of one, that green is itself the proof both
+keys fired. **Still owed before merge: Tasks 10, 11, 12, 13**, and the workspace suite +
+`cargo clippy --workspace` (Task 8 changed one test file and nothing else, so only
+`-p charpente` was run).
