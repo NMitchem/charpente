@@ -2656,3 +2656,60 @@ field is the thing in question, so it agrees with the bug (the realtime sibling)
 suite that exists, passes, and never runs (this). All three are green-looking coverage that
 cannot fail, and none is caught by reading the test — only by asking what single change should
 make it red, and then making that change.
+
+## 2026-09-04 — Task 13, and the tenant-scoping plan is complete (13 of 13)
+
+**Task 13 (`1673bfb`) — the docs catch up with what shipped.** DESIGN §3 gains a `Scope`
+bullet; **DESIGN §8's "deferred to its own design" sentence is REPLACED, not left standing
+beside the new text** — the specific drift a previous review caught. `docs/GUIDE.md` gains
+§16 "Tenant scoping" (~370 lines, two extractor-compiled ```rust blocks), PLAN's M2 bullet
+moves to shipped in the shipped-bullet voice, and M1's deferral line stops claiming
+multi-tenancy is a convention today.
+
+**DECISIONS gains two entries and loses a stale number.** §11 records spec §3's hard-rule-2
+reading so it binds future work: anything crossing tenants must be a declared, enumerable
+capability carrying the tenant in its result type — not an escape hatch. §12 is written as a
+**DRAFT explicitly marked "Status: not ratified"**, stating the R48/R49 boundary (the tenancy
+guarantee covers the typed surface handed to handlers and jobs; a `Db` holder is the operator)
+together with its evidence and the open question, because CLAUDE.md sends a decision of that
+shape to Noah rather than letting a task write it in as settled. It is now load-bearing in two
+places, not one: `CrossTenant`'s only constructor is `Group::cross_tenant_cap`, and
+`begin_group` lives in `impl Db`.
+
+**§7's "~30 call sites" is retired, with a measure attached.** Two independent recounts during
+this design disagreed at 46 and 64 — the tell that a number was being quoted with no measure
+behind it. The definition now recorded with the count: *one call expression in
+`crates/charpente-core/src/table.rs` whose callee is an item defined by the `redb` crate —
+inherent method, trait method, or associated function — counted per expression, comments
+stripped, including `#[cfg(test)] mod latch_tests`.* That yields **170** (164 in the module
+proper, 6 in tests), with a per-API breakdown recorded so a future recount that disagrees is
+either a real change or a different definition, never an unresolvable difference of opinion.
+The type-level surface is reported SEPARATELY (29 `redb::` paths plus one seven-name `use`)
+because conflating the two is what made the earlier recounts diverge. The one-file containment
+claim still holds exactly: `redb::` appears in `table.rs` alone.
+
+Note what this does and does not change. §7's deferral rested on "deferral does not compound
+the swap cost", and 170 is not 30 — but the containment argument was always the one-file
+claim, which survives intact. The stale figure was evidence hygiene, not a load-bearing input.
+
+**Two fixes beyond the six steps, both hard rule 6.** GUIDE §9's error index PARAPHRASED the
+`across_tenants` macro error ("but this route does not declare cross_tenant") where the real
+message reconstructs the attribute; the index quotes errors byte-for-byte by contract, so it is
+now verbatim. And two source doc comments cited `DESIGN.md:1377` for a deferral that no longer
+exists — line-number citations into a file being edited, already stale, and about to read
+wrong. Both now name the bullet.
+
+**Controller verification.** Every task on this branch was re-run rather than accepted from its
+report. For Task 13: fmt 0, inventory gate 3/3 exit 0, clippy `--workspace --all-targets -D
+warnings` exit 0. The first `cargo build -p guide-examples` returned in 0.05s — fully cached,
+which proves nothing about the extractor — so it was **forced**: `cargo clean -p guide-examples`
+(removed 4042 files, 314.8 MiB), then a real 20.05s compile, exit 0. The GUIDE's rust blocks
+provably compile. Spot-checks that reproduced exactly: `open_table(` = 41 and `.value()` = 43
+against the claimed buckets; `redb::` in one file; §8's old sentence gone; §12 marked
+unratified.
+
+**Plan complete: 13 of 13.** `f453a95` (8), `65821f0` (10), `2270c11` (11), `3b2457f` (the R56
+fault sibling), `fef12f6` (12), `1673bfb` (13), on top of Tasks 1-7/6b/6c/9. **Merge to main is
+Noah's call and has not been made.** Owed before it: the full workspace suite (only scoped
+per-package runs were made), and the two decisions above — DECISIONS §12's ratification, and
+whether the edge-harness wire layer should enter CI.
