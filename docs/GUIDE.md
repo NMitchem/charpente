@@ -14,7 +14,8 @@ the machine-readable contract of a mounted app; section 14 covers the
 generated TypeScript client — deriving `Wire`, 64-bit integers, and
 `gen-client`/`check-client`; section 15 covers the archive — configuring
 one, the notices it raises, and restoring a data directory from a
-bucket.)*
+bucket; section 16 covers tenant scoping — `scoped_by`, opening a scope,
+and the cross-tenant capability.)*
 
 ## 1. Project setup
 
@@ -2326,7 +2327,7 @@ emits(...) must name at least one #[event] type — write `emits(NoteAdded, Note
 emits takes a parenthesized list of #[event] types — write `emits(NoteAdded, NoteRemoved)`
 `auth` given twice — write it once
 `cross_tenant` given twice — write it once
-`revenue` takes `cap: &CrossTenant`, but this route does not declare `cross_tenant` — enumerating a scoped table across every tenant is a declared capability, and `charpente describe` lists every route that declared it. Write `#[route(GET "/admin/revenue", cross_tenant)]`, or drop the `cap` argument and read one tenant through `tx.scope::<Org>(org, ctx)?`
+`revenue` takes `cap: &CrossTenant`, but `#[route(GET "/admin/revenue")]` does not declare `cross_tenant` — enumerating a scoped table across every tenant is a declared capability, and `charpente describe` lists every route that declared it. Write `#[route(GET "/admin/revenue", cross_tenant)]`, or drop the `cap` argument and read one tenant through `tx.scope::<Org>(org, ctx)?`
 `emits(...)` given twice — a route declares one set, so name every event in one list: `emits(NoteAdded, NoteRemoved)`
 `NoteAdded` is named twice in emits(...) — a stream declares each event type once, and a repeat would put the same member in a generated client's union twice; write it once
 #[route] handlers are free functions — no `self`
@@ -3037,6 +3038,11 @@ sharing a raw id share a key (an app with more than one scope type keys its
 subscriptions per scope type as well); and it is durable — stored in
 `EventRow.key` and exact-matched on resume — which is why it is not built from
 a type name that a compiler upgrade could respell.
+
+This is the realtime face of tenant scoping, and it is documented here rather
+than twice: §16 covers the mechanism it belongs to — declaring `scoped_by`,
+writing the scope's `authorize`, and the cross-tenant capability — and points
+back here for the emit and subscribe shapes above.
 
 One contract rides along with the `Serialize` derive: every `#[event]` payload must
 be JSON-serializable. A value serde_json rejects — a `NaN` or infinite float, a map
@@ -4929,3 +4935,367 @@ its own snapshot metadata. That happens after the new manifest is durable, never
 Do **not** add an age-based expiry over the generation objects themselves to "help": age has
 nothing to do with supersession, and a rule aggressive enough to reclaim a superseded
 generation will eventually delete a live one that a restore needs.
+
+## 16. Tenant scoping
+
+Multi-tenancy here is a property of the *types*, not a rule everyone has to
+remember. A scoped table's key is the `(scope, id)` composite and every one of
+its secondary-index entries carries the same prefix, so a tenant is a key
+prefix rather than a `where` clause; and the only way a handler or a job can
+reach one of those rows is a handle that the app's own membership check had to
+hand back. A scoped read attempted on a bare `Tx` is a compile error, not a 500
+and not a leak. (What that guarantee does *not* cover — an operator holding the
+`Db` — is the last subsection here, and it is a boundary, not an oversight.)
+
+The shape of an app that uses it:
+
+- one **scope type** (`Org`, `Workspace`, `Tenant` — your name), with one
+  `impl Tenant` carrying the membership check;
+- `#[table(scoped_by = Org)]` on every table that belongs to a tenant;
+- exactly one line per handler, `let tx = tx.scope::<Org>(org, ctx)?;`, after
+  which everything reads and writes inside that tenant.
+
+### Declaring a scope and a scoped table
+
+```rust
+use charpente::auth::Principal;
+use charpente::http::{ApiError, Ctx};
+use charpente::wire::WireU64;
+use charpente::{Id, Scoped, Tenant, Tx, route, table};
+
+/// The scope type. It owes exactly one thing — `authorize`. It is a `#[table]`
+/// here only so `Id<Org>` can appear as a route path parameter (`Id<T>`'s wire
+/// impl is bounded on `T: Row`); a scope that never crosses the wire can be a
+/// bare marker struct instead.
+#[table]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    type Who = Principal;
+    type Error = ApiError;
+
+    /// Runs once per `tx.scope::<Org>(…)`, and it is the app's own policy —
+    /// the platform never derives a tenant from a subject, a header or a row
+    /// field. `who` is `None` for an unauthenticated request: an `authorize`
+    /// that admits `None` has declared anonymous access to that scope.
+    fn authorize(_tx: &Tx, who: Option<&Principal>, scope: Id<Org>) -> Result<(), ApiError> {
+        match who {
+            Some(p) if p.subject == format!("org:{}", scope.raw()) => Ok(()),
+            _ => Err(ApiError::BadRequest(format!(
+                "not a member of org {}",
+                scope.raw()
+            ))),
+        }
+    }
+}
+
+#[table(scoped_by = Org)]
+struct Memo {
+    id: Id<Memo>,
+    #[index]
+    author: String,
+    text: String,
+}
+
+#[route(GET "/memos/:org", auth)]
+fn count_memos(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    // The one auditable line. `Org::authorize` runs inside it; its `Err` is
+    // this handler's `Err`, mapped like any other `ApiError`.
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(WireU64(tx.scan::<Memo>()?.len() as u64))
+}
+
+#[route(GET "/memos/:org/by/:author", auth)]
+fn memos_by_author(
+    tx: &mut Tx,
+    org: Id<Org>,
+    author: String,
+    ctx: &Ctx,
+) -> Result<WireU64, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    // A scoped table's generated `by_<field>` takes the `ScopedTx`, not a
+    // `View` — there is no tenant-free way to ask.
+    Ok(WireU64(Memo::by_author(&tx, &author)?.len() as u64))
+}
+```
+
+Three things that fall out of that, worth stating plainly:
+
+- **`scoped_by` without an `impl Tenant` does not compile**, at the struct.
+- **The scope type is never inspected.** `authorize` is the only hook, and the
+  one thing the platform reads off a scope is its decimal form, as a
+  subscription key (below). Nothing parses a key back into a tenant.
+- **Ids stay globally unique and app-minted.** The key prefix is what separates
+  tenants, not id re-use, so two tenants may hold the same `Id<Memo>` and the
+  same `#[index]` value without colliding.
+
+### What a `ScopedTx` gives you
+
+```rust,ignore
+impl<S> ScopedTx<'_, '_, S> {
+    pub fn scope(&self) -> Id<S>;
+    pub fn get<R: Row<Scope = S>>(&self, id: Id<R>) -> io::Result<Option<R>>;
+    pub fn scan<R: Row<Scope = S>>(&self) -> io::Result<Vec<R>>;
+    pub fn scan_by<R: Row<Scope = S>>(&self, index_name: &str, key: &impl Codec) -> io::Result<Vec<R>>;
+    pub fn scan_from<R: Row<Scope = S>>(&self, from_id: u64, limit: usize) -> io::Result<Vec<R>>;
+    pub fn put<R: Row<Scope = S>>(&mut self, row: &R);
+    pub fn delete<R: Row<Scope = S>>(&mut self, id: Id<R>);
+    pub fn emit<Ev: Event>(&mut self, event: Ev);      // keyed by the scope — §11
+    pub fn event_key(&self) -> String;                 // the scope's decimal id
+}
+```
+
+Every one of those reads and writes is bounded to the tenant the handle names.
+The type parameter travels with it: a `ScopedTx<'_, '_, OrgA>` is not a
+`ScopedTx<'_, '_, OrgB>`, so a helper written for one scope type cannot be
+handed another's transaction.
+
+**Unscoped tables stay reachable.** `ScopedTx` derefs to `Tx`, so a handler that
+opened a scope still reads a global table — through an explicit deref, because
+Rust does not fall through the deref when an inherent method of the same name
+exists but its bound fails:
+
+```rust,ignore
+let tx = tx.scope::<Org>(org, ctx)?;
+tx.scan::<Memo>()?;          // scoped:   Memo is scoped_by = Org
+(*tx).scan::<Region>()?;     // unscoped: Region has no tenant
+(*tx).emit(SystemNotice {}); // an event that genuinely belongs to no tenant
+```
+
+**One scope per transaction.** Opening a *second, different* tenant on the same
+transaction is a contract violation and panics by name — including through the
+deref — rather than quietly performing a cross-tenant write:
+
+```text
+contract: a transaction opens ONE tenant scope (spec §8) — this one already opened myapp::Org(1) and is now asked for myapp::Org(2); run the second tenant's work in its own transaction
+```
+
+(The scope type prints as `std::any::type_name` renders it, module path
+included.)
+
+Re-opening the *same* scope is a no-op. Cross-tenant *writes* in one
+transaction are deliberately not offered; a rollup that must touch two tenants
+runs two transactions.
+
+### The compile errors, so you recognize them
+
+Both are rendered below with rustc's own `help:` chains trimmed away, leaving
+the message line and the `note:` that carries the fix. Both are pinned
+byte-for-byte by the compile-fail matrix in
+`crates/charpente-macros/tests/compile_fail/`.
+
+A scoped read on a bare `Tx` — the error the whole feature exists to produce:
+
+```text
+error[E0277]: `Invoice` is a tenant-scoped table (`#[table(scoped_by = Org)]`) and a bare `Tx` names no tenant
+  --> src/routes.rs:31:18
+   |
+31 |     Ok(tx.scan::<Invoice>()?)
+   |           ----   ^^^^^^^ `Invoice` is scoped by `Org`
+   |
+   = note: open the tenant scope first; `Org`'s own `Tenant::authorize` runs there, once per handler:
+               let tx = tx.scope::<Org>(scope, ctx)?;
+               tx.scan::<Invoice>()?
+```
+
+`scoped_by` naming a type with no membership check:
+
+```text
+error[E0277]: `Org` is used as a tenant scope but has no `Tenant` impl
+ --> src/tables.rs:9:21
+  |
+9 | #[table(scoped_by = Org)]
+  |                     ^^^ no `impl Tenant for Org`
+  |
+  = note: a scoped table needs the app's own membership check; add:
+          impl Tenant for Org {
+              type Who = Principal;
+              type Error = ApiError;
+              fn authorize(tx: &Tx, who: Option<&Principal>, scope: Id<Self>) -> Result<(), ApiError> { … }
+          }
+```
+
+There is no one-line way out of either. The marker the message hangs on
+(`NoTenant`) and the trait `View` actually bounds on (`UnscopedRow`) are both
+sealed by a supertrait no other crate can name, so `impl UnscopedRow for
+Invoice {}` — orphan-legal, and the obvious workaround — is itself a compile
+error telling you to open the scope. The six scope-taking primitives underneath
+(`get_in`, `scan_in`, `scan_by_in`, `scan_from_in`, `put_in`, `delete_in`) are
+private to the core, so there is no back door on a bare `Tx` either.
+
+### Realtime: one mechanism, not two
+
+`tx.emit` on a `ScopedTx` is automatically keyed with the scope, and an SSE
+handler keys its `Subscription` with the same `tx.event_key()`. A subscription
+keyed to one tenant therefore never receives another tenant's event, for the
+same reason its queries cannot cross — the app did not have to remember a
+second rule. §11 ("Emitting: `tx.emit` and `tx.emit_keyed`") carries the code
+for both sides.
+
+**The limit that travels with it:** `event_key` is the scope's *decimal id* and
+nothing more. Two **different scope types** sharing a raw id therefore share a
+subscription key. It is decimal rather than type-qualified on purpose — the key
+is durable (stored in `EventRow.key`, shipped by replication, exact-matched on
+resume), so it cannot be built from a type name that a compiler or binary
+upgrade could respell without making every pre-upgrade backlog event invisible
+to a reconnecting subscriber. An app with more than one scope type should key
+its subscriptions per scope type as well.
+
+### Reading across every tenant: the `cross_tenant` capability
+
+Naming a tenant is always allowed — a point read already supplies the scope.
+*Enumerating without naming one* is a declared capability. A billing rollup or
+an admin console says so out loud on the route or job, and the platform hands
+it the token:
+
+```rust
+use charpente::auth::Principal;
+use charpente::http::ApiError;
+use charpente::kernel::JobError;
+use charpente::wire::WireU64;
+use charpente::{CrossTenant, Id, Tenant, Tx, job, route, table};
+
+#[table]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<Org>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+#[table(scoped_by = Org)]
+struct Ledger {
+    id: Id<Ledger>,
+    cents: u64,
+}
+
+#[route(GET "/admin/revenue", auth, cross_tenant)]
+fn admin_revenue(tx: &mut Tx, cap: &CrossTenant) -> Result<WireU64, ApiError> {
+    // Rows come back PAIRED WITH THEIR SCOPE.
+    let rows: Vec<(Id<Org>, Ledger)> = tx.across_tenants::<Org>(cap).scan::<Ledger>()?;
+    Ok(WireU64(rows.iter().map(|(_, l)| l.cents).sum()))
+}
+
+/// The job half of the same declaration: `run` takes the token after `tx`.
+/// The flag composes with `retry(...)` — they share one attribute.
+#[job(cross_tenant, retry(max = 2, backoff = "5s"))]
+struct Rollup {
+    day: u64,
+}
+
+impl Rollup {
+    fn run(self, tx: &mut Tx, cap: &CrossTenant) -> Result<(), JobError> {
+        for (org, row) in tx.across_tenants::<Org>(cap).scan::<Ledger>()? {
+            let _ = (self.day, org, row.cents);
+        }
+        Ok(())
+    }
+}
+```
+
+Four properties make this a capability rather than an escape hatch:
+
+- **You cannot take the argument without the declaration.** A handler that
+  writes `cap: &CrossTenant` on a route that did not say `cross_tenant` is a
+  macro error naming the contract, the site and the fix — it reconstructs the
+  attribute you should have written. §9's `#[route]` list quotes it verbatim.
+
+- **You cannot forge the token.** `CrossTenant`'s field is private and its only
+  constructor hangs off `Db::begin_group`, which a handler never holds —
+  `CrossTenant(())` is `error[E0423]: cannot initialize a tuple struct which
+  contains private fields`.
+- **The result carries the tenant.** `AllTenants::scan` yields
+  `Vec<(Id<Org>, Ledger)>`, never `Vec<Ledger>`, so a cross-tenant answer cannot
+  be handed to code expecting one tenant's data without a visible `.map`. It is
+  also read-only: there is no `put` or `delete` on the cross-tenant handle.
+- **It is enumerable.** Because the declaration lives on the route, `charpente
+  describe` (§13) lists every endpoint and job that can read across tenants —
+  an inventory, not a grep someone has to remember to run:
+
+  ```text
+  $ charpente describe --format human
+  ...
+  routes:
+    GET /admin/revenue name=admin_revenue auth=true cross_tenant=true stream=false
+      params=[] request=... response=... error=... emits=[]
+    GET /memos/:org name=count_memos auth=true cross_tenant=false stream=false
+      params=[...] request=... response=... error=... emits=[]
+  ...
+  jobs:
+    Rollup max=2 backoff_nanos=5000000000 cross_tenant=true builtin=false
+  ```
+
+  (Each route prints a second, indented line of type info, and the dump also
+  carries `tables:`, `events:` and `cron:` sections — elided here.) The JSON
+  form carries the same `"cross_tenant": true` on both `routes` and `jobs`,
+  which is what makes "audit the cross-tenant reads" a machine check.
+
+### What happens underneath, and what it means operationally
+
+The scope is part of the row key, so it travels the whole way down: WAL effect
+records, replication frames, the archive, `charpente restore`, follower
+snapshot seeding, and `migrate_schema`'s resume watermark all carry it. Two
+consequences you may meet:
+
+- **A table cannot gain a scope in place.** Adding `scoped_by` to a table that
+  already holds unscoped rows is refused rather than silently misread:
+
+  ```text
+  table "Memo" is declared scoped_by but its rows are keyed unscoped: a table cannot gain a scope in place; create a new scoped table and copy rows through a job
+  ```
+
+- **A binary compiled against the wrong shape refuses the record by name.** A
+  replica or a restored directory running an older binary that does not know a
+  table is scoped stops instead of misreading the key:
+
+  ```text
+  record decode: table "Doc" is not tenant-scoped (Row::Scope = Unscoped) but this Put effect carries scope 1 (tag 0x05/0x06) — the record was written for a scoped shape of this table; restore from a replica or backup, or replay under the schema that wrote it
+  ```
+
+  Note that the replication handshake's schema digest covers a table's fields
+  and version but **not** its scopedness, so a mixed-version follower is
+  admitted at the handshake and stopped at the first scoped record. Upgrade
+  followers before the primary starts writing a newly scoped table.
+
+### Where the guarantee stops
+
+**The guarantee is about the typed surface the framework hands your app.** A
+route handler and a job receive a `Tx`; through a `Tx`, a scoped table is
+unreachable without `tx.scope::<Org>(org, ctx)?`. That is the property a
+reviewer checks by reading one line per handler, and the compiler enforces it.
+
+It is **not** a sandbox around the process. Your own `main` builds the `App` it
+hands to `launch`, so it holds `App::db()` — and a `Db` reaches every tenant:
+`Db::snapshot()` exposes scoped and raw reads that take a scope on the caller's
+word with no `authorize` on the path (replication seeding, the archive and
+`restore` are built on them), and `Db::begin_group` can mint the `CrossTenant`
+token. Whoever holds the `Db` holds the store, with the same standing as
+whoever holds the data directory: an operator, not a request.
+
+**So: code outside a handler that wants the guarantee should go through a
+transaction and `tx.scope::<Org>(org, ctx)?` exactly as a handler does.** Do not
+build an app-internal helper that takes a raw scope and reads through
+`Db::snapshot`; that is the one shape that looks tenant-aware and is not.
+
+### Deliberately not built
+
+Stated so you do not go looking:
+
+- **Nested or hierarchical scopes** (Org → Project → …). One level.
+- **Cross-tenant writes in one transaction.** A transaction opens one scope.
+- **Platform-derived tenancy.** There is no `Principal → Org` resolver hook;
+  the tenant is named by your code at the `tx.scope` line and nowhere else.
+- **Retrofitting existing tables.** Scoping is opt-in per table and no
+  migration is forced on any app — but see the in-place refusal above.
+- **Tenant-local ids.** Ids stay globally unique and app-minted.
+- **Permissions.** This answers *which tenant*, never *what may this principal
+  do*; API-key scopes and permissions are their own future design.

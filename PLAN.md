@@ -43,8 +43,8 @@ required zero framework patches.
   *Shipped.* WebSockets and TS client codegen for events and routes: **deferred to M2**
   (both were declared non-goals of the realtime spec).
 - **Auth, properly:** OIDC (static-JWKS RS256), API keys, sessions. *Shipped.* Tenant
-  scoping as typed key prefixes: **deferred to M2** — multi-tenancy is a convention today,
-  not compiler-enforced (DESIGN §9 carries it as its own future design).
+  scoping as typed key prefixes: **deferred to M2**, and shipped there 2026-09-04 (see the
+  M2 bullet below; DESIGN §8 carries the mechanism).
 - **Migrations:** schema versions as log records; compile-time incompatibility detection.
   *Shipped.*
 - **Error/introspection polish:** `charpente describe`, structured sim-failure reports —
@@ -142,7 +142,33 @@ is why the milestone closed with them outstanding rather than silently absorbing
 - **WebSockets** (deferred from M1) — the generated client targets SSE; a WebSocket
   transport would be a swap behind the same generated API (routes, types, `Result<T,
   E>`), not a second client.
-- **Tenant scoping as typed key prefixes** (deferred from M1; DESIGN §9).
+- **Tenant scoping as typed key prefixes** (deferred from M1). *Shipped 2026-09-04.*
+  `#[table(scoped_by = Org)]` makes `(scope, id)` the row key and prefixes every secondary
+  index, and the scope-taking primitives are private to the core — so a scoped row is
+  reachable only through `tx.scope::<Org>(org, ctx)?`, which runs the app's own
+  `Tenant::authorize` first. "Every query is tenant-scoped" stops being a review checklist
+  item: a scoped read on a bare `Tx` is a compile error naming the table, its scope, and
+  the line to write, and the traits underneath it (`NoTenant`, `UnscopedRow`) are sealed,
+  so an app cannot opt back out in one orphan-legal line. The scope travels the whole way
+  down — WAL effects, replication, archive, `restore`, snapshot seeding, and
+  `migrate_schema`'s watermark — and a binary compiled against the unscoped shape of a
+  scoped table refuses the record by name rather than misreading it. Realtime is the same mechanism rather than a second
+  one: `emit` inside a scope is keyed by the scope. Enumerating every tenant is a
+  **declared capability**, not an escape hatch — `#[route(…, cross_tenant)]` /
+  `#[job(cross_tenant)]` mint the token `Tx::across_tenants` requires, rows come back
+  paired with their scope, and `charpente describe` turns "audit the cross-tenant reads"
+  into a mechanical inventory (DECISIONS §11). The flagship oracle is
+  `every_scoped_read_returns_only_its_own_tenants_rows` — all four read paths, two tenants
+  sharing an id space *and* an index key, 256 universes at a pinned base plus 768 over
+  three fresh ones — with two naive victims that fail it by name, a scope-keyed realtime
+  sibling, and a two-tenant wire oracle over real TCP in the edge harness.
+  **Two limits travel with it.** The subscription key is the scope's decimal id, so two
+  different scope types sharing a raw id share a key. And the guarantee's boundary is the
+  typed surface handed to handlers and jobs: a `Db` holder reaches every tenant and can
+  mint the cross-tenant capability, with the standing of whoever holds the data directory —
+  an operator, not a request (DECISIONS §12, drafted and awaiting sign-off).
+  Deliberately not built: nested scopes, cross-tenant writes in one transaction,
+  platform-derived tenancy, tenant-local ids, and any forced retrofit of existing tables.
 - **Typed telemetry with change-time checks** — the observability contract as a lockfile;
   instrumentation that cannot silently rot.
 - **Read-only Postgres-wire endpoint** for BI tools.

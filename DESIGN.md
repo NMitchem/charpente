@@ -528,6 +528,21 @@ platform is one dependency, not two.
 
 - **Tables.** `#[table]` on a struct derives the row codec, key type (`Id<T>`, typed, never
   a bare u64), and secondary index declarations. Schema *is* the Rust definition.
+- **Scope.** `#[table(scoped_by = Org)]` sets a row's `Row::Scope`, and a scoped row's key
+  becomes the `(scope, id)` composite (every secondary-index entry gains the same prefix) —
+  a tenant is a key prefix, not a `where` clause someone has to remember. A table without
+  the attribute gets `type Scope = Unscoped`. The scope type owes exactly one thing, an
+  `impl Tenant` with its own `authorize`; `scoped_by` without one is a compile error at the
+  struct. The six scope-taking primitives on `Tx` are private to `charpente-core`, so the
+  ONE way to reach a scoped row is `tx.scope::<Org>(org, ctx)?` — the single auditable line
+  per handler — which runs the app's `authorize` before it returns the `ScopedTx` that
+  `get`/`scan`/`scan_from`/`scan_by`/`put`/`delete` live on. Both the marker
+  (`NoTenant`) and the trait `View` actually bounds on (`UnscopedRow`) are sealed, so an app
+  cannot re-open a scoped table with one orphan-legal line; a scoped read on a bare `Tx` is an
+  unsatisfied trait bound whose text names the table, its scope, and the `tx.scope` line to
+  write. `ScopedTx` derefs to `Tx`, so unscoped tables stay reachable
+  (`(*tx).scan::<Region>()`), and a transaction opens exactly one scope. Full treatment in
+  §8; spec `docs/superpowers/specs/2026-08-30-tenant-scoping-design.md`, GUIDE §16.
 - **Migrations.** `#[table(version = N)]` versions a row's shape; a bump without a
   registered `TableMigration` is a compile error. Ordinary Rust already catches a query
   referencing a field that no longer exists — the mechanism below is for what Rust
@@ -1355,7 +1370,7 @@ Charpente treats the coding agent as the primary developer persona:
   pack designed to be loaded into an agent's context (the framework's conventions are only
   worth having if the agent applying them has them in scope).
 
-## 8. Auth & multi-tenancy [M1]
+## 8. Auth & multi-tenancy [auth M1; multi-tenancy M2]
 
 Sessions and API keys are built-in typed tables inside the commit point; a pre-transaction
 resolution ladder turns a presented credential into one `Principal`, and `#[route(…, auth)]`
@@ -1454,12 +1469,41 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   (possession of an expired token proves past authorization; JWT claims are attacker-visible
   by construction). The exact strings live in the code and are pinned by the ladder/OIDC/repl
   test matrices; GUIDE §5 quotes the set byte-for-byte in its error-index voice.
-- **Multi-tenancy (deferred to its own design).** Org/tenant scoping as a first-class key
-  prefix — "every query is tenant-scoped" as a type-level property rather than a review
-  checklist item — is a table-layer type-system feature, deferred to a design of its own; the
-  session-subject pattern (and `emit_keyed`'s scoping key for realtime, §6) covers scoping
-  until then, as the realtime demo shows. API-key scopes/permissions are subject-only in v1 —
-  a permissions story earns its own design too.
+- **Multi-tenancy (shipped M2, 2026-09-04).** Org/tenant scoping is a first-class key prefix
+  and a type-level property, not a review checklist item: the session-subject convention the
+  realtime demo used is no longer the mechanism. Design:
+  `docs/superpowers/specs/2026-08-30-tenant-scoping-design.md`; app-facing walkthrough:
+  GUIDE §16; the typed surface is §3's `Scope` bullet.
+  `#[table(scoped_by = Org)]` makes `(scope, id)` the row key and prefixes every index
+  entry, and the scope-taking primitives are private, so a scoped row is reachable only
+  through `tx.scope::<Org>(org, ctx)?` — which runs the app's own `Tenant::authorize`
+  first, and whose refusal is the app's own `ApiError`. The platform never *derives* a
+  scope: the tenant is named by the app at that one line and nowhere else, and no key is
+  ever parsed back into one. Realtime is the same mechanism rather than a second one —
+  `emit` inside a scope is `emit_keyed` with the scope's key (§6), which retires
+  `emit_keyed`'s hand-rolled scoping key as the stopgap it was. The composite key travels
+  the whole way down: WAL effects, replication, the archive, `restore`, snapshot seeding
+  and `migrate_schema`'s watermark all carry the scope, and a binary compiled against the
+  unscoped shape of a scoped table refuses the record **by name** rather than misreading it.
+  Enumerating every tenant is possible and **declared, never silent**:
+  `#[route(…, cross_tenant)]` / `#[job(cross_tenant)]` mint the `CrossTenant` token
+  `Tx::across_tenants::<S>(cap)` requires, rows come back paired with their scope
+  (`Vec<(Id<Org>, Invoice)>`, never `Vec<Invoice>`), and `charpente describe` lists every
+  route and job that declared it — an inventory, not a grep. That is a capability, not an
+  escape hatch on a guarantee (DECISIONS §11).
+  **Two limits travel with it, documented rather than engineered around.** The subscription
+  key is the scope's decimal id, so two DIFFERENT scope types sharing a raw id share a key —
+  an app with more than one scope type keys its subscriptions per scope type as well. And
+  the guarantee's boundary is the typed surface handed to handlers and jobs: whoever holds
+  the `Db` reaches every tenant through `Db::snapshot`'s scoped and raw reads, which take a
+  scope on the caller's word because replication seeding and the archive are built on them,
+  and can mint a `CrossTenant` through `begin_group`. A `Db` holder has the standing of
+  whoever holds the data directory — an operator, not a request (DECISIONS §12, drafted and
+  awaiting sign-off).
+  Out of scope and staying out: nested scopes, cross-tenant writes in one transaction,
+  platform-derived tenancy, and forced retrofitting of existing tables. API-key
+  scopes/permissions are subject-only in v1 — this feature answers *which tenant*, never
+  *what may this principal do*, and a permissions story earns its own design.
 
 ## 9. Open questions (tracked, not blocking)
 

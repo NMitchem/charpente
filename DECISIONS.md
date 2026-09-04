@@ -75,8 +75,9 @@ Reopen (on schedule): M2.
 
 **Reopened on schedule 2026-08-06; re-closed: deferred behind measurement** (Noah-ruled,
 premise re-examination at M2 start). The harness precondition is met, but the urgency
-case is gone: redb coupling is confined to `table.rs` (one file, ~30 call sites — deferral
-does not compound the swap cost); redb is healthy and its known gaps are fenced and pinned
+case is gone: redb coupling is confined to `table.rs` (one file, 170 call sites — the
+measure that produces that number is recorded at the end of this entry; deferral does not
+compound the swap cost); redb is healthy and its known gaps are fenced and pinned
 (the open-time panic fence, both mode-skew profile overrides, the 0a latch); and the moat
 NEIGHBORS defines — determinism + the compile-time oracle — already exists, while the
 engine is invisible to the adopters the wager needs. Building a performance-shaped engine
@@ -105,6 +106,35 @@ binding constraint at this workload on this hardware* — it does not measure re
 isolation, and says nothing about a workload whose store cost is not swamped by an fsync. A
 finer attribution needs per-phase profiling the instrument does not do. The follow-up this
 opens is group commit, not an engine swap.
+
+**The call-site measure, defined 2026-09-04 (tenant-scoping spec §10).** This entry quoted
+"~30 call sites" from 2026-08-06 onward and the figure was stale; two independent
+recounts during the tenant-scoping design disagreed (46 and 64) because each used a
+different pattern set,
+which is the tell that a number was being quoted without a measure behind it. So the
+measure is recorded here with the count, and a future recount that disagrees is either a
+real change or a different definition — never an unresolvable difference of opinion.
+
+> **A redb call site is one call expression in `crates/charpente-core/src/table.rs` whose
+> callee is an item defined by the `redb` crate** — a redb inherent method, a redb trait
+> method, or a redb associated function — counted per expression rather than per line, over
+> the file with comments and doc comments stripped, and including the file's own
+> `#[cfg(test)] mod latch_tests`. A *mention* of a redb type is not a call site.
+
+**170**, as of 2026-09-04 (HEAD of `tenant-scoping`), broken down so it can be audited:
+`AccessGuard::value` 43, `open_table` 41, `get` 19, `insert` 15, `range` 11, `begin_write` 6,
+`commit` 6, `remove` 6, `StorageBackend` methods driven by `latch_tests` 6,
+`set_durability` 5, `TableDefinition::new` 4, `iter` 3, `begin_read` 2, and one each of
+`Builder::new`, `create_with_backend` and `delete_table`. 164 of the 170 are in the module
+proper; the remaining 6 are the latch tests. The separate type-level surface — deliberately
+*not* folded into that number, since conflating the two is what produced the disagreement —
+is 29 `redb::` paths plus the file's single `use redb::{…}` importing seven names.
+
+**The one-file claim in the paragraph above still holds exactly.** `grep -rln 'redb::'
+--include='*.rs' crates/ examples/` returns only `crates/charpente-core/src/table.rs`, and
+only `charpente-core/Cargo.toml` names the dependency (`redb = "4.1.0"`). What the recount
+changes is the *size* of the confined surface, not its confinement — and it argues neither
+way on the deferral, which rests on the build triggers, not on the call count.
 
 ## 8. Name
 
@@ -143,3 +173,89 @@ interleaving exploration comes from crash-time write-buffer collapse, not async 
 shuffling. Costs accepted: concurrency at the edges needs its own deterministic executor
 when HTTP/queue land (M0 steps 5–6); tokio-flavored async stays outside the deterministic
 boundary. Reopen if: the edge executor proves the core traits must be awaitable.
+
+## 11. Cross-tenant enumeration is a declared capability, not an escape hatch (2026-09-04)
+
+Tenant scoping (M2, DESIGN §8, spec
+`docs/superpowers/specs/2026-08-30-tenant-scoping-design.md` §3) ships
+`Tx::across_tenants::<S>(cap)`, which enumerates a scoped table across every tenant.
+Hard rule 2 says there are no escape hatches on guarantees, so this entry records why
+`across_tenants` is not one — because the reading binds future work, not just this
+sub-project.
+
+**The guarantee is "a scoped query cannot silently cross tenants."** `across_tenants` is
+not silent: it is named at the call site, its capability is declared in the route or job
+attribute (`#[route(…, cross_tenant)]` / `#[job(cross_tenant)]`), the token
+(`CrossTenant`) is unforgeable from a handler because its only constructor is
+`Group::cross_tenant_cap` and `begin_group` lives on `Db`, and every row comes back paired
+with its scope — `Vec<(Id<Org>, Invoice)>`, never `Vec<Invoice>` — so a cross-tenant result
+cannot be handed to code expecting one tenant's data without a visible `.map`. It is closer
+to `unsafe` than to a feature flag: a named construct where the obligation visibly moves,
+not a switch that turns the checker off. Nothing about `ScopedTx` weakens when it exists;
+there is no mode, no config key, and no build flag on the scoped path — which is precisely
+what "optional guarantees are no guarantees" targets.
+
+**It is also the thing that makes the audit mechanical.** Because the capability is
+declared on the route rather than discovered in a function body, `charpente describe`
+enumerates every endpoint and job in an app that can read across tenants. "Audit the
+cross-tenant reads" stops being a grep someone has to remember and becomes an inventory,
+the same move `check-client` and `doc_inventory` already make.
+
+**The rejected alternative, stated so it stays rejected.** Making cross-tenant enumeration
+*inexpressible* is coherent, and it was considered. It loses billing rollups, admin
+consoles and usage reporting — i.e. most real SaaS — and an app that needs one would build
+it outside the typed surface, where nothing is declared and nothing is enumerable. A
+capability the platform refuses to name does not disappear; it moves somewhere the oracle
+cannot see it.
+
+**What this binds.** Any future feature that wants to read or write outside one tenant must
+arrive as a *declared, enumerable capability with the tenant visible in its result type* —
+not as a config option, a `DbConfig` field, an undeclared bypass method, or an
+"internal-only" accessor. If a proposal cannot be declared on the route and listed by
+`describe`, it is an escape hatch and hard rule 2 refuses it. Reopen if: a real app needs
+a cross-tenant surface that cannot be expressed as a declaration on the entry point.
+A louder notch remains available and unbuilt — the capability could additionally be
+required at `App::mount` — and would be the first thing to reach for if declarations at the
+route prove too quiet in practice.
+
+## 12. DRAFT, AWAITING NOAH'S SIGN-OFF — the tenancy guarantee's boundary is the typed surface
+
+**Status: not ratified.** Written up because it is now load-bearing in two places and was
+ruled twice in flight (R48, R49) without being recorded here. Do not cite it as settled
+until Noah confirms it; if he rejects it, the tenancy surface needs a different answer and
+DESIGN §8's limits paragraph and PLAN's M2 bullet both change with it.
+
+**The claim.** The tenancy guarantee covers the typed surface the framework hands app
+logic — a `Tx`, and through it a scoped table reachable only via
+`tx.scope::<Org>(org, ctx)?`, which runs the app's own `Tenant::authorize` first. It is
+*not* a sandbox around the process. Whoever holds the `Db` is the operator, with the same
+standing as whoever holds the data directory.
+
+**The evidence, both directions.** Task 7's review proved the reachable path: an app's own
+`main` builds the `App` it hands `launch`, so it holds `App::db()`, and
+`Db::snapshot()` yields `scan_scoped`/`scan_raw`-class reads that take a scope on the
+caller's word with no `authorize` anywhere on the path. Those reads are public and stay
+public because replication seeding, the archive and `restore` are built on them. Task 10
+made the same boundary load-bearing a second time: `CrossTenant`'s only constructor is
+`Group::cross_tenant_cap`, and `begin_group` lives in `impl Db` — so a handler (which holds
+`&mut Tx` and `&Ctx`, never a `Group`) cannot mint the capability, while a `Db` holder can.
+The seal on the handler side is exactly as strong as the boundary claim on the `Db` side;
+they are the same ruling seen twice.
+
+**Why the alternative was not taken.** Making `Db`'s scoped and raw reads private would
+require a second, privileged path for replication seeding, archive and restore — a second
+place where a scope is taken on trust, with the same reachability and less visibility.
+Making them `authorize`-checked is worse: there is no request, no principal and no tenant
+to ask about at seed time, so the check would have to admit everything, which is a check in
+name only.
+
+**What an app is told, and where.** DESIGN §8 states the boundary in its limits paragraph;
+`crates/charpente/src/tenant.rs`'s module doc states it at the code; GUIDE §16 states it to
+app authors, with the remedy: code outside a handler that wants the guarantee should go
+through a transaction and `tx.scope::<Org>(org, ctx)?` exactly as a handler does.
+
+**The open question this leaves for Noah.** Is "the `Db` holder is the operator" the right
+line for a platform whose pitch is compiler-enforced tenancy — or should a future release
+put the raw reads behind a named, `describe`-visible operator capability (the §11 shape
+applied one layer down), so that even the operator path is enumerable? That is the decision
+being asked for, not merely a ratification of the status quo.

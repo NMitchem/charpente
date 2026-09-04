@@ -299,8 +299,8 @@ pub struct Unscoped;
 pub trait Row: Sized + 'static {
     /// The tenant scope this row is partitioned by, or `Unscoped`.
     /// Set by `#[table(scoped_by = …)]`. DESIGN §8's last bullet
-    /// ("Multi-tenancy", DESIGN.md:1377) defers the mechanism to a design
-    /// of its own; that design is
+    /// ("Multi-tenancy") records the shipped mechanism and §3's `Scope`
+    /// bullet the typed surface; the design behind both is
     /// docs/superpowers/specs/2026-08-30-tenant-scoping-design.md, whose §1
     /// ("The type surface") specifies this associated type and the
     /// attribute that sets it.

@@ -9,8 +9,8 @@
 //! bare `&mut Tx`. What stays here is everything that names a platform-edge
 //! type — `Principal` (`crate::auth::Principal`), `ApiError`
 //! (`crate::http::ApiError`) and `Ctx`, none of which `charpente-core` may
-//! depend on (ruling R2, amended by R45; DESIGN.md §8's deferred
-//! multi-tenancy note, DESIGN.md:1377).
+//! depend on (ruling R2, amended by R45; DESIGN.md §8's multi-tenancy
+//! bullet).
 //!
 //! # What the guarantee covers (ruling R48)
 //!
