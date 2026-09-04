@@ -22,6 +22,9 @@ use crate::scenario::Scenario;
 /// The rig's built binaries, as located by `build_bins`.
 pub struct Bins {
     pub node: PathBuf,
+    /// The invoicing example's second harness vehicle: the same process
+    /// shape as `node`, over a tenant-SCOPED app (`tenant_wire.rs`).
+    pub tenant_node: PathBuf,
     pub charpente: PathBuf,
 }
 
@@ -325,8 +328,13 @@ pub fn build_bins() -> io::Result<Bins> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let bins = find_bins(&stdout);
     let node = locate(&bins, "node")?;
+    let tenant_node = locate(&bins, "tenant_node")?;
     let charpente = locate(&bins, "charpente")?;
-    Ok(Bins { node, charpente })
+    Ok(Bins {
+        node,
+        tenant_node,
+        charpente,
+    })
 }
 
 fn locate(bins: &[(String, String)], name: &str) -> io::Result<PathBuf> {
