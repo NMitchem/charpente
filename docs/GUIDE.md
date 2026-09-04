@@ -2320,11 +2320,13 @@ this argument must be named `id` to match :id in "/notes/:id" — got `key`
 route path must start with '/' — got "notes"
 unknown method PUSH — one of GET, POST, PUT, PATCH, DELETE, SSE
 the route path must be a string literal — e.g. #[route(GET "/notes/:id")]
-a route flag is `auth` or `emits(Ev, …)` — write `#[route(GET "/path", auth)]`, or `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`
+a route flag is `auth`, `cross_tenant` or `emits(Ev, …)` — write `#[route(GET "/path", auth)]`, or `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`
 emits(...) applies to SSE routes only — a plain route returns one response, not a stream of events; drop emits(...) or make this `#[route(SSE "…")]`
 emits(...) must name at least one #[event] type — write `emits(NoteAdded, NoteRemoved)`, or drop it
 emits takes a parenthesized list of #[event] types — write `emits(NoteAdded, NoteRemoved)`
 `auth` given twice — write it once
+`cross_tenant` given twice — write it once
+`revenue` takes `cap: &CrossTenant`, but this route does not declare `cross_tenant` — enumerating a scoped table across every tenant is a declared capability, and `charpente describe` lists every route that declared it. Write `#[route(GET "/admin/revenue", cross_tenant)]`, or drop the `cap` argument and read one tenant through `tx.scope::<Org>(org, ctx)?`
 `emits(...)` given twice — a route declares one set, so name every event in one list: `emits(NoteAdded, NoteRemoved)`
 `NoteAdded` is named twice in emits(...) — a stream declares each event type once, and a repeat would put the same member in a generated client's union twice; write it once
 #[route] handlers are free functions — no `self`

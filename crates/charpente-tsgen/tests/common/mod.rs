@@ -65,6 +65,7 @@ pub fn fixture_contract() -> Contract {
                 pattern: "/orgs/:org_id/widgets/:id",
                 name: "get_org_widget",
                 auth: true,
+                cross_tenant: false,
                 stream: false,
                 params: vec![
                     ParamInfo {
@@ -86,6 +87,7 @@ pub fn fixture_contract() -> Contract {
                 pattern: "/customers",
                 name: "create_customer",
                 auth: false,
+                cross_tenant: false,
                 stream: false,
                 params: Vec::new(),
                 request: Some(TypeSchema::Ref("CustomerNew")),
@@ -98,6 +100,7 @@ pub fn fixture_contract() -> Contract {
                 pattern: "/widgets/:id",
                 name: "delete_widget",
                 auth: false,
+                cross_tenant: false,
                 stream: false,
                 params: vec![ParamInfo {
                     name: "id",
@@ -118,6 +121,7 @@ pub fn fixture_contract() -> Contract {
                 pattern: "/feed",
                 name: "feed",
                 auth: true,
+                cross_tenant: false,
                 stream: true,
                 params: Vec::new(),
                 request: None,
@@ -142,6 +146,7 @@ pub fn fixture_contract() -> Contract {
                 pattern: "/raw-feed",
                 name: "raw_feed",
                 auth: false,
+                cross_tenant: false,
                 stream: true,
                 params: Vec::new(),
                 request: None,

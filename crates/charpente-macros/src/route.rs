@@ -1,10 +1,12 @@
-//! `#[route(METHOD "/path/:param"[, auth][, emits(Ev, …)])]` (DESIGN.md §3,
-//! specs 2026-07-02-http-layer and 2026-08-20-ts-client-codegen §2):
+//! `#[route(METHOD "/path/:param"[, auth][, cross_tenant][, emits(Ev, …)])]`
+//! (DESIGN.md §3, specs 2026-07-02-http-layer,
+//! 2026-08-20-ts-client-codegen §2 and 2026-08-30-tenant-scoping §3):
 //! validates the handler signature against the path and emits typed
 //! extraction glue plus a `RouteDef` marker struct. The argument convention
 //! — `tx`, one arg per `:param` by name in path order, at most one JSON body
-//! arg, optional trailing `ctx` — is enforced here with errors that name the
-//! contract and the fix.
+//! arg, an optional `cap: &CrossTenant` on a `cross_tenant` route, optional
+//! trailing `ctx` — is enforced here with errors that name the contract and
+//! the fix.
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -19,6 +21,11 @@ pub(crate) struct RouteArgs {
     method: Ident,
     path: LitStr,
     auth: bool,
+    /// `cross_tenant` — the declared capability to enumerate a scoped table
+    /// across every tenant (tenant-scoping spec §3). Drives two things: the
+    /// `cap: &CrossTenant` argument the glue may fill, and the flag
+    /// `charpente describe` lists so the audit is an inventory.
+    cross_tenant: bool,
     /// The event types a stream route declares with `emits(Ev, …)`
     /// (TS-codegen spec §2) — empty when the attribute carries none, which
     /// is every non-stream route and any stream route that has not adopted
@@ -41,6 +48,7 @@ impl Parse for RouteArgs {
             )
         })?;
         let mut auth = false;
+        let mut cross_tenant = false;
         let mut emits: Vec<Ident> = Vec::new();
         while input.peek(Token![,]) {
             input.parse::<Token![,]>()?;
@@ -53,6 +61,14 @@ impl Parse for RouteArgs {
                     ));
                 }
                 auth = true;
+            } else if flag == "cross_tenant" {
+                if cross_tenant {
+                    return Err(Error::new(
+                        flag.span(),
+                        "`cross_tenant` given twice — write it once",
+                    ));
+                }
+                cross_tenant = true;
             } else if flag == "emits" {
                 // Non-empty means an earlier `emits(...)` clause landed:
                 // `emits()` is refused below, so the vector cannot be
@@ -110,6 +126,7 @@ impl Parse for RouteArgs {
             method,
             path,
             auth,
+            cross_tenant,
             emits,
         })
     }
@@ -119,9 +136,31 @@ impl Parse for RouteArgs {
 /// that can reach it (a non-identifier token, and an identifier that isn't
 /// one of the flags) so they cannot drift apart. Pinned by
 /// `docs/GUIDE.md`'s error catalog (hard rule 5).
-const FLAGS: &str = "a route flag is `auth` or `emits(Ev, …)` — write \
+const FLAGS: &str = "a route flag is `auth`, `cross_tenant` or `emits(Ev, …)` — write \
                      `#[route(GET \"/path\", auth)]`, or \
                      `#[route(SSE \"/path\", emits(NoteAdded, NoteRemoved))]`";
+
+/// The refusal for a handler that takes the capability token on a route
+/// that never declared it — the compile error tenant-scoping spec §3 calls
+/// for. Names the contract, the site (the argument's own span, at the call
+/// site) and the fix (hard rule 5). Shared by both route flavors so the two
+/// cannot drift.
+fn undeclared_capability(name: &str, args: &RouteArgs, pat: &PatType) -> Error {
+    let method = &args.method;
+    let path = args.path.value();
+    let auth = if args.auth { ", auth" } else { "" };
+    Error::new(
+        pat.span(),
+        format!(
+            "`{name}` takes `cap: &CrossTenant`, but `#[route({method} \"{path}\"{auth})]` \
+             does not declare `cross_tenant` — enumerating a scoped table across every \
+             tenant is a declared capability, and `charpente describe` lists every route \
+             that declared it. Write `#[route({method} \"{path}\"{auth}, cross_tenant)]`, \
+             or drop the `cap` argument and read one tenant through \
+             `tx.scope::<Org>(org, ctx)?`"
+        ),
+    )
+}
 
 fn arg_name(pat: &PatType) -> Option<String> {
     match &*pat.pat {
@@ -212,6 +251,28 @@ fn expand_http(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
         &rest[..]
     };
 
+    // The capability token, if the handler takes one: the argument named
+    // `cap`, after the :params and any body, before the optional `ctx`.
+    // Only a SPARE argument can be it — with exactly one argument per
+    // :param there is nothing left over, so a route with a `:cap` param
+    // still binds that param, not a token.
+    let has_cap = non_ctx.len() > params.len()
+        && non_ctx
+            .last()
+            .is_some_and(|p| arg_name(p).as_deref() == Some("cap"));
+    if has_cap && !args.cross_tenant {
+        return Err(undeclared_capability(
+            &name_str,
+            &args,
+            non_ctx[non_ctx.len() - 1],
+        ));
+    }
+    let non_ctx = if has_cap {
+        &non_ctx[..non_ctx.len() - 1]
+    } else {
+        non_ctx
+    };
+
     if non_ctx.len() < params.len() || non_ctx.len() > params.len() + 1 {
         return Err(Error::new(
             func.sig.span(),
@@ -275,10 +336,29 @@ fn expand_http(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
         );
         call_args.push(quote!(#ident));
     }
+    if has_cap {
+        call_args.push(quote!(cap));
+    }
     if has_ctx {
         call_args.push(quote!(ctx));
     }
+    // The token comes from the same `Ctx` field `Ctx::cap()` reads — one
+    // source of truth, with the argument as its typed spelling. `expect` is
+    // an invariant, not a fallible read: this `let` is emitted only for a
+    // route whose `Route.cross_tenant` this same expansion set, and the
+    // kernel mints the token from exactly that flag.
+    let cap_let = if has_cap {
+        quote! {
+            let cap = ctx.cap().expect(
+                "route declares cross_tenant but the kernel minted no CrossTenant — \
+                 the flag on Route and the token in Ctx come from the same expansion"
+            );
+        }
+    } else {
+        quote!()
+    };
     let auth = args.auth;
+    let cross_tenant = args.cross_tenant;
     let pattern_lit = &args.path;
 
     let ok_ty = result_ok_type(&func.sig.output)?;
@@ -331,6 +411,7 @@ fn expand_http(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
             let _ = (ctx, captures, body); // routes without params/body/ctx use none of them
             #(#param_lets)*
             #body_let
+            #cap_let
             let out = #name(#(#call_args),*)?;
             ::std::result::Result::Ok(::charpente::http::Response::json(200, &out))
         }
@@ -345,6 +426,7 @@ fn expand_http(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
                     method: ::charpente::http::Method::#method_variant,
                     pattern: #pattern_lit,
                     auth: #auth,
+                    cross_tenant: #cross_tenant,
                     name: #name_str,
                     glue: ::charpente::http::RouteGlue::Http(#glue_name),
                     params: &[#(#param_schema_entries),*],
@@ -488,13 +570,22 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
         })
         .collect::<syn::Result<_>>()?;
 
-    if rest.len() != params.len() + 2 {
+    // A stream route may take the capability token too, in the same slot
+    // the plain flavor puts it: after the :params, before `ctx`.
+    let has_cap =
+        rest.len() == params.len() + 3 && arg_name(rest[params.len()]).as_deref() == Some("cap");
+    if has_cap && !args.cross_tenant {
+        return Err(undeclared_capability(&name_str, &args, rest[params.len()]));
+    }
+    if rest.len() != params.len() + 2 + usize::from(has_cap) {
         return Err(Error::new(
             func.sig.span(),
             format!(
                 "an SSE route handler is `fn {name_str}(tx: &mut Tx, {}ctx: &Ctx, \
                  cursor: Option<Cursor>) -> Result<Subscription, ApiError>` — one argument \
-                 per :param in \"{pattern}\" (path order), then `ctx`, then `cursor`",
+                 per :param in \"{pattern}\" (path order), then `ctx`, then `cursor` \
+                 (with `cap: &CrossTenant` between the :params and `ctx` on a `cross_tenant` \
+                 route)",
                 params
                     .iter()
                     .map(|p| format!("{p}: _, "))
@@ -502,6 +593,7 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
             ),
         ));
     }
+    let tail = params.len() + usize::from(has_cap);
     for (i, param) in params.iter().enumerate() {
         let got = arg_name(rest[i]);
         if got.as_deref() != Some(param.as_str()) {
@@ -515,7 +607,7 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
             ));
         }
     }
-    let ctx_arg = rest[params.len()];
+    let ctx_arg = rest[tail];
     if arg_name(ctx_arg).as_deref() != Some("ctx") {
         return Err(Error::new(
             ctx_arg.span(),
@@ -525,7 +617,7 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
             ),
         ));
     }
-    let cursor_arg = rest[params.len() + 1];
+    let cursor_arg = rest[tail + 1];
     if arg_name(cursor_arg).as_deref() != Some("cursor") {
         return Err(Error::new(
             cursor_arg.span(),
@@ -568,10 +660,25 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
         let ident = format_ident!("{p}");
         call_args.push(quote!(#ident));
     }
+    if has_cap {
+        call_args.push(quote!(cap));
+    }
     call_args.push(quote!(ctx));
     call_args.push(quote!(cursor));
 
+    // See `expand_http`'s `cap_let`.
+    let cap_let = if has_cap {
+        quote! {
+            let cap = ctx.cap().expect(
+                "route declares cross_tenant but the kernel minted no CrossTenant — \
+                 the flag on Route and the token in Ctx come from the same expansion"
+            );
+        }
+    } else {
+        quote!()
+    };
     let auth = args.auth;
+    let cross_tenant = args.cross_tenant;
     let pattern_lit = &args.path;
 
     let err_ty = result_err_type(&func.sig.output)?;
@@ -644,6 +751,7 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
         ) -> ::std::result::Result<::charpente::http::Subscription, ::charpente::http::ApiError> {
             let _ = captures; // SSE routes without :params use none of them
             #(#param_lets)*
+            #cap_let
             #name(#(#call_args),*)
         }
 
@@ -657,6 +765,7 @@ fn expand_sse(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
                     method: ::charpente::http::Method::Get,
                     pattern: #pattern_lit,
                     auth: #auth,
+                    cross_tenant: #cross_tenant,
                     name: #name_str,
                     glue: ::charpente::http::RouteGlue::Sse(#glue_name),
                     params: &[#(#param_schema_entries),*],

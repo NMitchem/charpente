@@ -5,7 +5,7 @@ use std::fmt;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use charpente_core::db::{Db, Group, Tx, TxError};
+use charpente_core::db::{CrossTenant, Db, Group, Tx, TxError};
 use charpente_core::job::{JobRow, JobStatus, RetryPolicy};
 use charpente_core::table::{Id, Snapshot, View};
 
@@ -58,8 +58,23 @@ impl fmt::Debug for JobError {
 pub struct JobDef {
     pub name: &'static str,
     pub retry: RetryPolicy,
-    pub glue: fn(&mut Tx, &[u8]) -> Result<(), JobError>,
+    /// `#[job(cross_tenant)]` — the same declared capability a route carries
+    /// (spec §3), for the background rollups that need it. `describe` lists
+    /// it beside the route flag, so the cross-tenant inventory covers jobs
+    /// too.
+    pub cross_tenant: bool,
+    /// The token is `Some` exactly when `cross_tenant` is set: the glue
+    /// `#[job]` emits passes it on to the payload's `run` only for a
+    /// declared job, and a job that never declared it is handed `None` it
+    /// has no way to use.
+    pub glue: JobGlue,
 }
+
+/// The glue signature `#[job]` generates: decode the payload, call the
+/// payload's `run`, hand back its verdict. Named, like `http::Glue`, so the
+/// field above stays under clippy's type-complexity threshold rather than
+/// spelling a four-part fn pointer inline.
+pub type JobGlue = fn(&mut Tx, &[u8], Option<&CrossTenant>) -> Result<(), JobError>;
 
 /// Implemented by the marker impl `#[job]` emits, so `jobs![a, b]` collects
 /// descriptors explicitly.
@@ -175,6 +190,9 @@ impl Dispatcher {
         self.due.remove(&(due_at, id));
 
         let defs = &self.defs;
+        // Minted before the group is borrowed mutably, exactly as the
+        // request path mints it — see `CrossTenant`.
+        let cap = group.cross_tenant_cap();
         let attempt = group.stage(|tx| {
             let mut row = tx
                 .get(Id::<JobRow>::from_raw(id))?
@@ -191,7 +209,9 @@ impl Dispatcher {
                     row.name
                 )));
             };
-            match catch_unwind(AssertUnwindSafe(|| (def.glue)(tx, &row.payload))) {
+            match catch_unwind(AssertUnwindSafe(|| {
+                (def.glue)(tx, &row.payload, def.cross_tenant.then_some(&cap))
+            })) {
                 Ok(result) => result?,
                 Err(payload) => {
                     // A panic is the handler's own deterministic bug: an

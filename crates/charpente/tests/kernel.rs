@@ -66,7 +66,9 @@ fn job_macro_derives_codec_name_retry_and_glue() {
     let mut payload = Vec::new();
     charpente_core::table::Codec::encode(&CountUp { slot: 4 }, &mut payload);
     app.db_for_tests()
-        .transact(|tx| (def.glue)(tx, &payload))
+        // `None`: `CountUp` declares no `cross_tenant`, so its glue is handed
+        // no token — the dispatcher passes one only for a declared job.
+        .transact(|tx| (def.glue)(tx, &payload, None))
         .unwrap();
     let counters = app
         .db_for_tests()

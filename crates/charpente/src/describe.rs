@@ -74,6 +74,12 @@ pub struct RouteInfo {
     pub pattern: &'static str,
     pub name: &'static str,
     pub auth: bool,
+    /// `#[route(…, cross_tenant)]`: this endpoint declared the capability to
+    /// enumerate a scoped table across every tenant (spec §3). Beside `auth`
+    /// because it is the second thing an audit asks of a route, and here
+    /// rather than left to a grep because a declared capability is what
+    /// makes that audit an inventory.
+    pub cross_tenant: bool,
     pub stream: bool,
     pub params: Vec<ParamInfo>,
     /// `None` for routes with no JSON body.
@@ -146,6 +152,9 @@ macro_rules! events {
 pub struct JobInfo {
     pub name: &'static str,
     pub retry: RetryInfo,
+    /// `#[job(cross_tenant)]` — see `RouteInfo::cross_tenant`. The inventory
+    /// covers both surfaces that receive a `Tx`, or it covers neither.
+    pub cross_tenant: bool,
     pub builtin: bool,
 }
 
@@ -255,6 +264,7 @@ fn route_info(route: &Route) -> RouteInfo {
         pattern: route.pattern,
         name: route.name,
         auth: route.auth,
+        cross_tenant: route.cross_tenant,
         stream: matches!(route.glue, RouteGlue::Sse(_)),
         params: route
             .params
@@ -283,6 +293,7 @@ fn job_info(def: &JobDef) -> JobInfo {
             max: def.retry.max,
             backoff_nanos: nanos(def.retry.backoff),
         },
+        cross_tenant: def.cross_tenant,
         // The platform sweep JOB's name is `SessionSweep` (the `#[job]`
         // struct's own `Job::NAME`) — distinct from the CRON entry's name
         // (`SESSION_SWEEP_NAME`, "charpente.session_sweep") used below.
@@ -352,8 +363,8 @@ pub fn to_human(c: &Contract) -> String {
     for r in &c.routes {
         writeln!(
             out,
-            "  {} {} name={} auth={} stream={}",
-            r.method, r.pattern, r.name, r.auth, r.stream
+            "  {} {} name={} auth={} cross_tenant={} stream={}",
+            r.method, r.pattern, r.name, r.auth, r.cross_tenant, r.stream
         )
         .unwrap();
         // Task 5: a route's type info (params/request/response/error/emits)
@@ -399,8 +410,8 @@ pub fn to_human(c: &Contract) -> String {
     for j in &c.jobs {
         writeln!(
             out,
-            "  {} max={} backoff_nanos={} builtin={}",
-            j.name, j.retry.max, j.retry.backoff_nanos, j.builtin
+            "  {} max={} backoff_nanos={} cross_tenant={} builtin={}",
+            j.name, j.retry.max, j.retry.backoff_nanos, j.cross_tenant, j.builtin
         )
         .unwrap();
     }

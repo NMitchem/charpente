@@ -165,6 +165,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/login",
       "name": "login",
       "auth": false,
+      "cross_tenant": false,
       "stream": false,
       "params": [],
       "request": "String",
@@ -179,6 +180,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/customers/:id",
       "name": "create_customer",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [
         {
@@ -204,6 +206,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/customers/:id",
       "name": "get_customer",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [
         {
@@ -227,6 +230,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/customers",
       "name": "list_customers",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [],
       "request": null,
@@ -245,6 +249,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/invoices/:id",
       "name": "create_invoice",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [
         {
@@ -270,6 +275,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/invoices/:id",
       "name": "get_invoice",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [
         {
@@ -293,6 +299,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/invoices",
       "name": "list_invoices",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [],
       "request": null,
@@ -311,6 +318,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/invoices/:id/finalize",
       "name": "finalize_invoice",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [
         {
@@ -334,6 +342,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/invoices/:id/record-payment",
       "name": "record_payment",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [
         {
@@ -357,6 +366,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/events/feed",
       "name": "events_feed",
       "auth": true,
+      "cross_tenant": false,
       "stream": true,
       "params": [],
       "request": null,
@@ -371,6 +381,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/keys",
       "name": "create_key",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [],
       "request": null,
@@ -385,6 +396,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/keys/:id",
       "name": "revoke_key",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [
         {
@@ -676,6 +688,7 @@ const GOLDEN: &str = r#"{
         "max": 5,
         "backoff_nanos": 30000000000
       },
+      "cross_tenant": false,
       "builtin": true
     },
     {
@@ -684,6 +697,7 @@ const GOLDEN: &str = r#"{
         "max": 5,
         "backoff_nanos": 30000000000
       },
+      "cross_tenant": false,
       "builtin": false
     },
     {
@@ -692,6 +706,7 @@ const GOLDEN: &str = r#"{
         "max": 5,
         "backoff_nanos": 30000000000
       },
+      "cross_tenant": false,
       "builtin": false
     },
     {
@@ -700,6 +715,7 @@ const GOLDEN: &str = r#"{
         "max": 5,
         "backoff_nanos": 30000000000
       },
+      "cross_tenant": false,
       "builtin": false
     }
   ],

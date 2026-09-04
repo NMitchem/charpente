@@ -13,7 +13,9 @@ use charpente::describe::ParamInfo;
 use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, EmittedEvent, Subscription};
 use charpente::kernel::JobError;
 use charpente::wire::{TypeSchema, WireU64};
-use charpente::{Schema, Tx, View, Wire, event, events, job, jobs, route, routes, table};
+use charpente::{
+    CrossTenant, Schema, Tx, View, Wire, event, events, job, jobs, route, routes, table,
+};
 use charpente_core::table::Id;
 use charpente_sim::{FaultConfig, Sim};
 
@@ -234,6 +236,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/widgets",
       "name": "create_widget",
       "auth": false,
+      "cross_tenant": false,
       "stream": false,
       "params": [],
       "request": {
@@ -252,6 +255,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/widgets",
       "name": "list_widgets",
       "auth": false,
+      "cross_tenant": false,
       "stream": false,
       "params": [],
       "request": null,
@@ -270,6 +274,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/orgs/:org/widgets/:id",
       "name": "get_org_widget",
       "auth": false,
+      "cross_tenant": false,
       "stream": false,
       "params": [
         {
@@ -297,6 +302,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/widgets/feed",
       "name": "widget_feed",
       "auth": false,
+      "cross_tenant": false,
       "stream": true,
       "params": [],
       "request": null,
@@ -428,6 +434,7 @@ const GOLDEN: &str = r#"{
         "max": 5,
         "backoff_nanos": 30000000000
       },
+      "cross_tenant": false,
       "builtin": true
     },
     {
@@ -436,6 +443,7 @@ const GOLDEN: &str = r#"{
         "max": 5,
         "backoff_nanos": 30000000000
       },
+      "cross_tenant": false,
       "builtin": false
     }
   ],
@@ -492,7 +500,7 @@ fn to_human_pins_a_known_routes_type_line() {
     let out = charpente::describe::to_human(&fixture_app().describe());
     assert!(
         out.contains(
-            "  POST /widgets name=create_widget auth=false stream=false\n    \
+            "  POST /widgets name=create_widget auth=false cross_tenant=false stream=false\n    \
              params=[] request=Some(Ref(\"CreateWidget\")) response=Ref(\"WidgetView\") \
              error=Ref(\"ApiError\") emits=[]\n"
         ),
@@ -930,7 +938,7 @@ fn to_human_pins_a_stream_routes_emits() {
     let out = charpente::describe::to_human(&fixture_app().describe());
     assert!(
         out.contains(
-            "  GET /widgets/feed name=widget_feed auth=false stream=true\n    \
+            "  GET /widgets/feed name=widget_feed auth=false cross_tenant=false stream=true\n    \
              params=[] request=None response=Null error=Ref(\"ApiError\") \
              emits=[widget_added->WidgetAdded, widget_removed->WidgetRemoved]\n"
         ),
@@ -1075,5 +1083,144 @@ fn the_drift_probe_refuses_a_subscribe_handler_that_writes() {
         sessions, 1,
         "the guard reports a committed write, so the row must really be there — \
          refusing cannot mean skipping the commit"
+    );
+}
+
+// ------------------------------------------------- cross-tenant capability
+
+/// A scope type and one table scoped by it, so the cross-tenant route below
+/// enumerates something real. Neither is in `fixture_app`'s `Schema`: they
+/// exist for the routes in this section, which mount their own app rather
+/// than change the pinned golden (same reason `minting_feed` stays out).
+#[table]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+#[table(scoped_by = Org)]
+struct Ledger {
+    id: Id<Ledger>,
+    cents: u64,
+}
+
+impl charpente::Tenant for Org {
+    type Who = charpente::auth::Principal;
+    type Error = ApiError;
+    fn authorize(
+        _tx: &Tx,
+        _who: Option<&charpente::auth::Principal>,
+        _scope: Id<Org>,
+    ) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+/// The declared capability (spec §3): the route says `cross_tenant`, so the
+/// platform hands the handler the token `across_tenants` requires.
+#[route(GET "/admin/revenue", cross_tenant)]
+fn admin_revenue(tx: &mut Tx, cap: &CrossTenant) -> Result<WireU64, ApiError> {
+    let total: u64 = tx
+        .across_tenants::<Org>(cap)
+        .scan::<Ledger>()?
+        .iter()
+        .map(|(_, row)| row.cents)
+        .sum();
+    Ok(WireU64(total))
+}
+
+/// The ordinary route beside it — without this, the assertion below could
+/// not tell "exactly the declared route" from "every route".
+#[route(GET "/admin/plain")]
+fn admin_plain(tx: &mut Tx) -> Result<WireU64, ApiError> {
+    Ok(WireU64(tx.scan::<Widget>()?.len() as u64))
+}
+
+/// The job half of the same declaration (spec §3): a background rollup that
+/// enumerates every tenant declares the capability exactly as a route does,
+/// and its `run` takes the token the dispatcher minted.
+#[job(cross_tenant)]
+struct Rollup {
+    day: u64,
+}
+
+impl Rollup {
+    fn run(self, tx: &mut Tx, cap: &CrossTenant) -> Result<(), JobError> {
+        let _ = (self.day, tx.across_tenants::<Org>(cap).scan::<Ledger>()?);
+        Ok(())
+    }
+}
+
+fn capability_app() -> App {
+    let sim = Sim::with_faults(0x2EC2_0002, FaultConfig::none());
+    App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Widget>().table::<Ledger>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![admin_revenue, admin_plain])
+    .mount_jobs(jobs![Rollup, Ping])
+}
+
+/// What turns "audit the cross-tenant reads" from a grep someone must
+/// remember into a mechanical inventory (spec §3): `describe` names every
+/// endpoint that declared the capability, and only those.
+#[test]
+fn describe_names_exactly_the_cross_tenant_routes() {
+    let app = capability_app();
+    let c = app.describe();
+
+    let all: Vec<&str> = c.routes.iter().map(|r| r.name).collect();
+    assert_eq!(
+        all,
+        vec!["admin_revenue", "admin_plain"],
+        "the floor: both routes are mounted, so the filter below is not vacuous"
+    );
+
+    let declared: Vec<&str> = c
+        .routes
+        .iter()
+        .filter(|r| r.cross_tenant)
+        .map(|r| r.name)
+        .collect();
+    assert_eq!(declared, vec!["admin_revenue"]);
+
+    let plain = c.routes.iter().find(|r| r.name == "admin_plain").unwrap();
+    assert!(!plain.cross_tenant);
+    assert!(
+        !plain.auth,
+        "cross_tenant is its own flag, beside auth — not a rename of it"
+    );
+
+    // Jobs are the other surface that receives a `Tx`, so the inventory has
+    // to cover them or it is not an inventory. `Ping` and the platform's own
+    // `SessionSweep` are the floor: without them a `filter` over an
+    // all-declared list would pass.
+    let jobs: Vec<(&str, bool)> = c.jobs.iter().map(|j| (j.name, j.cross_tenant)).collect();
+    assert_eq!(
+        jobs,
+        vec![("SessionSweep", false), ("Rollup", true), ("Ping", false)]
+    );
+}
+
+/// The human dump carries the flag too, beside `auth` — `to_human` is the
+/// agent-readable contract dump, so a field only the JSON carries is a field
+/// half the readers cannot see.
+#[test]
+fn to_human_carries_the_cross_tenant_flag() {
+    let out = charpente::describe::to_human(&capability_app().describe());
+    assert!(
+        out.contains(
+            "  GET /admin/revenue name=admin_revenue auth=false cross_tenant=true stream=false\n"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "  GET /admin/plain name=admin_plain auth=false cross_tenant=false stream=false\n"
+        ),
+        "{out}"
     );
 }

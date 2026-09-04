@@ -1,0 +1,5 @@
+error: `revenue` takes `cap: &CrossTenant`, but `#[route(GET "/admin/revenue")]` does not declare `cross_tenant` — enumerating a scoped table across every tenant is a declared capability, and `charpente describe` lists every route that declared it. Write `#[route(GET "/admin/revenue", cross_tenant)]`, or drop the `cap` argument and read one tenant through `tx.scope::<Org>(org, ctx)?`
+  --> tests/compile_fail/across_tenants_without_capability.rs:46:5
+   |
+46 |     cap: &charpente::CrossTenant,
+   |     ^^^

@@ -1,4 +1,4 @@
-error: a route flag is `auth` or `emits(Ev, …)` — write `#[route(GET "/path", auth)]`, or `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`
+error: a route flag is `auth`, `cross_tenant` or `emits(Ev, …)` — write `#[route(GET "/path", auth)]`, or `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`
   --> tests/compile_fail/route_unknown_flag.rs:11:19
    |
 11 | #[route(GET "/x", cached)]

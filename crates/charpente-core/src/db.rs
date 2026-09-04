@@ -1264,6 +1264,127 @@ impl<'a, S> std::ops::DerefMut for ScopedTx<'_, 'a, S> {
     }
 }
 
+// ------------------------------------------------------- cross-tenant read
+
+/// The capability a route or job declares with `cross_tenant` (spec §3):
+/// naming a tenant is always allowed, enumerating without naming one is
+/// declared. `Tx::across_tenants` takes one, so a handler that was not
+/// handed a token cannot enumerate — and because the declaration is on the
+/// route, `charpente describe` can list every endpoint that can.
+///
+/// Unforgeable from a handler, which is what keeps that listing an inventory
+/// rather than a hint: the struct's field is private and
+/// `Group::cross_tenant_cap` is the only constructor. A handler holds
+/// `&mut Tx` and `&Ctx`, never a `Group` — while whoever holds the `Db` the
+/// group borrows is the operator, who already reaches every tenant through
+/// `Db::snapshot` (ruling R48).
+///
+/// `Clone` because the platform hands the same request's token to the `Ctx`
+/// and to the handler argument; cloning widens nothing, since holding one at
+/// all IS the capability.
+#[derive(Clone)]
+pub struct CrossTenant(());
+
+impl<'a> Group<'a> {
+    /// Mints the token the platform hands a route or job that declared
+    /// `cross_tenant`. See `CrossTenant`: this is the only constructor, and
+    /// it takes a `&Group` because that is a handle a handler never has.
+    pub fn cross_tenant_cap(&self) -> CrossTenant {
+        CrossTenant(())
+    }
+}
+
+impl<'a> Tx<'a> {
+    /// The global reader (spec §3). Enumerates a scoped table across every
+    /// tenant, which is why it takes the declared capability: `cap` is the
+    /// proof that some route or job said `cross_tenant` out loud, and
+    /// nothing else about it is read.
+    ///
+    /// No `Tenant::authorize` runs here, and none could: there is no single
+    /// tenant to ask about. The declaration is the authorization, and it is
+    /// auditable because `charpente describe` enumerates it.
+    pub fn across_tenants<S: 'static>(&self, cap: &CrossTenant) -> AllTenants<'_, 'a, S> {
+        let CrossTenant(()) = cap;
+        AllTenants {
+            tx: self,
+            scope: std::marker::PhantomData,
+        }
+    }
+}
+
+/// A read handle over every tenant's rows of one scope type — what
+/// `Tx::across_tenants` hands back. Read-only by construction: it borrows
+/// the transaction immutably, so the cross-tenant surface is a reader and
+/// there is no `put`/`delete` here to write one tenant's row under another's
+/// scope.
+pub struct AllTenants<'t, 'a, S> {
+    tx: &'t Tx<'a>,
+    scope: std::marker::PhantomData<S>,
+}
+
+impl<S: 'static> AllTenants<'_, '_, S> {
+    /// Every tenant's rows of `R`, in `(scope, id)` order, each PAIRED WITH
+    /// ITS SCOPE — `Vec<(Id<Org>, Invoice)>`, never `Vec<Invoice>` (spec
+    /// §3). The tenant rides on every row, so a cross-tenant result cannot
+    /// be quietly handed to code expecting one tenant's data: the types
+    /// differ, and stripping the scope is a visible `.map`.
+    ///
+    /// Same txn -> group -> snapshot order as every other read, merged by
+    /// `(scope, id)` rather than by bare id: ids are not unique across
+    /// tenants, so a merge keyed by id alone would let one tenant's row
+    /// overwrite another's in the answer.
+    pub fn scan<R: Row<Scope = S>>(&self) -> io::Result<Vec<(Id<S>, R)>> {
+        assert_scoped::<R>("across_tenants().scan", "View::scan");
+        let mut merged: BTreeMap<(u64, u64), R> = BTreeMap::new();
+        for (scope, id, bytes) in self.tx.snapshot.scan_raw(R::TABLE, true)? {
+            merged.insert((scope, id), R::decode_row(&bytes)?);
+        }
+        merge_overlay_all_scopes(&mut merged, self.tx.group.and_then(|g| g.get(R::TABLE)))?;
+        merge_overlay_all_scopes(&mut merged, self.tx.effects.overlay.get(R::TABLE))?;
+        Ok(merged
+            .into_iter()
+            .map(|((scope, _), row)| (Id::from_raw(scope), row))
+            .collect())
+    }
+}
+
+/// `merge_overlay_rows` without the scope filter — the one read that wants
+/// every tenant's staged rows, keyed by `(scope, id)` so no tenant's entry
+/// can land on another's. A separate function rather than a `scope:
+/// Option<u64>` parameter on `merge_overlay_rows`: that filter is the whole
+/// of spec §2's overlay rule, and a nullable filter is a filter one `None`
+/// away from being absent everywhere.
+fn merge_overlay_all_scopes<R: Row>(
+    merged: &mut BTreeMap<(u64, u64), R>,
+    overlay: Option<&TableOverlay>,
+) -> io::Result<()> {
+    let Some(overlay) = overlay else {
+        return Ok(());
+    };
+    // Negative space (hard rule 4): the caller asserted the table is
+    // scoped, so no entry here may carry UNSCOPED — an unscoped entry on a
+    // scoped table's overlay would be a staging bug, and answering with it
+    // would report a row belonging to tenant `table::UNSCOPED`.
+    for (&(scope, id), entry) in overlay {
+        assert_ne!(
+            scope,
+            UNSCOPED,
+            "table \"{}\" is tenant-scoped but its overlay holds id {id} under table::UNSCOPED \
+             — a scoped write stages its scope",
+            R::TABLE
+        );
+        match entry {
+            Some(bytes) => {
+                merged.insert((scope, id), R::decode_row(bytes)?);
+            }
+            None => {
+                merged.remove(&(scope, id));
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- machine
 
 /// The state machine the engine drives: decodes effect records and applies

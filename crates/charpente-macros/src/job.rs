@@ -1,4 +1,5 @@
-//! `#[job]` / `#[job(retry(max = N, backoff = "30s"))]` (DESIGN.md §6, spec
+//! `#[job]` / `#[job([cross_tenant, ]retry(max = N, backoff = "30s"))]`
+//! (DESIGN.md §6, spec
 //! 2026-07-02-queue-cron-design.md): turns a struct into a typed job
 //! payload — a field-wise `Codec` impl (mirrors `#[table]`'s row codec, minus
 //! the id: a job payload has no primary key), `impl Job` carrying the name
@@ -11,7 +12,8 @@ use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
 use syn::{Data, DeriveInput, Error, Fields, Ident, LitInt, LitStr, Token, parenthesized};
 
-const ACCEPTED_FORMS: &str = "write `#[job]` or `#[job(retry(max = <int>, backoff = \"<n><unit>\"))]` \
+const ACCEPTED_FORMS: &str = "write `#[job]`, `#[job(cross_tenant)]` or \
+     `#[job([cross_tenant, ]retry(max = <int>, backoff = \"<n><unit>\"))]` \
      (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff = \"10s\"))]`";
 
 // ---------------------------------------------------------------- args
@@ -19,6 +21,10 @@ const ACCEPTED_FORMS: &str = "write `#[job]` or `#[job(retry(max = <int>, backof
 pub(crate) struct JobArgs {
     pub max: u32,
     pub backoff_millis: u64,
+    /// `cross_tenant` — the same declared capability a route carries
+    /// (tenant-scoping spec §3), for the background rollups that need it.
+    /// A declared job's `run` is called with the token as a second argument.
+    pub cross_tenant: bool,
 }
 
 impl Default for JobArgs {
@@ -26,6 +32,7 @@ impl Default for JobArgs {
         JobArgs {
             max: 5,
             backoff_millis: 30_000,
+            cross_tenant: false,
         }
     }
 }
@@ -59,9 +66,32 @@ impl Parse for JobArgs {
         if input.is_empty() {
             return Ok(JobArgs::default());
         }
-        let kw: Ident = input
+        let mut cross_tenant = false;
+        let mut kw: Ident = input
             .parse()
             .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
+        if kw == "cross_tenant" {
+            cross_tenant = true;
+            if input.is_empty() {
+                let defaults = JobArgs::default();
+                return Ok(JobArgs {
+                    cross_tenant,
+                    ..defaults
+                });
+            }
+            input
+                .parse::<Token![,]>()
+                .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
+            kw = input
+                .parse()
+                .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
+            if kw == "cross_tenant" {
+                return Err(Error::new(
+                    kw.span(),
+                    "`cross_tenant` given twice — write it once",
+                ));
+            }
+        }
         if kw != "retry" {
             return Err(Error::new(kw.span(), ACCEPTED_FORMS));
         }
@@ -97,6 +127,7 @@ impl Parse for JobArgs {
         Ok(JobArgs {
             max: max.unwrap_or(defaults.max),
             backoff_millis: backoff_millis.unwrap_or(defaults.backoff_millis),
+            cross_tenant,
         })
     }
 }
@@ -169,6 +200,21 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
 
     let max = args.max;
     let backoff_millis = args.backoff_millis;
+    let cross_tenant = args.cross_tenant;
+    // A declared job's `run` takes the token; an undeclared one's does not,
+    // so `#[job]` alone still calls `run(tx)` exactly as before. `expect` is
+    // an invariant: the dispatcher passes the token from the SAME
+    // `JobDef.cross_tenant` this expansion sets.
+    let run_call = if cross_tenant {
+        quote! {
+            job.run(tx, cap.expect(
+                "job declares cross_tenant but the dispatcher passed no CrossTenant — \
+                 the flag on JobDef and the token come from the same expansion"
+            ))
+        }
+    } else {
+        quote! { job.run(tx) }
+    };
 
     Ok(quote! {
         #input
@@ -198,7 +244,9 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                 fn __charpente_job_glue(
                     tx: &mut ::charpente::Tx,
                     payload: &[u8],
+                    cap: ::std::option::Option<&::charpente::CrossTenant>,
                 ) -> ::std::result::Result<(), ::charpente::kernel::JobError> {
+                    let _ = cap; // an undeclared job is handed None and uses none of it
                     let input = &mut &payload[..];
                     let job = <#name as ::charpente::core::table::Codec>::decode(input)
                         .map_err(|e| ::charpente::kernel::JobError::App(::std::format!(
@@ -212,11 +260,12 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                             ),
                         ));
                     }
-                    job.run(tx)
+                    #run_call
                 }
                 ::charpente::kernel::JobDef {
                     name: <#name as ::charpente::core::db::Job>::NAME,
                     retry: <#name as ::charpente::core::db::Job>::RETRY,
+                    cross_tenant: #cross_tenant,
                     glue: __charpente_job_glue,
                 }
             }

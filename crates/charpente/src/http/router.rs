@@ -37,6 +37,12 @@ pub struct Route {
     pub method: Method,
     pub pattern: &'static str,
     pub auth: bool,
+    /// `#[route(…, cross_tenant)]` — the declared capability to enumerate a
+    /// scoped table across every tenant (spec §3). Carried on the route so
+    /// `charpente describe` can list every endpoint that can, and read by
+    /// `StagedDispatch::stage_or_subscribe` to decide whether this request's
+    /// `Ctx` gets a `CrossTenant` token at all.
+    pub cross_tenant: bool,
     pub name: &'static str,
     pub glue: RouteGlue,
     /// Path params in path order, each with its wire schema. Deferred behind
@@ -258,6 +264,7 @@ mod tests {
             method,
             pattern,
             auth: false,
+            cross_tenant: false,
             name,
             glue: RouteGlue::Http(ok),
             params: &[],

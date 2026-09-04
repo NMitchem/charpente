@@ -1337,6 +1337,7 @@ impl RouteDef for FailingFeed {
             method: Method::Get,
             pattern: "/feed-failing",
             auth: false,
+            cross_tenant: false,
             name: "FailingFeed",
             glue: RouteGlue::Sse(failing_feed_glue),
             params: &[],

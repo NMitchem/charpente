@@ -7,7 +7,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use charpente_core::db::{Db, DbConfig, Group, Job, Schema, Tx, TxError};
+use charpente_core::db::{CrossTenant, Db, DbConfig, Group, Job, Schema, Tx, TxError};
 use charpente_core::io::{Disk, Entropy};
 use charpente_core::table::{Id, View};
 use charpente_macros::table;
@@ -84,6 +84,11 @@ pub struct Ctx {
     now: u64,
     session_ttl: u64,
     created: Cell<bool>,
+    /// `Some` exactly when the matched route declared `cross_tenant` (spec
+    /// §3) — the token `Tx::across_tenants` requires. `None` on every other
+    /// route, which is why `cap()` is an `Option`: an undeclared route
+    /// carries no capability, not a dormant one.
+    cap: Option<CrossTenant>,
 }
 
 impl Ctx {
@@ -91,6 +96,17 @@ impl Ctx {
     /// `auth` and no credential presented.
     pub fn principal(&self) -> Option<&Principal> {
         self.principal.as_ref()
+    }
+
+    /// The cross-tenant capability this request carries, or `None` when the
+    /// matched route did not declare `cross_tenant` (spec §3). A handler
+    /// that needs it takes `cap: &CrossTenant` after its path/body
+    /// arguments, which `#[route]` fills from here — and refuses to compile
+    /// on a route that never declared the capability, so this accessor is a
+    /// reflective read ("did this request come in declared?"), not the
+    /// route to the token.
+    pub fn cap(&self) -> Option<&CrossTenant> {
+        self.cap.as_ref()
     }
 
     /// Compatibility accessor: the `Session` row, only when the principal
@@ -521,9 +537,14 @@ impl App {
             .map(|_| PROBE_CAPTURE.to_string())
             .collect();
         let session_ttl = self.config.session_ttl;
+        // Read before `begin_group` takes `&mut self` — and honoured rather
+        // than hardcoded to `None`, so probing a declared stream route gives
+        // its handler the same `Ctx` a request would.
+        let declares_cross_tenant = found.cross_tenant;
         let (mut group, _) = self
             .begin_group()
             .map_err(|e| format!("route `{route}`: the probe could not open a group: {e}"))?;
+        let cap = declares_cross_tenant.then(|| group.cross_tenant_cap());
         let staged = group.stage(|tx| {
             let ctx = build_ctx(
                 tx,
@@ -533,6 +554,7 @@ impl App {
                 0,
                 session_ttl,
                 None,
+                cap,
             )?;
             glue(tx, &ctx, &captures, None)
         });
@@ -692,6 +714,12 @@ impl<'a> StagedDispatch<'a> {
             ));
         }
         let auth_required = route.auth;
+        // Minted here, before `group.stage` borrows the group mutably, and
+        // only for a route that declared the capability: `Group` is the one
+        // handle a handler never holds, which is what keeps `describe`'s
+        // cross-tenant listing an inventory rather than a hint (spec §3,
+        // `CrossTenant`).
+        let cap = route.cross_tenant.then(|| group.cross_tenant_cap());
         let glue = route.glue;
         let cursor = match glue {
             RouteGlue::Sse(_) => match extract_cursor(&request) {
@@ -719,6 +747,7 @@ impl<'a> StagedDispatch<'a> {
                         now,
                         session_ttl,
                         oidc,
+                        cap.clone(),
                     )?;
                     glue(tx, &ctx, &captures, &request.body)
                 });
@@ -734,6 +763,7 @@ impl<'a> StagedDispatch<'a> {
                         now,
                         session_ttl,
                         oidc,
+                        cap.clone(),
                     )?;
                     glue(tx, &ctx, &captures, cursor)
                 });
@@ -761,6 +791,13 @@ pub enum Handled {
 /// `resolve` itself never produces this: it returns `Ok(None)` for "nothing
 /// presented"), and builds the `Ctx` the handler sees. `oidc` is the mounted
 /// verifier (spec §3) — `None` until `App::with_oidc` runs.
+// One more independent request fact than clippy's limit, each already its
+// own argument: the declared capability joins the credential, the auth gate,
+// the fresh token, the clock reading, the TTL and the verifier. Bundling
+// them into a struct would name no concept the kernel otherwise has —
+// `crate::repl::session`'s ladder carries the same allow for the same
+// reason.
+#[allow(clippy::too_many_arguments)]
 fn build_ctx(
     tx: &mut Tx,
     presented: &Presented,
@@ -769,6 +806,7 @@ fn build_ctx(
     now: u64,
     session_ttl: u64,
     oidc: Option<&OidcVerifier>,
+    cap: Option<CrossTenant>,
 ) -> Result<Ctx, ApiError> {
     let principal = resolve(tx, presented, oidc, now).map_err(|reject| match reject {
         AuthReject::Unrecognized => ApiError::UnrecognizedCredential,
@@ -793,6 +831,7 @@ fn build_ctx(
         now,
         session_ttl,
         created: Cell::new(false),
+        cap,
     })
 }
 

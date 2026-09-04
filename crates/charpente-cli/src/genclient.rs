@@ -283,6 +283,7 @@ mod contract {
         pattern: String,
         name: String,
         auth: bool,
+        cross_tenant: bool,
         stream: bool,
         params: Vec<ParamInfo>,
         request: Option<TypeSchema>,
@@ -369,6 +370,7 @@ mod contract {
     struct JobInfo {
         name: String,
         retry: RetryInfo,
+        cross_tenant: bool,
         builtin: bool,
     }
 
@@ -447,6 +449,7 @@ mod contract {
             pattern: leak(r.pattern),
             name: leak(r.name),
             auth: r.auth,
+            cross_tenant: r.cross_tenant,
             stream: r.stream,
             params: r
                 .params
@@ -492,6 +495,7 @@ mod contract {
                 max: j.retry.max,
                 backoff_nanos: j.retry.backoff_nanos,
             },
+            cross_tenant: j.cross_tenant,
             builtin: j.builtin,
         }
     }

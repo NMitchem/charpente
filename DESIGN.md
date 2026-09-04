@@ -533,11 +533,21 @@ platform is one dependency, not two.
   referencing a field that no longer exists — the mechanism below is for what Rust
   cannot see: a same-length field swap or retype that recompiles clean and misdecodes on
   disk.
-- **Routes (v0 implemented).** `#[route(METHOD "/path/:param"[, auth])]` — handler args:
-  `tx: &mut Tx`, one per `:param` (same name, path order), at most one JSON body arg,
-  optional trailing `ctx: &Ctx` (session access); return `Result<T: Serialize, ApiError>`.
+- **Routes (v0 implemented).** `#[route(METHOD "/path/:param"[, auth][, cross_tenant])]` —
+  handler args: `tx: &mut Tx`, one per `:param` (same name, path order), at most one JSON
+  body arg, optional `cap: &CrossTenant` (see below), optional trailing `ctx: &Ctx`
+  (session access); return `Result<T: Serialize, ApiError>`.
   Handlers run inside one transaction; 200 is emitted only after the commit is durable.
   The OpenAPI description will be *derived from* the types, never hand-written (step 7).
+  `cross_tenant` is the declared capability to enumerate a scoped table across every tenant
+  (tenant-scoping spec §3): the kernel mints a `CrossTenant` token for a route that declared
+  it, `#[route]` fills the handler's `cap` argument from it, and `Tx::across_tenants::<S>
+  (cap)` requires one — so a handler on a route that did not declare it cannot compile the
+  call, and `#[job(cross_tenant)]` says the same for a background rollup (whose `run` then
+  takes the token after `tx`). The rows come back PAIRED WITH THEIR SCOPE —
+  `AllTenants::scan` yields `Vec<(Id<Org>, Invoice)>`, never `Vec<Invoice>` — so a
+  cross-tenant result cannot be handed to code expecting one tenant's data. Naming a tenant
+  needs no capability: a point read already supplies the scope.
 - **Jobs.** `#[job]` structs with typed payloads and typed retry policy. Enqueue sites and
   handler signatures are checked against each other.
 - **Events.** `#[event]` structs; `tx.emit(...)` is typed; subscribers (server-side and
@@ -1202,7 +1212,9 @@ Charpente treats the coding agent as the primary developer persona:
   walk of a mounted app's own registries — no disk writes beyond an ephemeral run's own
   temp store, no socket, no kernel loop. It returns a `Contract`: tables (name, version,
   structural fingerprint, indexes, migration chain), routes (method, pattern, name,
-  whether it requires auth, whether it's an SSE stream, **plus, since the TS-client-codegen
+  whether it requires auth, **whether it declared `cross_tenant`** — which is what turns
+  "audit the cross-tenant reads" into a mechanical inventory — whether it's an SSE stream,
+  **plus, since the TS-client-codegen
   work: `params` — each path param's name and wire schema (`ParamInfo { name,
   schema: TypeSchema }`); `request` — the JSON body's schema, `None` for a bodyless route;
   `response` and `error` — the success and `ApiError` schemas every handler's `Result<T,
@@ -1212,7 +1224,7 @@ Charpente treats the coding agent as the primary developer persona:
   stream route that has not adopted the declaration**), **`events` — every `#[event]` type
   registered with `mount_events(events![…])` as `EventInfo { name, payload, keyed }`,
   sorted by event name (`keyed` is always `false`: `emit` vs `emit_keyed` is a call-site
-  choice, so nothing static can know it)**, jobs (name, retry policy), cron
+  choice, so nothing static can know it)**, jobs (name, retry policy, `cross_tenant`), cron
   (name, interval), and config, each serialized in registry order (routes/jobs/cron) or
   sorted-name order (tables — `Db::describe_tables`'s `BTreeMap` walk; events — by name);
   field order is

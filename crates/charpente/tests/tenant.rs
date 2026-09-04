@@ -21,7 +21,8 @@ use charpente::auth::Principal;
 use charpente::http::{ApiError, App, AppConfig, Ctx, Method, Request, Response};
 use charpente::wire::WireU64;
 use charpente::{
-    Db, DbConfig, Schema, Scoped, ScopedTx, Snapshot, Tenant, Tx, TxError, route, routes, table,
+    CrossTenant, Db, DbConfig, Schema, Scoped, ScopedTx, Snapshot, Tenant, Tx, TxError, route,
+    routes, table,
 };
 use charpente_core::io::Entropy;
 use charpente_core::log::WalConfig;
@@ -842,4 +843,167 @@ fn the_tenant_workload_replays_identically_for_the_same_seed() {
     for seed in [0x7E4A_5EED, 0x0BAD_5EED_0BAD_5EED] {
         assert_eq!(trace(seed), trace(seed));
     }
+}
+
+// ----------------------------------------------- the declared global reader
+
+/// A second scope type, whose `authorize` admits every tenant — the cross-
+/// tenant reader below needs rows in MORE than one tenant, and `Org`'s
+/// `authorize` (deliberately) refuses every tenant but one, so it cannot
+/// write the second tenant's rows to read back.
+#[table]
+struct Team {
+    id: Id<Team>,
+    name: String,
+}
+
+impl Tenant for Team {
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<Team>) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+#[table(scoped_by = Team)]
+struct Note {
+    id: Id<Note>,
+    text: String,
+}
+
+/// The wire shape of one cross-tenant row: the tenant travels WITH the row,
+/// which is the property spec §3 puts in the type (`Vec<(Id<Team>, Note)>`,
+/// never `Vec<Note>`). Pinning it on the wire too means a handler that
+/// dropped the scope on the way out is a failed assertion, not a silently
+/// tenant-less list.
+#[derive(charpente::Wire, serde::Serialize)]
+struct NoteRow {
+    team: Id<Team>,
+    note: Id<Note>,
+}
+
+#[route(PUT "/note/:team/:id")]
+fn write_note(tx: &mut Tx, team: Id<Team>, id: Id<Note>, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let mut tx = tx.scope::<Team>(team, ctx)?;
+    tx.put(&Note {
+        id,
+        text: format!("note {} of team {}", id.raw(), team.raw()),
+    });
+    Ok(WireU64(id.raw()))
+}
+
+/// One tenant's view, for the contrast the assertion needs: the same table,
+/// read through a scope, must still see only its own tenant.
+#[route(GET "/note/:team")]
+fn count_notes(tx: &mut Tx, team: Id<Team>, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let tx = tx.scope::<Team>(team, ctx)?;
+    Ok(WireU64(tx.scan::<Note>()?.len() as u64))
+}
+
+/// The declared capability (spec §3). `cap` is the token the kernel mints
+/// only because this route said `cross_tenant`; without the flag the macro
+/// refuses the argument, and without the argument there is no `&CrossTenant`
+/// to hand `across_tenants` (`compile_fail/across_tenants_without_capability`).
+#[route(GET "/admin/notes", cross_tenant)]
+fn all_notes(tx: &mut Tx, cap: &CrossTenant) -> Result<Vec<NoteRow>, ApiError> {
+    Ok(tx
+        .across_tenants::<Team>(cap)
+        .scan::<Note>()?
+        .into_iter()
+        .map(|(team, note)| NoteRow {
+            team,
+            note: note.id,
+        })
+        .collect())
+}
+
+fn note_app(seed: u64) -> (Sim, App) {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Note>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![write_note, count_notes, all_notes]);
+    (sim, app)
+}
+
+fn put(app: &mut App, path: &str) -> Response {
+    app.handle(Request::new(Method::Put, path.to_string()))
+}
+
+fn get(app: &mut App, path: &str) -> Response {
+    app.handle(Request::new(Method::Get, path.to_string()))
+}
+
+/// The runtime half of spec §3: a declared route enumerates every tenant,
+/// and each row comes back carrying the tenant it belongs to.
+///
+/// Two tenants share an id (`id = 1` exists in both team 1 and team 2), which
+/// is what makes the pairing load-bearing: a reader that merged by bare id
+/// would return three rows, not four, and could not say which tenant the
+/// survivor came from.
+#[test]
+fn a_declared_route_reads_every_tenant_with_the_scope_on_every_row() {
+    let (_sim, mut app) = note_app(0x7E4A_0001);
+    assert_eq!(put(&mut app, "/note/1/1").status, 200);
+    assert_eq!(put(&mut app, "/note/1/2").status, 200);
+    assert_eq!(put(&mut app, "/note/2/1").status, 200);
+    assert_eq!(put(&mut app, "/note/2/9").status, 200);
+
+    // The floor: each tenant's own scoped read still sees only its own rows,
+    // so what follows is a wider read, not a broken scope.
+    assert_eq!(body_text(&get(&mut app, "/note/1")), "\"2\"");
+    assert_eq!(body_text(&get(&mut app, "/note/2")), "\"2\"");
+
+    let all = get(&mut app, "/admin/notes");
+    assert_eq!(all.status, 200);
+    assert_eq!(
+        body_text(&all),
+        r#"[{"team":"1","note":"1"},{"team":"1","note":"2"},{"team":"2","note":"1"},{"team":"2","note":"9"}]"#,
+        "every tenant's rows, in (scope, id) order, each paired with its tenant"
+    );
+}
+
+/// The transaction's own staged writes are visible to a cross-tenant read,
+/// under the same txn -> group -> snapshot order every other read uses — and
+/// a tombstone staged for one tenant removes only that tenant's row.
+#[test]
+fn a_cross_tenant_read_sees_staged_writes_and_tombstones_per_tenant() {
+    let (_sim, mut app) = note_app(0x7E4A_0002);
+    assert_eq!(put(&mut app, "/note/1/1").status, 200);
+    assert_eq!(put(&mut app, "/note/2/1").status, 200);
+
+    let db = app.db_for_tests();
+    let mut group = db.begin_group().unwrap();
+    // The operator path to the token: `Group` is the only constructor, which
+    // is exactly why a handler cannot mint one (`CrossTenant`).
+    let cap = group.cross_tenant_cap();
+    let seen: Vec<(u64, u64)> = group
+        .stage(|tx| {
+            {
+                let mut scoped = tx.open_scope(Id::<Team>::from_raw(2), None)?;
+                scoped.delete::<Note>(Id::from_raw(1));
+                scoped.put(&Note {
+                    id: Id::from_raw(5),
+                    text: "staged".to_string(),
+                });
+            }
+            Ok::<_, ApiError>(
+                tx.across_tenants::<Team>(&cap)
+                    .scan::<Note>()?
+                    .into_iter()
+                    .map(|(team, note)| (team.raw(), note.id.raw()))
+                    .collect(),
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        seen,
+        vec![(1, 1), (2, 5)],
+        "team 2's staged tombstone removed only team 2's id 1, and its staged row is visible"
+    );
+    group.commit().unwrap();
 }

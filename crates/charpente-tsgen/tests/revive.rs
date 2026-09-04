@@ -63,6 +63,7 @@ fn route(name: &'static str, response: TypeSchema, error: TypeSchema) -> RouteIn
         pattern: "/x",
         name,
         auth: false,
+        cross_tenant: false,
         stream: false,
         params: Vec::new(),
         request: None,
