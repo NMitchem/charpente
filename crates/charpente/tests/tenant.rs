@@ -1008,3 +1008,59 @@ fn a_cross_tenant_read_sees_staged_writes_and_tombstones_per_tenant() {
     );
     group.commit().unwrap();
 }
+
+/// Tenant `0` is a REAL tenant, and a staged write for it must survive a
+/// cross-tenant read.
+///
+/// `db.rs`'s `GroupOverlay` doc settles the meaning (R35): "a scoped table's
+/// `0` slot is tenant 0, a real tenant, not an unset marker". Nothing guards
+/// against reaching it — `Id::from_raw` takes any `u64`, `FromParam for
+/// Id<T>` passes straight through it, and this fixture's `Team::authorize`
+/// admits every scope — so `PUT /note/0/1` is an ordinary request an app
+/// serves. This test is deliberately the previous one with a single literal
+/// changed (tenant `2` -> tenant `0`), which is the whole point: if the two
+/// disagree, the disagreement is about the number zero and nothing else.
+///
+/// The negative space it pins is severe rather than cosmetic. The failure
+/// mode is not a wrong answer but an `assert_ne!` inside
+/// `merge_overlay_all_scopes`, and assertions stay on in release (hard rule
+/// 4) while `crates/charpente/src` contains no `catch_unwind` at all — so
+/// the panic unwinds out of the kernel loop and takes the node with it.
+/// Worse, `merge_overlay_all_scopes` also reads the GROUP overlay, which
+/// accumulates across a batch: one request writing to tenant 0 can kill a
+/// different request's cross-tenant read committed alongside it.
+#[test]
+fn tenant_zero_is_a_real_tenant_to_a_cross_tenant_read() {
+    let (_sim, mut app) = note_app(0x7E4A_0003);
+    assert_eq!(put(&mut app, "/note/0/1").status, 200);
+    assert_eq!(put(&mut app, "/note/1/1").status, 200);
+
+    let db = app.db_for_tests();
+    let mut group = db.begin_group().unwrap();
+    let cap = group.cross_tenant_cap();
+    let seen: Vec<(u64, u64)> = group
+        .stage(|tx| {
+            {
+                let mut scoped = tx.open_scope(Id::<Team>::from_raw(0), None)?;
+                scoped.put(&Note {
+                    id: Id::from_raw(7),
+                    text: "staged for tenant zero".to_string(),
+                });
+            }
+            Ok::<_, ApiError>(
+                tx.across_tenants::<Team>(&cap)
+                    .scan::<Note>()?
+                    .into_iter()
+                    .map(|(team, note)| (team.raw(), note.id.raw()))
+                    .collect(),
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        seen,
+        vec![(0, 1), (0, 7), (1, 1)],
+        "tenant 0's committed row, its staged row, and tenant 1's row — \
+         scope 0 is a tenant like any other"
+    );
+    group.commit().unwrap();
+}

@@ -2777,3 +2777,90 @@ workspace opens `DECISIONS.md`, `DESIGN.md` or `PLAN.md`, so the suite in flight
 them. The new workflow YAML parses (`yaml.safe_load`, jobs `['edge-harness']`, triggers
 `['schedule', 'workflow_dispatch']`). **Merge to main remains Noah's call**; of the three things
 owed before it, the two decisions are now closed and the full workspace suite is outstanding.
+
+## 2026-09-05 — the pre-merge sweep: the suite was red, and so was a tenant
+
+Three reviewers over the two unmerged branches, then the full workspace suite that the plan
+had recorded as owed. **Both of the things that actually block a merge were invisible to the
+review that preceded them, and one was invisible to the reviewers too** — it took running the
+suite. That is the entry's point: 42 commits reviewed task-by-task, twice, and the two real
+defects surfaced only from execution.
+
+**The full workspace suite was RED at `14f5a94`, and had never been run.** `TEST_EXIT=101`:
+`genclient::tests::round_trip_preserves_every_shape` and
+`a_contract_missing_a_field_is_refused_rather_than_defaulted`, both in `charpente-cli`.
+Task 8-13 added `cross_tenant` to `RouteInfo` and `JobInfo` (`describe.rs:82`, `:157`), and
+`EVERY_SHAPE` — the hand-written contract fixture at `genclient.rs:598` — was never updated.
+`describe.rs` carries no `#[serde(default)]` anywhere, deliberately: the second test's own name
+says a missing field is *refused rather than defaulted*, so the strictness is the contract and
+the fixture was simply stale. The fix adds the field to both routes and the job, with
+**different values on purpose** (`false` on the POST, `true` on the SSE route and the job) so
+the round-trip proves each value survives, and so the `SSE + cross_tenant` serialization
+combination has at least one pin — the reviewer's I4 having found that combination had no test
+of any kind. **Why the branch's own gates missed it:** `EVERY_SHAPE` lives in a `src/` unit
+test, not a `tests/` suite, and only per-package runs were made. `crates/charpente/tests/
+describe.rs` and `examples/invoicing/tests/describe_golden.rs` — the fixtures people think of
+as "the describe oracles" — were both updated correctly in the same commits.
+
+**A reachable node-killing assert on a legal tenant, found by review and reproduced.**
+`db.rs`'s `GroupOverlay` doc has said since Task 4 that on a scoped table "`0` is tenant 0, a
+real tenant (R35), not an unset marker". Task 10's `merge_overlay_all_scopes` then asserted
+that value could not occur. Tenant 0 is reachable off the wire — `Id::from_raw` takes any
+`u64`, `FromParam for Id<T>` passes straight through, and no scope path has a zero-guard — so
+`assert_ne!(scope, UNSCOPED)` fires on ordinary data; with no `catch_unwind` anywhere in
+`crates/charpente/src` and assertions on in release, it unwinds out of the kernel loop.
+`merge_overlay_all_scopes` also reads the GROUP overlay, which accumulates across a batch, so
+**one request's tenant-0 write kills a different request's cross-tenant read committed
+alongside it.** Invisible because every fixture on the branch starts its tenants at 1.
+RED first, per hard rule 3: `tenant_zero_is_a_real_tenant_to_a_cross_tenant_read` is
+deliberately the neighbouring test with one literal changed (tenant `2` -> tenant `0`), and it
+panicked at `db.rs:1406` with `left: 0, right: 0` before any source was touched. The fix
+deletes the assertion, because on a scoped table there is nothing left to assert: `0` is a
+tenant, and the staging bug it reached for is already impossible by type — `Tx::put`/`delete`
+take `R: UnscopedRow`, so a scoped row "cannot reach this method at all, which is a stronger
+statement than any assertion here could make", in `Tx::put`'s own words at `db.rs:625`. The
+mirror `assert_eq!` on the unscoped path stays: there the two values differ in meaning.
+
+**A reviewer's headline finding was wrong, recorded so it is not re-raised.** The Tasks 1-7
+review reported `NoTenant<R>` as a public unsealed trait, an app able to write
+`impl NoTenant<Invoice> for Org {}` and turn the headline compile error off in one line, and
+proposed a "3-line private-supertrait seal". That seal is already there: `table.rs:376` is
+`pub trait NoTenant<R>: sealed::NotATenant {}` over a private `mod sealed` at `:384`, and
+`UnscopedRow` is sealed the same way at `:407` — and the doc comment above both names that
+exact one-line impl as the thing the seals exist to prevent. The reviewer did flag it as
+needing a build to settle; it needed only reading four lines further down. Its other findings
+held up when checked.
+
+**Confirmed and still open, none merge-blocking.** `scope_flip_error`'s named refusal is wired
+only into `scan_raw`/`scan_raw_from` (`table.rs:1808`, `:1871`), so the scoped reads and writes
+an app hits first fall through to redb's unnamed type error — hard rule 5. The realtime settle
+budget (`SETTLE_ATTEMPTS`/`SETTLE_BOOT_TRIES`) is red at 2 of 3 fresh bases, now the third
+instance of the budget-constant-as-seed-property class. `#[route(SSE …, cross_tenant)]` has no
+compile_pass, compile_fail or runtime test. DESIGN §3 states a compile-time property
+`ctx.cap().unwrap()` defeats, and `Ctx::cap()` is public API documented in neither DESIGN nor
+GUIDE. `README.md:127` listed "no tenant scoping as typed key prefixes" under what is *not*
+built — fixed here, hard rule 6.
+
+**The helpdesk experiment: keep the testimony, drop the app.** Reviewed against `14f5a94`:
+zero API drift, the app would still compile. It is refused as an *example* for three Criticals
+— an unauthenticated `POST /agents/:id` letting anyone join any org, an unscoped
+`tx.get(id)?.is_some()` that works as a cross-tenant existence oracle, and five one-sided sim
+properties (deleting the whole SLA sweep leaves the suite green) — plus it adds
+`examples/helpdesk` to `members` without touching CLAUDE.md, reddening `doc_inventory` at its
+own merge base. All three violate `BRIEF.md`'s own requirements, which is the useful part:
+where FINDINGS says something was HARD that is signal; where it says something was DONE, check
+the code. `docs/experiments/2026-09-helpdesk/` now holds the brief (rescued byte-identical from
+an untracked file in a disposable `/private/tmp` worktree — it existed nowhere else), FINDINGS,
+and a README recording which of its claims survive. **F4 is struck as factually wrong**: it
+claims no GUIDE example derives `Serialize` on a route body, and `GUIDE.md:2039` is
+`#[derive(Wire, Serialize, Deserialize)] struct HitBody`, sent with `Request::json` at `:2122`.
+
+**The experiment's real payoff is a platform oracle defect, not an app.** `checks::
+acked_implies_durable` takes a seed and builds its own `Sim::new(seed)` (`checks.rs:171-177`),
+so the `restart` coverage `Sim::restart` credits (`lib.rs:667`) lands on a sim the harness never
+reads — a `require: ["restart"]` over that checker **cannot fire, ever**. And `Sim::new` is
+`FaultConfig::default()`, which zeroes `bit_flip`, `misdirected_write`, `dir_entry_loss`,
+`read_error`, `conn_drop` and `net_spike`, so every property built on the public checker runs
+outside the swarm matrix while reading as though it were inside it. Found because an outsider
+used the documented checker library the documented way. Not fixed here; it is charpente's bug,
+not the experiment's, and it wants its own change with its own failing seed.

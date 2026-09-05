@@ -1398,18 +1398,26 @@ fn merge_overlay_all_scopes<R: Row>(
     let Some(overlay) = overlay else {
         return Ok(());
     };
-    // Negative space (hard rule 4): the caller asserted the table is
-    // scoped, so no entry here may carry UNSCOPED — an unscoped entry on a
-    // scoped table's overlay would be a staging bug, and answering with it
-    // would report a row belonging to tenant `table::UNSCOPED`.
+    // NO assertion on the scope slot here, deliberately — the mirror of the
+    // `assert_eq!` on the unscoped path in `merge_overlay_rows`, which is
+    // correct because there the two values genuinely differ in meaning.
+    // Here they do not: on a SCOPED table `0` is tenant 0, a real tenant
+    // (R35, `GroupOverlay` above), not a sentinel, and it is reachable off
+    // the wire — `Id::from_raw` takes any `u64` and `FromParam for Id<T>`
+    // passes straight through it. An `assert_ne!(scope, UNSCOPED)` here
+    // therefore fires on LEGAL data, and since `crates/charpente/src` has no
+    // `catch_unwind` and assertions stay on in release (hard rule 4), it
+    // unwinds out of the kernel loop and takes the node down. Worse, this
+    // function also reads the GROUP overlay, which accumulates across a
+    // batch, so one request's tenant-0 write would kill a different
+    // request's cross-tenant read. Pinned by
+    // `tenant_zero_is_a_real_tenant_to_a_cross_tenant_read`.
+    //
+    // The staging bug the assertion was reaching for cannot happen anyway:
+    // `Tx::put`/`Tx::delete` take `R: UnscopedRow`, so a scoped row "cannot
+    // reach this method at all, which is a stronger statement than any
+    // assertion here could make" (`Tx::put`'s own doc, above).
     for (&(scope, id), entry) in overlay {
-        assert_ne!(
-            scope,
-            UNSCOPED,
-            "table \"{}\" is tenant-scoped but its overlay holds id {id} under table::UNSCOPED \
-             — a scoped write stages its scope",
-            R::TABLE
-        );
         match entry {
             Some(bytes) => {
                 merged.insert((scope, id), R::decode_row(bytes)?);

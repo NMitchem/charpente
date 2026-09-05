@@ -123,8 +123,10 @@ fills the disk, and `charpente restore` rebuilds a data directory from what is
 there ([docs/GUIDE.md](docs/GUIDE.md) §15). `serve::backup` is still a different
 thing — a promotable hot standby, not a snapshot shipper. A TypeScript client
 generator has since shipped too ([docs/GUIDE.md](docs/GUIDE.md) §14) — SSE only, no
-WebSocket transport. What is *not* built, so you don't have to go looking: no blob
-store, no WebSockets, and no tenant scoping as typed key prefixes.
+WebSocket transport — and so has tenant scoping, where a tenant is a typed key prefix
+enforced by the compiler rather than a `where` clause anyone can forget
+([docs/GUIDE.md](docs/GUIDE.md) §16). What is *not* built, so you don't have to go
+looking: no blob store and no WebSockets.
 
 | Doc | What it is |
 |---|---|

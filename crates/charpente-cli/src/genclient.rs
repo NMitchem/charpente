@@ -605,12 +605,13 @@ mod tests {
       ],
       "routes": [
         { "method": "POST", "pattern": "/widgets/:id", "name": "create_widget",
-          "auth": true, "stream": false,
+          "auth": true, "stream": false, "cross_tenant": false,
           "params": [{ "name": "id", "schema": { "Id": "Widget" } }],
           "request": { "Ref": "CreateWidget" }, "response": { "Ref": "WidgetView" },
           "error": "String", "emits": [] },
         { "method": "GET", "pattern": "/feed", "name": "feed", "auth": false,
-          "stream": true, "params": [], "request": null, "response": "Null",
+          "stream": true, "cross_tenant": true,
+          "params": [], "request": null, "response": "Null",
           "error": "String",
           "emits": [{ "event": "widget_added", "payload": "WidgetAdded" }] }
       ],
@@ -651,7 +652,7 @@ mod tests {
         { "name": "WidgetView", "schema": { "Struct": { "fields": [] } } }
       ],
       "jobs": [{ "name": "SendMail", "retry": { "max": 3, "backoff_nanos": 1000 },
-                 "builtin": false }],
+                 "cross_tenant": true, "builtin": false }],
       "cron": [{ "name": "charpente.session_sweep", "interval_nanos": 60000000000,
                  "builtin": true }],
       "config": { "body_cap": 1024, "session_ttl": 3600, "store_path": "/tmp/x",
