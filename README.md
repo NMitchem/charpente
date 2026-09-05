@@ -14,9 +14,10 @@ point, one log.
 
 ## The three guarantees
 
-1. **Typed end-to-end.** Schema, queries, routes, jobs, events, config, and telemetry are
-   all Rust types checked at compile time. A schema change that breaks a query is a compile
-   error, not a 3am page.
+1. **Typed end-to-end.** Schema, queries, routes, jobs, events, and wire types are all Rust
+   types checked at compile time — a schema change that breaks a query is a compile error,
+   not a 3am page; config is a typed struct with no startup validation yet, and typed
+   telemetry with change-time checks is an M2 item that does not exist yet.
 
 2. **One commit point.** State changes, job enqueues, and realtime events commit in the
    same transaction. The dual-write bug class — outbox gaps, ghost webhooks, "the row
