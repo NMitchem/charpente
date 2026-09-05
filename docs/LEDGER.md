@@ -2925,3 +2925,22 @@ re-run in isolation. Four `INCONCLUSIVE -> Ok(())` wrappers exist across `replic
 required or floored. The realtime settle budget (`SETTLE_ATTEMPTS`/`SETTLE_BOOT_TRIES`) is
 untouched here and still fails loudly at 2 of 3 fresh bases — a false RED, not a false green,
 and a different fix (denominate the budget in no-progress, not in reconnections).
+
+**The wire layer ran on a runner for the first time, and corrected a number written earlier
+today.** Run 33974865000, dispatched manually against `main` rather than left for the nightly
+to discover: **green, 3m28s**, against a 30-minute timeout — an order of magnitude of headroom,
+with acked_durable the only slow binary at 147s. So real process spawns, loopback binds and
+`kill -9` do behave on `ubuntu-latest`, which no prior run of this rig had established.
+
+**It ran 34 ignored tests, not 15.** The entry above, the workflow comment and PLAN.md all
+said 15, and 15 is right for what it counted — the wire scenarios in
+`crates/edge-harness/tests/` — reproduced exactly by the runner (acked_durable 2, failover 3,
+hunts 5, realtime_resume 1, smoke 1, tenant_wire 3). What none of them counted is that
+`cargo test -p edge-harness -- --ignored` also picks up **19 ignored real-disk/real-process
+unit tests under the crate's `src/`**, equally skipped by `cargo test --workspace` and now
+equally covered. The three sites are corrected in place; the correction is recorded here
+rather than by rewriting the entry above, which was accurate about the thing it measured.
+Worth noting how it surfaced: the runner printed per-binary counts, they summed to 34 against
+an expected 15, and the gap was chased rather than waved through — a green run whose test
+count nobody checks is the same defect as an unfloored coverage key, which is the subject of
+this very entry.

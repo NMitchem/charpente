@@ -5,8 +5,13 @@ name: edge-harness
 # edge harness)", PLAN.md), and the one that until 2026-09-05 never ran automatically
 # anywhere.
 #
-# COUNTED, not estimated (2026-09-05): 15 `#[ignore]`d tests — acked_durable (2),
-# failover (3), hunts (5), realtime_resume (1), smoke (1), tenant_wire (3). `ci.yml:34`'s
+# COUNTED, not estimated (2026-09-05), and confirmed against the first runner execution:
+# this job runs **34** `#[ignore]`d tests. 15 are the wire scenarios in `tests/` —
+# acked_durable (2), failover (3), hunts (5), realtime_resume (1), smoke (1),
+# tenant_wire (3) — and the other 19 are the harness's own real-disk/real-process unit
+# tests under `src/`, which `--ignored` picks up too and which are just as absent from
+# `cargo test --workspace`. The 15 is the figure this ledger and PLAN.md quote for the
+# WIRE ORACLE specifically; 34 is what this job executes. `ci.yml:34`'s
 # `cargo test --workspace` skips every one of them, because it passes no `--ignored`, and
 # that workflow's ONLY `--ignored` invocation is `:75`, the bench-harness passthrough
 # guard, named `--exact`. So the wire oracle has been a local gate all along: guarded by a
@@ -31,15 +36,18 @@ name: edge-harness
 # already run in `ci.yml`) and `--test-threads=1` (the tests bind real loopback ports and
 # spawn real processes; serializing avoids port collisions).
 #
-# TWO THINGS THIS FILE DOES NOT YET PROVE, stated rather than left to inference:
-#  1. It has never executed on a runner. Every prior pass of this rig has been local, on
-#     macOS. The first scheduled run is the first evidence that real process spawns,
-#     loopback binds and `kill -9` behave on ubuntu-latest. If it reddens there, diagnose
-#     the runner before touching a test — a guard loosened for environment noise is a guard
-#     that never fires, the rule ci.yml:73 already states for the passthrough guard.
-#  2. GitHub runs `schedule` triggers ONLY on the default branch. While this file lives on
-#     a feature branch it fires never; the nightly starts the day it reaches `main`. Until
-#     then, `workflow_dispatch` against the branch is the only way to exercise it.
+# FIRST RUNNER EXECUTION: 2026-09-05, run 33974865000, dispatched manually against `main`
+# the moment the merge landed rather than left for the nightly to discover. GREEN, 34/34,
+# 3m28s wall — so real process spawns, loopback binds and `kill -9` do behave on
+# ubuntu-latest, and the 30-minute timeout below has an order of magnitude of headroom.
+# The longest single binary was acked_durable at 147s; everything else is seconds.
+# If this ever reddens, diagnose the runner before touching a test — a guard loosened for
+# environment noise is a guard that never fires, the rule ci.yml:73 already states for the
+# passthrough guard.
+#
+# STILL WORTH KNOWING: GitHub runs `schedule` triggers ONLY on the default branch, so this
+# fires never while it lives on a feature branch; the nightly began the day it reached
+# `main`. `workflow_dispatch` is how to exercise it from anywhere else.
 
 on:
   schedule:

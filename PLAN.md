@@ -63,6 +63,10 @@ true:** the wire oracle is 15 `#[ignore]`d tests that `cargo test --workspace` s
 from 2026-07-27 until 2026-09-05 it ran only when a human ran `scripts/edge-harness.sh`.
 It now runs nightly and on demand (`.github/workflows/edge-harness.yml`); it is still not
 a per-push gate, by choice — MANIFESTO §6's cadence for expensive fault work is per night.
+That job runs **34** ignored tests, not 15: the 15 wire scenarios in `crates/edge-harness/
+tests/` plus 19 real-disk/real-process unit tests under its `src/` that `--ignored` also
+picks up and `cargo test --workspace` also skipped. First runner execution 2026-09-05
+(run 33974865000): green, 34/34, 3m28s.
 
 ## M2 — The moat deepens [in progress]
 
