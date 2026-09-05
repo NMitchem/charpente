@@ -1498,8 +1498,9 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   the `Db` reaches every tenant through `Db::snapshot`'s scoped and raw reads, which take a
   scope on the caller's word because replication seeding and the archive are built on them,
   and can mint a `CrossTenant` through `begin_group`. A `Db` holder has the standing of
-  whoever holds the data directory — an operator, not a request (DECISIONS §12, drafted and
-  awaiting sign-off).
+  whoever holds the data directory — an operator, not a request (DECISIONS §12, ratified
+  2026-09-05; the `App::mount` notch that would make even the operator path enumerable is
+  recorded there as available and unbuilt, under §11's trigger).
   Out of scope and staying out: nested scopes, cross-tenant writes in one transaction,
   platform-derived tenancy, and forced retrofitting of existing tables. API-key
   scopes/permissions are subject-only in v1 — this feature answers *which tenant*, never

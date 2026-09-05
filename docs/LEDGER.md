@@ -2713,3 +2713,67 @@ fault sibling), `fef12f6` (12), `1673bfb` (13), on top of Tasks 1-7/6b/6c/9. **M
 Noah's call and has not been made.** Owed before it: the full workspace suite (only scoped
 per-package runs were made), and the two decisions above — DECISIONS §12's ratification, and
 whether the edge-harness wire layer should enter CI.
+
+## 2026-09-05 — both owed decisions close, and the doc set is what closed them
+
+Noah took the two decisions the tenant-scoping plan left owed. What is worth recording is not
+the outcomes but the method: **both were answered by reading the existing doc set rather than
+by fresh argument**, and in one case the doc set had already decided it and nobody had looked.
+That is the second time this repo has produced an "open choice" the spec had settled (see the
+north-star note in the fidelity audit), so the pattern is now two for two.
+
+**DECISIONS §12 is ratified — the boundary stands, and the notch belongs to §11.** The line
+holds as drafted: whoever holds the `Db` is the operator. The question that actually held the
+entry open was the other one — should a future release put the raw reads behind a named,
+`describe`-visible operator capability? Read against the rest of the doc set it collapses to
+one survivor. *Sandboxing* the operator is refused by §5, which rejected the WASM plugin model,
+so app code compiles into the same binary and there is no trust boundary between an app's
+`main` and `charpente` to enforce; MANIFESTO §4 and §7 both assume one process in one trust
+domain. *Discovering* operator reads is impossible by DESIGN §7's ruling 6 — enumeration cannot
+walk call sites, the same reason `tx.emit` sites are undiscoverable, and a `Db::snapshot()` in
+`main` sits in exactly that position. *Declaring* them is the only survivor, and a declaration
+needs a registration site; `main` has one, `App::mount`, which is the louder notch §11 already
+named as available and unbuilt. So the notch was not adopted as new work: it is §11's, and it
+inherits §11's trigger — build it when declarations at the route prove too quiet in practice,
+the concrete sign being an app or audit that had to read source to answer "what reaches every
+tenant here". **A real tension was fixed in passing:** §11's binding clause forbids "an
+undeclared bypass method, or an 'internal-only' accessor", which is very close to the shape
+§12 permits, and the two entries did not speak to each other. Each now says the clause binds
+the handler/job surface and that the operator path sits outside the guarantee rather than as an
+exception inside it. DESIGN §8 and PLAN's M2 bullet drop "drafted and awaiting sign-off".
+
+**The wire layer enters CI on a schedule, and the option to write it off was refused by the
+docs.** The honest options recorded on 2026-09-04 were a CI job or an explicit statement that
+this is a local gate. The second does not survive MANIFESTO §2 ("human review does not scale
+… and pretending it does is how incidents happen"), CLAUDE.md hard rule 1's enforce-
+mechanically-not-by-review, or MANIFESTO §9's wager. It is worse than a tone problem: PLAN
+discharges M1's exit criteria as "an oracle at two layers", so writing the wire layer off as
+local would have meant editing an exit criterion downward to stay honest. **The count was
+re-measured rather than inherited** — 15 `#[ignore]`d tests, acked_durable 2, failover 3, hunts
+5, realtime_resume 1, smoke 1, tenant_wire 3, counted directly; the older "31/31 scenarios"
+figures in this ledger are a different unit and should not be read as a test count.
+`.github/workflows/edge-harness.yml` runs `scripts/edge-harness.sh` — the script, not a copied
+command line, so the runner cannot drift from a local sweep — nightly at 07:17 UTC plus
+`workflow_dispatch`, with a 30-minute timeout against the 360-minute default because the rig
+spawns real processes and can hang rather than fail. **Nightly and not per-push is a positive
+choice, not a budget dodge:** MANIFESTO §6 sets the cadence for expensive fault work in its own
+words, "thousands of seeded universes per night". PLAN's M1 exit criteria gain a cadence
+sentence so the two-layer claim stops implying more than is true.
+
+**Two things this does not yet prove, stated rather than left to inference.** The workflow has
+never executed on a runner — every pass of this rig has been local, on macOS — so the first
+scheduled run is the first evidence that process spawns, loopback binds and `kill -9` behave on
+`ubuntu-latest`. And GitHub fires `schedule` only on the default branch, so while this sits on
+`tenant-scoping` it runs never; the nightly begins the day it reaches `main`. Until then
+`workflow_dispatch` is the only way to exercise it. If it reddens on a runner, diagnose the
+runner before touching a test — a guard loosened for environment noise is a guard that never
+fires, which `ci.yml:73` already says for the passthrough guard.
+
+**Verification at this commit.** `cargo fmt --all --check` exit 0 and `cargo clippy --workspace
+--all-targets -- -D warnings` exit 0, both at `14f5a94` before these edits; `cargo test
+--workspace` was still running when this entry was written and its result is NOT recorded here.
+The edits themselves touch no Rust: `doc_inventory` reads only `CLAUDE.md`, and nothing in the
+workspace opens `DECISIONS.md`, `DESIGN.md` or `PLAN.md`, so the suite in flight is blind to
+them. The new workflow YAML parses (`yaml.safe_load`, jobs `['edge-harness']`, triggers
+`['schedule', 'workflow_dispatch']`). **Merge to main remains Noah's call**; of the three things
+owed before it, the two decisions are now closed and the full workspace suite is outstanding.

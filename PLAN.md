@@ -58,6 +58,11 @@ throughout; a reconnecting realtime client provably misses no events. **Both dis
 2026-07-27**, each with an oracle at two layers (an in-sim property plus a wire oracle in
 the edge harness). None of the four deferred bullets above gates either criterion — which
 is why the milestone closed with them outstanding rather than silently absorbing them.
+**The second layer's cadence, stated because the claim above used to imply more than was
+true:** the wire oracle is 15 `#[ignore]`d tests that `cargo test --workspace` skips, so
+from 2026-07-27 until 2026-09-05 it ran only when a human ran `scripts/edge-harness.sh`.
+It now runs nightly and on demand (`.github/workflows/edge-harness.yml`); it is still not
+a per-push gate, by choice — MANIFESTO §6's cadence for expensive fault work is per night.
 
 ## M2 — The moat deepens [in progress]
 
@@ -166,7 +171,7 @@ is why the milestone closed with them outstanding rather than silently absorbing
   different scope types sharing a raw id share a key. And the guarantee's boundary is the
   typed surface handed to handlers and jobs: a `Db` holder reaches every tenant and can
   mint the cross-tenant capability, with the standing of whoever holds the data directory —
-  an operator, not a request (DECISIONS §12, drafted and awaiting sign-off).
+  an operator, not a request (DECISIONS §12, ratified 2026-09-05).
   Deliberately not built: nested scopes, cross-tenant writes in one transaction,
   platform-derived tenancy, tenant-local ids, and any forced retrofit of existing tables.
 - **Typed telemetry with change-time checks** — the observability contract as a lockfile;

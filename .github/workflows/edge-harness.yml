@@ -1,0 +1,67 @@
+name: edge-harness
+
+# The wire layer, on a schedule — the second of the two oracle layers M1's exit criteria
+# claim ("each with an oracle at two layers (an in-sim property plus a wire oracle in the
+# edge harness)", PLAN.md), and the one that until 2026-09-05 never ran automatically
+# anywhere.
+#
+# COUNTED, not estimated (2026-09-05): 15 `#[ignore]`d tests — acked_durable (2),
+# failover (3), hunts (5), realtime_resume (1), smoke (1), tenant_wire (3). `ci.yml:34`'s
+# `cargo test --workspace` skips every one of them, because it passes no `--ignored`, and
+# that workflow's ONLY `--ignored` invocation is `:75`, the bench-harness passthrough
+# guard, named `--exact`. So the wire oracle has been a local gate all along: guarded by a
+# human remembering to run `scripts/edge-harness.sh`. MANIFESTO §2 is explicit that "human
+# review does not scale to the volume agents produce, and pretending it does is how
+# incidents happen", and CLAUDE.md hard rule 1 states the same principle directly —
+# enforce mechanically, not by review. A guarantee guarded by memory is the shape both
+# forbid, and ci.yml:38-58 and :59-75 already exist because this exact condition was found
+# twice before, in the kernel pin and the passthrough guard.
+#
+# WHY A SCHEDULE AND NOT push/pull_request. These tests build release binaries and drive
+# real processes over real loopback TCP with `kill -9` — precisely the cost `ci.yml` avoids
+# on every push. MANIFESTO §6 sets the cadence for the expensive fault work in its own
+# words: fault injection "runs thousands of seeded universes per night". Nightly is
+# therefore the sanctioned rhythm here rather than a budget compromise, and the per-push
+# gate stays cheap. `workflow_dispatch` is included so a change touching `serve`, `repl` or
+# the tenancy surface can be checked on demand without waiting for the night.
+#
+# ONE DEFINITION. This job shells out to `scripts/edge-harness.sh` instead of repeating its
+# command line, so the runner cannot drift from what a local sweep runs. That script passes
+# `--ignored` (only the 15 — the crate's zero-IO parse/scan unit tests are NOT ignored and
+# already run in `ci.yml`) and `--test-threads=1` (the tests bind real loopback ports and
+# spawn real processes; serializing avoids port collisions).
+#
+# TWO THINGS THIS FILE DOES NOT YET PROVE, stated rather than left to inference:
+#  1. It has never executed on a runner. Every prior pass of this rig has been local, on
+#     macOS. The first scheduled run is the first evidence that real process spawns,
+#     loopback binds and `kill -9` behave on ubuntu-latest. If it reddens there, diagnose
+#     the runner before touching a test — a guard loosened for environment noise is a guard
+#     that never fires, the rule ci.yml:73 already states for the passthrough guard.
+#  2. GitHub runs `schedule` triggers ONLY on the default branch. While this file lives on
+#     a feature branch it fires never; the nightly starts the day it reaches `main`. Until
+#     then, `workflow_dispatch` against the branch is the only way to exercise it.
+
+on:
+  schedule:
+    # 07:17 UTC daily. Deliberately off the hour: GitHub queues scheduled jobs heavily at
+    # the top of the hour, and a long queue delay is indistinguishable from a hung rig when
+    # you are reading a log after the fact.
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  edge-harness:
+    runs-on: ubuntu-latest
+    # The rig spawns real processes and can hang rather than fail. GitHub's default ceiling
+    # is 360 minutes, which would let one wedged child burn six runner-hours before anyone
+    # saw it; the local pass is minutes, not hours, so this fails fast while leaving ample
+    # room for a cold build cache. Raise it only with a measured reason.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: ./scripts/edge-harness.sh

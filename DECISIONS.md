@@ -214,16 +214,21 @@ not as a config option, a `DbConfig` field, an undeclared bypass method, or an
 "internal-only" accessor. If a proposal cannot be declared on the route and listed by
 `describe`, it is an escape hatch and hard rule 2 refuses it. Reopen if: a real app needs
 a cross-tenant surface that cannot be expressed as a declaration on the entry point.
+**This clause binds the surface an app's handlers and jobs can reach.** It does not reach
+the operator path: a `Db` holder's scoped and raw reads sit outside the guarantee rather
+than as an exception inside it, which is §12's subject. Read the two entries together —
+the shapes forbidden here and the reads §12 permits look alike, and are not.
 A louder notch remains available and unbuilt — the capability could additionally be
 required at `App::mount` — and would be the first thing to reach for if declarations at the
-route prove too quiet in practice.
+route prove too quiet in practice. §12 adopts that notch as the answer to its own open
+question, inheriting this trigger rather than inventing a second one.
 
-## 12. DRAFT, AWAITING NOAH'S SIGN-OFF — the tenancy guarantee's boundary is the typed surface
+## 12. The tenancy guarantee's boundary is the typed surface (ratified 2026-09-05)
 
-**Status: not ratified.** Written up because it is now load-bearing in two places and was
-ruled twice in flight (R48, R49) without being recorded here. Do not cite it as settled
-until Noah confirms it; if he rejects it, the tenancy surface needs a different answer and
-DESIGN §8's limits paragraph and PLAN's M2 bullet both change with it.
+**Status: ratified 2026-09-05.** Written up because it is now load-bearing in two places
+and was ruled twice in flight (R48, R49) without being recorded here. The line is confirmed
+as stated: whoever holds the `Db` is the operator. What held this entry open was the
+question at the bottom, which is now answered there rather than left standing.
 
 **The claim.** The tenancy guarantee covers the typed surface the framework hands app
 logic — a `Tx`, and through it a scoped table reachable only via
@@ -254,8 +259,26 @@ name only.
 app authors, with the remedy: code outside a handler that wants the guarantee should go
 through a transaction and `tx.scope::<Org>(org, ctx)?` exactly as a handler does.
 
-**The open question this leaves for Noah.** Is "the `Db` holder is the operator" the right
-line for a platform whose pitch is compiler-enforced tenancy — or should a future release
-put the raw reads behind a named, `describe`-visible operator capability (the §11 shape
-applied one layer down), so that even the operator path is enumerable? That is the decision
-being asked for, not merely a ratification of the status quo.
+**The question that held this open, and its answer.** Should a future release put the raw
+reads behind a named, `describe`-visible operator capability — the §11 shape applied one
+layer down — so that even the operator path is enumerable? Read against the rest of the doc
+set, that question has three readings and only one survives.
+
+*Sandboxing the operator is already refused.* §5 rejected the WASM plugin model, so app code
+compiles into the same binary as the platform: there is no trust boundary between an app's
+`main` and `charpente` anywhere in this architecture, and MANIFESTO §4 and §7 both assume
+one process in one trust domain. A real operator boundary would have to invent the seam §5
+deliberately deleted, and would pay for it in the compile-time oracle.
+
+*Discovering operator reads is impossible, by a ruling already on the books.* DESIGN §7
+(ruling 6) settles that enumeration cannot walk call sites — `tx.emit` and
+`Subscription::of::<Ev>()` run inside handler bodies, "not anywhere an app-wide walk can
+observe". A `Db::snapshot()` in an app's `main` sits in that position for the same reason.
+
+*Declaring them is the only survivor*, and a declaration needs a registration site. `main`
+has exactly one: `App::mount` — the louder notch §11 already names. So the notch is not a
+new proposal, it is §11's, and it inherits §11's trigger: **build it when declarations at
+the route prove too quiet in practice.** The concrete sign will be an app or an audit that
+had to read source to answer "what reaches every tenant here" — the moment the inventory
+stops being an inventory. Until then the boundary stands as stated, documented in the three
+places above rather than guarded by a capability with nothing yet to enumerate.
