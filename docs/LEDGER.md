@@ -2978,3 +2978,55 @@ change. Four sites now carry reason keys (`replication.rs:241`, `:381`, `:394`, 
 arm at `:327`); the pre-existing torn-witness arm keeps its own older key name
 (`repl:witness-file-inconclusive`) because that arm is deliberately byte-identical across four
 copies in three files and renaming it is a separate edit.
+
+## 2026-09-05 — `acked_implies_durable` takes the caller's `Sim`, and the GUIDE taught the bug
+
+The defect the docs-only helpdesk experiment surfaced, now fixed. `checks::
+acked_implies_durable` took a `seed: u64` and built its own `Sim::new(seed)`. Three
+consequences, all of them silent:
+
+ 1. **Coverage went nowhere.** `Sim::restart` credits `restart` on the sim it is called on
+    (`lib.rs:667`) and the harness reports the keys of the sim it handed the workload, so
+    `require: ["restart"]` over this checker could never fire.
+ 2. **The excuse helpers answered from the wrong world.** `durable_corruption_fired` and
+    `dir_entry_loss_fired` read `sim.coverage()` and gate whether a data-loss shortfall may be
+    EXCUSED. Asked of the caller's sim after this checker ran, they report on faults that
+    universe never saw. This one was not in the original finding and is the worst of the three.
+ 3. **The fault matrix was replaced.** `Sim::new` is `FaultConfig::default()`, which zeroes
+    eleven axes — `bit_flip`, `misdirected_write`, `dir_entry_loss`, `read_error`, `conn_drop`,
+    `net_spike`, `subscriber_stall` and the four `object_*` — so a swarm universe's declared
+    matrix was silently discarded while the property read as though it were inside it.
+
+**The GUIDE taught it.** `docs/GUIDE.md`'s worked example ended
+`acked_implies_durable(sim.seed(), 5, drive(), verify)` — pulling the seed off the harness's
+sim and handing it to a checker that drove a different one. An outside agent building from the
+docs alone hit exactly this and discarded a working property over it.
+
+**Fixed by taking `&mut Sim`.** The alternatives are impossible rather than merely worse:
+`Sim` exposes no public `FaultConfig` accessor, so a caller cannot supply one; and
+`Sim::with_faults` derives all three RNG streams at construction with no rewind, so no
+seed-shaped API can recover a caller's fault SCHEDULE. `replays_identically` KEEPS its seed
+and is not a sibling bug — it needs two worlds identical at time zero, which a used sim cannot
+give. The rule now stated in both the code and GUIDE §the-checker-library: **a checker that
+needs a FRESH world takes a seed; one that continues THIS world takes `&mut Sim`.**
+
+**The repo had already reasoned this out once and not generalized it.** `sim-fixture/tests/
+sim.rs`'s `fixture_replays` carries a doc comment explaining that it deliberately has no
+`require` because `replays_identically`'s restarts happen in worlds the outer sim cannot see.
+That is this exact mechanism, understood correctly, sitting four lines from a checker with the
+opposite requirement that nobody re-examined.
+
+**RED first, and the end-to-end oracle is the real proof.** Two unit tests in `checks.rs` were
+written against the OLD signature and failed on assertions rather than on compilation — a test
+that merely fails to compile against old code proves nothing: `left: 0, right: 3` for the
+coverage count, and `unwrap_err()` on an `Ok` value for a `read_error: 1.0` axis that never
+fired. Then `sim-fixture` gains `acked_counter_survives_rounds require ["restart"]`, a real
+app workload that never calls `sim.restart()` itself, so the require IS the assertion.
+**Mutation-proved:** restoring the private `Sim::new` inside the checker makes it fail by name
+— "sim coverage requirement failed in acked_counter_survives_rounds: \"restart\" never
+occurred over 256 universes" — and removing the mutation returns it to green over 256
+universes. That is the claim proved through the harness, not asserted in a unit test.
+
+Verification: fmt 0, clippy `--workspace --all-targets -D warnings` 0, charpente-sim 143
+tests green, sim-fixture 256 universes green, `guide-examples` builds (the GUIDE's compiled
+```rust block is the backstop and was edited in the same commit, hard rule 6).

@@ -1850,13 +1850,22 @@ before hand-rolling the same logic a fourth time:
   its own seed, so a batch explores many fault mixes instead of every
   universe sharing one fixed matrix) — so it re-runs the workload's logic
   under default fault rates rather than replaying the exact fault schedule
-  of the swarm universe that called it.
-- `acked_implies_durable(seed: u64, rounds: u32, drive: impl FnMut(&mut Sim) -> Result<Vec<String>, String>, verify: impl FnMut(&mut Sim, &[String]) -> Result<(), String>) -> Result<(), String>`
+  of the swarm universe that called it. **It takes a seed because it needs two
+  worlds identical at time zero**, which a sim that has already run cannot give
+  it — the opposite of the checker below, and the rule is: a checker that needs
+  a FRESH world takes a seed, one that continues THIS world takes `&mut Sim`.
+- `acked_implies_durable(sim: &mut Sim, rounds: u32, drive: impl FnMut(&mut Sim) -> Result<Vec<String>, String>, verify: impl FnMut(&mut Sim, &[String]) -> Result<(), String>) -> Result<(), String>`
   — the ack-durability property, generically: `rounds` times, `drive` does
   one round of work and returns the ids it promised are durable (classifying
   its own faults with `is_fault_fallout`, same as above), the sim restarts,
   and `verify` checks every id acked *so far* survived. A failure names the
-  round it broke on.
+  round it broke on. **Pass it your own `sim`, not `sim.seed()`** — it restarts
+  the world you give it, so `require: ["restart"]` over it fires, the excuse
+  helpers below read the same world your workload ran in, and your universe's
+  fault config actually applies. Until 2026-09-05 it took a seed and built its
+  own `Sim::new` world, which silently did none of those three things; if you
+  have code calling it with `sim.seed()`, that code was running outside its
+  declared fault matrix and crediting coverage nowhere.
 - `durable_corruption_fired(sim: &Sim) -> bool` — true when a
   durable-corruption fault (`bit_flip` or `misdirected_write`) actually
   fired in this universe. Those axes can corrupt an acked WAL record above
@@ -1894,7 +1903,7 @@ pub fn replays_identically<T: PartialEq + std::fmt::Debug>(
 ) -> Result<(), String>
 
 pub fn acked_implies_durable(
-    seed: u64,
+    sim: &mut Sim,
     rounds: u32,
     drive: impl FnMut(&mut Sim) -> Result<Vec<String>, String>,
     verify: impl FnMut(&mut Sim, &[String]) -> Result<(), String>,
@@ -1950,7 +1959,10 @@ fn verify(sim: &mut Sim, acked: &[String]) -> Result<(), String> {
 }
 
 fn bytes_survive_restarts(sim: &mut Sim) -> Result<(), String> {
-    acked_implies_durable(sim.seed(), 5, drive(), verify)
+    // `sim`, not `sim.seed()`: the checker restarts the world you hand it, so
+    // the `restart` coverage lands where the harness reads it and your
+    // universe's fault config is the one the property runs under.
+    acked_implies_durable(sim, 5, drive(), verify)
 }
 ```
 

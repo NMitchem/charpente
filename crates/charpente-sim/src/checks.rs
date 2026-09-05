@@ -159,7 +159,7 @@ pub fn replays_identically<T: PartialEq + std::fmt::Debug>(
 }
 
 /// Ack-durability oracle: runs `rounds` rounds of drive-then-restart-then-
-/// verify on one `Sim::new(seed)`. Each round, `drive` performs one round of
+/// verify on THE CALLER'S `Sim`. Each round, `drive` performs one round of
 /// app work and returns the ack ids it answered success for — `drive`
 /// classifies its own faults via `is_fault_fallout` so an id only appears
 /// here if the app actually promised durability for it. `sim.restart()` then
@@ -167,23 +167,48 @@ pub fn replays_identically<T: PartialEq + std::fmt::Debug>(
 /// far (not just this round's) is still present. A `verify` failure fails
 /// the whole check, prefixed with the round and seed so a repro can target
 /// the exact round.
+///
+/// **Takes `&mut Sim`, not a seed, and the distinction is load-bearing** —
+/// unlike [`replays_identically`] above, which takes a seed because it needs
+/// two worlds identical AT TIME ZERO and a used sim cannot provide that. The
+/// rule: a checker that needs a FRESH world takes a seed; one that continues
+/// THIS world takes `&mut Sim`. This one continues yours, for two reasons that
+/// were defects until 2026-09-05:
+///
+///  - **Coverage.** `Sim::restart` credits the `restart` key on the sim it is
+///    called on, and the harness reports the keys of the sim it handed the
+///    workload. A checker restarting a private world credits nothing the
+///    harness can see, so `require: ["restart"]` over it could never fire —
+///    and `durable_corruption_fired`/`dir_entry_loss_fired`, which gate
+///    whether a data-loss shortfall may be EXCUSED, would answer from the
+///    wrong world entirely.
+///  - **Faults.** `Sim::new` is `FaultConfig::default()`, which zeroes eleven
+///    axes a swarm universe may have set. Building a world here silently ran
+///    the property outside the matrix its universe declared while reading as
+///    though it were inside it.
+///
+/// Neither is recoverable from a bare seed: `Sim::with_faults` derives its RNG
+/// streams at construction with no rewind, so a seed cannot reconstruct a
+/// caller's fault SCHEDULE even given its config.
 pub fn acked_implies_durable(
-    seed: u64,
+    sim: &mut Sim,
     rounds: u32,
     mut drive: impl FnMut(&mut Sim) -> Result<Vec<String>, String>,
     mut verify: impl FnMut(&mut Sim, &[String]) -> Result<(), String>,
 ) -> Result<(), String> {
-    let mut sim = Sim::new(seed);
+    // Named for the error text below, which stays seed-prefixed so a repro line
+    // is copy-pasteable — and now names the seed the caller is actually running.
+    let seed = sim.seed();
     let mut acked: Vec<String> = Vec::new();
     for round in 1..=rounds {
-        let mut new_acks = drive(&mut sim).map_err(|e| {
+        let mut new_acks = drive(sim).map_err(|e| {
             format!(
                 "acked-implies-durable: drive failed in round {round} under seed {seed:#x}: {e}"
             )
         })?;
         acked.append(&mut new_acks);
         sim.restart();
-        verify(&mut sim, &acked).map_err(|e| {
+        verify(sim, &acked).map_err(|e| {
             format!("acked-implies-durable violated after round {round} under seed {seed:#x}: {e}")
         })?;
     }
@@ -487,8 +512,9 @@ mod tests {
 
     #[test]
     fn acked_implies_durable_wraps_a_drive_error() {
+        let mut sim = Sim::new(9);
         let err = acked_implies_durable(
-            9,
+            &mut sim,
             3,
             |_sim: &mut Sim| Err::<Vec<String>, String>("boom".to_string()),
             toy_verify,
@@ -500,7 +526,50 @@ mod tests {
 
     #[test]
     fn acked_implies_durable_passes_when_synced_before_ack() {
-        acked_implies_durable(0xACED, 5, toy_drive(true), toy_verify).unwrap();
+        let mut sim = Sim::new(0xACED);
+        acked_implies_durable(&mut sim, 5, toy_drive(true), toy_verify).unwrap();
+    }
+
+    /// The checker must restart the CALLER'S world, because that is the world
+    /// the harness reads coverage from — `run_universe` hands the workload a
+    /// `Sim` and reports that sim's keys. A checker that restarts a private
+    /// world of its own credits `restart` where nothing can see it, so a
+    /// workload writing `require: ["restart"]` over this checker gets a key
+    /// that cannot fire: green, permanently, for a reason no reader can find.
+    /// Exact count, not merely non-zero, so shortening the loop is also red.
+    #[test]
+    fn acked_implies_durable_credits_restart_on_the_callers_sim() {
+        use crate::FaultConfig;
+        let mut sim = Sim::with_faults(0x0BAD_C0DE, FaultConfig::none());
+        acked_implies_durable(&mut sim, 3, toy_drive(true), toy_verify).unwrap();
+        assert_eq!(
+            sim.coverage().get("restart").copied().unwrap_or(0),
+            3,
+            "one `restart` credit per round, on the sim the caller passed in"
+        );
+    }
+
+    /// And it must run under the caller's FAULT CONFIG. `Sim::new` is
+    /// `FaultConfig::default()`, which zeroes eleven axes the swarm sets —
+    /// `bit_flip`, `misdirected_write`, `dir_entry_loss`, `read_error`,
+    /// `conn_drop`, `net_spike`, `subscriber_stall` and the four `object_*` —
+    /// so a checker that built its own world would silently run a property
+    /// OUTSIDE the matrix its universe declared, while reading as though it
+    /// were inside it. Here `read_error: 1.0` must reach `toy_verify`'s read
+    /// and come back named: `len()` does not roll the axis, `read_at` does.
+    #[test]
+    fn acked_implies_durable_runs_under_the_callers_fault_config() {
+        use crate::FaultConfig;
+        let mut sim = Sim::with_faults(
+            0x0BAD_F00D,
+            FaultConfig {
+                read_error: 1.0,
+                ..FaultConfig::none()
+            },
+        );
+        let err = acked_implies_durable(&mut sim, 1, toy_drive(true), toy_verify).unwrap_err();
+        assert!(err.contains("injected read error"), "{err}");
+        assert!(err.contains("violated after round 1"), "{err}");
     }
 
     #[test]
@@ -512,7 +581,8 @@ mod tests {
         // disk::collapse/tear code and FaultConfig::default()'s crash rates.
         // Re-pin if either changes.
         let seed = 0x5eed_ca11;
-        let err = acked_implies_durable(seed, 5, toy_drive(false), toy_verify).unwrap_err();
+        let mut sim = Sim::new(seed);
+        let err = acked_implies_durable(&mut sim, 5, toy_drive(false), toy_verify).unwrap_err();
         assert!(
             err.starts_with("acked-implies-durable violated after round"),
             "{err}"
