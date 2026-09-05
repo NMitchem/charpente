@@ -350,11 +350,27 @@ fn recover_node(sim: &Sim, node: &mut Node) -> Result<(), String> {
     node.carried_seeds += node.repl.stats().seeds; // the retired Repl's seeds
     node.db = None; // release the old handles before power-cycling
     let mut last = String::new();
-    for _ in 0..RECOVER_ATTEMPTS {
-        node.host.restart();
+    for attempt in 0..RECOVER_ATTEMPTS {
+        // Power-cycle on the first attempt (the caller needs the net torn so the
+        // peer reaps the session and the listener frees) and only PERIODICALLY
+        // after that — not before every try. `settle_boot`'s doc comment
+        // (`realtime.rs:706-712`) measured this exact distinction on seed
+        // 0x536007ad99fd90bf at write_error 0.144: cycling before each try,
+        // 0 of 20_000 boots ever succeeded; retrying in place, the same universe
+        // came up after ~16 cycles. The mechanism is that `Store::apply` commits
+        // at `Durability::None`, so every `Sim::restart` vanishes the store's
+        // uncheckpointed state and forces the next open to rebuild from the WAL —
+        // more writes, at the same per-write failure odds, on every single try.
+        // Retrying in place is also the faithful model: the machine did not lose
+        // power, so the page cache is still there for the next open. The periodic
+        // cycle stays because a pending `crash_disk_after` can fire mid-open and a
+        // crashed sim disk answers everything with `crashed_error` until a restart.
+        if attempt.is_multiple_of(RECOVER_CYCLE_EVERY) {
+            node.host.restart();
+        }
         match reopen(sim, node) {
             Ok(()) => return Ok(()),
-            Err(e) if is_fault_fallout(&e) => last = e, // open faulted; restart and retry
+            Err(e) if is_fault_fallout(&e) => last = e, // open faulted; retry, cycling periodically
             // The designed unrestorable-locally hard error: a crash bricked the
             // store AND checkpoint GC already compacted the log past 0, so
             // rebuild-from-WAL is impossible and the named fix is "restore from
@@ -395,6 +411,11 @@ fn reopen(sim: &Sim, node: &mut Node) -> Result<(), String> {
 }
 
 const RECOVER_ATTEMPTS: u32 = 500;
+
+/// Power-cycle every Nth recovery attempt rather than every one — the value
+/// `settle_boot` already uses (`SETTLE_CYCLE_EVERY`, `realtime.rs:657`), kept
+/// the same so the two retry loops model a failed process start identically.
+const RECOVER_CYCLE_EVERY: u32 = 8;
 
 // --------------------------------------------------------- the scheduler
 
@@ -862,9 +883,35 @@ fn follower_converges_to_the_primary_fingerprint() {
             "repl:logical-converged",
             "repl:fingerprint-compared"
         ],
-        floor: [("repl:fingerprint-compared", FINGERPRINT_FLOOR)]
+        floor: [
+            ("repl:fingerprint-compared", FINGERPRINT_FLOOR),
+            ("repl:logical-converged", CONVERGED_FLOOR)
+        ]
     );
 }
+
+/// Universes that reached a verdict at all, MEASURED: 167 of 256 at base
+/// `0x2EB1_0001`, reproduced identically on two runs (2026-09-05) — the run is
+/// deterministic at a fixed base, so this number moves only when code does.
+///
+/// **Why this needs a floor and `require:` is not enough.** The other 89
+/// universes end in `finish_universe`'s `INCONCLUSIVE => sim.cover(…); Ok(())`
+/// arm: a covered skip, deliberately not a failure, because a disk too faulty to
+/// reopen is not a bug. But `repl:inconclusive` is required by nothing and
+/// floored by nothing, and the runner enforces no ceiling on it — so before this
+/// line existed, the give-up rate could climb from 35% to 90% and this property
+/// would stay green while testing almost nothing. That is exactly the failure
+/// `FINGERPRINT_FLOOR`'s comment describes one constant above, and the same
+/// remedy applies: pin the POSITIVE key, so silence has to survive a number.
+///
+/// **A drop below this is a finding, not a number to lower.** It means more
+/// universes are giving up before the oracle runs. Find out which of the five
+/// inconclusive producers grew — `spawn_node` exhaustion (line 241), a torn
+/// witness file (304), a torn role file (327), a store bricked below a compacted
+/// log (381), or `recover_node` exhaustion (394). Three of those are honestly
+/// unrecoverable states and two are budgets, and today they are indistinguishable
+/// because all five cover the same key; splitting them is the named next step.
+const CONVERGED_FLOOR: u64 = 167;
 
 /// Universes in which the byte-fingerprint oracle actually compared files,
 /// MEASURED: 17 over these 256 universes at base `0x2EB1_0001`, reproduced on

@@ -2864,3 +2864,64 @@ reads — a `require: ["restart"]` over that checker **cannot fire, ever**. And 
 outside the swarm matrix while reading as though it were inside it. Found because an outsider
 used the documented checker library the documented way. Not fixed here; it is charpente's bug,
 not the experiment's, and it wants its own change with its own failing seed.
+
+## 2026-09-05 — tenant scoping merges, and the convergence property stops giving up quietly
+
+**MERGED. `main` is `f05df9d`**, 45 commits, and **CI is green on its first exposure** — run
+33973240362, both jobs (`check`, `ts-client`). Until this push, not one commit of the
+tenant-scoping work had ever run on a runner. The merge needed a real `DECISIONS.md`
+resolution: both sides had added different content at the same two places, and order was
+load-bearing in both — §7's body says the call-site measure is "recorded at the end of this
+entry" and main's §10 addition says "this is the closing paragraph", so main's blocks precede
+the branch's. Both sides kept in full. `DESIGN.md` and `README.md` auto-merged with the
+branch's edits intact. The `ts-client` job was known-safe in advance rather than hoped-for:
+`git log main..tenant-scoping -- ts-fixture crates/ts-fixture-app` is EMPTY, so the job ran
+against content byte-identical to what was already green on a Linux runner — worth recording
+because `ci.yml:175-180` names case-sensitivity as the one hazard it cannot check locally, and
+the honest answer here was "the surface did not move", not "we re-audited and it looked fine".
+
+**THE CONVERGENCE PROPERTY GAVE UP ON 38% OF ITS UNIVERSES, SILENTLY.** Measured, not
+estimated: at base `0x2EB1_0001` over 256 universes, `repl:inconclusive` **97**,
+`repl:logical-converged` **159**. `finish_universe` (`replication.rs:252`) maps any
+`INCONCLUSIVE` error to `sim.cover("repl:inconclusive"); Ok(())` — a covered skip, correct in
+principle, since a disk too faulty to reopen is not a bug. The defect is that
+**`repl:inconclusive` was required by nothing, floored by nothing, and the runner enforces no
+ceiling**, so the give-up rate could climb to 90% with the suite green. It is the fifth
+instance of the shape Task 12 named three of, and the first that was already quantified in
+this ledger (41%/43%, 2026-07-25) without anyone reading the number as a defect.
+
+**Two changes, both measured.** (1) `recover_node` power-cycled the host before EVERY one of
+its 500 attempts. `settle_boot`'s doc comment (`realtime.rs:706-712`) had already measured
+that exact pattern next door — seed `0x536007ad99fd90bf` at `write_error` 0.144, **0 of 20,000
+boots** succeeded cycling before each try, versus success after ~16 cycles retrying in place,
+because `Store::apply` commits at `Durability::None` so every restart vanishes uncheckpointed
+state and forces another rebuild-from-WAL at the same per-write odds. `recover_node` never got
+that treatment; it now cycles on attempt 0 (the caller needs the net torn so the listener
+frees) and every 8th after, the same `SETTLE_CYCLE_EVERY` the sibling uses. **Result: 97 -> 89
+inconclusive, 159 -> 167 converged, `restart` 4584 -> 4120, runtime 221s -> 193s.** Provably
+not inert (the restart count moved by 464), reproduced identically on a second run, and the
+full 59-test replication suite stays green.
+
+**The honest part: that is a 3.1-point improvement, not the sharp drop the hypothesis
+predicted.** The power-cycle pattern is a real contributor and NOT the main driver; 89
+universes still give up and the cause of most of them is unestablished. (2) So the fix that
+matters is the floor: `repl:logical-converged` is now pinned at `CONVERGED_FLOOR = 167`, the
+`FINGERPRINT_FLOOR` move applied to the key one line over — pin the POSITIVE outcome, so
+silence has to survive a number. Proven fireable rather than assumed: at 168 the property goes
+RED naming `"repl:logical-converged: 167 of 168 required"`, at 167 it is green, both at 193s.
+
+**Named next step, with the evidence for why.** The 89 is a MIXTURE and nothing distinguishes
+its parts: five sites in `convergence_universe`'s reach produce `INCONCLUSIVE` — `spawn_node`
+exhaustion (`replication.rs:241`), a torn witness file (`:304`), a torn role file (`:327`), a
+store bricked below a compacted log (`:381`), and `recover_node` exhaustion (`:394`) — and
+THREE of those are honestly unrecoverable states while two are budgets. All five cover the
+same key, which is why "is 38% bad?" was unanswerable and why H2 had to be tested by
+experiment instead of read off a report. Split the key by reason. Also unfixed and now
+counted: the same run shows **five** properties in `replication.rs` skipping universes
+(inconclusive counts 90, 39, 45, 109, 89 over their own universe sets) — only the 89 is
+attributed with confidence, because `--nocapture` interleaves output and only that one was
+re-run in isolation. Four `INCONCLUSIVE -> Ok(())` wrappers exist across `replication.rs`,
+`realtime.rs`, `auth.rs` and `charpente-core/tests/migrations.rs`; none of their keys is
+required or floored. The realtime settle budget (`SETTLE_ATTEMPTS`/`SETTLE_BOOT_TRIES`) is
+untouched here and still fails loudly at 2 of 3 fresh bases — a false RED, not a false green,
+and a different fix (denominate the budget in no-progress, not in reconnections).
