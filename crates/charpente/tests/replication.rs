@@ -237,6 +237,7 @@ fn spawn_node_with_schema(
             Err(e) => return Err(format!("{host}: {e}")),
         }
     }
+    sim.cover("repl:inconclusive:spawn-exhausted");
     Err(format!(
         "{INCONCLUSIVE}: {host} spawn exhausted {RECOVER_ATTEMPTS} attempts under faults"
     ))
@@ -323,6 +324,7 @@ fn open_node(
                 .contains("role file failed its integrity check") =>
         {
             if flipped {
+                sim.cover("repl:inconclusive:role-file-torn");
                 return Err(format!(
                     "{INCONCLUSIVE}: {} torn role file after a role flip — the operator \
                      restore path (not config re-init) is the fix: {e}",
@@ -377,6 +379,7 @@ fn recover_node(sim: &Sim, node: &mut Node) -> Result<(), String> {
             // a replica or backup" — the path T7's promote/backup provides.
             // Until then this node is honestly dead: inconclusive, not a bug.
             Err(e) if e.contains("cannot be rebuilt from the log alone") => {
+                sim.cover("repl:inconclusive:store-bricked");
                 return Err(format!(
                     "{INCONCLUSIVE}: {} store bricked below a compacted log — the restore \
                      path (T7) is the fix: {e}",
@@ -390,6 +393,13 @@ fn recover_node(sim: &Sim, node: &mut Node) -> Result<(), String> {
     // long fault-free streak of writes; under a persistently faulty disk it may
     // legitimately never succeed (the single-node suite skips such universes
     // too). Mark the universe inconclusive rather than failing it.
+    //
+    // This is the one inconclusive reason that is a BUDGET rather than a state:
+    // the others name a disk that cannot be recovered from at all, while this one
+    // says only that 500 attempts were not enough. If its share of
+    // `repl:inconclusive` grows, the budget or the retry shape is the suspect —
+    // which is the distinction the split keys exist to make visible.
+    sim.cover("repl:inconclusive:recover-exhausted");
     Err(format!(
         "{INCONCLUSIVE}: recover {} exhausted {RECOVER_ATTEMPTS} attempts (last: {last})",
         node.name

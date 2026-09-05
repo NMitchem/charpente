@@ -2944,3 +2944,37 @@ Worth noting how it surfaced: the runner printed per-binary counts, they summed 
 an expected 15, and the gap was chased rather than waved through — a green run whose test
 count nobody checks is the same defect as an unfloored coverage key, which is the subject of
 this very entry.
+
+## 2026-09-05 — the 89 are not a mixture: every one is the budget case
+
+**CORRECTION to the entry above.** It said the 89 inconclusive universes were a MIXTURE —
+"three of those are honestly unrecoverable states and two are budgets" — and used that to
+argue the split would apportion blame. Splitting the key took one run to prove that wrong:
+
+```
+repl:inconclusive:                   89
+repl:inconclusive:recover-exhausted: 89
+```
+
+**All 89 are `recover_node` exhausting its 500 attempts.** Zero `spawn-exhausted`, zero
+`role-file-torn`, zero `store-bricked`, zero torn-witness. The honestly-unrecoverable reasons
+— the ones that would have made a high inconclusive rate defensible — **never fire in this
+property at all.** So the give-up rate is 100% budget-or-liveness, and the reading that made
+35% look acceptable was wrong. Recorded as its own entry rather than by editing the one above:
+the claim was made, it was wrong, and both belong in the record.
+
+This is also the case for splitting keys generally. The previous entry proposed the split as
+future work and reached its (wrong) mixture claim by reasoning about which producers *exist*.
+The split answered it mechanically in a single run, which is the difference between an
+inventory and a guess — the same argument DECISIONS §11 makes for `describe`.
+
+**What it opens.** 89 universes in which 500 recovery attempts all fail — now WITH periodic
+rather than per-attempt power-cycling — is not obviously a budget. The next question is
+whether `RECOVER_ATTEMPTS` is simply too small or whether those universes are in a state no
+number of attempts escapes, and the decisive experiment is cheap: raise the constant by 10x
+and see whether the 89 moves at all. If it does not, the budget is innocent and the retry path
+has a liveness bug. **Not run here** — it is a measurement, not a fix, and it wants its own
+change. Four sites now carry reason keys (`replication.rs:241`, `:381`, `:394`, and the role
+arm at `:327`); the pre-existing torn-witness arm keeps its own older key name
+(`repl:witness-file-inconclusive`) because that arm is deliberately byte-identical across four
+copies in three files and renaming it is a separate edit.
