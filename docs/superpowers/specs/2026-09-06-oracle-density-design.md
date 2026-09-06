@@ -287,7 +287,8 @@ noted at those sites.
 The ledger's 2026-09-05 question — whether `RECOVER_ATTEMPTS` is too small or masks a
 liveness bug — was tested by raising it 500 → 5000 (temporary local edits, reverted) on all
 four floored properties, and by gating the per-attempt power-cycle in two helpers still on
-the shape Task 1 removed elsewhere.
+the shape Task 1 removed elsewhere — one of which was then deliberately reverted, for reasons
+recorded below.
 
 **What a 10× budget bought: nothing, four times over.** Give-ups moved *between* channels and
 the verdict counts did not follow — `repl:logical-converged` 145 → 149 and 72 → 73,
@@ -297,6 +298,29 @@ inside one SE. On `switchover…` the give-up channel did collapse (`:recover-ex
 `repl:switchover-inconclusive` path (131 → 158) rather than in a verdict. Runtime cost:
 5.1× to 9.1×. **Raising the budget is not the fix, and the floors are set against the current
 one.**
+
+**The gated power-cycle is a RECOVERY fix and does not generalize to a spawn — measured, and
+one port was reverted because of it.** `reopen_p_frames` was still restarting the host before
+every one of its 500 attempts; gating it changed nothing measurable
+(`failover_preserves_everything_the_follower_acked`, 128 universes: every coverage count
+byte-identical, and the new `repl:inconclusive:reopen-p-exhausted` key reads 0 — the loop had
+never taken a second attempt in those universes), so the fix stands as a latent-hazard
+removal. Porting the same gate to `spawn_kernel_node_with_schema` made things **worse**:
+`repl:inconclusive:spawn-exhausted` moved 5 → 19 (≈4 SE at n=128) while the property's give-up
+total stayed at exactly 90 and its floored key at exactly 32 — the same universes dying
+earlier, having exercised less. That port was reverted, the ungated state reproduces the
+baseline exactly (A/B/A), and the reason is now in the loop's own comment: **both halves of
+the trade invert for a spawn.** The gate's payoff is preserving a recovering node's
+accumulated WAL-replay progress, and a fresh create has none; its cost is that a sim disk
+whose `crash_disk_after` has fired answers every operation with `crashed_error` — whose text
+contains "simulated", which `checks::classify` reads as injected fallout — so the retry loop
+spins against a latched-dead disk until a restart clears `disk.crashed`, and under the gate 7
+of every 8 attempts are spent that way. Task 1's `settle_boot` measurement (0 successes in
+20 000 boots) is about recovery boots and does not transfer to a spawn loop. **Anyone
+"fixing" that site to match its siblings should re-run that A/B first.** The remaining
+every-attempt site, `recover_kernel_node`, is a genuine recovery loop where the measurement
+does transfer; it is carried as an explicit follow-up and threatens no floor here (5 of 90
+give-ups, and every floor is on a verdict key a fix could only raise).
 
 **What the dominant give-up causes are.** For two properties they are rules written down in
 the harness and checkable by reading it: the designated survivor is spawned

@@ -921,6 +921,28 @@ fn follower_converges_to_the_primary_fingerprint() {
 /// log (381), or `recover_node` exhaustion (394). Three of those are honestly
 /// unrecoverable states and two are budgets, and today they are indistinguishable
 /// because all five cover the same key; splitting them is the named next step.
+/// (That step has since landed — every one of those five now covers its own
+/// `repl:inconclusive:*` cause key, and all 89 of this property's give-ups are
+/// `:recover-exhausted`.)
+///
+/// **Why this floor sits ON its measurement while the four added in
+/// oracle-density task 3 sit 2 SEs below theirs.** The two conventions answer
+/// different questions and both are defensible. This one pins an exact-replay
+/// number: at a fixed base seed the run is deterministic, so 167 moves only when
+/// code moves, and a floor here goes red on *any* drift — maximum detection
+/// power, and a false red on any change that merely re-rolls the fault stream.
+/// `SEEDED_CONVERGED_FLOOR`, `SWITCHOVER_CONVERGED_FLOOR`, `FAILOVER_PREFIX_FLOOR`
+/// and `SURVIVOR_PROMISE_FLOOR` sit at measured − 2·sqrt(n·p·(1−p)) instead, so
+/// they survive a re-rolled stream (≈97.7% of the time) at the price of
+/// tolerating an 11-31% relative fall in reach before firing. Neither is the
+/// "right" convention in general: this one is sharper, those are quieter.
+///
+/// **This value is deliberately NOT being loosened to match them.** A floor is
+/// lowered only with a reason, and "it might flap" is a reason to find out why it
+/// moved, not to move it. The decision point is the first stream-shifting change
+/// that actually makes it flap — at which point the choice is between
+/// re-measuring it here and giving it the same 2-SE headroom, with the new
+/// number in hand rather than in advance.
 const CONVERGED_FLOOR: u64 = 167;
 
 /// Universes in which the byte-fingerprint oracle actually compared files,
@@ -1180,15 +1202,10 @@ fn late_follower_seeds_below_the_gcd_base_and_converges() {
 /// in reach** (145 → 129) before it fires, and every 2-SE floor in this file
 /// trades exactly that detection power for that false-red rate.
 ///
-/// **On the two conventions now in this file.** `CONVERGED_FLOOR` (167, exactly
-/// its measurement) and the four floors added in task 3 (2 SE below) answer
-/// different questions: the first pins an exact-replay number and goes red on
-/// any drift at all, the second survives a re-rolled fault stream. Neither is
-/// wrong, and `CONVERGED_FLOOR` is deliberately NOT being loosened here — a
-/// floor is only lowered with a reason, and "so it flaps less" is a reason to
-/// find out why it moved. The moment a stream-shifting change makes it flap, the
-/// choice is between re-measuring it and giving it the same headroom; that is
-/// the decision to make then, with the new number in hand.
+/// **On the two floor conventions now in this file** — this one and
+/// `CONVERGED_FLOOR`'s zero-headroom pin — the reconciliation is written out at
+/// `CONVERGED_FLOOR` itself, since that is the constant a reader arrives at
+/// wondering why it differs.
 ///
 /// **A drop below this is a finding, not a number to lower** — the same rule
 /// `CONVERGED_FLOOR` carries: it means more universes are giving up before the
@@ -4732,18 +4749,30 @@ fn spawn_kernel_node_with_schema(
             Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
             // Power-cycle on EVERY attempt here, deliberately — the opposite of
             // `recover_node`/`reopen_p_frames`'s gated shape, and MEASURED
-            // rather than assumed (oracle-density task 3, fix round 1). The
-            // gated shape exists to preserve a RECOVERING node's accumulated
-            // WAL-replay progress across retries; a spawn has no accumulated
-            // progress to preserve — it is a fresh create — and a failed create
-            // leaves partial state the next attempt trips over, which only a
-            // restart clears. Porting the gate here (128 universes, base
-            // 0x2EB1_000E) moved `repl:inconclusive:spawn-exhausted` 5 → 19,
-            // roughly 4 SE, while leaving the property's give-up total at
-            // exactly 90 and its floored verdict key at exactly 32: the same
-            // universes die, just earlier and having exercised less. Task 1's
-            // `settle_boot` measurement (0 successes in 20_000 boots) is about
-            // recovery boots and does not transfer to this loop.
+            // rather than assumed (oracle-density task 3, fix round 1).
+            //
+            // Both halves of the trade run the other way for a spawn. The
+            // gate's PAYOFF is preserving a recovering node's accumulated
+            // WAL-replay progress across retries, and a fresh create has none to
+            // preserve. Its COST is that a sim disk which has crashed
+            // (`crash_disk_after` fired) answers every operation with
+            // `crashed_error` — "simulated crash: the disk is gone until
+            // Sim::restart()" — and `classify` reads "simulated" as injected
+            // fallout, so this arm retries a latched-dead disk forever; only
+            // `SimHost::restart` clears `disk.crashed`. Under the gate 7 of
+            // every 8 attempts are spent against that latch. (What a restart
+            // clears, precisely: the crashed latch and the pending crash
+            // countdown, plus every unsynced write, collapsed per the crash
+            // axes. Synced bytes survive it — a restart is not a wipe.)
+            //
+            // Porting the gate here (128 universes, base 0x2EB1_000E) moved
+            // `repl:inconclusive:spawn-exhausted` 5 → 19, roughly 4 SE, while
+            // leaving the property's give-up total at exactly 90 and its floored
+            // verdict key at exactly 32: the same universes die, just earlier
+            // and having exercised less. Task 1's `settle_boot` measurement
+            // (0 successes in 20_000 boots) is about recovery boots and does not
+            // transfer to this loop. Do not "fix" this site to match its
+            // siblings without re-running that A/B.
             Err(e) if is_fault_fallout(&e) => {
                 h.restart();
                 continue;
