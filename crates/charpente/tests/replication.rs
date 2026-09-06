@@ -1159,6 +1159,11 @@ fn late_follower_seeds_below_the_gcd_base_and_converges() {
 /// tenant` measured identically at 145 and is `require:`d above). The other 111
 /// are 109 `repl:inconclusive` plus 2 `repl:seed-base-zero` — 145 + 109 + 2 =
 /// 256 exactly, so this key is the whole of what "reached a verdict" means here.
+/// `repl:seed-base-zero` is a third skip channel and is floored by nothing on
+/// purpose: it fires when faults left the primary too small to move its log base
+/// past 0, so the below-base seed path this property exists to test cannot
+/// happen. At 2 of 256 it is negligible; if it grew it would drain THIS key,
+/// which is the floor that would notice.
 ///
 /// **Headroom: 2 binomial SEs below the measurement, unlike `CONVERGED_FLOOR`.**
 /// That constant sits exactly ON its measured 167 and justifies it with "the run
@@ -1171,10 +1176,30 @@ fn late_follower_seeds_below_the_gcd_base_and_converges() {
 /// that altered nothing real. 145 − 2·7.9 = 129.1 → 129: a re-roll of the same
 /// distribution clears it with ~97.7% probability, while a genuine collapse of
 /// the give-up rate (the 42.6% measured here climbing past ~50%) still fails.
+/// **State the other side too**: this floor tolerates an **11.0% relative fall
+/// in reach** (145 → 129) before it fires, and every 2-SE floor in this file
+/// trades exactly that detection power for that false-red rate.
+///
+/// **On the two conventions now in this file.** `CONVERGED_FLOOR` (167, exactly
+/// its measurement) and the four floors added in task 3 (2 SE below) answer
+/// different questions: the first pins an exact-replay number and goes red on
+/// any drift at all, the second survives a re-rolled fault stream. Neither is
+/// wrong, and `CONVERGED_FLOOR` is deliberately NOT being loosened here — a
+/// floor is only lowered with a reason, and "so it flaps less" is a reason to
+/// find out why it moved. The moment a stream-shifting change makes it flap, the
+/// choice is between re-measuring it and giving it the same headroom; that is
+/// the decision to make then, with the new number in hand.
 ///
 /// **A drop below this is a finding, not a number to lower** — the same rule
 /// `CONVERGED_FLOOR` carries: it means more universes are giving up before the
 /// oracle runs, and which give-up cause grew is the question to answer first.
+///
+/// **The one open question behind this number** (task-3-report.md §10): its 109
+/// give-ups are all `recover_node` exhaustion, and a 10× retry budget rescued
+/// only 4 of them, which is consistent BOTH with disks the fault injector holds
+/// unrecoverable and with a fault-triggered wedge the retry cannot clear. The
+/// evidence gathered so far does not separate those, and this floor does not
+/// depend on which it is: the count it pins moved 145 → 149 under that same 10×.
 const SEEDED_CONVERGED_FLOOR: u64 = 129;
 
 fn seeding_universe(sim: &mut Sim) -> Result<(), String> {
@@ -3754,7 +3779,18 @@ fn switchover_mid_write_load_loses_nothing_and_serves_reads_throughout() {
 ///
 /// **Headroom: 2 binomial SEs below the measurement**, for the reason
 /// `SEEDED_CONVERGED_FLOOR` states in full. At p = 72/256 = 0.281, one SE on the
-/// count is sqrt(256 · 0.281 · 0.719) = 7.2, so 72 − 2·7.2 = 57.6 → 57.
+/// count is sqrt(256 · 0.281 · 0.719) = 7.2, so 72 − 2·7.2 = 57.6 → 57. What
+/// that does NOT catch: this floor tolerates a **20.8% relative fall in reach**
+/// (72 → 57) before it fires.
+///
+/// **This property is where a raised retry budget did the most and mattered the
+/// least.** At `RECOVER_ATTEMPTS` 5000, `repl:inconclusive` fell 45 → 17
+/// (`:recover-exhausted` 43 → 15, 65% of them rescued) — and the rescued
+/// universes landed in `repl:switchover-inconclusive` (131 → 158), the
+/// reduced-oracle path, moving this key by 1: 72 → 73. Worth knowing beside
+/// `SEEDED_CONVERGED_FLOOR`, where the SAME helper's exhaustions barely
+/// responded to the same 10× (109 → 105) — so whatever holds those universes is
+/// not a wedge in `recover_node` common to both.
 ///
 /// **A drop below this is a finding, not a number to lower.** The likeliest
 /// cause is the reduced-oracle path growing: more universes reaching
@@ -4049,18 +4085,15 @@ fn failover_preserves_everything_the_follower_acked() {
 /// `repl:failover-prefix-empty` measured 0: every universe that reached the
 /// oracle had something to compare.
 ///
-/// **This number is budget-invariant, measured, not assumed.** Re-running this
-/// property with `RECOVER_ATTEMPTS` at 5000 instead of 500 (oracle-density task
-/// 3, Step 0) moved `repl:inconclusive` 39 → 19 and
-/// `repl:failover-inconclusive` 43 → 63 — the rescued universes recovered `f`
-/// and were then rejected by the staging gate's own `f.recoveries > 0` — and
-/// left this key at exactly 46. A 10× retry budget costs 6.7× the runtime and
-/// buys zero additional verdicts here, which is why the floor is set against the
-/// current budget rather than a raised one.
+/// This count did not move under either intervention tried on it: a 10× retry
+/// budget, and gating `reopen_p_frames`'s power-cycle. Both moved the give-up
+/// causes around and left this key at exactly 46 (task-3-report.md §1, §10).
 ///
 /// **Headroom: 2 binomial SEs below the measurement**, for the reason
 /// `SEEDED_CONVERGED_FLOOR` states in full. At p = 46/128 = 0.359, one SE on the
-/// count is sqrt(128 · 0.359 · 0.641) = 5.4, so 46 − 2·5.4 = 35.1 → 35.
+/// count is sqrt(128 · 0.359 · 0.641) = 5.4, so 46 − 2·5.4 = 35.1 → 35. What
+/// that does NOT catch: this floor tolerates a **23.9% relative fall in reach**
+/// (46 → 35) before it fires.
 ///
 /// **A drop below this is a finding, not a number to lower.** The staging gate
 /// (`p` still a live primary, `f` never recovered, `f` holding a position) is
@@ -4130,7 +4163,7 @@ fn failover_universe(sim: &mut Sim) -> Result<(), String> {
                 .map_err(|e| e.to_string())
         })?
     };
-    let p_frames = reopen_p_frames(&mut p, &cfg)?;
+    let p_frames = reopen_p_frames(sim, &mut p, &cfg)?;
     let mut compared = 0u32;
     for (seq, bytes) in &f_frames {
         if *seq > f_last {
@@ -4155,6 +4188,16 @@ fn failover_universe(sim: &mut Sim) -> Result<(), String> {
     // runs the loop zero times and returns Ok having compared nothing — green
     // by vacuity, indistinguishable in the coverage from a real prefix check.
     // The two outcomes are keyed apart so the floor below can pin the real one.
+    //
+    // `> 0` is a shallow bar on purpose, and the depth behind it is MEASURED
+    // rather than hoped for: over these 128 universes the 46 that compare split
+    // 44 at ≥16 frames, 1 at 5-15, 1 at 2-4 and **0 at exactly one frame**
+    // (fix round 1, temporary bucket keys, reverted). So no universe currently
+    // passes on a single-frame comparison, and raising the bar to a round number
+    // would move the floor's measured value while catching nothing that exists.
+    // If `repl:failover-prefix-empty` (0 today) or a shallow tail ever grows,
+    // the bar is the thing to revisit — that is what keying the empty case
+    // separately is for.
     if compared > 0 {
         sim.cover("repl:failover-prefix-compared");
     } else {
@@ -4165,9 +4208,23 @@ fn failover_universe(sim: &mut Sim) -> Result<(), String> {
 
 /// Reopen p's crashed disk and read its full durable log — the prefix oracle's
 /// reference. Retried under open-time faults; inconclusive if it can't recover.
-fn reopen_p_frames(node: &mut Node, cfg: &DbConfig) -> Result<Vec<(u64, Vec<u8>)>, String> {
-    for _ in 0..RECOVER_ATTEMPTS {
-        node.host.restart();
+///
+/// The power-cycle is GATED (`RECOVER_CYCLE_EVERY`), not per-attempt: this
+/// helper was the fourth site still on the shape Task 1 removed from
+/// `recover_auth_node`/`recover_rt_node`, which `settle_boot` measured at 0
+/// successes in 20_000 boots — `Store::apply` commits at `Durability::None`, so
+/// a restart before every try discards the uncheckpointed store and forces a
+/// full WAL rebuild at the same per-write failure odds, forever. Attempt 0 still
+/// cycles, which is what a crashed sim disk needs to answer anything at all.
+fn reopen_p_frames(
+    sim: &Sim,
+    node: &mut Node,
+    cfg: &DbConfig,
+) -> Result<Vec<(u64, Vec<u8>)>, String> {
+    for attempt in 0..RECOVER_ATTEMPTS {
+        if attempt.is_multiple_of(RECOVER_CYCLE_EVERY) {
+            node.host.restart();
+        }
         match Db::open(Box::new(node.host.disk()), cfg.clone(), make_schema()) {
             Ok(db) => match db.read_log(db.log_base(), usize::MAX) {
                 Ok(frames) => return Ok(frames),
@@ -4178,6 +4235,7 @@ fn reopen_p_frames(node: &mut Node, cfg: &DbConfig) -> Result<Vec<(u64, Vec<u8>)
             Err(e) => return Err(format!("reopen p: {e}")),
         }
     }
+    sim.cover("repl:inconclusive:reopen-p-exhausted");
     Err(format!(
         "{INCONCLUSIVE}: reopening p exhausted {RECOVER_ATTEMPTS} attempts"
     ))
@@ -4672,6 +4730,20 @@ fn spawn_kernel_node_with_schema(
                 });
             }
             Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
+            // Power-cycle on EVERY attempt here, deliberately — the opposite of
+            // `recover_node`/`reopen_p_frames`'s gated shape, and MEASURED
+            // rather than assumed (oracle-density task 3, fix round 1). The
+            // gated shape exists to preserve a RECOVERING node's accumulated
+            // WAL-replay progress across retries; a spawn has no accumulated
+            // progress to preserve — it is a fresh create — and a failed create
+            // leaves partial state the next attempt trips over, which only a
+            // restart clears. Porting the gate here (128 universes, base
+            // 0x2EB1_000E) moved `repl:inconclusive:spawn-exhausted` 5 → 19,
+            // roughly 4 SE, while leaving the property's give-up total at
+            // exactly 90 and its floored verdict key at exactly 32: the same
+            // universes die, just earlier and having exercised less. Task 1's
+            // `settle_boot` measurement (0 successes in 20_000 boots) is about
+            // recovery boots and does not transfer to this loop.
             Err(e) if is_fault_fallout(&e) => {
                 h.restart();
                 continue;
@@ -5338,18 +5410,27 @@ fn wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower()
 /// contradiction). 87% of the give-ups are the DESIGNATED SURVIVOR faulting: `f`
 /// is spawned `recoverable: false` on purpose, because the single-follower
 /// promise needs one undamaged copy, so a fault on it ends the universe by
-/// construction. That is a workload-model constraint, not a budget and not a
-/// stall.
+/// construction — a workload-model rule written down in this file, not a budget.
 ///
-/// **Measured, not argued:** re-running at `RECOVER_ATTEMPTS` 5000 instead of
-/// 500 (task 3, Step 0) left `repl:inconclusive` at exactly 90 and this key at
-/// exactly 32; the budget causes went to zero (`:spawn-exhausted` 5 → 0,
-/// `:recover-exhausted` 5 → 0) and `:survivor-faulted` absorbed all ten
-/// (78 → 88). A 10× budget buys nothing here.
+/// **Two interventions, neither of which moved this count.** At
+/// `RECOVER_ATTEMPTS` 5000 instead of 500, `repl:inconclusive` stayed at exactly
+/// 90 and this key at exactly 32 (`:spawn-exhausted` 5 → 0, `:recover-exhausted`
+/// 5 → 0, `:survivor-faulted` 78 → 88 — the ten moved, none were rescued).
+/// Gating `spawn_kernel_node_with_schema`'s power-cycle: 90 and 32 again
+/// (`:spawn-exhausted` 5 → 19 the other way, see that loop's comment). What that
+/// does and does not license is set out in task-3-report.md §10 — it is evidence
+/// this number is robust to the retry shape, NOT proof that every give-up here
+/// is honest.
 ///
 /// **Headroom: 2 binomial SEs below the measurement**, for the reason
 /// `SEEDED_CONVERGED_FLOOR` states in full. At p = 32/128 = 0.25, one SE on the
-/// count is sqrt(128 · 0.25 · 0.75) = 4.9, so 32 − 2·4.9 = 22.2 → 22.
+/// count is sqrt(128 · 0.25 · 0.75) = 4.9, so 32 − 2·4.9 = 22.2 → 22. What that
+/// does NOT catch: this floor tolerates a **31.3% relative fall in reach**
+/// (32 → 22) before it fires — the loosest of the four, because 32 of 128 is the
+/// smallest verdict count and binomial noise is proportionally largest there.
+/// The 6 universes that finish with an EMPTY promise set are deliberately
+/// outside it: they pass `assert_survivor_holds` vacuously, and if that 6 grew
+/// while the 32 shrank this floor is what would notice.
 ///
 /// **A drop below this is a finding, not a number to lower.** With
 /// `:survivor-faulted` at 87% of the give-ups, the thing to check first is

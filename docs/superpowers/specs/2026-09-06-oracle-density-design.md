@@ -241,3 +241,77 @@ Runtimes (table order): 195.09s, 167.29s, 102.93s, 67.65s, 42.29s — all five w
 600s per-invocation ceiling; none deferred, no universe count reduced. Full detail, per-site
 guard text, and the additional switchover keys are in
 `.superpowers/sdd/2026-09-06-oracle-density/task-2-report.md`.
+
+## Floors, and the budget question, measured (2026-09-06)
+
+Task 3 gave each of the five properties a floor on a key its own oracle can reach. A floor is
+`require:`'s at-least-once generalized to an at-least-N *measured* rate, and it goes on a
+**verdict** key — one that means "this universe reached a real conclusion" — never on a
+give-up key, whose growth is the thing being guarded against.
+
+| property | universes | verdict key | measured | floor | tolerated fall in reach |
+|---|---:|---|---:|---:|---:|
+| `follower_converges_to_the_primary_fingerprint` | 256 | `repl:logical-converged` (+ `repl:fingerprint-compared`) | 167 (17) | 167 (17) | 0% |
+| `late_follower_seeds_below_the_gcd_base_and_converges` | 256 | `repl:logical-converged` | 145 | 129 | 11.0% |
+| `switchover_mid_write_load_loses_nothing_and_serves_reads_throughout` | 256 | `repl:logical-converged` | 72 | 57 | 20.8% |
+| `failover_preserves_everything_the_follower_acked` | 128 | `repl:failover-prefix-compared` | 46 | 35 | 23.9% |
+| `wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower` | 128 | `repl:promised-nonempty` | 32 | 22 | 31.3% |
+
+The four new floors carry **2 binomial SEs** of headroom below the measurement (SE_count =
+sqrt(n·p·(1−p)): 7.9, 7.2, 5.4, 4.9). `CONVERGED_FLOOR`'s existing zero-headroom convention
+answers a different question — "did anything drift in an exact replay" — and is deliberately
+left alone; the new ones must also survive a *re-rolled* fault stream, since any change that
+shifts fault draws makes the count a fresh binomial draw. The right-hand column is the price:
+a 2-SE floor tolerates that much relative decay in the oracle's reach before firing, and the
+tolerance is loosest where the verdict count is smallest. Every floor was mutation-proved
+(raised one above its measurement → RED naming the key → restored → GREEN).
+
+Two of the five could not reach `repl:logical-converged` at all, so flooring that key there
+would have been an assertion that can never fire — the defect this sub-project exists to
+remove. `failover_preserves_everything_the_follower_acked` had **no `require:` at all** and no
+verdict key: its prefix loop can run zero times and return `Ok` having compared nothing. It
+now keys the real and vacuous outcomes apart (`repl:failover-prefix-compared` 46,
+`repl:failover-prefix-empty` 0).
+
+**The kernel-level helper family is now instrumented.** The gap Task 2 named —
+`open_kernel`/`spawn_kernel_node_with_schema`/`recover_kernel_node` and the control-conn and
+restore helpers never marking a cause key — is closed, so the `wal_corruption…` property's 90
+give-ups are attributed for the first time: 78 `:survivor-faulted`, 5 `:recover-exhausted`,
+5 `:spawn-exhausted`, 3 `:restore-reopen`, 1 `:request-no-response`. Cause sums equal the
+aggregate for the `Db`-level family; where a caller catches an inconclusive and continues
+(the kernel promise scan, the switchover control conn) they are an upper bound, which is
+noted at those sites.
+
+### The budget question: narrowed, not answered
+
+The ledger's 2026-09-05 question — whether `RECOVER_ATTEMPTS` is too small or masks a
+liveness bug — was tested by raising it 500 → 5000 (temporary local edits, reverted) on all
+four floored properties, and by gating the per-attempt power-cycle in two helpers still on
+the shape Task 1 removed elsewhere.
+
+**What a 10× budget bought: nothing, four times over.** Give-ups moved *between* channels and
+the verdict counts did not follow — `repl:logical-converged` 145 → 149 and 72 → 73,
+`repl:failover-prefix-compared` 46 → 46, `repl:promised-nonempty` 32 → 32, each move well
+inside one SE. On `switchover…` the give-up channel did collapse (`:recover-exhausted`
+43 → 15) and the rescued universes landed in the *reduced-oracle*
+`repl:switchover-inconclusive` path (131 → 158) rather than in a verdict. Runtime cost:
+5.1× to 9.1×. **Raising the budget is not the fix, and the floors are set against the current
+one.**
+
+**What the dominant give-up causes are.** For two properties they are rules written down in
+the harness and checkable by reading it: the designated survivor is spawned
+`recoverable: false` because the single-follower promise needs one undamaged copy (78 of 90
+give-ups), and the failover staging gate rejects a subject that already needed a recovery
+before the deliberate crash (41 of that channel's 43).
+
+**What is still open.** `late_follower_seeds…`'s 109 give-ups are all `recover_node`
+exhaustion and a 10× budget rescued only 4 of them. That is equally consistent with disks the
+fault injector holds unrecoverable and with a fault-triggered wedge the retry cannot clear;
+the evidence gathered does not separate them, and an earlier draft of this section's claim
+that it did was retracted (task-3-report.md §10.1). One data point bears on it without
+settling it: the same helper under `switchover…`'s workload *does* largely clear with a
+bigger budget (65% of its exhaustions rescued), so any wedge would have to be specific to the
+seeding property's configuration or fault draws, not a universal property of that loop.
+Naming this as open is the point — the floors pin verdict counts that did not move under any
+intervention tried, so they do not depend on the answer, and if a wedge is later found and
+fixed the floors go up.
