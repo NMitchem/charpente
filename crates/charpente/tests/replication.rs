@@ -4193,10 +4193,15 @@ fn failover_universe(sim: &mut Sim) -> Result<(), String> {
         .and_then(|mut cli| drive_ctrl(sim, &mut [&mut f], &mut cli, CONVERGE_BUDGET))
     {
         Ok(m) => m,
-        // MEASURED (oracle-density task 2): 2/43 give-up universes. `e` is
-        // already `INCONCLUSIVE`-marked and covered at its origin site, so
-        // this arm adds only the promote-specific key and must not re-prefix
-        // the marker.
+        // MEASURED (oracle-density task 2): 2/43 give-up universes — and both
+        // were `repl:inconclusive:ctrl-conn-lost`, with `:ctrl-quiescent` and
+        // `:ctrl-no-reply` at zero (task 4 fix round). The `-timeout` in this
+        // key's name is historical and NOT a diagnosis: the site admits every
+        // `INCONCLUSIVE` shape `CtrlConn::open`/`drive_ctrl` can return, of
+        // which a timeout is only one, and it is not the one observed here.
+        // `e` is already `INCONCLUSIVE`-marked and covered at its origin site,
+        // so this arm adds only the promote-specific key and must not
+        // re-prefix the marker.
         Err(e) if e.contains(INCONCLUSIVE) => {
             sim.cover("repl:failover-inconclusive");
             sim.cover("repl:inconclusive:failover-promote-timeout");

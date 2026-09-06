@@ -215,13 +215,24 @@ literal string, so a one-time, fully-reverted instrumentation pass (distinct sub
 site, re-run, then `git checkout --` restoring `replication.rs` to its committed content —
 verified clean by `git status`/`git diff --stat`) attributed them: site 1
 (`:4000-4003`, the pre-crash staging gate) fired **41/43 (95.3%)**, site 3 (`:4014-4023`, the
-promote round timing out) fired **2/43 (4.7%)**, sites 2 (`:4004-4007`) and 4
+promote round coming back inconclusive — characterised here as "timing out", which the fix
+round's `drive_ctrl` keys later disproved: both firings were `:ctrl-conn-lost`) fired
+**2/43 (4.7%)**, sites 2 (`:4004-4007`) and 4
 (`:4033-4036`) fired **0**. The instrumented re-run reproduced byte-identical
 fault/restart/`repl:inconclusive` counts to the uninstrumented run, confirming the sub-key
-edit changed no behavior. This property carries no `require:`/`floor:` at all, so none of
-these four sites (nor the property's one fireable `repl:inconclusive` cause,
-`:recover-exhausted`) are checked for ever firing — a regression silencing any of them would
-still read green.
+edit changed no behavior.
+
+**Superseded in part (tasks 3 and 4).** At survey time this property carried no
+`require:`/`floor:` at all, so nothing here was checked for ever firing. Task 3 gave it
+`require: ["restart", "crash:host", "repl:failover-prefix-compared"]` and
+`floor: [("repl:failover-prefix-compared", FAILOVER_PREFIX_FLOOR)]`, and task 4's mutation
+proofs fired that `require:` by name (`["crash:host", "repl:failover-prefix-compared"] never
+occurred over 128 universes`). **The distinction that survives is what that gate does and
+does not reach.** The `require:`/`floor:` are on the *verdict* key, so a regression that
+collapses this property's reach — whatever silences it — is caught. The four cause keys and
+`:recover-exhausted` are **still ungated**: a regression that silences one *individual* cause
+while the verdict key holds above its floor would still read green. Attribution here buys
+diagnosis, not detection, for the individual causes.
 
 **Also observed, out of this task's scope:** the switchover property carries two more
 give-up-shaped keys not among the four cause keys or the sixth wrapper —
