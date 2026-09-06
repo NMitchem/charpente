@@ -225,6 +225,36 @@ never fire, the exact defect this sub-project exists to remove.
   not chosen.**
 - Produces: properties that go red when their give-up rate regresses.
 
+- [ ] **Step 0 (added 2026-09-06 by controller ruling J): find out whether the give-ups are
+      a budget or a liveness bug, BEFORE setting any floor.**
+
+Task 2 measured give-up rates of 64.1% (P4, union of both channels) and 70.3% (P5), with
+P1/P2/P4 at 100% `:recover-exhausted`. A floor set on top of that pins the status quo — and
+if the status quo is a liveness bug rather than a budget that is too small, the floor
+enshrines the bug and makes it permanent. The ledger has carried this question open since
+2026-09-05 ("whether `RECOVER_ATTEMPTS` is too small or masks a liveness bug") with the
+experiment named and explicitly not run.
+
+Run it. Raise `RECOVER_ATTEMPTS` (`replication.rs:423`) from 500 to 5000 **as a temporary
+local edit, not a commit**, and re-run three properties: P2
+(`late_follower_seeds_below_the_gcd_base_and_converges`, 100% recover-exhausted), P4
+(`failover_preserves_everything_the_follower_acked`), and P5
+(`wal_corruption_on_the_primary_…`). Then revert the edit and verify the file's blob
+matches HEAD.
+
+Read the result as follows, and state which case you are in:
+- **Give-up rate collapses** → it is a budget. Report the new rate, and say what budget
+  would be needed for a given target verdict rate. Set floors against the CURRENT budget
+  (do not change it in this task — that is its own decision, with its own runtime cost),
+  and record the finding.
+- **Give-up rate barely moves** → it is not a budget. Something is failing to make progress
+  under fault, and that is a real liveness finding on a property that guards a shipped
+  guarantee. Say so plainly, set no floor on the affected property, and stop for a ruling.
+
+**Do not skip this step because the floors can be set without it.** They can. The point is
+that a floor whose number encodes an unexamined bug is the exact defect this sub-project
+exists to remove.
+
 - [ ] **Step 1: For each of P2–P5, identify the key its oracle actually reaches.**
 
 P1's floors are on `repl:fingerprint-compared` and `repl:logical-converged`. P4 and P5 use
