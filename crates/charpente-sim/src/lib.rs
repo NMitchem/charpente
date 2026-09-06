@@ -405,6 +405,11 @@ struct State {
     /// Sometimes-coverage: named-event counts across the universe (Antithesis
     /// "sometimes assertions", adapted) — see `Sim::cover`.
     coverage: BTreeMap<&'static str, u64>,
+    /// Set by `Sim::give_up`: this universe could not adjudicate its property.
+    /// It lives on the world, not in the workload's returned `Result`, because
+    /// the returned `Result` is exactly what a `finish_universe`-style wrapper
+    /// launders into `Ok(())` before the runner ever sees it.
+    gave_up: Option<String>,
     /// Per-host worlds, created lazily by `Sim::host`. NEW state: no existing
     /// single-node universe ever populates this map, so the frozen global
     /// world above is untouched by this task (the replay contract).
@@ -563,6 +568,7 @@ impl Sim {
                     disk: DiskWorld::default(),
                     net: NetWorld::default(),
                     coverage: BTreeMap::new(),
+                    gave_up: None,
                     hosts: BTreeMap::new(),
                 }),
             }),
@@ -590,9 +596,37 @@ impl Sim {
     }
 
     /// The event counts marked so far in this universe (`cover` plus the
-    /// sim-internal auto-coverage: `fault:*`, `crash:*`, `restart`).
+    /// sim-internal auto-coverage: `fault:*`, `crash:*`, `restart`,
+    /// `universe:gave-up`).
     pub fn coverage(&self) -> BTreeMap<&'static str, u64> {
         self.world.lock().coverage.clone()
+    }
+
+    /// Declares that this universe could not adjudicate its property — the
+    /// injected faults were severe enough that the workload never reached a
+    /// verdict. That is neither a pass nor a failure, and until this existed
+    /// the runner could not tell it from a pass: a give-up rode inside an
+    /// `Err(String)` marker that the workload's own wrapper mapped back to
+    /// `Ok(())` *before* the runner saw it. Recorded on the world instead, so
+    /// no wrapper above the runner can launder it away.
+    ///
+    /// First call wins: the earliest give-up is the cause, later ones are its
+    /// consequences. A workload that gives up and then returns `Err` is still
+    /// a failure — failures outrank give-ups.
+    ///
+    /// Also marks `universe:gave-up` coverage, so a give-up *rate* is floorable
+    /// with the existing `floor:` machinery and needs no new wiring.
+    pub fn give_up(&self, reason: impl Into<String>) {
+        let mut guard = self.world.lock();
+        guard.cover("universe:gave-up");
+        if guard.gave_up.is_none() {
+            guard.gave_up = Some(reason.into());
+        }
+    }
+
+    /// The reason this universe gave up, if it did.
+    pub fn gave_up(&self) -> Option<String> {
+        self.world.lock().gave_up.clone()
     }
 
     pub fn now(&self) -> Instant {
@@ -1485,13 +1519,45 @@ pub fn run_universes_from_in(
     if let Ok(seed_var) = std::env::var("CHARPENTE_SEED") {
         let seed = parse_seed(&seed_var);
         eprintln!("charpente-sim [{test_file}]: replaying seed {seed:#018x}");
-        run_one(package, test_file, seed, &f);
+        let outcome = run_one(package, test_file, seed, &f);
+        eprintln!(
+            "charpente-sim [{test_file}]: this universe {}",
+            describe_outcome(&outcome)
+        );
         return;
     }
     eprintln!("charpente-sim [{test_file}]: {universes} universes from base seed {base:#018x}");
     let mut state = base;
+    let mut gave_up = 0u64;
     for _ in 0..universes {
-        run_one(package, test_file, splitmix64(&mut state), &f);
+        if run_one(package, test_file, splitmix64(&mut state), &f).gave_up() {
+            gave_up += 1;
+        }
+    }
+    report_outcomes(test_file, universes, gave_up);
+}
+
+/// The line that makes MANIFESTO §9's sentence sayable: how many of a batch's
+/// universes actually reached a verdict. Printed by both runners, always —
+/// "0 gave up" is the claim being made, not noise.
+fn report_outcomes(test_file: &str, universes: u64, gave_up: u64) {
+    let verdicts = universes - gave_up;
+    eprintln!(
+        "charpente-sim [{test_file}]: {verdicts} of {universes} universes reached a verdict, \
+         {gave_up} gave up"
+    );
+    if gave_up == universes && universes > 0 {
+        eprintln!(
+            "charpente-sim [{test_file}]: every universe gave up — this property adjudicated \
+             nothing over {universes} universes"
+        );
+    }
+}
+
+fn describe_outcome(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Verdict => "reached a verdict".to_string(),
+        Outcome::GaveUp { reason } => format!("gave up: {reason}"),
     }
 }
 
@@ -1501,10 +1567,19 @@ fn test_name(file: &str) -> &str {
     stem.strip_suffix(".rs").unwrap_or(stem)
 }
 
-fn run_one(package: &str, test_file: &str, seed: u64, f: &impl Fn(&mut Sim) -> Result<(), String>) {
+fn run_one(
+    package: &str,
+    test_file: &str,
+    seed: u64,
+    f: &impl Fn(&mut Sim) -> Result<(), String>,
+) -> Outcome {
     let mut sim = Sim::new(seed);
     if let Err(msg) = f(&mut sim) {
         panic!("{}", failure_report(package, test_file, seed, &msg));
+    }
+    match sim.gave_up() {
+        Some(reason) => Outcome::GaveUp { reason },
+        None => Outcome::Verdict,
     }
 }
 
@@ -1656,12 +1731,16 @@ pub fn run_universes_swarm_with_in(
         eprintln!(
             "charpente-sim [{test_file}]: replaying seed {seed:#018x} — coverage requirements skipped under CHARPENTE_SEED"
         );
-        let coverage = run_one_swarm_with(package, test_file, seed, &adjust, &f);
+        let end = run_one_swarm_with(package, test_file, seed, &adjust, &f);
+        eprintln!(
+            "charpente-sim [{test_file}]: this universe {}",
+            describe_outcome(&end.outcome)
+        );
         // The batch path reports coverage; a single-seed replay was throwing it
         // away, which is what you most want when asking why *this* universe
         // behaved (or cost) the way it did.
         eprintln!("charpente-sim [{test_file}]: coverage for this universe:");
-        for (key, count) in &coverage {
+        for (key, count) in &end.coverage {
             eprintln!("  {key}: {count}");
         }
         return;
@@ -1671,9 +1750,14 @@ pub fn run_universes_swarm_with_in(
     );
     let mut state = base;
     let mut coverage: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut gave_up = 0u64;
     for _ in 0..universes {
         let seed = splitmix64(&mut state);
-        for (key, count) in run_one_swarm_with(package, test_file, seed, &adjust, &f) {
+        let end = run_one_swarm_with(package, test_file, seed, &adjust, &f);
+        if end.outcome.gave_up() {
+            gave_up += 1;
+        }
+        for (key, count) in end.coverage {
             *coverage.entry(key).or_insert(0) += count;
         }
     }
@@ -1681,6 +1765,7 @@ pub fn run_universes_swarm_with_in(
     for (key, count) in &coverage {
         eprintln!("  {key}: {count}");
     }
+    report_outcomes(test_file, universes, gave_up);
     let missing: Vec<&str> = require
         .iter()
         .filter(|key| coverage.get(*key).copied().unwrap_or(0) == 0)
@@ -1712,10 +1797,50 @@ pub fn run_universes_swarm_with_in(
     );
 }
 
+/// How a universe ended. Until this type existed `run_universe` returned
+/// `Ok(coverage)` for both "reached a verdict" and "gave up cleanly", so a
+/// property could report green having concluded nothing — MANIFESTO §9 rests
+/// on being able to say how many universes actually adjudicated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// The workload adjudicated its property.
+    Verdict,
+    /// The workload could not adjudicate: see `Sim::give_up`.
+    GaveUp { reason: String },
+}
+
+impl Outcome {
+    pub fn gave_up(&self) -> bool {
+        matches!(self, Outcome::GaveUp { .. })
+    }
+}
+
+/// One universe's end: how it ended, and the coverage it marked. The Ok
+/// payload of `run_universe` — a give-up and a verdict are distinct values
+/// here, where they used to be the same `Ok(coverage_map)`.
+#[derive(Debug, Clone)]
+pub struct UniverseEnd {
+    pub outcome: Outcome,
+    pub coverage: BTreeMap<&'static str, u64>,
+}
+
+/// Reads the outcome off the world the workload just ran in. Called only on
+/// the success path: a workload that gave up AND then failed is a failure.
+fn end_of(sim: &Sim) -> UniverseEnd {
+    UniverseEnd {
+        outcome: match sim.gave_up() {
+            Some(reason) => Outcome::GaveUp { reason },
+            None => Outcome::Verdict,
+        },
+        coverage: sim.coverage(),
+    }
+}
+
 /// One universe, shared by the frozen swarm macro and the CLI harness
 /// (harness.rs). The seed→behavior mapping here is the frozen replay
 /// contract: config derives from `splitmix64(seed)`, the workload runs
-/// under catch_unwind, Ok returns coverage. Do not reorder anything.
+/// under catch_unwind, Ok returns the universe's end. Do not reorder
+/// anything.
 /// `sample_extended_fields` runs right after `FaultConfig::swarm` — its own
 /// sub-streams (keyed off `seed`, not `cfg_seed`) never touch the legacy
 /// draw above, so this addition changes no existing universe's replay
@@ -1727,14 +1852,14 @@ pub fn run_universes_swarm_with_in(
 pub(crate) fn run_universe(
     seed: u64,
     f: &dyn Fn(&mut Sim) -> Result<(), String>,
-) -> Result<BTreeMap<&'static str, u64>, (FaultConfig, String)> {
+) -> Result<UniverseEnd, (FaultConfig, String)> {
     let mut s = seed;
     let cfg_seed = splitmix64(&mut s);
     let mut cfg = FaultConfig::swarm(&mut Rng::new(cfg_seed));
     sample_extended_fields(seed, &mut cfg);
     let mut sim = Sim::with_faults(seed, cfg.clone());
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut sim))) {
-        Ok(Ok(())) => Ok(sim.coverage()),
+        Ok(Ok(())) => Ok(end_of(&sim)),
         Ok(Err(msg)) => Err((cfg, msg)),
         Err(payload) => Err((cfg, panic_message(&*payload))),
     }
@@ -1750,7 +1875,7 @@ fn run_universe_with_adjust(
     seed: u64,
     adjust: &dyn Fn(&mut FaultConfig),
     f: &dyn Fn(&mut Sim) -> Result<(), String>,
-) -> Result<BTreeMap<&'static str, u64>, (FaultConfig, String)> {
+) -> Result<UniverseEnd, (FaultConfig, String)> {
     let mut s = seed;
     let cfg_seed = splitmix64(&mut s);
     let mut cfg = FaultConfig::swarm(&mut Rng::new(cfg_seed));
@@ -1759,7 +1884,7 @@ fn run_universe_with_adjust(
     cfg.validate(); // an adjust closure that produces an invalid config is a workload bug
     let mut sim = Sim::with_faults(seed, cfg.clone());
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut sim))) {
-        Ok(Ok(())) => Ok(sim.coverage()),
+        Ok(Ok(())) => Ok(end_of(&sim)),
         Ok(Err(msg)) => Err((cfg, msg)),
         Err(payload) => Err((cfg, panic_message(&*payload))),
     }
@@ -1771,9 +1896,9 @@ fn run_one_swarm_with(
     seed: u64,
     adjust: &impl Fn(&mut FaultConfig),
     f: &impl Fn(&mut Sim) -> Result<(), String>,
-) -> BTreeMap<&'static str, u64> {
+) -> UniverseEnd {
     match run_universe_with_adjust(seed, adjust, f) {
-        Ok(coverage) => coverage,
+        Ok(end) => end,
         Err((cfg, msg)) => panic!(
             "{}",
             swarm_failure_report(package, test_file, seed, &cfg, &msg)

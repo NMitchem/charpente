@@ -1729,7 +1729,11 @@ them, rather than running a fixed list of `#[test]` functions once each.
 
 A workload is a plain function, `fn(&mut Sim) -> Result<(), String>`: `Ok(())`
 means the universe passed; `Err(message)` means it didn't, and so does a
-panic (both turn into the same kind of failure record). `sim_tests!` lists
+panic (both turn into the same kind of failure record). There is a third
+ending — see "Giving up" below: a universe the injected faults stopped before
+your property could be adjudicated at all. Say so with `sim.give_up(reason)`;
+it is neither a pass nor a failure, and the report counts it separately.
+`sim_tests!` lists
 the workloads to run by name, each optionally followed by `require [...]` —
 sometimes-coverage keys (`Sim::cover`, plus the sim's own auto-covered
 `fault:*`/`crash:*`/`restart` keys) that must be hit at least once across
@@ -1814,6 +1818,72 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     }
 }
 ```
+
+### Giving up: a universe that reached no verdict
+
+Sooner or later a workload hits a universe where the faults are severe enough
+that it cannot test its claim at all: the database never opened, the write was
+never acknowledged, every recovery attempt was exhausted. That is not a pass —
+nothing was proven — and it is not a failure either; the harness did exactly
+what it was told.
+
+Say so:
+
+```rust
+use charpente::{Db, DbConfig, Id, Schema, table};
+use charpente_sim::Sim;
+use charpente_sim::checks::is_fault_fallout;
+
+#[table]
+struct Counter {
+    id: Id<Counter>,
+    hits: u64,
+}
+
+fn counter_survives(sim: &mut Sim) -> Result<(), String> {
+    let schema = Schema::new().table::<Counter>();
+    let db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema) {
+        Ok(db) => db,
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            // Nothing to adjudicate: the disk broke before the claim was testable.
+            sim.give_up(format!("Db::open hit fault fallout: {e}"));
+            return Ok(());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let _ = db;
+    // … the real claim …
+    Ok(())
+}
+```
+
+- `sim.give_up(reason)` records the give-up **on the universe**, not in the
+  value you return. That is deliberate: a `Result` can be mapped back to
+  `Ok(())` by a wrapper before the runner ever sees it, and for a long time
+  that is exactly what happened — a property could report green having
+  concluded nothing over most of its universes.
+- First call wins; later ones are consequences of the first.
+- A workload that gives up and then returns `Err` is still a **failure**.
+  Failures outrank give-ups.
+- It also marks the coverage key `universe:gave-up`, so a give-up *rate* is
+  something you can put a `require`/floor on like any other sometimes-key.
+
+Every batch now states the split, whether or not anything gave up:
+
+```text
+sim: 64 universe(s) per test, 36 verdict(s), 28 gave up, no failures (master seed: 0x0000000000005eed)
+```
+
+and a test where *every* universe gave up is called out by name, because a
+property that adjudicated nothing is vacuous no matter how green it looks:
+
+```text
+sim: every universe of "counter_roundtrip" gave up — it adjudicated nothing over 64 universes; the property is vacuous until the faults it cannot survive are narrowed
+```
+
+The platform's own `cargo test` suites print the same split
+(`charpente-sim [replication]: 90 of 128 universes reached a verdict, 38 gave
+up`), so the number is visible at both layers.
 
 ### The checkers
 
@@ -2213,14 +2283,18 @@ charpente test --sim [--universes N] [--seed 0x…] [--master-seed 0x…] \
 - `--format human|json` — human is the default; `json` emits one object
   with `master_seed`, `universes`, `failures` (each carrying its own `test`,
   `seed`, `master_seed`, `config`, `message`, and copy-pasteable `repro`
-  command), `coverage`, `missing_coverage` (`{test, key}` pairs), and a
-  trailing `summary`, for downstream tooling.
+  command), `verdicts` and `gave_up` (batch totals), `outcomes` (the same
+  split per test: `{test, verdicts, gave_up}`), `coverage`,
+  `missing_coverage` (`{test, key}` pairs), and a trailing `summary`, for
+  downstream tooling.
 - `--dir PATH` — the app crate directory to build and run sim tests from
   (default: `.`). This flag is consumed by the CLI itself; every other flag
   passes straight through to the sim binary the CLI builds and execs.
 
 Exit codes: **0** every universe of every selected test passed and every
-`require`d coverage key was hit; **1** at least one universe failed, or a
+`require`d coverage key was hit (universes that *gave up* are reported, not
+failed — see "Giving up" above; a green run tells you how many reached a
+verdict, and reading that number is on you); **1** at least one universe failed, or a
 coverage requirement went unmet — the run itself completed, but something
 in it was red; **2** the run never got that far — a build failure, no
 `tests/sim.rs` target found, an unrecognized flag, a filter matching no

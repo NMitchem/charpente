@@ -34,13 +34,23 @@ fn fixture_replays(sim: &mut Sim) -> Result<(), String> {
 /// here). `counter_roundtrip` collapses this to pass/fail;
 /// `fixture_replays` additionally demands the `Option<u64>` itself replay
 /// identically across two independent worlds on the same seed.
+///
+/// Every `Ok(None)` here is a universe that adjudicated NOTHING — the faults
+/// stopped it before the claim could be tested. Each one calls `sim.give_up`,
+/// so the batch report states how many universes actually reached a verdict
+/// instead of counting these as passes. (`fixture_replays` drives this same
+/// function on two private `Sim`s of its own, so the give-ups it records land
+/// on those worlds, not on the harness's.)
 fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     use charpente_sim::checks::is_fault_fallout;
 
     let schema = || Schema::new().table::<FixtureCounter>();
     let mut db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema()) {
         Ok(db) => db,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(None),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up(format!("Db::open before the crash hit fault fallout: {e}"));
+            return Ok(None);
+        }
         Err(e) => return Err(e.to_string()),
     };
     let acked = db
@@ -55,20 +65,30 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
     drop(db);
     let db = match Db::open(Box::new(sim.disk()), DbConfig::default(), schema()) {
         Ok(db) => db,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(None),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up(format!("Db::open after the crash hit fault fallout: {e}"));
+            return Ok(None);
+        }
         Err(e) => return Err(e.to_string()),
     };
     if !acked {
+        sim.give_up("the write was never acked, so durability has nothing to prove");
         return Ok(None);
     }
     let snap = match db.snapshot() {
         Ok(snap) => snap,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(None),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up(format!("snapshot hit fault fallout: {e}"));
+            return Ok(None);
+        }
         Err(e) => return Err(e.to_string()),
     };
     let row = match snap.get::<FixtureCounter>(Id::from_raw(7)) {
         Ok(row) => row,
-        Err(e) if is_fault_fallout(&e.to_string()) => return Ok(None),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up(format!("the read-back hit fault fallout: {e}"));
+            return Ok(None);
+        }
         Err(e) => return Err(e.to_string()),
     };
     match row {
@@ -79,7 +99,10 @@ fn counter_roundtrip_result(sim: &mut Sim) -> Result<Option<u64>, String> {
         // horizon is silently cut at recovery, by the WAL convention — see
         // `durable_corruption_fired`'s docs. In every universe where no
         // corruption fired, this stays the hard check it always was.
-        None if charpente_sim::checks::durable_corruption_fired(sim) => Ok(None),
+        None if charpente_sim::checks::durable_corruption_fired(sim) => {
+            sim.give_up("durable corruption fired, so the acked row is excused");
+            Ok(None)
+        }
         None => Err("acked FixtureCounter row lost across a crash".into()),
     }
 }

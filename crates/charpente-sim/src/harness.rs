@@ -29,7 +29,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::rng::splitmix64;
-use crate::{FaultConfig, Sim, ambient_base_seed, run_universe};
+use crate::{FaultConfig, Sim, UniverseEnd, ambient_base_seed, run_universe};
 
 /// One registered sim workload. `require` lists sometimes-coverage keys that
 /// must be hit at least once across the test's universes in a batch run
@@ -165,6 +165,16 @@ pub struct Failure {
     pub message: String,
 }
 
+/// How one test's universes ended in this batch. A give-up is a universe the
+/// injected faults stopped from adjudicating anything — reported, never
+/// folded into the pass count (that fold is what this type exists to undo).
+#[derive(Debug, PartialEq, Eq)]
+pub struct TestOutcomes {
+    pub test: &'static str,
+    pub verdicts: u64,
+    pub gave_up: u64,
+}
+
 #[derive(Debug)]
 pub struct Report {
     pub master_seed: u64,
@@ -174,6 +184,19 @@ pub struct Report {
     /// (test name, key) — a `require`d key never hit across that test's
     /// universes in this batch.
     pub missing_coverage: Vec<(String, String)>,
+    /// Per test, in registry order: how many universes reached a verdict and
+    /// how many gave up. MANIFESTO §9 rests on being able to state this.
+    pub outcomes: Vec<TestOutcomes>,
+}
+
+impl Report {
+    pub fn verdicts(&self) -> u64 {
+        self.outcomes.iter().map(|o| o.verdicts).sum()
+    }
+
+    pub fn gave_up(&self) -> u64 {
+        self.outcomes.iter().map(|o| o.gave_up).sum()
+    }
 }
 
 /// Runs every test in `tests` whose name contains `args.filter` (all of them
@@ -232,10 +255,19 @@ fn run_single_seed(tests: &[&SimTest], seed: u64) -> Report {
         failures: Vec::new(),
         coverage: BTreeMap::new(),
         missing_coverage: Vec::new(),
+        outcomes: Vec::new(),
     };
     for test in tests {
+        let mut outcomes = TestOutcomes {
+            test: test.name,
+            verdicts: 0,
+            gave_up: 0,
+        };
         match run_universe(seed, &test.run) {
-            Ok(cov) => merge(&mut report.coverage, &cov),
+            Ok(end) => {
+                tally(&mut outcomes, &end);
+                merge(&mut report.coverage, &end.coverage);
+            }
             Err((config, message)) => report.failures.push(Failure {
                 test: test.name,
                 seed,
@@ -243,14 +275,25 @@ fn run_single_seed(tests: &[&SimTest], seed: u64) -> Report {
                 message,
             }),
         }
+        report.outcomes.push(outcomes);
     }
     report
+}
+
+/// A universe that failed is neither: it never lands here (the failure branch
+/// files a `Failure` instead), so verdicts + gave_up + failures = universes.
+fn tally(outcomes: &mut TestOutcomes, end: &UniverseEnd) {
+    if end.outcome.gave_up() {
+        outcomes.gave_up += 1;
+    } else {
+        outcomes.verdicts += 1;
+    }
 }
 
 /// One (test, universe) unit of work: the seed is pre-derived on the main
 /// thread before any worker starts, so `jobs` only changes scheduling, never
 /// the seed each universe runs with.
-type UniverseOutcome = Result<BTreeMap<&'static str, u64>, (FaultConfig, String)>;
+type UniverseOutcome = Result<UniverseEnd, (FaultConfig, String)>;
 
 fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) -> Report {
     // DESIGN §7: the master seed is printed at startup, before any universe
@@ -264,6 +307,7 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) 
         failures: Vec::new(),
         coverage: BTreeMap::new(),
         missing_coverage: Vec::new(),
+        outcomes: Vec::new(),
     };
 
     // Pre-derive every universe's seed on the main thread, in registry
@@ -308,13 +352,21 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) 
     let mut index = 0;
     for test in tests {
         let mut covered: BTreeMap<&'static str, u64> = BTreeMap::new();
+        let mut outcomes = TestOutcomes {
+            test: test.name,
+            verdicts: 0,
+            gave_up: 0,
+        };
         for _ in 0..universes {
             let (_, seed) = work[index];
             let outcome = slots[index]
                 .take()
                 .expect("every work item is filled before the pool returns");
             match outcome {
-                Ok(cov) => merge(&mut covered, &cov),
+                Ok(end) => {
+                    tally(&mut outcomes, &end);
+                    merge(&mut covered, &end.coverage);
+                }
                 Err((config, message)) => report.failures.push(Failure {
                     test: test.name,
                     seed,
@@ -324,6 +376,7 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) 
             }
             index += 1;
         }
+        report.outcomes.push(outcomes);
         merge(&mut report.coverage, &covered);
         for key in test.require {
             if covered.get(key).copied().unwrap_or(0) == 0 {
@@ -385,6 +438,25 @@ impl Report {
                 &mut out,
             );
             out.push_str("\"}");
+        }
+        out.push(']');
+
+        out.push_str(",\"verdicts\":");
+        out.push_str(&self.verdicts().to_string());
+        out.push_str(",\"gave_up\":");
+        out.push_str(&self.gave_up().to_string());
+
+        out.push_str(",\"outcomes\":[");
+        for (i, o) in self.outcomes.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"test\":\"");
+            json_escape(o.test, &mut out);
+            out.push_str(&format!(
+                "\",\"verdicts\":{},\"gave_up\":{}}}",
+                o.verdicts, o.gave_up
+            ));
         }
         out.push(']');
 
@@ -477,13 +549,40 @@ fn write_human(report: &Report, out: &mut dyn std::io::Write) {
             report.universes
         );
     }
-    if report.failures.is_empty() && report.missing_coverage.is_empty() {
-        let _ = writeln!(
-            out,
-            "sim: {} universe(s) per test, all green (master seed: {:#018x})",
-            report.universes, report.master_seed
-        );
+    // Printed on green AND red runs, and printed unconditionally: a batch that
+    // adjudicated nothing must never read as an unqualified success, and "0
+    // gave up" is the claim being made rather than noise (MANIFESTO §9).
+    for o in &report.outcomes {
+        if o.gave_up > 0 {
+            let _ = writeln!(
+                out,
+                "sim: {} of {} universes of \"{}\" gave up — reached no verdict",
+                o.gave_up, report.universes, o.test
+            );
+        }
+        if o.gave_up > 0 && o.verdicts == 0 {
+            let _ = writeln!(
+                out,
+                "sim: every universe of \"{}\" gave up — it adjudicated nothing over {} \
+                 universes; the property is vacuous until the faults it cannot survive are \
+                 narrowed",
+                o.test, report.universes
+            );
+        }
     }
+    let status = if report.failures.is_empty() && report.missing_coverage.is_empty() {
+        "no failures".to_string()
+    } else {
+        format!("{} failure(s)", report.failures.len())
+    };
+    let _ = writeln!(
+        out,
+        "sim: {} universe(s) per test, {} verdict(s), {} gave up, {status} (master seed: {:#018x})",
+        report.universes,
+        report.verdicts(),
+        report.gave_up(),
+        report.master_seed
+    );
 }
 
 fn human_failure_block(f: &Failure) -> String {
@@ -505,6 +604,11 @@ mod tests {
 
     fn always_fails(_sim: &mut Sim) -> Result<(), String> {
         Err("toy failure".into())
+    }
+
+    fn always_gives_up(sim: &mut Sim) -> Result<(), String> {
+        sim.give_up("toy give-up");
+        Ok(())
     }
 
     fn parse(flags: &[&str]) -> Result<HarnessArgs, String> {
@@ -833,6 +937,7 @@ mod tests {
         assert_eq!(sequential.universes, parallel.universes);
         assert_eq!(sequential.coverage, parallel.coverage);
         assert_eq!(sequential.missing_coverage, parallel.missing_coverage);
+        assert_eq!(sequential.outcomes, parallel.outcomes);
         assert_eq!(
             sequential.failures.len(),
             parallel.failures.len(),
@@ -893,6 +998,112 @@ mod tests {
             text.contains("raise the universe count, adjust the workload, or drop the requirement"),
             "{text}"
         );
+    }
+
+    // ---------------------------------------------------------- outcomes
+
+    /// The collapse this whole type exists to undo: a workload that gives up
+    /// returns `Ok(())` exactly like one that passes, so nothing about the
+    /// returned `Result` distinguishes them. The outcome comes off the `Sim`.
+    #[test]
+    fn a_give_up_is_counted_apart_from_a_verdict() {
+        let gives_up = SimTest {
+            name: "gives_up",
+            run: always_gives_up,
+            require: &[],
+        };
+        let passes = SimTest {
+            name: "passes",
+            run: always_ok,
+            require: &[],
+        };
+        let report = run_batch(&[&gives_up, &passes], 0x1234, 4, 2);
+        assert_eq!(
+            report.outcomes,
+            vec![
+                TestOutcomes {
+                    test: "gives_up",
+                    verdicts: 0,
+                    gave_up: 4,
+                },
+                TestOutcomes {
+                    test: "passes",
+                    verdicts: 4,
+                    gave_up: 0,
+                },
+            ]
+        );
+        assert_eq!(report.verdicts(), 4);
+        assert_eq!(report.gave_up(), 4);
+        assert!(report.failures.is_empty(), "giving up is not a failure");
+    }
+
+    /// A workload that gives up and then fails is a failure: failures outrank
+    /// give-ups, so this change can never turn a red universe green.
+    #[test]
+    fn a_failure_after_a_give_up_is_still_a_failure() {
+        fn gives_up_then_fails(sim: &mut Sim) -> Result<(), String> {
+            sim.give_up("toy give-up");
+            Err("toy failure".into())
+        }
+        let test = SimTest {
+            name: "both",
+            run: gives_up_then_fails,
+            require: &[],
+        };
+        let report = run_batch(&[&test], 0x1234, 3, 1);
+        assert_eq!(report.failures.len(), 3);
+        assert_eq!(report.verdicts(), 0);
+        assert_eq!(report.gave_up(), 0, "a failed universe is neither");
+    }
+
+    #[test]
+    fn a_batch_that_adjudicated_nothing_does_not_print_as_green() {
+        let tests = [SimTest {
+            name: "gives_up",
+            run: always_gives_up,
+            require: &[],
+        }];
+        let args = parse(&["--universes", "4"]).unwrap();
+        let mut out = Vec::new();
+        let code = run(&tests, &args, &mut out);
+        assert_eq!(code, 0, "giving up is not a failure");
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("all green"), "{text}");
+        assert!(text.contains("0 verdict(s), 4 gave up"), "{text}");
+        assert!(
+            text.contains("every universe of \"gives_up\" gave up"),
+            "{text}"
+        );
+        assert!(text.contains("adjudicated nothing"), "{text}");
+    }
+
+    #[test]
+    fn a_fully_green_batch_still_states_its_verdict_count() {
+        let tests = [SimTest {
+            name: "always_ok",
+            run: always_ok,
+            require: &[],
+        }];
+        let args = parse(&["--universes", "5"]).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(run(&tests, &args, &mut out), 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("5 verdict(s), 0 gave up, no failures"),
+            "\"0 gave up\" is the claim being made, not noise: {text}"
+        );
+    }
+
+    #[test]
+    fn give_up_marks_its_own_coverage_key() {
+        let test = SimTest {
+            name: "gives_up",
+            run: always_gives_up,
+            require: &[],
+        };
+        let report = run_batch(&[&test], 0x1234, 6, 1);
+        assert_eq!(report.coverage.get("universe:gave-up").copied(), Some(6));
     }
 
     // -------------------------------------------------------------- JSON

@@ -68,6 +68,87 @@ fn sim_failures_exit_one_with_seed_and_repro_line() {
     );
 }
 
+/// The end-to-end proof that a give-up is a REPORTED number, not a coverage
+/// string: a real app workload (`counter_roundtrip`) whose fault-fallout paths
+/// used to return `Ok(None)` — a universe that adjudicated nothing, counted as
+/// a pass. Pinned to a master seed so the split is exact and reproducible; the
+/// numbers are measured, and if the plumbing ever reports a constant or drops
+/// a give-up site they move.
+#[test]
+fn sim_reports_a_real_give_up_count_over_a_pinned_batch() {
+    let out = charpente()
+        .args([
+            "test",
+            "--sim",
+            "--universes",
+            "64",
+            "--master-seed",
+            "0x5eed",
+            "--filter",
+            "counter_roundtrip",
+            "--format",
+            "json",
+            "--dir",
+            &fixture_dir(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(r#""outcomes":[{"test":"counter_roundtrip","verdicts":36,"gave_up":28}]"#),
+        "the per-test outcome split is the machine-readable field:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(r#""verdicts":36,"gave_up":28,"outcomes""#),
+        "the batch totals sit alongside the per-test split:\n{stdout}"
+    );
+    // Cross-checked a second way: `Sim::give_up` also marks coverage, so the
+    // reported count and the coverage count must agree. Two independent paths
+    // to the same 28 — a constant wired into one of them cannot fake both.
+    assert!(
+        stdout.contains(r#""universe:gave-up":28"#),
+        "give-up coverage must agree with the reported count:\n{stdout}"
+    );
+}
+
+/// The sentence this whole change exists to make true (MANIFESTO §9): a batch
+/// in which every universe gave up must not print as an unqualified success.
+/// Seed 0x1 is a measured give-up universe of `counter_roundtrip`.
+#[test]
+fn a_batch_where_every_universe_gave_up_is_not_an_unqualified_success() {
+    let out = charpente()
+        .args([
+            "test",
+            "--sim",
+            "--seed",
+            "0x1",
+            "--filter",
+            "counter_roundtrip",
+            "--dir",
+            &fixture_dir(),
+        ])
+        .output()
+        .unwrap();
+    // Still exit 0: giving up is not a failure. The claim is about what the
+    // run SAYS, not what it returns.
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("all green"),
+        "a run that adjudicated nothing must not read as green:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("0 verdict(s), 1 gave up"),
+        "the human report states the verdict/give-up split:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("every universe of \"counter_roundtrip\" gave up")
+            && stdout.contains("adjudicated nothing"),
+        "an all-give-up test must say so by name:\n{stdout}"
+    );
+}
+
 #[test]
 fn usage_errors_exit_two_and_name_the_flag() {
     let out = charpente()
