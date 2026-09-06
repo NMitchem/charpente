@@ -1149,9 +1149,33 @@ fn late_follower_seeds_below_the_gcd_base_and_converges() {
             let r = seeding_universe(sim);
             finish_universe(sim, r)
         },
-        require: ["tenant:seeded-multi-tenant"]
+        require: ["tenant:seeded-multi-tenant", "repl:logical-converged"],
+        floor: [("repl:logical-converged", SEEDED_CONVERGED_FLOOR)]
     );
 }
+
+/// Universes that reached this property's verdict, MEASURED: 145 of 256 at base
+/// `0x2EB1_0002` on 2026-09-06 (`repl:logical-converged`; `tenant:seeded-multi-
+/// tenant` measured identically at 145 and is `require:`d above). The other 111
+/// are 109 `repl:inconclusive` plus 2 `repl:seed-base-zero` — 145 + 109 + 2 =
+/// 256 exactly, so this key is the whole of what "reached a verdict" means here.
+///
+/// **Headroom: 2 binomial SEs below the measurement, unlike `CONVERGED_FLOOR`.**
+/// That constant sits exactly ON its measured 167 and justifies it with "the run
+/// is deterministic at a fixed base, so this number moves only when code does."
+/// True for a byte-identical replay — but any change that shifts the fault
+/// stream (a platform change, a workload change) re-rolls all 256 universes, and
+/// the count is then a fresh binomial draw around the same rate. At p = 145/256
+/// = 0.566, one SE on the count is sqrt(256 · 0.566 · 0.434) = 7.9, so a floor
+/// set at the measurement itself would flap red about half the time on a change
+/// that altered nothing real. 145 − 2·7.9 = 129.1 → 129: a re-roll of the same
+/// distribution clears it with ~97.7% probability, while a genuine collapse of
+/// the give-up rate (the 42.6% measured here climbing past ~50%) still fails.
+///
+/// **A drop below this is a finding, not a number to lower** — the same rule
+/// `CONVERGED_FLOOR` carries: it means more universes are giving up before the
+/// oracle runs, and which give-up cause grew is the question to answer first.
+const SEEDED_CONVERGED_FLOOR: u64 = 129;
 
 fn seeding_universe(sim: &mut Sim) -> Result<(), String> {
     let mut p = spawn_node_with_schema(
@@ -3610,13 +3634,19 @@ impl CtrlConn {
     /// Connect and send the verb. A connect/send failure (the target crashed,
     /// an injected conn drop) is the operator's retry, not a bug: inconclusive.
     fn open(sim: &Sim, addr: &str, verb: &Msg) -> Result<CtrlConn, String> {
-        let conn = sim
-            .host("cli")
-            .net()
-            .connect(addr)
-            .map_err(|e| format!("{INCONCLUSIVE}: ctrl connect {addr}: {e}"))?;
-        conn.send(&encode(verb))
-            .map_err(|e| format!("{INCONCLUSIVE}: ctrl send: {e}"))?;
+        // Cause-keyed like every other inconclusive origin (oracle-density task
+        // 3). NOTE for whoever sums these: this site is shared by properties
+        // that catch the error into their OWN give-up wrapper — a
+        // `repl:failover-inconclusive` universe can carry this key without ever
+        // reaching `finish_universe`'s `repl:inconclusive` arm.
+        let conn = sim.host("cli").net().connect(addr).map_err(|e| {
+            sim.cover("repl:inconclusive:ctrl-connect");
+            format!("{INCONCLUSIVE}: ctrl connect {addr}: {e}")
+        })?;
+        conn.send(&encode(verb)).map_err(|e| {
+            sim.cover("repl:inconclusive:ctrl-send");
+            format!("{INCONCLUSIVE}: ctrl send: {e}")
+        })?;
         Ok(CtrlConn {
             conn,
             buf: vec![0u8; MAX_MESSAGE_BYTES],
@@ -3707,9 +3737,29 @@ fn switchover_mid_write_load_loses_nothing_and_serves_reads_throughout() {
             let r = switchover_universe(sim);
             finish_universe(sim, r)
         },
-        require: ["fault:conn_drop"]
+        require: ["fault:conn_drop", "repl:logical-converged"],
+        floor: [("repl:logical-converged", SWITCHOVER_CONVERGED_FLOOR)]
     );
 }
+
+/// Universes in which the switchover ran to `CtrlOk` and the FULL oracle ran
+/// (zero-loss on the new primary, both roles flipped, then reconvergence),
+/// MEASURED: 72 of 256 at base `0x2EB1_0009` on 2026-09-06. The other 184 are
+/// 131 `repl:switchover-inconclusive` (a reduced oracle: `assert_one_writable`
+/// only), 45 `repl:inconclusive` and 8 `repl:switchover-stalled` — 72 + 131 +
+/// 45 + 8 = 256 exactly. `repl:logical-converged` is covered only on the
+/// `CtrlOk` arm, which is why it is the verdict key here and the property's old
+/// lone `require: ["fault:conn_drop"]` (a FAULT firing, not an oracle running)
+/// was not.
+///
+/// **Headroom: 2 binomial SEs below the measurement**, for the reason
+/// `SEEDED_CONVERGED_FLOOR` states in full. At p = 72/256 = 0.281, one SE on the
+/// count is sqrt(256 · 0.281 · 0.719) = 7.2, so 72 − 2·7.2 = 57.6 → 57.
+///
+/// **A drop below this is a finding, not a number to lower.** The likeliest
+/// cause is the reduced-oracle path growing: more universes reaching
+/// `repl:switchover-inconclusive`, where only `assert_one_writable` runs.
+const SWITCHOVER_CONVERGED_FLOOR: u64 = 57;
 
 /// The result of one switchover attempt's drain.
 enum DrainResult {
@@ -3978,11 +4028,45 @@ fn no_gc_cfg() -> DbConfig {
 
 #[test]
 fn failover_preserves_everything_the_follower_acked() {
-    run_universes_swarm_with!(0x2EB1_000A, 128, no_media_corruption, |sim: &mut Sim| {
-        let r = failover_universe(sim);
-        finish_universe(sim, r)
-    });
+    run_universes_swarm_with!(
+        0x2EB1_000A,
+        128,
+        no_media_corruption,
+        |sim: &mut Sim| {
+            let r = failover_universe(sim);
+            finish_universe(sim, r)
+        },
+        require: ["restart", "crash:host", "repl:failover-prefix-compared"],
+        floor: [("repl:failover-prefix-compared", FAILOVER_PREFIX_FLOOR)]
+    );
 }
+
+/// Universes in which the prefix oracle actually compared at least one of f's
+/// frames against p's durable log, MEASURED: 46 of 128 at base `0x2EB1_000A` on
+/// 2026-09-06. The other 82 are the property's two mutually exclusive give-up
+/// channels — 43 `repl:failover-inconclusive` (41 of them the pre-crash staging
+/// gate) and 39 `repl:inconclusive` — and 46 + 43 + 39 = 128 exactly.
+/// `repl:failover-prefix-empty` measured 0: every universe that reached the
+/// oracle had something to compare.
+///
+/// **This number is budget-invariant, measured, not assumed.** Re-running this
+/// property with `RECOVER_ATTEMPTS` at 5000 instead of 500 (oracle-density task
+/// 3, Step 0) moved `repl:inconclusive` 39 → 19 and
+/// `repl:failover-inconclusive` 43 → 63 — the rescued universes recovered `f`
+/// and were then rejected by the staging gate's own `f.recoveries > 0` — and
+/// left this key at exactly 46. A 10× retry budget costs 6.7× the runtime and
+/// buys zero additional verdicts here, which is why the floor is set against the
+/// current budget rather than a raised one.
+///
+/// **Headroom: 2 binomial SEs below the measurement**, for the reason
+/// `SEEDED_CONVERGED_FLOOR` states in full. At p = 46/128 = 0.359, one SE on the
+/// count is sqrt(128 · 0.359 · 0.641) = 5.4, so 46 − 2·5.4 = 35.1 → 35.
+///
+/// **A drop below this is a finding, not a number to lower.** The staging gate
+/// (`p` still a live primary, `f` never recovered, `f` holding a position) is
+/// what most often denies this oracle its universe; a fall here means that gate
+/// closed more often, and why is the question.
+const FAILOVER_PREFIX_FLOOR: u64 = 35;
 
 fn failover_universe(sim: &mut Sim) -> Result<(), String> {
     let cfg = no_gc_cfg();
@@ -4047,12 +4131,13 @@ fn failover_universe(sim: &mut Sim) -> Result<(), String> {
         })?
     };
     let p_frames = reopen_p_frames(&mut p, &cfg)?;
+    let mut compared = 0u32;
     for (seq, bytes) in &f_frames {
         if *seq > f_last {
             continue;
         }
         match p_frames.iter().find(|(s, _)| s == seq) {
-            Some((_, pb)) if pb == bytes => {}
+            Some((_, pb)) if pb == bytes => compared += 1,
             Some(_) => {
                 return Err(format!(
                     "f's frame at seq {seq} diverges from p's — not a prefix of p's timeline"
@@ -4064,6 +4149,16 @@ fn failover_universe(sim: &mut Sim) -> Result<(), String> {
                 ));
             }
         }
+    }
+    // THE verdict key for this property (oracle-density task 3). Reaching this
+    // line is not enough: a universe where f held no frame at or below `f_last`
+    // runs the loop zero times and returns Ok having compared nothing — green
+    // by vacuity, indistinguishable in the coverage from a real prefix check.
+    // The two outcomes are keyed apart so the floor below can pin the real one.
+    if compared > 0 {
+        sim.cover("repl:failover-prefix-compared");
+    } else {
+        sim.cover("repl:failover-prefix-empty");
     }
     Ok(())
 }
@@ -4502,6 +4597,10 @@ fn open_kernel(
                 .contains("role file failed its integrity check") =>
         {
             if flipped {
+                // Same cause key as `open_node`'s equivalent arm: the failure
+                // shape is identical, and this family had no cause key at all
+                // until oracle-density task 3 (task-2-report.md named the gap).
+                sim.cover("repl:inconclusive:role-file-torn");
                 return Err(format!(
                     "{INCONCLUSIVE}: {} torn role file after a role flip — the operator restore \
                      path (not config re-init) is the fix: {e}",
@@ -4580,6 +4679,7 @@ fn spawn_kernel_node_with_schema(
             Err(e) => return Err(format!("{host}: {e}")),
         }
     }
+    sim.cover("repl:inconclusive:spawn-exhausted");
     Err(format!(
         "{INCONCLUSIVE}: {host} kernel spawn exhausted {RECOVER_ATTEMPTS} attempts"
     ))
@@ -4647,6 +4747,11 @@ fn recover_kernel_node(sim: &Sim, node: &mut KNode) -> Result<(), String> {
             Err(e) => return Err(format!("recover {}: {e}", node.name)),
         }
     }
+    // The kernel family's copy of `recover_node`'s budget-not-state cause: 500
+    // attempts were not enough, as distinct from a disk that cannot be
+    // recovered from at all. Uninstrumented until oracle-density task 3, which
+    // is why the wal-corruption property's give-ups had zero cause attribution.
+    sim.cover("repl:inconclusive:recover-exhausted");
     Err(format!(
         "{INCONCLUSIVE}: recover {} exhausted {RECOVER_ATTEMPTS} attempts (last: {last})",
         node.name
@@ -4684,10 +4789,13 @@ fn kstep_node(sim: &Sim, node: &mut KNode) -> Result<Step, String> {
         // read as a failure of the promise it can no longer underwrite). A
         // genuine data/consistency bug never surfaces here (those panic, or
         // the final oracles on the survivor's store catch them).
-        Err(e) if !node.recoverable => Err(format!(
-            "{INCONCLUSIVE}: {} (the designated survivor) faulted: {e}",
-            node.name
-        )),
+        Err(e) if !node.recoverable => {
+            sim.cover("repl:inconclusive:survivor-faulted");
+            Err(format!(
+                "{INCONCLUSIVE}: {} (the designated survivor) faulted: {e}",
+                node.name
+            ))
+        }
         Err(e) => Err(format!("{} kernel step: {e}", node.name)),
     }
 }
@@ -4796,6 +4904,7 @@ fn drive_request(
     if sink.lock().expect("responses lock").len() > before {
         Ok(sink.lock().expect("responses lock")[before].clone())
     } else {
+        sim.cover("repl:inconclusive:request-no-response");
         Err(format!(
             "{INCONCLUSIVE}: no response to a request on node {target} within budget"
         ))
@@ -4814,12 +4923,17 @@ fn drive_ctrl_kernel(
         match cli.poll() {
             Ok(Some(m)) => return Ok(m),
             Ok(None) => {}
-            Err(e) => return Err(format!("{INCONCLUSIVE}: {e}")),
+            Err(e) => {
+                sim.cover("repl:inconclusive:ctrl-conn-lost");
+                return Err(format!("{INCONCLUSIVE}: {e}"));
+            }
         }
         if !advanced {
+            sim.cover("repl:inconclusive:ctrl-quiescent");
             return Err(format!("{INCONCLUSIVE}: quiescent before a control reply"));
         }
     }
+    sim.cover("repl:inconclusive:ctrl-no-reply");
     Err(format!("{INCONCLUSIVE}: no control reply within budget"))
 }
 
@@ -5144,6 +5258,7 @@ fn restore_p_from_survivor(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<()
         match drive_ctrl_kernel(sim, &mut [f], &mut cli, KBUDGET)? {
             Msg::CtrlOk { .. } => {}
             other => {
+                sim.cover("repl:inconclusive:restore-promote-refused");
                 return Err(format!(
                     "{INCONCLUSIVE}: promoting the survivor failed: {other:?}"
                 ));
@@ -5166,8 +5281,10 @@ fn restore_p_from_survivor(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<()
     p.kernel = Some(
         open_kernel(sim, &p.host, &p.repl_cfg, &p.db_cfg, true, &p.schema).map_err(|e| {
             if e.contains(INCONCLUSIVE) {
+                // Already covered at its own origin site — do not double-count.
                 e
             } else {
+                sim.cover("repl:inconclusive:restore-reopen");
                 format!("{INCONCLUSIVE}: restore reopen: {e}")
             }
         })?,
@@ -5177,8 +5294,10 @@ fn restore_p_from_survivor(sim: &Sim, p: &mut KNode, f: &mut KNode) -> Result<()
     // another restore) is too much damage to adjudicate: inconclusive.
     krun_until(sim, &mut [p, f], kconverged, KBUDGET).map_err(|e| {
         if e.contains(INCONCLUSIVE) {
+            // Already covered at its own origin site — do not double-count.
             e
         } else {
+            sim.cover("repl:inconclusive:restore-stalled");
             format!("{INCONCLUSIVE}: restore convergence stalled: {e}")
         }
     })
@@ -5197,9 +5316,46 @@ fn wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower()
             let r = above_horizon_universe(sim);
             finish_universe(sim, r)
         },
-        require: ["fault:bit_flip", "repl:above-horizon-cut", "repl:promised-nonempty"]
+        require: ["fault:bit_flip", "repl:above-horizon-cut", "repl:promised-nonempty"],
+        floor: [("repl:promised-nonempty", SURVIVOR_PROMISE_FLOOR)]
     );
 }
+
+/// Universes in which the survivor oracle ran NON-VACUOUSLY — the promise set
+/// was non-empty, so `assert_survivor_holds` had something to assert — MEASURED:
+/// 32 of 128 at base `0x2EB1_000E` on 2026-09-06. The other 96 are 90
+/// `repl:inconclusive` plus 6 that reached the end with an empty promise set
+/// (`assert_survivor_holds` passes trivially there, which is why the empty case
+/// is not a verdict and this key, not the property's completion, is the floor).
+///
+/// **Why this floor is legitimate even though the 90 give-ups had no cause
+/// attribution when Task 2 measured them.** They have it now: this file's
+/// kernel-level helper family was instrumented in the same commit as this floor,
+/// and the 90 split 78 `:survivor-faulted`, 5 `:recover-exhausted`, 5
+/// `:spawn-exhausted`, 3 `:restore-reopen`, 1 `:request-no-response` (sum 92 —
+/// two universes cover a cause key inside the `unwrap_or_default()` promise scan
+/// and then continue, so the sum is an upper bound on distinct universes, not a
+/// contradiction). 87% of the give-ups are the DESIGNATED SURVIVOR faulting: `f`
+/// is spawned `recoverable: false` on purpose, because the single-follower
+/// promise needs one undamaged copy, so a fault on it ends the universe by
+/// construction. That is a workload-model constraint, not a budget and not a
+/// stall.
+///
+/// **Measured, not argued:** re-running at `RECOVER_ATTEMPTS` 5000 instead of
+/// 500 (task 3, Step 0) left `repl:inconclusive` at exactly 90 and this key at
+/// exactly 32; the budget causes went to zero (`:spawn-exhausted` 5 → 0,
+/// `:recover-exhausted` 5 → 0) and `:survivor-faulted` absorbed all ten
+/// (78 → 88). A 10× budget buys nothing here.
+///
+/// **Headroom: 2 binomial SEs below the measurement**, for the reason
+/// `SEEDED_CONVERGED_FLOOR` states in full. At p = 32/128 = 0.25, one SE on the
+/// count is sqrt(128 · 0.25 · 0.75) = 4.9, so 32 − 2·4.9 = 22.2 → 22.
+///
+/// **A drop below this is a finding, not a number to lower.** With
+/// `:survivor-faulted` at 87% of the give-ups, the thing to check first is
+/// whether the fault matrix got harsher on the survivor — that alone can retire
+/// this oracle without a single test going red.
+const SURVIVOR_PROMISE_FLOOR: u64 = 22;
 
 fn above_horizon_universe(sim: &mut Sim) -> Result<(), String> {
     let db_cfg = horizon_db_cfg();
