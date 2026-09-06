@@ -2138,10 +2138,15 @@ fn multi_node_realtime_universe(sim: &mut Sim) -> Result<(), String> {
     Ok(())
 }
 
+/// `give_up` beside `cover`, same reasoning as replication.rs's
+/// `finish_universe`: the coverage key is the floorable cause-side signal, and
+/// `give_up` is the scalar the runner reports, which mapping the marker to
+/// `Ok(())` here would otherwise hide.
 fn finish_rt_universe(sim: &Sim, r: Result<(), String>) -> Result<(), String> {
     match r {
         Err(e) if e.contains(INCONCLUSIVE) => {
             sim.cover("realtime:multi-node-inconclusive");
+            sim.give_up(e);
             Ok(())
         }
         other => other,

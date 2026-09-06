@@ -668,6 +668,10 @@ fn raw_credentials_universe(sim: &mut Sim) -> Result<(u64, u64, Vec<String>), St
     ))
 }
 
+/// `give_up` beside `cover`, same reasoning as replication.rs's
+/// `finish_universe`: the coverage key is the floorable cause-side signal, and
+/// `give_up` is the scalar the runner reports, which mapping the marker to
+/// `Ok(())` here would otherwise hide.
 fn finish_auth_universe(
     sim: &Sim,
     r: Result<(u64, u64, Vec<String>), String>,
@@ -675,6 +679,7 @@ fn finish_auth_universe(
     match r {
         Err(e) if e.contains(INCONCLUSIVE) => {
             sim.cover("auth:inconclusive");
+            sim.give_up(e);
             Ok(())
         }
         Ok(_) => Ok(()),

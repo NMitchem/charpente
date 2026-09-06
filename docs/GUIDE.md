@@ -1865,8 +1865,15 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
 - First call wins; later ones are consequences of the first.
 - A workload that gives up and then returns `Err` is still a **failure**.
   Failures outrank give-ups.
-- It also marks the coverage key `universe:gave-up`, so a give-up *rate* is
-  something you can put a `require`/floor on like any other sometimes-key.
+- It also marks the coverage key `universe:gave-up` — once per universe, not
+  once per call — so a give-up *rate* is something you can put a
+  `require`/floor on like any other sometimes-key, and it cross-checks the
+  reported count exactly.
+- If your workload already funnels give-ups through a wrapper (the
+  `Err("universe-inconclusive: …")` idiom the platform's own suites use), put
+  the `sim.give_up(e)` call there, beside the `sim.cover(...)` mark. Keep
+  both: the coverage keys are a floorable distribution over *causes*, and the
+  outcome is the scalar the runner reports. Neither replaces the other.
 
 Every batch now states the split, whether or not anything gave up:
 

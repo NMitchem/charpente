@@ -618,8 +618,12 @@ impl Sim {
     /// with the existing `floor:` machinery and needs no new wiring.
     pub fn give_up(&self, reason: impl Into<String>) {
         let mut guard = self.world.lock();
-        guard.cover("universe:gave-up");
         if guard.gave_up.is_none() {
+            // Inside the first-call guard on purpose: the key counts
+            // UNIVERSES that gave up, not calls to `give_up`, so a floor on
+            // it reads as a rate and cross-checks the runner's reported count
+            // exactly.
+            guard.cover("universe:gave-up");
             guard.gave_up = Some(reason.into());
         }
     }

@@ -250,10 +250,18 @@ const INCONCLUSIVE: &str = "universe-inconclusive";
 
 /// Wraps a swarm universe: an inconclusive result (a node that could not
 /// recover under persistent faults) is a covered skip, not a failure.
+///
+/// `sim.give_up` and `sim.cover` answer different questions and both are
+/// wanted. The coverage keys are a floorable distribution over CAUSES (marked
+/// at each give-up site, plus this aggregate); `give_up` is the scalar the
+/// runner reports — how many universes adjudicated anything at all. Without
+/// it, mapping the marker back to `Ok(())` here (above the runner) is exactly
+/// what made a give-up indistinguishable from a pass.
 fn finish_universe(sim: &Sim, r: Result<(), String>) -> Result<(), String> {
     match r {
         Err(e) if e.contains(INCONCLUSIVE) => {
             sim.cover("repl:inconclusive");
+            sim.give_up(e);
             Ok(())
         }
         other => other,
