@@ -3720,12 +3720,17 @@ fn drive_ctrl(
         match cli.poll() {
             Ok(Some(m)) => return Ok(m),
             Ok(None) => {}
-            Err(e) => return Err(format!("{INCONCLUSIVE}: {e}")),
+            Err(e) => {
+                sim.cover("repl:inconclusive:ctrl-conn-lost");
+                return Err(format!("{INCONCLUSIVE}: {e}"));
+            }
         }
         if !advanced {
+            sim.cover("repl:inconclusive:ctrl-quiescent");
             return Err(format!("{INCONCLUSIVE}: quiescent before a control reply"));
         }
     }
+    sim.cover("repl:inconclusive:ctrl-no-reply");
     Err(format!("{INCONCLUSIVE}: no control reply within budget"))
 }
 
@@ -4096,9 +4101,14 @@ fn failover_preserves_everything_the_follower_acked() {
 
 /// Universes in which the prefix oracle actually compared at least one of f's
 /// frames against p's durable log, MEASURED: 46 of 128 at base `0x2EB1_000A` on
-/// 2026-09-06. The other 82 are the property's two mutually exclusive give-up
-/// channels — 43 `repl:failover-inconclusive` (41 of them the pre-crash staging
-/// gate) and 39 `repl:inconclusive` — and 46 + 43 + 39 = 128 exactly.
+/// 2026-09-06. The other 82 all give up, and since oracle-density task 4 routed
+/// this property's four `repl:failover-inconclusive` sites through the shared
+/// `INCONCLUSIVE` convention they all reach `finish_universe`, so
+/// `repl:inconclusive` now counts the whole 82: 41 `:failover-staging-gate` + 2
+/// `:failover-promote-timeout` (together the 43 `repl:failover-inconclusive`) +
+/// 39 `:recover-exhausted`, and 46 + 82 = 128 exactly. The two keys are no
+/// longer mutually exclusive — `repl:failover-inconclusive` is now a subset of
+/// `repl:inconclusive`, not a disjoint channel beside it.
 /// `repl:failover-prefix-empty` measured 0: every universe that reached the
 /// oracle had something to compare.
 ///
@@ -4150,18 +4160,21 @@ fn failover_universe(sim: &mut Sim) -> Result<(), String> {
         ));
     }
     // MEASURED (oracle-density task 2): never fired in 43 give-up universes at
-    // this base seed. Structurally this can only trigger via `f.db.is_none()`
-    // OR `f.last_applied() == None`; the first disjunct is unreachable here —
-    // `f.db` only ever becomes `None` inside `recover_node` (replication.rs
-    // `node.db = None`), which increments `recoveries` first, and the gate
-    // above already returned for `f.recoveries > 0`. So reaching this line
-    // with `f.db` live means the second disjunct is the only way in: f has
-    // not applied a single frame from p yet. That IS reachable in principle —
-    // a follower stalled by conn-drop/net-spike faults for the whole 30-write
-    // warm-up plus the 40-round settle, without ever hitting a fault severe
-    // enough to force a `recover_node` — it simply did not happen in these 43
-    // universes. Keyed (not asserted unreachable) for that reason: a stronger
-    // net-fault trial, a shorter warm-up, or more universes could reach it.
+    // this base seed. Two disjuncts, and only the second is live here. `f.db`
+    // is cleared at exactly two sites reachable from this prelude:
+    // `recover_node` (`:353`), which increments `recoveries` at `:351` first,
+    // and `step_node`'s reseed `db.take()` (`:485`). That second take cannot
+    // still be observed by the time control returns here: its `Ok` arm puts a
+    // `Db` straight back, its fault-fallout arm hands off to `recover_node`
+    // (`recoveries` again), and its remaining `Err` arm propagates out through
+    // `drive_rounds`' `?` before this line runs. So `f.db.is_none()` here
+    // implies `f.recoveries > 0`, which the gate above already returned for:
+    // the first disjunct is dead. The second (`last_applied() == None` on a
+    // live db) is not — a follower stalled by conn-drop/net-spike faults for
+    // the whole 30-write warm-up plus the 40-round settle, never hitting a
+    // fault severe enough to force a `recover_node`, applies zero frames.
+    // Keyed rather than asserted dead for that reason: a stronger net-fault
+    // trial, a shorter warm-up, or more universes could reach it.
     let Some(f_last) = f.db.as_ref().and_then(|d| d.last_applied()) else {
         sim.cover("repl:failover-inconclusive");
         sim.cover("repl:inconclusive:failover-f-not-caught-up");
@@ -4180,18 +4193,14 @@ fn failover_universe(sim: &mut Sim) -> Result<(), String> {
         .and_then(|mut cli| drive_ctrl(sim, &mut [&mut f], &mut cli, CONVERGE_BUDGET))
     {
         Ok(m) => m,
-        // MEASURED (oracle-density task 2): 2/43 give-up universes — the
-        // promote control round (connect, send, or the `drive_ctrl` reply
-        // loop) came back inconclusive, most often the budget/quiescent
-        // "timeout" shape. `e` already carries its own `INCONCLUSIVE`-marked
-        // cause (`repl:inconclusive:ctrl-connect`/`:ctrl-send`, or an
-        // uncovered `drive_ctrl` timeout/quiescent text) — this site adds its
-        // own key on top so the promote-specific give-up stays attributable
-        // once wrapped in this property's give-up.
+        // MEASURED (oracle-density task 2): 2/43 give-up universes. `e` is
+        // already `INCONCLUSIVE`-marked and covered at its origin site, so
+        // this arm adds only the promote-specific key and must not re-prefix
+        // the marker.
         Err(e) if e.contains(INCONCLUSIVE) => {
             sim.cover("repl:failover-inconclusive");
             sim.cover("repl:inconclusive:failover-promote-timeout");
-            return Err(format!("{INCONCLUSIVE}: failover promote: {e}"));
+            return Err(format!("failover promote: {e}"));
         }
         Err(e) => return Err(e),
     };
@@ -4204,25 +4213,36 @@ fn failover_universe(sim: &mut Sim) -> Result<(), String> {
         Msg::CtrlErr { message } => return Err(format!("promote refused unexpectedly: {message}")),
         other => return Err(format!("unexpected promote reply: {other:?}")),
     }
+    // A recovery *during* the promote round is a give-up: the CtrlOk only
+    // proves the round finished, not that nothing perturbed f while
+    // `drive_ctrl` pumped its scheduler rounds — a disk fault mid-round routes
+    // through `step_node` into `recover_node` (incrementing `recoveries`) and
+    // f can still answer the control conn on a later round. The frames this
+    // oracle is about to read would then not be a fair comparison against p.
     // MEASURED (oracle-density task 2): never fired in 43 give-up universes at
-    // this base seed. Structurally reachable, not asserted unreachable: the
-    // CtrlOk reply above only proves the promote round finished, not that
-    // nothing perturbed f while `drive_ctrl` was pumping its scheduler round
-    // — a disk fault mid-round can still route through `step_node` into
-    // `recover_node` (incrementing `recoveries`) and f can still answer the
-    // control conn afterward, or f's writability can lag one round behind its
-    // own CtrlOk. Either way the frames this oracle is about to read would no
-    // longer be a fair comparison against p, so it is a precondition gate for
-    // `assert`-worthy comparability, not evidence of a control-plane bug —
-    // hence a give-up, keyed for when it does fire rather than asserted dead.
-    if f.recoveries > 0 || !f.db.as_ref().is_some_and(|d| d.writes_allowed()) {
+    // this base seed; keyed rather than asserted dead.
+    if f.recoveries > 0 {
         sim.cover("repl:failover-inconclusive");
         sim.cover("repl:inconclusive:failover-post-promote-gate");
         return Err(format!(
-            "{INCONCLUSIVE}: failover: f recovered during promotion or is not writable after a \
-             CtrlOk promote reply (recoveries: {}, writes_allowed: {})",
-            f.recoveries,
-            f.db.as_ref().is_some_and(|d| d.writes_allowed())
+            "{INCONCLUSIVE}: failover: f recovered {} time(s) during its own promotion, so its \
+             frames are no longer a fair comparison against p",
+            f.recoveries
+        ));
+    }
+    // Writability, by contrast, is NOT a give-up. `Repl::do_promote` calls
+    // `db.allow_writes()` (`repl/mod.rs:909`) BEFORE `reply_ctrl` (`:916`), so
+    // the CtrlOk above is itself the promise that writes are already open; and
+    // with `f.recoveries == 0` nothing has replaced that `Db` since. A
+    // non-writable f here is therefore a promotion violation, and folding it
+    // into the give-up above would let a control-plane bug report as green.
+    if !f.db.as_ref().is_some_and(|d| d.writes_allowed()) {
+        return Err(format!(
+            "promote contract violated: f replied CtrlOk to CtrlPromote yet does not allow \
+             writes (f.db live: {}, f role {:?}, recoveries 0) — `do_promote` must allow writes \
+             before it acks (repl/mod.rs:909 before :916); fix that ordering, not this check",
+            f.db.is_some(),
+            f.repl.role()
         ));
     }
 

@@ -147,22 +147,30 @@ each run's own printed summary, so there is no interleaving ambiguity.
 | `follower_converges_to_the_primary_fingerprint` | 256 | 89 | 0 | 0 | 0 | 89 | 34.8% |
 | `late_follower_seeds_below_the_gcd_base_and_converges` | 256 | 109 | 0 | 0 | 0 | 109 | 42.6% |
 | `switchover_mid_write_load_loses_nothing_and_serves_reads_throughout` | 256 | 45 | 0 | 2 | 0 | 43 | 17.6% |
-| `failover_preserves_everything_the_follower_acked` | 128 | 39 | 0 | 0 | 0 | 39 | 30.5%† |
+| `failover_preserves_everything_the_follower_acked` | 128 | 39 → 82† | 0 | 0 | 0 | 39 | 30.5% → 64.1%† |
 | `wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower` | 128 | 90 | 0 | 0 | 0 | 0 | 70.3% |
 
-†**Correction (fix round 1, 2026-09-06):** `repl:inconclusive` and `repl:failover-inconclusive`
-are **mutually exclusive per universe** for this property, not independent as first reported.
-A code trace of `failover_universe` shows all four `repl:failover-inconclusive` sites
-`return Ok(())` immediately, so a universe that hits one of them never reaches
-`finish_universe`'s `Err(e) if e.contains(INCONCLUSIVE)` arm — and `repl:inconclusive` fires
-only there. The two outcomes cannot both occur in one universe, so their union is derivable
-and is this property's real give-up rate: **82/128 = 64.1%**, decomposed into two mutually
-exclusive components — 30.5% (`repl:inconclusive`, all `:recover-exhausted`) plus 33.6%
-(`repl:failover-inconclusive`, detailed below). **64.1% is this property's headline give-up
-rate.** 30.5% is what the table column shows because it is the only component this task's
-four cause keys reach; the SE comparisons later in this section use that same 30.5%
-component (the one rate all five properties share a key for), not the 64.1% union, since no
-equivalent second wrapper has been measured for the other four properties.
+†**Correction (fix round 1, 2026-09-06), then superseded by task 4 (commit `a90b5dd`).**
+*As measured above*, `repl:inconclusive` and `repl:failover-inconclusive` were **mutually
+exclusive per universe** for this property, not independent as first reported: all four
+`repl:failover-inconclusive` sites `return Ok(())` immediately, so a universe that hit one of
+them never reached `finish_universe`'s `Err(e) if e.contains(INCONCLUSIVE)` arm — and
+`repl:inconclusive` fires only there. The two outcomes could not both occur in one universe,
+so their union was derivable and is this property's real give-up rate: **82/128 = 64.1%**,
+decomposed into two then-exclusive components — 30.5% (`repl:inconclusive`, all
+`:recover-exhausted`) plus 33.6% (`repl:failover-inconclusive`, detailed below). **64.1% is
+this property's headline give-up rate.**
+
+**The exclusivity ended with task 4.** All four sites now return `INCONCLUSIVE`-marked `Err`s
+carrying per-site cause keys, so they route through `finish_universe` like every other give-up
+in the file, and `repl:inconclusive` **measures** the 82 directly instead of it being derived:
+41 `:failover-staging-gate` + 2 `:failover-promote-timeout` + 39 `:recover-exhausted`.
+`repl:failover-inconclusive` (43) is now a *subset* of `repl:inconclusive`, not a disjoint
+channel. The `39` / `30.5%` in the table row are the pre-conversion values, kept because the
+row records what that run measured. The SE comparisons later in this section still use the
+30.5% `:recover-exhausted` component (the one rate all five properties share a key for), not
+the 64.1% union, since no equivalent second wrapper has been measured for the other four
+properties.
 
 `:spawn-exhausted` and `:store-bricked` never fire in any of the five properties measured.
 The fifth property's four zeros are **not** a clean bill of health: it doesn't route through
