@@ -1647,8 +1647,18 @@ fn recover_rt_node(sim: &Sim, node: &mut RNode) -> Result<(), String> {
     node.recoveries += 1;
     node.kernel = None;
     let mut last = String::new();
-    for _ in 0..RT_RECOVER_ATTEMPTS {
-        node.host.restart();
+    for attempt in 0..RT_RECOVER_ATTEMPTS {
+        // Power-cycle every Nth attempt rather than every one — cycling
+        // before every attempt is the wrong shape: `settle_boot`'s doc
+        // comment above (`:706-712`) measured it directly at 0 of 20_000
+        // boots ever succeeding, because every `Sim::restart` discards the
+        // uncheckpointed store and forces a full WAL rebuild on every try.
+        // Reuses `SETTLE_CYCLE_EVERY` rather than declaring a second
+        // constant: one file, one meaning for "how often to power-cycle a
+        // stuck boot".
+        if attempt.is_multiple_of(SETTLE_CYCLE_EVERY) {
+            node.host.restart();
+        }
         match open_rt_kernel(sim, &node.host, &node.repl_cfg, &node.db_cfg, node.flipped) {
             Ok(kernel) => {
                 node.kernel = Some(kernel);

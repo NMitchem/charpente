@@ -34,6 +34,17 @@ const SWARM_SECRET: &str = "swarm-secret";
 const AUTH_ROUNDS: u32 = 8;
 const AUTH_CONVERGE_ROUNDS: u32 = 400;
 const AUTH_RECOVER_ATTEMPTS: u32 = 200;
+/// Power-cycle every Nth recovery attempt rather than every one — cycling
+/// before EVERY attempt is the wrong shape: `realtime.rs`'s `settle_boot` doc
+/// comment (`:706-712`) measured it directly on seed `0x536007ad99fd90bf`
+/// (`write_error` 0.144) at 0 of 20_000 boots ever succeeding, because
+/// `Store::apply` commits at `Durability::None` and every `Sim::restart`
+/// discards the uncheckpointed store, forcing a full WAL rebuild on every
+/// single try. Retrying in place instead lets a boot settle; the same value
+/// (`8`) as its siblings (`replication.rs:428`'s `RECOVER_CYCLE_EVERY`,
+/// `realtime.rs:657`'s `SETTLE_CYCLE_EVERY`) keeps all the retry loops
+/// modeling a failed process start identically.
+const AUTH_RECOVER_CYCLE_EVERY: u32 = 8;
 const AUTH_STEP_BUDGET: u32 = 20_000;
 const AUTH_HORIZON: u64 = 300 * SEC;
 
@@ -274,8 +285,10 @@ fn recover_auth_node(sim: &Sim, node: &mut AuthNode) -> Result<(), String> {
     sim.cover("restart");
     node.kernel = None;
     let mut last = String::new();
-    for _ in 0..AUTH_RECOVER_ATTEMPTS {
-        node.host.restart();
+    for attempt in 0..AUTH_RECOVER_ATTEMPTS {
+        if attempt.is_multiple_of(AUTH_RECOVER_CYCLE_EVERY) {
+            node.host.restart();
+        }
         match open_auth_kernel(sim, &node.host, &node.repl_cfg, &node.db_cfg) {
             Ok(kernel) => {
                 node.kernel = Some(kernel);
