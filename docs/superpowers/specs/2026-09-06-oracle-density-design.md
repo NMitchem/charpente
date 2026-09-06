@@ -147,8 +147,22 @@ each run's own printed summary, so there is no interleaving ambiguity.
 | `follower_converges_to_the_primary_fingerprint` | 256 | 89 | 0 | 0 | 0 | 89 | 34.8% |
 | `late_follower_seeds_below_the_gcd_base_and_converges` | 256 | 109 | 0 | 0 | 0 | 109 | 42.6% |
 | `switchover_mid_write_load_loses_nothing_and_serves_reads_throughout` | 256 | 45 | 0 | 2 | 0 | 43 | 17.6% |
-| `failover_preserves_everything_the_follower_acked` | 128 | 39 | 0 | 0 | 0 | 39 | 30.5% |
+| `failover_preserves_everything_the_follower_acked` | 128 | 39 | 0 | 0 | 0 | 39 | 30.5%† |
 | `wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower` | 128 | 90 | 0 | 0 | 0 | 0 | 70.3% |
+
+†**Correction (fix round 1, 2026-09-06):** `repl:inconclusive` and `repl:failover-inconclusive`
+are **mutually exclusive per universe** for this property, not independent as first reported.
+A code trace of `failover_universe` shows all four `repl:failover-inconclusive` sites
+`return Ok(())` immediately, so a universe that hits one of them never reaches
+`finish_universe`'s `Err(e) if e.contains(INCONCLUSIVE)` arm — and `repl:inconclusive` fires
+only there. The two outcomes cannot both occur in one universe, so their union is derivable
+and is this property's real give-up rate: **82/128 = 64.1%**, decomposed into two mutually
+exclusive components — 30.5% (`repl:inconclusive`, all `:recover-exhausted`) plus 33.6%
+(`repl:failover-inconclusive`, detailed below). **64.1% is this property's headline give-up
+rate.** 30.5% is what the table column shows because it is the only component this task's
+four cause keys reach; the SE comparisons later in this section use that same 30.5%
+component (the one rate all five properties share a key for), not the 64.1% union, since no
+equivalent second wrapper has been measured for the other four properties.
 
 `:spawn-exhausted` and `:store-bricked` never fire in any of the five properties measured.
 The fifth property's four zeros are **not** a clean bill of health: it doesn't route through
@@ -166,11 +180,25 @@ property at a time instead of read off an interleaved run: no discrepancy to rep
 lands on `late_follower_seeds_below_the_gcd_base_and_converges`, a **256**-universe property,
 not a 128-universe one, so its rate is 42.6%, not the speculated ~85%. **No property gives up
 at ~85% of its universes** — the highest measured rate is 70.3% (the 90, on the 128-universe
-`wal_corruption...` property). At n=128 a swing of ~4-5 counts is roughly one binomial
-standard error near these rates (computed: 5.2 at both p=0.305 and p=0.703; at n=256: 7.6,
-7.9 and 6.1 for the three respective rates), so the 30.5%-vs-70.3% gap between the two
-128-universe properties is far outside noise, while the 42.6%-vs-34.8% gap between the two
-largest 256-universe properties is a probable but not overwhelming difference (~2.5 SEs).
+`wal_corruption...` property; `failover_preserves_everything_the_follower_acked`'s 64.1%
+union, above, is the next-highest).
+
+Comparisons below use each property's `repl:inconclusive`-only rate — the one key all five
+properties share — via the **two-sample combined standard error**,
+`SE = sqrt(p1(1-p1)/n1 + p2(1-p2)/n2)`, reported as the number of combined SEs the two rates
+are apart (not one property's own SE applied to a raw-count difference, which understates
+uncertainty). Bucketing: **indistinguishable** under ~1 combined SE, **suggestive** around 2,
+**clear** past ~3. The 30.5%-vs-70.3% gap between the two 128-universe properties
+(`failover`'s component rate vs `wal_corruption`) is a 39.8-percentage-point gap against a
+~5.7-point combined SE: **~6.95 combined SEs** — clear, well past noise, though not the
+order-of-magnitude an earlier, miscalculated version of this claim implied (that version
+compared a raw *count* difference of 51 against one property's own ~5-count SE). The
+42.6%-vs-34.8% gap between the two largest 256-universe properties (`late_follower_seeds` vs
+`follower_converges`) is **~1.82 combined SEs** — near the noise floor, suggestive at best,
+not the "probable" difference an earlier version of this claim called it. Full pairwise
+combined-SE figures for all five properties, including one pair that is statistically
+indistinguishable (~0.85 combined SEs), are in
+`.superpowers/sdd/2026-09-06-oracle-density/task-2-report.md`'s fix-round section.
 
 **The sixth wrapper, `repl:failover-inconclusive`** (exists only on
 `failover_preserves_everything_the_follower_acked`): **43** over the same 128-universe,
