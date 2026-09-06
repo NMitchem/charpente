@@ -135,3 +135,81 @@ for tenant-scoping. The branch ships complete and reviewed; it stops there.
 - No change to the tenancy guarantee's boundary (DECISIONS §12 stands as ratified).
 - No `#[route(public)]` macro change (R1).
 - No retrofit of existing properties beyond the six wrappers named in Finding A.
+
+## Attribution, measured (2026-09-06)
+
+Each of the five properties was run alone, in the foreground, one `cargo test` invocation
+per property, `CHARPENTE_SEED` never set (full command list below). Coverage was read off
+each run's own printed summary, so there is no interleaving ambiguity.
+
+| Property | Universes | `repl:inconclusive` | `:spawn-exhausted` | `:role-file-torn` | `:store-bricked` | `:recover-exhausted` | Give-up rate |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `follower_converges_to_the_primary_fingerprint` | 256 | 89 | 0 | 0 | 0 | 89 | 34.8% |
+| `late_follower_seeds_below_the_gcd_base_and_converges` | 256 | 109 | 0 | 0 | 0 | 109 | 42.6% |
+| `switchover_mid_write_load_loses_nothing_and_serves_reads_throughout` | 256 | 45 | 0 | 2 | 0 | 43 | 17.6% |
+| `failover_preserves_everything_the_follower_acked` | 128 | 39 | 0 | 0 | 0 | 39 | 30.5% |
+| `wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower` | 128 | 90 | 0 | 0 | 0 | 0 | 70.3% |
+
+`:spawn-exhausted` and `:store-bricked` never fire in any of the five properties measured.
+The fifth property's four zeros are **not** a clean bill of health: it doesn't route through
+the instrumented `Db`-level helpers at all. It calls a parallel kernel-level family
+(`spawn_kernel_node_with_schema`/`open_kernel`/`recover_kernel_node`,
+`replication.rs:4436-4665`) that mirrors the same failure shapes (torn witness/role file,
+store-bricked, spawn/recover exhaustion) but never marks any of the four cause keys — so its
+90 give-ups reach only the generic `finish_universe` catch-all, with zero cause-level
+attribution available from existing instrumentation. `open_kernel`'s torn-role-file arm also
+never covers a cause key at all, unlike `open_node`'s equivalent arm.
+
+**The ledger's open question, answered.** The measured counts — `{89, 109, 45, 39, 90}` —
+are **the same five numbers the ledger recorded** (90, 39, 45, 109, 89), now attributed one
+property at a time instead of read off an interleaved run: no discrepancy to report. The 109
+lands on `late_follower_seeds_below_the_gcd_base_and_converges`, a **256**-universe property,
+not a 128-universe one, so its rate is 42.6%, not the speculated ~85%. **No property gives up
+at ~85% of its universes** — the highest measured rate is 70.3% (the 90, on the 128-universe
+`wal_corruption...` property). At n=128 a swing of ~4-5 counts is roughly one binomial
+standard error near these rates (computed: 5.2 at both p=0.305 and p=0.703; at n=256: 7.6,
+7.9 and 6.1 for the three respective rates), so the 30.5%-vs-70.3% gap between the two
+128-universe properties is far outside noise, while the 42.6%-vs-34.8% gap between the two
+largest 256-universe properties is a probable but not overwhelming difference (~2.5 SEs).
+
+**The sixth wrapper, `repl:failover-inconclusive`** (exists only on
+`failover_preserves_everything_the_follower_acked`): **43** over the same 128-universe,
+unmodified run (33.6% of universes). Its four `cover(); return Ok(())` sites share one
+literal string, so a one-time, fully-reverted instrumentation pass (distinct sub-keys per
+site, re-run, then `git checkout --` restoring `replication.rs` to its committed content —
+verified clean by `git status`/`git diff --stat`) attributed them: site 1
+(`:4000-4003`, the pre-crash staging gate) fired **41/43 (95.3%)**, site 3 (`:4014-4023`, the
+promote round timing out) fired **2/43 (4.7%)**, sites 2 (`:4004-4007`) and 4
+(`:4033-4036`) fired **0**. The instrumented re-run reproduced byte-identical
+fault/restart/`repl:inconclusive` counts to the uninstrumented run, confirming the sub-key
+edit changed no behavior. This property carries no `require:`/`floor:` at all, so none of
+these four sites (nor the property's one fireable `repl:inconclusive` cause,
+`:recover-exhausted`) are checked for ever firing — a regression silencing any of them would
+still read green.
+
+**Also observed, out of this task's scope:** the switchover property carries two more
+give-up-shaped keys not among the four cause keys or the sixth wrapper —
+`repl:switchover-inconclusive` (131/256, 45.8%) and `repl:switchover-stalled` (8). Unlike
+`repl:failover-inconclusive`, `repl:switchover-inconclusive` does not unconditionally
+`return Ok(())` — it still runs `assert_one_writable` — so it is a reduced-oracle path, not
+a full bypass. Flagged as a candidate for the same attribution treatment, not attributed
+here.
+
+Commands used (verbatim):
+
+```bash
+set -o pipefail
+for p in follower_converges_to_the_primary_fingerprint \
+         late_follower_seeds_below_the_gcd_base_and_converges \
+         switchover_mid_write_load_loses_nothing_and_serves_reads_throughout \
+         failover_preserves_everything_the_follower_acked \
+         wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower; do
+  cargo test -p charpente --test replication "$p" -- --exact --test-threads=1 --nocapture \
+    2>&1 | tee "/tmp/attr-$p.log"
+done
+```
+
+Runtimes (table order): 195.09s, 167.29s, 102.93s, 67.65s, 42.29s — all five well inside the
+600s per-invocation ceiling; none deferred, no universe count reduced. Full detail, per-site
+guard text, and the additional switchover keys are in
+`.superpowers/sdd/2026-09-06-oracle-density/task-2-report.md`.
