@@ -3030,3 +3030,61 @@ universes. That is the claim proved through the harness, not asserted in a unit 
 Verification: fmt 0, clippy `--workspace --all-targets -D warnings` 0, charpente-sim 143
 tests green, sim-fixture 256 universes green, `guide-examples` builds (the GUIDE's compiled
 ```rust block is the backstop and was edited in the same commit, hard rule 6).
+
+## 2026-09-06 — two corrections to yesterday's entries, and the machine could not finish a suite
+
+**CORRECTION 1 — "no `catch_unwind` anywhere in `crates/charpente/src`" is FALSE, and I
+repeated it into the record.** The tenant-0 entry and commit `9e5cd9b` both argue the severity
+that way, citing `archive/mod.rs:842`'s doc comment. `kernel/dispatch.rs:212` is a
+`catch_unwind`. **The finding and the fix stand**: it wraps job-handler glue (`def.glue`), so a
+panicking JOB is absorbed into `JobError::App` as a failed attempt, while an HTTP route handler
+has no such wrapper — and the route path (`/admin/notes` in the fixture, plus the cross-request
+group-overlay case) is the one the repro demonstrates. What is wrong is the blanket sentence,
+and how it was obtained: a doc comment was quoted instead of a grep being run. **Two source
+comments carry the false claim and should be fixed** — `crates/charpente/src/archive/mod.rs:842`
+and `crates/charpente/tests/tenant.rs:1027`, the latter written by me yesterday. That
+`dispatch.rs` sibling deserves its own note: a panicking job handler also prints a raw trace
+before absorption, and unlike F1 that trace should probably STAY — there the panic is the app
+author's own bug and the trace is the useful artifact.
+
+**CORRECTION 2 — `CONVERGED_FLOOR` pins one property, not five.** Yesterday's entry presents
+the floor as closing the `repl:inconclusive` hole. `finish_universe` (`replication.rs:252`) is
+shared by FIVE properties — `follower_converges_to_the_primary_fingerprint` (:880),
+`late_follower_seeds_below_the_gcd_base_and_converges` (:1142),
+`switchover_mid_write_load_loses_nothing_and_serves_reads_throughout` (:3700),
+`failover_preserves_everything_the_follower_acked` (:3979), and
+`wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower` (:5187) — and
+`CONVERGED_FLOOR` constrains only the first. Four consumers of the same wrapper remain
+unpinned, and `repl:logical-converged` is not even reachable in two of them. A sixth wrapper
+exists that a marker grep cannot find: `repl:failover-inconclusive` has four
+`cover(); return Ok(())` sites (`:4001, :4005, :4019, :4034`), three carrying no `INCONCLUSIVE`
+string, on a property with **no `require:` at all**.
+
+**The number that should worry us most is still unattributed.** This ledger records
+`repl:inconclusive` at 90, 39, 45, 109, 89 across those five properties in one run. Their
+universe sets are 256/256/256/128/128 — so **if the 109 lands on a 128-universe property, that
+is an 85% give-up rate**, and the two 128-universe properties are the two with the weakest
+instrumentation. Attribution needs `--exact --test-threads=1 --nocapture` one property per
+invocation: the coverage block is tagged with the TEST FILE, never the test function, so two
+properties in one file are indistinguishable even when run serially. That measurement is the
+precondition for any further floor, and it has not been made.
+
+**Also carried forward, unfixed:** `recover_auth_node` (`auth.rs:272`) and `recover_rt_node`
+(`realtime.rs:1645`) still power-cycle before EVERY attempt — the pattern `settle_boot` measured
+at 0 of 20,000 boots — over a budget of 200 against replication's 500. Porting
+`RECOVER_CYCLE_EVERY` to both must land BEFORE their floors are measured, or the floors get
+taken against a known-bad retry shape.
+
+**No workspace suite was completed on 2026-09-06, and the reason is the machine.** Two
+out-of-memory kills (a ~1 GB `Virtualization.framework` VM resident, ~62 MB free at the second
+kill), and separately `syspolicyd` at **1044 minutes of CPU** stalling binary validation — one
+test binary sat 11 minutes at `_dyld_start` with a 96 KB footprint and 0:00.00 CPU, having
+never executed an instruction. Killed by pid to unblock the run. What DID pass at `c6e1dcc`
+before the second kill: `charpente-core` 10 suites, `charpente-macros` 3, `charpente-sim` 6
+(the package carrying the checker change), `charpente-tsgen` 3 of 4 — its `types.rs` is the one
+that stalled in dyld and is unverified, not failed. `fmt` 0 and
+`clippy --workspace --all-targets -D warnings` 0 were both banked at this HEAD earlier.
+**`charpente`, `charpente-cli`, `sim-fixture`, `ts-fixture-app`, `guide-examples`,
+`edge-harness`, `bench-harness` and `invoicing` are unverified at this commit** — recorded as
+owed rather than assumed, since the individually-affected packages were run green at the time
+each change landed.
