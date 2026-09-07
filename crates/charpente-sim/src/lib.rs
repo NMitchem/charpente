@@ -614,6 +614,20 @@ impl Sim {
     /// consequences. A workload that gives up and then returns `Err` is still
     /// a failure — failures outrank give-ups.
     ///
+    /// **The call must be terminal for the universe — nothing enforces this,
+    /// and it is the one way to make the report lie.** `gave_up` is sticky, so
+    /// a workload that gives up inside a retry arm and then goes on to
+    /// adjudicate its property is counted as a give-up despite having reached
+    /// a verdict. The error runs in the conservative direction (an honest
+    /// verdict is under-counted, never a give-up over-counted), and the
+    /// negative space cannot be asserted here: `Sim` has no way to know what
+    /// "adjudicating" means for a caller's property, so only the caller can
+    /// hold the rule. The shape where this will bite first is a multi-round
+    /// checker driven on the caller's own world — `checks::acked_implies_durable`
+    /// is the one in this crate: give up in round 1's fault-fallout arm and
+    /// rounds 2 and 3 still run, so their verdict is thrown away silently.
+    /// In a loop, `give_up` and `return`/`break` out belong on the same arm.
+    ///
     /// Also marks `universe:gave-up` coverage, so a give-up *rate* is floorable
     /// with the existing `floor:` machinery and needs no new wiring.
     pub fn give_up(&self, reason: impl Into<String>) {

@@ -69,3 +69,10 @@ $ charpente test --sim --dir examples/invoicing --universes 1024 --jobs 8 --form
 sim: 1024 universe(s) per test from master seed 0xd9334e2eda1d4e3c
 sim: 1024 universe(s) per test, all green (master seed: 0xd9334e2eda1d4e3c)
 ```
+
+(Transcript preserved as it was printed. That summary line has since been
+retired: a run now ends with its verdict/give-up split — `N verdict(s), M gave
+up, no failures` — instead of "all green", because "green" was equally true of
+a universe that gave up and one that adjudicated. This app does not yet call
+`Sim::give_up`, so the give-up count it reports today is unverified rather than
+measured. See docs/GUIDE.md's "Giving up" section.)

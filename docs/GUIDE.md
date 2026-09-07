@@ -1863,6 +1863,11 @@ fn counter_survives(sim: &mut Sim) -> Result<(), String> {
   that is exactly what happened — a property could report green having
   concluded nothing over most of its universes.
 - First call wins; later ones are consequences of the first.
+- **Give up and stop.** The record is sticky and nothing enforces terminality,
+  so if you give up inside a retry arm and the loop then goes on to adjudicate,
+  the universe is still reported as a give-up and that verdict is thrown away.
+  `give_up` and the `return`/`break` belong on the same arm. This bites hardest
+  in a multi-round checker on your own `sim` (`acked_implies_durable`).
 - A workload that gives up and then returns `Err` is still a **failure**.
   Failures outrank give-ups.
 - It also marks the coverage key `universe:gave-up` — once per universe, not
@@ -1888,9 +1893,24 @@ property that adjudicated nothing is vacuous no matter how green it looks:
 sim: every universe of "counter_roundtrip" gave up — it adjudicated nothing over 64 universes; the property is vacuous until the faults it cannot survive are narrowed
 ```
 
-The platform's own `cargo test` suites print the same split
-(`charpente-sim [replication]: 90 of 128 universes reached a verdict, 38 gave
-up`), so the number is visible at both layers.
+**Where the split is visible, and where it is not.** `charpente test --sim`
+always prints it: the sim binary is `harness = false`, so nothing captures its
+output. The platform's own internal suites print the same line —
+
+```text
+charpente-sim [replication]: 38 of 128 universes reached a verdict, 90 gave up
+```
+
+— but that one goes to stderr from inside a libtest `#[test]`, so **a passing
+`cargo test` swallows it.** Add `-- --nocapture` to see it (a failing test
+shows it either way). So do not expect a CI run to surface give-ups; go
+looking for them.
+
+Read that example line the right way round: **38** of those 128 universes
+adjudicated the property and **90** did not. It is a real measurement from
+`wal_corruption_on_the_primary_no_longer_loses_acked_records_with_a_follower`,
+and it means 70% of that property's universes prove nothing — which was
+invisible before the split was printed, and is the entire reason it is.
 
 ### The checkers
 

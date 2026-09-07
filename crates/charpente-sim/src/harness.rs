@@ -560,7 +560,10 @@ fn write_human(report: &Report, out: &mut dyn std::io::Write) {
                 o.gave_up, report.universes, o.test
             );
         }
-        if o.gave_up > 0 && o.verdicts == 0 {
+        // `gave_up == universes`, not `verdicts == 0`: a batch where some
+        // universes FAILED and the rest gave up has zero verdicts too, and
+        // calling that "every universe gave up" would misreport a red run.
+        if report.universes > 0 && o.gave_up == report.universes {
             let _ = writeln!(
                 out,
                 "sim: every universe of \"{}\" gave up — it adjudicated nothing over {} \
@@ -570,10 +573,13 @@ fn write_human(report: &Report, out: &mut dyn std::io::Write) {
             );
         }
     }
-    let status = if report.failures.is_empty() && report.missing_coverage.is_empty() {
-        "no failures".to_string()
-    } else {
-        format!("{} failure(s)", report.failures.len())
+    let status = match (report.failures.len(), report.missing_coverage.len()) {
+        (0, 0) => "no failures".to_string(),
+        (0, unmet) => format!("no failures, {unmet} unmet coverage requirement(s)"),
+        (failures, 0) => format!("{failures} failure(s)"),
+        (failures, unmet) => {
+            format!("{failures} failure(s), {unmet} unmet coverage requirement(s)")
+        }
     };
     let _ = writeln!(
         out,
@@ -1076,6 +1082,73 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("adjudicated nothing"), "{text}");
+    }
+
+    /// The vacuity line is about universes that ADJUDICATED NOTHING, not about
+    /// a zero verdict count — a batch whose universes half failed and half gave
+    /// up also has zero verdicts, and calling that "every universe gave up"
+    /// would describe a red run as a vacuous green one.
+    #[test]
+    fn a_batch_that_failed_is_not_reported_as_every_universe_gave_up() {
+        fn gives_up_or_fails(sim: &mut Sim) -> Result<(), String> {
+            use charpente_core::io::Entropy;
+            let mut b = [0u8; 1];
+            sim.entropy().fill(&mut b);
+            if b[0] % 2 == 0 {
+                sim.give_up("toy give-up");
+                Ok(())
+            } else {
+                Err("toy failure".into())
+            }
+        }
+        let tests = [SimTest {
+            name: "mixed",
+            run: gives_up_or_fails,
+            require: &[],
+        }];
+        let args = parse(&["--universes", "16", "--master-seed", "0xf00d"]).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(run(&tests, &args, &mut out), 1);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("0 verdict(s)"),
+            "no universe adjudicated: {text}"
+        );
+        // Non-vacuity: this batch really does mix failures with give-ups, so
+        // the absence of the vacuity line below is a decision, not an accident.
+        assert!(
+            text.contains("universes of \"mixed\" gave up"),
+            "some universes must have given up for this test to mean anything: {text}"
+        );
+        assert!(
+            !text.contains("every universe of"),
+            "some universes FAILED — they did not give up: {text}"
+        );
+        assert!(text.contains("failure(s)"), "{text}");
+    }
+
+    /// A run red only on coverage used to end "…, 0 failure(s)", which reads as
+    /// green to anyone skimming the last line.
+    #[test]
+    fn a_coverage_only_red_says_what_is_actually_unmet() {
+        fn covers_something_else(sim: &mut Sim) -> Result<(), String> {
+            sim.cover("sometimes:happens");
+            Ok(())
+        }
+        let tests = [SimTest {
+            name: "that_test",
+            run: covers_something_else,
+            require: &["never:happens"],
+        }];
+        let args = parse(&["--universes", "2"]).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(run(&tests, &args, &mut out), 1);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("no failures, 1 unmet coverage requirement(s)"),
+            "{text}"
+        );
+        assert!(!text.contains("0 failure(s)"), "{text}");
     }
 
     #[test]
