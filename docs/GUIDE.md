@@ -2375,6 +2375,40 @@ The same discipline extends outward: `run_universes!`/`run_universes_swarm!`
 --sim --seed 0x…` are the same idea at two different layers: a failure's
 seed is always enough, on its own, to see the exact same universe again.
 
+### Re-basing a pinned property: `CHARPENTE_BASE_SEED`
+
+Some properties fix their base seed (`run_universes_swarm_with!(BASE, N, …)`)
+so their `floor:` rates have a stable denominator. That is right for a rate and
+wrong for a correctness claim: a fixed base means the property only ever
+examines the same N universes, while a green run reads as though it examined
+the space.
+
+`CHARPENTE_BASE_SEED=0x… cargo test -p <pkg> --test <file>` re-bases every
+pinned property in that binary, so the claim "this property holds" can actually
+be tested rather than assumed:
+
+```text
+charpente-sim [realtime]: re-basing 0x000000002eb20001 -> 0x00000000a11ce001 under
+  CHARPENTE_BASE_SEED — coverage requirements and floors skipped (they are rates
+  measured at the pinned base)
+```
+
+Floors and `require:` keys are skipped under the override, for the reason the
+floor's own panic text gives: they are rates measured AT a base, so evaluating
+them somewhere else compares against a denominator that was never taken there.
+What the mode tests is the property's own assertions, which are untouched.
+
+**A correctness oracle should pass at every base.** If it passes at its pinned
+base and fails at others, it is not flaky — it is failing, and the pinned base
+is hiding it. Two realtime properties were found exactly that way
+(docs/LEDGER.md 2026-09-07).
+
+One caveat worth knowing before you chase a floor panic: a `sync_dir` or any
+other IO call consumes RNG draws, so changing *where* an IO operation happens
+inside code a property never names reshuffles every universe at a pinned base.
+Floors move for that reason far more often than they move because an oracle
+decayed.
+
 ### A note on the edge harness (platform dev tooling, not app surface)
 
 The repo also carries `crates/edge-harness`, which drives real built binaries

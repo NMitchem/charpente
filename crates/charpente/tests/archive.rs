@@ -7209,16 +7209,27 @@ const CONV_DISK_ERROR_DIVISOR: f64 = 16.0;
 /// only the `log.rs` barrier makes both properties pass at these same bases,
 /// which is what identifies the cause rather than assuming it.
 ///
-/// | floor | was | now | note |
+/// | floor | was | now | measures |
 /// |---|---|---|---|
-/// | `CONV_RESTORED_FLOOR` | 219 | 218 | one universe |
-/// | `CONV_SUBSTANTIAL_FLOOR` | 183 | 183 | unmoved |
-/// | `CONV_CHAINED_FLOOR` | 169 | 169 | measures 172 now; a floor is a MINIMUM, and raising one that is not failing is a separate decision from repairing one that is |
-/// | `CONV_SCOPED_RESTORED_FLOOR` | 214 | 214 | unmoved |
-/// | `CONV_SCOPED_SUBSTANTIAL_FLOOR` | 164 | 159 | five universes |
-/// | `CONV_SCOPED_CHAINED_FLOOR` | 158 | 158 | unmoved |
-const CONV_RESTORED_FLOOR: u64 = 218;
-const CONV_SUBSTANTIAL_FLOOR: u64 = 183;
+/// | `CONV_RESTORED_FLOOR` | 219 | 217 | 217 |
+/// | `CONV_SUBSTANTIAL_FLOOR` | 183 | 181 | 181 |
+/// | `CONV_CHAINED_FLOOR` | 169 | 169 | 174 — a floor is a MINIMUM; raising one that is not failing is a separate decision from repairing one that is |
+/// | `CONV_SCOPED_RESTORED_FLOOR` | 214 | 213 | 213 |
+/// | `CONV_SCOPED_SUBSTANTIAL_FLOOR` | 164 | 160 | 160 |
+/// | `CONV_SCOPED_CHAINED_FLOOR` | 158 | 156 | 156 |
+///
+/// **These moved TWICE in one day, and the second move is the more instructive.**
+/// The barrier first landed after the replay loop and the floors were re-measured
+/// to that; it then moved to before the replay loop (a correctness fix — see
+/// `log.rs`), and every floor moved again. A `sync_dir` call consumes RNG draws,
+/// so changing WHERE an IO op happens in `Wal::open` reshuffles every universe's
+/// fault schedule at a pinned base. **Pinned-base floors are therefore coupled to
+/// the IO-op ordering of code they do not name**, and any change to that ordering
+/// costs a re-measure here. That is a real maintenance cost of this instrument,
+/// recorded so the next person meeting these panics knows the cause is usually
+/// upstream and mechanical rather than a decayed oracle.
+const CONV_RESTORED_FLOOR: u64 = 217;
+const CONV_SUBSTANTIAL_FLOOR: u64 = 181;
 const CONV_CHAINED_FLOOR: u64 = 169;
 
 /// `archive_converges_with_a_scoped_table`'s own base and floors. Separate
@@ -7251,9 +7262,9 @@ const CONV_CHAINED_FLOOR: u64 = 169;
 /// `tenant:restored-multi-tenant` fired 244 times, so the `require:` key is a
 /// real floor rather than a decoration.
 const ARCHIVE_SCOPED_CONVERGENCE_BASE: u64 = 0xA2C0_5C09;
-const CONV_SCOPED_RESTORED_FLOOR: u64 = 214;
-const CONV_SCOPED_SUBSTANTIAL_FLOOR: u64 = 159; // 164 before the 2026-09-07 open-path barrier; see CONV_RESTORED_FLOOR
-const CONV_SCOPED_CHAINED_FLOOR: u64 = 158;
+const CONV_SCOPED_RESTORED_FLOOR: u64 = 213;
+const CONV_SCOPED_SUBSTANTIAL_FLOOR: u64 = 160; // 164 before the 2026-09-07 open-path barrier; see CONV_RESTORED_FLOOR
+const CONV_SCOPED_CHAINED_FLOOR: u64 = 156;
 
 /// A restored `Db` this size or larger counts as a substantial verdict.
 /// `require:`'s floor is one occurrence, which catches an oracle that

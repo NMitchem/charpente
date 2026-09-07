@@ -1763,6 +1763,32 @@ pub fn run_universes_swarm_with_in(
         }
         return;
     }
+    // A pinned base is the right instrument for a FLOOR — a rate needs a fixed
+    // denominator — and the wrong one for a CORRECTNESS oracle, which then only
+    // ever examines the same N universes while reading as though it examined the
+    // space. `CHARPENTE_BASE_SEED` re-bases any pinned property so that claim can
+    // be TESTED, which is how two realtime properties were found passing at their
+    // pinned base and failing at 5 of 11 others (docs/LEDGER.md 2026-09-07).
+    //
+    // Floors and requires are skipped under the override, for the reason
+    // archive.rs's floor doc already gives: they are rates measured AT a base, so
+    // evaluating them at a different one compares against a denominator that was
+    // never taken there. The property's own assertions are what this mode tests,
+    // and they are untouched. Same precedent as CHARPENTE_SEED above.
+    let rebased = std::env::var("CHARPENTE_BASE_SEED")
+        .ok()
+        .map(|v| parse_seed(&v));
+    let (base, require, floors) = match rebased {
+        Some(b) => {
+            eprintln!(
+                "charpente-sim [{test_file}]: re-basing {base:#018x} -> {b:#018x} under \
+                 CHARPENTE_BASE_SEED — coverage requirements and floors skipped (they are \
+                 rates measured at the pinned base)"
+            );
+            (b, &[][..], &[][..])
+        }
+        None => (base, require, floors),
+    };
     eprintln!(
         "charpente-sim [{test_file}]: {universes} swarm universes from base seed {base:#018x}"
     );

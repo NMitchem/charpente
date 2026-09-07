@@ -164,6 +164,24 @@ impl Wal {
             });
         }
 
+        // Re-establish the durability of every name we are about to treat as a
+        // real log, BEFORE replaying a single record. A `sync_dir` that FAILS
+        // leaves the names it covered non-durable while the segment files stay
+        // on disk (fsyncgate: a failed barrier guarantees nothing), so the next
+        // open finds a non-empty directory, recovers a perfectly valid log, and
+        // would otherwise acknowledge appends into a segment a crash can delete
+        // outright (seed 0xb957ceaaf1716fd5, pinned in charpente-sim/tests/wal.rs).
+        //
+        // BEFORE the replay loop, not after it, and the ordering is
+        // load-bearing: `Engine::recover` applies each recovered record to the
+        // store from inside this function's `on_record` callback, so a failure
+        // AFTER replay returns `Err` having already advanced the store — which
+        // `Db::open` then meets as "store applied_seq N is ahead of the durable
+        // log end" (db.rs). Barriering here fails before the store is touched.
+        // The cut arm's own barrier is kept: it must run before the truncation
+        // is treated as durable, which is a stronger ordering than this one.
+        disk.sync_dir(&prefix)?;
+
         let mut expected_seq = parse_segment_name(&cfg.dir, &names[0])?;
         let base_seq = expected_seq;
         let mut tail: Option<(Box<dyn File>, u64)> = None;
@@ -255,18 +273,6 @@ impl Wal {
             }
         }
         let (tail, tail_offset) = tail.expect("names was non-empty, so a tail segment exists");
-        // Every successful open leaves this directory durable, INCLUDING the
-        // clean path that recovered nothing. A `sync_dir` that FAILS leaves
-        // the name it covered non-durable (fsyncgate: a failed barrier
-        // guarantees nothing), and the segment file still exists afterwards —
-        // so the next open finds a non-empty directory, takes the recovery
-        // path, finds every frame valid, and used to return here having never
-        // re-established the name. The log would then acknowledge appends into
-        // a segment a crash could delete outright (seed 0xb957ceaaf1716fd5,
-        // pinned in charpente-sim/tests/wal.rs). The barrier below the cut
-        // arm is kept: it must run before the truncation is treated as
-        // durable, which is a stronger ordering than this one.
-        disk.sync_dir(&prefix)?;
         Ok(Wal {
             disk,
             cfg,

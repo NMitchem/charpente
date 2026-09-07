@@ -3392,3 +3392,80 @@ holding it would not make realtime work — realtime is already broken at 5 of 1
 pinned green base is what has been hiding it. Making that visible is the point of the
 instrument. Both realtime failures need their own investigation and their own seeds; neither
 is diagnosed here.
+
+## 2026-09-07 — the barrier moves BEFORE replay, because it was on the causal path
+
+**CORRECTION to the entry two above, and to my own reasoning about it.** That entry said the
+new open-path barrier "widened a pre-existing hazard" rather than causing anything. Then the
+base-seed audit below turned up `auth`'s `raw_credentials_never_touch_the_durable_store`
+failing on a CORE invariant — `db.rs`: "store applied_seq 4 is ahead of the durable log end
+Some(3) — the store outran durable truth, which append→sync→apply forbids" — at 1 of 20 fresh
+bases, against 0 of 8 without the barrier.
+
+**Statistics were the wrong instrument and nearly cost an hour.** One event in twenty against
+zero in eight cannot attribute anything, and the reflex was to gather more samples. The
+decisive experiment was a MECHANISM test taking one run: print when the new barrier returns
+`Err`, then run the failing base. It fired five times immediately before the assertion. The
+barrier was on the causal path, not merely correlated with it.
+
+**Why.** `Engine::recover` (engine.rs) passes a closure to `Wal::open_with_horizon` that calls
+`machine.apply(seq, payload)` for every recovered record — so **replay mutates the store from
+inside the WAL open, before that open is known to succeed.** A barrier placed AFTER the replay
+loop therefore returns `Err` having already advanced the store, and the next `Db::open` meets a
+store whose `applied_seq` is ahead of the log. Pre-existing failure points on the cut path had
+the same shape; putting one on the CLEAN path made it common.
+
+**The fix is placement, and it is strictly better.** `disk.sync_dir(&prefix)?` now runs
+immediately after `disk.list(&prefix)` and BEFORE the replay loop: the names about to be
+treated as a real log are made durable first, and a failed barrier returns before the store is
+touched. It closes the original durability hole exactly as well — the pinned mechanism test in
+`charpente-sim/tests/wal.rs` still passes, seed `0xb957ceaaf1716fd5` still reaches a verdict,
+20,000 fresh sim-fixture universes are clean — and `auth` goes to **0 of 12** fresh bases.
+
+**The archive floors moved a second time**, and that is the more transferable lesson. A
+`sync_dir` consumes RNG draws, so changing WHERE an IO op sits inside `Wal::open` reshuffles
+every universe at a pinned base. Pinned-base floors are coupled to the IO-op ORDERING of code
+they do not name. Final: `CONV_RESTORED_FLOOR` 219→217, `CONV_SUBSTANTIAL_FLOOR` 183→181,
+`CONV_SCOPED_RESTORED_FLOOR` 214→213, `CONV_SCOPED_SUBSTANTIAL_FLOOR` 164→160,
+`CONV_SCOPED_CHAINED_FLOOR` 158→156. `CONV_CHAINED_FLOOR` stays 169 (measures 174) — raising a
+floor that is not failing is a different decision from repairing one that is. Recorded in
+archive.rs so the next person meeting those panics knows the cause is usually mechanical.
+
+## 2026-09-07 — pinned-base audit: the pathology is narrow, and it found two more properties
+
+`CHARPENTE_BASE_SEED=0x…` re-bases every pinned property in a test binary, skipping floors and
+`require:` keys under the override for the reason the floor's own panic text gives — they are
+rates measured AT a base. What it tests is the property's own assertions. Documented in
+GUIDE.md. **A correctness oracle should pass at EVERY base**; one that passes at its pinned
+base and fails at others is not flaky, it is failing.
+
+26 pinned sites across 8 files; 18 carry no floor. Swept at fresh bases:
+
+| suite | pinned sites | result |
+|---|---|---|
+| `wal` | 8 | clean, 5 bases |
+| `migrations` | 2 | clean, 5 bases |
+| `group_commit` | 4 | clean, 5 bases |
+| `tenant` | 1 | clean, 5 bases |
+| `auth` | 1 | clean, 12 bases (after the placement fix above) |
+| `archive` | 2 | floors only; re-measured |
+| `realtime` | 3 | **`reconnecting_client…` 4/5 FAIL, `a_reconnecting_tenant_subscriber…` 3/5 FAIL** |
+| `replication` | 5 | **`late_follower_seeds_below_the_gcd_base_and_converges` 2/4 FAIL** |
+
+**The pathology is NARROW, and that is worth stating as plainly as the failures.** Five of
+seven swept suites are robust at fresh bases. This is not a suite built on sand; it is two
+realtime properties and one replication property, against 23 pinned sites that hold up.
+
+**The replication failure is a different KIND, and less severe.** Its message is
+`f: table store (redb): I/O error: injected read error`, with `fired: fault:read_error: 1`.
+That is an INJECTED FAULT reported as a correctness violation — a false RED, where realtime's
+is a false GREEN. Cause: `replication.rs:656` and its siblings wrap store errors with
+`.map_err(|e| format!("f: {e}"))?` and bubble them straight out, never consulting
+`checks::is_fault_fallout`. The classifier would have caught it — `classify` matches on
+`contains("injected")` — it is simply never asked. The property's `no_media_corruption` adjust
+zeroes `bit_flip` and `misdirected_write` but leaves `read_error` hot, so the fault is
+reachable and unhandled. This wants an `is_fault_fallout` check and a `give_up`, not a fix to
+the system.
+
+**Still OPEN: the two realtime properties**, which are genuine correctness failures and are
+next. Neither is diagnosed here.
