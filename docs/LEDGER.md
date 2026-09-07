@@ -3935,3 +3935,66 @@ surfaced it" and "my change caused it" are different claims.
 which was the recurring cost: one durability fix forced re-measures in three files in a day.
 Other workload and IO-shape changes still re-roll, so a future floor panic is still usually
 mechanical and upstream rather than a decayed oracle — just never again from a `sync_dir`.
+
+## 2026-09-07 — the open acked-durability finding is CLOSED: it was the barrier bug
+
+The oracle-density plan's Task 7 left an entry headed *"OPEN FINDING, HIGHEST PRIORITY, NOT YET
+EXPLAINED"*: `sim-fixture`'s `acked_counter_survives_rounds` failing with "acked round 2 lost
+across a restart" at seed `0xb957ceaaf1716fd5`, ~1 batch in 33. It named two readings and
+deliberately chose neither — (a) charpente genuinely loses an acked write under directory-entry
+loss, a defect in the guarantee the README sells first; (b) the checker's own restart
+bookkeeping is wrong in the three-round shape. **It is (a), and it is already fixed.**
+
+**The record was validated before anything was concluded from it.** At HEAD the pinned seed now
+passes — which proves nothing, because two different stories predict that: the bug was fixed, or
+today's stream split simply renamed every universe. So the seed was run in an isolated worktree
+at `85c2fc7`, the commit it was recorded against, with its own `CARGO_TARGET_DIR`: it fails
+there, exit 1. The finding was real.
+
+**Instrumenting that deterministic universe named the mechanism outright.** Printing the disk's
+files at each restart and every dropped directory entry:
+
+```
+[RESTART] files before: ["tables.redb"]                                   <- after round 1
+[RESTART] files before: ["tables.redb", "wal/00000000000000000000.log"]   <- after round 2
+[DROP-CREATE] wal/00000000000000000000.log
+acked round 2 lost across a restart
+```
+
+Round 2's `Db::open` created the WAL segment, the commit was **acked**, and at the restart the
+segment's directory entry was still pending — never made durable — so `dir_entry_loss` removed
+the file and the acknowledged record with it. The recorded fault profile fits exactly:
+`dir_entry_loss` 0.477 with `bit_flip`, `misdirected_write` and `read_error` all `0.0`, so
+`durable_corruption_fired` could not excuse the absence, and nothing should have.
+
+That is the defect fixed by `2d19535` / `36b214a`, whose title is literally "every successful
+open barriers the directory, not just the cut path". **The two findings were the same bug,
+reached from opposite ends** — one from the auth suite via a mechanism test, one from the
+flagship acked-implies-durable property.
+
+**A/B at the recording commit, 256 universes, master seed `0xC0FFEE`:** with the fixed `log.rs`
+grafted on, 0 acked-lost failures and 256 verdicts, exit 0; with it reverted and everything else
+identical, 1 acked-lost failure, exit 1. Honest caveat: pre-split the barrier itself consumed a
+draw, so the two arms are not byte-identical universes — this is a same-master-seed comparison,
+not a paired control. It is the instrumented mechanism above that carries the attribution; the
+A/B corroborates it.
+
+**The class was swept, not just the instance** — the recurring lesson that a fix confirmed on
+its known instance leaves siblings alive. Every segment-creation site in `log.rs` audited
+against every barrier: `:154` (segment 0 on fresh open) barriered at `:155`; `:196` (replay
+loop) barriered at `:183` by the fix; `:367` opens only names already returned by `list`, on a
+read path, and creates nothing; `:457` (`rotate`'s new segment) barriered at `:460` **before**
+any append into it. No unbarriered creation remains.
+
+**On the seed, under hard rule 3.** `0xb957ceaaf1716fd5` is not re-pinnable: it named a universe
+at `85c2fc7`, and both the barrier fix and the stream split have since renamed every universe.
+It is recorded here with the commit it reproduces at, which is the only form that stays true.
+The durable regression pin is the deterministic mechanism test
+`reopening_a_log_re_barriers_a_name_left_pending_by_a_failed_dir_sync`, which was RED before the
+fix and needs no seed at all — a strictly better pin than the seed would have been.
+
+**One correction to the earlier record.** Task 7's implementer dismissed this failure as
+"pre-existing, tracked, out of scope" citing a ledger entry about OOM-killed runs, and recorded
+no seed. The controller called that a misattribution at the time and was right to; the entry
+recorded the machine failing to finish suites, not an assertion failing. Had the dismissal
+stood, a real acked-write durability bug would have been closed as noise.
