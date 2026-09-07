@@ -34,7 +34,7 @@
 //! | Client saturation | **Does not apply** | There is no client and no server; nothing here measures a remote party that could be the bottleneck instead of the subject. |
 //! | Device-ratio gate | **Does not apply** | It bounds a durable *sync rate* against measured hardware. A compile issues no durable syncs whose rate this harness has ever measured, so there is no physical ceiling to compare against. **Nothing replaces it**, and that is a real reduction in this instrument's defences, stated rather than papered over. |
 //! | Bracket-stability gate | **Does not apply literally; its question does** | There is no device bracket to straddle a window. Its question — did the measured quantity move underneath us? — is answered by [`Invalid::Unstable`] over repeated observations instead. |
-//! | Floors | **Applies, adapted** | "Under one second" becomes [`MIN_WALL`]; "under five operations" has no analogue for a one-shot, and [`MIN_OBSERVATIONS`] replaces it — repetition is what a one-shot has instead of a window. |
+//! | Floors | **Applies, adapted** | "Under one second" becomes [`MIN_CHILD_CPU`] — on compiler CPU rather than wall time, for the reason recorded there; "under five operations" has no analogue for a one-shot, and [`MIN_OBSERVATIONS`] replaces it — repetition is what a one-shot has instead of a window. |
 //!
 //! **The contention record is a first-class field, not a footnote** (BENCH has
 //! been burned once by an unrecorded contention factor, and this machine runs
@@ -130,10 +130,10 @@ pub enum Invalid {
         child_millis: u128,
         parent_millis: u128,
     },
-    /// Below the floor, where cargo's own startup and fingerprint check
-    /// dominate whatever compiling happened.
+    /// Below the floor: too little compiler CPU for a compiler to have done
+    /// meaningful work.
     BelowFloor {
-        wall_millis: u128,
+        child_cpu_millis: u128,
     },
     /// The machine was already busy before the build began.
     Contended {
@@ -173,11 +173,12 @@ impl std::fmt::Display for Invalid {
                  the parent only waits, so this build's rustc processes were NOT aggregated. \
                  Use measure::children_cpu (RUSAGE_CHILDREN), not measure::process_cpu"
             ),
-            Invalid::BelowFloor { wall_millis } => write!(
+            Invalid::BelowFloor { child_cpu_millis } => write!(
                 f,
-                "the build took {wall_millis} ms, under the {} ms floor — cargo's own startup \
-                 and fingerprint check dominate anything measured here",
-                MIN_WALL.as_millis()
+                "the build spent {child_cpu_millis} ms of compiler CPU, under the {} ms floor \
+                 — that is a no-op rebuild in which cargo checked fingerprints and spawned no \
+                 real work, not a compile",
+                MIN_CHILD_CPU.as_millis()
             ),
             Invalid::Contended { load_before, cores } => write!(
                 f,
@@ -201,9 +202,27 @@ impl std::fmt::Display for Invalid {
     }
 }
 
-/// A build under this is not a compile measurement: cargo's startup and
-/// fingerprint scan dominate it.
-pub const MIN_WALL: Duration = Duration::from_millis(1500);
+/// Compiler CPU below which no meaningful compilation happened.
+///
+/// **This floor is on CPU, not wall time, and the first reading is why.** It
+/// began as `MIN_WALL = 1500 ms` on the reasoning that a short build must be
+/// dominated by cargo's startup and fingerprint scan. Taking the reading
+/// refuted that: incremental builds of `examples/invoicing` finish in
+/// 456–897 ms of wall while spending **1.5–2.1 s of child CPU** at a
+/// parallelism of 2.6–3.7. Real `rustc` work, refused by a rule that had
+/// mistaken a short wall clock for an absent compiler.
+///
+/// Wall time was never the quantity the rule cared about. What it wanted to
+/// exclude is a **no-op rebuild** — cargo checks fingerprints, spawns no
+/// `rustc`, and returns — and compiler CPU measures that directly instead of
+/// by proxy. A no-op rebuild spawns no compiler at all, so its child CPU is
+/// cargo's own fingerprint scan and nothing more; a real incremental build is
+/// an order of magnitude above it. The threshold sits in that gap.
+///
+/// Changing a gate after it refuses a reading is exactly how a real oracle
+/// becomes decorative, so the justification is the evidence above and not the
+/// inconvenience: the old rule was refuting its own stated reason.
+pub const MIN_CHILD_CPU: Duration = Duration::from_millis(500);
 
 /// Load average per core, sampled before the build, above which the machine
 /// was already busy. Half a core's worth of pre-existing work is generous —
@@ -247,9 +266,9 @@ pub fn verdict(o: &Observation) -> Result<Reading, Invalid> {
             parent_millis: o.parent_cpu.as_millis(),
         });
     }
-    if o.wall < MIN_WALL {
+    if o.child_cpu < MIN_CHILD_CPU {
         return Err(Invalid::BelowFloor {
-            wall_millis: o.wall.as_millis(),
+            child_cpu_millis: o.child_cpu.as_millis(),
         });
     }
     if let Some(load) = o.load_before {
@@ -358,11 +377,23 @@ mod tests {
         );
     }
 
+    /// A no-op rebuild — cargo checked fingerprints and spawned no compiler.
     #[test]
-    fn a_build_below_the_floor_is_refused() {
+    fn a_no_op_rebuild_is_refused_on_compiler_cpu_not_wall_time() {
         let mut o = healthy();
-        o.wall = MIN_WALL - Duration::from_millis(1);
+        o.child_cpu = MIN_CHILD_CPU - Duration::from_millis(1);
         assert!(matches!(verdict(&o), Err(Invalid::BelowFloor { .. })));
+    }
+
+    /// The regression the first reading exposed. A wall-time floor discarded
+    /// every incremental observation in that run, including builds with two
+    /// seconds of `rustc` behind a sub-second wall clock.
+    #[test]
+    fn a_fast_build_with_real_compiler_cpu_is_accepted() {
+        let mut o = healthy();
+        o.wall = Duration::from_millis(700);
+        o.child_cpu = Duration::from_millis(2000);
+        verdict(&o).expect("456-897 ms wall over 1.5-2.1 s of rustc CPU is a real build");
     }
 
     #[test]

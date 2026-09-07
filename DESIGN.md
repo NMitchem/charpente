@@ -1560,3 +1560,10 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
    a TypeScript client from route/event types (§7, GUIDE §14).
 5. **Compile latency mitigation** — platform as prebuilt dylib so app iteration recompiles
    app code only; quantify the win early, it is the adoption risk (see PLAN §Risks).
+   **Still unquantified as of 2026-09-07.** The instrument exists —
+   `bench-harness`'s `compile`/`compile_accounting` pair, measuring clean, handler-body
+   and schema edits against `examples/invoicing` — but its first reading refused all
+   nine observations, six of them to a floor that turned out to be measuring wall time
+   where it meant compiler CPU (docs/BENCH.md, "Compile latency"). Until a quiet machine
+   produces an accepted reading, this item's premise that a prebuilt dylib is the right
+   mitigation is untested: nobody has measured which phase actually hurts.

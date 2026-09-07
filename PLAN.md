@@ -191,7 +191,7 @@ picks up and `cargo test --workspace` also skipped. First runner execution 2026-
 
 | Risk | Read | Mitigation |
 |---|---|---|
-| Rust compile latency poisons the dev loop | The bet accepted going in | Prebuilt platform dylib; measure app-only incremental times in M0; cranelift hot reload later; toolchains are improving underneath us |
+| Rust compile latency poisons the dev loop | The bet accepted going in; **still unmeasured** | Prebuilt platform dylib; cranelift hot reload later; toolchains are improving underneath us. The "measure app-only incremental times in M0" mitigation **did not happen in M0**. An instrument landed 2026-09-07 (`bench-harness` `compile`/`compile_accounting`) and its first reading was refused in full — see docs/BENCH.md, "Compile latency". This row's read stays "accepted bet" because no number has yet been earned to move it. |
 | Storage engine is the hardest 20% | Real, why it's staged | redb first; own engine only after the sim harness can prove it; the harness is the safety equipment |
 | "No await in transactions" alienates users | Real for humans, smaller for agents | Docs sell the constraint as the feature it is; queue idiom must be *excellent* and heavily exampled |
 | Single-writer throughput ceiling | Overrated | No network hop between logic and data; TigerBeetle/Redis-class evidence; publish honest benchmarks early |

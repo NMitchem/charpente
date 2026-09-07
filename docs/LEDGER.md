@@ -4148,3 +4148,43 @@ healthy runs for doing their job.
 
 The `[profile.dev.package.redb] opt-level = 3` caveat travels with the instrument in the module
 header: a charpente incremental figure is not representative of a generic Rust project.
+
+## 2026-09-07 — the compile-latency reading was refused, and refused itself twice
+
+The instrument from the previous entry took its first reading against `examples/invoicing`.
+**All nine observations and all three summaries were refused.** No number reached docs/BENCH.md,
+and the section written there publishes none. Two causes, and only the first was the machine's.
+
+**The box was not quiet, and would not become quiet.** Sustained 1.4–2.0 runnable threads per
+core across a browser, a media player, a compositor and two unrelated agent sessions, against a
+gate of 0.5. Task 12's step 1 said to stop rather than publish through that, so the reading
+stops here; BENCH.md is the only source of quotable figures in this repo and an invalid one in
+it is worse than an absent one.
+
+**The wall-time floor was measuring the wrong quantity, and this is the finding.** `MIN_WALL =
+1500 ms` refused six incremental builds on the stated reasoning that a short build must be
+dominated by cargo's startup and fingerprint scan. The instrument's own child-CPU record refutes
+that premise: those 456–897 ms builds spent **1.5–2.1 seconds of compiler CPU** at a parallelism
+of 2.6–3.7. Real `rustc` work, thrown away by a rule that had mistaken a short wall clock for an
+absent compiler — and thrown away precisely the phase DESIGN's adoption-risk item cares most
+about, the inner loop. The floor is now on compiler CPU (`MIN_CHILD_CPU`), which is what it
+always meant: a no-op rebuild spawns no compiler at all. Each run prints its no-op settle builds
+as `NOOP` lines so the floor is calibrated against a measured case instead of an assumed one.
+
+Moving a gate right after it refuses a reading is how a live oracle turns into decoration, so the
+bar for this was that the old rule contradicted its own stated reason — not that it was in the
+way. It did. The second fixture-floor correction in two entries, which is itself the signal:
+both floors were picked by reasoning and both were wrong, and only taking the reading found it.
+
+**The harness was manufacturing the contention it then refused.** The load average is a
+one-minute exponential average and a clean build spends 44 seconds of compiler CPU, so each
+observation's `load_before` was partly reading the previous observation's build. Some share of
+every clean-phase contention refusal was self-inflicted. The driver now polls for the load to
+fall before each measured build and gives up after five minutes, taking the observation anyway
+so the contention gate still gets to judge it. The gate is untouched — this was a driver defect,
+not an accounting one, and fixing it in the accounting half would have been the same mistake as
+lowering the floor.
+
+DESIGN's compile-latency item and PLAN's risk row both now say **unquantified** in as many
+words, rather than carrying an M0 mitigation ("measure app-only incremental times in M0") that
+never happened.

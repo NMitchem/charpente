@@ -1500,3 +1500,103 @@ to exist — the paragraph that says "this point's gate was far more permissive 
 a well-bracketed point gets" is the observation the gate was built from. Treat the
 invoicing 1-connection number as withdrawn, not as evidence; every other point in
 the table brackets within the ceiling.
+
+---
+
+## Compile latency — the instrument exists, the reading is refused (2026-09-07)
+
+DESIGN §9.5 names compile latency "the adoption risk": a schema change that
+becomes a compile error is only a better oracle than a 500 if the compile is
+fast enough that a person stays in the loop. PLAN's risk table wants a number
+against that claim. **This section publishes no number.** It records an
+instrument, two defects that instrument found in itself, and the reason the
+reading was refused.
+
+### What the instrument measures
+
+Three phases against `examples/invoicing`, each repeated:
+
+- **Clean** — `cargo clean` then a full build. The worst case, and the one a
+  new contributor meets first.
+- **Handler body** — one statement added inside a route body. No signature
+  changes, so nothing downstream can need re-typechecking. This is the inner
+  loop: the edit an agent makes hundreds of times.
+- **Schema** — an `#[index]` added to an existing `#[table]` field. A real
+  schema change that still compiles. Adding a *field* would break every
+  constructor and measure a build failure instead of a recompile, which is a
+  different quantity.
+
+It splits measure from accounting the way every other instrument in this file
+does. `compile.rs` samples; `compile_accounting.rs` decides what is
+publishable and carries no deny-list suppression, so hard rule 1 mechanically
+holds the judging half free of clocks and IO. Its module header adjudicates
+each of the six invalidation rules above against this instrument — including
+the device-ratio gate, which **does not apply and is not replaced**, a real
+reduction in defences that is stated rather than papered over.
+
+**Child CPU is the measurement that makes this instrument possible at all.**
+A build's work happens in `rustc` processes, not in the harness, so
+`getrusage(RUSAGE_SELF)` sees essentially nothing — the parent's CPU came back
+at ~10 ms against builds that really cost 44 seconds. The harness reads
+`RUSAGE_CHILDREN`, which accumulates waited-for children and their
+descendants, and `Invalid::ChildCpuNotAggregated` refuses any observation
+whose child CPU does not exceed the parent's. Without that gate a plausible,
+entirely wrong number would print.
+
+### The reading was refused, and the refusal is the result
+
+Nine observations were taken on 2026-09-07. **All nine were refused and all
+three summaries came back empty.** Two causes, and only one of them was the
+machine's fault.
+
+| phase | n | refusal |
+|---|---|---|
+| clean | 3 | load 7.9–9.4 across 12 cores, over the 0.5-per-core ceiling |
+| handler body | 3 | 456–802 ms, under a 1500 ms wall floor |
+| schema | 3 | 621–897 ms, same |
+
+The contention refusals were correct in kind: the box carried a sustained
+1.4–2.0 runnable threads per core from a browser, a media player, a
+compositor and two unrelated agent sessions, and it did not quiet down on
+request. That is the condition Step 1 of this work was written for — an
+invalid number in this file is worse than no number, and this file is the only
+source of quotable figures in the repo.
+
+### Two defects in the instrument, found by taking the reading
+
+**The floor was measuring the wrong quantity.** `MIN_WALL = 1500 ms` existed
+to exclude builds where "cargo's startup and fingerprint scan dominate". The
+data refutes its own premise: those 456–897 ms builds spent **1.5–2.1 seconds
+of compiler CPU** at a parallelism of 2.6–3.7. Real `rustc` work, discarded by
+a rule that mistook a short wall clock for an absent compiler — and it
+discarded precisely the phase DESIGN §9.5 cares most about, the inner loop.
+The floor now reads compiler CPU directly (`MIN_CHILD_CPU`), which is what the
+rule always meant: a no-op rebuild spawns no compiler, so its child CPU is
+cargo's fingerprint scan and nothing more, an order of magnitude below a real
+incremental build. Each run now prints its no-op settle builds as `NOOP` lines
+so the floor is calibrated against a measured case rather than an assumed one.
+
+Moving a gate after it refuses a reading is how a real oracle becomes
+decorative, so the justification has to be that the old rule contradicted its
+own stated reason — not that it was inconvenient. It did, and the CPU figures
+above are the evidence.
+
+**The harness was manufacturing its own contention.** The load average is a
+one-minute exponential average and a clean build spends 44 seconds of compiler
+CPU, so each observation's `load_before` was still reading the *previous*
+observation's build. Some part of every clean-phase contention refusal above
+was self-inflicted. The driver now polls for the load to fall before each
+measured build rather than sampling immediately after its own work, and gives
+up after five minutes and takes the observation anyway — so the contention
+gate still gets to refuse it. The gate itself is untouched; this was a driver
+defect, not an accounting one.
+
+### What is needed to publish a number here
+
+A machine at or below 0.5 runnable threads per core for the duration, with no
+other build or test running. The instrument is `cargo run -p bench-harness
+--bin compile-bench` with a dedicated `CARGO_TARGET_DIR` — it refuses to start
+without one, because the clean phase deletes artifacts and would otherwise
+destroy the working cache. Until that reading is taken, **DESIGN §9.5's
+adoption risk is unquantified**, and no compile-latency figure anywhere in
+this repo is quotable.
