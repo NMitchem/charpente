@@ -525,3 +525,49 @@ Threading `sim` into `list_view`/`read_view` (and their two scan wrappers) is wh
 covers be per-site. The alternative — one central classifier matching on error prose in
 `finish_auth_universe` — needed no plumbing but would have re-coupled attribution to wording,
 which is the fragility `classify`'s own doc warns about.
+
+## `realtime.rs` give-ups, attributed (2026-09-07)
+
+The third and last unattributed suite. Eighteen `INCONCLUSIVE` sites, one aggregate counter.
+All eighteen now carry a per-cause key; every site already had `sim` in scope, so unlike
+`auth.rs` this needed no plumbing at all.
+
+Measured over 128 universes per property. Two of the three properties gave up in zero
+universes; the whole 60 belong to the multi-node property (base `0x2EB2_0002`):
+
+| cause | count | share of the 60 |
+|---|---:|---:|
+| `:recover-exhausted` (33 of 33 `:injected`) | 33 | 55.0% |
+| `:ctrl-poll-faulted` | 12 | 20.0% |
+| `:no-divergent-cursor` | 11 | 18.3% |
+| `:spawn-exhausted` | 3 | 5.0% |
+| `:request-no-response` | 1 | 1.7% |
+| the other 13 keys | 0 | — |
+
+**33 + 12 + 11 + 3 + 1 = 60, the aggregate exactly.** I expected this one NOT to reconcile —
+`realtime.rs` has five direct `sim.give_up(...)` calls that bypass the `INCONCLUSIVE` marker
+convention, so the aggregate could have counted universes the per-cause keys never saw. It
+does reconcile, which says those five paths did not fire in this population. That is a weaker
+statement than "they cannot fire", and they remain the place to look if the sum ever stops
+matching.
+
+**Thirteen of eighteen keys are zero.** `:witness-torn`, `:role-file-torn`,
+`:local-unrestorable`, the four `ctrl-*` variants other than `:ctrl-poll-faulted`,
+`:target-no-kernel`, `:subscribe-no-reply` and both `foreign-cursor-*` keys never fired. Those
+give-up paths are unexercised here, so nothing about them is under test — including whether
+their error prose still matches what `classify` expects.
+
+### The three suites together
+
+| suite | universes | gave up | rate | top cause | `:recover-exhausted` injected share |
+|---|---:|---:|---:|---|---:|
+| `replication` (P1) | 256 | 92 | 35.9% | `:recover-exhausted` (100%) | 92/92 |
+| `replication` (P2) | 256 | 111 | 43.4% | `:recover-exhausted` (99%) | 110/110 |
+| `auth` | 128 | 53 | 41.4% | `:recover-exhausted` (66%) | 35/35 |
+| `realtime` (multi-node) | 128 | 60 | 46.9% | `:recover-exhausted` (55%) | 33/33 |
+
+`:recover-exhausted` is the largest single cause in every suite, and it is **100% `:injected`
+in all four** — 270 of 270 across every property measured. Whatever holds these universes back
+is uniform across the codebase and is not a sticky state anywhere. Combined with the 10×
+experiment's ~4% rescue, the operative conclusion generalises: none of the three
+`*_RECOVER_ATTEMPTS` constants should be raised.

@@ -27,7 +27,7 @@ use charpente_core::event::EventRow;
 use charpente_core::io::{Clock, Conn, Disk, Entropy, Net};
 use charpente_core::log::WalConfig;
 use charpente_core::table::{Codec, Row, View};
-use charpente_sim::checks::{durable_corruption_fired, is_fault_fallout};
+use charpente_sim::checks::{FaultReason, classify, durable_corruption_fired, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim, SimEntropy, SimHost, run_universes_swarm_with};
 use serde::{Deserialize, Serialize};
 
@@ -1765,6 +1765,7 @@ fn open_rt_kernel(
                 .contains("witness file failed its integrity check") =>
         {
             sim.cover("repl:witness-file-inconclusive");
+            sim.cover("rt:inconclusive:witness-torn");
             return Err(format!(
                 "{INCONCLUSIVE}: {} torn witness file — the operator restore path is the fix: {e}",
                 h.name()
@@ -1775,6 +1776,7 @@ fn open_rt_kernel(
                 .contains("role file failed its integrity check") =>
         {
             if flipped {
+                sim.cover("rt:inconclusive:role-file-torn");
                 return Err(format!(
                     "{INCONCLUSIVE}: {} torn role file after a role flip — restore, not \
                      re-init, is the fix: {e}",
@@ -1832,6 +1834,7 @@ fn spawn_rt_node(
             Err(e) => return Err(format!("{host}: {e}")),
         }
     }
+    sim.cover("rt:inconclusive:spawn-exhausted");
     Err(format!(
         "{INCONCLUSIVE}: {host} kernel spawn exhausted {RT_RECOVER_ATTEMPTS} attempts"
     ))
@@ -1841,6 +1844,21 @@ fn spawn_rt_node(
 /// (no restore rig in this property — it isn't what this task proves) are
 /// folded into the same inconclusive skip the Db-level `recover_node` uses in
 /// replication.rs, rather than attempting the kernel-level restore dance.
+/// `realtime.rs`'s copy of `replication.rs`'s `recover_exhausted_key`.
+/// Duplicated for the reason given there: coverage keys must be
+/// `&'static str`, and each suite owns its prefix. Exhaustive, so a new
+/// `FaultReason` variant is a compile error rather than an unattributed
+/// give-up.
+fn rt_recover_exhausted_key(last: &str) -> &'static str {
+    match classify(last) {
+        FaultReason::Injected => "rt:inconclusive:recover-exhausted:injected",
+        FaultReason::Poisoned => "rt:inconclusive:recover-exhausted:poisoned",
+        FaultReason::RedbLatch => "rt:inconclusive:recover-exhausted:redb-latch",
+        FaultReason::DurableHorizon => "rt:inconclusive:recover-exhausted:durable-horizon",
+        FaultReason::Unrelated => "rt:inconclusive:recover-exhausted:unrelated",
+    }
+}
+
 fn recover_rt_node(sim: &Sim, node: &mut RNode) -> Result<(), String> {
     sim.cover("restart");
     node.recoveries += 1;
@@ -1869,6 +1887,7 @@ fn recover_rt_node(sim: &Sim, node: &mut RNode) -> Result<(), String> {
                     || e.contains("cannot be rebuilt from the log alone")
                     || e.contains("refusing to guess") =>
             {
+                sim.cover("rt:inconclusive:local-unrestorable");
                 return Err(format!(
                     "{INCONCLUSIVE}: {} local copy unrestorable (no restore rig in this \
                      property): {e}",
@@ -1879,6 +1898,8 @@ fn recover_rt_node(sim: &Sim, node: &mut RNode) -> Result<(), String> {
             Err(e) => return Err(format!("recover {}: {e}", node.name)),
         }
     }
+    sim.cover("rt:inconclusive:recover-exhausted");
+    sim.cover(rt_recover_exhausted_key(&last));
     Err(format!(
         "{INCONCLUSIVE}: recover {} exhausted {RT_RECOVER_ATTEMPTS} attempts (last: {last})",
         node.name
@@ -1975,6 +1996,7 @@ fn rt_drive_request(
     if guard.len() > before {
         Ok(guard[before].clone())
     } else {
+        sim.cover("rt:inconclusive:request-no-response");
         Err(format!(
             "{INCONCLUSIVE}: no response to a request on node {target} within budget"
         ))
@@ -1990,13 +2012,14 @@ struct CtrlConn {
 
 impl CtrlConn {
     fn open(sim: &Sim, addr: &str, verb: &Msg) -> Result<CtrlConn, String> {
-        let conn = sim
-            .host("cli")
-            .net()
-            .connect(addr)
-            .map_err(|e| format!("{INCONCLUSIVE}: ctrl connect {addr}: {e}"))?;
-        conn.send(&encode(verb))
-            .map_err(|e| format!("{INCONCLUSIVE}: ctrl send: {e}"))?;
+        let conn = sim.host("cli").net().connect(addr).map_err(|e| {
+            sim.cover("rt:inconclusive:ctrl-connect");
+            format!("{INCONCLUSIVE}: ctrl connect {addr}: {e}")
+        })?;
+        conn.send(&encode(verb)).map_err(|e| {
+            sim.cover("rt:inconclusive:ctrl-send");
+            format!("{INCONCLUSIVE}: ctrl send: {e}")
+        })?;
         Ok(CtrlConn {
             conn,
             buf: vec![0u8; MAX_MESSAGE_BYTES],
@@ -2024,12 +2047,17 @@ fn drive_ctrl_kernel(
         match cli.poll() {
             Ok(Some(m)) => return Ok(m),
             Ok(None) => {}
-            Err(e) => return Err(format!("{INCONCLUSIVE}: {e}")),
+            Err(e) => {
+                sim.cover("rt:inconclusive:ctrl-poll-faulted");
+                return Err(format!("{INCONCLUSIVE}: {e}"));
+            }
         }
         if !advanced {
+            sim.cover("rt:inconclusive:ctrl-quiescent");
             return Err(format!("{INCONCLUSIVE}: quiescent before a control reply"));
         }
     }
+    sim.cover("rt:inconclusive:ctrl-no-reply");
     Err(format!("{INCONCLUSIVE}: no control reply within budget"))
 }
 
@@ -2061,6 +2089,7 @@ fn drive_client_to_settled(
             let subscribe_info = {
                 let node = &mut *nodes[target];
                 let Some(kernel) = node.kernel.as_ref() else {
+                    sim.cover("rt:inconclusive:target-no-kernel");
                     return Err(format!("{INCONCLUSIVE}: target has no kernel"));
                 };
                 // A latched store makes this read fail (M2 sub-project 0a).
@@ -2106,13 +2135,14 @@ fn drive_client_to_settled(
                 }
             }
             let Some(resp) = got else {
+                sim.cover("rt:inconclusive:subscribe-no-reply");
                 return Err(format!("{INCONCLUSIVE}: no subscribe reply within budget"));
             };
             let node = &mut *nodes[target];
-            let kernel = node
-                .kernel
-                .as_ref()
-                .ok_or_else(|| format!("{INCONCLUSIVE}: target has no kernel"))?;
+            let kernel = node.kernel.as_ref().ok_or_else(|| {
+                sim.cover("rt:inconclusive:target-no-kernel");
+                format!("{INCONCLUSIVE}: target has no kernel")
+            })?;
             client.absorb(
                 sim,
                 kernel.app().db(),
@@ -2127,10 +2157,10 @@ fn drive_client_to_settled(
                 }
             }
             let node = &mut *nodes[target];
-            let kernel = node
-                .kernel
-                .as_ref()
-                .ok_or_else(|| format!("{INCONCLUSIVE}: target has no kernel"))?;
+            let kernel = node.kernel.as_ref().ok_or_else(|| {
+                sim.cover("rt:inconclusive:target-no-kernel");
+                format!("{INCONCLUSIVE}: target has no kernel")
+            })?;
             client.absorb(sim, kernel.app().db(), &[], None, &node.sinks)?;
         }
         if nodes[target].recoveries > recoveries_before {
@@ -2237,6 +2267,7 @@ fn multi_node_realtime_universe(sim: &mut Sim) -> Result<(), String> {
         }
     }
     let Some(divergent) = divergent else {
+        sim.cover("rt:inconclusive:no-divergent-cursor");
         return Err(format!(
             "{INCONCLUSIVE}: could not construct a p-only divergent cursor within the retry \
              budget"
@@ -2305,6 +2336,7 @@ fn multi_node_realtime_universe(sim: &mut Sim) -> Result<(), String> {
             }
         }
         let Some((status, body)) = resp else {
+            sim.cover("rt:inconclusive:foreign-cursor-no-reply");
             return Err(format!(
                 "{INCONCLUSIVE}: no reply to the deliberately foreign-cursor subscribe"
             ));
@@ -2327,6 +2359,7 @@ fn multi_node_realtime_universe(sim: &mut Sim) -> Result<(), String> {
         ));
     }
     if !got_family {
+        sim.cover("rt:inconclusive:foreign-cursor-no-verdict");
         return Err(format!(
             "{INCONCLUSIVE}: never got a clean diverged/below-floor reply for the foreign \
              cursor within the retry budget"
@@ -2350,6 +2383,49 @@ fn finish_rt_universe(sim: &Sim, r: Result<(), String>) -> Result<(), String> {
         }
         other => other,
     }
+}
+
+/// The third of these (replication and auth hold the others). `classify` keys
+/// on error PROSE, so a reworded exemplar silently becomes `Unrelated` and the
+/// wedge it named is filed as `:unrelated` — attributed-looking and wrong.
+#[test]
+fn every_rt_recover_exhausted_sub_key_is_reachable_and_distinct() {
+    let cases = [
+        (
+            "simulated disk write error (injected fault)",
+            "rt:inconclusive:recover-exhausted:injected",
+        ),
+        (
+            "WAL poisoned by an earlier IO failure",
+            "rt:inconclusive:recover-exhausted:poisoned",
+        ),
+        (
+            "Storage error: close and re-open the database",
+            "rt:inconclusive:recover-exhausted:redb-latch",
+        ),
+        (
+            "log frame 3 is invalid but at-or-below the store's durable horizon 7",
+            "rt:inconclusive:recover-exhausted:durable-horizon",
+        ),
+        ("", "rt:inconclusive:recover-exhausted:unrelated"),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(
+            rt_recover_exhausted_key(text),
+            expected,
+            "classify() no longer routes {text:?} to {expected} — the error was reworded or \
+             classify's arms moved, and the give-up it names is now misattributed rather \
+             than loudly wrong"
+        );
+    }
+    let mut keys: Vec<&str> = cases
+        .iter()
+        .map(|(t, _)| rt_recover_exhausted_key(t))
+        .collect();
+    keys.sort_unstable();
+    let before = keys.len();
+    keys.dedup();
+    assert_eq!(before, keys.len(), "two fault families share a sub-key");
 }
 
 #[test]
