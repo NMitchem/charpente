@@ -4188,3 +4188,25 @@ lowering the floor.
 DESIGN's compile-latency item and PLAN's risk row both now say **unquantified** in as many
 words, rather than carrying an M0 mitigation ("measure app-only incremental times in M0") that
 never happened.
+
+## 2026-09-07 — the `RECOVER_ATTEMPTS` call, answered: raise nothing
+
+The open question was budget-or-bug. It is neither, and the sub-key that settles it is four
+lines: classify the error the LAST recovery attempt saw, using the classifier the file already
+had. **92 of 92 on P1 and 110 of 110 on P2 are `:injected`; every other family is zero.**
+
+No sticky state means no wedge — a redb latch or an engine poison is what a liveness bug would
+have looked like, and there are none. But a fresh fault per attempt does not make it a budget,
+which is the misreading this measurement exists to prevent: P1 carries 109,852 injected write
+errors over 256 universes, ~430 per universe, and at that rate an open cannot complete no
+matter how many times it is retried. The seeded sibling's 10× experiment already showed it —
+~4% rescued where a budget-limited loop would mostly have been.
+
+These give-ups belong to the **fault rate**, the same family as P5's designated-survivor rule.
+A change that wants those universes back must soften what the matrix does to an opening node;
+raising `RECOVER_ATTEMPTS` would buy nothing and would make the next reader believe it had.
+
+Three comments asserted the budget reading as settled and now state what was measured — both
+cover sites, and this key's own doc comment, which I had written claiming an `:injected`
+terminal error means a bigger budget rescues it. The experiment cited two paragraphs below that
+sentence refutes it, which is a good argument for measuring before commenting.

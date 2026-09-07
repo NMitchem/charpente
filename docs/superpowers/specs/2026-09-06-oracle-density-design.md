@@ -441,3 +441,49 @@ the fact the survey could only estimate. Nothing in `charpente`, `charpente-core
 `charpente-macros` needs unwinding, and option (b) remains available, now with evidence. The
 converse mistake is not symmetric: had (b) been built first and proved unusable, the platform
 would carry a job-neutering branch that is awkward to remove and impossible to un-ship.
+
+## The `RECOVER_ATTEMPTS` call, answered (2026-09-07)
+
+The ledger has carried one question open since the runtime-profile work: are the
+`:recover-exhausted` give-ups **a budget too small** or **a liveness bug**? Two 10×
+experiments recorded in `replication.rs` disagreed — `SWITCHOVER_CONVERGED_FLOOR` rescued 65%
+of its exhaustions at `RECOVER_ATTEMPTS` 5000, `SEEDED_CONVERGED_FLOOR` rescued almost none
+(109 → 105) — and neither could say why, because a give-up recorded no terminal state.
+
+`recover_exhausted_key` adds that state: the family of the error the LAST attempt saw,
+classified by the existing `charpente_sim::checks::classify`.
+
+| Property | Universes | `:recover-exhausted` | `:injected` | `:poisoned` | `:redb-latch` | `:durable-horizon` |
+|---|---:|---:|---:|---:|---:|---:|
+| `follower_converges_to_the_primary_fingerprint` | 256 | 92 | **92** | 0 | 0 | 0 |
+| `late_follower_seeds_below_the_gcd_base_and_converges` | 256 | 110 | **110** | 0 | 0 | 0 |
+
+**Answer: neither, and the constant should not be raised.**
+
+*Not a wedge.* A sticky state — redb's latch, an engine poison — is a give-up that retrying
+cannot clear, and it is what a liveness bug would look like here. There are **zero** of them.
+Every one of the 202 exhaustions ends on a freshly injected fault, so the recovery loop is not
+stuck; it is failing anew each time.
+
+*Not a budget either.* `:injected` dominance is the easy thing to misread, and the reason this
+section exists rather than a raised constant. A fresh fault per attempt is consistent with bad
+luck that a larger budget would outlast — but only if per-attempt success probability is
+meaningfully above zero. P1 carries **109,852 injected write errors across 256 universes, ~430
+per universe**. At that rate an open essentially cannot complete, every attempt fails freshly,
+and more attempts buy nothing. The seeded sibling's 10× experiment measured exactly that: ~4%
+rescued where a budget-limited loop would have been largely rescued.
+
+So the honest reading is a third thing neither option named: these give-ups are a property of
+**the fault rate the recovery loop is asked to open through**, in the same family as P5's
+designated-survivor rule — a workload-model consequence, not a bug and not a constant. A future
+change that wants these universes back should lower what the fault matrix does to an opening
+node, not raise `RECOVER_ATTEMPTS`.
+
+**Three comments were corrected in the same commit**, all of which asserted the budget reading
+as established: both `:recover-exhausted` cover sites and (before it shipped) this key's own
+doc comment, which claimed an `:injected` terminal error means a larger budget would rescue it.
+That claim is refuted by the very experiment cited two paragraphs above it.
+
+**Counts differ slightly from Task 2's table** (92 vs 89, 110 vs 109) for the recorded reason:
+the directory-barrier stream split re-keyed every universe, so these are the same properties
+over a renamed population, not a drift in behaviour.

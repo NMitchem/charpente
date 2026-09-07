@@ -27,7 +27,7 @@ use charpente_core::io::{Clock, Conn, Disk, File, Net};
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::migration::{MigrationError, SchemaVersion, TableMigration, schema_version_id};
 use charpente_core::table::{Codec, IndexDef, Row, RowShape, Unscoped, View};
-use charpente_sim::checks::{dir_entry_loss_fired, is_fault_fallout};
+use charpente_sim::checks::{FaultReason, classify, dir_entry_loss_fired, is_fault_fallout};
 use charpente_sim::{FaultConfig, Sim, SimClock, SimHost, run_universes_swarm_with};
 
 // ------------------------------------------------------------- fixtures
@@ -402,16 +402,74 @@ fn recover_node(sim: &Sim, node: &mut Node) -> Result<(), String> {
     // legitimately never succeed (the single-node suite skips such universes
     // too). Mark the universe inconclusive rather than failing it.
     //
-    // This is the one inconclusive reason that is a BUDGET rather than a state:
-    // the others name a disk that cannot be recovered from at all, while this one
-    // says only that 500 attempts were not enough. If its share of
-    // `repl:inconclusive` grows, the budget or the retry shape is the suspect —
-    // which is the distinction the split keys exist to make visible.
+    // This reason differs from its siblings in KIND: the others name a disk that
+    // cannot be recovered from at all, while this one says only that 500
+    // attempts were not enough. It used to say that made it "a BUDGET rather
+    // than a state", which the sub-key below has now measured false in both
+    // directions — no sticky wedge (0 of 92 non-injected on P1), and no budget
+    // either (10x rescued ~4% on the seeded sibling). Treat a growing share as
+    // a question about the FAULT RATE the recovery loop is being asked to open
+    // through, not as a constant to raise.
     sim.cover("repl:inconclusive:recover-exhausted");
+    // ...and the sub-key that says whether "budget" above is TRUE. The comment
+    // asserts a budget; the terminal error is the evidence for or against it.
+    // An `injected` last error is a run of independent bad luck, which a bigger
+    // budget really would rescue. A `redb-latch` or `poisoned` one repeated 500
+    // times is a state the loop cannot retry its way out of, and raising
+    // `RECOVER_ATTEMPTS` against it just buys the same wedge more slowly. The
+    // 10x experiments recorded on `SWITCHOVER_CONVERGED_FLOOR` and
+    // `SURVIVOR_PROMISE_FLOOR` already disagree with each other about which
+    // this is; this key is how the file stops guessing.
+    sim.cover(recover_exhausted_key(&last));
     Err(format!(
         "{INCONCLUSIVE}: recover {} exhausted {RECOVER_ATTEMPTS} attempts (last: {last})",
         node.name
     ))
+}
+
+/// The sub-key for a `:recover-exhausted` give-up, naming the family of the
+/// error the LAST attempt saw.
+///
+/// **What this key settles, and what it does not.** The two sites that cover
+/// `:recover-exhausted` describe it as "500 attempts were not enough", which
+/// reads as a budget too small. This key can refute that outright in one
+/// direction: 500 consecutive `redb-latch` or `poisoned` errors are a state
+/// the loop cannot retry its way out of, and raising the budget against one
+/// buys the same wedge more slowly while hiding it better.
+///
+/// It cannot CONFIRM a budget, and the measurement below is why the difference
+/// matters. **Measured 2026-09-07: `:injected` accounts for 92 of 92 on P1 and
+/// 110 of 110 on P2 — every other family is zero.** So there is no sticky
+/// wedge here. But `:injected` dominance is not evidence of a budget either:
+/// when the fault rate is high enough that an open cannot complete, every
+/// attempt fails with a FRESH injected error and more attempts change nothing.
+/// P1 carries 109,852 injected write errors across 256 universes, ~430 per
+/// universe, and `SEEDED_CONVERGED_FLOOR`'s 10x experiment rescued ~4%
+/// (109 -> 105). Near-zero per-attempt success, not a budget one decimal place
+/// from working.
+///
+/// The operative conclusion: **do not raise `RECOVER_ATTEMPTS` against these.**
+/// Both readings that would justify it are now measured false.
+///
+/// Keys are `&'static str` on purpose (`Sim::cover`'s signature), so these are
+/// written out rather than formatted: the set stays greppable, and the match
+/// is exhaustive, so a new `FaultReason` variant is a compile error here
+/// instead of a silently unattributed give-up.
+fn recover_exhausted_key(last: &str) -> &'static str {
+    match classify(last) {
+        FaultReason::Injected => "repl:inconclusive:recover-exhausted:injected",
+        FaultReason::Poisoned => "repl:inconclusive:recover-exhausted:poisoned",
+        FaultReason::RedbLatch => "repl:inconclusive:recover-exhausted:redb-latch",
+        FaultReason::DurableHorizon => "repl:inconclusive:recover-exhausted:durable-horizon",
+        // `recover_node` only ever stores a fallout error in `last`, so this is
+        // unreachable through that path — but `last` also starts EMPTY, and a
+        // loop that exhausts without one failed open (RECOVER_ATTEMPTS == 0, or
+        // every attempt returning early) would land here. Attributed rather
+        // than asserted: an unattributed give-up is the defect this key exists
+        // to remove, and a panic inside a give-up path would convert an
+        // inconclusive universe into a dead node.
+        FaultReason::Unrelated => "repl:inconclusive:recover-exhausted:unrelated",
+    }
 }
 
 fn reopen(sim: &Sim, node: &mut Node) -> Result<(), String> {
@@ -881,6 +939,56 @@ fn follower_cfg(listen: &str, primary: &str) -> ReplConfig {
 fn no_media_corruption(cfg: &mut FaultConfig) {
     cfg.bit_flip = 0.0;
     cfg.misdirected_write = 0.0;
+}
+
+/// The sub-key is only evidence if the text it classifies still classifies.
+/// `classify` keys on error PROSE (DESIGN §7 makes that prose product surface),
+/// so a reworded exemplar silently becomes `Unrelated` and every wedge it used
+/// to name is filed as `:unrelated` instead — a give-up that looks attributed
+/// and is not. One exemplar per family, and a distinctness check, because two
+/// arms sharing a literal would merge a wedge into a budget in the counts.
+#[test]
+fn every_recover_exhausted_sub_key_is_reachable_and_distinct() {
+    let cases = [
+        (
+            "simulated disk write error (injected fault)",
+            "repl:inconclusive:recover-exhausted:injected",
+        ),
+        (
+            "WAL poisoned by an earlier IO failure",
+            "repl:inconclusive:recover-exhausted:poisoned",
+        ),
+        (
+            "Storage error: close and re-open the database",
+            "repl:inconclusive:recover-exhausted:redb-latch",
+        ),
+        (
+            "log frame 3 is invalid but at-or-below the store's durable horizon 7",
+            "repl:inconclusive:recover-exhausted:durable-horizon",
+        ),
+        ("", "repl:inconclusive:recover-exhausted:unrelated"),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(
+            recover_exhausted_key(text),
+            expected,
+            "classify() no longer routes {text:?} to {expected} — either the error was \
+             reworded or classify's arms moved, and the give-up it names is now \
+             misattributed rather than loudly wrong"
+        );
+    }
+    let mut keys: Vec<&str> = cases
+        .iter()
+        .map(|(t, _)| recover_exhausted_key(t))
+        .collect();
+    keys.sort_unstable();
+    let before = keys.len();
+    keys.dedup();
+    assert_eq!(
+        before,
+        keys.len(),
+        "two fault families share a sub-key, so a wedge and a budget count as one thing"
+    );
 }
 
 // ------------------------------------------------------- property: ship
@@ -5005,11 +5113,16 @@ fn recover_kernel_node(sim: &Sim, node: &mut KNode) -> Result<(), String> {
             Err(e) => return Err(format!("recover {}: {e}", node.name)),
         }
     }
-    // The kernel family's copy of `recover_node`'s budget-not-state cause: 500
-    // attempts were not enough, as distinct from a disk that cannot be
-    // recovered from at all. Uninstrumented until oracle-density task 3, which
-    // is why the wal-corruption property's give-ups had zero cause attribution.
+    // The kernel family's copy of `recover_node`'s cause: 500 attempts were not
+    // enough, as distinct from a disk that cannot be recovered from at all.
+    // Uninstrumented until oracle-density task 3, which is why the
+    // wal-corruption property's give-ups had zero cause attribution. See
+    // `recover_exhausted_key` for why "not enough" is NOT the same claim as
+    // "the budget is too small".
     sim.cover("repl:inconclusive:recover-exhausted");
+    // The kernel family's copy of the budget-or-wedge sub-key; see
+    // `recover_node`'s site for what the distinction buys.
+    sim.cover(recover_exhausted_key(&last));
     Err(format!(
         "{INCONCLUSIVE}: recover {} exhausted {RECOVER_ATTEMPTS} attempts (last: {last})",
         node.name
