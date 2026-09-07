@@ -4210,3 +4210,35 @@ Three comments asserted the budget reading as settled and now state what was mea
 cover sites, and this key's own doc comment, which I had written claiming an `:injected`
 terminal error means a bigger budget rescues it. The experiment cited two paragraphs below that
 sentence refutes it, which is a good argument for measuring before commenting.
+
+## 2026-09-07 — every give-up in the codebase now says why
+
+Task 4 attributed `replication.rs`'s give-ups and stopped there. `auth.rs` and `realtime.rs`
+kept one aggregate counter each, so between them **113 give-ups per run carried no cause at
+all** — the suites could say how often they failed to reach a verdict and nothing about what
+stopped them.
+
+Twenty-six per-site cause keys later, all three suites reconcile exactly:
+
+| suite | universes | gave up | rate | largest cause |
+|---|---:|---:|---:|---|
+| `replication` P1 / P2 | 256 each | 92 / 111 | 35.9% / 43.4% | `:recover-exhausted` |
+| `auth` | 128 | 53 | 41.4% | `:recover-exhausted` (66%) |
+| `realtime` multi-node | 128 | 60 | 46.9% | `:recover-exhausted` (55%) |
+
+**The sums are the check, not the tables.** 35 + 14 + 3 + 1 = 53 for auth and
+33 + 12 + 11 + 3 + 1 = 60 for realtime, each matching its aggregate to the unit. A short sum
+would have meant a give-up path nobody had named; realtime in particular has five direct
+`sim.give_up(...)` calls that bypass the marker convention, and I expected it to come up short.
+It did not, which says those paths did not fire here — not that they cannot.
+
+**`:recover-exhausted` is 100% `:injected` in all four properties — 270 of 270.** The largest
+give-up cause in every suite in the codebase has the same shape everywhere and is a sticky
+state nowhere. With the 10× experiment's ~4% rescue, the conclusion generalises past
+replication: none of the three `*_RECOVER_ATTEMPTS` constants should be raised, and a change
+that wants those universes back has to soften what the fault matrix does to an opening node.
+
+**What stays open: 17 of the 26 new keys are zero.** Those give-up paths never execute in the
+current populations, so nothing about them is under test — including whether their error prose
+still matches what `classify` expects, which is the one coupling these keys cannot check
+themselves. They are the first place to look whenever a give-up mix moves.
