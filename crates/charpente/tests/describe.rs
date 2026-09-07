@@ -173,6 +173,7 @@ const GOLDEN: &str = r#"{
         "key_hash"
       ],
       "migrations": [],
+      "scoped": false,
       "builtin": true
     },
     {
@@ -183,6 +184,7 @@ const GOLDEN: &str = r#"{
         "name"
       ],
       "migrations": [],
+      "scoped": false,
       "builtin": true
     },
     {
@@ -193,6 +195,7 @@ const GOLDEN: &str = r#"{
         "token_hash"
       ],
       "migrations": [],
+      "scoped": false,
       "builtin": true
     },
     {
@@ -203,6 +206,7 @@ const GOLDEN: &str = r#"{
         "org"
       ],
       "migrations": [],
+      "scoped": false,
       "builtin": false
     },
     {
@@ -211,6 +215,7 @@ const GOLDEN: &str = r#"{
       "fingerprint": null,
       "indexes": [],
       "migrations": [],
+      "scoped": false,
       "builtin": true
     },
     {
@@ -219,6 +224,7 @@ const GOLDEN: &str = r#"{
       "fingerprint": null,
       "indexes": [],
       "migrations": [],
+      "scoped": false,
       "builtin": true
     },
     {
@@ -227,6 +233,7 @@ const GOLDEN: &str = r#"{
       "fingerprint": null,
       "indexes": [],
       "migrations": [],
+      "scoped": false,
       "builtin": true
     }
   ],
@@ -1223,4 +1230,61 @@ fn to_human_carries_the_cross_tenant_flag() {
         ),
         "{out}"
     );
+}
+
+// ------------------------------------------------------------- table scope
+
+/// What turns "which tables are per-tenant" from a grep someone must
+/// remember into a mechanical inventory: `describe` names every table whose
+/// rows are tenant-scoped, carried straight from the registry's own
+/// `TableOps::scoped` (`Db::table_scoped`'s same value), and only those.
+/// `capability_app` (above) already mounts `Ledger` (`#[table(scoped_by =
+/// Org)]`) beside the plain `Widget` — this is the first test to assert
+/// anything about that pairing.
+#[test]
+fn describe_names_exactly_the_scoped_tables() {
+    let app = capability_app();
+    let c = app.describe();
+
+    let scoped: Vec<&str> = c
+        .tables
+        .iter()
+        .filter(|t| t.scoped)
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(
+        scoped,
+        vec!["Ledger"],
+        "Ledger is the only scoped_by table this app mounts — a hard-coded \
+         true or false here would pass either a vacuous or an over-eager filter"
+    );
+
+    let widget = c.tables.iter().find(|t| t.name == "Widget").unwrap();
+    assert!(
+        !widget.scoped,
+        "Widget is a plain #[table] beside Ledger — without naming it too, \
+         hard-coding `scoped: true` for every table would also pass"
+    );
+}
+
+/// The human dump carries the flag too, beside `builtin` — same rationale as
+/// `to_human_carries_the_cross_tenant_flag`: a field only the JSON carries is
+/// a field half the readers cannot see. Found by table name rather than a
+/// fixed fingerprint, since `Ledger`/`Widget`'s fingerprints are derived from
+/// their field layout, not chosen here.
+#[test]
+fn to_human_carries_the_scoped_flag() {
+    let out = charpente::describe::to_human(&capability_app().describe());
+
+    let ledger_line = out
+        .lines()
+        .find(|l| l.trim_start().starts_with("Ledger "))
+        .unwrap_or_else(|| panic!("no Ledger table line in:\n{out}"));
+    assert!(ledger_line.contains(" scoped=true "), "{ledger_line}");
+
+    let widget_line = out
+        .lines()
+        .find(|l| l.trim_start().starts_with("Widget "))
+        .unwrap_or_else(|| panic!("no Widget table line in:\n{out}"));
+    assert!(widget_line.contains(" scoped=false "), "{widget_line}");
 }

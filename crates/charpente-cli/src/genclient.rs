@@ -268,6 +268,7 @@ mod contract {
         fingerprint: Option<u64>,
         indexes: Vec<String>,
         migrations: Vec<MigrationInfo>,
+        scoped: bool,
         builtin: bool,
     }
 
@@ -439,6 +440,7 @@ mod contract {
                     to: m.to,
                 })
                 .collect(),
+            scoped: t.scoped,
             builtin: t.builtin,
         }
     }
@@ -593,15 +595,15 @@ mod tests {
 
     /// Every `TypeSchema` variant, every `EnumRepr` variant, an optional
     /// field, a null fingerprint, a bodyless route, a stream route with
-    /// `emits` — hand-written, so it is not a copy of whatever the emitter
-    /// happens to produce today.
+    /// `emits`, a scoped table beside an unscoped one — hand-written, so it
+    /// is not a copy of whatever the emitter happens to produce today.
     const EVERY_SHAPE: &str = r#"{
       "charpente_version": "0.0.0",
       "tables": [
         { "name": "Widget", "version": 2, "fingerprint": 42, "indexes": ["by_name"],
-          "migrations": [{"from":1,"to":2}], "builtin": false },
+          "migrations": [{"from":1,"to":2}], "scoped": true, "builtin": false },
         { "name": "Session", "version": 1, "fingerprint": null, "indexes": [],
-          "migrations": [], "builtin": true }
+          "migrations": [], "scoped": false, "builtin": true }
       ],
       "routes": [
         { "method": "POST", "pattern": "/widgets/:id", "name": "create_widget",

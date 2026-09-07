@@ -3681,9 +3681,9 @@ opts that table out of drift protection. Use `#[table]`.
 ## 13. describe — the machine-readable contract
 
 `charpente describe` renders the full shape of a mounted `App` — every table (with its
-version, structural fingerprint, indexes, and migration chain), every route (method,
-pattern, name, whether it requires auth, whether it's an SSE stream), every registered
-event (name, payload type — §11), every job (name, retry policy), every cron entry
+version, structural fingerprint, indexes, migration chain, and whether it's tenant-scoped),
+every route (method, pattern, name, whether it requires auth, whether it's an SSE stream),
+every registered event (name, payload type — §11), every job (name, retry policy), every cron entry
 (name, interval), and the app's config — as one JSON (or human-readable) document. It is a pure walk of the app's own registries (DESIGN §7): no
 disk writes beyond the ephemeral describe run itself, no socket, no kernel loop. This is
 the "what exists" query an agent would otherwise burn context reconstructing by reading
@@ -3812,6 +3812,7 @@ memorizing a list:
         "key_hash"
       ],
       "migrations": [],
+      "scoped": false,
       "builtin": true
     },
     {
@@ -3820,6 +3821,7 @@ memorizing a list:
       "fingerprint": 1422665991556096363,
       "indexes": [],
       "migrations": [],
+      "scoped": false,
       "builtin": false
     },
     {
@@ -3830,6 +3832,7 @@ memorizing a list:
         "name"
       ],
       "migrations": [],
+      "scoped": false,
       "builtin": true
     },
     {
@@ -3838,6 +3841,7 @@ memorizing a list:
       "fingerprint": 12205929389820576530,
       "indexes": [],
       "migrations": [],
+      "scoped": false,
       "builtin": false
     },
     {
@@ -3846,6 +3850,7 @@ memorizing a list:
       "fingerprint": 17814272651750401892,
       "indexes": [],
       "migrations": [],
+      "scoped": false,
       "builtin": false
     },
     {
@@ -3861,6 +3866,7 @@ memorizing a list:
           "to": 2
         }
       ],
+      "scoped": false,
       "builtin": false
     },
     {
@@ -3871,6 +3877,7 @@ memorizing a list:
         "invoice"
       ],
       "migrations": [],
+      "scoped": false,
       "builtin": false
     },
     {
@@ -3881,6 +3888,7 @@ memorizing a list:
         "invoice"
       ],
       "migrations": [],
+      "scoped": false,
       "builtin": false
     },
     {
@@ -3891,6 +3899,7 @@ memorizing a list:
         "invoice"
       ],
       "migrations": [],
+      "scoped": false,
       "builtin": false
     },
     {
@@ -3901,6 +3910,7 @@ memorizing a list:
         "token_hash"
       ],
       "migrations": [],
+      "scoped": false,
       "builtin": true
     },
     {
@@ -3909,6 +3919,7 @@ memorizing a list:
       "fingerprint": null,
       "indexes": [],
       "migrations": [],
+      "scoped": false,
       "builtin": true
     },
     {
@@ -3917,6 +3928,7 @@ memorizing a list:
       "fingerprint": null,
       "indexes": [],
       "migrations": [],
+      "scoped": false,
       "builtin": true
     },
     {
@@ -3925,6 +3937,7 @@ memorizing a list:
       "fingerprint": null,
       "indexes": [],
       "migrations": [],
+      "scoped": false,
       "builtin": true
     }
   ],
@@ -3934,6 +3947,7 @@ memorizing a list:
       "pattern": "/login",
       "name": "login",
       "auth": false,
+      "cross_tenant": false,
       "stream": false,
       "params": [],
       "request": "String",
@@ -3948,6 +3962,7 @@ memorizing a list:
       "pattern": "/customers/:id",
       "name": "create_customer",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [
         {
@@ -3973,6 +3988,7 @@ memorizing a list:
       "pattern": "/customers/:id",
       "name": "get_customer",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [
         {
@@ -3996,6 +4012,7 @@ memorizing a list:
       "pattern": "/customers",
       "name": "list_customers",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [],
       "request": null,
@@ -4014,6 +4031,7 @@ memorizing a list:
       "pattern": "/invoices/:id",
       "name": "create_invoice",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [
         {
@@ -4039,6 +4057,7 @@ memorizing a list:
       "pattern": "/invoices/:id",
       "name": "get_invoice",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [
         {
@@ -4062,6 +4081,7 @@ memorizing a list:
       "pattern": "/invoices",
       "name": "list_invoices",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [],
       "request": null,
@@ -4080,6 +4100,7 @@ memorizing a list:
       "pattern": "/invoices/:id/finalize",
       "name": "finalize_invoice",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [
         {
@@ -4103,6 +4124,7 @@ memorizing a list:
       "pattern": "/invoices/:id/record-payment",
       "name": "record_payment",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [
         {
@@ -4126,6 +4148,7 @@ memorizing a list:
       "pattern": "/events/feed",
       "name": "events_feed",
       "auth": true,
+      "cross_tenant": false,
       "stream": true,
       "params": [],
       "request": null,
@@ -4140,6 +4163,7 @@ memorizing a list:
       "pattern": "/keys",
       "name": "create_key",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [],
       "request": null,
@@ -4154,6 +4178,7 @@ memorizing a list:
       "pattern": "/keys/:id",
       "name": "revoke_key",
       "auth": true,
+      "cross_tenant": false,
       "stream": false,
       "params": [
         {
@@ -4445,6 +4470,7 @@ memorizing a list:
         "max": 5,
         "backoff_nanos": 30000000000
       },
+      "cross_tenant": false,
       "builtin": true
     },
     {
@@ -4453,6 +4479,7 @@ memorizing a list:
         "max": 5,
         "backoff_nanos": 30000000000
       },
+      "cross_tenant": false,
       "builtin": false
     },
     {
@@ -4461,6 +4488,7 @@ memorizing a list:
         "max": 5,
         "backoff_nanos": 30000000000
       },
+      "cross_tenant": false,
       "builtin": false
     },
     {
@@ -4469,6 +4497,7 @@ memorizing a list:
         "max": 5,
         "backoff_nanos": 30000000000
       },
+      "cross_tenant": false,
       "builtin": false
     }
   ],
@@ -5351,6 +5380,12 @@ Four properties make this a capability rather than an escape hatch:
   carries `tables:`, `events:` and `cron:` sections — elided here.) The JSON
   form carries the same `"cross_tenant": true` on both `routes` and `jobs`,
   which is what makes "audit the cross-tenant reads" a machine check.
+
+  The elided `tables:` section carries the matching signal for the table
+  itself: `Ledger`'s entry reports `scoped=true` (`Org`'s own entry, and every
+  plain `#[table]`, reports `scoped=false`) — carried from the same
+  `#[table(scoped_by = …)]` declaration, so an audit doesn't have to grep for
+  it either.
 
 ### What happens underneath, and what it means operationally
 

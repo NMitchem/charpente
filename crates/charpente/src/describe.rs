@@ -59,6 +59,14 @@ pub struct TableInfo {
     pub fingerprint: Option<u64>,
     pub indexes: Vec<&'static str>,
     pub migrations: Vec<MigrationInfo>,
+    /// `#[table(scoped_by = …)]`: every row lives under a tenant, so a scan
+    /// against this table without `across_tenants` sees one tenant's rows
+    /// only. Beside `builtin` because both are the classification bits an
+    /// audit asks of a table's shape first — is it the platform's or the
+    /// app's, and does it partition by tenant or not — computed once at
+    /// `Schema::table::<R>()` registration (`row_is_scoped::<R>()`) and
+    /// carried here unchanged, not re-derived.
+    pub scoped: bool,
     pub builtin: bool,
 }
 
@@ -240,6 +248,7 @@ fn table_info(t: TableDescription) -> TableInfo {
             .into_iter()
             .map(|(from, to)| MigrationInfo { from, to })
             .collect(),
+        scoped: t.scoped,
         builtin: is_builtin_table(t.name),
     }
 }
@@ -354,8 +363,9 @@ pub fn to_human(c: &Contract) -> String {
             .join(", ");
         writeln!(
             out,
-            "  {} v{} fingerprint={fp} indexes=[{indexes}] migrations=[{migrations}] builtin={}",
-            t.name, t.version, t.builtin
+            "  {} v{} fingerprint={fp} indexes=[{indexes}] migrations=[{migrations}] \
+             scoped={} builtin={}",
+            t.name, t.version, t.scoped, t.builtin
         )
         .unwrap();
     }

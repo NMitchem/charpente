@@ -198,6 +198,11 @@ pub struct TableDescription {
     pub index_names: Vec<&'static str>,
     /// Registered migration steps as (from_version, to_version), ascending.
     pub migrations: Vec<(u32, u32)>,
+    /// Carried straight from `TableOps::scoped` (`Schema::table`'s
+    /// `row_is_scoped::<R>()` call) — never recomputed here. Same value
+    /// `Db::table_scoped` already hands the archive/replication callers;
+    /// describe just gives it a third reader.
+    pub scoped: bool,
 }
 
 /// One sealed WAL segment, as `Db::sealed_segments` reports it (M2
@@ -2692,6 +2697,7 @@ impl Db {
                     fingerprint: ops.fingerprint,
                     index_names: ops.index_names.clone(),
                     migrations,
+                    scoped: ops.scoped,
                 }
             })
             .collect()

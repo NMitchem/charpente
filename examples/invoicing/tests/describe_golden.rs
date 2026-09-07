@@ -43,6 +43,7 @@ const GOLDEN: &str = r#"{
         "key_hash"
       ],
       "migrations": [],
+      "scoped": false,
       "builtin": true
     },
     {
@@ -51,6 +52,7 @@ const GOLDEN: &str = r#"{
       "fingerprint": 1422665991556096363,
       "indexes": [],
       "migrations": [],
+      "scoped": false,
       "builtin": false
     },
     {
@@ -61,6 +63,7 @@ const GOLDEN: &str = r#"{
         "name"
       ],
       "migrations": [],
+      "scoped": false,
       "builtin": true
     },
     {
@@ -69,6 +72,7 @@ const GOLDEN: &str = r#"{
       "fingerprint": 12205929389820576530,
       "indexes": [],
       "migrations": [],
+      "scoped": false,
       "builtin": false
     },
     {
@@ -77,6 +81,7 @@ const GOLDEN: &str = r#"{
       "fingerprint": 17814272651750401892,
       "indexes": [],
       "migrations": [],
+      "scoped": false,
       "builtin": false
     },
     {
@@ -92,6 +97,7 @@ const GOLDEN: &str = r#"{
           "to": 2
         }
       ],
+      "scoped": false,
       "builtin": false
     },
     {
@@ -102,6 +108,7 @@ const GOLDEN: &str = r#"{
         "invoice"
       ],
       "migrations": [],
+      "scoped": false,
       "builtin": false
     },
     {
@@ -112,6 +119,7 @@ const GOLDEN: &str = r#"{
         "invoice"
       ],
       "migrations": [],
+      "scoped": false,
       "builtin": false
     },
     {
@@ -122,6 +130,7 @@ const GOLDEN: &str = r#"{
         "invoice"
       ],
       "migrations": [],
+      "scoped": false,
       "builtin": false
     },
     {
@@ -132,6 +141,7 @@ const GOLDEN: &str = r#"{
         "token_hash"
       ],
       "migrations": [],
+      "scoped": false,
       "builtin": true
     },
     {
@@ -140,6 +150,7 @@ const GOLDEN: &str = r#"{
       "fingerprint": null,
       "indexes": [],
       "migrations": [],
+      "scoped": false,
       "builtin": true
     },
     {
@@ -148,6 +159,7 @@ const GOLDEN: &str = r#"{
       "fingerprint": null,
       "indexes": [],
       "migrations": [],
+      "scoped": false,
       "builtin": true
     },
     {
@@ -156,6 +168,7 @@ const GOLDEN: &str = r#"{
       "fingerprint": null,
       "indexes": [],
       "migrations": [],
+      "scoped": false,
       "builtin": true
     }
   ],

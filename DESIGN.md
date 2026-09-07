@@ -1235,7 +1235,10 @@ Charpente treats the coding agent as the primary developer persona:
 - **Introspection: `charpente describe` (v0, implemented).** `App::describe()` is a pure
   walk of a mounted app's own registries — no disk writes beyond an ephemeral run's own
   temp store, no socket, no kernel loop. It returns a `Contract`: tables (name, version,
-  structural fingerprint, indexes, migration chain), routes (method, pattern, name,
+  structural fingerprint, indexes, migration chain, **whether it's `scoped`** —
+  `#[table(scoped_by = …)]`, carried straight from the registry's own `TableOps::scoped`,
+  the same value `Db::table_scoped` already exposes to the archive/replication callers),
+  routes (method, pattern, name,
   whether it requires auth, **whether it declared `cross_tenant`** — which is what turns
   "audit the cross-tenant reads" into a mechanical inventory — whether it's an SSE stream,
   **plus, since the TS-client-codegen
