@@ -380,6 +380,8 @@ struct HostWorld {
     disk: DiskWorld,
     faults: Rng,
     entropy: Rng,
+    /// This host's directory-barrier stream — see `State::dir_faults`.
+    dir_faults: Rng,
 }
 
 impl HostWorld {
@@ -388,6 +390,7 @@ impl HostWorld {
             disk: DiskWorld::default(),
             faults: keyed_stream(seed, &format!("host-faults:{host}")),
             entropy: keyed_stream(seed, &format!("host-entropy:{host}")),
+            dir_faults: keyed_stream(seed, &format!("host-dir-faults:{host}")),
         }
     }
 }
@@ -400,6 +403,15 @@ struct State {
     faults: Rng,
     entropy: Rng,
     latency: Rng,
+    /// The directory barrier's own fault stream, split off `faults` on purpose.
+    /// `sync_dir` is the one disk op whose CALL SITES move as a consequence of
+    /// durability fixes rather than of workload changes, and `Rng::chance` draws
+    /// before it compares — so a barrier sharing `faults` displaces every later
+    /// read/write/sync roll and re-rolls every pinned universe merely by being
+    /// added or relocated. DESIGN.md made this same split for the object store's
+    /// delete arm for the same reason; `a_directory_barrier_does_not_perturb_the_
+    /// other_disk_faults` is the oracle that holds it.
+    dir_faults: Rng,
     disk: DiskWorld,
     net: NetWorld,
     /// Sometimes-coverage: named-event counts across the universe (Antithesis
@@ -442,6 +454,13 @@ impl State {
         match host {
             None => &mut self.faults,
             Some(name) => &mut self.host_mut(name).faults,
+        }
+    }
+
+    fn dir_faults_of(&mut self, host: &Option<String>) -> &mut Rng {
+        match host {
+            None => &mut self.dir_faults,
+            Some(name) => &mut self.host_mut(name).dir_faults,
         }
     }
 
@@ -556,6 +575,9 @@ impl Sim {
         let faults = Rng::new(splitmix64(&mut sm));
         let entropy = Rng::new(splitmix64(&mut sm));
         let latency = Rng::new(splitmix64(&mut sm));
+        // Drawn last: appending keeps every stream above byte-identical, so
+        // introducing this split perturbs nothing through the constructor.
+        let dir_faults = Rng::new(splitmix64(&mut sm));
         Sim {
             world: Arc::new(World {
                 seed,
@@ -565,6 +587,7 @@ impl Sim {
                     faults,
                     entropy,
                     latency,
+                    dir_faults,
                     disk: DiskWorld::default(),
                     net: NetWorld::default(),
                     coverage: BTreeMap::new(),
@@ -1043,7 +1066,7 @@ impl Disk for SimDisk {
         let mut guard = self.world.lock();
         guard.disk_op(&self.world.cfg, &self.host)?;
         if guard
-            .faults_of(&self.host)
+            .dir_faults_of(&self.host)
             .chance(self.world.cfg.sync_error)
         {
             guard.cover("fault:sync_error");
@@ -2092,6 +2115,57 @@ mod tests {
         // Everything after the crash fails too.
         assert!(file.len().is_err());
         assert!(disk.open("g").is_err());
+    }
+
+    #[test]
+    fn a_directory_barrier_does_not_perturb_the_other_disk_faults() {
+        // A barrier's fault roll must come off its own stream. Sharing one with
+        // reads, writes and file syncs means that merely ADDING a barrier — the
+        // exact shape of `Wal::open_with_horizon`'s durability fix — displaces
+        // every later roll and re-rolls every pinned universe. That is what
+        // forced convergence-floor re-measures in three separate files on
+        // 2026-09-07; DESIGN.md's object-store delete split is the same repair
+        // for the same hazard.
+        fn run(extra_barrier: bool) -> BTreeMap<&'static str, u64> {
+            let mut cfg = FaultConfig::none();
+            cfg.write_error = 0.3;
+            cfg.read_error = 0.3;
+            // `sync_error` stays at zero deliberately. `Rng::chance` draws BEFORE
+            // it compares, so a barrier still consumes its draw at p = 0 — which
+            // means the perturbation is still exercised, while `fault:sync_error`
+            // never marks. The two runs can then be compared as WHOLE coverage
+            // maps instead of a filtered subset that could hide a difference.
+            let sim = Sim::with_faults(0x9012_0100, cfg);
+            let disk = sim.disk();
+            if extra_barrier {
+                // Nothing is pending under this prefix, so the barrier is a
+                // semantic no-op: the only thing it can alter is the schedule.
+                disk.sync_dir("unrelated/").unwrap();
+            }
+            let file = disk.open("f").unwrap();
+            for i in 0..40u64 {
+                let _ = file.write_at(i * 8, b"abcdefgh");
+                let _ = file.sync();
+                let mut buf = [0u8; 8];
+                let _ = file.read_at(i * 8, &mut buf);
+            }
+            sim.coverage()
+        }
+
+        let baseline = run(false);
+        let with_barrier = run(true);
+        assert!(
+            baseline.values().sum::<u64>() > 0,
+            "anti-vacuity: this workload must actually inject faults, or the \
+             comparison below passes by comparing two empty maps"
+        );
+        assert_eq!(
+            baseline, with_barrier,
+            "inserting a no-op directory barrier changed the fault schedule: the \
+             barrier is drawing from the shared per-host stream, so every later \
+             read/write/sync roll shifted. Key it separately — DESIGN.md made the \
+             same repair for the object store's delete arm."
+        );
     }
 
     #[test]

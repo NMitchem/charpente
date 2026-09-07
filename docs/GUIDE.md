@@ -2403,11 +2403,16 @@ base and fails at others, it is not flaky — it is failing, and the pinned base
 is hiding it. Two realtime properties were found exactly that way
 (docs/LEDGER.md 2026-09-07).
 
-One caveat worth knowing before you chase a floor panic: a `sync_dir` or any
-other IO call consumes RNG draws, so changing *where* an IO operation happens
-inside code a property never names reshuffles every universe at a pinned base.
-Floors move for that reason far more often than they move because an oracle
-decayed.
+One caveat worth knowing before you chase a floor panic: an IO call consumes RNG
+draws, so changing *where* an IO operation happens inside code a property never
+names reshuffles every universe at a pinned base. Floors move for that reason far
+more often than they move because an oracle decayed.
+
+The directory barrier used to be the worst offender, because `sync_dir` is the
+call a *durability* fix is most likely to add — one such fix moved floors in
+three separate files in a single day. It now draws from its own fault stream, so
+adding or relocating a barrier perturbs nothing else. No other IO call has that
+treatment, so the caveat above still holds for the rest of them.
 
 ### A note on the edge harness (platform dev tooling, not app surface)
 

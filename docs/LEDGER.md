@@ -3874,3 +3874,64 @@ measurement wearing the shape of a passing one — dropped coverage on the failu
 is the same failure in the process rather than the instrument: a question handed upward reads
 like diligence and produces no verdict at all. Check the documents before deciding something is
 undecided.
+
+## 2026-09-07 — the barrier gets its own fault stream, and every universe re-rolls once
+
+The standing fix from the entry above, taken. `SimDisk::sync_dir` now rolls `sync_error` off
+`keyed_stream(seed, "host-dir-faults:{host}")` — and a global `dir_faults` stream for the
+un-hosted disk — instead of the shared `faults` stream that reads, writes, file syncs and
+misdirected writes draw from. DESIGN.md carries the doctrine paragraph next to the object
+store's delete-arm split, which is the same repair for the same hazard.
+
+**Written RED first, and the RED names the mechanism.** The new oracle,
+`a_directory_barrier_does_not_perturb_the_other_disk_faults`, runs a fixed workload twice and
+inserts one *semantically no-op* barrier into the second run — a prefix with nothing pending,
+under `sync_error = 0.0` so `fault:sync_error` never marks and the two runs can be compared as
+whole coverage maps rather than a filtered subset. `Rng::chance` draws before it compares, so
+the barrier still consumes its draw at p = 0 and the perturbation is still exercised. Before
+the split: `{read_error: 6, write_error: 11}` against `{read_error: 10, write_error: 9}` — one
+no-op barrier moved four read faults and two write faults. After: identical. The test also
+carries an anti-vacuity assertion, because two empty coverage maps compare equal.
+
+**Two facts checked before building it, both of which could have made it the wrong fix.**
+`disk_op` consumes no RNG at all, so `sync_dir`'s only draw was the `sync_error` roll — one
+draw, and keying removes exactly it. And `disk_op` *does* tick `crash_countdown`, which counts
+disk ops rather than RNG draws and which keying therefore cannot protect; that would have left
+the perturbation half-fixed. It turns out `crash_countdown` is reachable only through the aimed
+`crash_disk_after`/`crash_after` APIs, which nothing outside `lib.rs` calls, so it is `None` in
+every swarm universe and adding a disk op cannot shift crash timing there. Keying is sufficient.
+Had that gone the other way the honest answer would have been that the fix does not work.
+
+**The one-time cost, itemised.** As predicted, introducing the split re-rolled all pinned
+universes once: 6 failures across 4 targets out of 77. Five were floors moving by 2–3 counts
+with reach intact (`archive:chained` 169→166, `archive:restored` scoped 213→211,
+`archive:chained` scoped 156→153, `tenant:own-backlog-verified` 79→78,
+`realtime:resume-backlog` 128→125, `repl:logical-converged` 166→164) plus the CLI fixture's
+give-up split (36/28 → 32/32, still cross-checked two independent ways). All re-measured, none
+widened.
+
+**The sixth was not a floor, and it is the finding worth keeping.** The pinned regression seed
+`0x22eac3ba9fa5bef7` stopped reproducing its scenario — **a pinned seed names a universe, and
+re-keying a fault stream renames every universe at once.** The test did not go quietly green;
+it went red, which is the good failure mode, but a differently-shaped test could easily have
+gone vacuous instead. Re-found by scanning the same swarm construction for a universe ending
+with zero clean settle attempts: `0xbb93400e0bc80ca4`, base `0xA11CE002`, universe 6 — four
+candidates in 768 scanned. The assertion was strengthened while re-pinning: it now requires the
+give-up REASON to contain "there was no node to catch up from" rather than merely requiring
+*some* give-up, so a future re-roll landing on an unrelated give-up cannot keep it green while
+testing nothing. Mutation-proved live (substitute an impossible substring ⇒ RED, restore ⇒
+GREEN), and the RED printed the real reason, confirming the new seed reproduces the identical
+12-attempt shape.
+
+**One observation, deliberately not claimed as a finding.** A redb panic
+(`page_manager.rs:257`, `left: 135168, right: 137216`) surfaced inside
+`follower_converges_to_the_primary_fingerprint`. It is caught by the existing fence — the test
+continued past it and failed on its floor — and it is the known upstream redb issue DESIGN §7
+already records. Re-rolling changes which universes reach it. Recorded as an observation
+because I have no pre-split control run proving it was reachable before, and "my change
+surfaced it" and "my change caused it" are different claims.
+
+**What this does and does not buy.** Barrier movement can no longer re-roll a pinned universe,
+which was the recurring cost: one durability fix forced re-measures in three files in a day.
+Other workload and IO-shape changes still re-roll, so a future floor panic is still usually
+mechanical and upstream rather than a decayed oracle — just never again from a `sync_dir`.

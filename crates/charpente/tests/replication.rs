@@ -989,7 +989,13 @@ fn follower_converges_to_the_primary_fingerprint() {
 /// Left sharp, therefore, on the doctrine and not on a pending ruling — a floor
 /// is lowered with a reason, and "it flapped once, as designed" is the reason to
 /// record the flap, not to widen it.
-const CONVERGED_FLOOR: u64 = 166;
+///
+/// **166 -> 164 on 2026-09-07 when that standing fix was taken.** Splitting the
+/// barrier onto its own stream re-rolled every universe one final time, exactly
+/// as this comment predicted it would; the reach it measures is unchanged in
+/// kind (164 of 256 against 166). Barrier movement can no longer move this
+/// number again.
+const CONVERGED_FLOOR: u64 = 164;
 
 /// Universes in which the byte-fingerprint oracle actually compared files,
 /// MEASURED: 17 over these 256 universes at base `0x2EB1_0001`, reproduced on

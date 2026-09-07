@@ -143,6 +143,24 @@ alongside it — a probability cannot guarantee the delete-fails-FOREVER shape i
 And `SimObjectStore` completes each operation in the `poll` that takes it, so object-store
 latency is not modelled at all.
 
+**The same split a second time: the directory barrier.** `SimDisk::sync_dir` rolls
+`sync_error` off `keyed_stream(seed, "host-dir-faults:{host}")` — and off a global
+`dir_faults` stream for the un-hosted disk — not off the shared `faults` stream that reads,
+writes, file syncs and misdirected writes draw from. The hazard is the object store's,
+generalised: `Rng::chance` draws before it compares, so a barrier sharing the stream
+displaces every later roll, and **adding or relocating a single `sync_dir` call re-rolls
+every universe at a pinned base**. That is measured, not hypothetical — `open_with_horizon`'s
+durability fix (§2) added exactly one barrier and forced convergence-floor re-measures in
+three separate test files on the same day. `sync_dir` earns its own stream because it is the
+disk op whose call sites move for *durability* reasons rather than workload reasons, so it is
+the one most likely to be added by a correctness fix. Unlike the delete arm, this split was
+**not** free: that axis defaulted to `0.0` and could be introduced with every pinned count
+reproducing exactly, whereas `sync_error` fires in existing runs, so the split re-rolled every
+pinned universe once and the floors were re-measured against it. The guarantee is mechanical
+rather than argued — `a_directory_barrier_does_not_perturb_the_other_disk_faults` inserts a
+semantically no-op barrier and demands the entire coverage map be unchanged; without the split
+it fails, one barrier having moved four read faults and two write faults.
+
 **Per-host worlds** (landed with M1 replication's first task): `Sim::host(name)` gives a
 named simulated host its own disk (`DiskWorld`, unchanged — the same crash/countdown/epoch
 model, just one instance per host) and its own fault + entropy streams, keyed sub-streams

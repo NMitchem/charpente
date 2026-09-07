@@ -1084,24 +1084,33 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
     );
 }
 
-/// Seed `0x22eac3ba9fa5bef7`, found by re-basing this property
-/// (`CHARPENTE_BASE_SEED`, docs/LEDGER.md 2026-09-07). Instrumenting the settle
-/// loop showed all **12** of `SETTLE_ATTEMPTS` ending with `settle_boot`
-/// returning `None` — `boot_none=12, sub_fault=0, run_fault=0, clean=0`. The
-/// node never booted once, so the client never had a single fault-free chance
-/// to receive event 0.
+/// Seed `0xbb93400e0bc80ca4` (base `0xA11CE002`, universe 6).
 ///
-/// The workload nonetheless returned `unsettled_report()`, whose text asserts
-/// the platform lost an event. What actually happened is the fact the settle
-/// loop's own comment says is NOT this property's subject: "there was no node
-/// to catch up FROM". `settle_boot` exists to draw exactly that distinction,
-/// and returns `Ok(None)` only after every boot failure classified as fault
-/// fallout — a non-injected failure returns `Err` immediately. So a universe
-/// with no clean attempt adjudicated NOTHING, and must give up rather than
-/// report a miss it never had the chance to observe.
+/// **This pin was re-found once already, and that is worth knowing before
+/// touching it.** The original was `0x22eac3ba9fa5bef7`, located by re-basing
+/// this property (`CHARPENTE_BASE_SEED`, docs/LEDGER.md 2026-09-07). The
+/// directory-barrier stream split later that day re-rolled every universe one
+/// final time and that seed stopped reproducing the scenario — a pinned seed
+/// names a UNIVERSE, and re-keying a fault stream renames all of them at once.
+/// So the regression was re-found by scanning the same swarm construction for a
+/// universe whose settle loop ends with zero clean attempts, and the assertion
+/// below now pins the give-up REASON rather than merely its presence: a future
+/// re-roll that happens to land on some *other* give-up can no longer keep this
+/// test quietly green while testing nothing.
+///
+/// The scenario: every one of `SETTLE_ATTEMPTS` attempts ends with `settle_boot`
+/// returning `None`. The node never booted once, so the client never had a single
+/// fault-free chance to receive event 0. The workload would otherwise return
+/// `unsettled_report()`, whose text asserts the platform lost an event. What
+/// actually happened is the fact the settle loop's own comment says is NOT this
+/// property's subject: "there was no node to catch up FROM". `settle_boot` exists
+/// to draw exactly that distinction, and returns `Ok(None)` only after every boot
+/// failure classified as fault fallout — a non-injected failure returns `Err`
+/// immediately. So a universe with no clean attempt adjudicated NOTHING, and must
+/// give up rather than report a miss it never had the chance to observe.
 #[test]
 fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
-    const SEED: u64 = 0x22ea_c3ba_9fa5_bef7;
+    const SEED: u64 = 0xbb93_400e_0bc8_0ca4;
     // Reconstruct this universe exactly as the swarm runner derives it.
     let mut state = SEED;
     let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
@@ -1116,10 +1125,14 @@ fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
          event — it never observed one: {:?}",
         result.err()
     );
-    assert!(
-        sim.gave_up().is_some(),
+    let reason = sim.gave_up().expect(
         "and it must be RECORDED as a give-up, not counted as a pass: a universe that \
-         adjudicated nothing is not evidence for the property"
+         adjudicated nothing is not evidence for the property",
+    );
+    assert!(
+        reason.contains("there was no node to catch up from"),
+        "and it must be THIS give-up — no settle attempt ever ran cleanly — rather than \
+         some unrelated cause that happens to keep the test green: {reason}"
     );
 }
 
@@ -3235,8 +3248,10 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
 ///
 /// Measured over the 128 universes at `SCOPED_REALTIME_BASE`, read off a
 /// batch reproduced identically twice: `tenant:both-tenants-emitted` 77,
-/// `tenant:own-backlog-verified` 79,
-/// `tenant:foreign-backlog-not-delivered` 85, `realtime:resume-backlog` 128,
+/// `tenant:own-backlog-verified` 79 (78 since the 2026-09-07 barrier stream
+/// split — see `CONV_RESTORED_FLOOR`'s table in `archive.rs`),
+/// `tenant:foreign-backlog-not-delivered` 85, `realtime:resume-backlog` 128
+/// (125 since that same split),
 /// `fault:subscriber_stall` 30, `realtime:stall-drop` 30, `realtime:gap` 8.
 /// `realtime:resume-backlog` is floored because a batch that stopped
 /// reconnecting with backlog waiting would still settle, vacuously — this
@@ -3319,9 +3334,9 @@ fn a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing() {
 /// Counts reproduced identically across two consecutive batches before these
 /// numbers were taken, the same discipline the original measurement states.
 const SCOPED_BOTH_TENANTS_FLOOR: u64 = 75;
-const SCOPED_OWN_BACKLOG_FLOOR: u64 = 79;
+const SCOPED_OWN_BACKLOG_FLOOR: u64 = 78;
 const SCOPED_FOREIGN_SKIPPED_FLOOR: u64 = 80;
-const SCOPED_RESUME_BACKLOG_FLOOR: u64 = 128;
+const SCOPED_RESUME_BACKLOG_FLOOR: u64 = 125;
 
 /// Floors pinned at an exact measurement are only meaningful if the batch is
 /// reproducible, which is the same claim the flagship's own replay check
