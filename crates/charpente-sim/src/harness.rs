@@ -162,6 +162,13 @@ pub struct Failure {
     pub test: &'static str,
     pub seed: u64,
     pub config: FaultConfig,
+    /// What actually fired in THIS universe. `config` is the enabled axes and
+    /// their probabilities; this is the events. Kept per-failure rather than
+    /// folded into `Report::coverage` (which stays the batch statistic that
+    /// `require:`/floors are measured against, unchanged) — the question a
+    /// failure raises is "which axis explains THIS universe", and the batch
+    /// aggregate cannot answer it.
+    pub coverage: BTreeMap<&'static str, u64>,
     pub message: String,
 }
 
@@ -268,10 +275,11 @@ fn run_single_seed(tests: &[&SimTest], seed: u64) -> Report {
                 tally(&mut outcomes, &end);
                 merge(&mut report.coverage, &end.coverage);
             }
-            Err((config, message)) => report.failures.push(Failure {
+            Err((config, coverage, message)) => report.failures.push(Failure {
                 test: test.name,
                 seed,
                 config,
+                coverage,
                 message,
             }),
         }
@@ -293,7 +301,7 @@ fn tally(outcomes: &mut TestOutcomes, end: &UniverseEnd) {
 /// One (test, universe) unit of work: the seed is pre-derived on the main
 /// thread before any worker starts, so `jobs` only changes scheduling, never
 /// the seed each universe runs with.
-type UniverseOutcome = Result<UniverseEnd, (FaultConfig, String)>;
+type UniverseOutcome = Result<UniverseEnd, (FaultConfig, BTreeMap<&'static str, u64>, String)>;
 
 fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) -> Report {
     // DESIGN §7: the master seed is printed at startup, before any universe
@@ -367,10 +375,11 @@ fn run_batch(tests: &[&SimTest], master_seed: u64, universes: u64, jobs: usize) 
                     tally(&mut outcomes, &end);
                     merge(&mut covered, &end.coverage);
                 }
-                Err((config, message)) => report.failures.push(Failure {
+                Err((config, coverage, message)) => report.failures.push(Failure {
                     test: test.name,
                     seed,
                     config,
+                    coverage,
                     message,
                 }),
             }
@@ -427,6 +436,8 @@ impl Report {
             out.push_str(&format!("{:#x}", self.master_seed));
             out.push_str("\",\"config\":");
             config_json(&f.config, &mut out);
+            out.push_str(",\"coverage\":");
+            coverage_json(&f.coverage, &mut out);
             out.push_str(",\"message\":\"");
             json_escape(&f.message, &mut out);
             out.push_str("\",\"repro\":\"");
@@ -504,14 +515,41 @@ fn coverage_json(coverage: &BTreeMap<&'static str, u64>, out: &mut String) {
     out.push('}');
 }
 
+/// Every axis of the config, not a subset. The human format prints
+/// `{cfg:?}` — all of it — while this listed four probabilities and the two
+/// latencies, so the MACHINE-readable record silently omitted
+/// `dir_entry_loss`, `bit_flip`, `misdirected_write`, `read_error`, the four
+/// `object_*`, `corruption_scope`, `conn_drop`, `net_spike` and
+/// `subscriber_stall`. A consumer diffing configs across runs could not see
+/// the axis that explained the failure (docs/LEDGER.md 2026-09-07). Adding a
+/// field to `FaultConfig` without adding it here reopens that gap:
+/// `config_json_carries_every_fault_axis` fails the moment it does.
 fn config_json(cfg: &FaultConfig, out: &mut String) {
     out.push_str(&format!(
         "{{\"write_error\":{},\"sync_error\":{},\"crash_apply\":{},\"crash_torn\":{},\
-         \"disk_latency\":{{\"lo_ns\":{},\"hi_ns\":{}}},\"net_latency\":{{\"lo_ns\":{},\"hi_ns\":{}}}}}",
+         \"dir_entry_loss\":{},\"bit_flip\":{},\"misdirected_write\":{},\"read_error\":{},\
+         \"object_put_error\":{},\"object_get_error\":{},\"object_lost_ack\":{},\
+         \"object_delete_error\":{},\"corruption_scope\":\"",
         cfg.write_error,
         cfg.sync_error,
         cfg.crash_apply,
         cfg.crash_torn,
+        cfg.dir_entry_loss,
+        cfg.bit_flip,
+        cfg.misdirected_write,
+        cfg.read_error,
+        cfg.object_put_error,
+        cfg.object_get_error,
+        cfg.object_lost_ack,
+        cfg.object_delete_error,
+    ));
+    json_escape(&cfg.corruption_scope, out);
+    out.push_str(&format!(
+        "\",\"conn_drop\":{},\"net_spike\":{},\"subscriber_stall\":{},\
+         \"disk_latency\":{{\"lo_ns\":{},\"hi_ns\":{}}},\"net_latency\":{{\"lo_ns\":{},\"hi_ns\":{}}}}}",
+        cfg.conn_drop,
+        cfg.net_spike,
+        cfg.subscriber_stall,
         cfg.disk_latency.0.as_nanos(),
         cfg.disk_latency.1.as_nanos(),
         cfg.net_latency.0.as_nanos(),
@@ -593,8 +631,14 @@ fn write_human(report: &Report, out: &mut dyn std::io::Write) {
 
 fn human_failure_block(f: &Failure) -> String {
     format!(
-        "\nsim failure in {}: {}\n  seed:   {:#018x}\n  config: {:?}\n  repro:  charpente test --sim --filter {} --seed {:#x}\n",
-        f.test, f.message, f.seed, f.config, f.test, f.seed
+        "\nsim failure in {}: {}\n  seed:   {:#018x}\n  config: {:?}\n  fired:  {}\n  repro:  charpente test --sim --filter {} --seed {:#x}\n",
+        f.test,
+        f.message,
+        f.seed,
+        f.config,
+        crate::render_fired(&f.coverage),
+        f.test,
+        f.seed
     )
 }
 
@@ -751,6 +795,7 @@ mod tests {
             test: "receipts_exactly_once",
             seed: 0x8bee_1752_811a_e873,
             config,
+            coverage: BTreeMap::from([("fault:dir-entry", 3), ("restart", 7)]),
             message: "exactly-once violated: hits 2, done 1 for key 3".to_string(),
         };
         let block = human_failure_block(&failure);
@@ -766,10 +811,22 @@ mod tests {
             "{block}"
         );
         assert!(
+            block.contains("  fired:  fault:dir-entry: 3, restart: 7"),
+            "{block}"
+        );
+        assert!(
             block.contains(
                 "  repro:  charpente test --sim --filter receipts_exactly_once --seed 0x8bee1752811ae873"
             ),
             "{block}"
+        );
+        // The GUIDE calls this five load-bearing lines; if that stops being
+        // true the doc is wrong (hard rule 6, docs/GUIDE.md "Reading a
+        // failure, replaying its seed").
+        assert_eq!(
+            block.trim_matches('\n').lines().count(),
+            5,
+            "the GUIDE documents five lines: {block}"
         );
     }
 
@@ -843,6 +900,119 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("that_test"), "{text}");
         assert!(text.contains("never:happens"), "{text}");
+    }
+
+    // ------------------------------------------- what actually fired
+
+    /// The oracle for the whole change: a FAILING universe must report the
+    /// faults that fired in it. This was structurally impossible until
+    /// 2026-09-07 — `run_universe`'s `Err` payload was `(FaultConfig, String)`,
+    /// with nowhere to put coverage — so on the one run where a reader most
+    /// needs to know which axis explains the failure, the report carried none
+    /// at all, while a GREEN run of the same workload reported it fine.
+    ///
+    /// Asserts through the public `Report`, not the renderer, so it fails if
+    /// the payload is ever narrowed again regardless of how the text is
+    /// formatted.
+    #[test]
+    fn a_failing_universe_reports_the_coverage_it_marked() {
+        fn restarts_then_fails(sim: &mut Sim) -> Result<(), String> {
+            sim.restart();
+            Err("toy failure after a restart".into())
+        }
+        let tests = [SimTest {
+            name: "solo",
+            run: restarts_then_fails,
+            require: &[],
+        }];
+        let refs: Vec<&SimTest> = tests.iter().collect();
+        let report = run_single_seed(&refs, 0x1234);
+        assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+        assert_eq!(
+            report.failures[0].coverage.get("restart").copied(),
+            Some(1),
+            "a failing universe must carry the coverage it marked, got {:?}",
+            report.failures[0].coverage
+        );
+    }
+
+    /// A failure with NO faults fired must say so in words rather than by
+    /// printing an empty list — "nothing fired" is the most informative thing
+    /// a report can say (it means the bug is not fault-induced), and it is
+    /// exactly the reading that an absent line leaves a reader to guess at.
+    #[test]
+    fn a_failure_with_no_faults_says_nothing_fired() {
+        let tests = [SimTest {
+            name: "solo",
+            run: always_fails,
+            require: &[],
+        }];
+        let refs: Vec<&SimTest> = tests.iter().collect();
+        let report = run_single_seed(&refs, 0x1234);
+        let block = human_failure_block(&report.failures[0]);
+        assert!(
+            block.contains("fired:  nothing (no faults or events marked coverage"),
+            "{block}"
+        );
+    }
+
+    /// `config_json` listed four probabilities and two latencies, so the
+    /// machine-readable record omitted the axis a diagnosis actually turned on.
+    /// Pinned against `{cfg:?}` — the human format, which has always printed
+    /// every field — so adding a `FaultConfig` field without adding it here
+    /// reddens this test instead of silently reopening the hole.
+    #[test]
+    fn config_json_carries_every_fault_axis() {
+        let cfg = FaultConfig {
+            write_error: 0.068,
+            sync_error: 0.049,
+            crash_apply: 0.354,
+            crash_torn: 0.507_756,
+            dir_entry_loss: 0.477,
+            bit_flip: 0.0,
+            misdirected_write: 0.0,
+            read_error: 0.0,
+            object_put_error: 0.0,
+            object_get_error: 0.0,
+            object_lost_ack: 0.0,
+            object_delete_error: 0.0,
+            corruption_scope: "wal/".to_string(),
+            conn_drop: 0.02,
+            net_spike: 0.081,
+            subscriber_stall: 0.0,
+            disk_latency: (Duration::ZERO, Duration::ZERO),
+            net_latency: (Duration::ZERO, Duration::from_millis(20)),
+        };
+        let mut json = String::new();
+        config_json(&cfg, &mut json);
+        // Every field name the Debug rendering shows must appear as a JSON key.
+        for field in format!("{cfg:?}")
+            .split(&['{', '}', ',', ' '][..])
+            .filter(|t| t.ends_with(':'))
+            .map(|t| t.trim_end_matches(':'))
+        {
+            assert!(
+                json.contains(&format!("\"{field}\":")),
+                "config_json omits `{field}`, which the human format prints: {json}"
+            );
+        }
+        assert!(json.contains("\"dir_entry_loss\":0.477"), "{json}");
+    }
+
+    #[test]
+    fn json_failure_record_carries_the_coverage_that_fired() {
+        fn restarts_then_fails(sim: &mut Sim) -> Result<(), String> {
+            sim.restart();
+            Err("toy failure after a restart".into())
+        }
+        let tests = [SimTest {
+            name: "solo",
+            run: restarts_then_fails,
+            require: &[],
+        }];
+        let refs: Vec<&SimTest> = tests.iter().collect();
+        let json = run_single_seed(&refs, 0x1234).to_json();
+        assert!(json.contains("\"coverage\":{\"restart\":1}"), "{json}");
     }
 
     #[test]

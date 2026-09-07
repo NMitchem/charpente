@@ -3119,6 +3119,35 @@ after the finding was reported, from the printed repro alone. Rate measured by t
 high directory-entry loss and *no media corruption whatsoever*. Nothing has to be mangled for
 an acknowledged write to disappear; a directory entry merely has to go missing across a crash.
 
+**CORRECTION, same day, and it invalidates how the paragraph above was obtained.** Those are
+CONFIGURED PROBABILITIES, not events. At the time that paragraph was written no artifact
+anywhere recorded whether `dir_entry_loss` ever fired in this universe, because the failure
+path discarded coverage entirely: `run_universe`'s error payload was `(FaultConfig, String)`,
+with nowhere to put it. A GREEN run of the same workload reports coverage fine
+(`fault:dir-entry: 3` over 20 universes); the failing single-universe run reported
+`"coverage":{}`, and single-universe GREEN controls confirmed the emptiness came from the
+FAILURE, not from the universe count. So three separate readers — the finder, a reviewing
+agent, and the controller — each named `dir_entry_loss: 0.477` as "the lead" from a line that
+says only that the axis was switched on. The repo had already learned this exact lesson once
+and not generalized it: `run_universes_swarm_with_in`'s `CHARPENTE_SEED` branch prints
+coverage with the comment "the batch path reports coverage; a single-seed replay was throwing
+it away, which is what you most want when asking why *this* universe behaved (or cost) the way
+it did" — the same reasoning, never applied to the failure path.
+
+**Now measured.** The failure report carries a `fired:` line, and seed `0xb957ceaaf1716fd5`
+answers:
+
+```
+  fired:  crash:dropped: 1, crash:torn: 7, fault:dir-entry: 1, fault:sync_error: 4,
+          fault:write_error: 4, restart: 2
+```
+
+`fault:dir-entry` **did** fire — once. The guess was right; the reasoning behind it was not
+evidence, and would have read identically had the axis never fired at all. Note also
+`fault:sync_error: 4`: fsync failures occurred in this universe, and per the fsyncgate
+convention a failed fsync poisons the log rather than permitting an ack. Both axes are now on
+the table for the a-vs-b question, where before only one was, on worse grounds.
+
 **Why it was invisible until now, and why that is the thesis working.** The 2026-09-05 entry
 above records that `checks::acked_implies_durable` used to build its own `Sim::new(seed)`, and
 that `Sim::new` is `FaultConfig::default()`, which zeroes eleven axes — `dir_entry_loss`
@@ -3174,5 +3203,86 @@ hard rule 5 is satisfied by the tool. What is wrong is CLAUDE.md's blanket claim
 (`--universes/--seed/--master-seed/--filter/--jobs/--format`), so `CHARPENTE_SEED` does not
 reach it. Following the doc instead of the printed line cost one wasted run.
 
-**Status: OPEN and unfixed at `85c2fc7`.** Tasks 8-12 of the oracle-density plan are held until
-the three readings are separated.
+**Reading 3 is RULED OUT, and so is reading 1 in its naive form.** The sim models the barrier
+faithfully: `collapse_dir_entries` (`charpente-sim/src/disk.rs`) touches only names still in
+`pending_creates`/`pending_removes`, and `Disk::sync_dir` retains those out by prefix, so a
+correctly barriered name is immune and the fault IS survivable. And every name-creation site on
+this path barriers itself, each with a comment citing DESIGN §2: `log.rs`'s `rotate` (the new
+segment's name, before frames land), `Wal::open_with_horizon`'s first segment, `gc` after each
+removal, `Store::open` ("the store file's name must be durable too"), and the horizon
+breadcrumb write. **There is no missing parent-directory fsync.** The suspect named above —
+the classic textbook one — is not what is happening here.
+
+**Status: OPEN at `85c2fc7`, narrowed but unfixed.** What remains is reading 2 (the checker's
+three-round restart bookkeeping) or a subtler form of reading 1 in the interaction between the
+single `fault:dir-entry` event, the four `fault:sync_error` events, and the checkpoint-then-gc
+ordering in `Db::checkpoint`. Tasks 8-12 of the oracle-density plan stay held.
+
+One further asymmetry, noted and NOT yet acted on: `checks.rs` exposes two excuse helpers,
+`durable_corruption_fired` and `dir_entry_loss_fired`. `sim-fixture`'s property excuses only
+the first, and `dir_entry_loss_fired` has exactly ONE consumer in the whole workspace
+(`charpente/tests/replication.rs`, guarding a "refusing to guess" error). Whether losing an
+acked write under directory-entry loss is excusable at all IS the open question — so that
+asymmetry must be resolved BY the answer, never used to reach it. Excusing it to get green
+would convert this finding into a decorative oracle, which is exactly what the floor-lowering
+warning in `run_universes_swarm_with_in` exists to forbid.
+
+## 2026-09-07 — a sim failure now says what actually fired, not just what was enabled
+
+The instrument the entry above needed, built because that entry could not be written honestly
+without it.
+
+**The defect was structural, not cosmetic.** `run_universe`'s signature was
+`Result<UniverseEnd, (FaultConfig, String)>`. `UniverseEnd` carries `coverage`; the `Err` arm
+had nowhere to put it, so on every failing universe — in both the sequential and parallel
+runners, and in the `run_universes_swarm!` panic path the platform's own suites use — the
+coverage map was dropped on the floor. A green run reported it; a red run did not. The one
+place a reader most needs to know which fault explains the behaviour was the one place the
+harness refused to say.
+
+**What it cost.** Everything in the entry above that reasons from `dir_entry_loss: 0.477` was
+reasoning from a probability. Three readers in sequence took a configured axis for an observed
+event, and no artifact existed that could have contradicted them. The measurement, once
+possible, took one command.
+
+**The fix.** Both `run_universe` and `run_universe_with_adjust` carry the coverage map in their
+`Err` payload; `harness::Failure` gains a `coverage` field; the human block and the swarm panic
+report gain a `fired:` line; the JSON failure record gains its own `coverage` object. Per-
+failure, deliberately — `Report::coverage` stays the batch statistic that `require:` and floors
+are measured against, untouched, because the question a failure raises is "which axis explains
+THIS universe" and an aggregate cannot answer it.
+
+**`config_json` was a second, quieter instance of the same defect.** It listed four
+probabilities and two latency ranges, so the machine-readable record omitted `dir_entry_loss`,
+`bit_flip`, `misdirected_write`, `read_error`, all four `object_*`, `corruption_scope`,
+`conn_drop`, `net_spike` and `subscriber_stall` — the human format has always printed every
+field via `{cfg:?}`. A tool consuming `--format json` could not see the axis under discussion.
+Now every axis is emitted, and `config_json_carries_every_fault_axis` derives its expectations
+from the Debug rendering rather than a hand-written list, so adding a `FaultConfig` field
+without adding it here reddens a test instead of silently reopening the hole.
+
+**The GUIDE taught the misreading and is corrected in the same commit** (hard rule 6). Its
+"Reading a failure" section said of `config`: "Reading it tells you what kind of trouble was
+injected." It tells you what was *possible*. That sentence now distinguishes enabled-vs-fired
+explicitly, the block is five lines rather than four, and `fired:` is documented as the line to
+reason from — including that `fired: nothing` is a real answer meaning the failure is a plain
+bug rather than fault-induced.
+
+**Verification.** RED-first was unavailable (the field did not exist, and a test that merely
+fails to compile proves nothing — the 2026-09-05 rule), so both halves are **mutation-proved**
+instead. Restoring the discard (`Err((cfg, BTreeMap::new(), msg))`) fails
+`a_failing_universe_reports_the_coverage_it_marked` and
+`json_failure_record_carries_the_coverage_that_fired` by name; dropping `dir_entry_loss` from
+`config_json` fails `config_json_carries_every_fault_axis`, which names the missing field in
+its message. Both restored green. `fmt` 0, `clippy --workspace --all-targets -D warnings` 0,
+`cargo build --workspace --all-targets` 0, charpente-sim 117 + 4 + 1 + 1 + 31 green,
+charpente-cli 7 suites green (`repro_meta` pins the JSON shape and still passes),
+`guide-examples` builds. The assertion is through the public `Report`, not the renderer, so
+narrowing the payload again fails regardless of how the text is formatted.
+
+**The repo had reasoned this out once already.** `run_universes_swarm_with_in`'s
+`CHARPENTE_SEED` branch prints per-universe coverage under the comment "the batch path reports
+coverage; a single-seed replay was throwing it away, which is what you most want when asking
+why *this* universe behaved (or cost) the way it did." Correct, and never generalized to the
+failure path — the same shape as 2026-09-05's `fixture_replays` note, where the right
+reasoning sat four lines from the code that needed it.

@@ -1870,7 +1870,7 @@ fn end_of(sim: &Sim) -> UniverseEnd {
 pub(crate) fn run_universe(
     seed: u64,
     f: &dyn Fn(&mut Sim) -> Result<(), String>,
-) -> Result<UniverseEnd, (FaultConfig, String)> {
+) -> Result<UniverseEnd, (FaultConfig, BTreeMap<&'static str, u64>, String)> {
     let mut s = seed;
     let cfg_seed = splitmix64(&mut s);
     let mut cfg = FaultConfig::swarm(&mut Rng::new(cfg_seed));
@@ -1878,8 +1878,8 @@ pub(crate) fn run_universe(
     let mut sim = Sim::with_faults(seed, cfg.clone());
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut sim))) {
         Ok(Ok(())) => Ok(end_of(&sim)),
-        Ok(Err(msg)) => Err((cfg, msg)),
-        Err(payload) => Err((cfg, panic_message(&*payload))),
+        Ok(Err(msg)) => Err((cfg, sim.coverage(), msg)),
+        Err(payload) => Err((cfg, sim.coverage(), panic_message(&*payload))),
     }
 }
 
@@ -1893,7 +1893,7 @@ fn run_universe_with_adjust(
     seed: u64,
     adjust: &dyn Fn(&mut FaultConfig),
     f: &dyn Fn(&mut Sim) -> Result<(), String>,
-) -> Result<UniverseEnd, (FaultConfig, String)> {
+) -> Result<UniverseEnd, (FaultConfig, BTreeMap<&'static str, u64>, String)> {
     let mut s = seed;
     let cfg_seed = splitmix64(&mut s);
     let mut cfg = FaultConfig::swarm(&mut Rng::new(cfg_seed));
@@ -1903,8 +1903,8 @@ fn run_universe_with_adjust(
     let mut sim = Sim::with_faults(seed, cfg.clone());
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut sim))) {
         Ok(Ok(())) => Ok(end_of(&sim)),
-        Ok(Err(msg)) => Err((cfg, msg)),
-        Err(payload) => Err((cfg, panic_message(&*payload))),
+        Ok(Err(msg)) => Err((cfg, sim.coverage(), msg)),
+        Err(payload) => Err((cfg, sim.coverage(), panic_message(&*payload))),
     }
 }
 
@@ -1917,9 +1917,9 @@ fn run_one_swarm_with(
 ) -> UniverseEnd {
     match run_universe_with_adjust(seed, adjust, f) {
         Ok(end) => end,
-        Err((cfg, msg)) => panic!(
+        Err((cfg, coverage, msg)) => panic!(
             "{}",
-            swarm_failure_report(package, test_file, seed, &cfg, &msg)
+            swarm_failure_report(package, test_file, seed, &cfg, &coverage, &msg)
         ),
     }
 }
@@ -1939,11 +1939,34 @@ fn swarm_failure_report(
     test_file: &str,
     seed: u64,
     cfg: &FaultConfig,
+    coverage: &BTreeMap<&'static str, u64>,
     msg: &str,
 ) -> String {
     format!(
-        "\nsim failure in {test_file}: {msg}\n  seed:   {seed:#018x}\n  config: {cfg:?}\n  repro:  CHARPENTE_SEED={seed:#x} cargo test -p {package} --test {test_file} -- --nocapture\n"
+        "\nsim failure in {test_file}: {msg}\n  seed:   {seed:#018x}\n  config: {cfg:?}\n  fired:  {}\n  repro:  CHARPENTE_SEED={seed:#x} cargo test -p {package} --test {test_file} -- --nocapture\n",
+        render_fired(coverage)
     )
+}
+
+/// The faults and events that ACTUALLY fired in a universe, for a failure
+/// report. `config:` above lists the axes that were ENABLED and their
+/// probabilities — it says nothing about what happened, and reading a
+/// diagnosis off it is reasoning from a probability (docs/LEDGER.md
+/// 2026-09-07, where an acked-write finding was attributed to
+/// `dir_entry_loss: 0.477` by every reader, including two agents and the
+/// controller, with no artifact anywhere recording whether that axis fired
+/// at all). "nothing" is a real answer and must print as one: a failure with
+/// no faults fired is a plain bug, which is the single most useful thing a
+/// report can say.
+fn render_fired(coverage: &BTreeMap<&'static str, u64>) -> String {
+    if coverage.is_empty() {
+        return "nothing (no faults or events marked coverage in this universe)".to_string();
+    }
+    coverage
+        .iter()
+        .map(|(key, count)| format!("{key}: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ------------------------------------------------------------ App harness

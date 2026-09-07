@@ -2309,8 +2309,9 @@ charpente test --sim [--universes N] [--seed 0x…] [--master-seed 0x…] \
   reports — worker scheduling is unobservable.
 - `--format human|json` — human is the default; `json` emits one object
   with `master_seed`, `universes`, `failures` (each carrying its own `test`,
-  `seed`, `master_seed`, `config`, `message`, and copy-pasteable `repro`
-  command), `verdicts` and `gave_up` (batch totals), `outcomes` (the same
+  `seed`, `master_seed`, `config` — every fault axis, not a subset — its own
+  `coverage` of what actually fired in that universe, `message`, and a
+  copy-pasteable `repro` command), `verdicts` and `gave_up` (batch totals), `outcomes` (the same
   split per test: `{test, verdicts, gave_up}`), `coverage`,
   `missing_coverage` (`{test, key}` pairs), and a trailing `summary`, for
   downstream tooling.
@@ -2337,20 +2338,31 @@ A human-format failure looks like this (the exact shape a pinned test in
 sim failure in receipts_exactly_once: exactly-once violated: hits 2, done 1 for key 3
   seed:   0x8bee1752811ae873
   config: FaultConfig { write_error: 0.0, sync_error: 0.118, crash_apply: 0.002, crash_torn: 0.664668, dir_entry_loss: 0.0, disk_latency: (0ns, 0ns), net_latency: (0ns, 250ms) }
+  fired:  crash:torn: 7, fault:sync_error: 4, restart: 2
   repro:  charpente test --sim --filter receipts_exactly_once --seed 0x8bee1752811ae873
 ```
 
-Four lines, each load-bearing:
+Five lines, each load-bearing:
 
 - The first line is the workload's own `Err` message (or an absorbed panic
   payload) — the actual claim that failed.
 - `seed` is the one `u64` that determined this entire universe: virtual
   time, every entropy draw, and the fault matrix's decisions.
 - `config` is that universe's sampled `FaultConfig` — the fault rates and
-  latency ranges actually in effect (per-universe swarm sampling, glossed
-  under the checkers above). Reading it tells you what kind of trouble was
-  injected — e.g. `crash_torn: 0.664668` here means torn writes were
-  common in this universe.
+  latency ranges that were ENABLED (per-universe swarm sampling, glossed
+  under the checkers above). It is a set of probabilities, so it tells you
+  what kind of trouble was *possible*: `crash_torn: 0.664668` means torn
+  writes were likely in this universe, not that any occurred. Do not read a
+  diagnosis off this line — that is the next one's job.
+- `fired` is what ACTUALLY happened: the universe's coverage map, every
+  fault and event that really occurred, with counts. This is the line to
+  reason from. A high probability whose key is absent here never fired, and
+  an explanation resting on it is wrong. `fired: nothing` is a real and
+  valuable answer — it means no injected fault was involved and the failure
+  is a plain bug. (This line exists because it once did not: a durability
+  finding was attributed to `dir_entry_loss: 0.477` by three separate
+  readers, none of whom could have known whether that axis fired, because
+  the failure path discarded coverage entirely — docs/LEDGER.md 2026-09-07.)
 - `repro` is not advice, it **is** the reproduction: paste that exact line
   and the same universe runs again, because `--seed` (above) replays a
   literal seed byte-identically. There is no separate "figure out how to
