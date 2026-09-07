@@ -487,3 +487,41 @@ That claim is refuted by the very experiment cited two paragraphs above it.
 **Counts differ slightly from Task 2's table** (92 vs 89, 110 vs 109) for the recorded reason:
 the directory-barrier stream split re-keyed every universe, so these are the same properties
 over a renamed population, not a drift in behaviour.
+
+## `auth.rs` give-ups, attributed (2026-09-07)
+
+Task 4 gave `replication.rs` per-cause give-up keys. `auth.rs` never got them: its eight
+`INCONCLUSIVE` sites all funnelled into one `auth:inconclusive` counter, so the suite could say
+that **53 of 128 universes gave up (41.4%) and not one word about why**.
+
+Eight per-site covers, mirroring replication's naming. Measured over 128 universes, base
+`0x2EB3_0001`:
+
+| cause | count | share of the 53 |
+|---|---:|---:|
+| `:recover-exhausted` | 35 | 66.0% |
+| `:request-no-response` | 14 | 26.4% |
+| `:spawn-exhausted` | 3 | 5.7% |
+| `:needs-restore` | 1 | 1.9% |
+| `:witness-torn` | 0 | — |
+| `:local-unrestorable` | 0 | — |
+| `:scan-list-faulted` | 0 | — |
+| `:scan-read-faulted` | 0 | — |
+
+**35 + 14 + 3 + 1 = 53, which is the aggregate exactly.** That sum is the check that matters:
+every give-up is attributed and none falls through, so a future cause cannot hide inside the
+total. Had it come up short, the difference would have been an unattributed path.
+
+`:recover-exhausted` is **35 of 35 `:injected`**, the same shape replication measured — so the
+same conclusion applies before anyone raises `AUTH_RECOVER_ATTEMPTS`: no sticky wedge, and a
+fresh fault per attempt is not evidence of a budget.
+
+**The four zeroes are a finding, not padding.** Those give-up paths never execute in this
+population, so nothing about them is under test — including whether their error text still
+matches what the classifier expects. They are the sites to look at first if auth's give-up mix
+ever moves.
+
+Threading `sim` into `list_view`/`read_view` (and their two scan wrappers) is what let all eight
+covers be per-site. The alternative — one central classifier matching on error prose in
+`finish_auth_universe` — needed no plumbing but would have re-coupled attribution to wording,
+which is the fragility `classify`'s own doc warns about.

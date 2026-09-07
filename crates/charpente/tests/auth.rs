@@ -20,7 +20,9 @@ use charpente::{DbConfig, Schema, Tx, route, routes};
 use charpente_core::io::{Clock, Disk};
 use charpente_core::log::WalConfig;
 use charpente_core::table::Id;
-use charpente_sim::checks::{durable_corruption_fired, is_fault_fallout, replays_identically};
+use charpente_sim::checks::{
+    FaultReason, classify, durable_corruption_fired, is_fault_fallout, replays_identically,
+};
 use charpente_sim::{FaultConfig, Sim, SimHost, run_universes_swarm_with};
 
 const SEC: u64 = 1_000_000_000;
@@ -188,6 +190,7 @@ fn open_auth_kernel(
                 .contains("witness file failed its integrity check") =>
         {
             sim.cover("repl:witness-file-inconclusive");
+            sim.cover("auth:inconclusive:witness-torn");
             return Err(format!(
                 "{INCONCLUSIVE}: {} torn witness file — the operator restore path is the fix: {e}",
                 h.name()
@@ -244,6 +247,7 @@ fn spawn_auth_node(
             Err(e) => return Err(format!("{host}: {e}")),
         }
     }
+    sim.cover("auth:inconclusive:spawn-exhausted");
     Err(format!(
         "{INCONCLUSIVE}: {host} kernel spawn exhausted {AUTH_RECOVER_ATTEMPTS} attempts"
     ))
@@ -281,6 +285,30 @@ fn is_witness_gated(body: &[u8]) -> bool {
 /// Restart-and-recover a node in place — folds local-corruption-shaped hard
 /// errors into an inconclusive skip (no restore rig in this property, exactly
 /// as realtime.rs's `recover_rt_node` does).
+/// `auth.rs`'s copy of `replication.rs`'s `recover_exhausted_key` — the family
+/// of the error the LAST recovery attempt saw.
+///
+/// Duplicated rather than shared because coverage keys must be `&'static str`
+/// (`Sim::cover`'s signature) and each suite's keys carry its own prefix; a
+/// shared helper would have to format, which that signature forbids. The match
+/// is exhaustive, so a new `FaultReason` variant is a compile error in both
+/// files rather than a silently unattributed give-up.
+///
+/// Replication measured this at 100% `:injected` on both convergence
+/// properties, which is what established that "500 attempts were not enough"
+/// and "the budget is too small" are different claims. Auth's split is
+/// unmeasured; this key is what makes it measurable before anyone reaches for
+/// `AUTH_RECOVER_ATTEMPTS`.
+fn auth_recover_exhausted_key(last: &str) -> &'static str {
+    match classify(last) {
+        FaultReason::Injected => "auth:inconclusive:recover-exhausted:injected",
+        FaultReason::Poisoned => "auth:inconclusive:recover-exhausted:poisoned",
+        FaultReason::RedbLatch => "auth:inconclusive:recover-exhausted:redb-latch",
+        FaultReason::DurableHorizon => "auth:inconclusive:recover-exhausted:durable-horizon",
+        FaultReason::Unrelated => "auth:inconclusive:recover-exhausted:unrelated",
+    }
+}
+
 fn recover_auth_node(sim: &Sim, node: &mut AuthNode) -> Result<(), String> {
     sim.cover("restart");
     node.kernel = None;
@@ -296,6 +324,7 @@ fn recover_auth_node(sim: &Sim, node: &mut AuthNode) -> Result<(), String> {
             }
             Err(e) if e.contains(INCONCLUSIVE) => return Err(e),
             Err(e) if needs_restore(&e) => {
+                sim.cover("auth:inconclusive:local-unrestorable");
                 return Err(format!(
                     "{INCONCLUSIVE}: {} local copy unrestorable (no restore rig in this \
                      property): {e}",
@@ -306,6 +335,11 @@ fn recover_auth_node(sim: &Sim, node: &mut AuthNode) -> Result<(), String> {
             Err(e) => return Err(format!("recover {}: {e}", node.name)),
         }
     }
+    sim.cover("auth:inconclusive:recover-exhausted");
+    // Same budget-or-wedge question replication.rs measured, same answer shape
+    // required before anyone raises `AUTH_RECOVER_ATTEMPTS`: see
+    // `replication.rs`'s `recover_exhausted_key`.
+    sim.cover(auth_recover_exhausted_key(&last));
     Err(format!(
         "{INCONCLUSIVE}: recover {} exhausted {AUTH_RECOVER_ATTEMPTS} attempts (last: {last})",
         node.name
@@ -329,11 +363,14 @@ fn kstep_auth_node(sim: &Sim, node: &mut AuthNode) -> Result<Step, String> {
         // refusing to ship a frame that failed read-back verification, or the
         // follower refusing a forked timeline (spec §5's Diverged) — both the
         // platform working as designed, both needing an out-of-scope restore.
-        Err(e) if needs_restore(&e.to_string()) => Err(format!(
-            "{INCONCLUSIVE}: {} local durable copy needs restore (media corruption of \
+        Err(e) if needs_restore(&e.to_string()) => Err({
+            sim.cover("auth:inconclusive:needs-restore");
+            format!(
+                "{INCONCLUSIVE}: {} local durable copy needs restore (media corruption of \
              acknowledged data; no restore rig in this property): {e}",
-            node.name
-        )),
+                node.name
+            )
+        }),
         Err(e) => Err(format!("{} kernel step: {e}", node.name)),
     }
 }
@@ -400,6 +437,7 @@ fn auth_drive_request(
     if guard.len() > before {
         Ok(guard[before].clone())
     } else {
+        sim.cover("auth:inconclusive:request-no-response");
         Err(format!(
             "{INCONCLUSIVE}: no response to a request on node {target} within budget"
         ))
@@ -417,7 +455,7 @@ fn applied(node: &AuthNode) -> Option<u64> {
 /// List a disk's files, retrying through transient injected read faults, and
 /// tagging exhaustion as inconclusive (a scan that can never read is not a
 /// verdict).
-fn list_view(disk: &impl Disk) -> Result<Vec<String>, String> {
+fn list_view(sim: &Sim, disk: &impl Disk) -> Result<Vec<String>, String> {
     for _ in 0..64 {
         match disk.list("") {
             Ok(v) => return Ok(v),
@@ -425,13 +463,14 @@ fn list_view(disk: &impl Disk) -> Result<Vec<String>, String> {
             Err(e) => return Err(e.to_string()),
         }
     }
+    sim.cover("auth:inconclusive:scan-list-faulted");
     Err(format!("{INCONCLUSIVE}: listing durable files faulted 64x"))
 }
 
 /// Read a file's whole current view (durable bytes plus any un-synced page
 /// cache — a superset of the durable state, so strictly stronger for proving
 /// ABSENCE). Same transient-fault handling as `list_view`.
-fn read_view(disk: &impl Disk, name: &str) -> Result<Vec<u8>, String> {
+fn read_view(sim: &Sim, disk: &impl Disk, name: &str) -> Result<Vec<u8>, String> {
     for _ in 0..64 {
         let attempt = (|| -> io::Result<Vec<u8>> {
             let file = disk.open(name)?;
@@ -448,6 +487,7 @@ fn read_view(disk: &impl Disk, name: &str) -> Result<Vec<u8>, String> {
             Err(e) => return Err(e.to_string()),
         }
     }
+    sim.cover("auth:inconclusive:scan-read-faulted");
     Err(format!(
         "{INCONCLUSIVE}: reading {name:?} faulted 64x during the durable scan"
     ))
@@ -462,12 +502,13 @@ fn read_view(disk: &impl Disk, name: &str) -> Result<Vec<u8>, String> {
 /// (per host) and the meta-test (the global disk), so both prove the exact
 /// same predicate.
 fn assert_no_raw_credentials_on_disk(
+    sim: &Sim,
     disk: &impl Disk,
     label: &str,
     raws: &[String],
 ) -> Result<(), String> {
-    for name in list_view(disk)? {
-        let bytes = read_view(disk, &name)?;
+    for name in list_view(sim, disk)? {
+        let bytes = read_view(sim, disk, &name)?;
         for raw in raws {
             if !raw.is_empty() && bytes.windows(raw.len()).any(|w| w == raw.as_bytes()) {
                 return Err(format!(
@@ -482,9 +523,9 @@ fn assert_no_raw_credentials_on_disk(
 
 /// True if `needle` appears in any of the disk's files — the anti-vacuity
 /// companion to the oracle (used to prove the scan read real, populated data).
-fn disk_contains(disk: &impl Disk, needle: &str) -> Result<bool, String> {
-    for name in list_view(disk)? {
-        let bytes = read_view(disk, &name)?;
+fn disk_contains(sim: &Sim, disk: &impl Disk, needle: &str) -> Result<bool, String> {
+    for name in list_view(sim, disk)? {
+        let bytes = read_view(sim, disk, &name)?;
         if !needle.is_empty() && bytes.windows(needle.len()).any(|w| w == needle.as_bytes()) {
             return Ok(true);
         }
@@ -637,8 +678,8 @@ fn raw_credentials_universe(sim: &mut Sim) -> Result<(u64, u64, Vec<String>), St
     // ORACLE: no raw on either host's durable files.
     let p_disk = p.host.disk();
     let f_disk = f.host.disk();
-    assert_no_raw_credentials_on_disk(&p_disk, "p", &raws)?;
-    assert_no_raw_credentials_on_disk(&f_disk, "f", &raws)?;
+    assert_no_raw_credentials_on_disk(sim, &p_disk, "p", &raws)?;
+    assert_no_raw_credentials_on_disk(sim, &f_disk, "f", &raws)?;
 
     // Anti-vacuity: at least one acked hash IS on disk. Gated on no media
     // corruption, which can silently cut an acked-but-uncheckpointed row (the
@@ -646,7 +687,7 @@ fn raw_credentials_universe(sim: &mut Sim) -> Result<(u64, u64, Vec<String>), St
     if !durable_corruption_fired(sim) && !acked_hashes.is_empty() {
         let mut seen = false;
         for h in &acked_hashes {
-            if disk_contains(&p_disk, h)? || disk_contains(&f_disk, h)? {
+            if disk_contains(sim, &p_disk, h)? || disk_contains(sim, &f_disk, h)? {
                 seen = true;
                 break;
             }
@@ -685,6 +726,56 @@ fn finish_auth_universe(
         Ok(_) => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// `classify` keys on error PROSE (DESIGN §7 makes that prose product surface),
+/// so a reworded exemplar silently becomes `Unrelated` and the wedge it used to
+/// name is filed as `:unrelated` — a give-up that looks attributed and is not.
+/// The replication twin of this test is
+/// `every_recover_exhausted_sub_key_is_reachable_and_distinct`; both must exist,
+/// because each file owns its own key prefix.
+#[test]
+fn every_auth_recover_exhausted_sub_key_is_reachable_and_distinct() {
+    let cases = [
+        (
+            "simulated disk write error (injected fault)",
+            "auth:inconclusive:recover-exhausted:injected",
+        ),
+        (
+            "WAL poisoned by an earlier IO failure",
+            "auth:inconclusive:recover-exhausted:poisoned",
+        ),
+        (
+            "Storage error: close and re-open the database",
+            "auth:inconclusive:recover-exhausted:redb-latch",
+        ),
+        (
+            "log frame 3 is invalid but at-or-below the store's durable horizon 7",
+            "auth:inconclusive:recover-exhausted:durable-horizon",
+        ),
+        ("", "auth:inconclusive:recover-exhausted:unrelated"),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(
+            auth_recover_exhausted_key(text),
+            expected,
+            "classify() no longer routes {text:?} to {expected} — the error was reworded or \
+             classify's arms moved, and the give-up it names is now misattributed rather \
+             than loudly wrong"
+        );
+    }
+    let mut keys: Vec<&str> = cases
+        .iter()
+        .map(|(t, _)| auth_recover_exhausted_key(t))
+        .collect();
+    keys.sort_unstable();
+    let before = keys.len();
+    keys.dedup();
+    assert_eq!(
+        before,
+        keys.len(),
+        "two fault families share a sub-key, so a wedge and a budget count as one thing"
+    );
 }
 
 // ------------------------------------------------------------------ tests
@@ -743,7 +834,7 @@ fn the_harness_catches_a_raw_token_written_to_disk() {
         .unwrap();
 
     let disk = sim.disk();
-    let err = assert_no_raw_credentials_on_disk(&disk, "global", std::slice::from_ref(&raw))
+    let err = assert_no_raw_credentials_on_disk(&sim, &disk, "global", std::slice::from_ref(&raw))
         .expect_err("the oracle must catch a raw token written to disk");
     assert!(
         err.contains(&raw),
@@ -756,7 +847,7 @@ fn the_harness_catches_a_raw_token_written_to_disk() {
     // guarantee is about.
     let mut wal_has_raw = false;
     for name in disk.list("wal/").unwrap() {
-        let bytes = read_view(&disk, &name).unwrap();
+        let bytes = read_view(&sim, &disk, &name).unwrap();
         if bytes.windows(raw.len()).any(|w| w == raw.as_bytes()) {
             wal_has_raw = true;
             break;
@@ -790,7 +881,7 @@ fn the_harness_catches_a_raw_token_written_to_disk() {
             Ok::<(), io::Error>(())
         })
         .unwrap();
-    assert_no_raw_credentials_on_disk(&sim_ok.disk(), "global", &[raw])
+    assert_no_raw_credentials_on_disk(&sim_ok, &sim_ok.disk(), "global", &[raw])
         .expect("a hashed-at-rest app must pass the oracle");
 }
 
