@@ -2414,6 +2414,74 @@ three separate files in a single day. It now draws from its own fault stream, so
 adding or relocating a barrier perturbs nothing else. No other IO call has that
 treatment, so the caveat above still holds for the rest of them.
 
+### Finding a one-sided property: `charpente test --mutants`
+
+A green suite tells you your properties passed. It does not tell you they would
+have **failed** if the code stopped working. A property that asserts something
+true whether or not your job ran is *one-sided*: it costs time, reports success,
+and is not evidence about anything.
+
+This is not hypothetical. A helpdesk app built on charpente shipped five such
+properties — deleting its entire SLA sweep loop left the suite green.
+
+The instrument answers one question: **if this code did nothing, would anything
+go red?** It runs your suite repeatedly against deliberately broken copies of
+your source (patched in a scratch directory — nothing about the mutation touches
+your tree or ships), and a mutant that survives is a gap in your oracles.
+
+```
+scripts/mutants.sh --file src/jobs.rs
+```
+
+A mutant reported **MISSED** is the finding. Worked example, from this repo's own
+fixture app — one job whose whole effect is a counter bump, and two properties
+that drive it identically and differ only in what they assert:
+
+```
+$ charpente test --mutants --file crates/sim-fixture/src/lib.rs \
+    --re 'BumpCounter::run.*Ok' --test-package sim-fixture \
+    --property counter_bump_job_leaves_the_row_readable
+
+MISSED   crates/sim-fixture/src/lib.rs:40:9: replace BumpCounter::run -> Result<(), JobError> with Ok(())
+mutants: 1 total — 0 caught, 1 missed, 0 unviable, 0 timed out
+  1 MISSED, judged by "counter_bump_job_leaves_the_row_readable" ALONE: that property
+  runs, reaches a verdict, and does not notice this change — it is ONE-SIDED with
+  respect to the mutated code, and would pass just the same if the code were deleted.
+  Fix: assert the EFFECT the mutated code produces (a value that differs when it does
+  not run), not merely that the surrounding state is still readable.
+```
+
+The same mutant, judged by the honest sibling, is **CAUGHT**:
+
+```
+$ charpente test --mutants … --property counter_bump_job_changes_the_row
+mutants: 1 total — 1 caught, 0 missed, 0 unviable, 0 timed out
+```
+
+Both properties ran 256 universes and reached ~147 verdicts each, so neither
+result is an artifact of a property that never executed. The only difference is
+the assertion: one checks the row is still *readable*, the other checks it now
+reads `hits = 2`.
+
+**Scope is part of the claim, and this is the part that misleads.** A mutant is
+reported CAUGHT if *any* test in scope fails, so one honest sibling hides every
+one-sided property beside it. `--property NAME` judges the mutants by a single
+property — that is how you ask whether *that* property earns its place.
+Similarly `--test-package` decides which packages' suites are allowed to run;
+without it only the mutated package's own tests judge the mutant, which
+understates coverage whenever the real oracle lives elsewhere.
+
+**Two results that are not findings.** `unviable` means the mutant did not
+compile — your types rejected it, which is the compile-time contract doing its
+job. `timed out` means the run did **not resolve**: it is not a catch, and the
+verb will not let it read as one.
+
+**It is not part of `cargo test`.** Every mutant is a rebuild plus a test run,
+so this is an on-demand instrument like the edge harness below, not something
+your inner loop pays for. Scope it at a file or a function (`--file`, `--re`)
+rather than turning it loose on a whole workspace. It needs the pinned tool:
+`cargo install cargo-mutants --version 27.1.0 --locked`.
+
 ### A note on the edge harness (platform dev tooling, not app surface)
 
 The repo also carries `crates/edge-harness`, which drives real built binaries

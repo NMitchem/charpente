@@ -524,6 +524,15 @@ smaller, and it no longer touches `charpente-macros` at all.
 
 ### Task 10: Catch a one-sided property, end to end
 
+**AMENDED 2026-09-07, during implementation.** `cargo-mutants` reports a mutant CAUGHT if
+*any* test in scope fails, so with the victim and the control both running, the control
+catches the mutant and nothing is ever reported one-sided. Demonstrating one-sidedness
+requires judging by a **single** property, which the CLI now does with `--property NAME`.
+The observable claim in Step 2 is unchanged; what changed is that it takes two scoped runs
+of the same mutant rather than one run of the pair. The general form is worth keeping: one
+honest sibling hides every one-sided property beside it, so a suite-wide "all caught" is not
+evidence that each property pulls its weight.
+
 The acceptance test for Phase 3, and the reason it exists. The helpdesk app shipped five
 properties where deleting the entire SLA sweep loop left the suite green.
 
@@ -537,20 +546,20 @@ properties where deleting the entire SLA sweep loop left the suite green.
 - Consumes: Tasks 5 and 9.
 - Produces: the demonstrated claim.
 
-- [ ] **Step 1: Write the victim and the control** in `sim-fixture`: one property that
+- [x] **Step 1: Write the victim and the control** in `sim-fixture`: one property that
       genuinely tests its job's effect, and one that is one-sided in the helpdesk shape
       (it asserts something true whether or not the job ran). Comment both as deliberate
       fixtures so a future reader does not "fix" the victim.
-- [ ] **Step 2: Demonstrate the catch:** with the job handler mutated, the control goes RED
+- [x] **Step 2: Demonstrate the catch:** with the job handler mutated, the control goes RED
       and the victim stays GREEN, and the tool reports that mutant as **MISSED** — which is
       `cargo-mutants`' native name for "no oracle noticed", i.e. the one-sided property.
       Capture the exact output. (AMENDED 2026-09-07: "neutered" now means a source mutant in
       a scratch tree, not a macro mode; the observable claim is unchanged.)
-- [ ] **Step 3: Hard rule 5 on the report text** — it must name the property, the handler
+- [x] **Step 3: Hard rule 5 on the report text** — it must name the property, the handler
       that was neutered, and what the author should do about it.
-- [ ] **Step 4: Document it in GUIDE** in the same commit, and add any new test file to
+- [x] **Step 4: Document it in GUIDE** in the same commit, and add any new test file to
       CLAUDE.md's inventory.
-- [ ] **Step 5: Commit,** stating universe counts.
+- [x] **Step 5: Commit,** stating universe counts.
 
 ---
 

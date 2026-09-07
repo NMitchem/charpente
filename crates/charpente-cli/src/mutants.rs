@@ -37,6 +37,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "--timeout",
     "--jobs",
     "--test-package",
+    "--property",
 ];
 
 /// The default target set: the oracle-bearing files. A mutation run over the
@@ -76,6 +77,9 @@ pub const USAGE: &str = "usage: charpente test --mutants [--file PATH]… [--re 
        --dir PATH   the workspace directory to run in (default: .)\n\
        --test-package NAME  whose tests judge the mutants (repeatable). Without this, \
 cargo-mutants runs only the MUTATED package's tests, which understates coverage.\n\
+       --property NAME  judge the mutants with ONE sim property only — the way to ask \
+whether that property alone would notice. Without it every property runs, and one honest \
+sibling is enough to report a mutant CAUGHT.\n\
        --timeout    per-mutant test timeout in seconds; a TIMEOUT IS NOT A CATCH";
 
 /// The fields of `mutants.out/outcomes.json` this verb reads. Deserialized
@@ -119,6 +123,22 @@ pub fn run(args: &[String]) -> i32 {
         argv.push("--test-package".into());
         argv.push(pkg.clone());
     }
+    if let Some(prop) = &opts.property {
+        // The app-side convention this CLI already assumes elsewhere
+        // (`sim.rs`'s `find_sim_executable`): the sim target is `tests/sim.rs`
+        // with `harness = false`, so its own `--filter` reaches it only after a
+        // bare `--`. Naming `--test sim` is not optional: without it the args
+        // also reach the crate's libtest targets, which have no `--filter` flag
+        // and exit 101 — failing the BASELINE rather than filtering anything.
+        for a in ["--cargo-test-arg", "--test", "--cargo-test-arg", "sim"] {
+            argv.push(a.into());
+        }
+        for a in ["--cargo-test-arg", "--", "--cargo-test-arg", "--filter"] {
+            argv.push(a.into());
+        }
+        argv.push("--cargo-test-arg".into());
+        argv.push(prop.clone());
+    }
     if let Some(t) = &opts.timeout {
         argv.push("--timeout".into());
         argv.push(t.clone());
@@ -151,13 +171,16 @@ pub fn run(args: &[String]) -> i32 {
         return 2;
     }
 
-    report(&out_dir.join("mutants.out/outcomes.json"))
+    report(
+        &out_dir.join("mutants.out/outcomes.json"),
+        opts.property.as_deref(),
+    )
 }
 
 /// Reads the run's own record and turns every "nothing was measured" shape
 /// into a loud failure. The tool's exit code is deliberately NOT consulted:
 /// it is 0 both for a clean sweep and for a filter that selected nothing.
-fn report(path: &std::path::Path) -> i32 {
+fn report(path: &std::path::Path, property: Option<&str>) -> i32 {
     // Reading cargo-mutants' own run record is edge tooling, outside the
     // deterministic core (DESIGN.md §1) — nothing inside charpente-core
     // touches the filesystem directly.
@@ -181,7 +204,7 @@ fn report(path: &std::path::Path) -> i32 {
             return 2;
         }
     };
-    let v = verdict(&o, &path.display().to_string());
+    let v = verdict(&o, &path.display().to_string(), property);
     for line in &v.lines {
         if v.code == 2 {
             eprintln!("{line}");
@@ -200,7 +223,7 @@ struct Verdict {
 /// The decision, split out of `report`'s IO so the ruling's two anti-vacuity
 /// rules are TESTED rather than merely intended — the spec requires exactly
 /// that, and an untested honesty gate is the thing it is guarding against.
-fn verdict(o: &Outcomes, where_: &str) -> Verdict {
+fn verdict(o: &Outcomes, where_: &str, property: Option<&str>) -> Verdict {
     if let Some(bad) = o
         .outcomes
         .iter()
@@ -235,13 +258,27 @@ fn verdict(o: &Outcomes, where_: &str) -> Verdict {
     )];
     let mut code = 0;
     if o.missed > 0 {
-        lines.push(format!(
-            "  {} MISSED: no test IN THE PACKAGES UNDER TEST caught this mutant. That is either \
-             a one-sided property, or an oracle that lives in a package outside --test-package \
-             — cargo-mutants runs only the mutated package's own tests unless told otherwise, \
-             so the scope is part of the claim. See the run directory for the surviving diffs.",
-            o.missed
-        ));
+        lines.push(match property {
+            // Hard rule 5: name the contract, the site, and the fix.
+            Some(prop) => format!(
+                "  {} MISSED, judged by \"{prop}\" ALONE: that property runs, reaches a \
+                 verdict, and does not notice this change — it is ONE-SIDED with respect to \
+                 the mutated code, and would pass just the same if the code were deleted. \
+                 Fix: assert the EFFECT the mutated code produces (a value that differs when \
+                 it does not run), not merely that the surrounding state is still readable. \
+                 The surviving diff is in the run directory.",
+                o.missed
+            ),
+            None => format!(
+                "  {} MISSED: no test IN THE PACKAGES UNDER TEST caught this mutant. That is \
+                 either a one-sided property, or an oracle that lives in a package outside \
+                 --test-package — cargo-mutants runs only the mutated package's own tests \
+                 unless told otherwise, so the scope is part of the claim. Re-run with \
+                 --property NAME to ask which single property is blind to it. See the run \
+                 directory for the surviving diffs.",
+                o.missed
+            ),
+        });
         code = 1;
     }
     if o.timeout > 0 {
@@ -263,6 +300,7 @@ struct Opts {
     files: Vec<String>,
     res: Vec<String>,
     test_packages: Vec<String>,
+    property: Option<String>,
     timeout: Option<String>,
     jobs: Option<String>,
 }
@@ -272,6 +310,7 @@ fn parse(args: &[String]) -> Result<Opts, i32> {
     let mut files = Vec::new();
     let mut res = Vec::new();
     let mut test_packages = Vec::new();
+    let mut property = None;
     let mut timeout = None;
     let mut jobs = None;
 
@@ -293,6 +332,7 @@ fn parse(args: &[String]) -> Result<Opts, i32> {
             "--file" => files.push(value.clone()),
             "--re" => res.push(value.clone()),
             "--test-package" => test_packages.push(value.clone()),
+            "--property" => property = Some(value.clone()),
             "--timeout" => timeout = Some(value.clone()),
             "--jobs" => jobs = Some(value.clone()),
             _ => unreachable!("KNOWN_FLAGS and this match are the same list"),
@@ -313,6 +353,7 @@ fn parse(args: &[String]) -> Result<Opts, i32> {
         files,
         res,
         test_packages,
+        property,
         timeout,
         jobs,
     })
@@ -339,6 +380,7 @@ mod tests {
                 r#"{{"total_mutants":5,"caught":5,"missed":0,"timeout":0,"unviable":0,{OK_BASELINE}}}"#
             )),
             "out",
+            None,
         );
         assert_eq!(v.code, 0, "{:?}", v.lines);
     }
@@ -350,6 +392,7 @@ mod tests {
                 r#"{{"total_mutants":5,"caught":4,"missed":0,"timeout":1,"unviable":0,{OK_BASELINE}}}"#
             )),
             "out",
+            None,
         );
         assert_eq!(
             v.code, 1,
@@ -378,6 +421,7 @@ mod tests {
                    "outcomes":[{"scenario":"Baseline","summary":"Failure"}]}"#,
             ),
             "out",
+            None,
         );
         assert_eq!(v.code, 2, "{:?}", v.lines);
         assert!(
@@ -394,8 +438,30 @@ mod tests {
                 r#"{{"total_mutants":0,"caught":0,"missed":0,"timeout":0,"unviable":0,{OK_BASELINE}}}"#
             )),
             "out",
+            None,
         );
         assert_eq!(v.code, 2, "{:?}", v.lines);
+    }
+
+    /// Hard rule 5: the report names the property, says what is wrong with it,
+    /// and says what to do. A bare "1 missed" would name neither.
+    #[test]
+    fn a_missed_mutant_under_one_property_names_that_property_and_the_fix() {
+        let v = verdict(
+            &outcomes(&format!(
+                r#"{{"total_mutants":1,"caught":0,"missed":1,"timeout":0,"unviable":0,{OK_BASELINE}}}"#
+            )),
+            "out",
+            Some("counter_bump_job_leaves_the_row_readable"),
+        );
+        assert_eq!(v.code, 1);
+        let text = v.lines.join(" ");
+        assert!(
+            text.contains("counter_bump_job_leaves_the_row_readable"),
+            "must name the property judged: {text}"
+        );
+        assert!(text.contains("ONE-SIDED"), "must say what is wrong: {text}");
+        assert!(text.contains("Fix:"), "must say what to do: {text}");
     }
 
     #[test]
@@ -405,6 +471,7 @@ mod tests {
                 r#"{{"total_mutants":5,"caught":4,"missed":1,"timeout":0,"unviable":0,{OK_BASELINE}}}"#
             )),
             "out",
+            None,
         );
         assert_eq!(v.code, 1);
         assert!(

@@ -4,7 +4,8 @@
 //! T3): `counter_roundtrip_result` emits it alongside the `FixtureCounter`
 //! put, in the same transaction.
 
-use charpente::{Id, event, table};
+use charpente::kernel::JobError;
+use charpente::{Id, Tx, View, event, job, table};
 
 #[table]
 pub struct FixtureCounter {
@@ -19,4 +20,27 @@ pub struct FixtureCounter {
 #[event]
 pub struct NoteAdded {
     pub note: Id<FixtureCounter>,
+}
+
+/// The fixture's one job, and the deliberate target of the mutation
+/// demonstration in docs/GUIDE.md ("Finding a one-sided property").
+///
+/// Its entire observable effect is the `hits` bump below. `cargo-mutants`
+/// replaces this body with `Ok(())`, which is exactly the shape that matters:
+/// the job was dispatched, reported success, and did nothing. A property that
+/// cannot tell that apart from a real run is one-sided, and the whole point of
+/// `charpente test --mutants` is to name it.
+#[job]
+pub struct BumpCounter {
+    pub note: Id<FixtureCounter>,
+}
+
+impl BumpCounter {
+    pub fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+        if let Some(mut row) = tx.get(self.note)? {
+            row.hits += 1;
+            tx.put(&row);
+        }
+        Ok(())
+    }
 }

@@ -4047,3 +4047,53 @@ and binds real ports), and passed on a later identical run. Recorded as INTERMIT
 standing failure — but it establishes that a green `cargo test` in the real tree does not
 guarantee a green baseline in a scratch copy, which is why target files are paired with
 packages whose suites are hermetic.
+
+## 2026-09-07 — Task 10: a one-sided property, caught end to end
+
+The acceptance test for the mutation instrument, and the reason it exists. `sim-fixture` gains
+one job (`BumpCounter`, whose entire observable effect is a `hits` bump) and two properties that
+drive it **identically** and differ only in what they assert. Both are commented as deliberate
+fixtures; the one-sided one is wrong on purpose and must not be "fixed".
+
+- `counter_bump_job_changes_the_row` — asserts the effect (`hits == 2`). Honest.
+- `counter_bump_job_leaves_the_row_readable` — asserts only that the row is still readable,
+  which is true whether the job did its work or nothing at all. One-sided, in the helpdesk
+  shape where deleting an entire SLA sweep left the suite green.
+
+**The demonstration, same mutant, judged twice.** `cargo-mutants` replaces `BumpCounter::run`'s
+body with `Ok(())` — dispatched, reported success, did nothing:
+
+```
+  1 MISSED, judged by "counter_bump_job_leaves_the_row_readable" ALONE: that property runs,
+  reaches a verdict, and does not notice this change — it is ONE-SIDED with respect to the
+  mutated code, and would pass just the same if the code were deleted. Fix: assert the EFFECT
+  the mutated code produces …
+```
+
+and by the honest sibling: `1 total — 1 caught, 0 missed`. Exit 1 against exit 0.
+
+**Proved non-vacuous before being believed.** A MISSED from a property that never ran would be
+worthless, and the tool gives no hint either way. Run directly, each filter executes **256
+universes** and reaches ~147 verdicts (victim 147, control 148), so both properties genuinely
+adjudicate; the only difference between the two results is the assertion.
+
+**A design fact the plan had not accounted for, now amended into it.** `cargo-mutants` reports
+a mutant CAUGHT if *any* test in scope fails, so with both properties running the honest sibling
+catches the mutant and nothing is reported one-sided. Demonstrating one-sidedness therefore
+requires judging by a single property — which is what the new `--property NAME` flag does. **One
+honest sibling hides every one-sided property beside it**, which is a general statement about
+mutation testing and not a quirk of this fixture: a suite-wide "all caught" is not evidence that
+each property pulls its weight.
+
+**Two failures worth keeping, both from doing it rather than reasoning about it.** The naive
+arg passthrough (`--cargo-test-arg -- --filter NAME`) reaches the crate's libtest targets too,
+which have no `--filter` flag and exit 101 — failing the BASELINE rather than filtering
+anything, so the run reported nothing at all. `--test sim` is required, and the verb now emits
+that whole incantation itself. And the first attempt's "0s test" timing looked exactly like a
+filter that matched nothing; that suspicion is what prompted the direct universe-count check
+above, which is the only reason the result can be trusted.
+
+Report text follows hard rule 5 — it names the property judged, says what is wrong with it
+(one-sided), and says what to do (assert the effect, not the surrounding state) — and a unit
+test pins all three. docs/GUIDE.md §"Finding a one-sided property" documents it for app authors
+with this exact output.
