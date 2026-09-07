@@ -467,40 +467,58 @@ is answered, because the answer changes the blast radius by an order of magnitud
   mutant by env var owes a forced-rebuild mechanism and a test that proves the rebuild
   happened.
 
-- [ ] **Step 1: Read the two macros and the CLI's process-spawning precedent in full.**
-- [ ] **Step 2: Rule.** Choose one of: (a) wire `cargo-mutants` from `charpente-cli`;
+- [x] **Step 1: Read the two macros and the CLI's process-spawning precedent in full.**
+- [x] **Step 2: Rule.** Choose one of: (a) wire `cargo-mutants` from `charpente-cli`;
       (b) build the job-neutering macro mode; (c) both, with a stated division of labour;
       (d) something the survey missed. State the reasoning, the biggest risk, and what it
       costs if the ruling is wrong.
-- [ ] **Step 3: State where the code lives** with respect to hard rule 1 — `charpente-cli`
+- [x] **Step 3: State where the code lives** with respect to hard rule 1 — `charpente-cli`
       may spawn processes; core may not. Proc-macro expansion runs in the proc-macro process
       at compile time, not in the deterministic runtime, but say so explicitly rather than
       leaving a reviewer to infer it.
-- [ ] **Step 4: Scope Tasks 9 and 10** to the ruling: if the ruling makes either task
+- [x] **Step 4: Scope Tasks 9 and 10** to the ruling: if the ruling makes either task
       substantially larger or smaller than written below, amend them in this plan file and
       say what changed.
-- [ ] **Step 5: Commit the spec and plan amendments together.**
+- [x] **Step 5: Commit the spec and plan amendments together.**
 
 ---
 
 ### Task 9: Implement the ruled mutation mode
 
-**Files:** per Task 8's ruling.
+**AMENDED 2026-09-07 to Task 8's ruling (a): `cargo-mutants` driven from `charpente-cli`,
+not a macro neutering mode.** What changed, so a reader need not diff: Step 2's
+stale-expansion trap is **moot and deliberately retired** — it existed because an env-var
+mutant selector cannot be fingerprinted by cargo, and the ruling selects no mutant by env
+var. It is replaced below by the two traps `cargo-mutants` actually has. Step 3's
+negative-space requirement is unchanged in spirit and sharpened in target. Net size: slightly
+smaller, and it no longer touches `charpente-macros` at all.
+
+**Files:**
+- Modify: `crates/charpente-cli/` (the verb), `scripts/` (the on-demand runner, mirroring
+  `scripts/edge-harness.sh`), `CLAUDE.md` (inventory, if a test file is added)
+- Add: a pinned `cargo-mutants` version and the default target set
 
 **Interfaces:**
 - Consumes: Task 8's ruling.
-- Produces: the ability to neuter one named app handler per run.
+- Produces: a scoped mutation run over a named target set, reporting caught / missed /
+  unviable / timed-out **separately**.
 
-- [ ] **Step 1: Implement the mechanism.**
-- [ ] **Step 2: Close the stale-expansion trap.** If the ruling selects a mutant by env var,
-      the driver MUST force the rebuild, and you MUST prove it did: run the same mutant twice
-      with different selections and show the emitted code differed. **A mutation run that
-      cannot prove it rebuilt is not evidence** — this is the false-green class the whole
-      sub-project targets, and shipping it here would be self-refuting.
-- [ ] **Step 3: Test the mechanism itself,** not just its output. The negative-space
-      assertion (hard rule 4): selecting a handler that does not exist must fail loudly by
-      name, never silently neuter nothing and report green.
-- [ ] **Step 4: Commit.**
+- [ ] **Step 1: Implement the verb,** following `sim.rs:50`/`:127`'s process-spawning idiom
+      verbatim — `#[allow(clippy::disallowed_methods)]` with the DESIGN §1 rationale comment.
+- [ ] **Step 2: Close the two traps this tool actually has.**
+      (i) **Baseline.** The unmutated suite must be confirmed green before any mutant counts;
+      a suite already red catches every mutant for the wrong reason. (ii) **A timeout is not
+      a catch.** A mutant exceeding its budget is UNRESOLVED. Summing it into "caught" is the
+      same lie Task 5 removed from the simulator's give-up accounting, and it must not
+      reappear in a second instrument. Both must be tested, not merely intended.
+- [ ] **Step 3: Test the mechanism itself,** not just its output (hard rule 4, negative
+      space): a target filter that matches **nothing** must fail loudly by name. "0 missed"
+      from a filter that selected zero functions is a vacuous green, and it is
+      indistinguishable in a log from a genuinely clean run — the exact shape of the
+      `grep`-matched-nothing and suites-never-ran defects recorded on 2026-09-07.
+- [ ] **Step 4: Commit,** stating the measured per-mutant wall-clock on this workspace —
+      the number the survey could only estimate, and the one that decides whether the ruling
+      holds.
 
 ---
 
@@ -523,9 +541,11 @@ properties where deleting the entire SLA sweep loop left the suite green.
       genuinely tests its job's effect, and one that is one-sided in the helpdesk shape
       (it asserts something true whether or not the job ran). Comment both as deliberate
       fixtures so a future reader does not "fix" the victim.
-- [ ] **Step 2: Demonstrate the catch:** with the job neutered, the control goes RED and the
-      victim stays GREEN, and the tool **reports the victim as one-sided**. Capture the exact
-      output.
+- [ ] **Step 2: Demonstrate the catch:** with the job handler mutated, the control goes RED
+      and the victim stays GREEN, and the tool reports that mutant as **MISSED** — which is
+      `cargo-mutants`' native name for "no oracle noticed", i.e. the one-sided property.
+      Capture the exact output. (AMENDED 2026-09-07: "neutered" now means a source mutant in
+      a scratch tree, not a macro mode; the observable claim is unchanged.)
 - [ ] **Step 3: Hard rule 5 on the report text** — it must name the property, the handler
       that was neutered, and what the author should do about it.
 - [ ] **Step 4: Document it in GUIDE** in the same commit, and add any new test file to

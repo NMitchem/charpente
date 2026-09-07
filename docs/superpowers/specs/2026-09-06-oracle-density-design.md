@@ -358,3 +358,86 @@ seeding property's configuration or fault draws, not a universal property of tha
 Naming this as open is the point — the floors pin verdict counts that did not move under any
 intervention tried, so they do not depend on the answer, and if a wedge is later found and
 fixed the floors go up.
+
+## Mutation mode, ruled (2026-09-07)
+
+**Ruling: (a) — wire `cargo-mutants` as a `charpente-cli` verb, modelled on the edge
+harness. Option (b), a job-neutering mode inside `#[job]`, is rejected.**
+
+### Why (b) is rejected
+
+**1. It ships an escape hatch into the platform (hard rule 2, MANIFESTO §8).** Option (b)
+puts a switch inside `charpente-macros` that makes a declared job *not do its work*. Gated
+or not, opt-in or not, that switch exists in the crate whose emitted code IS the compile-time
+contract — and "no feature flags on correctness" is the rule this repo says it cannot absorb
+a violation of. `cargo-mutants` patches a copy of the source in a scratch directory; nothing
+about the mutation exists in anything we ship. That difference is categorical, not stylistic.
+
+**2. Its cheapness is illusory.** The survey's appeal for (b) is that neutering is cheap
+because `#[job]`'s glue has a uniform `Result<(), JobError>` return. But selecting the mutant
+by env var does not avoid a rebuild — it *hides* the need for one. Cargo's fingerprint does
+not track env vars read during proc-macro expansion, and unlike a build script a proc macro
+cannot declare `rerun-if-env-changed`. So (b) needs a bespoke rebuild-forcing mechanism plus
+a test proving the rebuild happened (the plan's Task 9 Step 2 already demands exactly this),
+and after paying for both it rebuilds `charpente` and every dependent anyway. The saving
+evaporates; the machinery remains.
+
+**3. The asymmetry that makes (b) hard does not arise under (a).** The survey's central
+technical finding is that `#[job]` never sees the handler body while `#[route]` does but has
+an app-chosen `Result<T, ApiError>` with no generic safe stub. That asymmetry is a property
+of *macro-level* neutering. `cargo-mutants` mutates source, so it never needs a stub the
+macro can synthesise: it derives a replacement from the signature and, where it cannot,
+reports the mutant **unviable** by name rather than skipping in silence. Jobs and routes get
+the same treatment for free — and route handlers, which (b) could not reach at all, are
+covered from the first run.
+
+**4. Reversibility is asymmetric, and that decides it under uncertainty.** (a) costs one CLI
+verb and one script; if scoped mutation proves too slow to be useful, delete both and (b) is
+still on the table with a measured number in hand. (b) puts a permanent branch into
+`charpente-macros` — the first `cfg`/env branch either macro has ever had (both are at zero
+today) — and once apps depend on the emitted behaviour it is far harder to withdraw. When
+two options differ mainly in confidence, take the one whose mistake is cheaper to undo.
+
+### Where the code lives (hard rule 1)
+
+`charpente-cli` may spawn processes; core may not. The precedent is already in this repo at
+`crates/charpente-cli/src/sim.rs:50` and `:127`, each carrying
+`#[allow(clippy::disallowed_methods)]` above it with a comment stating that process spawning
+is edge tooling outside the deterministic boundary (DESIGN §1). The mutation driver follows
+that idiom exactly: `cargo-mutants` runs as a child process of the CLI and never links into
+`charpente-core`.
+
+**Stated explicitly so no reviewer has to infer it:** proc-macro expansion runs at compile
+time, in the proc-macro process, not in the deterministic runtime — so option (b) would
+**not** have violated hard rule 1. It is rejected on hard rule 2 grounds. Conflating the two
+would be a wrong reason for a right conclusion, and the distinction matters if (b) is ever
+revisited.
+
+### The biggest risk, and the mitigation
+
+**Cost, and therefore disuse.** A full rebuild per mutant on a proc-macro-heavy workspace
+means minutes each; an instrument that takes hours is an instrument nobody runs, and a
+mutation report nobody runs is worth exactly nothing. The mitigation is to copy the shape
+DESIGN already sanctions for the edge harness: an expensive rig that lives outside the
+deterministic boundary, is not part of the default suite, runs on demand through a script and
+nightly in CI, and carries an explicit honesty contract about what it can and cannot claim.
+Default scope is a **named target set** — the oracle-bearing code and the fixture handlers —
+never the whole workspace.
+
+**Two anti-vacuity requirements, both non-negotiable.** First, a baseline: `cargo-mutants`
+must confirm the *unmutated* suite is green before any mutant counts, because a suite that is
+already red catches everything for the wrong reason. Second, **timeouts are not catches.** A
+mutant whose run exceeds the budget is unresolved, and reporting it as caught would be the
+same lie this sub-project exists to remove — precisely the give-up-versus-verdict distinction
+Task 5 built for the simulator, arriving here in a second instrument. The report must state
+caught / missed / unviable / timed-out separately, and a timeout must never be summed into
+"caught".
+
+### What it costs if this ruling is wrong
+
+If scoped `cargo-mutants` is still too slow to be run in practice, we will have spent one CLI
+verb and one script, and we will know the real per-mutant number on this workspace — which is
+the fact the survey could only estimate. Nothing in `charpente`, `charpente-core` or
+`charpente-macros` needs unwinding, and option (b) remains available, now with evidence. The
+converse mistake is not symmetric: had (b) been built first and proved unusable, the platform
+would carry a job-neutering branch that is awkward to remove and impossible to un-ship.
