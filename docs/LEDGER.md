@@ -3525,3 +3525,58 @@ pinned base and at 5 of 6 swept bases (was 1 of 6).
     `0x2EB2_5C09`: expected `(ping, {"n":"1638627"})`, received `(ping, {"n":"1441716"})`.
     Different content at the same id, which is not a delivery-budget shape at all. This is the
     one remaining red in `-p charpente`.
+
+## 2026-09-07 — realtime root cause 2: one `(id, seq)` with two different payloads
+
+Characterized, NOT fixed, and recorded now because it is the more serious of the two
+remaining reds and the evidence is cheap to lose.
+
+**Repro.** `CHARPENTE_SEED=0x17004e6a572d737d cargo test -p charpente --test realtime --
+--nocapture`, deterministic, the scoped property at its own pinned base `0x2EB2_5C09`:
+
+```
+content mismatch at event id 0: expected (ping, {"n":"1638627"}) but received (ping, {"n":"1441716"})
+  fired:  crash:dropped: 18, fault:misdirected_write: 1, fault:sync_error: 5, restart: 2
+```
+
+**An ordered trace settles what happened, and refutes the obvious reading.** Instrumenting the
+client's ledger readback and its frame ingestion with a shared tick:
+
+```
+DIAG[0] LEDGER id=0 seq=1 json={"n":"1638627"}     <- read back from the STORE
+DIAG[1] LEDGER id=1 seq=2 json={"n":"2215267"}
+DIAG[2] FRAME  id=0 seq=1 json={"n":"1441716"}     <- DELIVERED afterwards
+```
+
+**The seqs are identical.** My working hypothesis had been id reuse across a crash-diverged
+timeline, which DESIGN §the-cursor explicitly anticipates: "Two diverged timelines … can mint
+the same event id for two different events; a bare id cannot detect that", defended by
+"resume validation reads the retained row at `id == c` and requires its `seq == s`". That
+would have made this a TEST defect — an oracle keying on a bare id, which the design says is
+an invalid model. **It is not that.** The seq half is present and equal on both sides. One
+`(id=0, seq=1)` maps to two different payloads, so the design's own disambiguator does not
+separate them, and the oracle is asking a fair question.
+
+**Why this is serious.** `checks::durable_corruption_fired`'s doctrine states the contract
+directly: an excuse may never cover wrong DATA, because "corruption must surface as loss or a
+named error, not as different bytes". Different bytes at the same `(id, seq)` is precisely the
+outcome that sentence says cannot happen. `fault:misdirected_write` fired exactly once in this
+universe, and a misdirected write is the one axis that can relocate a CHECKSUM-VALID frame to
+a position where it does not belong — the failure mode CRCs do not catch, because nothing is
+mangled.
+
+**Two readings, NOT distinguished, and I am not guessing between them:**
+
+ 1. The stored row for id 0 was corrupted, so the ledger readback is the wrong value and the
+    delivered frame was right.
+ 2. The delivery path read the wrong payload, so the frame is wrong and the store is right.
+
+The discriminator is which side the misdirected write landed on, and it wants the same
+treatment that found root cause 1: instrument the injection to name the file and offset it
+relocated, then compare against where event 0's frame and the store's row actually live. That
+is one run's work and it has not been done.
+
+**Do not "fix" this by excusing it.** The tempting move — routing this shortfall through
+`durable_corruption_fired`, which WOULD fire here — is the exact use its own doc forbids, and
+would convert the finding into a decorative oracle. Root cause 3 (`clean_attempts=1` and still
+unsettled, seed `0x1890c2db82a370b2`) remains untouched and is a separate question again.
