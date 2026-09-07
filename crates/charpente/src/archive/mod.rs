@@ -838,8 +838,9 @@ fn frontier_crc(db: &Db, frontier: u64) -> io::Result<u32> {
         // in the tail segment, and `Wal::gc` never takes the tail), and it
         // is returned as an ERROR rather than asserted anyway. The reason is
         // narrow and specific to this call site: this runs on the archive
-        // ARM, where `Kernel::step` absorbs every `Err` and there is no
-        // `catch_unwind` anywhere in `crates/charpente/src` — so a panic
+        // ARM, where `Kernel::step` absorbs every `Err`, and the one
+        // `catch_unwind` in `crates/charpente/src` (`kernel/dispatch.rs`,
+        // around a JOB handler's glue) does not cover this path — so a panic
         // here unwinds straight out of the kernel loop, on the one arm Task
         // 9 spent a commit proving only ever degrades. Its oracle,
         // `an_archive_io_failure_degrades_the_arm_and_never_the_kernel`,
@@ -2456,8 +2457,9 @@ impl Archive {
                     // ASSERT downstream, and its trigger is this decoded
                     // manifest: an operator rolling the manifest object back
                     // during recovery reaches it, and so does a peer sharing
-                    // `ArchiveConfig::writer` (spec §4). There is no
-                    // `catch_unwind` in production, so that assert took a
+                    // `ArchiveConfig::writer` (spec §4). Production's only
+                    // `catch_unwind` wraps a JOB handler's glue and not the
+                    // archive arm, so that assert took a
                     // serving node down out of the one kernel arm that
                     // exists to absorb every archive error. Retiring NOTHING
                     // is the conservative answer rather than `stop()`: the

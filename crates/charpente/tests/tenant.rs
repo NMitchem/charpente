@@ -1024,8 +1024,10 @@ fn a_cross_tenant_read_sees_staged_writes_and_tombstones_per_tenant() {
 /// The negative space it pins is severe rather than cosmetic. The failure
 /// mode is not a wrong answer but an `assert_ne!` inside
 /// `merge_overlay_all_scopes`, and assertions stay on in release (hard rule
-/// 4) while `crates/charpente/src` contains no `catch_unwind` at all — so
-/// the panic unwinds out of the kernel loop and takes the node with it.
+/// 4) while the sole `catch_unwind` in `crates/charpente/src`
+/// (`kernel/dispatch.rs`, around a JOB handler's glue) covers neither a route
+/// handler nor this read — so the panic unwinds out of the kernel loop and
+/// takes the node with it.
 /// Worse, `merge_overlay_all_scopes` also reads the GROUP overlay, which
 /// accumulates across a batch: one request writing to tenant 0 can kill a
 /// different request's cross-tenant read committed alongside it.
