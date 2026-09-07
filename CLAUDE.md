@@ -56,7 +56,7 @@ roadmap; do not reorder a milestone's dependency sequence.
   describe/genclient/repro_meta/restore; charpente-tsgen: revive/routes/types;
   charpente-macros: trybuild; edge-harness: acked_durable/failover/hunts/realtime_resume/
   smoke/tenant_wire; bench-harness: app/harness/phase_trace;
-  ts-fixture-app: drift/samples; guide-examples: doc_inventory; sim-fixture: sim;
+  ts-fixture-app: drift/samples; guide-examples: describe_contract/doc_inventory; sim-fixture: sim;
   invoicing: describe_golden/sim). Every list is exhaustive as written — if a name is
   missing, the list is stale, not selective.
   `guide-examples`' `doc_inventory` gate enforces that against `members`, so a NEW crate
@@ -97,8 +97,10 @@ roadmap; do not reorder a milestone's dependency sequence.
   so it also pins macro-path expansion.
 - `crates/ts-fixture-app` — the app the TS client is generated from; its `tests/` are the
   codegen's oracles (staleness diff, wire-shape drift).
-- `crates/guide-examples` — compile gate for docs/GUIDE.md, plus the CLAUDE.md inventory
-  gate (`tests/doc_inventory.rs`) that keeps this map and the test lists above honest.
+- `crates/guide-examples` — compile gate for docs/GUIDE.md, the CLAUDE.md inventory gate
+  (`tests/doc_inventory.rs`) that keeps this map and the test lists above honest, and
+  `tests/describe_contract.rs`, which diffs §13's `describe` JSON against a freshly built
+  `examples/invoicing` fixture.
 - `crates/edge-harness` — black-box wire rig outside the deterministic boundary: stock
   binaries over real TCP, `kill -9`, TCP-proxy fault injection.
 - `crates/bench-harness` — the benchmark instrument, also outside the boundary. Each layer
