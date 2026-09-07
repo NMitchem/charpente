@@ -31,7 +31,11 @@ jobs:
       # derive fails here. Task 2 fix round 1 confirmed both directions: FAILS (101) with
       # a `#[derive(serde::Serialize)]` probe present, PASSES (0) with it removed.
       - run: cargo check -p charpente-core
-      - run: cargo test --workspace
+      # `--no-fail-fast` is load-bearing: without it cargo stops at the first failing
+      # package, every later suite never runs, and the log is indistinguishable from a
+      # clean sweep. That blind spot hid two `replication` failures for three commits
+      # (2026-09-07). The job must exercise every suite before it reports.
+      - run: cargo test --workspace --no-fail-fast
       # Cross-build-mode seed replay (the mode-skew regression, seed 0xff159ed76d2806e4).
       - run: CHARPENTE_SEED=0x8bee1752811ae873 cargo test --release -p charpente-sim --test crash_recovery
       - run: CHARPENTE_SEED=0xff159ed76d2806e4 cargo test --release -p charpente --test replication -- late_follower_seeds_below_the_gcd_base_and_converges --exact

@@ -47,7 +47,14 @@ roadmap; do not reorder a milestone's dependency sequence.
 
 - Full check, same three commands as CI (.github/workflows/ci.yml):
   `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`
-  (carries the nondeterminism deny-list), `cargo test --workspace`.
+  (carries the nondeterminism deny-list), `cargo test --workspace --no-fail-fast`.
+  **`--no-fail-fast` is load-bearing, not tidiness.** Without it cargo stops at the first
+  failing package and every later suite silently never runs, which in a log is
+  indistinguishable from a pass — that blind spot hid two `replication` failures for three
+  commits. Confirm green by COUNTING: pipe through `tee`, then `grep -c "^test result:
+  ok"`. Never conclude it from the absence of `FAILED`, and note that a `grep` matching
+  nothing exits 1, so under `set -o pipefail` "nothing failed" and "the check itself
+  broke" produce the same status.
 - One test file: `cargo test -p charpente --test kernel` — suites live in each workspace
   member's `tests/` (charpente: archive/auth/describe/group_commit/http/kernel/realtime/
   replication/tenant/transactions/typed_tables/wire; charpente-core: describe_tables/engine/

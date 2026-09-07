@@ -3817,3 +3817,60 @@ a snapshot readback was treated as durable truth; and a rolled-back id was treat
 undelivered one. Every one was an oracle claiming more than the platform promises. The single
 genuine platform bug found this session remains the acked-write durability hole in
 `Wal::open_with_horizon`.
+
+## 2026-09-07 — CORRECTION: neither "open decision" was Noah's, and the docs said so
+
+I closed the realtime work by handing Noah two decisions: whether `CONVERGED_FLOOR` should
+keep its sharp pin or take the siblings' 2-SE headroom, and how CLAUDE.md's check command
+should be worded. He asked one question back — *"Based on our northstar documents, are the
+decisions mine?"* — and the answer, checked rather than asserted, is **no, to both.**
+
+**The rule I invoked does not apply.** CLAUDE.md's trigger for sign-off is specific: *"When a
+decision contradicts DECISIONS.md, don't silently override it — reopen the entry with the new
+evidence and get Noah's sign-off."* DECISIONS.md carries twelve entries; none covers coverage
+floors or check commands. Neither item met the trigger. This is the second time in one day I
+have promoted a question to Noah that the documents had already answered (the first was Design
+C's scope, which DECISIONS §6 had named), and the shape is identical: reaching for "this is the
+owner's call" at precisely the moment the work gets harder to finish.
+
+**The floor question was posed on the wrong axis.** Sharp-versus-2-SE offers two ways to
+*tolerate* a perturbation. DESIGN.md already rejected tolerating it. When declaring
+`object_delete_error` on the shared object-store stream would have "re-roll[ed] every pinned
+universe merely by declaring the field, and invalidat[ed] the convergence floors and both
+recorded seeds with it," the repair was to key the axis onto its own stream and **prove** the
+counts unchanged — twelve coverage counts across four bases reproducing exactly. The doctrine
+is: remove the perturbation, do not loosen the oracle that noticed it.
+
+Today's perturbation has the same shape. Every disk fault rolls off one shared per-host stream,
+`keyed_stream(seed, "host-faults:{host}")` (`lib.rs:389`), and `sync_dir` consumes two draws
+from it — `disk_op`, then `chance(sync_error)` (`lib.rs:1044-1047`). Moving one barrier inside
+`Wal::open` therefore re-rolled all 256 universes, which is why a single correctness fix forced
+pinned-base re-measures in three separate files. So the floor stays sharp at 166 on doctrine
+rather than on a pending ruling, and the constant's doc comment has been rewritten to say that
+instead of "Noah's to settle."
+
+**The standing fix, with its cost stated honestly.** Key the directory barrier onto its own
+stream, as the object store's delete arm is. This is *not* free the way that one was:
+`object_delete_error` was non-perturbing because it defaulted to zero, whereas `sync_dir` fires
+at nonzero rates in every existing run, so re-keying re-rolls every pinned universe **once** —
+one final re-measure of every convergence floor, plus the two seeds pinned at `ci.yml:36-37` —
+and then ends the recurrence permanently. Worth paying; flagged before starting rather than
+after, because the blast radius reaches recorded seeds.
+
+**The check command turned out to be worse than drift.** I went to CI expecting to find
+CLAUDE.md lagging behind it. `ci.yml` runs bare `cargo test --workspace` as well, so CLAUDE.md's
+"same three commands as CI" claim was *accurate* — the fail-fast blind spot that hid two
+`replication` failures for three commits is live **in CI itself**, not merely in the
+instructions describing it. Nothing in the north-star documents makes that a matter of taste:
+hard rule 6 makes a wrong doc a bug, and MANIFESTO §2 makes a check that silently skips suites
+an oracle defect of exactly the kind this whole session was spent removing. Both files now pass
+`--no-fail-fast`, and both carry the reason plus the counting discipline (`grep -c "^test
+result: ok"`, never the absence of `FAILED` — a `grep` matching nothing exits 1, so under
+`set -o pipefail` "nothing failed" and "the check broke" are the same status).
+
+**The generalisation worth keeping.** Every defect this session shared one shape: an absent
+measurement wearing the shape of a passing one — dropped coverage on the failure path, a no-op
+`git stash` control, five suites that never ran, a `grep` exiting 1 on no matches. An escalation
+is the same failure in the process rather than the instrument: a question handed upward reads
+like diligence and produces no verdict at all. Check the documents before deciding something is
+undecided.

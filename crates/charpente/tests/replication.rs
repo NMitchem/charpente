@@ -965,14 +965,30 @@ fn follower_converges_to_the_primary_fingerprint() {
 /// universes converge, against 167 before.
 ///
 /// Re-measured to 166, no margin subtracted, which keeps this floor's stated
-/// convention. Whether to ALSO give it the siblings' 2-SE headroom (which at
-/// n=256, p=0.648 would put it near 151) is a live question and Noah's to
-/// settle: today alone, one correctness fix forced three separate pinned-base
-/// floor re-measures across `archive.rs`, `realtime.rs` and here, which is
-/// evidence that stream-shifting changes are common enough for the sharp
-/// convention to cost real time. It is left sharp until ruled otherwise — a
-/// floor is lowered with a reason, and "it flapped once, as designed" is the
-/// reason to record the flap, not to widen it.
+/// convention. **Widening it to the siblings' 2-SE headroom is the wrong repair,
+/// and DESIGN.md had already settled it before this was framed as an open
+/// choice.** The cost being complained about — one correctness fix forcing three
+/// pinned-base re-measures in a single day, across `archive.rs`, `realtime.rs`
+/// and here — is not this floor being too sharp. It is the fault stream being
+/// perturbable. Every disk fault rolls off one shared per-host stream,
+/// `keyed_stream(seed, "host-faults:{host}")`, so `sync_dir`'s two draws
+/// (`disk_op`, then `chance(sync_error)`) displace every later roll, and moving
+/// one barrier inside `Wal::open` re-rolls all 256 universes.
+///
+/// DESIGN.md met the identical hazard on the object store: a delete roll on the
+/// shared stream would have "re-roll[ed] every pinned universe merely by
+/// declaring the field, and invalidat[ed] the convergence floors and both
+/// recorded seeds with it". The sanctioned repair there was to key the axis onto
+/// its own stream and **prove** the counts unchanged — not to loosen the oracle
+/// that noticed. Keying the directory barrier the same way is the standing fix.
+/// It is not free the way that one was: `object_delete_error` was non-perturbing
+/// because it defaulted to zero, whereas `sync_dir` fires at nonzero rates today,
+/// so re-keying costs one final re-measure everywhere (including the two seeds
+/// pinned in `ci.yml`) and then ends the recurrence.
+///
+/// Left sharp, therefore, on the doctrine and not on a pending ruling — a floor
+/// is lowered with a reason, and "it flapped once, as designed" is the reason to
+/// record the flap, not to widen it.
 const CONVERGED_FLOOR: u64 = 166;
 
 /// Universes in which the byte-fingerprint oracle actually compared files,
