@@ -951,7 +951,29 @@ fn follower_converges_to_the_primary_fingerprint() {
 /// that actually makes it flap — at which point the choice is between
 /// re-measuring it here and giving it the same 2-SE headroom, with the new
 /// number in hand rather than in advance.
-const CONVERGED_FLOOR: u64 = 167;
+///
+/// **That decision point ARRIVED 2026-09-07, and this is the re-measure half of
+/// it — the headroom half is deliberately NOT taken here.** The stream-shifting
+/// change is `Wal::open_with_horizon`'s directory barrier moving to before the
+/// replay loop (`log.rs`, a real acked-write durability fix): a `sync_dir`
+/// consumes RNG draws, so relocating an IO op inside `Wal::open` re-rolls every
+/// universe at a pinned base. Attribution is a CONTROL, not an inference —
+/// checking out the pre-barrier `log.rs` makes this whole suite green again
+/// (59 passed), and restoring it reproduces the shortfall. Exactly the "false
+/// red on any change that merely re-rolls the fault stream" this comment
+/// predicted, and the reach it measures is unchanged in kind: 166 of 256
+/// universes converge, against 167 before.
+///
+/// Re-measured to 166, no margin subtracted, which keeps this floor's stated
+/// convention. Whether to ALSO give it the siblings' 2-SE headroom (which at
+/// n=256, p=0.648 would put it near 151) is a live question and Noah's to
+/// settle: today alone, one correctness fix forced three separate pinned-base
+/// floor re-measures across `archive.rs`, `realtime.rs` and here, which is
+/// evidence that stream-shifting changes are common enough for the sharp
+/// convention to cost real time. It is left sharp until ruled otherwise — a
+/// floor is lowered with a reason, and "it flapped once, as designed" is the
+/// reason to record the flap, not to widen it.
+const CONVERGED_FLOOR: u64 = 166;
 
 /// Universes in which the byte-fingerprint oracle actually compared files,
 /// MEASURED: 17 over these 256 universes at base `0x2EB1_0001`, reproduced on
@@ -1104,12 +1126,35 @@ fn commit_scoped(sim: &Sim, node: &mut Node, i: u64) -> Result<(), String> {
 /// tenant that lands whole under another's key.
 fn follower_kept_its_tenants(sim: &Sim, f: &Node) -> Result<(), String> {
     let fdb = f.db.as_ref().ok_or("f has no db")?;
-    let snap = fdb.snapshot().map_err(|e| format!("f: {e}"))?;
+    // Every read here is fault-classified before it is allowed to fail the
+    // universe. These `f:`-tagged reads used to propagate with `?`, so an
+    // INJECTED read error surfaced as "f: table store (redb): I/O error:
+    // injected read error" — a fault reported as a tenancy violation, which is
+    // a false RED. `converged_read`'s siblings have always been classified by
+    // `assert_converged`'s retry loop (`Err(e) if is_fault_fallout(&e) =>
+    // continue`); this oracle sits outside that loop and was never given the
+    // same treatment. It takes `sim` precisely so it can give up instead
+    // (docs/LEDGER.md 2026-09-07, surfaced at base 0x2EB1_0002 once the WAL
+    // open-path barrier reshuffled this pinned base's universes).
+    macro_rules! fallible {
+        ($e:expr, $what:literal) => {
+            match $e {
+                Ok(v) => v,
+                Err(e) if is_fault_fallout(&e.to_string()) => {
+                    sim.give_up(format!(
+                        "follower tenant oracle: {} hit fault fallout: {e}",
+                        $what
+                    ));
+                    return Ok(());
+                }
+                Err(e) => return Err(format!("f: {e}")),
+            }
+        };
+    }
+    let snap = fallible!(fdb.snapshot(), "snapshot");
     let mut seen_any = false;
     for tenant in SEED_TENANTS {
-        let rows = snap
-            .scan_scoped::<SeedLedger>(tenant)
-            .map_err(|e| format!("f: {e}"))?;
+        let rows = fallible!(snap.scan_scoped::<SeedLedger>(tenant), "tenant scan");
         for row in &rows {
             seen_any = true;
             if row.marker / SEED_MARKER_STRIDE != tenant {
@@ -1123,10 +1168,10 @@ fn follower_kept_its_tenants(sim: &Sim, f: &Node) -> Result<(), String> {
         // The index carries the scope prefix too (spec §5's worst failure
         // mode is a forgotten index prefix, and the seed rebuilds indexes).
         for bucket in 0..3u32 {
-            for row in snap
-                .scan_by_scoped::<SeedLedger>(tenant, "bucket", &bucket)
-                .map_err(|e| format!("f: {e}"))?
-            {
+            for row in fallible!(
+                snap.scan_by_scoped::<SeedLedger>(tenant, "bucket", &bucket),
+                "tenant index scan"
+            ) {
                 if row.marker / SEED_MARKER_STRIDE != tenant {
                     return Err(format!(
                         "follower's tenant {tenant} index bucket {bucket} returned id {} marked \

@@ -1733,6 +1733,20 @@ every figure below that way. `.github/workflows/ci.yml` now names the consuming 
 
 ## M2 follow-up backlog (carried from M1, ruled — written to be read cold)
 
+- **Design C (a durable timeline epoch) — REOPENED 2026-09-07 with a single-node instance.**
+  DECISIONS §6 and the 2026-08-06 verifying-peer close-out both ledger Design C in REPLICATION
+  terms: "a durable timeline epoch at fork points", "on `Hello`", sharpening a refusal a probe
+  already makes. Seed `0x17004e6a572d737d` reaches the same gap **with no replication at all**.
+  One node, one misdirected write that moved `wal/…0.log`'s first frame off offset 0, recovery
+  cutting at 0, and event id 0 re-minted at seq 1 with different content — two timelines at one
+  `(id, seq)`, on a single node, with no `Hello` to carry an epoch. DESIGN §the-cursor's claim
+  that the seq half detects the cross-timeline case does not hold here, and DESIGN is corrected
+  in the same commit (hard rule 6). **This does not reopen the DECISION** — async replication
+  and the bounded loss window stand, and consensus is not implied. It says Design C's SCOPE as
+  written is too narrow: an epoch attached to the replication handshake would not cover the
+  single-node cut path. Not urgent (the platform owes nothing for a non-durable write — see
+  below), but the scope note belongs with the item before someone implements the narrow version.
+
 - **`applied_delta`'s release-mode wrap — RETIRED 2026-08-10, closed by its own interlude**
   (close-out in "Current state" above). Ruled 2026-08-08, fixed with exactly the one-liner
   recommended below; the account is kept here as record, and this section now holds **no open
@@ -3630,3 +3644,117 @@ seed so it can be reopened with evidence.
 **Not fixed here, deliberately.** Finding A's fix changes what the oracle asserts, and doing
 that while Finding B is unresolved risks weakening the property to match the bug. Root cause 3
 (`clean_attempts=1` still unsettled, seed `0x1890c2db82a370b2`) remains untouched.
+
+## 2026-09-07 — root cause 2 fixed, and a correction to how I escalated it
+
+**CORRECTION to the two entries above.** Both ended by calling Finding B "a DECISIONS-level
+question" that "wants Noah rather than a unilateral answer". That was wrong, and it is the
+mistake this repo's own north-star rule exists to prevent: the spec had already decided it.
+DECISIONS §6's trigger read names **Design C (a durable timeline epoch on `Hello`)** as the
+ledgered sharpening step, and the 2026-08-06 verifying-peer close-out records it as "stays
+ledgered and stays compatible". Escalating a decided item as an open one costs the reader the
+context that already exists. What the evidence actually contributes is SCOPE — Design C is
+written in replication terms and this instance has no replication — so the backlog item is
+reopened with that note rather than a new question being asked.
+
+**And the second correction: the fresh-base fragility was already documented.** The scoped
+property's own doc comment records that the flagship "fails 'client never caught up' at fresh
+bases `0x9F3A_0001` and `0x41D7_0001`, passes at `0xC58E_0001`", attributes it to the shared
+settle budget, and declines to raise it ("Raising the budget is not this task's to do"). The
+audit reported this as a discovery. It was known, measured, and correctly declined — what was
+missing was the classification, not the measurement. The right answer was never "raise the
+budget": a budget too small for a config is a universe that **adjudicated nothing**, which is a
+give-up. Both bases now pass.
+
+**The fix for root cause 2.** `Client::sync_ledger` scans forward and never revisits an id, so
+a ledger entry is a snapshot of COMMITTED state — which is not DURABLE state. DESIGN makes
+delivery commit-triggered by design ("a commit simply advances `next_event_id`, which makes
+tails ready"), and MANIFESTO §5 makes the log the only place things become true, so a record
+that never landed durably never became true. The platform owes nothing for it — this is not
+even DECISIONS §6's loss window, which covers records the primary **acked**. The oracle was
+asserting delivery consistency against state the platform is entitled to discard.
+
+`diverged_ledger_entry` re-reads the store at the ids the ledger recorded and reports the first
+whose content changed underneath it. On a drain error only — so a passing universe pays no
+extra disk ops and its fault schedule is untouched. A divergence is a give-up with the reason
+named; anything else is still the hard failure it was.
+
+**One thing the first attempt got wrong, worth keeping.** The probe fired correctly and the
+universe still failed, because the workload kept running afterwards and later returned `Err` —
+and `Sim::give_up`'s own doc says "a workload that gives up and then returns `Err` is still a
+failure — failures outrank give-ups." Both workloads now return at the top of their epoch and
+settle loops once a give-up is recorded. A give-up that does not stop the universe is not a
+give-up.
+
+**Scoped floors re-measured** (`tenant:both-tenants-emitted` 77→75,
+`tenant:foreign-backlog-not-delivered` 85→80; the two unmoved floors left alone), counts
+reproduced identically across two consecutive batches first. Cause is the same mechanical one
+as the archive floors: the probe's error-path disk ops shift the universes that hit it, and one
+universe now gives up instead of running its epochs to completion — a universe that adjudicated
+nothing, whose coverage was never evidence for these rates.
+
+**Result: `-p charpente --test realtime` is GREEN, 17 of 17**, and the suite is clean at 7 of 8
+fresh bases including both bases the doc comment recorded as failing. Base `0xA11CE002` still
+fails both properties — that is root cause 3 (`clean_attempts=1` and still unsettled, seed
+`0x1890c2db82a370b2`), untouched and still undiagnosed.
+
+## 2026-09-07 — CORRECTION: `cargo test` stops at the first failing target
+
+**The verification claim in commit `36b214a` — "Everything else in `-p charpente` passes" — was
+not supported by the run it cited, and it was wrong.** `cargo test` stops after the first
+failing test binary unless `--no-fail-fast`. Every full-package run that day short-circuited at
+`realtime`, so `replication`, `tenant`, `transactions`, `typed_tables`, `wire` and the rest
+**never executed**. Their absence from the failure list was read as a pass. It was not evidence
+of anything.
+
+The cost: two replication properties broke at `36b214a` and stayed hidden for three commits,
+surfacing only once `realtime` went green and cargo finally reached them.
+
+**This is the third instance of one shape in a single day, and the shape is worth naming.**
+Coverage was empty on failure and read as "no faults fired"; a `git stash push` on an
+already-clean path was a no-op whose "stashed" echo read as a control being applied; and a
+suite that never ran read as a suite that passed. In all three the misleading signal was not a
+wrong answer — it was an ABSENT MEASUREMENT wearing the shape of a passing one. This ledger
+already names the family ("a green run whose test count nobody checks is the same defect as an
+unfloored coverage key"); these are three more members of it.
+
+**CLAUDE.md's documented full check inherits the same blind spot.** `cargo test --workspace`
+stops at the first failing PACKAGE for the same reason. Left as a note rather than a silent
+edit, because the fix is a one-word change to a documented command and belongs with Noah's eye
+on it: `--no-fail-fast` on both the workspace and per-package forms, and a habit of reading a
+POSITIVE count (`grep -c "^test result: ok"`) rather than the absence of failure lines. Note
+the second half matters independently — `... | grep -E "FAILED"` exiting 1 because it matched
+nothing is itself an absent measurement, and under `set -o pipefail` it even reports as a
+failing pipeline, which is the same trap one level up.
+
+## 2026-09-07 — replication: one false red fixed, one floor re-measured
+
+Both surfaced by the WAL open-path barrier re-rolling `replication.rs`'s pinned bases, and
+**attribution is a control, not an inference**: checking out the pre-barrier `log.rs` makes the
+whole suite green (59 passed), restoring it reproduces both failures exactly.
+
+**`late_follower_seeds_below_the_gcd_base_and_converges` — FIXED, and it was a false RED.**
+Message: `f: table store (redb): I/O error: injected read error`. An INJECTED FAULT reported as
+a tenancy violation. `follower_kept_its_tenants` tags its reads `f:` and propagates them with
+`?`, never consulting `is_fault_fallout` — while its sibling `converged_read` has always been
+classified, by `assert_converged`'s retry loop (`Err(e) if is_fault_fallout(&e) => continue`).
+This oracle sits OUTSIDE that loop and never received the same treatment, despite taking `sim`
+precisely so it could give up. It now classifies every read and gives up by name. This is the
+defect the pinned-base audit predicted from a grep and could not then reach; the barrier move
+reached it.
+
+**`follower_converges_to_the_primary_fingerprint` — floor re-measured 167 → 166.**
+`CONVERGED_FLOOR`'s own doc comment predicted this exactly: it is deliberately sharp, "a false
+red on any change that merely re-rolls the fault stream", and it named the trigger — "the
+decision point is the first stream-shifting change that actually makes it flap … the choice is
+between re-measuring it here and giving it the same 2-SE headroom, with the new number in hand
+rather than in advance." That change has now happened and the number is in hand: 166 of 256.
+
+**Only the re-measure half is taken. The headroom half is Noah's** and is left explicitly open:
+at n=256, p=0.648, SE=7.64, so the siblings' 2-SE convention would put this floor near **151**.
+The case FOR headroom is today's evidence — a single correctness fix forced three separate
+pinned-base floor re-measures (`archive.rs` twice, `realtime.rs`, and here), so stream-shifting
+changes are frequent enough that the sharp convention costs real time. The case AGAINST is that
+every flap so far was correctly diagnosed rather than blindly lowered, and 2-SE headroom would
+tolerate a ~9% relative fall in reach before firing. Left sharp until ruled: a floor is lowered
+with a reason, and "it flapped once, as designed" is a reason to record the flap.

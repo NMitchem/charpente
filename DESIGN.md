@@ -1225,7 +1225,16 @@ slot.
   behind retention mid-stream gets the same fact set as a terminal SSE frame —
   `event: charpente.gap` — then its sink closes. Sink overflow itself sends nothing (there
   is no one left to tell); the client that reconnects with `Last-Event-ID` resumes exactly,
-  which is the point. Follower tails read the same materialized table whose ROWS
+  which is the point. **The seq half does not separate every cross-timeline pair, and
+  the sentence above should not be read as claiming it does.** A local recovery cut that
+  returns the log to the same position lets the replacement record take the SAME seq, so
+  two different events can occupy one `(id, seq)` and the divergence refusal cannot fire
+  (seed 0x17004e6a572d737d, docs/LEDGER.md 2026-09-07 — a misdirected write moved a WAL
+  segment's first frame off offset 0, recovery cut there, and event id 0 was re-minted at
+  seq 1 with new content). This is the gap DECISIONS §6's Design C (a durable timeline
+  epoch) closes; the M2 follow-up backlog carries it, now with a single-node instance
+  rather than only the failover one it was written for. Follower tails read the same
+  materialized table whose ROWS
   replication keeps byte-identical (§5 — the file they live in is not, property 1), so a
   subscribe on a follower works with zero app-code changes; a
   failover honors the DECISIONS §6 bounded-loss window for events exactly as it does for
