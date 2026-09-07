@@ -1038,6 +1038,54 @@ fn unsynced_segment_name_vanishes_at_crash_without_a_dir_barrier() {
     );
 }
 
+/// A FAILED directory barrier leaves the segment's name pending, and until
+/// 2026-09-07 nothing ever re-established it: `Wal::open_with_horizon`
+/// barriers the prefix when it CREATES the first segment and again on the
+/// recovery path that cuts or removes something, but the clean path — every
+/// frame valid, nothing to truncate — fell out of the loop with no barrier at
+/// all, while the comment on the cut-path barrier claims "recovery leaves a
+/// durably-clean directory".
+///
+/// So a log could accept and ACKNOWLEDGE appends into a segment whose name was
+/// never made durable, and a crash took the whole segment with them. Found end
+/// to end by `sim-fixture`'s `acked_counter_survives_rounds` at seed
+/// 0xb957ceaaf1716fd5 (docs/LEDGER.md 2026-09-07), where an injected
+/// `sync_error` failed the create-path barrier in one round and the next round
+/// reopened cleanly and acked into it.
+///
+/// The pending-name state is built directly rather than by injecting
+/// `sync_error`, which at a rate high enough to fail the barrier would also
+/// fail the `wal.sync()` this test needs to SUCCEED — the ack is the whole
+/// premise.
+#[test]
+fn reopening_a_log_re_barriers_a_name_left_pending_by_a_failed_dir_sync() {
+    let sim = Sim::with_faults(
+        0xD1E_0010,
+        FaultConfig {
+            dir_entry_loss: 1.0,
+            crash_apply: 1.0,
+            ..FaultConfig::none()
+        },
+    );
+    let disk = sim.disk();
+    // Exactly what a failed `sync_dir` leaves behind: the file exists, its
+    // directory entry is not durable.
+    disk.open("wal/00000000000000000000.log").unwrap();
+
+    let mut wal = Wal::open(Box::new(sim.disk()), small_segments(), |_, _| Ok(())).unwrap();
+    wal.append(b"acked").unwrap();
+    wal.sync().unwrap(); // the acknowledgement
+
+    sim.crash_disk_now();
+    sim.restart();
+    assert_eq!(
+        disk.list("wal/").unwrap().len(),
+        1,
+        "an acked append's segment vanished at crash: its name was left pending by a failed \
+         barrier and reopening the log never re-established it"
+    );
+}
+
 #[test]
 fn unsynced_removal_resurrects_at_crash_without_a_dir_barrier() {
     let cfg = FaultConfig {

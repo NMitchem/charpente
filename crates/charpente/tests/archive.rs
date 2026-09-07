@@ -7196,7 +7196,28 @@ const CONV_DISK_ERROR_DIVISOR: f64 = 16.0;
 /// report is not in the tree they will be reading. Note the difference from
 /// `replication.rs`'s `FINGERPRINT_FLOOR`, whose value was corroborated on
 /// unpinned runs: these deliberately are not, and the spread above is why.
-const CONV_RESTORED_FLOOR: u64 = 219;
+///
+/// **Re-measured 2026-09-07, at the same bases, for a deliberate behavior
+/// change.** `Wal::open_with_horizon` now barriers its directory on the clean
+/// recovery path too (`log.rs`), closing a durability hole where an acked
+/// append could land in a segment whose name a failed `sync_dir` had left
+/// non-durable — see docs/LEDGER.md 2026-09-07 and the pinned mechanism test
+/// in `charpente-sim/tests/wal.rs`. That adds one more fallible IO op to every
+/// open, so a handful of universes now stop earlier than they used to and
+/// never reach the oracle. This is the floor doing its job: it fell, and the
+/// why is a known cause, not decay. Verified as such by CONTROL RUN — reverting
+/// only the `log.rs` barrier makes both properties pass at these same bases,
+/// which is what identifies the cause rather than assuming it.
+///
+/// | floor | was | now | note |
+/// |---|---|---|---|
+/// | `CONV_RESTORED_FLOOR` | 219 | 218 | one universe |
+/// | `CONV_SUBSTANTIAL_FLOOR` | 183 | 183 | unmoved |
+/// | `CONV_CHAINED_FLOOR` | 169 | 169 | measures 172 now; a floor is a MINIMUM, and raising one that is not failing is a separate decision from repairing one that is |
+/// | `CONV_SCOPED_RESTORED_FLOOR` | 214 | 214 | unmoved |
+/// | `CONV_SCOPED_SUBSTANTIAL_FLOOR` | 164 | 159 | five universes |
+/// | `CONV_SCOPED_CHAINED_FLOOR` | 158 | 158 | unmoved |
+const CONV_RESTORED_FLOOR: u64 = 218;
 const CONV_SUBSTANTIAL_FLOOR: u64 = 183;
 const CONV_CHAINED_FLOOR: u64 = 169;
 
@@ -7231,7 +7252,7 @@ const CONV_CHAINED_FLOOR: u64 = 169;
 /// real floor rather than a decoration.
 const ARCHIVE_SCOPED_CONVERGENCE_BASE: u64 = 0xA2C0_5C09;
 const CONV_SCOPED_RESTORED_FLOOR: u64 = 214;
-const CONV_SCOPED_SUBSTANTIAL_FLOOR: u64 = 164;
+const CONV_SCOPED_SUBSTANTIAL_FLOOR: u64 = 159; // 164 before the 2026-09-07 open-path barrier; see CONV_RESTORED_FLOOR
 const CONV_SCOPED_CHAINED_FLOOR: u64 = 158;
 
 /// A restored `Db` this size or larger counts as a substantial verdict.

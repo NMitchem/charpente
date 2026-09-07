@@ -3286,3 +3286,109 @@ coverage; a single-seed replay was throwing it away, which is what you most want
 why *this* universe behaved (or cost) the way it did." Correct, and never generalized to the
 failure path — the same shape as 2026-09-05's `fixture_replays` note, where the right
 reasoning sat four lines from the code that needed it.
+
+## 2026-09-07 — the acked-write bug is real: a failed dir barrier is never re-established
+
+Reading (a), confirmed and fixed. Not the textbook missing-fsync — that barrier was always
+there — but a subtler thing the earlier entries could not see.
+
+**The mechanism.** `collapse_dir_entries` was instrumented to name the file it dropped, and
+under seed `0xb957ceaaf1716fd5` it named `wal/00000000000000000000.log`, VANISH-CREATE — the
+first WAL segment, lost as a still-pending create. Combined with `fault:sync_error: 4` from the
+new `fired:` line, the sequence is:
+
+ 1. Round 1: `Wal::open_with_horizon` finds an empty directory, creates segment 0, and calls
+    `disk.sync_dir(&prefix)?`. The injected `sync_error` FAILS that barrier. The error
+    propagates, `Db::open` fails, the round acks nothing. **But the file now exists, and its
+    directory entry is still pending** — a failed barrier guarantees nothing (fsyncgate).
+ 2. Round 2: `Db::open` again. `disk.list(&prefix)` is no longer empty, so the create branch is
+    skipped and recovery runs. Every frame is valid, so there is nothing to cut or remove —
+    and the clean path (`None => tail = Some((file, len))`) fell out of the loop and returned
+    **without any directory barrier**. The log then accepted an append and ACKNOWLEDGED it.
+ 3. `sim.restart()`: the still-pending create is collapsed, the segment vanishes whole, and the
+    acked round-2 record goes with it.
+
+The module's own comment on the cut-path barrier reads "recovery leaves a durably-clean
+directory". True on the cut path; **false on the clean path**, which is the common one.
+
+**The fix** is one `disk.sync_dir(&prefix)?` before `open_with_horizon`'s success return, so
+every successful open leaves the directory durable regardless of which recovery path it took.
+The cut arm's barrier is kept — it must run before the truncation is treated as durable, a
+stronger ordering than this one.
+
+**Evidence.** A deterministic RED-first test pins the mechanism without seed-hunting
+(`charpente-sim/tests/wal.rs::reopening_a_log_re_barriers_a_name_left_pending_by_a_failed_dir_sync`):
+it builds the pending-name state directly, appends, syncs — the acknowledgement — crashes, and
+asserts the segment survives. RED before the fix (`left: 0, right: 1`), green after. The
+original seed `0xb957ceaaf1716fd5` now reaches a VERDICT rather than a give-up. A sweep of
+**22,048 sim-fixture universes** (8 batches of 256 including master seed `0x0482ca1ad2b14fa2`,
+the batch that originally found it, plus 4 batches of 5,000) produced ZERO failures, where the
+original ~1-per-8,400 rate predicts ~2.6. Verdict rate is unchanged at 87%, so the extra
+barrier did not push universes into give-ups.
+
+**Two archive floors were re-measured, and the cause was PROVEN rather than assumed.**
+`CONV_RESTORED_FLOOR` 219→218 and `CONV_SCOPED_SUBSTANTIAL_FLOOR` 164→159: one more fallible IO
+op on every open means a handful of universes stop earlier and never reach the oracle. A
+control run — reverting only the `log.rs` barrier — makes both properties pass at the same
+bases, which is what identifies the cause instead of assuming it. `CONV_CHAINED_FLOOR` now
+measures 172 against a floor of 169 and was left alone: a floor is a minimum, and raising one
+that is not failing is a different decision from repairing one that is.
+
+## 2026-09-07 — two realtime properties are pinned to a green base and fail at ~40% of others
+
+Found while control-testing the entry above, and it is the more serious of the two findings.
+
+The WAL fix reddened `charpente --test realtime`'s
+`reconnecting_client_misses_nothing_under_the_fault_matrix` and
+`a_reconnecting_tenant_subscriber_misses_nothing_and_leaks_nothing`. The obvious reading — the
+fix broke realtime — is WRONG, and the mechanism that makes it wrong is worth stating: in the
+sim, `Disk::sync_dir` consumes RNG draws. Adding one call to every `Wal::open` therefore
+reshuffles the whole downstream fault schedule of every universe. That is equivalent to
+changing the base seed, not to changing behaviour.
+
+**Tested directly, with the fix removed from the tree entirely**, by varying only the pinned
+base constants:
+
+| property | base | result |
+|---|---|---|
+| `reconnecting_client_misses_nothing_under_the_fault_matrix` (`realtime.rs:927`) | `0x2EB2_0001` (pinned) | PASS |
+| | `0x2EB2_0011` | PASS |
+| | `0x2EB2_0021` | **FAIL** |
+| | `0x2EB2_0031` | **FAIL** |
+| | `0x2EB2_0041` | PASS |
+| `a_reconnecting_tenant_subscriber…` (`SCOPED_REALTIME_BASE`, `realtime.rs:2628`) | `0x2EB2_5C09` (pinned) | PASS |
+| | `0x2EB2_5C19` / `0x2EB2_5C29` | PASS |
+| | `0x2EB2_5C39` / `0x2EB2_5C49` / `0x2EB2_5C59` | **FAIL** |
+
+**Five of eleven alternative bases fail, with no change to the product code at all.** Both
+properties are latently broken and both are pinned to a base that happens to be green. The
+suite has been reporting them as passing.
+
+The two failures are distinct and neither is a floor shortfall — they are the properties' own
+oracles firing:
+
+- `content mismatch at event id 0: expected (ping, {"n":"1638627"}) but received
+  (ping, {"n":"1441716"})`, with `fired: crash:dropped: 18, fault:misdirected_write: 1,
+  fault:sync_error: 5, restart: 2`
+- `client never caught up: ledger has 5 entries scanned through id 5, floor 0, 2 frames still
+  unverified, … cursor=Some(Cursor { id: 7, seq: 11 }) need_subscribe=true`, with
+  `fired: crash:applied: 221, fault:crash: 2, fault:misdirected_write: 1, fault:sync_error: 806,
+  realtime:resume-backlog: 2, restart: 101`
+
+Both `fired:` lines come from the instrument built earlier today; neither would have been
+available this morning.
+
+**Why this matters beyond two tests.** A pinned base is the right instrument for a FLOOR — a
+rate needs a fixed denominator, and `archive.rs`'s floor docs argue that case well. It is the
+wrong instrument for a CORRECTNESS oracle, where a fixed base means the property only ever
+examines the same 128 universes and a green run says nothing about the other 2^64. These two
+properties assert correctness, not a rate, and they are pinned. **The whole suite should be
+audited for correctness oracles running on pinned bases** — that is the general form of this
+bug, and it is the same family as the unfireable-test trap: green is true, and the inference
+from green is false.
+
+**Status: OPEN, and the branch is RED at this commit.** The WAL fix lands anyway, because
+holding it would not make realtime work — realtime is already broken at 5 of 11 bases, and the
+pinned green base is what has been hiding it. Making that visible is the point of the
+instrument. Both realtime failures need their own investigation and their own seeds; neither
+is diagnosed here.

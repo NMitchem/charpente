@@ -386,8 +386,12 @@ creates/removes and, only when `FaultConfig.dir_entry_loss > 0.0`, independently
 each pending entry at crash (an affected create vanishes even if its bytes synced; an
 affected remove resurrects the file with its last durable content) — zero rng draws when
 the field is 0.0 (its default), so every pre-existing pinned seed replays unchanged. The
-log barriers rotation (before the new segment takes writes) and post-cut recovery cleanup
-(a durably-clean directory after truncation); the store barriers creation and the
+log barriers rotation (before the new segment takes writes), post-cut recovery cleanup (a
+durably-clean directory after truncation), and **every successful open, including the
+clean recovery path that cut nothing** — a barrier that FAILS leaves its names pending and
+the segment file still on disk, so without that last one a reopen finds a valid log and
+acknowledges appends into a segment whose name a crash can still delete (found
+2026-09-07, seed 0xb957ceaaf1716fd5). The store barriers creation and the
 rebuild-discard-then-reopen path. Coverage key `fault:dir-entry`.
 (3) *Held (recovery-cut ordering).* A non-tail cut truncates one segment and removes the
 orphaned later ones — two separate durability events. Truncating first strands a durable

@@ -32,6 +32,14 @@
 //! resurrected by an unsynced removal would reintroduce the exact stale data
 //! the cut just discarded (and, now, reopen the gap the ordering closes).
 //!
+//! Every successful `open` also barriers the directory before returning,
+//! including the clean recovery path that cut nothing. A `sync_dir` that
+//! FAILS leaves the names it covered non-durable while the segment file
+//! remains on disk, so the next open finds a non-empty directory, recovers a
+//! perfectly valid log, and — before this barrier existed — returned without
+//! ever re-establishing the name, then acknowledged appends into a segment a
+//! crash could delete outright (seed 0xb957ceaaf1716fd5).
+//!
 //! Any IO failure poisons the log: after a failed fsync the durability of
 //! prior writes is unknown and retrying cannot honestly clear that (the
 //! fsyncgate lesson). The only recovery from poison is a restart.
@@ -247,6 +255,18 @@ impl Wal {
             }
         }
         let (tail, tail_offset) = tail.expect("names was non-empty, so a tail segment exists");
+        // Every successful open leaves this directory durable, INCLUDING the
+        // clean path that recovered nothing. A `sync_dir` that FAILS leaves
+        // the name it covered non-durable (fsyncgate: a failed barrier
+        // guarantees nothing), and the segment file still exists afterwards —
+        // so the next open finds a non-empty directory, takes the recovery
+        // path, finds every frame valid, and used to return here having never
+        // re-established the name. The log would then acknowledge appends into
+        // a segment a crash could delete outright (seed 0xb957ceaaf1716fd5,
+        // pinned in charpente-sim/tests/wal.rs). The barrier below the cut
+        // arm is kept: it must run before the truncation is treated as
+        // durable, which is a stronger ordering than this one.
+        disk.sync_dir(&prefix)?;
         Ok(Wal {
             disk,
             cfg,
