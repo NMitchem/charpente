@@ -3758,3 +3758,62 @@ changes are frequent enough that the sharp convention costs real time. The case 
 every flap so far was correctly diagnosed rather than blindly lowered, and 2-SE headroom would
 tolerate a ~9% relative fall in reach before firing. Left sharp until ruled: a floor is lowered
 with a reason, and "it flapped once, as designed" is a reason to record the flap.
+
+## 2026-09-07 — realtime root cause 3: a ledger id the store rolled back PAST
+
+The third and last of the realtime reds. Same family as root cause 2 — a stale ledger entry
+from a discarded timeline — but the event is **absent** rather than **changed**, which is
+exactly the case RC2's probe did not cover. I had seen `stored=ABSENT` in that probe's own
+diagnostic output and did not act on it; it came back as this.
+
+**Reproduced, then instrumented, and the instrumentation is what found it.** Seed
+`0x1890c2db82a370b2` at base `0xA11CE002`, deterministic, both properties. Per-attempt tracing
+of the settle loop:
+
+```
+a0: subscribe faulted        a1: boot=None
+a2: CLEAN run -> cursor=None verified=0 pending=0   (delivered nothing)
+a3..a11: boot=None           (nine consecutive — the node never boots again)
+```
+
+One clean attempt in twelve, and it delivered nothing. The tell was in the numbers already
+printed: `floor=0` means `next_event_id` was **0** when the client subscribed, while the ledger
+had already scanned event 0 (`scan=1`). Both cannot be true of one timeline. A direct probe
+settled it: `store event0=Some(None)` — the snapshot succeeds and the row is simply not there.
+
+**Root cause.** The client's ledger recorded event 0 from a node whose store later rolled back
+past it. The event was committed but never durable, the platform is entitled to discard it
+(MANIFESTO §5; DESIGN's delivery is commit-triggered), and no reconnect can ever deliver an id
+the store no longer has. `first_unaccounted` then names id 0 forever and the settle budget
+expires against a claim that cannot be satisfied.
+
+**The discriminator is `next_event_id`, and it is precise.** That counter only advances on
+commit — retention GC deletes rows without ever rewinding it — so:
+
+- recorded id **at or above** the store's current `next_event_id` ⇒ the store rolled back past
+  it ⇒ never durable ⇒ give up, it can never be delivered;
+- recorded id **below** `next_event_id` but absent ⇒ the retention case, deliberately NOT
+  excused: the row existed in this timeline, so a client subscribed below it should have
+  received it, and forgiving that would hide the exact miss this property exists to catch.
+
+That asymmetry is the whole safety of the fix. Excusing absence unconditionally would have been
+the decorative-oracle move.
+
+**Plumbing note.** RC2's probe runs on the drain-error path, and RC3 never errors in `drain` —
+the client simply never receives the frame, and the verdict comes from the final
+`!client.settled()` check, which has no node of its own to ask. The observation is therefore
+taken during a clean attempt that left the client behind (a settled client breaks out at the
+top of the next iteration and never reaches the probe, so no universe that catches up pays for
+it) and carried to the verdict. No floors moved, unlike every other change today.
+
+**Verification.** Seed `0x1890c2db82a370b2` gives up naming the id and the rolled-back counter.
+The realtime suite is **17/17 at its pinned bases and clean at 12 of 12 fresh bases** —
+`0xA11CE001`-`008`, plus `0x9F3A_0001`, `0x41D7_0001`, `0xC58E_0001` (the three the property's
+own doc comment recorded verdicts for) and `0xBEEF_0001`. Before today it was 1 of 6.
+
+**All three realtime root causes are now closed**, and the shape of all three is worth stating
+together: none was a platform defect. A settle budget too small was reported as a missed event;
+a snapshot readback was treated as durable truth; and a rolled-back id was treated as an
+undelivered one. Every one was an oracle claiming more than the platform promises. The single
+genuine platform bug found this session remains the acked-write durability hole in
+`Wal::open_with_horizon`.

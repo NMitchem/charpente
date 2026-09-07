@@ -383,11 +383,37 @@ impl Client {
     /// disk ops and its injected-fault schedule is untouched.
     fn diverged_ledger_entry(&self, db: &Db) -> Option<(u64, String, String)> {
         let snap = db.snapshot().ok()?;
+        let next_event_id = snap.next_event_id().ok()?;
         for (&id, (_, _, recorded)) in &self.ledger {
-            let row = snap.get::<EventRow>(Id::from_raw(id)).ok()??;
-            let (_, stored) = decode_event_row(&row).ok()?;
-            if stored != *recorded {
-                return Some((id, recorded.clone(), stored));
+            match snap.get::<EventRow>(Id::from_raw(id)).ok()? {
+                Some(row) => {
+                    let (_, stored) = decode_event_row(&row).ok()?;
+                    if stored != *recorded {
+                        return Some((id, recorded.clone(), stored));
+                    }
+                }
+                // ABSENT, and the counter says why. `next_event_id` only ever
+                // advances on commit — retention GC deletes rows without ever
+                // rewinding it — so a recorded id at-or-above the store's
+                // current `next_event_id` is one the store has rolled back
+                // PAST: that event was committed but never durable, and this
+                // node's timeline no longer contains it. It can never be
+                // delivered and this universe cannot adjudicate it.
+                //
+                // An absent id BELOW `next_event_id` is the retention case and
+                // is deliberately NOT excused here: the row existed in this
+                // timeline, so a client subscribed from below it should have
+                // received it, and forgiving that would hide the miss this
+                // property exists to catch (`gone`/`first_unaccounted` own
+                // that path).
+                None if id >= next_event_id => {
+                    return Some((
+                        id,
+                        recorded.clone(),
+                        format!("ABSENT — store rolled back to next_event_id {next_event_id}"),
+                    ));
+                }
+                None => {}
             }
         }
         None
@@ -937,6 +963,11 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
     // fault fallout. Zero means this universe never observed the platform
     // delivering anything, so it cannot testify about a missed event.
     let mut clean_attempts = 0u32;
+    // A ledger id this node's store has rolled back PAST, observed during a clean
+    // attempt. Carried out of the loop because the unsettled verdict below has no
+    // node of its own to ask, and booting one there would be both fault-prone and a
+    // new disk op on the failure path.
+    let mut rolled_back: Option<(u64, String, String)> = None;
     for _attempt in 0..SETTLE_ATTEMPTS {
         // A give-up already recorded means this universe adjudicated
         // nothing; carrying on can only turn it into a failure, and the
@@ -992,6 +1023,12 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
             client.current_handle = None;
         } else {
             clean_attempts += 1;
+            // Only when this clean run still left the client behind: a settled client
+            // breaks out at the top of the next iteration and never reaches here, so
+            // no universe that catches up pays for this probe.
+            if rolled_back.is_none() && !client.settled() {
+                rolled_back = client.diverged_ledger_entry(kernel.app().db());
+            }
         }
     }
 
@@ -1005,6 +1042,16 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
         // on evidence that was never gathered (seed 0x22eac3ba9fa5bef7, pinned
         // above). A universe that adjudicated nothing gives up; it does not fail,
         // and it does not pass either.
+        if let Some((id, recorded, stored)) = rolled_back {
+            sim.give_up(format!(
+                "ledger id {id} is behind this node's timeline: recorded {recorded} \
+                 when scanned, store now says {stored} — a committed-but-not-durable \
+                 event the platform is entitled to discard, so it can never be \
+                 delivered and nothing here adjudicates ({})",
+                client.unsettled_report()
+            ));
+            return Ok(client.trace);
+        }
         if clean_attempts == 0 {
             sim.give_up(format!(
                 "no settle attempt completed without fault fallout over \
@@ -3043,6 +3090,11 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
     // attempts means this universe never observed a delivery and cannot
     // testify about a missed one.
     let mut clean_attempts = 0u32;
+    // A ledger id this node's store has rolled back PAST, observed during a clean
+    // attempt. Carried out of the loop because the unsettled verdict below has no
+    // node of its own to ask, and booting one there would be both fault-prone and a
+    // new disk op on the failure path.
+    let mut rolled_back: Option<(u64, String, String)> = None;
     for _attempt in 0..SETTLE_ATTEMPTS {
         // A give-up already recorded means this universe adjudicated
         // nothing; carrying on can only turn it into a failure, and the
@@ -3096,6 +3148,12 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
             client.current_handle = None;
         } else {
             clean_attempts += 1;
+            // Only when this clean run still left the client behind: a settled client
+            // breaks out at the top of the next iteration and never reaches here, so
+            // no universe that catches up pays for this probe.
+            if rolled_back.is_none() && !client.settled() {
+                rolled_back = client.diverged_ledger_entry(kernel.app().db());
+            }
         }
     }
 
@@ -3103,6 +3161,16 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
         // See `realtime_workload`'s note: `settle_boot` returning `None` is
         // fault-only, so no clean attempt means there was no node to catch up
         // FROM. That universe adjudicated nothing and gives up.
+        if let Some((id, recorded, stored)) = rolled_back {
+            sim.give_up(format!(
+                "ledger id {id} is behind this node's timeline: recorded {recorded} \
+                 when scanned, store now says {stored} — a committed-but-not-durable \
+                 event the platform is entitled to discard, so it can never be \
+                 delivered and nothing here adjudicates ({})",
+                client.unsettled_report()
+            ));
+            return Ok(client.trace);
+        }
         if clean_attempts == 0 {
             sim.give_up(format!(
                 "no settle attempt completed without fault fallout over \
