@@ -862,6 +862,10 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
     // `first_unaccounted` keeps naming it however many attempts follow. The
     // budgets bound how long the client may keep trying; they do not touch
     // what counts as caught up.
+    // How many settle attempts ran all the way through `kernel.run` without
+    // fault fallout. Zero means this universe never observed the platform
+    // delivering anything, so it cannot testify about a missed event.
+    let mut clean_attempts = 0u32;
     for _attempt in 0..SETTLE_ATTEMPTS {
         if client.settled() {
             break;
@@ -909,10 +913,29 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
             sim.restart();
             client.need_subscribe = true;
             client.current_handle = None;
+        } else {
+            clean_attempts += 1;
         }
     }
 
     if !client.settled() {
+        // `settle_boot` returns `None` only after every boot failure classified
+        // as fault fallout (a non-injected failure returns `Err` at once), and the
+        // two `continue` arms above are likewise fault-only. So zero clean attempts
+        // means the client never once had a working node to catch up FROM — the
+        // fact this loop's comment above says is NOT this property's subject.
+        // Reporting it as `unsettled_report()` claimed the platform lost an event
+        // on evidence that was never gathered (seed 0x22eac3ba9fa5bef7, pinned
+        // above). A universe that adjudicated nothing gives up; it does not fail,
+        // and it does not pass either.
+        if clean_attempts == 0 {
+            sim.give_up(format!(
+                "no settle attempt completed without fault fallout over \
+                 {SETTLE_ATTEMPTS} attempts — there was no node to catch up from ({})",
+                client.unsettled_report()
+            ));
+            return Ok(client.trace);
+        }
         return Err(client.unsettled_report());
     }
 
@@ -934,6 +957,45 @@ fn reconnecting_client_misses_nothing_under_the_fault_matrix() {
             "realtime:stall-drop",
             "fault:subscriber_stall"
         ]
+    );
+}
+
+/// Seed `0x22eac3ba9fa5bef7`, found by re-basing this property
+/// (`CHARPENTE_BASE_SEED`, docs/LEDGER.md 2026-09-07). Instrumenting the settle
+/// loop showed all **12** of `SETTLE_ATTEMPTS` ending with `settle_boot`
+/// returning `None` — `boot_none=12, sub_fault=0, run_fault=0, clean=0`. The
+/// node never booted once, so the client never had a single fault-free chance
+/// to receive event 0.
+///
+/// The workload nonetheless returned `unsettled_report()`, whose text asserts
+/// the platform lost an event. What actually happened is the fact the settle
+/// loop's own comment says is NOT this property's subject: "there was no node
+/// to catch up FROM". `settle_boot` exists to draw exactly that distinction,
+/// and returns `Ok(None)` only after every boot failure classified as fault
+/// fallout — a non-injected failure returns `Err` immediately. So a universe
+/// with no clean attempt adjudicated NOTHING, and must give up rather than
+/// report a miss it never had the chance to observe.
+#[test]
+fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
+    const SEED: u64 = 0x22ea_c3ba_9fa5_bef7;
+    // Reconstruct this universe exactly as the swarm runner derives it.
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    let result = realtime_workload(&mut sim);
+    assert!(
+        result.is_ok(),
+        "a universe in which no settle attempt ever ran cleanly must not report a missed \
+         event — it never observed one: {:?}",
+        result.err()
+    );
+    assert!(
+        sim.gave_up().is_some(),
+        "and it must be RECORDED as a give-up, not counted as a pass: a universe that \
+         adjudicated nothing is not evidence for the property"
     );
 }
 
@@ -2894,6 +2956,10 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
     // Settle, identical in shape and rationale to the flagship's: no new
     // emits, boot a node through the remaining faults, let the client
     // reconnect and catch up on its own tenant's backlog.
+    // Same counter, same reason, as `realtime_workload` above: zero clean
+    // attempts means this universe never observed a delivery and cannot
+    // testify about a missed one.
+    let mut clean_attempts = 0u32;
     for _attempt in 0..SETTLE_ATTEMPTS {
         if client.settled() {
             break;
@@ -2939,10 +3005,23 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
             sim.restart();
             client.need_subscribe = true;
             client.current_handle = None;
+        } else {
+            clean_attempts += 1;
         }
     }
 
     if !client.settled() {
+        // See `realtime_workload`'s note: `settle_boot` returning `None` is
+        // fault-only, so no clean attempt means there was no node to catch up
+        // FROM. That universe adjudicated nothing and gives up.
+        if clean_attempts == 0 {
+            sim.give_up(format!(
+                "no settle attempt completed without fault fallout over \
+                 {SETTLE_ATTEMPTS} attempts — there was no node to catch up from ({})",
+                client.unsettled_report()
+            ));
+            return Ok(client.trace);
+        }
         return Err(client.unsettled_report());
     }
     scoped_key_oracle(&client.ledger, &client.trace, SCOPED_TENANT_A_KEY)?;

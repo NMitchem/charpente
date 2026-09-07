@@ -3469,3 +3469,59 @@ the system.
 
 **Still OPEN: the two realtime properties**, which are genuine correctness failures and are
 next. Neither is diagnosed here.
+
+## 2026-09-07 — realtime, root cause 1 of 3: "never caught up" when there was never a node
+
+The first of the two red realtime properties, fixed. Systematic debugging rather than
+guessing, and the decisive step was instrumentation, not inspection.
+
+**Reproduced first, deterministically.** Re-basing found seed `0x22eac3ba9fa5bef7`; it
+replays byte-identically. Counting the settle phase's attempt outcomes gave the answer in one
+run: `boot_none=12, sub_fault=0, run_fault=0, clean=0`. **All 12 of `SETTLE_ATTEMPTS` ended
+with `settle_boot` returning `None`.** The node never booted once, so the client never had a
+single fault-free chance to receive event 0.
+
+**The workload's own comment already named the distinction it then failed to make.** The
+settle loop is documented: "'the client failed to catch up' and 'there was no node to catch up
+FROM' are different facts and only the first is this property's subject." `settle_boot` exists
+precisely to separate them. But when every boot failed, control fell through to
+`unsettled_report()` — whose text asserts the platform lost an event. The property reported the
+fact its author had explicitly ruled out of scope.
+
+The neighbouring comment block argues the budget cannot mask a miss: "retries add chances to
+RECEIVE, nothing else… an id the platform ever skips is one the cursor has already moved past."
+That argument is sound **only for a client that made progress**. Here `cursor=None` and the
+cursor never moved, so it does not apply — and the conclusion it licensed was wrong.
+
+**Fix.** Count attempts that ran all the way through `kernel.run` without fault fallout. Zero
+of them means the universe never observed a delivery and cannot testify about a missed one, so
+it gives up rather than failing. Sound because `settle_boot` returns `Ok(None)` ONLY after
+every boot failure classified as fault fallout — a non-injected failure returns `Err`
+immediately — and both `continue` arms above it are likewise fault-only. Conservative by
+construction: one clean attempt and still unsettled remains a hard failure, which is the
+property's actual subject.
+
+**RED first, genuinely.** The universe is reconstructed in-test from the seed
+(`splitmix64` → `FaultConfig::swarm` → `sample_extended_fields`, the swarm runner's own
+derivation), so the regression is a pinned seed in the suite per hard rule 3 rather than a
+comment. It failed with the exact reported message before the fix and passes after.
+
+Applied to `scoped_realtime_workload` too — same loop, same reasoning. **NOT applied to
+`multi_node_realtime_universe`'s two sites**: they carry no `SETTLE_ATTEMPTS` loop and no
+`settle_boot`, so the argument above does not transfer and assuming it would is how a give-up
+becomes a mask. They are unexamined, not cleared.
+
+**Result.** `reconnecting_client_misses_nothing_under_the_fault_matrix` now passes at its
+pinned base and at 5 of 6 swept bases (was 1 of 6).
+
+**Two root causes remain, both distinct from this one and neither diagnosed:**
+
+ 1. **`clean_attempts=1` and still unsettled** — seed `0x1890c2db82a370b2`, reached at base
+    `0xA11CE002`. `cursor=None need_subscribe=false` with `fault:bit_flip: 1` and
+    `fault:read_error: 69` fired. A clean attempt DID occur, so the give-up above correctly
+    does not cover it. Whether durable corruption excuses it (the `durable_corruption_fired`
+    doctrine) or the platform genuinely skipped is exactly the open question.
+ 2. **`content mismatch at event id 0`** — the scoped property at its pinned base
+    `0x2EB2_5C09`: expected `(ping, {"n":"1638627"})`, received `(ping, {"n":"1441716"})`.
+    Different content at the same id, which is not a delivery-budget shape at all. This is the
+    one remaining red in `-p charpente`.
