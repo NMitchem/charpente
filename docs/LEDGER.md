@@ -3088,3 +3088,91 @@ that stalled in dyld and is unverified, not failed. `fmt` 0 and
 `edge-harness`, `bench-harness` and `invoicing` are unverified at this commit** — recorded as
 owed rather than assumed, since the individually-affected packages were run green at the time
 each change landed.
+
+## 2026-09-07 — an acked write does not survive a restart under directory-entry loss
+
+**The most important thing to come out of the oracle-density sub-project is not its
+deliverable — it is what the deliverable found.** Recorded here first, before any fix, because
+until this commit it existed only in a gitignored `progress.md` on one laptop, on a branch with
+no upstream.
+
+```
+cargo test -p sim-fixture --test sim -- --seed 0xb957ceaaf1716fd5 --filter acked_counter_survives_rounds
+```
+
+```
+sim failure in acked_counter_survives_rounds: acked-implies-durable violated after round 2
+under seed 0xb957ceaaf1716fd5: acked round 2 lost across a restart
+  config: FaultConfig { write_error: 0.068, sync_error: 0.049, crash_apply: 0.354,
+    crash_torn: 0.507756, dir_entry_loss: 0.477, bit_flip: 0.0, misdirected_write: 0.0,
+    read_error: 0.0, corruption_scope: "wal/", conn_drop: 0.02, net_spike: 0.081, … }
+sim: 1 universe(s) per test, 0 verdict(s), 0 gave up, 1 failure(s)
+```
+
+One command, one universe, exit 1. Reproduced independently at `85c2fc7` by a second party
+after the finding was reported, from the printed repro alone. Rate measured by the finder at
+**1 real failure in 33 full batches (~3%)**; the batch that found it had master seed
+`0x0482ca1ad2b14fa2`. That rate is the finder's measurement and is not re-verified here.
+
+**The fault profile is the lead, and it is unusually clean.** `dir_entry_loss` 0.477 and
+`crash_torn` 0.508 with `bit_flip`, `misdirected_write` and `read_error` all at **0.0** —
+high directory-entry loss and *no media corruption whatsoever*. Nothing has to be mangled for
+an acknowledged write to disappear; a directory entry merely has to go missing across a crash.
+
+**Why it was invisible until now, and why that is the thesis working.** The 2026-09-05 entry
+above records that `checks::acked_implies_durable` used to build its own `Sim::new(seed)`, and
+that `Sim::new` is `FaultConfig::default()`, which zeroes eleven axes — `dir_entry_loss`
+**among them**. So this checker had never once been shown directory-entry loss. It was shown
+it nine days ago, and inside a fortnight it produced a reproducible violation of the guarantee
+the README sells first. A fix to an *oracle* surfaced a defect in the *system*: that is the
+oracle-density argument in MANIFESTO §2 paying out, and it needed someone to actually run the
+thing enough times to catch a 3% event.
+
+**Three readings. None is chosen here, and the third has not previously been named.**
+
+ 1. **A real durability defect.** charpente loses an acked write when directory entries are
+    lost. The specific suspect, given a profile with zero media corruption, is the classic
+    missing parent-directory fsync: create a WAL segment, write it, fsync the *file*, ack, and
+    never fsync the *directory* — the crash then takes the directory entry and the segment goes
+    with it, acked records inside. This is a hypothesis from the fault profile, not a code
+    reading; nobody has yet opened the segment-creation path.
+ 2. **The checker's restart bookkeeping is wrong in the three-round shape**, and the assertion
+    is firing on its own accounting rather than on lost data.
+ 3. **The fault is unsurvivable by construction.** If the sim drops a directory entry even for
+    a file whose parent directory *was* correctly fsynced, then no implementation can pass this
+    property and the red carries no information about durability at all. That is the mirror of
+    the unfireable-test trap this repo already knows: a test that cannot fail proves nothing,
+    and a fault that cannot be survived proves nothing either.
+
+**The decisive experiment is small and reads two files, not a debugging session:** what does
+the sim's `dir_entry_loss` injection actually drop, and does it spare a file whose parent
+directory was synced; and does the WAL's segment-creation path fsync the parent directory
+before the first ack. Those two answers separate all three readings. Reading 2 is ranked last
+precisely because the profile is so narrow.
+
+**Hard rule 3 was violated on the way here, and it is the second time this defect was nearly
+buried.** Task 7's implementer *saw this failure*, dismissed it as "pre-existing, tracked, out
+of scope" by citing the 2026-09-06 entry above, and **recorded no seed**. That entry records
+the machine failing to finish suites; it says nothing about a durability assertion firing. The
+misattribution is the exact failure mode rule 3 exists to prevent — "if you fix a bug without a
+failing seed first, you haven't reproduced it" cuts equally against dismissing one without a
+seed. Combined with the `FaultConfig::default()` masking, this bug has now survived two
+separate opportunities to be seen.
+
+**A false positive worth recording, because it has now caught two agents.** The first hunt for
+this failure reported one at run 4 that was not real: it grepped for `panicked` and matched the
+benign redb `page_manager.rs` trace that F1 describes, in a *green* universe. F1 already
+records that trace destroying a competent agent's work; here it caught the controller running
+the hunt. The second hunt keyed on the process exit code and `test result: FAILED`, and that is
+what found the real one. **Grepping logs for panic text is not a failure detector in this repo.**
+
+**One doc correction, narrower than first stated.** The sim's own output is correct — it printed
+`repro: charpente test --sim --filter … --seed …`, which is a working one-command replay, so
+hard rule 5 is satisfied by the tool. What is wrong is CLAUDE.md's blanket claim that
+"every sim failure prints this exact repro line" for `CHARPENTE_SEED=0x… cargo test -p <crate>
+--test <file>`: `sim-fixture`'s suite is `harness = false` with its own flags
+(`--universes/--seed/--master-seed/--filter/--jobs/--format`), so `CHARPENTE_SEED` does not
+reach it. Following the doc instead of the printed line cost one wasted run.
+
+**Status: OPEN and unfixed at `85c2fc7`.** Tasks 8-12 of the oracle-density plan are held until
+the three readings are separated.
