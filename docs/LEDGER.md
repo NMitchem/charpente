@@ -3580,3 +3580,53 @@ is one run's work and it has not been done.
 `durable_corruption_fired`, which WOULD fire here — is the exact use its own doc forbids, and
 would convert the finding into a decorative oracle. Root cause 3 (`clean_attempts=1` and still
 unsettled, seed `0x1890c2db82a370b2`) remains untouched and is a separate question again.
+
+## 2026-09-07 — root cause 2, diagnosed: a cut re-mints the same `(id, seq)`
+
+The discriminator the entry above asked for, run. Instrumenting the injection to name what it
+relocated:
+
+```
+DIAG misdirected_write path=wal/00000000000000000000.log intended_offset=0 landed_at=1024 bytes=154
+```
+
+**The first WAL frame — the record that mints event id 0 — was written to offset 1024 instead
+of 0.** Offset 0 keeps whatever was there before, so recovery finds no valid frame at the
+start, cuts there, and the log is empty. The store's event 0 goes with it. A new record is then
+appended at the same position and mints **event id 0 again, at the same seq 1**, with new
+content drawn from fresh entropy.
+
+That explains every number in the trace: the ledger read `(id 0, seq 1) = {"n":"1638627"}` from
+the pre-crash store, and the post-recovery node delivered `(id 0, seq 1) = {"n":"1441716"}`.
+Neither side is corrupt. Both are internally consistent. They belong to two different
+timelines that occupy the same coordinates.
+
+**So neither of the two readings in the entry above is right, and I should record that.** I
+framed it as "corrupted store row vs corrupted delivery read" and it is neither: the
+misdirected write never corrupted a record at all, it *removed* one by landing it where nothing
+reads, and the damage is the re-mint that follows. The `durable_corruption_fired` doctrine
+("corruption must surface as loss or a named error, not as different bytes") is NOT violated —
+corruption did surface as loss. What produced different bytes is the re-mint, one layer up.
+
+**Finding A (test defect, and the one that makes this red).** `Client::sync_ledger` treats a
+`db.snapshot()` readback as ground truth for what must be delivered. A snapshot sees COMMITTED
+state, which is not DURABLE state — the platform promises durability for acked writes, and this
+event's record was never durable. The oracle is asserting delivery consistency against state
+the platform is entitled to roll back. Its own doc comment says a ledger entry is "never a
+guess about what was *sent*, only a readback of what was *stored*" — correct, and the gap is
+that "stored" was taken to mean "durable".
+
+**Finding B (a design question, NOT a bug I am asserting).** DESIGN §the-cursor says the seq
+half of the cursor exists so that "two diverged timelines … can mint the same event id for two
+different events; a bare id cannot detect that", defended by requiring the retained row's
+`seq == s` at resume. **This universe produces two different events at the same `(id, seq)`,**
+because the cut returned the log to the same position and the replacement record took the same
+seq. A client resuming at cursor `(0, 1)` would pass that validation and silently misattribute.
+Whether that is in scope (the passage's stated case is failover, where replication's
+diverged-`Hello` refusal is the primary defense) or a real gap in the single-node cut path is a
+DECISIONS-level question, and it wants Noah rather than a unilateral answer. Recorded with the
+seed so it can be reopened with evidence.
+
+**Not fixed here, deliberately.** Finding A's fix changes what the oracle asserts, and doing
+that while Finding B is unresolved risks weakening the property to match the bug. Root cause 3
+(`clean_attempts=1` still unsettled, seed `0x1890c2db82a370b2`) remains untouched.
