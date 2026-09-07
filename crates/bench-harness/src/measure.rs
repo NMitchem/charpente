@@ -42,6 +42,7 @@ struct Rusage {
 
 unsafe extern "C" {
     fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+    fn getloadavg(loadavg: *mut f64, nelem: i32) -> i32;
 }
 
 /// Widens `tv_usec` to `i64` for summing. Cfg'd the same way as the
@@ -60,8 +61,47 @@ fn usec_to_i64(u: i64) -> i64 {
     u
 }
 
+/// `getrusage`'s `who` selectors. `RUSAGE_SELF` is 0 and `RUSAGE_CHILDREN` is
+/// -1 on both macOS and 64-bit Linux.
+const RUSAGE_SELF: i32 = 0;
+const RUSAGE_CHILDREN: i32 = -1;
+
+/// User + system CPU time consumed by every child process this one has
+/// **waited for**, plus those children's own descendants.
+///
+/// This is the number a `cargo build` measurement lives or dies on, and
+/// reaching for [`process_cpu`] instead is the single most likely way to
+/// publish a confidently wrong figure: the parent does nothing but wait, so
+/// `RUSAGE_SELF` reports a few milliseconds while dozens of `rustc` processes
+/// burn minutes. POSIX specifies that `RUSAGE_CHILDREN` accumulates
+/// terminated, waited-for children *and their descendants*, so a `rustc`
+/// spawned by `cargo` is counted here once `cargo` has reaped it and this
+/// process has reaped `cargo`.
+///
+/// Two consequences ride with that and both bind the caller. It is
+/// **cumulative over the process's whole life**, so it is meaningful only as a
+/// difference across a window. And it counts **nothing until the child is
+/// reaped**, so the window must close *after* the wait returns — a window
+/// stamped around the spawn alone reads zero, which looks exactly like a build
+/// that did no work.
+pub fn children_cpu() -> Duration {
+    rusage_cpu(RUSAGE_CHILDREN)
+}
+
 /// User + system CPU time consumed by this process so far.
 pub fn process_cpu() -> Duration {
+    rusage_cpu(RUSAGE_SELF)
+}
+
+/// The 1-minute load average, or `None` where the platform declines to report
+/// one. BENCH requires a contention record on every reading; this is it.
+pub fn load_average() -> Option<f64> {
+    let mut out = [0.0f64; 1];
+    let n = unsafe { getloadavg(out.as_mut_ptr(), 1) };
+    (n == 1).then_some(out[0])
+}
+
+fn rusage_cpu(who: i32) -> Duration {
     let mut ru = Rusage {
         ru_utime: Timeval {
             tv_sec: 0,
@@ -83,11 +123,8 @@ pub fn process_cpu() -> Duration {
         },
         pad: [0; 14],
     };
-    let rc = unsafe { getrusage(0, &mut ru) };
-    assert_eq!(
-        rc, 0,
-        "getrusage(RUSAGE_SELF) cannot fail with valid arguments"
-    );
+    let rc = unsafe { getrusage(who, &mut ru) };
+    assert_eq!(rc, 0, "getrusage({who}) cannot fail with valid arguments");
     let usec = usec_to_i64(ru.ru_utime.tv_usec) + usec_to_i64(ru.ru_stime.tv_usec);
     Duration::from_secs((ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) as u64)
         + Duration::from_micros(usec as u64)

@@ -590,23 +590,23 @@ builds the instrument only — Task 12 takes the reading.
 - A compile is one-shot, not a rate to window-average: BENCH's usual windowing does not
   apply, and repeated observations are the substitute.
 
-- [ ] **Step 1: Obey the measure/accounting split.** The accounting half carries no
+- [x] **Step 1: Obey the measure/accounting split.** The accounting half carries no
       deny-list suppression, so hard rule 1 mechanically holds it free of clocks and IO.
       Read a sibling's doc header and follow it exactly.
-- [ ] **Step 2: Solve the child-process CPU problem explicitly.** State in your report how
+- [x] **Step 2: Solve the child-process CPU problem explicitly.** State in your report how
       you aggregate `rustc` children, and prove it: a build known to spawn multiple `rustc`
       processes must report more CPU than the parent alone.
-- [ ] **Step 3: Define the phases to measure** — at minimum: clean build; incremental after
+- [x] **Step 3: Define the phases to measure** — at minimum: clean build; incremental after
       a handler-body edit; incremental after a schema change (the case DESIGN §9.5's
       prebuilt-dylib idea targets). Name what each phase tells an adopter.
-- [ ] **Step 4: Record cache state and contention as first-class fields.** BENCH.md has
+- [x] **Step 4: Record cache state and contention as first-class fields.** BENCH.md has
       already been burned once by an unrecorded contention factor; this machine runs
       Spotlight and `syspolicyd` hot. A reading with no contention record is INVALID by
       BENCH's own rules.
-- [ ] **Step 5: Implement BENCH's invalidation rules for this instrument** — state which of
+- [x] **Step 5: Implement BENCH's invalidation rules for this instrument** — state which of
       the existing five apply, which do not, and what replaces them. An instrument with no
       invalidation rule produces numbers nobody may quote.
-- [ ] **Step 6: Commit** the instrument alone, with no numbers in the message.
+- [x] **Step 6: Commit** the instrument alone, with no numbers in the message.
 
 ---
 

@@ -4097,3 +4097,54 @@ Report text follows hard rule 5 — it names the property judged, says what is w
 (one-sided), and says what to do (assert the effect, not the surrounding state) — and a unit
 test pins all three. docs/GUIDE.md §"Finding a one-sided property" documents it for app authors
 with this exact output.
+
+## 2026-09-07 — Task 11: the compile-latency instrument (instrument only, no reading)
+
+PLAN.md's risk table calls compile latency the accepted headline risk and DESIGN §9.5 calls it
+*the* adoption risk. It has never been measured. This builds the instrument; Task 12 takes the
+reading, and no number here is quotable.
+
+`compile.rs` (measure) and `compile_accounting.rs` (accounting) follow the existing split. The
+accounting half carries **no** deny-list suppression — its measure-side siblings all open with
+`#![allow(clippy::disallowed_methods, clippy::disallowed_types)]` — so hard rule 1's CI
+deny-list mechanically holds it free of clocks, filesystems and process spawning. An edit that
+reached for `Instant::now()` there fails the build rather than needing a reviewer to notice.
+
+**The child-process problem, which the plan names as the single most likely way to publish a
+confidently wrong number.** `cargo` does almost nothing; `rustc` does the work in processes the
+harness never touches, so `measure::process_cpu()` (RUSAGE_SELF) would report the few
+milliseconds the parent spent waiting and call that the cost of a compile. The fix is
+`measure::children_cpu()` (RUSAGE_CHILDREN), which POSIX specifies accumulates terminated,
+waited-for children **and their descendants** — so every `rustc` lands there once `cargo` has
+reaped it and we have reaped `cargo`. Two consequences are documented at the call site because
+both are silent when got wrong: it is cumulative over process lifetime, so only a difference
+means anything; and it counts nothing until the child is reaped, so a window stamped around the
+*spawn* reads zero, which is indistinguishable from a build that did no work.
+
+Not left to documentation. `Invalid::ChildCpuNotAggregated` refuses any observation where child
+CPU fails to exceed a parent that only waits, and the message names both the wrong probe and
+the right one. The end-to-end proof builds a throwaway three-crate dependency chain — so
+"several rustc processes" is a property of the fixture rather than an assumption about cache
+state — validates it compiles, `cargo clean`s it, and then requires children to out-consume the
+parent **by 10x**, a margin RUSAGE_SELF can never produce. Stable across three consecutive runs.
+
+**Two failures on the way, both instructive.** The proof first failed undiagnosably because
+`measure_build` uses `.status()`, which inherits stdio and discards cargo's diagnostics — right
+for a measurement, useless for a diagnosis. The test now validates the fixture with **captured**
+output first, and says why it could not compile. Then it failed honestly: `child_cpu` was
+89.993 ms against a 100 ms floor I had picked out of the air. The aggregation was working — the
+10x ratio passed — and the floor was simply wrong for three dependency-free crates. Lowered to
+25 ms with the reasoning written down: the fixture exists to prove process structure, not to be
+a realistic build, and the ratio carries the actual claim.
+
+**BENCH's invalidation rules are adjudicated one by one** in the accounting module's header,
+including the one that does **not** get a replacement: the device-ratio gate bounds a durable
+sync rate against measured hardware, a compile has no such rate, and nothing stands in for it.
+That is a real reduction in this instrument's defences and is recorded as one. (BENCH lists six
+bullets there, not the five the plan says — the extra is the bracket-stability gate.) Contention
+is first class: `load_before` gates at 0.5/core, while `load_after` is deliberately a disclosure
+only, because a 1-minute load average rises from our own build and gating on it would refuse
+healthy runs for doing their job.
+
+The `[profile.dev.package.redb] opt-level = 3` caveat travels with the instrument in the module
+header: a charpente incremental figure is not representative of a generic Rust project.

@@ -14,6 +14,8 @@ use charpente::{Id, Schema, Tx, View};
 use charpente::{event, job, jobs, route, routes, table};
 
 pub mod client;
+pub mod compile;
+pub mod compile_accounting;
 pub mod core_accounting;
 pub mod core_bench;
 pub mod counting;
