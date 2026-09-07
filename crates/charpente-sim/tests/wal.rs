@@ -1581,3 +1581,29 @@ fn read_from_below_base_is_a_named_error() {
         "must name the snapshot path: {msg}"
     );
 }
+
+/// `parse_segment_name` guards on two separate operands — a 20-character length
+/// and all-ASCII-digits — and only the digit half was pinned. The first real
+/// finding from `charpente test --mutants` (2026-09-07) was that replacing the
+/// `||` between them with `&&` left every test in the workspace green.
+///
+/// With `&&` a name is refused only when it is BOTH the wrong length AND
+/// non-numeric, so a short all-digit name like `wal/123.log` parses as segment
+/// 123 and the documented contract — "refusing to recover around foreign
+/// files" — stops holding without a single test noticing. This pins the length
+/// operand on its own, which is what the mutant proved was missing.
+#[test]
+fn a_short_all_digit_name_is_a_foreign_file_not_a_segment() {
+    let sim = Sim::with_faults(0xD1E_0011, FaultConfig::none());
+    let disk = sim.disk();
+    disk.open("wal/00000000000000000000.log").unwrap();
+    disk.open("wal/123.log").unwrap(); // all digits, wrong length
+
+    let err = Wal::open(Box::new(sim.disk()), small_segments(), |_, _| Ok(()))
+        .expect_err("a 3-digit name is not a segment name — opening must refuse, not adopt it");
+    assert!(
+        err.to_string()
+            .contains("refusing to recover around foreign files"),
+        "the refusal must name the contract it enforces: {err}"
+    );
+}

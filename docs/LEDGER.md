@@ -3998,3 +3998,52 @@ fix and needs no seed at all — a strictly better pin than the seed would have 
 no seed. The controller called that a misattribution at the time and was right to; the entry
 recorded the machine failing to finish suites, not an assertion failing. Had the dismissal
 stood, a real acked-write durability bug would have been closed as noise.
+
+## 2026-09-07 — Task 9: the mutation instrument, and the two ways it can lie
+
+`charpente test --mutants` implements Task 8's ruling: `cargo-mutants` driven from the CLI
+over a named target set, reporting caught / missed / unviable / timed-out separately.
+`scripts/mutants.sh` is the on-demand runner, shaped like `scripts/edge-harness.sh` — outside
+the deterministic boundary, not in `cargo test --workspace`.
+
+**Measured, since the survey could only estimate.** 3 mutants in 17s; 27 mutants in 33s
+(≈1.2s each) on `charpente-cli`; 5 mutants in 36-39s on `charpente-core/src/log.rs`. The
+survey's "minutes-plus per mutant" was pessimistic for scoped runs. Scale, for why scoping is
+not optional: **4193 mutants across the workspace**, 117 in `log.rs` alone.
+
+**The verb exists because the raw tool exits 0 twice over when nothing was measured, and both
+were observed here rather than assumed.** A filter matching nothing prints "Found 0 mutants to
+test", writes **no `outcomes.json` at all**, and exits 0. A failed baseline exits 4 but leaves
+an `outcomes.json` reading `total_mutants: 0, caught: 0, missed: 0` — every counter zero,
+which to anyone reading the JSON is indistinguishable from a clean sweep. The verb turns both
+into loud failures and deliberately ignores cargo-mutants' exit code. Five unit tests pin the
+decision, including `a_timeout_is_not_a_catch`, which asserts the timeout is reported *beside*
+`caught` and never summed into it — the ruling's second anti-vacuity rule, tested rather than
+intended, with fixtures copied from the real artifacts.
+
+**First real finding, within minutes of the instrument existing.** Mutating
+`parse_segment_name` in the WAL, the `||` between its two guard operands became `&&` and every
+test stayed green. With `&&` a name is refused only when it is BOTH the wrong length AND
+non-numeric — so `wal/123.log` parses as segment 123, and the documented contract "refusing to
+recover around foreign files" silently stops holding. The length operand was never pinned on
+its own. `a_short_all_digit_name_is_a_foreign_file_not_a_segment` now pins it.
+
+**Then the instrument caught me out, which is the more useful half.** After adding that test,
+the mutant was STILL reported missed. Cause: `cargo-mutants` runs only the **mutated package's**
+tests, and the new test lives in `charpente-sim`, not `charpente-core` — where most of the WAL's
+real oracle coverage has always lived. So the tool's default systematically understates
+coverage, and my MISSED message ("no oracle noticed the change") was claiming more than the run
+measured. Proven by control: the same 5 mutants report **1 missed** under the default package
+scope and **5 caught, 0 missed** with `--test-package charpente-sim`. Same mutant, two answers,
+decided entirely by which suites were allowed to run.
+
+Fixed both ways: the verb now passes a default `--test-package` set and exposes the flag, and
+the MISSED line states the scope it measured instead of asserting a universal negative. A
+report that does not name its scope is not a smaller claim — it is a wrong one.
+
+**One observation at its true strength.** `charpente-cli`'s `tests/ctl.rs` failed the baseline
+inside cargo-mutants' scratch copy once (it shells out via `env!("CARGO_BIN_EXE_charpente")`
+and binds real ports), and passed on a later identical run. Recorded as INTERMITTENT, not a
+standing failure — but it establishes that a green `cargo test` in the real tree does not
+guarantee a green baseline in a scratch copy, which is why target files are paired with
+packages whose suites are hermetic.

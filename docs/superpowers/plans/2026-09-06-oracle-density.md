@@ -503,20 +503,20 @@ smaller, and it no longer touches `charpente-macros` at all.
 - Produces: a scoped mutation run over a named target set, reporting caught / missed /
   unviable / timed-out **separately**.
 
-- [ ] **Step 1: Implement the verb,** following `sim.rs:50`/`:127`'s process-spawning idiom
+- [x] **Step 1: Implement the verb,** following `sim.rs:50`/`:127`'s process-spawning idiom
       verbatim — `#[allow(clippy::disallowed_methods)]` with the DESIGN §1 rationale comment.
-- [ ] **Step 2: Close the two traps this tool actually has.**
+- [x] **Step 2: Close the two traps this tool actually has.**
       (i) **Baseline.** The unmutated suite must be confirmed green before any mutant counts;
       a suite already red catches every mutant for the wrong reason. (ii) **A timeout is not
       a catch.** A mutant exceeding its budget is UNRESOLVED. Summing it into "caught" is the
       same lie Task 5 removed from the simulator's give-up accounting, and it must not
       reappear in a second instrument. Both must be tested, not merely intended.
-- [ ] **Step 3: Test the mechanism itself,** not just its output (hard rule 4, negative
+- [x] **Step 3: Test the mechanism itself,** not just its output (hard rule 4, negative
       space): a target filter that matches **nothing** must fail loudly by name. "0 missed"
       from a filter that selected zero functions is a vacuous green, and it is
       indistinguishable in a log from a genuinely clean run — the exact shape of the
       `grep`-matched-nothing and suites-never-ran defects recorded on 2026-09-07.
-- [ ] **Step 4: Commit,** stating the measured per-mutant wall-clock on this workspace —
+- [x] **Step 4: Commit,** stating the measured per-mutant wall-clock on this workspace —
       the number the survey could only estimate, and the one that decides whether the ruling
       holds.
 

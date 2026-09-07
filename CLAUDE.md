@@ -75,6 +75,15 @@ roadmap; do not reorder a milestone's dependency sequence.
   [--seed 0x…] [--master-seed 0x…] [--filter S] [--jobs N] [--format human|json]
   [--dir PATH]` — dogfood target `--dir crates/sim-fixture`. Exit 0 green, 1 failures,
   2 usage/launch error. `--master-seed` replays a whole batch byte-identically.
+- **Mutation instrument (on demand, NOT in `cargo test --workspace`):** `scripts/mutants.sh`
+  wraps `charpente test --mutants [--file PATH]… [--re REGEX] [--timeout SECS]`. Needs
+  `cargo install cargo-mutants --version 27.1.0 --locked`. Scoped by design — the whole
+  workspace is 4193 mutants (days of wall clock), so the default is a named oracle-bearing
+  target set. Exit 0 every viable mutant caught, 1 a finding (**MISSED** = no oracle noticed,
+  i.e. a one-sided property) or an unresolved run (**a timeout is not a catch**), 2 usage,
+  infrastructure, or a baseline that was not green. Read the verb's output, never
+  cargo-mutants' own exit code: the raw tool exits **0** when a filter matches nothing and
+  writes no `outcomes.json` at all, and a failed baseline leaves every counter reading zero.
 - Editing docs/GUIDE.md can break the build: `crates/guide-examples`'s build.rs extracts
   and compiles every ```rust block. `cargo build -p guide-examples` checks it alone.
 - **Capturing a sweep's exit status: this shell is zsh, which does not populate bash's
