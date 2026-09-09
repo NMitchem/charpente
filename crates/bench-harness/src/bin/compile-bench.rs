@@ -12,7 +12,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use bench_harness::compile::{Edit, clean, measure_build};
-use bench_harness::compile_accounting::{Cache, Phase, Reading, summarize, verdict};
+use bench_harness::compile_accounting::{Cache, Invalid, Phase, Reading, summarize, verdict};
 use bench_harness::measure::load_average;
 
 /// The handler-body edit: one statement added inside a route body. No
@@ -90,12 +90,14 @@ fn main() {
         "compile-bench: CARGO_TARGET_DIR = {:?}",
         std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "<unset — refusing>".into())
     );
-    assert!(
-        std::env::var("CARGO_TARGET_DIR").is_ok(),
-        "refusing to run without a dedicated CARGO_TARGET_DIR: the clean phase deletes \
-         artifacts, and sharing the repo's target/ would destroy the working cache and let \
-         unrelated cargo runs perturb the measurement"
-    );
+    if std::env::var("CARGO_TARGET_DIR").is_err() {
+        eprintln!(
+            "compile-bench: refusing to run without a dedicated CARGO_TARGET_DIR: the clean \
+             phase deletes artifacts, and sharing the repo's target/ would destroy the \
+             working cache and let unrelated cargo runs perturb the measurement"
+        );
+        std::process::exit(2);
+    }
 
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     eprintln!("compile-bench: cores = {cores}");
@@ -103,6 +105,9 @@ fn main() {
     let mut clean_readings = Vec::new();
     let mut handler_readings = Vec::new();
     let mut schema_readings = Vec::new();
+    let mut clean_refusals: Vec<Invalid> = Vec::new();
+    let mut handler_refusals: Vec<Invalid> = Vec::new();
+    let mut schema_refusals: Vec<Invalid> = Vec::new();
 
     for i in 0..OBSERVATIONS {
         // --- clean --------------------------------------------------------
@@ -110,6 +115,7 @@ fn main() {
         quiesce(cores);
         record(
             &mut clean_readings,
+            &mut clean_refusals,
             measure_build(&app, Phase::Clean, Cache::Cold).expect("clean build"),
             i,
             "clean",
@@ -125,6 +131,7 @@ fn main() {
             let _edit = Edit::apply(&routes, HANDLER_FIND, HANDLER_REPLACE).expect("handler edit");
             record(
                 &mut handler_readings,
+                &mut handler_refusals,
                 measure_build(&app, Phase::HandlerBody, Cache::Warm).expect("handler build"),
                 i,
                 "handler",
@@ -139,6 +146,7 @@ fn main() {
             let _edit = Edit::apply(&model, SCHEMA_FIND, SCHEMA_REPLACE).expect("schema edit");
             record(
                 &mut schema_readings,
+                &mut schema_refusals,
                 measure_build(&app, Phase::Schema, Cache::Warm).expect("schema build"),
                 i,
                 "schema",
@@ -146,10 +154,18 @@ fn main() {
         }
     }
 
-    for (label, phase, readings) in [
-        ("clean", Phase::Clean, &clean_readings),
-        ("handler-body", Phase::HandlerBody, &handler_readings),
-        ("schema", Phase::Schema, &schema_readings),
+    let mut any_refused = false;
+    let mut any_final = false;
+
+    for (label, phase, readings, refusals) in [
+        ("clean", Phase::Clean, &clean_readings, &clean_refusals),
+        (
+            "handler-body",
+            Phase::HandlerBody,
+            &handler_readings,
+            &handler_refusals,
+        ),
+        ("schema", Phase::Schema, &schema_readings, &schema_refusals),
     ] {
         match summarize(phase, readings) {
             Ok(s) => println!(
@@ -157,9 +173,27 @@ fn main() {
                  median_cpu={:?} spread={}%",
                 s.n, s.median_wall, s.fastest_wall, s.slowest_wall, s.median_cpu, s.spread_percent
             ),
-            Err(e) => println!("SUMMARY {label}: REFUSED — {e}"),
+            Err(e) => {
+                println!("SUMMARY {label}: REFUSED — {e}");
+                any_refused = true;
+                // A phase is classified by ALL its refusals, so a BelowFloor
+                // observation cannot hide behind a TooFewObservations summary.
+                if !e.is_environmental() || refusals.iter().any(|r| !r.is_environmental()) {
+                    any_final = true;
+                }
+            }
         }
     }
+
+    let code = if any_final {
+        3
+    } else if any_refused {
+        1
+    } else {
+        0
+    };
+    println!("VERDICT exit={code} (0 accepted, 1 refused-retryable, 2 usage, 3 refused-final)");
+    std::process::exit(code);
 }
 
 /// The settle build is a no-op rebuild: the tree is already built and
@@ -176,6 +210,7 @@ fn no_op_evidence(o: &bench_harness::compile_accounting::Observation, i: usize, 
 
 fn record(
     into: &mut Vec<Reading>,
+    refusals: &mut Vec<Invalid>,
     o: bench_harness::compile_accounting::Observation,
     i: usize,
     label: &str,
@@ -190,6 +225,9 @@ fn record(
             println!("    accepted, parallelism={:.2}", r.parallelism);
             into.push(r);
         }
-        Err(e) => println!("    REFUSED — {e}"),
+        Err(e) => {
+            println!("    REFUSED — {e}");
+            refusals.push(e);
+        }
     }
 }

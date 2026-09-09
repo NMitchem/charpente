@@ -202,6 +202,31 @@ impl std::fmt::Display for Invalid {
     }
 }
 
+impl Invalid {
+    /// Whether this refusal describes the MACHINE rather than the measurement.
+    /// Only these may be retried (spec §4): re-running after a busy or
+    /// suspended box is legitimate, while re-running after `Unstable` is
+    /// rerolling until the spread looks tight, and re-running after
+    /// `BelowFloor`, `BuildFailed` or `ChildCpuNotAggregated` hides a defect
+    /// instead of reporting it.
+    ///
+    /// `TooFewObservations` is environmental only in that it is always
+    /// downstream of per-observation refusals. The driver therefore classifies
+    /// a phase by ALL of its refusals, not by the summary's alone — otherwise a
+    /// `BelowFloor` observation would be laundered into a retryable verdict.
+    pub fn is_environmental(&self) -> bool {
+        match self {
+            Invalid::Contended { .. }
+            | Invalid::Suspended(_)
+            | Invalid::TooFewObservations { .. } => true,
+            Invalid::BuildFailed
+            | Invalid::ChildCpuNotAggregated { .. }
+            | Invalid::BelowFloor { .. }
+            | Invalid::Unstable { .. } => false,
+        }
+    }
+}
+
 /// Compiler CPU below which no meaningful compilation happened.
 ///
 /// **This floor is on CPU, not wall time, and the first reading is why.** It
@@ -460,5 +485,38 @@ mod tests {
         assert_eq!(s.fastest_wall, Duration::from_secs(10));
         assert_eq!(s.slowest_wall, Duration::from_secs(12));
         assert_eq!(s.spread_percent, 20, "measured against the FASTEST reading");
+    }
+
+    /// Spec §4. Retrying a refusal that describes the MACHINE is legitimate;
+    /// retrying one that describes the MEASUREMENT is rerolling a result until
+    /// it looks tight. The split is encoded here rather than left to a shell
+    /// script's judgement at 3 a.m.
+    #[test]
+    fn only_refusals_about_the_machine_may_be_retried() {
+        assert!(
+            Invalid::Contended {
+                load_before: 9.0,
+                cores: 10
+            }
+            .is_environmental()
+        );
+        assert!(Invalid::Suspended("the box slept".into()).is_environmental());
+        assert!(Invalid::TooFewObservations { got: 1 }.is_environmental());
+
+        assert!(!Invalid::Unstable { spread_percent: 90 }.is_environmental());
+        assert!(
+            !Invalid::BelowFloor {
+                child_cpu_millis: 10
+            }
+            .is_environmental()
+        );
+        assert!(!Invalid::BuildFailed.is_environmental());
+        assert!(
+            !Invalid::ChildCpuNotAggregated {
+                child_millis: 1,
+                parent_millis: 2
+            }
+            .is_environmental()
+        );
     }
 }
