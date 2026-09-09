@@ -4288,3 +4288,98 @@ followed is comment-only and re-verified against `charpente-core`'s 10 suites.
 rows are physically composite-keyed — is named only in `scan_raw`'s unscoped arm, via
 `scan_raw_shape_error`. Same class, opposite direction, and it wants its own failing test
 rather than being folded in behind this one's green.
+
+## 2026-09-09 — the compile-latency number, read against the prebuilt-dylib premise
+
+The reading is published in docs/BENCH.md, "Compile latency (2026-09-09)", with its
+conditioning and its refusal history; the run artifact is committed at
+`bench-runs/compile-bench/20260909T000045-25002/attempt-1/`. This entry is the other half
+of the sub-project's exit criteria: what the number says about the mitigation DESIGN §9.5
+names, which the same section admitted was "untested: nobody has measured which phase
+actually hurts."
+
+**The reading was committed to before it was read.** The sub-project's plan wrote down
+what each outcome would mean, so the number could not be narrated into a conclusion that
+was already preferred:
+
+- **handler body slow** → the inner loop hurts and the dylib is aimed correctly;
+- **handler body fast, clean/schema slow** → the mitigation targets a phase an agent meets
+  rarely, and the premise is wrong even though the number is real;
+- **all three fast** → the risk row was over-weighted and can be downgraded on evidence.
+
+**The outcome is the second one, and more sharply than that framing anticipated.** Clean
+is 5.969 s wall / 37.63 s compiler CPU. Handler body is 436.1 ms / 1.838 s. Schema is
+515.0 ms / 1.964 s. Clean costs **13.7x** the inner loop on wall clock and **20.5x** on
+compiler CPU, while schema — the phase the framing paired with clean — turns out to sit
+next to handler body rather than next to clean, at 1.18x its wall and 1.07x its compiler
+CPU. So it is not "clean and schema are slow". **Exactly one phase is expensive, and it is
+the one met once per checkout.**
+
+**The premise is not merely mis-aimed; its stated mechanism is already delivered.**
+DESIGN §9.5 words the mitigation as "platform as prebuilt dylib **so app iteration
+recompiles app code only**". That clause describes an outcome, and the log shows the
+outcome already holds. Every one of the nine incremental observations prints exactly one
+`Compiling` line, and it is `Compiling invoicing` — verified by sweeping the log rather
+than by reading three of them: 210 `Compiling` lines in the run, 201 of them inside the
+three clean builds (67 crates each) and **9 in the incremental builds, one per
+observation, all `invoicing`**. `charpente`, `charpente-core` and `charpente-macros` are
+never rebuilt on an app edit. Cargo's fingerprinting already recompiles app code only, so
+a dylib cannot buy the thing this item says it is for.
+
+**Where a dylib does still have headroom, and it is the phase agents meet least.** The
+37.63 s of compiler CPU in a clean build is 67 crates, and only one of them is the app. A
+prebuilt and distributed platform would remove most of it. That is a real cost — it is
+what a new contributor and every fresh CI checkout pays — but it is not the inner loop,
+and the M2 bullet's justification for it is the inner loop.
+
+**What is size-dependent here, and what is not.** These two halves have to be separated or
+the verdict over-reaches:
+
+- **Size-independent:** "app iteration recompiles app code only" is a property of cargo's
+  fingerprinting, not of this app being small. A larger app does not make cargo start
+  rebuilding unchanged upstream crates. The dylib's stated mechanism is therefore
+  redundant at any app size, and this half of the verdict does not depend on `invoicing`.
+- **Size-dependent:** the 436 ms itself. `examples/invoicing` is the M0 demo, and a real
+  application's own crate compiles for longer. But the growth lands in the app crate, and
+  **a platform dylib does not compile the app crate** — so a bigger app makes the inner
+  loop worse precisely in the part this mitigation cannot touch. Growing app size is an
+  argument for incremental/codegen work inside the app crate, not an argument for the
+  dylib.
+
+**Verdict.** The prebuilt-platform-dylib item in PLAN's M2 list and DESIGN §9.5 is
+**not aimed at the phase that hurts**, and its stated mechanism is already provided by
+cargo. It should be re-scoped as a *clean-build and CI-checkout* optimisation, judged
+against the 37.63 s figure, or dropped — not carried forward as a dev-loop mitigation. It
+is **not** promoted to a decision here: re-scoping a PLAN item is Noah's call rather than
+a reading's. The item stays open in DESIGN §9.5 and this entry is the evidence under it.
+
+**The DECISIONS check was run, and it found no contradiction but one adjacency.** Three
+entries sit near this: §1 (the "fast Rust dev-loop toolchain" ranked as charpente's biggest
+risk-reducer — consistent, and this reading is mild evidence the loop needed it less than
+assumed), §2 (single binary, not incremental/hybrid — about deployment positioning and
+retained external services, not about rlib-vs-dylib linkage), and **§9, which is the
+adjacency**: the license reasoning rests on apps *linking against* the platform and
+compiling into one binary, so that "the platform *is* the app's binary" and a
+source-available license would sit inside every adopter's shipped artifact. A prebuilt
+platform dylib makes the platform a separately shipped object, which does not reverse §9's
+conclusion but does weaken one of its supporting arguments. Nothing to reopen while the
+dylib is not being built; whoever reopens the dylib inherits that thread.
+
+**What this does NOT settle, stated plainly because the temptation runs the other way.**
+One reading, one machine, one app, one profile:
+
+- **Not a cross-platform claim.** One Apple M4 Pro laptop, 12 heterogeneous cores, macOS.
+  An x86 CI runner, a cold page cache, fewer cores, or a different linker can move these
+  figures by far more than the 1–8% spreads.
+- **Not a claim about large apps.** See the size split above; `invoicing` is a demo.
+- **Not a claim about `release`.** Every figure is `dev`.
+- **Not a decomposition.** The 436 ms is not split into macro expansion, typecheck, codegen
+  and link. If most of it were linking, a dylib would change it — that is unmeasured, and
+  it is the one route by which this verdict could be wrong. Measuring it is the cheap next
+  step if anyone wants to reopen the dylib on inner-loop grounds.
+- **n=3, the instrument's minimum.** The spreads say three observations agreed on one
+  night; they do not bound the next night.
+
+Nothing was built here, and nothing should be: the sub-project's scope stops at the
+number and this verdict. The prebuilt dylib, cranelift hot reload, and any performance
+work these figures suggest are separate sub-projects that this one's output authorizes.
