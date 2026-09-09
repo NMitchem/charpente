@@ -359,6 +359,52 @@ pub fn summarize(phase: Phase, readings: &[Reading]) -> Result<Summary, Invalid>
     })
 }
 
+/// The verdict for one phase, after its `summarize` result and every refusal
+/// collected while producing it are folded together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhaseVerdict {
+    /// The summary succeeded and no refusal in the phase described the
+    /// measurement rather than the machine.
+    Accepted,
+    /// The summary failed, but every refusal in the phase — the summary's own
+    /// and every per-observation refusal collected while producing it —
+    /// describes the machine. Retrying is legitimate (spec §4).
+    Retryable,
+    /// At least one refusal in the phase describes the measurement rather
+    /// than the machine, whether or not the summary itself happened to
+    /// succeed.
+    Final,
+}
+
+/// Classifies one phase from its `summarize` result and every refusal
+/// observed while producing it. Pure folding of already-computed data, so it
+/// belongs beside [`Invalid::is_environmental`] rather than inline in the
+/// driver — that is what makes it cheap to cover with synthetic values
+/// instead of real compiles.
+///
+/// **The refusals are checked unconditionally, not only when the summary
+/// itself is `Err`.** `OBSERVATIONS == MIN_OBSERVATIONS` today (both 3), so
+/// any single non-environmental refusal drops the accepted count below the
+/// floor and forces `summarize`'s `Err` arm — but nothing ties those two
+/// constants together. Raise `OBSERVATIONS` for statistical headroom and a
+/// `BuildFailed` among enough still-accepted observations produces an `Ok`
+/// summary; a phase-wide check that only fired on `Err` would launder that
+/// refusal into an accepted reading through a different door than the one
+/// spec §4 already closed. A failed build or an instrument bug during the run
+/// makes the measurement suspect no matter how many other observations
+/// passed, so it must win over an `Ok` summary rather than hide behind it.
+pub fn classify_phase(summary: &Result<Summary, Invalid>, refusals: &[Invalid]) -> PhaseVerdict {
+    let has_final_refusal = refusals.iter().any(|r| !r.is_environmental())
+        || matches!(summary, Err(e) if !e.is_environmental());
+    if has_final_refusal {
+        PhaseVerdict::Final
+    } else if summary.is_err() {
+        PhaseVerdict::Retryable
+    } else {
+        PhaseVerdict::Accepted
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,5 +564,68 @@ mod tests {
             }
             .is_environmental()
         );
+    }
+
+    #[test]
+    fn a_clean_summary_with_no_refusals_is_accepted() {
+        let s = summarize(Phase::HandlerBody, &[reading(10), reading(11), reading(12)])
+            .expect("within the limit");
+        assert_eq!(classify_phase(&Ok(s), &[]), PhaseVerdict::Accepted);
+    }
+
+    #[test]
+    fn a_contended_summary_with_only_environmental_refusals_is_retryable() {
+        let summary: Result<Summary, Invalid> = Err(Invalid::Contended {
+            load_before: 9.0,
+            cores: 10,
+        });
+        let refusals = [
+            Invalid::Contended {
+                load_before: 9.0,
+                cores: 10,
+            },
+            Invalid::Suspended("the box slept".into()),
+        ];
+        assert_eq!(classify_phase(&summary, &refusals), PhaseVerdict::Retryable);
+    }
+
+    /// The laundering case the original design note warned about: a
+    /// `TooFewObservations` summary is itself environmental, but it must not
+    /// paper over a `BelowFloor` refusal that happened along the way.
+    #[test]
+    fn too_few_observations_with_a_below_floor_refusal_among_them_is_final() {
+        let summary: Result<Summary, Invalid> = Err(Invalid::TooFewObservations { got: 2 });
+        let refusals = [
+            Invalid::BelowFloor {
+                child_cpu_millis: 10,
+            },
+            Invalid::Contended {
+                load_before: 9.0,
+                cores: 10,
+            },
+        ];
+        assert_eq!(classify_phase(&summary, &refusals), PhaseVerdict::Final);
+    }
+
+    /// Finding 2's laundering case: `OBSERVATIONS` and `MIN_OBSERVATIONS`
+    /// coincide today (both 3), so any refusal drops the accepted count below
+    /// the floor and forces `summarize`'s `Err` arm. Nothing ties those two
+    /// constants together — raise `OBSERVATIONS` for statistical headroom and
+    /// a `BuildFailed` among enough still-accepted observations produces an
+    /// `Ok` summary. The verdict must still be `Final`: a failed build or an
+    /// instrument bug during the run makes the measurement suspect no matter
+    /// how many other observations passed.
+    #[test]
+    fn an_ok_summary_with_a_build_failed_refusal_among_them_is_final() {
+        let s = summarize(Phase::HandlerBody, &[reading(10), reading(11), reading(12)])
+            .expect("within the limit");
+        let refusals = [Invalid::BuildFailed];
+        assert_eq!(classify_phase(&Ok(s), &refusals), PhaseVerdict::Final);
+    }
+
+    #[test]
+    fn an_unstable_summary_is_final() {
+        let summary: Result<Summary, Invalid> = Err(Invalid::Unstable { spread_percent: 90 });
+        assert_eq!(classify_phase(&summary, &[]), PhaseVerdict::Final);
     }
 }

@@ -12,7 +12,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use bench_harness::compile::{Edit, clean, measure_build};
-use bench_harness::compile_accounting::{Cache, Invalid, Phase, Reading, summarize, verdict};
+use bench_harness::compile_accounting::{
+    Cache, Invalid, Phase, PhaseVerdict, Reading, classify_phase, summarize, verdict,
+};
 use bench_harness::measure::load_average;
 
 /// The handler-body edit: one statement added inside a route body. No
@@ -167,20 +169,24 @@ fn main() {
         ),
         ("schema", Phase::Schema, &schema_readings, &schema_refusals),
     ] {
-        match summarize(phase, readings) {
+        let summary = summarize(phase, readings);
+        match &summary {
             Ok(s) => println!(
                 "SUMMARY {label}: n={} median_wall={:?} fastest={:?} slowest={:?} \
                  median_cpu={:?} spread={}%",
                 s.n, s.median_wall, s.fastest_wall, s.slowest_wall, s.median_cpu, s.spread_percent
             ),
-            Err(e) => {
-                println!("SUMMARY {label}: REFUSED — {e}");
+            Err(e) => println!("SUMMARY {label}: REFUSED — {e}"),
+        }
+        // Classified by ALL of the phase's refusals, not just summarize's own
+        // (compile_accounting::classify_phase) — a BelowFloor or BuildFailed
+        // refusal cannot hide behind a TooFewObservations OR an Ok summary.
+        match classify_phase(&summary, refusals) {
+            PhaseVerdict::Accepted => {}
+            PhaseVerdict::Retryable => any_refused = true,
+            PhaseVerdict::Final => {
                 any_refused = true;
-                // A phase is classified by ALL its refusals, so a BelowFloor
-                // observation cannot hide behind a TooFewObservations summary.
-                if !e.is_environmental() || refusals.iter().any(|r| !r.is_environmental()) {
-                    any_final = true;
-                }
+                any_final = true;
             }
         }
     }
