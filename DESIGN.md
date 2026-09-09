@@ -1560,10 +1560,15 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
    a TypeScript client from route/event types (§7, GUIDE §14).
 5. **Compile latency mitigation** — platform as prebuilt dylib so app iteration recompiles
    app code only; quantify the win early, it is the adoption risk (see PLAN §Risks).
-   **Still unquantified as of 2026-09-07.** The instrument exists —
-   `bench-harness`'s `compile`/`compile_accounting` pair, measuring clean, handler-body
-   and schema edits against `examples/invoicing` — but its first reading refused all
-   nine observations, six of them to a floor that turned out to be measuring wall time
-   where it meant compiler CPU (docs/BENCH.md, "Compile latency"). Until a quiet machine
-   produces an accepted reading, this item's premise that a prebuilt dylib is the right
-   mitigation is untested: nobody has measured which phase actually hurts.
+   **Quantified 2026-09-09.** The instrument — `bench-harness`'s
+   `compile`/`compile_accounting` pair, measuring clean, handler-body and schema edits
+   against `examples/invoicing` — refused its first reading in full on 2026-09-07, six of
+   the nine observations to a floor that turned out to be measuring wall time where it
+   meant compiler CPU. An accepted reading followed on 2026-09-09 (docs/BENCH.md,
+   "Compile latency (2026-09-09)"), and it answers which phase hurts: on one 12-core
+   laptop, `dev` profile, **the expensive phase is the clean build** — 5.97 s wall and
+   37.6 s of compiler CPU — while the inner loop an agent actually meets is 436 ms for a
+   handler-body edit and 515 ms for a schema edit, with only 1.18x between them. One
+   reading, one laptop, one small app, n=3 is not a cross-platform claim, and it does not
+   decompose those 436 ms into macro expansion, typecheck, codegen and link — so it sizes
+   no mitigation on its own. The prebuilt-dylib item itself stays open.

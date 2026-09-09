@@ -1503,14 +1503,20 @@ the table brackets within the ceiling.
 
 ---
 
-## Compile latency — the instrument exists, the reading is refused (2026-09-07)
+## Compile latency (2026-09-09)
 
 DESIGN §9.5 names compile latency "the adoption risk": a schema change that
 becomes a compile error is only a better oracle than a 500 if the compile is
 fast enough that a person stays in the loop. PLAN's risk table wants a number
-against that claim. **This section publishes no number.** It records an
-instrument, two defects that instrument found in itself, and the reason the
-reading was refused.
+against that claim. **This section publishes one.** The reading was taken
+2026-09-09 at 00:00:45 EDT; `summarize()` accepted all three phases.
+
+**There is no headline number here, and asking for one is the error the
+three-phase split exists to prevent.** `Clean` is not "the compile time" — it
+is the once-per-checkout worst case, and it costs 13.7x the wall clock of the
+edit an agent actually makes hundreds of times a day. Quoting either figure as
+"charpente's compile time" misdescribes the other by better than an order of
+magnitude. Every citation out of this section carries its phase name.
 
 ### What the instrument measures
 
@@ -1543,83 +1549,143 @@ descendants, and `Invalid::ChildCpuNotAggregated` refuses any observation
 whose child CPU does not exceed the parent's. Without that gate a plausible,
 entirely wrong number would print.
 
-### The reading was refused, and the refusal is the result
+### The reading
 
-Nine observations were taken on 2026-09-07. **All nine were refused and all
-three summaries came back empty.** Two causes, and only one of them was the
-machine's fault.
+| phase | n | median wall | median compiler CPU | fastest | slowest | spread |
+|---|---|---|---|---|---|---|
+| clean | 3 | 5.969 s | 37.63 s | 5.697 s | 6.012 s | 6% |
+| handler body | 3 | 436.1 ms | 1.838 s | 430.2 ms | 436.4 ms | 1% |
+| schema | 3 | 515.0 ms | 1.964 s | 495.4 ms | 533.8 ms | 8% |
+
+Full-precision figures are in the artifact (below); these are that log's own
+`SUMMARY` lines rounded. Build parallelism — compiler CPU over wall — ran
+6.21–6.62 on clean, 4.19–4.23 on handler body, 3.68–3.97 on schema, against 12
+heterogeneous cores.
+
+**The two phases an agent meets constantly are both under 550 ms, and they are
+close to each other**: a schema edit costs 1.18x a handler-body edit on wall
+clock and 1.07x on compiler CPU. The only expensive phase is the one met once
+per checkout.
+
+### Conditioning, which travels with the number
+
+- **Machine:** MacBook Pro (Mac16,8), Apple M4 Pro, 12 cores (8 performance +
+  4 efficiency), 24 GB. **A laptop, not a server and not a CI runner.**
+- **Profile:** `dev` (unoptimized + debuginfo) throughout. Release is unmeasured.
+- **App:** `examples/invoicing`, the M0 demo — **a small app.** Its dependency
+  graph is 60-odd crates plus `charpente-macros`, `charpente-core` and
+  `charpente`.
+- **Target dir:** dedicated, outside the repository, as the instrument requires.
+- **n = 3 per phase**, which is `MIN_OBSERVATIONS` — the minimum the instrument
+  accepts, not a comfortable margin above it.
+- **The machine was not idle, and much of the load was the harness's own.** The
+  whole run finished in 53 seconds, i.e. inside a single one-minute
+  load-average window, so `load_before` climbed 2.06 → 4.58 as the harness's own
+  compilation entered the average. Accepted observations sampled **0.17–0.38
+  runnable threads per core** against the 0.5/core ceiling; seven of the nine
+  sat at 0.34–0.38, and only the first two saw the pre-run box at 0.17–0.21.
+  The quiesce loop (0.4/core) blocked twice, 20.0 s after `clean[1]` and 10.0 s
+  after `clean[2]`. Under the gate, then, but not a quiet machine — and since
+  the residual load was mostly self-inflicted, these wall figures are
+  conservative rather than flattering.
+
+### The floor is calibrated, not assumed
+
+`MIN_CHILD_CPU = 500 ms` exists to refuse builds in which no compiler ran. Its
+rationale claims a genuine no-op settle sits an order of magnitude below it.
+This run measured that claim rather than asserting it: the three `NOOP
+handler[i]` settles spent **41.0 / 42.1 / 43.1 ms** of compiler CPU — 12x under
+the floor, and 44x under the real incremental builds the floor is there to
+admit. That is the first time the constant's stated rationale has been shown
+against an accepted run.
+
+The schema phase's settle is deliberately *not* floor evidence and prints as
+`SETTLE`: it recompiles the handler edit its guard has just reverted, so it is
+a full incremental build (416–425 ms wall, 1.87–1.92 s compiler CPU). Reading
+it as a no-op would put `MIN_CHILD_CPU` an order of magnitude too high and
+start refusing real builds, with the instrument's own output appearing to
+authorize the move.
+
+### Attempts and refusals, per spec §4
+
+A reading earned on the fourth night is a different claim from one earned on
+the first, so the count is published with the number.
+
+| night | attempt | outcome |
+|---|---|---|
+| 2026-09-07 | hand-run, before the runner existed | **all nine observations refused, all three summaries empty** |
+| 2026-09-09 | 1 of a maximum 4 | **accepted, all three phases** |
+
+**2026-09-09 refused nothing.** `scripts/compile-bench.sh` had never been run
+before; it took the reading on its first attempt and exited 0. There is no
+retry history to disclose because no retry happened.
+
+**2026-09-07 refused everything, and only part of that was the machine.**
 
 | phase | n | refusal |
 |---|---|---|
-| clean | 3 | load 7.9–9.4 across 12 cores, over the 0.5-per-core ceiling |
-| handler body | 3 | 456–802 ms, under a 1500 ms wall floor |
-| schema | 3 | 621–897 ms, same |
+| clean | 3 | `Contended` — load 7.9–9.4 across 12 cores, over the 0.5-per-core ceiling |
+| handler body | 3 | `BelowFloor` — 456–802 ms, under a 1500 ms **wall** floor |
+| schema | 3 | `BelowFloor` — 621–897 ms, same |
 
 The contention refusals were correct in kind: the box carried a sustained
-1.4–2.0 runnable threads per core from a browser, a media player, a
-compositor and two unrelated agent sessions, and it did not quiet down on
-request. That is the condition Step 1 of this work was written for — an
-invalid number in this file is worse than no number, and this file is the only
-source of quotable figures in the repo.
+1.4–2.0 runnable threads per core from a browser, a media player, a compositor
+and two unrelated agent sessions. The floor refusals were the instrument's own
+defect. `MIN_WALL = 1500 ms` existed to exclude builds where cargo's startup
+and fingerprint scan dominate, and the data refuted its own premise: those
+456–897 ms builds spent **1.5–2.1 seconds of compiler CPU** at a parallelism of
+2.6–3.7. Real `rustc` work, discarded by a rule that mistook a short wall clock
+for an absent compiler — and it discarded precisely the phase DESIGN §9.5 cares
+most about. The floor was moved onto compiler CPU (`MIN_CHILD_CPU`), which is
+what the rule always meant. A gate moving right after it refuses a reading is
+how a live oracle turns into decoration, so the bar was that the old rule
+contradicted its own stated reason; it did, and the CPU figures are the
+evidence. Separately, the driver had been manufacturing part of its own
+contention by sampling `load_before` immediately after its own 44-second clean
+build, and now quiesces first.
 
-### Two defects in the instrument, found by taking the reading
+**Those refused observations corroborate this reading, and remain
+unquotable.** 2026-09-07's handler and schema builds — 456–897 ms wall,
+1.5–2.1 s compiler CPU, parallelism 2.6–3.7 — bracket 2026-09-09's handler
+body at 430–436 ms, 1.80–1.85 s, 4.19–4.23. Same machine, same workload, two
+nights apart, with the instrument changed in between; the higher wall clock and
+lower parallelism are what a contended box looks like. They were refused on
+gate grounds, not because they were wrong, and they stay refused: they are a
+consistency check on the accepted number, never a figure to cite.
 
-**The floor was measuring the wrong quantity.** `MIN_WALL = 1500 ms` existed
-to exclude builds where "cargo's startup and fingerprint scan dominate". The
-data refutes its own premise: those 456–897 ms builds spent **1.5–2.1 seconds
-of compiler CPU** at a parallelism of 2.6–3.7. Real `rustc` work, discarded by
-a rule that mistook a short wall clock for an absent compiler — and it
-discarded precisely the phase DESIGN §9.5 cares most about, the inner loop.
-The floor now reads compiler CPU directly (`MIN_CHILD_CPU`), which is what the
-rule always meant: a no-op rebuild spawns no compiler, so its child CPU is
-cargo's fingerprint scan and nothing more, an order of magnitude below a real
-incremental build. Each run now prints that no-op as a `NOOP` line so the
-floor is calibrated against a measured case rather than an assumed one.
+### What this reading does NOT settle
 
-**Exactly one line per iteration is that evidence, and it is labelled to say
-so.** The driver runs a settle build before each measured edit, but only the
-handler phase's settle is a genuine no-op — the schema phase's settle
-recompiles the handler edit its `Edit` guard has just reverted, so it is a full
-incremental build. It prints as `SETTLE`, never `NOOP`. Reading it as no-op
-evidence would put `MIN_CHILD_CPU` an order of magnitude too high and start
-refusing real builds, with the instrument's own output appearing to authorize
-the move — which is precisely what §4's "the gates are not touched" forbids.
+- **It is not a cross-platform claim.** One reading, one Apple-silicon laptop,
+  12 cores, `dev` profile, n=3. An x86 CI runner, a cold filesystem cache, a
+  machine with fewer or slower cores, or a Linux linker can differ by far more
+  than the spreads above.
+- **It is not a claim about large apps.** `examples/invoicing` is a demo. The
+  clean figure's dependency portion is roughly fixed, but an application's own
+  crate grows with the application, and nothing here bounds how it grows.
+- **It does not decompose the 436 ms** into macro expansion, typecheck, codegen
+  and link. Which of those a mitigation would move is unmeasured, so no
+  mitigation can be sized from this table.
+- **It says nothing about `release`.** Every figure is `dev`.
+- **n=3 is the minimum, and spread is not a confidence interval.** The 1% and
+  6% spreads say the three observations agree; they do not say the next three
+  would land in the same place on a different night.
 
-Moving a gate after it refuses a reading is how a real oracle becomes
-decorative, so the justification has to be that the old rule contradicted its
-own stated reason — not that it was inconvenient. It did, and the CPU figures
-above are the evidence.
+### Reproducing it
 
-**The harness was manufacturing its own contention.** The load average is a
-one-minute exponential average and a clean build spends 44 seconds of compiler
-CPU, so each observation's `load_before` was still reading the *previous*
-observation's build. Some part of every clean-phase contention refusal above
-was self-inflicted. The driver now polls for the load to fall before each
-measured build rather than sampling immediately after its own work, and gives
-up after five minutes and takes the observation anyway — so the contention
-gate still gets to refuse it. The gate itself is untouched; this was a driver
-defect, not an accounting one.
+`scripts/compile-bench.sh` (holds `caffeinate`, encodes spec §4's retry rule in
+its exit codes, records every attempt under `bench-runs/compile-bench/`, and
+refuses to start while any recorded attempt's status file holds a final
+refusal). The instrument beneath it is `cargo run -p bench-harness --bin
+compile-bench` with a dedicated `CARGO_TARGET_DIR`; it refuses to start without
+one and refuses one that resolves *inside the repository*. The stated reason has
+always been that the clean phase deletes artifacts and would destroy the working
+cache. The reason that corrupts a *number* is quieter, and is why this is a
+refusal rather than a warning: a concurrent `cargo` on a shared target directory
+blocks the measured build on the target-dir lock, and that wait lands in wall
+time while child CPU and the load average stay perfectly normal — so
+`BelowFloor`, `Contended` and `Unstable` all pass and an inflated figure is
+published as accepted.
 
-### What is needed to publish a number here
-
-A machine at or below 0.5 runnable threads per core for the duration, with no
-other build or test running. The instrument is `cargo run -p bench-harness
---bin compile-bench` with a dedicated `CARGO_TARGET_DIR` — it refuses to start
-without one, and it refuses one that resolves *inside the repository*. The
-stated reason has always been that the clean phase deletes artifacts and would
-destroy the working cache; the reason that corrupts a *number* is quieter, and
-is why this is a refusal rather than a warning. A concurrent `cargo` on a
-shared target directory blocks the measured build on the target-dir lock, and
-that wait lands in wall time while child CPU and the load average stay
-perfectly normal — so `BelowFloor`, `Contended` and `Unstable` all pass and an
-inflated figure is published as accepted.
-
-`scripts/compile-bench.sh` is the unattended runner: it holds `caffeinate`,
-records every attempt under `bench-runs/compile-bench/` (outside `target/`, so
-`cargo clean` cannot erase the refusal history this document is required to
-publish), and encodes spec §4's retry rule in its exit codes — 0 accepted,
-1 refused on the environment (retry), 2 operator or setup error, 3 a refusal
-about the measurement (stop and report, and it refuses to start again on any
-later night while that refusal stands). Until that reading is taken,
-**DESIGN §9.5's adoption risk is unquantified**, and no compile-latency figure
-anywhere in this repo is quotable.
+This reading's artifact, committed as its provenance:
+`bench-runs/compile-bench/20260909T000045-25002/attempt-1/` (`run.log`, and
+`status` holding 0).
