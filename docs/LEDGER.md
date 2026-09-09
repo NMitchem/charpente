@@ -4242,3 +4242,49 @@ that wants those universes back has to soften what the fault matrix does to an o
 current populations, so nothing about them is under test — including whether their error prose
 still matches what `classify` expects, which is the one coupling these keys cannot check
 themselves. They are the first place to look whenever a give-up mix moves.
+
+## 2026-09-08 — the scope-flip contract was named at two doors out of eleven
+
+`scan_raw`/`scan_raw_from` refuse a scope flip by name. Every other scoped reader and writer
+fell through to `redb_err`, whose text is redb's own — `table store (redb): test.ticket is of
+type Table<u64, &[u8]>` — naming neither the contract, nor the site, nor the fix. Hard rule 5
+makes that a defect, and **the GUIDE had already promised the fixed behaviour
+unconditionally** (`docs/GUIDE.md:5516`, "A table cannot gain a scope in place… is refused
+rather than silently misread", with the full error text quoted beneath it). So this is not doc
+drift in the usual direction: the spec was right and the code met it at 2 of 11 entry points.
+Nothing in the docs changed here; they became true.
+
+**Measured, not estimated.** Eleven functions in `table.rs` open a scoped row table:
+`delete`, `rebuild_indexes_for`, `put_raw`, `delete_raw`, `get_raw`, `replace_row`,
+`get_scoped`, `scan_scoped`, `scan_from_scoped`, plus the two that were already correct. Nine
+were unnamed, eight of them `pub`. **An earlier count of "thirteen" was wrong and was caught
+before it shipped**, which is worth recording for how it was wrong: it counted every row-table
+open, including the bare-`u64` ones that cannot hit this contract at all. The number went into
+a rationale comment before it was checked; checking it took one `awk` pass over the file.
+
+**RED first, and the RED is an assertion rather than a compile error.**
+`every_scoped_entry_point_refuses_the_scope_flip_by_name` (`crates/charpente-core/tests/
+engine.rs`) builds the physically bare table with `put_raw(None, …)` — the same construction
+the sibling test uses, i.e. the shape any pre-scope write path leaves behind — then knocks on
+all eight public doors. It failed with `Snapshot::get_scoped must name the scope-flip
+contract, got: table store (redb): test.ticket is of type Table<u64, &[u8]>`. A test that
+merely fails to compile against the old code would have proved nothing, so the first draft —
+which did exactly that, on a missing `Debug` bound — was rewritten rather than accepted.
+
+**Single-sourced, not repeated per site.** `scoped_open_err(table, e)` maps
+`TableTypeMismatch` onto `scope_flip_error` and everything else onto `redb_err`; all eleven
+opens route through it, `scan_raw`'s hand-written mismatch arm included. The per-site shape is
+what allowed the gap: correct in two places, silently absent in nine, and nothing could
+notice. The test pins the BEHAVIOUR an operator meets at whichever door they knocked on, not
+the call sites, so a scoped reader added later without the mapping goes red here rather than
+passing by omission.
+
+Verification: `cargo fmt --all --check` 0, `cargo clippy --workspace --all-targets -D
+warnings` 0, `cargo test --workspace --no-fail-fast` **exit 0, 79 `test result: ok`, 0
+FAILED** (counted, not inferred from the absence of `FAILED`); the comment correction that
+followed is comment-only and re-verified against `charpente-core`'s 10 suites.
+
+**Not fixed here, and a real sibling.** The REVERSE flip — a table declared unscoped whose
+rows are physically composite-keyed — is named only in `scan_raw`'s unscoped arm, via
+`scan_raw_shape_error`. Same class, opposite direction, and it wants its own failing test
+rather than being folded in behind this one's green.

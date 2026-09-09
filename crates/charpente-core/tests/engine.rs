@@ -545,6 +545,7 @@ impl Tenant for TestOrg {
 /// The secondary index is not decoration: it is the only handle an integration
 /// test has on a scoped table's contents before Task 5/Task 7 land. See
 /// `ticket_index_entry_survives`.
+#[derive(Debug)]
 struct Ticket {
     id: Id<Ticket>,
     n: u32,
@@ -666,6 +667,95 @@ fn a_scoped_read_over_a_physically_bare_table_refuses_the_scope_flip_by_name() {
         err2.to_string()
             .contains("is declared scoped_by but its rows are keyed unscoped"),
         "{err2}"
+    );
+}
+
+/// Hard rule 5 across the whole scope-flip CLASS, not the two functions that
+/// happened to get it first. `scan_raw`/`scan_raw_from` refuse the flip by
+/// name; every other scoped entry point fell through to `redb_err`'s
+/// "table store (redb): {e}", which names neither the contract nor the fix —
+/// so the same operator mistake produced an actionable error from exactly one
+/// read path and a bare redb type error from eight public ones.
+///
+/// A physically bare table is reachable from every entry point here, so each
+/// must refuse by name. Built with `put_raw(None, …)` exactly as the sibling
+/// test above: the disk shape any pre-scope write path leaves behind, not a
+/// contrived one. This pins the BEHAVIOUR (an operator learns the contract and
+/// the fix at whichever door they knocked on) rather than the call sites, so a
+/// new scoped reader added later without the mapping goes red here.
+#[test]
+fn every_scoped_entry_point_refuses_the_scope_flip_by_name() {
+    let sim = Sim::with_faults(0x7A2E_000A, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    store
+        .apply(0, |w| w.put_raw(Ticket::TABLE, None, 5, b"old"))
+        .expect("a bare put must not error");
+
+    fn names_the_contract(err: &io::Error, site: &str) {
+        let s = err.to_string();
+        assert!(
+            s.contains("is declared scoped_by but its rows are keyed unscoped"),
+            "{site} must name the scope-flip contract, got: {s}"
+        );
+        assert!(
+            s.contains("a table cannot gain a scope in place"),
+            "{site} must name the fix, got: {s}"
+        );
+    }
+
+    let snap = store.snapshot().unwrap();
+    names_the_contract(
+        &snap
+            .get_scoped::<Ticket>(10, Id::from_raw(5))
+            .expect_err("must refuse the scope flip"),
+        "Snapshot::get_scoped",
+    );
+    names_the_contract(
+        &snap
+            .scan_scoped::<Ticket>(10)
+            .expect_err("must refuse the scope flip"),
+        "Snapshot::scan_scoped",
+    );
+    names_the_contract(
+        &snap
+            .scan_from_scoped::<Ticket>(10, 0, 10)
+            .expect_err("must refuse the scope flip"),
+        "Snapshot::scan_from_scoped",
+    );
+    drop(snap);
+
+    // Every writer arm below fails before commit, so `applied_seq` stays 0 and
+    // each attempt is the same gapless seq 1 rather than a running counter.
+    names_the_contract(
+        &store
+            .apply(1, |w| w.get_raw(Ticket::TABLE, Some(10), 5))
+            .expect_err("must refuse the scope flip"),
+        "Writer::get_raw",
+    );
+    names_the_contract(
+        &store
+            .apply(1, |w| w.put_raw(Ticket::TABLE, Some(10), 6, b"new"))
+            .expect_err("must refuse the scope flip"),
+        "Writer::put_raw",
+    );
+    names_the_contract(
+        &store
+            .apply(1, |w| w.delete_raw(Ticket::TABLE, Some(10), 5))
+            .expect_err("must refuse the scope flip"),
+        "Writer::delete_raw",
+    );
+    names_the_contract(
+        &store
+            .apply(1, |w| w.delete::<Ticket>(10, Id::from_raw(5)))
+            .expect_err("must refuse the scope flip"),
+        "Writer::delete",
+    );
+    names_the_contract(
+        &store
+            .apply(1, |w| w.rebuild_indexes_for::<Ticket>())
+            .expect_err("must refuse the scope flip"),
+        "Writer::rebuild_indexes_for",
     );
 }
 
