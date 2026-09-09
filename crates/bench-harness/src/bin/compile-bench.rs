@@ -11,9 +11,12 @@
 use std::path::Path;
 use std::time::Duration;
 
+use std::path::PathBuf;
+
 use bench_harness::compile::{Edit, clean, measure_build};
 use bench_harness::compile_accounting::{
-    Cache, Invalid, Phase, PhaseVerdict, Reading, classify_phase, summarize, verdict,
+    Cache, Invalid, Observation, Phase, PhaseVerdict, Reading, classify_phase, exit_code,
+    settle_verdict, summarize, target_dir_inside_repo, verdict,
 };
 use bench_harness::measure::load_average;
 
@@ -78,6 +81,28 @@ fn quiesce(cores: usize) {
     }
 }
 
+/// Absolute, symlink-resolved, and tolerant of a path that does not exist yet
+/// — cargo creates the target directory, so the check that it is outside the
+/// repo has to run before it is there. Canonicalizes the deepest existing
+/// ancestor and re-attaches the rest, which is what makes macOS's
+/// `/tmp -> /private/tmp` and `/var -> /private/var` compare correctly against
+/// a canonicalized repo root. Filesystem access, so it stays in the driver:
+/// `compile_accounting` owns the rule and never resolves a path.
+fn resolve(p: &Path) -> PathBuf {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    };
+    for ancestor in abs.ancestors() {
+        if let Ok(real) = ancestor.canonicalize() {
+            let rest = abs.strip_prefix(ancestor).expect("ancestor of abs");
+            return real.join(rest);
+        }
+    }
+    abs
+}
+
 fn main() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -92,11 +117,34 @@ fn main() {
         "compile-bench: CARGO_TARGET_DIR = {:?}",
         std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "<unset — refusing>".into())
     );
-    if std::env::var("CARGO_TARGET_DIR").is_err() {
+    let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") else {
         eprintln!(
             "compile-bench: refusing to run without a dedicated CARGO_TARGET_DIR: the clean \
              phase deletes artifacts, and sharing the repo's target/ would destroy the \
              working cache and let unrelated cargo runs perturb the measurement"
+        );
+        std::process::exit(2);
+    };
+    // Set is not the same as dedicated, and "dedicated" is the rule the number
+    // depends on. Point CARGO_TARGET_DIR at the repo's own target/ and a
+    // concurrent cargo blocks this build on the target-dir lock: the wait lands
+    // in `wall` while child_cpu stays normal and the load average stays low, so
+    // BelowFloor, Contended and Unstable all pass and an inflated wall figure is
+    // published as accepted. The gate this class of defect defeats is every gate
+    // there is, which is why it is refused here rather than left to the script.
+    if target_dir_inside_repo(&resolve(&PathBuf::from(&target_dir)), &resolve(repo)) {
+        eprintln!(
+            "compile-bench: refusing to run with CARGO_TARGET_DIR inside the repository.\n  \
+             CARGO_TARGET_DIR = {target_dir}\n  repository       = {}\n  \
+             The rule: the target directory must be DEDICATED and OUTSIDE the repo. Sharing it \
+             means a concurrent cargo can block this build on the target-dir lock — that wait \
+             lands in wall time while child CPU and load average stay normal, so every gate \
+             passes and an inflated figure is published as accepted. The clean phase would also \
+             delete the repo's working cache.\n  \
+             Fix: CARGO_TARGET_DIR=\"${{TMPDIR:-/tmp}}/charpente-compile-bench-target\" (and not \
+             a git worktree's target either — a shared target dir leaks one tree's artifacts \
+             into another's verification with `git diff` clean).",
+            repo.display()
         );
         std::process::exit(2);
     }
@@ -126,8 +174,12 @@ fn main() {
         // --- incremental: handler body -----------------------------------
         // Settle first: the tree must be built and unedited, or the measured
         // build would also be paying for whatever the previous phase left.
+        // This one settles a tree that the clean build above left already
+        // built and unedited, so it is the GENUINE no-op — see
+        // `no_op_evidence`.
         let settle = measure_build(&app, Phase::HandlerBody, Cache::Warm).expect("settle");
         no_op_evidence(&settle, i, "handler");
+        judge_settle(&settle, &mut handler_refusals, i, "handler");
         quiesce(cores);
         {
             let _edit = Edit::apply(&routes, HANDLER_FIND, HANDLER_REPLACE).expect("handler edit");
@@ -141,8 +193,14 @@ fn main() {
         }
 
         // --- incremental: schema ------------------------------------------
+        // NOT a no-op: the handler `Edit` guard dropped at the close of the
+        // block above and rewrote routes.rs, so this settle recompiles the
+        // revert. It is a full incremental build wearing a settle's name, and
+        // labelling it NOOP is how a future reader would recalibrate
+        // MIN_CHILD_CPU upward off a number that never measured a no-op.
         let settle = measure_build(&app, Phase::Schema, Cache::Warm).expect("settle");
-        no_op_evidence(&settle, i, "schema");
+        settle_evidence(&settle, i, "schema");
+        judge_settle(&settle, &mut schema_refusals, i, "schema");
         quiesce(cores);
         {
             let _edit = Edit::apply(&model, SCHEMA_FIND, SCHEMA_REPLACE).expect("schema edit");
@@ -156,8 +214,7 @@ fn main() {
         }
     }
 
-    let mut any_refused = false;
-    let mut any_final = false;
+    let mut verdicts: Vec<PhaseVerdict> = Vec::new();
 
     for (label, phase, readings, refusals) in [
         ("clean", Phase::Clean, &clean_readings, &clean_refusals),
@@ -181,43 +238,69 @@ fn main() {
         // Classified by ALL of the phase's refusals, not just summarize's own
         // (compile_accounting::classify_phase) — a BelowFloor or BuildFailed
         // refusal cannot hide behind a TooFewObservations OR an Ok summary.
-        match classify_phase(&summary, refusals) {
-            PhaseVerdict::Accepted => {}
-            PhaseVerdict::Retryable => any_refused = true,
-            PhaseVerdict::Final => {
-                any_refused = true;
-                any_final = true;
-            }
-        }
+        let v = classify_phase(&summary, refusals);
+        println!("VERDICT {label}: {v:?}");
+        verdicts.push(v);
     }
 
-    let code = if any_final {
-        3
-    } else if any_refused {
-        1
-    } else {
-        0
-    };
+    // The fold lives in the accounting half (compile_accounting::exit_code) and
+    // is covered there. Inline, this was the last hop of spec §4's integrity
+    // property with no oracle at all: transposing the 3 and the 1 turned "never
+    // retry Unstable" into "always retry Unstable" with the whole suite green.
+    let code = exit_code(&verdicts);
     println!("VERDICT exit={code} (0 accepted, 1 refused-retryable, 2 usage, 3 refused-final)");
     std::process::exit(code);
 }
 
-/// The settle build is a no-op rebuild: the tree is already built and
-/// unedited, so cargo checks fingerprints and spawns no compiler. Printing its
-/// compiler CPU is what calibrates [`MIN_CHILD_CPU`] against something measured
-/// rather than assumed — the floor is only meaningful if the case it exists to
-/// reject actually sits well below it.
-fn no_op_evidence(o: &bench_harness::compile_accounting::Observation, i: usize, label: &str) {
+/// The **handler** settle, and only that one, is a genuine no-op rebuild: the
+/// clean build immediately above it left the tree built and unedited, so cargo
+/// checks fingerprints and spawns no compiler. Printing its compiler CPU is
+/// what calibrates `MIN_CHILD_CPU` against something measured rather than
+/// assumed — the floor is only meaningful if the case it exists to reject
+/// actually sits well below it.
+///
+/// **`NOOP` is printed here and nowhere else, deliberately.** The schema
+/// phase's settle recompiles the reverted handler edit and is a full
+/// incremental build; it prints `SETTLE` (see [`settle_evidence`]) so nobody
+/// can read it as floor evidence. This line is the only no-op calibration this
+/// instrument produces.
+fn no_op_evidence(o: &Observation, i: usize, label: &str) {
     println!(
         "NOOP {label}[{i}] wall={:?} child_cpu={:?}   (calibrates the compiler-CPU floor)",
         o.wall, o.child_cpu
     );
 }
 
+/// A settle build that is NOT a no-op: it exists to get the tree back to a
+/// known state before the next measured edit, and it recompiles whatever the
+/// previous phase's `Edit` guard reverted. Reported for the trace, never as
+/// floor evidence, and never published as a reading.
+fn settle_evidence(o: &Observation, i: usize, label: &str) {
+    println!(
+        "SETTLE {label}[{i}] wall={:?} child_cpu={:?}   (rebuilds the reverted edit — NOT a \
+         no-op, NOT floor evidence)",
+        o.wall, o.child_cpu
+    );
+}
+
+/// A settle is not published, but it is a real build, and before this existed
+/// neither settle passed through any check at all: a settle that failed to
+/// build, or that spanned a laptop suspend, left no trace and every
+/// observation taken after it was believed anyway. The floor and the
+/// aggregation rule deliberately do NOT apply — a genuine settle sits below
+/// the floor by construction — so this goes through
+/// `compile_accounting::settle_verdict` rather than `verdict`.
+fn judge_settle(o: &Observation, refusals: &mut Vec<Invalid>, i: usize, label: &str) {
+    if let Some(e) = settle_verdict(o) {
+        println!("    SETTLE REFUSED {label}[{i}] — {e}");
+        refusals.push(e);
+    }
+}
+
 fn record(
     into: &mut Vec<Reading>,
     refusals: &mut Vec<Invalid>,
-    o: bench_harness::compile_accounting::Observation,
+    o: Observation,
     i: usize,
     label: &str,
 ) {

@@ -7,9 +7,10 @@
 //! `#![allow(clippy::disallowed_methods, clippy::disallowed_types)]` because
 //! they touch clocks and processes. This file does not, so hard rule 1's CI
 //! deny-list mechanically holds it free of clocks, filesystems and process
-//! spawning: it sees only the numbers a caller hands it. If a future edit
-//! reaches for `Instant::now()` here, the build fails rather than a reviewer
-//! having to notice.
+//! spawning: it sees only the numbers — and, for [`target_dir_inside_repo`],
+//! the two already-resolved paths — a caller hands it. Nothing here opens,
+//! reads or stats anything. If a future edit reaches for `Instant::now()`
+//! here, the build fails rather than a reviewer having to notice.
 //!
 //! **A compile is one-shot, not a rate**, so BENCH's windowing does not apply:
 //! there is no denominator to divide by and no per-second figure to publish.
@@ -49,6 +50,7 @@
 //! as one would be wrong in charpente's own favour or against it depending on
 //! the phase.
 
+use std::path::Path;
 use std::time::Duration;
 
 /// The three phases, and what an adopter learns from each.
@@ -314,6 +316,27 @@ pub fn verdict(o: &Observation) -> Result<Reading, Invalid> {
     })
 }
 
+/// The verdict for a **settle** build — the rebuild the driver runs between
+/// phases so the measured build is not also paying for whatever the previous
+/// phase left behind. A settle is never a published reading, so the floor and
+/// the aggregation check do not apply to it: a genuine settle is a no-op
+/// rebuild and sits *below* [`MIN_CHILD_CPU`] on purpose.
+///
+/// Two of [`verdict`]'s rules still do apply, and before this existed the
+/// driver checked neither — a settle that failed or that spanned a suspend was
+/// invisible, and every observation taken after it was believed anyway. A
+/// settle that did not build means the tree is broken (final, a bug); a settle
+/// that spanned a suspend means the machine did not stay up (environmental).
+pub fn settle_verdict(o: &Observation) -> Option<Invalid> {
+    if !o.succeeded {
+        return Some(Invalid::BuildFailed);
+    }
+    if let Some(why) = &o.suspension {
+        return Some(Invalid::Suspended(why.clone()));
+    }
+    None
+}
+
 /// The published figure over repeated observations of one phase.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Summary {
@@ -403,6 +426,64 @@ pub fn classify_phase(summary: &Result<Summary, Invalid>, refusals: &[Invalid]) 
     } else {
         PhaseVerdict::Accepted
     }
+}
+
+/// The whole run's exit code, folded from every phase's verdict. **This is the
+/// last hop of spec §4's integrity property and it is the one that used to have
+/// no oracle** — the same argument [`crate::measure::verdict`] carries for the
+/// heartbeat's composition. Inline in the driver, transposing the `3` and the
+/// `1`, or dropping the `Final` arm, silently converted "never retry
+/// `Unstable`" into "always retry `Unstable`" with the whole suite green,
+/// because the runner script reads nothing but this number.
+///
+/// - `0` — every phase accepted; this is a reading.
+/// - `1` — refused, and every refusal describes the machine. Retry is
+///   legitimate (spec §4).
+/// - `3` — at least one refusal describes the MEASUREMENT. Stop and report.
+///   **`Final` wins over `Retryable`**: a run that is partly a bug is a bug,
+///   and folding it the other way is exactly how rerolling gets authorized.
+///
+/// `2` is never produced here — it is the driver's usage/launch code, and a
+/// fold over phase verdicts is past the point where usage can be wrong.
+///
+/// An empty slice is not "everything passed", it is a driver that measured
+/// nothing, so it asserts rather than returning `0` (hard rule 4: the negative
+/// space). The binary turns that into a panic, which the runner's catch-all
+/// arm reports as an abnormal exit — never as a publishable reading.
+pub fn exit_code(verdicts: &[PhaseVerdict]) -> i32 {
+    assert!(
+        !verdicts.is_empty(),
+        "compile-bench: exit_code called with no phase verdicts — a run that classified \
+         nothing has not earned exit 0. Every phase measured must be classified and passed \
+         in (compile_accounting::exit_code)"
+    );
+    if verdicts.contains(&PhaseVerdict::Final) {
+        3
+    } else if verdicts.contains(&PhaseVerdict::Retryable) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Whether a **already-resolved** `CARGO_TARGET_DIR` sits inside the
+/// repository. Resolving both paths (canonicalizing symlinks, making them
+/// absolute) is the caller's job because it touches the filesystem; the rule
+/// itself is lexical and belongs here where it can be covered.
+///
+/// The rule: the target directory must be dedicated and outside the repo. The
+/// stated reason has always been that the clean phase deletes artifacts. The
+/// one that actually corrupts a *number* is quieter — a concurrent `cargo` on
+/// a shared target directory blocks the measured build on the target-dir lock,
+/// and that wait lands in `wall` while `child_cpu` stays normal and the load
+/// average stays low. [`Invalid::BelowFloor`], [`Invalid::Contended`] and
+/// [`Invalid::Unstable`] can all pass while an inflated wall figure is
+/// published as accepted.
+///
+/// `Path::starts_with` is component-wise, not textual, so a sibling directory
+/// named `charpente-bench` beside `charpente` is correctly *not* inside it.
+pub fn target_dir_inside_repo(target_dir: &Path, repo_root: &Path) -> bool {
+    target_dir.starts_with(repo_root)
 }
 
 #[cfg(test)]
@@ -627,5 +708,138 @@ mod tests {
     fn an_unstable_summary_is_final() {
         let summary: Result<Summary, Invalid> = Err(Invalid::Unstable { spread_percent: 90 });
         assert_eq!(classify_phase(&summary, &[]), PhaseVerdict::Final);
+    }
+
+    /// The arm that encodes the decision and had no test: refusals happened,
+    /// every one of them described the machine, and enough observations
+    /// survived to summarize anyway. That is an accepted phase — the retry
+    /// rule is about refusals that *stopped* a reading, not about a busy
+    /// moment the run outlasted.
+    #[test]
+    fn an_ok_summary_with_only_environmental_refusals_is_accepted() {
+        let summary = summarize(Phase::HandlerBody, &[reading(10), reading(11), reading(12)]);
+        let refusals = [
+            Invalid::Contended {
+                load_before: 9.0,
+                cores: 10,
+            },
+            Invalid::Suspended("the box slept".into()),
+            Invalid::TooFewObservations { got: 2 },
+        ];
+        assert_eq!(
+            classify_phase(&summary, &refusals),
+            PhaseVerdict::Accepted,
+            "a phase that survived a busy moment and still summarized is a reading"
+        );
+    }
+
+    /// A settle build is a no-op rebuild by design, so the floor must not
+    /// judge it — but a settle that FAILED or spanned a suspend was invisible
+    /// before `settle_verdict` existed.
+    #[test]
+    fn a_genuine_no_op_settle_is_not_refused_for_being_below_the_floor() {
+        let mut o = healthy();
+        o.child_cpu = Duration::from_millis(20); // cargo's fingerprint scan
+        o.parent_cpu = Duration::from_millis(5);
+        assert_eq!(settle_verdict(&o), None);
+        assert!(
+            matches!(verdict(&o), Err(Invalid::BelowFloor { .. })),
+            "the same observation is rightly refused as a READING"
+        );
+    }
+
+    #[test]
+    fn a_settle_that_did_not_build_is_a_final_refusal() {
+        let mut o = healthy();
+        o.succeeded = false;
+        let e = settle_verdict(&o).expect("a broken tree must not be invisible");
+        assert_eq!(e, Invalid::BuildFailed);
+        assert!(!e.is_environmental(), "a broken tree is a bug, not a night");
+    }
+
+    #[test]
+    fn a_settle_that_spanned_a_suspend_is_an_environmental_refusal() {
+        let mut o = healthy();
+        o.suspension = Some("laptop slept".to_string());
+        let e = settle_verdict(&o).expect("a suspend must not be invisible");
+        assert!(matches!(e, Invalid::Suspended(_)));
+        assert!(e.is_environmental());
+    }
+
+    /// Spec §4's last hop. Every combination that changes the answer, because
+    /// the driver's inline fold could be transposed or half-deleted with the
+    /// whole suite green — the runner script reads nothing but this number.
+    #[test]
+    fn every_phase_accepted_is_the_only_way_to_exit_zero() {
+        use PhaseVerdict::{Accepted, Retryable};
+        assert_eq!(exit_code(&[Accepted, Accepted, Accepted]), 0);
+        assert_eq!(exit_code(&[Accepted]), 0);
+
+        // One retryable phase refuses the whole run, retryably.
+        assert_eq!(exit_code(&[Retryable, Accepted, Accepted]), 1);
+        assert_eq!(exit_code(&[Accepted, Retryable, Accepted]), 1);
+        assert_eq!(exit_code(&[Accepted, Accepted, Retryable]), 1);
+        assert_eq!(exit_code(&[Retryable, Retryable, Retryable]), 1);
+    }
+
+    /// The transposition oracle: 3 and 1 are not interchangeable, and `Final`
+    /// must not be reachable through the retry arm in ANY position or mixture.
+    #[test]
+    fn a_single_final_phase_forbids_a_retry_from_any_position() {
+        use PhaseVerdict::{Accepted, Final, Retryable};
+        assert_eq!(exit_code(&[Final, Accepted, Accepted]), 3);
+        assert_eq!(exit_code(&[Accepted, Final, Accepted]), 3);
+        assert_eq!(exit_code(&[Accepted, Accepted, Final]), 3);
+        assert_eq!(exit_code(&[Final]), 3);
+
+        // Mixed with retryable phases in both orders — Final always wins, or
+        // "never retry Unstable" becomes "retry Unstable whenever some other
+        // phase was merely contended".
+        assert_eq!(exit_code(&[Final, Retryable, Retryable]), 3);
+        assert_eq!(exit_code(&[Retryable, Retryable, Final]), 3);
+        assert_eq!(exit_code(&[Retryable, Final, Accepted]), 3);
+    }
+
+    /// An `Unstable` phase reaches the runner as 3 and nothing else. This is
+    /// the end-to-end statement of the rule, from the refusal the accounting
+    /// half produced to the number the shell script switches on.
+    #[test]
+    fn an_unstable_phase_reaches_the_runner_as_stop_not_retry() {
+        let summary: Result<Summary, Invalid> = Err(Invalid::Unstable { spread_percent: 90 });
+        let v = classify_phase(&summary, &[]);
+        assert_eq!(
+            exit_code(&[v, PhaseVerdict::Accepted, PhaseVerdict::Accepted]),
+            3
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "no phase verdicts")]
+    fn a_run_that_classified_nothing_has_not_earned_exit_zero() {
+        exit_code(&[]);
+    }
+
+    /// The hazard is a target dir inside the repo; the trap is a sibling that
+    /// shares a name prefix with it.
+    #[test]
+    fn a_target_dir_inside_the_repo_is_refused_and_a_sibling_is_not() {
+        let repo = Path::new("/Users/x/GitHub/charpente");
+        assert!(target_dir_inside_repo(
+            Path::new("/Users/x/GitHub/charpente/target"),
+            repo
+        ));
+        assert!(
+            target_dir_inside_repo(repo, repo),
+            "the repo root itself is inside the repo"
+        );
+        assert!(
+            !target_dir_inside_repo(Path::new("/private/tmp/charpente-bench-target"), repo),
+            "a dedicated dir outside the repo is the supported setup"
+        );
+        assert!(
+            !target_dir_inside_repo(Path::new("/Users/x/GitHub/charpente-bench/target"), repo),
+            "a SIBLING sharing the repo's name prefix is not inside it — Path::starts_with \
+             is component-wise, and a textual prefix test would refuse this"
+        );
     }
 }

@@ -1573,8 +1573,17 @@ discarded precisely the phase DESIGN §9.5 cares most about, the inner loop.
 The floor now reads compiler CPU directly (`MIN_CHILD_CPU`), which is what the
 rule always meant: a no-op rebuild spawns no compiler, so its child CPU is
 cargo's fingerprint scan and nothing more, an order of magnitude below a real
-incremental build. Each run now prints its no-op settle builds as `NOOP` lines
-so the floor is calibrated against a measured case rather than an assumed one.
+incremental build. Each run now prints that no-op as a `NOOP` line so the
+floor is calibrated against a measured case rather than an assumed one.
+
+**Exactly one line per iteration is that evidence, and it is labelled to say
+so.** The driver runs a settle build before each measured edit, but only the
+handler phase's settle is a genuine no-op — the schema phase's settle
+recompiles the handler edit its `Edit` guard has just reverted, so it is a full
+incremental build. It prints as `SETTLE`, never `NOOP`. Reading it as no-op
+evidence would put `MIN_CHILD_CPU` an order of magnitude too high and start
+refusing real builds, with the instrument's own output appearing to authorize
+the move — which is precisely what §4's "the gates are not touched" forbids.
 
 Moving a gate after it refuses a reading is how a real oracle becomes
 decorative, so the justification has to be that the old rule contradicted its
@@ -1596,7 +1605,21 @@ defect, not an accounting one.
 A machine at or below 0.5 runnable threads per core for the duration, with no
 other build or test running. The instrument is `cargo run -p bench-harness
 --bin compile-bench` with a dedicated `CARGO_TARGET_DIR` — it refuses to start
-without one, because the clean phase deletes artifacts and would otherwise
-destroy the working cache. Until that reading is taken, **DESIGN §9.5's
-adoption risk is unquantified**, and no compile-latency figure anywhere in
-this repo is quotable.
+without one, and it refuses one that resolves *inside the repository*. The
+stated reason has always been that the clean phase deletes artifacts and would
+destroy the working cache; the reason that corrupts a *number* is quieter, and
+is why this is a refusal rather than a warning. A concurrent `cargo` on a
+shared target directory blocks the measured build on the target-dir lock, and
+that wait lands in wall time while child CPU and the load average stay
+perfectly normal — so `BelowFloor`, `Contended` and `Unstable` all pass and an
+inflated figure is published as accepted.
+
+`scripts/compile-bench.sh` is the unattended runner: it holds `caffeinate`,
+records every attempt under `bench-runs/compile-bench/` (outside `target/`, so
+`cargo clean` cannot erase the refusal history this document is required to
+publish), and encodes spec §4's retry rule in its exit codes — 0 accepted,
+1 refused on the environment (retry), 2 operator or setup error, 3 a refusal
+about the measurement (stop and report, and it refuses to start again on any
+later night while that refusal stands). Until that reading is taken,
+**DESIGN §9.5's adoption risk is unquantified**, and no compile-latency figure
+anywhere in this repo is quotable.
