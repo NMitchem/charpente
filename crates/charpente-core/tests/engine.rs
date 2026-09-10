@@ -2437,3 +2437,64 @@ fn reopening_the_same_scope_is_allowed() {
     })
     .unwrap();
 }
+
+/// F1 mechanism (no child process — see `crates/edge-harness/tests/
+/// open_fence.rs` for the printed-output oracle, which needs one).
+/// `Store::open`'s `IN_OPEN_FENCE` thread-local must clear on EVERY exit
+/// path, including the one where `catch_unwind` actually caught a real redb
+/// panic — a leaked `true` here would silently swallow the next genuine
+/// panic on this thread forever, which is worse than F1 itself.
+#[test]
+fn open_fence_flag_clears_after_catching_a_real_redb_open_panic() {
+    assert!(
+        !charpente_core::table::in_open_fence(),
+        "must start clear: nothing has entered the fence on this thread yet"
+    );
+
+    let sim = Sim::with_faults(0x0FEE_1234, FaultConfig::none());
+    let disk = sim.disk();
+    {
+        let store = Store::open(&disk, "probe.redb").unwrap();
+        // Enough committed data that redb's durable header records a
+        // nontrivial layout, then a graceful close so header layout == file
+        // length (same shape as crates/charpente/tests/transactions.rs's
+        // `unopenable_store_with_compacted_wal_is_a_named_hard_error`).
+        store
+            .import(|w| {
+                for i in 0..500u64 {
+                    w.put_raw("probe", None, i, &[7u8; 64])?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        store.checkpoint().unwrap();
+    }
+    assert!(
+        !charpente_core::table::in_open_fence(),
+        "the ordinary successful open above must also leave the flag clear"
+    );
+
+    // Truncate past the durable header's recorded layout so redb's open-time
+    // assert (page_manager.rs:231) fires — the exact condition the fence
+    // exists to catch.
+    let file = disk.open("probe.redb").unwrap();
+    let len = file.len().unwrap();
+    file.set_len(len - 4096).unwrap();
+    file.sync().unwrap();
+    drop(file);
+
+    let err = match Store::open(&disk, "probe.redb") {
+        Ok(_) => panic!("the corrupted store must fail to open"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("panicked at open"),
+        "the fence must still convert redb's open-time assert into a named \
+         io::Error: {err}"
+    );
+    assert!(
+        !charpente_core::table::in_open_fence(),
+        "the flag must clear even though the fence just caught a REAL panic \
+         — this is the guard's teeth, not merely the fence's"
+    );
+}

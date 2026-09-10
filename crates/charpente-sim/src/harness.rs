@@ -206,6 +206,43 @@ impl Report {
     }
 }
 
+static OPEN_FENCE_HOOK: std::sync::Once = std::sync::Once::new();
+
+/// Replaces redb's benign open-fence trace with one named line, and delegates
+/// every other panic to the previous hook untouched. Idempotent — call it from
+/// any entry point. Deliberately contains no `panicked` substring: a log grep
+/// for that word is what F1 trained agents to misuse.
+///
+/// Muting is gated on BOTH the fence flag AND the panic's own source location
+/// naming redb — the flag alone is a time window, not a guarantee about what
+/// panicked inside it (review finding, F1 round 2). `DiskBackend` (table.rs)
+/// calls straight through to whatever `Disk`/`File` the app provided, and a
+/// real backend can panic for its own reasons while `Store::open`'s
+/// `catch_unwind` is active — `SimFile`'s own `panic!`/`expect` sites in this
+/// crate (lib.rs, `file_state` and `read_at`) are exactly that. Muting on the
+/// flag alone would silence a genuine simulator bug the same way F1's
+/// original defect silenced a benign one, one notch narrower and strictly
+/// worse: `Db::open`'s discard-and-rebuild path (db.rs) swallows the
+/// resulting `io::Error` unprinted either way.
+pub fn install_open_fence_hook() {
+    OPEN_FENCE_HOOK.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let from_redb = info
+                .location()
+                .is_some_and(|loc| loc.file().contains("redb"));
+            if from_redb && charpente_core::table::in_open_fence() {
+                eprintln!(
+                    "charpente: redb open-fence engaged (benign) — the store is treated \
+                     as unopenable and Db::open rebuilds it; see Store::open"
+                );
+                return;
+            }
+            prev(info);
+        }));
+    });
+}
+
 /// Runs every test in `tests` whose name contains `args.filter` (all of them
 /// if unset) and writes a human report to `out`. Exit code: 0 green, 1 if
 /// any universe failed or a coverage requirement went unmet, 2 if the

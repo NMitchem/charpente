@@ -754,6 +754,42 @@ fn apply_one_in_txn<T>(
     Ok(out)
 }
 
+thread_local! {
+    /// Set only while `Store::open`'s redb fence is active.
+    ///
+    /// A thread-local rather than a `set_hook` swap, and the reason is not
+    /// style: `std::panic::set_hook` is process-global while sim universes
+    /// run on parallel worker threads (`charpente-sim`'s harness, under
+    /// `thread::scope`). Swapping the hook around this fence would silence a
+    /// DIFFERENT worker's genuine panic for its duration — trading a benign
+    /// false alarm for a suppressed real one, which is strictly worse.
+    static IN_OPEN_FENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// True while this thread sits inside `Store::open`'s redb open-panic fence.
+/// A panic hook consults this to replace redb's benign `page_manager.rs`
+/// trace with one named line (F1).
+pub fn in_open_fence() -> bool {
+    IN_OPEN_FENCE.with(std::cell::Cell::get)
+}
+
+/// Clears the flag on unwind as well as on return. The hook runs BEFORE
+/// unwinding, so the flag is still set when it reads it.
+struct OpenFenceGuard;
+
+impl OpenFenceGuard {
+    fn enter() -> Self {
+        IN_OPEN_FENCE.with(|f| f.set(true));
+        OpenFenceGuard
+    }
+}
+
+impl Drop for OpenFenceGuard {
+    fn drop(&mut self) {
+        IN_OPEN_FENCE.with(|f| f.set(false));
+    }
+}
+
 impl Store {
     pub fn open(disk: &dyn Disk, path: &str) -> io::Result<Store> {
         let file = disk.open(path)?;
@@ -771,12 +807,15 @@ impl Store {
         // to open only — a redb panic during operation still propagates.
         // Reported upstream; drop the fence when redb returns Err here.
         let latch = Arc::new(AtomicBool::new(false));
-        let db = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Builder::new().create_with_backend(DiskBackend {
-                file,
-                latch: latch.clone(),
-            })
-        }))
+        let db = {
+            let _fence = OpenFenceGuard::enter();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Builder::new().create_with_backend(DiskBackend {
+                    file,
+                    latch: latch.clone(),
+                })
+            }))
+        }
         .map_err(|panic| {
             let msg = panic
                 .downcast_ref::<&str>()
