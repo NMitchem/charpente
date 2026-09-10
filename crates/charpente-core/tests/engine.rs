@@ -24,7 +24,7 @@ use charpente_core::io::{Disk, File};
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::migration::{SchemaVersion, schema_version_id};
-use charpente_core::table::{Codec, Id, IndexDef, Row, Snapshot, Store, UNSCOPED, Unscoped};
+use charpente_core::table::{Codec, Id, IndexDef, Row, Snapshot, Store, UNSCOPED, Unscoped, View};
 use charpente_sim::{FaultConfig, Sim};
 
 #[derive(Default)]
@@ -759,6 +759,131 @@ fn every_scoped_entry_point_refuses_the_scope_flip_by_name() {
     );
 }
 
+/// The mirror of `every_scoped_entry_point_refuses_the_scope_flip_by_name`
+/// above. `14863db` fixed the scoped direction at all eleven doors; the
+/// reverse — declared unscoped, physically composite-keyed — was named only
+/// in `scan_raw`/`scan_raw_from`'s arms via `scan_raw_shape_error`. Every
+/// other unscoped entry point fell through to `redb_err`, whose text is
+/// redb's own and names neither the contract, the site, nor the fix (hard
+/// rule 5).
+///
+/// `Ticket` (above) cannot stand in for the unscoped fixture: it is the
+/// SCOPED type the sibling test uses (`Row::Scope = TestOrg`). `Widget`
+/// (`type Scope = Unscoped`, declared below for
+/// `an_unscoped_index_entry_stays_byte_identical`) is the exact inverse
+/// fixture this test needs, and it already carries a secondary index.
+///
+/// `View::scan_by` is a ninth public unscoped door but is deliberately not
+/// knocked on here: it opens the INDEX table (`index_def`, always
+/// `&[u8]`-keyed, unaffected by the primary rows table's shape) and reaches
+/// the primary table only transitively, through `self.get(id)` for an id an
+/// index entry names. Populating such an entry requires a write that is
+/// shape-consistent with the schema (typed `put`/`delete`), which is
+/// mutually exclusive with the composite-but-declared-unscoped disk state
+/// this test builds — a redb table's shape is fixed at its first write, and
+/// there is no public API to reshape or drop the primary rows table in
+/// place. So `scan_by` cannot observably hit this defect through any
+/// construction; it inherits `View::get`'s fix for free rather than needing
+/// one of its own (confirmed by census: no `open_table(rows_def(` call
+/// inside it). The scoped sibling test above has the identical gap for the
+/// identical reason — its eight doors omit `Snapshot::scan_by_scoped`.
+#[test]
+fn every_unscoped_entry_point_refuses_the_reverse_flip_by_name() {
+    let sim = Sim::with_faults(0x7A2E_000B, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    // `Widget` is declared WITHOUT scoped_by. Writing it composite-keyed is
+    // the disagreement under test — the exact inverse of the scoped test
+    // above, which writes bare and then reads scoped.
+    store
+        .apply(0, |w| w.put_raw(Widget::TABLE, Some(10), 5, b"old"))
+        .expect("a scoped put must not error");
+
+    fn names_the_contract(err: &io::Error, site: &str) {
+        let s = err.to_string();
+        assert!(
+            s.contains("is declared without scoped_by but its rows are keyed with a tenant scope"),
+            "{site} must name the reverse-flip contract, got: {s}"
+        );
+        assert!(
+            s.contains("a table cannot lose a scope in place"),
+            "{site} must name the fix, got: {s}"
+        );
+    }
+
+    // The unscoped readers are `View` trait methods on `Snapshot`
+    // (`crates/charpente-core/src/table.rs:1415-1496`); `View` must be in
+    // scope (imported above alongside `Snapshot`).
+    let snap = store.snapshot().unwrap();
+    names_the_contract(
+        &snap
+            .get::<Widget>(Id::from_raw(5))
+            .expect_err("must refuse the reverse flip"),
+        "View::get",
+    );
+    names_the_contract(
+        &snap
+            .scan::<Widget>()
+            .expect_err("must refuse the reverse flip"),
+        "View::scan",
+    );
+    names_the_contract(
+        &snap
+            .scan_from::<Widget>(0, 10)
+            .expect_err("must refuse the reverse flip"),
+        "View::scan_from",
+    );
+    drop(snap);
+
+    // Every writer arm below fails before commit, so `applied_seq` stays 0
+    // and each attempt is the same gapless seq 1 — the same reasoning the
+    // scoped test above records at its writer block.
+    names_the_contract(
+        &store
+            .apply(1, |w| w.get_raw(Widget::TABLE, None, 5))
+            .expect_err("must refuse the reverse flip"),
+        "Writer::get_raw",
+    );
+    names_the_contract(
+        &store
+            .apply(1, |w| w.put_raw(Widget::TABLE, None, 6, b"new"))
+            .expect_err("must refuse the reverse flip"),
+        "Writer::put_raw",
+    );
+    names_the_contract(
+        &store
+            .apply(1, |w| w.delete_raw(Widget::TABLE, None, 5))
+            .expect_err("must refuse the reverse flip"),
+        "Writer::delete_raw",
+    );
+    names_the_contract(
+        &store
+            .apply(1, |w| w.delete::<Widget>(UNSCOPED, Id::from_raw(5)))
+            .expect_err("must refuse the reverse flip"),
+        "Writer::delete",
+    );
+    names_the_contract(
+        &store
+            .apply(1, |w| w.rebuild_indexes_for::<Widget>())
+            .expect_err("must refuse the reverse flip"),
+        "Writer::rebuild_indexes_for",
+    );
+    names_the_contract(
+        &store
+            .apply(1, |w| {
+                w.put(
+                    UNSCOPED,
+                    &Widget {
+                        id: Id::from_raw(6),
+                        n: 42,
+                    },
+                )
+            })
+            .expect_err("must refuse the reverse flip"),
+        "Writer::put",
+    );
+}
+
 /// Task 4's central claim, and the only test that goes red when it stops
 /// being true: the SCOPE reaches the stored key. A 16-byte key alone proves
 /// nothing — `scoped_key(UNSCOPED, id)` is also 16 bytes — so this pins the
@@ -1384,9 +1509,13 @@ fn a_scoped_index_lookup_cannot_see_another_tenants_rows() {
 }
 
 /// A hand-written UNSCOPED `Row` with one secondary index — the
-/// byte-identity fixture for `an_unscoped_index_entry_stays_byte_identical`.
-/// Needs its own type because core's other hand-written `Row` impls
-/// (`JobRow`, `EventRow`) both declare `INDEXES: &[]`.
+/// byte-identity fixture for `an_unscoped_index_entry_stays_byte_identical`,
+/// and also the unscoped fixture `every_unscoped_entry_point_refuses_the_
+/// reverse_flip_by_name` reads back through `View::get`/`scan`/`scan_from`
+/// (hence `#[derive(Debug)]`: `Result::expect_err` needs the Ok side to be
+/// `Debug`). Needs its own type because core's other hand-written `Row`
+/// impls (`JobRow`, `EventRow`) both declare `INDEXES: &[]`.
+#[derive(Debug)]
 struct Widget {
     id: Id<Widget>,
     n: u32,

@@ -549,6 +549,33 @@ fn scoped_open_err(table: &str, e: redb::TableError) -> io::Error {
     }
 }
 
+/// An unscoped row-table open failed. `TableTypeMismatch` is the reverse
+/// scope-flip contract: the schema asked for the bare-`u64` shape and the
+/// disk holds composite-keyed rows. Every unscoped entry point routes its
+/// open failure through here, so an operator meets the named contract at
+/// whichever door they knocked on — the mirror of `scoped_open_err` above.
+/// Twelve functions open an unscoped row table; `scan_raw` and
+/// `scan_raw_from` named the contract via `scan_raw_shape_error`,
+/// `gc_events`' event-table open is unreachable by this disagreement
+/// (`EventRow::Scope` is `Unscoped` at compile time and its only writer,
+/// `materialize_event`, always calls `put` under `UNSCOPED`, so its rows
+/// table can never be created composite-keyed), and the other NINE — every
+/// one reachable through a `pub` entry point — fell through to `redb_err`,
+/// whose text is redb's own ("… is of type Table<[u8;16], &[u8]>") and names
+/// neither the contract nor the fix (hard rule 5). The per-site shape is
+/// exactly what let the forward gap (`14863db`) open unnoticed, hence
+/// single-sourced here too.
+fn unscoped_open_err(table: &str, e: redb::TableError) -> io::Error {
+    match e {
+        redb::TableError::TableTypeMismatch { .. } => io::Error::other(format!(
+            "table \"{table}\" is declared without scoped_by but its rows are keyed with a \
+             tenant scope: a table cannot lose a scope in place; declare it scoped_by, or \
+             create a new unscoped table and copy rows through a job"
+        )),
+        other => redb_err(other),
+    }
+}
+
 /// The row-key scope slot for a table that is not tenant-scoped — every
 /// table today. `pub`, not `pub(crate)`: `Writer::put`/`Writer::delete` now
 /// take an explicit, required scope (RULING, tenant-scoping Task 4 dispatch
@@ -1121,7 +1148,10 @@ impl Writer<'_> {
                  was called with scope {scope} — pass table::UNSCOPED for an unscoped table",
                 R::TABLE
             );
-            let mut rows = self.txn.open_table(rows_def(R::TABLE)).map_err(redb_err)?;
+            let mut rows = self
+                .txn
+                .open_table(rows_def(R::TABLE))
+                .map_err(|e| unscoped_open_err(R::TABLE, e))?;
             match rows.remove(id.raw()).map_err(redb_err)? {
                 Some(guard) => R::decode_row(guard.value())?,
                 None => return Ok(()), // deleting an absent row is a no-op
@@ -1245,7 +1275,10 @@ impl Writer<'_> {
                     entries.push(scoped_index_entry(scope, key, id));
                 }
             } else {
-                let rows = self.txn.open_table(rows_def(R::TABLE)).map_err(redb_err)?;
+                let rows = self
+                    .txn
+                    .open_table(rows_def(R::TABLE))
+                    .map_err(|e| unscoped_open_err(R::TABLE, e))?;
                 for item in rows.iter().map_err(redb_err)? {
                     let (k, v) = item.map_err(redb_err)?;
                     let row = R::decode_row(v.value())?;
@@ -1291,7 +1324,10 @@ impl Writer<'_> {
                 rows.insert(scoped_key(scope, id), row).map_err(redb_err)?;
             }
             None => {
-                let mut rows = self.txn.open_table(rows_def(table)).map_err(redb_err)?;
+                let mut rows = self
+                    .txn
+                    .open_table(rows_def(table))
+                    .map_err(|e| unscoped_open_err(table, e))?;
                 rows.insert(id, row).map_err(redb_err)?;
             }
         }
@@ -1314,7 +1350,10 @@ impl Writer<'_> {
                 rows.remove(scoped_key(scope, id)).map_err(redb_err)?;
             }
             None => {
-                let mut rows = self.txn.open_table(rows_def(table)).map_err(redb_err)?;
+                let mut rows = self
+                    .txn
+                    .open_table(rows_def(table))
+                    .map_err(|e| unscoped_open_err(table, e))?;
                 rows.remove(id).map_err(redb_err)?;
             }
         }
@@ -1345,7 +1384,7 @@ impl Writer<'_> {
                 let rows = match self.txn.open_table(rows_def(table)) {
                     Ok(rows) => rows,
                     Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-                    Err(e) => return Err(redb_err(e)),
+                    Err(e) => return Err(unscoped_open_err(table, e)),
                 };
                 Ok(rows.get(id).map_err(redb_err)?.map(|g| g.value().to_vec()))
             }
@@ -1391,7 +1430,10 @@ impl Writer<'_> {
                  called with scope {scope} — pass table::UNSCOPED for an unscoped table",
                 R::TABLE
             );
-            let mut rows = self.txn.open_table(rows_def(R::TABLE)).map_err(redb_err)?;
+            let mut rows = self
+                .txn
+                .open_table(rows_def(R::TABLE))
+                .map_err(|e| unscoped_open_err(R::TABLE, e))?;
             let old = match rows.get(id).map_err(redb_err)? {
                 Some(guard) => Some(R::decode_row(guard.value())?),
                 None => None,
@@ -1417,7 +1459,7 @@ impl View for Snapshot {
         let rows = match self.txn.open_table(rows_def(R::TABLE)) {
             Ok(rows) => rows,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(e) => return Err(redb_err(e)),
+            Err(e) => return Err(unscoped_open_err(R::TABLE, e)),
         };
         match rows.get(id.raw()).map_err(redb_err)? {
             Some(guard) => Ok(Some(R::decode_row(guard.value())?)),
@@ -1429,7 +1471,7 @@ impl View for Snapshot {
         let rows = match self.txn.open_table(rows_def(R::TABLE)) {
             Ok(rows) => rows,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(e) => return Err(redb_err(e)),
+            Err(e) => return Err(unscoped_open_err(R::TABLE, e)),
         };
         let mut out = Vec::new();
         for entry in rows.range(0u64..=u64::MAX).map_err(redb_err)? {
@@ -1483,7 +1525,7 @@ impl View for Snapshot {
         let rows = match self.txn.open_table(rows_def(R::TABLE)) {
             Ok(rows) => rows,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(e) => return Err(redb_err(e)),
+            Err(e) => return Err(unscoped_open_err(R::TABLE, e)),
         };
         let mut out = Vec::new();
         for entry in rows.range(from_id..).map_err(redb_err)?.take(limit) {
