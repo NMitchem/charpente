@@ -162,6 +162,10 @@ dependencies = [
 [[package]]
 name = "edge-harness"
 version = "0.0.0"
+dependencies = [
+ "charpente-core",
+ "charpente-sim",
+]
 
 [[package]]
 name = "equivalent"

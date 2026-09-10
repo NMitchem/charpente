@@ -206,6 +206,28 @@ impl Report {
     }
 }
 
+static OPEN_FENCE_HOOK: std::sync::Once = std::sync::Once::new();
+
+/// Replaces redb's benign open-fence trace with one named line, and delegates
+/// every other panic to the previous hook untouched. Idempotent — call it from
+/// any entry point. Deliberately contains no `panicked` substring: a log grep
+/// for that word is what F1 trained agents to misuse.
+pub fn install_open_fence_hook() {
+    OPEN_FENCE_HOOK.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if charpente_core::table::in_open_fence() {
+                eprintln!(
+                    "charpente: redb open-fence engaged (benign) — the store is treated \
+                     as unopenable and Db::open rebuilds it; see Store::open"
+                );
+                return;
+            }
+            prev(info);
+        }));
+    });
+}
+
 /// Runs every test in `tests` whose name contains `args.filter` (all of them
 /// if unset) and writes a human report to `out`. Exit code: 0 green, 1 if
 /// any universe failed or a coverage requirement went unmet, 2 if the
