@@ -8,16 +8,3 @@ publish = false
 
 [lints]
 workspace = true
-
-# Test-only: `tests/open_fence.rs`'s `a_panic_outside_the_open_fence_still_prints`
-# calls `charpente_sim::harness::install_open_fence_hook()` and
-# `charpente_core::table::in_open_fence()` directly, in the RE-INVOKED child
-# process it spawns of itself, to prove the hook installed by F1's fix is not
-# a blanket mute. This does not contradict this crate's "depends on nothing
-# else in the workspace at runtime" (lib.rs's module doc): that statement is
-# about the edge rig itself driving real built binaries, never linking
-# against `charpente`; this is a test-time-only link against the sim's own
-# hook-installer, needed to reproduce F1's install site outside `charpente-sim`.
-[dev-dependencies]
-charpente-core.workspace = true
-charpente-sim = { path = "../charpente-sim" }

@@ -59,7 +59,7 @@ roadmap; do not reorder a milestone's dependency sequence.
   member's `tests/` (charpente: archive/auth/describe/group_commit/http/kernel/realtime/
   replication/tenant/transactions/typed_tables/wire; charpente-core: describe_tables/engine/
   group_commit/materialize/migrate_apply/migration_gate/migrations/store_latch;
-  charpente-sim: crash_recovery/determinism/net_partition/wal; charpente-cli: cli/ctl/
+  charpente-sim: crash_recovery/determinism/net_partition/open_fence/wal; charpente-cli: cli/ctl/
   describe/genclient/repro_meta/restore; charpente-tsgen: revive/routes/types;
   charpente-macros: trybuild; edge-harness: acked_durable/failover/hunts/open_fence/
   realtime_resume/smoke/tenant_wire; bench-harness: app/compile/compile_bench_script/harness/phase_trace;
