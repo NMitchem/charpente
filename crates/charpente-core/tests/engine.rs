@@ -24,7 +24,7 @@ use charpente_core::io::{Disk, File};
 use charpente_core::job::{JobRow, JobStatus};
 use charpente_core::log::{Wal, WalConfig};
 use charpente_core::migration::{SchemaVersion, schema_version_id};
-use charpente_core::table::{Codec, Id, IndexDef, Row, Snapshot, Store, UNSCOPED, Unscoped};
+use charpente_core::table::{Codec, Id, IndexDef, Row, Snapshot, Store, UNSCOPED, Unscoped, View};
 use charpente_sim::{FaultConfig, Sim};
 
 #[derive(Default)]
@@ -759,6 +759,309 @@ fn every_scoped_entry_point_refuses_the_scope_flip_by_name() {
     );
 }
 
+/// The mirror of `every_scoped_entry_point_refuses_the_scope_flip_by_name`
+/// above. `14863db` fixed the scoped direction at all eleven doors; the
+/// reverse — declared unscoped, physically composite-keyed — was named only
+/// in `scan_raw`/`scan_raw_from`'s arms via `scan_raw_shape_error`. Every
+/// other unscoped entry point fell through to `redb_err`, whose text is
+/// redb's own and names neither the contract, the site, nor the fix (hard
+/// rule 5).
+///
+/// `Ticket` (above) cannot stand in for the unscoped fixture: it is the
+/// SCOPED type the sibling test uses (`Row::Scope = TestOrg`). `Widget`
+/// (`type Scope = Unscoped`, declared below for
+/// `an_unscoped_index_entry_stays_byte_identical`) is the exact inverse
+/// fixture this test needs, and it already carries a secondary index.
+///
+/// `View::scan_by` is a ninth public unscoped door and is not one of the 9
+/// fixed sites (no `open_table(rows_def(` call of its own — it opens the
+/// INDEX table, and reaches the primary table only transitively through
+/// `self.get(id)?` for an id an index-range query returns), so it is not
+/// knocked on IN THIS TEST. It is pinned separately, in
+/// `view_scan_by_reaches_the_reverse_flip_through_a_crafted_scope_collision`
+/// below, because reaching it needs a different disk state (a genuinely
+/// scoped `put`, not `put_raw`) and a second fixture — see that test's doc
+/// comment for why the door IS reachable: an earlier version of this
+/// comment claimed it could never be reached, and that claim was FALSE,
+/// disproved by review with a working probe. Do not re-derive that
+/// "unreachable" conclusion from first principles without re-reading the
+/// sibling test first.
+#[test]
+fn every_unscoped_entry_point_refuses_the_reverse_flip_by_name() {
+    let sim = Sim::with_faults(0x7A2E_000B, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    // `Widget` is declared WITHOUT scoped_by. Writing it composite-keyed is
+    // the disagreement under test — the exact inverse of the scoped test
+    // above, which writes bare and then reads scoped.
+    store
+        .apply(0, |w| w.put_raw(Widget::TABLE, Some(10), 5, b"old"))
+        .expect("a scoped put must not error");
+
+    fn names_the_contract(err: &io::Error, site: &str) {
+        let s = err.to_string();
+        assert!(
+            s.contains("is declared without scoped_by but its rows are keyed with a tenant scope"),
+            "{site} must name the reverse-flip contract, got: {s}"
+        );
+        assert!(
+            s.contains("a table cannot lose a scope in place"),
+            "{site} must name the fix, got: {s}"
+        );
+    }
+
+    // The unscoped readers are `View` trait methods on `Snapshot`
+    // (`crates/charpente-core/src/table.rs:1415-1496`); `View` must be in
+    // scope (imported above alongside `Snapshot`).
+    let snap = store.snapshot().unwrap();
+    names_the_contract(
+        &snap
+            .get::<Widget>(Id::from_raw(5))
+            .expect_err("must refuse the reverse flip"),
+        "View::get",
+    );
+    names_the_contract(
+        &snap
+            .scan::<Widget>()
+            .expect_err("must refuse the reverse flip"),
+        "View::scan",
+    );
+    names_the_contract(
+        &snap
+            .scan_from::<Widget>(0, 10)
+            .expect_err("must refuse the reverse flip"),
+        "View::scan_from",
+    );
+    drop(snap);
+
+    // Every writer arm below fails before commit, so `applied_seq` stays 0
+    // and each attempt is the same gapless seq 1 — the same reasoning the
+    // scoped test above records at its writer block.
+    names_the_contract(
+        &store
+            .apply(1, |w| w.get_raw(Widget::TABLE, None, 5))
+            .expect_err("must refuse the reverse flip"),
+        "Writer::get_raw",
+    );
+    names_the_contract(
+        &store
+            .apply(1, |w| w.put_raw(Widget::TABLE, None, 6, b"new"))
+            .expect_err("must refuse the reverse flip"),
+        "Writer::put_raw",
+    );
+    names_the_contract(
+        &store
+            .apply(1, |w| w.delete_raw(Widget::TABLE, None, 5))
+            .expect_err("must refuse the reverse flip"),
+        "Writer::delete_raw",
+    );
+    names_the_contract(
+        &store
+            .apply(1, |w| w.delete::<Widget>(UNSCOPED, Id::from_raw(5)))
+            .expect_err("must refuse the reverse flip"),
+        "Writer::delete",
+    );
+    names_the_contract(
+        &store
+            .apply(1, |w| w.rebuild_indexes_for::<Widget>())
+            .expect_err("must refuse the reverse flip"),
+        "Writer::rebuild_indexes_for",
+    );
+    names_the_contract(
+        &store
+            .apply(1, |w| {
+                w.put(
+                    UNSCOPED,
+                    &Widget {
+                        id: Id::from_raw(6),
+                        n: 42,
+                    },
+                )
+            })
+            .expect_err("must refuse the reverse flip"),
+        "Writer::put",
+    );
+}
+
+/// Exists only to open `Ticket::TABLE` ("test.ticket") through the
+/// UNSCOPED door once an ordinary scoped `put` has physically created it
+/// composite-keyed — what
+/// `view_scan_by_reaches_the_reverse_flip_through_a_crafted_scope_collision`
+/// needs. `index_table_name` keys the physical index table purely off
+/// `R::TABLE` and `index.name`, never the Rust type
+/// (`crates/charpente-core/src/table.rs`'s `index_table_name`), so this
+/// type's `by_n` index reads the exact same physical index table `Ticket`'s
+/// `by_n` index writes. `decode_row` is never reached in that test: the
+/// primary-table open fails (by design — that is the assertion) before any
+/// bytes are decoded. `#[derive(Debug)]` for the same reason `Ticket`/
+/// `Widget` need it: `Result::expect_err` requires the `Ok` side
+/// (`Vec<TicketViaUnscopedDoor>`) to be `Debug`.
+#[derive(Debug)]
+struct TicketViaUnscopedDoor {
+    id: Id<TicketViaUnscopedDoor>,
+    n: u32,
+}
+
+impl Row for TicketViaUnscopedDoor {
+    type Scope = Unscoped;
+    const TABLE: &'static str = Ticket::TABLE;
+    const INDEXES: &'static [IndexDef<TicketViaUnscopedDoor>] = &[IndexDef {
+        name: "by_n",
+        key: |t, out| t.n.encode(out),
+    }];
+
+    fn id(&self) -> Id<TicketViaUnscopedDoor> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.n.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<TicketViaUnscopedDoor> {
+        let input = &mut &bytes[..];
+        let id = Id::decode(input)?;
+        let n = u32::decode(input)?;
+        Ok(TicketViaUnscopedDoor { id, n })
+    }
+}
+
+/// `View::scan_by`'s own `open_table` call is on the INDEX table
+/// (`index_def`), never the primary rows table, so it cannot surface the
+/// reverse-flip `TableTypeMismatch` directly — it only reaches the primary
+/// table transitively, through `self.get(id)?` for an id an index-range
+/// query returns. In the ORDINARY case that never happens for a genuinely
+/// scoped write, because `scoped_index_entry` prefixes every entry with an
+/// 8-byte big-endian `scope`: those bytes sort outside `scan_by`'s unscoped
+/// range for a typical scope/key pair, so the range query returns nothing
+/// and `self.get` is never called. `scoped_index_entry_layout_is_scope_be_
+/// then_keylen_le_then_key_then_id_be`'s own doc comment
+/// (`crates/charpente-core/src/table.rs`) already names the fragility here:
+/// "writer and reader agree under a coordinated re-encoding (little-endian
+/// scope, or scope moved after the key)" — i.e. this is a BYTE-LAYOUT
+/// PROPERTY of the current encoding, not a seal on the door. Nothing in the
+/// type system or the write path forbids a scope value whose big-endian
+/// bytes happen to coincide with `index_entry`'s `[keylen_le][key]` prefix
+/// for some query.
+///
+/// This test constructs exactly that coincidence rather than arguing it is
+/// impossible (an earlier version of the sibling test's doc comment argued
+/// exactly that, and was wrong — review disproved it with this same
+/// construction): `key = 42u32` encodes little-endian to `[0x2A, 0x00,
+/// 0x00, 0x00]`, and `keylen_le` for that 4-byte key is `4u32.to_le_bytes()
+/// = [0x04, 0x00, 0x00, 0x00]`. `scan_by`'s unscoped range for querying
+/// `42u32` is bounded by `[keylen_le][key][id=0..=u64::MAX]`, i.e. both
+/// bounds share the leading 8 bytes `[0x04,0x00,0x00,0x00,0x2A,0x00,0x00,
+/// 0x00]`. Choosing `scope = 0x0400_0000_2A00_0000` (whose `to_be_bytes()`
+/// is exactly those same 8 bytes) makes ANY scoped index entry written
+/// under that scope fall inside `scan_by`'s range for `42u32`, regardless
+/// of the entry's own key or id bytes: the entry's 9th byte (the first byte
+/// of ITS OWN `keylen_le`, which is `0x04` for any 4-byte index key) sorts
+/// strictly between the range's lower bound's corresponding byte (`0x00`,
+/// from id=0) and its upper bound's (`0xFF`, from id=`u64::MAX`).
+///
+/// The write below — `w.put(scope, &Ticket { .. })` — is an ORDINARY
+/// scoped `put`, not a contrived raw write: this is exactly the disk state
+/// `14863db`'s fix and this task's fix both already handle correctly at
+/// every OTHER door. Reaching the primary table this way still meets the
+/// same `unscoped_open_err` every other unscoped door gives, so the fix
+/// holds — but that conclusion needed proving with a working construction,
+/// not arguing from a false "cannot be populated" premise.
+#[test]
+fn view_scan_by_reaches_the_reverse_flip_through_a_crafted_scope_collision() {
+    let sim = Sim::with_faults(0x7A2E_000C, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    let scope = 0x0400_0000_2A00_0000u64;
+    store
+        .apply(0, |w| {
+            w.put(
+                scope,
+                &Ticket {
+                    id: Id::from_raw(5),
+                    n: 42,
+                },
+            )
+        })
+        .expect("an ordinary scoped put must not error");
+
+    let snap = store.snapshot().unwrap();
+    let err = snap
+        .scan_by::<TicketViaUnscopedDoor>("by_n", &42u32)
+        .expect_err("the crafted-scope entry must route scan_by into the reverse flip");
+    let s = err.to_string();
+    assert!(
+        s.contains("is declared without scoped_by but its rows are keyed with a tenant scope"),
+        "View::scan_by must name the reverse-flip contract, got: {s}"
+    );
+    assert!(
+        s.contains("a table cannot lose a scope in place"),
+        "View::scan_by must name the fix, got: {s}"
+    );
+}
+
+/// Task 3 fix round 1, Important 2: `scan_raw`/`scan_raw_from`'s SCOPED
+/// branch already routed every open failure through `scoped_open_err` (the
+/// confident, named message) for any error, `TableTypeMismatch` included.
+/// Their UNSCOPED branch did not match this: it routed every error,
+/// `TableTypeMismatch` included, through `scan_raw_shape_error`'s vaguer
+/// "neither shape opened it", which names neither the contract nor the fix.
+/// So two of the twelve unscoped-open sites answered this exact
+/// disagreement with a different message than the other nine and nothing
+/// pinned that as deliberate — the same per-site divergence shape hard rule
+/// 5 exists to close, and the one `14863db`'s own commit message calls out
+/// as "exactly what let the forward gap open unnoticed."
+///
+/// `TableTypeMismatch` now routes through the same `unscoped_open_err`
+/// every other unscoped door uses; `scan_raw_shape_error` remains only for
+/// whatever else `open_table` could return there — a case this test does
+/// not construct, since it is a materially different condition (genuine
+/// doubt about which shape was expected, not a confirmed disagreement).
+#[test]
+fn scan_raw_and_scan_raw_from_unscoped_branch_name_the_reverse_flip_too() {
+    let sim = Sim::with_faults(0x7A2E_000D, FaultConfig::none());
+    let store = Store::open(&sim.disk(), "store.redb").unwrap();
+
+    store
+        .apply(0, |w| w.put_raw(Widget::TABLE, Some(10), 5, b"old"))
+        .expect("a scoped put must not error");
+
+    let snap = store.snapshot().unwrap();
+
+    let err = snap.scan_raw(Widget::TABLE, false).unwrap_err();
+    let s = err.to_string();
+    assert!(
+        s.contains("is declared without scoped_by but its rows are keyed with a tenant scope"),
+        "scan_raw's unscoped branch must name the reverse-flip contract, got: {s}"
+    );
+    assert!(
+        s.contains("a table cannot lose a scope in place"),
+        "scan_raw's unscoped branch must name the fix, got: {s}"
+    );
+    assert!(
+        !s.contains("neither the scoped composite-key shape"),
+        "scan_raw's unscoped branch must no longer answer a TableTypeMismatch with the vague \
+         both-shapes-failed message now that it has a confident answer, got: {s}"
+    );
+
+    let err2 = snap
+        .scan_raw_from(Widget::TABLE, false, None, 10)
+        .unwrap_err();
+    let s2 = err2.to_string();
+    assert!(
+        s2.contains("is declared without scoped_by but its rows are keyed with a tenant scope"),
+        "scan_raw_from's unscoped branch must name the reverse-flip contract, got: {s2}"
+    );
+    assert!(
+        s2.contains("a table cannot lose a scope in place"),
+        "scan_raw_from's unscoped branch must name the fix, got: {s2}"
+    );
+    assert!(
+        !s2.contains("neither the scoped composite-key shape"),
+        "scan_raw_from's unscoped branch must no longer answer a TableTypeMismatch with the \
+         vague both-shapes-failed message now that it has a confident answer, got: {s2}"
+    );
+}
+
 /// Task 4's central claim, and the only test that goes red when it stops
 /// being true: the SCOPE reaches the stored key. A 16-byte key alone proves
 /// nothing — `scoped_key(UNSCOPED, id)` is also 16 bytes — so this pins the
@@ -1384,9 +1687,13 @@ fn a_scoped_index_lookup_cannot_see_another_tenants_rows() {
 }
 
 /// A hand-written UNSCOPED `Row` with one secondary index — the
-/// byte-identity fixture for `an_unscoped_index_entry_stays_byte_identical`.
-/// Needs its own type because core's other hand-written `Row` impls
-/// (`JobRow`, `EventRow`) both declare `INDEXES: &[]`.
+/// byte-identity fixture for `an_unscoped_index_entry_stays_byte_identical`,
+/// and also the unscoped fixture `every_unscoped_entry_point_refuses_the_
+/// reverse_flip_by_name` reads back through `View::get`/`scan`/`scan_from`
+/// (hence `#[derive(Debug)]`: `Result::expect_err` needs the Ok side to be
+/// `Debug`). Needs its own type because core's other hand-written `Row`
+/// impls (`JobRow`, `EventRow`) both declare `INDEXES: &[]`.
+#[derive(Debug)]
 struct Widget {
     id: Id<Widget>,
     n: u32,

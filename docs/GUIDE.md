@@ -5510,7 +5510,7 @@ Four properties make this a capability rather than an escape hatch:
 
 The scope is part of the row key, so it travels the whole way down: WAL effect
 records, replication frames, the archive, `charpente restore`, follower
-snapshot seeding, and `migrate_schema`'s resume watermark all carry it. Two
+snapshot seeding, and `migrate_schema`'s resume watermark all carry it. Three
 consequences you may meet:
 
 - **A table cannot gain a scope in place.** Adding `scoped_by` to a table that
@@ -5518,6 +5518,14 @@ consequences you may meet:
 
   ```text
   table "Memo" is declared scoped_by but its rows are keyed unscoped: a table cannot gain a scope in place; create a new scoped table and copy rows through a job
+  ```
+
+- **A table cannot lose a scope in place, either.** Removing `scoped_by` from
+  a table that already holds scope-keyed rows is refused the same way, not
+  silently read back as a different tenant's `id`:
+
+  ```text
+  table "Doc" is declared without scoped_by but its rows are keyed with a tenant scope: a table cannot lose a scope in place; declare it scoped_by, or create a new unscoped table and copy rows through a job
   ```
 
 - **A binary compiled against the wrong shape refuses the record by name.** A
