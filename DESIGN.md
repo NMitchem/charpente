@@ -1571,4 +1571,10 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
    handler-body edit and 515 ms for a schema edit, with only 1.18x between them. One
    reading, one laptop, one small app, n=3 is not a cross-platform claim, and it does not
    decompose those 436 ms into macro expansion, typecheck, codegen and link — so it sizes
-   no mitigation on its own. The prebuilt-dylib item itself stays open.
+   no mitigation on its own. **The prebuilt-dylib item is dropped (Noah, 2026-09-09).** Its
+stated mechanism — "app iteration recompiles app code only" — is already what cargo does:
+every incremental observation in that run rebuilt exactly one crate, the app's. What a
+dylib could still reach is the clean build, which is a CI-checkout cost rather than the
+dev-loop risk this item was opened against. Reopening it on inner-loop grounds needs the
+decomposition that reading does not have: split the 436 ms into macro expansion,
+typecheck, codegen and link, and show link dominant.

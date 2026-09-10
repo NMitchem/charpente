@@ -4383,3 +4383,51 @@ One reading, one machine, one app, one profile:
 Nothing was built here, and nothing should be: the sub-project's scope stops at the
 number and this verdict. The prebuilt dylib, cranelift hot reload, and any performance
 work these figures suggest are separate sub-projects that this one's output authorizes.
+
+## 2026-09-09 — the prebuilt dylib is dropped
+
+Noah ruled: the prebuilt-platform-dylib item in PLAN's M2 list and DESIGN §9.5 is
+**dropped**, not re-scoped, closing the question the entry above left open on the same
+day. Landed in `PLAN.md` (the M2 bullet and the compile-latency risk row's Mitigation
+column) and `DESIGN.md` §9.5 in the same commit as this entry.
+
+**The ruling rests on the same two grounds the reading above already established.**
+First, the item's stated mechanism — "app iteration recompiles app code only" — is not a
+gap a dylib would close; it is what cargo's fingerprinting already does, proven by all
+nine incremental observations in the 2026-09-09 run printing exactly one `Compiling`
+line, every one of them `invoicing`. Second, what headroom the item still has is the
+once-per-checkout clean build (37.63 s of compiler CPU across 67 crates), which is a
+CI-checkout cost, not the dev-loop adoption risk PLAN opened the item against.
+
+**The two grounds split on size, and only one of them travels with a bigger app.**
+"App iteration recompiles app code only" is size-independent — a property of cargo's
+fingerprinting, not of `invoicing` being small — so it holds at any app size. The 436 ms
+inner loop is the opposite: size-dependent, and its growth lands inside the app crate. A
+platform dylib does not compile the app crate, so a larger app makes the inner loop worse
+exactly where this mitigation cannot reach. Growing app size is an argument for work
+inside the app crate, not for the dylib.
+
+**DECISIONS check: no contradiction, one thread retired.** DECISIONS §9's license
+reasoning rests on apps linking against the platform and compiling into one binary, so
+"the platform *is* the app's binary." A separately-shipped platform dylib would have
+weakened that supporting argument without reversing its conclusion — the adjacency the
+entry above flagged and left for whoever reopened the dylib to inherit. Dropping the item
+retires that thread; nothing in §9 needs reopening.
+
+**An upper bound on what a dylib could have bought the inner loop, from published
+figures rather than new measurement.** Link is serial; the handler-body build sustained
+4.19–4.23x parallelism over 436.1 ms at 1.838 s of compiler CPU. Treating the build as a
+parallel region plus a serial link of duration `s`, `C <= P(w-s) + s` gives `s <= 309 ms`
+at a theoretical 12-core ceiling and `s <= 187 ms` at the 6.62x this run actually
+observed in its clean builds. This is arithmetic over BENCH.md's table, **not a
+measurement**, and BENCH.md is right that its table sizes no mitigation — an upper bound
+can only flatter the dylib, which is why it is usable here: even granting the generous
+ceiling, and even pretending a dylib eliminates link time rather than changing it, the
+inner loop lands near 250 ms instead of 436 ms. That is not an adoption risk being
+retired. It is not a quotable number and does not belong in BENCH.md.
+
+**What this does not settle.** The ruling closes the PLAN and DESIGN item; it does not
+retroactively strengthen the reading it closes on. That reading was one laptop, one small
+app, `dev` profile, n=3, and it did not decompose the 436 ms into macro expansion,
+typecheck, codegen and link — so whether link dominates that number, the one route by
+which a dylib could still matter to the inner loop, remains unmeasured.

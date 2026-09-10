@@ -181,8 +181,14 @@ picks up and `cargo test --workspace` also skipped. First runner execution 2026-
 - **Typed telemetry with change-time checks** — the observability contract as a lockfile;
   instrumentation that cannot silently rot.
 - **Read-only Postgres-wire endpoint** for BI tools.
-- **Compile-latency work:** platform-as-prebuilt-dylib; optionally cranelift hot reload for
-  handlers if it proves out.
+- **Compile-latency work: DROPPED 2026-09-09**, on the reading in docs/BENCH.md
+  "Compile latency (2026-09-09)". The prebuilt-platform-dylib item was justified on the
+  inner loop, and the inner loop is not where the cost is: its stated mechanism — "app
+  iteration recompiles app code only" — is already delivered by cargo's fingerprinting,
+  proven by 9 of 9 incremental observations printing exactly one `Compiling` line, every
+  one of them `invoicing`. Its residual headroom is the once-per-checkout clean build,
+  which is a CI-checkout cost and not this item's justification. Cranelift hot reload
+  stays an open question in DESIGN §9.1, unchanged and unpromoted.
 - **Hosted control plane** — if this becomes a company: managed replicas, backups,
   failover, metrics. The binary stays fully self-hostable; the moat is the platform, the
   business is not-having-to-operate-it.
@@ -191,7 +197,7 @@ picks up and `cargo test --workspace` also skipped. First runner execution 2026-
 
 | Risk | Read | Mitigation |
 |---|---|---|
-| Rust compile latency poisons the dev loop | **Measured 2026-09-09, and smaller than the bet assumed** — on one 12-core laptop, `dev` profile, against `examples/invoicing`: the inner loop an agent actually meets is 436 ms (handler-body edit) and 515 ms (schema edit); only the once-per-checkout clean build is expensive, at 5.97 s wall / 37.6 s compiler CPU | Prebuilt platform dylib; cranelift hot reload later; toolchains are improving underneath us. The "measure app-only incremental times in M0" mitigation **did not happen in M0**: an instrument landed 2026-09-07 (`bench-harness` `compile`/`compile_accounting`), its first reading was refused in full, and the accepted reading came on 2026-09-09. The number, its conditioning and every refusal along the way are in docs/BENCH.md, "Compile latency (2026-09-09)" — read the three phases together, because no one of them is "the compile time". One laptop, one small app, `dev`, n=3 moves this row from "unmeasured" to "measured once", not to "closed". |
+| Rust compile latency poisons the dev loop | **Measured 2026-09-09, and smaller than the bet assumed** — on one 12-core laptop, `dev` profile, against `examples/invoicing`: the inner loop an agent actually meets is 436 ms (handler-body edit) and 515 ms (schema edit); only the once-per-checkout clean build is expensive, at 5.97 s wall / 37.6 s compiler CPU | Prebuilt platform dylib **dropped 2026-09-09** — see the M2 list above; cranelift hot reload remains an open question, not a scheduled mitigation; toolchains are improving underneath us. The "measure app-only incremental times in M0" mitigation **did not happen in M0**: an instrument landed 2026-09-07 (`bench-harness` `compile`/`compile_accounting`), its first reading was refused in full, and the accepted reading came on 2026-09-09. The number, its conditioning and every refusal along the way are in docs/BENCH.md, "Compile latency (2026-09-09)" — read the three phases together, because no one of them is "the compile time". One laptop, one small app, `dev`, n=3 moves this row from "unmeasured" to "measured once", not to "closed". |
 | Storage engine is the hardest 20% | Real, why it's staged | redb first; own engine only after the sim harness can prove it; the harness is the safety equipment |
 | "No await in transactions" alienates users | Real for humans, smaller for agents | Docs sell the constraint as the feature it is; queue idiom must be *excellent* and heavily exampled |
 | Single-writer throughput ceiling | Overrated | No network hop between logic and data; TigerBeetle/Redis-class evidence; publish honest benchmarks early |
