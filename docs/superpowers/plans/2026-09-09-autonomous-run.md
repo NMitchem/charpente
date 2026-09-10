@@ -182,7 +182,22 @@ The replacement line deliberately contains **no `panicked` substring**, because 
 **Files:**
 - Modify: `crates/charpente-core/src/table.rs:757-796` (`Store::open` and its new thread-local)
 - Modify: `crates/charpente-sim/src/harness.rs` (hook installation)
-- Test: `crates/charpente/tests/transactions.rs` (the two existing fence regressions at `:1282` and `:1433`)
+- Create: `crates/edge-harness/tests/open_fence.rs` (the end-to-end output oracle)
+- Modify: `CLAUDE.md` (add `open_fence` to the exhaustive `edge-harness` suite list)
+- Test (mechanism only, no child process): `crates/charpente-core/tests/engine.rs`
+- Read: `crates/charpente/tests/transactions.rs:1282` and `:1433` — the two existing
+  deterministic fence regressions the child process drives. **Not modified.**
+
+> **Controller ruling (pre-flight).** The output oracle does NOT live in
+> `crates/charpente/tests/transactions.rs`. It calls `std::process::Command::new`, which is
+> on the clippy deny-list (`clippy.toml`: "ambient process spawning — edge tooling only
+> (charpente-cli); nothing inside the deterministic boundary spawns processes"), and clippy
+> runs `--workspace --all-targets` as a Global Constraint of this plan — the test would fail
+> its own gate. It lands in `crates/edge-harness/tests/open_fence.rs` instead, the crate
+> CLAUDE.md calls the "black-box wire rig outside the deterministic boundary", using the
+> file-level allow that crate already uses at `tests/failover.rs:38`. Do NOT put a
+> file-level allow on `transactions.rs` — that would disable the fence across a large
+> existing suite to spare one test a move.
 
 **Interfaces:**
 - Consumes: nothing from other tasks.
@@ -201,7 +216,14 @@ cd ../charpente-f1 && git log --oneline -1 && echo "target=$CARGO_TARGET_DIR"
 
 - [ ] **Step 2: Write the failing test — observe the trace RED**
 
-Add to `crates/charpente/tests/transactions.rs`. The two existing regressions at `:1282` and `:1433` already drive the fence deterministically; this asserts on what reaches stderr while they do.
+Create `crates/edge-harness/tests/open_fence.rs`. The two existing regressions in
+`crates/charpente/tests/transactions.rs` (`:1282`, `:1433`) already drive the fence
+deterministically; this runs one as a child and asserts on what reaches its stderr.
+The file opens with the allow that `edge-harness` already uses crate-wide:
+
+```rust
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+```
 
 ```rust
 /// F1: the fence catches redb's open-time assert, but the DEFAULT panic hook
@@ -252,12 +274,14 @@ fn open_fence_does_not_print_a_raw_redb_panic_trace() {
 }
 ```
 
-Guard the child so it cannot recurse: at the top of the new test, `if std::env::var("CHARPENTE_F1_CHILD").is_ok() { return; }`.
+The child runs a test in a DIFFERENT crate (`-p charpente`), so it cannot re-enter this
+test and no recursion guard is needed. Keep the `CHARPENTE_F1_CHILD` env var anyway as a
+marker the child's own output can be attributed to.
 
 - [ ] **Step 3: Run it and confirm it fails for the stated reason**
 
 ```bash
-cd ../charpente-f1 && cargo test -p charpente --test transactions \
+cd ../charpente-f1 && cargo test -p edge-harness --test open_fence \
   open_fence_does_not_print_a_raw_redb_panic_trace -- --nocapture 2>&1 | tee /tmp/f1-red.log
 echo "exit=${pipestatus[1]}"
 ```
@@ -370,7 +394,7 @@ Call it at the top of `run_batch` (`crates/charpente-sim/src/harness.rs:306`) an
 - [ ] **Step 7: Run the new test and confirm it passes**
 
 ```bash
-cd ../charpente-f1 && cargo test -p charpente --test transactions \
+cd ../charpente-f1 && cargo test -p edge-harness --test open_fence \
   open_fence_does_not_print_a_raw_redb_panic_trace -- --nocapture 2>&1 | tee /tmp/f1-green.log
 echo "exit=${pipestatus[1]}"
 ```
@@ -379,7 +403,7 @@ Expected: PASS.
 
 - [ ] **Step 8: Prove the hook still reports a REAL panic**
 
-A fix that silences everything would pass Step 7 and be far worse than the bug. Add and run:
+A fix that silences everything would pass Step 7 and be far worse than the bug. Add to the same `crates/edge-harness/tests/open_fence.rs` and run:
 
 ```rust
 /// The fence must not become a blanket mute. A panic OUTSIDE the fence still
@@ -393,7 +417,7 @@ fn a_panic_outside_the_open_fence_still_prints() {
     }
     let out = std::process::Command::new(env!("CARGO"))
         .args([
-            "test", "-p", "charpente", "--test", "transactions",
+            "test", "-p", "edge-harness", "--test", "open_fence",
             "a_panic_outside_the_open_fence_still_prints", "--", "--nocapture", "--exact",
         ])
         .env("CHARPENTE_F1_PANIC_CHILD", "1")
@@ -431,7 +455,8 @@ cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tee /tmp/f1-clippy.
 cargo test -p charpente --no-fail-fast 2>&1 | tee /tmp/f1-charpente.log
 cargo test -p charpente-core --no-fail-fast 2>&1 | tee /tmp/f1-core.log
 cargo test -p charpente-sim --no-fail-fast 2>&1 | tee /tmp/f1-sim.log
-for f in /tmp/f1-charpente.log /tmp/f1-core.log /tmp/f1-sim.log; do
+cargo test -p edge-harness --no-fail-fast 2>&1 | tee /tmp/f1-edge.log
+for f in /tmp/f1-charpente.log /tmp/f1-core.log /tmp/f1-sim.log /tmp/f1-edge.log; do
   echo "$f ok=$(grep -c '^test result: ok' $f) failed=$(grep -c 'FAILED' $f)"
 done
 ```
@@ -450,10 +475,24 @@ grep -c "redb open-fence engaged" /tmp/f1-batch.log || echo "0 fence lines"
 
 Expected: exit 0, **0** `page_manager.rs` lines. The fence-engaged count may be zero if this batch never trips it — that is not evidence of a fix, only the absence of a counter-example, and must be reported as such.
 
+- [ ] **Step 11b: Add the new suite to CLAUDE.md's exhaustive list**
+
+CLAUDE.md's per-crate suite lists are exhaustive by contract, and `guide-examples`'
+`doc_inventory` gate enforces it — a new suite file that is not listed fails the gate.
+Add `open_fence` to the `edge-harness` list (currently
+`acked_durable/failover/hunts/realtime_resume/smoke/tenant_wire`), keeping alphabetical
+order, then confirm:
+
+```bash
+cd ../charpente-f1 && cargo test -p guide-examples --no-fail-fast 2>&1 | tee /tmp/f1-inventory.log
+echo "ok=$(grep -c '^test result: ok' /tmp/f1-inventory.log)"
+```
+
 - [ ] **Step 12: Commit named paths only**
 
 ```bash
-git add crates/charpente-core/src/table.rs crates/charpente-sim/src/harness.rs crates/charpente/tests/transactions.rs
+git add crates/charpente-core/src/table.rs crates/charpente-sim/src/harness.rs \
+        crates/edge-harness/tests/open_fence.rs crates/charpente-core/tests/engine.rs CLAUDE.md
 git status --porcelain
 git commit -F /tmp/f1-msg.txt
 git log --oneline -1
