@@ -389,7 +389,21 @@ pub fn install_open_fence_hook() {
 }
 ```
 
-Call it at the top of `run_batch` (`crates/charpente-sim/src/harness.rs:306`) and from the `run_universes!` runner's entry, so both the CLI batch path and the in-test path install it.
+**Install it from `Sim::with_faults` (`crates/charpente-sim/src/lib.rs:572`), NOT from
+`run_batch`.** Controller ruling, pre-flight: the deterministic fence regressions this task's
+oracle drives construct `Sim::with_faults(...)` **directly** — they never enter `run_batch`
+or `run_universes!`. Installing only at those entry points would leave the hook uninstalled
+in the child process, and Step 7 would fail even after a correct implementation.
+`Sim::new` (`:568`) funnels into `Sim::with_faults`, so `with_faults` is the single
+constructor funnel and covers every path: direct construction, the CLI batch, and the
+in-test runner alike.
+
+This scoping is correct rather than merely convenient. The 134-line flood F1 describes is a
+*simulation* artifact — benign traces from faults the simulator injected on purpose. In
+production a fenced redb open-panic is a genuinely notable event and printing it is right,
+so the filter belongs where the simulator is, not inside `Store::open`. Do NOT install the
+hook from `charpente-core`: that would put process-global mutation inside the deterministic
+boundary.
 
 - [ ] **Step 7: Run the new test and confirm it passes**
 
@@ -446,7 +460,18 @@ The two hashes must differ only by the intended edit; run this from the worktree
 
 - [ ] **Step 10: Full-package verification, foregrounded**
 
-Expected before running: exit 0 and **11** `test result: ok` lines for `-p charpente` (verify against a `main` baseline run first if the count is unknown; an unreconciled delta is a finding).
+Expected before running, measured on `main` at `b15cdc7` by the controller and to be
+reconciled exactly:
+
+| package | baseline `test result: ok` | expected after this task | why |
+|---|---|---|---|
+| `charpente-core` | 10 | **10** | mechanism tests join the existing `engine` suite; no new binary |
+| `charpente` | 14 | **14** | `transactions.rs` is read, not modified |
+| `charpente-sim` | 6 | **6** | `harness.rs` gains a function, no new test binary |
+| `edge-harness` | 8 | **9** | the new `open_fence.rs` is one new test binary |
+
+`test result: ok` counts test BINARIES, not individual tests. An unreconciled delta is a
+finding, not a rounding error.
 
 ```bash
 cd ../charpente-f1
