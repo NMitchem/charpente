@@ -4749,3 +4749,71 @@ silently, and the floor accumulates slack silently unless every new pin touches 
 
 **Not settled.** The fifteen one-sided WAL properties the 2026-09-10 sweep queued
 (`log.rs:504`'s three survivors first) are the next sub-project; nothing here touched them.
+
+## 2026-09-12 — instrument hygiene: the refusal's dead end, and a census that sees through blanket allows
+
+Bounded work, designed in chat and implemented by the controller with TDD rather than through a
+plan — four commits on `instrument-hygiene` off `d61dbeb` (two of work, one closing a hole the
+controller found in its own gate, one review round), one opus review, merged `6694db8`
+(`--no-ff`) and pushed. The workspace is `.superpowers/sdd/2026-09-12-instrument-hygiene/`.
+
+**The `--mutants` verb created a dead end and then misnamed it.** `9164ea0`. Under an exported
+`CARGO_TARGET_DIR` the workspace's `./target` never exists; cargo-mutants needs `--output`'s
+parent to exist and dies with `create output parent directory "./target/charpente-mutants"`;
+and the verb — which ignores the tool's exit code for the verdict *on purpose*, because 0 is
+both a clean sweep and a filter that matched nothing — then reported "the usual cause is a
+`--file` or `--re` that matched no mutants". The wrong cause, in the one message the operator
+reads (hard rule 5). The 2026-09-10 sweep had worked around it with a hand `mkdir -p`, and the
+refusal merged in `41624bc` sends operators straight at it with "run with `--jobs 1`". The verb
+now creates the `--output` path it chose, and reads the exit code in exactly one place: with no
+`outcomes.json` at all, exit 0 is the filter shape, any other exit is "cargo-mutants exited N
+before measuring anything — its own error is printed above this line", and a signal says so.
+The verdict stays exit-code-blind. RED was observed through the real binary against a five-line
+`cargo` shell shim placed first on `PATH` — CI installs no cargo-mutants, and the tool's real
+error shape is already on record verbatim — which records whether the output dir existed when
+it was called and exits on command: shim exit 1 → the old verb blamed the filter; the dir was
+`missing`. After: three mutations, three named REDs (drop `create_dir_all`; sever the code in
+`report()`; delete the exit-0 arm). The test harness had its own defect first — two tests
+sharing a scratch name by pid and deleting each other's directory in parallel — a counter fixed
+it.
+
+**One installer, held by a walk.** `c45fae7`. `clippy.toml`'s `set_hook`/`take_hook` entries
+(mechanical fences, Item 1) are inert inside any file carrying a blanket
+`#![allow(clippy::disallowed_methods)]` — 36 files by attribute line, the edge-harness/
+prod/serve surface and a few modules; the entry above says 42, which was a naive grep that
+counted comment mentions, four of them the bench-harness accounting files that carry NO
+suppression on purpose — so there the invariant was review-held.
+`guide-examples/tests/hook_census.rs` walks every `.rs` under `crates/` and `examples/` and
+asserts the only non-comment call sites are the two inside `install_open_fence_hook`. The RED
+that justifies it, observed: a scratch `set_hook` in `edge-harness/src/proxy.rs` — `cargo
+clippy --workspace --all-targets -- -D warnings` **exit 0, silent**; the census red naming
+`proxy.rs:197`. Getting that observation took three placements, and the first two failed on
+*other* lints (`items_after_test_module`, then a `dead_code` from landing between
+`#[cfg(test)]` and its module) — a clippy exit 101 that is not the lint you are testing is not
+the observation, and reading the error text is what separated them. The gate self-hit six times
+on its first run (its own fixtures carry the pattern by construction) and excludes its own
+file, the exclusion `doc_truth.rs` learned the same week. `doc_inventory` refused the new
+binary's absence from CLAUDE.md before the name was added — the inventory gate doing its job on
+the gate that joined it. The gate's first reading of "inside the sanctioned function" was the
+nearest column-zero `fn` above a call site, and an indented `impl` method in `harness.rs` has
+none of its own, so a second installer there would have read as sanctioned and only the exact
+count `== 2` would have objected — with a message inviting the count to be raised. `3b0178f`:
+the enclosing item is the nearest column-zero line that opens anything, RED on a fixture and
+then on the real tree (a scratch impl method now named at its line as "elsewhere"). Review
+(opus) found three sentences the code disproved (`edab1a9`): the exit-N diagnosis said "not a
+filter" when a malformed `--re` also exits 1 with no outcomes — it now defers to the tool's own
+line and the absence of the over-claim is pinned; `report()`'s doc still said the exit code is
+"deliberately NOT consulted"; the 42. Minors ledgered, not fixed: a relative non-`.` `--dir`
+double-applies the path (pre-existing), and `--dir <member>` now leaves
+`<member>/target/charpente-mutants` untracked under a root-only `/target` ignore where it used
+to dead-end — the output dir belongs under the workspace root (`cargo locate-project
+--workspace`), a later change.
+
+**The gate.** `cargo fmt --all --check` 0, `cargo clippy --workspace --all-targets -- -D
+warnings` 0, `cargo test --workspace --no-fail-fast`: **84** `test result: ok` / 0 FAILED,
+counted in the worktree at `c45fae7` and again in the main tree on the merge commit, predicted
+from 83 plus the one new binary.
+
+**Next.** The fifteen one-sided WAL properties the 2026-09-10 sweep queued (`log.rs:504`'s
+three survivors first): the instrument they need is now usable from a worktree without a hand
+`mkdir`, and refuses the one configuration that lies.
