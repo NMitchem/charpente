@@ -73,3 +73,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: ./scripts/edge-harness.sh
+      # The rig's reproduction IS the scenario script it records (DESIGN §7:
+      # "no seed promise here"), and on failure `run_oracle` preserves that
+      # script and both data dirs deliberately — under `/tmp`, on a runner
+      # that is discarded minutes later. Three nightlies (2026-09-09, -11, -12)
+      # reddened with their primary evidence already gone, so the diagnosis had
+      # to be rebuilt from the panic line alone. Failure-only: a green run
+      # deletes its own directories, so there is nothing to upload.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge-harness-scenarios-${{ github.run_id }}
+          path: /tmp/edge-harness-*
+          if-no-files-found: warn
+          retention-days: 14

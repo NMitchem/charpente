@@ -142,8 +142,82 @@ const RESURRECTION_REFUSAL_TIMEOUT: Duration = Duration::from_secs(20);
 /// leaves the id in the acked-but-not-converged tail).
 const CONVERGE_TIMEOUT: Duration = Duration::from_secs(3);
 const CONVERGE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// How long a mid-load `login` waits for a just-restarted primary to open its
+/// write gate. A durable primary with a recorded witness boots `Verifying`
+/// and probes that witness before it accepts a write (DESIGN §5, the boot
+/// gate); `ChildNode::restart` returns when the HTTP port accepts, which is
+/// before the kernel thread has resolved the probe — so the first write can
+/// meet the documented 503 (nightlies 2026-09-09 and 2026-09-12, both through
+/// `run_oracle`). One loopback round-trip resolves it; 10 s is a wide margin
+/// that stays well under `WITNESS_DEADLINE_NANOS` (30 s), so a gate that
+/// never opens still fails here by name instead of dissolving into that
+/// deadline's read-only fallback. Not a tuning knob: needing to raise it
+/// means the probe regressed.
+const WRITE_GATE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ------------------------------------------------------------------- client
+
+/// The witness-gate 503 body, single-witness rendering, pinned byte-exact
+/// (hard rule 5): `verifying_message` (http/app.rs) pluralises, so a
+/// regression that lost the singular form fails by text at every site that
+/// compares against this.
+fn witness_gate_503(follower_repl_addr: &str) -> String {
+    format!(
+        "this node is not accepting writes yet: it was a primary before restarting and has \
+         not confirmed that its follower {follower_repl_addr} was never promoted — reads \
+         are being served normally, and writes resume automatically once that node answers; \
+         if it is gone for good, see GUIDE §10's witness-set remedy"
+    )
+}
+
+/// `login` against a primary restarted mid-load: retries ONLY while the body
+/// is the witness-gate 503 — the one transient a restarted primary is
+/// documented to answer with — and fails on anything else exactly as `login`
+/// does. Records how long the gate took, so a slow probe shows in the script.
+fn login_once_writable(
+    http: &mut Http,
+    scenario: &mut Scenario,
+    follower_repl_addr: &str,
+) -> Result<String, String> {
+    let gate = witness_gate_503(follower_repl_addr);
+    let started = Instant::now();
+    let deadline = started + WRITE_GATE_TIMEOUT;
+    let mut gated = 0u32;
+    loop {
+        let resp = http
+            .post("/login", "\"edge-tester\"")
+            .map_err(|e| format!("login request failed: {e}"))?;
+        let body = String::from_utf8_lossy(&resp.body).to_string();
+        if resp.status == 503 && body.contains(&gate) {
+            gated += 1;
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "the restarted primary's write gate never opened within \
+                     {WRITE_GATE_TIMEOUT:?} ({gated} login attempt(s) answered the witness-gate \
+                     503) — its witness {follower_repl_addr} is alive and a follower, so the \
+                     probe should have resolved in one round-trip; body {body:?}"
+                ));
+            }
+            std::thread::sleep(CONVERGE_POLL_INTERVAL);
+            continue;
+        }
+        if resp.status != 200 {
+            return Err(format!(
+                "login failed: status {} body {body:?}",
+                resp.status
+            ));
+        }
+        let token = resp
+            .as_json_string()
+            .ok_or_else(|| "login response body was not a JSON string token".to_string())?;
+        http.set_session(token.clone());
+        scenario.record(format!(
+            "logged in after the restart; write gate open after {gated} gated attempt(s), {:?}",
+            started.elapsed()
+        ));
+        return Ok(token);
+    }
+}
 
 fn login(http: &mut Http, scenario: &mut Scenario) -> Result<String, String> {
     let login = http
@@ -471,7 +545,7 @@ fn run_oracle(
                 std::thread::sleep(Duration::from_millis(delay_ms));
                 primary.kill9(&mut scenario);
                 primary.restart(&mut scenario).map_err(|e| e.to_string())?;
-                login(&mut primary_http, &mut scenario)?;
+                login_once_writable(&mut primary_http, &mut scenario, &follower_repl_addr)?;
             }
         }
 
@@ -1075,15 +1149,8 @@ fn run_resurrection_oracle(
         }
         scenario.record("phase A: the resurrected old primary serves reads (200) while gated");
 
-        // Pinned byte-exact (hard rule 5), and it is the single-witness
-        // rendering — `verifying_message` (http/app.rs) pluralises, so a
-        // regression that lost the singular form fails here by text.
-        let expected_503 = format!(
-            "this node is not accepting writes yet: it was a primary before restarting and has \
-             not confirmed that its follower {follower_repl_addr} was never promoted — reads \
-             are being served normally, and writes resume automatically once that node answers; \
-             if it is gone for good, see GUIDE §10's witness-set remedy"
-        );
+        // Pinned byte-exact (hard rule 5) — see `witness_gate_503`.
+        let expected_503 = witness_gate_503(&follower_repl_addr);
         let gated = old_http
             .post("/customers/99", r#"{"name":"Z","email":"z@example.com"}"#)
             .map_err(|e| format!("POST on the write-gated old primary failed: {e}"))?;

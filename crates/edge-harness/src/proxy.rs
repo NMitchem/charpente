@@ -139,8 +139,24 @@ fn relay(client: TcpStream, upstream: &str, state: Arc<Mutex<ProxyState>>) {
     // `connect` returns left a window where `stop`/`drop_all`'s drain could
     // neither see nor sever a connection that had already passed the
     // accept-loop's `stopped` check.
-    if let Ok(clone) = client.try_clone() {
-        state.lock().unwrap().conns.push(clone);
+    //
+    // And `stopped` is re-read under the SAME lock as the registration: the
+    // accept loop checked it, released the lock, then spawned this thread,
+    // so a `stop` landing in that gap drains a list this connection is not
+    // on yet and never severs it — it then relays as if nothing happened
+    // (nightly 2026-09-11, `stop_severs_live_connections_and_frees_the_port`
+    // read an echo back). One critical section leaves no interleaving in
+    // which neither the drain nor this check sees the connection.
+    {
+        let mut st = state.lock().unwrap();
+        if st.stopped {
+            drop(st);
+            let _ = client.shutdown(Shutdown::Both);
+            return;
+        }
+        if let Ok(clone) = client.try_clone() {
+            st.conns.push(clone);
+        }
     }
     let Ok(upstream_conn) = TcpStream::connect(upstream) else {
         return;
