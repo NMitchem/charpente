@@ -1816,13 +1816,15 @@ const FIRST_SEGMENT: &str = "wal/00000000000000000000.log";
 #[test]
 fn read_frame_cuts_zero_length_oversized_and_past_end_frames() {
     // One valid frame, then a frame the three-way size check must refuse.
-    // Under the `||` -> `&&` mutant the check is unsatisfiable and dead, and
-    // each case shows it its own way: (a) a declared length of 0 with a
-    // correct crc is recovered as an EMPTY record, which append forbids;
-    // (b) a length above MAX with 8 bytes present and (c) a length of 64
-    // with 8 bytes present both read past EOF, and recovery errors instead
-    // of cutting. The crc in (a) is deliberately right so the size arm is the
-    // only thing between the frame and Valid.
+    // cargo-mutants' `:504:9` turns the FIRST `||` into `&&`, and `&&` binds
+    // tighter than `||`: the mutant is `(len == 0 && len > MAX) || past_end`,
+    // so arms 1-2 are dead and the past-end arm lives. Case (a) — a declared
+    // length of 0 with a correct crc — is what distinguishes it: under the
+    // mutant it is recovered as an EMPTY record, which append forbids. Cases
+    // (b) and (c) pin arms 2 and 3 of the ORIGINAL check (an oversized and a
+    // past-end declaration each cut) and are still refused by arm 3 under the
+    // mutant. The crc in (a) is deliberately right so the size arm is the only
+    // thing between the frame and Valid.
     let valid = raw_frame(0, 8, &[7u8; 8]);
     let cases: [(&str, Vec<u8>); 3] = [
         ("zero-length", raw_frame(1, 0, &[])),

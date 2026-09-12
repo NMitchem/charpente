@@ -60,8 +60,8 @@ Line numbers are `main` at `a93f100`. "Kills" names the mutant(s) a property mus
 | 10 | `:435:9` `poisoned` | → `false` | **property** | Same. |
 | 11 | `:466:9` `check_poison` | body → `Ok(())` | **property** | A poisoned log refuses nothing. §3.4. |
 | 12 | `:493:30` `read_frame` | `offset + HEADER_BYTES > len` → `>=` | **equivalent** | At `offset + 16 == len` the original reads a complete header and then fails the payload check (`payload_len == 0` or `… > len`): `Invalid` either way; the mutant returns `Invalid` one read earlier. Excluded, §5, after the check moves into a named helper so the exclusion is line-free. |
-| 13 | `:504:9` `read_frame` | `\|\|` → `&&` | **property** | `payload_len == 0 && payload_len > MAX` is unsatisfiable, so the whole three-way check is dead: zero-length, oversized and past-end frames all read as valid. §3.5. |
-| 14 | `:504:24` `read_frame` | `payload_len > MAX` → `==` | **property** | A declared length above `MAX` that is not exactly `MAX` passes this arm and, when the bytes are present, is recovered as a record larger than the contract allows. §3.6. |
+| 13 | `:504:9` `read_frame` | `\|\|` → `&&` | **property** | The first `\|\|` becomes `&&`, which binds tighter: `(len == 0 && len > MAX) \|\| past_end` — the zero-length and oversized arms are dead, the past-end arm lives. A zero-length frame with a correct crc is recovered as an empty record. §3.5. |
+| 14 | `:504:24` `read_frame` | `payload_len > MAX` → `==` | **property** | Exactly `MAX` is now flagged, so a record of `MAX_RECORD_BYTES` — which `append` accepts — is cut on recovery (the observed RED); and a declared length above `MAX` passes the arm and, with the bytes present, would be recovered as a record larger than the contract allows. §3.6. |
 | 15 | `:504:24` `read_frame` | `payload_len > MAX` → `>=` | **property** | A record of exactly `MAX_RECORD_BYTES` — which `append` accepts — is cut on recovery. §3.6. |
 
 Eleven properties at seven sites, two rewrites, two exclusions.
@@ -130,11 +130,7 @@ on `sim.disk()`: one valid frame (seq 0, 8-byte payload) followed by (a) a frame
 `len = 0` with a CORRECT crc for seq 1 over the empty payload; (b) a frame declaring
 `len = MAX_RECORD_BYTES + 1` with only 8 payload bytes present; (c) a frame declaring
 `len = 64` with 8 bytes present. Each `Wal::open` recovers exactly ONE record (seq 0) and
-leaves the segment truncated to that frame's length — the cut. Under the mutant the
-three-way check is dead and each case is observable in its own way: (a) passes CRC and seq
-and is recovered as a second, EMPTY record — a payload the `append` contract forbids;
-(b) and (c) read past EOF into a `read_at` error, so `open` returns `Err` instead of
-cutting. The crc in (a) is deliberately correct so that the size arm is the only thing
+leaves the segment truncated to that frame's length — the cut. Under the mutant — the first `||` turned `&&`, which binds tighter, so `(len == 0 && len > MAX) || past_end` — arms 1–2 are dead and arm 3 lives: (a) passes CRC and seq and is recovered as a second, EMPTY record — a payload the `append` contract forbids — and is the case that kills the mutant; (b) and (c) are still refused by the past-end arm and pin arms 2 and 3 of the original check. The crc in (a) is deliberately correct so that the size arm is the only thing
 between the frame and `Valid`; the report states which arm each case pins.
 
 ### 3.6 `a_maximum_size_record_round_trips_and_one_byte_over_is_invalid` — kills #14, #15
