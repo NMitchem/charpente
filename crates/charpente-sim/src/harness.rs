@@ -213,17 +213,23 @@ static OPEN_FENCE_HOOK: std::sync::Once = std::sync::Once::new();
 /// `panicked` substring: a log grep for that word is what F1 trained agents
 /// to misuse.
 ///
-/// **Install-once-EVER, not idempotent.** The `Once` fires the first time any
-/// entry point calls this and never again — so calling it from several entry
-/// points is safe, which is what the old "idempotent" wording meant. What it
-/// does NOT give is restoration: if anything installs a hook *after* this one,
-/// the filter is gone and a second call here restores nothing, because the
-/// `Once` has already fired. That is why `std::panic::set_hook` and
-/// `take_hook` are on `clippy.toml`'s deny-list with this function as the one
-/// sanctioned site (mechanical-fences Item 1): the invariant "exactly one
-/// installer, in the simulator" is what makes the filter trustworthy, and a
-/// deny-list is the only thing that makes the invariant hold without a
-/// reviewer.
+/// **Install-once-EVER, with no restoration.** The `Once` fires the first
+/// time any entry point calls this and never again — calling it from several
+/// entry points is safe (it IS idempotent in the ordinary sense: a repeat
+/// call is a no-op), which is what the old "idempotent" wording meant to
+/// capture. What it lacks is restoration: if anything installs a hook after
+/// this one, the filter is gone unless that hook chains to the previous one,
+/// and nothing here can restore it — the `Once` has already fired. That is
+/// why `std::panic::set_hook` and `take_hook` are on `clippy.toml`'s
+/// deny-list with this function as the one sanctioned site (mechanical-
+/// fences Item 1): wherever that deny-list is live — the whole deterministic
+/// boundary and every process that runs sim universes in-process (this
+/// crate, `charpente-core`, `charpente` outside `prod`/`serve`,
+/// `charpente-cli`'s library code) — the invariant "exactly one installer"
+/// holds mechanically, with no reviewer needed. It does not reach the
+/// harnesses that carry a blanket `#![allow(clippy::disallowed_methods)]`
+/// (`edge-harness`, `bench-harness`) or `charpente::prod`/`serve`'s own
+/// file-level allow; those stay review-enforced, same as before this task.
 ///
 /// Muting is gated on BOTH the fence flag AND the panic's own source location
 /// naming redb — the flag alone is a time window, not a guarantee about what
@@ -238,8 +244,10 @@ static OPEN_FENCE_HOOK: std::sync::Once = std::sync::Once::new();
 /// resulting `io::Error` unprinted either way.
 // The ONE sanctioned installer of the process-global panic hook (clippy.toml's
 // `std::panic::set_hook`/`take_hook` entries name this function). The allow is
-// function-scoped because the function IS the site; nothing else in the
-// workspace may carry this allow for these two paths.
+// function-scoped because the function IS the site; other files may carry a
+// blanket `#![allow(clippy::disallowed_methods)]` for unrelated reasons
+// (edge-harness, bench-harness, prod.rs, serve.rs), but none of them is
+// SANCTIONED to install a panic hook — only this function is.
 #[allow(clippy::disallowed_methods)]
 pub fn install_open_fence_hook() {
     OPEN_FENCE_HOOK.call_once(|| {

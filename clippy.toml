@@ -43,12 +43,12 @@ disallowed-methods = [
     { path = "std::process::Command::spawn", reason = "ambient process spawning — edge tooling only (charpente-cli); nothing inside the deterministic boundary spawns processes (DESIGN.md §1)" },
     # The process-global panic hook is installed by exactly ONE site, the simulator's
     # `install_open_fence_hook` (charpente-sim/src/harness.rs), which filters redb's
-    # benign open-fence trace (F1, 2026-09-09). A second installer anywhere — and above
+    # benign open-fence trace (F1, 2026-09-09). A second installer — and above
     # all one inside the deterministic boundary — replaces that filter silently, and
     # can mute a genuine panic on a parallel sim worker. This was a review-enforced
     # invariant in a repo whose hard rule 1 forbids that arrangement.
     { path = "std::panic::set_hook", reason = "the process-global panic hook has one sanctioned installer, charpente-sim's install_open_fence_hook — a second one silently replaces the redb open-fence filter (F1) and can mute a real panic on another sim worker; route new hook needs through that function" },
-    { path = "std::panic::take_hook", reason = "pairs with set_hook — taking the hook outside charpente-sim's install_open_fence_hook is the first half of installing a second one" },
+    { path = "std::panic::take_hook", reason = "pairs with set_hook — taking the hook outside charpente-sim's install_open_fence_hook is the first half of installing a second one; go through that function" },
     # rsa (auth T5, OIDC RS256 verification) pulls rand/rand_core/getrandom
     # transitively and unconditionally via num-bigint-dig's mandatory "prime"
     # feature — no combination of rsa's own feature flags disables it. The
