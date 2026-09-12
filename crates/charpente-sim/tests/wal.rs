@@ -1907,3 +1907,64 @@ fn a_maximum_size_record_round_trips_and_one_byte_over_is_invalid() {
         "…and the cut truncates it away"
     );
 }
+
+/// A disk whose `remove` returns Ok and leaves the name in place. Not a
+/// fault any filesystem exhibits — a BROKEN INVARIANT, which is exactly what
+/// recovery's gaplessness check (`open_with_horizon`, "no segment past the
+/// cut point may still exist before the truncation runs") is there to refuse
+/// rather than recover around. Test-local (spec §6).
+struct LyingRemove(SimDisk);
+
+impl Disk for LyingRemove {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        self.0.open(path)
+    }
+    fn remove(&self, _path: &str) -> io::Result<()> {
+        Ok(())
+    }
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.0.list(prefix)
+    }
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.0.sync_dir(prefix)
+    }
+}
+
+#[test]
+#[should_panic(expected = "orphaned segments must be removed before the cut segment is truncated")]
+fn a_remove_that_lies_trips_the_gaplessness_assert_before_the_cut() {
+    // The log of bit_flip_cuts_the_log_there_and_deletes_later_segments: 40
+    // 300-byte records, 12 frames per 4 KiB segment, one payload byte of
+    // frame 3 flipped so the cut lands in segment 0 with later segments on
+    // disk. Recovery removes them first; through a disk whose remove lies
+    // they are still listed when the negative-space check runs, and the
+    // check — not the truncation — is what must happen next. The sweep's
+    // mutant inverted the check's guard so it ran only when there was
+    // nothing to check; under it recovery truncates and returns Ok.
+    let sim = quiet_sim();
+    let records: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 300]).collect();
+    let refs: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
+    build_log(&sim, &refs);
+    let names = sim.disk().list("wal/").unwrap();
+    assert!(
+        names.len() > 1,
+        "later segments must exist for the check to have work: {names:?}"
+    );
+    let segment = sim.disk().open(&names[0]).unwrap();
+    let offset = 3 * 316 + 16 + 100;
+    let mut byte = [0u8; 1];
+    segment.read_at(offset, &mut byte).unwrap();
+    segment.write_at(offset, &[byte[0] ^ 0xFF]).unwrap();
+    segment.sync().unwrap();
+
+    let result = Wal::open(
+        Box::new(LyingRemove(sim.disk())),
+        small_segments(),
+        |_, _| Ok(()),
+    );
+    panic!(
+        "recovery returned {:?} instead of refusing to truncate beside a surviving later \
+         segment",
+        result.map(|_| ())
+    );
+}
