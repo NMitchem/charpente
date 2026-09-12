@@ -63,7 +63,7 @@ roadmap; do not reorder a milestone's dependency sequence.
   describe/genclient/repro_meta/restore; charpente-tsgen: revive/routes/types;
   charpente-macros: trybuild; edge-harness: acked_durable/failover/hunts/open_fence/
   realtime_resume/smoke/tenant_wire; bench-harness: app/compile/compile_bench_script/harness/phase_trace;
-  ts-fixture-app: drift/samples; guide-examples: describe_contract/doc_inventory; sim-fixture: sim;
+  ts-fixture-app: drift/samples; guide-examples: describe_contract/doc_inventory/doc_truth; sim-fixture: sim;
   invoicing: describe_golden/sim). Every list is exhaustive as written — if a name is
   missing, the list is stale, not selective.
   `guide-examples`' `doc_inventory` gate enforces that against `members`, so a NEW crate
@@ -83,11 +83,18 @@ roadmap; do not reorder a milestone's dependency sequence.
   workspace is 4193 mutants (days of wall clock), so the default is a named oracle-bearing
   target set. Exit 0 every viable mutant caught, 1 a finding (**MISSED** = no oracle noticed,
   i.e. a one-sided property) or an unresolved run (**a timeout is not a catch**), 2 usage,
-  infrastructure, or a baseline that was not green. Read the verb's output, never
-  cargo-mutants' own exit code: the raw tool exits **0** when a filter matches nothing and
-  writes no `outcomes.json` at all, and a failed baseline leaves every counter reading zero.
+  infrastructure, or a baseline that was not green. `--jobs > 1` (flag
+  or `CARGO_MUTANTS_JOBS`) is refused under an inherited `CARGO_TARGET_DIR`: cargo's
+  artifact hash does not vary by mutation content, so parallel jobs sharing one target
+  dir report results that measured nothing. Read the verb's output, never
+  cargo-mutants' own exit code: the raw tool exits **0** when a filter matches nothing
+  and writes no `outcomes.json` at all, and a failed baseline leaves every counter
+  reading zero.
 - Editing docs/GUIDE.md can break the build: `crates/guide-examples`'s build.rs extracts
-  and compiles every ```rust block. `cargo build -p guide-examples` checks it alone.
+  and compiles every ```rust block. `cargo build -p guide-examples` checks it alone. A
+  pinned `text` block (preceded by `<!-- pinned -->`) is gated
+  by `tests/doc_truth.rs`: its quoted text must still appear in the code,
+  and the pinned count is a floor.
 - **Capturing a sweep's exit status: this shell is zsh, which does not populate bash's
   `PIPESTATUS` at all.** `${PIPESTATUS[0]}` expands to the empty string in every case,
   and an empty string in a log reads as "no failure" to whoever skims it. Use

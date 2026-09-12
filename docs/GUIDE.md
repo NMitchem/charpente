@@ -2,7 +2,12 @@
 
 *(This file is compile-gated: every `rust` code block below is extracted
 and built by `crates/guide-examples` — `cargo build -p guide-examples` fails
-if a block stops compiling. Sections 1–4 cover the persistence layer:
+if a block stops compiling. A `text` block preceded by the line
+`<!-- pinned -->` is gated too: `crates/guide-examples/tests/doc_truth.rs`
+proves every fragment of 16+ characters outside a `<placeholder>` still
+appears in a source or test file under `crates/` or `examples/`, so a quoted
+error message cannot silently drift from what the code emits.
+Sections 1–4 cover the persistence layer:
 project setup, tables, the database, and transactions. Sections 5–7 cover
 the deterministic kernel: HTTP, jobs, and cron. Section 8 covers sim
 testing — writing `tests/sim.rs`, running `charpente test --sim`, and
@@ -834,6 +839,7 @@ route, so a garbage bearer never reaches a handler.
 The 401s are named and fixed — copy these verbatim if you assert against
 them:
 
+<!-- pinned -->
 ```text
 authentication required — send "Authorization: Bearer <token>" or the charpente_session cookie
 unrecognized credential — it may have been revoked; obtain a new one
@@ -938,6 +944,7 @@ the token's `sub` claim — ephemeral, no row, nothing to revoke but a short
 tolerance. Each failed check is its own named 401 (the `iss`/`aud` ones name
 presented-vs-configured; `<presented>`/`<configured>` are the actual values):
 
+<!-- pinned -->
 ```text
 malformed OIDC token — expected "header.payload.signature" (three dot-separated segments); got 2 segment(s)
 unsupported OIDC token alg "HS256" — only "RS256" is verified; mint the token with an RS256-signed key
@@ -2634,6 +2641,7 @@ One more from the same file, `JobError::Io`'s own `Display` — not a
 rejection at all, the opposite: proof nothing was attempted, folded into
 the poisoned-engine story below:
 
+<!-- pinned -->
 ```text
 platform IO failure during the handler (not an attempt): <e>
 ```
@@ -2675,6 +2683,7 @@ request.
 
 ### Call-site contract panics (`charpente-core/src/db.rs`, `charpente/src/prod.rs`, `charpente/src/kernel/cron.rs`)
 
+<!-- pinned -->
 ```text
 contract: an idempotency key names the job's external identity — it cannot be empty
 Disk paths are relative flat names like "wal/000001.log" — got "<path>"
@@ -2730,6 +2739,7 @@ data is migrated away; §3 covers registration.
 
 ### Poisoned-engine errors (restart-and-recover)
 
+<!-- pinned -->
 ```text
 WAL poisoned by an earlier IO failure — durability is unknown and fsync cannot honestly be retried; restart and recover
 engine poisoned: a durable record failed to apply, so machine state no longer matches the log — restart and recover
@@ -2763,6 +2773,7 @@ keep accepting traffic against a dead engine.
 The stop names *which* poison, because the two imply opposite things about
 your data:
 
+<!-- pinned -->
 ```text
 kernel stopped: the engine is poisoned (a request-path IO failure made durability unknowable) — the request received its 500; restart the process to recover from the WAL
 kernel stopped: the store handle is dead after a disk IO failure (redb refuses every further operation until you close and re-open the database) — durable state is intact and the WAL is authoritative; restart the process to recover
@@ -2837,6 +2848,7 @@ direction — configure the followers first, then the primary (the reverse
 would lock the not-yet-configured followers out). A refused inbound gets one
 named message, before any state moves:
 
+<!-- pinned -->
 ```text
 peer secret missing or mismatched — set ReplConfig.peer_secret to match this node (or run the CLI verb with --secret)
 ```
@@ -2847,6 +2859,7 @@ which is easy to reach through an empty env var or a shell-quoting slip. It is
 refused by name where `ReplConfig` is consumed, before any socket or state
 work:
 
+<!-- pinned -->
 ```text
 ReplConfig.peer_secret is Some("") — an empty peer secret authenticates any peer that presents no proof, which is almost never what a configured secret intends; set a real secret, or use None to explicitly accept all peers (DESIGN §8)
 ```
@@ -3001,6 +3014,7 @@ section prescribes below, and precisely what lets the gate resolve. But it
 refused newcomer is not recorded as a witness (the refuse arm never assigns
 `listen`, so `record_witnesses` never sees it):
 
+<!-- pinned -->
 ```text
 cannot seed a new follower yet: this node restarted as a primary and is still
 verifying its witnesses — it has not confirmed that none of the followers it
@@ -3447,6 +3461,7 @@ unparseable one never reaches app code:
 
 A present-but-unparseable cursor is a 400, and the handler never runs:
 
+<!-- pinned -->
 ```text
 cursor must be "<id>.<seq>" — got "not-a-cursor"; omit it to tail from now
 ```
@@ -3778,6 +3793,7 @@ A crash *before* a clean shutdown leaves an old binary's writes sitting in the W
 tail, uncheckpointed. Starting a version-bumped binary against that tail refuses
 rather than guess at decoding bytes it cannot prove are its own shape:
 
+<!-- pinned -->
 ```text
 table "Widget" has unrecovered writes from the previous binary (persisted version 1,
 this binary is compiled for version 2) — run the previous binary once to a clean
@@ -3864,6 +3880,7 @@ exactly as a hand-rolled `main` would; `myapp describe` and `myapp describe --fo
 are new, for free — and so is `restore` (§15). An unrecognized verb or a bad `--format`
 value exits 2 with a pinned usage message:
 
+<!-- pinned -->
 ```text
 usage: <app> [describe [--format json|human]]
        <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]  — no verb serves the app
@@ -3880,6 +3897,7 @@ the app required, not even the `launch` migration above (it works against any bi
 calls `charpente::launch`, which is what makes it a description of the app rather than
 something the app has to expose over HTTP itself):
 
+<!-- pinned -->
 ```text
 usage: charpente describe [--dir PATH] [--format json|human] [--bin NAME]
        --dir PATH   the app crate directory to build and describe (default: .)
@@ -5036,6 +5054,7 @@ point in it.
 
 Every app binary that calls `charpente::launch` has the verb already:
 
+<!-- pinned -->
 ```text
 usage: <app> restore --from BUCKET --prefix PREFIX [--to DIR] [--force]
        --from BUCKET    the archive's root directory (the bucket an archive wrote)

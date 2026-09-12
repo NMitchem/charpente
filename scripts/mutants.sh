@@ -30,4 +30,6 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 cargo build -p charpente-cli
-exec ./target/debug/charpente test --mutants "$@"
+# An exported CARGO_TARGET_DIR moves the build; exec from wherever cargo put it
+# rather than from ./target, which under that variable holds nothing.
+exec "${CARGO_TARGET_DIR:-./target}/debug/charpente" test --mutants "$@"
