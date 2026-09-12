@@ -190,8 +190,8 @@ exclude_re = [
 HEADER_BYTES > len }` in `log.rs`, called from `read_frame` — so the mutant's `--list` name
 carries a unique function and the regex needs no line number. Its other six mutants (`→ true`,
 `→ false`, `> → ==`, `> → <`, `+ → -`, `+ → *`) are all observable and were observed CAUGHT
-(`+ → -` as an overflow panic at offset 0 in the debug build) (a torn-tail universe in
-`wal_survives_the_fault_matrix` reads past EOF under `== `).
+(`+ → -` as an overflow panic at offset 0 in the debug build; a torn-tail universe in
+`wal_survives_the_fault_matrix` reads past EOF under `==`).
 
 The ceiling: `crates/guide-examples/tests/mutants_exclusions.rs` reads `.cargo/mutants.toml`
 as text and asserts (a) exactly `EXCLUSIONS = 2` string entries inside `exclude_re`, and
