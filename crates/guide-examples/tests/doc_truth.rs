@@ -160,11 +160,12 @@ fn push_fragment(out: &mut Vec<String>, piece: &str) {
 /// backslash pair is kept as typed. Raw strings are NOT distinguished from
 /// ordinary ones: a raw string containing one of the five decoded pairs is
 /// decoded as if it were an ordinary literal, which is wrong for that
-/// string. At landing the only raw string with a backslash in the corpus
-/// (this file's own fixtures excluded — `normalized_corpus` does not walk
-/// this file) is `charpente-cli/src/sim.rs`'s `r"C:\Users\proj\sim.exe"`,
-/// whose pairs (`\U`, `\p`, `\s`) all fall through to "kept as typed", so
-/// nothing is mis-decoded today — the exposure is nil, the mechanism is
+/// string. At landing the corpus (this file excluded — the walk skips it)
+/// holds two raw strings with backslashes, both in charpente-cli/src/sim.rs:
+/// :251's r#"…"C:\\Users\\proj\\sim.exe"…"# whose \\ pairs DO decode here
+/// (to \), and :254's r"C:\Users\proj\sim.exe" whose \U \p \s fall through
+/// as typed — so both normalise to the same C:\Users\proj\sim.exe and
+/// nothing is mis-decoded today. The exposure is nil, the mechanism is
 /// real.
 fn unescape(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
@@ -198,6 +199,21 @@ fn unescape(src: &str) -> String {
     out
 }
 
+/// Per-file normalization the walk applies before a source file joins the
+/// corpus: drop every line whose `trim_start()` begins with `//` (covers
+/// `///` and `//!`) — a comment is never what an operator sees, so a pinned
+/// fragment satisfied only by one is pinning trivia, not a real emitter or
+/// pinning test. Filtering happens on raw lines, before `unescape`, so a
+/// `//` inside a string literal (not at a trimmed line start) survives.
+fn normalize_source(src: &str) -> String {
+    let filtered: String = src
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    unescape(&filtered)
+}
+
 /// Every `.rs` under `crates/` and `examples/`, `target/` excluded, unescaped
 /// and joined. Order does not matter — only membership.
 fn normalized_corpus() -> String {
@@ -221,7 +237,7 @@ fn normalized_corpus() -> String {
                 }
                 let src =
                     fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-                out.push_str(&unescape(&src));
+                out.push_str(&normalize_source(&src));
                 out.push('\n');
             }
         }
@@ -272,10 +288,12 @@ fn pinned_guide_text_is_what_the_code_emits() {
          appear in some .rs file under crates/ or examples/.\n\
          fix: EITHER the doc drifted — update the quote to what the code emits today (grep \
          crates/ for a distinctive part of the old text to find the site) — OR the code \
-         regressed and the doc is right — fix the code. A rephrasing of the CODE's message \
-         is a doc update; a rephrasing of the DOC's quote is exactly what this gate refuses. \
-         Do not unpin the block to pass: the pinned count is a floor ({PINNED_FLOOR}) and \
-         lowering it belongs in its own commit message.",
+         regressed and the doc is right — fix the code. OR the code now builds this message \
+         from parts and no single literal holds the fragment — add a test that pins the \
+         RENDERED text (a pinning test's literal counts as the corpus on purpose). A \
+         rephrasing of the CODE's message is a doc update; a rephrasing of the DOC's quote \
+         is exactly what this gate refuses. Do not unpin the block to pass: the pinned count \
+         is a floor ({PINNED_FLOOR}) and lowering it belongs in its own commit message.",
         missing.len(),
         missing.join("\n  "),
     );
@@ -321,6 +339,36 @@ fn a_fragment_the_corpus_lacks_is_named_with_its_guide_line() {
     let full = "peer secret missing or mismatched — set ReplConfig.peer_secret\n\
                 this exact sentence is nowhere in any source file";
     assert!(missing(&pinned, full).is_empty());
+}
+
+#[test]
+fn a_fragment_that_lives_only_in_a_comment_is_missing() {
+    // Comments are never what the operator sees; a doc quote satisfied by one
+    // is pinning trivia (spec §4). The corpus drops comment lines.
+    let src = "// peer secret missing or mismatched — set ReplConfig.peer_secret\nlet x = 1;\n";
+    let corpus = normalize_source(src);
+    let pinned = vec![Pinned {
+        marker_line: 1,
+        lines: vec![(
+            1,
+            "peer secret missing or mismatched — set ReplConfig.peer_secret".to_string(),
+        )],
+    }];
+    assert_eq!(missing(&pinned, &corpus).len(), 1);
+}
+
+#[test]
+fn a_slash_slash_inside_a_literal_survives() {
+    let src = "let u = \"see https://example.test/where-the-fragment-lives\";\n";
+    let corpus = normalize_source(src);
+    let pinned = vec![Pinned {
+        marker_line: 1,
+        lines: vec![(
+            1,
+            "https://example.test/where-the-fragment-lives".to_string(),
+        )],
+    }];
+    assert!(missing(&pinned, &corpus).is_empty());
 }
 
 #[test]
@@ -438,4 +486,18 @@ fn a_well_formed_marker_pins_its_block() {
             lines: vec![(4, "line one".into()), (6, "line two".into())]
         }]
     );
+}
+
+/// The module doc's scope rule ("an UNMARKED block is not checked") stated
+/// nowhere else as a test: an unmarked ```text fence must not be pinned.
+#[test]
+fn an_unmarked_text_block_is_not_pinned() {
+    let guide = "prose\n<!-- pinned -->\n```text\nmarked line\n```\nmore prose\n```text\nunmarked line\n```\n";
+    let pinned = pinned_blocks(guide);
+    assert_eq!(
+        pinned.len(),
+        1,
+        "an unmarked block must not be pinned: {pinned:?}"
+    );
+    assert_eq!(pinned[0].lines, vec![(4, "marked line".to_string())]);
 }

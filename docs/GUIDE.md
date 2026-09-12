@@ -4,8 +4,9 @@
 and built by `crates/guide-examples` — `cargo build -p guide-examples` fails
 if a block stops compiling. A `text` block preceded by the line
 `<!-- pinned -->` is gated too: `crates/guide-examples/tests/doc_truth.rs`
-proves every fragment of it outside a `<placeholder>` still appears in the
-code, so a quoted error message cannot drift from what the binary prints.
+proves every fragment of 16+ characters outside a `<placeholder>` still
+appears in a source or test file under `crates/` or `examples/`, so a quoted
+error message cannot silently drift from what the code emits.
 Sections 1–4 cover the persistence layer:
 project setup, tables, the database, and transactions. Sections 5–7 cover
 the deterministic kernel: HTTP, jobs, and cron. Section 8 covers sim
