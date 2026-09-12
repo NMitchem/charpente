@@ -160,3 +160,46 @@ fn usage_errors_exit_two_and_name_the_flag() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("--univeres"));
 }
+
+/// `--jobs > 1` with an inherited `CARGO_TARGET_DIR` makes every cargo-mutants
+/// scratch tree build into ONE directory, and cargo's artifact hash does not
+/// vary by mutation content — so a mutant's tests can judge another mutant's
+/// build. Observed 2026-09-10 (one rlib hash in 21 of 36 mutants' logs; a
+/// MISSED that flipped to CAUGHT with only `--jobs` changed). The verb must
+/// refuse BEFORE spawning anything, exit 2, and name the contract, the site
+/// and both fixes (hard rule 5).
+#[test]
+fn mutants_refuses_parallel_jobs_under_a_shared_target_dir() {
+    let out = charpente()
+        .args([
+            "test",
+            "--mutants",
+            "--jobs",
+            "2",
+            "--re",
+            "no-such-mutant-anywhere",
+        ])
+        .env(
+            "CARGO_TARGET_DIR",
+            "/tmp/charpente-shared-target-dir-for-this-test",
+        )
+        .output()
+        .expect("charpente binary runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the refusal is a usage error (exit 2); stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--jobs 2 with CARGO_TARGET_DIR set")
+            && stderr.contains("run with --jobs 1, or unset CARGO_TARGET_DIR"),
+        "the refusal must name the combination and both fixes; got:\n{stderr}"
+    );
+    // The negative space — `--jobs 1`, no `--jobs`, no variable, an
+    // unparseable `--jobs` — is pinned on the pure function in mutants.rs's
+    // unit tests. Spawning the non-refused shape here would run cargo-mutants
+    // for real against this crate's cwd and leave a stray
+    // `crates/charpente-cli/target/` behind (`.gitignore` is `/target`,
+    // root-only).
+}

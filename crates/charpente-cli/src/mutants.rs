@@ -103,11 +103,51 @@ struct Outcome {
     summary: String,
 }
 
+/// `Some(refusal)` when `--jobs > 1` is combined with an inherited
+/// `CARGO_TARGET_DIR`. cargo-mutants isolates parallel jobs by building each
+/// scratch tree into its own `target/`; an inherited `CARGO_TARGET_DIR`
+/// points every job at ONE directory, and cargo's artifact filename hash does
+/// not vary by mutation content — so a mutant's tests can run against a
+/// different mutant's (or the baseline's) build and report a MISSED or a
+/// CAUGHT that measured nothing. Observed 2026-09-10: one rlib hash shared by
+/// 21 of 36 mutants' logs including the baseline's, and a MISSED that flipped
+/// to CAUGHT with only `--jobs` changed. The combination is reachable by
+/// following this repo's own advice (a dedicated `CARGO_TARGET_DIR` per
+/// worktree), so the verb refuses it by name rather than trusting the operator
+/// to know. Pure so the message is unit-testable; `run` supplies the env.
+fn shared_target_dir_refusal(
+    jobs: Option<&str>,
+    target_dir: Option<&std::ffi::OsStr>,
+) -> Option<String> {
+    let n: u64 = jobs?.parse().ok()?;
+    if n <= 1 {
+        return None;
+    }
+    let dir = target_dir?.to_string_lossy().into_owned();
+    Some(format!(
+        "error: --jobs {n} with CARGO_TARGET_DIR set ({dir}) — cargo-mutants builds each \
+         job's scratch tree into a target dir of its own, and an inherited CARGO_TARGET_DIR \
+         points every job at ONE directory; cargo's artifact hash does not vary by mutation \
+         content, so a mutant's tests can run against a different mutant's build and report \
+         a MISSED (or a CAUGHT) that measured nothing (observed 2026-09-10: one rlib hash \
+         shared by 21 of 36 mutants' logs). Fix: run with --jobs 1, or unset CARGO_TARGET_DIR \
+         for this invocation."
+    ))
+}
+
 pub fn run(args: &[String]) -> i32 {
     let opts = match parse(args) {
         Ok(opts) => opts,
         Err(code) => return code,
     };
+
+    if let Some(refusal) = shared_target_dir_refusal(
+        opts.jobs.as_deref(),
+        std::env::var_os("CARGO_TARGET_DIR").as_deref(),
+    ) {
+        eprintln!("{refusal}");
+        return 2;
+    }
 
     let out_dir = PathBuf::from(&opts.dir).join("target/charpente-mutants");
     let mut argv: Vec<String> = vec!["mutants".into(), "--output".into(), display(&out_dir)];
@@ -478,6 +518,36 @@ mod tests {
             v.lines.iter().any(|l| l.contains("MISSED")),
             "{:?}",
             v.lines
+        );
+    }
+
+    #[test]
+    fn parallel_jobs_under_a_shared_target_dir_are_refused_by_name() {
+        let dir = std::ffi::OsStr::new("/tmp/shared");
+        let msg = shared_target_dir_refusal(Some("4"), Some(dir)).expect("refused");
+        assert!(msg.starts_with("error: --jobs 4 with CARGO_TARGET_DIR set (/tmp/shared)"));
+        assert!(msg.contains("observed 2026-09-10"));
+        assert!(msg.ends_with("run with --jobs 1, or unset CARGO_TARGET_DIR for this invocation."));
+    }
+
+    #[test]
+    fn the_refusal_needs_both_halves() {
+        let dir = std::ffi::OsStr::new("/tmp/shared");
+        assert!(
+            shared_target_dir_refusal(Some("1"), Some(dir)).is_none(),
+            "one job cannot collide"
+        );
+        assert!(
+            shared_target_dir_refusal(None, Some(dir)).is_none(),
+            "no --jobs is the tool's default of 1"
+        );
+        assert!(
+            shared_target_dir_refusal(Some("4"), None).is_none(),
+            "no shared dir, no collision"
+        );
+        assert!(
+            shared_target_dir_refusal(Some("many"), Some(dir)).is_none(),
+            "an unparseable --jobs is cargo-mutants' to refuse, not ours"
         );
     }
 }
