@@ -63,7 +63,7 @@ roadmap; do not reorder a milestone's dependency sequence.
   describe/genclient/repro_meta/restore; charpente-tsgen: revive/routes/types;
   charpente-macros: trybuild; edge-harness: acked_durable/failover/hunts/open_fence/
   realtime_resume/smoke/tenant_wire; bench-harness: app/compile/compile_bench_script/harness/phase_trace;
-  ts-fixture-app: drift/samples; guide-examples: describe_contract/doc_inventory/doc_truth; sim-fixture: sim;
+  ts-fixture-app: drift/samples; guide-examples: describe_contract/doc_inventory/doc_truth/hook_census; sim-fixture: sim;
   invoicing: describe_golden/sim). Every list is exhaustive as written — if a name is
   missing, the list is stale, not selective.
   `guide-examples`' `doc_inventory` gate enforces that against `members`, so a NEW crate
@@ -89,7 +89,10 @@ roadmap; do not reorder a milestone's dependency sequence.
   dir report results that measured nothing. Read the verb's output, never
   cargo-mutants' own exit code: the raw tool exits **0** when a filter matches nothing
   and writes no `outcomes.json` at all, and a failed baseline leaves every counter
-  reading zero.
+  reading zero. The verb consults that exit code in exactly one place — when there is
+  no `outcomes.json` — to tell "matched nothing" (exit 0) from "died before running"
+  (any other exit), and it creates its own `--output` directory, so an exported
+  CARGO_TARGET_DIR no longer needs a hand `mkdir`.
 - Editing docs/GUIDE.md can break the build: `crates/guide-examples`'s build.rs extracts
   and compiles every ```rust block. `cargo build -p guide-examples` checks it alone. A
   pinned `text` block (preceded by `<!-- pinned -->`) is gated
@@ -123,9 +126,10 @@ roadmap; do not reorder a milestone's dependency sequence.
 - `crates/ts-fixture-app` — the app the TS client is generated from; its `tests/` are the
   codegen's oracles (staleness diff, wire-shape drift).
 - `crates/guide-examples` — compile gate for docs/GUIDE.md, the CLAUDE.md inventory gate
-  (`tests/doc_inventory.rs`) that keeps this map and the test lists above honest, and
+  (`tests/doc_inventory.rs`) that keeps this map and the test lists above honest,
   `tests/describe_contract.rs`, which diffs §13's `describe` JSON against a freshly built
-  `examples/invoicing` fixture.
+  `examples/invoicing` fixture, and `tests/hook_census.rs`, which holds "one panic-hook
+  installer" by walking the sources — the deny-list is inert under a file-level allow.
 - `crates/edge-harness` — black-box wire rig outside the deterministic boundary: stock
   binaries over real TCP, `kill -9`, TCP-proxy fault injection.
 - `crates/bench-harness` — the benchmark instrument, also outside the boundary. Each layer

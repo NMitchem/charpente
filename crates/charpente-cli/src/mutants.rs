@@ -18,7 +18,11 @@
 //!
 //! Both are the "absent measurement wearing the shape of a passing one" shape
 //! this sub-project exists to remove, so every one of them is turned into a
-//! loud failure below rather than a green line.
+//! loud failure below rather than a green line. The exit code is read in ONE
+//! place only: with no `outcomes.json` at all, exit 0 is the filter shape
+//! above and anything else is the tool dying before it ran — which this verb
+//! used to blame on the filter (observed 2026-09-12: a missing `--output`
+//! parent, cargo-mutants exit 1, and "the usual cause is a --file or --re").
 //!
 //! Exit codes: 0 every viable mutant was caught, 1 the run produced a finding
 //! (mutants missed) or failed to resolve (timeouts), 2 usage, infrastructure,
@@ -201,6 +205,19 @@ pub fn run(args: &[String]) -> i32 {
         argv.push(j.clone());
     }
 
+    // cargo-mutants needs `--output`'s parent to exist and dies with its own
+    // error when it does not; under an exported CARGO_TARGET_DIR `./target`
+    // is never created, so the verb makes the path it chose exist itself
+    // (edge tooling, outside the deterministic core — DESIGN.md §1).
+    #[allow(clippy::disallowed_methods)]
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        eprintln!(
+            "error: could not create the output directory {}: {e}",
+            display(&out_dir)
+        );
+        return 2;
+    }
+
     // Process spawning is edge tooling here, outside the deterministic core
     // (DESIGN.md §1) — this shells out to cargo-mutants, which patches a
     // scratch copy of the tree; nothing inside the core spawns processes.
@@ -219,21 +236,53 @@ pub fn run(args: &[String]) -> i32 {
         );
         return 2;
     }
-    if let Err(e) = status {
-        eprintln!("error: failed to run cargo-mutants: {e}");
-        return 2;
-    }
+    let status = match status {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!("error: failed to run cargo-mutants: {e}");
+            return 2;
+        }
+    };
 
     report(
         &out_dir.join("mutants.out/outcomes.json"),
         opts.property.as_deref(),
+        status.code(),
     )
 }
 
+/// What to say when the run left no `outcomes.json` at all. The tool's exit
+/// code is ignored for the VERDICT (0 is a clean sweep and also a filter that
+/// matched nothing), but here it is the one signal that separates "matched
+/// nothing" from "died before running": observed 2026-09-12, a missing
+/// `--output` parent made cargo-mutants exit 1 with its own error and this
+/// verb blamed the filter. `code` is `None` when a signal killed the tool.
+fn no_outcomes_diagnosis(code: Option<i32>, path: &str, err: &str) -> String {
+    match code {
+        Some(0) => format!(
+            "error: cargo-mutants wrote no outcomes at {path} ({err}) — NOTHING WAS MEASURED. \
+             The usual cause is a --file or --re that matched no mutants, which the tool \
+             itself reports as success. Check the filter names a real path or function."
+        ),
+        Some(n) => format!(
+            "error: cargo-mutants exited {n} before measuring anything (no outcomes at {path}: \
+             {err}) — NOTHING WAS MEASURED; its own error is printed above this line and is \
+             the diagnosis (a missing directory, a malformed --re, a usage error — not a \
+             mutant's verdict)."
+        ),
+        None => format!(
+            "error: cargo-mutants was killed by a signal before measuring anything (no outcomes \
+             at {path}: {err}) — NOTHING WAS MEASURED."
+        ),
+    }
+}
+
 /// Reads the run's own record and turns every "nothing was measured" shape
-/// into a loud failure. The tool's exit code is deliberately NOT consulted:
-/// it is 0 both for a clean sweep and for a filter that selected nothing.
-fn report(path: &std::path::Path, property: Option<&str>) -> i32 {
+/// into a loud failure. The tool's exit code is NOT consulted for the
+/// verdict — it is 0 both for a clean sweep and for a filter that selected
+/// nothing — and IS consulted in exactly one place, when there is no record
+/// at all (`no_outcomes_diagnosis`).
+fn report(path: &std::path::Path, property: Option<&str>, code: Option<i32>) -> i32 {
     // Reading cargo-mutants' own run record is edge tooling, outside the
     // deterministic core (DESIGN.md §1) — nothing inside charpente-core
     // touches the filesystem directly.
@@ -242,10 +291,8 @@ fn report(path: &std::path::Path, property: Option<&str>) -> i32 {
         Ok(text) => text,
         Err(e) => {
             eprintln!(
-                "error: cargo-mutants wrote no outcomes at {} ({e}) — NOTHING WAS MEASURED. \
-                 The usual cause is a --file or --re that matched no mutants, which the tool \
-                 itself reports as success. Check the filter names a real path or function.",
-                path.display()
+                "{}",
+                no_outcomes_diagnosis(code, &path.display().to_string(), &e.to_string())
             );
             return 2;
         }
@@ -575,5 +622,33 @@ mod tests {
             shared_target_dir_refusal(Some(("CARGO_MUTANTS_JOBS=", "1")), Some(dir)).is_none(),
             "one env-sourced job cannot collide either"
         );
+    }
+
+    #[test]
+    fn a_tool_that_died_is_named_by_its_exit_not_blamed_on_the_filter() {
+        let msg = no_outcomes_diagnosis(Some(1), "x/outcomes.json", "No such file");
+        assert!(msg.starts_with("error: cargo-mutants exited 1 before measuring anything"));
+        assert!(msg.contains("NOTHING WAS MEASURED"));
+        assert!(msg.contains("its own error is printed above"));
+        assert!(!msg.contains("matched no mutants"));
+        // A malformed --re also exits 1, so the verb must not rule the
+        // filter out; the tool's own line above is the diagnosis.
+        assert!(!msg.contains("not a filter"));
+        assert!(no_outcomes_diagnosis(Some(4), "x", "e").contains("exited 4 before"));
+    }
+
+    #[test]
+    fn a_tool_that_exited_zero_with_no_outcomes_is_the_filter_shape() {
+        let msg = no_outcomes_diagnosis(Some(0), "x/outcomes.json", "No such file");
+        assert!(msg.starts_with("error: cargo-mutants wrote no outcomes at x/outcomes.json"));
+        assert!(msg.contains("matched no mutants"));
+        assert!(!msg.contains("exited 0"));
+    }
+
+    #[test]
+    fn a_tool_killed_by_a_signal_says_so() {
+        let msg = no_outcomes_diagnosis(None, "x", "e");
+        assert!(msg.starts_with("error: cargo-mutants was killed by a signal before measuring"));
+        assert!(!msg.contains("matched no mutants"));
     }
 }
