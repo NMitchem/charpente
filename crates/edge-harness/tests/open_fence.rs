@@ -19,6 +19,16 @@
 //! fence-triggering code that the last two tests drive lives in
 //! `crates/charpente-sim/tests/open_fence.rs`, on the other side of that
 //! boundary.
+//!
+//! The child is NOT marked with an env var. An earlier draft set
+//! `CHARPENTE_F1_CHILD=1` on the spawned `cargo test` "as a marker the
+//! child's output can be attributed to", and nothing ever read it — dead
+//! scaffolding that looked load-bearing (mechanical-fences Item 3). The child
+//! runs a test in a DIFFERENT crate (`-p charpente`), so it cannot re-enter
+//! this test and needs no recursion guard either. Do not confuse this with
+//! `CHARPENTE_F1_PANIC_CHILD`, which `crates/charpente-sim/tests/open_fence.rs`
+//! DOES read: that one gates its tests to run only as a spawned child, and
+//! removing it would make those tests fire inside the ordinary sweep.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 /// The existing deterministic fence regression this oracle drives (read, not
@@ -47,7 +57,6 @@ fn open_fence_does_not_print_a_raw_redb_panic_trace() {
             "--nocapture",
             "--exact",
         ])
-        .env("CHARPENTE_F1_CHILD", "1")
         .output()
         .expect("child cargo test runs");
 

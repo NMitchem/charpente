@@ -209,9 +209,21 @@ impl Report {
 static OPEN_FENCE_HOOK: std::sync::Once = std::sync::Once::new();
 
 /// Replaces redb's benign open-fence trace with one named line, and delegates
-/// every other panic to the previous hook untouched. Idempotent — call it from
-/// any entry point. Deliberately contains no `panicked` substring: a log grep
-/// for that word is what F1 trained agents to misuse.
+/// every other panic to the previous hook untouched. Deliberately contains no
+/// `panicked` substring: a log grep for that word is what F1 trained agents
+/// to misuse.
+///
+/// **Install-once-EVER, not idempotent.** The `Once` fires the first time any
+/// entry point calls this and never again — so calling it from several entry
+/// points is safe, which is what the old "idempotent" wording meant. What it
+/// does NOT give is restoration: if anything installs a hook *after* this one,
+/// the filter is gone and a second call here restores nothing, because the
+/// `Once` has already fired. That is why `std::panic::set_hook` and
+/// `take_hook` are on `clippy.toml`'s deny-list with this function as the one
+/// sanctioned site (mechanical-fences Item 1): the invariant "exactly one
+/// installer, in the simulator" is what makes the filter trustworthy, and a
+/// deny-list is the only thing that makes the invariant hold without a
+/// reviewer.
 ///
 /// Muting is gated on BOTH the fence flag AND the panic's own source location
 /// naming redb — the flag alone is a time window, not a guarantee about what
@@ -224,6 +236,11 @@ static OPEN_FENCE_HOOK: std::sync::Once = std::sync::Once::new();
 /// original defect silenced a benign one, one notch narrower and strictly
 /// worse: `Db::open`'s discard-and-rebuild path (db.rs) swallows the
 /// resulting `io::Error` unprinted either way.
+// The ONE sanctioned installer of the process-global panic hook (clippy.toml's
+// `std::panic::set_hook`/`take_hook` entries name this function). The allow is
+// function-scoped because the function IS the site; nothing else in the
+// workspace may carry this allow for these two paths.
+#[allow(clippy::disallowed_methods)]
 pub fn install_open_fence_hook() {
     OPEN_FENCE_HOOK.call_once(|| {
         let prev = std::panic::take_hook();
