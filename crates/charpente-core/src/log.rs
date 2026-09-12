@@ -267,10 +267,12 @@ impl Wal {
                     );
                     if cut != len {
                         // Load-bearing truncation; see the module docs. `!=`
-                        // rather than `<`: with the assert above they mean the
-                        // same, and `!=`'s mutant (`==`) skips every real
-                        // truncation where `<`'s (`<=`) was a no-op set_len
-                        // no oracle can see (2026-09-10 sweep, log.rs:263).
+                        // rather than `<`: `cut == len` never reaches here (a
+                        // scan that ends at `len` yields `CleanEnd`, not a
+                        // cut), so `<`'s mutant (`<=`) changed nothing
+                        // reachable, where `!=`'s (`==`) skips every real
+                        // truncation and three tests go red (2026-09-10 sweep,
+                        // log.rs:263).
                         file.set_len(cut)?;
                         file.sync()?;
                     }

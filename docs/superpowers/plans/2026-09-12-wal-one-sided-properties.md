@@ -775,7 +775,7 @@ Expected: `torn_header` lines (`-> bool with true`, `with false`, `replace > wit
 ```bash
 # cut != len -> ==
 perl -pi -e 's/if cut != len \{/if cut == len {/' crates/charpente-core/src/log.rs && git diff --stat
-cargo test -p charpente-sim --test wal wal_fixed_size_payloads_cannot_resurrect_stale_frames 2>&1 | grep -E '^test |panicked' | head -3
+cargo test -p charpente-sim --test wal 2>&1 | grep -E '^test result|FAILED' | head -6   # three tests red; the single test first named here stays green alone
 git checkout -- crates/charpente-core/src/log.rs
 # tail_offset != 0 -> == 0
 perl -pi -e 's/if self\.tail_offset != 0 &&/if self.tail_offset == 0 \&\&/' crates/charpente-core/src/log.rs && git diff --stat
@@ -822,14 +822,14 @@ refactor(core): two WAL gates written so their mutants are visible, and the torn
 
 `cut < len` -> `assert!(cut <= len); cut != len`: `<`'s `<=` mutant
 was a no-op set_len no oracle can see; `!=`'s `==` skips every real
-truncation and wal_fixed_size_payloads_cannot_resurrect_stale_frames
-goes red. `tail_offset > 0` -> `!= 0` on the u64: `>= 0` re-opened the
-same segment name; `== 0` never rotates a full segment and the rotation
-family goes red. The torn-header comparison moves into `torn_header`
-so its one equivalent mutant (`>=`: a header that exactly fits is
-refused by the payload check anyway) can be excluded by name. Every
-other mutant at the three sites watched caught; the equivalent one
-watched surviving the whole core+sim suite. No behaviour change.
+truncation and three wal tests go red. `tail_offset > 0` -> `!= 0` on
+the u64: `>= 0` re-opened the same segment name; `== 0` never rotates
+a full segment and the rotation family goes red. The torn-header
+comparison moves into `torn_header` so its one equivalent mutant
+(`>=`: a header that exactly fits is refused by the payload check
+anyway) can be excluded by name. Every other mutant at the three
+sites watched caught; the equivalent one watched surviving the whole
+core+sim suite. No behaviour change.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_017gCrhXqM7QqtVbwYF1266M
