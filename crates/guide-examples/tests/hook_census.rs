@@ -46,13 +46,22 @@ fn sites_in(src: &str) -> Vec<(usize, String)> {
         .collect()
 }
 
-/// The top-level `fn` a line sits under, by the nearest preceding
-/// column-zero `fn`/`pub fn` line — enough to say "inside the sanctioned
-/// function" without parsing Rust.
-fn enclosing_fn(src: &str, line_no: usize) -> Option<String> {
+/// The top-level item a line sits under: the nearest preceding column-zero
+/// line that opens something — not blank, not a closing `}`, not an
+/// attribute, not a comment. Enough to say "inside the sanctioned function"
+/// without parsing Rust, and it does not mistake an `impl` block's indented
+/// method for the `fn` above the `impl` (a hole the nearest-`fn` reading had).
+fn enclosing_item(src: &str, line_no: usize) -> Option<String> {
     src.lines()
         .take(line_no)
-        .filter(|l| l.starts_with("fn ") || l.starts_with("pub fn "))
+        .filter(|l| {
+            !l.is_empty()
+                && !l.starts_with(char::is_whitespace)
+                && !l.starts_with('}')
+                && !l.starts_with("#[")
+                && !l.starts_with("#!")
+                && !l.starts_with("//")
+        })
         .last()
         .map(|l| l.to_string())
 }
@@ -96,7 +105,7 @@ fn the_panic_hook_has_exactly_one_installer_and_blanket_allows_cannot_hide_a_sec
             .to_string();
         for (line_no, text) in sites_in(&src) {
             let inside = rel == SANCTIONED_FILE
-                && enclosing_fn(&src, line_no).is_some_and(|f| f.contains(SANCTIONED_FN));
+                && enclosing_item(&src, line_no).is_some_and(|f| f.contains(SANCTIONED_FN));
             if inside {
                 sanctioned.push(format!("{rel}:{line_no}: {text}"));
             } else {
@@ -149,8 +158,19 @@ fn a_call_is_a_site_by_line_whatever_its_path_prefix() {
 }
 
 #[test]
-fn the_enclosing_fn_is_the_nearest_top_level_one() {
+fn the_enclosing_item_is_the_nearest_top_level_one() {
     let src = "pub fn a() {\n}\nfn b() {\n    let c = || set_hook(x);\n}\n";
-    assert_eq!(enclosing_fn(src, 4).as_deref(), Some("fn b() {"));
-    assert_eq!(enclosing_fn(src, 1).as_deref(), Some("pub fn a() {"));
+    assert_eq!(enclosing_item(src, 4).as_deref(), Some("fn b() {"));
+    assert_eq!(enclosing_item(src, 1).as_deref(), Some("pub fn a() {"));
+}
+
+#[test]
+fn a_method_in_an_impl_after_the_sanctioned_fn_is_not_inside_it() {
+    // An indented `impl` method has no column-zero `fn` of its own; the
+    // nearest one above it is the sanctioned function, which would read a
+    // second installer in the same file as sanctioned. The enclosing item
+    // must be the nearest column-zero ITEM, and `impl Foo {` is one.
+    let src = "pub fn install_open_fence_hook() {\n}\nimpl Foo {\n    fn bar() {\n        \
+               set_hook(x);\n    }\n}\n";
+    assert_eq!(enclosing_item(src, 5).as_deref(), Some("impl Foo {"));
 }
