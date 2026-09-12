@@ -230,3 +230,118 @@ fn mutants_refuses_env_sourced_parallel_jobs_under_a_shared_target_dir() {
     // --help`: `[env: CARGO_MUTANTS_JOBS=]`), so an operator with it exported
     // reaches the shared-target-dir collision with no flag on the command line.
 }
+
+/// A `cargo` placed first on PATH so the verb's `Command::new("cargo")`
+/// resolves to it: records whether the `--output` directory existed at call
+/// time, then exits with `$SHIM_EXIT`. The real tool needs that directory's
+/// parent to exist and dies with its own error when it does not — the shape
+/// observed 2026-09-12 under an exported CARGO_TARGET_DIR, where `./target`
+/// is never created. CI does not install cargo-mutants, so the verb's own
+/// behaviour is pinned against a stand-in that fails the same way on demand.
+// Writing the shim and the scratch workspace is edge tooling outside the
+// deterministic core (DESIGN.md §1), the same shape as tests/genclient.rs.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)]
+fn run_mutants_with_cargo_shim(shim_exit: &str) -> (std::process::Output, String) {
+    use std::os::unix::fs::PermissionsExt;
+    // Tests run in parallel threads of one process, so pid alone is not a
+    // unique name; a counter is.
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let scratch = std::env::temp_dir().join(format!(
+        "charpente-mutants-shim-{}-{call}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&scratch);
+    let bin = scratch.join("bin");
+    let ws = scratch.join("ws");
+    std::fs::create_dir_all(&bin).expect("shim bin dir");
+    std::fs::create_dir_all(&ws).expect("scratch workspace");
+    let shim = bin.join("cargo");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\n\
+         out=\n\
+         while [ $# -gt 0 ]; do\n\
+           if [ \"$1\" = --output ]; then out=$2; fi\n\
+           shift\n\
+         done\n\
+         if [ -d \"$out\" ]; then echo existed > \"$SHIM_RECORD\"; \
+         else echo missing > \"$SHIM_RECORD\"; fi\n\
+         echo \"shim: cargo-mutants stand-in exiting $SHIM_EXIT\" >&2\n\
+         exit \"$SHIM_EXIT\"\n",
+    )
+    .expect("write shim");
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let record = scratch.join("record");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = charpente()
+        .args(["test", "--mutants", "--dir"])
+        .arg(&ws)
+        .args(["--re", "no-such-mutant-anywhere"])
+        .env("PATH", path)
+        .env("SHIM_EXIT", shim_exit)
+        .env("SHIM_RECORD", &record)
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_MUTANTS_JOBS")
+        .output()
+        .expect("charpente binary runs");
+    let recorded = std::fs::read_to_string(&record).unwrap_or_else(|e| {
+        panic!(
+            "the shim never ran (no record at {}): {e}",
+            record.display()
+        )
+    });
+    let _ = std::fs::remove_dir_all(&scratch);
+    (out, recorded.trim().to_string())
+}
+
+#[cfg(unix)]
+#[test]
+fn mutants_names_the_tools_exit_when_it_dies_before_measuring() {
+    let (out, _) = run_mutants_with_cargo_shim("1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "infrastructure failure is exit 2; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("cargo-mutants exited 1 before measuring anything"),
+        "a tool that died must be reported as the tool dying; got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("matched no mutants"),
+        "the filter is not the cause when the tool exited non-zero; got:\n{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mutants_blames_the_filter_only_when_the_tool_exited_zero() {
+    let (out, _) = run_mutants_with_cargo_shim("0");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "no outcomes is exit 2; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("matched no mutants") && !stderr.contains("exited 0 before"),
+        "exit 0 with no outcomes is the filter-matched-nothing shape; got:\n{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mutants_creates_the_output_dir_before_spawning_the_tool() {
+    let (_, recorded) = run_mutants_with_cargo_shim("0");
+    assert_eq!(
+        recorded, "existed",
+        "the verb chose the --output path, so the verb makes it exist; the shim saw"
+    );
+}

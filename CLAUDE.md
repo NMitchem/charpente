@@ -89,7 +89,10 @@ roadmap; do not reorder a milestone's dependency sequence.
   dir report results that measured nothing. Read the verb's output, never
   cargo-mutants' own exit code: the raw tool exits **0** when a filter matches nothing
   and writes no `outcomes.json` at all, and a failed baseline leaves every counter
-  reading zero.
+  reading zero. The verb consults that exit code in exactly one place — when there is
+  no `outcomes.json` — to tell "matched nothing" (exit 0) from "died before running"
+  (any other exit), and it creates its own `--output` directory, so an exported
+  CARGO_TARGET_DIR no longer needs a hand `mkdir`.
 - Editing docs/GUIDE.md can break the build: `crates/guide-examples`'s build.rs extracts
   and compiles every ```rust block. `cargo build -p guide-examples` checks it alone. A
   pinned `text` block (preceded by `<!-- pinned -->`) is gated
