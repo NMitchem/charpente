@@ -1042,10 +1042,10 @@ Expected: fmt 0, clippy 0, test exit 0, **83** ok, 0 FAILED. This run can exceed
 - [ ] **Step 3: Prove no runtime behaviour changed (spec §5 criterion 7)**
 
 ```bash
-git diff --stat "20 20 12 61 79 80 81 701 33 98 100 204 250 395 398 399 400git merge-base main HEAD)"..HEAD
+git diff --stat "$(git merge-base main HEAD)"..HEAD
 ```
 
-Expected files, and nothing else: `clippy.toml`, `crates/charpente-sim/src/harness.rs`, `crates/edge-harness/tests/open_fence.rs`, `crates/charpente-cli/src/mutants.rs`, `crates/charpente-cli/tests/cli.rs`, `scripts/mutants.sh`, `crates/guide-examples/tests/doc_truth.rs`, `docs/GUIDE.md`, `CLAUDE.md`, `DESIGN.md`. Of these, the only non-test, non-doc, non-config source files are `harness.rs` (doc + attribute + comment only — verify with `git diff "20 20 12 61 79 80 81 701 33 98 100 204 250 395 398 399 400git merge-base main HEAD)"..HEAD -- crates/charpente-sim/src/harness.rs | grep '^[-+]' | grep -v '^[-+][-+]' | grep -v '^[-+]\s*//'` printing only the `#[allow]` line) and `mutants.rs` (a refusal that returns before the spawn). State this in the report verbatim with the grep output.
+Expected files, and nothing else: `clippy.toml`, `crates/charpente-sim/src/harness.rs`, `crates/edge-harness/tests/open_fence.rs`, `crates/charpente-cli/src/mutants.rs`, `crates/charpente-cli/tests/cli.rs`, `scripts/mutants.sh`, `crates/guide-examples/tests/doc_truth.rs`, `docs/GUIDE.md`, `CLAUDE.md`, `DESIGN.md`. Of these, the only non-test, non-doc, non-config source files are `harness.rs` (doc + attribute + comment only — verify with `git diff "$(git merge-base main HEAD)"..HEAD -- crates/charpente-sim/src/harness.rs | grep '^[-+]' | grep -v '^[-+][-+]' | grep -v '^[-+]\s*//'` printing only the `#[allow]` line) and `mutants.rs` (a refusal that returns before the spawn). State this in the report verbatim with the grep output.
 
 - [ ] **Step 4: Commit**
 
