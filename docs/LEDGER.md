@@ -4431,3 +4431,158 @@ retroactively strengthen the reading it closes on. That reading was one laptop, 
 app, `dev` profile, n=3, and it did not decompose the 436 ms into macro expansion,
 typecheck, codegen and link — so whether link dominates that number, the one route by
 which a dylib could still matter to the inner loop, remains unmeasured.
+
+## 2026-09-10 — the autonomous run: two defects merged, one instrument caught lying, fifteen one-sided properties
+
+Recorded 2026-09-12, two days after the merges; the plan is
+`docs/superpowers/plans/2026-09-09-autonomous-run.md`, the spec beside it, and the per-task
+briefs, reviews and the sweep's full findings are in the plan's SDD workspace. Five tasks: the
+dylib drop (entry above, `b15cdc7`, pushed), two defect fixes on separate branches off that
+commit, a baseline collection for the agent-skills sub-project, and a mutation sweep over the
+merged result. `main` carried the merges unpushed until this entry — Noah's word was "merge
+locally", and Task 1's push consent was read as not extending to the defect branches.
+
+**F1 — the redb open-fence printed a false alarm, and the fix was nearly one notch too wide.**
+`566c7df` merges `f1-open-fence` (`b15cdc7..4211ff5`). The `catch_unwind` fence around
+`Store::open` converted redb's open-time assert into an open failure correctly, but the
+default panic hook printed `panicked at …page_manager.rs` BEFORE the catch — 134 such lines
+on a fully green 10,000-universe batch, which had already cost one agent a correct property
+and later caught a hunt's own controller. The fix is a thread-local flag in `charpente-core`
+(`in_open_fence()`) and one install-once hook in `Sim::with_faults`, the single constructor
+funnel — `run_batch` was the plan's first choice and was wrong, because the fence regressions
+in `crates/charpente/tests/transactions.rs` construct `Sim::with_faults` directly and never
+enter it. `set_hook` around the fence itself was refused: it is process-global and sim
+universes run on parallel worker threads, so it would silence a different worker's genuine
+panic. `charpente-core` contains no `set_hook` call, only the rationale comment at
+`table.rs:803`. Review (opus) found the controller's own design defect: the mute was scoped to
+a TIME WINDOW, not to redb — `SimFile`'s own `panic!` is reachable inside the fence through
+`DiskBackend`, so a genuine simulator bug would have printed "benign". The hook now requires
+`from_redb && in_open_fence()` (`harness.rs:234`); the reviewer proved the conjunction by
+mutating it back to flag-only and watching a real panic print as benign. The child-process
+output oracle went to `edge-harness` (process spawning is deny-listed inside the platform
+crate) and then, when that gave `edge-harness` its first dev-dependencies on the simulator,
+the child moved into `crates/charpente-sim/tests/open_fence.rs` and the dev-deps were dropped
+— the rig's empty dependency list is a mechanical guarantee it cannot shortcut through the
+simulator, and the module doc that claims it stayed true instead of being amended. The same
+oracle was also vacuous as first written: `--exact <bogus>` exited 0 with "45 filtered out"
+and all three assertions passing, so it now asserts the child actually ran the named test.
+
+**The reverse scope-flip was named at two doors out of twelve.** `f9302eb` merges
+`reverse-scope-flip` (`b15cdc7..37e117a`), the sibling the 2026-09-08 entry left open: a
+table declared unscoped whose rows are physically composite-keyed. Twelve
+`open_table(rows_def(` sites in `table.rs`; `:981` is the event table and `scan_raw`'s two
+arms already named the contract, so **9 of 12** now route through a single
+`unscoped_open_err` — thirteen references in the file today, `scan_raw`'s arms included,
+which keep their distinct both-shapes-failed text. RED first:
+`every_unscoped_entry_point_refuses_the_reverse_flip_by_name` (`tests/engine.rs:790`) uses
+`Widget` as the unscoped fixture because the plan's own snippet named `Ticket`, which is
+scoped — the implementer checked and substituted. Review proved the test is not trivially
+true by a per-site sweep: reverting each of the 9 sites alone produced 9 distinct REDs, each
+naming exactly its own door. GUIDE had not promised this direction (unlike the forward one),
+so it gained the bullet hard rule 6 owes.
+
+**`View::scan_by`: the reasoning was refuted and the outcome confirmed, which is why the
+claim could not be accepted on the implementer's word.** The brief excluded `scan_by` as
+"structurally unreachable for this defect via the public API" and the controller flagged that
+as exactly the reasoning that produces a test which passes by construction. The reviewer found
+the premise false — a scoped `put` populates both the index entry and the composite rows
+table, routinely — and with a scope chosen so the entry sorts into `scan_by`'s unscoped range
+(`0x0400_0000_2A00_0000`, colliding with the `[keylen_le][key]` prefix for `key=42u32` at byte
+8), `scan_by` reached the primary table and DID name the contract, through `self.get(id)?`.
+Reachable and covered; but what keeps it quiet in the ordinary case is that
+`scoped_index_entry` prefixes the scope — **a byte-layout property, not a seal**, and the
+codebase's own unit-test comment names "scope moved after the key" as the change that would
+break it. It is pinned by
+`view_scan_by_reaches_the_reverse_flip_through_a_crafted_scope_collision` (`engine.rs:970`),
+whose doc comment says the protection is a property of the current encoding. The re-review
+re-derived the byte math from source independently and showed by isolated mutation that this
+fix and the `scan_raw` arms are separately load-bearing.
+
+**A false red, caused by the controller, recorded rather than quietly re-run.** Verifying
+`9b7efee` reported `guide-examples` 3 ok / 1 FAILED against a prediction of 4. Cause:
+`doc_inventory` correctly refused `crates/charpente-core/tests/zz_review_probe.rs` — the live
+reviewer's scratch file, created in the same worktree while it probed the `scan_by` question.
+`git show 9b7efee --name-only` does not contain it; `git status` showed it untracked. The
+commit was never at fault; the measurement was, because a verification sweep ran in a
+worktree where a reviewer was writing — the gate-chain-vs-concurrent-writer hazard this repo
+already has on file. Re-run on the clean tree: 4 ok. Standing correction from here: verify
+first, THEN dispatch the reviewer, never both in one tree. The oracle caught a stray test
+file within seconds of it appearing; the gate works.
+
+**The merge is the arithmetic sum of its branches.** Both `--no-ff`, zero textual conflicts.
+`git diff --shortstat b15cdc7 f9302eb` is 814 insertions / 26 deletions; the branches alone
+are 418/9 and 396/17, and 418 + 396 = 814, 9 + 17 = 26 — `ort` invented no resolution. The
+two fixes share `table.rs` but are structurally independent: `Store::open` contains zero
+`open_table` calls, so `unscoped_open_err` is unreachable inside the fence and the fence's
+guard block is unreachable from any door. Verified twice, once by the final review in a
+scratch worktree and once by the controller on its own merge: `cargo fmt --all --check` 0,
+`cargo clippy --workspace --all-targets -- -D warnings` 0, `cargo test --workspace
+--no-fail-fast` **exit 0, 82 `test result: ok`, 0 FAILED** — the first time this corpus had
+faced the whole-workspace gate, which also retired an open Minor (recursive cargo does not
+deadlock). Per-package binary counts predicted before running and matched exactly at every
+gate: `charpente-core` 10, `charpente` 14, `charpente-sim` 7, `edge-harness` 9,
+`guide-examples` 4. CLAUDE.md's suite lists gained `open_fence` under both `charpente-sim`
+and `edge-harness` in the same commits.
+
+**The mutation instrument was caught reporting wrong verdicts, by the sweep it was running.**
+`scripts/mutants.sh` over the default target set (`log.rs` + `checks.rs`) at `62e3c0c`, in a
+worktree nothing else touched. The sweep's brief said to export `CARGO_TARGET_DIR` before
+every cargo command — this repo's own worktree hygiene — and to use `--jobs 4`. A MISSED at
+`log.rs:68:39` (`1 << 24` → `1 >> 24`, i.e. `MAX_RECORD_BYTES = 0`) contradicted a plain
+reading of the code: `Wal::append`'s own contract assert must fire on every non-empty
+append. The agent read the mutant's build log instead of accepting it: the rlib hash
+`4dcf93a9ab102cb1` appears in **21 of 36 mutants' logs, including the baseline's**. Cargo's
+filename hash does not vary by mutation content, so four concurrent scratch trees built into
+one shared path and a mutant's tests could run against a different mutant's artifact. The
+same mutant alone at `--jobs 1`: CAUGHT. The agent then threw out its own clean
+`checks.rs` pass (23/23, 0 MISSED, `--jobs 4`) on the grounds that a green result from a
+compromised instrument is not evidence, and redid everything serially. This is a product
+defect, not a run note: `charpente test --mutants` accepts `--jobs N`
+(`crates/charpente-cli/src/mutants.rs:38,146`) and `scripts/mutants.sh` sets neither the
+flag nor a target directory, so an operator following CLAUDE.md's hygiene and reaching for
+a supported flag gets silently wrong answers in either direction. It is Item 5 of the
+mechanical-fences spec.
+
+**Fifteen one-sided properties, all in the WAL, nothing fixed by design.** 140 mutants at
+`--jobs 1` — 100% of the default set — **117 caught, 15 MISSED, 8 unviable, 0 timed out, 0
+unresolved**; `checks.rs` 23/23 clean, every MISSED in `log.rs`. Two are severe.
+`log.rs:504:9`, `||` → `&&` in `read_frame`'s three-way corruption check, makes the whole
+condition unconditionally false — zero-length, oversized and past-end-of-file frames all stop
+being `Invalid` — and nothing in `charpente-core`/`charpente-sim` noticed frame-level
+corruption detection was disabled. The controller re-ran that line with no shared target
+dir and found it **worse than reported: three mutants at `:504` survive, not one** — `||`→`&&`,
+`>`→`==` and `>`→`>=` — so the guard is unpinned in its branch AND its boundary arithmetic,
+the prove-the-operands class, in the one component the architecture calls its commit point.
+`log.rs:466:9` replaces `check_poison`'s body with `Ok(())`: a poisoned WAL never refuses
+anything, and with `Wal::poisoned()` surviving both `true` and `false` at `:435`, three sites
+across two functions say the WAL's own self-poisoning has no direct coverage — distinct from
+Engine/Db-level poisoning, which is well covered. The remaining twelve are boundaries:
+`read_from`'s `seq == up_to` untested from either direction (a log-shipping path), `gc`'s
+`bases[i+1] == keep_from`, `append`'s rotation gate at exactly `segment_bytes` and on a first
+record larger than a segment, the gaplessness assert at `:242` inverted to run only when
+there is nothing to check. Deciding what each property should assert is design judgment, not
+transcription, so the sweep recorded and stopped; it is the sub-project queued AFTER
+mechanical-fences, deliberately not folded in — that one adds fences, this one writes
+properties.
+
+**Task 4's baselines, and a void call that was wrong on the facts.** Three uncontaminated
+baselines (C, D, E) of the agent-skills Task-3 scenario were collected at `ee17b8c` and
+archived beside that sub-project's criteria. D was declared void by the controller after 90
+minutes with no live cargo and an applied mutation left in the tree; Noah pushed back that a
+stalled baseline gets re-run, not written off, and a fresh worktree was dispatched. D was
+never stalled. It ran 7h15m, wrote a 210-line review and restored the production file
+byte-for-byte. Nothing in the signals the controller read separated a stalled agent from a
+slow one, the cheap disambiguator — message it — went unused, and a status message claimed a
+nudge had been sent that never was. Recorded so a scorer knows the process wobbled; the data
+is unaffected, C and D are a prompt-identical pair, and E is flagged as carrying two
+process-only sentences. Wall clock on the identical scenario, model, commit and machine:
+41m, 44m, 7h15m, with the slowest producing the shortest review.
+
+**What this does not settle.** The 15 MISSED are named, not closed. The panic-hook
+invariant — exactly one installer, in the simulator, never inside the deterministic boundary
+— is the F1 fix's whole safety argument and is enforced by review in a repo whose hard rule 1
+forbids that; the final review promoted it, and it is Item 1 of the mechanical-fences spec
+(`docs/superpowers/specs/2026-09-10-mechanical-fences-design.md`, committed 2026-09-12),
+which also carries the `Once`-is-not-idempotent doc claim, a dead env marker, GUIDE's untied
+error strings, and the `--jobs` defect above. No runtime behaviour changes in that
+sub-project; its output is oracles.
