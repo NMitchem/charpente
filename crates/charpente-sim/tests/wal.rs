@@ -6,13 +6,15 @@
 //! acknowledged record, and nothing is ever corrupt, reordered, or invented.
 
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use charpente_core::engine::{Engine, StateMachine};
 use charpente_core::io::{Disk, Entropy, File};
 use charpente_core::log::{Wal, WalConfig};
 use charpente_sim::checks::is_fault_fallout;
 use charpente_sim::{
-    FaultConfig, Sim, run_universes, run_universes_swarm, run_universes_swarm_with,
+    FaultConfig, Sim, SimDisk, run_universes, run_universes_swarm, run_universes_swarm_with,
 };
 
 fn small_segments() -> WalConfig {
@@ -1694,4 +1696,102 @@ fn gc_deletes_the_segment_whose_successor_starts_at_keep_from() {
         "the segment ending exactly at keep_from is deletable: {names:?}"
     );
     assert_eq!(wal.base_seq(), 4);
+}
+
+/// A disk whose files fail `sync` once, on demand, then behave. Poison is
+/// one-shot by nature — after one failed fsync the durability of everything
+/// since the last good one is unknown, and a later fsync that succeeds
+/// cannot un-know it — so the property needs a disk that fails exactly once
+/// and heals, a shape the fault matrix's `sync_error` RATE does not express.
+/// Test-local on purpose (spec §6): not a fault mode, an injection.
+struct FailOneSync {
+    inner: SimDisk,
+    /// Set by the test right before the sync that must fail; the file clears
+    /// it as it fails, so every later sync goes through.
+    arm: Arc<AtomicBool>,
+}
+
+struct FailOneSyncFile {
+    inner: Box<dyn File>,
+    arm: Arc<AtomicBool>,
+}
+
+impl Disk for FailOneSync {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        Ok(Box::new(FailOneSyncFile {
+            inner: self.inner.open(path)?,
+            arm: self.arm.clone(),
+        }))
+    }
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+impl File for FailOneSyncFile {
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.inner.read_at(offset, out)
+    }
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write_at(offset, data)
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn sync(&self) -> io::Result<()> {
+        if self.arm.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::other("injected fsync failure"));
+        }
+        self.inner.sync()
+    }
+}
+
+#[test]
+fn a_failed_sync_poisons_the_log_and_every_later_call_is_refused() {
+    // The WAL's own poison, as distinct from the Engine/Db flag the
+    // apply_failure_poisons_the_engine_until_recovery test covers: the
+    // accessor was read by no test, and check_poison's body could be
+    // replaced with Ok(()) — a poisoned log that refuses nothing — with
+    // nothing noticing (three mutants, two functions, 2026-09-10 sweep).
+    let sim = quiet_sim();
+    let arm = Arc::new(AtomicBool::new(false));
+    let disk = FailOneSync {
+        inner: sim.disk(),
+        arm: arm.clone(),
+    };
+    let mut wal = Wal::open(Box::new(disk), tiny_segments(), |_, _| Ok(())).unwrap();
+    wal.append(&[1u8; 8]).unwrap();
+    assert!(!wal.poisoned(), "a healthy log is not poisoned");
+
+    arm.store(true, Ordering::SeqCst);
+    let err = wal.sync().unwrap_err();
+    assert_eq!(err.to_string(), "injected fsync failure");
+    assert!(wal.poisoned(), "one failed fsync poisons the log");
+    assert!(
+        !arm.load(Ordering::SeqCst),
+        "the injection fired exactly once; the disk is healthy from here"
+    );
+
+    for (what, result) in [
+        ("append", wal.append(&[2u8; 8]).map(|_| ())),
+        ("sync", wal.sync()),
+        ("gc", wal.gc(0, 1)),
+    ] {
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("WAL poisoned by an earlier IO failure"),
+            "{what} after poison must be refused by name; got: {err}"
+        );
+    }
+    assert!(wal.poisoned(), "refusals do not clear the poison");
 }
