@@ -203,3 +203,30 @@ fn mutants_refuses_parallel_jobs_under_a_shared_target_dir() {
     // `crates/charpente-cli/target/` behind (`.gitignore` is `/target`,
     // root-only).
 }
+
+#[test]
+fn mutants_refuses_env_sourced_parallel_jobs_under_a_shared_target_dir() {
+    let out = charpente()
+        .args(["test", "--mutants", "--re", "no-such-mutant-anywhere"])
+        .env("CARGO_MUTANTS_JOBS", "2")
+        .env(
+            "CARGO_TARGET_DIR",
+            "/tmp/charpente-shared-target-dir-for-this-test",
+        )
+        .output()
+        .expect("charpente binary runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the refusal is a usage error (exit 2); stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("CARGO_MUTANTS_JOBS=2 with CARGO_TARGET_DIR set")
+            && stderr.contains("run with --jobs 1, or unset CARGO_TARGET_DIR"),
+        "the refusal must name the env-sourced job count and both fixes; got:\n{stderr}"
+    );
+    // cargo-mutants reads `--jobs` from CARGO_MUTANTS_JOBS too (`cargo mutants
+    // --help`: `[env: CARGO_MUTANTS_JOBS=]`), so an operator with it exported
+    // reaches the shared-target-dir collision with no flag on the command line.
+}

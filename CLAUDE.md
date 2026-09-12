@@ -83,9 +83,13 @@ roadmap; do not reorder a milestone's dependency sequence.
   workspace is 4193 mutants (days of wall clock), so the default is a named oracle-bearing
   target set. Exit 0 every viable mutant caught, 1 a finding (**MISSED** = no oracle noticed,
   i.e. a one-sided property) or an unresolved run (**a timeout is not a catch**), 2 usage,
-  infrastructure, or a baseline that was not green. Read the verb's output, never
-  cargo-mutants' own exit code: the raw tool exits **0** when a filter matches nothing and
-  writes no `outcomes.json` at all, and a failed baseline leaves every counter reading zero.
+  infrastructure, or a baseline that was not green. `--jobs > 1` (flag
+  or `CARGO_MUTANTS_JOBS`) is refused under an inherited `CARGO_TARGET_DIR`: cargo's
+  artifact hash does not vary by mutation content, so parallel jobs sharing one target
+  dir report results that measured nothing. Read the verb's output, never
+  cargo-mutants' own exit code: the raw tool exits **0** when a filter matches nothing
+  and writes no `outcomes.json` at all, and a failed baseline leaves every counter
+  reading zero.
 - Editing docs/GUIDE.md can break the build: `crates/guide-examples`'s build.rs extracts
   and compiles every ```rust block. `cargo build -p guide-examples` checks it alone. A
   pinned `text` block (preceded by `<!-- pinned -->`) is gated
