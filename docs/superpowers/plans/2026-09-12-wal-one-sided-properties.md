@@ -766,7 +766,7 @@ Expected: `40 passed`; the package count is **17** `test result: ok` (charpente-
 ```bash
 cargo mutants --list --file crates/charpente-core/src/log.rs 2>/dev/null | grep -E 'torn_header|replace != with ==|replace <= with' | tee /tmp/wal-t5-new-mutants.txt
 ```
-Expected: `torn_header` lines (`-> bool with true`, `with false`, `replace > with ==`, `replace > with >=`, `replace > with <`), the two `!=` → `==` lines (in `Wal::open_with_horizon` and `Wal::append`), and the assert's `<=` lines. Paste the list. Every one EXCEPT `replace > with >= in torn_header` must now be observed CAUGHT.
+Expected: `torn_header` lines (`-> bool with true`, `with false`, `replace > with ==`, `replace > with >=`, `replace > with <`, `replace + with -`, `replace + with *`), the two `!=` → `==` lines (in `Wal::open_with_horizon` and `Wal::append`), and the assert's `<=` lines. Paste the list. Every one EXCEPT `replace > with >= in torn_header` must now be observed CAUGHT.
 
 - [ ] **Step 4: Watch each new mutant caught, one at a time**
 

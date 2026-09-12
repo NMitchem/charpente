@@ -1,14 +1,16 @@
 //! The known-equivalent mutant list, pinned. `.cargo/mutants.toml`'s
 //! `exclude_re` hides mutants from `charpente test --mutants` by name; a
 //! hidden mutant is a hole the instrument stops reporting, so every entry
-//! must carry — in a `#` comment directly above it — the argument that it is
-//! equivalent (unobservable through any surface the oracle may see), and the
-//! count is pinned so an entry cannot arrive with a commit that says nothing
-//! about it. Two at landing (wal-one-sided-properties spec §5).
+//! must carry — in a `#` comment on the nearest non-blank line above it — the
+//! argument that it is equivalent (unobservable through any surface the
+//! oracle may see), and the count is pinned so an entry cannot arrive with a
+//! commit that says nothing about it. Two at landing (wal-one-sided-properties
+//! spec §5).
 //!
 //! Read as text, not TOML: the rule is about comments, which a TOML parser
 //! drops. An entry is a line inside `exclude_re = [ … ]` whose trimmed start
-//! is a double quote.
+//! is a double quote. Every other non-blank, non-comment line is refused: the
+//! file holds only the opener, one entry per line, and the closer.
 
 // Reading the repo's config at test time is build tooling outside the
 // deterministic boundary, the same sanctioned-edge pattern as
@@ -59,6 +61,55 @@ fn uncommented(text: &str) -> Vec<(usize, String)> {
             !above.is_some_and(|l| l.trim_start().starts_with('#'))
         })
         .collect()
+}
+
+/// Lines the file may hold besides blanks and `#` comments: the array
+/// opener, one double-quoted entry per line, the closer. Anything else — a
+/// single-quoted entry, two entries on a line, another key such as
+/// `exclude_globs` or `examine_re` — would narrow the instrument uncounted.
+fn strays(text: &str) -> Vec<(usize, String)> {
+    text.lines()
+        .enumerate()
+        .map(|(i, l)| (i + 1, l.trim()))
+        .filter(|(_, t)| !t.is_empty() && !t.starts_with('#'))
+        .filter(|(_, t)| {
+            let entry = t.starts_with('"') && t.ends_with("\",") && t.matches('"').count() == 2;
+            !(*t == "exclude_re = [" || *t == "]" || entry)
+        })
+        .map(|(n, t)| (n, t.to_string()))
+        .collect()
+}
+
+#[test]
+fn the_file_holds_nothing_the_ceiling_does_not_count() {
+    let strays = strays(&config());
+    assert!(
+        strays.is_empty(),
+        ".cargo/mutants.toml has {} line(s) the exclusion ceiling does not count:\n  {}\n\
+         contract: besides `#` comments the file holds only `exclude_re = [`, one \
+         double-quoted entry per line, and `]` — a single-quoted string, two entries on one \
+         line, or another key such as exclude_globs narrows the instrument uncounted. fix: \
+         write it as a counted entry with its rationale above it, or delete the line.",
+        strays.len(),
+        strays
+            .iter()
+            .map(|(n, l)| format!(".cargo/mutants.toml:{n}: {l}"))
+            .collect::<Vec<_>>()
+            .join("\n  "),
+    );
+}
+
+#[test]
+fn a_single_quoted_entry_a_doubled_line_and_another_key_are_strays() {
+    let text = "exclude_re = [\n    # why\n    \"a\",\n    'b',\n    \"c\", \"d\",\n]\nexclude_globs = [\"x\"]\n";
+    assert_eq!(
+        strays(text),
+        vec![
+            (4, "'b',".to_string()),
+            (5, "\"c\", \"d\",".to_string()),
+            (7, "exclude_globs = [\"x\"]".to_string()),
+        ]
+    );
 }
 
 #[test]

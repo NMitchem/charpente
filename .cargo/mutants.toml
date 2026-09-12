@@ -13,5 +13,6 @@ exclude_re = [
     # At offset + HEADER_BYTES == len the original reads a complete header and
     # the payload-length check returns Invalid; `>=` returns Invalid one read
     # earlier. Watched surviving the whole core+sim suite (2026-09-12).
-    "replace > with >= in torn_header",
+    # Anchored: the name ends at the function, and a future torn_header_* must not inherit the hole.
+    "replace > with >= in torn_header$",
 ]

@@ -50,7 +50,7 @@ Line numbers are `main` at `a93f100`. "Kills" names the mutant(s) a property mus
 |---|---|---|---|---|
 | 1 | `:106:9` `impl Debug for Wal` | body → `Ok(Default::default())` | **equivalent** | Diagnostic impl that exists so `unwrap_err` has a `Debug` bound; its text is not product surface (hard rule 5 is about error messages the operator reads, and this is not one). Excluded, §5. |
 | 2 | `:242:24` `open_with_horizon` | `!later.is_empty()` → `later.is_empty()` | **property** | The gaplessness assert runs only when there is nothing to check. Observable with a disk whose `remove` returns `Ok` and leaves the name: the original panics with the gaplessness message before truncating; the mutant truncates. §3.7. |
-| 3 | `:263:28` `open_with_horizon` | `cut < len` → `<=` | **rewrite** | At `cut == len` the mutant issues `set_len(len)` + `sync`, a no-op plus a syscall. Rewritten as `assert!(cut <= len); if cut != len`, whose mutant `==` skips every real truncation and is caught by three tests (`bit_flip_cuts_the_log_there_and_deletes_later_segments`, `read_frame_cuts_zero_length_oversized_and_past_end_frames`, `a_maximum_size_record_round_trips_and_one_byte_over_is_invalid`; `wal_fixed_size_payloads_cannot_resurrect_stale_frames` alone stays green — measured 2026-09-12). §4. |
+| 3 | `:263:28` `open_with_horizon` | `cut < len` → `<=` | **rewrite** | The mutant differs only at `cut == len`, which never reaches the branch (a scan that ends at `len` yields `CleanEnd`, not a cut), so it changes nothing reachable. Rewritten as `assert!(cut <= len); if cut != len`, whose mutant `==` skips every real truncation and is caught by three tests (`bit_flip_cuts_the_log_there_and_deletes_later_segments`, `read_frame_cuts_zero_length_oversized_and_past_end_frames`, `a_maximum_size_record_round_trips_and_one_byte_over_is_invalid`; `wal_fixed_size_payloads_cannot_resurrect_stale_frames` alone stays green — measured 2026-09-12). §4. |
 | 4 | `:296:29` `append` | `tail_offset > 0` → `>= 0` | **rewrite** | On a `u64` the mutant deletes the gate; the only effect is a rotate on an empty segment that reopens the *same* name (`segment_name(dir, next_seq)` is unchanged). Rewritten as `tail_offset != 0`, whose mutant `== 0` rotates only on empty segments and never on full ones — segments then grow unbounded, and the rotation family notices. §4. |
 | 5 | `:296:65` `append` | `tail_offset + frame_len > segment_bytes` → `>=` | **property** | A frame that lands exactly at `segment_bytes` rotates one record early. §3.1. |
 | 6 | `:396:20` `read_from` | `seq > up_to` → `==` | **property** | Both mutants break out of the segment loop when the inner loop ended at a clean segment end with `seq == up_to` — i.e. when `up_to`'s frame is the first frame of the next segment — and drop it. One test kills both. §3.2. |
@@ -138,7 +138,8 @@ between the frame and `Valid`; the report states which arm each case pins.
 `append` accepts `payload.len() <= MAX_RECORD_BYTES` (16 MiB). Append one record of exactly
 `MAX_RECORD_BYTES` (segment_bytes large enough that it does not rotate mid-record is
 irrelevant — rotation is between frames), sync, reopen: one record recovered, byte-equal.
-Mutant #15 (`>=`) cuts it. Then, in a fresh sim, write a raw frame declaring
+Mutants #15 (`>=`) and #14 (`==`) both cut it — the `==` RED was observed on this half, not on
+the over-by-one half. Then, in a fresh sim, write a raw frame declaring
 `MAX_RECORD_BYTES + 1` WITH the bytes present and a correct CRC; `Wal::open` recovers zero
 records (the frame is `Invalid` by the size arm). Mutant #14 (`==`) recovers it — a record
 the contract forbids. Cost: two ~16 MiB in-memory files; the CRC over 16 MiB is tens of
@@ -187,9 +188,10 @@ exclude_re = [
 
 `torn_header` is a new three-line `fn torn_header(offset: u64, len: u64) -> bool { offset +
 HEADER_BYTES > len }` in `log.rs`, called from `read_frame` — so the mutant's `--list` name
-carries a unique function and the regex needs no line number. Its other mutants (`→ true`,
-`→ false`, `> → ==`, `> → <`) are all observable and must be observed CAUGHT (a torn-tail
-universe in `wal_survives_the_fault_matrix` reads past EOF under `== `).
+carries a unique function and the regex needs no line number. Its other six mutants (`→ true`,
+`→ false`, `> → ==`, `> → <`, `+ → -`, `+ → *`) are all observable and were observed CAUGHT
+(`+ → -` as an overflow panic at offset 0 in the debug build) (a torn-tail universe in
+`wal_survives_the_fault_matrix` reads past EOF under `== `).
 
 The ceiling: `crates/guide-examples/tests/mutants_exclusions.rs` reads `.cargo/mutants.toml`
 as text and asserts (a) exactly `EXCLUSIONS = 2` string entries inside `exclude_re`, and
