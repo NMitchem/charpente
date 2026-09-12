@@ -6,13 +6,15 @@
 //! acknowledged record, and nothing is ever corrupt, reordered, or invented.
 
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use charpente_core::engine::{Engine, StateMachine};
 use charpente_core::io::{Disk, Entropy, File};
-use charpente_core::log::{Wal, WalConfig};
+use charpente_core::log::{MAX_RECORD_BYTES, Wal, WalConfig, frame_crc};
 use charpente_sim::checks::is_fault_fallout;
 use charpente_sim::{
-    FaultConfig, Sim, run_universes, run_universes_swarm, run_universes_swarm_with,
+    FaultConfig, Sim, SimDisk, run_universes, run_universes_swarm, run_universes_swarm_with,
 };
 
 fn small_segments() -> WalConfig {
@@ -1605,5 +1607,364 @@ fn a_short_all_digit_name_is_a_foreign_file_not_a_segment() {
         err.to_string()
             .contains("refusing to recover around foreign files"),
         "the refusal must name the contract it enforces: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Boundaries the 2026-09-10 mutation sweep found unpinned (spec
+// docs/superpowers/specs/2026-09-12-wal-one-sided-properties-design.md §3).
+// Each of these was watched going RED under its named mutant before landing.
+
+#[test]
+fn a_frame_that_exactly_fills_the_segment_stays_in_it() {
+    // 64-byte segments, 16-byte payloads -> 32-byte frames: two fill a
+    // segment to the byte. The rotation gate is `tail_offset + frame_len >
+    // segment_bytes`; at exactly `==` the frame belongs to THIS segment, and
+    // the `>=` mutant rotated it one record early with nothing noticing.
+    let sim = quiet_sim();
+    let mut wal = Wal::open(Box::new(sim.disk()), tiny_segments(), |_, _| Ok(())).unwrap();
+    wal.append(&[1u8; 16]).unwrap();
+    wal.append(&[2u8; 16]).unwrap();
+    wal.sync().unwrap();
+    let names = sim.disk().list("wal/").unwrap();
+    assert_eq!(names.len(), 1, "an exact fit does not rotate: {names:?}");
+    assert_eq!(
+        sim.disk().open(&names[0]).unwrap().len().unwrap(),
+        64,
+        "the segment is full to the byte"
+    );
+    wal.append(&[3u8; 16]).unwrap();
+    wal.sync().unwrap();
+    let names = sim.disk().list("wal/").unwrap();
+    assert_eq!(
+        names.len(),
+        2,
+        "one byte over the capacity rotates: {names:?}"
+    );
+}
+
+#[test]
+fn read_from_includes_up_to_when_its_frame_opens_the_next_segment() {
+    // The log of read_from_returns_verified_frames_across_segments: 8-byte
+    // payloads, two 24-byte frames per 64-byte segment, bases 0, 2, 4, ….
+    // `up_to = 26` is the FIRST frame of a segment, so the scan reaches the
+    // clean end of [24, 25] with `seq == up_to` still unread — the boundary
+    // the sibling's odd `up_to` never touches, and where both `>` mutants
+    // (`==` and `>=`) break out of the segment loop and drop the last frame.
+    let sim = quiet_sim();
+    let mut wal = Wal::open(Box::new(sim.disk()), tiny_segments(), |_, _| Ok(())).unwrap();
+    let records: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 8]).collect();
+    for record in &records {
+        wal.append(record).unwrap();
+    }
+    wal.sync().unwrap();
+    let names = sim.disk().list("wal/").unwrap();
+    assert!(
+        names.iter().any(|n| base_of(n) == 26),
+        "26 must open a segment for this to be the boundary: {names:?}"
+    );
+
+    let got = wal.read_from(13, 26, usize::MAX).unwrap();
+    assert_eq!(
+        got.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        (13..=26).collect::<Vec<_>>(),
+        "up_to is inclusive even when its frame opens the next segment"
+    );
+    assert_eq!(got.last().unwrap().1, records[26]);
+}
+
+#[test]
+fn gc_deletes_the_segment_whose_successor_starts_at_keep_from() {
+    // Bases 0, 2, 4, …: `gc(4, 1)` may delete [0,1] and [2,3] — every frame
+    // in both is below 4 — and must stop at [4,5]. The sibling
+    // gc_deletes_only_whole_segments_below_keep_from asserts only
+    // `first_base <= keep_from`, which a gc that stops one segment early
+    // satisfies; this pins the boundary exactly.
+    let sim = quiet_sim();
+    let mut wal = Wal::open(Box::new(sim.disk()), tiny_segments(), |_, _| Ok(())).unwrap();
+    for i in 0..40u8 {
+        wal.append(&[i; 8]).unwrap();
+    }
+    wal.sync().unwrap();
+
+    wal.gc(4, 1).unwrap();
+
+    let names = sim.disk().list("wal/").unwrap();
+    assert_eq!(
+        base_of(&names[0]),
+        4,
+        "the segment ending exactly at keep_from is deletable: {names:?}"
+    );
+    assert_eq!(wal.base_seq(), 4);
+}
+
+/// A disk whose files fail `sync` once, on demand, then behave. Poison is
+/// one-shot by nature — after one failed fsync the durability of everything
+/// since the last good one is unknown, and a later fsync that succeeds
+/// cannot un-know it — so the property needs a disk that fails exactly once
+/// and heals, a shape the fault matrix's `sync_error` RATE does not express.
+/// Test-local on purpose (spec §6): not a fault mode, an injection.
+struct FailOneSync {
+    inner: SimDisk,
+    /// Set by the test right before the sync that must fail; the file clears
+    /// it as it fails, so every later sync goes through.
+    arm: Arc<AtomicBool>,
+}
+
+struct FailOneSyncFile {
+    inner: Box<dyn File>,
+    arm: Arc<AtomicBool>,
+}
+
+impl Disk for FailOneSync {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        Ok(Box::new(FailOneSyncFile {
+            inner: self.inner.open(path)?,
+            arm: self.arm.clone(),
+        }))
+    }
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.inner.sync_dir(prefix)
+    }
+}
+
+impl File for FailOneSyncFile {
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.inner.read_at(offset, out)
+    }
+    fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write_at(offset, data)
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn sync(&self) -> io::Result<()> {
+        if self.arm.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::other("injected fsync failure"));
+        }
+        self.inner.sync()
+    }
+}
+
+#[test]
+fn a_failed_sync_poisons_the_log_and_every_later_call_is_refused() {
+    // The WAL's own poison, as distinct from the Engine/Db flag the
+    // apply_failure_poisons_the_engine_until_recovery test covers: the
+    // accessor was read by no test, and check_poison's body could be
+    // replaced with Ok(()) — a poisoned log that refuses nothing — with
+    // nothing noticing (three mutants, two functions, 2026-09-10 sweep).
+    let sim = quiet_sim();
+    let arm = Arc::new(AtomicBool::new(false));
+    let disk = FailOneSync {
+        inner: sim.disk(),
+        arm: arm.clone(),
+    };
+    let mut wal = Wal::open(Box::new(disk), tiny_segments(), |_, _| Ok(())).unwrap();
+    wal.append(&[1u8; 8]).unwrap();
+    assert!(!wal.poisoned(), "a healthy log is not poisoned");
+
+    arm.store(true, Ordering::SeqCst);
+    let err = wal.sync().unwrap_err();
+    assert_eq!(err.to_string(), "injected fsync failure");
+    assert!(wal.poisoned(), "one failed fsync poisons the log");
+    assert!(
+        !arm.load(Ordering::SeqCst),
+        "the injection fired exactly once; the disk is healthy from here"
+    );
+
+    for (what, result) in [
+        ("append", wal.append(&[2u8; 8]).map(|_| ())),
+        ("sync", wal.sync()),
+        ("gc", wal.gc(0, 1)),
+    ] {
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("WAL poisoned by an earlier IO failure"),
+            "{what} after poison must be refused by name; got: {err}"
+        );
+    }
+    assert!(wal.poisoned(), "refusals do not clear the poison");
+}
+
+/// One frame in the WAL's real format — `[seq u64 le][len u32 le][crc u32
+/// le][payload]`, crc over seq‖len‖payload as `frame_crc` computes it — so a
+/// hand-built log differs from an appended one only where the test says.
+/// `declared_len` lets a frame LIE about its length; the crc is over the
+/// bytes actually supplied, which is what recovery recomputes when it reads
+/// `declared_len` bytes.
+fn raw_frame(seq: u64, declared_len: u32, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(16 + payload.len());
+    frame.extend_from_slice(&seq.to_le_bytes());
+    frame.extend_from_slice(&declared_len.to_le_bytes());
+    frame.extend_from_slice(&frame_crc(seq, payload).to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+const FIRST_SEGMENT: &str = "wal/00000000000000000000.log";
+
+#[test]
+fn read_frame_cuts_zero_length_oversized_and_past_end_frames() {
+    // One valid frame, then a frame the three-way size check must refuse.
+    // cargo-mutants' `:504:9` turns the FIRST `||` into `&&`, and `&&` binds
+    // tighter than `||`: the mutant is `(len == 0 && len > MAX) || past_end`,
+    // so arms 1-2 are dead and the past-end arm lives. Case (a) — a declared
+    // length of 0 with a correct crc — is what distinguishes it: under the
+    // mutant it is recovered as an EMPTY record, which append forbids. Cases
+    // (b) and (c) pin arms 2 and 3 of the ORIGINAL check (an oversized and a
+    // past-end declaration each cut) and are still refused by arm 3 under the
+    // mutant. The crc in (a) is deliberately right so the size arm is the only
+    // thing between the frame and Valid.
+    let valid = raw_frame(0, 8, &[7u8; 8]);
+    let cases: [(&str, Vec<u8>); 3] = [
+        ("zero-length", raw_frame(1, 0, &[])),
+        (
+            "oversized",
+            raw_frame(1, (MAX_RECORD_BYTES + 1) as u32, &[9u8; 8]),
+        ),
+        ("past-end", raw_frame(1, 64, &[9u8; 8])),
+    ];
+    for (name, bad) in cases {
+        let sim = quiet_sim();
+        let file = sim.disk().open(FIRST_SEGMENT).unwrap();
+        file.write_at(0, &valid).unwrap();
+        file.write_at(valid.len() as u64, &bad).unwrap();
+        file.sync().unwrap();
+        sim.disk().sync_dir("wal/").unwrap();
+
+        let mut recovered = Vec::new();
+        Wal::open(Box::new(sim.disk()), small_segments(), |seq, p| {
+            recovered.push((seq, p.to_vec()));
+            Ok(())
+        })
+        .unwrap_or_else(|e| panic!("{name}: recovery must cut, not fail: {e}"));
+        assert_eq!(
+            recovered,
+            vec![(0, vec![7u8; 8])],
+            "{name}: exactly the valid frame is recovered"
+        );
+        assert_eq!(
+            sim.disk().open(FIRST_SEGMENT).unwrap().len().unwrap(),
+            valid.len() as u64,
+            "{name}: the cut truncates at the bad frame"
+        );
+    }
+}
+
+#[test]
+fn a_maximum_size_record_round_trips_and_one_byte_over_is_invalid() {
+    // append accepts exactly MAX_RECORD_BYTES; recovery's size arm is
+    // `payload_len > MAX`, so a record AT the maximum is the boundary the
+    // `>=` mutant cuts, and a frame declaring one byte more — bytes present,
+    // crc correct — is the record the `==` mutant recovers.
+    let sim = quiet_sim();
+    let big = vec![0xABu8; MAX_RECORD_BYTES];
+    let mut wal = Wal::open(Box::new(sim.disk()), small_segments(), |_, _| Ok(())).unwrap();
+    wal.append(&big).unwrap();
+    wal.sync().unwrap();
+    let mut recovered = Vec::new();
+    Wal::open(Box::new(sim.disk()), small_segments(), |seq, payload| {
+        recovered.push((seq, payload.len(), payload == big.as_slice()));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        recovered,
+        vec![(0, MAX_RECORD_BYTES, true)],
+        "a record of exactly MAX_RECORD_BYTES survives recovery"
+    );
+
+    let sim = quiet_sim();
+    let over = vec![0xCDu8; MAX_RECORD_BYTES + 1];
+    let file = sim.disk().open(FIRST_SEGMENT).unwrap();
+    file.write_at(0, &raw_frame(0, (MAX_RECORD_BYTES + 1) as u32, &over))
+        .unwrap();
+    file.sync().unwrap();
+    sim.disk().sync_dir("wal/").unwrap();
+    let mut count = 0;
+    Wal::open(Box::new(sim.disk()), small_segments(), |_, _| {
+        count += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        count, 0,
+        "a frame declaring MAX_RECORD_BYTES + 1 is invalid even with its bytes present"
+    );
+    assert_eq!(
+        sim.disk().open(FIRST_SEGMENT).unwrap().len().unwrap(),
+        0,
+        "…and the cut truncates it away"
+    );
+}
+
+/// A disk whose `remove` returns Ok and leaves the name in place. Not a
+/// fault any filesystem exhibits — a BROKEN INVARIANT, which is exactly what
+/// recovery's gaplessness check (`open_with_horizon`, "no segment past the
+/// cut point may still exist before the truncation runs") is there to refuse
+/// rather than recover around. Test-local (spec §6).
+struct LyingRemove(SimDisk);
+
+impl Disk for LyingRemove {
+    fn open(&self, path: &str) -> io::Result<Box<dyn File>> {
+        self.0.open(path)
+    }
+    fn remove(&self, _path: &str) -> io::Result<()> {
+        Ok(())
+    }
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        self.0.list(prefix)
+    }
+    fn sync_dir(&self, prefix: &str) -> io::Result<()> {
+        self.0.sync_dir(prefix)
+    }
+}
+
+#[test]
+#[should_panic(expected = "orphaned segments must be removed before the cut segment is truncated")]
+fn a_remove_that_lies_trips_the_gaplessness_assert_before_the_cut() {
+    // The log of bit_flip_cuts_the_log_there_and_deletes_later_segments: 40
+    // 300-byte records, 12 frames per 4 KiB segment, one payload byte of
+    // frame 3 flipped so the cut lands in segment 0 with later segments on
+    // disk. Recovery removes them first; through a disk whose remove lies
+    // they are still listed when the negative-space check runs, and the
+    // check — not the truncation — is what must happen next. The sweep's
+    // mutant inverted the check's guard so it ran only when there was
+    // nothing to check; under it recovery truncates and returns Ok.
+    let sim = quiet_sim();
+    let records: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 300]).collect();
+    let refs: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
+    build_log(&sim, &refs);
+    let names = sim.disk().list("wal/").unwrap();
+    assert!(
+        names.len() > 1,
+        "later segments must exist for the check to have work: {names:?}"
+    );
+    let segment = sim.disk().open(&names[0]).unwrap();
+    let offset = 3 * 316 + 16 + 100;
+    let mut byte = [0u8; 1];
+    segment.read_at(offset, &mut byte).unwrap();
+    segment.write_at(offset, &[byte[0] ^ 0xFF]).unwrap();
+    segment.sync().unwrap();
+
+    let result = Wal::open(
+        Box::new(LyingRemove(sim.disk())),
+        small_segments(),
+        |_, _| Ok(()),
+    );
+    panic!(
+        "recovery returned {:?} instead of refusing to truncate beside a surviving later \
+         segment",
+        result.map(|_| ())
     );
 }

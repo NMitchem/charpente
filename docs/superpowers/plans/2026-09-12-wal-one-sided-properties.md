@@ -416,13 +416,15 @@ const FIRST_SEGMENT: &str = "wal/00000000000000000000.log";
 #[test]
 fn read_frame_cuts_zero_length_oversized_and_past_end_frames() {
     // One valid frame, then a frame the three-way size check must refuse.
-    // Under the `||` -> `&&` mutant the check is unsatisfiable and dead, and
-    // each case shows it its own way: (a) a declared length of 0 with a
-    // correct crc is recovered as an EMPTY record, which append forbids;
-    // (b) a length above MAX with 8 bytes present and (c) a length of 64
-    // with 8 bytes present both read past EOF, and recovery errors instead
-    // of cutting. The crc in (a) is deliberately right so the size arm is the
-    // only thing between the frame and Valid.
+    // cargo-mutants' `:504:9` turns the FIRST `||` into `&&`, and `&&` binds
+    // tighter than `||`: the mutant is `(len == 0 && len > MAX) || past_end`,
+    // so arms 1-2 are dead and the past-end arm lives. Case (a) — a declared
+    // length of 0 with a correct crc — is what distinguishes it: under the
+    // mutant it is recovered as an EMPTY record, which append forbids. Cases
+    // (b) and (c) pin arms 2 and 3 of the ORIGINAL check (an oversized and a
+    // past-end declaration each cut) and are still refused by arm 3 under the
+    // mutant. The crc in (a) is deliberately right so the size arm is the only
+    // thing between the frame and Valid.
     let valid = raw_frame(0, 8, &[7u8; 8]);
     let cases: [(&str, Vec<u8>); 3] = [
         ("zero-length", raw_frame(1, 0, &[])),
@@ -516,14 +518,14 @@ Expected: `39 passed`, exit 0. Note the `finished in` time — the 16 MiB fixtur
 
 - [ ] **Step 4: RED under #13 (`||` → `&&`)**
 
-cargo-mutants' `:504:9` flips the FIRST `||`, and `payload_len == 0 && (…)` is already unsatisfiable — the whole check is dead. Apply exactly that:
+cargo-mutants' `:504:9` flips the FIRST `||`; `&&` binds tighter, so the mutant is `(len == 0 && len > MAX) || past_end` — arms 1–2 dead, the past-end arm alive. Apply exactly that:
 ```bash
 perl -pi -e 's/^        \|\| payload_len > MAX_RECORD_BYTES as u64$/        \&\& payload_len > MAX_RECORD_BYTES as u64/' crates/charpente-core/src/log.rs && git diff --stat
 git diff crates/charpente-core/src/log.rs | grep -c '^+.*&&'
 cargo test -p charpente-sim --test wal read_frame_cuts 2>&1 | grep -E '^test |panicked|recovery must cut|exactly the valid'
 git checkout -- crates/charpente-core/src/log.rs && git status --short
 ```
-Expected: the grep prints `1`; the test FAILS on the FIRST case — `zero-length: exactly the valid frame is recovered`, with a second, empty record in `left`. Cases (b) and (c) are reached only when (a) passes, so this one run is the observation for the branch; the report says so. To ALSO see (b)/(c) under the mutant, make a scratch edit to the TEST (comment out the `"zero-length"` case), run, paste the `recovery must cut, not fail` panic naming `oversized`, and revert the test edit with `git diff --stat` showing only the intended hunks — optional, and never committed.
+Expected: the grep prints `1`; the test FAILS on the FIRST case — `zero-length: exactly the valid frame is recovered`, with a second, empty record in `left`. Cases (b) and (c) stay GREEN under this mutant — arm 3 still refuses them — so (a) is the observation for the branch; the report says so. To ALSO see (b)/(c) under the mutant, make a scratch edit to the TEST (comment out the `"zero-length"` case), run, paste the `recovery must cut, not fail` panic naming `oversized`, and revert the test edit with `git diff --stat` showing only the intended hunks — optional, and never committed.
 
 - [ ] **Step 5: RED under #14 and #15 (`> MAX` → `==`, then `>=`)**
 
@@ -764,7 +766,7 @@ Expected: `40 passed`; the package count is **17** `test result: ok` (charpente-
 ```bash
 cargo mutants --list --file crates/charpente-core/src/log.rs 2>/dev/null | grep -E 'torn_header|replace != with ==|replace <= with' | tee /tmp/wal-t5-new-mutants.txt
 ```
-Expected: `torn_header` lines (`-> bool with true`, `with false`, `replace > with ==`, `replace > with >=`, `replace > with <`), the two `!=` → `==` lines (in `Wal::open_with_horizon` and `Wal::append`), and the assert's `<=` lines. Paste the list. Every one EXCEPT `replace > with >= in torn_header` must now be observed CAUGHT.
+Expected: `torn_header` lines (`-> bool with true`, `with false`, `replace > with ==`, `replace > with >=`, `replace > with <`, `replace + with -`, `replace + with *`), the two `!=` → `==` lines (in `Wal::open_with_horizon` and `Wal::append`), and the assert's `<=` lines. Paste the list. Every one EXCEPT `replace > with >= in torn_header` must now be observed CAUGHT.
 
 - [ ] **Step 4: Watch each new mutant caught, one at a time**
 
@@ -773,7 +775,7 @@ Expected: `torn_header` lines (`-> bool with true`, `with false`, `replace > wit
 ```bash
 # cut != len -> ==
 perl -pi -e 's/if cut != len \{/if cut == len {/' crates/charpente-core/src/log.rs && git diff --stat
-cargo test -p charpente-sim --test wal wal_fixed_size_payloads_cannot_resurrect_stale_frames 2>&1 | grep -E '^test |panicked' | head -3
+cargo test -p charpente-sim --test wal 2>&1 | grep -E '^test result|FAILED' | head -6   # three tests red; the single test first named here stays green alone
 git checkout -- crates/charpente-core/src/log.rs
 # tail_offset != 0 -> == 0
 perl -pi -e 's/if self\.tail_offset != 0 &&/if self.tail_offset == 0 \&\&/' crates/charpente-core/src/log.rs && git diff --stat
@@ -820,14 +822,14 @@ refactor(core): two WAL gates written so their mutants are visible, and the torn
 
 `cut < len` -> `assert!(cut <= len); cut != len`: `<`'s `<=` mutant
 was a no-op set_len no oracle can see; `!=`'s `==` skips every real
-truncation and wal_fixed_size_payloads_cannot_resurrect_stale_frames
-goes red. `tail_offset > 0` -> `!= 0` on the u64: `>= 0` re-opened the
-same segment name; `== 0` never rotates a full segment and the rotation
-family goes red. The torn-header comparison moves into `torn_header`
-so its one equivalent mutant (`>=`: a header that exactly fits is
-refused by the payload check anyway) can be excluded by name. Every
-other mutant at the three sites watched caught; the equivalent one
-watched surviving the whole core+sim suite. No behaviour change.
+truncation and three wal tests go red. `tail_offset > 0` -> `!= 0` on
+the u64: `>= 0` re-opened the same segment name; `== 0` never rotates
+a full segment and the rotation family goes red. The torn-header
+comparison moves into `torn_header` so its one equivalent mutant
+(`>=`: a header that exactly fits is refused by the payload check
+anyway) can be excluded by name. Every other mutant at the three
+sites watched caught; the equivalent one watched surviving the whole
+core+sim suite. No behaviour change.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_017gCrhXqM7QqtVbwYF1266M

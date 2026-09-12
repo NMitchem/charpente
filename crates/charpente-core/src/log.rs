@@ -260,8 +260,19 @@ impl Wal {
                              {remaining:?}"
                         );
                     }
-                    if cut < len {
-                        // Load-bearing truncation; see the module docs.
+                    assert!(
+                        cut <= len,
+                        "recovery cut {cut} is past segment length {len} — the cut is an \
+                         offset the scan reached inside the file"
+                    );
+                    if cut != len {
+                        // Load-bearing truncation; see the module docs. `!=`
+                        // rather than `<`: `cut == len` never reaches here (a
+                        // scan that ends at `len` yields `CleanEnd`, not a
+                        // cut), so `<`'s mutant (`<=`) changed nothing
+                        // reachable, where `!=`'s (`==`) skips every real
+                        // truncation and three tests go red (2026-09-10 sweep,
+                        // log.rs:263).
                         file.set_len(cut)?;
                         file.sync()?;
                     }
@@ -293,7 +304,10 @@ impl Wal {
         );
         self.check_poison()?;
         let frame_len = HEADER_BYTES + payload.len() as u64;
-        if self.tail_offset > 0 && self.tail_offset + frame_len > self.cfg.segment_bytes {
+        // `!= 0` rather than `> 0` on a u64: same gate, and its mutant (`== 0`)
+        // never rotates a full segment where `> 0`'s (`>= 0`) re-opened the
+        // same name and no oracle could see it (2026-09-10 sweep, log.rs:296).
+        if self.tail_offset != 0 && self.tail_offset + frame_len > self.cfg.segment_bytes {
             self.rotate()?;
         }
         let mut frame = Vec::with_capacity(frame_len as usize);
@@ -486,12 +500,21 @@ enum Frame {
     CleanEnd,
 }
 
+/// A header that does not fit before the end of the file is a torn tail.
+/// Its own function so the instrument can name it: at `offset + HEADER_BYTES
+/// == len` the header fits and the payload-length check refuses the frame
+/// anyway, so the `>=` mutant here is equivalent — excluded by name in
+/// `.cargo/mutants.toml`, where the argument is repeated.
+fn torn_header(offset: u64, len: u64) -> bool {
+    offset + HEADER_BYTES > len
+}
+
 fn read_frame(file: &dyn File, len: u64, offset: u64, expected_seq: u64) -> io::Result<Frame> {
     if offset == len {
         return Ok(Frame::CleanEnd);
     }
-    if offset + HEADER_BYTES > len {
-        return Ok(Frame::Invalid); // partial header: torn tail
+    if torn_header(offset, len) {
+        return Ok(Frame::Invalid);
     }
     let mut header = [0u8; HEADER_BYTES as usize];
     file.read_at(offset, &mut header)?;

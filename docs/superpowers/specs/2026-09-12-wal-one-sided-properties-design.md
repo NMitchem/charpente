@@ -50,7 +50,7 @@ Line numbers are `main` at `a93f100`. "Kills" names the mutant(s) a property mus
 |---|---|---|---|---|
 | 1 | `:106:9` `impl Debug for Wal` | body → `Ok(Default::default())` | **equivalent** | Diagnostic impl that exists so `unwrap_err` has a `Debug` bound; its text is not product surface (hard rule 5 is about error messages the operator reads, and this is not one). Excluded, §5. |
 | 2 | `:242:24` `open_with_horizon` | `!later.is_empty()` → `later.is_empty()` | **property** | The gaplessness assert runs only when there is nothing to check. Observable with a disk whose `remove` returns `Ok` and leaves the name: the original panics with the gaplessness message before truncating; the mutant truncates. §3.7. |
-| 3 | `:263:28` `open_with_horizon` | `cut < len` → `<=` | **rewrite** | At `cut == len` the mutant issues `set_len(len)` + `sync`, a no-op plus a syscall. Rewritten as `assert!(cut <= len); if cut != len`, whose mutant `==` skips every real truncation and is caught by `wal_fixed_size_payloads_cannot_resurrect_stale_frames`. §4. |
+| 3 | `:263:28` `open_with_horizon` | `cut < len` → `<=` | **rewrite** | The mutant differs only at `cut == len`, which never reaches the branch (a scan that ends at `len` yields `CleanEnd`, not a cut), so it changes nothing reachable. Rewritten as `assert!(cut <= len); if cut != len`, whose mutant `==` skips every real truncation and is caught by three tests (`bit_flip_cuts_the_log_there_and_deletes_later_segments`, `read_frame_cuts_zero_length_oversized_and_past_end_frames`, `a_maximum_size_record_round_trips_and_one_byte_over_is_invalid`; `wal_fixed_size_payloads_cannot_resurrect_stale_frames` alone stays green — measured 2026-09-12). §4. |
 | 4 | `:296:29` `append` | `tail_offset > 0` → `>= 0` | **rewrite** | On a `u64` the mutant deletes the gate; the only effect is a rotate on an empty segment that reopens the *same* name (`segment_name(dir, next_seq)` is unchanged). Rewritten as `tail_offset != 0`, whose mutant `== 0` rotates only on empty segments and never on full ones — segments then grow unbounded, and the rotation family notices. §4. |
 | 5 | `:296:65` `append` | `tail_offset + frame_len > segment_bytes` → `>=` | **property** | A frame that lands exactly at `segment_bytes` rotates one record early. §3.1. |
 | 6 | `:396:20` `read_from` | `seq > up_to` → `==` | **property** | Both mutants break out of the segment loop when the inner loop ended at a clean segment end with `seq == up_to` — i.e. when `up_to`'s frame is the first frame of the next segment — and drop it. One test kills both. §3.2. |
@@ -60,8 +60,8 @@ Line numbers are `main` at `a93f100`. "Kills" names the mutant(s) a property mus
 | 10 | `:435:9` `poisoned` | → `false` | **property** | Same. |
 | 11 | `:466:9` `check_poison` | body → `Ok(())` | **property** | A poisoned log refuses nothing. §3.4. |
 | 12 | `:493:30` `read_frame` | `offset + HEADER_BYTES > len` → `>=` | **equivalent** | At `offset + 16 == len` the original reads a complete header and then fails the payload check (`payload_len == 0` or `… > len`): `Invalid` either way; the mutant returns `Invalid` one read earlier. Excluded, §5, after the check moves into a named helper so the exclusion is line-free. |
-| 13 | `:504:9` `read_frame` | `\|\|` → `&&` | **property** | `payload_len == 0 && payload_len > MAX` is unsatisfiable, so the whole three-way check is dead: zero-length, oversized and past-end frames all read as valid. §3.5. |
-| 14 | `:504:24` `read_frame` | `payload_len > MAX` → `==` | **property** | A declared length above `MAX` that is not exactly `MAX` passes this arm and, when the bytes are present, is recovered as a record larger than the contract allows. §3.6. |
+| 13 | `:504:9` `read_frame` | `\|\|` → `&&` | **property** | The first `\|\|` becomes `&&`, which binds tighter: `(len == 0 && len > MAX) \|\| past_end` — the zero-length and oversized arms are dead, the past-end arm lives. A zero-length frame with a correct crc is recovered as an empty record. §3.5. |
+| 14 | `:504:24` `read_frame` | `payload_len > MAX` → `==` | **property** | Exactly `MAX` is now flagged, so a record of `MAX_RECORD_BYTES` — which `append` accepts — is cut on recovery (the observed RED); and a declared length above `MAX` passes the arm and, with the bytes present, would be recovered as a record larger than the contract allows. §3.6. |
 | 15 | `:504:24` `read_frame` | `payload_len > MAX` → `>=` | **property** | A record of exactly `MAX_RECORD_BYTES` — which `append` accepts — is cut on recovery. §3.6. |
 
 Eleven properties at seven sites, two rewrites, two exclusions.
@@ -130,11 +130,7 @@ on `sim.disk()`: one valid frame (seq 0, 8-byte payload) followed by (a) a frame
 `len = 0` with a CORRECT crc for seq 1 over the empty payload; (b) a frame declaring
 `len = MAX_RECORD_BYTES + 1` with only 8 payload bytes present; (c) a frame declaring
 `len = 64` with 8 bytes present. Each `Wal::open` recovers exactly ONE record (seq 0) and
-leaves the segment truncated to that frame's length — the cut. Under the mutant the
-three-way check is dead and each case is observable in its own way: (a) passes CRC and seq
-and is recovered as a second, EMPTY record — a payload the `append` contract forbids;
-(b) and (c) read past EOF into a `read_at` error, so `open` returns `Err` instead of
-cutting. The crc in (a) is deliberately correct so that the size arm is the only thing
+leaves the segment truncated to that frame's length — the cut. Under the mutant — the first `||` turned `&&`, which binds tighter, so `(len == 0 && len > MAX) || past_end` — arms 1–2 are dead and arm 3 lives: (a) passes CRC and seq and is recovered as a second, EMPTY record — a payload the `append` contract forbids — and is the case that kills the mutant; (b) and (c) are still refused by the past-end arm and pin arms 2 and 3 of the original check. The crc in (a) is deliberately correct so that the size arm is the only thing
 between the frame and `Valid`; the report states which arm each case pins.
 
 ### 3.6 `a_maximum_size_record_round_trips_and_one_byte_over_is_invalid` — kills #14, #15
@@ -142,7 +138,8 @@ between the frame and `Valid`; the report states which arm each case pins.
 `append` accepts `payload.len() <= MAX_RECORD_BYTES` (16 MiB). Append one record of exactly
 `MAX_RECORD_BYTES` (segment_bytes large enough that it does not rotate mid-record is
 irrelevant — rotation is between frames), sync, reopen: one record recovered, byte-equal.
-Mutant #15 (`>=`) cuts it. Then, in a fresh sim, write a raw frame declaring
+Mutants #15 (`>=`) and #14 (`==`) both cut it — the `==` RED was observed on this half, not on
+the over-by-one half. Then, in a fresh sim, write a raw frame declaring
 `MAX_RECORD_BYTES + 1` WITH the bytes present and a correct CRC; `Wal::open` recovers zero
 records (the frame is `Invalid` by the size arm). Mutant #14 (`==`) recovers it — a record
 the contract forbids. Cost: two ~16 MiB in-memory files; the CRC over 16 MiB is tens of
@@ -167,7 +164,7 @@ Both in `log.rs`, both semantics-preserving, both in Task order before the sweep
 
 After each rewrite, the NEW site's mutants are enumerated with `cargo mutants --list` and
 each is observed CAUGHT by hand-applying it and running the named existing test
-(`wal_fixed_size_payloads_cannot_resurrect_stale_frames` for the first;
+(the full `wal` suite for the first — three tests go red, and the single test §2 row 3 first named stays green alone;
 `rotation_spreads_records_across_segments_and_recovers` for the second). If a new mutant
 survives, it is a property to write in this sub-project, not a rewrite to keep.
 
@@ -191,9 +188,10 @@ exclude_re = [
 
 `torn_header` is a new three-line `fn torn_header(offset: u64, len: u64) -> bool { offset +
 HEADER_BYTES > len }` in `log.rs`, called from `read_frame` — so the mutant's `--list` name
-carries a unique function and the regex needs no line number. Its other mutants (`→ true`,
-`→ false`, `> → ==`, `> → <`) are all observable and must be observed CAUGHT (a torn-tail
-universe in `wal_survives_the_fault_matrix` reads past EOF under `== `).
+carries a unique function and the regex needs no line number. Its other six mutants (`→ true`,
+`→ false`, `> → ==`, `> → <`, `+ → -`, `+ → *`) are all observable and were observed CAUGHT
+(`+ → -` as an overflow panic at offset 0 in the debug build; a torn-tail universe in
+`wal_survives_the_fault_matrix` reads past EOF under `==`).
 
 The ceiling: `crates/guide-examples/tests/mutants_exclusions.rs` reads `.cargo/mutants.toml`
 as text and asserts (a) exactly `EXCLUSIONS = 2` string entries inside `exclude_re`, and

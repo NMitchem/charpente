@@ -1,0 +1,18 @@
+# Known-equivalent mutants, hidden from `charpente test --mutants` BY NAME,
+# each with the argument that no surface the oracle may see distinguishes it
+# from the original. A hidden mutant is a hole the instrument stops
+# reporting, so: one comment per entry, and the count is pinned by
+# crates/guide-examples/tests/mutants_exclusions.rs (EXCLUSIONS) — raising
+# it is a deliberate act for a commit message. Spec:
+# docs/superpowers/specs/2026-09-12-wal-one-sided-properties-design.md §5.
+exclude_re = [
+    # Diagnostic impl kept only so `unwrap_err` has a Debug bound; its text is
+    # not an error message an operator reads (hard rule 5 is about those).
+    # Replacing the body is unobservable.
+    "replace <impl fmt::Debug for Wal>::fmt",
+    # At offset + HEADER_BYTES == len the original reads a complete header and
+    # the payload-length check returns Invalid; `>=` returns Invalid one read
+    # earlier. Watched surviving the whole core+sim suite (2026-09-12).
+    # Anchored: the name ends at the function, and a future torn_header_* must not inherit the hole.
+    "replace > with >= in torn_header$",
+]
