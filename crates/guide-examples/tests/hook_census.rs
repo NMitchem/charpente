@@ -3,10 +3,11 @@
 //! `std::panic::set_hook`/`take_hook` with `charpente-sim`'s
 //! `install_open_fence_hook` as the one allowed site (mechanical-fences
 //! Item 1), but a deny-list entry is inert inside any file or module that
-//! carries `#![allow(clippy::disallowed_methods)]` — 42 files at landing
-//! (`edge-harness`, `bench-harness`, `prod`, `serve`, `archive.rs`'s
-//! `fs_object_store` module, …) — so inside them the invariant was held by
-//! review. Here it is held by a walk: every `.rs` under `crates/` and
+//! carries `#![allow(clippy::disallowed_methods)]` — 36 files at landing,
+//! counting attribute lines rather than mentions (a naive grep says 42; six
+//! of those only name the attribute in a comment, four of them the
+//! bench-harness accounting files that carry none on purpose) — so inside
+//! them the invariant was held by review. Here it is held by a walk: every `.rs` under `crates/` and
 //! `examples/`, and the only non-comment lines that call `set_hook(` or
 //! `take_hook(` are the two inside `install_open_fence_hook`.
 //!

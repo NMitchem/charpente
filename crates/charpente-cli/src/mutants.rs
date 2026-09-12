@@ -266,8 +266,9 @@ fn no_outcomes_diagnosis(code: Option<i32>, path: &str, err: &str) -> String {
         ),
         Some(n) => format!(
             "error: cargo-mutants exited {n} before measuring anything (no outcomes at {path}: \
-             {err}) — NOTHING WAS MEASURED; its own error is printed above this line. This is \
-             the tool or its environment failing, not a filter or a mutant."
+             {err}) — NOTHING WAS MEASURED; its own error is printed above this line and is \
+             the diagnosis (a missing directory, a malformed --re, a usage error — not a \
+             mutant's verdict)."
         ),
         None => format!(
             "error: cargo-mutants was killed by a signal before measuring anything (no outcomes \
@@ -277,8 +278,10 @@ fn no_outcomes_diagnosis(code: Option<i32>, path: &str, err: &str) -> String {
 }
 
 /// Reads the run's own record and turns every "nothing was measured" shape
-/// into a loud failure. The tool's exit code is deliberately NOT consulted:
-/// it is 0 both for a clean sweep and for a filter that selected nothing.
+/// into a loud failure. The tool's exit code is NOT consulted for the
+/// verdict — it is 0 both for a clean sweep and for a filter that selected
+/// nothing — and IS consulted in exactly one place, when there is no record
+/// at all (`no_outcomes_diagnosis`).
 fn report(path: &std::path::Path, property: Option<&str>, code: Option<i32>) -> i32 {
     // Reading cargo-mutants' own run record is edge tooling, outside the
     // deterministic core (DESIGN.md §1) — nothing inside charpente-core
@@ -628,6 +631,9 @@ mod tests {
         assert!(msg.contains("NOTHING WAS MEASURED"));
         assert!(msg.contains("its own error is printed above"));
         assert!(!msg.contains("matched no mutants"));
+        // A malformed --re also exits 1, so the verb must not rule the
+        // filter out; the tool's own line above is the diagnosis.
+        assert!(!msg.contains("not a filter"));
         assert!(no_outcomes_diagnosis(Some(4), "x", "e").contains("exited 4 before"));
     }
 
