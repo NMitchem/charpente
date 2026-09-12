@@ -88,8 +88,9 @@ roadmap; do not reorder a milestone's dependency sequence.
   writes no `outcomes.json` at all, and a failed baseline leaves every counter reading zero.
 - Editing docs/GUIDE.md can break the build: `crates/guide-examples`'s build.rs extracts
   and compiles every ```rust block. `cargo build -p guide-examples` checks it alone. A
-  ```text block preceded by `<!-- pinned -->` is gated by `tests/doc_truth.rs`: its
-  quoted text must still appear in the code, and the pinned count is a floor.
+  pinned `text` block (preceded by `<!-- pinned -->`) is gated
+  by `tests/doc_truth.rs`: its quoted text must still appear in the code,
+  and the pinned count is a floor.
 - **Capturing a sweep's exit status: this shell is zsh, which does not populate bash's
   `PIPESTATUS` at all.** `${PIPESTATUS[0]}` expands to the empty string in every case,
   and an empty string in a log reads as "no failure" to whoever skims it. Use

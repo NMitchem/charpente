@@ -22,7 +22,12 @@
 //! applied so the comparison is against what a literal DENOTES rather than
 //! how it was typed (backslash-newline continuations vanish, `\"` decodes).
 //! Tests are in the corpus on purpose: a rendered instance ("got 0") lives in
-//! a pinning test's literal where the source has `{}`.
+//! a pinning test's literal where the source has `{}`. This file itself is
+//! the one exclusion: its own fixture strings mirror pinned GUIDE lines by
+//! construction (that is how they prove `missing` works), so leaving it in
+//! the corpus lets a pinned fragment match the gate's own test literal
+//! instead of a real emitter or pinning test — a doc lie the gate would then
+//! wave through.
 //!
 //! Scope, so it is not read wider: an UNMARKED block is not checked. The
 //! blocks left unmarked at landing are the ones that carry instance values
@@ -149,10 +154,18 @@ fn push_fragment(out: &mut Vec<String>, piece: &str) {
 }
 
 /// Rust's string-literal rules applied to a source file, so a doc quote is
-/// compared against what a literal denotes: `\` + newline + the next line's
-/// leading whitespace vanish (a continuation), and `\"`, `\'`, `\\`, `\n`,
-/// `\t` decode. Any other backslash pair is kept as typed. Raw strings need
-/// nothing and are untouched by construction (they contain no escapes).
+/// compared against what a literal denotes: `\` + newline + all following
+/// whitespace — spaces, tabs, and further newlines — vanish (a
+/// continuation), and `\"`, `\'`, `\\`, `\n`, `\t` decode. Any other
+/// backslash pair is kept as typed. Raw strings are NOT distinguished from
+/// ordinary ones: a raw string containing one of the five decoded pairs is
+/// decoded as if it were an ordinary literal, which is wrong for that
+/// string. At landing the only raw string with a backslash in the corpus
+/// (this file's own fixtures excluded — `normalized_corpus` does not walk
+/// this file) is `charpente-cli/src/sim.rs`'s `r"C:\Users\proj\sim.exe"`,
+/// whose pairs (`\U`, `\p`, `\s`) all fall through to "kept as typed", so
+/// nothing is mis-decoded today — the exposure is nil, the mechanism is
+/// real.
 fn unescape(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     let mut chars = src.chars().peekable();
@@ -163,7 +176,10 @@ fn unescape(src: &str) -> String {
         }
         match chars.next() {
             Some('\n') => {
-                while chars.peek().is_some_and(|c| *c == ' ' || *c == '\t') {
+                while chars
+                    .peek()
+                    .is_some_and(|c| matches!(c, ' ' | '\t' | '\n' | '\r'))
+                {
                     chars.next();
                 }
             }
@@ -195,6 +211,14 @@ fn normalized_corpus() -> String {
                 }
                 walk(&path, out);
             } else if path.extension().is_some_and(|x| x == "rs") {
+                // This gate's own fixtures mirror pinned GUIDE lines by
+                // construction, so including this file would let a pinned
+                // fragment match the gate's own test literal instead of a
+                // real emitter or pinning test — observed masking a doc
+                // lie (mechanical-fences task-3 review, Important #1).
+                if path.ends_with("tests/doc_truth.rs") {
+                    continue;
+                }
                 let src =
                     fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
                 out.push_str(&unescape(&src));
@@ -339,6 +363,12 @@ fn unescape_applies_rusts_literal_rules() {
         "a backslash-newline continuation and the indentation after it vanish"
     );
     assert_eq!(
+        unescape("\"one \\\n\n         two\""),
+        "\"one two\"",
+        "a continuation followed by a blank line still skips through to the next non-whitespace \
+         (rustc's rule, not just spaces/tabs on the immediate next line)"
+    );
+    assert_eq!(
         unescape(r#"send \"Authorization: Bearer <token>\""#),
         r#"send "Authorization: Bearer <token>""#
     );
@@ -351,14 +381,55 @@ fn unescape_applies_rusts_literal_rules() {
     );
 }
 
+/// The formatted message from a `catch_unwind` panic payload — `assert!`
+/// and `assert_eq!` with a format-string message always panic with a
+/// `String` payload, never a bare `&str`, but the `&str` arm is kept so a
+/// caller can tell the difference rather than silently swallowing it.
+fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
+    err.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+        .expect("panic payload should be a formatted string")
+}
+
+// Three ways a marker can refuse to pin: before a non-text fence, before a
+// fence never closed, and before a block with no non-empty lines. Hard rule
+// 5 — a refusal is product surface, so each asserts the message an author
+// actually sees, not merely that pinned_blocks panicked (which would stay
+// green even if the message drifted or the panic came from elsewhere).
+
 #[test]
-fn a_marker_that_pins_nothing_is_refused() {
+fn a_marker_before_a_non_text_fence_is_refused() {
     let guide = "prose\n<!-- pinned -->\n```rust\nfn x() {}\n```\n";
-    let r = std::panic::catch_unwind(|| pinned_blocks(guide));
+    let err = std::panic::catch_unwind(|| pinned_blocks(guide))
+        .expect_err("a marker before a non-text fence must panic, not silently pin nothing");
+    let msg = panic_message(err);
     assert!(
-        r.is_err(),
-        "a marker before a non-text fence must panic, not silently pin nothing"
+        msg.contains("docs/GUIDE.md:2:") && msg.contains("decoration"),
+        "must name the marker line and call an unmatched marker decoration: {msg}"
     );
+}
+
+#[test]
+fn an_unclosed_pinned_fence_is_refused() {
+    let guide = "prose\n<!-- pinned -->\n```text\nline one\n";
+    let err = std::panic::catch_unwind(|| pinned_blocks(guide))
+        .expect_err("an unclosed pinned fence must panic, not silently drop the block");
+    let msg = panic_message(err);
+    assert!(msg.contains("never closed"), "{msg}");
+}
+
+#[test]
+fn an_empty_pinned_block_is_refused() {
+    let guide = "prose\n<!-- pinned -->\n```text\n```\nmore\n";
+    let err = std::panic::catch_unwind(|| pinned_blocks(guide))
+        .expect_err("an empty pinned block must panic, not silently pin nothing");
+    let msg = panic_message(err);
+    assert!(msg.contains("is empty"), "{msg}");
+}
+
+#[test]
+fn a_well_formed_marker_pins_its_block() {
     let guide = "prose\n<!-- pinned -->\n```text\nline one\n\nline two\n```\nmore\n";
     assert_eq!(
         pinned_blocks(guide),
