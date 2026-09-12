@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use charpente_core::engine::{Engine, StateMachine};
 use charpente_core::io::{Disk, Entropy, File};
-use charpente_core::log::{Wal, WalConfig};
+use charpente_core::log::{MAX_RECORD_BYTES, Wal, WalConfig, frame_crc};
 use charpente_sim::checks::is_fault_fallout;
 use charpente_sim::{
     FaultConfig, Sim, SimDisk, run_universes, run_universes_swarm, run_universes_swarm_with,
@@ -1794,4 +1794,114 @@ fn a_failed_sync_poisons_the_log_and_every_later_call_is_refused() {
         );
     }
     assert!(wal.poisoned(), "refusals do not clear the poison");
+}
+
+/// One frame in the WAL's real format — `[seq u64 le][len u32 le][crc u32
+/// le][payload]`, crc over seq‖len‖payload as `frame_crc` computes it — so a
+/// hand-built log differs from an appended one only where the test says.
+/// `declared_len` lets a frame LIE about its length; the crc is over the
+/// bytes actually supplied, which is what recovery recomputes when it reads
+/// `declared_len` bytes.
+fn raw_frame(seq: u64, declared_len: u32, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(16 + payload.len());
+    frame.extend_from_slice(&seq.to_le_bytes());
+    frame.extend_from_slice(&declared_len.to_le_bytes());
+    frame.extend_from_slice(&frame_crc(seq, payload).to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+const FIRST_SEGMENT: &str = "wal/00000000000000000000.log";
+
+#[test]
+fn read_frame_cuts_zero_length_oversized_and_past_end_frames() {
+    // One valid frame, then a frame the three-way size check must refuse.
+    // Under the `||` -> `&&` mutant the check is unsatisfiable and dead, and
+    // each case shows it its own way: (a) a declared length of 0 with a
+    // correct crc is recovered as an EMPTY record, which append forbids;
+    // (b) a length above MAX with 8 bytes present and (c) a length of 64
+    // with 8 bytes present both read past EOF, and recovery errors instead
+    // of cutting. The crc in (a) is deliberately right so the size arm is the
+    // only thing between the frame and Valid.
+    let valid = raw_frame(0, 8, &[7u8; 8]);
+    let cases: [(&str, Vec<u8>); 3] = [
+        ("zero-length", raw_frame(1, 0, &[])),
+        (
+            "oversized",
+            raw_frame(1, (MAX_RECORD_BYTES + 1) as u32, &[9u8; 8]),
+        ),
+        ("past-end", raw_frame(1, 64, &[9u8; 8])),
+    ];
+    for (name, bad) in cases {
+        let sim = quiet_sim();
+        let file = sim.disk().open(FIRST_SEGMENT).unwrap();
+        file.write_at(0, &valid).unwrap();
+        file.write_at(valid.len() as u64, &bad).unwrap();
+        file.sync().unwrap();
+        sim.disk().sync_dir("wal/").unwrap();
+
+        let mut recovered = Vec::new();
+        Wal::open(Box::new(sim.disk()), small_segments(), |seq, p| {
+            recovered.push((seq, p.to_vec()));
+            Ok(())
+        })
+        .unwrap_or_else(|e| panic!("{name}: recovery must cut, not fail: {e}"));
+        assert_eq!(
+            recovered,
+            vec![(0, vec![7u8; 8])],
+            "{name}: exactly the valid frame is recovered"
+        );
+        assert_eq!(
+            sim.disk().open(FIRST_SEGMENT).unwrap().len().unwrap(),
+            valid.len() as u64,
+            "{name}: the cut truncates at the bad frame"
+        );
+    }
+}
+
+#[test]
+fn a_maximum_size_record_round_trips_and_one_byte_over_is_invalid() {
+    // append accepts exactly MAX_RECORD_BYTES; recovery's size arm is
+    // `payload_len > MAX`, so a record AT the maximum is the boundary the
+    // `>=` mutant cuts, and a frame declaring one byte more — bytes present,
+    // crc correct — is the record the `==` mutant recovers.
+    let sim = quiet_sim();
+    let big = vec![0xABu8; MAX_RECORD_BYTES];
+    let mut wal = Wal::open(Box::new(sim.disk()), small_segments(), |_, _| Ok(())).unwrap();
+    wal.append(&big).unwrap();
+    wal.sync().unwrap();
+    let mut recovered = Vec::new();
+    Wal::open(Box::new(sim.disk()), small_segments(), |seq, payload| {
+        recovered.push((seq, payload.len(), payload == big.as_slice()));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        recovered,
+        vec![(0, MAX_RECORD_BYTES, true)],
+        "a record of exactly MAX_RECORD_BYTES survives recovery"
+    );
+
+    let sim = quiet_sim();
+    let over = vec![0xCDu8; MAX_RECORD_BYTES + 1];
+    let file = sim.disk().open(FIRST_SEGMENT).unwrap();
+    file.write_at(0, &raw_frame(0, (MAX_RECORD_BYTES + 1) as u32, &over))
+        .unwrap();
+    file.sync().unwrap();
+    sim.disk().sync_dir("wal/").unwrap();
+    let mut count = 0;
+    Wal::open(Box::new(sim.disk()), small_segments(), |_, _| {
+        count += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        count, 0,
+        "a frame declaring MAX_RECORD_BYTES + 1 is invalid even with its bytes present"
+    );
+    assert_eq!(
+        sim.disk().open(FIRST_SEGMENT).unwrap().len().unwrap(),
+        0,
+        "…and the cut truncates it away"
+    );
 }
