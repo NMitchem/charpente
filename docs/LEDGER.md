@@ -4586,3 +4586,166 @@ forbids that; the final review promoted it, and it is Item 1 of the mechanical-f
 which also carries the `Once`-is-not-idempotent doc claim, a dead env marker, GUIDE's untied
 error strings, and the `--jobs` defect above. No runtime behaviour changes in that
 sub-project; its output is oracles.
+
+## 2026-09-12 — the nightly wire oracle reddened three nights in four, and none of it was the kernel
+
+`8cf5375`, on `main`, pushed. The edge-harness nightly (`.github/workflows/edge-harness.yml`,
+07:17 UTC) went red on 2026-09-09, -11 and -12, on three different tests, after four straight
+green executions (the 09-05 dispatch, then the 09-06, -07 and -08 nightlies), with 09-10
+green in between. Read as three unrelated failures it looked like the wire layer coming
+apart; read together, all three are the rig racing a transient the design documents, on a
+runner slower than the laptop that never showed them. No assertion was loosened.
+
+**Nights 1 and 3 (`failover`, both through `run_oracle`).** After each mid-load `kill -9` and
+restart of the primary the scenario fired `login` exactly once. A durable primary that has
+recorded a witness boots into `Verifying` and probes it before accepting a write (DESIGN §5,
+`TxError::Verifying` → 503), and `ChildNode::restart` returns the moment the HTTP port
+accepts, while `serve_replicated` binds that edge concurrently with the kernel thread that
+resolves the probe — so the first write can meet the witness-gate 503 *by construction*, and
+whether it does is a scheduling question the laptop answered one way and ubuntu-latest the
+other. `login_once_writable` now retries only that exact body — single-sourced with phase B's
+byte-exact pin through `witness_gate_503` — bounded at `WRITE_GATE_TIMEOUT` = 10 s, well
+under `WITNESS_DEADLINE_NANOS`'s 30 s so a gate that never opens still fails by name, and
+fails any other status on the spot. RED was observed locally, not only inferred from the
+runner: one restart in six answered the gate (`gated=1`, 31 ms) where the old code fails with
+the runner's exact text. The scenario script records how many gated attempts each restart
+cost, so a runner where the gate takes seconds shows up as a number, not a pass.
+
+**Night 2 (`proxy::stop_severs_live_connections_and_frees_the_port`).** The accept loop
+checked `stopped` under the lock, released it, then spawned `relay`, which registered the
+connection with no re-check — so a `stop` landing in that gap drained a list the connection
+was not on yet, and the connection relayed anyway (`got Ok(5)`). Registration and the
+`stopped` check now share one critical section. Forcing the RED took two attempts, and the
+first is the instructive one: a 200 ms sleep inside `relay` alone stayed green in 0.00 s,
+because `stop()` ran before the accept loop had accepted anything — widening one side of a
+race is not widening the race. A 50 ms sleep in the test after `connect` produced 3/3
+failures with the runner's text; the fix was 3/3 green under the same widened gap; both
+scratch edits removed and the removal verified by `git diff --stat`.
+
+**The evidence the runner discarded.** `run_oracle` preserves the scenario script and both
+data dirs on failure deliberately — DESIGN §7 makes the script the rig's reproduction, there
+being no seed promise outside the simulator — under `/tmp`, on a runner that is gone minutes
+later. Three nightlies had to be diagnosed from the panic line alone. The workflow now
+uploads `/tmp/edge-harness-*` as an artifact on failure only (a green run deletes its own
+directories), 14-day retention. Dispatched run 34694334842 against `main` after the push:
+green, 34/34.
+
+**Held.** The rule `edge-harness.yml:44` states — diagnose the runner before touching a test
+— was the rule applied: each fix narrows a race in the rig, and the oracles' bodies (the
+Verifying text, the severed-connection check) are byte-identical to before.
+
+## 2026-09-12 — mechanical fences: six conventions that were held by review are now held by a check
+
+The spec is `docs/superpowers/specs/2026-09-10-mechanical-fences-design.md`, the plan
+`docs/superpowers/plans/2026-09-12-mechanical-fences.md` (four tasks), and the SDD workspace
+beside them carried ten rulings, four task reviews, three re-reviews and a final whole-branch
+review (opus). Branch `mechanical-fences` off `56d579f`, nine commits, merged `41624bc`
+(`--no-ff`) and pushed. Every item is one the
+2026-09-10 entry's reviews had found by *reading*; the sub-project's whole claim is that each
+now fails mechanically, and each shipped only after its failing case was observed — a RED
+that is a runtime refusal, an assertion, or a clippy error naming the site. A test that merely
+fails to compile against the old code proves nothing (2026-09-08), and that standard was
+enforced on every task.
+
+**Item 1 — the panic hook has one installer, and clippy now says so.** `clippy.toml` denies
+`std::panic::set_hook` and `std::panic::take_hook`; `install_open_fence_hook` in
+`charpente-sim/src/harness.rs` is the one sanctioned site, with a site-local
+`#[allow(clippy::disallowed_methods)]` and its rationale. RED observed twice: first the two
+entries fired against the sanctioned site itself (`harness.rs:229`/`:230`, before the allow),
+proving they point where the census said; then a scratch `set_hook` appended to
+`charpente-core/src/lib.rs` (14 lines long, so the lint's `:18:5` is exactly where a scratch
+call lands) produced `error: use of a disallowed method` with the entry's own `= note:` text,
+exit 101, on a tree that had compiled clean one step earlier. The review found the docs
+overclaiming the reach: 42 files carry a file-level blanket `#![allow(clippy::disallowed_methods)]`
+for their own reasons (`edge-harness`, `bench-harness`, `prod`, `serve`, and one module in
+`charpente/tests/archive.rs` that the doc's list still omits), so inside them the entry is
+inert. The doc now names the hosts it is live in — the deterministic boundary and every
+process that runs sim universes in-process — and the ones that stay review-enforced (Ruling
+3); a census test, `set_hook|take_hook` call sites == `harness.rs` and immune to blanket
+allows, is the next fence, not this one.
+
+**Item 2 — `Once` is install-once-ever, not idempotent.** The old doc said "idempotent"; a
+second `set_hook` anywhere replaces the F1 filter and the `Once` has already fired, so nothing
+here can restore it. The doc says that now, and says what a later hook must do (chain) to keep
+the filter (Ruling 4: explain the wrong word rather than merely negate it).
+
+**Item 3 — `CHARPENTE_F1_CHILD` was dead and is gone.** Set by one edge-harness test and read
+by nothing; removed, with the module doc naming the live sibling `CHARPENTE_F1_PANIC_CHILD` so
+the removal is not read as license to strip that one too.
+
+**Item 4 — the doc-truth gate.** `crates/guide-examples/tests/doc_truth.rs`: a ```text block in
+GUIDE.md preceded by the line `<!-- pinned -->` is split on lowercase-initial `<placeholder>`
+tokens, and every fragment of 16+ characters must be a substring of the normalised source
+corpus (every `.rs` under `crates/` and `examples/`, Rust's literal rules applied so a
+`\`-newline continuation and a `\"` compare as what they denote; the gate's own file excluded,
+because its fixtures mirror pinned lines by construction and were observed masking a doc lie).
+The spec's §4 trap — a decoration gate that checks prose — is avoided by making pinning an
+explicit per-block choice: a one-time census of all 41 text blocks found byte-exact error
+contracts mixed with CLI usage, SSE frames, rustc output and sim reports carrying instance
+numbers, so **14 are pinned**, a marker that pins nothing is an error, and the count is a
+FLOOR (`PINNED_FLOOR = 14`). RED observed three ways: the floor against zero markers; the
+real gate against `mismatched` → `mismatchedd` in GUIDE:2848 (exit 101, naming the line and
+the fragment); and, in the fix round, GUIDE:3465's `cursor must be "` after starving both
+`http/app.rs:920` and `realtime_resume.rs`'s three pinning literals — the controller's one-file
+recipe stayed green, correctly, because a pinning test's literal is evidence by design. The
+unpinned classes are named in the module doc. The final review's strengthening: comment lines
+now leave the corpus before matching (a fragment satisfied only by a `//` line was pinning
+trivia — true-by-review at landing, which is the arrangement the gate exists to retire), the
+real gate stayed green under it, and the scope rule "an unmarked block is not pinned" is a
+fixture that was watched firing under a scratch mutation of `pinned_blocks`. The filter is
+lexically blind to a `//`-initial continuation line inside a string literal
+(`charpente-tsgen/src/events.rs:55-56` is live); that fails loud — a false MISSING naming the
+line — never silent, and no pinned block reaches it (Ruling 10).
+
+**Item 5 — `charpente test --mutants` refuses the combination that lies.** The 2026-09-10
+sweep's instrument defect: `--jobs 4` under an inherited `CARGO_TARGET_DIR` put every job's
+scratch build in one directory, cargo's artifact hash does not vary by mutation content, and
+21 of 36 mutants' logs shared one rlib hash — `log.rs:68:39` read MISSED under `--jobs 4` and
+CAUGHT under `--jobs 1` with nothing else changed. `shared_target_dir_refusal` in
+`charpente-cli/src/mutants.rs` runs after parse and before `Command::new`, exits 2 with the
+mechanism and both fixes, and is observed through the real binary in `tests/cli.rs`. The
+final review then found the fence's hole: cargo-mutants also reads jobs from
+`CARGO_MUTANTS_JOBS` (`--help`: `[env: CARGO_MUTANTS_JOBS=]`), the verb inspected only the
+flag, and the unit test's "no --jobs is the tool's default of 1" was a doc the tool
+disproves. The refusal now takes the effective count and names its source —
+`CARGO_MUTANTS_JOBS=2 with CARGO_TARGET_DIR set (…)` — RED observed first through the real
+binary (the old verb spawned cargo-mutants and printed "NOTHING WAS MEASURED", no refusal),
+and the refusal is stated in CLAUDE.md's instrument bullet and the verb's USAGE, which the plan
+had omitted (hard rule 6). `scripts/mutants.sh` execs the binary from wherever
+`CARGO_TARGET_DIR` put it — under an exported one it used to exec a path that did not exist.
+
+**Item 6 — DESIGN §9 item 5's six continuation lines carry the list's indent.** A rendering
+no-op under CommonMark's lazy continuation; fixed so the source reads as the list it is.
+
+**The gate.** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
+warnings`, `cargo test --workspace --no-fail-fast`: exit 0, 0, 0, and **83** `test result:
+ok` / 0 FAILED, counted from the log three times — in the worktree at Task 4, by the final
+reviewer, and in the main tree on the merge commit — against a prediction stated before each
+run: 82 on
+`62e3c0c` plus the one new test binary. No runtime behaviour changed beyond the refusal:
+the branch's non-comment code delta outside tests is the one `#[allow]` line in `harness.rs`
+(the `call_once` closure is byte-identical), the refusal in `mutants.rs`, and the exec path in
+`mutants.sh` — measured by the final review, not asserted.
+
+**What the run cost, and what it found about itself.** Ten rulings, all recorded in the
+workspace ledger; the ones that matter: the plan's own text was wrong three times — a Step 7
+grep that could not pass against the doc it mandated (Ruling 2), a one-file RED recipe that
+stays green by design (caught by the implementer), and Task 4's Step 3 commands with their
+`$(` eaten in a substitution when the base refs were rewritten, which shipped in the plan
+commit and was repaired on the branch (`3dd5d30`, Ruling 7). A CLAUDE.md wrap that put a
+line-initial ``` into the file — a code span today, a fence on the next reflow — was caught
+in review. The 2026-09-10 entry's lesson holds: the defects the reviews found were in docs
+and plan text, not in the mechanisms.
+
+**Ledgered, not fixed (spec §3, no runtime change beyond the refusal).** The refusal's own fix
+clause — "run with --jobs 1" — leads straight into a pre-existing defect: under an exported
+`CARGO_TARGET_DIR` the verb's `--output ./target/charpente-mutants` fails on a missing parent
+directory and the verb's report names the wrong cause ("the usual cause is a --file or --re
+that matched no mutants"). The 2026-09-10 sweep worked around it with a manual `mkdir -p`. It
+is a hard-rule-5 defect and first in line. Also deferred: the census test for hook installers
+(closes Item 1's reach question fully); the doc-truth gate's per-line matching is blind to a
+change landing exactly at a doc-side wrap; near-miss markers (`<!--pinned-->`) pin nothing
+silently, and the floor accumulates slack silently unless every new pin touches the constant.
+
+**Not settled.** The fifteen one-sided WAL properties the 2026-09-10 sweep queued
+(`log.rs:504`'s three survivors first) are the next sub-project; nothing here touched them.
