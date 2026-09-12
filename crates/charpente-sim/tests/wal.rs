@@ -1607,3 +1607,91 @@ fn a_short_all_digit_name_is_a_foreign_file_not_a_segment() {
         "the refusal must name the contract it enforces: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Boundaries the 2026-09-10 mutation sweep found unpinned (spec
+// docs/superpowers/specs/2026-09-12-wal-one-sided-properties-design.md §3).
+// Each of these was watched going RED under its named mutant before landing.
+
+#[test]
+fn a_frame_that_exactly_fills_the_segment_stays_in_it() {
+    // 64-byte segments, 16-byte payloads -> 32-byte frames: two fill a
+    // segment to the byte. The rotation gate is `tail_offset + frame_len >
+    // segment_bytes`; at exactly `==` the frame belongs to THIS segment, and
+    // the `>=` mutant rotated it one record early with nothing noticing.
+    let sim = quiet_sim();
+    let mut wal = Wal::open(Box::new(sim.disk()), tiny_segments(), |_, _| Ok(())).unwrap();
+    wal.append(&[1u8; 16]).unwrap();
+    wal.append(&[2u8; 16]).unwrap();
+    wal.sync().unwrap();
+    let names = sim.disk().list("wal/").unwrap();
+    assert_eq!(names.len(), 1, "an exact fit does not rotate: {names:?}");
+    assert_eq!(
+        sim.disk().open(&names[0]).unwrap().len().unwrap(),
+        64,
+        "the segment is full to the byte"
+    );
+    wal.append(&[3u8; 16]).unwrap();
+    wal.sync().unwrap();
+    let names = sim.disk().list("wal/").unwrap();
+    assert_eq!(
+        names.len(),
+        2,
+        "one byte over the capacity rotates: {names:?}"
+    );
+}
+
+#[test]
+fn read_from_includes_up_to_when_its_frame_opens_the_next_segment() {
+    // The log of read_from_returns_verified_frames_across_segments: 8-byte
+    // payloads, two 24-byte frames per 64-byte segment, bases 0, 2, 4, ….
+    // `up_to = 26` is the FIRST frame of a segment, so the scan reaches the
+    // clean end of [24, 25] with `seq == up_to` still unread — the boundary
+    // the sibling's odd `up_to` never touches, and where both `>` mutants
+    // (`==` and `>=`) break out of the segment loop and drop the last frame.
+    let sim = quiet_sim();
+    let mut wal = Wal::open(Box::new(sim.disk()), tiny_segments(), |_, _| Ok(())).unwrap();
+    let records: Vec<Vec<u8>> = (0..40u8).map(|i| vec![i; 8]).collect();
+    for record in &records {
+        wal.append(record).unwrap();
+    }
+    wal.sync().unwrap();
+    let names = sim.disk().list("wal/").unwrap();
+    assert!(
+        names.iter().any(|n| base_of(n) == 26),
+        "26 must open a segment for this to be the boundary: {names:?}"
+    );
+
+    let got = wal.read_from(13, 26, usize::MAX).unwrap();
+    assert_eq!(
+        got.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        (13..=26).collect::<Vec<_>>(),
+        "up_to is inclusive even when its frame opens the next segment"
+    );
+    assert_eq!(got.last().unwrap().1, records[26]);
+}
+
+#[test]
+fn gc_deletes_the_segment_whose_successor_starts_at_keep_from() {
+    // Bases 0, 2, 4, …: `gc(4, 1)` may delete [0,1] and [2,3] — every frame
+    // in both is below 4 — and must stop at [4,5]. The sibling
+    // gc_deletes_only_whole_segments_below_keep_from asserts only
+    // `first_base <= keep_from`, which a gc that stops one segment early
+    // satisfies; this pins the boundary exactly.
+    let sim = quiet_sim();
+    let mut wal = Wal::open(Box::new(sim.disk()), tiny_segments(), |_, _| Ok(())).unwrap();
+    for i in 0..40u8 {
+        wal.append(&[i; 8]).unwrap();
+    }
+    wal.sync().unwrap();
+
+    wal.gc(4, 1).unwrap();
+
+    let names = sim.disk().list("wal/").unwrap();
+    assert_eq!(
+        base_of(&names[0]),
+        4,
+        "the segment ending exactly at keep_from is deletable: {names:?}"
+    );
+    assert_eq!(wal.base_seq(), 4);
+}
