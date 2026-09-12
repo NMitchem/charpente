@@ -21,6 +21,10 @@
 # Requires the pinned tool:
 #   cargo install cargo-mutants --version 27.1.0 --locked
 #
+# Known-equivalent mutants are hidden by name in .cargo/mutants.toml, each
+# with its argument; crates/guide-examples/tests/mutants_exclusions.rs pins
+# the count. A MISSED is a property to write, never an entry to add.
+#
 # Exit codes are the verb's: 0 every viable mutant caught, 1 a finding
 # (mutants MISSED) or an unresolved run (TIMEOUTS — a timeout is not a catch),
 # 2 usage, infrastructure, or a baseline that was not green.

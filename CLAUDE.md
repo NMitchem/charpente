@@ -63,7 +63,7 @@ roadmap; do not reorder a milestone's dependency sequence.
   describe/genclient/repro_meta/restore; charpente-tsgen: revive/routes/types;
   charpente-macros: trybuild; edge-harness: acked_durable/failover/hunts/open_fence/
   realtime_resume/smoke/tenant_wire; bench-harness: app/compile/compile_bench_script/harness/phase_trace;
-  ts-fixture-app: drift/samples; guide-examples: describe_contract/doc_inventory/doc_truth/hook_census; sim-fixture: sim;
+  ts-fixture-app: drift/samples; guide-examples: describe_contract/doc_inventory/doc_truth/hook_census/mutants_exclusions; sim-fixture: sim;
   invoicing: describe_golden/sim). Every list is exhaustive as written — if a name is
   missing, the list is stale, not selective.
   `guide-examples`' `doc_inventory` gate enforces that against `members`, so a NEW crate
@@ -92,7 +92,10 @@ roadmap; do not reorder a milestone's dependency sequence.
   reading zero. The verb consults that exit code in exactly one place — when there is
   no `outcomes.json` — to tell "matched nothing" (exit 0) from "died before running"
   (any other exit), and it creates its own `--output` directory, so an exported
-  CARGO_TARGET_DIR no longer needs a hand `mkdir`.
+  CARGO_TARGET_DIR no longer needs a hand `mkdir`. Mutants proven equivalent are hidden by
+  name in `.cargo/mutants.toml`, one rationale comment
+  per entry, and `tests/mutants_exclusions.rs` pins the count — a third survivor is a
+  property to write, not an entry to add.
 - Editing docs/GUIDE.md can break the build: `crates/guide-examples`'s build.rs extracts
   and compiles every ```rust block. `cargo build -p guide-examples` checks it alone. A
   pinned `text` block (preceded by `<!-- pinned -->`) is gated
@@ -130,6 +133,8 @@ roadmap; do not reorder a milestone's dependency sequence.
   `tests/describe_contract.rs`, which diffs §13's `describe` JSON against a freshly built
   `examples/invoicing` fixture, and `tests/hook_census.rs`, which holds "one panic-hook
   installer" by walking the sources — the deny-list is inert under a file-level allow.
+  `tests/mutants_exclusions.rs` pins the known-equivalent mutant list's size and demands a
+  rationale per entry.
 - `crates/edge-harness` — black-box wire rig outside the deterministic boundary: stock
   binaries over real TCP, `kill -9`, TCP-proxy fault injection.
 - `crates/bench-harness` — the benchmark instrument, also outside the boundary. Each layer

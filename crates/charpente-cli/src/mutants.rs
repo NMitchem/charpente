@@ -24,6 +24,12 @@
 //! used to blame on the filter (observed 2026-09-12: a missing `--output`
 //! parent, cargo-mutants exit 1, and "the usual cause is a --file or --re").
 //!
+//! `.cargo/mutants.toml` (read by cargo-mutants from the `--dir` root) hides
+//! mutants PROVEN equivalent — unobservable through any surface the oracle may
+//! see — by name, one rationale comment per entry; the list's size is pinned
+//! by guide-examples' `mutants_exclusions` gate. Hiding is never the answer to
+//! a MISSED: that is a property to write.
+//!
 //! Exit codes: 0 every viable mutant was caught, 1 the run produced a finding
 //! (mutants missed) or failed to resolve (timeouts), 2 usage, infrastructure,
 //! or a baseline that was not green.
