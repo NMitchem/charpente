@@ -4817,3 +4817,83 @@ from 83 plus the one new binary.
 **Next.** The fifteen one-sided WAL properties the 2026-09-10 sweep queued (`log.rs:504`'s
 three survivors first): the instrument they need is now usable from a worktree without a hand
 `mkdir`, and refuses the one configuration that lies.
+
+
+## 2026-09-12 — the fifteen one-sided WAL properties: eleven pinned, two rewritten, two hidden by name under a ceiling
+
+The 2026-09-10 sweep left fifteen MISSED mutants in `log.rs` and nothing fixed by design; this
+sub-project answers each one. Spec
+`docs/superpowers/specs/2026-09-12-wal-one-sided-properties-design.md`, plan
+`docs/superpowers/plans/2026-09-12-wal-one-sided-properties.md`, six tasks by subagent-driven
+development on `wal-properties` off `18d5824`, ten commits, six task reviews (opus for the
+core-code task), one final opus review, one fix wave, merged `--no-ff` as `f4c6d58`. Workspace
+`.superpowers/sdd/2026-09-12-wal-one-sided-properties/`, rulings 1–10 in its `progress.md`.
+
+**Eleven properties, seven tests, every one watched RED under its named mutant before it was
+trusted.** `crates/charpente-sim/tests/wal.rs` 33 → 40. Rotation's exact-fit boundary
+(`a_frame_that_exactly_fills_the_segment_stays_in_it`: under `>=` a frame that exactly fills
+the segment opened a second one, `left: 2, right: 1`); `read_from`'s inclusive `up_to` when its
+frame opens the next segment (both `==` and `>=` stop at 25 of 26); `gc` at the watermark
+(`bases[i+1] > keep_from` → `>=` keeps the segment whose successor starts exactly at
+`keep_from`, `left: 2, right: 4`); the log's own poison, read by name through a `Disk` wrapper
+that fails exactly one `sync` (`poisoned()` → `true` red on "a healthy log is not poisoned", →
+`false` red on "one failed fsync poisons the log", `check_poison` neutralized red because
+`append` was accepted after poison); the gaplessness assert watched FIRING through a `remove`
+that returns Ok and leaves the file (`should_panic` on the assert's own phrase, red under the
+inverted guard because recovery returned `Ok(())`); frame-level corruption detection in its
+branch and at its boundary — a raw-frame writer with a declared length and a correct CRC, three
+cases (zero-length, declared 17 MiB with the bytes absent, declared past the end), and a 16 MiB
+record that round-trips while 16 MiB + 1 with the bytes present is `Invalid`. The last pair
+carried the sub-project's one misreading: the spec, the plan and the first test comment said
+`||`→`&&` at `:504` makes "the whole check dead"; Rust binds `&&` tighter, so the mutant is
+`(len == 0 && len > MAX) || past_end` — two arms dead, the third alive — and only the
+zero-length case distinguishes it. The property killed the mutant regardless; the three docs
+were corrected in the same fix round (`b84c812`), and `b2e8cc4`'s message still carries the
+misreading — corrected forward, not amended, the same treatment as `82194bf` below.
+
+**Two rewrites so the survivor becomes a mutant an oracle can see.** `82194bf`. `cut < len` →
+`assert!(cut <= len, …); if cut != len`: the surviving `<=` differed only at `cut == len`,
+which never reaches the branch (a scan that ends at `len` yields `CleanEnd`, not a cut — the
+spec's first reading, "a no-op `set_len`", was a counterfactual; `395e19e` says the sharper
+thing). The `!=`'s `==` skips every real truncation and three tests go red — not the single
+test the plan named, which stays green alone; measured, and the spec/plan say so now.
+`tail_offset > 0` → `!= 0` on the u64: `>= 0` re-opened the same segment name, `== 0` never
+rotates a full segment. The torn-header comparison moved into `fn torn_header` so its one
+equivalent mutant has a name; its six siblings were all watched CAUGHT — two of them (`+ → -`,
+an overflow panic at offset 0 in the debug build; `+ → *`) only after the opus task review
+found `82194bf`'s "every other mutant watched caught" two wider than its evidence.
+cargo-mutants generates no mutant inside an `assert!` body, so the hand-applied `<=`→`<` on the
+new assert (which survives, for the unreachability reason) needs no exclusion — refused as a
+third entry (Ruling 5).
+
+**Two hidden by name, under a ceiling.** `82e089f` + the fix wave. `.cargo/mutants.toml`
+excludes `<impl fmt::Debug for Wal>::fmt`'s body (diagnostic text no operator reads) and
+`replace > with >= in torn_header$` (at `offset + 16 == len` the header fits and the
+payload-length check refuses the frame anyway — watched surviving the whole core+sim suite, 17
+ok / 0 failed, identical to the unmutated baseline), each with its argument in the comment
+above it. `guide-examples/tests/mutants_exclusions.rs` pins the count (`EXCLUSIONS = 2`),
+refuses an entry with no rationale, and — after the final review found its grammar open —
+refuses every line it cannot count: a single-quoted TOML string, two entries on one line, or
+another key (`exclude_globs`, `examine_re`) would have narrowed the instrument with the count
+still reading 2. Both REDs observed against the real file; the count test stayed green through
+both, which was the hole. `--list`: 113 with the config, 115 without, the same two names. The
+rule, written where the instrument is documented: a MISSED is a property to write, never an
+entry to add.
+
+**The sweep, spec §7.5.** `scripts/mutants.sh --file crates/charpente-core/src/log.rs --jobs 1`
+in the worktree with its own target dir, on `82e089f` (the fix wave after it changed no file
+the sweep compiles — `log.rs` and `wal.rs` byte-identical, and the anchored regex hides the
+same two names, shown by `--list` twice): **113 mutants tested in 15m: 106 caught, 0 missed, 7
+unviable, 0 timed out**, verb exit 0, 931 s wall. 115 listed, 2 hidden. Predicted 113 / 0
+MISSED / exit 0 before it ran.
+
+**The gate.** `cargo fmt --all --check` 0, `cargo clippy --workspace --all-targets -- -D
+warnings` 0, `cargo test --workspace --no-fail-fast`: **85** `test result: ok`, 0 FAILED, exit
+0, 479 s on `f4c6d58` (predicted 85 — no new binary since the plan commit's 84 + one; the
+branch head `82e089f` read 85 as well, 448 s).
+
+**Ledgered, not fixed.** The test comment for case (b) says it "pins arm 2 of the ORIGINAL" —
+loose, (b) is refused by arm 3 as well; Task 1's trailing asserts carry no message and the
+poison test's `unwrap_err` fails with Rust's generic text under its mutant; code comments cite
+the sweep-time lines `log.rs:263`/`:296`; one underfilled wrapped line in CLAUDE.md. A doc
+wave, or nothing.
