@@ -4,6 +4,8 @@ description = "The charpente CLI: test --sim, describe, serve."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
 
 [[bin]]
 name = "charpente"
@@ -16,7 +18,7 @@ charpente.workspace = true
 # threading and no time of their own, and charpente already depends on both
 # — this crate names them directly because it deserializes a contract into
 # its own owned mirror (src/genclient.rs), which charpente does not.
-charpente-tsgen = { path = "../charpente-tsgen", version = "0.0.0" }
+charpente-tsgen = { path = "../charpente-tsgen", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

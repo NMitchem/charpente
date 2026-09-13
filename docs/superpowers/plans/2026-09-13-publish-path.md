@@ -1181,7 +1181,7 @@ fn a_scaffolded_app_is_fmt_clean_clippy_clean_under_the_fence_and_green_under_th
         charpente()
             .current_dir(&app)
             .env("CARGO_TARGET_DIR", &target)
-            .args(["test", "--sim", "--universes", "8"]),
+            .args(["test", "--sim", "--universes", "64"]),
         "charpente test --sim on the scaffold",
     );
 }
@@ -1230,7 +1230,7 @@ git commit -m "cli(new): the end-to-end oracle — the scaffold is fmt-clean, cl
 Scaffolds into a scratch dir, patches charpente/charpente-sim to the
 workspace (the Cargo book's unpublished-version mechanism), shares the
 workspace target dir, and runs fmt --check, clippy -D warnings, and
-charpente test --sim --universes 8. Template fixes from its first compile
+charpente test --sim --universes 64. Template fixes from its first compile
 are in the task report.
 
 Claude-Session: https://claude.ai/code/session_012dRc31xomeEgW4QZUYdjPr"

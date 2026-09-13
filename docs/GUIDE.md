@@ -24,14 +24,44 @@ and the cross-tenant capability.)*
 
 ## 1. Project setup
 
-A charpente app is a Rust crate that links against the `charpente` platform
-crate and compiles into one binary. Deployment is one binary and one data
-directory — no database server, queue service, or config store to
-provision.
+Install the CLI once. The crate is `charpente-cli`; the binary it installs is `charpente`:
+
+```text
+cargo install charpente-cli
+```
+
+Then scaffold an app and run its two gates:
+
+```text
+charpente new myapp
+cd myapp
+cargo clippy --all-targets -- -D warnings   # hard rule 1, in your app
+charpente test --sim                        # seeded fault-injection universes
+```
+
+`charpente new` writes six files and does nothing else — no `git init`, no build, no
+prompts. It refuses a name cargo would reject, a Rust keyword or a reserved crate or
+build-directory name, and an existing path, each by name.
+
+| File | What it is |
+|---|---|
+| `Cargo.toml` | the manifest below, byte for byte |
+| `clippy.toml` | the fence: the standard-library calls a transaction must never make |
+| `.gitignore` | `/target` and `/data` |
+| `src/lib.rs` | one table, one route, one job, one event, and `build_app` |
+| `src/main.rs` | `charpente::launch(...)` — one line (§13) |
+| `tests/sim.rs` | two properties in the give-up idiom (§8) |
 
 ### `Cargo.toml`
 
-One dependency is all a charpente app needs:
+A charpente app is a Rust crate that links against the `charpente` platform
+crate and compiles into one binary. Deployment is one binary and one data
+directory — no database server, queue service, or config store to
+provision. Two dependencies: `charpente`, and `serde` for the request and
+response types you define — `charpente` re-exports serde, but
+`#[derive(Deserialize)]` looks the crate up by name in your own dependency
+list (§5). This is the file `charpente new myapp` writes; a test holds the
+two together:
 
 ```toml
 [package]
@@ -40,22 +70,48 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-charpente = "0.0.0"
+charpente = "0.1"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-charpente-sim = "0.0.0"
+charpente-sim = "0.1"
 
 [[test]]
 name = "sim"
 harness = false
+
+[lints.clippy]
+disallowed_methods = "deny"
+disallowed_types = "deny"
 ```
 
 `charpente-sim` is dev-only: it drives your app's tables, routes, jobs, and
 time through a deterministic simulator with seeded fault injection, and
 never links into the shipped binary. The `[[test]] name = "sim", harness =
-false` block is required for `charpente test --sim` (covered in a later
-section): it tells Cargo to build a `tests/sim.rs` binary without the
-default libtest harness, so the sim runner supplies its own `main` instead.
+false` block is required for `charpente test --sim` (§8): it tells Cargo to
+build a `tests/sim.rs` binary without the default libtest harness, so the
+sim runner supplies its own `main` instead.
+
+### The fence
+
+`clippy.toml` names the standard-library calls a transaction must never
+make — `SystemTime::now`, `Instant::now`, `thread::spawn`, the `std::fs`
+functions, `TcpStream::connect`, `HashMap` — with the trait to use instead.
+The `[lints.clippy]` lines above turn each into an error, so a handler that
+reaches for the wall clock is refused at `cargo clippy` by name:
+
+```text
+error: use of a disallowed method `std::time::SystemTime::now`
+  --> src/lib.rs:51:17
+   |
+   = note: ambient wall clock — use the Clock trait (DESIGN.md §1)
+```
+
+It is the platform's own fence (its CLAUDE.md hard rule 1) minus the entries
+that guard platform internals, and a test keeps it a subset. Where a real
+edge needs ambient IO — the production `Disk` your `main` mounts — the
+sanctioned form is `#[allow(clippy::disallowed_methods)]` on that one
+statement with a rationale comment, never at file level.
 
 ### The data directory
 
@@ -3939,7 +3995,7 @@ memorizing a list:
 
 ```json
 {
-  "charpente_version": "0.0.0",
+  "charpente_version": "0.1.0",
   "tables": [
     {
       "name": "ApiKey",

@@ -4,6 +4,7 @@ description = "Deterministic core of charpente: IO traits, log, transaction engi
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [lints]
 workspace = true

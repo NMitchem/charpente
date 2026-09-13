@@ -22,7 +22,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bench-harness"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "charpente",
  "charpente-sim",
@@ -51,7 +51,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "charpente"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "base64ct",
  "charpente-core",
@@ -69,7 +69,7 @@ dependencies = [
 
 [[package]]
 name = "charpente-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "charpente",
  "charpente-tsgen",
@@ -79,7 +79,7 @@ dependencies = [
 
 [[package]]
 name = "charpente-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "charpente-sim",
  "redb",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "charpente-macros"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "charpente",
  "proc-macro2",
@@ -100,14 +100,14 @@ dependencies = [
 
 [[package]]
 name = "charpente-sim"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "charpente-core",
 ]
 
 [[package]]
 name = "charpente-tsgen"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "charpente",
 ]
@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "edge-harness"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "equivalent"
@@ -213,7 +213,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "guide-examples"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "charpente",
  "charpente-sim",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "invoicing"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "charpente",
  "charpente-sim",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "sim-fixture"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "charpente",
  "charpente-sim",
@@ -751,7 +751,7 @@ dependencies = [
 
 [[package]]
 name = "ts-fixture-app"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "charpente",
  "charpente-sim",

@@ -60,7 +60,7 @@ PLAN.md are the roadmap; do not reorder a milestone's dependency sequence.
   replication/tenant/transactions/typed_tables/wire; charpente-core: describe_tables/engine/
   group_commit/materialize/migrate_apply/migration_gate/migrations/store_latch;
   charpente-sim: crash_recovery/determinism/net_partition/open_fence/wal; charpente-cli: cli/ctl/
-  describe/genclient/repro_meta/restore; charpente-tsgen: revive/routes/types;
+  describe/genclient/new/repro_meta/restore; charpente-tsgen: revive/routes/types;
   charpente-macros: trybuild; edge-harness: acked_durable/failover/hunts/open_fence/
   realtime_resume/smoke/tenant_wire; bench-harness: app/compile/compile_bench_script/harness/phase_trace;
   ts-fixture-app: drift/samples; guide-examples: describe_contract/doc_inventory/doc_truth/hook_census/mutants_exclusions; sim-fixture: sim;

@@ -4975,3 +4975,189 @@ against the helpdesk repro in sub-project 4, not assumed from the census. And
 the v1.x table: DECISIONS §3 puts error-message quality ahead of tutorials, and a skill for
 building on charpente is a tutorial until the default-secure surfaces make the errors do
 the teaching.
+
+## 2026-09-13 — publish path: 0.1.0 is publishable, and `charpente new` is the app the guide describes
+
+Spec `docs/superpowers/specs/2026-09-13-publish-path-design.md`, plan
+`docs/superpowers/plans/2026-09-13-publish-path.md`, seven tasks (0 through 6) by
+subagent-driven development on `publish-path` off `d94df6c`, seven commits before this
+one (Task 3 took a fix round), eight rulings recorded in its `progress.md`. Workspace
+`.superpowers/sdd/2026-09-13-publish-path/`.
+
+**Closes the previous entry's open question.** The 2026-07-01 crates.io name reservation
+did happen, for five of the six names: packaging the still-`0.0.0` manifests (before any
+edit) warned "warning: crate charpente-core@0.0.0 already exists on crates.io index", and
+the same line for `charpente-sim`, `charpente`, `charpente-macros`, and `charpente-cli`
+(`t1-red.log:2-6`). `charpente-tsgen` carried no such warning — consistent with it never
+having been reserved, and with it being the crate this sub-project's first RED was about.
+
+**The gate's first RED was cargo, not code.** Before any manifest changed, `cargo publish
+--workspace --dry-run --no-verify` refused at packaging: "error: failed to prepare local
+package for uploading" / "Caused by: no matching package named `charpente-tsgen` found" /
+"required by package `charpente-cli v0.0.0`" — `--workspace` skips `publish = false`
+members but does not skip a *dependency* on one, and `charpente-tsgen` was `publish =
+false`. Dropping that line and moving all six crates' `[workspace.package] version` to
+`0.1.0` was the fix; the six `Packaging` lines
+that follow (`charpente-core`, `charpente-macros`, `charpente`, `charpente-tsgen`,
+`charpente-cli`, `charpente-sim`, all `v0.1.0`) recur unchanged in this task's own re-run
+of the dry-run below. Running the local verification dry-run before its commit lands
+needs `--allow-dirty` — cargo 1.95 refuses uncommitted manifest edits at packaging, a gate
+that cannot fire on CI's already-clean checkout — so the CI step stays the plan's exact
+line with no `--allow-dirty` (Ruling 2); recorded in `decisions-pending.md` for sign-off,
+not silently resolved.
+
+**`scripts/publish.sh`'s dry-run verify-built all six.** Six `Verifying` lines, same
+order as packaging, all `v0.1.0`: `charpente-core`, `charpente-macros`, `charpente`,
+`charpente-tsgen`, `charpente-cli`, `charpente-sim`. Exit 0. The dirty-tree
+refusal ("the tree is dirty — commit or stash first; a publish must be reproducible from a
+commit") fires before argument parsing, so it also caught a deliberate `--nonsense`
+invocation until the script itself was committed and the usage line could be shown on its
+own: `usage: scripts/publish.sh [--for-real]   (default: dry run with verify)`, exit 2.
+
+**One inconsistency was designed away rather than discovered by a stranger.** GUIDE §1
+said "one dependency is all a charpente app needs" while §5's route bodies write `use
+serde::Deserialize` and `#[derive(Wire, Deserialize)]` — `charpente` re-exports serde
+(`pub use serde;`) but serde's derive emits `::serde::` paths that need the crate in the
+extern prelude, so a one-dependency app cannot write the §5 idiom. The scaffold's
+`Cargo.toml` carries two dependencies (`charpente = "0.1"`, `serde = { version = "1",
+features = ["derive"] }`); GUIDE §1 was rewritten to match, and a byte-diff test holds the
+two together (below).
+
+**The scaffold's templates needed one real fix, once each, at two different layers.**
+Task 3's `templates/lib.rs` and `sim.rs.tmpl` were transcribed from the spec already
+rustfmt-clean under 2015-style import sort, but the scaffold declares `edition = "2024"`,
+whose rustfmt wants uppercase names first — caught by `rustfmt --edition 2024 --check`,
+not the edition-blind check the plan's own text ran first; fixed in both files (Ruling 5).
+Task 4's end-to-end oracle then compiled a *rendered* scaffold and hit the one thing
+neither template fix touched: `tests/sim.rs` called `.get`/`.scan` on a `Snapshot` with
+`View` out of scope — "error[E0599]: no method named `get` found for struct
+`charpente::Snapshot` in the current scope", with rustc's own help naming the fix in two
+lines: "help: trait `View` which provides `get` is implemented but not in scope; perhaps
+you want to import it" and "+ use charpente::View;". One import, merged into
+`sim.rs.tmpl`'s existing `use charpente::Id;` line; the oracle went green on the next run,
+and no sim
+failure was ever hit (`acked_post_implies_the_echo_after_recovery`'s STOP condition, held
+in the plan for exactly this task, never fired — this task fires it deliberately, below).
+
+**Two oracles hold the guide's promise byte for byte, and one held under a hand-paraphrase.**
+`the_rendered_cargo_toml_is_guide_section_1s_block_byte_for_byte` was RED against the old
+GUIDE §1 (`charpente = "0.0.0"`, no serde, no `[lints.clippy]`), naming the drift itself:
+"`charpente new myapp` writes a Cargo.toml that is not the block GUIDE §1 shows — the doc
+is the spec (hard rule 6); update whichever one drifted." Rewriting GUIDE §1 turned it
+green. `the_emitted_clippy_toml_is_a_subset_of_the_workspace_fence` was already green — it
+guards Task 3's copy against a future paraphrase, not this task's drift — so its RED was
+shown by hand: one entry's `reason` string edited from "ambient wall clock" to "ambient
+wallclock" in `templates/clippy.toml`, and the test named the exact entry that no longer
+matched the workspace fence. Restored, green again.
+
+**RED 1 — the deleted enqueue, seed `0x0967d63945c56859`.** Scaffolding `demo` fresh with
+`charpente new`, then patching `charpente` and `charpente-sim` to this worktree's own
+`crates/charpente` and `crates/charpente-sim` via `[patch.crates-io]` (per §10 item 5 —
+every run below, baseline through both REDs, is built against this worktree, not the
+registry), `charpente test --sim --universes 64` was green: master seed
+`0x9927b86346c3be5a`, 43 verdict(s), 85 gave up, 0 failures (`t6-baseline.log`). Deleting
+`tx.enqueue(Echo { note: id });` from `add_note` (`grep -c` 1 → 0) turned
+`acked_post_implies_the_echo_after_recovery` red across the whole run — batch master seed
+`0xf2717895cf62c2b5` (`t6-red-enqueue.log`), 0 verdict(s), 41
+gave up, 23 failure(s) out of 64, no universe reaching a passing verdict at all — every
+failure printing: "sim failure in acked_post_implies_the_echo_after_recovery:
+ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the
+enqueue did not commit with the row." The printed `repro:` line for this seed, run
+verbatim (`charpente test --sim --filter acked_post_implies_the_echo_after_recovery
+--seed 0x967d63945c56859`), reproduced the identical failure text and fault trace
+(`fault:sync_error: 1, restart: 1`). Restoring the enqueue line (byte-identical to
+`templates/lib.rs` again) returned the property to green: 22 verdict(s), 42 gave up, 0
+failures, over the same 64 universes.
+
+**RED 2 — the neutered job, seed `0x91bec92516eee8d3`.** Replacing `Echo::run`'s body with
+`Ok(())` — the exact shape cargo-mutants applies — turned the same property red across
+the whole run again: batch master seed `0x3a908e0f71e18e6d` (`t6-red-neuter.log`), 0
+verdict(s), 30 gave up, 34 failure(s) out of 64, no universe
+reaching a passing verdict at all, every failure: "sim failure in
+acked_post_implies_the_echo_after_recovery: exactly-once violated: note 1 reads echoed =
+false but 1 Echo job(s) are Done — a job's effect and its Done mark commit as one
+record." The repro line for this seed reproduced the identical text and fault trace
+(`crash_torn: 1.0`, `fired: restart: 1`). Restoring `Echo::run` to the template's body
+returned the property to green: 22 verdict(s), 42 gave up, 0 failures, over the same 64
+universes.
+
+**The mutation instrument caught the mutant clean — no `--dir` refusal.** `charpente test
+--mutants --dir /tmp/charpente-evidence/demo --file src/lib.rs --re 'Echo::run' --jobs 1`
+(Ruling 6: `--file src/lib.rs` is required — the verb's default file set is the
+workspace's own oracle-bearing files, which do not exist in a scaffold) found one mutant,
+tested it, and reported "1 mutant tested in 3s: 1 caught" — "mutants: 1 total — 1 caught,
+0 missed, 0 unviable, 0 timed out", exit 0. Two `WARN` lines (`WARN Package
+"charpente-core" not found in source tree`, same for `"charpente-sim"`) are harmless:
+those are path-patched dependencies living outside `--dir`'s tree, not the crate under
+test. The plan's fallback (RED 2 above already proves the property if `--dir` refuses)
+was not needed on this run.
+
+**The gate, counted.** `cargo fmt --all --check`: exit 0. `cargo clippy --workspace
+--all-targets -- -D warnings`: exit 0. `cargo test --workspace --no-fail-fast`, run
+backgrounded and polled for the cargo process to exit rather than the tool's own timeout:
+**86** `test result: ok`, **0** `FAILED` (counted directly from `t6-suite.log`, predicted
+86 = 85 + `tests/new.rs` before the run), ~388s wall (log created 11:57:25, last write
+12:03:53). `cargo publish --workspace --dry-run --no-verify` on the still-clean tree: exit
+0, the same six `Packaging` lines as Task 1's.
+
+**The final review's fix wave (four commits).** The whole-branch review measured
+`tests/new.rs`'s e2e at `--universes 8` as a ~2.5% flake — 5 of 200 runs exit 1 on an
+unmet `require ["restart"]`, no failures. Replayed: master seed `0x7ad351d01d2ca664` at 8
+universes exits 1, at 64 exits 0 (`final-fix-universes.log`); fixed by raising the test,
+spec §7 step 3, and plan Task 4 to 64 universes (`eb48a4d`). Separately, `charpente new
+deps` exited 0 on `c832b95` and scaffolded a crate cargo itself refuses to build — `deps`
+is one of cargo's build-directory names, not a Rust keyword, the same class as `alloc`,
+`core`, `proc_macro`, `std`, `test`, `build`, `examples` and `incremental`
+(`final-fix-reserved.log`); fixed by splitting `KEYWORDS` from a new `RESERVED` const with
+its own hard-rule-5 message, and by refusing a stray second positional argument as a usage
+error (`38983c7`). A third commit corrected spec §5/§3/§10.1's drift from what shipped,
+added the `serde` exception to DESIGN §3, narrowed GUIDE §1's `std::fs` claim to the
+functions the fence actually names, and gave the four unrationaled `#[allow]` sites in
+`tests/new.rs` their own comment (`ce45b55`).
+
+**Ledgered, not fixed.** RED 1's own failure report is inconsistent with itself: the
+`seed:` line prints `0x0967d63945c56859` and the `repro:` line for the identical seed
+prints `0x967d63945c56859` — the leading zero silently dropped, evidently an unpadded hex
+formatter on the repro path against a zero-padded one on the seed line. That one seed was
+replayed and matched; the same drop appears by inspection on three other seeds in RED 1's
+own log without being replayed a second time (`t6-red-enqueue.log:10-13`
+`0x072fe112f898a50a` → `0x72fe112f898a50a`, `:34-37` `0x00ca7d85df4f4e00` →
+`0xca7d85df4f4e00`, `:76-79` `0x0f354154840079f8` → `0xf354154840079f8`). Not a
+correctness bug — every replay used the trimmed digits and reproduced the identical
+failure — but a `repro:` line that does not print the same digits as the `seed:` line two
+lines above it is a hard-rule-5 wart in the platform's own failure report, worth a fix,
+not this sub-project's to make.
+
+**Open instrument finding: the mutants run leaves its own last build sitting in the
+shared target dir.** The baseline re-run's first attempt — overwritten by the corrected
+run above, its numbers preserved only in the task report — came back 18 failures, every
+one carrying RED 2's exact signature — "exactly-once violated: ... echoed = false but 1
+Echo job(s) are Done" — against source already verified byte-identical to the template.
+The controller reproduced the mechanism in 5s (`t6-contamination-repro.log`, no
+other cargo process running): `charpente test --sim --universes 16` green (master seed
+`0xaf30ca690d664ae0`, 0 failures); the same `--mutants --dir ... --file src/lib.rs --re
+'Echo::run' --jobs 1` run (1 caught); `charpente test --sim --universes 16` again, source
+untouched, no clean in between — 6 failures, every one "exactly-once violated ... echoed =
+false but 1 Echo job(s) are Done", 0 passing verdicts on that property (master seed
+`0x671e2f7ecb576915`); then `cargo clean -p demo` alone (761 files) — 0 failures again
+(master seed `0x30517397f736b1c0`). The failure signature being exactly the applied
+mutant, on both this task's own contaminated run and the controller's reproduction, is the
+discriminator. Cause, per the verb's own doc comment
+(`crates/charpente-cli/src/mutants.rs:120-126`): cargo's artifact filename hash does not
+vary by mutation content, so
+the mutants run's *last* build of `demo` (`Echo::run` → `Ok(())`) sits in the shared
+`CARGO_TARGET_DIR` looking fresh, and the scaffold's next plain build runs it — not the
+concurrent workspace suite, which never builds `demo` at all. The verb's existing refusal
+covers only `--jobs > 1` combined with an inherited `CARGO_TARGET_DIR`; `--jobs 1`, used
+throughout this task, is admitted and still leaves this hazard. The fix — clean the
+mutated package(s) on exit, or widen the refusal to cover this configuration too — belongs
+to the instrument, open, not fixed here.
+
+**What stays open.** The real publish (`scripts/publish.sh --for-real`) is Noah's hand,
+not run here. The post-publish run against the live registry that spec §10 item 2 asks
+for waits on that publish. The `Wire`-derive/serde question spec §9 refused — absorbing
+serde into `#[derive(Wire)]` so a route body needs no second import — stays refused;
+today's fix was documenting the two-dependency shape, not collapsing it to one. And the
+`--mutants` verb's own target-dir poisoning under `--jobs 1` (above) is unfixed: either an
+exit-time clean of the mutated package(s) or a refusal widened past `--jobs > 1` is needed
+before trusting a plain build in the same tree right after a mutants run.

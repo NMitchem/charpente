@@ -135,6 +135,18 @@ enforced by the compiler rather than a `where` clause anyone can forget
 ([docs/GUIDE.md](docs/GUIDE.md) §16). What is *not* built, so you don't have to go
 looking: no blob store and no WebSockets.
 
+## Try it
+
+```text
+cargo install charpente-cli
+charpente new myapp && cd myapp
+cargo clippy --all-targets -- -D warnings   # hard rule 1, in your app
+charpente test --sim                        # seeded fault-injection universes
+```
+
+Then delete the `tx.enqueue` line in `src/lib.rs` and run the sim again: the second
+property goes red with a seed, and the seed replays. That is the whole pitch.
+
 | Doc | What it is |
 |---|---|
 | [MANIFESTO.md](MANIFESTO.md) | Why this exists — the agent-era argument |

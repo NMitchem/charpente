@@ -1,0 +1,178 @@
+//! Two properties, both honest: each asserts a claim that holds under ANY
+//! fault schedule and gives up — rather than passing — in a universe where
+//! injected faults stopped it before the claim could be tested (GUIDE §8).
+//!
+//! Run them: `charpente test --sim`. Watch one fail: delete the `tx.enqueue`
+//! line in `src/lib.rs` and run again.
+
+use charpente::core::job::{JobRow, JobStatus};
+use charpente::http::{App, Method, Request};
+use charpente::kernel::{Kernel, SimSource};
+use charpente::{Id, View};
+use charpente_sim::Sim;
+use charpente_sim::checks::{durable_corruption_fired, is_fault_fallout};
+use {{ident}}::{NewNote, Note, build_app};
+
+charpente_sim::sim_tests! {
+    acked_note_survives_a_restart require ["restart"],
+    acked_post_implies_the_echo_after_recovery require ["restart"],
+}
+
+const SEC: u64 = 1_000_000_000; // SimSource timestamps are virtual nanoseconds
+
+/// Opens the app on this universe's disk, or gives up on fault fallout.
+fn open_app(sim: &mut Sim) -> Result<Option<App>, String> {
+    match build_app(Box::new(sim.disk()), Box::new(sim.entropy())) {
+        Ok(app) => Ok(Some(app)),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up(format!("App::open hit fault fallout: {e}"));
+            Ok(None)
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Runs the production event loop against a scripted source and hands the
+/// app back, or gives up on fault fallout.
+fn run_kernel(sim: &mut Sim, app: App, source: &mut SimSource) -> Result<Option<App>, String> {
+    let mut kernel = match Kernel::new(app, Box::new(sim.clock())) {
+        Ok(kernel) => kernel,
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up(format!("Kernel::new hit fault fallout: {e}"));
+            return Ok(None);
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    if let Err(e) = kernel.run(source) {
+        if is_fault_fallout(&e.to_string()) {
+            sim.give_up(format!("the kernel loop hit fault fallout: {e}"));
+            return Ok(None);
+        }
+        return Err(e.to_string());
+    }
+    Ok(Some(kernel.into_app()))
+}
+
+/// POST one note, crash, reopen. Returns the reopened app and whether the
+/// POST was acked with a 200 — the only case in which there is a claim.
+fn post_then_crash(sim: &mut Sim) -> Result<Option<(App, bool)>, String> {
+    let Some(app) = open_app(sim)? else {
+        return Ok(None);
+    };
+    let mut source = SimSource::new(Box::new(sim.clock()), 2 * SEC);
+    source.push_at(
+        0,
+        Request::new(Method::Post, "/notes/1").json(&NewNote {
+            body: "hello".to_string(),
+        }),
+    );
+    let responses = source.responses();
+    let Some(app) = run_kernel(sim, app, &mut source)? else {
+        return Ok(None);
+    };
+    let acked = responses
+        .lock()
+        .map_err(|_| "responses lock poisoned".to_string())?
+        .iter()
+        .any(|(status, _)| *status == 200);
+    sim.restart();
+    drop(app);
+    let Some(app) = open_app(sim)? else {
+        return Ok(None);
+    };
+    Ok(Some((app, acked)))
+}
+
+/// An acked write is durable: after a crash the row is still there.
+fn acked_note_survives_a_restart(sim: &mut Sim) -> Result<(), String> {
+    let Some((app, acked)) = post_then_crash(sim)? else {
+        return Ok(());
+    };
+    if !acked {
+        sim.give_up("the POST was never acked, so durability has nothing to prove");
+        return Ok(());
+    }
+    let snap = match app.db().snapshot() {
+        Ok(snap) => snap,
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up(format!("the snapshot hit fault fallout: {e}"));
+            return Ok(());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    match snap.get::<Note>(Id::from_raw(1)) {
+        Ok(Some(_)) => Ok(()),
+        // Acked-but-lost is excused ONLY where the harness injected durable
+        // corruption into this universe (GUIDE §8, "Giving up").
+        Ok(None) if durable_corruption_fired(sim) => {
+            sim.give_up("durable corruption fired, so the acked row is excused");
+            Ok(())
+        }
+        Ok(None) => Err("acked note 1 lost across a crash".to_string()),
+        Err(e) if is_fault_fallout(&e.to_string()) => {
+            sim.give_up(format!("the read-back hit fault fallout: {e}"));
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The end-state oracle: two invariants that hold under any fault schedule.
+/// - Ack-durability: a 200 from `/notes/:id` committed its enqueue in the
+///   same log record, so an `Echo` job row exists.
+/// - Exactly-once: `echoed` is true iff an `Echo` job is Done — a job's
+///   effect and its Done mark commit as one record.
+fn check_invariants(app: &App, acked: bool) -> Result<(), String> {
+    let snap = app.db().snapshot().map_err(|e| e.to_string())?;
+    let echo_jobs: Vec<JobRow> = snap
+        .scan::<JobRow>()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|job| job.name == "Echo")
+        .collect();
+    if acked && echo_jobs.is_empty() {
+        return Err(
+            "ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — \
+             the enqueue did not commit with the row"
+                .to_string(),
+        );
+    }
+    let done = echo_jobs
+        .iter()
+        .filter(|job| job.status == JobStatus::Done)
+        .count();
+    for note in snap.scan::<Note>().map_err(|e| e.to_string())? {
+        if note.echoed != (done > 0) {
+            return Err(format!(
+                "exactly-once violated: note {} reads echoed = {} but {done} Echo job(s) are Done — \
+                 a job's effect and its Done mark commit as one record",
+                note.id.raw(),
+                note.echoed
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// An acked POST implies the job's effect once the queue has drained —
+/// through a crash in between. Delete `tx.enqueue` in `src/lib.rs`, or make
+/// `Echo::run` do nothing, and this goes red with a seed.
+fn acked_post_implies_the_echo_after_recovery(sim: &mut Sim) -> Result<(), String> {
+    let Some((app, acked)) = post_then_crash(sim)? else {
+        return Ok(());
+    };
+    // No requests this time: the loop just runs whatever is due, then idles.
+    let mut idle = SimSource::new(Box::new(sim.clock()), 60 * SEC);
+    let Some(app) = run_kernel(sim, app, &mut idle)? else {
+        return Ok(());
+    };
+    match check_invariants(&app, acked) {
+        Ok(()) => Ok(()),
+        // The oracle's own reads go through the same faulted disk.
+        Err(msg) if is_fault_fallout(&msg) => {
+            sim.give_up(format!("the end-state read hit fault fallout: {msg}"));
+            Ok(())
+        }
+        Err(msg) => Err(msg),
+    }
+}

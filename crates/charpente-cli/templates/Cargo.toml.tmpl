@@ -1,0 +1,19 @@
+[package]
+name = "{{name}}"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+charpente = "{{version}}"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+charpente-sim = "{{version}}"
+
+[[test]]
+name = "sim"
+harness = false
+
+[lints.clippy]
+disallowed_methods = "deny"
+disallowed_types = "deny"

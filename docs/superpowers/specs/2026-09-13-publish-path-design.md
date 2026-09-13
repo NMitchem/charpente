@@ -6,6 +6,21 @@ defined"), which closed M2 and defined M3 — Launch. This is M3's first sub-pro
 the one every later one stands on: sub-project 3's third docs-only build and sub-project
 5's launch run both start from `cargo install charpente-cli` and `charpente new`.
 
+**Correction, 2026-09-13 (final fix wave, review Minor #3):** §5's route shape and §3/§10.1's
+CI step drifted from what shipped, the same class of drift Task 0's correction fixed for
+the outbox-bug sentence. §5 said the route was `POST "/notes"` returning
+`Result<Note, ApiError>` with `#[derive(Wire, Deserialize)]` on the body, and property 1 was
+"put through `db.transact`"; the template ships `POST "/notes/:id"` returning
+`Result<Id<Note>, ApiError>`, `#[derive(Wire, Serialize, Deserialize)]`, and property 1
+drives a POST through the kernel. There is no id-minting API in this codebase, so a route
+that hands back a fresh `Id<Note>` has nothing to mint it with; `/notes/:id` is the guide's
+own idiom (GUIDE §5) for a caller-supplied id, and `Serialize` is needed because the sim
+template calls `.json(&NewNote { .. })` to build the request body. §3 and §10.1 said CI runs
+`cargo package --workspace --no-verify`; CI (`.github/workflows/ci.yml:40`) runs
+`cargo publish --workspace --dry-run --no-verify` — `cargo package --workspace` does not
+skip `publish = false` members the way the dry-run publish does, so the two commands prove
+different things. Corrected in place below; this paragraph is the record of why.
+
 ## Context
 
 M3's goal is that a stranger reproduces the wager in one sitting. Today they cannot start:
@@ -76,12 +91,13 @@ overlay. So:
   `cargo publish --workspace --dry-run` — the full verify build of every packaged crate.
   `--for-real` runs `cargo publish --workspace`. Nothing else: no tagging, no changelog.
 - **CI** (`.github/workflows/ci.yml`, the `check` job): one step,
-  `cargo package --workspace --no-verify`. Seconds, and it catches the realistic failures —
-  a `publish = false` somewhere in the graph, a missing `description`, a path-only normal
-  dependency, a version mismatch between the path and the requirement. The verify build
-  stays in the local dry-run: it is a sixth rebuild of the workspace and the minutes are
-  metered. **CI's gate is therefore weaker than "publishable"** — it proves the manifests,
-  not the packaged sources; the script's dry-run proves both, and the plan runs it once.
+  `cargo publish --workspace --dry-run --no-verify`. Seconds, and it catches the realistic
+  failures — a `publish = false` somewhere in the graph, a missing `description`, a
+  path-only normal dependency, a version mismatch between the path and the requirement. The
+  verify build stays in the local dry-run: it is a sixth rebuild of the workspace and the
+  minutes are metered. **CI's gate is therefore weaker than "publishable"** — it proves the
+  manifests, not the packaged sources; the script's dry-run proves both, and the plan runs
+  it once.
 
 ## §4 The verb: `charpente new <name>`
 
@@ -166,13 +182,17 @@ and show the app list is a subset.
 **`lib.rs`** — one of each, and no more:
 
 - `#[table] Note { id: Id<Note>, body: String, echoed: bool }`.
-- `#[derive(Wire, Deserialize)] NewNote { body: String }` — the POST body.
+- `#[derive(Wire, Serialize, Deserialize)] NewNote { body: String }` — the POST body;
+  `Serialize` is needed because `tests/sim.rs.tmpl` builds the request with
+  `.json(&NewNote { .. })`.
 - `#[event] NoteAdded { note: Id<Note> }`.
 - `#[job] Echo { note: Id<Note> }` whose `run` sets `echoed = true` on the row — an
   in-row effect, so a property can pin it and `--mutants` has something to catch.
-- `#[route(POST "/notes")] fn add_note(tx, body: NewNote) -> Result<Note, ApiError>`:
-  `tx.put`, `tx.enqueue(Echo)`, `tx.emit(NoteAdded)`, return the row. The three effects in
-  one transaction is the second guarantee in the README, in the stranger's own file.
+- `#[route(POST "/notes/:id")] fn add_note(tx, id: Id<Note>, body: NewNote) ->
+  Result<Id<Note>, ApiError>`: `tx.put`, `tx.enqueue(Echo)`, `tx.emit(NoteAdded)`, return the
+  id. There is no id-minting API, so the caller supplies the id in the path — the guide's own
+  idiom (GUIDE §5). The three effects in one transaction is the second guarantee in the
+  README, in the stranger's own file.
 - `pub fn build_app(...)` in the shape `charpente::launch` takes (GUIDE §13).
 
 Route auth is whatever `#[route]` requires today; sub-project 2 (default-secure surfaces)
@@ -185,13 +205,16 @@ scaffold gated rather than hand-maintained.
 idiom `crates/sim-fixture/tests/sim.rs` uses (`is_fault_fallout` → `sim.give_up`, and the
 `durable_corruption_fired` excuse for an acked row):
 
-1. `acked_note_survives_a_restart` (`require ["restart"]`): put through `db.transact`,
-   `sim.restart()`, reopen, read back.
+1. `acked_note_survives_a_restart` (`require ["restart"]`): drives a POST through the
+   kernel, `sim.restart()`, reopen, read back.
 2. `acked_post_implies_the_echo_after_recovery`: drive `POST /notes` through the app,
    restart, dispatch due jobs, read the row: `echoed` must be `true`. This is the thesis in
-   one property. It goes red when `Echo::run` is neutered (`charpente test --mutants`) and
-   when the enqueue is moved outside the transaction (the DEMO.md outbox bug) — so the
-   launch run mutates the scaffold, not invoicing.
+   one property, and it is DEMO.md's own oracle shape (`receipts_exactly_once`): acked ⇒ an
+   `Echo` job row is durable; `echoed` ≡ that job is Done. It goes red when `Echo::run` is
+   neutered (`charpente test --mutants`), when the `tx.enqueue` line is deleted, and — under
+   the framework patch DEMO.md describes (`c0dbcea`), which is the only way to write it —
+   when the enqueue is split into a second transaction. So the launch run mutates the
+   scaffold, not invoicing; whether it re-applies that patch is sub-project 5's call.
 
 Nothing one-sided ships. The `counter_bump_job_leaves_the_row_readable` demonstration stays
 in `sim-fixture`, where GUIDE's mutants walkthrough points.
@@ -233,7 +256,11 @@ there; nothing here is `#[ignore]`d). CLAUDE.md's `charpente-cli` test list gain
    graph is warm and the test costs one small crate's compile, not hyper's), run in that
    dir: `cargo fmt --check`; `cargo clippy --all-targets -- -D warnings` — which proves the
    emitted fence is live against the template's own code; and
-   `charpente test --sim --universes 8 --dir <tmp>` — exit 0.
+   `charpente test --sim --universes 64 --dir <tmp>` — exit 0. Both scaffold properties
+   `require ["restart"]`, and ~55% of universes give up before a restart occurs, so at 8
+   universes the requirement goes unmet on ~2.5% of fresh master seeds (replay:
+   `--universes 8 --master-seed 0x7ad351d01d2ca664` exits 1, `--universes 64` exits 0); 64
+   puts the miss at ~1e-17.
 
 Every `Command` here is `charpente-cli`'s to spawn; the deny-list's `Command::new` entry
 names this crate as the sanctioned site.
@@ -262,7 +289,8 @@ after scaffolding. No release workflow in CI. No `Wire`-derive change to absorb 
 ## §10 Exit criteria
 
 1. `scripts/publish.sh` (dry-run) exits 0 on `main` with its full verify build, output
-   recorded in the ledger; CI's `cargo package --workspace --no-verify` step is green.
+   recorded in the ledger; CI's `cargo publish --workspace --dry-run --no-verify` step is
+   green.
 2. `charpente new myapp && cd myapp && cargo clippy --all-targets -- -D warnings &&
    charpente test --sim` is green from a shell that has only the installed binary and
    crates.io — the e2e test proves it against the workspace; the ledger records one
@@ -270,6 +298,6 @@ after scaffolding. No release workflow in CI. No `Wire`-derive change to absorb 
 3. The four refusals print the text in §4; `tests/new.rs` pins each.
 4. GUIDE §1's `Cargo.toml` block and the verb's output are byte-identical, held by a test.
 5. Under the template, `charpente test --mutants` reports `Echo::run` → `Ok(())` **caught**
-   by `acked_post_implies_the_echo_after_recovery`; and moving the enqueue outside the
-   transaction turns that property red under `--sim`, with a seed. Both recorded — they
-   are what the launch run will show.
+   by `acked_post_implies_the_echo_after_recovery`; and deleting the `tx.enqueue` line turns
+   that property red under `--sim`, with a seed. Both recorded — they are what the launch
+   run will show. (The dual-write proper needs DEMO.md's framework patch; sub-project 5.)

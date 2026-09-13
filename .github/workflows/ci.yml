@@ -31,6 +31,13 @@ jobs:
       # derive fails here. Task 2 fix round 1 confirmed both directions: FAILS (101) with
       # a `#[derive(serde::Serialize)]` probe present, PASSES (0) with it removed.
       - run: cargo check -p charpente-core
+      # The publish gate (spec 2026-09-13-publish-path §3): `--workspace` skips
+      # `publish = false` members and then refuses a publishable crate whose dependency
+      # is not in the set — which is exactly how charpente-tsgen's `publish = false`
+      # was caught on 2026-09-13. `--no-verify` skips the six verify builds; the full
+      # verify runs in scripts/publish.sh's dry-run, not here (metered minutes). This
+      # proves the manifests, not the packaged sources.
+      - run: cargo publish --workspace --dry-run --no-verify
       # `--no-fail-fast` is load-bearing: without it cargo stops at the first failing
       # package, every later suite never runs, and the log is indistinguishable from a
       # clean sweep. That blind spot hid two `replication` failures for three commits

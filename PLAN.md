@@ -202,12 +202,13 @@ gap that matters.
 
 Sub-projects, in dependency order:
 
-1. **Publish path.** Workspace to `0.1.0`; the six crates on crates.io (verify the
-   2026-07-01 name reservation under "Naming" below actually happened — nothing in the tree
-   records it). `charpente new <name>` scaffolds GUIDE §1's layout — `Cargo.toml` with the
-   `[[test]] name = "sim"` block, `src/main.rs`, `tests/sim.rs` — and the scaffold is
-   compile-gated the way GUIDE's Rust code blocks are, so it cannot drift from the guide it
-   claims to match. GUIDE §1's `charpente = "0.0.0"` dependency line becomes true.
+1. **Publish path.** Workspace to `0.1.0`; the six crates on crates.io (five names reserved
+   2026-07-01, confirmed 2026-09-13; `charpente-tsgen` publishes fresh). `charpente new
+   <name>` scaffolds GUIDE §1's layout — `Cargo.toml` with the `[[test]] name = "sim"`
+   block, `src/main.rs`, `tests/sim.rs` — and the scaffold is compile-gated the way
+   GUIDE's Rust code blocks are, so it cannot drift from the guide it claims to match.
+   GUIDE §1's dependency line is `charpente = "0.1"`, and a test holds the guide's
+   `Cargo.toml` block byte-identical to the verb's output.
 2. **Default-secure surfaces** (own brainstorm and spec; a DESIGN §7/§8 change). A
    `#[route]` that declares neither `auth` nor an explicit `public` is a compile error
    naming both. A table that should be tenant-scoped and is not is a compile error — *how*
@@ -224,7 +225,7 @@ Sub-projects, in dependency order:
    raw panic trace that "demonstrably destroyed a competent agent's work" — is verified
    closed against the helpdesk repro, not assumed closed because a hook now exists.
 5. **The launch run.** DEMO.md re-executed against the published version by a docs-only
-   agent starting from `cargo install charpente`: reaches a red sim with a seed, replays
+   agent starting from `cargo install charpente-cli`: reaches a red sim with a seed, replays
    it. That transcript is the launch post.
 
 **Exit criteria:** (a) the launch run, recorded with its seeds; (b) the third docs-only
@@ -272,4 +273,6 @@ escape hatches. No feature flags on guarantees.
 
 Crate `charpente` — verified available on crates.io 2026-07-01 (along with the rejected
 alternates; `socle`, `massif`, `menhir`, `chassis`, `armature` are taken). Reserve the
-crate name early with an empty publish.
+crate name early with an empty publish. Publishable at 0.1.0 since the 2026-09-13
+publish-path sub-project; the real publish is Noah's, recorded in the ledger when it
+happens.
