@@ -72,6 +72,41 @@ fn a_rust_keyword_is_refused_because_the_ident_cannot_be_used() {
 }
 
 #[test]
+fn a_reserved_crate_or_build_dir_name_is_refused_because_the_scaffold_cannot_build() {
+    let dir = scratch("reserved");
+    let (code, _, err) = run_in(&dir, &["new", "deps"]);
+    assert_eq!(code, 2, "stderr: {err}");
+    assert!(
+        err.contains(
+            "`deps` is reserved — `deps` names a built-in crate or one of cargo's build \
+             directories, so the scaffold cannot build; pick another name, e.g. `charpente new \
+             deps-app`"
+        ),
+        "{err}"
+    );
+    assert!(
+        !dir.join("deps").exists(),
+        "a refused name must write nothing"
+    );
+}
+
+#[test]
+fn a_second_positional_argument_is_a_usage_error() {
+    let dir = scratch("second-arg");
+    let (code, _, err) = run_in(&dir, &["new", "foo", "bar"]);
+    assert_eq!(code, 2, "stderr: {err}");
+    assert!(
+        err.contains("error: `charpente new` takes one name, got 2 arguments"),
+        "{err}"
+    );
+    assert!(err.contains("usage: charpente new <name>"), "{err}");
+    assert!(
+        !dir.join("foo").exists(),
+        "a refused invocation must write nothing"
+    );
+}
+
+#[test]
 #[allow(clippy::disallowed_methods)]
 fn an_existing_path_is_never_written_into() {
     let dir = scratch("exists");

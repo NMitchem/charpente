@@ -17,67 +17,32 @@ const LIB_RS: &str = include_str!("../templates/lib.rs");
 const MAIN_RS: &str = include_str!("../templates/main.rs.tmpl");
 const SIM_RS: &str = include_str!("../templates/sim.rs.tmpl");
 
-/// Rust's strict and reserved keywords, plus the crate names cargo itself
-/// refuses. The name becomes `use <ident>::…` in two files, so a keyword
-/// would fail there rather than here — refuse it where the fix is nameable.
+/// Rust's strict and reserved keywords. The name becomes `use <ident>::…`
+/// in two files, so a keyword would fail there rather than here — refuse
+/// it where the fix is nameable.
 const KEYWORDS: &[&str] = &[
-    "abstract",
+    "abstract", "as", "async", "await", "become", "box", "break", "const", "continue", "crate",
+    "do", "dyn", "else", "enum", "extern", "false", "final", "fn", "for", "gen", "if", "impl",
+    "in", "let", "loop", "macro", "match", "mod", "move", "mut", "override", "priv", "pub", "ref",
+    "return", "self", "Self", "static", "struct", "super", "trait", "true", "try", "type",
+    "typeof", "unsafe", "unsized", "use", "virtual", "where", "while", "yield",
+];
+
+/// Names cargo itself refuses, or accepts but leaves unbuildable: the
+/// built-in crate names (`use <ident>::…` would shadow the crate, not name
+/// the app) and cargo's own build-directory names (a binary target with one
+/// of these names collides with cargo's output layout). Neither is a
+/// keyword — the identifier is legal — but the scaffold cannot build.
+const RESERVED: &[&str] = &[
     "alloc",
-    "as",
-    "async",
-    "await",
-    "become",
-    "box",
-    "break",
-    "const",
-    "continue",
+    "build",
     "core",
-    "crate",
-    "do",
-    "dyn",
-    "else",
-    "enum",
-    "extern",
-    "false",
-    "final",
-    "fn",
-    "for",
-    "gen",
-    "if",
-    "impl",
-    "in",
-    "let",
-    "loop",
-    "macro",
-    "match",
-    "mod",
-    "move",
-    "mut",
-    "override",
-    "priv",
+    "deps",
+    "examples",
+    "incremental",
     "proc_macro",
-    "pub",
-    "ref",
-    "return",
-    "self",
-    "Self",
-    "static",
     "std",
-    "struct",
-    "super",
     "test",
-    "trait",
-    "true",
-    "try",
-    "type",
-    "typeof",
-    "unsafe",
-    "unsized",
-    "use",
-    "virtual",
-    "where",
-    "while",
-    "yield",
 ];
 
 /// `major.minor` of this binary's own version: a new app's requirement is
@@ -109,6 +74,13 @@ fn refuse_name(name: &str) -> Option<String> {
              name, e.g. `charpente new {name}-app`"
         ));
     }
+    if RESERVED.contains(&ident.as_str()) {
+        return Some(format!(
+            "`{name}` is reserved — `{ident}` names a built-in crate or one of cargo's build \
+             directories, so the scaffold cannot build; pick another name, e.g. `charpente new \
+             {name}-app`"
+        ));
+    }
     None
 }
 
@@ -137,6 +109,13 @@ pub fn run(args: &[String]) -> i32 {
         eprintln!("error: `charpente new` needs a name\n\n{USAGE}");
         return 2;
     };
+    if args.len() > 1 {
+        eprintln!(
+            "error: `charpente new` takes one name, got {} arguments\n\n{USAGE}",
+            args.len()
+        );
+        return 2;
+    }
     if let Some(why) = refuse_name(name) {
         eprintln!("error: {why}");
         return 2;
@@ -204,7 +183,8 @@ mod tests {
                 .contains("[a-zA-Z][a-zA-Z0-9_-]*")
         );
         assert!(refuse_name("match").unwrap().contains("Rust keyword"));
-        assert!(refuse_name("proc-macro").unwrap().contains("Rust keyword"));
+        assert!(refuse_name("proc-macro").unwrap().contains("is reserved"));
+        assert!(refuse_name("deps").unwrap().contains("is reserved"));
     }
 
     #[test]

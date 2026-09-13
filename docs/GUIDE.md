@@ -40,8 +40,8 @@ charpente test --sim                        # seeded fault-injection universes
 ```
 
 `charpente new` writes six files and does nothing else — no `git init`, no build, no
-prompts. It refuses a name cargo would reject, a Rust keyword, and an existing path, each
-by name.
+prompts. It refuses a name cargo would reject, a Rust keyword or a reserved crate or
+build-directory name, and an existing path, each by name.
 
 | File | What it is |
 |---|---|
