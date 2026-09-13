@@ -236,7 +236,11 @@ there; nothing here is `#[ignore]`d). CLAUDE.md's `charpente-cli` test list gain
    graph is warm and the test costs one small crate's compile, not hyper's), run in that
    dir: `cargo fmt --check`; `cargo clippy --all-targets -- -D warnings` — which proves the
    emitted fence is live against the template's own code; and
-   `charpente test --sim --universes 8 --dir <tmp>` — exit 0.
+   `charpente test --sim --universes 64 --dir <tmp>` — exit 0. Both scaffold properties
+   `require ["restart"]`, and ~55% of universes give up before a restart occurs, so at 8
+   universes the requirement goes unmet on ~2.5% of fresh master seeds (replay:
+   `--universes 8 --master-seed 0x7ad351d01d2ca664` exits 1, `--universes 64` exits 0); 64
+   puts the miss at ~1e-17.
 
 Every `Command` here is `charpente-cli`'s to spawn; the deny-list's `Command::new` entry
 names this crate as the sanctioned site.

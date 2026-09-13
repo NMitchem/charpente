@@ -216,7 +216,7 @@ fn a_scaffolded_app_is_fmt_clean_clippy_clean_under_the_fence_and_green_under_th
         charpente()
             .current_dir(&app)
             .env("CARGO_TARGET_DIR", &target)
-            .args(["test", "--sim", "--universes", "8"]),
+            .args(["test", "--sim", "--universes", "64"]),
         "charpente test --sim on the scaffold",
     );
 }
