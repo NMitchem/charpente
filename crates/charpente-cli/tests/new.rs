@@ -220,3 +220,65 @@ fn a_scaffolded_app_is_fmt_clean_clippy_clean_under_the_fence_and_green_under_th
         "charpente test --sim on the scaffold",
     );
 }
+
+/// The first ```toml block after GUIDE §1's heading, verbatim.
+fn guide_section_1_cargo_toml() -> String {
+    let guide = read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/GUIDE.md"));
+    let section = guide
+        .split("## 1. Project setup")
+        .nth(1)
+        .expect("docs/GUIDE.md has a `## 1. Project setup` heading");
+    let block = section
+        .split("```toml\n")
+        .nth(1)
+        .expect("GUIDE §1 has a ```toml block");
+    block
+        .split("```")
+        .next()
+        .expect("the ```toml block is closed")
+        .to_string()
+}
+
+/// The doc is the spec: the file the verb writes and the file the guide
+/// shows are one file, held together here (the describe_contract pattern).
+#[test]
+fn the_rendered_cargo_toml_is_guide_section_1s_block_byte_for_byte() {
+    let dir = scratch("guide-diff");
+    let (code, _, err) = run_in(&dir, &["new", "myapp"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let rendered = read(&dir.join("myapp/Cargo.toml"));
+    let documented = guide_section_1_cargo_toml();
+    assert_eq!(
+        rendered, documented,
+        "\n`charpente new myapp` writes a Cargo.toml that is not the block GUIDE §1 shows — \
+         the doc is the spec (hard rule 6); update whichever one drifted.\n"
+    );
+}
+
+/// Every entry in the emitted clippy.toml is an entry in the workspace's,
+/// character for character — the app's fence is a subset of the platform's,
+/// never a paraphrase of it.
+#[test]
+fn the_emitted_clippy_toml_is_a_subset_of_the_workspace_fence() {
+    let dir = scratch("clippy-subset");
+    let (code, _, err) = run_in(&dir, &["new", "myapp"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let emitted = read(&dir.join("myapp/clippy.toml"));
+    let workspace = read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../clippy.toml"));
+    let entries: Vec<&str> = emitted
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("{ path = "))
+        .collect();
+    assert!(
+        entries.len() >= 20,
+        "the emitted fence lost its entries: {}",
+        entries.len()
+    );
+    for entry in entries {
+        assert!(
+            workspace.contains(entry),
+            "emitted clippy.toml carries an entry the workspace fence does not:\n{entry}"
+        );
+    }
+}

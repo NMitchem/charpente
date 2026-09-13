@@ -1344,6 +1344,13 @@ Charpente treats the coding agent as the primary developer persona:
   CI runs, regenerating and comparing against the committed file rather than trusting
   that a Rust change was remembered to be followed by a re-run (docs/GUIDE.md §14).
   Transport is SSE only; no WebSocket client ships.
+- **`charpente new` (v0, implemented; `crates/charpente-cli/src/new.rs`).** The scaffold
+  a stranger starts from: six files — the GUIDE §1 manifest byte for byte, hard rule 1's
+  standard-library fence as the app's own `clippy.toml`, one table/route/job/event, a
+  one-line `launch` main, and two sim properties in the give-up idiom, the second of
+  which is DEMO.md's outbox oracle. Its templates are compiled, linted under their own
+  fence and run under the sim on every push (`tests/new.rs`), and refusals name the rule
+  and the fix (docs/GUIDE.md §1).
 - **Errors are prompts.** Compile-time and sim-failure output is structured for machine
   consumption: the exact contract violated, the file/line, the seed and fault schedule for
   sim failures, and the minimal repro command. Error quality is a feature with a test suite.
