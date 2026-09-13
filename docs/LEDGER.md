@@ -4975,3 +4975,124 @@ against the helpdesk repro in sub-project 4, not assumed from the census. And
 the v1.x table: DECISIONS §3 puts error-message quality ahead of tutorials, and a skill for
 building on charpente is a tutorial until the default-secure surfaces make the errors do
 the teaching.
+
+## 2026-09-13 — publish path: 0.1.0 is publishable, and `charpente new` is the app the guide describes
+
+Spec `docs/superpowers/specs/2026-09-13-publish-path-design.md`, plan
+`docs/superpowers/plans/2026-09-13-publish-path.md`, seven tasks (0 through 6) by
+subagent-driven development on `publish-path` off `d94df6c`, seven commits before this
+one (Task 3 took a fix round), six rulings recorded in its `progress.md`. Workspace
+`.superpowers/sdd/2026-09-13-publish-path/`.
+
+**The gate's first RED was cargo, not code.** Before any manifest changed, `cargo publish
+--workspace --dry-run --no-verify` refused at packaging: "error: failed to prepare local
+package for uploading" / "Caused by: no matching package named `charpente-tsgen` found" /
+"required by package `charpente-cli v0.0.0`" — `--workspace` skips `publish = false`
+members but does not skip a *dependency* on one, and `charpente-tsgen` was `publish =
+false`. Dropping that line and moving all six
+crates' `[workspace.package] version` to `0.1.0` was the fix; the six `Packaging` lines
+that follow (`charpente-core`, `charpente-macros`, `charpente`, `charpente-tsgen`,
+`charpente-cli`, `charpente-sim`, all `v0.1.0`) recur unchanged in this task's own re-run
+of the dry-run below. Running the local verification dry-run before its commit lands
+needs `--allow-dirty` — cargo 1.95 refuses uncommitted manifest edits at packaging, a gate
+that cannot fire on CI's already-clean checkout — so the CI step stays the plan's exact
+line with no `--allow-dirty` (Ruling 2); recorded in `decisions-pending.md` for sign-off,
+not silently resolved.
+
+**`scripts/publish.sh`'s dry-run verify-built all six.** Six `Verifying` lines, same
+order as packaging, all `v0.1.0`: `charpente-core`, `charpente-macros`, `charpente`,
+`charpente-tsgen`, `charpente-cli`, `charpente-sim`. Exit 0, ~34s warm. The dirty-tree
+refusal ("the tree is dirty — commit or stash first; a publish must be reproducible from a
+commit") fires before argument parsing, so it also caught a deliberate `--nonsense`
+invocation until the script itself was committed and the usage line could be shown on its
+own: `usage: scripts/publish.sh [--for-real]   (default: dry run with verify)`, exit 2.
+
+**One inconsistency was designed away rather than discovered by a stranger.** GUIDE §1
+said "one dependency is all a charpente app needs" while §5's route bodies write `use
+serde::Deserialize` and `#[derive(Wire, Deserialize)]` — `charpente` re-exports serde
+(`pub use serde;`) but serde's derive emits `::serde::` paths that need the crate in the
+extern prelude, so a one-dependency app cannot write the §5 idiom. The scaffold's
+`Cargo.toml` carries two dependencies (`charpente = "0.1"`, `serde = { version = "1",
+features = ["derive"] }`); GUIDE §1 was rewritten to match, and a byte-diff test holds the
+two together (below).
+
+**The scaffold's templates needed one real fix, once each, at two different layers.**
+Task 3's `templates/lib.rs` and `sim.rs.tmpl` were transcribed from the spec already
+rustfmt-clean under 2015-style import sort, but the scaffold declares `edition = "2024"`,
+whose rustfmt wants uppercase names first — caught by `rustfmt --edition 2024 --check`,
+not the edition-blind check the plan's own text ran first; fixed in both files (Ruling 5).
+Task 4's end-to-end oracle then compiled a *rendered* scaffold and hit the one thing
+neither template fix touched: `tests/sim.rs` called `.get`/`.scan` on a `Snapshot` with
+`View` out of scope — "error[E0599]: no method named `get` found for struct
+`charpente::Snapshot` in the current scope", with rustc naming its own fix ("perhaps you
+want to import it: `use charpente::View;`"). One import, merged into `sim.rs.tmpl`'s
+existing `use charpente::Id;` line; the oracle went green on the next run, and no sim
+failure was ever hit (`acked_post_implies_the_echo_after_recovery`'s STOP condition, held
+in the plan for exactly this task, never fired — this task fires it deliberately, below).
+
+**Two oracles hold the guide's promise byte for byte, and one held under a hand-paraphrase.**
+`the_rendered_cargo_toml_is_guide_section_1s_block_byte_for_byte` was RED against the old
+GUIDE §1 (`charpente = "0.0.0"`, no serde, no `[lints.clippy]`), naming the drift itself:
+"`charpente new myapp` writes a Cargo.toml that is not the block GUIDE §1 shows — the doc
+is the spec (hard rule 6); update whichever one drifted." Rewriting GUIDE §1 turned it
+green. `the_emitted_clippy_toml_is_a_subset_of_the_workspace_fence` was already green — it
+guards Task 3's copy against a future paraphrase, not this task's drift — so its RED was
+shown by hand: one entry's `reason` string edited from "ambient wall clock" to "ambient
+wallclock" in `templates/clippy.toml`, and the test named the exact entry that no longer
+matched the workspace fence. Restored, green again.
+
+**RED 1 — the deleted enqueue, seed `0x0967d63945c56859`.** Scaffolding `demo` fresh with
+`charpente new` and patching in `[patch.crates-io]` paths (per §10 item 5), `charpente
+test --sim --universes 64` was green (master seed `0x776924b1c3b17e06`, 44 verdicts, 84
+give-ups, no failures). Deleting `tx.enqueue(Echo { note: id });` from `add_note`
+(`grep -c` 1 → 0) turned `acked_post_implies_the_echo_after_recovery` red on every one of
+23 failing universes out of 64, each printing: "sim failure in
+acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was
+acked with 200 but no Echo job is durable — the enqueue did not commit with the row." The
+printed `repro:` line for this seed, run verbatim (`charpente test --sim --filter
+acked_post_implies_the_echo_after_recovery --seed 0x967d63945c56859`), reproduced the
+identical failure text and fault trace (`fault:sync_error: 1, restart: 1`). Restoring the
+enqueue line (byte-identical to `templates/lib.rs` again) returned the property to green
+over 64 universes, 0 failures.
+
+**RED 2 — the neutered job, seed `0x91bec92516eee8d3`.** Replacing `Echo::run`'s body with
+`Ok(())` — the exact shape cargo-mutants applies — turned the same property red on 34 of
+64 universes, each: "sim failure in acked_post_implies_the_echo_after_recovery:
+exactly-once violated: note 1 reads echoed = false but 1 Echo job(s) are Done — a job's
+effect and its Done mark commit as one record." The repro line for this seed reproduced
+the identical text and fault trace (`crash_torn: 1.0`, `fired: restart: 1`). Restoring
+`Echo::run` to the template's body returned the property to green over 64 universes, 0
+failures.
+
+**The mutation instrument caught the mutant clean — no `--dir` refusal.** `charpente test
+--mutants --dir /tmp/charpente-evidence/demo --file src/lib.rs --re 'Echo::run' --jobs 1`
+(Ruling 6: `--file src/lib.rs` is required — the verb's default file set is the
+workspace's own oracle-bearing files, which do not exist in a scaffold) found one mutant,
+tested it, and reported "1 mutant tested in 3s: 1 caught" — "mutants: 1 total — 1 caught,
+0 missed, 0 unviable, 0 timed out", exit 0. Two `WARN` lines ("Package `charpente-core`
+not found in source tree", same for `charpente-sim`) are harmless: those are path-patched
+dependencies living outside `--dir`'s tree, not the crate under test. The plan's fallback
+(RED 2 above already proves the property if `--dir` refuses) was not needed on this run.
+
+**The gate, counted.** `cargo fmt --all --check`: exit 0. `cargo clippy --workspace
+--all-targets -- -D warnings`: exit 0. `cargo test --workspace --no-fail-fast`, run
+backgrounded and polled for the cargo process to exit rather than the tool's own timeout:
+**86** `test result: ok`, **0** `FAILED` (counted directly from `t6-suite.log`, predicted
+86 = 85 + `tests/new.rs` before the run), ~388s wall (log created 11:57:25, last write
+12:03:53). `cargo publish --workspace --dry-run --no-verify` on the still-clean tree: exit
+0, the same six `Packaging` lines as Task 1's.
+
+**Ledgered, not fixed.** RED 1's own failure report is inconsistent with itself: the
+`seed:` line prints `0x0967d63945c56859` and the `repro:` line for the identical seed
+prints `0x967d63945c56859` — the leading zero silently dropped, evidently an unpadded hex
+formatter on the repro path against a zero-padded one on the seed line. It replayed
+correctly here and in several of RED 1's other 22 universes with the same pattern, so it
+is not a correctness bug, but a `repro:` line that does not print the same digits as the
+`seed:` line two lines above it is a hard-rule-5 wart in the platform's own failure
+report — worth a fix, not this sub-project's to make.
+
+**What stays open.** The real publish (`scripts/publish.sh --for-real`) is Noah's hand,
+not run here. The post-publish run against the live registry that spec §10 item 2 asks
+for waits on that publish. And the `Wire`-derive/serde question spec §9 refused —
+absorbing serde into `#[derive(Wire)]` so a route body needs no second import — stays
+refused; today's fix was documenting the two-dependency shape, not collapsing it to one.
