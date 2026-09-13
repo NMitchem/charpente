@@ -106,8 +106,14 @@ API keys, static-JWKS OIDC), schema migrations as log records, `charpente
 describe`, and a black-box edge harness that drives stock binaries over
 real TCP with `kill -9` and TCP-proxy fault injection.
 
-**M2 is in progress.** Two of its sub-projects have shipped — an honest
-benchmark harness and primary-side group commit — and their numbers are in
+**M2 closed 2026-09-13; M3 — launch — is in progress.** M2 shipped six
+sub-projects, dropped one, and reclassified the rest to after launch with the
+trigger that reopens each ([PLAN.md](PLAN.md)). M3 is the finish line before
+this is public: a stranger installs charpente from crates.io, scaffolds an app,
+and reaches a red sim with a seed in one sitting; a third docs-only agent build
+passes review with zero Criticals the platform should have caught; and every
+number in this file is measured or gone. The first two of M2's sub-projects — an
+honest benchmark harness and primary-side group commit — have their numbers in
 [docs/BENCH.md](docs/BENCH.md), measured on a dev laptop under `F_FULLFSYNC`
 and explicitly not the launch claim. Read them before the scaling paragraph
 above: one connection still costs one durable fsync per transaction, ~215
@@ -133,7 +139,7 @@ looking: no blob store and no WebSockets.
 |---|---|
 | [MANIFESTO.md](MANIFESTO.md) | Why this exists — the agent-era argument |
 | [DESIGN.md](DESIGN.md) | Architecture: the deterministic core, write model, typed surface, simulation |
-| [PLAN.md](PLAN.md) | Milestones (M0–M2), risks, non-goals |
+| [PLAN.md](PLAN.md) | Milestones (M0–M3), what waits until after launch, risks, non-goals |
 | [docs/GUIDE.md](docs/GUIDE.md) | How to build an app — agent-first, every runnable example compile-gated |
 | [docs/BENCH.md](docs/BENCH.md) | Measured numbers, method first — dev hardware, honestly labeled as not the launch claim |
 | [examples/invoicing](examples/invoicing) | The M0 demo: agent-built against the docs alone; DEMO.md + FINDINGS.md |

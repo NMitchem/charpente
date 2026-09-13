@@ -4897,3 +4897,81 @@ loose, (b) is refused by arm 3 as well; Task 1's trailing asserts carry no messa
 poison test's `unwrap_err` fails with Rust's generic text under its mutant; code comments cite
 the sweep-time lines `log.rs:263`/`:296`; one underfilled wrapped line in CLAUDE.md. A doc
 wave, or nothing.
+
+## 2026-09-13 — "complete" defined: M2 closed, M3 is launch, five items reclassified to after it
+
+Noah asked what "complete" means for this project before it goes public, and whether the
+own-LSM engine and the blob store are high-value adds toward it. Neither the question nor
+the answer was in any doc: PLAN.md stopped at M2, M2 had no exit criterion — it was a list
+of thirteen bullets, six shipped, one dropped, five untouched, one conditional on a
+company existing — and MANIFESTO §9's wager is a positioning claim, not an engineering
+finish line. So the survey that opened the day (main at `a0bd191`, tree clean, even with
+origin, one worktree, no plan in flight) could count milestones but not distance.
+
+**The yardstick is the thesis, not the bullet count.** NEIGHBORS' synthesis and DECISIONS
+§1 say the product is the oracle substrate — the two edges no neighbor can retrofit,
+determinism and the compile-time oracle — and MANIFESTO §3 says distribution rides agent
+preference, i.e. how fast and precisely the framework says no. Read against that, the M2
+leftovers sort themselves:
+
+- **Own LSM engine: not a launch item, by its own ruling.** DECISIONS §7 (2026-08-06)
+  already says "the engine is invisible to the adopters the wager needs"; trigger (a) has
+  been read three times (08-06, 08-10, 08-20) and declined every time — the ceiling is
+  fsync, not redb, and group commit and per-batch apply were the correct responses; and
+  trigger (c) is "post-launch adoption", which cannot gate launch by definition. PLAN's own
+  risk table calls it "the hardest 20%". Spending that on an item adopters cannot see,
+  before they exist, is the romantic move §7 rejected in its first sentence.
+- **Blob store: a real bundle gap, not a gate.** It is the item an ordinary SaaS hits on
+  day one — PocketBase's pull is auth+DB+realtime+*files* — but it strengthens no oracle,
+  invoicing did not need it, and the `ObjectStore` trait shipping with the archive took most
+  of its design cost. First v1.x item; the README's "no blob store" sentence is the honest
+  launch line.
+- WebSockets (a transport swap), the Postgres-wire endpoint (a BI ask), and typed telemetry
+  (on-thesis — the one reviewer-shaped item of the five — but README guarantee 1 currently
+  *claims* it and admits in the same sentence that it does not exist) go the same way, each
+  with its reopening trigger written into PLAN. The hosted control plane leaves the roadmap:
+  "if this becomes a company" is a business decision, and a roadmap that carries it reads as
+  though the platform were incomplete without it.
+
+**The finding that shaped M3.** The M0 exit criterion — an agent builds an app from the
+docs alone with zero framework patches — is the only milestone criterion that has ever been
+re-run against the platform, and on 2026-09-03 it failed. The docs-only helpdesk agent
+shipped three Criticals (`docs/experiments/2026-09-helpdesk/README.md`): an unauthenticated
+`POST /agents/:id`, an unscoped `tx.get(id)?.is_some()` that works as a cross-tenant
+existence oracle, and five one-sided sim properties. Checked today against `a0bd191`: the
+one-sided-property class now has a mechanical oracle (`charpente test --mutants`, 09-07,
+which caught fifteen of them in the platform's own WAL suite on 09-12). The other two do
+not. `#[route(…, auth)]` is opt-in per route — `describe` prints `auth=false`, an inventory
+rather than a refusal — and `#[table(scoped_by = …)]` is opt-in per table. Both guarantees
+exist; both have to be remembered. For a framework whose thesis is *the framework is the
+reviewer*, that is the gap, and it is the opposite of an LSM engine: cheap, and exactly what
+the next adopter hits.
+
+**Two decisions, Noah's, 2026-09-13.** (1) The launch path is crates.io plus a
+`charpente new` scaffold, not clone-and-go: GUIDE §1's `charpente = "0.0.0"` line must
+become true, because agents `cargo add` things. (2) The two opt-in guarantees flip to
+default-on as an M3 sub-project with its own brainstorm and spec — a route without `auth` or
+an explicit `public` is a compile error naming both; a table that should be scoped and is
+not is a compile error, with "should be" left to that spec — rather than gating only on a
+third docs-only build and hoping, or treating both as GUIDE problems.
+
+**What landed.** PLAN.md: M2's header closes it with the sort stated; the five unshipped
+bullets and the control plane leave the M2 list; "M3 — Launch" is added with five
+sub-projects in dependency order (publish path, default-secure surfaces, third docs-only
+build, claims audit, the launch run) and three exit criteria in M0's shape — a recorded run
+with its seeds, a third build passing on a stated bar, every README/MANIFESTO number in
+BENCH.md or absent; and "After launch (v1.x)" carries the five reclassified items plus DECISIONS §6's
+Design C epoch as a table with one trigger each. README's status paragraph and doc table, and CLAUDE.md's two
+milestone-status lines, say M3. DECISIONS.md is untouched: §7 stays behind its triggers, and
+default-secure is a DESIGN §7/§8 change whose brainstorm should confirm it reverses no
+entry. Docs only; no code, no gate exercised beyond `doc_inventory`'s CLAUDE.md read, which
+this commit does not touch (the two edited lines are the status lines, not the inventories).
+
+**Open, deliberately.** Whether the 2026-07-01 crates.io name reservation actually
+happened — PLAN's "Naming" says to do it and nothing in the tree records that it was done —
+is the first thing sub-project 1 checks. The panic-hook fix for helpdesk F1 is verified
+against the helpdesk repro in sub-project 4, not assumed from the census. And
+`.superpowers/sdd/2026-08-14-agent-skills`, stalled since Task 1, is neither in M3 nor in
+the v1.x table: DECISIONS §3 puts error-message quality ahead of tutorials, and a skill for
+building on charpente is a tutorial until the default-secure surfaces make the errors do
+the teaching.

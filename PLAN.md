@@ -68,7 +68,16 @@ tests/` plus 19 real-disk/real-process unit tests under its `src/` that `--ignor
 picks up and `cargo test --workspace` also skipped. First runner execution 2026-09-05
 (run 33974865000): green, 34/34, 3m28s.
 
-## M2 — The moat deepens [in progress]
+## M2 — The moat deepens [closed 2026-09-13 — six shipped, one dropped, the rest reclassified]
+
+M2 never had an exit criterion; it was a list, and a list closes when what remains on it
+has been sorted rather than when it is empty. Sorted 2026-09-13 against the thesis: the
+six bullets marked *Shipped* below stand; the compile-latency bullet stands as dropped;
+the five unshipped bullets (own LSM engine, blob store, WebSockets, typed telemetry,
+Postgres-wire) move to "After launch" below, each with the trigger that reopens it, and
+the hosted control plane leaves the roadmap altogether. The reasoning is in
+docs/LEDGER.md's 2026-09-13 entry; the short form is that none of the five strengthens
+the oracle, and the oracle is the product.
 
 - **Honest benchmark harness** — the "publish honest benchmarks early" mitigation below,
   and the instrument DECISIONS §7's LSM build triggers are read against. *Shipped
@@ -132,11 +141,6 @@ picks up and `cargo test --workspace` also skipped. First runner execution 2026-
   forever" keeps its two aimed hand-driven modes, which a per-op probability cannot replace,
   but it is no longer the only evidence.
 
-- **Own LSM storage engine**, proven under the (by now battle-hardened) sim harness before
-  it replaces redb. The harness is what makes this safe to attempt. **Deferred behind
-  measurement** (ruled 2026-08-06): the build triggers live in DECISIONS §7, and the
-  benchmark harness above is what reads them.
-- **Blob store** (content-addressed, spill-over columns, direct streaming).
 - **TypeScript client codegen** (deferred from M1). *Shipped 2026-08-29.*
   `charpente_tsgen::emit_client` is a pure `Contract -> client.ts` function: branded id types, a
   discriminated `Result<T, E>` per route, and per-event SSE dispatch for a route's
@@ -148,9 +152,6 @@ picks up and `cargo test --workspace` also skipped. First runner execution 2026-
   `serde_json` documents through a stubbed `fetch`, not `tsc` alone. No bare `u64`/`i64`
   reaches the wire: the `Wire` bound refuses one at compile time, and `WireU64`/`WireI64`
   carry a 64-bit value as a decimal string, `bigint` client-side. Transport is SSE only.
-- **WebSockets** (deferred from M1) — the generated client targets SSE; a WebSocket
-  transport would be a swap behind the same generated API (routes, types, `Result<T,
-  E>`), not a second client.
 - **Tenant scoping as typed key prefixes** (deferred from M1). *Shipped 2026-09-04.*
   `#[table(scoped_by = Org)]` makes `(scope, id)` the row key and prefixes every secondary
   index, and the scope-taking primitives are private to the core — so a scoped row is
@@ -178,9 +179,6 @@ picks up and `cargo test --workspace` also skipped. First runner execution 2026-
   an operator, not a request (DECISIONS §12, ratified 2026-09-05).
   Deliberately not built: nested scopes, cross-tenant writes in one transaction,
   platform-derived tenancy, tenant-local ids, and any forced retrofit of existing tables.
-- **Typed telemetry with change-time checks** — the observability contract as a lockfile;
-  instrumentation that cannot silently rot.
-- **Read-only Postgres-wire endpoint** for BI tools.
 - **Compile-latency work: DROPPED 2026-09-09**, on the reading in docs/BENCH.md
   "Compile latency (2026-09-09)". The prebuilt-platform-dylib item was justified on the
   inner loop, and the inner loop is not where the cost is: its stated mechanism — "app
@@ -189,9 +187,70 @@ picks up and `cargo test --workspace` also skipped. First runner execution 2026-
   one of them `invoicing`. Its residual headroom is the once-per-checkout clean build,
   which is a CI-checkout cost and not this item's justification. Cranelift hot reload
   stays an open question in DESIGN §9.1, unchanged and unpromoted.
-- **Hosted control plane** — if this becomes a company: managed replicas, backups,
-  failover, metrics. The binary stays fully self-hostable; the moat is the platform, the
-  business is not-having-to-operate-it.
+
+## M3 — Launch [in progress; defined 2026-09-13]
+
+**Goal:** a stranger reproduces the wager in one sitting, and the reviewer catches what it
+claims to. This is M0's shape again — it ends in a recorded run, not a checklist — because
+M0's exit criterion is the only one that has ever been re-run against the platform, and on
+2026-09-03 it failed: a docs-only agent building a helpdesk shipped three Critical defects
+(`docs/experiments/2026-09-helpdesk/README.md`). One of the three — the one-sided sim
+property — now has a mechanical oracle (`charpente test --mutants`, 2026-09-07). The other
+two — an unauthenticated route and an unscoped existence check — are guarantees that exist
+but are opt-in, which for a framework whose thesis is *the framework is the reviewer* is the
+gap that matters.
+
+Sub-projects, in dependency order:
+
+1. **Publish path.** Workspace to `0.1.0`; the six crates on crates.io (verify the
+   2026-07-01 name reservation under "Naming" below actually happened — nothing in the tree
+   records it). `charpente new <name>` scaffolds GUIDE §1's layout — `Cargo.toml` with the
+   `[[test]] name = "sim"` block, `src/main.rs`, `tests/sim.rs` — and the scaffold is
+   compile-gated the way GUIDE's Rust code blocks are, so it cannot drift from the guide it
+   claims to match. GUIDE §1's `charpente = "0.0.0"` dependency line becomes true.
+2. **Default-secure surfaces** (own brainstorm and spec; a DESIGN §7/§8 change). A
+   `#[route]` that declares neither `auth` nor an explicit `public` is a compile error
+   naming both. A table that should be tenant-scoped and is not is a compile error — *how*
+   "should be" is detected is that sub-project's design question, not settled here. The
+   oracle is already in the tree: the helpdesk app at `8913038`, rebased, must fail to
+   compile at both of its Critical sites.
+3. **Third docs-only build.** A new domain — not invoicing, not helpdesk — with the brief
+   written first and the agent given README + GUIDE only. Exit: zero framework patches,
+   zero Criticals in review that a platform oracle should have caught, `--mutants` clean
+   over its sim properties. Findings ledgered as testimony, as the helpdesk write-up was.
+4. **Claims audit.** The bare-metal Linux BENCH run owed since 2026-08-15 lands, or the
+   README scaling paragraph is rewritten to what has been measured. README guarantee 1
+   stops naming telemetry until telemetry exists. F1 from the helpdesk experiment — the
+   raw panic trace that "demonstrably destroyed a competent agent's work" — is verified
+   closed against the helpdesk repro, not assumed closed because a hook now exists.
+5. **The launch run.** DEMO.md re-executed against the published version by a docs-only
+   agent starting from `cargo install charpente`: reaches a red sim with a seed, replays
+   it. That transcript is the launch post.
+
+**Exit criteria:** (a) the launch run, recorded with its seeds; (b) the third docs-only
+build passes on the bar in sub-project 3; (c) every number in README.md and MANIFESTO.md
+is in docs/BENCH.md or absent.
+
+## After launch (v1.x) — five from M2 and one from DECISIONS §6, each with the trigger that reopens it
+
+None of these is debt. Each was weighed on 2026-09-13 against the thesis — does it make the
+reviewer catch more, or a stranger's first hour shorter — and none does. They are listed
+with their triggers so that "is it time yet" has a mechanical answer.
+
+| Item | Trigger |
+|---|---|
+| **Blob store** (content-addressed, spill-over columns, direct streaming) | First adopter needs attachments. `ObjectStore` exists behind hard rule 1 since the archive shipped; the design cost is what it was minus that trait. |
+| **WebSockets** | First adopter needs bidirectional. A transport swap behind the same generated API (routes, types, `Result<T, E>`), not a second client. |
+| **Typed telemetry with change-time checks** — the observability contract as a lockfile | On-thesis, and the one item here that is reviewer work; when there is a dashboard to protect. |
+| **Read-only Postgres-wire endpoint** | First BI ask. Compatible with DECISIONS §4; never the primary interface. |
+| **Own LSM storage engine** | DECISIONS §7's triggers, unchanged. Trigger (c) — post-launch adoption — is after M3 by definition, which is why the engine cannot gate it. |
+| **Design C timeline epoch** (DECISIONS §6's sharpening step short of consensus) | The first loss-window finding that the bounded, named window does not cover. |
+
+**Hosted control plane — off the roadmap.** "If this becomes a company: managed replicas,
+backups, failover, metrics; the binary stays fully self-hostable" is a business decision,
+not a milestone, and a roadmap that carries it reads as if the platform were incomplete
+without it. It is not. The moat is the platform; the business, if there is one, is
+not-having-to-operate-it.
 
 ## Risks, honestly
 
