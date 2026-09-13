@@ -4981,7 +4981,7 @@ the teaching.
 Spec `docs/superpowers/specs/2026-09-13-publish-path-design.md`, plan
 `docs/superpowers/plans/2026-09-13-publish-path.md`, seven tasks (0 through 6) by
 subagent-driven development on `publish-path` off `d94df6c`, seven commits before this
-one (Task 3 took a fix round), six rulings recorded in its `progress.md`. Workspace
+one (Task 3 took a fix round), eight rulings recorded in its `progress.md`. Workspace
 `.superpowers/sdd/2026-09-13-publish-path/`.
 
 **Closes the previous entry's open question.** The 2026-07-01 crates.io name reservation
@@ -5008,7 +5008,7 @@ not silently resolved.
 
 **`scripts/publish.sh`'s dry-run verify-built all six.** Six `Verifying` lines, same
 order as packaging, all `v0.1.0`: `charpente-core`, `charpente-macros`, `charpente`,
-`charpente-tsgen`, `charpente-cli`, `charpente-sim`. Exit 0, ~34s warm. The dirty-tree
+`charpente-tsgen`, `charpente-cli`, `charpente-sim`. Exit 0. The dirty-tree
 refusal ("the tree is dirty — commit or stash first; a publish must be reproducible from a
 commit") fires before argument parsing, so it also caught a deliberate `--nonsense`
 invocation until the script itself was committed and the usage line could be shown on its
@@ -5057,7 +5057,8 @@ every run below, baseline through both REDs, is built against this worktree, not
 registry), `charpente test --sim --universes 64` was green: master seed
 `0x9927b86346c3be5a`, 43 verdict(s), 85 gave up, 0 failures (`t6-baseline.log`). Deleting
 `tx.enqueue(Echo { note: id });` from `add_note` (`grep -c` 1 → 0) turned
-`acked_post_implies_the_echo_after_recovery` red across the whole run — 0 verdict(s), 41
+`acked_post_implies_the_echo_after_recovery` red across the whole run — batch master seed
+`0xf2717895cf62c2b5` (`t6-red-enqueue.log`), 0 verdict(s), 41
 gave up, 23 failure(s) out of 64, no universe reaching a passing verdict at all — every
 failure printing: "sim failure in acked_post_implies_the_echo_after_recovery:
 ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the
@@ -5070,7 +5071,8 @@ failures, over the same 64 universes.
 
 **RED 2 — the neutered job, seed `0x91bec92516eee8d3`.** Replacing `Echo::run`'s body with
 `Ok(())` — the exact shape cargo-mutants applies — turned the same property red across
-the whole run again: 0 verdict(s), 30 gave up, 34 failure(s) out of 64, no universe
+the whole run again: batch master seed `0x3a908e0f71e18e6d` (`t6-red-neuter.log`), 0
+verdict(s), 30 gave up, 34 failure(s) out of 64, no universe
 reaching a passing verdict at all, every failure: "sim failure in
 acked_post_implies_the_echo_after_recovery: exactly-once violated: note 1 reads echoed =
 false but 1 Echo job(s) are Done — a job's effect and its Done mark commit as one
@@ -5097,6 +5099,21 @@ backgrounded and polled for the cargo process to exit rather than the tool's own
 86 = 85 + `tests/new.rs` before the run), ~388s wall (log created 11:57:25, last write
 12:03:53). `cargo publish --workspace --dry-run --no-verify` on the still-clean tree: exit
 0, the same six `Packaging` lines as Task 1's.
+
+**The final review's fix wave (four commits).** The whole-branch review measured
+`tests/new.rs`'s e2e at `--universes 8` as a ~2.5% flake — 5 of 200 runs exit 1 on an
+unmet `require ["restart"]`, no failures. Replayed: master seed `0x7ad351d01d2ca664` at 8
+universes exits 1, at 64 exits 0 (`final-fix-universes.log`); fixed by raising the test,
+spec §7 step 3, and plan Task 4 to 64 universes (`eb48a4d`). Separately, `charpente new
+deps` exited 0 on `c832b95` and scaffolded a crate cargo itself refuses to build — `deps`
+is one of cargo's build-directory names, not a Rust keyword, the same class as `alloc`,
+`core`, `proc_macro`, `std`, `test`, `build`, `examples` and `incremental`
+(`final-fix-reserved.log`); fixed by splitting `KEYWORDS` from a new `RESERVED` const with
+its own hard-rule-5 message, and by refusing a stray second positional argument as a usage
+error (`38983c7`). A third commit corrected spec §5/§3/§10.1's drift from what shipped,
+added the `serde` exception to DESIGN §3, narrowed GUIDE §1's `std::fs` claim to the
+functions the fence actually names, and gave the four unrationaled `#[allow]` sites in
+`tests/new.rs` their own comment (`ce45b55`).
 
 **Ledgered, not fixed.** RED 1's own failure report is inconsistent with itself: the
 `seed:` line prints `0x0967d63945c56859` and the `repro:` line for the identical seed
