@@ -2,13 +2,14 @@
 //! `test --mutants` (scoped mutation run; the ruling is in the oracle-density spec),
 //! `promote`/`switchover` (replication control verbs), `describe` (the
 //! machine-readable contract), `restore` (rebuild a data directory from an
-//! object-storage archive), `gen-client`/`check-client` (the TypeScript
-//! client and its staleness gate), `serve` (DESIGN.md §7).
+//! object-storage archive), `new` (scaffold an app), `gen-client`/`check-client`
+//! (the TypeScript client and its staleness gate), `serve` (DESIGN.md §7).
 
 mod ctl;
 mod describe;
 mod genclient;
 mod mutants;
+mod new;
 mod restore;
 mod sim;
 
@@ -24,16 +25,18 @@ fn main() {
         (Some("switchover"), _) => ctl::run(&args),
         (Some("describe"), _) => describe::run(&args[1..]),
         (Some("restore"), _) => restore::run(&args[1..]),
+        (Some("new"), _) => new::run(&args[1..]),
         (Some("gen-client"), _) => genclient::generate(&args[1..]),
         (Some("check-client"), _) => genclient::check(&args[1..]),
         _ => {
             eprintln!(
-                "{}\n{}\n{}\n{}\n{}\n{}",
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}",
                 sim::USAGE,
                 mutants::USAGE,
                 ctl::USAGE,
                 describe::USAGE,
                 restore::USAGE,
+                new::USAGE,
                 genclient::USAGE
             );
             2
