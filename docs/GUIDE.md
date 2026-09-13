@@ -95,8 +95,8 @@ sim runner supplies its own `main` instead.
 ### The fence
 
 `clippy.toml` names the standard-library calls a transaction must never
-make — `SystemTime::now`, `Instant::now`, `thread::spawn`, every `std::fs`
-function, `TcpStream::connect`, `HashMap` — with the trait to use instead.
+make — `SystemTime::now`, `Instant::now`, `thread::spawn`, the `std::fs`
+functions, `TcpStream::connect`, `HashMap` — with the trait to use instead.
 The `[lints.clippy]` lines above turn each into an error, so a handler that
 reaches for the wall clock is refused at `cargo clippy` by name:
 

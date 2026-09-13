@@ -15,6 +15,8 @@ fn charpente() -> Command {
 
 /// A fresh, empty scratch directory named for the test, under the OS temp
 /// dir, removed first if a previous run left it behind.
+// A scratch directory under the OS temp dir is edge tooling (DESIGN.md
+// §1): the test harness's own bookkeeping, not code under test.
 #[allow(clippy::disallowed_methods)]
 fn scratch(test: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("charpente-new-{test}-{}", std::process::id()));
@@ -23,6 +25,8 @@ fn scratch(test: &str) -> PathBuf {
     dir
 }
 
+// Reading back what the verb wrote is edge tooling (DESIGN.md §1): the
+// oracle inspects the filesystem, the core under test never does.
 #[allow(clippy::disallowed_methods)]
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
@@ -107,6 +111,8 @@ fn a_second_positional_argument_is_a_usage_error() {
 }
 
 #[test]
+// Seeding the target path before refusing it is edge tooling (DESIGN.md
+// §1): setup for the oracle, not a write the verb under test performs.
 #[allow(clippy::disallowed_methods)]
 fn an_existing_path_is_never_written_into() {
     let dir = scratch("exists");
@@ -214,6 +220,9 @@ fn run_ok(cmd: &mut Command, what: &str) {
 /// whether or not the registry has it yet. The only delta from a stranger's
 /// build is the registry itself, which scripts/publish.sh's dry-run covers.
 #[test]
+// Rewriting the scaffold's Cargo.toml to add [patch.crates-io] is edge
+// tooling (DESIGN.md §1): the test rig setting up the build, not the
+// verb or the app code the sim exercises.
 #[allow(clippy::disallowed_methods)]
 fn a_scaffolded_app_is_fmt_clean_clippy_clean_under_the_fence_and_green_under_the_sim() {
     let dir = scratch("e2e");
