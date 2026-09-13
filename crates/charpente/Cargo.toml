@@ -4,6 +4,8 @@ description = "The load-bearing frame for the whole backend: tables, routes, job
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
 
 [dependencies]
 charpente-core.workspace = true

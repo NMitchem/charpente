@@ -598,7 +598,7 @@ mod tests {
     /// `emits`, a scoped table beside an unscoped one — hand-written, so it
     /// is not a copy of whatever the emitter happens to produce today.
     const EVERY_SHAPE: &str = r#"{
-      "charpente_version": "0.0.0",
+      "charpente_version": "0.1.0",
       "tables": [
         { "name": "Widget", "version": 2, "fingerprint": 42, "indexes": ["by_name"],
           "migrations": [{"from":1,"to":2}], "scoped": true, "builtin": false },

@@ -33,7 +33,7 @@ fn fixture_app() -> App {
 // count reviewed field-by-field against invoicing's actual surface (T5
 // report).
 const GOLDEN: &str = r#"{
-  "charpente_version": "0.0.0",
+  "charpente_version": "0.1.0",
   "tables": [
     {
       "name": "ApiKey",

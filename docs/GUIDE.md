@@ -3939,7 +3939,7 @@ memorizing a list:
 
 ```json
 {
-  "charpente_version": "0.0.0",
+  "charpente_version": "0.1.0",
   "tables": [
     {
       "name": "ApiKey",
