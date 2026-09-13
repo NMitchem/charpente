@@ -5111,8 +5111,36 @@ failure — but a `repro:` line that does not print the same digits as the `seed
 lines above it is a hard-rule-5 wart in the platform's own failure report, worth a fix,
 not this sub-project's to make.
 
+**Open instrument finding: the mutants run leaves its own last build sitting in the
+shared target dir.** The baseline re-run's first attempt — overwritten by the corrected
+run above, its numbers preserved only in the task report — came back 18 failures, every
+one carrying RED 2's exact signature — "exactly-once violated: ... echoed = false but 1
+Echo job(s) are Done" — against source already verified byte-identical to the template.
+The controller reproduced the mechanism in 5s (`t6-contamination-repro.log`, no
+other cargo process running): `charpente test --sim --universes 16` green (master seed
+`0xaf30ca690d664ae0`, 0 failures); the same `--mutants --dir ... --file src/lib.rs --re
+'Echo::run' --jobs 1` run (1 caught); `charpente test --sim --universes 16` again, source
+untouched, no clean in between — 6 failures, every one "exactly-once violated ... echoed =
+false but 1 Echo job(s) are Done", 0 passing verdicts on that property (master seed
+`0x671e2f7ecb576915`); then `cargo clean -p demo` alone (761 files) — 0 failures again
+(master seed `0x30517397f736b1c0`). The failure signature being exactly the applied
+mutant, on both this task's own contaminated run and the controller's reproduction, is the
+discriminator. Cause, per the verb's own doc comment
+(`crates/charpente-cli/src/mutants.rs:120-126`): cargo's artifact filename hash does not
+vary by mutation content, so
+the mutants run's *last* build of `demo` (`Echo::run` → `Ok(())`) sits in the shared
+`CARGO_TARGET_DIR` looking fresh, and the scaffold's next plain build runs it — not the
+concurrent workspace suite, which never builds `demo` at all. The verb's existing refusal
+covers only `--jobs > 1` combined with an inherited `CARGO_TARGET_DIR`; `--jobs 1`, used
+throughout this task, is admitted and still leaves this hazard. The fix — clean the
+mutated package(s) on exit, or widen the refusal to cover this configuration too — belongs
+to the instrument, open, not fixed here.
+
 **What stays open.** The real publish (`scripts/publish.sh --for-real`) is Noah's hand,
 not run here. The post-publish run against the live registry that spec §10 item 2 asks
-for waits on that publish. And the `Wire`-derive/serde question spec §9 refused —
-absorbing serde into `#[derive(Wire)]` so a route body needs no second import — stays
-refused; today's fix was documenting the two-dependency shape, not collapsing it to one.
+for waits on that publish. The `Wire`-derive/serde question spec §9 refused — absorbing
+serde into `#[derive(Wire)]` so a route body needs no second import — stays refused;
+today's fix was documenting the two-dependency shape, not collapsing it to one. And the
+`--mutants` verb's own target-dir poisoning under `--jobs 1` (above) is unfixed: either an
+exit-time clean of the mutated package(s) or a refusal widened past `--jobs > 1` is needed
+before trusting a plain build in the same tree right after a mutants run.
