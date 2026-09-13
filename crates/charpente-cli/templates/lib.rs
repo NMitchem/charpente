@@ -4,7 +4,7 @@
 use charpente::core::io::{Disk, Entropy};
 use charpente::http::{ApiError, App, AppConfig};
 use charpente::kernel::JobError;
-use charpente::{event, job, jobs, route, routes, table, Id, Schema, Tx, View, Wire};
+use charpente::{Id, Schema, Tx, View, Wire, event, job, jobs, route, routes, table};
 use serde::{Deserialize, Serialize};
 use std::io;
 
