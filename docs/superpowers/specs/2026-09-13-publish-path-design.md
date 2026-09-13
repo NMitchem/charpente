@@ -14,7 +14,7 @@ the outbox-bug sentence. §5 said the route was `POST "/notes"` returning
 `Result<Id<Note>, ApiError>`, `#[derive(Wire, Serialize, Deserialize)]`, and property 1
 drives a POST through the kernel. There is no id-minting API in this codebase, so a route
 that hands back a fresh `Id<Note>` has nothing to mint it with; `/notes/:id` is the guide's
-own idiom (GUIDE §8) for a caller-supplied id, and `Serialize` is needed because the sim
+own idiom (GUIDE §5) for a caller-supplied id, and `Serialize` is needed because the sim
 template calls `.json(&NewNote { .. })` to build the request body. §3 and §10.1 said CI runs
 `cargo package --workspace --no-verify`; CI (`.github/workflows/ci.yml:40`) runs
 `cargo publish --workspace --dry-run --no-verify` — `cargo package --workspace` does not
@@ -191,7 +191,7 @@ and show the app list is a subset.
 - `#[route(POST "/notes/:id")] fn add_note(tx, id: Id<Note>, body: NewNote) ->
   Result<Id<Note>, ApiError>`: `tx.put`, `tx.enqueue(Echo)`, `tx.emit(NoteAdded)`, return the
   id. There is no id-minting API, so the caller supplies the id in the path — the guide's own
-  idiom (GUIDE §8). The three effects in one transaction is the second guarantee in the
+  idiom (GUIDE §5). The three effects in one transaction is the second guarantee in the
   README, in the stranger's own file.
 - `pub fn build_app(...)` in the shape `charpente::launch` takes (GUIDE §13).
 
