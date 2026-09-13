@@ -4984,13 +4984,20 @@ subagent-driven development on `publish-path` off `d94df6c`, seven commits befor
 one (Task 3 took a fix round), six rulings recorded in its `progress.md`. Workspace
 `.superpowers/sdd/2026-09-13-publish-path/`.
 
+**Closes the previous entry's open question.** The 2026-07-01 crates.io name reservation
+did happen, for five of the six names: packaging the still-`0.0.0` manifests (before any
+edit) warned "warning: crate charpente-core@0.0.0 already exists on crates.io index", and
+the same line for `charpente-sim`, `charpente`, `charpente-macros`, and `charpente-cli`
+(`t1-red.log:2-6`). `charpente-tsgen` carried no such warning — consistent with it never
+having been reserved, and with it being the crate this sub-project's first RED was about.
+
 **The gate's first RED was cargo, not code.** Before any manifest changed, `cargo publish
 --workspace --dry-run --no-verify` refused at packaging: "error: failed to prepare local
 package for uploading" / "Caused by: no matching package named `charpente-tsgen` found" /
 "required by package `charpente-cli v0.0.0`" — `--workspace` skips `publish = false`
 members but does not skip a *dependency* on one, and `charpente-tsgen` was `publish =
-false`. Dropping that line and moving all six
-crates' `[workspace.package] version` to `0.1.0` was the fix; the six `Packaging` lines
+false`. Dropping that line and moving all six crates' `[workspace.package] version` to
+`0.1.0` was the fix; the six `Packaging` lines
 that follow (`charpente-core`, `charpente-macros`, `charpente`, `charpente-tsgen`,
 `charpente-cli`, `charpente-sim`, all `v0.1.0`) recur unchanged in this task's own re-run
 of the dry-run below. Running the local verification dry-run before its commit lands
@@ -5024,9 +5031,11 @@ not the edition-blind check the plan's own text ran first; fixed in both files (
 Task 4's end-to-end oracle then compiled a *rendered* scaffold and hit the one thing
 neither template fix touched: `tests/sim.rs` called `.get`/`.scan` on a `Snapshot` with
 `View` out of scope — "error[E0599]: no method named `get` found for struct
-`charpente::Snapshot` in the current scope", with rustc naming its own fix ("perhaps you
-want to import it: `use charpente::View;`"). One import, merged into `sim.rs.tmpl`'s
-existing `use charpente::Id;` line; the oracle went green on the next run, and no sim
+`charpente::Snapshot` in the current scope", with rustc's own help naming the fix in two
+lines: "help: trait `View` which provides `get` is implemented but not in scope; perhaps
+you want to import it" and "+ use charpente::View;". One import, merged into
+`sim.rs.tmpl`'s existing `use charpente::Id;` line; the oracle went green on the next run,
+and no sim
 failure was ever hit (`acked_post_implies_the_echo_after_recovery`'s STOP condition, held
 in the plan for exactly this task, never fired — this task fires it deliberately, below).
 
@@ -5042,37 +5051,44 @@ wallclock" in `templates/clippy.toml`, and the test named the exact entry that n
 matched the workspace fence. Restored, green again.
 
 **RED 1 — the deleted enqueue, seed `0x0967d63945c56859`.** Scaffolding `demo` fresh with
-`charpente new` and patching in `[patch.crates-io]` paths (per §10 item 5), `charpente
-test --sim --universes 64` was green (master seed `0x776924b1c3b17e06`, 44 verdicts, 84
-give-ups, no failures). Deleting `tx.enqueue(Echo { note: id });` from `add_note`
-(`grep -c` 1 → 0) turned `acked_post_implies_the_echo_after_recovery` red on every one of
-23 failing universes out of 64, each printing: "sim failure in
-acked_post_implies_the_echo_after_recovery: ack-durability violated: POST /notes/1 was
-acked with 200 but no Echo job is durable — the enqueue did not commit with the row." The
-printed `repro:` line for this seed, run verbatim (`charpente test --sim --filter
-acked_post_implies_the_echo_after_recovery --seed 0x967d63945c56859`), reproduced the
-identical failure text and fault trace (`fault:sync_error: 1, restart: 1`). Restoring the
-enqueue line (byte-identical to `templates/lib.rs` again) returned the property to green
-over 64 universes, 0 failures.
+`charpente new`, then patching `charpente` and `charpente-sim` to this worktree's own
+`crates/charpente` and `crates/charpente-sim` via `[patch.crates-io]` (per §10 item 5 —
+every run below, baseline through both REDs, is built against this worktree, not the
+registry), `charpente test --sim --universes 64` was green: master seed
+`0x9927b86346c3be5a`, 43 verdict(s), 85 gave up, 0 failures (`t6-baseline.log`). Deleting
+`tx.enqueue(Echo { note: id });` from `add_note` (`grep -c` 1 → 0) turned
+`acked_post_implies_the_echo_after_recovery` red across the whole run — 0 verdict(s), 41
+gave up, 23 failure(s) out of 64, no universe reaching a passing verdict at all — every
+failure printing: "sim failure in acked_post_implies_the_echo_after_recovery:
+ack-durability violated: POST /notes/1 was acked with 200 but no Echo job is durable — the
+enqueue did not commit with the row." The printed `repro:` line for this seed, run
+verbatim (`charpente test --sim --filter acked_post_implies_the_echo_after_recovery
+--seed 0x967d63945c56859`), reproduced the identical failure text and fault trace
+(`fault:sync_error: 1, restart: 1`). Restoring the enqueue line (byte-identical to
+`templates/lib.rs` again) returned the property to green: 22 verdict(s), 42 gave up, 0
+failures, over the same 64 universes.
 
 **RED 2 — the neutered job, seed `0x91bec92516eee8d3`.** Replacing `Echo::run`'s body with
-`Ok(())` — the exact shape cargo-mutants applies — turned the same property red on 34 of
-64 universes, each: "sim failure in acked_post_implies_the_echo_after_recovery:
-exactly-once violated: note 1 reads echoed = false but 1 Echo job(s) are Done — a job's
-effect and its Done mark commit as one record." The repro line for this seed reproduced
-the identical text and fault trace (`crash_torn: 1.0`, `fired: restart: 1`). Restoring
-`Echo::run` to the template's body returned the property to green over 64 universes, 0
-failures.
+`Ok(())` — the exact shape cargo-mutants applies — turned the same property red across
+the whole run again: 0 verdict(s), 30 gave up, 34 failure(s) out of 64, no universe
+reaching a passing verdict at all, every failure: "sim failure in
+acked_post_implies_the_echo_after_recovery: exactly-once violated: note 1 reads echoed =
+false but 1 Echo job(s) are Done — a job's effect and its Done mark commit as one
+record." The repro line for this seed reproduced the identical text and fault trace
+(`crash_torn: 1.0`, `fired: restart: 1`). Restoring `Echo::run` to the template's body
+returned the property to green: 22 verdict(s), 42 gave up, 0 failures, over the same 64
+universes.
 
 **The mutation instrument caught the mutant clean — no `--dir` refusal.** `charpente test
 --mutants --dir /tmp/charpente-evidence/demo --file src/lib.rs --re 'Echo::run' --jobs 1`
 (Ruling 6: `--file src/lib.rs` is required — the verb's default file set is the
 workspace's own oracle-bearing files, which do not exist in a scaffold) found one mutant,
 tested it, and reported "1 mutant tested in 3s: 1 caught" — "mutants: 1 total — 1 caught,
-0 missed, 0 unviable, 0 timed out", exit 0. Two `WARN` lines ("Package `charpente-core`
-not found in source tree", same for `charpente-sim`) are harmless: those are path-patched
-dependencies living outside `--dir`'s tree, not the crate under test. The plan's fallback
-(RED 2 above already proves the property if `--dir` refuses) was not needed on this run.
+0 missed, 0 unviable, 0 timed out", exit 0. Two `WARN` lines (`WARN Package
+"charpente-core" not found in source tree`, same for `"charpente-sim"`) are harmless:
+those are path-patched dependencies living outside `--dir`'s tree, not the crate under
+test. The plan's fallback (RED 2 above already proves the property if `--dir` refuses)
+was not needed on this run.
 
 **The gate, counted.** `cargo fmt --all --check`: exit 0. `cargo clippy --workspace
 --all-targets -- -D warnings`: exit 0. `cargo test --workspace --no-fail-fast`, run
@@ -5085,11 +5101,15 @@ backgrounded and polled for the cargo process to exit rather than the tool's own
 **Ledgered, not fixed.** RED 1's own failure report is inconsistent with itself: the
 `seed:` line prints `0x0967d63945c56859` and the `repro:` line for the identical seed
 prints `0x967d63945c56859` — the leading zero silently dropped, evidently an unpadded hex
-formatter on the repro path against a zero-padded one on the seed line. It replayed
-correctly here and in several of RED 1's other 22 universes with the same pattern, so it
-is not a correctness bug, but a `repro:` line that does not print the same digits as the
-`seed:` line two lines above it is a hard-rule-5 wart in the platform's own failure
-report — worth a fix, not this sub-project's to make.
+formatter on the repro path against a zero-padded one on the seed line. That one seed was
+replayed and matched; the same drop appears by inspection on three other seeds in RED 1's
+own log without being replayed a second time (`t6-red-enqueue.log:10-13`
+`0x072fe112f898a50a` → `0x72fe112f898a50a`, `:34-37` `0x00ca7d85df4f4e00` →
+`0xca7d85df4f4e00`, `:76-79` `0x0f354154840079f8` → `0xf354154840079f8`). Not a
+correctness bug — every replay used the trimmed digits and reproduced the identical
+failure — but a `repro:` line that does not print the same digits as the `seed:` line two
+lines above it is a hard-rule-5 wart in the platform's own failure report, worth a fix,
+not this sub-project's to make.
 
 **What stays open.** The real publish (`scripts/publish.sh --for-real`) is Noah's hand,
 not run here. The post-publish run against the live registry that spec §10 item 2 asks
