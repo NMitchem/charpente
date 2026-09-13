@@ -5,10 +5,10 @@
 //! Run them: `charpente test --sim`. Watch one fail: delete the `tx.enqueue`
 //! line in `src/lib.rs` and run again.
 
-use charpente::Id;
 use charpente::core::job::{JobRow, JobStatus};
 use charpente::http::{App, Method, Request};
 use charpente::kernel::{Kernel, SimSource};
+use charpente::{Id, View};
 use charpente_sim::Sim;
 use charpente_sim::checks::{durable_corruption_fired, is_fault_fallout};
 use {{ident}}::{NewNote, Note, build_app};
