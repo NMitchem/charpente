@@ -189,9 +189,12 @@ idiom `crates/sim-fixture/tests/sim.rs` uses (`is_fault_fallout` → `sim.give_u
    `sim.restart()`, reopen, read back.
 2. `acked_post_implies_the_echo_after_recovery`: drive `POST /notes` through the app,
    restart, dispatch due jobs, read the row: `echoed` must be `true`. This is the thesis in
-   one property. It goes red when `Echo::run` is neutered (`charpente test --mutants`) and
-   when the enqueue is moved outside the transaction (the DEMO.md outbox bug) — so the
-   launch run mutates the scaffold, not invoicing.
+   one property, and it is DEMO.md's own oracle shape (`receipts_exactly_once`): acked ⇒ an
+   `Echo` job row is durable; `echoed` ≡ that job is Done. It goes red when `Echo::run` is
+   neutered (`charpente test --mutants`), when the `tx.enqueue` line is deleted, and — under
+   the framework patch DEMO.md describes (`c0dbcea`), which is the only way to write it —
+   when the enqueue is split into a second transaction. So the launch run mutates the
+   scaffold, not invoicing; whether it re-applies that patch is sub-project 5's call.
 
 Nothing one-sided ships. The `counter_bump_job_leaves_the_row_readable` demonstration stays
 in `sim-fixture`, where GUIDE's mutants walkthrough points.
@@ -270,6 +273,6 @@ after scaffolding. No release workflow in CI. No `Wire`-derive change to absorb 
 3. The four refusals print the text in §4; `tests/new.rs` pins each.
 4. GUIDE §1's `Cargo.toml` block and the verb's output are byte-identical, held by a test.
 5. Under the template, `charpente test --mutants` reports `Echo::run` → `Ok(())` **caught**
-   by `acked_post_implies_the_echo_after_recovery`; and moving the enqueue outside the
-   transaction turns that property red under `--sim`, with a seed. Both recorded — they
-   are what the launch run will show.
+   by `acked_post_implies_the_echo_after_recovery`; and deleting the `tx.enqueue` line turns
+   that property red under `--sim`, with a seed. Both recorded — they are what the launch
+   run will show. (The dual-write proper needs DEMO.md's framework patch; sub-project 5.)
