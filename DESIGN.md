@@ -567,7 +567,7 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   (`NoTenant`) and the trait `View` actually bounds on (`UnscopedRow`) are sealed, so an app
   cannot re-open a scoped table with one orphan-legal line; a scoped read on a bare `Tx` is an
   unsatisfied trait bound whose text names the table, its scope, and the `tx.scope` line to
-  write. `ScopedTx` derefs to `Tx`, so unscoped tables stay reachable
+  write. `ScopedTx` derefs to `Tx`, so global tables stay reachable
   (`(*tx).scan::<Region>()`), and a transaction opens exactly one scope. Full treatment in
   §8; spec `docs/superpowers/specs/2026-08-30-tenant-scoping-design.md`, GUIDE §16.
 - **Migrations.** `#[table(version = N)]` versions a row's shape; a bump without a
@@ -1467,7 +1467,7 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   `#[route(…, auth)]` answers the no-credential 401 when the principal is absent;
   `Ctx::principal()` is the surface, and `Ctx::session()` survives as a compat accessor
   returning the row only for a `Session` principal. The ladder runs unconditionally before
-  the `auth` gate, so a garbage credential on a no-auth route is still rejected. Lookups are
+  the `auth` gate, so a garbage credential on a public route is still rejected. Lookups are
   hash-then-index-equality on SHA-256 outputs — an attacker controls no stored preimage and
   learns nothing exploitable from index-lookup timing; the one equality on secret-derived
   data both sides control is the repl secret compare below, which is constant-time.

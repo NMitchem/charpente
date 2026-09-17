@@ -310,10 +310,8 @@ above has no such ceiling.
 ### What the macro rejects
 
 Every rejection happens at compile time, and the message names the contract
-and the fix:
-
-The first rejection is the one every table meets once — a declaration with
-no tenancy stance:
+and the fix. The first rejection is the one every table meets once — a
+declaration with no tenancy stance:
 
 <!-- pinned -->
 ```text
@@ -909,7 +907,7 @@ request's credential into a `Principal`, in this order:
 `#[route(METHOD "/path", auth)]` rejects the request before your handler runs
 when the principal is `None`. With `public`, the route always runs and
 `ctx.principal()` is whatever the ladder resolved (possibly `None`) — but a
-*presented* credential is still resolved and rejected even on a no-auth
+*presented* credential is still resolved and rejected even on a public
 route, so a garbage bearer never reaches a handler.
 
 The 401s are named and fixed — copy these verbatim if you assert against
@@ -1219,9 +1217,8 @@ fn main() -> std::io::Result<()> {
 
 ### What `#[route]` rejects
 
-Every rejection is a compile error naming the contract and the fix:
-
-The first is the one every route meets once:
+Every rejection is a compile error naming the contract and the fix. The
+first is the one every route meets once:
 
 <!-- pinned -->
 ```text
@@ -2604,10 +2601,10 @@ what it means, and what to do. Every message below names its own fix
 already (hard rule 5) — this index adds which subsystem produced it, since
 that's what a bare string on a terminal doesn't tell you.
 
-### `#[table]` shape violations (`charpente-macros/src/table.rs`, compile time)
+### `#[table]` tenancy and shape violations (`charpente-macros/src/lib.rs` and `src/table.rs`, compile time)
 
-Nine ways `#[table]` rejects a struct — §2 walks through all of them on a
-`Ping` example:
+Nine ways `#[table]` rejects a struct — §2 pins the first three and walks
+through the other six on a `Ping` example:
 
 ```text
 `<table>` declares no tenancy — a table says which: write `#[table(scoped_by = Org)]` if every row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot read it), or `#[table(global)]` if its rows belong to no tenant. Neither is the default.
@@ -2653,7 +2650,7 @@ a #[route] handler's first argument must be `tx: &mut Tx` — `ping` is missing 
 this argument must be named `id` to match :id in "/notes/:id" — got `key`
 route path must start with '/' — got "notes"
 unknown method PUSH — one of GET, POST, PUT, PATCH, DELETE, SSE
-the route path must be a string literal — e.g. #[route(GET "/notes/:id")]
+the route path must be a string literal — e.g. #[route(GET "/notes/:id", auth)]
 a route flag is `auth`, `public`, `cross_tenant` or `emits(Ev, …)` — write `#[route(GET "/path", auth)]`, `#[route(GET "/path", public)]`, or `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`
 emits(...) applies to SSE routes only — a plain route returns one response, not a stream of events; drop emits(...) or make this `#[route(SSE "…")]`
 emits(...) must name at least one #[event] type — write `emits(NoteAdded, NoteRemoved)`, or drop it
@@ -2665,12 +2662,11 @@ emits takes a parenthesized list of #[event] types — write `emits(NoteAdded, N
 `NoteAdded` is named twice in emits(...) — a stream declares each event type once, and a repeat would put the same member in a generated client's union twice; write it once
 #[route] handlers are free functions — no `self`
 empty :param name in "/notes/:"
-write `#[route(METHOD "/path")]` — e.g. #[route(GET "/notes/:id")]
+write `#[route(METHOD "/path", auth | public)]` — e.g. #[route(GET "/notes/:id", auth)]
 ```
 
-§5's "What `#[route]` rejects" walks through the first three with full
-examples. The rest, in order: the route declares neither `auth` nor
-`public`; it declares both; `public` appears twice; the path literal
+§5's "What `#[route]` rejects" pins the first three and walks through the
+next three with full examples. The rest, in order: the path literal
 doesn't start with `/`; the method name isn't one of
 `GET`/`POST`/`PUT`/`PATCH`/`DELETE`/`SSE`; the path isn't a string literal
 at all (e.g. a `const`); a flag after the path is none of `auth`, `public`,
@@ -5619,7 +5615,7 @@ Four properties make this a capability rather than an escape hatch:
 
   The elided `tables:` section carries the matching signal for the table
   itself: `Ledger`'s entry reports `scoped=true` (`Org`'s own entry, and every
-  plain `#[table]`, reports `scoped=false`) — carried from the same
+  `#[table(global)]`, reports `scoped=false`) — carried from the same
   `#[table(scoped_by = …)]` declaration, so an audit doesn't have to grep for
   it either.
 

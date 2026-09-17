@@ -44,13 +44,14 @@ impl Parse for RouteArgs {
         let method: Ident = input.parse().map_err(|e| {
             Error::new(
                 e.span(),
-                "write `#[route(METHOD \"/path\")]` — e.g. #[route(GET \"/notes/:id\")]",
+                "write `#[route(METHOD \"/path\", auth | public)]` — e.g. \
+                 #[route(GET \"/notes/:id\", auth)]",
             )
         })?;
         let path: LitStr = input.parse().map_err(|e| {
             Error::new(
                 e.span(),
-                "the route path must be a string literal — e.g. #[route(GET \"/notes/:id\")]",
+                "the route path must be a string literal — e.g. #[route(GET \"/notes/:id\", auth)]",
             )
         })?;
         let mut auth = false;
