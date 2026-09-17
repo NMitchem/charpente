@@ -48,9 +48,11 @@ testimony and the verdict are.
 PLAN.md states the bar in three clauses. This section makes each one checkable.
 
 **(a) Zero framework patches.** The app's manifest reaches charpente only through
-`[patch.crates-io]` (or the path-dep fallback §4 names) at a pinned sha. At close-out,
-`git -C charpente status --porcelain` is empty and `git -C charpente rev-parse HEAD` is
-the pinned sha. The builder's transcript is grepped for any tool call naming a path outside
+`[patch.crates-io]` (or the path-dep fallback §4 names) at a pinned sha. At every gate,
+`git -C charpente status --porcelain` is empty and `git -C charpente diff <sha> --stat --
+crates Cargo.toml Cargo.lock` is empty: the code the builder compiled is the code at the
+sha. Docs-only commits may land on `main` during an attempt (sub-project 4 runs beside
+this one); the builder reads frozen copies, so they change nothing it saw. The builder's transcript is grepped for any tool call naming a path outside
 the run directory (§4); a hit voids the attempt — not a fail of the bar, a void, because
 nothing about the attempt is then docs-only.
 
