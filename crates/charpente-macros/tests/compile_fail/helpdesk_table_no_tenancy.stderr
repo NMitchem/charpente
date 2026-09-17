@@ -1,0 +1,7 @@
+error: `Ticket` declares no tenancy — a table says which: write `#[table(scoped_by = Org)]` if every row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot read it), or `#[table(global)]` if its rows belong to no tenant. Neither is the default.
+  --> tests/compile_fail/helpdesk_table_no_tenancy.rs:21:1
+   |
+21 | #[table(version = 2)]
+   | ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `table` (in Nightly builds, run with -Z macro-backtrace for more info)

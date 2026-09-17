@@ -1,4 +1,4 @@
-error: #[table] takes only `version = N`, `scoped_by = <Type>` or `global` (or no arguments)
+error: #[table] takes `version = N`, `scoped_by = <Type>` or `global`
   --> tests/compile_fail/table_unknown_arg.rs:12:9
    |
 12 | #[table(bogus = 1)]

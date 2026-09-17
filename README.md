@@ -32,16 +32,22 @@ point, one log.
 
 ```rust
 #[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+#[table(scoped_by = Org)]
 struct Invoice {
     id: Id<Invoice>,
-    org: Id<Org>,
     amount_cents: i64,
     state: InvoiceState,
 }
 
-#[route(POST "/invoices/:id/finalize", public)]
-fn finalize(tx: &mut Tx, id: Id<Invoice>) -> Result<Invoice, ApiError> {
-    let mut inv = tx.get(id)?.ok_or(ApiError::NotFound)?; // typed row, no SQL string
+#[route(POST "/orgs/:org/invoices/:id/finalize", auth)]
+fn finalize(tx: &mut Tx, org: Id<Org>, id: Id<Invoice>, ctx: &Ctx) -> Result<Invoice, ApiError> {
+    let mut tx = tx.scope::<Org>(org, ctx)?;                // the one auditable line
+    let mut inv = tx.get(id)?.ok_or(ApiError::NotFound)?;   // typed row, no SQL string
     inv.state = InvoiceState::Final;
     tx.put(&inv);
     tx.enqueue(SendReceipt { invoice: id });   // job enqueued IN the same transaction
@@ -53,7 +59,9 @@ fn finalize(tx: &mut Tx, id: Id<Invoice>) -> Result<Invoice, ApiError> {
 Note what's absent: no connection pool, no ORM session, no message-broker client, no
 `await` on a network hop between your logic and your data. The transaction is a pure
 function over state; external effects (the receipt email) run post-commit via the durable
-queue, exactly-once-observable via idempotency keys.
+queue, exactly-once-observable via idempotency keys. Note also what's declared: the route
+says `auth`, the table says which tenant owns its rows, and a route or table that says
+neither does not compile.
 
 ## Why now
 

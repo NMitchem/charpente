@@ -175,13 +175,8 @@ const ONE_OR_THE_OTHER: &str =
 fn undeclared_capability(name: &str, args: &RouteArgs, pat: &PatType) -> Error {
     let method = &args.method;
     let path = args.path.value();
-    let stance = if args.auth {
-        ", auth"
-    } else if args.public {
-        ", public"
-    } else {
-        ""
-    };
+    // `expand` refused a route with neither flag before reaching here.
+    let stance = if args.auth { ", auth" } else { ", public" };
     Error::new(
         pat.span(),
         format!(
@@ -203,6 +198,20 @@ fn arg_name(pat: &PatType) -> Option<String> {
 }
 
 pub(crate) fn expand(args: RouteArgs, func: ItemFn) -> syn::Result<TokenStream> {
+    if !args.auth && !args.public {
+        let name = &func.sig.ident;
+        let method = &args.method;
+        let path = args.path.value();
+        return Err(Error::new(
+            args.path.span(),
+            format!(
+                "`{name}` declares neither `auth` nor `public` — a route says which callers \
+                 reach it: write `#[route({method} \"{path}\", auth)]` to require a principal \
+                 (`ctx.principal()` is `Some`), or `#[route({method} \"{path}\", public)]` to \
+                 serve anonymous callers. Neither is the default."
+            ),
+        ));
+    }
     if !args.emits.is_empty() && args.method != "SSE" {
         return Err(Error::new(
             args.path.span(),

@@ -144,6 +144,11 @@ plus one lookup function per `#[index]` field.
 
 ### The `#[table]` contract
 
+- It declares its tenancy: `#[table(scoped_by = Org)]` if every row belongs
+  to one tenant (§16), or `#[table(global)]` if its rows belong to none. A
+  bare `#[table]` is a compile error naming both — the platform never guesses
+  which a table is, and the built-in tables (`Session`, `ApiKey`, …) are
+  `global` like any other.
 - The struct must be a non-generic, braced struct with named fields — a
   table is one concrete row shape.
 - It must have an `id` field of type `Id<Self>` — a typed primary key.
@@ -306,6 +311,19 @@ above has no such ceiling.
 
 Every rejection happens at compile time, and the message names the contract
 and the fix:
+
+The first rejection is the one every table meets once — a declaration with
+no tenancy stance:
+
+<!-- pinned -->
+```text
+`<table>` declares no tenancy — a table says which: write `#[table(scoped_by = Org)]` if every row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot read it), or `#[table(global)]` if its rows belong to no tenant. Neither is the default.
+`global` and `scoped_by = <scope>` on one table — a table is one or the other; drop one
+`global` given twice — write it once
+```
+
+`<table>` is the struct's name. The other six rejections are about the
+struct's shape:
 
 ```rust,ignore
 // no `id` field at all
@@ -638,8 +656,10 @@ call covered in §4.
 ### The `#[route]` argument convention
 
 `#[route(METHOD "/path/:param", ...)]` goes on a free function (`METHOD` is
-one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `SSE`; the trailing `, auth`
-flag is optional and covered under Sessions below). The macro checks the
+one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `SSE`; exactly one of `, auth`
+/ `, public` follows the path — a route says which callers reach it, and a
+route that says neither is a compile error naming both; `auth` is covered
+under Sessions below). The macro checks the
 function's argument list against the path and emits the glue that extracts,
 decodes, and dispatches to it:
 
@@ -887,7 +907,7 @@ request's credential into a `Principal`, in this order:
 4. Nothing presented — `principal` is `None`.
 
 `#[route(METHOD "/path", auth)]` rejects the request before your handler runs
-when the principal is `None`. Without `auth`, the route always runs and
+when the principal is `None`. With `public`, the route always runs and
 `ctx.principal()` is whatever the ladder resolved (possibly `None`) — but a
 *presented* credential is still resolved and rejected even on a no-auth
 route, so a garbage bearer never reaches a handler.
@@ -1200,6 +1220,17 @@ fn main() -> std::io::Result<()> {
 ### What `#[route]` rejects
 
 Every rejection is a compile error naming the contract and the fix:
+
+The first is the one every route meets once:
+
+<!-- pinned -->
+```text
+`<handler>` declares neither `auth` nor `public` — a route says which callers reach it: write `#[route(<method> "<path>", auth)]` to require a principal (`ctx.principal()` is `Some`), or `#[route(<method> "<path>", public)]` to serve anonymous callers. Neither is the default.
+`auth` and `public` on one route — a route is one or the other; drop one
+`public` given twice — write it once
+```
+
+The rest are about the handler's shape:
 
 ```rust,ignore
 // first argument isn't named `tx`
@@ -2575,10 +2606,13 @@ that's what a bare string on a terminal doesn't tell you.
 
 ### `#[table]` shape violations (`charpente-macros/src/table.rs`, compile time)
 
-Six ways `#[table]` rejects a struct — §2 walks through all of them on a
+Nine ways `#[table]` rejects a struct — §2 walks through all of them on a
 `Ping` example:
 
 ```text
+`<table>` declares no tenancy — a table says which: write `#[table(scoped_by = Org)]` if every row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot read it), or `#[table(global)]` if its rows belong to no tenant. Neither is the default.
+`global` and `scoped_by = <scope>` on one table — a table is one or the other; drop one
+`global` given twice — write it once
 missing `id: Id<Ping>` field — every #[table] row needs a typed primary key (add `id: Id<Ping>`)
 the `id` field of a #[table] must be `Id<Ping>` — a typed id, never a bare integer
 `id` is the primary key — it is already the fastest lookup; remove #[index]
@@ -2587,12 +2621,13 @@ the `id` field of a #[table] must be `Id<Ping>` — a typed id, never a bare int
 #[table] structs cannot be generic — a table is one concrete row shape; make `Ping` non-generic
 ```
 
-In order: no `id` field at all — add one. `id` present but not `Id<Self>` —
-type it. `#[index]` on `id` itself — remove it, `id` is already the primary
-key. Not a braced struct with named fields (tuple/unit structs) — rewrite
-as one. An enum or union — `#[table]` only applies to structs. A generic
-struct — a table is one concrete row shape; monomorphize it yourself before
-attaching `#[table]`.
+In order: No tenancy declared — write `scoped_by = …` or `global`. Both at
+once — drop one. `global` twice — once. No `id` field at all — add one.
+`id` present but not `Id<Self>` — type it. `#[index]` on `id` itself —
+remove it, `id` is already the primary key. Not a braced struct with named
+fields (tuple/unit structs) — rewrite as one. An enum or union — `#[table]`
+only applies to structs. A generic struct — a table is one concrete row
+shape; monomorphize it yourself before attaching `#[table]`.
 
 One more, at runtime rather than macro-expansion time — corrupted or
 schema-drifted bytes on disk fail to decode into a row:
@@ -2610,19 +2645,22 @@ fields on a table with durable data; add new fields, or write a v1 schema
 ### `#[route]` argument-convention violations (`charpente-macros/src/route.rs`, compile time)
 
 ```text
+`<handler>` declares neither `auth` nor `public` — a route says which callers reach it: write `#[route(<method> "<path>", auth)]` to require a principal (`ctx.principal()` is `Some`), or `#[route(<method> "<path>", public)]` to serve anonymous callers. Neither is the default.
+`auth` and `public` on one route — a route is one or the other; drop one
+`public` given twice — write it once
 a #[route] handler's first argument must be `tx: &mut Tx` — `ping` is missing it
 `get_note` takes 0 argument(s) after `tx` (excluding `ctx`) but the path "/notes/:id" has 1 :param(s) — write one argument per :param (same name, path order) plus at most one JSON body argument
 this argument must be named `id` to match :id in "/notes/:id" — got `key`
 route path must start with '/' — got "notes"
 unknown method PUSH — one of GET, POST, PUT, PATCH, DELETE, SSE
 the route path must be a string literal — e.g. #[route(GET "/notes/:id")]
-a route flag is `auth`, `cross_tenant` or `emits(Ev, …)` — write `#[route(GET "/path", auth)]`, or `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`
+a route flag is `auth`, `public`, `cross_tenant` or `emits(Ev, …)` — write `#[route(GET "/path", auth)]`, `#[route(GET "/path", public)]`, or `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`
 emits(...) applies to SSE routes only — a plain route returns one response, not a stream of events; drop emits(...) or make this `#[route(SSE "…")]`
 emits(...) must name at least one #[event] type — write `emits(NoteAdded, NoteRemoved)`, or drop it
 emits takes a parenthesized list of #[event] types — write `emits(NoteAdded, NoteRemoved)`
 `auth` given twice — write it once
 `cross_tenant` given twice — write it once
-`revenue` takes `cap: &CrossTenant`, but `#[route(GET "/admin/revenue")]` does not declare `cross_tenant` — enumerating a scoped table across every tenant is a declared capability, and `charpente describe` lists every route that declared it. Write `#[route(GET "/admin/revenue", cross_tenant)]`, or drop the `cap` argument and read one tenant through `tx.scope::<Org>(org, ctx)?`
+`revenue` takes `cap: &CrossTenant`, but `#[route(GET "/admin/revenue", public)]` does not declare `cross_tenant` — enumerating a scoped table across every tenant is a declared capability, and `charpente describe` lists every route that declared it. Write `#[route(GET "/admin/revenue", public, cross_tenant)]`, or drop the `cap` argument and read one tenant through `tx.scope::<Org>(org, ctx)?`
 `emits(...)` given twice — a route declares one set, so name every event in one list: `emits(NoteAdded, NoteRemoved)`
 `NoteAdded` is named twice in emits(...) — a stream declares each event type once, and a repeat would put the same member in a generated client's union twice; write it once
 #[route] handlers are free functions — no `self`
@@ -2631,10 +2669,12 @@ write `#[route(METHOD "/path")]` — e.g. #[route(GET "/notes/:id")]
 ```
 
 §5's "What `#[route]` rejects" walks through the first three with full
-examples. The rest, in order: the path literal doesn't start with `/`; the
-method name isn't one of `GET`/`POST`/`PUT`/`PATCH`/`DELETE`/`SSE`; the path
-isn't a string literal at all (e.g. a `const`); a flag after the path is
-neither `auth` nor `emits(...)`; `emits(...)` is on a route that isn't a
+examples. The rest, in order: the route declares neither `auth` nor
+`public`; it declares both; `public` appears twice; the path literal
+doesn't start with `/`; the method name isn't one of
+`GET`/`POST`/`PUT`/`PATCH`/`DELETE`/`SSE`; the path isn't a string literal
+at all (e.g. a `const`); a flag after the path is none of `auth`, `public`,
+`cross_tenant`, `emits(...)`; `emits(...)` is on a route that isn't a
 stream (only an SSE route has events to declare — see §11); `emits()` names
 nothing at all; `emits` was written without its parentheses; `auth` or
 `emits(...)` appears twice on the same route (a flag is a yes/no and a route
@@ -5287,7 +5327,9 @@ The shape of an app that uses it:
 
 - one **scope type** (`Org`, `Workspace`, `Tenant` — your name), with one
   `impl Tenant` carrying the membership check;
-- `#[table(scoped_by = Org)]` on every table that belongs to a tenant;
+- `#[table(scoped_by = Org)]` on every table that belongs to a tenant,
+  `#[table(global)]` on the scope type and every table that belongs to
+  none — a bare `#[table]` does not compile;
 - exactly one line per handler, `let tx = tx.scope::<Org>(org, ctx)?;`, after
   which everything reads and writes inside that tenant.
 
@@ -5389,7 +5431,7 @@ The type parameter travels with it: a `ScopedTx<'_, '_, OrgA>` is not a
 `ScopedTx<'_, '_, OrgB>`, so a helper written for one scope type cannot be
 handed another's transaction.
 
-**Unscoped tables stay reachable.** `ScopedTx` derefs to `Tx`, so a handler that
+**Global tables stay reachable.** `ScopedTx` derefs to `Tx`, so a handler that
 opened a scope still reads a global table — through an explicit deref, because
 Rust does not fall through the deref when an inherent method of the same name
 exists but its bound fails:
@@ -5397,7 +5439,7 @@ exists but its bound fails:
 ```rust,ignore
 let tx = tx.scope::<Org>(org, ctx)?;
 tx.scan::<Memo>()?;          // scoped:   Memo is scoped_by = Org
-(*tx).scan::<Region>()?;     // unscoped: Region has no tenant
+(*tx).scan::<Region>()?;     // global: Region has no tenant
 (*tx).emit(SystemNotice {}); // an event that genuinely belongs to no tenant
 ```
 
@@ -5644,8 +5686,10 @@ Stated so you do not go looking:
 - **Cross-tenant writes in one transaction.** A transaction opens one scope.
 - **Platform-derived tenancy.** There is no `Principal → Org` resolver hook;
   the tenant is named by your code at the `tx.scope` line and nowhere else.
-- **Retrofitting existing tables.** Scoping is opt-in per table and no
-  migration is forced on any app — but see the in-place refusal above.
+- **Retrofitting existing tables.** Every table declares `scoped_by` or
+  `global`, but no migration is forced: `global` is what a bare table
+  always was, and a table cannot gain a scope in place — see the refusal
+  above.
 - **Tenant-local ids.** Ids stay globally unique and app-minted.
 - **Permissions.** This answers *which tenant*, never *what may this principal
   do*; API-key scopes and permissions are their own future design.

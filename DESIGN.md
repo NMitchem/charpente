@@ -551,11 +551,14 @@ error. App crates depend on `charpente` alone: all three derive macros resolve t
 platform is one dependency, not two (plus `serde` for your own wire types — GUIDE §1).
 
 - **Tables.** `#[table]` on a struct derives the row codec, key type (`Id<T>`, typed, never
-  a bare u64), and secondary index declarations. Schema *is* the Rust definition.
+  a bare u64), and secondary index declarations. Schema *is* the Rust definition. Every
+  table declares its tenancy — `scoped_by = Org` or `global` — and a bare `#[table]` is
+  a compile error naming both (spec 2026-09-16-default-secure-surfaces).
 - **Scope.** `#[table(scoped_by = Org)]` sets a row's `Row::Scope`, and a scoped row's key
   becomes the `(scope, id)` composite (every secondary-index entry gains the same prefix) —
-  a tenant is a key prefix, not a `where` clause someone has to remember. A table without
-  the attribute gets `type Scope = Unscoped`. The scope type owes exactly one thing, an
+  a tenant is a key prefix, not a `where` clause someone has to remember. A
+  `#[table(global)]` gets `type Scope = Unscoped`; a table that declares neither is a
+  compile error (the Tables bullet above). The scope type owes exactly one thing, an
   `impl Tenant` with its own `authorize`; `scoped_by` without one is a compile error at the
   struct. The six scope-taking primitives on `Tx` are private to `charpente-core`, so the
   ONE way to reach a scoped row is `tx.scope::<Org>(org, ctx)?` — the single auditable line
@@ -572,7 +575,7 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   referencing a field that no longer exists — the mechanism below is for what Rust
   cannot see: a same-length field swap or retype that recompiles clean and misdecodes on
   disk.
-- **Routes (v0 implemented).** `#[route(METHOD "/path/:param"[, auth][, cross_tenant])]` —
+- **Routes (v0 implemented).** `#[route(METHOD "/path/:param", auth | public[, cross_tenant])]` —
   handler args: `tx: &mut Tx`, one per `:param` (same name, path order), at most one JSON
   body arg, optional `cap: &CrossTenant` (see below), optional trailing `ctx: &Ctx`
   (session access); return `Result<T: Serialize, ApiError>`.
@@ -586,7 +589,8 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   takes the token after `tx`). The rows come back PAIRED WITH THEIR SCOPE —
   `AllTenants::scan` yields `Vec<(Id<Org>, Invoice)>`, never `Vec<Invoice>` — so a
   cross-tenant result cannot be handed to code expecting one tenant's data. Naming a tenant
-  needs no capability: a point read already supplies the scope.
+  needs no capability: a point read already supplies the scope. A route declares exactly
+  one of `auth`/`public`; neither is a compile error naming both.
 - **Jobs.** `#[job]` structs with typed payloads and typed retry policy. Enqueue sites and
   handler signatures are checked against each other.
 - **Events.** `#[event]` structs; `tx.emit(...)` is typed; subscribers (server-side and
@@ -1270,7 +1274,8 @@ Charpente treats the coding agent as the primary developer persona:
   `#[table(scoped_by = …)]`, carried straight from the registry's own `TableOps::scoped`,
   the same value `Db::table_scoped` already exposes to the archive/replication callers),
   routes (method, pattern, name,
-  whether it requires auth, **whether it declared `cross_tenant`** — which is what turns
+  whether it declared `auth` (`false` is a declared `public`, never an omission),
+  **whether it declared `cross_tenant`** — which is what turns
   "audit the cross-tenant reads" into a mechanical inventory — whether it's an SSE stream,
   **plus, since the TS-client-codegen
   work: `params` — each path param's name and wire schema (`ParamInfo { name,
@@ -1419,7 +1424,9 @@ Charpente treats the coding agent as the primary developer persona:
 
 Sessions and API keys are built-in typed tables inside the commit point; a pre-transaction
 resolution ladder turns a presented credential into one `Principal`, and `#[route(…, auth)]`
-gates on it. Deliberately boring — the value is that credential state is a transaction like
+gates on it — a route that declares neither `auth` nor `public` does not compile, so an
+open route is a declaration, never an omission (default-secure, 2026-09-16). Deliberately
+boring — the value is that credential state is a transaction like
 everything else (durable, replicated, recovered on restart), not a bolted-on side store.
 Everything here is pure computation plus the kernel's one `Clock` reading per request, so it
 replays byte-identically in sim; the crypto is RustCrypto (`sha2`, `rsa`, `base64ct`), never
@@ -1522,7 +1529,11 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   `#[table(scoped_by = Org)]` makes `(scope, id)` the row key and prefixes every index
   entry, and the scope-taking primitives are private, so a scoped row is reachable only
   through `tx.scope::<Org>(org, ctx)?` — which runs the app's own `Tenant::authorize`
-  first, and whose refusal is the app's own `ApiError`. The platform never *derives* a
+  first, and whose refusal is the app's own `ApiError`. A table that declares neither
+  `scoped_by` nor `global` does not compile: which tables are tenant data is the app's
+  declaration at every struct, never the platform's inference (default-secure,
+  2026-09-16; the field-type inference was weighed and rejected — the membership table
+  must be `global` and must hold `Id<Org>`). The platform never *derives* a
   scope: the tenant is named by the app at that one line and nowhere else, and no key is
   ever parsed back into one. Realtime is the same mechanism rather than a second one —
   `emit` inside a scope is `emit_keyed` with the scope's key (§6), which retires

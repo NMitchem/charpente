@@ -656,7 +656,7 @@ struct GizmoV1 {
     count: u32,
 }
 
-#[charpente::table(version = 2)]
+#[charpente::table(version = 2, global)]
 struct Gizmo {
     id: charpente::core::table::Id<Gizmo>,
     count: u32,

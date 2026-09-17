@@ -24,10 +24,21 @@ pub fn table(args: TokenStream, input: TokenStream) -> TokenStream {
         Ok(a) => a,
         Err(e) => return e.to_compile_error().into(),
     };
-    // Read here so the declaration is part of the parse contract from this
-    // commit on; the refusal of its absence lands with the sweep (spec §7).
-    let _declared_global = args.global;
     let input = parse_macro_input!(input as DeriveInput);
+    if args.scoped_by.is_none() && !args.global {
+        let name = &input.ident;
+        return Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "`{name}` declares no tenancy — a table says which: write \
+                 `#[table(scoped_by = Org)]` if every row belongs to one tenant (the key \
+                 becomes `(scope, id)` and a bare `Tx` cannot read it), or `#[table(global)]` \
+                 if its rows belong to no tenant. Neither is the default."
+            ),
+        )
+        .to_compile_error()
+        .into();
+    }
     match table::expand(input, args.version, args.scoped_by) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
@@ -125,7 +136,7 @@ impl syn::parse::Parse for TableArg {
         } else {
             Err(syn::Error::new(
                 ident.span(),
-                "takes only `version = N`, `scoped_by = <Type>` or `global` (or no arguments)",
+                "takes `version = N`, `scoped_by = <Type>` or `global`",
             ))
         }
     }

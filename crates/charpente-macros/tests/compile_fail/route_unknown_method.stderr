@@ -1,5 +1,5 @@
 error: unknown method FETCH — one of GET, POST, PUT, PATCH, DELETE, SSE
  --> tests/compile_fail/route_unknown_method.rs:3:9
   |
-3 | #[route(FETCH "/x")]
+3 | #[route(FETCH "/x", public)]
   |         ^^^^^

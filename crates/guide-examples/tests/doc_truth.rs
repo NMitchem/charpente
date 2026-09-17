@@ -42,9 +42,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Hand-counted at landing (2026-09-12): the number of `<!-- pinned -->`
+/// Hand-counted at landing (2026-09-16): the number of `<!-- pinned -->`
 /// blocks in docs/GUIDE.md. Fewer than this is red.
-const PINNED_FLOOR: usize = 14;
+const PINNED_FLOOR: usize = 16;
 
 /// Below this a fragment is not evidence — `usage:` or `id: 1.0` would match
 /// almost any corpus. Long enough that a coincidental hit is implausible,
