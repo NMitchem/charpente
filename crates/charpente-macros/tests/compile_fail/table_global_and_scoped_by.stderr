@@ -1,0 +1,5 @@
+error: `global` and `scoped_by = Org` on one table — a table is one or the other; drop one
+  --> tests/compile_fail/table_global_and_scoped_by.rs:16:26
+   |
+16 | #[table(scoped_by = Org, global)]
+   |                          ^^^^^^

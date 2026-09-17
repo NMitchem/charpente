@@ -24,6 +24,9 @@ pub fn table(args: TokenStream, input: TokenStream) -> TokenStream {
         Ok(a) => a,
         Err(e) => return e.to_compile_error().into(),
     };
+    // Read here so the declaration is part of the parse contract from this
+    // commit on; the refusal of its absence lands with the sweep (spec §7).
+    let _declared_global = args.global;
     let input = parse_macro_input!(input as DeriveInput);
     match table::expand(input, args.version, args.scoped_by) {
         Ok(tokens) => tokens.into(),
@@ -83,24 +86,33 @@ fn parse_version(args: TokenStream) -> syn::Result<u32> {
         .map_err(|e| syn::Error::new(e.span(), format!("#[row_shape] {e}")))
 }
 
-/// `#[table]`'s parsed argument list: `version = N` (default 1) and
-/// `scoped_by = <Type>` (`#[table(scoped_by = Org)]`), each optional, comma
-/// separated, either order — but each at most once (`route`'s
-/// `auth`/`emits` and `job`'s `max`/`backoff` refuse a repeat by name
-/// rather than last-write-wins; this follows the same precedent).
+/// `#[table]`'s parsed argument list: `version = N` (default 1),
+/// `scoped_by = <Type>` (`#[table(scoped_by = Org)]`) and the bare word
+/// `global` (`#[table(global)]`), comma separated, any order — but each at
+/// most once (`route`'s `auth`/`emits` and `job`'s `max`/`backoff` refuse a
+/// repeat by name rather than last-write-wins; this follows the same
+/// precedent), and never both `scoped_by` and `global`.
 struct TableArgs {
     version: u32,
     scoped_by: Option<syn::Path>,
+    /// The explicit declaration that no row belongs to a tenant
+    /// (default-secure spec §3). Changes nothing in expansion — a `global`
+    /// table is what a bare `#[table]` was before absence became a refusal.
+    global: bool,
 }
 
 enum TableArg {
     Version(u32, proc_macro2::Span),
     ScopedBy(syn::Path, proc_macro2::Span),
+    Global(proc_macro2::Span),
 }
 
 impl syn::parse::Parse for TableArg {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<TableArg> {
         let ident: syn::Ident = input.parse()?;
+        if ident == "global" {
+            return Ok(TableArg::Global(ident.span()));
+        }
         input.parse::<syn::Token![=]>()?;
         if ident == "version" {
             let lit: syn::LitInt = input.parse()?;
@@ -113,7 +125,7 @@ impl syn::parse::Parse for TableArg {
         } else {
             Err(syn::Error::new(
                 ident.span(),
-                "takes only `version = N` and `scoped_by = <Type>` (or no arguments)",
+                "takes only `version = N`, `scoped_by = <Type>` or `global` (or no arguments)",
             ))
         }
     }
@@ -124,6 +136,7 @@ fn parse_table_args(args: TokenStream) -> syn::Result<TableArgs> {
         return Ok(TableArgs {
             version: 1,
             scoped_by: None,
+            global: false,
         });
     }
     let args2: proc_macro2::TokenStream = args.into();
@@ -133,6 +146,7 @@ fn parse_table_args(args: TokenStream) -> syn::Result<TableArgs> {
 
     let mut version = None;
     let mut scoped_by = None;
+    let mut global: Option<proc_macro2::Span> = None;
     for arg in parsed {
         match arg {
             TableArg::Version(v, span) => {
@@ -159,11 +173,34 @@ fn parse_table_args(args: TokenStream) -> syn::Result<TableArgs> {
                 }
                 scoped_by = Some(path);
             }
+            TableArg::Global(span) => {
+                if global.is_some() {
+                    return Err(syn::Error::new(
+                        span,
+                        "`global` given twice — write it once",
+                    ));
+                }
+                global = Some(span);
+            }
         }
+    }
+    if let (Some(span), Some(path)) = (global, &scoped_by) {
+        let scope = &path
+            .segments
+            .last()
+            .expect("a parsed path has a segment")
+            .ident;
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "`global` and `scoped_by = {scope}` on one table — a table is one or the other; drop one"
+            ),
+        ));
     }
     Ok(TableArgs {
         version: version.unwrap_or(1),
         scoped_by,
+        global: global.is_some(),
     })
 }
 

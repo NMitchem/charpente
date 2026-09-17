@@ -1,0 +1,5 @@
+error: `global` given twice — write it once
+  --> tests/compile_fail/table_duplicate_global.rs:10:17
+   |
+10 | #[table(global, global)]
+   |                 ^^^^^^
