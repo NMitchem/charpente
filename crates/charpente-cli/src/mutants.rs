@@ -60,9 +60,12 @@ const DEFAULT_TARGETS: &[&str] = &[
 ];
 
 /// The packages whose tests judge those mutants, and this is **not** a
-/// convenience default — it corrects a systematic understatement.
-/// `cargo-mutants` runs only the MUTATED package's own tests unless told
-/// otherwise, and most of `charpente-core`'s real oracle coverage lives
+/// convenience default — it corrects a systematic understatement. Without
+/// this, the verb judges every mutant with `charpente-core` and
+/// `charpente-sim`'s tests — the default target set's oracles — so a
+/// `--file` in any other crate must name its own package here, or its
+/// mutants are judged by suites that never exercise them and all report
+/// MISSED. Most of `charpente-core`'s real oracle coverage lives
 /// elsewhere: the WAL's properties are in `charpente-sim/tests/wal.rs`, not in
 /// `charpente-core`. Measured 2026-09-07: the `||` -> `&&` mutant in
 /// `parse_segment_name` is reported MISSED under the default package scope and
@@ -88,7 +91,9 @@ pub const USAGE: &str = "usage: charpente test --mutants [--file PATH]… [--re 
        --jobs N     cargo-mutants' parallelism (also CARGO_MUTANTS_JOBS); refused above 1 when \
 CARGO_TARGET_DIR is inherited\n\
        --test-package NAME  whose tests judge the mutants (repeatable). Without this, \
-cargo-mutants runs only the MUTATED package's tests, which understates coverage.\n\
+the verb judges every mutant with charpente-core and charpente-sim's tests — the default \
+target set's oracles — so a --file in any other crate must name its own package here, or \
+its mutants are judged by suites that never exercise them and all report MISSED.\n\
        --property NAME  judge the mutants with ONE sim property only — the way to ask \
 whether that property alone would notice. Without it every property runs, and one honest \
 sibling is enough to report a mutant CAUGHT.\n\
@@ -378,8 +383,11 @@ fn verdict(o: &Outcomes, where_: &str, property: Option<&str>) -> Verdict {
             None => format!(
                 "  {} MISSED: no test IN THE PACKAGES UNDER TEST caught this mutant. That is \
                  either a one-sided property, or an oracle that lives in a package outside \
-                 --test-package — cargo-mutants runs only the mutated package's own tests \
-                 unless told otherwise, so the scope is part of the claim. Re-run with \
+                 --test-package. Without --test-package the verb judges every mutant with \
+                 charpente-core and charpente-sim's tests — the default target set's oracles \
+                 — so a --file in any other crate must name its own package here, or its \
+                 mutants are judged by suites that never exercise them and all report \
+                 MISSED; the scope is part of the claim. Re-run with \
                  --property NAME to ask which single property is blind to it. See the run \
                  directory for the surviving diffs.",
                 o.missed

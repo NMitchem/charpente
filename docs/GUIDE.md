@@ -2563,8 +2563,10 @@ reported CAUGHT if *any* test in scope fails, so one honest sibling hides every
 one-sided property beside it. `--property NAME` judges the mutants by a single
 property — that is how you ask whether *that* property earns its place.
 Similarly `--test-package` decides which packages' suites are allowed to run;
-without it only the mutated package's own tests judge the mutant, which
-understates coverage whenever the real oracle lives elsewhere.
+without this, the verb judges every mutant with `charpente-core` and
+`charpente-sim`'s tests — the default target set's oracles — so a `--file`
+in any other crate must name its own package here, or its mutants are
+judged by suites that never exercise them and all report MISSED.
 
 **Two results that are not findings.** `unviable` means the mutant did not
 compile — your types rejected it, which is the compile-time contract doing its
