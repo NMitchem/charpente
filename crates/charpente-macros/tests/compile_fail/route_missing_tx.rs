@@ -1,6 +1,6 @@
 use charpente::route;
 
-#[route(GET "/x")]
+#[route(GET "/x", public)]
 fn handler() -> Result<(), charpente::http::ApiError> {
     Ok(())
 }

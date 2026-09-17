@@ -6,7 +6,7 @@
 use charpente_core::table::Id;
 use charpente_macros::table;
 
-#[table]
+#[table(global)]
 pub struct ApiKey {
     pub id: Id<ApiKey>,
     #[index]

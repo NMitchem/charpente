@@ -10,7 +10,7 @@ use std::io;
 
 /// A row. `#[table]` makes this a typed table keyed by `id`; its storage
 /// shape and its wire shape are separate on purpose (GUIDE §5).
-#[table]
+#[table(global)]
 pub struct Note {
     pub id: Id<Note>,
     pub body: String,
@@ -48,7 +48,7 @@ impl Echo {
 
 /// Three effects, one commit: the row, the job and the event all become
 /// true together or not at all. There is no way to split them.
-#[route(POST "/notes/:id")]
+#[route(POST "/notes/:id", public)]
 fn add_note(tx: &mut Tx, id: Id<Note>, body: NewNote) -> Result<Id<Note>, ApiError> {
     tx.put(&Note {
         id,

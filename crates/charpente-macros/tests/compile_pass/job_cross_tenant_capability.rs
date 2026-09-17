@@ -9,7 +9,7 @@ use charpente::auth::Principal;
 use charpente::kernel::JobError;
 use charpente::{CrossTenant, Id, Tenant, Tx, job, route, table};
 
-#[table]
+#[table(global)]
 struct Org {
     id: Id<Org>,
     name: String,
@@ -61,7 +61,7 @@ impl Plain {
     }
 }
 
-#[route(GET "/x")]
+#[route(GET "/x", public)]
 fn handler(tx: &mut Tx) -> Result<(), charpente::http::ApiError> {
     let _ = tx;
     Ok(())

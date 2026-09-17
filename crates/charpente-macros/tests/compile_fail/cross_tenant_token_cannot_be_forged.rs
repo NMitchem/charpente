@@ -14,7 +14,7 @@ use charpente::http::ApiError;
 use charpente::wire::WireU64;
 use charpente::{CrossTenant, Id, Tenant, Tx, route, table};
 
-#[table]
+#[table(global)]
 struct Org {
     id: Id<Org>,
     name: String,
@@ -34,7 +34,7 @@ impl Tenant for Org {
     }
 }
 
-#[route(GET "/admin/revenue")]
+#[route(GET "/admin/revenue", public)]
 fn revenue(tx: &mut Tx) -> Result<WireU64, ApiError> {
     Ok(WireU64(
         tx.across_tenants::<Org>(&CrossTenant(()))

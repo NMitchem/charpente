@@ -32,7 +32,7 @@ use charpente_sim::{FaultConfig, Sim, SimClock, SimHost, run_universes_swarm_wit
 
 // ------------------------------------------------------------- fixtures
 
-#[table]
+#[table(global)]
 struct Widget {
     id: Id<Widget>,
     #[index]
@@ -40,7 +40,7 @@ struct Widget {
     weight: i64,
 }
 
-#[table]
+#[table(global)]
 struct Gadget {
     id: Id<Gadget>,
     label: String,
@@ -115,7 +115,7 @@ impl RowShape for WidgetV1 {
 /// The compiled target: adds an index (so the close-out's index rebuild has
 /// something concrete to prove converged) plus the `note` field the
 /// migration fills.
-#[table(version = 2)]
+#[table(version = 2, global)]
 struct WidgetV2 {
     id: Id<WidgetV2>,
     #[index]
@@ -3597,7 +3597,7 @@ impl RowShape for GizmoV1 {
     }
 }
 
-#[table(version = 2)]
+#[table(version = 2, global)]
 struct GizmoV2 {
     id: Id<GizmoV2>,
     count: u32,
@@ -4763,7 +4763,7 @@ use charpente::wire::WireI64;
 use charpente::{Tx, job, jobs, route, routes};
 use charpente_core::job::JobRow;
 
-#[table]
+#[table(global)]
 struct Tally {
     id: Id<Tally>,
     count: u64,
@@ -4787,7 +4787,7 @@ impl Bump {
     }
 }
 
-#[route(POST "/widget/:id")]
+#[route(POST "/widget/:id", public)]
 fn put_widget(tx: &mut Tx, id: Id<Widget>) -> Result<Id<Widget>, ApiError> {
     let raw = id.raw();
     tx.put(&Widget {
@@ -4799,7 +4799,7 @@ fn put_widget(tx: &mut Tx, id: Id<Widget>) -> Result<Id<Widget>, ApiError> {
     Ok(id)
 }
 
-#[route(GET "/widget/:id")]
+#[route(GET "/widget/:id", public)]
 fn get_widget(tx: &mut Tx, id: Id<Widget>) -> Result<WireI64, ApiError> {
     Ok(WireI64(tx.get(id)?.ok_or(ApiError::NotFound)?.weight))
 }

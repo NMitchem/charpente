@@ -5,7 +5,7 @@
 use charpente::http::ApiError;
 use charpente::{Tx, route};
 
-#[route(GET "/x")]
+#[route(GET "/x", public)]
 fn handler(tx: &mut Tx) -> Result<String, ApiError> {
     let _ = tx;
     Ok(String::new())

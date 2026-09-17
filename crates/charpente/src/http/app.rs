@@ -58,7 +58,7 @@ pub const SESSION_TTL: u64 = 30 * 24 * 60 * 60 * 1_000_000_000;
 /// hashed (M1 "auth, properly") — only `token_hash` ever reaches disk; the
 /// raw token lives only in the response that mints it. `expires_at` is a
 /// clock reading (nanos); a row past it is treated as absent, never valid.
-#[table]
+#[table(global)]
 pub struct Session {
     pub id: Id<Session>,
     #[index]

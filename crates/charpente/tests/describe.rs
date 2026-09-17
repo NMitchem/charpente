@@ -19,7 +19,7 @@ use charpente::{
 use charpente_core::table::Id;
 use charpente_sim::{FaultConfig, Sim};
 
-#[table]
+#[table(global)]
 struct Widget {
     id: Id<Widget>,
     #[index]
@@ -37,7 +37,7 @@ struct WidgetView {
     org: WireU64,
 }
 
-#[route(POST "/widgets")]
+#[route(POST "/widgets", public)]
 fn create_widget(tx: &mut Tx, body: CreateWidget) -> Result<WidgetView, ApiError> {
     let id = Id::from_raw(body.org.0);
     tx.put(&Widget {
@@ -50,7 +50,7 @@ fn create_widget(tx: &mut Tx, body: CreateWidget) -> Result<WidgetView, ApiError
 /// A `Vec<T>`-returning route (Ruling 24): pins the container-response case
 /// — `response` must come back as `Seq(Box::new(Ref("WidgetView")))`, not
 /// `None`/inlined.
-#[route(GET "/widgets")]
+#[route(GET "/widgets", public)]
 fn list_widgets(tx: &mut Tx) -> Result<Vec<WidgetView>, ApiError> {
     Ok(tx
         .scan::<Widget>()?
@@ -69,7 +69,7 @@ fn list_widgets(tx: &mut Tx) -> Result<Vec<WidgetView>, ApiError> {
 /// distinct schemas attached to the right names. `org: String` and
 /// `id: Id<Widget>` are deliberately different shapes so a mix-up (schemas
 /// swapped between names) would be visible, not just a coincidental match.
-#[route(GET "/orgs/:org/widgets/:id")]
+#[route(GET "/orgs/:org/widgets/:id", public)]
 fn get_org_widget(tx: &mut Tx, org: String, id: Id<Widget>) -> Result<WidgetView, ApiError> {
     let _ = org;
     let w = tx.get(id)?.ok_or(ApiError::NotFound)?;
@@ -102,7 +102,7 @@ struct WidgetRemoved {
 /// test, which builds its own app around it. `create_session` on a subscribe
 /// path is the realistic case the guard exists for — minting a credential
 /// for the stream the client is about to open.
-#[route(SSE "/widgets/minting-feed", emits(WidgetAdded))]
+#[route(SSE "/widgets/minting-feed", public, emits(WidgetAdded))]
 fn minting_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = ctx.create_session(tx, "probe-subject");
     Ok(Subscription::of::<WidgetAdded>().cursor(cursor))
@@ -111,7 +111,7 @@ fn minting_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscr
 /// A subscribe handler that REJECTS the probe's synthetic request — the
 /// third of the probe's three error strings (task 7 review, Minor 3). Not
 /// mounted in `fixture_app`, for the same reason `minting_feed` is not.
-#[route(SSE "/widgets/picky-feed", emits(WidgetAdded))]
+#[route(SSE "/widgets/picky-feed", public, emits(WidgetAdded))]
 fn picky_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx, cursor);
     Err(ApiError::Unauthorized)
@@ -121,7 +121,7 @@ fn picky_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscrip
 /// oracle below cannot tell "the declaration and the subscription agree"
 /// from "both happen to be one element long", and narrowing the declaration
 /// to prove the oracle red would have nothing to narrow to.
-#[route(SSE "/widgets/feed", emits(WidgetAdded, WidgetRemoved))]
+#[route(SSE "/widgets/feed", public, emits(WidgetAdded, WidgetRemoved))]
 fn widget_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<WidgetAdded>()
@@ -1099,7 +1099,7 @@ fn the_drift_probe_refuses_a_subscribe_handler_that_writes() {
 /// enumerates something real. Neither is in `fixture_app`'s `Schema`: they
 /// exist for the routes in this section, which mount their own app rather
 /// than change the pinned golden (same reason `minting_feed` stays out).
-#[table]
+#[table(global)]
 struct Org {
     id: Id<Org>,
     name: String,
@@ -1125,7 +1125,7 @@ impl charpente::Tenant for Org {
 
 /// The declared capability (spec §3): the route says `cross_tenant`, so the
 /// platform hands the handler the token `across_tenants` requires.
-#[route(GET "/admin/revenue", cross_tenant)]
+#[route(GET "/admin/revenue", public, cross_tenant)]
 fn admin_revenue(tx: &mut Tx, cap: &CrossTenant) -> Result<WireU64, ApiError> {
     let total: u64 = tx
         .across_tenants::<Org>(cap)
@@ -1138,7 +1138,7 @@ fn admin_revenue(tx: &mut Tx, cap: &CrossTenant) -> Result<WireU64, ApiError> {
 
 /// The ordinary route beside it — without this, the assertion below could
 /// not tell "exactly the declared route" from "every route".
-#[route(GET "/admin/plain")]
+#[route(GET "/admin/plain", public)]
 fn admin_plain(tx: &mut Tx) -> Result<WireU64, ApiError> {
     Ok(WireU64(tx.scan::<Widget>()?.len() as u64))
 }

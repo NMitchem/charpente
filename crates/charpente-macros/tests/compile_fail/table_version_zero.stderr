@@ -1,5 +1,5 @@
 error: #[table] version 0 does not exist — versions start at 1
   --> tests/compile_fail/table_version_zero.rs:11:19
    |
-11 | #[table(version = 0)]
+11 | #[table(version = 0, global)]
    |                   ^

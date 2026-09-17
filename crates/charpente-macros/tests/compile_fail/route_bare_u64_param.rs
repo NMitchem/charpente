@@ -10,7 +10,7 @@
 //! `FromParam`.
 use charpente::route;
 
-#[route(GET "/things/:id")]
+#[route(GET "/things/:id", public)]
 fn handler(tx: &mut charpente::Tx, id: u64) -> Result<(), charpente::http::ApiError> {
     let _ = (tx, id);
     Ok(())

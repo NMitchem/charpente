@@ -8,7 +8,7 @@
 // real flag in that same position.
 use charpente::route;
 
-#[route(GET "/x", cached)]
+#[route(GET "/x", public, cached)]
 fn handler(tx: &mut charpente::Tx) -> Result<(), charpente::http::ApiError> {
     let _ = tx;
     Ok(())

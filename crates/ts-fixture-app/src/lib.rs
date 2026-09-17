@@ -42,19 +42,19 @@ use charpente::{events as events_macro, table};
 // registered wire type, which is the case `emit_types` had to grow a second
 // collection loop for (types.rs, review round 1 Important 6).
 
-#[table]
+#[table(global)]
 pub struct Customer {
     pub id: Id<Customer>,
     pub name: String,
 }
 
-#[table]
+#[table(global)]
 pub struct Invoice {
     pub id: Id<Invoice>,
     pub customer: Id<Customer>,
 }
 
-#[table]
+#[table(global)]
 pub struct Widget {
     pub id: Id<Widget>,
     pub hits: u64,
@@ -362,13 +362,13 @@ pub fn create_customer(
     })
 }
 
-#[route(GET "/invoices/:id")]
+#[route(GET "/invoices/:id", public)]
 pub fn get_invoice(tx: &mut Tx, id: Id<Invoice>) -> Result<InvoiceView, ApiError> {
     let inv = tx.get(id)?.ok_or(ApiError::NotFound)?;
     Ok(samples::invoice_view(inv.id, inv.customer))
 }
 
-#[route(GET "/invoices")]
+#[route(GET "/invoices", public)]
 pub fn list_invoices(tx: &mut Tx) -> Result<Vec<InvoiceView>, ApiError> {
     Ok(tx
         .scan::<Invoice>()?
@@ -380,7 +380,7 @@ pub fn list_invoices(tx: &mut Tx) -> Result<Vec<InvoiceView>, ApiError> {
 /// The route that reaches an `Int64` in a REQUEST body (chunk B1a's coverage
 /// gap, A2). The handler is a stub like its neighbours — nothing here is
 /// executed in anger — so `body` is unused past being deserialized.
-#[route(POST "/invoices/:id/adjust")]
+#[route(POST "/invoices/:id/adjust", public)]
 pub fn adjust_invoice(
     tx: &mut Tx,
     id: Id<Invoice>,
@@ -394,7 +394,7 @@ pub fn adjust_invoice(
 /// The route whose ERROR type carries an `Int64` (chunk B1b, exit
 /// criterion 5) — see `LimitExceeded`'s doc comment for what this route
 /// does and does not prove. The handler is a stub like its neighbours.
-#[route(POST "/invoices/:id/withdraw")]
+#[route(POST "/invoices/:id/withdraw", public)]
 pub fn withdraw_invoice(tx: &mut Tx, id: Id<Invoice>) -> Result<InvoiceView, LimitExceeded> {
     let _ = tx;
     Ok(samples::invoice_view(id, Id::<Customer>::from_raw(0)))
@@ -410,7 +410,7 @@ pub fn withdraw_invoice(tx: &mut Tx, id: Id<Invoice>) -> Result<InvoiceView, Lim
 /// string). The handler is a stub like its neighbours — what matters is the
 /// SCHEMA this route declares, since every `*.test.ts` stubs `fetch()`
 /// rather than invoking it.
-#[route(GET "/invoices/:id/last-item")]
+#[route(GET "/invoices/:id/last-item", public)]
 pub fn last_item(tx: &mut Tx, id: Id<Invoice>) -> Result<FeedItem, ApiError> {
     let _ = (tx, id);
     Ok(FeedItem::Ping)
@@ -419,7 +419,7 @@ pub fn last_item(tx: &mut Tx, id: Id<Invoice>) -> Result<FeedItem, ApiError> {
 /// `CostNode` (fix round 1, F6): see its own doc comment for the two shapes
 /// (`Ref` cycle, sibling `Ref`) this route exists to execute, not just
 /// compile.
-#[route(GET "/cost-tree")]
+#[route(GET "/cost-tree", public)]
 pub fn cost_tree(tx: &mut Tx) -> Result<CostNode, ApiError> {
     let _ = tx;
     Ok(samples::cost_tree())
@@ -428,7 +428,7 @@ pub fn cost_tree(tx: &mut Tx) -> Result<CostNode, ApiError> {
 /// `-> Result<(), ApiError>`: the response schema is `Null`, the JSON
 /// literal `null`, which is a different document from `{}`. Also the one
 /// route whose `Id<Widget>` never appears in any registered wire type.
-#[route(DELETE "/widgets/:id")]
+#[route(DELETE "/widgets/:id", public)]
 pub fn delete_widget(tx: &mut Tx, id: Id<Widget>) -> Result<(), ApiError> {
     let _ = (tx, id);
     Ok(())
@@ -450,7 +450,7 @@ pub fn feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscripti
 /// is optional — and the contract genuinely does not know what it carries,
 /// so the generated client types it as the honest `UnknownEvent` rather than
 /// inventing a union. Kept precisely so that branch has a real app behind it.
-#[route(SSE "/raw-feed")]
+#[route(SSE "/raw-feed", public)]
 pub fn raw_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<InvoicePaid>().cursor(cursor))

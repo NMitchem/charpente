@@ -7,7 +7,7 @@ mod handlers {
     use charpente::http::ApiError;
     use charpente::{Tx, route};
 
-    #[route(GET "/ping")]
+    #[route(GET "/ping", public)]
     pub fn ping(tx: &mut Tx) -> Result<(), ApiError> {
         let _ = tx;
         Ok(())

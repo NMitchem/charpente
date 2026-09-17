@@ -3,12 +3,12 @@
 // `job`'s `max`/`backoff` already make for their own duplicate keys.
 use charpente::table;
 
-#[table]
+#[table(global)]
 struct A {
     id: charpente::core::table::Id<A>,
 }
 
-#[table]
+#[table(global)]
 struct B {
     id: charpente::core::table::Id<B>,
 }

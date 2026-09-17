@@ -40,7 +40,7 @@ use charpente_sim::{FaultConfig, Sim, run_universes_swarm_with};
 /// platform never DERIVES a scope — it only renders one, as the subscription
 /// key `ScopedTx::emit` attaches (`ScopedTx::event_key`, spec §4; the standing
 /// `emit_keyed` ruling, DESIGN.md §6).
-#[table]
+#[table(global)]
 struct Org {
     id: Id<Org>,
     name: String,
@@ -88,7 +88,7 @@ struct Memo {
 /// The shape spec §1 prescribes: one `scope()` line, everything below it
 /// bounded to that tenant. Returns the tenant's row count BEFORE the write, so
 /// a body that ran when it should not have is visible in the response too.
-#[route(POST "/memo/:org")]
+#[route(POST "/memo/:org", public)]
 fn write_memo(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError> {
     let mut tx = tx.scope::<Org>(org, ctx)?;
     BODIES_ENTERED.fetch_add(1, Ordering::Relaxed);
@@ -102,7 +102,7 @@ fn write_memo(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError>
 
 /// Reads one tenant's rows back, so the refused tenant's emptiness is checked
 /// on the store and not only on the counters.
-#[route(GET "/memo/:org")]
+#[route(GET "/memo/:org", public)]
 fn count_memos(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError> {
     let tx = tx.scope::<Org>(org, ctx)?;
     Ok(WireU64(tx.scan::<Memo>()?.len() as u64))
@@ -210,7 +210,7 @@ fn a_refusing_authorize_is_the_answer_and_nothing_below_the_scope_line_runs() {
 ///
 /// `Firm` admits every tenant: this property is about the row BOUND, not
 /// about the membership check, which the unit test above owns.
-#[table]
+#[table(global)]
 struct Firm {
     id: Id<Firm>,
     name: String,
@@ -852,7 +852,7 @@ fn the_tenant_workload_replays_identically_for_the_same_seed() {
 /// tenant reader below needs rows in MORE than one tenant, and `Org`'s
 /// `authorize` (deliberately) refuses every tenant but one, so it cannot
 /// write the second tenant's rows to read back.
-#[table]
+#[table(global)]
 struct Team {
     id: Id<Team>,
     name: String,
@@ -883,7 +883,7 @@ struct NoteRow {
     note: Id<Note>,
 }
 
-#[route(PUT "/note/:team/:id")]
+#[route(PUT "/note/:team/:id", public)]
 fn write_note(tx: &mut Tx, team: Id<Team>, id: Id<Note>, ctx: &Ctx) -> Result<WireU64, ApiError> {
     let mut tx = tx.scope::<Team>(team, ctx)?;
     tx.put(&Note {
@@ -895,7 +895,7 @@ fn write_note(tx: &mut Tx, team: Id<Team>, id: Id<Note>, ctx: &Ctx) -> Result<Wi
 
 /// One tenant's view, for the contrast the assertion needs: the same table,
 /// read through a scope, must still see only its own tenant.
-#[route(GET "/note/:team")]
+#[route(GET "/note/:team", public)]
 fn count_notes(tx: &mut Tx, team: Id<Team>, ctx: &Ctx) -> Result<WireU64, ApiError> {
     let tx = tx.scope::<Team>(team, ctx)?;
     Ok(WireU64(tx.scan::<Note>()?.len() as u64))
@@ -905,7 +905,7 @@ fn count_notes(tx: &mut Tx, team: Id<Team>, ctx: &Ctx) -> Result<WireU64, ApiErr
 /// only because this route said `cross_tenant`; without the flag the macro
 /// refuses the argument, and without the argument there is no `&CrossTenant`
 /// to hand `across_tenants` (`compile_fail/across_tenants_without_capability`).
-#[route(GET "/admin/notes", cross_tenant)]
+#[route(GET "/admin/notes", public, cross_tenant)]
 fn all_notes(tx: &mut Tx, cap: &CrossTenant) -> Result<Vec<NoteRow>, ApiError> {
     Ok(tx
         .across_tenants::<Team>(cap)

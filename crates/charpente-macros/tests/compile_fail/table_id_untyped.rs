@@ -1,6 +1,6 @@
 use charpente::table;
 
-#[table]
+#[table(global)]
 struct W {
     id: u64,
 }

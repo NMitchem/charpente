@@ -8,7 +8,7 @@
 // warning in the pinned .stderr.
 use charpente::table;
 
-#[table(version = 0)]
+#[table(version = 0, global)]
 struct W {
     id: charpente::core::table::Id<W>,
 }

@@ -33,7 +33,7 @@ pub mod wire_accounting;
 /// set stays cache-resident (the spec measures the commit path, not paging).
 pub const SLOTS: u64 = 1024;
 
-#[table]
+#[table(global)]
 pub struct Slot {
     pub id: Id<Slot>,
     pub hits: u64,
@@ -61,7 +61,7 @@ impl Bump {
 }
 
 /// The canonical write transaction, README-shaped: get + put + enqueue + emit.
-#[route(POST "/hit/:id")]
+#[route(POST "/hit/:id", public)]
 pub fn hit(tx: &mut Tx, id: Id<Slot>) -> Result<WireU64, ApiError> {
     let raw = id.raw() % SLOTS;
     let slot_id = Id::<Slot>::from_raw(raw);
@@ -72,7 +72,7 @@ pub fn hit(tx: &mut Tx, id: Id<Slot>) -> Result<WireU64, ApiError> {
     Ok(WireU64(hits))
 }
 
-#[route(GET "/slot/:id")]
+#[route(GET "/slot/:id", public)]
 pub fn read_slot(tx: &mut Tx, id: Id<Slot>) -> Result<WireU64, ApiError> {
     Ok(WireU64(
         tx.get(Id::<Slot>::from_raw(id.raw() % SLOTS))?
@@ -107,7 +107,7 @@ pub fn read_slot(tx: &mut Tx, id: Id<Slot>) -> Result<WireU64, ApiError> {
 pub static SYNC_COUNTER: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicU64>> =
     std::sync::OnceLock::new();
 
-#[route(GET "/__syncs")]
+#[route(GET "/__syncs", public)]
 pub fn syncs(tx: &mut Tx) -> Result<WireU64, ApiError> {
     // `#[route]` requires the first parameter to be named exactly `tx` — an
     // `_tx` is a compile error naming the contract, the site and the fix. This

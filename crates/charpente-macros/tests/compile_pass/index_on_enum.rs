@@ -33,7 +33,7 @@ impl Codec for InvoiceState {
     }
 }
 
-#[table]
+#[table(global)]
 struct Invoice {
     id: Id<Invoice>,
     #[index]

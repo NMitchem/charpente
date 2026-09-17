@@ -23,7 +23,7 @@ struct NoteRemoved {
     n: WireU64,
 }
 
-#[route(SSE "/x", emits(NoteAdded), emits(NoteRemoved))]
+#[route(SSE "/x", public, emits(NoteAdded), emits(NoteRemoved))]
 fn handler(
     tx: &mut charpente::Tx,
     ctx: &charpente::http::Ctx,

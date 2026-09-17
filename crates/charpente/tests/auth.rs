@@ -59,7 +59,7 @@ const INCONCLUSIVE: &str = "universe-inconclusive";
 
 /// Login mints a session; the raw token is the response body (the only place
 /// it ever exists — the row stores only its hash).
-#[route(POST "/login")]
+#[route(POST "/login", public)]
 fn login(tx: &mut Tx, subject: String, ctx: &Ctx) -> Result<String, ApiError> {
     Ok(ctx.create_session(tx, subject))
 }

@@ -10,7 +10,7 @@ struct BumpBody {
     count: WireU64,
 }
 
-#[route(POST "/bump")]
+#[route(POST "/bump", public)]
 fn handler(tx: &mut charpente::Tx, body: BumpBody) -> Result<(), charpente::http::ApiError> {
     let _ = (tx, body);
     Ok(())

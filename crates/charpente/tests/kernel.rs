@@ -19,7 +19,7 @@ use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, Unscoped, View};
 use charpente_sim::checks::is_fault_fallout;
 use charpente_sim::{FaultConfig, Sim};
 
-#[table]
+#[table(global)]
 struct Counter {
     id: Id<Counter>,
     hits: u64,
@@ -236,7 +236,7 @@ fn a_panicking_route_handler_stops_the_node_it_is_not_isolated() {
     );
 }
 
-#[route(POST "/boom")]
+#[route(POST "/boom", public)]
 fn boom(tx: &mut Tx) -> Result<(), ApiError> {
     let _ = tx;
     panic!("route handler exploded");
@@ -488,7 +488,7 @@ struct Hit {
     slot: WireU64,
 }
 
-#[route(POST "/hit")]
+#[route(POST "/hit", public)]
 fn hit(tx: &mut Tx, body: Hit) -> Result<WireU64, ApiError> {
     tx.enqueue(CountUp { slot: body.slot.0 });
     Ok(body.slot)
@@ -721,14 +721,14 @@ fn kernel_stops_after_a_request_poisons_the_engine() {
 
 /// A pure read path: no effects, so nothing it does can reach the WAL, and any
 /// status it returns is the store's answer alone.
-#[route(GET "/count/:id")]
+#[route(GET "/count/:id", public)]
 fn read_count(tx: &mut Tx, id: Id<Counter>) -> Result<WireU64, ApiError> {
     Ok(WireU64(tx.get(id)?.map_or(0, |c| c.hits)))
 }
 
 /// A pure store write — no enqueue, so servicing it never also arms the job
 /// arm and the reply sequence below stays exactly one reply per request.
-#[route(POST "/bump/:id")]
+#[route(POST "/bump/:id", public)]
 fn bump_count(tx: &mut Tx, id: Id<Counter>) -> Result<WireU64, ApiError> {
     let hits = tx.get(id)?.map_or(0, |c| c.hits) + 1;
     tx.put(&Counter { id, hits });
@@ -1380,7 +1380,7 @@ struct Post {
 /// The only scoped write in the swarm, and the shape spec §1 prescribes:
 /// one `scope()` line, every table access below it bounded to that tenant by
 /// construction.
-#[route(POST "/post")]
+#[route(POST "/post", public)]
 fn post(tx: &mut Tx, body: Post, ctx: &Ctx) -> Result<WireU64, ApiError> {
     let tenant = body.tenant.0;
     let id = body.id.0;
@@ -2020,7 +2020,7 @@ fn due_jobs_are_serviced_before_a_request_flood_exhausts_the_source() {
 /// Mints a session the same way `http.rs`'s `login` does — the sweep test
 /// only needs its own routes to avoid cross-file coupling between the two
 /// integration test binaries.
-#[route(POST "/sweep-login")]
+#[route(POST "/sweep-login", public)]
 fn sweep_login(tx: &mut Tx, subject: String, ctx: &Ctx) -> Result<String, ApiError> {
     Ok(ctx.create_session(tx, subject))
 }
@@ -2121,7 +2121,7 @@ struct EmitBody {
     n: WireU64,
 }
 
-#[route(POST "/emit")]
+#[route(POST "/emit", public)]
 fn emit_one(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
     tx.emit(Bumped { n: body.n });
     Ok(())
@@ -2138,7 +2138,7 @@ struct FloodBody {
 /// that both mints many events AND crosses the checkpoint threshold is the
 /// only way to move the retention floor without ever giving a live tail a
 /// chance to interleave a delivery attempt in between.
-#[route(POST "/flood")]
+#[route(POST "/flood", public)]
 fn flood(tx: &mut Tx, body: FloodBody) -> Result<(), ApiError> {
     for i in 0..body.count.0 {
         tx.emit(Bumped { n: WireU64(i) });
@@ -2146,7 +2146,7 @@ fn flood(tx: &mut Tx, body: FloodBody) -> Result<(), ApiError> {
     Ok(())
 }
 
-#[route(SSE "/feed")]
+#[route(SSE "/feed", public)]
 fn tail_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<Bumped>().cursor(cursor))
@@ -2449,7 +2449,7 @@ impl RowShape for GadgetV1 {
     }
 }
 
-#[table(version = 2)]
+#[table(version = 2, global)]
 struct Gadget {
     id: Id<Gadget>,
     count: u32,

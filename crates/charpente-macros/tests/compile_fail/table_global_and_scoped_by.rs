@@ -8,7 +8,7 @@
 // (`scoped_by` alone).
 use charpente::table;
 
-#[table]
+#[table(global)]
 struct Org {
     id: charpente::core::table::Id<Org>,
 }

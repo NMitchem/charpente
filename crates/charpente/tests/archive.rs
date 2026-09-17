@@ -45,7 +45,7 @@ struct Ping {
 /// A fixed-width row: every commit produces an identically-sized WAL frame,
 /// which is what makes `RECORDS_PER_SEGMENT` an exact, reusable constant
 /// (Ruling 34) rather than an average.
-#[table]
+#[table(global)]
 struct Rec {
     id: Id<Rec>,
     value: u64,
@@ -55,7 +55,7 @@ struct Rec {
 /// scope marker (`#[table(scoped_by = …)]` requires the app's own `Tenant`
 /// impl, trivial here because this file reads the archived bytes rather than
 /// going through a scope, same as `charpente/tests/typed_tables.rs`'s `Org`).
-#[table]
+#[table(global)]
 struct ScopedOrg {
     id: Id<ScopedOrg>,
     name: String,
@@ -4278,7 +4278,7 @@ struct RecBody {
 /// A writing route, deliberately: an archive with a `Db` that never moves
 /// goes caught-up and stays there, and every "does the arm keep up under
 /// load" question would then be asked of an archive with nothing to do.
-#[route(POST "/rec")]
+#[route(POST "/rec", public)]
 fn put_rec(tx: &mut Tx, body: RecBody) -> Result<WireU64, ApiError> {
     tx.put(&Rec {
         id: Id::from_raw(body.n.0),

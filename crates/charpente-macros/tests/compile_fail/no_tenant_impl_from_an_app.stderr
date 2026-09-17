@@ -7,8 +7,8 @@ error[E0277]: the trait bound `Org: table::sealed::NotATenant` is not satisfied
 help: the trait `table::sealed::NotATenant` is not implemented for `Org`
   --> tests/compile_fail/no_tenant_impl_from_an_app.rs:12:1
    |
-12 | #[table]
-   | ^^^^^^^^
+12 | #[table(global)]
+   | ^^^^^^^^^^^^^^^^
 help: the trait `table::sealed::NotATenant` is implemented for `Unscoped`
   --> $WORKSPACE/crates/charpente-core/src/table.rs
    |

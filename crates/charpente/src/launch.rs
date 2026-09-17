@@ -549,7 +549,7 @@ mod tests {
 
     const BUCKET_PREFIX: &str = "node-a-archive";
 
-    #[table]
+    #[table(global)]
     struct RestoreItem {
         id: Id<RestoreItem>,
         value: u64,

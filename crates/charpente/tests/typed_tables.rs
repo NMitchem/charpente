@@ -19,13 +19,13 @@ use charpente_core::table::{Codec, Id, Snapshot, Store, UNSCOPED, View};
 use charpente_sim::checks::is_fault_fallout;
 use charpente_sim::{FaultConfig, Sim, run_universes_swarm};
 
-#[table]
+#[table(global)]
 struct Org {
     id: Id<Org>,
     name: String,
 }
 
-#[table]
+#[table(global)]
 struct Invoice {
     id: Id<Invoice>,
     #[index]
@@ -311,7 +311,7 @@ fn crash_reverts_to_the_last_checkpoint() {
 // ---------------------------------------------------- integration property
 
 /// Log records for the property test: a put or delete of a `Kv` row.
-#[table]
+#[table(global)]
 struct Kv {
     id: Id<Kv>,
     #[index]

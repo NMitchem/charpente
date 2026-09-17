@@ -9,8 +9,8 @@ error[E0277]: `Invoice` is a tenant-scoped table (`#[table(scoped_by = Org)]`) a
 help: the trait `NoTenant<Invoice>` is not implemented for `Org`
   --> tests/compile_fail/scoped_read_from_bare_tx.rs:9:1
    |
- 9 | #[table]
-   | ^^^^^^^^
+ 9 | #[table(global)]
+   | ^^^^^^^^^^^^^^^^
    = note: open the tenant scope first; `Org`'s own `Tenant::authorize` runs there, once per handler:
                let tx = tx.scope::<Org>(scope, ctx)?;
                tx.scan::<Invoice>()?

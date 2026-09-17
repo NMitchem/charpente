@@ -29,7 +29,7 @@ struct NoteRemoved {
     n: WireU64,
 }
 
-#[route(SSE "/x", emits(NoteAdded))]
+#[route(SSE "/x", public, emits(NoteAdded))]
 fn handler(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<NoteAdded>().cursor(cursor))
@@ -57,7 +57,7 @@ fn feed_reversed(
     Ok(Subscription::of::<NoteRemoved>().cursor(cursor))
 }
 
-#[route(SSE "/w", emits(NoteAdded, NoteRemoved))]
+#[route(SSE "/w", public, emits(NoteAdded, NoteRemoved))]
 fn feed_merged(
     tx: &mut Tx,
     ctx: &Ctx,

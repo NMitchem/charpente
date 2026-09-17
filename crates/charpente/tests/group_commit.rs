@@ -43,7 +43,7 @@ const SEC: u64 = 1_000_000_000;
 
 // ------------------------------------------------------------------ routes
 
-#[table]
+#[table(global)]
 struct Hit {
     id: Id<Hit>,
     count: u64,
@@ -53,7 +53,7 @@ struct Hit {
 /// incremented. One `stage()` call against this always produces exactly one
 /// record (the row always changes), which is what makes `g.len() == 1` a
 /// meaningful assertion below rather than an accident of an empty diff.
-#[route(POST "/hit/:id")]
+#[route(POST "/hit/:id", public)]
 fn hit(tx: &mut Tx, id: Id<Hit>) -> Result<WireU64, ApiError> {
     let count = tx.get(id)?.map_or(0, |h| h.count) + 1;
     tx.put(&Hit { id, count });
@@ -64,7 +64,7 @@ fn hit(tx: &mut Tx, id: Id<Hit>) -> Result<WireU64, ApiError> {
 /// router work — it touches no disk, so the committed pre-batching fixture is
 /// unaffected (and `a_never_contended_universe_traces_identically_...` would
 /// say so immediately if that were wrong).
-#[route(GET "/count/:id")]
+#[route(GET "/count/:id", public)]
 fn count(tx: &mut Tx, id: Id<Hit>) -> Result<WireU64, ApiError> {
     Ok(WireU64(tx.get(id)?.map_or(0, |h| h.count)))
 }
@@ -1983,24 +1983,24 @@ impl QuietJob {
     }
 }
 
-#[route(POST "/enqueue")]
+#[route(POST "/enqueue", public)]
 fn enqueue_quiet(tx: &mut Tx) -> Result<(), ApiError> {
     tx.enqueue(QuietJob {});
     Ok(())
 }
 
-#[route(GET "/job-count")]
+#[route(GET "/job-count", public)]
 fn job_count(tx: &mut Tx) -> Result<WireU64, ApiError> {
     Ok(WireU64(tx.scan::<JobRow>()?.len() as u64))
 }
 
-#[route(POST "/emit-tick")]
+#[route(POST "/emit-tick", public)]
 fn emit_tick(tx: &mut Tx) -> Result<(), ApiError> {
     tx.emit(Tick { n: WireU64(1) });
     Ok(())
 }
 
-#[route(GET "/event-count")]
+#[route(GET "/event-count", public)]
 fn event_count(tx: &mut Tx) -> Result<WireU64, ApiError> {
     Ok(WireU64(tx.scan::<EventRow>()?.len() as u64))
 }

@@ -20,7 +20,7 @@ use charpente::auth::Principal;
 use charpente::http::ApiError;
 use charpente::{Id, Tenant, Tx, route, table};
 
-#[table]
+#[table(global)]
 struct Org {
     id: Id<Org>,
     name: String,
@@ -40,7 +40,7 @@ impl Tenant for Org {
     }
 }
 
-#[route(GET "/admin/revenue")]
+#[route(GET "/admin/revenue", public)]
 fn revenue(
     tx: &mut Tx,
     cap: &charpente::CrossTenant,

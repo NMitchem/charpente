@@ -11,13 +11,13 @@ use charpente::auth::Principal;
 use charpente::http::{ApiError, Ctx};
 use charpente::{Id, Scoped, ScopedTx, Tenant, Tx, table};
 
-#[table]
+#[table(global)]
 struct OrgA {
     id: Id<OrgA>,
     name: String,
 }
 
-#[table]
+#[table(global)]
 struct OrgB {
     id: Id<OrgB>,
     name: String,

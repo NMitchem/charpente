@@ -31,7 +31,7 @@ point, one log.
 ## What it looks like
 
 ```rust
-#[table]
+#[table(global)]
 struct Invoice {
     id: Id<Invoice>,
     org: Id<Org>,
@@ -39,7 +39,7 @@ struct Invoice {
     state: InvoiceState,
 }
 
-#[route(POST "/invoices/:id/finalize")]
+#[route(POST "/invoices/:id/finalize", public)]
 fn finalize(tx: &mut Tx, id: Id<Invoice>) -> Result<Invoice, ApiError> {
     let mut inv = tx.get(id)?.ok_or(ApiError::NotFound)?; // typed row, no SQL string
     inv.state = InvoiceState::Final;

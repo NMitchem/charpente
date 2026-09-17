@@ -9,13 +9,13 @@ use charpente::auth::Principal;
 use charpente::http::{ApiError, Ctx};
 use charpente::{Id, Scoped, Tenant, Tx, View, table};
 
-#[table]
+#[table(global)]
 struct Org {
     id: Id<Org>,
     name: String,
 }
 
-#[table]
+#[table(global)]
 struct Region {
     id: Id<Region>,
     name: String,

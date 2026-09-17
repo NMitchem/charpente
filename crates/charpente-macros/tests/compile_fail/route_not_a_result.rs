@@ -5,7 +5,7 @@
 //! directly, which hits `result_arg`'s `seg.ident != "Result"` branch.
 use charpente::route;
 
-#[route(GET "/x")]
+#[route(GET "/x", public)]
 fn handler(tx: &mut charpente::Tx) -> String {
     let _ = tx;
     String::new()

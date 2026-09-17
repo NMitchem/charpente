@@ -1,5 +1,5 @@
 error: a route flag is `auth`, `public`, `cross_tenant` or `emits(Ev, …)` — write `#[route(GET "/path", auth)]`, `#[route(GET "/path", public)]`, or `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`
-  --> tests/compile_fail/route_unknown_flag.rs:11:19
+  --> tests/compile_fail/route_unknown_flag.rs:11:27
    |
-11 | #[route(GET "/x", cached)]
-   |                   ^^^^^^
+11 | #[route(GET "/x", public, cached)]
+   |                           ^^^^^^

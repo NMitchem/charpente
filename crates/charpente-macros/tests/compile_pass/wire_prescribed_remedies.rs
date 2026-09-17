@@ -7,7 +7,7 @@
 use charpente::wire::{Wire, WireI64, WireU64};
 use charpente::{Id, table};
 
-#[table]
+#[table(global)]
 struct SomeRow {
     id: Id<SomeRow>,
 }

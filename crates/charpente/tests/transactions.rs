@@ -16,13 +16,13 @@ use charpente_core::log::{Wal, WalConfig};
 use charpente_core::table::{Codec, Id, Row, Snapshot, Store};
 use charpente_sim::{FaultConfig, Sim, run_universes_swarm};
 
-#[table]
+#[table(global)]
 struct Org {
     id: Id<Org>,
     name: String,
 }
 
-#[table]
+#[table(global)]
 struct Invoice {
     id: Id<Invoice>,
     #[index]
@@ -283,7 +283,7 @@ fn duplicate_schema_registration_is_a_contract_violation() {
     let _ = Schema::new().table::<Invoice>().table::<Invoice>();
 }
 
-#[table]
+#[table(global)]
 struct Blob {
     id: Id<Blob>,
     data: Vec<u8>,
@@ -340,7 +340,7 @@ fn empty_idempotency_key_is_a_contract_violation() {
 
 // ---------------------------------------------------- crash property
 
-#[table]
+#[table(global)]
 struct Account {
     id: Id<Account>,
     #[index]
@@ -348,7 +348,7 @@ struct Account {
     balance: i64,
 }
 
-#[table]
+#[table(global)]
 struct EntryRow {
     id: Id<EntryRow>,
     account: Id<Account>,

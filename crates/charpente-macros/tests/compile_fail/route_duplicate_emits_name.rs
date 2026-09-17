@@ -17,7 +17,7 @@ struct NoteAdded {
     n: WireU64,
 }
 
-#[route(SSE "/x", emits(NoteAdded, NoteAdded))]
+#[route(SSE "/x", public, emits(NoteAdded, NoteAdded))]
 fn handler(
     tx: &mut charpente::Tx,
     ctx: &charpente::http::Ctx,

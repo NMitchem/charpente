@@ -7,7 +7,7 @@
 use charpente::kernel::JobError;
 use charpente::{Id, Tx, View, event, job, table};
 
-#[table]
+#[table(global)]
 pub struct FixtureCounter {
     pub id: Id<FixtureCounter>,
     pub hits: u64,

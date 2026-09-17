@@ -1,6 +1,6 @@
 use charpente::{Id, table};
 
-#[table]
+#[table(global)]
 struct Org {
     id: Id<Org>,
     name: String,

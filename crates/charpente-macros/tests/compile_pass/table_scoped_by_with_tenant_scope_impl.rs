@@ -6,7 +6,7 @@ use charpente::auth::Principal;
 use charpente::http::ApiError;
 use charpente::{Id, Tenant, Tx, table};
 
-#[table]
+#[table(global)]
 struct Org {
     id: Id<Org>,
     name: String,

@@ -9,7 +9,7 @@ use charpente_core::db::{Db, Group, Tx, TxError};
 use charpente_core::table::{Id, View};
 use charpente_macros::table;
 
-#[table]
+#[table(global)]
 pub struct CronRow {
     pub id: Id<CronRow>,
     #[index]

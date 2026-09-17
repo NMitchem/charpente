@@ -7,12 +7,12 @@
 use charpente::core::table::Id;
 use charpente::{Tx, route, table};
 
-#[table]
+#[table(global)]
 struct Thing {
     id: Id<Thing>,
 }
 
-#[route(GET "/things/:id")]
+#[route(GET "/things/:id", public)]
 fn handler(tx: &mut Tx, id: Id<Thing>) -> Result<(), charpente::http::ApiError> {
     let _ = (tx, id);
     Ok(())

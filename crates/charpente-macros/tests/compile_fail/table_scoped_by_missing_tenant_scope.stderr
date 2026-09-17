@@ -7,8 +7,8 @@ error[E0277]: `Org` is used as a tenant scope but has no `Tenant` impl
 help: the trait `TenantScope` is not implemented for `Org`
  --> tests/compile_fail/table_scoped_by_missing_tenant_scope.rs:3:1
   |
-3 | #[table]
-  | ^^^^^^^^
+3 | #[table(global)]
+  | ^^^^^^^^^^^^^^^^
   = note: a scoped table needs the app's own membership check; add:
           impl Tenant for Org {
               type Who = Principal;

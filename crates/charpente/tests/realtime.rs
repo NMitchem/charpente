@@ -55,7 +55,7 @@ struct EmitBody {
     key: Option<String>,
 }
 
-#[route(POST "/ping")]
+#[route(POST "/ping", public)]
 fn emit_ping(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
     match body.key {
         Some(key) => tx.emit_keyed(key, Ping { n: body.n }),
@@ -64,7 +64,7 @@ fn emit_ping(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
     Ok(())
 }
 
-#[route(POST "/pong")]
+#[route(POST "/pong", public)]
 fn emit_pong(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
     match body.key {
         Some(key) => tx.emit_keyed(key, Pong { n: body.n }),
@@ -77,13 +77,13 @@ fn emit_pong(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
 /// key filter branches, not just "everything, unfiltered" (T5 left both
 /// unexercised) — one mode, deterministically chosen per universe from the
 /// seed, drives every (re)subscribe within that universe.
-#[route(SSE "/feed-both", emits(Ping, Pong))]
+#[route(SSE "/feed-both", public, emits(Ping, Pong))]
 fn feed_both(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<Ping>().and::<Pong>().cursor(cursor))
 }
 
-#[route(SSE "/feed-ping", emits(Ping))]
+#[route(SSE "/feed-ping", public, emits(Ping))]
 fn feed_ping(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<Ping>().cursor(cursor))
@@ -93,7 +93,7 @@ fn feed_ping(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscript
 /// pass `.key(...)` — the key is a per-emit call-site value the contract
 /// cannot know (same reason `EventInfo.keyed` is always false), so a keyed
 /// feed declares the same two types the unkeyed one does.
-#[route(SSE "/feed-keyed", emits(Ping, Pong))]
+#[route(SSE "/feed-keyed", public, emits(Ping, Pong))]
 fn feed_keyed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<Ping>()
@@ -1562,7 +1562,7 @@ struct NoteBody {
     n: WireU64,
 }
 
-#[route(POST "/note")]
+#[route(POST "/note", public)]
 fn emit_note(tx: &mut Tx, body: NoteBody) -> Result<(), ApiError> {
     tx.emit(NoteAdded { n: body.n });
     Ok(())
@@ -2731,7 +2731,7 @@ fn every_stream_routes_declared_emits_matches_its_subscription() {
 /// parameter (`Id<R>`'s `Wire` impl is bounded on `R: Row`); nothing reads the
 /// table and it is not registered in any `Schema`. A scope type owes nothing
 /// but `authorize`.
-#[table]
+#[table(global)]
 struct Org {
     id: Id<Org>,
     name: String,
@@ -2757,7 +2757,7 @@ struct ScopedEmitBody {
 
 /// The shape spec §1 prescribes: one `scope()` line, and every effect below it
 /// — reads, writes, and now emits — bounded to that tenant.
-#[route(POST "/scoped-ping")]
+#[route(POST "/scoped-ping", public)]
 fn emit_scoped_ping(tx: &mut Tx, body: ScopedEmitBody, ctx: &Ctx) -> Result<(), ApiError> {
     let mut tx = tx.scope::<Org>(Id::from_raw(body.org.0), ctx)?;
     tx.emit(Ping { n: body.n });
@@ -2767,7 +2767,7 @@ fn emit_scoped_ping(tx: &mut Tx, body: ScopedEmitBody, ctx: &Ctx) -> Result<(), 
 /// The subscriber half of the same mechanism: opening the scope both runs the
 /// app's `authorize` for the subscriber and yields the very key the emitter
 /// used, so the two sides cannot drift into two encodings.
-#[route(SSE "/scoped-feed/:org", emits(Ping))]
+#[route(SSE "/scoped-feed/:org", public, emits(Ping))]
 fn scoped_feed(
     tx: &mut Tx,
     org: Id<Org>,
@@ -2787,7 +2787,7 @@ fn scoped_feed(
 /// is not cosmetic: the key is DURABLE (`EventRow.key`), replicated, and
 /// exact-matched on resume, so a changed encoding makes every pre-upgrade
 /// backlog event invisible to a reconnecting subscriber.
-#[route(SSE "/literal-feed/:key", emits(Ping))]
+#[route(SSE "/literal-feed/:key", public, emits(Ping))]
 fn literal_feed(
     tx: &mut Tx,
     key: String,
@@ -2993,7 +2993,7 @@ fn scoped_key_oracle(
 /// returning a constant produces, and it is the direction that LEAKS: the
 /// unkeyed `(*tx).emit(…)` naive fix fails closed instead (Task 11's commit
 /// message), so it is not the interesting victim.
-#[route(POST "/leaky-ping")]
+#[route(POST "/leaky-ping", public)]
 fn emit_leaky_ping(tx: &mut Tx, body: ScopedEmitBody, ctx: &Ctx) -> Result<(), ApiError> {
     let mut tx = tx.scope::<Org>(Id::from_raw(body.org.0), ctx)?;
     tx.emit_keyed(SCOPED_TENANT_A_KEY.to_string(), Ping { n: body.n });

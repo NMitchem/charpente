@@ -1,5 +1,5 @@
 error: `NoteAdded` is named twice in emits(...) — a stream declares each event type once, and a repeat would put the same member in a generated client's union twice; write it once
-  --> tests/compile_fail/route_duplicate_emits_name.rs:20:36
+  --> tests/compile_fail/route_duplicate_emits_name.rs:20:44
    |
-20 | #[route(SSE "/x", emits(NoteAdded, NoteAdded))]
-   |                                    ^^^^^^^^^
+20 | #[route(SSE "/x", public, emits(NoteAdded, NoteAdded))]
+   |                                            ^^^^^^^^^

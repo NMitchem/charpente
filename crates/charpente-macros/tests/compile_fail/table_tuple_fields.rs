@@ -1,6 +1,6 @@
 use charpente::table;
 
-#[table]
+#[table(global)]
 struct W(u64);
 
 fn main() {}

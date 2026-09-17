@@ -17,7 +17,7 @@ struct NoteAdded {
     n: WireU64,
 }
 
-#[route(GET "/x", emits(NoteAdded))]
+#[route(GET "/x", public, emits(NoteAdded))]
 fn handler(tx: &mut charpente::Tx) -> Result<(), charpente::http::ApiError> {
     let _ = tx;
     Ok(())

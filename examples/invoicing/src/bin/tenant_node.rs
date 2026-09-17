@@ -51,7 +51,7 @@ const USAGE: &str = "usage: tenant_node --addr A --data-dir D [--legacy-unscoped
 /// The scope type. A `#[table]` so `Id<Org>` can be a path parameter
 /// (`Id<R>`'s `Wire` impl is bounded on `R: Row`); no `Org` row is ever
 /// written — a scope type owes nothing but `authorize`.
-#[table]
+#[table(global)]
 struct Org {
     id: Id<Org>,
     name: String,
@@ -91,7 +91,7 @@ struct Doc {
 mod legacy {
     use charpente::{Id, table};
 
-    #[table]
+    #[table(global)]
     pub struct Doc {
         pub id: Id<Doc>,
         #[index]
@@ -134,7 +134,7 @@ impl From<Doc> for DocView {
     }
 }
 
-#[route(POST "/login")]
+#[route(POST "/login", public)]
 fn login(tx: &mut Tx, subject: String, ctx: &Ctx) -> Result<String, ApiError> {
     Ok(ctx.create_session(tx, subject))
 }
@@ -205,7 +205,7 @@ fn feed(
 /// tenant anywhere in the question — which is the point. An older follower
 /// that MISREAD a scoped record instead of refusing it would answer this with
 /// a row; refusing means it stays empty.
-#[route(GET "/legacy/docs")]
+#[route(GET "/legacy/docs", public)]
 fn legacy_list_docs(tx: &mut Tx) -> Result<Vec<String>, ApiError> {
     Ok(tx
         .scan::<legacy::Doc>()?

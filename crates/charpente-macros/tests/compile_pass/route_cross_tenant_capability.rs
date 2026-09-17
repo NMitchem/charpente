@@ -11,7 +11,7 @@ use charpente::http::ApiError;
 use charpente::wire::WireU64;
 use charpente::{CrossTenant, Id, Tenant, Tx, route, table};
 
-#[table]
+#[table(global)]
 struct Org {
     id: Id<Org>,
     name: String,

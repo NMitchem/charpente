@@ -17,7 +17,7 @@ use rsa::{BigUint, Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[table]
+#[table(global)]
 struct Note {
     id: Id<Note>,
     #[index]
@@ -31,7 +31,7 @@ struct CreateNote {
     text: String,
 }
 
-#[route(POST "/notes")]
+#[route(POST "/notes", public)]
 fn create_note(tx: &mut Tx, body: CreateNote, ctx: &Ctx) -> Result<Id<Note>, ApiError> {
     let owner = ctx
         .session()
@@ -45,13 +45,13 @@ fn create_note(tx: &mut Tx, body: CreateNote, ctx: &Ctx) -> Result<Id<Note>, Api
     Ok(body.id)
 }
 
-#[route(GET "/notes/:id")]
+#[route(GET "/notes/:id", public)]
 fn get_note(tx: &mut Tx, id: Id<Note>) -> Result<String, ApiError> {
     use charpente_core::table::View;
     Ok(tx.get(id)?.ok_or(ApiError::NotFound)?.text)
 }
 
-#[route(POST "/login")]
+#[route(POST "/login", public)]
 fn login(tx: &mut Tx, subject: String, ctx: &Ctx) -> Result<String, ApiError> {
     Ok(ctx.create_session(tx, subject))
 }
@@ -91,7 +91,7 @@ fn revoke_key(tx: &mut Tx, id: Id<ApiKey>, ctx: &Ctx) -> Result<&'static str, Ap
 
 /// Test-only route driving the one-mint-per-request assert: a handler that
 /// calls both mints in the same request.
-#[route(POST "/double-mint")]
+#[route(POST "/double-mint", public)]
 fn double_mint(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
     let _ = ctx.create_session(tx, "x");
     Ok(ctx.create_api_key(tx, "x"))
@@ -1040,7 +1040,7 @@ struct NoteAdded {
     note: WireU64,
 }
 
-#[route(SSE "/feed")]
+#[route(SSE "/feed", public)]
 fn feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<NoteAdded>().cursor(cursor))
@@ -1115,7 +1115,7 @@ use charpente_core::log::WalConfig;
 use charpente_core::table::{Codec, View};
 use charpente_sim::run_universes_swarm;
 
-#[table]
+#[table(global)]
 struct Item {
     id: Id<Item>,
     content: u64,
@@ -1145,7 +1145,7 @@ impl Job for Ping {
     const NAME: &'static str = "ping";
 }
 
-#[route(POST "/items")]
+#[route(POST "/items", public)]
 fn put_item(tx: &mut Tx, body: PutItem) -> Result<WireU64, ApiError> {
     tx.put(&Item {
         id: Id::from_raw(body.i.0),

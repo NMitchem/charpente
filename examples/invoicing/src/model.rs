@@ -16,7 +16,7 @@ use charpente::core::table::Codec;
 use charpente::{Id, Tx, View, row_shape, table};
 use std::io;
 
-#[table]
+#[table(global)]
 pub struct Customer {
     pub id: Id<Customer>,
     pub name: String,
@@ -64,7 +64,7 @@ pub struct InvoiceV1 {
 
 /// Bumping to `version = 2` without the `TableMigration` impl below is a
 /// compile error — the macro emits an assert-impl const.
-#[table(version = 2)]
+#[table(version = 2, global)]
 pub struct Invoice {
     pub id: Id<Invoice>,
     #[index]
@@ -91,7 +91,7 @@ impl TableMigration for Invoice {
     }
 }
 
-#[table]
+#[table(global)]
 pub struct LineItem {
     pub id: Id<LineItem>,
     #[index]
@@ -101,7 +101,7 @@ pub struct LineItem {
     pub quantity: i64,
 }
 
-#[table]
+#[table(global)]
 pub struct Receipt {
     pub id: Id<Receipt>,
     #[index]
@@ -110,7 +110,7 @@ pub struct Receipt {
     pub issued_day: u64,
 }
 
-#[table]
+#[table(global)]
 pub struct Reminder {
     pub id: Id<Reminder>,
     #[index]
@@ -120,7 +120,7 @@ pub struct Reminder {
 
 /// Singleton row (fixed id 0): the app's own day counter, advanced only by
 /// `AdvanceDay` (jobs.rs), once per daily cron tick.
-#[table]
+#[table(global)]
 pub struct AppClock {
     pub id: Id<AppClock>,
     pub day: u64,
@@ -134,7 +134,7 @@ pub const APP_CLOCK_ID: u64 = 0;
 /// FINDINGS.md); this mirrors the platform's own internal `next_job_id`
 /// counter pattern (CLAUDE.md, M0 step 6) rather than bit-packing ids out of
 /// a caller-supplied invoice id, which is unbounded and would risk collisions.
-#[table]
+#[table(global)]
 pub struct IdCounter {
     pub id: Id<IdCounter>,
     pub next: u64,

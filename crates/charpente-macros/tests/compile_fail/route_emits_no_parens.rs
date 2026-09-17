@@ -11,7 +11,7 @@
 // warnings in the pinned .stderr.
 use charpente::route;
 
-#[route(SSE "/x", emits)]
+#[route(SSE "/x", public, emits)]
 fn handler(
     tx: &mut charpente::Tx,
     ctx: &charpente::http::Ctx,

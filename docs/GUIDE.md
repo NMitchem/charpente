@@ -165,7 +165,7 @@ use charpente::{Id, View, table};
 
 struct Org; // referenced only through its typed id below
 
-#[table]
+#[table(global)]
 struct Invoice {
     id: Id<Invoice>,
     #[index]
@@ -233,7 +233,7 @@ impl Codec for InvoiceState {
     }
 }
 
-#[table]
+#[table(global)]
 struct Invoice {
     id: Id<Invoice>,
     #[index]
@@ -275,7 +275,7 @@ without writing anything at all).
 use charpente::{Id, Tx, View, table};
 use std::io;
 
-#[table]
+#[table(global)]
 struct IdCounter {
     id: Id<IdCounter>,
     next: u64,
@@ -309,37 +309,37 @@ and the fix:
 
 ```rust,ignore
 // no `id` field at all
-#[table]
+#[table(global)]
 struct Ping { hits: u64 }
 // "missing `id: Id<Ping>` field — every #[table] row needs a typed primary
 //  key (add `id: Id<Ping>`)"
 
 // `id` isn't `Id<Self>`
-#[table]
+#[table(global)]
 struct Ping { id: u64, hits: u64 }
 // "the `id` field of a #[table] must be `Id<Ping>` — a typed id, never a
 //  bare integer"
 
 // `#[index]` on the primary key
-#[table]
+#[table(global)]
 struct Ping { #[index] id: Id<Ping>, hits: u64 }
 // "`id` is the primary key — it is already the fastest lookup; remove
 //  #[index]"
 
 // not a braced struct with named fields (tuple structs and unit structs
 // both hit this)
-#[table]
+#[table(global)]
 struct Ping(u64);
 // "#[table] needs named fields — `Ping` must be a braced struct with an
 //  `id: Id<Ping>` field"
 
 // enums and unions cannot be rows
-#[table]
+#[table(global)]
 enum Ping { A, B }
 // "#[table] applies to structs — enums and unions cannot be rows"
 
 // generic structs — a table is one concrete row shape
-#[table]
+#[table(global)]
 struct Ping<T> { id: Id<Ping<T>>, data: T }
 // "#[table] structs cannot be generic — a table is one concrete row shape;
 //  make `Ping` non-generic"
@@ -366,7 +366,7 @@ rows and maintain indexes:
 use charpente::prod::ProdDisk;
 use charpente::{Db, DbConfig, Id, Schema, table};
 
-#[table]
+#[table(global)]
 struct Counter {
     id: Id<Counter>,
     hits: u64,
@@ -465,7 +465,7 @@ use charpente::core::table::Codec;
 use charpente::{Db, Id, Job, Tx, TxError, View, event, table};
 use std::io;
 
-#[table]
+#[table(global)]
 struct Invoice {
     id: Id<Invoice>,
     amount_cents: i64,
@@ -671,7 +671,7 @@ use charpente::prod::{ProdDisk, ProdEntropy};
 use charpente::{Schema, Tx, View, Wire, route, routes, table};
 use serde::Deserialize;
 
-#[table]
+#[table(global)]
 struct Note {
     id: Id<Note>,
     text: String,
@@ -686,7 +686,7 @@ struct NoteBody {
 
 // tx, then :id (named `id`, path order), then the JSON body, then `ctx`. A
 // path param is a wire position too, so it is `Id<Note>`, not a bare `u64`.
-#[route(POST "/notes/:id")]
+#[route(POST "/notes/:id", public)]
 fn create_note(tx: &mut Tx, id: Id<Note>, body: NoteBody, ctx: &Ctx) -> Result<Id<Note>, ApiError> {
     let _ = ctx; // available; this route just doesn't need a session
     tx.put(&Note {
@@ -696,7 +696,7 @@ fn create_note(tx: &mut Tx, id: Id<Note>, body: NoteBody, ctx: &Ctx) -> Result<I
     Ok(id)
 }
 
-#[route(GET "/notes/:id")]
+#[route(GET "/notes/:id", public)]
 fn get_note(tx: &mut Tx, id: Id<Note>) -> Result<String, ApiError> {
     Ok(tx.get(id)?.ok_or(ApiError::NotFound)?.text)
 }
@@ -744,7 +744,7 @@ use charpente::prod::{ProdDisk, ProdEntropy};
 use charpente::{Id, Schema, Tx, View, Wire, route, routes, table};
 use serde::Serialize;
 
-#[table]
+#[table(global)]
 struct Note {
     id: Id<Note>,
     text: String,
@@ -768,7 +768,7 @@ impl From<Note> for NoteView {
     }
 }
 
-#[route(GET "/notes/:id")]
+#[route(GET "/notes/:id", public)]
 fn get_note(tx: &mut Tx, id: Id<Note>) -> Result<NoteView, ApiError> {
     Ok(tx.get(id)?.ok_or(ApiError::NotFound)?.into())
 }
@@ -800,19 +800,19 @@ sequence of literal-vs-`:param` segments, so both could match one real path
 use charpente::http::{ApiError, App};
 use charpente::{Id, Tx, route, routes, table};
 
-#[table]
+#[table(global)]
 struct Note {
     id: Id<Note>,
 }
 
 // A path param is a wire position too — `Id<Note>`, not a bare `u64`.
-#[route(GET "/notes/:id")]
+#[route(GET "/notes/:id", public)]
 fn by_id(tx: &mut Tx, id: Id<Note>) -> Result<Id<Note>, ApiError> {
     let _ = tx;
     Ok(id)
 }
 
-#[route(GET "/notes/:key")]
+#[route(GET "/notes/:key", public)]
 fn by_key(tx: &mut Tx, key: String) -> Result<String, ApiError> {
     let _ = tx;
     Ok(key)
@@ -915,7 +915,7 @@ use charpente::http::{ApiError, App, AppConfig, Ctx};
 use charpente::prod::{ProdDisk, ProdEntropy};
 use charpente::{Id, Schema, Tx, route, routes};
 
-#[route(POST "/login")]
+#[route(POST "/login", public)]
 fn login(tx: &mut Tx, subject: String, ctx: &Ctx) -> Result<String, ApiError> {
     Ok(ctx.create_session(tx, subject))
 }
@@ -1153,7 +1153,7 @@ use charpente::prod::{ProdDisk, ProdEntropy};
 use charpente::{Schema, Tx, View, Wire, route, routes, table};
 use serde::Deserialize;
 
-#[table]
+#[table(global)]
 struct Note {
     id: Id<Note>,
     text: String,
@@ -1164,7 +1164,7 @@ struct NoteBody {
     text: String,
 }
 
-#[route(POST "/notes/:id")]
+#[route(POST "/notes/:id", public)]
 fn create_note(tx: &mut Tx, id: Id<Note>, body: NoteBody) -> Result<Id<Note>, ApiError> {
     tx.put(&Note {
         id,
@@ -1173,7 +1173,7 @@ fn create_note(tx: &mut Tx, id: Id<Note>, body: NoteBody) -> Result<Id<Note>, Ap
     Ok(id)
 }
 
-#[route(GET "/notes/:id")]
+#[route(GET "/notes/:id", public)]
 fn get_note(tx: &mut Tx, id: Id<Note>) -> Result<String, ApiError> {
     Ok(tx.get(id)?.ok_or(ApiError::NotFound)?.text)
 }
@@ -1203,7 +1203,7 @@ Every rejection is a compile error naming the contract and the fix:
 
 ```rust,ignore
 // first argument isn't named `tx`
-#[route(GET "/ping")]
+#[route(GET "/ping", public)]
 fn ping(ctx: &Ctx) -> Result<&'static str, ApiError> {
     Ok("pong")
 }
@@ -1211,7 +1211,7 @@ fn ping(ctx: &Ctx) -> Result<&'static str, ApiError> {
 //  missing it"
 
 // argument count doesn't match the :param count
-#[route(GET "/notes/:id")]
+#[route(GET "/notes/:id", public)]
 fn get_note(tx: &mut Tx) -> Result<String, ApiError> {
     Ok(String::new())
 }
@@ -1220,7 +1220,7 @@ fn get_note(tx: &mut Tx) -> Result<String, ApiError> {
 //  name, path order) plus at most one JSON body argument"
 
 // argument name doesn't match the :param name
-#[route(GET "/notes/:id")]
+#[route(GET "/notes/:id", public)]
 fn get_note(tx: &mut Tx, key: u64) -> Result<String, ApiError> {
     Ok(String::new())
 }
@@ -1290,7 +1290,7 @@ use charpente::core::table::Id;
 use charpente::kernel::JobError;
 use charpente::{Tx, View, job, table};
 
-#[table]
+#[table(global)]
 struct Counter {
     id: Id<Counter>,
     hits: u64,
@@ -1326,7 +1326,7 @@ use charpente::kernel::JobError;
 use charpente::prod::{ProdDisk, ProdEntropy};
 use charpente::{Schema, Tx, View, job, jobs, table};
 
-#[table]
+#[table(global)]
 struct Counter {
     id: Id<Counter>,
     hits: u64,
@@ -1387,7 +1387,7 @@ use charpente::http::ApiError;
 use charpente::kernel::JobError;
 use charpente::{Tx, View, job, route, table};
 
-#[table]
+#[table(global)]
 struct Invoice {
     id: Id<Invoice>,
     finalized: bool,
@@ -1404,7 +1404,7 @@ impl SendReminder {
     }
 }
 
-#[route(POST "/invoices/:id/remind")]
+#[route(POST "/invoices/:id/remind", public)]
 fn remind(tx: &mut Tx, id: Id<Invoice>) -> Result<(), ApiError> {
     let mut inv = tx.get(id)?.ok_or(ApiError::NotFound)?;
     inv.finalized = true;
@@ -1502,7 +1502,7 @@ use charpente::prod::{ProdDisk, ProdEntropy};
 use charpente::{Schema, Tx, View, job, jobs, table};
 use std::time::Duration;
 
-#[table]
+#[table(global)]
 struct DigestState {
     id: Id<DigestState>,
     sent: u64,
@@ -1633,7 +1633,7 @@ use std::time::Duration;
 
 /// Singleton row (fixed id 0): the app's own day counter. Nothing but
 /// `AdvanceDay::run` ever writes it, and it only ever adds one.
-#[table]
+#[table(global)]
 struct AppClock {
     id: Id<AppClock>,
     day: u64,
@@ -1694,13 +1694,13 @@ use charpente::{Schema, Tx, View, Wire, job, jobs, route, routes, table};
 use serde::Deserialize;
 use std::time::Duration;
 
-#[table]
+#[table(global)]
 struct Note {
     id: Id<Note>,
     text: String,
 }
 
-#[table]
+#[table(global)]
 struct DigestState {
     id: Id<DigestState>,
     sent: u64,
@@ -1725,7 +1725,7 @@ impl SendDigest {
     }
 }
 
-#[route(POST "/notes/:id")]
+#[route(POST "/notes/:id", public)]
 fn create_note(tx: &mut Tx, id: Id<Note>, body: NoteBody, ctx: &Ctx) -> Result<Id<Note>, ApiError> {
     let _ = ctx;
     tx.put(&Note {
@@ -1735,7 +1735,7 @@ fn create_note(tx: &mut Tx, id: Id<Note>, body: NoteBody, ctx: &Ctx) -> Result<I
     Ok(id)
 }
 
-#[route(GET "/notes/:id")]
+#[route(GET "/notes/:id", public)]
 fn get_note(tx: &mut Tx, id: Id<Note>) -> Result<String, ApiError> {
     Ok(tx.get(id)?.ok_or(ApiError::NotFound)?.text)
 }
@@ -1810,7 +1810,7 @@ use charpente::{Db, DbConfig, Id, Schema, View, table};
 use charpente_sim::Sim;
 use charpente_sim::checks::{is_fault_fallout, replays_identically};
 
-#[table]
+#[table(global)]
 struct Counter {
     id: Id<Counter>,
     hits: u64,
@@ -1897,7 +1897,7 @@ use charpente::{Db, DbConfig, Id, Schema, table};
 use charpente_sim::Sim;
 use charpente_sim::checks::is_fault_fallout;
 
-#[table]
+#[table(global)]
 struct Counter {
     id: Id<Counter>,
     hits: u64,
@@ -2182,7 +2182,7 @@ use std::time::Duration;
 
 const SEC: u64 = 1_000_000_000; // SimSource timestamps are virtual nanoseconds
 
-#[table]
+#[table(global)]
 struct Counter {
     id: Id<Counter>,
     hits: u64,
@@ -2213,7 +2213,7 @@ struct HitBody {
     slot: WireU64,
 }
 
-#[route(POST "/hit")]
+#[route(POST "/hit", public)]
 fn hit(tx: &mut Tx, body: HitBody) -> Result<WireU64, ApiError> {
     tx.enqueue(CountUp { slot: body.slot.0 });
     Ok(body.slot)
@@ -3324,7 +3324,7 @@ The subscriber side uses the same `event_key`, so the two sides cannot drift
 into two spellings of one tenant:
 
 ```rust,ignore
-#[route(SSE "/feed/:org", emits(NoteAdded))]
+#[route(SSE "/feed/:org", public, emits(NoteAdded))]
 fn feed(tx: &mut Tx, org: Id<Org>, ctx: &Ctx, cursor: Option<Cursor>)
     -> Result<Subscription, ApiError>
 {
@@ -3390,7 +3390,7 @@ struct PingBody {
     n: WireU64,
 }
 
-#[route(POST "/ping")]
+#[route(POST "/ping", public)]
 fn send_ping(tx: &mut Tx, body: PingBody) -> Result<(), ApiError> {
     tx.emit(Ping { n: body.n });
     Ok(())
@@ -3402,7 +3402,7 @@ fn send_ping(tx: &mut Tx, body: PingBody) -> Result<(), ApiError> {
 ///
 /// `emits(Ping)` declares what this stream carries, for the contract and the
 /// generated client — see "Declaring what a stream carries" below.
-#[route(SSE "/feed", emits(Ping))]
+#[route(SSE "/feed", public, emits(Ping))]
 fn feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<Ping>().cursor(cursor))
@@ -3443,7 +3443,7 @@ would otherwise have to offer "subscribe to anything". A stream route says so on
 attribute instead:
 
 ```rust,ignore
-#[route(SSE "/feed", emits(Ping, Pong))]
+#[route(SSE "/feed", public, emits(Ping, Pong))]
 ```
 
 The names inside `emits(...)` are the `#[event]` TYPES, exactly like `Subscription::of`
@@ -3640,13 +3640,13 @@ struct PingBody {
     n: WireU64,
 }
 
-#[route(POST "/ping")]
+#[route(POST "/ping", public)]
 fn send_ping(tx: &mut Tx, body: PingBody) -> Result<(), ApiError> {
     tx.emit(Ping { n: body.n });
     Ok(())
 }
 
-#[route(SSE "/feed", emits(Ping))]
+#[route(SSE "/feed", public, emits(Ping))]
 fn feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
     let _ = (tx, ctx);
     Ok(Subscription::of::<Ping>().cursor(cursor))
@@ -3756,7 +3756,7 @@ Start from an ordinary version-1 table:
 ```rust
 use charpente::{Id, table};
 
-#[table]
+#[table(global)]
 struct Widget {
     id: Id<Widget>,
     count: u32,
@@ -3781,7 +3781,7 @@ struct WidgetV1 {
 
 /// The current shape. Bumping to `version = 2` without the `TableMigration`
 /// impl below is a compile error — the macro emits an assert-impl const.
-#[table(version = 2)]
+#[table(version = 2, global)]
 struct Widget {
     id: Id<Widget>,
     count: u32,
@@ -3901,7 +3901,7 @@ use charpente::http::{ApiError, App, AppConfig};
 use charpente::{Schema, Tx, View, Wire, route, routes, table};
 use serde::Deserialize;
 
-#[table]
+#[table(global)]
 struct Note {
     id: Id<Note>,
     text: String,
@@ -3912,7 +3912,7 @@ struct NoteBody {
     text: String,
 }
 
-#[route(POST "/notes/:id")]
+#[route(POST "/notes/:id", public)]
 fn create_note(tx: &mut Tx, id: Id<Note>, body: NoteBody) -> Result<Id<Note>, ApiError> {
     tx.put(&Note {
         id,
@@ -5303,7 +5303,7 @@ use charpente::{Id, Scoped, Tenant, Tx, route, table};
 /// here only so `Id<Org>` can appear as a route path parameter (`Id<T>`'s wire
 /// impl is bounded on `T: Row`); a scope that never crosses the wire can be a
 /// bare marker struct instead.
-#[table]
+#[table(global)]
 struct Org {
     id: Id<Org>,
     name: String,
@@ -5494,7 +5494,7 @@ use charpente::kernel::JobError;
 use charpente::wire::WireU64;
 use charpente::{CrossTenant, Id, Tenant, Tx, job, route, table};
 
-#[table]
+#[table(global)]
 struct Org {
     id: Id<Org>,
     name: String,

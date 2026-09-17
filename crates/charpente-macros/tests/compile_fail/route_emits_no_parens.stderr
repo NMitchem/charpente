@@ -1,5 +1,5 @@
 error: emits takes a parenthesized list of #[event] types — write `emits(NoteAdded, NoteRemoved)`
-  --> tests/compile_fail/route_emits_no_parens.rs:14:19
+  --> tests/compile_fail/route_emits_no_parens.rs:14:27
    |
-14 | #[route(SSE "/x", emits)]
-   |                   ^^^^^
+14 | #[route(SSE "/x", public, emits)]
+   |                           ^^^^^

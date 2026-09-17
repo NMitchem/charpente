@@ -234,7 +234,7 @@ fn the_64_bit_carriers_encode_exactly_as_their_inner_integer() {
     assert_eq!(WireI64::decode(&mut &plain[..]).unwrap(), WireI64(-42));
 }
 
-#[table]
+#[table(global)]
 struct WireTestRow {
     id: Id<WireTestRow>,
 }
