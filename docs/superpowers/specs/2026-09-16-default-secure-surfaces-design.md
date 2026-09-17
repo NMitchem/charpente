@@ -172,8 +172,9 @@ ledger is the record.
 | `table_duplicate_global.rs` | the given-twice refusal |
 | `table_bare.rs` | the empty-argument-list path — a bare `#[table]` (added in review round 1) |
 
-The two helpdesk fixtures pin the first message of each surface with real code; the four
-minimal ones pin the other two states. trybuild's `compile_fail` is two-sided by
+The two helpdesk fixtures pin the first message of each surface with real code; the five
+minimal ones pin the other three states — one-or-the-other, given-twice, and the bare
+attribute. trybuild's `compile_fail` is two-sided by
 construction: a mutant that drops either refusal makes a fixture compile, and that is a
 test failure, not a silent pass.
 
