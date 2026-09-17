@@ -1,7 +1,8 @@
 // The helpdesk oracle, Critical 2 (docs/experiments/2026-09-helpdesk/README.md;
 // default-secure spec §5). The declaration the cross-tenant existence oracle
 // cascades from: `Ticket`, quoted from `8913038:examples/helpdesk/src/lib.rs:134-143`
-// with its enum fields reduced to the `Codec` primitives they encode as. It
+// with its enum fields reduced to the `Codec` primitives they encode as, and
+// `pub` and its two `#[index]` attributes dropped. It
 // carries an `org: Id<Org>` and declares no tenancy, so every
 // `tx.get(id)?.is_some()` on it (lib.rs:542) ran unscoped. Once it says
 // `scoped_by = Org`, each of those reads becomes GUIDE §16's E0277 at the

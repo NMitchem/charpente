@@ -1,0 +1,5 @@
+error: `auth` and `public` on one route — a route is one or the other; drop one
+  --> tests/compile_fail/route_public_and_auth.rs:13:27
+   |
+13 | #[route(GET "/x", public, auth)]
+   |                           ^^^^

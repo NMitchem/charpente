@@ -48,6 +48,7 @@ impl Echo {
 
 /// Three effects, one commit: the row, the job and the event all become
 /// true together or not at all. There is no way to split them.
+// `public`: the scaffold has no principals yet — GUIDE §5 (Sessions) is where `auth` starts.
 #[route(POST "/notes/:id", public)]
 fn add_note(tx: &mut Tx, id: Id<Note>, body: NewNote) -> Result<Id<Note>, ApiError> {
     tx.put(&Note {

@@ -1,0 +1,5 @@
+error: the route path must be a string literal — e.g. #[route(GET "/notes/:id", auth)]
+ --> tests/compile_fail/route_path_not_literal.rs:9:13
+  |
+9 | #[route(GET x, auth)]
+  |             ^

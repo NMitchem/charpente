@@ -188,6 +188,10 @@ fn invoices_for_org(view: &impl View, org: Id<Org>) -> std::io::Result<Vec<Invoi
 }
 ```
 
+`global` here because this section is about `#[index]`, not tenancy; a real invoice table
+belongs to its tenant and would say `#[table(scoped_by = Org)]` (§16) — which also retires
+the `org` column, because the scope is the key prefix.
+
 A table can carry any number of `#[index]` fields; each gets its own
 function with this exact shape:
 

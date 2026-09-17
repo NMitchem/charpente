@@ -858,9 +858,10 @@ error, for a table that was never created). `scope` is `table::UNSCOPED` for eve
 an unscoped table; a scoped table's physical redb table is composite-`[u8;16]`-keyed, so
 `scan_raw` and `scan_raw_from` (the migration/archive-export paged read) take `scoped: bool`
 from the caller's own `TableOps.scoped` — the schema's word, never guessed by probing —
-and open that shape. Scoping is opt-in per table and never retrofitted onto an existing one
-(spec §8's non-goal, "Retrofitting existing tables"): a table's physical shape is fixed at
-its first write for the table's whole life, so a `TableTypeMismatch` is always a
+and open that shape. Scoping is declared per table (`scoped_by` or `global`, never inferred
+— spec 2026-09-16-default-secure-surfaces) and never retrofitted onto an existing one (the
+half of the tenant-scoping spec's §8 non-goal that survives): a table's physical shape is
+fixed at its first write for the table's whole life, so a `TableTypeMismatch` is always a
 schema/disk disagreement, never a state to tolerate, and both directions are refused by
 name rather than silently resolved — `scoped = true` over a physically bare table names the
 scope-flip contract and its fix ("create a new scoped table and copy rows through a job");

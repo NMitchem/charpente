@@ -85,21 +85,19 @@ PLAN.md are the roadmap; do not reorder a milestone's dependency sequence.
   `--file`, so a `--file` in any other crate needs `--test-package <that crate>` or the run
   judges its mutants with suites that never exercise them and reports them all MISSED
   (2026-09-16, `charpente-macros`). Exit 0 every viable mutant caught, 1 a finding
-  (**MISSED** = no oracle noticed,
-  i.e. a one-sided property) or an unresolved run (**a timeout is not a catch**), 2 usage,
-  infrastructure, or a baseline that was not green. `--jobs > 1` (flag
-  or `CARGO_MUTANTS_JOBS`) is refused under an inherited `CARGO_TARGET_DIR`: cargo's
-  artifact hash does not vary by mutation content, so parallel jobs sharing one target
-  dir report results that measured nothing. Read the verb's output, never
-  cargo-mutants' own exit code: the raw tool exits **0** when a filter matches nothing
-  and writes no `outcomes.json` at all, and a failed baseline leaves every counter
-  reading zero. The verb consults that exit code in exactly one place — when there is
-  no `outcomes.json` — to tell "matched nothing" (exit 0) from "died before running"
-  (any other exit), and it creates its own `--output` directory, so an exported
-  CARGO_TARGET_DIR no longer needs a hand `mkdir`. Mutants proven equivalent are hidden by
-  name in `.cargo/mutants.toml`, one rationale comment
-  per entry, and `tests/mutants_exclusions.rs` pins the count — a third survivor is a
-  property to write, not an entry to add.
+  (**MISSED** = no oracle noticed, i.e. a one-sided property) or an unresolved run (**a
+  timeout is not a catch**), 2 usage, infrastructure, or a baseline that was not green.
+  `--jobs > 1` (flag or `CARGO_MUTANTS_JOBS`) is refused under an inherited
+  `CARGO_TARGET_DIR`: cargo's artifact hash does not vary by mutation content, so parallel
+  jobs sharing one target dir report results that measured nothing. Read the verb's output,
+  never cargo-mutants' own exit code: the raw tool exits **0** when a filter matches nothing
+  and writes no `outcomes.json` at all, and a failed baseline leaves every counter reading
+  zero. The verb consults that exit code in exactly one place — when there is no
+  `outcomes.json` — to tell "matched nothing" (exit 0) from "died before running" (any other
+  exit), and it creates its own `--output` directory, so an exported CARGO_TARGET_DIR no
+  longer needs a hand `mkdir`. Mutants proven equivalent are hidden by name in
+  `.cargo/mutants.toml`, one rationale comment per entry, and `tests/mutants_exclusions.rs`
+  pins the count — a third survivor is a property to write, not an entry to add.
 - Editing docs/GUIDE.md can break the build: `crates/guide-examples`'s build.rs extracts
   and compiles every ```rust block. `cargo build -p guide-examples` checks it alone. A
   pinned `text` block (preceded by `<!-- pinned -->`) is gated

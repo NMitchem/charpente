@@ -159,7 +159,7 @@ This is a one-off, human-witnessed run: CI cannot depend on an unmerged branch, 
 branch stays unmerged (`docs/experiments/2026-09-helpdesk/README.md` says why). The
 ledger is the record.
 
-**The oracle that stays in CI: six trybuild fixtures**, pinned stderr, in
+**The oracle that stays in CI: seven trybuild fixtures**, pinned stderr, in
 `crates/charpente-macros/tests/compile_fail/`:
 
 | Fixture | Pins |
@@ -170,6 +170,7 @@ ledger is the record.
 | `route_duplicate_public.rs` | the given-twice refusal |
 | `table_global_and_scoped_by.rs` | the one-or-the-other refusal |
 | `table_duplicate_global.rs` | the given-twice refusal |
+| `table_bare.rs` | the empty-argument-list path — a bare `#[table]` (added in review round 1) |
 
 The two helpdesk fixtures pin the first message of each surface with real code; the four
 minimal ones pin the other two states. trybuild's `compile_fail` is two-sided by
@@ -250,8 +251,9 @@ or the test says so.
 
 ## §9 Exit criteria
 
-1. The three CI commands green, counted (`grep -c "^test result: ok"`), with the six new
-   compile-fail fixtures pinned and the existing 80 unchanged in meaning.
+1. The three CI commands green, counted (`grep -c "^test result: ok"`), with the seven new
+   compile-fail fixtures pinned (ten with the three added by the final review) and the
+   existing sixty fixtures (forty compile-fail, twenty compile-pass) unchanged in meaning.
 2. The rebased helpdesk fails to compile at `lib.rs:473` and `lib.rs:134`, the full error
    list in the ledger.
 3. `scripts/mutants.sh` over the two parse files: every viable mutant caught, counts in

@@ -5171,9 +5171,9 @@ Workspace `.superpowers/sdd/2026-09-16-default-secure-surfaces/`.
 **What landed.** `#[route]` gained `public`; `#[table]` gained `global`; each is a no-op in
 expansion. A route with neither `auth` nor `public`, and a table with neither `scoped_by`
 nor `global`, are compile errors naming both choices (GUIDE §5, §2, §9). The sweep added the
-words at 64 sites across `crates/`, `examples/`, GUIDE's rust blocks, README and the
-`charpente new` template — 76 files touched, +236/−236, the other twelve being regenerated
-`.stderr`; the flip commit found the two sites its own message names, the ones the
+words at 210 attribute lines in 64 files (76 with the twelve regenerated `.stderr`) across
+`crates/`, `examples/`, GUIDE's rust blocks, README and the `charpente new` template —
++236/−236; the flip commit found the two sites its own message names, the ones the
 line-anchored sweep had missed: `crates/charpente/tests/typed_tables.rs:659`
 (`#[charpente::table(version = 2)]`, fully-qualified, so the sweep's `#[table(`-anchored
 regex could not match it) and `compile_fail/route_unknown_method.rs` (`FETCH`, unmatched by
@@ -5204,6 +5204,10 @@ error: `Ticket` declares no tenancy — a table says which: write `#[table(scope
     = note: this error originates in the attribute macro `table` (in Nightly builds, run with -Z macro-backtrace for more info)
 ```
 
+All eleven, in `oracle-run.txt`'s order: `Org` :22, `Agent` :28, `Ticket` :134, `Comment`
+:167, `Survey` :179, `SlaReminder` :189, `AppClock` :203, `IdCounter` :214 (no tenancy);
+`create_org` :461, `create_agent` :473, `login` :503 (neither `auth` nor `public`).
+
 The branch is untouched (`git rev-parse docs-only-helpdesk` = `8913038…`) and stays unmerged.
 
 **Pins.** Seven new compile-fail cases (`helpdesk_route_neither_auth_nor_public`,
@@ -5213,7 +5217,8 @@ The branch is untouched (`git rev-parse docs-only-helpdesk` = `8913038…`) and 
 existing `.stderr` re-generated for the shifted snippet and reviewed. Two `doc_truth` pinned
 blocks added (floor 14 → 16).
 
-**Mutation run** (`scripts/mutants.sh --file route.rs --file lib.rs --re
+**Mutation run** (`scripts/mutants.sh --file crates/charpente-macros/src/route.rs --file
+crates/charpente-macros/src/lib.rs --re
 '(in|replace) (expand|table|parse_table_args|undeclared_capability)( |$)|Parse for
 (RouteArgs|TableArg)>::parse' --test-package charpente-macros`, Task 7): 26 total — 18
 caught, 0 missed, 8 unviable, 0 timed out, EXIT=0; no new entry in `.cargo/mutants.toml`.
