@@ -191,8 +191,11 @@ is unchanged), `doc_inventory`, `hook_census`, `mutants_exclusions` (no new excl
   `public` in the route-shape prose. **GUIDE §2**: the same for `#[table]` and `global`.
   **GUIDE §16**: "global" for "unscoped" where it names the declaration; the `Org` and
   `Memo` examples carry `global` / `scoped_by`; the `count_memos` route stays `auth`.
-- **GUIDE §9** error index: the pinned `#[route]` and `#[table]` blocks gain the six lines
-  above; `doc_truth` holds each to the code, and the pinned count is a floor.
+- **GUIDE §9** error index: the `#[route]` and `#[table]` catalog blocks gain the six lines
+  above. What `doc_truth` holds to the code are the two new pinned blocks in §2 and §5 (the
+  same six lines in `<placeholder>` form); §9's catalog is unpinned because its instance
+  values (`Ping`, `get_note`) cannot be placeholder-split, and the pinned count stays a
+  floor.
 - **Every GUIDE code block** compiles under `guide-examples`' build.rs, so every `#[route]`
   and `#[table]` in the guide is swept in §7 — a missed one is a red build.
 - **DESIGN §7**: the agent-interface list says a route *declares* `auth` or `public`.

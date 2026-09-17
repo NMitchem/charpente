@@ -384,6 +384,9 @@ pinned and the seed count stated in the commit.
 - **Platform-derived tenancy.** No `Principal → Org` resolver hook; ruling 3 forbids it.
 - **Retrofitting existing tables.** Scoping is opt-in per table; no migration is forced on
   any app, and none of the fixtures is converted except as an oracle needs one.
+  *Superseded 2026-09-16* (`2026-09-16-default-secure-surfaces-design.md`, Noah's 2026-09-13
+  ruling): opt-in ended — every table now declares `scoped_by` or `global`. The
+  no-forced-migration half stands: `global` is what a bare table always was.
 - **Cross-tenant *writes* in one transaction.** Out of scope for v1; a transaction opens one
   scope. Revisit only with a real workload.
 - **Tenant-local `Id<T>`.** Ids stay globally unique and app-minted; the key prefix, not id

@@ -350,3 +350,35 @@ the route prove too quiet in practice.** The concrete sign will be an app or an 
 had to read source to answer "what reaches every tenant here" — the moment the inventory
 stops being an inventory. Until then the boundary stands as stated, documented in the three
 places above rather than guarded by a capability with nothing yet to enumerate.
+
+## 13. No surface has a permissive default (2026-09-16)
+
+M3 sub-project 2 (spec `docs/superpowers/specs/2026-09-16-default-secure-surfaces-design.md`)
+made a `#[route]` that declares neither `auth` nor `public`, and a `#[table]` that declares
+neither `scoped_by = X` nor `global`, compile errors naming both choices. This entry records
+the reading that generalises, because it binds the next surface as much as these two.
+
+**The ruling.** Where a declaration on a route, table or job selects between a guarded
+behaviour and an open one, its absence is a compile error naming both — never a quiet
+default to either. The framework is the reviewer, and a reviewer's first question is "is
+this open?"; a default answers it silently, on the author's behalf, which is the one thing
+the 2026-09-03 helpdesk build showed an agent will not notice. This extends §11's shape —
+declared on the entry point, enumerable by `describe` — from capabilities to stances: `public`
+and `global` are declarations `describe` already lists (`auth=false`, `scoped=false`), so an
+audit of "what is open" is an inventory, not a grep.
+
+**Why the platform declares rather than infers, stated so it stays decided.** Two inference
+rules for "this table should be tenant-scoped" were weighed and rejected in the spec (§4):
+keying off a declared scope type cannot fire on an app that declared none — the helpdesk —
+and keying off a field of type `Id<scope>` flags the membership table first, which must be
+`global` and must hold that id because `Tenant::authorize` reads it through a bare `&Tx`. An
+inference with a mandatory override is a declaration with a heuristic in front of it. The
+platform asks at every struct instead.
+
+**What this binds.** A future `#[route]`, `#[table]` or `#[job]` word that gates a behaviour
+arrives as a required choice between named alternatives, with a compile-fail pin for the
+absent case in `crates/charpente-macros/tests/compile_fail/` and its line in GUIDE §9. A
+config key, a builder default, or a "sensible" fallback in the macro is the thing this entry
+refuses. **Reopen if:** a surface appears whose only honest default is "always on" with no
+second choice worth naming — then there is nothing to declare, and this entry does not
+apply to it.
