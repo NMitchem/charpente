@@ -5161,3 +5161,86 @@ today's fix was documenting the two-dependency shape, not collapsing it to one. 
 `--mutants` verb's own target-dir poisoning under `--jobs 1` (above) is unfixed: either an
 exit-time clean of the mutated package(s) or a refusal widened past `--jobs > 1` is needed
 before trusting a plain build in the same tree right after a mutants run.
+
+## 2026-09-16 — default-secure surfaces: a route says auth or public, a table says scoped_by or global, and neither is a default
+
+Spec `docs/superpowers/specs/2026-09-16-default-secure-surfaces-design.md`, plan
+`docs/superpowers/plans/2026-09-16-default-secure-surfaces.md`, eight tasks. M3 sub-project 2.
+Workspace `.superpowers/sdd/2026-09-16-default-secure-surfaces/`.
+
+**What landed.** `#[route]` gained `public`; `#[table]` gained `global`; each is a no-op in
+expansion. A route with neither `auth` nor `public`, and a table with neither `scoped_by`
+nor `global`, are compile errors naming both choices (GUIDE §5, §2, §9). The sweep added the
+words at 64 sites across `crates/`, `examples/`, GUIDE's rust blocks, README and the
+`charpente new` template — 76 files touched, +236/−236, the other twelve being regenerated
+`.stderr`; the flip commit found the two sites its own message names, the ones the
+line-anchored sweep had missed: `crates/charpente/tests/typed_tables.rs:659`
+(`#[charpente::table(version = 2)]`, fully-qualified, so the sweep's `#[table(`-anchored
+regex could not match it) and `compile_fail/route_unknown_method.rs` (`FETCH`, unmatched by
+the method alternation). `describe`'s wire is unchanged; `describe_contract` and the TS
+client did not move. DESIGN §3/§8 say declared, not opt-in; DECISIONS §13 records the
+generalising ruling; the tenant-scoping spec's opt-in non-goal carries its superseded line.
+
+**The oracle, run literally.** `docs-only-helpdesk` (`8913038`) rebased onto
+`default-secure` at `b041618` (the flip itself is `3e01b27`) in a detached sibling
+worktree — the helpdesk's own `Cargo.toml` needed its `charpente-sim` pin moved from
+`0.0.0` to `0.1.0` in the throwaway worktree, the same edit every in-tree example received
+in the publish path (ruling 8) — `cargo check -p helpdesk`: 11 refusals — eight tables and
+three routes — and the two Critical sites among them:
+
+```text
+error: `create_agent` declares neither `auth` nor `public` — a route says which callers reach it: write `#[route(POST "/agents/:id", auth)]` to require a principal (`ctx.principal()` is `Some`), or `#[route(POST "/agents/:id", public)]` to serve anonymous callers. Neither is the default.
+   --> examples/helpdesk/src/lib.rs:473:14
+    |
+473 | #[route(POST "/agents/:id")]
+    |              ^^^^^^^^^^^^^
+
+error: `Ticket` declares no tenancy — a table says which: write `#[table(scoped_by = Org)]` if every row belongs to one tenant (the key becomes `(scope, id)` and a bare `Tx` cannot read it), or `#[table(global)]` if its rows belong to no tenant. Neither is the default.
+   --> examples/helpdesk/src/lib.rs:134:1
+    |
+134 | #[table(version = 2)]
+    | ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: this error originates in the attribute macro `table` (in Nightly builds, run with -Z macro-backtrace for more info)
+```
+
+The branch is untouched (`git rev-parse docs-only-helpdesk` = `8913038…`) and stays unmerged.
+
+**Pins.** Seven new compile-fail cases (`helpdesk_route_neither_auth_nor_public`,
+`helpdesk_table_no_tenancy`, `table_bare`, `route_auth_and_public`, `route_duplicate_public`,
+`table_global_and_scoped_by`, `table_duplicate_global`), three compile-pass controls
+(`route_public_flag`, `route_public_cross_tenant`, `table_global_with_version`), twelve
+existing `.stderr` re-generated for the shifted snippet and reviewed. Two `doc_truth` pinned
+blocks added (floor 14 → 16).
+
+**Mutation run** (`scripts/mutants.sh --file route.rs --file lib.rs --re
+'(in|replace) (expand|table|parse_table_args|undeclared_capability)( |$)|Parse for
+(RouteArgs|TableArg)>::parse' --test-package charpente-macros`, Task 7): 26 total — 18
+caught, 0 missed, 8 unviable, 0 timed out, EXIT=0; no new entry in `.cargo/mutants.toml`.
+The first run, dispatched without `--test-package`, reported 26/26 MISSED because the
+verb's default test set is `charpente-core` + `charpente-sim`, which never exercise
+`charpente-macros/tests/trybuild.rs` (ruling 11) — a verified instrument-scope defect, not
+a finding about the refusals themselves.
+
+**The review round.** Task 4's review (opus) found nine issues — one Important
+(plan-mandated: the brief's §9 prepend made "in order" false), two more upgraded to
+Important by the controller (the bare `#[table]` empty-args path had no pin, a one-sided
+property the mutation run would have reported MISSED; and the route error text prescribed
+a `#[route(METHOD "/path")]` form the macro itself refuses) and six Minor — all nine fixed
+in one round (`d979330`). Two rulings from the round turned out wrong on evidence and are
+worth keeping: ruling 5's premise, that `compile_fail/route_unknown_method.rs` needed no
+change because its `FETCH` method could never reach the new stance check, was false — the
+unknown-method rejection lives in `expand_http`, downstream of `expand`'s stance-first
+check, so the fixture needed `, public` added to isolate its pin again. Ruling 7 rejected
+the review's finding to raise `PINNED_FLOOR` from 16 to 17 — `doc_truth`'s own
+`pinned_blocks()` counts 16; the reviewer's 17 came from a `grep -c` over a GUIDE prose
+mention, not the pinned blocks themselves, and the floor stayed at its true value.
+
+**Workspace gate** on b041618 plus this entry's docs: fmt clean, clippy clean, `cargo test
+--workspace --no-fail-fast` 86 of 86 `test result: ok`, zero FAILED, EXIT=0.
+
+**Open, deliberately.** `public` + `cross_tenant` stays expressible (DECISIONS §11); the
+field-type second oracle is deferred to a real leak through a `global` table (spec §4); the
+typed `&Principal` parameter waits for the third docs-only build to ask for it (spec §8).
+Next is M3 sub-project 3, the third docs-only build, which now builds against a platform
+that asks.
