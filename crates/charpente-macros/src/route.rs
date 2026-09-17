@@ -1,4 +1,4 @@
-//! `#[route(METHOD "/path/:param"[, auth][, cross_tenant][, emits(Ev, …)])]`
+//! `#[route(METHOD "/path/:param", auth | public[, cross_tenant][, emits(Ev, …)])]`
 //! (DESIGN.md §3, specs 2026-07-02-http-layer,
 //! 2026-08-20-ts-client-codegen §2 and 2026-08-30-tenant-scoping §3):
 //! validates the handler signature against the path and emits typed
@@ -21,6 +21,12 @@ pub(crate) struct RouteArgs {
     method: Ident,
     path: LitStr,
     auth: bool,
+    /// `public` — the explicit declaration that anonymous callers reach this
+    /// handler (default-secure spec §2). Expands to nothing: a `public` route
+    /// is what a bare route was before absence became a refusal. Exactly one
+    /// of `auth`/`public` is required (checked in `expand`, where the handler
+    /// name is known for the message).
+    public: bool,
     /// `cross_tenant` — the declared capability to enumerate a scoped table
     /// across every tenant (tenant-scoping spec §3). Drives two things: the
     /// `cap: &CrossTenant` argument the glue may fill, and the flag
@@ -48,6 +54,7 @@ impl Parse for RouteArgs {
             )
         })?;
         let mut auth = false;
+        let mut public = false;
         let mut cross_tenant = false;
         let mut emits: Vec<Ident> = Vec::new();
         while input.peek(Token![,]) {
@@ -60,7 +67,21 @@ impl Parse for RouteArgs {
                         "`auth` given twice — write it once",
                     ));
                 }
+                if public {
+                    return Err(Error::new(flag.span(), ONE_OR_THE_OTHER));
+                }
                 auth = true;
+            } else if flag == "public" {
+                if public {
+                    return Err(Error::new(
+                        flag.span(),
+                        "`public` given twice — write it once",
+                    ));
+                }
+                if auth {
+                    return Err(Error::new(flag.span(), ONE_OR_THE_OTHER));
+                }
+                public = true;
             } else if flag == "cross_tenant" {
                 if cross_tenant {
                     return Err(Error::new(
@@ -126,6 +147,7 @@ impl Parse for RouteArgs {
             method,
             path,
             auth,
+            public,
             cross_tenant,
             emits,
         })
@@ -136,9 +158,14 @@ impl Parse for RouteArgs {
 /// that can reach it (a non-identifier token, and an identifier that isn't
 /// one of the flags) so they cannot drift apart. Pinned by
 /// `docs/GUIDE.md`'s error catalog (hard rule 5).
-const FLAGS: &str = "a route flag is `auth`, `cross_tenant` or `emits(Ev, …)` — write \
-                     `#[route(GET \"/path\", auth)]`, or \
+const FLAGS: &str = "a route flag is `auth`, `public`, `cross_tenant` or `emits(Ev, …)` — write \
+                     `#[route(GET \"/path\", auth)]`, `#[route(GET \"/path\", public)]`, or \
                      `#[route(SSE \"/path\", emits(NoteAdded, NoteRemoved))]`";
+
+/// A route answers "who reaches this handler" once. Shared by the two
+/// branches that can see both flags so the wording cannot drift.
+const ONE_OR_THE_OTHER: &str =
+    "`auth` and `public` on one route — a route is one or the other; drop one";
 
 /// The refusal for a handler that takes the capability token on a route
 /// that never declared it — the compile error tenant-scoping spec §3 calls
@@ -148,14 +175,20 @@ const FLAGS: &str = "a route flag is `auth`, `cross_tenant` or `emits(Ev, …)` 
 fn undeclared_capability(name: &str, args: &RouteArgs, pat: &PatType) -> Error {
     let method = &args.method;
     let path = args.path.value();
-    let auth = if args.auth { ", auth" } else { "" };
+    let stance = if args.auth {
+        ", auth"
+    } else if args.public {
+        ", public"
+    } else {
+        ""
+    };
     Error::new(
         pat.span(),
         format!(
-            "`{name}` takes `cap: &CrossTenant`, but `#[route({method} \"{path}\"{auth})]` \
+            "`{name}` takes `cap: &CrossTenant`, but `#[route({method} \"{path}\"{stance})]` \
              does not declare `cross_tenant` — enumerating a scoped table across every \
              tenant is a declared capability, and `charpente describe` lists every route \
-             that declared it. Write `#[route({method} \"{path}\"{auth}, cross_tenant)]`, \
+             that declared it. Write `#[route({method} \"{path}\"{stance}, cross_tenant)]`, \
              or drop the `cap` argument and read one tenant through \
              `tx.scope::<Org>(org, ctx)?`"
         ),

@@ -1,0 +1,5 @@
+error: `public` given twice — write it once
+ --> tests/compile_fail/route_duplicate_public.rs:9:27
+  |
+9 | #[route(GET "/x", public, public)]
+  |                           ^^^^^^

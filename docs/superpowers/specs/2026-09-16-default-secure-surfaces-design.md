@@ -88,8 +88,8 @@ other three states:
 `global` given twice — write it once
 ```
 
-The first error is at the attribute (`Span::call_site()` when the argument list is empty;
-the `version` argument's span otherwise), with the struct name interpolated. The example
+The first error is at the attribute (`Span::call_site()`, which for an attribute macro is the
+`#[table(…)]` invocation itself, whatever its argument list), with the struct name interpolated. The example
 scope name in the fix is `Org` when the crate has not told us better — the macro sees one
 struct, not the app — and the message says "if every row belongs to one tenant", which is
 the question the reviewer would have asked. The `#[table]` argument-list message becomes
@@ -220,10 +220,11 @@ Every `#[route]` in the tree that lacks `auth` gains `public`; every `#[table]` 
 bench and edge harnesses, and every trybuild fixture that is meant to compile past the
 attribute.
 
-**Order is the verification.** Macro and the six new fixtures land first; the workspace
-goes red at every undeclared site. The sweep lands second; the workspace goes green.
-The compiler, not a reviewer, proves the sweep found every site. The `charpente new`
-template and GUIDE §1's block are held byte-identical by test, so both change together
+**Order is the verification, and every commit is green.** The words are accepted first
+(`public`, `global` — no-ops in expansion), the sweep adds them everywhere second, and the
+refusal of their absence lands third: that third commit is where the compiler proves the
+sweep found every site, and no commit in between leaves the workspace red. The `charpente
+new` template and GUIDE §1's block are held byte-identical by test, so both change together
 or the test says so.
 
 ## §8 Refused, so the plan does not grow them
