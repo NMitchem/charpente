@@ -132,13 +132,12 @@ fn strip_structure(chars: &mut [char]) {
     let n = chars.len();
     let mut i = 0;
     while i < n {
-        #[allow(clippy::collapsible_if)] // let-chains would change the transcribed structure
-        if chars[i] == '`' {
-            if let Some(j) = chars[i + 1..].iter().position(|&c| c == '`') {
-                blank(chars, i, i + j + 2);
-                i += j + 2;
-                continue;
-            }
+        if chars[i] == '`'
+            && let Some(j) = chars[i + 1..].iter().position(|&c| c == '`')
+        {
+            blank(chars, i, i + j + 2);
+            i += j + 2;
+            continue;
         }
         i += 1;
     }
