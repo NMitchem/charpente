@@ -278,10 +278,11 @@ reproduces after batching at 222 records/sec against a 215–261/sec ceiling. Wh
 batching changed is the kernel and the wire, measured under *Numbers of record —
 group commit* below.
 
-MANIFESTO §7 and README claim "hundreds of thousands of transactions per second"
-on one big box. This instrument measures **215/sec** for the canonical
-transaction on this laptop. That gap is roughly three orders of magnitude, and
-naming it plainly is the point of building the instrument.
+MANIFESTO §7 and README claimed "hundreds of thousands of transactions per second" on one
+big box until 2026-09-22, when the claims audit (docs/LEDGER.md) replaced that headline
+with this instrument's figure. This instrument measures **215/sec** for the canonical
+transaction on this laptop. That gap is roughly three orders of magnitude, and naming it
+plainly is the point of building the instrument.
 
 Two things the gap is **not**:
 

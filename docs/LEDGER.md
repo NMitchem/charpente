@@ -5267,7 +5267,8 @@ measures; the Linux run itself is not a gate — it moves to PLAN's "After launc
 with the trigger that reopens it. **charpente numbers → BENCH.md, external → cite:** a
 number that is a claim about charpente lives in docs/BENCH.md or is absent; every other
 figure — MANIFESTO §1/§2's external AI-compiler-experiment claim — cites its source or is
-reworded to carry no digits; no citation arrived before the rewrite task, so branch B ran.
+reworded to carry no digits; no citation arrived before the rewrite task, so branch B ran
+at first — the figures came back with a citation in the final fix wave (below).
 **A standing oracle, not a one-time sweep:** `crates/guide-examples/tests/claims_census.rs`
 holds exit criterion (c) the way `doc_truth.rs` holds GUIDE's pinned blocks, with an
 explicit `CLAIMS` table, an `EXEMPT` list (one rationale per entry, a pinned count), and an
@@ -5284,18 +5285,20 @@ error that names the three ways to fix a new number.
 | README.md:127-128 | "one durable fsync per transaction, ~215 / durable records/sec on that hardware, roughly three orders of magnitude below" | PERF | FOUND — docs/BENCH.md:210-212, 232-233, 261-262 | rewritten — "three orders of magnitude below the headline figure" → "the figure the scaling paragraph above states" |
 | README.md:131 | "worth up to / ~31x where the queue is deep enough to fill one" | PERF | FOUND — docs/BENCH.md:373-374 | kept, unchanged |
 | README.md:85-86 (word-form) | "hundreds of / thousands of transactions per second" | PERF (spelled out) | quoted, not measured, at docs/BENCH.md:282-283; substance ABSENT | deleted — the unmeasured headline is gone, replaced by the 215-records/sec paragraph |
-| MANIFESTO.md:9 | "sixteen parallel AI agents built a ~100,000-line C" | PERF (external claim) | ABSENT FROM BENCH | reworded — branch B: figures dropped entirely |
-| MANIFESTO.md:10 | "compiler in two weeks for about $20,000 — a compiler that passes 99% of the GCC torture" | PERF (external claim) | ABSENT FROM BENCH | reworded — branch B, same sentence |
-| MANIFESTO.md:18 | "the agents hit 99%." | PERF (same external claim, repeated) | ABSENT FROM BENCH | reworded — "the agents passed nearly all of it." |
+| MANIFESTO.md:9 | "sixteen parallel AI agents built a ~100,000-line C" | PERF (external claim) | ABSENT FROM BENCH | cited (branch A) — figures restored with Anthropic's write-up and RESEARCH.md as the citation |
+| MANIFESTO.md:10 | "compiler in two weeks for about $20,000 — a compiler that passes 99% of the GCC torture" | PERF (external claim) | ABSENT FROM BENCH | cited (branch A) — same sentence |
+| MANIFESTO.md:18 | "the agents hit 99%." | PERF (same external claim, repeated) | ABSENT FROM BENCH | cited (branch A) — unchanged from the quoted claim |
 | MANIFESTO.md:114 | "Designing for the 99.9% is not a" | PERF-shaped but rhetorical | ABSENT FROM BENCH | reworded — "Designing for the overwhelming majority" |
 | MANIFESTO.md:108-109 (word-form) | "a single modern server sustains hundreds of thousands of / transactions per second" | PERF (spelled out) | quoted, not measured, at docs/BENCH.md:282-283; substance ABSENT | rewritten — names the disk's durable write rate and points at docs/BENCH.md, no digits |
 
 All eleven rows moved in `62503e8` (`git show --numstat`: 13/11 MANIFESTO.md, 38/38
 README.md); the follow-up `e4c034c` (3/3 MANIFESTO.md, 2/2 README.md) touched no figure
 again — it dropped a dangling em dash the phrase-swap left behind and reflowed §1/§2 to
-the file's ~90-column style. Branch B ran for MANIFESTO §1/§2 (`task-1-report.md`): no
-citation for the sixteen-agents/$20,000/99% compiler claim arrived before the rewrite
-task, so the sentence lost its figures rather than gaining a source.
+the file's ~90-column style. Branch B ran for MANIFESTO §1/§2 (`task-1-report.md`) at
+first, on the premise that no source had been supplied; the final review found
+`RESEARCH.md:9-18` carrying the figures and Anthropic's primary source, so branch A
+landed in the final fix wave — the figures are back with the citation, and `EXEMPT`
+carries them under that rationale.
 
 **The oracle.** `claims_census.rs` holds exit criterion (c) the way `doc_truth.rs` holds
 GUIDE's pinned blocks. It blanks structural digits (list markers, section numbers, `§`
@@ -5347,12 +5350,13 @@ corruption axis (25 `fault:bit_flip`, 10 `fault:misdirected_write`, per the kept
 dir_entry_loss_fired(sim) => {}` to the helpdesk's `verify_tickets` turns the identical
 master seed green — 0 failures, 50000 verdicts, `EXIT=0` (`f1-fix-b.json`). By the
 platform's own oracle (`checks.rs`'s `durable_corruption_fired` contract) this is not a
-platform defect. Nor is it a helpdesk omission of a pattern the docs teach: GUIDE
-§8 documents the two excuse helpers, and did at the helpdesk's fork, but its worked
+platform defect. Nor is it a helpdesk omission of a pattern the docs teach: GUIDE §8
+documents the two excuse helpers, and did at the helpdesk's fork, but its worked
 `acked_implies_durable` example (`docs/GUIDE.md:2105-2157`) carries no excuse arm — the
-shape exists only in `crates/sim-fixture/tests/sim.rs:179`. The omission was inert under
-the signature the helpdesk was written against and became live only when `c6e1dcc` moved
-the property into the caller's swarm world.
+shape is in the platform's own suites, in `examples/invoicing/tests/sim.rs:144-160` and in
+`crates/sim-fixture/tests/sim.rs:179` — everywhere but the GUIDE example. The omission was
+inert under the signature the helpdesk was written against and became live only when
+`c6e1dcc` moved the property into the caller's swarm world.
 
 `git diff 566c7df main -- crates/charpente-sim/src/harness.rs`: 31 lines changed (28
 insertions, 3 deletions) — doc-comment prose plus one

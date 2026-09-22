@@ -6,16 +6,18 @@ For seventy years, every architectural decision in software assumed that expert 
 the scarce resource. Frameworks, ORMs, managed services, microservices, the entire vendor
 stack — all of it exists to *economize on elite engineering labor*.
 
-That constraint is gone. In early 2026, a team of parallel AI agents built a C compiler
-that passes nearly all of the GCC torture suite and boots a Linux kernel, in weeks, for
-less than a junior engineer's quarter. Agents write storage engines, schedulers, and
+That constraint is gone. In early 2026, sixteen parallel AI agents built a
+~100,000-line C compiler in two weeks for about $20,000 — a compiler that passes 99% of
+the GCC torture suite and boots a Linux kernel
+([Anthropic's write-up](https://www.anthropic.com/engineering/building-c-compiler);
+sources in [RESEARCH.md](RESEARCH.md)). Agents write storage engines, schedulers, and
 protocol implementations at a marginal cost approaching zero. The question is no longer
 "can we afford to build it?" It is "can we afford to *trust* it?"
 
 ## 2. The bottleneck moved from writing to verifying
 
 Look closely at that compiler experiment and you see the shape of the new world. Where a
-dense mechanical oracle existed — the torture suite — the agents passed nearly all of it.
+dense mechanical oracle existed — the torture suite — the agents hit 99%.
 Where no oracle existed — codegen efficiency, assembler correctness, code quality — the
 output was weak.
 
@@ -86,10 +88,10 @@ approximation of it.
 
 Charpente substitutes machine verification for the human review that no longer happens:
 
-- **Compile-time contracts.** Tables, queries, routes, jobs, events, config, and telemetry
-  are Rust types. The type system is the oracle for the layer that has no torture suite:
-  business logic. An agent that breaks the schema contract gets a precise, local, fixable
-  error in seconds — the exact feedback loop agents thrive on.
+- **Compile-time contracts.** Tables, queries, routes, jobs, events, and config are Rust
+  types. The type system is the oracle for the layer that has no torture suite: business
+  logic. An agent that breaks the schema contract gets a precise, local, fixable error in
+  seconds — the exact feedback loop agents thrive on.
 - **Deterministic simulation.** Because the core is a deterministic state machine and all
   IO passes through swappable interfaces, the entire application runs inside a simulator.
   Fault injection — crashes between any two writes, torn pages, partitions, clock skew —

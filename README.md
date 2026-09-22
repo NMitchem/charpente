@@ -124,20 +124,18 @@ charpente from crates.io, scaffolds an app, and reaches a red sim with a seed in
 sitting; a third docs-only agent build passes review with zero Criticals the platform
 should have caught; and every number in this file is measured or gone. The first two of
 M2's sub-projects — an honest benchmark harness and primary-side group commit — have their
-numbers in [docs/BENCH.md](docs/BENCH.md), measured on a dev laptop under `F_FULLFSYNC`
-and explicitly not the launch claim. Read them before the scaling paragraph above: one
-connection still costs one durable fsync per transaction, ~215 durable records/sec on that
-hardware, the figure the scaling paragraph above states. Group commit closes the
-*amortization* half of that gap and none of the device-speed half — one fsync for a whole
-batch, worth up to ~31x where the queue is deep enough to fill one and nothing at all at
-one connection; no bare-metal Linux run exists, and PLAN.md's after-launch table carries
-it. The object-storage archive has since shipped, unmeasured — BENCH.md carries
-nothing about it. It ships one generation at a time to a bucket: a full logical snapshot
-plus the sealed WAL segments that continue it, held by a retention pin that yields to the
-primary rather than growing the log until it fills the disk, and `charpente restore`
-rebuilds a data directory from what is there ([docs/GUIDE.md](docs/GUIDE.md) §15).
-`serve::backup` is still a different thing — a promotable hot standby, not a snapshot
-shipper. A TypeScript client generator has since shipped too
+numbers in [docs/BENCH.md](docs/BENCH.md), measured on a dev laptop under `F_FULLFSYNC`:
+one connection costs one durable fsync per transaction, ~215 durable records/sec on that
+hardware — the figure the scaling paragraph above states — and group commit amortizes that
+fsync across a batch, worth up to ~31x where the queue is deep enough to fill one and
+nothing at all at one connection. No bare-metal Linux run exists; PLAN.md's after-launch
+table carries it. The object-storage archive has since shipped, unmeasured — BENCH.md
+carries nothing about it. It ships one generation at a time to a bucket: a full logical
+snapshot plus the sealed WAL segments that continue it, held by a retention pin that
+yields to the primary rather than growing the log until it fills the disk, and `charpente
+restore` rebuilds a data directory from what is there ([docs/GUIDE.md](docs/GUIDE.md)
+§15). `serve::backup` is still a different thing — a promotable hot standby, not a
+snapshot shipper. A TypeScript client generator has since shipped too
 ([docs/GUIDE.md](docs/GUIDE.md) §14) — SSE only, no WebSocket transport — and so has
 tenant scoping, where a tenant is a typed key prefix enforced by the compiler rather than
 a `where` clause anyone can forget ([docs/GUIDE.md](docs/GUIDE.md) §16), and since
