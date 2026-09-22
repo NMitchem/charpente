@@ -5249,3 +5249,125 @@ field-type second oracle is deferred to a real leak through a `global` table (sp
 typed `&Principal` parameter waits for the third docs-only build to ask for it (spec §8).
 Next is M3 sub-project 3, the third docs-only build, which now builds against a platform
 that asks.
+
+## 2026-09-22 — claims audit: the launch documents state what BENCH measured, a census holds it, and F1 is verified closed against its repro
+
+M3 sub-project 4 ("claims audit") closes two obligations left open since the 2026-08-15
+BENCH run and the 2026-09-03 helpdesk build: README's scaling paragraph and MANIFESTO §7
+claimed a rate no bare-metal Linux run had measured, and F1 — the raw redb panic trace a
+docs-only agent saw printed by the default panic hook — had a fix (`566c7df`) but no
+verification that the fix silenced the actual repro rather than some other case. Spec
+`docs/superpowers/specs/2026-09-21-claims-audit-design.md` carries both, plus a third
+obligation this sub-project adds: every number in README.md and MANIFESTO.md that claims
+something about charpente needed a permanent, mechanical check, not a one-time sweep.
+
+Noah ruled three things before any file moved (spec §1). **Rewrite now, run later:** the
+README scaling paragraph and MANIFESTO §7 are rewritten to what docs/BENCH.md already
+measures; the Linux run itself is not a gate — it moves to PLAN's "After launch" table
+with the trigger that reopens it. **charpente numbers → BENCH.md, external → cite:** a
+number that is a claim about charpente lives in docs/BENCH.md or is absent; every other
+figure — MANIFESTO §1/§2's external AI-compiler-experiment claim — cites its source or is
+reworded to carry no digits; no citation arrived before the rewrite task, so branch B ran.
+**A standing oracle, not a one-time sweep:** `crates/guide-examples/tests/claims_census.rs`
+holds exit criterion (c) the way `doc_truth.rs` holds GUIDE's pinned blocks, with an
+explicit `CLAIMS` table, an `EXEMPT` list (one rationale per entry, a pinned count), and an
+error that names the three ways to fix a new number.
+
+**The census.** The 2026-09-17 sweep's PERF rows
+(`.superpowers/sdd/2026-09-17-claims-audit/sweep.md` §A), with what happened to each:
+
+| file:line | quoted claim | class | BENCH.md provenance | outcome |
+|---|---|---|---|---|
+| README.md:92 | "rate — 215/sec on a dev laptop under `F_FULLFSYNC`." | PERF | FOUND — docs/BENCH.md:210-212 | kept — same 215 figure, prose rewritten |
+| README.md:105 | "it runs green over 10,000 seeded" | PERF (seed/universe count) | ABSENT FROM BENCH — testimony, home is docs/LEDGER.md:169 | kept — sentence now names its source (docs/LEDGER.md, 2026-07-07) |
+| README.md:106 | "fault-injection universes (master seed `0x483e230baed4922b`)." | PERF (seed identifier) | ABSENT FROM BENCH — same as above | kept — same LEDGER citation added |
+| README.md:127-128 | "one durable fsync per transaction, ~215 / durable records/sec on that hardware, roughly three orders of magnitude below" | PERF | FOUND — docs/BENCH.md:210-212, 232-233, 261-262 | rewritten — "three orders of magnitude below the headline figure" → "the figure the scaling paragraph above states" |
+| README.md:131 | "worth up to / ~31x where the queue is deep enough to fill one" | PERF | FOUND — docs/BENCH.md:373-374 | kept, unchanged |
+| README.md:85-86 (word-form) | "hundreds of / thousands of transactions per second" | PERF (spelled out) | quoted, not measured, at docs/BENCH.md:282-283; substance ABSENT | deleted — the unmeasured headline is gone, replaced by the 215-records/sec paragraph |
+| MANIFESTO.md:9 | "sixteen parallel AI agents built a ~100,000-line C" | PERF (external claim) | ABSENT FROM BENCH | reworded — branch B: figures dropped entirely |
+| MANIFESTO.md:10 | "compiler in two weeks for about $20,000 — a compiler that passes 99% of the GCC torture" | PERF (external claim) | ABSENT FROM BENCH | reworded — branch B, same sentence |
+| MANIFESTO.md:18 | "the agents hit 99%." | PERF (same external claim, repeated) | ABSENT FROM BENCH | reworded — "the agents passed nearly all of it." |
+| MANIFESTO.md:114 | "Designing for the 99.9% is not a" | PERF-shaped but rhetorical | ABSENT FROM BENCH | reworded — "Designing for the overwhelming majority" |
+| MANIFESTO.md:108-109 (word-form) | "a single modern server sustains hundreds of thousands of / transactions per second" | PERF (spelled out) | quoted, not measured, at docs/BENCH.md:282-283; substance ABSENT | rewritten — names the disk's durable write rate and points at docs/BENCH.md, no digits |
+
+All eleven rows moved in `62503e8` (`git show --numstat`: 13/11 MANIFESTO.md, 38/38
+README.md); the follow-up `e4c034c` (3/3 MANIFESTO.md, 2/2 README.md) touched no figure
+again — it dropped a dangling em dash the phrase-swap left behind and reflowed §1/§2 to
+the file's ~90-column style. Branch B ran for MANIFESTO §1/§2 (`task-1-report.md`): no
+citation for the sixteen-agents/$20,000/99% compiler claim arrived before the rewrite
+task, so the sentence lost its figures rather than gaining a source.
+
+**The oracle.** `claims_census.rs` holds exit criterion (c) the way `doc_truth.rs` holds
+GUIDE's pinned blocks. It blanks structural digits (list markers, section numbers, `§`
+refs, milestone labels, dates, a bounded bare-year rule, `hard rule N`, anything in
+backticks or a fence), then scans README.md/MANIFESTO.md in line-pairs joined by a space —
+so a phrase wrapped across a line break, like "hundreds of thousands" split from "of
+transactions per second", is one figure, not two — for digit tokens and the ten
+`WORD_FIGURES` word-forms. Every occurrence must be one of three things: seed-bearing (its
+line or the next carries `master seed`), covered by a `CLAIMS` row (checked in both
+directions, so BENCH.md losing the line is red too), or covered by an `EXEMPT` entry with
+its own rationale, under `EXEMPT_COUNT = 9`. RED against the pre-rewrite documents
+(`git checkout 9835b08 -- README.md MANIFESTO.md`) named exactly the ten unrewritten
+figures: README.md:85 "hundreds of thousands", README.md:128 "orders of magnitude",
+MANIFESTO.md:9 "sixteen"/"~100,000", MANIFESTO.md:10 "two weeks"/"$20,000"/"99%",
+MANIFESTO.md:18 "99%", MANIFESTO.md:108 "hundreds of thousands", MANIFESTO.md:114 "99.9%"
+— then GREEN against the current documents, 5/5. Landed as `d46c82e` (the file, 438
+lines, plus the CLAUDE.md inventory line), with two review-driven fixes: `1544387` (a
+let-chain instead of a lint `#[allow]` on the backtick scan) and `bfa4e85` (the spec's
+word seeds restored, the bare-year rule bounded, and the wrapped-phrase check changed from
+full containment to overlap — a longer word on its trailing edge, like "thousands of"
+against an already-recorded "hundreds of thousands", was not suppressed by containment
+alone).
+
+**F1.** Two throwaway worktrees, one overlay: `examples/helpdesk` staged from `8913038`
+(the docs-only build where the original raw-panic finding happened), added to
+`Cargo.toml`'s `members`, and the one `acked_implies_durable(sim.seed(), …)` call rewritten
+to `acked_implies_durable(sim, …)` for the post-`c6e1dcc` signature — no edit needed beyond
+those two, in either worktree. Control at `566c7df^1` = `b15cdc7` (main before the fix);
+fix at `566c7df` itself. Same command both times: `cargo run -p charpente-cli -- test
+--sim --dir examples/helpdesk --universes 10000 --master-seed 0x12124e6ebd9cf8b9`. Control:
+`panicked at` 1, `page_manager` 1 (`…redb-4.1.0/src/tree_store/page_manager.rs:257:9`),
+batch `EXIT=1`, 35 failures, 49965 verdicts. Fix: `panicked at` 0, `page_manager` 0 — one
+named line instead (`charpente: redb open-fence engaged (benign) — the store is treated as
+unopenable and Db::open rebuilds it; see Store::open`), batch still `EXIT=1`, the same 35
+failures, `.out` byte-identical to the control's.
+
+The predicted panic count was 134, not the 1 observed; the record does not isolate why.
+Two candidates it cannot separate: `6ca6d4e` re-keys a fault stream in `b15cdc7`'s ancestry
+between `14f5a94` and itself; and the 134 was counted with the property running in the
+private `Sim::new(seed)` world of the pre-`c6e1dcc` checker, while this run's 1 is counted
+in the swarm world the one-line patch moves it into. F1's closure rests on the qualitative
+repro — the `panicked at …page_manager.rs` trace present at `b15cdc7`, absent at
+`566c7df`, same app modulo the one-line patch, same seed, same command — not on the count.
+
+The 35 `acked_durable_across_crashes` failures, identical at control and fix, all fired a
+corruption axis (25 `fault:bit_flip`, 10 `fault:misdirected_write`, per the kept
+`f1-fix-a.json`); adding the excuse arm `Ok(None) if durable_corruption_fired(sim) ||
+dir_entry_loss_fired(sim) => {}` to the helpdesk's `verify_tickets` turns the identical
+master seed green — 0 failures, 50000 verdicts, `EXIT=0` (`f1-fix-b.json`). By the
+platform's own oracle (`checks.rs`'s `durable_corruption_fired` contract) this is not a
+platform defect. It is not, however, a helpdesk omission of a pattern the docs teach: GUIDE
+§8 documents the two excuse helpers, and did at the helpdesk's fork, but its worked
+`acked_implies_durable` example (`docs/GUIDE.md:2105-2157`) carries no excuse arm — the
+shape exists only in `crates/sim-fixture/tests/sim.rs:179`. The omission was inert under
+the signature the helpdesk was written against and became live only when `c6e1dcc` moved
+the property into the caller's swarm world.
+
+`git diff 566c7df main -- crates/charpente-sim/src/harness.rs`: 31 lines changed (28
+insertions, 3 deletions) — doc-comment prose plus one
+`#[allow(clippy::disallowed_methods)]` annotation; the `OPEN_FENCE_HOOK.call_once` body is
+byte-identical in the diff's context. `hook_census` (`cargo test -p guide-examples --test
+hook_census`): 5/5 at HEAD `bfa4e85`, mechanically pinning "exactly one installer". F1 is
+closed.
+
+**Workspace gate** on `bfa4e85` plus this entry's PLAN.md/LEDGER.md edits: fmt clean,
+clippy clean, `cargo test --workspace --no-fail-fast` 87 of 87 `test result: ok`, zero
+FAILED, EXIT=0.
+
+**Open, deliberately.** The Linux run (PLAN, after launch). GUIDE §8's worked
+`acked_implies_durable` example still carries no excuse arm for
+`durable_corruption_fired`/`dir_entry_loss_fired`, though its prose promises one and
+`crates/sim-fixture/tests/sim.rs:179` shows the shape — a hard-rule-6 docs follow-up, out
+of this sub-project's scope (spec §6).
+Next is the real publish and M3 sub-project 5, once sub-project 3's attempt reaches its
+verdict.

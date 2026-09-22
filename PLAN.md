@@ -220,18 +220,21 @@ Sub-projects, in dependency order:
    written first and the agent given README + GUIDE only. Exit: zero framework patches,
    zero Criticals in review that a platform oracle should have caught, `--mutants` clean
    over its sim properties. Findings ledgered as testimony, as the helpdesk write-up was.
-4. **Claims audit.** The bare-metal Linux BENCH run owed since 2026-08-15 lands, or the
-   README scaling paragraph is rewritten to what has been measured. README guarantee 1
-   stops naming telemetry until telemetry exists. F1 from the helpdesk experiment — the
-   raw panic trace that "demonstrably destroyed a competent agent's work" — is verified
-   closed against the helpdesk repro, not assumed closed because a hook now exists.
+4. **Claims audit** [shipped 2026-09-22; spec
+   `docs/superpowers/specs/2026-09-21-claims-audit-design.md`]. The bare-metal Linux BENCH
+   run owed since 2026-08-15 lands, or the README scaling paragraph is rewritten to what
+   has been measured. README guarantee 1 stops naming telemetry until telemetry exists.
+   F1 from the helpdesk experiment — the raw panic trace that "demonstrably destroyed a
+   competent agent's work" — is verified closed against the helpdesk repro, not assumed
+   closed because a hook now exists.
 5. **The launch run.** DEMO.md re-executed against the published version by a docs-only
    agent starting from `cargo install charpente-cli`: reaches a red sim with a seed, replays
    it. That transcript is the launch post.
 
 **Exit criteria:** (a) the launch run, recorded with its seeds; (b) the third docs-only
 build passes on the bar in sub-project 3; (c) every number in README.md and MANIFESTO.md
-is in docs/BENCH.md or absent.
+that is a claim about charpente is in docs/BENCH.md or absent, and every other figure
+cites its source or carries no digits (held by `claims_census`).
 
 ## After launch (v1.x) — five from M2 and one from DECISIONS §6, each with the trigger that reopens it
 
@@ -247,6 +250,7 @@ with their triggers so that "is it time yet" has a mechanical answer.
 | **Read-only Postgres-wire endpoint** | First BI ask. Compatible with DECISIONS §4; never the primary interface. |
 | **Own LSM storage engine** | DECISIONS §7's triggers, unchanged. Trigger (c) — post-launch adoption — is after M3 by definition, which is why the engine cannot gate it. |
 | **Design C timeline epoch** (DECISIONS §6's sharpening step short of consensus) | The first loss-window finding that the bounded, named window does not cover. |
+| **Bare-metal Linux BENCH run** (owed since 2026-08-15) | A Linux box Noah runs docs/BENCH.md's protocol on. Resizes README's scaling paragraph, which since 2026-09-21 states the laptop figure and says no bare-metal run exists. |
 
 **Hosted control plane — off the roadmap.** "If this becomes a company: managed replicas,
 backups, failover, metrics; the binary stays fully self-hostable" is a business decision,
