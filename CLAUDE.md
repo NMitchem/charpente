@@ -63,7 +63,7 @@ PLAN.md are the roadmap; do not reorder a milestone's dependency sequence.
   describe/genclient/new/repro_meta/restore; charpente-tsgen: revive/routes/types;
   charpente-macros: trybuild; edge-harness: acked_durable/failover/hunts/open_fence/
   realtime_resume/smoke/tenant_wire; bench-harness: app/compile/compile_bench_script/harness/phase_trace;
-  ts-fixture-app: drift/samples; guide-examples: describe_contract/doc_inventory/doc_truth/hook_census/mutants_exclusions; sim-fixture: sim;
+  ts-fixture-app: drift/samples; guide-examples: claims_census/describe_contract/doc_inventory/doc_truth/hook_census/mutants_exclusions; sim-fixture: sim;
   invoicing: describe_golden/sim). Every list is exhaustive as written — if a name is
   missing, the list is stale, not selective.
   `guide-examples`' `doc_inventory` gate enforces that against `members`, so a NEW crate
