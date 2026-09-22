@@ -8,9 +8,9 @@ stack — all of it exists to *economize on elite engineering labor*.
 
 That constraint is gone. In early 2026, a team of parallel AI agents built a C compiler
 that passes nearly all of the GCC torture suite and boots a Linux kernel, in weeks, for
-less than a junior engineer's quarter. Agents write storage engines, schedulers, and protocol
-implementations at a marginal cost approaching zero. The question is no longer "can we
-afford to build it?" It is "can we afford to *trust* it?"
+less than a junior engineer's quarter. Agents write storage engines, schedulers, and
+protocol implementations at a marginal cost approaching zero. The question is no longer
+"can we afford to build it?" It is "can we afford to *trust* it?"
 
 ## 2. The bottleneck moved from writing to verifying
 

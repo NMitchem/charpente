@@ -130,8 +130,8 @@ connection still costs one durable fsync per transaction, ~215 durable records/s
 hardware, the figure the scaling paragraph above states. Group commit closes the
 *amortization* half of that gap and none of the device-speed half — one fsync for a whole
 batch, worth up to ~31x where the queue is deep enough to fill one and nothing at all at
-one connection — ; no bare-metal Linux run exists, and PLAN.md's after-launch table
-carries it. The object-storage archive has since shipped, unmeasured — BENCH.md carries
+one connection; no bare-metal Linux run exists, and PLAN.md's after-launch table carries
+it. The object-storage archive has since shipped, unmeasured — BENCH.md carries
 nothing about it. It ships one generation at a time to a bucket: a full logical snapshot
 plus the sealed WAL segments that continue it, held by a retention pin that yields to the
 primary rather than growing the log until it fills the disk, and `charpente restore`
