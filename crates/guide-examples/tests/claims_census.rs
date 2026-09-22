@@ -42,9 +42,11 @@ const BENCH: &str = "docs/BENCH.md";
 /// exempted by name below, not by dropping the word here.
 const WORD_FIGURES: &[&str] = &[
     "hundreds of thousands",
-    "tens of thousands",
-    "orders of magnitude",
     "overwhelming majority",
+    "orders of magnitude",
+    "tens of thousands",
+    "thousands of",
+    "hundreds of",
     "nearly all",
     "two weeks",
     "sixteen",
@@ -66,7 +68,7 @@ const CLAIMS: &[(&str, &str, &str)] = &[
     ),
     (
         "README.md",
-        "~215",
+        "~215 durable records/sec",
         "| device | durable appends/sec (WAL op shape) | **215** |",
     ),
     ("README.md", "~31×", "it recovers up to ~31x"),
@@ -94,8 +96,21 @@ const EXEMPT: &[(&str, &str)] = &[
         "overwhelming majority",
         "MANIFESTO §7; rhetorical, was \"99.9%\"",
     ),
+    (
+        "Thousands of seeded universes per night",
+        "README guarantee 3: the sim's scale, substantiated by the recorded 10,000-universe batch \
+         two paragraphs down (seed-bearing) and the ledger, 2026-07-07",
+    ),
+    (
+        "thousands of seeded universes per night",
+        "MANIFESTO §6: the same statement in the same words",
+    ),
+    (
+        "thousands of times",
+        "MANIFESTO §9: the wager's restatement of that record; rhetorical",
+    ),
 ];
-const EXEMPT_COUNT: usize = 6;
+const EXEMPT_COUNT: usize = 9;
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -179,8 +194,12 @@ fn strip_structure(chars: &mut [char]) {
         let is_year = run == 4
             && chars[i] == '2'
             && chars[i + 1] == '0'
+            && matches!(chars[i + 2], '2' | '3')
             && !prev.is_alphanumeric()
-            && !next.is_alphanumeric();
+            && prev != '~'
+            && prev != '$'
+            && !next.is_alphanumeric()
+            && !matches!(next, '%' | '/' | '×');
         let is_ref = prev == '§' || (prev == 'M' && run == 1);
         let is_rule = i >= 10 && chars[i - 10..i].iter().collect::<String>() == "hard rule ";
         if is_year || is_ref || is_rule {
@@ -272,11 +291,21 @@ impl Doc {
             let lowered: Vec<char> = pair.iter().map(|c| c.to_ascii_lowercase()).collect();
             for word in WORD_FIGURES {
                 let w: Vec<char> = word.chars().collect();
+                let shift = if i > 0 {
+                    self.lines[i - 1].len() + 1
+                } else {
+                    0
+                };
                 let mut from = 0;
                 while from < own && from + w.len() <= n {
                     if lowered[from..from + w.len()] == w[..] {
+                        let end = from + w.len();
                         let seen = out.iter().any(|f: &Figure| {
-                            f.line_no == i + 1 && f.span.0 <= from && from + w.len() <= f.span.1
+                            (f.line_no == i + 1 && f.span.0 < end && from < f.span.1)
+                                || (i > 0
+                                    && f.line_no == i
+                                    && f.span.0 < end + shift
+                                    && from + shift < f.span.1)
                         });
                         if !seen {
                             out.push(Figure {
@@ -327,7 +356,7 @@ impl Doc {
         let has = |i: usize| {
             self.lines
                 .get(i)
-                .is_some_and(|l| l.iter().collect::<String>().contains("master seed"))
+                .is_some_and(|l| l.iter().collect::<String>().contains("master seed `0x"))
         };
         has(f.line_no - 1) || has(f.line_no)
     }
@@ -391,15 +420,18 @@ fn every_exemption_is_live_and_counted() {
          count in the commit that adds the entry, and say why there",
         EXEMPT.len()
     );
-    let docs: Vec<String> = DOCS.iter().map(|d| read(d)).collect();
+    let docs: Vec<Doc> = DOCS.iter().map(|d| Doc::parse(&read(d))).collect();
     for (fig, why) in EXEMPT {
         assert!(
             !why.trim().is_empty(),
             "claims_census: EXEMPT entry {fig:?} has no rationale"
         );
+        let live = docs
+            .iter()
+            .any(|doc| doc.figures().iter().any(|f| doc.covers(fig, f)));
         assert!(
-            docs.iter().any(|d| d.contains(fig)),
-            "claims_census: EXEMPT entry {fig:?} occurs in neither README.md nor MANIFESTO.md — \
+            live,
+            "claims_census: EXEMPT entry {fig:?} covers no figure in README.md or MANIFESTO.md — \
              a stale exemption hides nothing and must go"
         );
     }
@@ -412,26 +444,50 @@ fn the_scan_sees_wrapped_word_figures_and_skips_structure() {
                 executes hundreds of\n\
                 thousands of X\n\
                 runs 10,000 universes\n\
-                (master seed `0x1`)\n";
+                (master seed `0x1`)\n\
+                costs about\n\
+                $20,000 per run\n\
+                handles thousands of requests\n";
     let doc = Doc::parse(text);
     let f = doc.figures();
     let texts: Vec<&str> = f.iter().map(|f| f.text.as_str()).collect();
-    assert_eq!(texts, ["~31x", "hundreds of thousands", "10,000"]);
-    assert_eq!((f[0].line_no, f[1].line_no, f[2].line_no), (3, 4, 6));
+    assert_eq!(
+        texts,
+        [
+            "~31x",
+            "hundreds of thousands",
+            "10,000",
+            "$20,000",
+            "thousands of"
+        ]
+    );
+    assert_eq!(
+        (
+            f[0].line_no,
+            f[1].line_no,
+            f[2].line_no,
+            f[3].line_no,
+            f[4].line_no
+        ),
+        (3, 4, 6, 9, 10)
+    );
     assert!(doc.seed_bearing(&f[2]));
     assert!(!doc.seed_bearing(&f[0]));
     assert!(doc.covers("hundreds of thousands of X", &f[1]));
     assert!(!doc.covers("thousands of X", &f[1]));
+    assert!(doc.covers("about $20,000", &f[3]));
 }
 
 #[test]
 fn an_unclassified_figure_names_its_site_and_the_three_ways_out() {
     let msgs = unclassified("t.md", "we do 500 things a day\n");
     assert_eq!(msgs.len(), 1);
-    assert!(
-        msgs[0].starts_with("claims_census: t.md:1 carries a figure with no provenance: \"500\"")
+    assert_eq!(
+        msgs[0],
+        "claims_census: t.md:1 carries a figure with no provenance: \"500\"\n  \
+         a number in README.md or MANIFESTO.md is one of three things — a charpente measurement\n  \
+         (add a CLAIMS row naming the docs/BENCH.md line that carries it), a seed-bearing sim\n  \
+         record (write it beside its `master seed 0x…`), or not a claim about charpente (add an\n  \
+         EXEMPT entry with its rationale and raise EXEMPT_COUNT). M3 exit criterion (c)."
     );
-    assert!(msgs[0].contains("CLAIMS row"));
-    assert!(msgs[0].contains("master seed 0x"));
-    assert!(msgs[0].contains("raise EXEMPT_COUNT"));
 }
