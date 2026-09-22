@@ -47,7 +47,11 @@ const WORD_FIGURES: &[&str] = &[
     "tens of thousands",
     "thousands of",
     "hundreds of",
+    "millions of",
+    "billions of",
     "nearly all",
+    "a million",
+    "a billion",
     "two weeks",
     "sixteen",
     "seventy",
@@ -84,14 +88,14 @@ const EXEMPT: &[(&str, &str)] = &[
     ("runtime 500", "an HTTP status code, not a measurement"),
     ("seventy years", "the span of software history; rhetorical"),
     (
-        "nearly all of the GCC torture",
-        "MANIFESTO §1's external compiler experiment, reworded to carry no figure \
-         (claims-audit spec §1.4, branch B)",
+        "sixteen parallel AI agents",
+        "MANIFESTO §1's external compiler experiment, cited inline and in RESEARCH.md \
+         (claims-audit spec §1.4, branch A)",
     ),
-    (
-        "passed nearly all of it",
-        "the same experiment, MANIFESTO §2",
-    ),
+    ("~100,000-line C", "the same experiment"),
+    ("in two weeks for about $20,000", "the same experiment"),
+    ("passes 99% of the GCC torture", "the same experiment"),
+    ("the agents hit 99%", "the same experiment, MANIFESTO §2"),
     (
         "overwhelming majority",
         "MANIFESTO §7; rhetorical, was \"99.9%\"",
@@ -99,7 +103,7 @@ const EXEMPT: &[(&str, &str)] = &[
     (
         "Thousands of seeded universes per night",
         "README guarantee 3: the sim's scale, substantiated by the recorded 10,000-universe batch \
-         two paragraphs down (seed-bearing) and the ledger, 2026-07-07",
+         in the Status section below (seed-bearing) and the ledger, 2026-07-07",
     ),
     (
         "thousands of seeded universes per night",
@@ -110,7 +114,7 @@ const EXEMPT: &[(&str, &str)] = &[
         "MANIFESTO §9: the wager's restatement of that record; rhetorical",
     ),
 ];
-const EXEMPT_COUNT: usize = 9;
+const EXEMPT_COUNT: usize = 12;
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -354,9 +358,10 @@ impl Doc {
 
     fn seed_bearing(&self, f: &Figure) -> bool {
         let has = |i: usize| {
-            self.lines
-                .get(i)
-                .is_some_and(|l| l.iter().collect::<String>().contains("master seed `0x"))
+            self.lines.get(i).is_some_and(|l| {
+                let l = l.iter().collect::<String>();
+                l.contains("master seed `0x") || l.contains("master seed 0x")
+            })
         };
         has(f.line_no - 1) || has(f.line_no)
     }
