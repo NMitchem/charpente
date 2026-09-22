@@ -16,8 +16,7 @@ point, one log.
 
 1. **Typed end-to-end.** Schema, queries, routes, jobs, events, and wire types are all Rust
    types checked at compile time — a schema change that breaks a query is a compile error,
-   not a 3am page; config is a typed struct with no startup validation yet, and typed
-   telemetry with change-time checks is an M2 item that does not exist yet.
+   not a 3am page; config is a typed struct with no startup validation yet.
 
 2. **One commit point.** State changes, job enqueues, and realtime events commit in the
    same transaction. The dual-write bug class — outbox gaps, ghost webhooks, "the row
@@ -82,12 +81,15 @@ about effects, deterministic by construction, and introspectable by machines. Re
 
 One big box, replicated. Writes flow through a single ordered log applied by a
 deterministic state machine; the log ships to followers for read scaling and failover.
-There is no sharding story and there will not be one. A modern server executes hundreds of
-thousands of transactions per second when there is no network hop between app and data —
-you will not outgrow this before you can afford to build something bespoke, and pretending
-otherwise is how platforms die building a worse Spanner instead of a better SQLite.
+There is no sharding story and there will not be one. With no network hop between app and
+data, one box's ceiling is its disk's durable write rate, not a network round trip. What
+charpente measures today is 215 durable records/sec per connection on a dev laptop under
+`F_FULLFSYNC`, and up to ~31× that under group commit where the queue is deep enough to
+fill a batch ([docs/BENCH.md](docs/BENCH.md)). No bare-metal run exists; this paragraph is
+resized when one lands. You will not outgrow one box before you can afford to build
+something bespoke, and pretending otherwise is how platforms die building a worse Spanner
+instead of a better SQLite.
 
-That last sentence is the argument, not a measurement of what charpente does today.
 Measured, an uncontended commit costs one durable fsync, which puts it at the device's fsync
 rate — 215/sec on a dev laptop under `F_FULLFSYNC`. Group commit amortizes that fsync across
 a batch once requests actually queue, which is worth a great deal on a device this slow to
@@ -103,7 +105,8 @@ test --sim` — the deterministic simulator with seeded fault injection this
 whole platform is staked on. A docs-only agent then built
 [`examples/invoicing`](examples/invoicing) from these documents alone, with
 zero framework patches, and it runs green over 10,000 seeded
-fault-injection universes (master seed `0x483e230baed4922b`). The
+fault-injection universes (master seed `0x483e230baed4922b`;
+[docs/LEDGER.md](docs/LEDGER.md), 2026-07-07). The
 dual-write bug class the second guarantee above claims to delete
 structurally is demonstrated, caught, and reverted at
 [examples/invoicing/DEMO.md](examples/invoicing/DEMO.md).
@@ -114,36 +117,33 @@ API keys, static-JWKS OIDC), schema migrations as log records, `charpente
 describe`, and a black-box edge harness that drives stock binaries over
 real TCP with `kill -9` and TCP-proxy fault injection.
 
-**M2 closed 2026-09-13; M3 — launch — is in progress.** M2 shipped six
-sub-projects, dropped one, and reclassified the rest to after launch with the
-trigger that reopens each ([PLAN.md](PLAN.md)). M3 is the finish line before
-this is public: a stranger installs charpente from crates.io, scaffolds an app,
-and reaches a red sim with a seed in one sitting; a third docs-only agent build
-passes review with zero Criticals the platform should have caught; and every
-number in this file is measured or gone. The first two of M2's sub-projects — an
-honest benchmark harness and primary-side group commit — have their numbers in
-[docs/BENCH.md](docs/BENCH.md), measured on a dev laptop under `F_FULLFSYNC`
-and explicitly not the launch claim. Read them before the scaling paragraph
-above: one connection still costs one durable fsync per transaction, ~215
-durable records/sec on that hardware, roughly three orders of magnitude below
-the headline figure. Group commit closes the *amortization* half of that gap
-and none of the device-speed half — one fsync for a whole batch, worth up to
-~31x where the queue is deep enough to fill one and nothing at all at one
-connection — and the bare-metal Linux numbers that would resize it do not
-exist yet. The object-storage archive has since shipped, unmeasured — BENCH.md
-carries nothing about it. It ships one generation at a time to a bucket: a full
-logical snapshot plus the sealed WAL segments that continue it, held by a
-retention pin that yields to the primary rather than growing the log until it
-fills the disk, and `charpente restore` rebuilds a data directory from what is
-there ([docs/GUIDE.md](docs/GUIDE.md) §15). `serve::backup` is still a different
-thing — a promotable hot standby, not a snapshot shipper. A TypeScript client
-generator has since shipped too ([docs/GUIDE.md](docs/GUIDE.md) §14) — SSE only, no
-WebSocket transport — and so has tenant scoping, where a tenant is a typed key prefix
-enforced by the compiler rather than a `where` clause anyone can forget
-([docs/GUIDE.md](docs/GUIDE.md) §16), and since 2026-09-16 the platform asks: a route
-says `auth` or `public`, a table says `scoped_by` or `global`, and neither is a default.
-What is *not* built, so you don't have to go
-looking: no blob store and no WebSockets.
+**M2 closed 2026-09-13; M3 — launch — is in progress.** M2 shipped six sub-projects,
+dropped one, and reclassified the rest to after launch with the trigger that reopens each
+([PLAN.md](PLAN.md)). M3 is the finish line before this is public: a stranger installs
+charpente from crates.io, scaffolds an app, and reaches a red sim with a seed in one
+sitting; a third docs-only agent build passes review with zero Criticals the platform
+should have caught; and every number in this file is measured or gone. The first two of
+M2's sub-projects — an honest benchmark harness and primary-side group commit — have their
+numbers in [docs/BENCH.md](docs/BENCH.md), measured on a dev laptop under `F_FULLFSYNC`
+and explicitly not the launch claim. Read them before the scaling paragraph above: one
+connection still costs one durable fsync per transaction, ~215 durable records/sec on that
+hardware, the figure the scaling paragraph above states. Group commit closes the
+*amortization* half of that gap and none of the device-speed half — one fsync for a whole
+batch, worth up to ~31x where the queue is deep enough to fill one and nothing at all at
+one connection — ; no bare-metal Linux run exists, and PLAN.md's after-launch table
+carries it. The object-storage archive has since shipped, unmeasured — BENCH.md carries
+nothing about it. It ships one generation at a time to a bucket: a full logical snapshot
+plus the sealed WAL segments that continue it, held by a retention pin that yields to the
+primary rather than growing the log until it fills the disk, and `charpente restore`
+rebuilds a data directory from what is there ([docs/GUIDE.md](docs/GUIDE.md) §15).
+`serve::backup` is still a different thing — a promotable hot standby, not a snapshot
+shipper. A TypeScript client generator has since shipped too
+([docs/GUIDE.md](docs/GUIDE.md) §14) — SSE only, no WebSocket transport — and so has
+tenant scoping, where a tenant is a typed key prefix enforced by the compiler rather than
+a `where` clause anyone can forget ([docs/GUIDE.md](docs/GUIDE.md) §16), and since
+2026-09-16 the platform asks: a route says `auth` or `public`, a table says `scoped_by` or
+`global`, and neither is a default. What is *not* built, so you don't have to go looking:
+no blob store and no WebSockets.
 
 ## Try it
 

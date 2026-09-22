@@ -6,17 +6,18 @@ For seventy years, every architectural decision in software assumed that expert 
 the scarce resource. Frameworks, ORMs, managed services, microservices, the entire vendor
 stack — all of it exists to *economize on elite engineering labor*.
 
-That constraint is gone. In early 2026, sixteen parallel AI agents built a ~100,000-line C
-compiler in two weeks for about $20,000 — a compiler that passes 99% of the GCC torture
-suite and boots a Linux kernel. Agents write storage engines, schedulers, and protocol
+That constraint is gone. In early 2026, a team of parallel AI agents built a C compiler
+that passes nearly all of the GCC torture suite and boots a Linux kernel, in weeks, for
+less than a junior engineer's quarter. Agents write storage engines, schedulers, and protocol
 implementations at a marginal cost approaching zero. The question is no longer "can we
 afford to build it?" It is "can we afford to *trust* it?"
 
 ## 2. The bottleneck moved from writing to verifying
 
 Look closely at that compiler experiment and you see the shape of the new world. Where a
-dense mechanical oracle existed — the torture suite — the agents hit 99%. Where no oracle
-existed — codegen efficiency, assembler correctness, code quality — the output was weak.
+dense mechanical oracle existed — the torture suite — the agents passed nearly all of it.
+Where no oracle existed — codegen efficiency, assembler correctness, code quality — the
+output was weak.
 
 **Agent output quality tracks oracle density.** Cheap code is only valuable where
 verification is also cheap. A proof checker, a conformance suite, a differential test, a
@@ -105,14 +106,15 @@ Charpente substitutes machine verification for the human review that no longer h
 
 Charpente refuses the sharding arms race. Writes flow through one ordered log on one
 primary; followers replay it for reads and failover. This is an honest bet: with no network
-hop between logic and data, a single modern server sustains hundreds of thousands of
-transactions per second — more than almost any business will ever need. The platforms that
-promise infinite horizontal scale charge for it up front, in complexity, consistency
-compromises, and ops burden, whether you ever need it or not.
+hop between logic and data, one server's ceiling is its disk's durable write rate, and that
+is more than almost any business will ever need (what charpente measures is in
+docs/BENCH.md). The platforms that promise infinite horizontal scale charge for it up
+front, in complexity, consistency compromises, and ops burden, whether you ever need it or
+not.
 
 If you outgrow one big box, you will by then have the revenue to build something bespoke —
-and the log gives you a clean migration path out. Designing for the 99.9% is not a
-limitation. It is the moat.
+and the log gives you a clean migration path out. Designing for the overwhelming majority
+is not a limitation. It is the moat.
 
 ## 8. What we refuse to build
 
