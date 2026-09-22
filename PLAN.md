@@ -236,11 +236,12 @@ build passes on the bar in sub-project 3; (c) every number in README.md and MANI
 that is a claim about charpente is in docs/BENCH.md or absent, and every other figure
 cites its source or carries no digits (held by `claims_census`).
 
-## After launch (v1.x) — five from M2 and one from DECISIONS §6, each with the trigger that reopens it
+## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, each with the trigger that reopens it
 
-None of these is debt. Each was weighed on 2026-09-13 against the thesis — does it make the
-reviewer catch more, or a stranger's first hour shorter — and none does. They are listed
-with their triggers so that "is it time yet" has a mechanical answer.
+None of these is debt. Each was weighed against the thesis on 2026-09-13 (the Linux run on
+2026-09-21) — does it make the reviewer catch more, or a stranger's first hour shorter —
+and none does. They are listed with their triggers so that "is it time yet" has a
+mechanical answer.
 
 | Item | Trigger |
 |---|---|

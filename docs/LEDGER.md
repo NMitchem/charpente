@@ -5321,16 +5321,17 @@ alone).
 
 **F1.** Two throwaway worktrees, one overlay: `examples/helpdesk` staged from `8913038`
 (the docs-only build where the original raw-panic finding happened), added to
-`Cargo.toml`'s `members`, and the one `acked_implies_durable(sim.seed(), …)` call rewritten
-to `acked_implies_durable(sim, …)` for the post-`c6e1dcc` signature — no edit needed beyond
-those two, in either worktree. Control at `566c7df^1` = `b15cdc7` (main before the fix);
-fix at `566c7df` itself. Same command both times: `cargo run -p charpente-cli -- test
---sim --dir examples/helpdesk --universes 10000 --master-seed 0x12124e6ebd9cf8b9`. Control:
-`panicked at` 1, `page_manager` 1 (`…redb-4.1.0/src/tree_store/page_manager.rs:257:9`),
-batch `EXIT=1`, 35 failures, 49965 verdicts. Fix: `panicked at` 0, `page_manager` 0 — one
-named line instead (`charpente: redb open-fence engaged (benign) — the store is treated as
-unopenable and Db::open rebuilds it; see Store::open`), batch still `EXIT=1`, the same 35
-failures, `.out` byte-identical to the control's.
+`Cargo.toml`'s `members`, and the one `acked_implies_durable(sim.seed(), …)` call
+rewritten to `acked_implies_durable(sim, …)` for the post-`c6e1dcc` signature — no edit
+needed beyond those two, in either worktree. Control at `566c7df^1` = `b15cdc7` (main
+before the fix); fix at `566c7df` itself. Same command both times: `cargo run -p
+charpente-cli -- test --sim --dir examples/helpdesk --universes 10000 --master-seed
+0x12124e6ebd9cf8b9`. Control: `panicked at` 1, `page_manager` 1
+(`…redb-4.1.0/src/tree_store/page_store/page_manager.rs:257:9`), batch `EXIT=1`, 35
+failures, 49965 verdicts. Fix: `panicked at` 0, `page_manager` 0 — one named line instead
+(`charpente: redb open-fence engaged (benign) — the store is treated as unopenable and
+Db::open rebuilds it; see Store::open`), batch still `EXIT=1`, the same 35 failures,
+`.out` byte-identical to the control's.
 
 The predicted panic count was 134, not the 1 observed; the record does not isolate why.
 Two candidates it cannot separate: `6ca6d4e` re-keys a fault stream in `b15cdc7`'s ancestry
@@ -5346,7 +5347,7 @@ corruption axis (25 `fault:bit_flip`, 10 `fault:misdirected_write`, per the kept
 dir_entry_loss_fired(sim) => {}` to the helpdesk's `verify_tickets` turns the identical
 master seed green — 0 failures, 50000 verdicts, `EXIT=0` (`f1-fix-b.json`). By the
 platform's own oracle (`checks.rs`'s `durable_corruption_fired` contract) this is not a
-platform defect. It is not, however, a helpdesk omission of a pattern the docs teach: GUIDE
+platform defect. Nor is it a helpdesk omission of a pattern the docs teach: GUIDE
 §8 documents the two excuse helpers, and did at the helpdesk's fork, but its worked
 `acked_implies_durable` example (`docs/GUIDE.md:2105-2157`) carries no excuse arm — the
 shape exists only in `crates/sim-fixture/tests/sim.rs:179`. The omission was inert under
