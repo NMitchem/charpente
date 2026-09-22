@@ -135,8 +135,9 @@ claims_census: README.md:86 carries a figure with no provenance: "hundreds of th
 ```
 
 Written first and shown red against the pre-rewrite documents — it must name
-"hundreds of thousands" at both sites, the telemetry line's "M2" and "99%" — then green
-after §2 lands. `CLAIMS` after the rewrite is small: `215` in README's scaling and status paragraphs →
+"hundreds of thousands" at both sites, "orders of magnitude", MANIFESTO §1's five figures,
+"99%" twice and "99.9%" — then green after §2 lands. (Guarantee 1's "M2" is a milestone
+label, blanked by rule; that clause is a truthfulness fix, not a number.) `CLAIMS` after the rewrite is small: `215` in README's scaling and status paragraphs →
 BENCH's `device durable appends/sec` line; `~31×`/`~31x` in the same two paragraphs →
 BENCH's "recovers up to ~31x" line. A `CLAIMS` row whose BENCH regex matches nothing is
 its own failure with its own message naming the row.
@@ -196,7 +197,7 @@ is closed only if the control reproduces.
 
 ## §7 Exit criteria
 
-1. `claims_census` red against `d0b2b7e`'s README/MANIFESTO at the four named sites,
+1. `claims_census` red against the pre-rewrite README/MANIFESTO at the sites §3 names,
    green after §2, with `EXEMPT_COUNT` pinned and every `CLAIMS` row resolving in
    BENCH.md.
 2. The §2 rewrites landed verbatim, and the ledger says whether §1.4 ran branch A or B.
