@@ -15,8 +15,8 @@ use charpente::http::{
     RouteGlue, SubEntry, Subscription,
 };
 use charpente::kernel::{
-    ERROR_FRAME, Kernel, RESHAPED_FRAME, RecordedResponses, SimSinkHandle, SimSource, SinkHandles,
-    Step,
+    ERROR_FRAME, EventFrame, EventSink, Kernel, RESHAPED_FRAME, RecordedResponses, SimSink,
+    SimSinkHandle, SimSource, SinkHandles, SinkStatus, Step,
 };
 use charpente::repl::protocol::{Msg, decode, encode};
 use charpente::repl::role::Role;
@@ -2658,7 +2658,22 @@ fn shapes_workload(sim: &mut Sim) -> Result<(), String> {
         // `EventRow` is not `Clone`: the anchor is an index into `rows`.
         let anchor_at = (entropy.next_u64() % rows.len() as u64) as usize;
         let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 60 * SEC);
-        source.push_stall(stall_closure(sim.entropy(), sim.subscriber_stall()));
+        // Whether the stall closure ever refused a send: the one thing that
+        // makes a short stream legal. `closed()` cannot say it, because the
+        // terminal `charpente.reshaped` frame drops the tail too. The wrapper
+        // calls the closure exactly once per send, so the draws are unchanged.
+        let stalled = Arc::new(Mutex::new(false));
+        let (fired, mut stall) = (
+            stalled.clone(),
+            stall_closure(sim.entropy(), sim.subscriber_stall()),
+        );
+        source.push_stall(Box::new(move || {
+            let full = stall();
+            if full {
+                *fired.lock().expect("stall flag lock") = true;
+            }
+            full
+        }));
         source.push_at(
             sim.now().as_nanos(),
             Request::new(
@@ -2671,7 +2686,10 @@ fn shapes_workload(sim: &mut Sim) -> Result<(), String> {
         );
         let (responses, sinks) = (source.responses(), source.sinks());
         match kernel.run(&mut source) {
-            Ok(()) => return shapes_verdict(sim, &rows, &rows[anchor_at], &responses, &sinks),
+            Ok(()) => {
+                let stalled = *stalled.lock().expect("stall flag lock");
+                return shapes_verdict(sim, &rows, &rows[anchor_at], &responses, &sinks, stalled);
+            }
             Err(e) if is_fault_fallout(&e.to_string()) => sim.restart(),
             Err(e) => return Err(format!("resume kernel.run failed non-injected: {e}")),
         }
@@ -2687,14 +2705,16 @@ fn shapes_workload(sim: &mut Sim) -> Result<(), String> {
 /// prefix of exactly what a resume must produce — every later v2 or pong row,
 /// decoded, up to the first foreign row, which arrives as one
 /// `charpente.reshaped` frame that ends the stream. A strict prefix is legal
-/// only when the sink stalled. Nothing is skipped and nothing is decoded from
-/// a foreign row.
+/// only when `stalled`, meaning the sink's stall closure refused a send. A
+/// closed tail is not evidence of that, since the terminal frame closes it
+/// too. Nothing is skipped and nothing is decoded from a foreign row.
 fn shapes_verdict(
     sim: &Sim,
     rows: &[EventRow],
     anchor: &EventRow,
     responses: &RecordedResponses,
     sinks: &SinkHandles,
+    stalled: bool,
 ) -> Result<(), String> {
     let v2 = <shapes_v2::IncidentOpened as Event>::FINGERPRINT;
     let foreign = |row: &EventRow| row.name == "incident_opened" && row.shape != Some(v2);
@@ -2752,7 +2772,7 @@ fn shapes_verdict(
             cursor_of(anchor)
         ));
     }
-    if got.len() < expected.len() && !handle.closed() {
+    if got.len() < expected.len() && !stalled {
         return Err(format!(
             "the resume from {} stopped short with no stall to explain it: got {got:?} of {expected:?}",
             cursor_of(anchor)
@@ -2782,6 +2802,64 @@ fn a_resume_across_mixed_shapes_is_exact_or_named_under_the_fault_matrix() {
             "shapes:reshaped-409",
             "shapes:v2-delivered"
         ]
+    );
+}
+
+/// `shapes_verdict`'s short-stream arm, called directly. The sink is dropped
+/// before every verdict, so the tail is closed the way the terminal
+/// `charpente.reshaped` frame leaves it. That alone must not excuse a stream
+/// that stops before the log does; only a stall that fired does.
+#[test]
+fn a_short_stream_passes_the_shapes_verdict_only_when_a_stall_fired() {
+    let (sim, _kernel, rows) = mixed_log(
+        0x5A11_0001,
+        &[
+            ("/pong", 1, None),
+            ("/v2/incident", 5, None),
+            ("/pong", 7, None),
+        ],
+    );
+    let full = [
+        EventFrame {
+            id: rows[1].id.raw(),
+            seq: rows[1].seq,
+            name: "incident_opened",
+            json: r#"{"n":"5","severity":"2"}"#.to_string(),
+        },
+        EventFrame {
+            id: rows[2].id.raw(),
+            seq: rows[2].seq,
+            name: "pong",
+            json: r#"{"n":"7"}"#.to_string(),
+        },
+    ];
+    let verdict = |frames: &[EventFrame], stalled: bool| {
+        let responses: RecordedResponses = Arc::new(Mutex::new(vec![(200, Vec::new())]));
+        let (mut sink, handle) = SimSink::new(Box::new(|| false));
+        for frame in frames {
+            assert!(matches!(sink.send(frame), SinkStatus::Ok));
+        }
+        drop(sink);
+        assert!(handle.closed());
+        let sinks: SinkHandles = Arc::new(Mutex::new(vec![handle]));
+        shapes_verdict(&sim, &rows, &rows[0], &responses, &sinks, stalled)
+    };
+
+    assert_eq!(
+        verdict(&full, false),
+        Ok(()),
+        "the whole resume with no stall is exact"
+    );
+    let short = verdict(&full[..1], false)
+        .expect_err("a strict prefix with no stall must be refused, closed tail or not");
+    assert!(
+        short.contains("stopped short with no stall to explain it"),
+        "refused by the short-stream arm, not some other one: {short}"
+    );
+    assert_eq!(
+        verdict(&full[..1], true),
+        Ok(()),
+        "a strict prefix is legal once a stall fired"
     );
 }
 
