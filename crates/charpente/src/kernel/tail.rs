@@ -29,6 +29,13 @@ pub const TAIL_BATCH_EVENTS: usize = 64;
 /// than resuming past an event it never received.
 pub const RESHAPED_FRAME: &str = "charpente.reshaped";
 
+/// The terminal frame for an event this node holds but cannot render: its
+/// bytes are corrupt, or its payload does not encode as JSON (payload-shapes
+/// spec §3). It fails this tail and never the node. The wire form carries no
+/// `id:` line (serve.rs `encode_frame`), so the client's cursor does not
+/// advance past the event and every reconnect fails at the same row.
+pub const ERROR_FRAME: &str = "charpente.error";
+
 /// What a sink reports back from one `send` attempt.
 pub enum SinkStatus {
     /// Delivered (buffered, in the prod channel's case).
@@ -81,7 +88,8 @@ pub struct Tail {
 /// own `SinkStatus` is not acted on). A row whose recorded shape is not the
 /// matching entry's is the other terminal case: the tail gets the terminal
 /// `charpente.reshaped` frame instead of a decode, and dies the same way
-/// (payload-shapes spec §3).
+/// (payload-shapes spec §3). Returns `Err` only for the platform's own store
+/// failures; nothing a subscriber can reach stops the node.
 pub fn deliver_unit(tail: &mut Tail, db: &Db) -> io::Result<bool> {
     let floor = db.event_floor()?;
     if tail.next_id < floor {
@@ -97,7 +105,34 @@ pub fn deliver_unit(tail: &mut Tail, db: &Db) -> io::Result<bool> {
         let _ = tail.sink.send(&gap);
         return Ok(false);
     }
-    let rows: Vec<EventRow> = db.snapshot()?.scan_from(tail.next_id, TAIL_BATCH_EVENTS)?;
+    let rows: Vec<EventRow> = match db.snapshot()?.scan_from(tail.next_id, TAIL_BATCH_EVENTS) {
+        Ok(rows) => rows,
+        // A stored row `EventRow` cannot decode is corrupt bytes, which
+        // subscribers can reach but did not cause: it fails this tail, never
+        // the node (spec amendment A11). `InvalidData` is exactly the codec's
+        // kind; redb's own failures are `Other` and still bubble, because a
+        // failing store is the platform's to stop on.
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+            let error = format!(
+                "event rows from id {} could not be decoded: {e} — the stored bytes are corrupt; \
+                 restore this node from its archive (GUIDE §15) or re-seed it from its primary \
+                 (GUIDE §10)",
+                tail.next_id
+            );
+            let _ = tail.sink.send(&EventFrame {
+                id: tail.next_id,
+                seq: 0,
+                name: ERROR_FRAME,
+                json: format!(
+                    "{{\"id\":{},\"error\":{}}}",
+                    tail.next_id,
+                    serde_json::Value::String(error)
+                ),
+            });
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
     for row in rows {
         tail.next_id = row.id.raw() + 1;
         if tail.sub.key.is_some() && tail.sub.key.as_deref() != row.key.as_deref() {
@@ -122,16 +157,28 @@ pub fn deliver_unit(tail: &mut Tail, db: &Db) -> io::Result<bool> {
             });
             return Ok(false);
         }
-        // An encode error here is deliberately whole-node-fatal (bubbles out
-        // of Kernel::run) — a tail that cannot render its frames is a build
-        // bug, not a client condition; the gentler per-tail-drop shape is a
-        // ledgered follow-up, and THIS test is its pin:
-        // realtime.rs::tail_encode_error_is_whole_node_fatal.
+        let json = match (entry.encode_json)(&row.payload) {
+            Ok(json) => json,
+            Err(e) => {
+                let _ = tail.sink.send(&EventFrame {
+                    id: row.id.raw(),
+                    seq: row.seq,
+                    name: ERROR_FRAME,
+                    json: format!(
+                        "{{\"event\":\"{}\",\"id\":{},\"error\":{}}}",
+                        entry.name,
+                        row.id.raw(),
+                        serde_json::Value::String(e.to_string())
+                    ),
+                });
+                return Ok(false);
+            }
+        };
         let frame = EventFrame {
             id: row.id.raw(),
             seq: row.seq,
             name: entry.name,
-            json: (entry.encode_json)(&row.payload)?,
+            json,
         };
         match tail.sink.send(&frame) {
             SinkStatus::Ok => {}

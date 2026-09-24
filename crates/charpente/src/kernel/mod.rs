@@ -9,7 +9,8 @@ mod tail;
 pub use cron::{CronRow, CronScheduler};
 pub use dispatch::{Dispatcher, JobDef, JobEntry, JobError, JobOutcome};
 pub use tail::{
-    EventFrame, EventSink, RESHAPED_FRAME, SimSink, SimSinkHandle, SinkStatus, TAIL_BATCH_EVENTS,
+    ERROR_FRAME, EventFrame, EventSink, RESHAPED_FRAME, SimSink, SimSinkHandle, SinkStatus,
+    TAIL_BATCH_EVENTS,
 };
 
 use std::collections::VecDeque;

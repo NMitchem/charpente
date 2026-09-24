@@ -15,7 +15,8 @@ use charpente::http::{
     RouteGlue, SubEntry, Subscription,
 };
 use charpente::kernel::{
-    Kernel, RESHAPED_FRAME, RecordedResponses, SimSinkHandle, SimSource, SinkHandles, Step,
+    ERROR_FRAME, Kernel, RESHAPED_FRAME, RecordedResponses, SimSinkHandle, SimSource, SinkHandles,
+    Step,
 };
 use charpente::repl::protocol::{Msg, decode, encode};
 use charpente::repl::role::Role;
@@ -460,6 +461,27 @@ fn legacy_emit_record(event: &str, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A record exactly as a shaped binary writes it: one `0x09` emit.
+fn shaped_emit_record(event: &str, payload: &[u8], shape: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    1u32.encode(&mut out);
+    out.push(9);
+    event.to_string().encode(&mut out);
+    payload.to_vec().encode(&mut out);
+    None::<String>.encode(&mut out);
+    shape.encode(&mut out);
+    out
+}
+
+/// Applies one shipped record to a live kernel's store, the way a follower
+/// applies a frame — the only way a test can plant bytes the typed API would
+/// never write.
+fn apply_record(kernel: &mut Kernel, record: Vec<u8>) {
+    let db = kernel.app_mut_for_tests().db_for_tests();
+    let seq = db.last_applied().map_or(0, |s| s + 1);
+    db.apply_shipped(&[(seq, record)]).unwrap();
+}
+
 /// Spec §6.1 — the statuspage review's C-1 probe, as a sim test. The old
 /// binary emitted `incident_opened` in its v1 shape between pongs; the node
 /// restarted as the new binary, whose `incident_opened` gained a field; a
@@ -719,12 +741,10 @@ fn a_pre_shape_event_is_foreign_on_both_paths_even_when_its_bytes_would_decode()
         severity: WireU64(1),
     }
     .encode(&mut v2_bytes);
-    {
-        let db = kernel.app_mut_for_tests().db_for_tests();
-        let seq = db.last_applied().map_or(0, |s| s + 1);
-        db.apply_shipped(&[(seq, legacy_emit_record("incident_opened", &v2_bytes))])
-            .unwrap();
-    }
+    apply_record(
+        &mut kernel,
+        legacy_emit_record("incident_opened", &v2_bytes),
+    );
     let legacy: Vec<EventRow> = kernel
         .app()
         .db()
@@ -766,6 +786,128 @@ fn a_pre_shape_event_is_foreign_on_both_paths_even_when_its_bytes_would_decode()
             &legacy[0],
             <shapes_v2::IncidentOpened as Event>::FINGERPRINT
         )
+    );
+}
+
+/// Spec §6.5: the shape matches but the bytes do not decode — corruption, not
+/// a reshape. The frame has no `id:` on the wire (serve.rs's `encode_frame`),
+/// so the client's cursor stays before the row, and each reconnect fails at
+/// the same row, the way a corrupt table row answers 500 on every read.
+#[test]
+fn a_corrupt_payload_under_a_matching_shape_fails_its_tail_by_name() {
+    let (sim, mut kernel, rows) = mixed_log(0x5A9E_0301, &[("/pong", 0, None)]);
+    let v2 = <shapes_v2::IncidentOpened as Event>::FINGERPRINT;
+    // v2's payload is 16 bytes; 8 is a truncation under a matching shape.
+    apply_record(
+        &mut kernel,
+        shaped_emit_record("incident_opened", &[0u8; 8], v2),
+    );
+    let expected_error = format!(
+        "event incident_opened failed to decode although its recorded shape matches this \
+         binary ({v2:#x}): row decode: needed 8 bytes for u64, 0 left — schema drift or \
+         corruption — the stored bytes are corrupt, not a shape change; restore this node \
+         from its archive (GUIDE §15) or re-seed it from its primary (GUIDE §10)"
+    );
+    for _ in 0..2 {
+        let (_, sinks) = run_script(
+            &mut kernel,
+            &sim,
+            vec![Request::new(
+                Method::Get,
+                format!("/v2/incidents-and-pongs?cursor={}", cursor_of(&rows[0])),
+            )],
+        );
+        let frames = frames_of(&sinks.lock().unwrap()[0]);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0].2, "charpente.error");
+        let body: serde_json::Value = serde_json::from_str(&frames[0].3).unwrap();
+        assert_eq!(body["event"], "incident_opened");
+        assert_eq!(body["id"], 1);
+        assert_eq!(
+            body["error"],
+            expected_error.as_str(),
+            "the same named error on every reconnect"
+        );
+    }
+    let (responses, _) = run_script(
+        &mut kernel,
+        &sim,
+        vec![Request::new(Method::Post, "/pong").json(&EmitBody {
+            n: WireU64(5),
+            key: None,
+        })],
+    );
+    assert_eq!(statuses(&responses), vec![200], "the node keeps serving");
+}
+
+/// `ev_json` checks trailing bytes now: a matching shape with bytes left over
+/// is corruption too, never a silent short decode.
+#[test]
+fn leftover_bytes_under_a_matching_shape_fail_the_tail_by_name() {
+    let (sim, mut kernel, rows) = mixed_log(0x5A9E_0302, &[("/pong", 0, None)]);
+    let v2 = <shapes_v2::IncidentOpened as Event>::FINGERPRINT;
+    apply_record(
+        &mut kernel,
+        shaped_emit_record("incident_opened", &[0u8; 24], v2),
+    );
+    let (_, sinks) = run_script(
+        &mut kernel,
+        &sim,
+        vec![Request::new(
+            Method::Get,
+            format!("/v2/incidents-and-pongs?cursor={}", cursor_of(&rows[0])),
+        )],
+    );
+    let frames = frames_of(&sinks.lock().unwrap()[0]);
+    let body: serde_json::Value = serde_json::from_str(&frames[0].3).unwrap();
+    assert_eq!(
+        body["error"],
+        format!(
+            "event incident_opened failed to decode although its recorded shape matches this \
+             binary ({v2:#x}): 8 bytes left over after the payload — the stored bytes are \
+             corrupt, not a shape change; restore this node from its archive (GUIDE §15) or \
+             re-seed it from its primary (GUIDE §10)"
+        )
+        .as_str()
+    );
+}
+
+/// Review focus 5 (spec amendment A11): a stored `EventRow` whose own bytes do
+/// not decode fails its tail, not the node. Planted through a shipped `0x04`
+/// migrate-put — the decode-free raw write — over a real row id, so the
+/// counter says the row exists and the tail reaches it.
+#[test]
+fn a_corrupt_event_row_fails_its_tail_not_the_node() {
+    let (sim, mut kernel, rows) = mixed_log(0x5A9E_0303, &[("/pong", 0, None), ("/pong", 1, None)]);
+    let mut record = Vec::new();
+    1u32.encode(&mut record);
+    record.push(4);
+    "charpente.events".to_string().encode(&mut record);
+    rows[1].id.raw().encode(&mut record);
+    vec![0xFFu8; 3].encode(&mut record);
+    apply_record(&mut kernel, record);
+    let (_, sinks) = run_script(
+        &mut kernel,
+        &sim,
+        vec![Request::new(
+            Method::Get,
+            format!("/pongs?cursor={}", cursor_of(&rows[0])),
+        )],
+    );
+    let frames = frames_of(&sinks.lock().unwrap()[0]);
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert_eq!(frames[0].2, "charpente.error");
+    let body: serde_json::Value = serde_json::from_str(&frames[0].3).unwrap();
+    assert_eq!(body["id"], rows[1].id.raw());
+    assert_eq!(
+        body["error"],
+        format!(
+            "event rows from id {} could not be decoded: row decode: needed 8 bytes for u64, 3 \
+             left — schema drift or corruption — the stored bytes are corrupt; restore this node \
+             from its archive (GUIDE §15) or re-seed it from its primary (GUIDE §10)",
+            rows[1].id.raw()
+        )
+        .as_str()
     );
 }
 
@@ -1355,7 +1497,7 @@ impl Client {
                     self.need_subscribe = true;
                     break;
                 }
-                if frame.name == RESHAPED_FRAME {
+                if frame.name == RESHAPED_FRAME || frame.name == ERROR_FRAME {
                     // Every event in this workload has one shape, and the
                     // matrix's corruption axes (`bit_flip`,
                     // `misdirected_write`) are wal/-scoped and checksummed —
@@ -2085,9 +2227,10 @@ fn the_harness_refuses_a_diverged_409_without_durable_corruption() {
 /// The arm therefore ends a batch at a subscribe.
 ///
 /// Found the honest way — by an existing test going red — but by
-/// `tail_encode_error_is_whole_node_fatal`, whose name promises nothing about
-/// batch ordering, so the property gets its own pin here rather than living
-/// on as a side effect of that one.
+/// `tail_encode_error_is_whole_node_fatal` (since renamed
+/// `an_unencodable_event_fails_its_tail_not_the_node`), whose name promises
+/// nothing about batch ordering, so the property gets its own pin here
+/// rather than living on as a side effect of that one.
 #[test]
 fn a_subscribe_still_sees_an_emit_that_arrives_with_it() {
     let sim = Sim::with_faults(0x2EB2_B471, FaultConfig::none());
@@ -2183,14 +2326,12 @@ fn a_delivered_frame_carries_its_64_bit_field_as_a_decimal_string() {
     );
 }
 
-/// The encode-error contract (spec §5): `deliver_unit` (kernel/tail.rs)
-/// bubbles a `SubEntry::encode_json` failure with `?`, which bubbles again at
-/// the `Ready::Tail` call site (kernel/mod.rs) out of `Kernel::step`/`run` —
-/// whole-node-fatal, not a per-tail drop. No `#[route(SSE ...)]` handler can
-/// produce a failing encoder (the macro only emits `Subscription::of::<Ev>()`'s
-/// real, working one), so this subscribes through a HAND-WRITTEN `RouteDef` —
-/// no macro — whose glue builds a `Subscription` with a `SubEntry` closure
-/// that always errors.
+/// Spec §3/§6.5: an encode failure fails its own tail, never the node — this
+/// test was `tail_encode_error_is_whole_node_fatal`, the pin of the decision
+/// payload shapes reversed (docs/LEDGER.md:286's per-tail follow-up). The
+/// failing encoder is hand-built (`FailingFeed`), because no `#[event]` the
+/// macro accepts can make `Subscription::of`'s real encoder fail on its own
+/// bytes. The stream ends with `charpente.error`, and the node keeps serving.
 struct FailingFeed;
 
 fn failing_feed_glue(
@@ -2250,7 +2391,7 @@ fn emit_note(tx: &mut Tx, body: NoteBody) -> Result<(), ApiError> {
 }
 
 #[test]
-fn tail_encode_error_is_whole_node_fatal() {
+fn an_unencodable_event_fails_its_tail_not_the_node() {
     let sim = Sim::with_faults(0x2EB2_FA11, FaultConfig::none());
     let app = App::open(
         Box::new(sim.disk()),
@@ -2262,33 +2403,40 @@ fn tail_encode_error_is_whole_node_fatal() {
     .mount(vec![FailingFeed::route()])
     .mount(routes![emit_note]);
     let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
-
-    let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 10 * SEC);
-    let t = sim.now().as_nanos();
-    source.push_at(t, Request::new(Method::Get, "/feed-failing"));
-    source.push_at(
-        t,
-        Request::new(Method::Post, "/note").json(&NoteBody { n: WireU64(1) }),
+    let (_, sinks) = run_script(
+        &mut kernel,
+        &sim,
+        vec![
+            Request::new(Method::Get, "/feed-failing"),
+            Request::new(Method::Post, "/note").json(&NoteBody { n: WireU64(1) }),
+        ],
     );
-
-    // Step 1: the subscribe registers the tail (no events exist yet, so it is
-    // not ready this step).
-    kernel
-        .step(&mut source)
-        .expect("the subscribe request must not itself fail");
-    // Step 2: the emit request commits the event the tail is waiting for.
-    kernel
-        .step(&mut source)
-        .expect("the emit request must not itself fail");
-    // Step 3: nothing is left in the script, so the only ready source is the
-    // now-behind tail -- deliver_unit's encode_json call fails, and that
-    // failure must bubble all the way out of `step` (`Step` has no `Debug`,
-    // so this can't go through `expect_err`).
-    let err = match kernel.step(&mut source) {
-        Ok(_) => panic!("an encode error must bubble out of Kernel::step, not be absorbed"),
-        Err(e) => e,
-    };
-    assert!(err.to_string().contains("encode exploded"), "{err}");
+    let rows: Vec<EventRow> = kernel
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan_from(0, 8)
+        .unwrap();
+    assert_eq!(
+        frames_of(&sinks.lock().unwrap()[0]),
+        vec![(
+            rows[0].id.raw(),
+            rows[0].seq,
+            "charpente.error".to_string(),
+            format!(
+                r#"{{"event":"note_added","id":{},"error":"encode exploded"}}"#,
+                rows[0].id.raw()
+            ),
+        )],
+        "one terminal error frame naming the event and the row"
+    );
+    let (responses, _) = run_script(
+        &mut kernel,
+        &sim,
+        vec![Request::new(Method::Post, "/note").json(&NoteBody { n: WireU64(2) })],
+    );
+    assert_eq!(statuses(&responses), vec![200], "the node keeps serving");
 }
 
 // ==================================== multi-node: follower tails + failover

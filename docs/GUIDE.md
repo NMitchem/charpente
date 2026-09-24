@@ -3396,15 +3396,28 @@ than twice: §16 covers the mechanism it belongs to — declaring `scoped_by`,
 writing the scope's `authorize`, and the cross-tenant capability — and points
 back here for the emit and subscribe shapes above.
 
-One contract rides along with the `Serialize` derive: every `#[event]` payload must
-be JSON-serializable. A value serde_json rejects — a `NaN` or infinite float, a map
-with non-string keys — is a contract violation, and it is not caught at emit time
-(the log/table store `Codec` bytes; JSON encoding happens at delivery). Delivery of
-an unserializable event is kernel-fatal: the encode error (`"event <name> failed
-JSON encoding: <serde_json's message>"`) propagates out of the delivery arm as a
-platform `io::Error` and stops the kernel loop, and since the event row is durable, a
-restart re-encounters it the moment a matching subscription catches up to it. Keep
-event payloads to plainly-JSON shapes.
+One contract rides along with the `Serialize` derive: every `#[event]` payload must be
+plainly JSON. serde_json refuses a map whose keys are not strings, and it does not
+refuse a `NaN` or infinite float — it writes `null`, so a client receives `null` where
+a number was. Neither is caught at emit time (the log stores `Codec` bytes; JSON
+encoding happens at delivery). An event that fails to encode fails its own tail and
+never the node: the stream ends with one terminal frame, the same frame a stored event
+whose bytes are corrupt gets:
+
+<!-- pinned -->
+```text
+event: charpente.error
+data: {"event":"<event>","id":<id>,"error":"<message>"}
+```
+
+The frame has no `id:` line, so the client's `Last-Event-ID` stays before the event
+and every reconnect ends at the same row, the way a corrupt table row answers 500 on
+every read. The `error` text names the event and the fix: for an encode failure,
+`event <name> failed JSON encoding: <serde_json's message> — every #[event] payload
+must be plainly JSON (GUIDE §11); fix the emitting code`; for corrupt bytes, restore
+the node from its archive (§15) or re-seed it from its primary (§10). A row whose own
+envelope is corrupt gets the same frame, with `id` naming the first event this tail had
+not yet received and no `event`.
 
 ### The SSE route and `Subscription`
 
@@ -3636,8 +3649,9 @@ data: {"floor":4,"tail":1,"fix":"re-sync current state through reads, then recon
 ```
 
 A tail that reaches an event written under a different shape of its type ends the
-same way, with `charpente.reshaped` (see "Changing an event"). Neither frame stops
-the node.
+same way, with `charpente.reshaped` (see "Changing an event"), and an event that
+cannot be rendered ends it with `charpente.error`. None of these frames stops the
+node.
 
 A sink that reports itself full or closed — a slow browser tab, a dead TCP
 connection — costs its own tail immediately; it never blocks the kernel loop for
@@ -3663,9 +3677,9 @@ time; two events emitted by the *same* transaction share one `seq` (§4's "call
 order" note applies to delivery order too). Each frame is `id: <id>.<seq>`,
 `event: <name>`, `data: <json>`, then a blank line.
 `id` matches `Cursor::wire` exactly, which is what makes a browser's native
-`Last-Event-ID` resume work with zero client code. An idle connection gets a `:hb`
-comment frame every 15 seconds — pure keepalive, no semantics, never interpreted as
-an event.
+`Last-Event-ID` resume work with zero client code — except `charpente.error`, which
+carries no `id:` line (above). An idle connection gets a `:hb` comment frame every 15
+seconds — pure keepalive, no semantics, never interpreted as an event.
 
 ### Changing an event
 

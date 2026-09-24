@@ -379,8 +379,13 @@ fn sse_pump(frames: mpsc::Receiver<kernel::EventFrame>, byte_tx: tokio::sync::mp
 
 /// Wire form (spec): `id: <id>.<seq>` — matching `Cursor::wire` exactly is
 /// what makes the browser's native `Last-Event-ID` resume work — then
-/// `event:`, `data:`, and the blank line ending the frame.
+/// `event:`, `data:`, and the blank line ending the frame. `charpente.error`
+/// alone carries no `id:` (payload-shapes spec §3): the client's cursor must
+/// not advance past an event it never received.
 fn encode_frame(frame: &kernel::EventFrame) -> Bytes {
+    if frame.name == kernel::ERROR_FRAME {
+        return Bytes::from(format!("event: {}\ndata: {}\n\n", frame.name, frame.json));
+    }
     Bytes::from(format!(
         "id: {}.{}\nevent: {}\ndata: {}\n\n",
         frame.id, frame.seq, frame.name, frame.json
@@ -585,6 +590,23 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(&encode_frame(&frame)).unwrap(),
             "id: 5.12\nevent: charpente.reshaped\ndata: {\"event\":\"incident_opened\",\"id\":5,\"fix\":\"re-sync current state through reads, then reconnect without a cursor\"}\n\n"
+        );
+    }
+
+    /// `charpente.error` has NO `id:` line (payload-shapes spec §3, A7): a
+    /// client's `Last-Event-ID` must not advance past an event it never
+    /// received, so a reconnect fails at the same row rather than skipping it.
+    #[test]
+    fn an_error_frame_carries_no_id_on_the_wire() {
+        let frame = kernel::EventFrame {
+            id: 5,
+            seq: 12,
+            name: kernel::ERROR_FRAME,
+            json: r#"{"event":"incident_opened","id":5,"error":"boom"}"#.to_string(),
+        };
+        assert_eq!(
+            std::str::from_utf8(&encode_frame(&frame)).unwrap(),
+            "event: charpente.error\ndata: {\"event\":\"incident_opened\",\"id\":5,\"error\":\"boom\"}\n\n"
         );
     }
 

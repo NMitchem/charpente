@@ -260,13 +260,38 @@ impl Subscription {
     }
 }
 
+/// Only ever called on a row whose recorded shape is `Ev::FINGERPRINT`
+/// (`deliver_unit` checks first), so a decode failure here — a short read or
+/// bytes left over — is corrupt storage, not a shape change, and says so.
 fn ev_json<Ev: Event + serde::Serialize>(bytes: &[u8]) -> io::Result<String> {
+    let corrupt = |detail: String| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "event {} failed to decode although its recorded shape matches this binary \
+                 ({:#x}): {detail} — the stored bytes are corrupt, not a shape change; restore \
+                 this node from its archive (GUIDE §15) or re-seed it from its primary (GUIDE §10)",
+                Ev::NAME,
+                Ev::FINGERPRINT
+            ),
+        )
+    };
     let mut input = bytes;
-    let ev = Ev::decode(&mut input)?;
+    let ev = Ev::decode(&mut input).map_err(|e| corrupt(e.to_string()))?;
+    if !input.is_empty() {
+        return Err(corrupt(format!(
+            "{} bytes left over after the payload",
+            input.len()
+        )));
+    }
     serde_json::to_string(&ev).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("event {} failed JSON encoding: {e}", Ev::NAME),
+            format!(
+                "event {} failed JSON encoding: {e} — every #[event] payload must be plainly \
+                 JSON (GUIDE §11); fix the emitting code",
+                Ev::NAME
+            ),
         )
     })
 }
