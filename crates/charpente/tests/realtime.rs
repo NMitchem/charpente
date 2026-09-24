@@ -2555,6 +2555,236 @@ fn a_real_events_serialize_failure_fails_its_tail_not_the_node() {
     assert_eq!(statuses(&responses), vec![200], "the node keeps serving");
 }
 
+// ------------------------------------ mixed shapes under the fault matrix
+
+/// How many resume attempts a universe gets through injected faults before it
+/// gives up. Only an attempt whose `kernel.run` returns without fault fallout
+/// is adjudicated.
+const SHAPES_SETTLE_ATTEMPTS: u32 = 12;
+
+#[derive(Clone, Copy, Debug)]
+enum Era {
+    /// The old binary: `incident_opened` in its v1 shape.
+    V1,
+    /// The new binary: `incident_opened` in its v2 shape.
+    V2,
+}
+
+/// `settle_boot` over `shapes_app` — the file's own boot-through-faults idiom,
+/// copied like `scoped_settle_boot` rather than parameterized, so the
+/// flagship's boot path is untouched.
+fn shapes_boot(sim: &Sim) -> Result<Option<Kernel>, String> {
+    for try_n in 0..SETTLE_BOOT_TRIES {
+        if try_n > 0 && try_n.is_multiple_of(SETTLE_CYCLE_EVERY) {
+            sim.restart();
+        }
+        let app = match shapes_app(sim) {
+            Ok(app) => app,
+            Err(e) if is_fault_fallout(&e.to_string()) => continue,
+            Err(e) => return Err(format!("shapes open failed non-injected: {e}")),
+        };
+        match Kernel::new(app, Box::new(sim.clock())) {
+            Ok(kernel) => return Ok(Some(kernel)),
+            Err(e) if is_fault_fallout(&e.to_string()) => {}
+            Err(e) => return Err(format!("shapes Kernel::new failed non-injected: {e}")),
+        }
+    }
+    Ok(None)
+}
+
+/// One universe of spec §6.3. The old binary emits `incident_opened` in its v1
+/// shape (and pongs); the node restarts as the new binary, which emits the v2
+/// shape; then a client resumes `/v2/incidents-and-pongs` from a cursor drawn
+/// from the durable log. Every phase runs under the fault matrix. The verdict
+/// is taken against that log.
+fn shapes_workload(sim: &mut Sim) -> Result<(), String> {
+    let entropy = sim.entropy();
+    for era in [Era::V1, Era::V2] {
+        if sim.gave_up().is_some() {
+            return Ok(());
+        }
+        sim.crash_disk_after(64 + entropy.next_u64() % 512);
+        if let Some(mut kernel) = shapes_boot(sim)? {
+            let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 60 * SEC);
+            let t = sim.now().as_nanos();
+            for i in 0..(2 + entropy.next_u64() % 5) {
+                let path = match (era, entropy.next_u64() % 3) {
+                    (_, 0) => "/pong",
+                    (Era::V1, _) => "/v1/incident",
+                    (Era::V2, _) => "/v2/incident",
+                };
+                source.push_at(
+                    t + i * SEC,
+                    Request::new(Method::Post, path).json(&EmitBody {
+                        n: WireU64(entropy.next_u64() % 1000),
+                        key: None,
+                    }),
+                );
+            }
+            if let Err(e) = kernel.run(&mut source)
+                && !is_fault_fallout(&e.to_string())
+            {
+                return Err(format!("{era:?} kernel.run failed non-injected: {e}"));
+            }
+        }
+        // The deploy between eras — or the crash, whichever came first.
+        sim.restart();
+    }
+    for _ in 0..SHAPES_SETTLE_ATTEMPTS {
+        if sim.gave_up().is_some() {
+            return Ok(());
+        }
+        let Some(mut kernel) = shapes_boot(sim)? else {
+            sim.restart();
+            continue;
+        };
+        let rows: Vec<EventRow> = match kernel
+            .app()
+            .db()
+            .snapshot()
+            .and_then(|s| s.scan_from(0, 1024))
+        {
+            Ok(rows) => rows,
+            Err(e) if is_fault_fallout(&e.to_string()) => {
+                sim.restart();
+                continue;
+            }
+            Err(e) => return Err(format!("event scan failed non-injected: {e}")),
+        };
+        if rows.is_empty() {
+            sim.give_up("no event survived the two eras — nothing to resume across");
+            return Ok(());
+        }
+        // `EventRow` is not `Clone`: the anchor is an index into `rows`.
+        let anchor_at = (entropy.next_u64() % rows.len() as u64) as usize;
+        let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 60 * SEC);
+        source.push_stall(stall_closure(sim.entropy(), sim.subscriber_stall()));
+        source.push_at(
+            sim.now().as_nanos(),
+            Request::new(
+                Method::Get,
+                format!(
+                    "/v2/incidents-and-pongs?cursor={}",
+                    cursor_of(&rows[anchor_at])
+                ),
+            ),
+        );
+        let (responses, sinks) = (source.responses(), source.sinks());
+        match kernel.run(&mut source) {
+            Ok(()) => return shapes_verdict(sim, &rows, &rows[anchor_at], &responses, &sinks),
+            Err(e) if is_fault_fallout(&e.to_string()) => sim.restart(),
+            Err(e) => return Err(format!("resume kernel.run failed non-injected: {e}")),
+        }
+    }
+    sim.give_up(format!(
+        "no resume completed without fault fallout in {SHAPES_SETTLE_ATTEMPTS} attempts"
+    ));
+    Ok(())
+}
+
+/// The oracle, against the retained log `rows` the resume ran over. A cursor
+/// ON a foreign row is refused with the named 409. Otherwise the frames are a
+/// prefix of exactly what a resume must produce — every later v2 or pong row,
+/// decoded, up to the first foreign row, which arrives as one
+/// `charpente.reshaped` frame that ends the stream. A strict prefix is legal
+/// only when the sink stalled. Nothing is skipped and nothing is decoded from
+/// a foreign row.
+fn shapes_verdict(
+    sim: &Sim,
+    rows: &[EventRow],
+    anchor: &EventRow,
+    responses: &RecordedResponses,
+    sinks: &SinkHandles,
+) -> Result<(), String> {
+    let v2 = <shapes_v2::IncidentOpened as Event>::FINGERPRINT;
+    let foreign = |row: &EventRow| row.name == "incident_opened" && row.shape != Some(v2);
+    let responses = responses.lock().expect("responses lock").clone();
+    let [(status, body)] = responses.as_slice() else {
+        return Err(format!(
+            "expected exactly the subscribe's response, got {responses:?}"
+        ));
+    };
+    if foreign(anchor) {
+        let expected = reshaped_409(anchor, v2);
+        if *status != 409 || error_text(body) != expected {
+            return Err(format!(
+                "a cursor on foreign row {} must be refused 409 {expected:?}, got {status} {}",
+                anchor.id.raw(),
+                String::from_utf8_lossy(body)
+            ));
+        }
+        sim.cover("shapes:reshaped-409");
+        return Ok(());
+    }
+    if *status != 200 {
+        return Err(format!(
+            "a resume from a v2 or pong cursor must open the stream, got {status} {}",
+            String::from_utf8_lossy(body)
+        ));
+    }
+    let mut expected = Vec::new();
+    for row in rows.iter().filter(|r| r.id.raw() > anchor.id.raw()) {
+        if foreign(row) {
+            expected.push(reshaped_frame(row));
+            break;
+        }
+        let json = match row.name.as_str() {
+            "incident_opened" => serde_json::to_string(
+                &shapes_v2::IncidentOpened::decode(&mut &row.payload[..])
+                    .map_err(|e| e.to_string())?,
+            ),
+            "pong" => serde_json::to_string(
+                &Pong::decode(&mut &row.payload[..]).map_err(|e| e.to_string())?,
+            ),
+            other => return Err(format!("this workload emits no {other:?}")),
+        }
+        .expect("both payloads serialize");
+        expected.push((row.id.raw(), row.seq, row.name.clone(), json));
+    }
+    let handles = sinks.lock().expect("sinks lock");
+    let [handle] = handles.as_slice() else {
+        return Err(format!("expected one stream, got {}", handles.len()));
+    };
+    let got = frames_of(handle);
+    if got.len() > expected.len() || got[..] != expected[..got.len()] {
+        return Err(format!(
+            "the resume from {} diverged from the log:\n  expected (a prefix of) {expected:?}\n  got {got:?}",
+            cursor_of(anchor)
+        ));
+    }
+    if got.len() < expected.len() && !handle.closed() {
+        return Err(format!(
+            "the resume from {} stopped short with no stall to explain it: got {got:?} of {expected:?}",
+            cursor_of(anchor)
+        ));
+    }
+    if got.last().is_some_and(|f| f.2 == RESHAPED_FRAME) {
+        sim.cover("shapes:reshaped-frame");
+    }
+    if got.iter().any(|f| f.2 == "incident_opened") {
+        sim.cover("shapes:v2-delivered");
+    }
+    Ok(())
+}
+
+/// Spec §6.3's property. The universe count was set by timing one batch (see
+/// the commit message); the seed base is fixed and replays with
+/// `CHARPENTE_SEED`/`CHARPENTE_BASE_SEED` like every swarm here.
+#[test]
+fn a_resume_across_mixed_shapes_is_exact_or_named_under_the_fault_matrix() {
+    run_universes_swarm_with!(
+        0x2EB2_5A10,
+        180,
+        |_cfg: &mut FaultConfig| {},
+        |sim: &mut Sim| shapes_workload(sim),
+        require: [
+            "shapes:reshaped-frame",
+            "shapes:reshaped-409",
+            "shapes:v2-delivered"
+        ]
+    );
+}
+
 // ==================================== multi-node: follower tails + failover
 //
 // Task 8: two REPLICATED kernels (the rig shape from replication.rs's T8
