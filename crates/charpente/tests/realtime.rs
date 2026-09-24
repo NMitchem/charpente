@@ -578,10 +578,12 @@ fn a_dropped_trailing_field_is_refused_not_delivered_short() {
     );
 }
 
-/// Review focus 1: the key filter runs BEFORE the shape check, on both paths.
-/// Another tenant's reshaped event must not end this tenant's tail, and a
-/// cursor on it must not be refused — this subscription would never deliver
-/// that row either way.
+/// The key filter runs BEFORE the shape check, on both paths — proven both
+/// ways. Another tenant's reshaped event must not end this tenant's tail, and
+/// a cursor on it must not be refused, since this subscription would never
+/// deliver that row either way; a SAME-key foreign row is the opposite case —
+/// it DOES end the tail, and a cursor on it IS refused. An unkeyed
+/// subscription passes every key, so org-b's foreign row refuses it too.
 #[test]
 fn another_keys_reshaped_event_neither_ends_nor_refuses_this_tail() {
     let (sim, mut kernel, rows) = mixed_log(
@@ -590,7 +592,13 @@ fn another_keys_reshaped_event_neither_ends_nor_refuses_this_tail() {
             ("/pong", 0, None),
             ("/v1/incident", 1, Some("org-b")),
             ("/v2/incident", 2, Some("org-a")),
+            ("/v1/incident", 3, Some("org-a")),
         ],
+    );
+    assert_ne!(
+        rows[1].shape,
+        Some(<shapes_v2::IncidentOpened as Event>::FINGERPRINT),
+        "the precondition: org-b's row is foreign to this binary's incident_opened"
     );
     let expected = vec![(
         rows[2].id.raw(),
@@ -598,6 +606,9 @@ fn another_keys_reshaped_event_neither_ends_nor_refuses_this_tail() {
         "incident_opened".to_string(),
         r#"{"n":"2","severity":"2"}"#.to_string(),
     )];
+    let mut with_own_reshaped = expected.clone();
+    with_own_reshaped.push(reshaped_frame(&rows[3]));
+
     let (responses, sinks) = run_script(
         &mut kernel,
         &sim,
@@ -620,13 +631,44 @@ fn another_keys_reshaped_event_neither_ends_nor_refuses_this_tail() {
     let handles = sinks.lock().unwrap();
     assert_eq!(
         frames_of(&handles[0]),
-        expected,
-        "org-b's foreign row did not end org-a's tail"
+        with_own_reshaped,
+        "org-b's foreign row did not end org-a's tail, but org-a's own foreign row does"
     );
     assert_eq!(
         frames_of(&handles[1]),
-        expected,
-        "a cursor on org-b's foreign row resumes"
+        with_own_reshaped,
+        "a cursor on org-b's foreign row resumes, and still ends at org-a's own foreign row"
+    );
+    drop(handles);
+
+    let (responses, _) = run_script(
+        &mut kernel,
+        &sim,
+        vec![
+            Request::new(
+                Method::Get,
+                format!("/v2/incidents-org-a?cursor={}", cursor_of(&rows[3])),
+            ),
+            Request::new(
+                Method::Get,
+                format!("/v2/incidents-and-pongs?cursor={}", cursor_of(&rows[1])),
+            ),
+        ],
+    );
+    let responses = responses.lock().unwrap().clone();
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0].0, 409, "a same-key foreign cursor is refused");
+    assert_eq!(
+        error_text(&responses[0].1),
+        reshaped_409(&rows[3], <shapes_v2::IncidentOpened as Event>::FINGERPRINT)
+    );
+    assert_eq!(
+        responses[1].0, 409,
+        "an unkeyed subscription passes every key, so org-b's foreign row refuses it too"
+    );
+    assert_eq!(
+        error_text(&responses[1].1),
+        reshaped_409(&rows[1], <shapes_v2::IncidentOpened as Event>::FINGERPRINT)
     );
 }
 

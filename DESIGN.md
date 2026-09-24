@@ -662,8 +662,8 @@ opting a table out of drift protection is the cost of not using `#[table]`.
 **Payload shapes.** `#[event]` and `#[job]` carry the same structural fingerprint
 `#[table]` does (`Event::FINGERPRINT`, `Job::FINGERPRINT` — required on a hand-written
 impl, no default), and every emit and enqueue records it in the log beside the payload.
-A payload is decoded only under the shape it was written with: delivery refuses a
-foreign-shape event by name and ends that one tail (§6). There is no per-row versioned
+An event payload is decoded only under the shape it was written with: delivery refuses
+a foreign-shape event by name and ends that one tail (§6). There is no per-row versioned
 decode — the migrations spec rejected it twice — and no override (MANIFESTO §8).
 
 **The gate, the barrier, and the seven refusals.** A built-in table,

@@ -3576,7 +3576,7 @@ The wire form is always `<id>.<seq>`: an event id and its committing record's lo
 seq, joined by a dot (`Cursor::wire`). The seq half is not decorative — two diverged
 timelines (an old primary's unshipped tail vs. a promoted follower's new writes, §10)
 can mint the same event id for two *different* events, and a bare id can't tell them
-apart. Resume validation at subscribe time checks both, in order:
+apart. Resume validation at subscribe time checks, in order:
 
 - **Below the retention floor** — the cursor's id predates everything this node
   still retains:
@@ -3701,12 +3701,16 @@ filter excludes, is not refused: the subscription would never deliver that row a
 The node keeps serving throughout, and every other tail is untouched.
 
 **To keep exact resume across a deploy, do not change an existing event's fields.**
-Add a new `#[event]` type with the new fields, emit it from the new code, and keep the
-old type in code — and in any subscription that still needs it — for as long as its
-rows are retained (`DbConfig::event_retention`). Old rows keep decoding under their
-own type. Changing the fields in place costs every subscriber positioned before the
-change one re-sync. What the fingerprint cannot see, a change inside a type a field
-holds, is in §12.
+Add a new `#[event]` type under a new name, with the new fields, emit it from the new
+code, and keep the old type in code — and in any subscription that still needs it —
+for as long as its rows are retained (`DbConfig::event_retention`). A new name is not
+optional: `NAME` is the type's own snake_case, so putting the new type in a new module
+with the *same* type identifier (`mod v2 { struct IncidentOpened { ... } }`) still
+collides on `incident_opened` — nothing stops that pair from compiling or mounting,
+and a subscription carrying both then treats every row of the newer shape as a foreign
+row of the older one. Old rows keep decoding under their own type. Changing the fields
+in place costs every subscriber positioned before the change one re-sync. What the
+fingerprint cannot see, a change inside a type a field holds, is in §12.
 
 ### Testing a tail in sim
 

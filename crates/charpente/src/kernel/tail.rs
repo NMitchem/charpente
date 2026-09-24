@@ -78,7 +78,10 @@ pub struct Tail {
 /// FIRST: a tail that fell behind retention gets the terminal gap frame and
 /// dies — deterministic, part of the unit, independent of whatever the sink
 /// reports for that final send (the tail is dying either way, so the send's
-/// own `SinkStatus` is not acted on).
+/// own `SinkStatus` is not acted on). A row whose recorded shape is not the
+/// matching entry's is the other terminal case: the tail gets the terminal
+/// `charpente.reshaped` frame instead of a decode, and dies the same way
+/// (payload-shapes spec §3).
 pub fn deliver_unit(tail: &mut Tail, db: &Db) -> io::Result<bool> {
     let floor = db.event_floor()?;
     if tail.next_id < floor {

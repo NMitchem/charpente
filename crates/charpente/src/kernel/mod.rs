@@ -934,8 +934,9 @@ impl Kernel {
 /// everything this node has ever minted, and a cursor whose id landed on a
 /// different event than the one the client saw, are both a diverged
 /// timeline, distinguished only by the message's `{detail}`); and if the row
-/// is on this subscription's timeline, it must not be one this binary
-/// refuses to decode (checked third — payload-shapes spec §3). No cursor at
+/// is one this subscription would deliver (a name it carries, a key it
+/// passes), it must not be one this binary refuses to decode (checked third —
+/// payload-shapes spec §3). No cursor at
 /// all always succeeds, positioned to tail from now. Returns the tail's
 /// starting `next_id` on success.
 fn validate_subscribe(db: &Db, sub: &Subscription) -> Result<u64, Response> {
