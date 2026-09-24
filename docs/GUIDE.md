@@ -3803,8 +3803,7 @@ its type, not the type's definition. A change inside a type a field holds — a 
 variant on an enum, a field added to a nested struct — leaves the fingerprint
 unchanged, for tables and for `#[event]`/`#[job]` payloads alike (§6, §11). Such a
 change is exactly as dangerous as a field change and nothing catches it: treat an edit
-to any type a row or payload contains as an edit to that row or payload itself. A deep
-fingerprint is on PLAN.md's after-launch list with its trigger.
+to any type a row or payload contains as an edit to that row or payload itself.
 
 ### Worked example: adding a field
 

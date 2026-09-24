@@ -1001,10 +1001,12 @@ Vec<(u64, Vec<u8>)> }` (tag 5, unchanged since before tenant scoping), a scoped 
 rather than a widened tag 5, so tag 5's bytes for an unscoped table stay exactly what an
 older binary already expects); the receiving side checks the message against its own
 schema's word for that table and refuses a mismatch by name rather than importing a row
-under the wrong scope. `PROTO_VERSION` is 2 — a message body's shape changing is what
-bumps it, and a `Hello` declaring 1 is refused by name. The follower buffers the
-stream and, at `SnapshotEnd`, latches `db_needs_reseed` — `Repl::step` cannot replace a
-`Db` it only borrows, so the CALLER (the kernel arm, T8) runs `Repl::run_seed(db, clock)`,
+under the wrong scope. `PROTO_VERSION` is 3 — a message body's shape changing is what
+bumps it: tenant scoping's tag 14 made it 2, payload shapes' `0x08`/`0x09` record tags
+made it 3, and a `Hello` declaring an older version is refused by name. The follower
+buffers the stream and, at `SnapshotEnd`, latches `db_needs_reseed` — `Repl::step`
+cannot replace a `Db` it only borrows, so the CALLER (the kernel arm, T8) runs
+`Repl::run_seed(db, clock)`,
 which consumes the `Db` through `into_seeder`, replays the buffer, `finish`es at the
 horizon + 1 boundary, re-gates writes, and returns the new `Db`; a conn death mid-stream
 never latches, and the next `Hello` restarts the seed from scratch (idempotent —
