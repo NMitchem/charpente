@@ -104,7 +104,8 @@ pub trait Job: Codec {
 pub trait Event: Codec {
     const NAME: &'static str;
     /// The payload's structural fingerprint, as for `Job::FINGERPRINT`:
-    /// recorded beside every emit.
+    /// recorded beside every emit. Delivery decodes a stored event only
+    /// under the shape it was written with (payload-shapes spec §3).
     const FINGERPRINT: u64;
 }
 

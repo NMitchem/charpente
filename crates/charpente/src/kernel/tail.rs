@@ -22,6 +22,13 @@ use crate::http::Subscription;
 /// for, the same role `TAIL_BATCH_EVENTS`'s peers (job/cron ticks) play.
 pub const TAIL_BATCH_EVENTS: usize = 64;
 
+/// The terminal frame a tail gets instead of a decode when a stored event's
+/// recorded shape is not the subscribed type's (payload-shapes spec §3). It
+/// carries the foreign row's own `id.seq`, so a client that ignores it and
+/// reconnects with that cursor meets `validate_subscribe`'s named 409 rather
+/// than resuming past an event it never received.
+pub const RESHAPED_FRAME: &str = "charpente.reshaped";
+
 /// What a sink reports back from one `send` attempt.
 pub enum SinkStatus {
     /// Delivered (buffered, in the prod channel's case).
@@ -96,6 +103,22 @@ pub fn deliver_unit(tail: &mut Tail, db: &Db) -> io::Result<bool> {
         let Some(entry) = tail.sub.entries.iter().find(|e| e.name == row.name) else {
             continue;
         };
+        if row.shape != Some(entry.fingerprint) {
+            // Never decoded: this binary cannot prove those bytes are its own
+            // shape. The tail ends here, the node does not, and every other
+            // tail is untouched — the `charpente.gap` lifecycle.
+            let _ = tail.sink.send(&EventFrame {
+                id: row.id.raw(),
+                seq: row.seq,
+                name: RESHAPED_FRAME,
+                json: format!(
+                    "{{\"event\":\"{}\",\"id\":{},\"fix\":\"re-sync current state through reads, then reconnect without a cursor\"}}",
+                    entry.name,
+                    row.id.raw()
+                ),
+            });
+            return Ok(false);
+        }
         // An encode error here is deliberately whole-node-fatal (bubbles out
         // of Kernel::run) — a tail that cannot render its frames is a build
         // bug, not a client condition; the gentler per-tail-drop shape is a

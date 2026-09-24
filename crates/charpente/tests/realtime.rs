@@ -14,7 +14,9 @@ use charpente::http::{
     ApiError, App, AppConfig, Ctx, Cursor, EmittedEvent, Method, Request, Route, RouteDef,
     RouteGlue, SubEntry, Subscription,
 };
-use charpente::kernel::{Kernel, RecordedResponses, SimSinkHandle, SimSource, SinkHandles, Step};
+use charpente::kernel::{
+    Kernel, RESHAPED_FRAME, RecordedResponses, SimSinkHandle, SimSource, SinkHandles, Step,
+};
 use charpente::repl::protocol::{Msg, decode, encode};
 use charpente::repl::role::Role;
 use charpente::repl::{MAX_MESSAGE_BYTES, Repl, ReplConfig};
@@ -210,6 +212,512 @@ fn feed_keyed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscrip
         .and::<Pong>()
         .key("org-a")
         .cursor(cursor))
+}
+
+// ------------------------------------------------------- reshaped events
+//
+// Routes over the `shapes_v1`/`shapes_v2` pairs. The v1 emitters are what the
+// OLD binary served, the v2 emitters and feeds what the new one serves; one
+// binary hosts both, so a mixed log is one POST away. The feeds declare no
+// `emits(...)`: that list takes bare idents, these types live in modules, and
+// nothing here generates a client.
+
+#[route(POST "/v1/incident", public)]
+fn emit_v1_incident(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
+    let ev = shapes_v1::IncidentOpened { n: body.n };
+    match body.key {
+        Some(key) => tx.emit_keyed(key, ev),
+        None => tx.emit(ev),
+    }
+    Ok(())
+}
+
+#[route(POST "/v2/incident", public)]
+fn emit_v2_incident(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
+    let ev = shapes_v2::IncidentOpened {
+        n: body.n,
+        severity: WireU64(body.n.0 % 3),
+    };
+    match body.key {
+        Some(key) => tx.emit_keyed(key, ev),
+        None => tx.emit(ev),
+    }
+    Ok(())
+}
+
+#[route(POST "/v1/swapped", public)]
+fn emit_v1_swapped(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
+    tx.emit(shapes_v1::Swapped {
+        a: body.n,
+        b: WireU64(body.n.0 + 100),
+    });
+    Ok(())
+}
+
+#[route(POST "/v1/dropped", public)]
+fn emit_v1_dropped(tx: &mut Tx, body: EmitBody) -> Result<(), ApiError> {
+    tx.emit(shapes_v1::Dropped {
+        a: body.n,
+        b: WireU64(body.n.0 + 100),
+    });
+    Ok(())
+}
+
+#[route(SSE "/v2/incidents-and-pongs", public)]
+fn feed_v2_incidents_and_pongs(
+    tx: &mut Tx,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<shapes_v2::IncidentOpened>()
+        .and::<Pong>()
+        .cursor(cursor))
+}
+
+#[route(SSE "/v2/incidents-org-a", public)]
+fn feed_v2_incidents_org_a(
+    tx: &mut Tx,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<shapes_v2::IncidentOpened>()
+        .key("org-a")
+        .cursor(cursor))
+}
+
+#[route(SSE "/v2/swapped", public)]
+fn feed_v2_swapped(
+    tx: &mut Tx,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<shapes_v2::Swapped>().cursor(cursor))
+}
+
+#[route(SSE "/v2/dropped", public)]
+fn feed_v2_dropped(
+    tx: &mut Tx,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<shapes_v2::Dropped>().cursor(cursor))
+}
+
+#[route(SSE "/pongs", public)]
+fn feed_pongs(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<Pong>().cursor(cursor))
+}
+
+/// Default retention (65,536): nothing in these tests may fall behind it, so
+/// a gap frame or a below-floor 409 here is a bug, never an excuse.
+fn shapes_app(sim: &Sim) -> io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?
+    .mount(routes![
+        emit_pong,
+        emit_v1_incident,
+        emit_v2_incident,
+        emit_v1_swapped,
+        emit_v1_dropped,
+        feed_v2_incidents_and_pongs,
+        feed_v2_incidents_org_a,
+        feed_v2_swapped,
+        feed_v2_dropped,
+        feed_pongs
+    ]))
+}
+
+/// Pushes `requests` at one instant and steps the kernel until the script is
+/// spent. Every step must succeed: the property these tests pin is that
+/// nothing a subscriber does stops the node.
+fn run_script(
+    kernel: &mut Kernel,
+    sim: &Sim,
+    requests: Vec<Request>,
+) -> (RecordedResponses, SinkHandles) {
+    let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 10 * SEC);
+    let t = sim.now().as_nanos();
+    for request in requests {
+        source.push_at(t, request);
+    }
+    let (responses, sinks) = (source.responses(), source.sinks());
+    for _ in 0..16 {
+        if let Err(e) = kernel.step(&mut source) {
+            panic!("no step may fail — nothing a subscriber does stops the node: {e}");
+        }
+    }
+    (responses, sinks)
+}
+
+/// Emits `(path, n, key)` in order on a fresh node — the mixed log a
+/// reshaping deploy leaves — then restarts it (the deploy) and returns the new
+/// kernel with every retained event row, so each test builds its cursors and
+/// expected frames from real ids and seqs.
+fn mixed_log(seed: u64, emits: &[(&str, u64, Option<&str>)]) -> (Sim, Kernel, Vec<EventRow>) {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let mut kernel = Kernel::new(shapes_app(&sim).unwrap(), Box::new(sim.clock())).unwrap();
+    let requests = emits
+        .iter()
+        .map(|&(path, n, key)| {
+            Request::new(Method::Post, path).json(&EmitBody {
+                n: WireU64(n),
+                key: key.map(str::to_string),
+            })
+        })
+        .collect();
+    let (responses, _) = run_script(&mut kernel, &sim, requests);
+    assert!(
+        statuses(&responses).iter().all(|s| *s == 200),
+        "every emit commits: {:?}",
+        statuses(&responses)
+    );
+    sim.restart();
+    drop(kernel);
+    let kernel = Kernel::new(shapes_app(&sim).unwrap(), Box::new(sim.clock())).unwrap();
+    let rows: Vec<EventRow> = kernel
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan_from(0, 64)
+        .unwrap();
+    assert_eq!(rows.len(), emits.len(), "every emit is one retained row");
+    (sim, kernel, rows)
+}
+
+fn statuses(responses: &RecordedResponses) -> Vec<u16> {
+    responses.lock().unwrap().iter().map(|(s, _)| *s).collect()
+}
+
+fn frames_of(handle: &SimSinkHandle) -> Vec<(u64, u64, String, String)> {
+    handle
+        .frames()
+        .iter()
+        .map(|f| (f.id, f.seq, f.name.to_string(), f.json.clone()))
+        .collect()
+}
+
+fn cursor_of(row: &EventRow) -> String {
+    format!("{}.{}", row.id.raw(), row.seq)
+}
+
+/// The terminal frame for a foreign row, spelled out here rather than taken
+/// from the product so the comparison pins the spec's wording (§3).
+fn reshaped_frame(row: &EventRow) -> (u64, u64, String, String) {
+    (
+        row.id.raw(),
+        row.seq,
+        "charpente.reshaped".to_string(),
+        format!(
+            r#"{{"event":"{}","id":{},"fix":"re-sync current state through reads, then reconnect without a cursor"}}"#,
+            row.name,
+            row.id.raw()
+        ),
+    )
+}
+
+/// The reshaped 409's text (spec §3 as amended, A5), spelled out.
+fn reshaped_409(row: &EventRow, compiled: u64) -> String {
+    let recorded = match row.shape {
+        Some(shape) => format!("{shape:#x}"),
+        None => "none — written before event shapes were tagged".to_string(),
+    };
+    format!(
+        "cursor {} sits on an \"{}\" event written under a different shape of that event \
+         (recorded {recorded}; this binary {compiled:#x}) — this binary will not decode it; \
+         re-sync current state through reads, then reconnect without a cursor",
+        cursor_of(row),
+        row.name
+    )
+}
+
+/// A `Response::error` body's `error` text.
+fn error_text(body: &[u8]) -> String {
+    let v: serde_json::Value = serde_json::from_slice(body).expect("an error body is JSON");
+    v["error"]
+        .as_str()
+        .expect("an error body has an error string")
+        .to_string()
+}
+
+/// A record as a pre-shape binary wrote it: one `0x03` emit, no shape.
+fn legacy_emit_record(event: &str, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    1u32.encode(&mut out);
+    out.push(3);
+    event.to_string().encode(&mut out);
+    payload.to_vec().encode(&mut out);
+    None::<String>.encode(&mut out);
+    out
+}
+
+/// Spec §6.1 — the statuspage review's C-1 probe, as a sim test. The old
+/// binary emitted `incident_opened` in its v1 shape between pongs; the node
+/// restarted as the new binary, whose `incident_opened` gained a field; a
+/// client resumes from the pong before it. At c28250e this stopped the kernel
+/// (`kernel.step` = Err, "needed 8 bytes for u64, 0 left") and every restart
+/// stopped it again. Now the pong before the foreign row is delivered, the
+/// foreign row ends the stream with one named frame carrying its own id, the
+/// pong after it never arrives, a second tail on the same node keeps flowing,
+/// and a client that ignored the frame and reconnects from its id is refused
+/// by name.
+#[test]
+fn a_reshaped_event_ends_its_tail_by_name_and_the_node_keeps_serving() {
+    let (sim, mut kernel, rows) = mixed_log(
+        0x5A9E_0201,
+        &[
+            ("/pong", 0, None),
+            ("/pong", 1, None),
+            ("/v1/incident", 2, None),
+            ("/pong", 3, None),
+        ],
+    );
+    let (responses, sinks) = run_script(
+        &mut kernel,
+        &sim,
+        vec![
+            Request::new(
+                Method::Get,
+                format!("/v2/incidents-and-pongs?cursor={}", cursor_of(&rows[0])),
+            ),
+            Request::new(Method::Get, "/pongs"),
+            Request::new(Method::Post, "/pong").json(&EmitBody {
+                n: WireU64(4),
+                key: None,
+            }),
+        ],
+    );
+    assert_eq!(statuses(&responses), vec![200, 200, 200]);
+    let handles = sinks.lock().unwrap();
+    assert_eq!(
+        frames_of(&handles[0]),
+        vec![
+            (
+                rows[1].id.raw(),
+                rows[1].seq,
+                "pong".to_string(),
+                r#"{"n":"1"}"#.to_string()
+            ),
+            reshaped_frame(&rows[2]),
+        ]
+    );
+    assert_eq!(
+        frames_of(&handles[1])
+            .into_iter()
+            .map(|f| f.3)
+            .collect::<Vec<_>>(),
+        vec![r#"{"n":"4"}"#.to_string()],
+        "a second tail on the same node keeps flowing"
+    );
+    drop(handles);
+
+    let (responses, _) = run_script(
+        &mut kernel,
+        &sim,
+        vec![Request::new(
+            Method::Get,
+            format!("/v2/incidents-and-pongs?cursor={}", cursor_of(&rows[2])),
+        )],
+    );
+    let responses = responses.lock().unwrap().clone();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].0, 409);
+    assert_eq!(
+        error_text(&responses[0].1),
+        reshaped_409(&rows[2], <shapes_v2::IncidentOpened as Event>::FINGERPRINT)
+    );
+}
+
+/// Spec §6.2 — the silent misdecodes. At c28250e this delivered
+/// {"b":"1","a":"101"} for an event whose a was 1 and whose b was 101, with no
+/// error anywhere.
+#[test]
+fn a_same_typed_field_swap_is_refused_not_delivered_with_the_values_traded() {
+    let (sim, mut kernel, rows) =
+        mixed_log(0x5A9E_0202, &[("/pong", 0, None), ("/v1/swapped", 1, None)]);
+    let (_, sinks) = run_script(
+        &mut kernel,
+        &sim,
+        vec![Request::new(
+            Method::Get,
+            format!("/v2/swapped?cursor={}", cursor_of(&rows[0])),
+        )],
+    );
+    assert_eq!(
+        frames_of(&sinks.lock().unwrap()[0]),
+        vec![reshaped_frame(&rows[1])]
+    );
+}
+
+/// Spec §6.2 — at c28250e this delivered {"a":"1"}: the event's b silently
+/// gone, and the eight bytes it left behind never checked.
+#[test]
+fn a_dropped_trailing_field_is_refused_not_delivered_short() {
+    let (sim, mut kernel, rows) =
+        mixed_log(0x5A9E_0203, &[("/pong", 0, None), ("/v1/dropped", 1, None)]);
+    let (_, sinks) = run_script(
+        &mut kernel,
+        &sim,
+        vec![Request::new(
+            Method::Get,
+            format!("/v2/dropped?cursor={}", cursor_of(&rows[0])),
+        )],
+    );
+    assert_eq!(
+        frames_of(&sinks.lock().unwrap()[0]),
+        vec![reshaped_frame(&rows[1])]
+    );
+}
+
+/// Review focus 1: the key filter runs BEFORE the shape check, on both paths.
+/// Another tenant's reshaped event must not end this tenant's tail, and a
+/// cursor on it must not be refused — this subscription would never deliver
+/// that row either way.
+#[test]
+fn another_keys_reshaped_event_neither_ends_nor_refuses_this_tail() {
+    let (sim, mut kernel, rows) = mixed_log(
+        0x5A9E_0204,
+        &[
+            ("/pong", 0, None),
+            ("/v1/incident", 1, Some("org-b")),
+            ("/v2/incident", 2, Some("org-a")),
+        ],
+    );
+    let expected = vec![(
+        rows[2].id.raw(),
+        rows[2].seq,
+        "incident_opened".to_string(),
+        r#"{"n":"2","severity":"2"}"#.to_string(),
+    )];
+    let (responses, sinks) = run_script(
+        &mut kernel,
+        &sim,
+        vec![
+            Request::new(
+                Method::Get,
+                format!("/v2/incidents-org-a?cursor={}", cursor_of(&rows[0])),
+            ),
+            Request::new(
+                Method::Get,
+                format!("/v2/incidents-org-a?cursor={}", cursor_of(&rows[1])),
+            ),
+        ],
+    );
+    assert_eq!(
+        statuses(&responses),
+        vec![200, 200],
+        "neither subscribe is refused"
+    );
+    let handles = sinks.lock().unwrap();
+    assert_eq!(
+        frames_of(&handles[0]),
+        expected,
+        "org-b's foreign row did not end org-a's tail"
+    );
+    assert_eq!(
+        frames_of(&handles[1]),
+        expected,
+        "a cursor on org-b's foreign row resumes"
+    );
+}
+
+/// Spec §3: a cursor on a foreign row of an event the subscription does NOT
+/// carry is not refused.
+#[test]
+fn a_cursor_on_a_foreign_row_of_an_unsubscribed_event_is_not_refused() {
+    let (sim, mut kernel, rows) = mixed_log(
+        0x5A9E_0205,
+        &[("/v1/incident", 0, None), ("/pong", 1, None)],
+    );
+    let (responses, sinks) = run_script(
+        &mut kernel,
+        &sim,
+        vec![Request::new(
+            Method::Get,
+            format!("/pongs?cursor={}", cursor_of(&rows[0])),
+        )],
+    );
+    assert_eq!(statuses(&responses), vec![200]);
+    assert_eq!(
+        frames_of(&sinks.lock().unwrap()[0]),
+        vec![(
+            rows[1].id.raw(),
+            rows[1].seq,
+            "pong".to_string(),
+            r#"{"n":"1"}"#.to_string()
+        )]
+    );
+}
+
+/// Spec §6.6: a row from a pre-shape binary is foreign on both paths — even
+/// when its bytes are ones the v2 type WOULD decode. The rule is the recorded
+/// shape, not whether a decode happens to succeed.
+#[test]
+fn a_pre_shape_event_is_foreign_on_both_paths_even_when_its_bytes_would_decode() {
+    let (sim, mut kernel, rows) = mixed_log(0x5A9E_0206, &[("/pong", 0, None)]);
+    let mut v2_bytes = Vec::new();
+    shapes_v2::IncidentOpened {
+        n: WireU64(9),
+        severity: WireU64(1),
+    }
+    .encode(&mut v2_bytes);
+    {
+        let db = kernel.app_mut_for_tests().db_for_tests();
+        let seq = db.last_applied().map_or(0, |s| s + 1);
+        db.apply_shipped(&[(seq, legacy_emit_record("incident_opened", &v2_bytes))])
+            .unwrap();
+    }
+    let legacy: Vec<EventRow> = kernel
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan_from(1, 1)
+        .unwrap();
+    assert_eq!(
+        legacy[0].shape, None,
+        "a 0x03 record materializes with no shape"
+    );
+
+    let (_, sinks) = run_script(
+        &mut kernel,
+        &sim,
+        vec![Request::new(
+            Method::Get,
+            format!("/v2/incidents-and-pongs?cursor={}", cursor_of(&rows[0])),
+        )],
+    );
+    assert_eq!(
+        frames_of(&sinks.lock().unwrap()[0]),
+        vec![reshaped_frame(&legacy[0])]
+    );
+
+    let (responses, _) = run_script(
+        &mut kernel,
+        &sim,
+        vec![Request::new(
+            Method::Get,
+            format!("/v2/incidents-and-pongs?cursor={}", cursor_of(&legacy[0])),
+        )],
+    );
+    let responses = responses.lock().unwrap().clone();
+    assert_eq!(responses[0].0, 409);
+    assert_eq!(
+        error_text(&responses[0].1),
+        reshaped_409(
+            &legacy[0],
+            <shapes_v2::IncidentOpened as Event>::FINGERPRINT
+        )
+    );
 }
 
 fn realtime_app(sim: &Sim) -> io::Result<App> {
@@ -797,6 +1305,19 @@ impl Client {
                     self.cursor = None;
                     self.need_subscribe = true;
                     break;
+                }
+                if frame.name == RESHAPED_FRAME {
+                    // Every event in this workload has one shape, and the
+                    // matrix's corruption axes (`bit_flip`,
+                    // `misdirected_write`) are wal/-scoped and checksummed —
+                    // a hit surfaces as a cut, never as a stored row that
+                    // decodes wrong. So the platform has no reason to send
+                    // this here; if it does, that is a finding to
+                    // adjudicate, not an excuse to add.
+                    return Err(format!(
+                        "a tail ended on {} in a workload with one shape per event: {}",
+                        frame.name, frame.json
+                    ));
                 }
                 assert_strictly_increasing(frame.id, &mut self.last_id)?;
                 self.pending
@@ -1635,6 +2156,7 @@ fn failing_feed_glue(
             encode_json: |_: &[u8]| -> io::Result<String> {
                 Err(io::Error::other("encode exploded"))
             },
+            fingerprint: <NoteAdded as Event>::FINGERPRINT,
         }],
         key: None,
         cursor,

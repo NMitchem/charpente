@@ -8,7 +8,9 @@ mod tail;
 
 pub use cron::{CronRow, CronScheduler};
 pub use dispatch::{Dispatcher, JobDef, JobEntry, JobError, JobOutcome};
-pub use tail::{EventFrame, EventSink, SimSink, SimSinkHandle, SinkStatus, TAIL_BATCH_EVENTS};
+pub use tail::{
+    EventFrame, EventSink, RESHAPED_FRAME, SimSink, SimSinkHandle, SinkStatus, TAIL_BATCH_EVENTS,
+};
 
 use std::collections::VecDeque;
 use std::io;
@@ -20,7 +22,7 @@ use charpente_core::io::{Clock, Instant, ObjectStore};
 use charpente_core::table::View;
 
 use crate::archive::Archive;
-use crate::http::{App, Cursor, Handled, Request, Response, io_failure_response};
+use crate::http::{App, Handled, Request, Response, Subscription, io_failure_response};
 use crate::kernel::tail::Tail;
 use crate::repl::{REPL_TICK_NANOS, Repl};
 
@@ -572,15 +574,13 @@ impl Kernel {
                     }
                     match outcome {
                         Handled::Response(response) => reply.send(response),
-                        Handled::Subscribe(sub) => {
-                            match validate_subscribe(self.app.db(), sub.cursor) {
-                                Ok(next_id) => {
-                                    let sink = reply.stream(Response::sse_headers());
-                                    self.tails.push(Tail { sub, sink, next_id });
-                                }
-                                Err(response) => reply.send(response),
+                        Handled::Subscribe(sub) => match validate_subscribe(self.app.db(), &sub) {
+                            Ok(next_id) => {
+                                let sink = reply.stream(Response::sse_headers());
+                                self.tails.push(Tail { sub, sink, next_id });
                             }
-                        }
+                            Err(response) => reply.send(response),
+                        },
                     }
                 }
                 self.stats.requests += drained as u64;
@@ -929,16 +929,18 @@ impl Kernel {
 /// Registration-time validation for an SSE subscribe (T5, DESIGN §6), reading
 /// off the `Db` snapshot: a present cursor must sit at or above this node's
 /// retention floor (checked first — a cursor that old is simply gone, no
-/// finer diagnosis is possible), and if it clears that bar, the retained row
-/// at its id must carry its exact seq (checked second — a cursor ahead of
+/// finer diagnosis is possible); if it clears that bar, the retained row at
+/// its id must carry its exact seq (checked second — a cursor ahead of
 /// everything this node has ever minted, and a cursor whose id landed on a
 /// different event than the one the client saw, are both a diverged
-/// timeline, distinguished only by the message's `{detail}`). No cursor at
+/// timeline, distinguished only by the message's `{detail}`); and if the row
+/// is on this subscription's timeline, it must not be one this binary
+/// refuses to decode (checked third — payload-shapes spec §3). No cursor at
 /// all always succeeds, positioned to tail from now. Returns the tail's
 /// starting `next_id` on success.
-fn validate_subscribe(db: &Db, cursor: Option<Cursor>) -> Result<u64, Response> {
+fn validate_subscribe(db: &Db, sub: &Subscription) -> Result<u64, Response> {
     let next_event_id = db.next_event_id().map_err(io_500)?;
-    let Some(cursor) = cursor else {
+    let Some(cursor) = sub.cursor else {
         return Ok(next_event_id);
     };
     let floor = db.event_floor().map_err(io_500)?;
@@ -967,6 +969,35 @@ fn validate_subscribe(db: &Db, cursor: Option<Cursor>) -> Result<u64, Response> 
                         cursor.id,
                         row.seq,
                         cursor.seq
+                    ),
+                ));
+            }
+            // The row the client last saw is one this binary refuses to
+            // decode. Resuming past it would skip the very event the
+            // `charpente.reshaped` frame named — the frame carries this id, so
+            // a client that ignored it reconnects exactly here. A name the
+            // subscription does not carry, or a row its key filter excludes,
+            // is never delivered to it either way, and is not refused
+            // (payload-shapes spec §3).
+            let key_passes = sub.key.is_none() || sub.key.as_deref() == row.key.as_deref();
+            if let Some(entry) = sub.entries.iter().find(|e| e.name == row.name)
+                && key_passes
+                && row.shape != Some(entry.fingerprint)
+            {
+                let recorded = match row.shape {
+                    Some(shape) => format!("{shape:#x}"),
+                    None => "none — written before event shapes were tagged".to_string(),
+                };
+                return Err(Response::error(
+                    409,
+                    &format!(
+                        "cursor {} sits on an \"{}\" event written under a different shape of \
+                         that event (recorded {recorded}; this binary {:#x}) — this binary will \
+                         not decode it; re-sync current state through reads, then reconnect \
+                         without a cursor",
+                        cursor.wire(),
+                        entry.name,
+                        entry.fingerprint
                     ),
                 ));
             }

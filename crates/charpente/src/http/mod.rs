@@ -204,6 +204,10 @@ impl Cursor {
 pub struct SubEntry {
     pub name: &'static str,
     pub encode_json: fn(&[u8]) -> io::Result<String>,
+    /// The subscribed type's `Event::FINGERPRINT`: delivery decodes a stored
+    /// row with `encode_json` only when the row's recorded shape equals this
+    /// (payload-shapes spec §3).
+    pub fingerprint: u64,
 }
 
 /// What an SSE route handler returns: which event types to tail (compile-
@@ -222,6 +226,7 @@ impl Subscription {
             entries: vec![SubEntry {
                 name: Ev::NAME,
                 encode_json: ev_json::<Ev>,
+                fingerprint: Ev::FINGERPRINT,
             }],
             key: None,
             cursor: None,
@@ -232,6 +237,7 @@ impl Subscription {
         self.entries.push(SubEntry {
             name: Ev::NAME,
             encode_json: ev_json::<Ev>,
+            fingerprint: Ev::FINGERPRINT,
         });
         self
     }

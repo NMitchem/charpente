@@ -662,8 +662,9 @@ opting a table out of drift protection is the cost of not using `#[table]`.
 **Payload shapes.** `#[event]` and `#[job]` carry the same structural fingerprint
 `#[table]` does (`Event::FINGERPRINT`, `Job::FINGERPRINT` — required on a hand-written
 impl, no default), and every emit and enqueue records it in the log beside the payload.
-There is no per-row versioned decode — the migrations spec rejected it twice — and no
-override (MANIFESTO §8).
+A payload is decoded only under the shape it was written with: delivery refuses a
+foreign-shape event by name and ends that one tail (§6). There is no per-row versioned
+decode — the migrations spec rejected it twice — and no override (MANIFESTO §8).
 
 **The gate, the barrier, and the seven refusals.** A built-in table,
 `charpente.schema_versions`, records each versioned table's last-known `(version,
@@ -1257,8 +1258,13 @@ slot.
   refused at subscribe with a 409 naming the floor or the divergence detail and the fix:
   re-sync current state through reads, then reconnect without a cursor. A tail that falls
   behind retention mid-stream gets the same fact set as a terminal SSE frame —
-  `event: charpente.gap` — then its sink closes. Sink overflow itself sends nothing (there
-  is no one left to tell); the client that reconnects with `Last-Event-ID` resumes exactly,
+  `event: charpente.gap` — then its sink closes. A stored event whose recorded shape (§3)
+  is not the subscribed type's is never decoded: the tail gets a terminal `event:
+  charpente.reshaped` frame carrying that row's own `id.seq`, and a subscribe whose
+  cursor sits on such a row — for a name the subscription carries and a key it passes —
+  is refused with a 409 naming the event, both shapes and the same re-sync fix. Sink
+  overflow itself sends nothing (there is no one left to tell); the client that
+  reconnects with `Last-Event-ID` resumes exactly,
   which is the point. **The seq half does not separate every cross-timeline pair, and
   the sentence above should not be read as claiming it does.** A local recovery cut that
   returns the log to the same position lets the replacement record take the SAME seq, so

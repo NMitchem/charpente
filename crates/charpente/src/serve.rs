@@ -571,6 +571,23 @@ mod tests {
         Ok(Response::json(200, &"hello"))
     }
 
+    /// The reshaped frame on the wire carries the foreign row's OWN id, so a
+    /// client that ignores it and reconnects with `Last-Event-ID` lands on the
+    /// named 409 instead of skipping the event (payload-shapes spec §3).
+    #[test]
+    fn a_reshaped_frame_carries_the_foreign_rows_own_id_on_the_wire() {
+        let frame = kernel::EventFrame {
+            id: 5,
+            seq: 12,
+            name: kernel::RESHAPED_FRAME,
+            json: r#"{"event":"incident_opened","id":5,"fix":"re-sync current state through reads, then reconnect without a cursor"}"#.to_string(),
+        };
+        assert_eq!(
+            std::str::from_utf8(&encode_frame(&frame)).unwrap(),
+            "id: 5.12\nevent: charpente.reshaped\ndata: {\"event\":\"incident_opened\",\"id\":5,\"fix\":\"re-sync current state through reads, then reconnect without a cursor\"}\n\n"
+        );
+    }
+
     #[test]
     fn serve_answers_http1_over_loopback() {
         let mut suffix = [0u8; 8];

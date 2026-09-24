@@ -547,10 +547,10 @@ fn finalize(db: &mut Db, id: u64) -> Result<(), TxError<io::Error>> {
 section). `#[event]` derives everything an event needs in one step: `Codec`
 (the log format), `Event` (`NAME` is the snake_case of the type name — §11 has
 the exact splitting rule — and `FINGERPRINT` is the payload's structural
-fingerprint, recorded beside every emit), `Serialize` (the wire format
-`#[route(SSE …)]` subscribers receive, §11), `Wire` (that wire format's schema,
-so the contract can name it), and an `EventEntry` impl so `events![...]` can
-register it (§11).
+fingerprint, recorded beside every emit, §11 "Changing an event"), `Serialize`
+(the wire format `#[route(SSE …)]` subscribers receive, §11), `Wire` (that wire
+format's schema, so the contract can name it), and an `EventEntry` impl so
+`events![...]` can register it (§11).
 Because the payload IS what a subscriber receives, it obeys the wire rules a
 route's types obey — which is why `InvoiceFinalized.invoice` above is
 `Id<Invoice>` and not the bare `u64` the `SendReceipt` *job* beside it carries:
@@ -3283,9 +3283,10 @@ the payload type — which is also why a bare `u64`/`i64` field is a compile err
 here, exactly as in a route's request or response: use `Id<T>` for a row id, or
 `WireU64`/`WireI64`), and an `EventEntry` impl so `events![...]` can collect the type
 (next section). It also derives `Event::FINGERPRINT`, a structural fingerprint of the
-payload's fields (§12's helper), recorded beside every emit. A `#[job]` payload has no
-`Wire` requirement, because it never leaves the process — only an event's payload is
-itself a wire document.
+payload's fields (§12's helper), recorded beside every emit; delivery decodes a stored
+event only under the shape it was written with (see "Changing an event" below). A
+`#[job]` payload has no `Wire` requirement, because it never leaves the process — only
+an event's payload is itself a wire document.
 `NAME` is the snake_case of the type name, computed at compile time — not a name you
 choose, so it can never drift from the type. The splitting rule inserts `_` before an
 uppercase letter that follows a lowercase letter or digit, and before the *last*
@@ -3604,7 +3605,10 @@ apart. Resume validation at subscribe time checks both, in order:
   through reads, then reconnect without a cursor
   ```
 
-Every one of these three named errors ends with the identical fix: re-sync current
+- **Reshaped** — the retained row at that id is an event this subscription carries,
+  written under a different shape of it (see "Changing an event" below).
+
+Every one of these four named errors ends with the identical fix: re-sync current
 state through ordinary reads, then reconnect with no cursor at all — a fresh
 "from now" subscribe never revalidates against history it doesn't have.
 
@@ -3630,6 +3634,10 @@ event: charpente.gap
 data: {"floor":4,"tail":1,"fix":"re-sync current state through reads, then reconnect without a cursor"}
 
 ```
+
+A tail that reaches an event written under a different shape of its type ends the
+same way, with `charpente.reshaped` (see "Changing an event"). Neither frame stops
+the node.
 
 A sink that reports itself full or closed — a slow browser tab, a dead TCP
 connection — costs its own tail immediately; it never blocks the kernel loop for
@@ -3658,6 +3666,47 @@ order" note applies to delivery order too). Each frame is `id: <id>.<seq>`,
 `Last-Event-ID` resume work with zero client code. An idle connection gets a `:hb`
 comment frame every 15 seconds — pure keepalive, no semantics, never interpreted as
 an event.
+
+### Changing an event
+
+Every emit records its payload's shape — `Event::FINGERPRINT`, the structural
+fingerprint `#[event]` computes from the fields (§12) — and delivery decodes a stored
+event only under the shape it was written with. Change an event's fields, and every
+retained row of the old shape is one this binary will not decode. There is no per-row
+versioned decode and no override.
+
+A live tail that reaches an old-shape row gets one terminal frame instead of a wrong
+or crashing decode, and its connection closes — the `charpente.gap` lifecycle. Its
+`id:` line is that row's own `<id>.<seq>`:
+
+<!-- pinned -->
+```text
+event: charpente.reshaped
+data: {"event":"<event>","id":<id>,"fix":"re-sync current state through reads, then reconnect without a cursor"}
+```
+
+A client that ignores the frame — a browser's `EventSource` reconnects on its own,
+with `Last-Event-ID` set to that id — is refused at subscribe, so it cannot resume
+past an event it never received:
+
+<!-- pinned -->
+```text
+cursor <id>.<seq> sits on an "<event>" event written under a different shape of that event (recorded <recorded>; this binary <fingerprint>) — this binary will not decode it; re-sync current state through reads, then reconnect without a cursor
+```
+
+`<recorded>` reads `none — written before event shapes were tagged` for a row emitted
+before shapes were recorded, and such a row is refused like any other foreign one. A
+cursor on a foreign row of an event the subscription does not carry, or one its key
+filter excludes, is not refused: the subscription would never deliver that row anyway.
+The node keeps serving throughout, and every other tail is untouched.
+
+**To keep exact resume across a deploy, do not change an existing event's fields.**
+Add a new `#[event]` type with the new fields, emit it from the new code, and keep the
+old type in code — and in any subscription that still needs it — for as long as its
+rows are retained (`DbConfig::event_retention`). Old rows keep decoding under their
+own type. Changing the fields in place costs every subscriber positioned before the
+change one re-sync. What the fingerprint cannot see, a change inside a type a field
+holds, is in §12.
 
 ### Testing a tail in sim
 
