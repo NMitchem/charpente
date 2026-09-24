@@ -144,13 +144,13 @@ fn main() -> std::io::Result<()> {
         }
     };
 
-    match parsed.repl {
+    let server = match parsed.repl {
         None => {
             let app = build(&parsed.data_dir)?;
             let addr = parsed
                 .addr
                 .expect("plain serve requires --addr (checked in parse)");
-            serve::serve(&addr, app)?;
+            serve::serve(&addr, app)?
         }
         Some(repl) => {
             let initial_role = match repl.role {
@@ -177,13 +177,14 @@ fn main() -> std::io::Result<()> {
             let addr = parsed
                 .addr
                 .expect("non-backup repl roles require --addr (checked in parse)");
-            serve::serve_replicated(&addr, app, Box::new(ProdDisk::new(&parsed.data_dir)?), cfg)?;
+            serve::serve_replicated(&addr, app, Box::new(ProdDisk::new(&parsed.data_dir)?), cfg)?
         }
-    }
+    };
 
-    loop {
-        std::thread::park();
-    }
+    // A stopped kernel ends the process with its code (spec §5): this is
+    // what lets `edge-harness` see a refused node exit instead of a live
+    // process answering every request 500.
+    std::process::exit(server.wait());
 }
 
 #[cfg(test)]

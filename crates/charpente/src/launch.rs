@@ -39,10 +39,12 @@ pub fn launch(
         &mut io::stderr().lock(),
     )? {
         // Ok(0) falls through to a normal return — the process exits 0
-        // naturally. A nonzero code (describe's usage errors) exits the
-        // process directly; the `[]` serve arm never reaches this match at
-        // all (it diverges in its own park loop), so `launch` never returns
-        // while serving.
+        // naturally (a clean shutdown, or a describe that printed and
+        // exited fine). A nonzero code exits the process directly: a
+        // describe usage error, or — now that the `[]` serve arm waits on
+        // the kernel and returns its exit code instead of parking forever
+        // (spec §5) — a stopped kernel, whose stderr line already named
+        // what stopped it and the fix.
         0 => Ok(()),
         code => std::process::exit(code),
     }
@@ -72,10 +74,9 @@ pub(crate) fn dispatch(
         let disk = ProdDisk::new(data_dir)?;
         let entropy = ProdEntropy::new()?;
         let app = build(Box::new(disk), Box::new(entropy))?;
-        crate::serve::serve(addr, app)?;
-        loop {
-            std::thread::park();
-        }
+        // A stopped kernel ends the process with its code (spec §5), rather
+        // than parking forever behind an edge that can only answer 500.
+        return Ok(crate::serve::serve(addr, app)?.wait());
     };
 
     if verb == "restore" {

@@ -16,6 +16,7 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
+use charpente_core::db::Refusal;
 use charpente_core::io::{Clock, Disk, Listener, Net};
 
 use crate::Db;
@@ -119,16 +120,13 @@ pub struct ReplConfig {
     /// and only then stops, by returning an error out of `Repl::step` that
     /// bubbles through `Kernel::run` (DESIGN §5's restart-and-recover exit).
     ///
-    /// **What that stop looks like depends on the entry point, and only one of
-    /// the two reaches a supervisor.** Under `serve::backup` the error is the
-    /// tail expression of an `io::Result<()>`, so it leaves the process with a
-    /// non-zero status and a supervisor restarts it — loud and repeating, the
-    /// intended shape. Under `serve::serve_replicated` the kernel runs on a
-    /// spawned thread: the error is printed and the thread ends while the HTTP
-    /// edge stays up, so the process does NOT exit, nothing restarts it, and
-    /// every later request gets `500 "the kernel thread is gone"`. That is
-    /// still fail-stop for writes, but it is silent to a supervisor — set this
-    /// flag on an HTTP node only if something watches the 500s.
+    /// **The stop reaches a supervisor on every node shape** (payload-shapes
+    /// spec §5): under `serve::backup` the error is the tail expression of an
+    /// `io::Result<()>`, so it leaves the process with a non-zero status.
+    /// Under `serve::serve_replicated` the kernel runs on a joined thread, but
+    /// `Server::wait` blocks on it and hands its exit code to the process —
+    /// so a stopped kernel ends the process there too, and a supervisor
+    /// restarts it and keeps restarting it until a witness answers.
     pub strict_witnesses: bool,
 }
 
@@ -551,7 +549,7 @@ impl Repl {
                 // loudly until a witness answers rather than sitting in a
                 // degraded state nobody is watching.
                 if self.strict_witnesses {
-                    return Err(io::Error::other(self.strict_witness_refusal()));
+                    return Err(io::Error::other(Refusal(self.strict_witness_refusal())));
                 }
                 if !self.witness_notice_sent {
                     self.emit_witness_notice();
@@ -663,7 +661,7 @@ impl Repl {
             // writes are not ours to discard. `{detail}` is already
             // Debug-escaped and length-bounded at capture (probe.rs), so it
             // is interpolated plainly here rather than quoted a second time.
-            return Err(io::Error::other(format!(
+            return Err(io::Error::other(Refusal(format!(
                 "witness {addr} answers as a primary itself ({detail}): this node restarted as \
                  a durable primary, but a follower it had shipped to has been promoted or \
                  handed off to while it was down, so this node is not the primary any more. It \
@@ -673,7 +671,7 @@ impl Repl {
                  data dir, restart to snapshot-seed from {addr}); if instead this node's \
                  records are the ones to keep, stop {addr}, then clear this node's witness set \
                  (GUIDE §10) and restart it."
-            )));
+            ))));
         }
         if self
             .probes

@@ -155,6 +155,23 @@ impl ChildNode {
         &self.stderr_log
     }
 
+    /// Waits up to `timeout` for the process to exit ON ITS OWN — a node whose
+    /// kernel stopped now ends its process (payload-shapes spec §5).
+    /// `Ok(None)` means it was still running at the deadline; this never
+    /// kills it.
+    pub fn wait_exit(&mut self, timeout: Duration) -> io::Result<Option<std::process::ExitStatus>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(PORT_POLL_INTERVAL);
+        }
+    }
+
     /// Respawns the SAME `bin`/`args` (so the same `--data-dir`) — the
     /// operator's real remedy after a crash. Retries a handful of times: the
     /// previous process's listen socket can take a moment to release the

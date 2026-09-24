@@ -154,8 +154,9 @@ pub enum TxError<E> {
 
 /// A named refusal: the platform declining to proceed on state it will not
 /// guess about — a Pending job of a foreign shape
-/// (`Db::pending_job_shape_refusal`), or an enqueue of a mounted job name
-/// under another shape (`Group::stage`, as `TxError::Io`). Carried inside
+/// (`Db::pending_job_shape_refusal`), an enqueue of a mounted job name under
+/// another shape (`Group::stage`, as `TxError::Io`), a table-gate barrier, a
+/// witness conflict, or a strict-witness deadline. Carried inside
 /// `io::Error::other`, so every `io::Result` path is untouched, and read back
 /// with `Refusal::of`: restarting or retrying clears a platform IO failure
 /// and never a refusal, so whoever reports the error must tell the two apart
@@ -172,10 +173,44 @@ impl fmt::Display for Refusal {
 impl std::error::Error for Refusal {}
 
 impl Refusal {
-    /// `Some` when `e` carries a `Refusal`.
+    /// `Some` when `e` carries a `Refusal` — a bare one, or the
+    /// `JobShapeRefusal` special case, so every caller that only needs "is
+    /// this a refusal at all" (`kernel_stop_line`, spec §5) sees both without
+    /// knowing the second type exists.
     pub fn of(e: &io::Error) -> Option<&Refusal> {
+        e.get_ref().and_then(|inner| {
+            inner
+                .downcast_ref::<Refusal>()
+                .or_else(|| inner.downcast_ref::<JobShapeRefusal>().map(|j| &j.0))
+        })
+    }
+}
+
+/// The one refusal a job handler's own transaction can produce: `Group::stage`
+/// refusing an enqueue of a mounted job name under a foreign shape. A
+/// distinct type, not a flag on `Refusal`, so dispatch (`kernel/dispatch.rs`)
+/// can tell it apart from every OTHER refusal that can reach a job's
+/// transaction — a table-gate barrier or a witness conflict must still stop
+/// the kernel, because unlike this one, no restart or retry fixes them
+/// either, and only this one is the handler's OWN deterministic bug (payload-
+/// shapes spec §5, R23-a). Wraps a `Refusal` rather than duplicating its text
+/// and `Display`, so `Refusal::of` still finds it.
+#[derive(Debug)]
+pub struct JobShapeRefusal(pub Refusal);
+
+impl fmt::Display for JobShapeRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for JobShapeRefusal {}
+
+impl JobShapeRefusal {
+    /// `Some` only for THIS refusal — dispatch's one narrow question.
+    pub fn of(e: &io::Error) -> Option<&JobShapeRefusal> {
         e.get_ref()
-            .and_then(|inner| inner.downcast_ref::<Refusal>())
+            .and_then(|inner| inner.downcast_ref::<JobShapeRefusal>())
     }
 }
 
@@ -1948,33 +1983,33 @@ fn check_replay_version(
         return Ok(()); // FINGERPRINT: None — not a versioned table.
     };
     let Some(&(persisted_version, persisted_fp)) = versions.get(table) else {
-        return Err(io::Error::other(format!(
+        return Err(io::Error::other(Refusal(format!(
             "replaying a record for versioned table \"{table}\" with no adoption row on \
              record — this log was not written by an adoption-aware binary, or is corrupt; \
              restore from a replica or backup"
-        )));
+        ))));
     };
     if persisted_version < compiled_version {
-        return Err(io::Error::other(upgrade_barrier_msg(
+        return Err(io::Error::other(Refusal(upgrade_barrier_msg(
             table,
             persisted_version,
             compiled_version,
-        )));
+        ))));
     }
     if persisted_version > compiled_version {
-        return Err(io::Error::other(downgrade_msg(
+        return Err(io::Error::other(Refusal(downgrade_msg(
             table,
             persisted_version,
             compiled_version,
-        )));
+        ))));
     }
     if persisted_fp != compiled_fp {
-        return Err(io::Error::other(drift_msg(
+        return Err(io::Error::other(Refusal(drift_msg(
             table,
             persisted_fp,
             compiled_fp,
             compiled_version,
-        )));
+        ))));
     }
     Ok(())
 }
@@ -2925,7 +2960,7 @@ impl Db {
                 persisted.as_ref(),
                 rows_exist,
             ) {
-                GateStatus::Refuse(msg) => return Err(io::Error::other(msg)),
+                GateStatus::Refuse(msg) => return Err(io::Error::other(Refusal(msg))),
                 // The upgrade barrier fires POST-replay for a full rebuild,
                 // discriminated by saw_below (spec §2). A table that needs
                 // migration (Migrate) AND replayed below-version records during
@@ -2945,11 +2980,11 @@ impl Db {
                         .is_some_and(|to| to == version);
                     if !in_flight_to_compiled {
                         let persisted_version = persisted.as_ref().map_or(1, |r| r.version);
-                        return Err(io::Error::other(upgrade_barrier_msg(
+                        return Err(io::Error::other(Refusal(upgrade_barrier_msg(
                             table,
                             persisted_version,
                             version,
-                        )));
+                        ))));
                     }
                 }
                 _ => {}
@@ -3009,7 +3044,7 @@ impl Db {
                 rows_exist,
             ) {
                 GateStatus::Current | GateStatus::Adopt => continue,
-                GateStatus::Refuse(msg) => return Err(io::Error::other(msg)),
+                GateStatus::Refuse(msg) => return Err(io::Error::other(Refusal(msg))),
                 GateStatus::Migrate { from } => from,
             };
             // Chain existence, before touching anything.
@@ -3018,12 +3053,12 @@ impl Db {
             let mut cursor = from;
             while cursor != compiled_version {
                 let Some(step) = steps.iter().find(|s| s.from_version == cursor) else {
-                    return Err(io::Error::other(format!(
+                    return Err(io::Error::other(Refusal(format!(
                         "table \"{table}\" has no registered migration from version {cursor} — \
                          persisted version is {from}, compiled version is {compiled_version}; \
                          register Schema::migration::<Step>(\"{table}\") for the \
                          version-{cursor} step, or this data cannot be opened by this binary"
-                    )));
+                    ))));
                 };
                 cursor = step.to_version;
             }
@@ -3275,12 +3310,14 @@ impl<'a> Group<'a> {
             if let Some(&mounted) = job_shapes.get(*name)
                 && mounted != *shape
             {
-                return Err(TxError::Io(io::Error::other(Refusal(format!(
-                    "job \"{name}\" was enqueued under a different shape of {name} than this \
+                return Err(TxError::Io(io::Error::other(JobShapeRefusal(Refusal(
+                    format!(
+                        "job \"{name}\" was enqueued under a different shape of {name} than this \
                      binary mounts (enqueued {shape:#x}; this binary {mounted:#x}) — two #[job] \
                      types share the name {name}; the transaction was refused and nothing was \
                      written, so a retry cannot succeed — enqueue the mounted type, or give the \
                      other type its own name (GUIDE §6)"
+                    ),
                 )))));
             }
         }

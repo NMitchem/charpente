@@ -1178,8 +1178,11 @@ rather than infer it from the status code.
 `charpente::serve::serve(addr: &str, app: App) -> io::Result<Server>` spawns
 the kernel (requests, due jobs, and cron ticks — §6 and §7 ride the same
 loop) on one thread and the hyper listener on another, then returns as soon
-as both are up — it does not block. v0 has no graceful shutdown: the
-process owns the server for as long as it runs.
+as both are up — it does not block. `Server::wait` blocks until the kernel
+stops and returns the exit code the process should end with. A kernel that
+stopped — on a platform IO failure or a named refusal, each printed on
+stderr with its fix — must end the process, or a supervisor sees a live
+process answering every request 500 and never restarts it.
 
 ```rust
 use charpente::core::table::Id;
@@ -1222,13 +1225,11 @@ fn main() -> std::io::Result<()> {
     )?
     .mount(routes![create_note, get_note]);
 
-    charpente::serve::serve("0.0.0.0:8080", app)?;
-
-    // `serve` already returned a running server; park the main thread to
-    // keep the process alive for it (no graceful shutdown in v0).
-    loop {
-        std::thread::park();
-    }
+    let server = charpente::serve::serve("0.0.0.0:8080", app)?;
+    // `serve` returned once the listener was up; `wait` blocks until the
+    // kernel stops. Exiting with its code is what lets a supervisor see a
+    // stopped kernel and restart it (no graceful shutdown in v0).
+    std::process::exit(server.wait());
 }
 ```
 
@@ -1524,7 +1525,8 @@ At most five ids are listed, then `…`. A job enqueued before shapes were recor
 `recorded none — enqueued before job shapes were tagged`, and it is refused the same way:
 nothing decodes bytes it cannot prove are its own shape.
 
-- At startup, or when the write gate opens, the refusal stops the kernel.
+- At startup, or when the write gate opens, the refusal stops the kernel, and a stopped
+  kernel ends the process (§5).
 - At `promote`, it answers `CtrlErr` prefixed `cannot promote:`, and the node stays a
   follower.
 - A switchover is never refused partway. Once the old primary hands off it never resumes
@@ -1864,10 +1866,7 @@ fn main() -> std::io::Result<()> {
         SendDigest {}
     });
 
-    charpente::serve::serve("0.0.0.0:8080", app)?;
-    loop {
-        std::thread::park();
-    }
+    std::process::exit(charpente::serve::serve("0.0.0.0:8080", app)?.wait());
 }
 ```
 
@@ -3069,9 +3068,11 @@ fn run_primary(app: App) -> std::io::Result<()> {
         peer_secret: Some("shared-with-every-follower".to_string()),
         strict_witnesses: false,
     };
-    // HTTP on 8080, replication on 9090. Returns once both are up.
-    serve::serve_replicated("0.0.0.0:8080", app, Box::new(ProdDisk::new("./data")?), cfg)?;
-    Ok(())
+    // HTTP on 8080, replication on 9090; exits when the kernel stops.
+    std::process::exit(
+        serve::serve_replicated("0.0.0.0:8080", app, Box::new(ProdDisk::new("./data")?), cfg)?
+            .wait(),
+    );
 }
 
 fn run_follower(app: App) -> std::io::Result<()> {
@@ -3083,8 +3084,11 @@ fn run_follower(app: App) -> std::io::Result<()> {
         peer_secret: Some("shared-with-every-follower".to_string()),
         strict_witnesses: false,
     };
-    serve::serve_replicated("0.0.0.0:8080", app, Box::new(ProdDisk::new("./data")?), cfg)?;
-    Ok(())
+    // HTTP on 8080, replication on 9090; exits when the kernel stops.
+    std::process::exit(
+        serve::serve_replicated("0.0.0.0:8080", app, Box::new(ProdDisk::new("./data")?), cfg)?
+            .wait(),
+    );
 }
 
 fn run_backup(app: App) -> std::io::Result<()> {
@@ -3225,14 +3229,11 @@ primary* still refuses regardless of this flag.
 Two things about it are easy to get wrong. It is **not** "refuse to start":
 whether a witness is unreachable is only established by probing, so a strict
 node starts, serves reads for the whole 30-second window, and only then stops.
-And **the stop reaches a supervisor under `serve::backup` only** — there the
-error exits the process with a non-zero status, so a supervisor restarts it and
-keeps restarting until a witness answers. Under `serve::serve_replicated` the
-kernel runs on a spawned thread: it prints the error and the thread ends, but
-the HTTP edge stays up and the process does not exit, so every subsequent
-request gets `500 the kernel thread is gone` and nothing external notices.
-Writes are fail-stopped either way; only the backup shape is loud. On an HTTP
-node, set this flag only if something is watching for those 500s.
+And **the stop reaches a supervisor on every node shape** (§5): under
+`serve::backup` the error returns from the call, and under
+`serve::serve_replicated` the kernel's stop ends the process through
+`Server::wait` (§5) with status 1 — so a supervisor restarts it, and keeps
+restarting it until a witness answers.
 
 **The escape hatch, and its cost.** A follower that is permanently
 decommissioned stays in the witness set forever, and a primary whose only
@@ -4146,6 +4147,10 @@ usage: <app> [describe [--format json|human]]
 (`launch.rs`'s `the_guide_quotes_the_usage_text_the_binary_actually_prints` `include_str!`s
 this file and asserts the block above is the constant verbatim, so the two cannot drift
 apart silently again — they did once, when §15 was added.)
+
+When the kernel stops — a platform IO failure, or a named refusal such as a table-gate
+barrier or a Pending job of a foreign shape (§6) — `launch` exits the process with status 1
+after its stderr line names what stopped it and the fix.
 
 ### `charpente describe` — the CLI verb
 

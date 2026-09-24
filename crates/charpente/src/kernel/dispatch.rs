@@ -5,7 +5,7 @@ use std::fmt;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use charpente_core::db::{CrossTenant, Db, Group, Refusal, Tx, TxError};
+use charpente_core::db::{CrossTenant, Db, Group, JobShapeRefusal, Tx, TxError};
 use charpente_core::job::{JobRow, JobStatus, RetryPolicy};
 use charpente_core::table::{Id, Snapshot, View};
 
@@ -254,9 +254,13 @@ impl Dispatcher {
         // The handler's own transaction refused by name — it enqueued
         // another shape of a mounted job name — is the handler's
         // deterministic bug, like a panic: an attempt, never a platform
-        // fault, since no restart could clear it.
+        // fault, since no restart could clear it. `JobShapeRefusal`
+        // specifically, not `Refusal` generally: a table-gate barrier or a
+        // witness conflict can also reach here as a `TxError::Io` in
+        // principle, and unlike this one, no restart or retry fixes either —
+        // they must still stop the kernel (payload-shapes spec §5, R23-a).
         let attempt = match attempt {
-            Err(TxError::Io(e)) if Refusal::of(&e).is_some() => {
+            Err(TxError::Io(e)) if JobShapeRefusal::of(&e).is_some() => {
                 Err(TxError::App(JobError::App(e.to_string())))
             }
             other => other,

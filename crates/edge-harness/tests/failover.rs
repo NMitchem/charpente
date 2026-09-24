@@ -966,10 +966,11 @@ fn failover_non_converged_tail_is_exercised_and_bounded() {
 //   **Phase B (witness reachable) proves the conclusive path.** The promoted
 //   node comes back, the probe reaches it, it answers as a primary, and the
 //   old primary refuses BY NAME with both remedies. That refusal bubbles out
-//   of `Kernel::run`, so the node stops serving entirely and every later
-//   request is `serve.rs`'s 500 "the kernel thread is gone". A 500 on its own
-//   would prove nothing — any crash produces one — which is exactly why the
-//   write refusal is asserted in Phase A rather than here.
+//   of `Kernel::run`, so `Server::wait` returns its exit code and the process
+//   then exits 1 (payload-shapes spec §5) — a stopped kernel ends the
+//   process now, rather than leaving a live edge that only ever answers 500.
+//   An exit on its own would prove nothing — any crash produces one — which
+//   is exactly why the write refusal is asserted in Phase A rather than here.
 //
 // Scope, stated honestly (crate honesty contract, DESIGN §7's §4.4): this is
 // a wire test against stock binaries with no seed promise. It proves the
@@ -1102,7 +1103,12 @@ fn run_resurrection_oracle(
         // ---- TIME_WAIT collision right after kill9), SAME data dir. ----
         let old_addr = free_addr();
         let old_repl_addr = free_addr();
-        let old_primary = ChildNode::spawn(
+        // `mut`: Phase B waits on this node's own exit (`wait_exit`, spec
+        // §5), which takes `&mut self`. Held here (not moved into
+        // `old_primary_restart` until Phase B is done with it) so it can
+        // still be borrowed directly; `old_primary_restart` keeps it alive
+        // past this closure's early returns either way, for `drop` below.
+        let mut old_primary = ChildNode::spawn(
             node_bin,
             &[
                 "--addr".to_string(),
@@ -1122,7 +1128,6 @@ fn run_resurrection_oracle(
             format!("restarting the old primary (original config, no demote attempt) failed: {e}")
         })?;
         let stderr_path = old_primary.stderr_log().to_path_buf();
-        old_primary_restart = Some(old_primary);
 
         let mut old_http = Http::new(&old_addr);
         // Sessions are durable and replicate like any other table row (auth
@@ -1256,14 +1261,14 @@ fn run_resurrection_oracle(
             ));
         };
         // Prefixed by `serve.rs`'s kernel-stopped line: the refusal bubbles
-        // out of `Kernel::run`, it is not an in-process notice.
-        if !stderr_contents.contains(&format!(
-            "charpente kernel stopped on a platform IO failure — restart to recover: {matched}"
-        )) {
+        // out of `Kernel::run`, it is not an in-process notice. A witness
+        // conflict is a `Refusal` (payload-shapes spec §5, R23-a) — a restart
+        // cannot fix it, unlike a platform IO failure — so it gets the
+        // "stopped on a refusal" line, not the platform-IO-failure one.
+        if !stderr_contents.contains(&format!("charpente kernel stopped on a refusal: {matched}")) {
             return Err(format!(
                 "the witness refusal was present but not on the \"charpente kernel stopped on a \
-                 platform IO failure\" line it must bubble out of `Kernel::run` on: \
-                 {stderr_contents:?}"
+                 refusal\" line it must bubble out of `Kernel::run` on: {stderr_contents:?}"
             ));
         }
         scenario.record(
@@ -1271,27 +1276,24 @@ fn run_resurrection_oracle(
              to demote itself, and gives both remedies",
         );
 
-        // The refusal stopped the kernel, so the node no longer serves at
-        // all. Asserting this alone would prove nothing (any crash produces a
-        // 500) — it is Phase A that proves the gate; this pins what an
-        // operator actually sees afterwards.
-        let after = old_http
-            .post("/customers/99", r#"{"name":"Z","email":"z@example.com"}"#)
-            .map_err(|e| format!("POST after the witness refusal failed at the transport: {e}"))?;
-        let after_body = String::from_utf8_lossy(&after.body).to_string();
-        let kernel_gone = after_body.contains("the kernel thread is gone")
-            || after_body.contains("the kernel dropped the request");
-        if after.status != 500 || !kernel_gone {
-            return Err(format!(
-                "after refusing by name the node must stop serving: expected 500 naming a gone \
-                 kernel (\"the kernel thread is gone\", or \"the kernel dropped the request\" \
-                 for a request that raced the thread's teardown), got {} body {after_body:?}",
-                after.status
-            ));
+        // The refusal stopped the kernel, and a stopped kernel now ends the
+        // process (payload-shapes spec §5): an operator's supervisor sees the
+        // exit, where it used to see a live process answering every request
+        // 500. Phase A still carries the attribution; this pins what an
+        // operator sees afterwards.
+        let status = old_primary
+            .wait_exit(Duration::from_secs(10))
+            .map_err(|e| format!("waiting for the refused node's exit failed: {e}"))?
+            .ok_or_else(|| {
+                "the refused node was still running 10s after its kernel stopped — the \
+                 zombie payload-shapes spec §5 removes"
+                    .to_string()
+            })?;
+        if status.code() != Some(1) {
+            return Err(format!("the refused node must exit 1, got {status}"));
         }
-        scenario.record(
-            "phase B: the refused node stops serving — writes get 500, the kernel thread is gone",
-        );
+        scenario.record("phase B: the refused node exits 1 — a stopped kernel ends the process");
+        old_primary_restart = Some(old_primary);
 
         // ---- the legitimate primary is untouched: its own witness set ----
         // ---- was cleared on the flip toward Primary, so it resumes ----

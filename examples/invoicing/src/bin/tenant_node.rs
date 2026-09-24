@@ -344,10 +344,8 @@ fn main() -> std::io::Result<()> {
     };
 
     let app = build(&args)?;
-    match &args.repl {
-        None => {
-            serve::serve(&args.addr, app)?;
-        }
+    let server = match &args.repl {
+        None => serve::serve(&args.addr, app)?,
         Some(repl) => {
             let initial_role = match repl.role {
                 RoleKind::Primary => Role::Primary,
@@ -366,11 +364,10 @@ fn main() -> std::io::Result<()> {
                 app,
                 Box::new(ProdDisk::new(&args.data_dir)?),
                 cfg,
-            )?;
+            )?
         }
-    }
+    };
 
-    loop {
-        std::thread::park();
-    }
+    // A stopped kernel ends the process with its code (spec §5).
+    std::process::exit(server.wait());
 }

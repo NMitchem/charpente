@@ -1093,9 +1093,11 @@ because the alternative is silent acked-write loss). `ReplConfig::strict_witness
 `false`) overrides that last arm alone: past the same deadline the node stops instead of
 serving reads it cannot write to. It is not "refuse to start" — unreachability is only
 established by probing, so a strict node starts, serves reads for the deadline window, and
-only then stops; and the stop reaches a supervisor only under `serve::backup`, where it
-exits the process, not under `serve::serve_replicated`, where the kernel thread ends and the
-HTTP edge stays up returning 500s. **The bound, stated so it is not read
+only then stops; and the stop reaches a supervisor on every node shape — under
+`serve::backup` the error returns from the call, and under `serve::serve_replicated` the
+kernel's stop ends the process through `Server::wait` (below) with status 1, so a
+supervisor restarts it and keeps restarting it until a witness answers. **The bound, stated
+so it is not read
 wider: a probe answers "is THIS witness a primary", never "does another primary exist".**
 A node promoted after a switchover chain, never in this node's witness set, is invisible to
 the check — the witness set is the bound on the whole defence, and the M2 backlog's Design C
@@ -1172,6 +1174,13 @@ genuinely owns. The reseed swap that `Repl::run_seed` needs lands
 in `App`: the `Db` sits behind an `Option` so the `Ready::Repl` arm can `take` it, hand it
 to `run_seed`, and `put` the rebuilt one back, adjacent so no other code observes the empty
 slot.
+
+**A stopped kernel ends the process.** `serve`/`serve_replicated` run the kernel on a
+joined thread; `Server::wait` returns its exit code, and `launch` exits with it. The last
+stderr line names the stop — `refused to start`/`stopped on a refusal` for a `Refusal`
+(table-gate barrier, witness conflict, strict-witness deadline, foreign-shape jobs),
+`failed to start`/`stopped on a platform IO failure — restart to recover` otherwise —
+because a restart clears an IO failure and never a refusal.
 
 ## 6. Queue, cron, realtime — all faces of the log
 

@@ -17,6 +17,7 @@ use hyper::body::{Bytes, Frame, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 
+use charpente_core::db::Refusal;
 use charpente_core::io::{Clock, Disk, Instant, ObjectStore};
 
 use crate::archive::{Archive, ArchiveConfig};
@@ -24,15 +25,47 @@ use crate::http::{App, Method, Request, Response};
 use crate::kernel;
 use crate::repl::{self, Repl};
 
-/// A running server. v0 has no graceful shutdown — the process owns it; the
-/// threads end when the process does.
+/// A running server: the HTTP edge, and the kernel thread it feeds. v0 has no
+/// graceful shutdown. `wait` is how a binary learns the kernel stopped.
 pub struct Server {
     addr: SocketAddr,
+    kernel: std::thread::JoinHandle<i32>,
 }
 
 impl Server {
     pub fn local_addr(&self) -> String {
         self.addr.to_string()
+    }
+
+    /// Blocks until the kernel thread ends, and returns the exit code the
+    /// process should end with:
+    /// - `1` when the kernel stopped on an error (its stderr line is already
+    ///   printed, naming the refusal or IO failure and the fix);
+    /// - `101` when the thread panicked (the panic message is already printed);
+    /// - `0` on a clean shutdown.
+    ///
+    /// Serve with `std::process::exit(serve(addr, app)?.wait())`: a kernel that
+    /// stopped must end the process, or a supervisor sees a live process
+    /// answering every request 500 and never restarts it (payload-shapes spec
+    /// §5).
+    pub fn wait(self) -> i32 {
+        self.kernel.join().unwrap_or(101)
+    }
+}
+
+/// The kernel thread's last stderr line. A refusal is named as one, because
+/// restarting the same binary clears an IO failure and never a refusal; every
+/// refusal's own text names its fix.
+fn kernel_stop_line(started: bool, e: &io::Error) -> String {
+    match (started, Refusal::of(e).is_some()) {
+        (false, true) => format!("charpente kernel refused to start: {e}"),
+        (false, false) => {
+            format!("charpente kernel failed to start — fix the store/log and restart: {e}")
+        }
+        (true, true) => format!("charpente kernel stopped on a refusal: {e}"),
+        (true, false) => {
+            format!("charpente kernel stopped on a platform IO failure — restart to recover: {e}")
+        }
     }
 }
 
@@ -42,13 +75,13 @@ pub fn serve(addr: &str, app: App) -> io::Result<Server> {
 
     // The kernel: one thread owning the App — requests, due jobs, and cron
     // ticks all serialize through Kernel::run's event loop (DESIGN §1).
-    std::thread::spawn(move || {
+    let kernel = std::thread::spawn(move || -> i32 {
         let clock = crate::prod::ProdClock::new();
         let mut kernel = match kernel::Kernel::new(app, Box::new(crate::prod::ProdClock::new())) {
             Ok(kernel) => kernel,
             Err(e) => {
-                eprintln!("charpente kernel failed to start — fix the store/log and restart: {e}");
-                return;
+                eprintln!("{}", kernel_stop_line(false, &e));
+                return 1;
             }
         };
         let mut source = ProdSource {
@@ -56,14 +89,16 @@ pub fn serve(addr: &str, app: App) -> io::Result<Server> {
             stash: None,
             clock,
         };
-        if let Err(e) = kernel.run(&mut source) {
-            eprintln!(
-                "charpente kernel stopped on a platform IO failure — restart to recover: {e}"
-            );
+        match kernel.run(&mut source) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", kernel_stop_line(true, &e));
+                1
+            }
         }
     });
 
-    http_edge(addr, body_cap, kernel_tx)
+    http_edge(addr, body_cap, kernel_tx, kernel)
 }
 
 /// A replicated node: the same HTTP edge, but the kernel thread opens a `Repl`
@@ -81,7 +116,7 @@ pub fn serve_replicated(
     let body_cap = app.config().body_cap;
     let (kernel_tx, kernel_rx) = mpsc::channel::<(Request, kernel::Reply)>();
 
-    std::thread::spawn(move || {
+    let kernel = std::thread::spawn(move || -> i32 {
         let clock = crate::prod::ProdClock::new();
         let mut app = app;
         let repl = match Repl::open(
@@ -100,7 +135,7 @@ pub fn serve_replicated(
                 eprintln!(
                     "charpente replication failed to start — fix the role file and restart: {e}"
                 );
-                return;
+                return 1;
             }
         };
         let mut kernel = match kernel::Kernel::with_replication(
@@ -110,8 +145,8 @@ pub fn serve_replicated(
         ) {
             Ok(kernel) => kernel,
             Err(e) => {
-                eprintln!("charpente kernel failed to start — fix the store/log and restart: {e}");
-                return;
+                eprintln!("{}", kernel_stop_line(false, &e));
+                return 1;
             }
         };
         let mut source = ProdSource {
@@ -119,14 +154,16 @@ pub fn serve_replicated(
             stash: None,
             clock,
         };
-        if let Err(e) = kernel.run(&mut source) {
-            eprintln!(
-                "charpente kernel stopped on a platform IO failure — restart to recover: {e}"
-            );
+        match kernel.run(&mut source) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", kernel_stop_line(true, &e));
+                1
+            }
         }
     });
 
-    http_edge(addr, body_cap, kernel_tx)
+    http_edge(addr, body_cap, kernel_tx, kernel)
 }
 
 /// A backup node: replication only, no HTTP edge. Runs `Kernel::with_replication`
@@ -203,6 +240,7 @@ fn http_edge(
     addr: &str,
     body_cap: usize,
     kernel_tx: mpsc::Sender<(Request, kernel::Reply)>,
+    kernel: std::thread::JoinHandle<i32>,
 ) -> io::Result<Server> {
     let listener = std::net::TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
@@ -262,7 +300,10 @@ fn http_edge(
         });
     });
 
-    Ok(Server { addr: local })
+    Ok(Server {
+        addr: local,
+        kernel,
+    })
 }
 
 /// Frames buffered per SSE connection before the kernel's drop-on-full
@@ -564,6 +605,113 @@ mod tests {
     use charpente_core::db::{Event, Schema, Tx};
     use charpente_core::io::Entropy;
     use charpente_core::table::{Codec, Id, View};
+
+    /// The kernel thread's last stderr line names what stopped it (spec §5):
+    /// a refusal is named as one, because restarting the same binary clears
+    /// an IO failure and never a refusal. Each refusal's own text carries its
+    /// fix.
+    #[test]
+    fn every_kernel_stop_line_names_what_stopped_it() {
+        let refusal = io::Error::other(charpente_core::db::Refusal(
+            "the refusal names its own fix".to_string(),
+        ));
+        let io_failure = io::Error::other("disk on fire");
+        assert_eq!(
+            kernel_stop_line(false, &refusal),
+            "charpente kernel refused to start: the refusal names its own fix"
+        );
+        assert_eq!(
+            kernel_stop_line(false, &io_failure),
+            "charpente kernel failed to start — fix the store/log and restart: disk on fire"
+        );
+        assert_eq!(
+            kernel_stop_line(true, &refusal),
+            "charpente kernel stopped on a refusal: the refusal names its own fix"
+        );
+        assert_eq!(
+            kernel_stop_line(true, &io_failure),
+            "charpente kernel stopped on a platform IO failure — restart to recover: disk on fire"
+        );
+        // The RUN path (`started: true`) must be told apart from a platform
+        // IO failure by TYPE — `Refusal::of` is the oracle `kernel_stop_line`
+        // itself consults — not by reading its own formatted string back,
+        // which would pass even if the line's wording and the classification
+        // drifted apart.
+        assert!(charpente_core::db::Refusal::of(&refusal).is_some());
+        assert!(charpente_core::db::Refusal::of(&io_failure).is_none());
+
+        // A refusal naming several job types is several lines joined by
+        // `\n` (`Db::pending_job_shape_refusal`) — the prefix labels only
+        // the first line, but the operator still sees it and every line,
+        // because `eprintln!` prints the whole string in one call.
+        let multi_line_refusal = io::Error::other(charpente_core::db::Refusal(
+            "job \"a\" ...\njob \"b\" ...".to_string(),
+        ));
+        assert_eq!(
+            kernel_stop_line(false, &multi_line_refusal),
+            "charpente kernel refused to start: job \"a\" ...\njob \"b\" ..."
+        );
+    }
+
+    /// Spec §5: a kernel that refuses to start ends the process — `wait`
+    /// returns 1 — rather than parking behind an edge that answers 500. The
+    /// refusal is Task 6's: a Pending job enqueued under one shape, mounted
+    /// under another.
+    #[test]
+    fn a_kernel_that_refuses_to_start_ends_wait_with_status_1() {
+        struct Receipt {
+            invoice: u64,
+        }
+        impl Codec for Receipt {
+            fn encode(&self, out: &mut Vec<u8>) {
+                self.invoice.encode(out);
+            }
+            fn decode(input: &mut &[u8]) -> io::Result<Receipt> {
+                Ok(Receipt {
+                    invoice: u64::decode(input)?,
+                })
+            }
+        }
+        impl charpente_core::db::Job for Receipt {
+            const NAME: &'static str = "receipt";
+            const FINGERPRINT: u64 = 0x7E57_0701;
+        }
+        fn noop_glue(
+            _tx: &mut Tx,
+            _payload: &[u8],
+            _cap: Option<&charpente_core::db::CrossTenant>,
+        ) -> Result<(), crate::kernel::JobError> {
+            Ok(())
+        }
+        let mut suffix = [0u8; 8];
+        ProdEntropy::new().unwrap().fill(&mut suffix);
+        let root = std::env::temp_dir().join(format!(
+            "charpente-serve-refuse-{:016x}",
+            u64::from_le_bytes(suffix)
+        ));
+        let mut app = App::open(
+            Box::new(ProdDisk::new(&root).unwrap()),
+            Schema::new(),
+            Box::new(ProdEntropy::new().unwrap()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(vec![crate::kernel::JobDef {
+            name: "receipt",
+            retry: charpente_core::job::RetryPolicy::DEFAULT,
+            cross_tenant: false,
+            fingerprint: 0x7E57_0702,
+            glue: noop_glue,
+        }]);
+        app.db_mut()
+            .transact(|tx| {
+                tx.enqueue(Receipt { invoice: 1 });
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
+        let server = serve("127.0.0.1:0", app).unwrap();
+        assert_eq!(server.wait(), 1);
+    }
 
     // #[route] can't be used inside the charpente crate itself (it emits
     // ::charpente paths), so the smoke route is built by hand.
