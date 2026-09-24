@@ -93,9 +93,11 @@ pub trait Job: Codec {
     /// fields (the helper `#[table]` uses). Recorded beside every enqueue. A
     /// Pending job is decoded only by a binary whose `FINGERPRINT` matches:
     /// a Pending job of a foreign shape is refused before dispatch can start
-    /// (`Db::pending_job_shape_refusal`), and dispatch asserts it. No
-    /// default, unlike `Row::FINGERPRINT`: a hand-written impl must state one,
-    /// or a hand-written job would opt out of the check silently.
+    /// (`Db::pending_job_shape_refusal`), an enqueue under another shape of a
+    /// mounted name refuses its transaction (`Group::stage`), and dispatch
+    /// asserts it. No default, unlike `Row::FINGERPRINT`: a hand-written impl
+    /// must state one, or a hand-written job would opt out of the check
+    /// silently.
     const FINGERPRINT: u64;
     const RETRY: crate::job::RetryPolicy = crate::job::RetryPolicy::DEFAULT;
 }
@@ -115,7 +117,10 @@ pub trait Event: Codec {
 /// Why a transaction did not return `Ok`: the application's own rejection,
 /// or a platform IO failure. The distinction is load-bearing — `App` means
 /// nothing was written; `Io` after the WAL sync means the record is durable
-/// but unacknowledged and will resurface on recovery.
+/// but unacknowledged and will resurface on recovery. An `Io` carrying a
+/// `Refusal` (`Refusal::of`) is not a platform failure at all: the
+/// transaction was refused before anything was written — an enqueue of a
+/// mounted job name under another shape — and a retry cannot succeed.
 #[derive(Debug)]
 pub enum TxError<E> {
     App(E),
@@ -149,10 +154,11 @@ pub enum TxError<E> {
 
 /// A named refusal: the platform declining to proceed on state it will not
 /// guess about — a Pending job of a foreign shape
-/// (`Db::pending_job_shape_refusal`). Carried inside `io::Error::other`, so
-/// every `io::Result` path is untouched, and read back with `Refusal::of`:
-/// restarting the same binary clears a platform IO failure and never a
-/// refusal, so whoever reports why the kernel stopped must tell the two apart
+/// (`Db::pending_job_shape_refusal`), or an enqueue of a mounted job name
+/// under another shape (`Group::stage`, as `TxError::Io`). Carried inside
+/// `io::Error::other`, so every `io::Result` path is untouched, and read back
+/// with `Refusal::of`: restarting or retrying clears a platform IO failure
+/// and never a refusal, so whoever reports the error must tell the two apart
 /// (payload-shapes spec §5).
 #[derive(Debug)]
 pub struct Refusal(pub String);
@@ -3257,6 +3263,25 @@ impl<'a> Group<'a> {
                 return Err(TxError::Verifying {
                     unreached: unreached.clone(),
                 });
+            }
+        }
+        // A mounted job name has one shape. `NAME` is the bare type
+        // identifier, so a second `#[job]` type of the same name enqueues
+        // under a shape no dispatch of this binary can decode; refusing it
+        // here, before a record exists, is what makes dispatch's shape
+        // assert an invariant (payload-shapes spec §4).
+        let job_shapes = &self.db.engine.machine().schema.job_shapes;
+        for (name, _, _, shape) in &effects.enqueues {
+            if let Some(&mounted) = job_shapes.get(*name)
+                && mounted != *shape
+            {
+                return Err(TxError::Io(io::Error::other(Refusal(format!(
+                    "job \"{name}\" was enqueued under a different shape of {name} than this \
+                     binary mounts (enqueued {shape:#x}; this binary {mounted:#x}) — two #[job] \
+                     types share the name {name}; the transaction was refused and nothing was \
+                     written, so a retry cannot succeed — enqueue the mounted type, or give the \
+                     other type its own name (GUIDE §6)"
+                )))));
             }
         }
         // First-write adoption, group-aware (spec §T4 note): two staged

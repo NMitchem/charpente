@@ -7760,7 +7760,17 @@ fn a_promote_over_same_shape_pending_jobs_succeeds() {
 /// Done rows are never decoded again, so they never refuse anything.
 #[test]
 fn a_promote_over_foreign_done_jobs_succeeds() {
-    let sim = Sim::with_faults(0x5A9E_0703, FaultConfig::none());
+    promote_over_a_foreign_finished_ping(0x5A9E_0703, JobStatus::Done);
+}
+
+/// Nor do Dead ones: a dead-lettered job is never dispatched again.
+#[test]
+fn a_promote_over_foreign_dead_jobs_succeeds() {
+    promote_over_a_foreign_finished_ping(0x5A9E_0707, JobStatus::Dead);
+}
+
+fn promote_over_a_foreign_finished_ping(seed: u64, status: JobStatus) {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
     let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
     let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
     f.db.as_mut()
@@ -7773,7 +7783,7 @@ fn a_promote_over_foreign_done_jobs_succeeds() {
             let mut job = tx
                 .get(Id::<JobRow>::from_raw(0))?
                 .expect("the enqueued ping");
-            job.status = JobStatus::Done;
+            job.status = status;
             tx.put(&job);
             Ok::<(), io::Error>(())
         })

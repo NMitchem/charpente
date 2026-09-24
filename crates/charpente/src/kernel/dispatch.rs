@@ -5,7 +5,7 @@ use std::fmt;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use charpente_core::db::{CrossTenant, Db, Group, Tx, TxError};
+use charpente_core::db::{CrossTenant, Db, Group, Refusal, Tx, TxError};
 use charpente_core::job::{JobRow, JobStatus, RetryPolicy};
 use charpente_core::table::{Id, Snapshot, View};
 
@@ -213,19 +213,23 @@ impl Dispatcher {
                     row.name
                 )));
             };
-            // `Kernel::build` (writable) and `after_repl_step` (every write-
-            // gate opening) refuse to start dispatch over a Pending row of a
-            // foreign shape, and a heap is only ever fed while writable; a
-            // fresh enqueue records this binary's own shape. So a
-            // foreign-shape payload never reaches decode — asserted, not
-            // handled (hard rule 4).
+            // Dispatch runs only while writable (the `Ready::Job` push is
+            // gated on it), and every way to become writable passes a
+            // refusal over a Pending row of a foreign shape first:
+            // `Kernel::build` on a node writable at start, `after_repl_step`
+            // at every write-gate opening. While writable, new rows come only
+            // from this binary's own enqueues, and `Group::stage` refuses one
+            // under another shape of a mounted name; shipped frames apply only
+            // on a follower. So a foreign-shape payload never reaches decode
+            // — asserted, not handled (hard rule 4).
             assert_eq!(
                 row.shape,
                 Some(def.fingerprint),
-                "dispatcher invariant: job {id} (\"{}\") has recorded shape {:?} but this binary \
+                "dispatcher invariant: job {id} (\"{}\") has recorded shape {} but this binary \
                  compiled {:#x} — a foreign-shape payload never reaches decode",
                 row.name,
-                row.shape,
+                row.shape
+                    .map_or_else(|| "none".to_string(), |shape| format!("{shape:#x}")),
                 def.fingerprint
             );
             match catch_unwind(AssertUnwindSafe(|| {
@@ -247,6 +251,16 @@ impl Dispatcher {
             Ok(())
         });
 
+        // The handler's own transaction refused by name — it enqueued
+        // another shape of a mounted job name — is the handler's
+        // deterministic bug, like a panic: an attempt, never a platform
+        // fault, since no restart could clear it.
+        let attempt = match attempt {
+            Err(TxError::Io(e)) if Refusal::of(&e).is_some() => {
+                Err(TxError::App(JobError::App(e.to_string())))
+            }
+            other => other,
+        };
         match attempt {
             Ok(()) => Ok(JobOutcome::Done { id }),
             // Platform faults — the transaction machinery's own, or one the

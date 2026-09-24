@@ -1190,7 +1190,11 @@ slot.
   startup and wherever its write gate opens, and `promote` checks before its durable flip.
   A switchover is never refused at the hand-off, which is the primary's point of no return
   (§5): its target stops at the write-gate flip instead, where the refusal's fix still
-  works. Dispatch asserts the invariant.
+  works. The binary never writes such a row itself: an enqueue under another shape of a
+  mounted job name (two `#[job]` types sharing one) refuses its whole transaction by name,
+  before any record exists. Dispatch asserts the invariant. A charpente release never
+  changes the platform's own `SessionSweep` job's fields without renaming it, because an
+  app author cannot apply the refusal's fix to it.
 - **Cron.** Schedules are rows; a due tick is one transaction that advances `next_due` and
   enqueues through the normal path — a recurring enqueuer, inheriting retry and
   observability for free. Catch-up fires once per wake, never backfills. In simulation,

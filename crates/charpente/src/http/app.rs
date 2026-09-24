@@ -7,7 +7,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use charpente_core::db::{CrossTenant, Db, DbConfig, Group, Job, Schema, Tx, TxError};
+use charpente_core::db::{CrossTenant, Db, DbConfig, Group, Job, Refusal, Schema, Tx, TxError};
 use charpente_core::io::{Disk, Entropy};
 use charpente_core::table::{Id, View};
 use charpente_macros::table;
@@ -835,9 +835,6 @@ fn build_ctx(
     })
 }
 
-/// `TxError<ApiError>` -> `Response`, shared by both route flavors: `App`
-/// names the handler's own rejection; `Io`/`NotPrimary`/`Verifying` name the
-/// platform failure and the fix (hard rule 5).
 /// The 500 a request gets when the platform cannot tell it whether its write
 /// committed. One function, two callers: this path and the kernel's batched
 /// commit-failure tail (group-commit T6), which must produce byte-identical
@@ -854,9 +851,15 @@ pub(crate) fn io_failure_response(e: &io::Error) -> Response {
     )
 }
 
+/// `TxError<ApiError>` -> `Response`, shared by both route flavors: `App`
+/// names the handler's own rejection; `Io`/`NotPrimary`/`Verifying` name the
+/// platform failure and the fix (hard rule 5). An `Io` carrying a `Refusal`
+/// is answered with the refusal's own text instead of the storage-failure
+/// one: nothing was written, and a retry cannot succeed.
 fn tx_error_response(err: TxError<ApiError>) -> Response {
     match err {
         TxError::App(e) => e.response(),
+        TxError::Io(e) if Refusal::of(&e).is_some() => Response::error(500, &e.to_string()),
         TxError::Io(e) => io_failure_response(&e),
         TxError::NotPrimary { primary } => Response::error(
             421,

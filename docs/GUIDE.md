@@ -608,6 +608,12 @@ committed record's log entry after `f` returned `Ok`. That second case is
 genuinely ambiguous — the record may already be durable and will reappear
 after the next recovery even though the caller was told the commit failed —
 so treat `TxError::Io` as "unknown," never as "definitely didn't happen."
+The one exception is an `Io` carrying a `Refusal`
+(`charpente::core::db::Refusal::of`): the transaction was refused before
+anything was written, and a retry cannot succeed — today, an enqueue under
+another shape of a job name this binary mounts (§6, "Changing a job's
+fields"). The HTTP layer answers it with a 500 carrying the refusal's own
+text.
 `NotPrimary { primary }` fires only when `f` had at least one effect to
 write and this node has been marked a read-only follower
 (`Db::forbid_writes`, DESIGN §5) — reads and effect-free transactions never
@@ -1473,7 +1479,8 @@ vice versa: exactly-once state effects, structurally.
 On `Err(JobError::App(msg))` — your handler's own rejection, a panic inside
 it (absorbed as `"handler panicked: <payload>"`), or a corrupt payload
 (corrupt stored bytes: `"job decode for <Name>: <e> — the stored payload is
-corrupt …"`; a shape change never reaches dispatch — see "Changing a job's
+corrupt …"`; a Pending job of another shape is refused before dispatch can
+start, and this binary refuses to enqueue one — see "Changing a job's
 fields") — that attempt's own effects never committed, and a *second*
 transaction records the failure: `attempts` increments, `last_error` gets
 the message, and:
@@ -1529,6 +1536,22 @@ nothing decodes bytes it cannot prove are its own shape.
 
 Done and Dead rows are never decoded again and never refuse anything. A Pending row of a
 job type this binary does not mount keeps the "not registered" path above.
+
+This binary never writes a foreign-shape row itself. `NAME` is the type's bare identifier,
+so two `#[job]` types can share one: a route that still enqueues `v1::SendReceipt` in a
+binary that mounts `v2::SendReceipt`, say. An enqueue under another shape of a mounted name
+refuses its whole transaction before anything is written:
+
+<!-- pinned -->
+```text
+job "<job>" was enqueued under a different shape of <job> than this binary mounts (enqueued <shape>; this binary <fingerprint>) — two #[job] types share the name <job>; the transaction was refused and nothing was written, so a retry cannot succeed — enqueue the mounted type, or give the other type its own name (GUIDE §6)
+```
+
+A route answers it with a 500 carrying that text, never the retryable storage-failure 500
+(§5). Inside a job handler it is an attempt, like a panic: the job retries and then
+dead-letters, with the text as its `last_error`. In a cron schedule's enqueue it stops the
+kernel. An enqueue of a job type this binary does not mount at all is not refused here: it
+commits and takes the "not registered" path.
 
 There are two ways through a shape change:
 
@@ -5335,9 +5358,10 @@ A successful restore prints what it rebuilt and exits 0:
 restored generation 7 into "./data"
   frontier      seq 41203
   segments      12
-  pending jobs  4 — these WILL dispatch when this node starts, so restore can re-fire mail
-  and third-party calls that already ran (idempotency keys are what make that
-  exactly-once-observable)
+  pending jobs  4 — these WILL dispatch when this node starts (unless one was enqueued
+  under a job shape this binary does not compile, which refuses the start by name — GUIDE
+  §6), so restore can re-fire mail and third-party calls that already ran (idempotency keys
+  are what make that exactly-once-observable)
 ```
 
 ### Stop the node first

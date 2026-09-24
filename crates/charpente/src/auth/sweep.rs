@@ -21,6 +21,10 @@ use crate::kernel::cron::CronEntry;
 pub const SESSION_SWEEP_NAME: &str = "charpente.session_sweep";
 pub const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(86_400);
 
+/// A charpente release never changes these fields without renaming the
+/// type: a node refuses to start over a Pending job of another shape, and
+/// that refusal's fix (restore the old fields, or give the new shape its own
+/// `#[job]` type) is one an app author cannot apply to the platform's own job.
 #[job]
 pub struct SessionSweep {
     pub before: u64,

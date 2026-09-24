@@ -255,9 +255,10 @@ fn restore_verb(
         "  pending jobs  0".to_string()
     } else {
         format!(
-            "  pending jobs  {} — these WILL dispatch when this node starts, so restore can \
-             re-fire mail and third-party calls that already ran (idempotency keys are what \
-             make that exactly-once-observable)",
+            "  pending jobs  {} — these WILL dispatch when this node starts (unless one was \
+             enqueued under a job shape this binary does not compile, which refuses the start \
+             by name — GUIDE §6), so restore can re-fire mail and third-party calls that \
+             already ran (idempotency keys are what make that exactly-once-observable)",
             report.pending_jobs
         )
     };

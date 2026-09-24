@@ -45,8 +45,9 @@ use std::path::{Path, PathBuf};
 /// Hand-counted at landing (2026-09-16): the number of `<!-- pinned -->`
 /// blocks in docs/GUIDE.md. Fewer than this is red. 16 at landing
 /// (2026-09-16); 18 with payload shapes' reshaped frame and 409, 19 with its
-/// `charpente.error` frame, 20 with its Pending-job refusal (2026-09-24).
-const PINNED_FLOOR: usize = 20;
+/// `charpente.error` frame, 20 with its Pending-job refusal, 21 with its
+/// enqueue refusal (2026-09-24).
+const PINNED_FLOOR: usize = 21;
 
 /// Below this a fragment is not evidence — `usage:` or `id: 1.0` would match
 /// almost any corpus. Long enough that a coincidental hit is implausible,
