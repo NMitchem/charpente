@@ -3397,9 +3397,10 @@ writing the scope's `authorize`, and the cross-tenant capability — and points
 back here for the emit and subscribe shapes above.
 
 One contract rides along with the `Serialize` derive: every `#[event]` payload must be
-plainly JSON. serde_json refuses a map whose keys are not strings, and it does not
-refuse a `NaN` or infinite float — it writes `null`, so a client receives `null` where
-a number was. Neither is caught at emit time (the log stores `Codec` bytes; JSON
+plainly JSON. serde_json refuses a map whose keys do not serialize as a string or a
+number (a `Vec<u8>`, tuple or struct key, say), and it does not refuse a `NaN` or
+infinite float value — it writes `null`, so a client receives `null` where a number
+was. Neither is caught at emit time (the log stores `Codec` bytes; JSON
 encoding happens at delivery). An event that fails to encode fails its own tail and
 never the node: the stream ends with one terminal frame, the same frame a stored event
 whose bytes are corrupt gets:

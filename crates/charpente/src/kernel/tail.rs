@@ -53,6 +53,10 @@ pub enum SinkStatus {
 /// replay into a named divergence error instead of silent misattribution),
 /// `name` is the subscribed event's `Event::NAME`, `json` is the already-
 /// encoded payload (`SubEntry::encode_json`, `crate::http::Subscription`).
+/// That holds for every frame EXCEPT `ERROR_FRAME`: its wire form carries no
+/// `id:` line at all (`serve.rs::encode_frame`), so `id` there names the
+/// failing row instead of a resumable cursor position, and `seq` is 0 in the
+/// envelope-corruption arm below (there is no row to read one from).
 /// Clone is load-bearing: the prod sink's `try_send` takes an owned frame.
 #[derive(Clone, Debug)]
 pub struct EventFrame {

@@ -1250,9 +1250,10 @@ slot.
   that reports `Full` or `Closed` costs the tail its connection, deterministically and
   immediately: a slow or dead consumer never costs kernel progress, and the client's cursor
   resume is the recovery mechanism, not a server-side retry queue. Event payloads must be
-  plainly JSON — serde_json refuses a map with non-string keys (and writes a non-finite
-  float as `null`). An event that fails to encode, or whose stored bytes are corrupt,
-  ends that subscriber's tail with a terminal `charpente.error` frame that carries no
+  plainly JSON — serde_json refuses a map whose keys do not serialize as a string or a
+  number (and writes a non-finite float value as `null`). An event that fails to
+  encode, or whose stored bytes are corrupt, ends that subscriber's tail with a
+  terminal `charpente.error` frame that carries no
   `id:`, so the client's cursor does not advance past it. No delivery path stops the
   kernel; only the platform's own store failures do.
 - **Honesty at the edges.** A cursor below the retention floor, or one naming an event id

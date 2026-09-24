@@ -859,7 +859,11 @@ fn leftover_bytes_under_a_matching_shape_fail_the_tail_by_name() {
         )],
     );
     let frames = frames_of(&sinks.lock().unwrap()[0]);
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert_eq!(frames[0].2, "charpente.error");
     let body: serde_json::Value = serde_json::from_str(&frames[0].3).unwrap();
+    assert_eq!(body["event"], "incident_opened");
+    assert_eq!(body["id"], 1);
     assert_eq!(
         body["error"],
         format!(
@@ -899,6 +903,10 @@ fn a_corrupt_event_row_fails_its_tail_not_the_node() {
     assert_eq!(frames[0].2, "charpente.error");
     let body: serde_json::Value = serde_json::from_str(&frames[0].3).unwrap();
     assert_eq!(body["id"], rows[1].id.raw());
+    assert!(
+        body.get("event").is_none(),
+        "an envelope-corrupt row's own name is unreadable — no `event` key, per GUIDE §11: {body}"
+    );
     assert_eq!(
         body["error"],
         format!(
@@ -2329,9 +2337,12 @@ fn a_delivered_frame_carries_its_64_bit_field_as_a_decimal_string() {
 /// Spec §3/§6.5: an encode failure fails its own tail, never the node — this
 /// test was `tail_encode_error_is_whole_node_fatal`, the pin of the decision
 /// payload shapes reversed (docs/LEDGER.md:286's per-tail follow-up). The
-/// failing encoder is hand-built (`FailingFeed`), because no `#[event]` the
-/// macro accepts can make `Subscription::of`'s real encoder fail on its own
-/// bytes. The stream ends with `charpente.error`, and the node keeps serving.
+/// failing encoder is hand-built (`FailingFeed`), which covers an encoder
+/// that fails regardless of the payload's type — no shape check, no field
+/// ever read. `a_real_events_serialize_failure_fails_its_tail_not_the_node`
+/// (below) covers the other case, a real `#[event]` whose own field
+/// `Serialize` impl fails on its own bytes. The stream ends with
+/// `charpente.error`, and the node keeps serving.
 struct FailingFeed;
 
 fn failing_feed_glue(
@@ -2435,6 +2446,111 @@ fn an_unencodable_event_fails_its_tail_not_the_node() {
         &mut kernel,
         &sim,
         vec![Request::new(Method::Post, "/note").json(&NoteBody { n: WireU64(2) })],
+    );
+    assert_eq!(statuses(&responses), vec![200], "the node keeps serving");
+}
+
+/// A field type whose `Serialize` always fails (fix round 1, I-1): `#[event]`
+/// only requires `Codec`/`Wire`/`Serialize` on its fields (charpente-macros
+/// event.rs), and `Wire` is an open `pub trait`, so a hand-written field type
+/// can make `Subscription::of`'s REAL encoder fail on its own bytes — not
+/// `FailingFeed`'s hand-built stub. `Codec`/`Wire` are modeled on `WireU64`:
+/// a fixed-shape carrier with nothing to decide, so only `Serialize` is
+/// interesting here.
+#[derive(Clone, Copy)]
+struct Poisoned;
+
+impl Codec for Poisoned {
+    fn encode(&self, _out: &mut Vec<u8>) {}
+    fn decode(_input: &mut &[u8]) -> io::Result<Poisoned> {
+        Ok(Poisoned)
+    }
+}
+
+impl Wire for Poisoned {
+    const WIRE_NAME: &'static str = "";
+    fn schema() -> TypeSchema {
+        TypeSchema::Null
+    }
+    fn register(_reg: &mut charpente::wire::TypeRegistry) {}
+}
+
+impl Serialize for Poisoned {
+    fn serialize<S: serde::Serializer>(&self, _s: S) -> Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom(
+            "poisoned field refuses to serialize",
+        ))
+    }
+}
+
+#[event]
+struct PoisonedEvent {
+    field: Poisoned,
+}
+
+#[route(POST "/poison", public)]
+fn emit_poison(tx: &mut Tx) -> Result<(), ApiError> {
+    tx.emit(PoisonedEvent { field: Poisoned });
+    Ok(())
+}
+
+#[route(SSE "/feed-poisoned", public, emits(PoisonedEvent))]
+fn feed_poisoned(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<PoisonedEvent>().cursor(cursor))
+}
+
+/// I-1: the same `charpente.error` frame `an_unencodable_event_…` pins, but
+/// reached through a REAL `#[event]`/`Subscription::of` encoder (`ev_json`,
+/// http/mod.rs) rather than `FailingFeed`'s hand-built stub — this is what
+/// pins the JSON-encode failure text GUIDE §11 quotes
+/// (`event <name> failed JSON encoding: <message> — every #[event] payload
+/// must be plainly JSON (GUIDE §11); fix the emitting code`), spelled out
+/// independently of the product's own `format!`.
+#[test]
+fn a_real_events_serialize_failure_fails_its_tail_not_the_node() {
+    let sim = Sim::with_faults(0x2EB2_FA13, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![feed_poisoned, emit_poison]);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let (_, sinks) = run_script(
+        &mut kernel,
+        &sim,
+        vec![
+            Request::new(Method::Get, "/feed-poisoned"),
+            Request::new(Method::Post, "/poison"),
+        ],
+    );
+    let rows: Vec<EventRow> = kernel
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan_from(0, 8)
+        .unwrap();
+    assert_eq!(
+        frames_of(&sinks.lock().unwrap()[0]),
+        vec![(
+            rows[0].id.raw(),
+            rows[0].seq,
+            "charpente.error".to_string(),
+            format!(
+                r#"{{"event":"poisoned_event","id":{},"error":"event poisoned_event failed JSON encoding: poisoned field refuses to serialize — every #[event] payload must be plainly JSON (GUIDE §11); fix the emitting code"}}"#,
+                rows[0].id.raw()
+            ),
+        )],
+        "the real Subscription::of encoder fails on its own bytes, byte-exact"
+    );
+    let (responses, _) = run_script(
+        &mut kernel,
+        &sim,
+        vec![Request::new(Method::Post, "/poison")],
     );
     assert_eq!(statuses(&responses), vec![200], "the node keeps serving");
 }
