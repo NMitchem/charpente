@@ -5376,3 +5376,130 @@ FAILED, EXIT=0.
 of this sub-project's scope (spec §6).
 Next is the real publish and M3 sub-project 5, once sub-project 3's attempt reaches its
 verdict.
+
+## 2026-09-24 — the third docs-only build: a status page, 1 attempt, PASS
+
+Spec `docs/superpowers/specs/2026-09-17-third-docs-only-build-design.md`, plan
+`docs/superpowers/plans/2026-09-17-third-docs-only-build.md`, eight tasks. M3 sub-project 3.
+Workspace `.superpowers/sdd/2026-09-17-third-docs-only-build/`; record
+`docs/experiments/2026-09-statuspage/`.
+
+**What was asked.** A sealed Opus agent, given `BRIEF.md` (sha256
+`3dc351f013fbd3d119d705b0bd2821f890a02ca19a271e9efcb75fc31a9b253c`), README and GUIDE and
+nothing else, built a multi-tenant status page in its own repository scaffolded by
+`charpente new`: anonymous page reads, subscribes and an SSE feed; operator-only writes; a
+notify job, a maintenance cron sweep, and an `Incident` v1 → v2 migration in a separate
+commit. The brief reaches for the shapes where the platform now asks — anonymous reads and
+authenticated writes on one tenant's rows — and says nothing about how to get there.
+Pinned at `d0b2b7e`, the brief commit; the CLI was installed from `66d79d8`, and the four
+crates the app compiles and the workspace manifest are identical between the two and
+unchanged through `48e6420`. Dependency form `[patch.crates-io]`. One attempt, one resume
+(the harness ended the builder on an API 529, not on anything it did). The app's final
+commit is `6037704`, 18 commits, kept as `statuspage-attempt-1.bundle` beside the run
+directory.
+
+**Verdict: PASS, signed by Noah 2026-09-24 — "PASS, fix before publish".** Every mechanical
+clause passed (below). The blind review found 2 Critical, 5 Important and 6 Minor, both
+Criticals demonstrated by running code and both re-run by the controller:
+
+- **C-1: the v2 commit reshaped a durable event.** `dd1993a` inserted `severity` mid-struct
+  in `IncidentOpened`. After the upgrade, an anonymous feed resume from a pre-upgrade
+  cursor decodes a v1 row with the v2 codec and stops the node with `row decode: needed 1
+  bytes for bool, 0 left — schema drift or corruption`, again on every reboot while the row
+  is retained (65,536 events by default). **Ruling: no claim, an agent bug by §2(b)'s
+  letter.** README guarantee 1 is compile-time type consistency; GUIDE §12 promises safe
+  shape changes for "A `#[table]` row's shape" only (`docs/GUIDE.md:3775-3779`);
+  DESIGN.md:655-657 says `EventRow` "is invisible to the gate"; §11 already documents
+  durable-row delivery failure as kernel-fatal (`docs/GUIDE.md:3391-3399`). It was the
+  verdict's closest call, because the severity is platform-made: `#[event]` payloads carry
+  no version or fingerprint and GUIDE never says how to evolve one; a decode failure at
+  delivery is whole-node-fatal (`crates/charpente/src/kernel/tail.rs:99-104`), which makes
+  an anonymous cursor a node-kill switch; and the decode error names neither the event nor
+  a fix, against hard rule 5. Read by the spirit of guarantee 1 — "a schema change … is a
+  compile error, not a 3am page" — it would have been a platform finding and a FAIL. Noah
+  chose the letter plus a pre-publish fix.
+- **C-2: the isolation property is blind to most operator writes.**
+  `no_org_observes_another_org` never drives `create_operator`, and drives two of the
+  seven write routes across orgs. With `create_operator`'s scope line deleted and four
+  write routes rewritten to `open_scope(org, None)`, the sim batch is byte-identical to
+  pristine, and alpha's key mints a working operator key in beta and reads beta's
+  subscriber emails. **Ruling: no claim, an agent bug — a one-sided property.** The
+  compile-time refusal covers scoped tables (`docs/GUIDE.md:5470-5482`), and `Operator` is
+  `global` and must be, since `authorize` takes a bare `&Tx`; `open_scope` is public;
+  `--mutants` has no mutant that removes a handler's scope line (none of `operators.rs`'s
+  22 does) and states sibling masking as part of its claim (`docs/GUIDE.md:2560-2563`); the
+  brief scoped mutants to the job, cron and state-machine files.
+
+The two probe sources that decided the Criticals are kept in the record
+(`attempt-1/probes/upgrade.rs`, `attempt-1/probes/takeover.rs`), because the scratch
+directory they ran in is session-scoped and dies with the session.
+
+**Public reads: the shape, and whether §16 led there.** `authorize` admits `None`
+unconditionally; operator routes use `tx.scope(org, ctx)`; the three public operations and
+both jobs use the undocumented `tx.open_scope(org, None)`. Sound as shipped, but
+fail-open: flipping all seven write routes to `public` leaves the sim batch byte-identical
+and lets anonymous callers resolve incidents (Important I-1). §16 led there twice. For
+public reads, its only `authorize` refuses `None`, §11's "public" feed scopes with the
+caller's `ctx`, and "admits `None`" is never said to include writes — `authorize` sees
+neither the operation nor whether the caller is a route or a job. For jobs, §16 prescribes
+`tx.scope(org, ctx)`, a job has no `Ctx`, `open_scope` has zero doc hits, and
+`cross_tenant` is read-only, so the notify job's writes force `authorize` to admit `None`.
+
+**Platform findings, all found by attempt 1.** None was fixed between attempts: attempt 1
+passed, so the fail loop (spec §7) never ran and no platform commit belongs to this
+sub-project. Noah's ruling makes two of them preconditions of the 0.1.0 publish: (1)
+`#[event]` payload evolution is unguarded, delivery-time decode failure is
+whole-node-fatal, and the decode error names neither the event nor a fix (C-1); (2) a job
+cannot open a tenant scope the way GUIDE §16 documents (`docs/GUIDE.md:5322`,
+`:5665-5679`, against `run(self, tx)`), and `authorize` sees neither the operation nor the
+caller kind. The other ten stay testimony, ranked in the record: the upgrade barrier's
+remedy cannot be performed on a `launch` binary (the real remedy lives only in a comment,
+`crates/charpente-core/src/db.rs:2246`); `Kernel::into_app` returns a spent App; the sim
+records no reply for a dropped request while production answers a named 500; durable
+corruption cuts void history-dependent expectations and rewind app id counters; §8's own
+examples map fault fallout to `Ok(())` with no `give_up`; a `launch` node whose kernel
+stops answers 500 forever and never exits; auth is credentials-only and never says so;
+the membership table is necessarily outside the type-level guarantee and §16 never says
+so (C-2); one global event/seq space leaks another org's volume through any public feed;
+and a list of smaller doc gaps.
+
+**Testimony.** FINDINGS.md made 49 distinct claims about charpente: 41 right, 2 wrong, 5
+right for the wrong reason, and #45 right on a run. Wrong: #21, "replies stay positional
+through a crash", which the builder retracted itself after a 256-universe batch; and #28,
+"a connection reset", where production answers `500 "the kernel dropped the request"`
+(`crates/charpente/src/serve.rs:245-248`). Right for the wrong reason: #11 (a hash
+primitive exists — `charpente::auth::hash_token` — undocumented), #13 (`ApiKey`'s
+`key_hash` index finds a new key's row, no scan diff needed), #27 (`crash:dropped` is a
+disk coverage key, not a request fate; a job, cron or tail arm's `Err` strands the parked
+request), #32 (no SIGINT handler exists; the ignore was likely inherited from the shell),
+and #34 (`Db::checkpoint` is documented, but no `App`-built binary can reach `&mut Db`).
+#45 — "every one of the 28 repro lines replayed byte-for-byte … before the fix and to a
+green (or give-up) after it" — was run by the controller in two clones from the bundle:
+on `223e30a` all 28 exit 1 with their failure block byte for byte as logged, and on
+`1d0a0c4` all 28 exit 0 with no failure. The seed-repro line held for every real failure
+a stranger hit. The census, with every ruling's file:line, is in the record's README.
+
+**Replay and mutants.** Master seed `0x58129e7e4b18d000` (10,000 universes per test). Two
+controller replays a day apart, the second under heavy concurrent load, are byte-identical
+(sha256 `bbdb98898b6c329d56eb268b5150616216f466a19ca8ab6ab34f4805079fa8c0`): 0 failures,
+27,120 verdicts, 22,880 gave up, every total and per-test give-up count equal to the
+builder's recorded run. The controller's `--mutants`, one run per file, `--test-package
+statuspage --timeout 600`: 78 total — 48 caught, 30 unviable, 0 missed, 0 timed out, over
+`notify.rs`, `maintenance.rs`, `incidents.rs` and `lib.rs`; the builder's three-file
+54 — 35 caught, 19 unviable equals the controller's sum for those files. `authorize →
+Ok(())` is caught by `no_org_observes_another_org`. App gates: clippy EXIT 0; `cargo test`
+EXIT 0, 4 `test result: ok`, 0 FAILED; `check-client` EXIT 0; v2 is its own commit,
+`dd1993a`. §2(a): charpente's four compiled crates and manifest unchanged
+`66d79d8..48e6420`; the transcript's 252 tool calls produced 2 grep hits, both ruled
+non-violations, the second a recorded near-miss (a `grep` into charpente's crates piped to
+`head -0`, which macOS rejects, so zero bytes reached the builder).
+
+**Gate** on `48e6420` plus this record (docs only; no crate changed): fmt clean;
+`cargo build -p guide-examples` clean; `cargo test -p guide-examples --no-fail-fast`
+8 of 8 `test result: ok`, 0 FAILED, EXIT=0. The full workspace gate is run separately.
+
+**Open, deliberately.** The two pre-publish platform fixes above. The other ten findings
+are testimony with no schedule. Whether the app repository goes to GitHub as a launch
+artifact is Noah's call; the bundle stays beside the run directory until then.
+Next are the two pre-publish platform fixes named above, then the real publish, then M3
+sub-project 5, the launch run.

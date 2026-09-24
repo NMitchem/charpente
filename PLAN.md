@@ -216,10 +216,16 @@ Sub-projects, in dependency order:
    "should be" is detected is that sub-project's design question, not settled here. The
    oracle is already in the tree: the helpdesk app at `8913038`, rebased, must fail to
    compile at both of its Critical sites.
-3. **Third docs-only build.** A new domain — not invoicing, not helpdesk — with the brief
-   written first and the agent given README + GUIDE only. Exit: zero framework patches,
-   zero Criticals in review that a platform oracle should have caught, `--mutants` clean
-   over its sim properties. Findings ledgered as testimony, as the helpdesk write-up was.
+3. **Third docs-only build** [shipped 2026-09-24; record
+   `docs/experiments/2026-09-statuspage/`]. A new domain — not invoicing, not helpdesk —
+   with the brief written first and the agent given README + GUIDE only. Exit: zero
+   framework patches, zero Criticals in review that a platform oracle should have caught,
+   `--mutants` clean over its sim properties. Findings ledgered as testimony, as the
+   helpdesk write-up was. The 0.1.0 publish now waits on two platform fixes this build
+   found: (1) `#[event]` payload evolution is unguarded, and a delivery-time decode
+   failure stops the whole node with an error naming neither the event nor a fix; (2) a
+   job cannot open a tenant scope the way GUIDE §16 documents, and `authorize` sees
+   neither the operation nor the caller kind.
 4. **Claims audit** [shipped 2026-09-22; spec
    `docs/superpowers/specs/2026-09-21-claims-audit-design.md`]. The bare-metal Linux BENCH
    run owed since 2026-08-15 lands, or the README scaling paragraph is rewritten to what
