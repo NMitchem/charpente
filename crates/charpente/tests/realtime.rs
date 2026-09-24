@@ -2716,8 +2716,44 @@ fn shapes_verdict(
     sinks: &SinkHandles,
     stalled: bool,
 ) -> Result<(), String> {
+    let v1 = <shapes_v1::IncidentOpened as Event>::FINGERPRINT;
     let v2 = <shapes_v2::IncidentOpened as Event>::FINGERPRINT;
+    let pong = <Pong as Event>::FINGERPRINT;
     let foreign = |row: &EventRow| row.name == "incident_opened" && row.shape != Some(v2);
+    // `foreign` reads the platform's own stored tag, so the tag is checked
+    // against the bytes before anything trusts it: every row carries a shape
+    // this workload writes under its name, and decodes as exactly that shape.
+    // A v2 row mis-tagged v1 leaves 8 bytes behind and fails here, instead of
+    // drawing a reshaped frame the oracle would agree with. Each entry is the
+    // row's JSON as a v2 subscriber must see it, or `None` for a foreign row.
+    let mut decoded = Vec::with_capacity(rows.len());
+    for row in rows {
+        decoded.push(match (row.name.as_str(), row.shape) {
+            ("incident_opened", Some(tag)) if tag == v1 => {
+                decode_exact::<shapes_v1::IncidentOpened>(row, tag)?;
+                None
+            }
+            ("incident_opened", Some(tag)) if tag == v2 => Some(
+                serde_json::to_string(&decode_exact::<shapes_v2::IncidentOpened>(row, tag)?)
+                    .expect("a v2 incident serializes"),
+            ),
+            ("pong", Some(tag)) if tag == pong => Some(
+                serde_json::to_string(&decode_exact::<Pong>(row, tag)?).expect("a pong serializes"),
+            ),
+            (name, shape) => {
+                let recorded = match shape {
+                    Some(tag) => format!("{tag:#x}"),
+                    None => "no shape".to_string(),
+                };
+                return Err(format!(
+                    "row {} is a {name:?} event tagged {recorded} — this workload writes \
+                     incident_opened tagged {v1:#x} (v1) or {v2:#x} (v2) and pong tagged \
+                     {pong:#x}, nothing else; {SHAPE_TAG_CONTRACT}",
+                    row.id.raw()
+                ));
+            }
+        });
+    }
     let responses = responses.lock().expect("responses lock").clone();
     let [(status, body)] = responses.as_slice() else {
         return Err(format!(
@@ -2743,22 +2779,18 @@ fn shapes_verdict(
         ));
     }
     let mut expected = Vec::new();
-    for row in rows.iter().filter(|r| r.id.raw() > anchor.id.raw()) {
+    for (row, json) in rows
+        .iter()
+        .zip(&decoded)
+        .filter(|(r, _)| r.id.raw() > anchor.id.raw())
+    {
         if foreign(row) {
             expected.push(reshaped_frame(row));
             break;
         }
-        let json = match row.name.as_str() {
-            "incident_opened" => serde_json::to_string(
-                &shapes_v2::IncidentOpened::decode(&mut &row.payload[..])
-                    .map_err(|e| e.to_string())?,
-            ),
-            "pong" => serde_json::to_string(
-                &Pong::decode(&mut &row.payload[..]).map_err(|e| e.to_string())?,
-            ),
-            other => return Err(format!("this workload emits no {other:?}")),
-        }
-        .expect("both payloads serialize");
+        let json = json
+            .clone()
+            .expect("the tag check decoded every non-foreign row");
         expected.push((row.id.raw(), row.seq, row.name.clone(), json));
     }
     let handles = sinks.lock().expect("sinks lock");
@@ -2772,11 +2804,25 @@ fn shapes_verdict(
             cursor_of(anchor)
         ));
     }
-    if got.len() < expected.len() && !stalled {
-        return Err(format!(
-            "the resume from {} stopped short with no stall to explain it: got {got:?} of {expected:?}",
-            cursor_of(anchor)
-        ));
+    // Two-sided. A refused send ends the tail (every send site in
+    // `deliver_unit` returns `Ok(false)` on it), so a stall always leaves the
+    // stream short, and a short stream always needs a stall.
+    if (got.len() < expected.len()) != stalled {
+        return Err(if stalled {
+            format!(
+                "the resume from {} holds every frame the log owes, yet its sink refused a send \
+                 — a refused frame was redelivered or an extra frame was sent: got {got:?}",
+                cursor_of(anchor)
+            )
+        } else {
+            format!(
+                "the resume from {} stopped short with no stall to explain it: got {got:?} of {expected:?}",
+                cursor_of(anchor)
+            )
+        });
+    }
+    if stalled {
+        sim.cover("fault:subscriber_stall");
     }
     if got.last().is_some_and(|f| f.2 == RESHAPED_FRAME) {
         sim.cover("shapes:reshaped-frame");
@@ -2785,6 +2831,32 @@ fn shapes_verdict(
         sim.cover("shapes:v2-delivered");
     }
     Ok(())
+}
+
+/// The contract `shapes_verdict`'s tag check holds the platform to.
+const SHAPE_TAG_CONTRACT: &str = "a row's stored shape tag must name the shape its bytes were \
+                                  written under (payload-shapes spec §2)";
+
+/// `row`'s payload decoded as `T`, the shape its tag `tag` names, with every
+/// byte consumed. Either failure means the stored tag does not match the bytes.
+fn decode_exact<T: Codec>(row: &EventRow, tag: u64) -> Result<T, String> {
+    let input = &mut &row.payload[..];
+    let value = T::decode(input).map_err(|e| {
+        format!(
+            "row {} is tagged {tag:#x} yet its payload does not decode as that shape: {e} — \
+             {SHAPE_TAG_CONTRACT}",
+            row.id.raw()
+        )
+    })?;
+    if !input.is_empty() {
+        return Err(format!(
+            "row {} is tagged {tag:#x} yet its payload leaves {} bytes behind after decoding \
+             as that shape — {SHAPE_TAG_CONTRACT}",
+            row.id.raw(),
+            input.len()
+        ));
+    }
+    Ok(value)
 }
 
 /// Spec §6.3's property. The universe count was set by timing one batch (see
@@ -2800,15 +2872,31 @@ fn a_resume_across_mixed_shapes_is_exact_or_named_under_the_fault_matrix() {
         require: [
             "shapes:reshaped-frame",
             "shapes:reshaped-409",
-            "shapes:v2-delivered"
+            "shapes:v2-delivered",
+            "fault:subscriber_stall"
+        ],
+        floor: [
+            ("shapes:reshaped-frame", SHAPES_RESHAPED_FRAME_FLOOR),
+            ("shapes:reshaped-409", SHAPES_RESHAPED_409_FLOOR),
+            ("shapes:v2-delivered", SHAPES_V2_DELIVERED_FLOOR)
         ]
     );
 }
 
-/// `shapes_verdict`'s short-stream arm, called directly. The sink is dropped
-/// before every verdict, so the tail is closed the way the terminal
+/// **Measured 2026-09-24** at base `0x2EB2_5A10`, 180 universes, identical
+/// across consecutive batches before and after the stall flag and the tag
+/// check (neither moves a draw). Each floor is the exact count: a drop is a
+/// finding, not a number to lower. `fault:subscriber_stall` is required, not
+/// floored, like every fault axis here; it reads 2 at this base.
+const SHAPES_RESHAPED_FRAME_FLOOR: u64 = 11;
+const SHAPES_RESHAPED_409_FLOOR: u64 = 52;
+const SHAPES_V2_DELIVERED_FLOOR: u64 = 42;
+
+/// `shapes_verdict`'s stall arm, both sides, called directly. The sink is
+/// dropped before every verdict, so the tail is closed the way the terminal
 /// `charpente.reshaped` frame leaves it. That alone must not excuse a stream
-/// that stops before the log does; only a stall that fired does.
+/// that stops before the log does; only a stall that fired does. And a stall
+/// that fired cannot leave the stream full, since a refused send ends the tail.
 #[test]
 fn a_short_stream_passes_the_shapes_verdict_only_when_a_stall_fired() {
     let (sim, _kernel, rows) = mixed_log(
@@ -2860,6 +2948,12 @@ fn a_short_stream_passes_the_shapes_verdict_only_when_a_stall_fired() {
         verdict(&full[..1], true),
         Ok(()),
         "a strict prefix is legal once a stall fired"
+    );
+    let redelivered =
+        verdict(&full, true).expect_err("a stall that refused a send cannot leave the stream full");
+    assert!(
+        redelivered.contains("a refused frame was redelivered or an extra frame was sent"),
+        "refused by the stalled-but-full arm, not some other one: {redelivered}"
     );
 }
 
