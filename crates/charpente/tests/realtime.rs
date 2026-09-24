@@ -631,12 +631,19 @@ fn another_keys_reshaped_event_neither_ends_nor_refuses_this_tail() {
 }
 
 /// Spec §3: a cursor on a foreign row of an event the subscription does NOT
-/// carry is not refused.
+/// carry is not refused. The foreign row is a `swapped` one, not an
+/// `incident_opened` one: `#[event]` fingerprints hash fields, not names, and
+/// `shapes_v1::IncidentOpened`'s single `{n: WireU64}` shares Pong's exact
+/// shape — a name-blind check couldn't be told apart from a correct one by
+/// that row. `shapes_v1::Swapped`'s `{a, b}` can.
 #[test]
 fn a_cursor_on_a_foreign_row_of_an_unsubscribed_event_is_not_refused() {
-    let (sim, mut kernel, rows) = mixed_log(
-        0x5A9E_0205,
-        &[("/v1/incident", 0, None), ("/pong", 1, None)],
+    let (sim, mut kernel, rows) =
+        mixed_log(0x5A9E_0205, &[("/v1/swapped", 0, None), ("/pong", 1, None)]);
+    assert_ne!(
+        rows[0].shape,
+        Some(<Pong as Event>::FINGERPRINT),
+        "the precondition: a name-blind check would refuse this row"
     );
     let (responses, sinks) = run_script(
         &mut kernel,
