@@ -1,8 +1,9 @@
 diff --git a/crates/charpente/src/kernel/mod.rs b/crates/charpente/src/kernel/mod.rs
-index a4cb49e..eba2eb4 100644
+index 826172d..f00d123 100644
 --- a/crates/charpente/src/kernel/mod.rs
 +++ b/crates/charpente/src/kernel/mod.rs
-@@ -374,40 +374,29 @@ impl Kernel {
+@@ -550,39 +550,30 @@ impl Kernel {
+                         next = source.poll();
                      }
                  }
                  let drained = handled.len();
@@ -29,15 +30,13 @@ index a4cb49e..eba2eb4 100644
 -                    }
 -                    match outcome {
 -                        Handled::Response(response) => reply.send(response),
--                        Handled::Subscribe(sub) => {
--                            match validate_subscribe(self.app.db(), sub.cursor) {
--                                Ok(next_id) => {
--                                    let sink = reply.stream(Response::sse_headers());
--                                    self.tails.push(Tail { sub, sink, next_id });
--                                }
--                                Err(response) => reply.send(response),
+-                        Handled::Subscribe(sub) => match validate_subscribe(self.app.db(), &sub) {
+-                            Ok(next_id) => {
+-                                let sink = reply.stream(Response::sse_headers());
+-                                self.tails.push(Tail { sub, sink, next_id });
 -                            }
--                        }
+-                            Err(response) => reply.send(response),
+-                        },
 -                    }
 +                // WRONG BUILD — edge-harness meta-test injection
 +                // (patches/wrong-ack-before-commit.patch). NEVER MERGE: acks
