@@ -5,18 +5,27 @@
 // than a throwaway assertion, so a broken stub (not a broken client) is also
 // caught here rather than surfacing as a confusing failure in int64.test.ts.
 //
-// Neither test here does bigint arithmetic, so neither observes the Int64 gap
-// int64.test.ts (request path) and int64-sse.test.ts (stream path) pin — those
-// two do the arithmetic that only a real bigint survives. What the SSE round
-// trip below adds is the CONVERSION at the boundary: `amount_cents` comes off
-// the wire as a decimal string and must reach the caller as `BigInt(that)`, so
-// it is compared against the sample's own value converted, never against the
-// raw literal (which is what it was before chunk B1c revived this path, and
-// what would silently be true again if the revive were dropped).
+// Neither of the first two tests does bigint arithmetic, so neither observes
+// the Int64 gap int64.test.ts (request path) and int64-sse.test.ts (stream
+// path) pin — those two do the arithmetic that only a real bigint survives.
+// What the SSE round trip below adds is the CONVERSION at the boundary:
+// `amount_cents` comes off the wire as a decimal string and must reach the
+// caller as `BigInt(that)`, so it is compared against the sample's own value
+// converted, never against the raw literal (which is what it was before
+// chunk B1c revived this path, and what would silently be true again if the
+// revive were dropped).
 //
 // The JSON round trip also asserts on the stub's recorded call (`calls[0]`) —
 // proof that request-body capture itself works, on a real body
 // (`createCustomerBody`), not just that responses can be served.
+//
+// The four tests after that are behavioural oracles for the two terminal
+// frames `charpente.reshaped` and `charpente.error` add (payload-shapes spec
+// §3, amendment A6): each pins that the frame ends the stream by name, typed
+// as the matching `StreamEnd` member, with nothing delivered after it — and
+// the two error-frame tests (one on a declared route, one on `rawFeed`,
+// which is undeclared) additionally pin that the frame's absent `id:` line
+// never reaches a cursor-storing callback, on either route shape.
 
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
@@ -133,12 +142,14 @@ test("an error frame ends the stream by name, and nothing after it is delivered"
     { event: "invoice_voided", data: invoiceVoided, id: "2.3" },
   ]);
   const seen: string[] = [];
+  const cursors: string[] = [];
   const unknown: string[] = [];
   let ended: StreamEnd | undefined;
   try {
     await new Api("http://fixture.invalid").feed({
-      onEvent: (ev) => {
+      onEvent: (ev, at) => {
         seen.push(ev.event);
+        cursors.push(at);
       },
       onUnknown: (ev) => {
         unknown.push(ev.event);
@@ -151,7 +162,48 @@ test("an error frame ends the stream by name, and nothing after it is delivered"
     restore();
   }
   assert.deepEqual(seen, ["invoice_paid"]);
+  // The empty-id guarantee restated by cursor rather than by event name: the
+  // only cursor any callback ever sees is the one `invoice_paid` frame's own
+  // id, never the error frame's absent one.
+  assert.deepEqual(cursors, ["0.1"]);
   assert.deepEqual(unknown, []);
   assert.equal(ended?.kind, "error");
   assert.deepEqual(JSON.parse((ended as { detail: string }).detail), detail);
+});
+
+// The empty-id hazard is worst on an UNDECLARED route: `rawFeed` passes no
+// `declared` map, so every frame `stream()` does not intercept by name is
+// delivered straight to `onEvent` — there is no separate `onUnknown` path to
+// fall into instead. A caller that stored a `charpente.error` frame's cursor
+// as `""` and resubscribed with `cursor: ""` would silently tail "from now"
+// rather than raise `CursorRefused` (`stream()`'s `if (opts.cursor)` reads
+// `""` as absent). This proves the same branch that fixes `feed` above also
+// closes that path for a route with no declaration to filter by.
+test("an error frame ends an undeclared route's stream too, before onEvent ever sees it", async () => {
+  const detail = { event: "invoice_paid", id: 1, error: "event invoice_paid failed JSON encoding" };
+  const { restore } = stubSseResponse([
+    { event: "invoice_paid", data: invoicePaid, id: "0.1" },
+    { event: "charpente.error", data: detail },
+    { event: "invoice_voided", data: invoiceVoided, id: "2.3" },
+  ]);
+  const cursors: string[] = [];
+  let ended: StreamEnd | undefined;
+  try {
+    await new Api("http://fixture.invalid").rawFeed({
+      onEvent: (_ev, at) => {
+        cursors.push(at);
+      },
+      onEnd: (end) => {
+        ended = end;
+      },
+    });
+  } finally {
+    restore();
+  }
+  assert.deepEqual(cursors, ["0.1"]);
+  assert.ok(
+    !cursors.includes(""),
+    "no onEvent call may ever carry the error frame's absent cursor as \"\"",
+  );
+  assert.equal(ended?.kind, "error");
 });

@@ -5009,6 +5009,8 @@ is `?: T | undefined` (`onEvent` and `onEnd` are required, no `?`), because ther
 ordinary pass-through
 `function tail(api: Api, cursor?: string) { return api.feed({ cursor, … }); }`.
 
+### Ending a stream: `StreamEnd`
+
 `onEnd` is how a subscribed stream tells its caller it stopped, typed as `StreamEnd`,
 which carries four kinds:
 
@@ -5017,13 +5019,15 @@ which carries four kinds:
   were skipped.
 - `reshaped` (§11, "Changing an event") — the server met a stored event written under
   a different shape of its type and will not decode it.
-- `error` (§11) — a stored event is corrupt or does not encode as JSON.
+- `error` (§11) — a stored event is corrupt or does not encode as JSON. Its `detail`
+  names the server-side fix (§11): restore or re-seed the node for corrupt bytes, or
+  fix the emitting code for an encode failure.
 
 None of `gap`, `reshaped` or `error` may be auto-resumed from: re-sync current state
 through reads, then subscribe again with no cursor. `onEnd` is deliberately not a
 catch-all — `CursorRefused`, `StreamRejected`, and `UndeclaredEvent` are thrown, not
 passed to it, so teardown that must run on every exit belongs in `.finally()` on the
-promise `feed`/`subscribe` returns.
+promise the generated subscribe method (`feed` in the fixture) returns.
 
 ### `#[route]`'s `emits(...)`: per-event dispatch
 

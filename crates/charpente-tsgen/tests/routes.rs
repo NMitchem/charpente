@@ -128,13 +128,18 @@ fn the_no_auto_resume_rule_is_in_the_thrown_errors_message_not_only_a_comment() 
     );
     // Hard rule 5: the message must be true for EVERY path that raises it.
     // `validate_subscribe` (charpente/src/kernel/mod.rs) answers 409 for a
-    // cursor below the retention floor — "events that old are gone" — as well
-    // as for the two divergence cases. The message used to assert "the history
-    // behind that cursor came from another primary" for all three, naming a
-    // cause that is false on the retention path (task 9a review, finding 3).
+    // cursor below the retention floor — "events that old are gone" — for the
+    // two divergence cases, and for a cursor sitting on a reshaped row. The
+    // message used to assert "the history behind that cursor came from
+    // another primary" for all three, naming a cause that is false on the
+    // retention path (task 9a review, finding 3).
     assert!(
-        body.contains("retention floor") && body.contains("divergence"),
-        "the 409 message must name both of its causes, not only divergence: {body}"
+        body.contains("retention floor")
+            && body.contains("divergence")
+            && body.contains(
+                "At a reshaped event, resuming would skip the one event the server refused to decode."
+            ),
+        "the 409 message must name all three of its causes (floor, divergence, reshaped): {body}"
     );
     assert!(
         !body.contains("the history behind that cursor came from another primary"),
@@ -384,21 +389,31 @@ fn an_undeclared_event_name_is_refused_by_name_rather_than_cast_into_the_union()
     );
 }
 
-/// Both early exits from the read loop — the terminal `charpente.gap` return
-/// and the `UndeclaredEvent` throw — walk away from a body the server may
-/// still be writing to. charpente notices a gone client only when hyper drops
-/// that body (`serve.rs` `sse_pump`), so a reader left locked lets the kernel
+/// Every early exit from the read loop — the terminal `charpente.gap`,
+/// `charpente.reshaped` and `charpente.error` returns, and the
+/// `UndeclaredEvent` throw — walk away from a body the server may still be
+/// writing to. charpente notices a gone client only when hyper drops that
+/// body (`serve.rs` `sse_pump`), so a reader left locked lets the kernel
 /// `Tail` outlive the client that stopped reading.
 ///
 /// The guarantee is structural, so the check is structural: this pins that
-/// both exits fall between the `try` and the `finally` that cancels, which is
-/// what the emitter can be held to. It does not execute the JavaScript.
+/// every exit falls between the `try` and the `finally` that cancels, which
+/// is what the emitter can be held to. It does not execute the JavaScript.
+///
+/// Scoped to `ApiBase`'s body, the way `the_reshaped_and_error_frames_end_the_stream_by_name`
+/// is: unscoped, a doc comment quoting any of these literals above the `try`
+/// would satisfy `ts.find` and the test would read the comment, not the code.
 #[test]
-fn both_early_exits_sit_inside_the_try_whose_finally_cancels_the_reader() {
+fn every_early_exit_sits_inside_the_try_whose_finally_cancels_the_reader() {
     let ts = emit_client(&fixture_contract());
+    let base = ts
+        .split_once("export class ApiBase {")
+        .expect("the runtime must declare ApiBase")
+        .1;
+    let base = &base[..base.find("\n}").expect("the class must close")];
     let at = |needle: &str| {
-        ts.find(needle)
-            .unwrap_or_else(|| panic!("the runtime must contain `{needle}`: {ts}"))
+        base.find(needle)
+            .unwrap_or_else(|| panic!("the runtime must contain `{needle}`: {base}"))
     };
     let reader = at("res.body.getReader()");
     let try_ = at("\n    try {\n");
@@ -418,13 +433,13 @@ fn both_early_exits_sit_inside_the_try_whose_finally_cancels_the_reader() {
             && reshaped < finally
             && error < finally
             && throw < finally,
-        "both early exits must be inside the try: reader {reader}, try {try_}, gap {gap}, \
-         reshaped {reshaped}, error {error}, throw {throw}, finally {finally}: {ts}"
+        "every early exit must be inside the try: reader {reader}, try {try_}, gap {gap}, \
+         reshaped {reshaped}, error {error}, throw {throw}, finally {finally}: {base}"
     );
     assert!(
         finally < cancel,
         "the cancel must be in the finally, not on one path: finally {finally}, \
-         cancel {cancel}: {ts}"
+         cancel {cancel}: {base}"
     );
 }
 

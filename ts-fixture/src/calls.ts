@@ -198,11 +198,24 @@ export function tail(api: Api, cursor?: string): Promise<void> {
         }
       }
     },
-    // `onEnd` fires only for the two ways the SERVER ends a stream. It is
-    // not a cleanup hook — a refusal rejects the promise instead.
+    // `onEnd` fires only for the ways the SERVER ends a stream. It is not a
+    // cleanup hook — a refusal rejects the promise instead.
     onEnd: (end) => {
-      if (end.kind === "gap") console.warn("gap:", end.detail);
-      else console.warn("closed");
+      switch (end.kind) {
+        case "gap":
+        case "reshaped":
+        case "error":
+          console.warn(end.kind + ":", end.detail); // re-sync, then subscribe without a cursor
+          break;
+        case "closed":
+          console.warn("closed");
+          break;
+        default: {
+          // Exhaustiveness: a kind added to StreamEnd stops assigning here.
+          const unreachable: never = end;
+          return unreachable;
+        }
+      }
     },
     // Without this, a frame the route never declared raises UndeclaredEvent
     // rather than being cast into the union or dropped.
