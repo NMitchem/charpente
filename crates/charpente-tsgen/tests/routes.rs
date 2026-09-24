@@ -76,6 +76,39 @@ fn the_gap_and_divergence_frames_are_modelled_not_swallowed() {
     );
 }
 
+/// The two new terminal frames (payload-shapes spec §3) are dispatched on
+/// inside ApiBase, not merely documented in `StreamEnd`'s comment — scoped to
+/// the class body for the same reason as the gap test above.
+#[test]
+fn the_reshaped_and_error_frames_end_the_stream_by_name() {
+    let ts = emit_client(&fixture_contract());
+    let base = ts
+        .split_once("export class ApiBase {")
+        .expect("the runtime must declare ApiBase")
+        .1;
+    let base = &base[..base.find("\n}").expect("the class must close")];
+    for (frame, kind) in [
+        ("charpente.reshaped", "reshaped"),
+        ("charpente.error", "error"),
+    ] {
+        assert!(
+            base.contains(&format!(r#"if (name === "{frame}") {{"#)),
+            "{frame} must be dispatched on: {base}"
+        );
+        assert!(
+            base.contains(&format!(
+                r#"opts.onEnd({{ kind: "{kind}", detail: data }});"#
+            )),
+            "{frame} must end the stream as {kind}: {base}"
+        );
+    }
+    assert!(
+        ts.contains(r#"| { kind: "reshaped"; detail: string }"#)
+            && ts.contains(r#"| { kind: "error"; detail: string }"#),
+        "StreamEnd must carry both new ends: {ts}"
+    );
+}
+
 /// The rule above is stated where a CALLER meets it, not only where a reader
 /// of the generated source does: it is inside the message `CursorRefused`
 /// carries, so the developer who hits a 409 at 3am reads it in their console.
@@ -370,13 +403,23 @@ fn both_early_exits_sit_inside_the_try_whose_finally_cancels_the_reader() {
     let reader = at("res.body.getReader()");
     let try_ = at("\n    try {\n");
     let gap = at(r#"opts.onEnd({ kind: "gap", detail: data });"#);
+    let reshaped = at(r#"opts.onEnd({ kind: "reshaped", detail: data });"#);
+    let error = at(r#"opts.onEnd({ kind: "error", detail: data });"#);
     let throw = at("throw new UndeclaredEvent(name);");
     let finally = at("\n    } finally {\n");
     let cancel = at("await reader.cancel()");
     assert!(
-        reader < try_ && try_ < gap && try_ < throw && gap < finally && throw < finally,
+        reader < try_
+            && try_ < gap
+            && try_ < reshaped
+            && try_ < error
+            && try_ < throw
+            && gap < finally
+            && reshaped < finally
+            && error < finally
+            && throw < finally,
         "both early exits must be inside the try: reader {reader}, try {try_}, gap {gap}, \
-         throw {throw}, finally {finally}: {ts}"
+         reshaped {reshaped}, error {error}, throw {throw}, finally {finally}: {ts}"
     );
     assert!(
         finally < cancel,

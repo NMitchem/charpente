@@ -61,13 +61,19 @@ export type Result<T, E> =
   | { ok: false; error: E };
 
 /**
- * Why a subscribed stream stopped — the two ways the SERVER ends one.
+ * Why a subscribed stream stopped — the four ways the SERVER ends one.
  *
  * `gap` is DESIGN §6's terminal `charpente.gap` frame: the tail fell behind
  * retention, so events the server no longer holds were skipped. It is a
  * DELIBERATE, NAMED refusal, not a dropped socket — a client that reconnected
  * on it would resume past the hole and deliver a history with a silent
  * discontinuity in it.
+ *
+ * `reshaped` is DESIGN §6's terminal `charpente.reshaped` frame: the server
+ * met an event written under a different shape of its type and will not
+ * decode it (GUIDE §11, "Changing an event"). `error` is `charpente.error`: a
+ * stored event is corrupt or does not encode as JSON. Neither may be resumed
+ * from: re-sync, then subscribe without a cursor.
  *
  * `closed` is the ordinary end of the response body.
  *
@@ -76,20 +82,22 @@ export type Result<T, E> =
  * into a healthy stream. Handling a refusal in the same branch as a normal end
  * is the mistake, and each carries a name and a fix no `kind` could. The
  * consequence, stated because it is easy to get wrong: `onEnd` is NOT a
- * cleanup hook. It fires only for the two members below, so teardown that must
+ * cleanup hook. It fires only for the members below, so teardown that must
  * run on every exit belongs in `.finally()` on the promise `subscribe` returns,
  * which those throws reject. Every member of this union has a producer in
  * `ApiBase.stream` below.
  */
 export type StreamEnd =
   | { kind: "gap"; detail: string }
+  | { kind: "reshaped"; detail: string }
+  | { kind: "error"; detail: string }
   | { kind: "closed" };
 
 /**
- * The server refused the cursor: HTTP 409 (DESIGN §6). TWO different causes
- * raise this, and only the server's `detail` distinguishes them — the cursor
- * is below this node's retention floor, or this node's history at that id is
- * not the history the cursor came from. Both are in `validate_subscribe`.
+ * The server refused the cursor: HTTP 409 (DESIGN §6). THREE different causes
+ * raise this, and only the server's `detail` distinguishes them: below the
+ * retention floor; diverged history; or the event at the cursor was written
+ * under a different shape of its type. All three are in `validate_subscribe`.
  * The rule is in the message on purpose — it is what a developer reads at 3am.
  */
 export class CursorRefused extends Error {
@@ -99,8 +107,9 @@ export class CursorRefused extends Error {
       "whichever cause the server names above. Past a retention floor, resuming would " +
       "deliver a history with a silent hole in it; past a divergence, it would deliver " +
       "another timeline's events under ids this client has already used, which is the " +
-      "misattribution the cursor's seq half exists to detect. Re-sync current state " +
-      "through reads, then reconnect without a cursor.",
+      "misattribution the cursor's seq half exists to detect. At a reshaped event, " +
+      "resuming would skip the one event the server refused to decode. Re-sync current " +
+      "state through reads, then reconnect without a cursor.",
     );
   }
 }
@@ -292,8 +301,9 @@ export class ApiBase {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";
-    // Every exit from the loop below cancels the reader: the `gap` return,
-    // an `UndeclaredEvent` throw, or a callback of the caller's that throws.
+    // Every exit from the loop below cancels the reader: the `gap`,
+    // `reshaped` or `error` return, an `UndeclaredEvent` throw, or a callback
+    // of the caller's that throws.
     // charpente notices a gone client only when hyper drops the response body
     // (serve.rs `sse_pump`), so a reader left locked and abandoned lets the
     // kernel Tail outlive the client that stopped reading. `catch` because
@@ -331,6 +341,14 @@ export class ApiBase {
           if (data === undefined) continue;
           if (name === "charpente.gap") {
             opts.onEnd({ kind: "gap", detail: data });
+            return;
+          }
+          if (name === "charpente.reshaped") {
+            opts.onEnd({ kind: "reshaped", detail: data });
+            return;
+          }
+          if (name === "charpente.error") {
+            opts.onEnd({ kind: "error", detail: data });
             return;
           }
           const ev = { event: name, data: JSON.parse(data) as unknown };

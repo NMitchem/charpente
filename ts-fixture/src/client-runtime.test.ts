@@ -21,7 +21,7 @@
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import { Api } from "./generated/client";
-import type { CustomerId } from "./generated/client";
+import type { CustomerId, StreamEnd } from "./generated/client";
 import {
   createCustomerBody,
   customerView,
@@ -86,4 +86,72 @@ test("SSE round trip: real sample frames dispatch through stream()", async () =>
   }
   assert.deepEqual(seen, ["invoice_paid", "invoice_voided"]);
   assert.equal(ended, "closed");
+});
+
+test("a reshaped frame ends the stream by name, and nothing after it is delivered", async () => {
+  const detail = {
+    event: "invoice_paid",
+    id: 1,
+    fix: "re-sync current state through reads, then reconnect without a cursor",
+  };
+  const { restore } = stubSseResponse([
+    { event: "invoice_paid", data: invoicePaid, id: "0.1" },
+    { event: "charpente.reshaped", data: detail, id: "1.2" },
+    { event: "invoice_voided", data: invoiceVoided, id: "2.3" },
+  ]);
+  const seen: string[] = [];
+  let ended: StreamEnd | undefined;
+  try {
+    await new Api("http://fixture.invalid").feed({
+      onEvent: (ev) => {
+        seen.push(ev.event);
+      },
+      onEnd: (end) => {
+        ended = end;
+      },
+    });
+  } finally {
+    restore();
+  }
+  assert.deepEqual(seen, ["invoice_paid"]);
+  assert.equal(ended?.kind, "reshaped");
+  assert.deepEqual(JSON.parse((ended as { detail: string }).detail), detail);
+});
+
+// The `id` reset to "" every frame (runtime.rs) is what makes a resume
+// cursor absent for `charpente.error`, which carries no `id:` line on the
+// wire (spec A7). That guarantee only holds if this frame never reaches
+// `onEvent`/`onUnknown` at all — a caller cannot store an id it was never
+// handed a callback with. `onUnknown` below records every call it gets so
+// this test can assert there are none, rather than relying on `seen`'s
+// shape alone to notice a regression.
+test("an error frame ends the stream by name, and nothing after it is delivered", async () => {
+  const detail = { event: "invoice_paid", id: 1, error: "event invoice_paid failed JSON encoding" };
+  const { restore } = stubSseResponse([
+    { event: "invoice_paid", data: invoicePaid, id: "0.1" },
+    { event: "charpente.error", data: detail },
+    { event: "invoice_voided", data: invoiceVoided, id: "2.3" },
+  ]);
+  const seen: string[] = [];
+  const unknown: string[] = [];
+  let ended: StreamEnd | undefined;
+  try {
+    await new Api("http://fixture.invalid").feed({
+      onEvent: (ev) => {
+        seen.push(ev.event);
+      },
+      onUnknown: (ev) => {
+        unknown.push(ev.event);
+      },
+      onEnd: (end) => {
+        ended = end;
+      },
+    });
+  } finally {
+    restore();
+  }
+  assert.deepEqual(seen, ["invoice_paid"]);
+  assert.deepEqual(unknown, []);
+  assert.equal(ended?.kind, "error");
+  assert.deepEqual(JSON.parse((ended as { detail: string }).detail), detail);
 });
