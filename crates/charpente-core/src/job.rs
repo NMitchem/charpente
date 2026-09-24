@@ -75,6 +75,12 @@ pub struct JobRow {
     /// The last failure's message (handler error or absorbed panic) — the
     /// dead-letter record's substance (hard rule 5).
     pub last_error: Option<String>,
+    /// The enqueuing type's `Job::FINGERPRINT`, from the record's `0x08`
+    /// tag; `None` for a row applied from a pre-shape `0x02` record. Encoded
+    /// LAST and only when `Some`, so a row written before this field existed
+    /// decodes unchanged: `last_error` before it is tagged, and nothing
+    /// follows it (payload-shapes spec §2).
+    pub shape: Option<u64>,
 }
 
 // Manual impl: core cannot use the #[table] macro (macros depend on core).
@@ -96,30 +102,45 @@ impl Row for JobRow {
         self.attempts.encode(out);
         self.due_at.encode(out);
         self.last_error.encode(out);
+        if let Some(shape) = self.shape {
+            shape.encode(out);
+        }
     }
 
     fn decode_row(bytes: &[u8]) -> io::Result<JobRow> {
         let input = &mut &bytes[..];
-        let row = JobRow {
-            id: Id::decode(input)?,
-            name: String::decode(input)?,
-            payload: Vec::<u8>::decode(input)?,
-            key: Option::<String>::decode(input)?,
-            status: JobStatus::decode(input)?,
-            attempts: u32::decode(input)?,
-            due_at: u64::decode(input)?,
-            last_error: Option::<String>::decode(input)?,
+        let id = Id::decode(input)?;
+        let name = String::decode(input)?;
+        let payload = Vec::<u8>::decode(input)?;
+        let key = Option::<String>::decode(input)?;
+        let status = JobStatus::decode(input)?;
+        let attempts = u32::decode(input)?;
+        let due_at = u64::decode(input)?;
+        let last_error = Option::<String>::decode(input)?;
+        let shape = match input.len() {
+            0 => None,
+            8 => Some(u64::decode(input)?),
+            n => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "row decode: {n} bytes after a JobRow's last_error — a shape is 8 bytes \
+                         or absent, so the stored row is corrupt"
+                    ),
+                ));
+            }
         };
-        if !input.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "row decode: {} trailing bytes after a JobRow — schema drift or corruption",
-                    input.len()
-                ),
-            ));
-        }
-        Ok(row)
+        Ok(JobRow {
+            id,
+            name,
+            payload,
+            key,
+            status,
+            attempts,
+            due_at,
+            last_error,
+            shape,
+        })
     }
 }
 
@@ -138,6 +159,7 @@ mod tests {
             attempts: 3,
             due_at: 99,
             last_error: Some("boom".into()),
+            shape: Some(0xFEED),
         };
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
@@ -148,6 +170,64 @@ mod tests {
         assert_eq!(back.status, JobStatus::Pending);
         assert_eq!((back.attempts, back.due_at), (3, 99));
         assert_eq!(back.last_error.as_deref(), Some("boom"));
+        assert_eq!(back.shape, row.shape);
+    }
+
+    /// A row written before `shape` existed ends exactly after its
+    /// `last_error`: a `None` shape adds no bytes, so old rows decode, as
+    /// `None`, unchanged.
+    #[test]
+    fn a_pre_shape_job_row_decodes_with_no_shape() {
+        let row = JobRow {
+            id: Id::from_raw(7),
+            name: "send_receipt".into(),
+            payload: vec![1, 2],
+            key: None,
+            status: JobStatus::Pending,
+            attempts: 0,
+            due_at: 0,
+            last_error: None,
+            shape: None,
+        };
+        let mut bytes = Vec::new();
+        row.encode_row(&mut bytes);
+        let mut legacy = Vec::new();
+        row.id.encode(&mut legacy);
+        row.name.encode(&mut legacy);
+        row.payload.encode(&mut legacy);
+        row.key.encode(&mut legacy);
+        row.status.encode(&mut legacy);
+        row.attempts.encode(&mut legacy);
+        row.due_at.encode(&mut legacy);
+        row.last_error.encode(&mut legacy);
+        assert_eq!(bytes, legacy, "a None shape adds no bytes");
+        assert_eq!(JobRow::decode_row(&legacy).unwrap().shape, None);
+    }
+
+    #[test]
+    fn a_torn_job_row_shape_is_a_named_decode_error() {
+        let row = JobRow {
+            id: Id::from_raw(7),
+            name: "send_receipt".into(),
+            payload: vec![1, 2],
+            key: None,
+            status: JobStatus::Pending,
+            attempts: 0,
+            due_at: 0,
+            last_error: None,
+            shape: Some(0xFEED),
+        };
+        let mut bytes = Vec::new();
+        row.encode_row(&mut bytes);
+        bytes.truncate(bytes.len() - 5);
+        let err = JobRow::decode_row(&bytes)
+            .err()
+            .expect("3 bytes where a shape should be");
+        assert_eq!(
+            err.to_string(),
+            "row decode: 3 bytes after a JobRow's last_error — a shape is 8 bytes or absent, \
+             so the stored row is corrupt"
+        );
     }
 
     #[test]

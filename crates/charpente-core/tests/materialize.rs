@@ -29,6 +29,7 @@ impl Codec for Ping {
 }
 impl Job for Ping {
     const NAME: &'static str = "ping";
+    const FINGERPRINT: u64 = 0x7E57_0009;
 }
 
 struct TestEvent {
@@ -46,6 +47,7 @@ impl Codec for TestEvent {
 }
 impl Event for TestEvent {
     const NAME: &'static str = "test_event";
+    const FINGERPRINT: u64 = 0x7E57_000A;
 }
 
 #[test]
@@ -82,6 +84,50 @@ fn enqueues_materialize_job_rows_with_counter_ids() {
     })
     .unwrap();
     assert_eq!(db.drain_enqueued()[0].raw(), 2);
+}
+
+#[test]
+fn enqueues_and_emits_record_their_types_shape() {
+    let sim = Sim::with_faults(0x605, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    db.transact(|tx: &mut Tx| {
+        tx.enqueue(Ping);
+        tx.emit(TestEvent { n: 1 });
+        Ok::<(), io::Error>(())
+    })
+    .unwrap();
+    let snap = db.snapshot().unwrap();
+    assert_eq!(
+        snap.scan::<JobRow>().unwrap()[0].shape,
+        Some(<Ping as Job>::FINGERPRINT)
+    );
+    let events: Vec<EventRow> = snap.scan_from(0, 1).unwrap();
+    assert_eq!(events[0].shape, Some(<TestEvent as Event>::FINGERPRINT));
+}
+
+/// Spec §6.6: a record a pre-shape binary wrote (`0x02` enqueue, `0x03`
+/// emit), applied the way a follower applies shipped frames, materializes
+/// with no shape — which every later check treats as foreign.
+#[test]
+fn a_pre_shape_record_materializes_with_no_shape() {
+    let sim = Sim::with_faults(0x606, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    let mut record = Vec::new();
+    2u32.encode(&mut record);
+    record.push(2);
+    "ping".to_string().encode(&mut record);
+    Vec::<u8>::new().encode(&mut record);
+    None::<String>.encode(&mut record);
+    record.push(3);
+    "test_event".to_string().encode(&mut record);
+    vec![1u8, 0, 0, 0].encode(&mut record);
+    None::<String>.encode(&mut record);
+    let seq = db.last_applied().map_or(0, |s| s + 1);
+    db.apply_shipped(&[(seq, record)]).unwrap();
+    let snap = db.snapshot().unwrap();
+    assert_eq!(snap.scan::<JobRow>().unwrap()[0].shape, None);
+    let events: Vec<EventRow> = snap.scan_from(0, 1).unwrap();
+    assert_eq!(events[0].shape, None);
 }
 
 #[test]

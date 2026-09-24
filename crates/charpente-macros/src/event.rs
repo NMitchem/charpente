@@ -1,6 +1,7 @@
 //! `#[event]` (DESIGN.md §6, realtime spec): turns a struct into a typed
 //! realtime event — a field-wise `Codec` impl (mirrors `#[job]`'s payload
-//! codec), `impl Event` carrying the name (snake_case of the type name), a
+//! codec), `impl Event` carrying the name (snake_case of the type name) and
+//! the payload's structural fingerprint (`fingerprint::compute`), a
 //! `Serialize` derive emitted through the `::charpente::serde` re-export
 //! (with `#[serde(crate = "::charpente::serde")]` redirecting serde_derive's
 //! generated code off the ambient `::serde` path) so app crates emitting
@@ -51,6 +52,7 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         .map(|f| f.ident.clone().expect("named fields have idents"))
         .collect();
     let field_types: Vec<_> = fields.named.iter().map(|f| f.ty.clone()).collect();
+    let fingerprint = crate::fingerprint::compute(&field_idents, &field_types);
 
     let event_name = snake_case(&name_str);
 
@@ -73,6 +75,7 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
 
         impl ::charpente::core::db::Event for #name {
             const NAME: &'static str = #event_name;
+            const FINGERPRINT: u64 = #fingerprint;
         }
 
         impl ::charpente::describe::EventEntry for #name {

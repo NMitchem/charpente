@@ -7,14 +7,17 @@
 //!
 //! Record payload v0: `[n: u32 le]` then n tagged effects —
 //! `0x00 [table][row]` put, `0x01 [table][id: u64 le]` delete,
-//! `0x02 [job][payload][key: Option<String>]` enqueue,
-//! `0x03 [event][payload][key: Option<String>]` emit,
 //! `0x04 [table][id: u64 le][row]` migrate-put,
 //! `0x05 [table][scope: u64 le][row]` scoped put,
 //! `0x06 [table][scope: u64 le][id: u64 le]` scoped delete,
-//! `0x07 [table][scope: u64 le][id: u64 le][row]` scoped migrate-put —
-//! strings and byte fields length-prefixed per the `Codec` layout; `0x08` is
-//! the next free tag. `0x05`/`0x06`/`0x07` are the ONLY tags that carry a
+//! `0x07 [table][scope: u64 le][id: u64 le][row]` scoped migrate-put,
+//! `0x08 [job][payload][key: Option<String>][shape: u64 le]` shaped enqueue,
+//! `0x09 [event][payload][key: Option<String>][shape: u64 le]` shaped emit —
+//! strings and byte fields length-prefixed per the `Codec` layout; `0x0a` is
+//! the next free tag. `0x02`/`0x03` (the same without the shape) still
+//! decode, with the shape unknown, and are never written — `TxEffects` holds
+//! a bare shape, so a shapeless enqueue or emit cannot be represented.
+//! `0x05`/`0x06`/`0x07` are the ONLY tags that carry a
 //! scope, chosen by the table's own `Row::Scope`, not by the scope value
 //! (tenant 0 is a legal tenant, so a scoped table's records always use
 //! `0x05`/`0x06`/`0x07`, never `0x00`/`0x01`/`0x04`, even at scope 0). A
@@ -86,6 +89,11 @@ impl Default for DbConfig {
 /// `charpente::kernel`. v0: implemented by hand; `#[job]` derives it.
 pub trait Job: Codec {
     const NAME: &'static str;
+    /// The payload's structural fingerprint — `#[job]` computes it from the
+    /// fields (the helper `#[table]` uses). Recorded beside every enqueue. No
+    /// default, unlike `Row::FINGERPRINT`: a hand-written impl must state one,
+    /// or a hand-written job would opt out of the check silently.
+    const FINGERPRINT: u64;
     const RETRY: crate::job::RetryPolicy = crate::job::RetryPolicy::DEFAULT;
 }
 
@@ -95,6 +103,9 @@ pub trait Job: Codec {
 /// v0: implemented by hand; `#[event]` will derive it.
 pub trait Event: Codec {
     const NAME: &'static str;
+    /// The payload's structural fingerprint, as for `Job::FINGERPRINT`:
+    /// recorded beside every emit.
+    const FINGERPRINT: u64;
 }
 
 /// Why a transaction did not return `Ok`: the application's own rejection,
@@ -362,15 +373,20 @@ enum Effect {
         scope: Option<u64>,
         id: u64,
     },
+    // `shape`: `None` for the pre-shape tags `0x02`/`0x03`, `Some` for
+    // `0x08`/`0x09` — the wire presence, like `scope` above. `None` is
+    // foreign to every check downstream (payload-shapes spec §2).
     Enqueue {
         job: String,
         payload: Vec<u8>,
         key: Option<String>,
+        shape: Option<u64>,
     },
     Emit {
         event: String,
         payload: Vec<u8>,
         key: Option<String>,
+        shape: Option<u64>,
     },
     // `scope`: same presence-not-value convention as `Put`/`Delete` above —
     // `None` for tag `0x04` (unscoped), `Some` for tag `0x07` (scoped).
@@ -419,8 +435,10 @@ const UNSCOPED: u64 = 0;
 struct TxEffects {
     overlay: GroupOverlay,
     scoped_tables: BTreeSet<&'static str>,
-    enqueues: Vec<(&'static str, Vec<u8>, Option<String>)>,
-    emits: Vec<(&'static str, Vec<u8>, Option<String>)>,
+    // The shape is a bare `u64`, so a shapeless enqueue or emit cannot be
+    // represented (payload-shapes amendment A2).
+    enqueues: Vec<(&'static str, Vec<u8>, Option<String>, u64)>,
+    emits: Vec<(&'static str, Vec<u8>, Option<String>, u64)>,
     migrate_puts: Vec<(&'static str, Option<u64>, u64, Vec<u8>)>,
 }
 
@@ -486,17 +504,19 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
             }
         }
     }
-    for (job, payload, key) in &effects.enqueues {
-        out.push(2);
+    for (job, payload, key, shape) in &effects.enqueues {
+        out.push(8);
         encode_bytes(job.as_bytes(), &mut out);
         encode_bytes(payload, &mut out);
         key.encode(&mut out);
+        shape.encode(&mut out);
     }
-    for (event, payload, key) in &effects.emits {
-        out.push(3);
+    for (event, payload, key, shape) in &effects.emits {
+        out.push(9);
         encode_bytes(event.as_bytes(), &mut out);
         encode_bytes(payload, &mut out);
         key.encode(&mut out);
+        shape.encode(&mut out);
     }
     for (table, scope, id, row) in &effects.migrate_puts {
         match scope {
@@ -537,11 +557,13 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 job: String::decode(input)?,
                 payload: Vec::<u8>::decode(input)?,
                 key: Option::<String>::decode(input)?,
+                shape: None,
             },
             3 => Effect::Emit {
                 event: String::decode(input)?,
                 payload: Vec::<u8>::decode(input)?,
                 key: Option::<String>::decode(input)?,
+                shape: None,
             },
             4 => Effect::MigratePut {
                 table: String::decode(input)?,
@@ -564,6 +586,18 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 scope: Some(u64::decode(input)?),
                 id: u64::decode(input)?,
                 row: Vec::<u8>::decode(input)?,
+            },
+            8 => Effect::Enqueue {
+                job: String::decode(input)?,
+                payload: Vec::<u8>::decode(input)?,
+                key: Option::<String>::decode(input)?,
+                shape: Some(u64::decode(input)?),
+            },
+            9 => Effect::Emit {
+                event: String::decode(input)?,
+                payload: Vec::<u8>::decode(input)?,
+                key: Option::<String>::decode(input)?,
+                shape: Some(u64::decode(input)?),
             },
             other => {
                 return Err(io::Error::new(
@@ -720,7 +754,9 @@ impl<'a> Tx<'a> {
     pub fn enqueue<J: Job>(&mut self, job: J) {
         let mut payload = Vec::new();
         job.encode(&mut payload);
-        self.effects.enqueues.push((J::NAME, payload, None));
+        self.effects
+            .enqueues
+            .push((J::NAME, payload, None, J::FINGERPRINT));
     }
 
     /// Enqueues with an idempotency key: the job's stable identity to the world
@@ -735,13 +771,17 @@ impl<'a> Tx<'a> {
         );
         let mut payload = Vec::new();
         job.encode(&mut payload);
-        self.effects.enqueues.push((J::NAME, payload, Some(key)));
+        self.effects
+            .enqueues
+            .push((J::NAME, payload, Some(key), J::FINGERPRINT));
     }
 
     pub fn emit<Ev: Event>(&mut self, event: Ev) {
         let mut payload = Vec::new();
         event.encode(&mut payload);
-        self.effects.emits.push((Ev::NAME, payload, None));
+        self.effects
+            .emits
+            .push((Ev::NAME, payload, None, Ev::FINGERPRINT));
     }
 
     /// Emits with an opaque scoping key (e.g. an org id) — the exact-match
@@ -751,7 +791,7 @@ impl<'a> Tx<'a> {
         event.encode(&mut payload);
         self.effects
             .emits
-            .push((Ev::NAME, payload, Some(key.into())));
+            .push((Ev::NAME, payload, Some(key.into()), Ev::FINGERPRINT));
     }
 }
 
@@ -1625,15 +1665,21 @@ impl StateMachine for TableMachine {
                             resolve_effect_scope(table, ops.scoped, *scope, "MigratePut")?;
                         w.put_raw(table, ops.scoped.then_some(resolved), *id, row)?;
                     }
-                    Effect::Enqueue { job, payload, key } => {
-                        new_ids.push(w.materialize_job(job, payload, key.as_deref())?);
+                    Effect::Enqueue {
+                        job,
+                        payload,
+                        key,
+                        shape,
+                    } => {
+                        new_ids.push(w.materialize_job(job, payload, key.as_deref(), *shape)?);
                     }
                     Effect::Emit {
                         event,
                         payload,
                         key,
+                        shape,
                     } => {
-                        w.materialize_event(seq, event, payload, key.as_deref())?;
+                        w.materialize_event(seq, event, payload, key.as_deref(), *shape)?;
                     }
                 }
             }
@@ -3437,8 +3483,12 @@ mod tests {
             .entry("org")
             .or_default()
             .insert((UNSCOPED, 1), Some(vec![9]));
-        effects.enqueues.push(("send_receipt", vec![10, 0], None));
-        effects.emits.push(("invoice_finalized", vec![7], None));
+        effects
+            .enqueues
+            .push(("send_receipt", vec![10, 0], None, 0x5E4D));
+        effects
+            .emits
+            .push(("invoice_finalized", vec![7], None, 0xE7E7));
         effects
     }
 
@@ -3466,12 +3516,14 @@ mod tests {
                 Effect::Enqueue {
                     job: "send_receipt".into(),
                     payload: vec![10, 0],
-                    key: None
+                    key: None,
+                    shape: Some(0x5E4D)
                 },
                 Effect::Emit {
                     event: "invoice_finalized".into(),
                     payload: vec![7],
-                    key: None
+                    key: None,
+                    shape: Some(0xE7E7)
                 },
             ]
         );
@@ -3519,10 +3571,13 @@ mod tests {
     #[test]
     fn keyed_emit_roundtrips() {
         let mut effects = TxEffects::default();
-        effects
-            .emits
-            .push(("invoice_finalized", vec![1], Some("org-7".to_string())));
-        effects.emits.push(("ping", vec![2], None));
+        effects.emits.push((
+            "invoice_finalized",
+            vec![1],
+            Some("org-7".to_string()),
+            0xE7E7,
+        ));
+        effects.emits.push(("ping", vec![2], None, 0x9196));
         let decoded = decode_record(&encode_record(&effects)).unwrap();
         assert_eq!(
             decoded,
@@ -3530,12 +3585,14 @@ mod tests {
                 Effect::Emit {
                     event: "invoice_finalized".into(),
                     payload: vec![1],
-                    key: Some("org-7".into())
+                    key: Some("org-7".into()),
+                    shape: Some(0xE7E7)
                 },
                 Effect::Emit {
                     event: "ping".into(),
                     payload: vec![2],
-                    key: None
+                    key: None,
+                    shape: Some(0x9196)
                 },
             ]
         );
@@ -3544,10 +3601,13 @@ mod tests {
     #[test]
     fn keyed_enqueue_roundtrips() {
         let mut effects = TxEffects::default();
-        effects
-            .enqueues
-            .push(("send_receipt", vec![1], Some("receipt:10".to_string())));
-        effects.enqueues.push(("ping", vec![2], None));
+        effects.enqueues.push((
+            "send_receipt",
+            vec![1],
+            Some("receipt:10".to_string()),
+            0x5E4D,
+        ));
+        effects.enqueues.push(("ping", vec![2], None, 0x9196));
         let decoded = decode_record(&encode_record(&effects)).unwrap();
         assert_eq!(
             decoded,
@@ -3555,12 +3615,86 @@ mod tests {
                 Effect::Enqueue {
                     job: "send_receipt".into(),
                     payload: vec![1],
-                    key: Some("receipt:10".into())
+                    key: Some("receipt:10".into()),
+                    shape: Some(0x5E4D)
                 },
                 Effect::Enqueue {
                     job: "ping".into(),
                     payload: vec![2],
-                    key: None
+                    key: None,
+                    shape: Some(0x9196)
+                },
+            ]
+        );
+    }
+
+    /// A record written before payload shapes (tags `0x02`/`0x03`) still
+    /// decodes, its shape unknown (payload-shapes spec §2). Literal bytes, not
+    /// a fresh encode: no binary writes these tags any more, so encoding on
+    /// both sides would prove nothing.
+    #[test]
+    fn a_pre_shape_enqueue_and_emit_decode_with_no_shape() {
+        let bytes = vec![
+            2, 0, 0, 0, // two effects
+            // enqueue "ping" [7], no key
+            2, 4, 0, 0, 0, b'p', b'i', b'n', b'g', 1, 0, 0, 0, 7, 0,
+            // emit "pong" [9], no key
+            3, 4, 0, 0, 0, b'p', b'o', b'n', b'g', 1, 0, 0, 0, 9, 0,
+        ];
+        assert_eq!(
+            decode_record(&bytes).unwrap(),
+            vec![
+                Effect::Enqueue {
+                    job: "ping".into(),
+                    payload: vec![7],
+                    key: None,
+                    shape: None
+                },
+                Effect::Emit {
+                    event: "pong".into(),
+                    payload: vec![9],
+                    key: None,
+                    shape: None
+                },
+            ]
+        );
+    }
+
+    /// The shaped tags, pinned as literal bytes: `0x08`/`0x09`, then the
+    /// shape as eight little-endian bytes after the key.
+    #[test]
+    fn shaped_enqueue_and_emit_bytes_are_pinned() {
+        let mut effects = TxEffects::default();
+        effects
+            .enqueues
+            .push(("ping", vec![7], None, 0x0102_0304_0506_0708));
+        effects
+            .emits
+            .push(("pong", vec![9], None, 0x1112_1314_1516_1718));
+        assert_eq!(
+            encode_record(&effects),
+            vec![
+                2, 0, 0, 0, // two effects
+                8, 4, 0, 0, 0, b'p', b'i', b'n', b'g', 1, 0, 0, 0, 7, 0, // shaped enqueue
+                8, 7, 6, 5, 4, 3, 2, 1, // its shape
+                9, 4, 0, 0, 0, b'p', b'o', b'n', b'g', 1, 0, 0, 0, 9, 0, // shaped emit
+                0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, // its shape
+            ]
+        );
+        assert_eq!(
+            decode_record(&encode_record(&effects)).unwrap(),
+            vec![
+                Effect::Enqueue {
+                    job: "ping".into(),
+                    payload: vec![7],
+                    key: None,
+                    shape: Some(0x0102_0304_0506_0708)
+                },
+                Effect::Emit {
+                    event: "pong".into(),
+                    payload: vec![9],
+                    key: None,
+                    shape: Some(0x1112_1314_1516_1718)
                 },
             ]
         );
@@ -3722,13 +3856,14 @@ mod tests {
         );
     }
 
+    /// `0x0a`, the next free tag: `0x08`/`0x09` are the shaped enqueue/emit.
     #[test]
     fn decode_refuses_unknown_tags() {
         let mut out = Vec::new();
         1u32.encode(&mut out);
-        out.push(9);
+        out.push(10);
         let err = decode_record(&out).unwrap_err();
-        assert!(err.to_string().contains("unknown effect tag 9"), "{err}");
+        assert!(err.to_string().contains("unknown effect tag 10"), "{err}");
     }
 
     #[test]

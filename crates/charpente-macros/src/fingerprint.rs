@@ -1,8 +1,8 @@
-//! Shared by `#[table]` and `#[row_shape]`: the structural fingerprint
-//! over a struct's `(field_name, type_name)` sequence, computed at
-//! expansion time (spec §1). A deliberate, exact duplicate of
-//! `charpente_core::migration::fnv1a_hash` — proc-macros run in the host
-//! compiler and cannot call core's compiled code.
+//! Shared by `#[table]`, `#[row_shape]`, `#[event]` and `#[job]`: the
+//! structural fingerprint over a struct's `(field_name, type_name)`
+//! sequence, computed at expansion time (spec §1). A deliberate, exact
+//! duplicate of `charpente_core::migration::fnv1a_hash` — proc-macros run in
+//! the host compiler and cannot call core's compiled code.
 use syn::Type;
 
 fn fnv1a(bytes: &[u8]) -> u64 {

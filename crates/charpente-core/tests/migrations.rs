@@ -1307,6 +1307,12 @@ fn count_migrate_puts(frames: &[(u64, Vec<u8>)], table: &str) -> usize {
                     let _payload = Vec::<u8>::decode(input).unwrap();
                     let _key = Option::<String>::decode(input).unwrap();
                 }
+                0x08 | 0x09 => {
+                    let _name = String::decode(input).unwrap();
+                    let _payload = Vec::<u8>::decode(input).unwrap();
+                    let _key = Option::<String>::decode(input).unwrap();
+                    let _shape = u64::decode(input).unwrap();
+                }
                 0x04 => {
                     let t = String::decode(input).unwrap();
                     let _id = u64::decode(input).unwrap();

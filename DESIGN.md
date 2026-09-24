@@ -425,11 +425,14 @@ loud again).
 
 **Record payload (v0, implemented).** A committed transaction's effects:
 `[n: u32]` then n tagged effects — put `0x00 [table][row]`, delete
-`0x01 [table][id]`, enqueue `0x02 [job][payload][key: Option<String>]`, emit
-`0x03 [event][payload][key: Option<String>]`, migrate-put
+`0x01 [table][id]`, enqueue `0x08 [job][payload][key: Option<String>][shape: u64]`,
+emit `0x09 [event][payload][key: Option<String>][shape: u64]`, migrate-put
 `0x04 [table][id: u64][row]` (§3's `MigratePut`, below), strings and byte
-fields length-prefixed per the row codec. A tenant-scoped table's
-(`Row::Scope != Unscoped`, tenant-scoping Task 4) put and delete carry the
+fields length-prefixed per the row codec. The shape is the payload type's
+structural fingerprint (§3). The pre-shape `0x02`/`0x03` (the same without the
+shape) still decode, with the shape unknown, and are never written. A
+tenant-scoped table's (`Row::Scope != Unscoped`, tenant-scoping Task 4) put
+and delete carry the
 scope instead: `0x05 [table][scope: u64][row]`, `0x06 [table][scope:
 u64][id]` — chosen by the table's own scopedness, never by the scope's
 value, so a scoped table still uses `0x05`/`0x06` at scope 0 (tenant 0 is a
@@ -438,7 +441,7 @@ the `0x00`/`0x01` shape above, byte-identical to before tenant scoping. A
 scoped table's `MigratePut` (tenant-scoping Task 6c) is `0x07 [table][scope:
 u64][id: u64][row]` — a NEW tag rather than a widened `0x04`, the same
 choice `0x05`/`0x06` made over `0x00`/`0x01`, so `0x04`'s bytes for an
-unscoped table stay exactly as above. `0x08` is the next free tag. A binary
+unscoped table stay exactly as above. `0x0a` is the next free tag. A binary
 that does not know a tag (older, or a later one it hasn't caught up to)
 refuses it by name rather than misreading a wider record. Table effects are
 the transaction's collapsed write set in (table, scope, id) order —
@@ -655,6 +658,12 @@ compile-time checking cannot: a same-shape struct edited without bumping `versio
 `Row::FINGERPRINT` defaults to `None`; a hand-written `Row` impl (the platform's own
 `JobRow`/`EventRow`/`SchemaVersion`) stays `None` and is invisible to the gate — silently
 opting a table out of drift protection is the cost of not using `#[table]`.
+
+**Payload shapes.** `#[event]` and `#[job]` carry the same structural fingerprint
+`#[table]` does (`Event::FINGERPRINT`, `Job::FINGERPRINT` — required on a hand-written
+impl, no default), and every emit and enqueue records it in the log beside the payload.
+There is no per-row versioned decode — the migrations spec rejected it twice — and no
+override (MANIFESTO §8).
 
 **The gate, the barrier, and the seven refusals.** A built-in table,
 `charpente.schema_versions`, records each versioned table's last-known `(version,

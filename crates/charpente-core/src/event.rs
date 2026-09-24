@@ -18,6 +18,12 @@ pub struct EventRow {
     pub name: String,
     pub key: Option<String>,
     pub payload: Vec<u8>,
+    /// The emitting type's `Event::FINGERPRINT`, from the record's `0x09`
+    /// tag; `None` for a row applied from a pre-shape `0x03` record. Encoded
+    /// LAST and only when `Some`, so a row written before this field existed
+    /// decodes unchanged: the payload before it is length-prefixed, and
+    /// nothing follows it (payload-shapes spec §2).
+    pub shape: Option<u64>,
 }
 
 // Manual impl: core cannot use the #[table] macro (macros depend on core).
@@ -36,27 +42,39 @@ impl Row for EventRow {
         self.name.encode(out);
         self.key.encode(out);
         self.payload.encode(out);
+        if let Some(shape) = self.shape {
+            shape.encode(out);
+        }
     }
 
     fn decode_row(bytes: &[u8]) -> io::Result<EventRow> {
         let input = &mut &bytes[..];
-        let row = EventRow {
-            id: Id::decode(input)?,
-            seq: u64::decode(input)?,
-            name: String::decode(input)?,
-            key: Option::<String>::decode(input)?,
-            payload: Vec::<u8>::decode(input)?,
+        let id = Id::decode(input)?;
+        let seq = u64::decode(input)?;
+        let name = String::decode(input)?;
+        let key = Option::<String>::decode(input)?;
+        let payload = Vec::<u8>::decode(input)?;
+        let shape = match input.len() {
+            0 => None,
+            8 => Some(u64::decode(input)?),
+            n => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "row decode: {n} bytes after an EventRow's payload — a shape is 8 bytes \
+                         or absent, so the stored row is corrupt"
+                    ),
+                ));
+            }
         };
-        if !input.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "row decode: {} trailing bytes after an EventRow — schema drift or corruption",
-                    input.len()
-                ),
-            ));
-        }
-        Ok(row)
+        Ok(EventRow {
+            id,
+            seq,
+            name,
+            key,
+            payload,
+            shape,
+        })
     }
 }
 
@@ -72,6 +90,7 @@ mod tests {
             name: "invoice_finalized".into(),
             key: Some("org-7".into()),
             payload: vec![1, 2, 3],
+            shape: Some(0xFEED),
         };
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
@@ -81,5 +100,53 @@ mod tests {
         assert_eq!(back.name, row.name);
         assert_eq!(back.key, row.key);
         assert_eq!(back.payload, row.payload);
+        assert_eq!(back.shape, row.shape);
+    }
+
+    /// A row written before `shape` existed ends exactly after its payload:
+    /// a `None` shape adds no bytes, so old rows decode, as `None`, unchanged.
+    #[test]
+    fn a_pre_shape_event_row_decodes_with_no_shape() {
+        let row = EventRow {
+            id: Id::from_raw(3),
+            seq: 12,
+            name: "invoice_finalized".into(),
+            key: None,
+            payload: vec![1, 2, 3],
+            shape: None,
+        };
+        let mut bytes = Vec::new();
+        row.encode_row(&mut bytes);
+        let mut legacy = Vec::new();
+        row.id.encode(&mut legacy);
+        row.seq.encode(&mut legacy);
+        row.name.encode(&mut legacy);
+        row.key.encode(&mut legacy);
+        row.payload.encode(&mut legacy);
+        assert_eq!(bytes, legacy, "a None shape adds no bytes");
+        assert_eq!(EventRow::decode_row(&legacy).unwrap().shape, None);
+    }
+
+    #[test]
+    fn a_torn_event_row_shape_is_a_named_decode_error() {
+        let row = EventRow {
+            id: Id::from_raw(3),
+            seq: 12,
+            name: "invoice_finalized".into(),
+            key: None,
+            payload: vec![1, 2, 3],
+            shape: Some(0xFEED),
+        };
+        let mut bytes = Vec::new();
+        row.encode_row(&mut bytes);
+        bytes.truncate(bytes.len() - 5);
+        let err = EventRow::decode_row(&bytes)
+            .err()
+            .expect("3 bytes where a shape should be");
+        assert_eq!(
+            err.to_string(),
+            "row decode: 3 bytes after an EventRow's payload — a shape is 8 bytes or absent, \
+             so the stored row is corrupt"
+        );
     }
 }

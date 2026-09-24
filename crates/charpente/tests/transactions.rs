@@ -48,6 +48,7 @@ impl Codec for SendReceipt {
 
 impl Job for SendReceipt {
     const NAME: &'static str = "send_receipt";
+    const FINGERPRINT: u64 = 0x7E57_0001;
 }
 
 struct InvoiceFinalized {
@@ -67,6 +68,7 @@ impl Codec for InvoiceFinalized {
 
 impl Event for InvoiceFinalized {
     const NAME: &'static str = "invoice_finalized";
+    const FINGERPRINT: u64 = 0x7E57_0002;
 }
 
 fn invoice(id: u64, org: u64, amount_cents: i64) -> Invoice {
@@ -325,6 +327,7 @@ impl Codec for Ping {
 
 impl Job for Ping {
     const NAME: &'static str = "ping";
+    const FINGERPRINT: u64 = 0x7E57_0003;
 }
 
 #[test]
@@ -372,6 +375,7 @@ impl Codec for Audit {
 
 impl Job for Audit {
     const NAME: &'static str = "audit";
+    const FINGERPRINT: u64 = 0x7E57_0004;
 }
 
 fn property_schema() -> Schema {

@@ -1237,6 +1237,7 @@ impl Writer<'_> {
         name: &str,
         payload: &[u8],
         key: Option<&str>,
+        shape: Option<u64>,
     ) -> io::Result<u64> {
         let mut meta = self.txn.open_table(META).map_err(redb_err)?;
         let id = meta
@@ -1257,6 +1258,7 @@ impl Writer<'_> {
                 attempts: 0,
                 due_at: 0,
                 last_error: None,
+                shape,
             },
         )?;
         Ok(id)
@@ -1271,6 +1273,7 @@ impl Writer<'_> {
         name: &str,
         payload: &[u8],
         key: Option<&str>,
+        shape: Option<u64>,
     ) -> io::Result<u64> {
         let mut meta = self.txn.open_table(META).map_err(redb_err)?;
         let id = meta
@@ -1288,6 +1291,7 @@ impl Writer<'_> {
                 name: name.to_string(),
                 key: key.map(str::to_string),
                 payload: payload.to_vec(),
+                shape,
             },
         )?;
         Ok(id)

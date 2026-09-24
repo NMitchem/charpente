@@ -321,3 +321,25 @@ failing against the platform at `c28250e` (current main), and the failure is rec
   exit and a named line.
 - §6's oracles are green, the gate is counted, and the seed count and master seed are
   recorded. §7's docs land in the same commits.
+
+## Amendments (implementation plan)
+
+- **A1 — the jobs check runs wherever the write gate opens, and a promote checks before its role flips.** "Beside the schema gate in `do_promote`" would run it after `store_role(Primary)`, leaving a durable primary that refuses on every restart. It runs before `clear_stale_witnesses` and answers `CtrlErr`, so the operator hears it on the command and nothing durable changes. The kernel checks in `after_repl_step` whenever the write gate opens: a witness gate opening, or a switchover's target becoming primary.
+  - **A switchover gets no target-side pre-check.** DESIGN §5 makes HandedOff the point of no return: once the primary sends `HandOff`, it never aborts. A target refusing at that point would leave the primary write-stopped and the target a follower, and neither message would name a fix that works. So the hand-off completes, and the new primary's kernel refuses at its writable flip. That is the startup refusal, and its fix ("run the previous binary until they are Done or Dead") works from that state: the new primary on the old binary dispatches them.
+  - `repl.step` and `after_repl_step` run back to back inside one `Ready::Repl` arm, so no dispatch can come between the flip and the check.
+- **A2 — the encoder is structural, not asserted.** `TxEffects` carries a bare `u64` shape per enqueue and emit, so a shapeless one cannot be represented. `encode_record` writes only `0x08`/`0x09`, and there is nothing left to assert.
+- **A3 — `PROTO_VERSION` 2 → 3.** A version-2 follower would refuse `0x08` at apply by name; the bump refuses it at `Hello`, before any frame ships.
+- **A4 — the job-shape registry lives in `Schema`.** `Db::register_job_shapes` writes it and `Db::pending_job_shape_refusal` reads it. It sits in `Schema` rather than in the `Db` or the dispatcher for two reasons:
+  - a snapshot re-seed rebuilds the `Db` from its schema (`into_seeder` → `Seeder::finish` → `Db::open`), and a registry held anywhere else would come back empty;
+  - `do_promote` holds the `Db`, not the dispatcher.
+
+  It is excluded from `schema_digest` (spec §8: job shapes are not in `Hello`).
+- **A5 — one refusal parenthesis.** Every refusal text reads `(recorded X; this binary Y)`, the no-shape case included. The job refusal's wording and its five-id elision are fixed in Task 6.
+- **A6 — where the TypeScript runtime test lives.** It goes in `ts-fixture/src/client-runtime.test.ts` (`node --test`), because the new frames are runtime behaviour. `ts-fixture-app`'s drift test covers type shapes, not frames.
+- **A7 — `charpente.error` has no `id:` line on the wire.** The encoder omits that one line; `EventFrame.id` still holds the row id for sim tests.
+- **A8 — a `Refusal` marker.** `charpente_core::db::Refusal`, carried inside `io::Error::other`, is how the kernel's stderr line tells a refusal from a platform IO failure. Every existing `io::Result` path is untouched.
+- **A9 — the pinned `charpente.reshaped` block holds its `event:` and `data:` lines only.** `doc_truth` refuses a pinned line with no 16-character fragment outside placeholders, and an `id: <id>.<seq>` line is nothing else. The prose around the block states the `id:` line.
+- **A10 — (verified in Task 3) what serde_json cannot encode.** The spec's example of an unencodable payload, a `NaN`, is believed wrong: serde_json writes non-finite floats as `null`, and the case that fails is a map with non-string keys. Task 3 runs the experiment and writes GUIDE/DESIGN from what it shows.
+- **A11 — a corrupt `EventRow` fails its tail too.** This reads spec §1's "a corrupt event row" literally: a row whose own bytes fail to decode (`InvalidData` out of the scan) gets `charpente.error`. redb's own failures (`ErrorKind::Other`) still stop the node, because they are the platform's, not a subscriber's.
+- **A12 — four new pinned blocks.** The 409, the reshaped frame, the error frame and the job refusal take `PINNED_FLOOR` from 16 to 20.
+- **A13 — the stock-binary startup-exit test uses a corrupt role file.** A jobs refusal needs two builds of one app, which the edge harness does not have; a corrupt role file ends the same kernel thread at startup through `serve_replicated`.

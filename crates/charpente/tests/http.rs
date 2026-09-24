@@ -1143,6 +1143,7 @@ impl Codec for Ping {
 
 impl Job for Ping {
     const NAME: &'static str = "ping";
+    const FINGERPRINT: u64 = 0x7E57_0005;
 }
 
 #[route(POST "/items", public)]

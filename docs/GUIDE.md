@@ -509,6 +509,9 @@ impl Codec for SendReceipt {
 
 impl Job for SendReceipt {
     const NAME: &'static str = "send_receipt";
+    // The payload's shape, recorded beside every enqueue. `#[job]` computes
+    // it from the fields; by hand, change it whenever the fields change.
+    const FINGERPRINT: u64 = 0x5E4D_0001;
     // `RETRY` defaults to `RetryPolicy::DEFAULT` — retry/backoff and cron
     // are covered in a later section.
 }
@@ -539,13 +542,15 @@ fn finalize(db: &mut Db, id: u64) -> Result<(), TxError<io::Error>> {
 }
 ```
 
-`Job` needs `Codec` + a `NAME`, implemented by hand today (v0); `#[job]`
-derives the rest of a job's registration for you (a later section).
-`#[event]` derives everything an event needs in one step: `Codec` (the log
-format), `Event` (`NAME` is the snake_case of the type name — §11 has the
-exact splitting rule), `Serialize` (the wire format `#[route(SSE …)]`
-subscribers receive, §11), `Wire` (that wire format's schema, so the contract
-can name it), and an `EventEntry` impl so `events![...]` can register it (§11).
+`Job` needs `Codec`, a `NAME` and a `FINGERPRINT`, implemented by hand today
+(v0); `#[job]` derives the rest of a job's registration for you (a later
+section). `#[event]` derives everything an event needs in one step: `Codec`
+(the log format), `Event` (`NAME` is the snake_case of the type name — §11 has
+the exact splitting rule — and `FINGERPRINT` is the payload's structural
+fingerprint, recorded beside every emit), `Serialize` (the wire format
+`#[route(SSE …)]` subscribers receive, §11), `Wire` (that wire format's schema,
+so the contract can name it), and an `EventEntry` impl so `events![...]` can
+register it (§11).
 Because the payload IS what a subscriber receives, it obeys the wire rules a
 route's types obey — which is why `InvoiceFinalized.invoice` above is
 `Id<Invoice>` and not the bare `u64` the `SendReceipt` *job* beside it carries:
@@ -3277,8 +3282,10 @@ and delivery-filter name), `serde::Serialize` (the JSON a subscriber receives),
 the payload type — which is also why a bare `u64`/`i64` field is a compile error
 here, exactly as in a route's request or response: use `Id<T>` for a row id, or
 `WireU64`/`WireI64`), and an `EventEntry` impl so `events![...]` can collect the type
-(next section). A `#[job]` payload has no `Wire` requirement, because it never leaves
-the process — only an event's payload is itself a wire document.
+(next section). It also derives `Event::FINGERPRINT`, a structural fingerprint of the
+payload's fields (§12's helper), recorded beside every emit. A `#[job]` payload has no
+`Wire` requirement, because it never leaves the process — only an event's payload is
+itself a wire document.
 `NAME` is the snake_case of the type name, computed at compile time — not a name you
 choose, so it can never drift from the type. The splitting rule inserts `_` before an
 uppercase letter that follows a lowercase letter or digit, and before the *last*
@@ -3791,6 +3798,14 @@ the fingerprint catches it at the next startup — a compile-time check plus a r
 backstop for the one hole compile-time checking cannot close (nothing forces you to
 remember to bump `version`).
 
+**What the fingerprint cannot see.** It hashes each field's name and the *tokens* of
+its type, not the type's definition. A change inside a type a field holds — a new
+variant on an enum, a field added to a nested struct — leaves the fingerprint
+unchanged, for tables and for `#[event]`/`#[job]` payloads alike (§6, §11). Such a
+change is exactly as dangerous as a field change and nothing catches it: treat an edit
+to any type a row or payload contains as an edit to that row or payload itself. A deep
+fingerprint is on PLAN.md's after-launch list with its trigger.
+
 ### Worked example: adding a field
 
 Start from an ordinary version-1 table:
@@ -3909,7 +3924,9 @@ tail a differently-versioned binary cannot prove is safe to decode.
 
 `Row::FINGERPRINT` defaults to `None`, and a table whose row type is `None`-fingerprinted
 is invisible to the gate — writing `Row` by hand instead of using `#[table]` silently
-opts that table out of drift protection. Use `#[table]`.
+opts that table out of drift protection. Use `#[table]`. `Job::FINGERPRINT` and
+`Event::FINGERPRINT` have no such default: a hand-written `impl Job` or `impl Event`
+does not compile without one.
 
 ## 13. describe — the machine-readable contract
 

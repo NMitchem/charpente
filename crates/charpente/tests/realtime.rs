@@ -22,7 +22,7 @@ use charpente::wire::{TypeSchema, Wire, WireU64};
 use charpente::{
     DbConfig, Id, Schema, Scoped, Tenant, Tx, Wire as WireDerive, route, routes, table,
 };
-use charpente_core::db::Db;
+use charpente_core::db::{Db, Event};
 use charpente_core::event::EventRow;
 use charpente_core::io::{Clock, Conn, Disk, Entropy, Net};
 use charpente_core::log::WalConfig;
@@ -47,6 +47,116 @@ struct Ping {
 #[event]
 struct Pong {
     n: WireU64,
+}
+
+// Two shapes of one event under one NAME — what a deploy that edits an
+// #[event]'s fields leaves behind in charpente.events. `#[event]` names an
+// event by the snake_case of its TYPE name, so each pair shares a name and
+// differs only in fields (payload-shapes spec §6.1–6.2).
+mod shapes_v1 {
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    #[event]
+    pub struct IncidentOpened {
+        pub n: WireU64,
+    }
+
+    #[event]
+    pub struct Swapped {
+        pub a: WireU64,
+        pub b: WireU64,
+    }
+
+    #[event]
+    pub struct Dropped {
+        pub a: WireU64,
+        pub b: WireU64,
+    }
+}
+
+mod shapes_v2 {
+    use charpente::event;
+    use charpente::wire::WireU64;
+
+    /// v1 plus a field — the statuspage review's C-1 change.
+    #[event]
+    pub struct IncidentOpened {
+        pub n: WireU64,
+        pub severity: WireU64,
+    }
+
+    /// v1 with its two same-typed fields swapped.
+    #[event]
+    pub struct Swapped {
+        pub b: WireU64,
+        pub a: WireU64,
+    }
+
+    /// v1 with its trailing field dropped.
+    #[event]
+    pub struct Dropped {
+        pub a: WireU64,
+    }
+}
+
+/// `#[event]` fingerprints its FIELDS, not its name. Each pair shares one
+/// `NAME`, and each is one of the three things a reshaped event does when the
+/// new type decodes the old bytes: an inserted field runs out of input, a
+/// same-typed swap decodes with the values traded, a dropped trailing field
+/// leaves bytes behind. The fingerprint is what tells them apart.
+#[test]
+fn an_events_fingerprint_follows_its_fields_not_its_name() {
+    let mut v1 = Vec::new();
+    shapes_v1::IncidentOpened { n: WireU64(4) }.encode(&mut v1);
+    assert!(
+        shapes_v2::IncidentOpened::decode(&mut &v1[..]).is_err(),
+        "an inserted field runs out of input"
+    );
+
+    let mut v1 = Vec::new();
+    shapes_v1::Swapped {
+        a: WireU64(1),
+        b: WireU64(101),
+    }
+    .encode(&mut v1);
+    let swapped = shapes_v2::Swapped::decode(&mut &v1[..]).unwrap();
+    assert_eq!(
+        (swapped.a.0, swapped.b.0),
+        (101, 1),
+        "a same-typed swap decodes with the values traded, and no error anywhere"
+    );
+
+    let mut v1 = Vec::new();
+    shapes_v1::Dropped {
+        a: WireU64(1),
+        b: WireU64(101),
+    }
+    .encode(&mut v1);
+    let input = &mut &v1[..];
+    let dropped = shapes_v2::Dropped::decode(input).unwrap();
+    assert_eq!(dropped.a.0, 1);
+    assert_eq!(input.len(), 8, "the dropped field's bytes are left behind");
+
+    assert_eq!(
+        <shapes_v1::IncidentOpened as Event>::NAME,
+        <shapes_v2::IncidentOpened as Event>::NAME
+    );
+    assert_ne!(
+        <shapes_v1::IncidentOpened as Event>::FINGERPRINT,
+        <shapes_v2::IncidentOpened as Event>::FINGERPRINT
+    );
+    assert_ne!(
+        <shapes_v1::Swapped as Event>::FINGERPRINT,
+        <shapes_v2::Swapped as Event>::FINGERPRINT
+    );
+    assert_ne!(
+        <shapes_v1::Dropped as Event>::FINGERPRINT,
+        <shapes_v2::Dropped as Event>::FINGERPRINT
+    );
+    // The control: identical fields fingerprint identically whatever the
+    // name — NAME carries identity, FINGERPRINT carries shape.
+    assert_eq!(<Ping as Event>::FINGERPRINT, <Pong as Event>::FINGERPRINT);
 }
 
 #[derive(WireDerive, Serialize, Deserialize)]

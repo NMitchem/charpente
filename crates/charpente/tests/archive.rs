@@ -6978,7 +6978,12 @@ const CONV_SEGMENT_BYTES: u64 = 1 << 10;
 /// expressed in segments (the pin bound, the outage length) is computed from
 /// it, so if the frame size moves the pin fails rather than the property
 /// quietly stopping to seal anything.
-const CONV_RECORDS_PER_SEGMENT: u64 = 14;
+///
+/// Re-measured 2026-09-24: payload shapes grew enqueue/emit records by 8
+/// bytes. A conv commit (one `Rec` put, one `Ping` emit) went from a 70-byte
+/// frame (16 header + 54 payload) to 78, so a 1 KiB segment holds 13, not 14
+/// (13 × 78 = 1014; 14 × 70 = 980, 15 × 70 = 1050).
+const CONV_RECORDS_PER_SEGMENT: u64 = 13;
 
 /// Rounds per universe, and the writes and archive steps each round gets.
 /// Sized so a universe reaches a chain of several segments AND crosses a
@@ -7209,19 +7214,33 @@ const CONV_DISK_ERROR_DIVISOR: f64 = 16.0;
 /// only the `log.rs` barrier makes both properties pass at these same bases,
 /// which is what identifies the cause rather than assuming it.
 ///
-/// | floor | orig | after barrier | after stream split | measures now |
-/// |---|---|---|---|---|
-/// | `CONV_RESTORED_FLOOR` | 219 | 217 | 217 | 217 |
-/// | `CONV_SUBSTANTIAL_FLOOR` | 183 | 181 | 181 | 191 |
-/// | `CONV_CHAINED_FLOOR` | 169 | 169 | 166 | 166 |
-/// | `CONV_SCOPED_RESTORED_FLOOR` | 214 | 213 | 211 | 211 |
-/// | `CONV_SCOPED_SUBSTANTIAL_FLOOR` | 164 | 160 | 160 | 163 |
-/// | `CONV_SCOPED_CHAINED_FLOOR` | 158 | 156 | 153 | 153 |
+/// | floor | orig | after barrier | after stream split | measured then | after payload shapes | measures now |
+/// |---|---|---|---|---|---|---|
+/// | `CONV_RESTORED_FLOOR` | 219 | 217 | 217 | 217 | 213 | 213 |
+/// | `CONV_SUBSTANTIAL_FLOOR` | 183 | 181 | 181 | 191 | 181 | 187 |
+/// | `CONV_CHAINED_FLOOR` | 169 | 169 | 166 | 166 | 166 | 176 |
+/// | `CONV_SCOPED_RESTORED_FLOOR` | 214 | 213 | 211 | 211 | 211 | 217 |
+/// | `CONV_SCOPED_SUBSTANTIAL_FLOOR` | 164 | 160 | 160 | 163 | 160 | 172 |
+/// | `CONV_SCOPED_CHAINED_FLOOR` | 158 | 156 | 153 | 153 | 153 | 163 |
 ///
-/// Two floors sit BELOW what they now measure (`CONV_SUBSTANTIAL_FLOOR` 181/191,
-/// `CONV_SCOPED_SUBSTANTIAL_FLOOR` 160/163). That is deliberate: a floor is a
-/// MINIMUM, and raising one that is not failing is a separate decision from
-/// repairing one that is. Every column here is a MEASUREMENT, not a target.
+/// Every floor but `CONV_RESTORED_FLOOR` sits BELOW what it now measures. That is
+/// deliberate: a floor is a MINIMUM, and raising one that is not failing is a
+/// separate decision from repairing one that is. Every column here is a
+/// MEASUREMENT, not a target.
+///
+/// **Re-measured 2026-09-24, same bases, for payload shapes.** Every enqueue and
+/// emit record grew by 8 bytes (the shape, DESIGN §2) and every stored `EventRow`
+/// by 8 more, so both bases are different runs under the same seeds, and
+/// `CONV_RECORDS_PER_SEGMENT` moved 14 -> 13 with them. A CONTROL RUN of the
+/// parent commit at these bases reproduces the "measured then" column exactly.
+/// With the change, the unscoped base's four lost `archive:restored` are exactly
+/// `archive:verify_never_read_cleanly` going 16 -> 20, with `nothing_published` (22)
+/// and `restore_never_completed` (1) unchanged: universes that restored and then
+/// never got a clean read of their own destination, the arm directly above
+/// `archive:restored`'s `cover`. The scoped base moved the OTHER way at every
+/// floor (`restored` 211 -> 217), which a decaying rate cannot do. Only the
+/// failing floor was re-pinned, to its measurement: `CONV_RESTORED_FLOOR`
+/// 217 -> 213.
 ///
 /// **These moved TWICE in one day, and the second move is the more instructive.**
 /// The barrier first landed after the replay loop and the floors were re-measured
@@ -7243,7 +7262,7 @@ const CONV_DISK_ERROR_DIVISOR: f64 = 16.0;
 /// column. Barrier movement is now non-perturbing; other workload and IO-shape
 /// changes still re-roll, so a future panic here is still usually mechanical and
 /// upstream rather than a decayed oracle — just no longer from a `sync_dir`.
-const CONV_RESTORED_FLOOR: u64 = 217;
+const CONV_RESTORED_FLOOR: u64 = 213;
 const CONV_SUBSTANTIAL_FLOOR: u64 = 181;
 const CONV_CHAINED_FLOOR: u64 = 166;
 
@@ -7688,7 +7707,8 @@ fn conv_frontier(m: &Manifest) -> u64 {
 /// checker that cannot say which it hit turns every such roll into a false
 /// RED. `kernel.rs`'s workload takes exactly this care with its
 /// `exactly_once_holds` call, and its comment records the bug that taught it
-/// to (seed 0x348270b38f166529, then 0xe653f43924f17fe8).
+/// to (seed 0x348270b38f166529, then 0xe653f43924f17fe8, now
+/// 0xe2d97275c15cc087).
 enum ConvFail {
     /// Retryable: the matrix hit the checker. Recognized by
     /// `checks::is_fault_fallout`, never by this file's own substring list.

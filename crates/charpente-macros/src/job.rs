@@ -2,8 +2,9 @@
 //! (DESIGN.md §6, spec
 //! 2026-07-02-queue-cron-design.md): turns a struct into a typed job
 //! payload — a field-wise `Codec` impl (mirrors `#[table]`'s row codec, minus
-//! the id: a job payload has no primary key), `impl Job` carrying the name
-//! and retry policy, and the `JobEntry` glue `jobs![]` collects. Errors name
+//! the id: a job payload has no primary key), `impl Job` carrying the name,
+//! the payload's structural fingerprint (`fingerprint::compute`) and the
+//! retry policy, and the `JobEntry` glue `jobs![]` collects. Errors name
 //! the accepted forms (hard rule 5).
 
 use proc_macro2::TokenStream;
@@ -197,6 +198,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
         .map(|f| f.ident.clone().expect("named fields have idents"))
         .collect();
     let field_types: Vec<_> = fields.named.iter().map(|f| f.ty.clone()).collect();
+    let fingerprint = crate::fingerprint::compute(&field_idents, &field_types);
 
     let max = args.max;
     let backoff_millis = args.backoff_millis;
@@ -233,6 +235,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
 
         impl ::charpente::core::db::Job for #name {
             const NAME: &'static str = #name_str;
+            const FINGERPRINT: u64 = #fingerprint;
             const RETRY: ::charpente::core::job::RetryPolicy = ::charpente::core::job::RetryPolicy {
                 max: #max,
                 backoff: ::std::time::Duration::from_millis(#backoff_millis),

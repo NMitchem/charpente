@@ -406,6 +406,7 @@ mod tests {
     }
     impl Job for Ping {
         const NAME: &'static str = "probe-test-ping";
+        const FINGERPRINT: u64 = 0x7E57_0008;
     }
 
     /// A db with one committed record, so `last_applied` is `Some` — needed

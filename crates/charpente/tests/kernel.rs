@@ -97,6 +97,58 @@ impl Panics {
     }
 }
 
+// Two shapes of one job under one NAME (`#[job]` names a job by its type's
+// ident): what a deploy that edits a job's fields meets in charpente.jobs.
+mod receipt_v1 {
+    use charpente::kernel::JobError;
+    use charpente::{Tx, job};
+
+    #[job]
+    pub struct SendReceipt {
+        pub invoice: u64,
+    }
+
+    impl SendReceipt {
+        fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+            let _ = self.invoice;
+            Ok(())
+        }
+    }
+}
+
+mod receipt_v2 {
+    use charpente::kernel::JobError;
+    use charpente::{Tx, job};
+
+    /// v1 plus a field.
+    #[job]
+    pub struct SendReceipt {
+        pub invoice: u64,
+        pub copies: u32,
+    }
+
+    impl SendReceipt {
+        fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+            let _ = (self.invoice, self.copies);
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn a_jobs_fingerprint_follows_its_fields_not_its_name() {
+    assert_eq!(receipt_v1::SendReceipt::NAME, receipt_v2::SendReceipt::NAME);
+    assert_ne!(
+        <receipt_v1::SendReceipt as Job>::FINGERPRINT,
+        <receipt_v2::SendReceipt as Job>::FINGERPRINT
+    );
+    // The control: two empty payloads fingerprint identically.
+    assert_eq!(
+        <AlwaysFails as Job>::FINGERPRINT,
+        <Panics as Job>::FINGERPRINT
+    );
+}
+
 fn quiet_kernel_app(seed: u64) -> (Sim, App) {
     let sim = Sim::with_faults(seed, FaultConfig::none());
     let app = App::open(
@@ -1582,10 +1634,15 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
         // the op schedule, so its universe no longer trips a crash inside the
         // checker. Re-verified 2026-08-15 (T9): deleting the is_fault_fallout
         // classification below leaves 0x348270b38f166529 GREEN. The live
-        // reproduction is seed 0xe653f43924f17fe8, found by a 10,000-universe
-        // batch from this file's own ambient base and confirmed RED-first
-        // (RED with the classification deleted, GREEN with it restored). The
-        // old seed is kept: it is still this suite's CHARPENTE_SEED replay pin
+        // reproduction is seed 0xe2d97275c15cc087, found by a 10,000-universe
+        // batch from an ambient base (0x577d39b752d077c7) and confirmed
+        // RED-first (RED with the classification deleted — the checker's own
+        // scan_by_scoped hits an injected read error — GREEN with it
+        // restored). Re-pinned 2026-09-24: its predecessor 0xe653f43924f17fe8
+        // was already GREEN with the classification deleted before payload
+        // shapes landed, and payload shapes' 8-byte enqueue/emit growth renamed
+        // the universes again. The oldest seed is kept: it is still this
+        // suite's CHARPENTE_SEED replay pin
         // in .github/workflows/ci.yml, and it still exercises Kernel::build's
         // drain-id fix (dispatch.rs's "job in the heap is not Pending" assert).
         match exactly_once_holds(&mut app).and_then(|()| tenants_never_see_each_other(&mut app)) {
