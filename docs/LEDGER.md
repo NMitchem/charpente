@@ -5496,7 +5496,9 @@ non-violations, the second a recorded near-miss (a `grep` into charpente's crate
 
 **Gate** on `48e6420` plus this record (docs only; no crate changed): fmt clean;
 `cargo build -p guide-examples` clean; `cargo test -p guide-examples --no-fail-fast`
-8 of 8 `test result: ok`, 0 FAILED, EXIT=0. The full workspace gate is run separately.
+8 of 8 `test result: ok`, 0 FAILED, EXIT=0. The full workspace gate, run by the controller
+on `d2c3806`: fmt clean, clippy clean, `cargo test --workspace --no-fail-fast` 87 of 87
+`test result: ok`, 0 FAILED, EXIT=0.
 
 **Open, deliberately.** The two pre-publish platform fixes above. The other ten findings
 are testimony with no schedule. Whether the app repository goes to GitHub as a launch
