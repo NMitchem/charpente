@@ -253,12 +253,12 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                     let input = &mut &payload[..];
                     let job = <#name as ::charpente::core::table::Codec>::decode(input)
                         .map_err(|e| ::charpente::kernel::JobError::App(::std::format!(
-                            "job decode for {}: {e} — schema drift or corruption", #name_str
+                            "job decode for {}: {e} — the stored payload is corrupt (its recorded shape is this binary's, so this is not a shape change); it retries, then dead-letters — if other rows are damaged too, restore this node from its archive (GUIDE §15)", #name_str
                         )))?;
                     if !input.is_empty() {
                         return ::std::result::Result::Err(::charpente::kernel::JobError::App(
                             ::std::format!(
-                                "job decode: {} trailing bytes after a {} payload — schema drift or corruption",
+                                "job decode: {} trailing bytes after a {} payload — the stored payload is corrupt (its recorded shape is this binary's, so this is not a shape change); it retries, then dead-letters — if other rows are damaged too, restore this node from its archive (GUIDE §15)",
                                 input.len(), #name_str,
                             ),
                         ));
@@ -269,6 +269,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                     name: <#name as ::charpente::core::db::Job>::NAME,
                     retry: <#name as ::charpente::core::db::Job>::RETRY,
                     cross_tenant: #cross_tenant,
+                    fingerprint: <#name as ::charpente::core::db::Job>::FINGERPRINT,
                     glue: __charpente_job_glue,
                 }
             }

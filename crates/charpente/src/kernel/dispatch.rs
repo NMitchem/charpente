@@ -63,6 +63,10 @@ pub struct JobDef {
     /// it beside the route flag, so the cross-tenant inventory covers jobs
     /// too.
     pub cross_tenant: bool,
+    /// `Job::FINGERPRINT` — the payload shape this binary compiled. Dispatch
+    /// asserts a row's recorded shape equals it before the glue decodes
+    /// (payload-shapes spec §4).
+    pub fingerprint: u64,
     /// The token is `Some` exactly when `cross_tenant` is set: the glue
     /// `#[job]` emits passes it on to the payload's `run` only for a
     /// declared job, and a job that never declared it is handed `None` it
@@ -209,6 +213,21 @@ impl Dispatcher {
                     row.name
                 )));
             };
+            // `Kernel::build` (writable) and `after_repl_step` (every write-
+            // gate opening) refuse to start dispatch over a Pending row of a
+            // foreign shape, and a heap is only ever fed while writable; a
+            // fresh enqueue records this binary's own shape. So a
+            // foreign-shape payload never reaches decode — asserted, not
+            // handled (hard rule 4).
+            assert_eq!(
+                row.shape,
+                Some(def.fingerprint),
+                "dispatcher invariant: job {id} (\"{}\") has recorded shape {:?} but this binary \
+                 compiled {:#x} — a foreign-shape payload never reaches decode",
+                row.name,
+                row.shape,
+                def.fingerprint
+            );
             match catch_unwind(AssertUnwindSafe(|| {
                 (def.glue)(tx, &row.payload, def.cross_tenant.then_some(&cap))
             })) {

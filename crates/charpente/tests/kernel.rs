@@ -2573,3 +2573,361 @@ fn kernel_migrates_the_schema_before_the_first_request_is_served() {
         assert_eq!(row.count, row.id.raw() as u32);
     }
 }
+
+// ------------------------------------------------------------ job shapes
+
+use charpente_sim::run_universes_swarm_with;
+
+#[derive(WireDerive, Serialize, Deserialize)]
+struct ReceiptBody {
+    invoice: WireU64,
+}
+
+/// The OLD binary's enqueue path; the new binary mounts the same route, but
+/// nothing here calls it once the shapes have changed.
+#[route(POST "/receipt", public)]
+fn enqueue_receipt(tx: &mut Tx, body: ReceiptBody) -> Result<(), ApiError> {
+    tx.enqueue(receipt_v1::SendReceipt {
+        invoice: body.invoice.0,
+    });
+    Ok(())
+}
+
+fn receipts_app(sim: &Sim, v2: bool) -> std::io::Result<App> {
+    let defs = if v2 {
+        jobs![receipt_v2::SendReceipt]
+    } else {
+        jobs![receipt_v1::SendReceipt]
+    };
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?
+    .mount(routes![enqueue_receipt])
+    .mount_jobs(defs))
+}
+
+/// The refusal text, spelled out from the spec's wording rather than taken
+/// from the product's `format!`, so the byte-exact comparison pins the words.
+fn receipt_refusal(ids: &[u64], recorded: &str) -> String {
+    let mut listed: Vec<String> = ids.iter().take(5).map(u64::to_string).collect();
+    if ids.len() > 5 {
+        listed.push("…".to_string());
+    }
+    format!(
+        "{} Pending \"SendReceipt\" job(s) (ids {}) were enqueued under a different shape of \
+         SendReceipt (recorded {recorded}; this binary {:#x}) — this binary will not decode \
+         them; run the previous binary until they are Done or Dead, then upgrade, or restore \
+         SendReceipt's old fields and give the new shape its own #[job] type (GUIDE §6)",
+        ids.len(),
+        listed.join(", "),
+        <receipt_v2::SendReceipt as Job>::FINGERPRINT
+    )
+}
+
+/// Enqueues `n` v1 receipts on a fresh store and never runs them.
+fn old_binary_leaves_pending_receipts(seed: u64, n: u64) -> Sim {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let mut app = receipts_app(&sim, false).unwrap();
+    app.db_for_tests()
+        .transact(|tx| {
+            for invoice in 0..n {
+                tx.enqueue(receipt_v1::SendReceipt { invoice });
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+    sim.restart();
+    drop(app);
+    sim
+}
+
+/// Spec §6.4: a v1 job left Pending makes the v2 kernel refuse to start, by
+/// name, byte-exact, and the error is a `Refusal`.
+#[test]
+fn a_pending_job_of_another_shape_refuses_the_kernel_by_name() {
+    let sim = old_binary_leaves_pending_receipts(0x5A9E_0601, 3);
+    let err = match Kernel::new(receipts_app(&sim, true).unwrap(), Box::new(sim.clock())) {
+        Ok(_) => panic!("the v2 kernel started over three Pending v1 receipts"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.to_string(),
+        receipt_refusal(
+            &[0, 1, 2],
+            &format!("{:#x}", <receipt_v1::SendReceipt as Job>::FINGERPRINT)
+        )
+    );
+    assert!(
+        charpente::core::db::Refusal::of(&err).is_some(),
+        "a refusal, not an IO failure"
+    );
+}
+
+/// More than five: the line elides, the count does not.
+#[test]
+fn a_long_refusal_lists_five_ids_and_counts_them_all() {
+    let sim = old_binary_leaves_pending_receipts(0x5A9E_0602, 7);
+    let err = match Kernel::new(receipts_app(&sim, true).unwrap(), Box::new(sim.clock())) {
+        Ok(_) => panic!("the v2 kernel started over seven Pending v1 receipts"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.to_string(),
+        receipt_refusal(
+            &[0, 1, 2, 3, 4, 5, 6],
+            &format!("{:#x}", <receipt_v1::SendReceipt as Job>::FINGERPRINT)
+        )
+    );
+}
+
+/// The control: when every v1 job is Done, v2 starts. Done and Dead rows are
+/// never decoded again.
+#[test]
+fn a_drained_queue_lets_the_new_shape_start() {
+    let sim = Sim::with_faults(0x5A9E_0603, FaultConfig::none());
+    let mut app = receipts_app(&sim, false).unwrap();
+    let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+    let db = app.db_for_tests();
+    db.transact(|tx| {
+        tx.enqueue(receipt_v1::SendReceipt { invoice: 1 });
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    dispatcher.note_enqueued(db.drain_enqueued());
+    assert!(matches!(
+        dispatcher.run_due(db, 0).unwrap(),
+        JobOutcome::Done { .. }
+    ));
+    sim.restart();
+    drop(app);
+    assert!(Kernel::new(receipts_app(&sim, true).unwrap(), Box::new(sim.clock())).is_ok());
+}
+
+/// Spec §6.6: a job enqueued by a pre-shape binary (`0x02`) is refused even
+/// when its bytes are ones v2 WOULD decode — the rule is the recorded shape.
+#[test]
+fn a_pre_shape_pending_job_is_refused_even_when_its_bytes_would_decode() {
+    let sim = Sim::with_faults(0x5A9E_0604, FaultConfig::none());
+    let mut app = receipts_app(&sim, true).unwrap();
+    let mut v2_bytes = Vec::new();
+    receipt_v2::SendReceipt {
+        invoice: 1,
+        copies: 2,
+    }
+    .encode(&mut v2_bytes);
+    let mut record = Vec::new();
+    1u32.encode(&mut record);
+    record.push(2);
+    "SendReceipt".to_string().encode(&mut record);
+    v2_bytes.encode(&mut record);
+    None::<String>.encode(&mut record);
+    let db = app.db_for_tests();
+    let seq = db.last_applied().map_or(0, |s| s + 1);
+    db.apply_shipped(&[(seq, record)]).unwrap();
+    let err = match Kernel::new(app, Box::new(sim.clock())) {
+        Ok(_) => panic!("the v2 kernel started over a shapeless Pending receipt"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.to_string(),
+        receipt_refusal(&[0], "none — enqueued before job shapes were tagged")
+    );
+}
+
+/// A Pending row of an UNREGISTERED name keeps today's path (dispatch's "not
+/// registered" dead-letter) and does not refuse the kernel.
+#[test]
+fn an_unregistered_pending_job_does_not_refuse_the_kernel() {
+    let sim = old_binary_leaves_pending_receipts(0x5A9E_0605, 1);
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap();
+    assert!(Kernel::new(app, Box::new(sim.clock())).is_ok());
+}
+
+/// Hard rule 4: past the kernel's check, a foreign-shape payload never reaches
+/// decode, so dispatch asserts it rather than handling it. Driven through
+/// `Dispatcher` directly — the one path that skips `Kernel::build`'s check.
+#[test]
+#[should_panic(expected = "a foreign-shape payload never reaches decode")]
+fn dispatch_asserts_it_never_decodes_a_foreign_shape() {
+    let sim = Sim::with_faults(0x5A9E_0606, FaultConfig::none());
+    let mut app = receipts_app(&sim, true).unwrap();
+    let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+    let db = app.db_for_tests();
+    db.transact(|tx| {
+        tx.enqueue(receipt_v1::SendReceipt { invoice: 1 });
+        Ok::<(), std::io::Error>(())
+    })
+    .unwrap();
+    dispatcher.note_enqueued(db.drain_enqueued());
+    let _ = dispatcher.run_due(db, 0);
+}
+
+/// Spec §4: a payload whose recorded shape IS this binary's but whose bytes
+/// do not decode is corruption, not a shape change — it keeps the retry path,
+/// and its message names corruption, byte-exact. Planted as a shipped `0x08`
+/// record: v1 bytes under v2's tag, the one thing the typed API never writes.
+#[test]
+fn a_corrupt_payload_under_its_own_shape_retries_naming_corruption() {
+    let sim = Sim::with_faults(0x5A9E_0607, FaultConfig::none());
+    let mut app = receipts_app(&sim, true).unwrap();
+    let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+    let mut v1_bytes = Vec::new();
+    receipt_v1::SendReceipt { invoice: 1 }.encode(&mut v1_bytes);
+    let mut record = Vec::new();
+    1u32.encode(&mut record);
+    record.push(8);
+    "SendReceipt".to_string().encode(&mut record);
+    v1_bytes.encode(&mut record);
+    None::<String>.encode(&mut record);
+    <receipt_v2::SendReceipt as Job>::FINGERPRINT.encode(&mut record);
+    let db = app.db_for_tests();
+    let seq = db.last_applied().map_or(0, |s| s + 1);
+    db.apply_shipped(&[(seq, record)]).unwrap();
+    dispatcher.note_enqueued(db.drain_enqueued());
+    assert!(matches!(
+        dispatcher.run_due(db, 0).unwrap(),
+        JobOutcome::Retried { attempts: 1, .. }
+    ));
+    let job = &db.snapshot().unwrap().scan::<JobRow>().unwrap()[0];
+    assert_eq!(
+        job.last_error.as_deref(),
+        Some(
+            "job decode for SendReceipt: row decode: needed 4 bytes for u32, 0 left — schema \
+             drift or corruption — the stored payload is corrupt (its recorded shape is this \
+             binary's, so this is not a shape change); it retries, then dead-letters — if \
+             other rows are damaged too, restore this node from its archive (GUIDE §15)"
+        )
+    );
+}
+
+/// Spec §6.4 under the fault matrix. The old binary enqueues receipts and runs
+/// some, the machine crashes at an arbitrary op, and the new binary opens the
+/// same store. The kernel refuses exactly when a durable Pending receipt
+/// carries the old shape, naming exactly those ids — it never starts over one
+/// and never refuses over none.
+fn receipt_upgrade_universe(sim: &mut Sim) -> Result<(), String> {
+    let entropy = sim.entropy();
+    sim.crash_disk_after(32 + entropy.next_u64() % 256);
+    match receipts_app(sim, false).and_then(|app| Kernel::new(app, Box::new(sim.clock()))) {
+        Ok(mut kernel) => {
+            let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 60 * SEC);
+            let base = sim.now().as_nanos();
+            for i in 0..(1 + entropy.next_u64() % 6) {
+                source.push_at(
+                    base + i * SEC,
+                    Request::new(Method::Post, "/receipt").json(&ReceiptBody {
+                        invoice: WireU64(i),
+                    }),
+                );
+            }
+            if let Err(e) = kernel.run(&mut source)
+                && !is_fault_fallout(&e.to_string())
+            {
+                return Err(format!("v1 kernel.run failed non-injected: {e}"));
+            }
+        }
+        Err(e) if is_fault_fallout(&e.to_string()) => {}
+        Err(e) => return Err(format!("v1 boot failed non-injected: {e}")),
+    }
+    sim.restart();
+    for _ in 0..64 {
+        let mut app = match receipts_app(sim, true) {
+            Ok(app) => app,
+            Err(e) if is_fault_fallout(&e.to_string()) => {
+                sim.restart();
+                continue;
+            }
+            Err(e) => return Err(format!("v2 open failed non-injected: {e}")),
+        };
+        let receipts: Vec<JobRow> = match app
+            .db_for_tests()
+            .snapshot()
+            .and_then(|s| s.scan::<JobRow>())
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|r| r.name == "SendReceipt")
+                .collect(),
+            Err(e) if is_fault_fallout(&e.to_string()) => {
+                sim.restart();
+                continue;
+            }
+            Err(e) => return Err(format!("job scan failed non-injected: {e}")),
+        };
+        let pending: Vec<u64> = receipts
+            .iter()
+            .filter(|r| r.status == JobStatus::Pending)
+            .map(|r| r.id.raw())
+            .collect();
+        return match Kernel::new(app, Box::new(sim.clock())) {
+            Ok(_) if pending.is_empty() => {
+                // A store the old binary never enqueued into is a correct
+                // start too, but not the control this property claims.
+                sim.cover(if receipts.is_empty() {
+                    "shapes:job-none-enqueued"
+                } else {
+                    "shapes:job-drained"
+                });
+                Ok(())
+            }
+            Ok(_) => Err(format!(
+                "the v2 kernel STARTED over Pending v1 receipts {pending:?}"
+            )),
+            Err(e) if charpente::core::db::Refusal::of(&e).is_some() => {
+                let expected = receipt_refusal(
+                    &pending,
+                    &format!("{:#x}", <receipt_v1::SendReceipt as Job>::FINGERPRINT),
+                );
+                if pending.is_empty() || e.to_string() != expected {
+                    return Err(format!(
+                        "refused {e:?}; durable Pending receipts {pending:?}"
+                    ));
+                }
+                sim.cover("shapes:job-refused");
+                Ok(())
+            }
+            Err(e) if is_fault_fallout(&e.to_string()) => {
+                sim.restart();
+                continue;
+            }
+            Err(e) => Err(format!("v2 Kernel::new failed non-injected: {e}")),
+        };
+    }
+    sim.give_up("the v2 binary never booted cleanly — nothing adjudicated");
+    Ok(())
+}
+
+/// The universe count was set by timing batches (see the commit message); the
+/// seed base is fixed and replays with `CHARPENTE_SEED`/`CHARPENTE_BASE_SEED`
+/// like every swarm here.
+#[test]
+fn a_new_job_shape_starts_iff_no_old_shape_is_pending_under_the_fault_matrix() {
+    run_universes_swarm_with!(
+        0x5A9E_0600,
+        256,
+        |_cfg: &mut FaultConfig| {},
+        |sim: &mut Sim| receipt_upgrade_universe(sim),
+        require: ["shapes:job-refused", "shapes:job-drained", "fault:crash"],
+        floor: [
+            ("shapes:job-refused", RECEIPT_REFUSED_FLOOR),
+            ("shapes:job-drained", RECEIPT_DRAINED_FLOOR)
+        ]
+    );
+}
+
+/// **Measured 2026-09-24** at base `0x5A9E_0600`, 256 universes, identical
+/// across consecutive batches. Each floor is the exact count: a drop is a
+/// finding, not a number to lower. `shapes:job-none-enqueued` (a store the
+/// old binary never enqueued into) is a correct start but not the control,
+/// so it is neither required nor floored.
+const RECEIPT_REFUSED_FLOOR: u64 = 40;
+const RECEIPT_DRAINED_FLOOR: u64 = 115;

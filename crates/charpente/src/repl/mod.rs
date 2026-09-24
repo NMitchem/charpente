@@ -905,6 +905,19 @@ impl Repl {
             );
             return Ok(());
         }
+        // Before the durable role flips (spec amendment A1): a refused
+        // promote leaves a follower, never a durable primary that refuses to
+        // start on every restart.
+        if let Some(refusal) = db.pending_job_shape_refusal()? {
+            self.reply_ctrl(
+                ctrl_id,
+                &Msg::CtrlErr {
+                    message: format!("cannot promote: {refusal}"),
+                },
+                now,
+            );
+            return Ok(());
+        }
         self.clear_stale_witnesses()?;
         store_role(&*self.role_disk, &Role::Primary)?;
         self.role = Role::Primary;

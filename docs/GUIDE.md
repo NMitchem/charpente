@@ -509,8 +509,10 @@ impl Codec for SendReceipt {
 
 impl Job for SendReceipt {
     const NAME: &'static str = "send_receipt";
-    // The payload's shape, recorded beside every enqueue. `#[job]` computes
-    // it from the fields; by hand, change it whenever the fields change.
+    // The payload's shape, recorded beside every enqueue; a Pending job is
+    // only ever decoded by a binary whose FINGERPRINT matches (§6). `#[job]`
+    // computes it from the fields; by hand, change it whenever the fields
+    // change.
     const FINGERPRINT: u64 = 0x5E4D_0001;
     // `RETRY` defaults to `RetryPolicy::DEFAULT` — retry/backoff and cron
     // are covered in a later section.
@@ -1278,12 +1280,15 @@ or entry point.
 
 ### `#[job]` and its retry policy
 
-`#[job]` derives a job payload's `Codec`, its `NAME`, and the `JobEntry`
-glue `jobs![...]` collects — the same shape `#[table]` derives for rows
-(§2), minus the primary key. Bare `#[job]` takes `RetryPolicy::DEFAULT` (5
-attempts, 30s base backoff); `#[job(retry(max = <int>, backoff =
-"<n><unit>"))]` overrides either or both — `backoff` is a bare number plus
-a unit, one of `ms`, `s`, `m`, `h`.
+`#[job]` derives a job payload's `Codec`, its `NAME`, its `FINGERPRINT`,
+and the `JobEntry` glue `jobs![...]` collects — the same shape `#[table]`
+derives for rows (§2), minus the primary key. `Job::FINGERPRINT` is a
+structural fingerprint of the payload's fields (§12's helper), recorded
+beside every enqueue; a Pending job is decoded only by a binary whose
+`FINGERPRINT` matches (see "Changing a job's fields" below). Bare `#[job]`
+takes `RetryPolicy::DEFAULT` (5 attempts, 30s base backoff); `#[job(retry(max
+= <int>, backoff = "<n><unit>"))]` overrides either or both — `backoff` is a
+bare number plus a unit, one of `ms`, `s`, `m`, `h`.
 
 ```rust
 use charpente::core::job::RetryPolicy;
@@ -1467,10 +1472,11 @@ vice versa: exactly-once state effects, structurally.
 
 On `Err(JobError::App(msg))` — your handler's own rejection, a panic inside
 it (absorbed as `"handler panicked: <payload>"`), or a corrupt payload
-(schema drift: `"job decode for <Name>: <e> — schema drift or corruption"`)
-— that attempt's own effects never committed, and a *second* transaction
-records the failure: `attempts` increments, `last_error` gets the message,
-and:
+(corrupt stored bytes: `"job decode for <Name>: <e> — the stored payload is
+corrupt …"`; a shape change never reaches dispatch — see "Changing a job's
+fields") — that attempt's own effects never committed, and a *second*
+transaction records the failure: `attempts` increments, `last_error` gets
+the message, and:
 
 - if `attempts < retry.max`: stays Pending, `due_at` moves to
   `now + backoff * 2^(attempts - 1)` (nanoseconds; doubles every attempt,
@@ -1492,6 +1498,51 @@ One more failure mode: if a `JobRow`'s `name` isn't in the `jobs![...]` list
 type — it fails the same way as a handler rejection, with: `"job
 \"<name>\" is not registered — add it to the jobs![…] list passed to
 App::mount_jobs (or this log outlived a renamed job type)"`.
+
+### Changing a job's fields
+
+Every enqueue records the payload's shape — `Job::FINGERPRINT`, the structural
+fingerprint `#[job]` computes from the fields (§12) — and a Pending job is only ever
+decoded by a binary that compiled that same shape. A node about to become able to
+dispatch refuses while any Pending job of a type it mounts was enqueued under another
+shape. It checks at startup and at every moment its write gate opens (a witness gate
+opening, a completed switchover), and `promote` checks before it changes anything:
+
+<!-- pinned -->
+```text
+<n> Pending "<job>" job(s) (ids <ids>) were enqueued under a different shape of <job> (recorded <recorded>; this binary <fingerprint>) — this binary will not decode them; run the previous binary until they are Done or Dead, then upgrade, or restore <job>'s old fields and give the new shape its own #[job] type (GUIDE §6)
+```
+
+At most five ids are listed, then `…`. A job enqueued before shapes were recorded reads
+`recorded none — enqueued before job shapes were tagged`, and it is refused the same way:
+nothing decodes bytes it cannot prove are its own shape.
+
+- At startup, or when the write gate opens, the refusal stops the kernel.
+- At `promote`, it answers `CtrlErr` prefixed `cannot promote:`, and the node stays a
+  follower.
+- A switchover is never refused partway. Once the old primary hands off it never resumes
+  on its own (DESIGN §5 calls the hand-off its point of no return), so a refusal there
+  would leave neither node writable. The switchover completes. The new primary's kernel
+  then stops at the moment it becomes writable, with the refusal above, and its fix works
+  from there: run the previous binary on that node, now the primary, until the jobs are
+  Done or Dead. The old primary follows it throughout.
+
+Done and Dead rows are never decoded again and never refuse anything. A Pending row of a
+job type this binary does not mount keeps the "not registered" path above.
+
+There are two ways through a shape change:
+
+- **Drain first.** Run the old binary until every Pending job of the type is Done or Dead
+  (each reaches one within its retry policy), then deploy. In a replicated pair, drain on
+  the primary before a switchover onto an upgraded follower, or that follower stops as
+  described above.
+- **A new type.** Leave the old type's fields alone, put the new fields in a new `#[job]`
+  type, mount both, and switch enqueues to the new one. The new type needs a new
+  identifier: `NAME` is the type's own identifier, and `mount_jobs` panics on two jobs of
+  one name. The old type keeps dispatching its rows, because their shape is still its
+  own; remove it once none are Pending.
+
+What the fingerprint cannot see, a change inside a type a field holds, is in §12.
 
 ### What `#[job]` rejects
 
@@ -2723,15 +2774,16 @@ Three more, at job-dispatch time rather than macro-expansion time
 dead-letter, and exactly-once effects"):
 
 ```text
-job decode for SendReceipt: <the underlying decode error> — schema drift or corruption
+job decode for SendReceipt: <the underlying decode error> — the stored payload is corrupt (its recorded shape is this binary's, so this is not a shape change); it retries, then dead-letters — if other rows are damaged too, restore this node from its archive (GUIDE §15)
 handler panicked: <the panic payload>
 job "SendReceipt" is not registered — add it to the jobs![…] list passed to App::mount_jobs (or this log outlived a renamed job type)
 ```
 
-The first: a `JobRow`'s stored payload no longer decodes as its named job
-type — same schema-drift story as a table row, but for a job's fields.
-Fix, same rule: don't reorder or remove a job payload's fields once jobs of
-that type may exist Pending in the store. The second: your `run` method (or
+The first: a Pending job's stored payload failed to decode although its
+recorded shape is this binary's — corrupt bytes, not a shape change,
+because a shape change is refused before dispatch can start (see
+"Changing a job's fields"). It retries and then dead-letters like any
+rejection. The second: your `run` method (or
 something it called) panicked; charpente absorbs it as an ordinary handler
 rejection (an attempt, counted against retry budget) rather than crashing
 the kernel thread — fix the panic like any other bug in `run`. The third: a
@@ -3224,7 +3276,7 @@ forwarded verbatim:
   last_applied Some(41) — …`).
 - exit 1 — `CtrlErr` or `Refuse`, printed to stderr (a refusal: already
   primary, no matching follower session, switchover deadline exceeded, a
-  missing/mismatched `--secret`, …).
+  missing/mismatched `--secret`, a Pending job of a foreign shape (§6), …).
 - exit 2 — usage, connect, or timeout failure (bad flags, the node
   unreachable, no reply before the deadline) — never a node-level decision.
 

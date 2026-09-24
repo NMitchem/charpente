@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use charpente_core::db::{Db, MAX_BATCH};
+use charpente_core::db::{Db, MAX_BATCH, Refusal};
 use charpente_core::event::EventRow;
 use charpente_core::io::{Clock, Instant, ObjectStore};
 use charpente_core::table::View;
@@ -185,7 +185,10 @@ pub struct Kernel {
 impl Kernel {
     /// Consumes the mounted App: upserts cron rows, rebuilds the due-heap
     /// from Pending rows. `now` for the cron phase comes from `clock`. The
-    /// single-node constructor — no replication.
+    /// single-node constructor — no replication. On a writable node it first
+    /// refuses — an `io::Error` carrying a `Refusal` — while any Pending job
+    /// of a mounted type was enqueued under another shape
+    /// (`Db::pending_job_shape_refusal`).
     pub fn new(app: App, clock: Box<dyn Clock>) -> io::Result<Kernel> {
         Kernel::build(app, clock, None, None)
     }
@@ -220,7 +223,11 @@ impl Kernel {
         repl: Option<Repl>,
         archive: Option<(Archive, Box<dyn ObjectStore>)>,
     ) -> io::Result<Kernel> {
-        let mut dispatcher = Dispatcher::new(app.take_job_defs());
+        let defs = app.take_job_defs();
+        let shapes: Vec<(&'static str, u64)> =
+            defs.iter().map(|d| (d.name, d.fingerprint)).collect();
+        app.db_mut().register_job_shapes(&shapes);
+        let mut dispatcher = Dispatcher::new(defs);
         let mut cron = CronScheduler::new(app.take_cron_entries());
         let now = clock.now().as_nanos();
         let was_writable = app.db_mut().writes_allowed();
@@ -237,6 +244,7 @@ impl Kernel {
         // read, silently implementing strict-refuse instead of spec §2's
         // ruled "serve reads, withhold writes".
         if was_writable {
+            refuse_foreign_pending_jobs(app.db())?;
             cron.upsert(app.db_mut(), now)?;
         }
         dispatcher.rebuild(&app.db_mut().snapshot()?)?;
@@ -851,8 +859,10 @@ impl Kernel {
     }
 
     /// After a `Repl::step`, catch this node BECOMING WRITABLE — a promote, a
-    /// switchover hand-off, or the witness boot gate resolving — and run the
-    /// three pieces of startup a non-writable node had to skip:
+    /// switchover hand-off, or the witness boot gate resolving — refuse by
+    /// name while a Pending job of a mounted type carries a foreign shape
+    /// (`Kernel::build` checks that only on a writable node), and otherwise
+    /// run the three pieces of startup a non-writable node had to skip:
     ///
     /// - the schema gate (`Kernel::run` guards it on `writes_allowed()` and
     ///   never retries it),
@@ -872,6 +882,15 @@ impl Kernel {
     fn after_repl_step(&mut self) -> io::Result<()> {
         let writable = self.app.db().writes_allowed();
         if writable && !self.was_writable {
+            // Every way the write gate opens passes here: a witness gate
+            // opening, a promote (already refused in `do_promote`, so this
+            // never fires for one), and a switchover's target after
+            // `accept_handoff`. The hand-off itself is never refused over job
+            // shapes: HandedOff is the primary's point of no return (DESIGN
+            // §5), so refusing there would strand the pair write-stopped. The
+            // switchover completes, and this node stops here by name instead
+            // (payload-shapes amendment A1).
+            refuse_foreign_pending_jobs(self.app.db())?;
             self.app.db_mut().migrate_schema()?;
             let now = self.clock.now().as_nanos();
             self.cron.upsert(self.app.db_mut(), now)?;
@@ -1014,6 +1033,14 @@ fn validate_subscribe(db: &Db, sub: &Subscription) -> Result<u64, Response> {
                 cursor.wire()
             ),
         )),
+    }
+}
+
+/// Spec §4: dispatch may not start over a Pending job of a foreign shape.
+fn refuse_foreign_pending_jobs(db: &Db) -> io::Result<()> {
+    match db.pending_job_shape_refusal()? {
+        Some(refusal) => Err(io::Error::other(Refusal(refusal))),
+        None => Ok(()),
     }
 }
 

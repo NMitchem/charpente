@@ -662,9 +662,10 @@ opting a table out of drift protection is the cost of not using `#[table]`.
 **Payload shapes.** `#[event]` and `#[job]` carry the same structural fingerprint
 `#[table]` does (`Event::FINGERPRINT`, `Job::FINGERPRINT` — required on a hand-written
 impl, no default), and every emit and enqueue records it in the log beside the payload.
-An event payload is decoded only under the shape it was written with: delivery refuses
-a foreign-shape event by name and ends that one tail (§6). There is no per-row versioned
-decode — the migrations spec rejected it twice — and no override (MANIFESTO §8).
+A payload is decoded only under the shape it was written with: delivery refuses a
+foreign-shape event by name and ends that one tail, and a node refuses to dispatch while
+a Pending job of a type it mounts carries a foreign shape (§6). There is no per-row
+versioned decode — the migrations spec rejected it twice — and no override (MANIFESTO §8).
 
 **The gate, the barrier, and the seven refusals.** A built-in table,
 `charpente.schema_versions`, records each versioned table's last-known `(version,
@@ -1183,7 +1184,13 @@ slot.
   backoff, Dead at the policy's `max`, last_error carried (typed `RetryPolicy` on the
   `#[job]` item; handler panics are absorbed into the same path). At-least-once execution
   plus idempotency-key observability is the framing M1's external-effect handlers need; v0
-  handlers are pure state and don't need it yet.
+  handlers are pure state and don't need it yet. Every enqueue records the payload type's
+  structural fingerprint (§3). The kernel refuses to dispatch while a Pending job of a
+  mounted type carries another shape, naming the job, its ids and both shapes. It checks at
+  startup and wherever its write gate opens, and `promote` checks before its durable flip.
+  A switchover is never refused at the hand-off, which is the primary's point of no return
+  (§5): its target stops at the write-gate flip instead, where the refusal's fix still
+  works. Dispatch asserts the invariant.
 - **Cron.** Schedules are rows; a due tick is one transaction that advances `next_due` and
   enqueues through the normal path — a recurring enqueuer, inheriting retry and
   observability for free. Catch-up fires once per wake, never backfills. In simulation,

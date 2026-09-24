@@ -90,7 +90,10 @@ impl Default for DbConfig {
 pub trait Job: Codec {
     const NAME: &'static str;
     /// The payload's structural fingerprint — `#[job]` computes it from the
-    /// fields (the helper `#[table]` uses). Recorded beside every enqueue. No
+    /// fields (the helper `#[table]` uses). Recorded beside every enqueue. A
+    /// Pending job is decoded only by a binary whose `FINGERPRINT` matches:
+    /// a Pending job of a foreign shape is refused before dispatch can start
+    /// (`Db::pending_job_shape_refusal`), and dispatch asserts it. No
     /// default, unlike `Row::FINGERPRINT`: a hand-written impl must state one,
     /// or a hand-written job would opt out of the check silently.
     const FINGERPRINT: u64;
@@ -142,6 +145,32 @@ pub enum TxError<E> {
     Verifying {
         unreached: Vec<String>,
     },
+}
+
+/// A named refusal: the platform declining to proceed on state it will not
+/// guess about — a Pending job of a foreign shape
+/// (`Db::pending_job_shape_refusal`). Carried inside `io::Error::other`, so
+/// every `io::Result` path is untouched, and read back with `Refusal::of`:
+/// restarting the same binary clears a platform IO failure and never a
+/// refusal, so whoever reports why the kernel stopped must tell the two apart
+/// (payload-shapes spec §5).
+#[derive(Debug)]
+pub struct Refusal(pub String);
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+impl Refusal {
+    /// `Some` when `e` carries a `Refusal`.
+    pub fn of(e: &io::Error) -> Option<&Refusal> {
+        e.get_ref()
+            .and_then(|inner| inner.downcast_ref::<Refusal>())
+    }
 }
 
 /// Collapses a `TxError` from a platform-internal transaction (the schema
@@ -238,6 +267,13 @@ pub struct SealedSegment {
 pub struct Schema {
     tables: BTreeMap<&'static str, TableOps>,
     migrations: BTreeMap<&'static str, Vec<crate::migration::MigrationStep>>,
+    /// `Job::NAME` → `Job::FINGERPRINT` for every job type this binary
+    /// mounts (`Db::register_job_shapes`). Here rather than on `Db` because a
+    /// snapshot re-seed rebuilds the `Db` from its schema, and a registry
+    /// kept anywhere else would come back empty (spec amendment A4). Not part
+    /// of `schema_digest_of`: job shapes are refused at promote, never
+    /// compared in Hello (spec §8).
+    job_shapes: BTreeMap<&'static str, u64>,
 }
 
 impl Schema {
@@ -2587,6 +2623,89 @@ impl Db {
     /// `decide_hello` refuses to seed a newcomer in this state.
     pub fn verifying(&self) -> bool {
         matches!(self.gate, WriteGate::Verifying(_))
+    }
+
+    /// Registers each mounted job type's payload shape so
+    /// `pending_job_shape_refusal` can name a Pending row this binary would
+    /// decode under a foreign shape. `Kernel::build` calls it with the
+    /// mounted `JobDef`s. Re-registering the same pair is a no-op; one name
+    /// under two shapes is impossible past `mount_jobs`' duplicate refusal.
+    pub fn register_job_shapes(&mut self, shapes: &[(&'static str, u64)]) {
+        let registry = &mut self.engine.machine_mut().schema.job_shapes;
+        for &(name, fingerprint) in shapes {
+            let prev = registry.insert(name, fingerprint);
+            assert!(
+                prev.is_none_or(|p| p == fingerprint),
+                "job \"{name}\" registered under two shapes ({:#x} and {fingerprint:#x}) — \
+                 mount_jobs refuses a duplicate name, so this is a platform bug",
+                prev.unwrap_or_default()
+            );
+        }
+    }
+
+    /// The check that runs wherever dispatch could start (payload-shapes spec
+    /// §4, amendment A1): at kernel start on a writable node, whenever the
+    /// kernel's write gate opens (a witness gate opening, a completed
+    /// switchover), and before a promote flips the role. `Some(refusal)`
+    /// names every Pending job of a registered type whose recorded shape is
+    /// not the one this binary compiled — a row with no recorded shape
+    /// included — one line per job type. Done and Dead rows are never
+    /// decoded again and are ignored; a Pending row of an UNREGISTERED name
+    /// keeps its own path (dispatch's "not registered" dead-letter).
+    pub fn pending_job_shape_refusal(&self) -> io::Result<Option<String>> {
+        const LISTED_IDS: usize = 5;
+        let registry = &self.engine.machine().schema.job_shapes;
+        if registry.is_empty() {
+            return Ok(None);
+        }
+        let mut foreign: BTreeMap<&'static str, (Vec<u64>, BTreeSet<Option<u64>>)> =
+            BTreeMap::new();
+        for job in self.snapshot()?.scan::<JobRow>()? {
+            if job.status != crate::job::JobStatus::Pending {
+                continue;
+            }
+            let Some((&name, &compiled)) = registry.get_key_value(job.name.as_str()) else {
+                continue;
+            };
+            if job.shape == Some(compiled) {
+                continue;
+            }
+            let (ids, recorded) = foreign.entry(name).or_default();
+            ids.push(job.id.raw());
+            recorded.insert(job.shape);
+        }
+        if foreign.is_empty() {
+            return Ok(None);
+        }
+        let lines: Vec<String> = foreign
+            .into_iter()
+            .map(|(name, (ids, recorded))| {
+                let mut listed: Vec<String> =
+                    ids.iter().take(LISTED_IDS).map(u64::to_string).collect();
+                if ids.len() > LISTED_IDS {
+                    listed.push("…".to_string());
+                }
+                let recorded: Vec<String> = recorded
+                    .into_iter()
+                    .map(|shape| match shape {
+                        Some(shape) => format!("{shape:#x}"),
+                        None => "none — enqueued before job shapes were tagged".to_string(),
+                    })
+                    .collect();
+                format!(
+                    "{} Pending \"{name}\" job(s) (ids {}) were enqueued under a different shape \
+                     of {name} (recorded {}; this binary {:#x}) — this binary will not decode \
+                     them; run the previous binary until they are Done or Dead, then upgrade, or \
+                     restore {name}'s old fields and give the new shape its own #[job] type \
+                     (GUIDE §6)",
+                    ids.len(),
+                    listed.join(", "),
+                    recorded.join(", "),
+                    registry[name]
+                )
+            })
+            .collect();
+        Ok(Some(lines.join("\n")))
     }
 
     /// Applies frames shipped from the primary: the follower's only write

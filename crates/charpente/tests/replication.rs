@@ -7669,3 +7669,281 @@ fn the_kernel_completes_its_skipped_startup_work_when_the_witness_gate_opens() {
     )
     .unwrap();
 }
+
+// ============================================================ job shapes
+//
+// A Pending job is only ever decoded by a binary that compiled its shape
+// (payload-shapes spec §4, amendment A1): a promote over a foreign one is
+// refused before its durable flip, and every other way the write gate opens
+// stops the kernel by name.
+
+/// A different shape for `Ping` ("ping"): what a follower running a binary
+/// whose `Ping` gained a field would register.
+const PING_V2_FINGERPRINT: u64 = 0x7E57_0106;
+
+fn ping_refusal(ids: &str, compiled: u64) -> String {
+    format!(
+        "1 Pending \"ping\" job(s) (ids {ids}) were enqueued under a different shape of ping \
+         (recorded {:#x}; this binary {compiled:#x}) — this binary will not decode them; run \
+         the previous binary until they are Done or Dead, then upgrade, or restore ping's old \
+         fields and give the new shape its own #[job] type (GUIDE §6)",
+        <Ping as Job>::FINGERPRINT
+    )
+}
+
+fn enqueue_ping(node: &mut Node) {
+    node.db
+        .as_mut()
+        .unwrap()
+        .transact(|tx| {
+            tx.enqueue(Ping { n: 7 });
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+}
+
+fn promote_f(sim: &Sim, f: &mut Node) -> Msg {
+    f.flipped = true;
+    CtrlConn::open(sim, "f:1", &Msg::CtrlPromote { secret: None })
+        .and_then(|mut cli| drive_ctrl(sim, &mut [f], &mut cli, CONVERGE_BUDGET))
+        .unwrap()
+}
+
+/// Spec §4 at promote, amendment A1: refused BY NAME before the durable role
+/// flips, so the node stays a follower. Promoting first and stopping after
+/// would leave a durable primary that refuses to start on every restart.
+#[test]
+fn a_promote_over_foreign_pending_jobs_is_refused_and_the_node_stays_a_follower() {
+    let sim = Sim::with_faults(0x5A9E_0701, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    f.db.as_mut()
+        .unwrap()
+        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT)]);
+    enqueue_ping(&mut p);
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    p.host.crash_now();
+    match promote_f(&sim, &mut f) {
+        Msg::CtrlErr { message } => assert_eq!(
+            message,
+            format!("cannot promote: {}", ping_refusal("0", PING_V2_FINGERPRINT))
+        ),
+        other => panic!("expected CtrlErr, got {other:?}"),
+    }
+    assert!(
+        matches!(f.repl.role(), Role::Follower { .. }),
+        "still a follower in memory"
+    );
+    assert!(!f.db.as_ref().unwrap().writes_allowed(), "and not writable");
+    let (durable, _) = charpente::repl::role::load_role(&f.host.disk(), &Role::Primary).unwrap();
+    assert!(
+        matches!(durable, Role::Follower { .. }),
+        "and still a follower on disk"
+    );
+}
+
+/// The control: the same promote with a matching shape succeeds.
+#[test]
+fn a_promote_over_same_shape_pending_jobs_succeeds() {
+    let sim = Sim::with_faults(0x5A9E_0702, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    f.db.as_mut()
+        .unwrap()
+        .register_job_shapes(&[("ping", <Ping as Job>::FINGERPRINT)]);
+    enqueue_ping(&mut p);
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    p.host.crash_now();
+    assert!(matches!(promote_f(&sim, &mut f), Msg::CtrlOk { .. }));
+}
+
+/// Done rows are never decoded again, so they never refuse anything.
+#[test]
+fn a_promote_over_foreign_done_jobs_succeeds() {
+    let sim = Sim::with_faults(0x5A9E_0703, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    f.db.as_mut()
+        .unwrap()
+        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT)]);
+    enqueue_ping(&mut p);
+    p.db.as_mut()
+        .unwrap()
+        .transact(|tx| {
+            let mut job = tx
+                .get(Id::<JobRow>::from_raw(0))?
+                .expect("the enqueued ping");
+            job.status = JobStatus::Done;
+            tx.put(&job);
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    p.host.crash_now();
+    assert!(matches!(promote_f(&sim, &mut f), Msg::CtrlOk { .. }));
+}
+
+/// Review focus 4, amendment A4: a snapshot re-seed rebuilds the follower's
+/// `Db` from its schema, so the job-shape registry must live IN the schema. A
+/// registry kept anywhere else comes back empty and this promote goes through.
+#[test]
+fn a_promote_after_a_snapshot_reseed_still_refuses_foreign_pending_jobs() {
+    let sim = Sim::with_faults(0x5A9E_0704, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), seeding_db_cfg()).unwrap();
+    enqueue_ping(&mut p);
+    for i in 0..60u64 {
+        p.db.as_mut()
+            .unwrap()
+            .transact(|tx| {
+                tx.put(&Widget {
+                    id: Id::from_raw(i),
+                    kind: i % 3,
+                    weight: i as i64,
+                });
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
+    }
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), seeding_db_cfg()).unwrap();
+    f.db.as_mut()
+        .unwrap()
+        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT)]);
+    run_until(
+        &sim,
+        &mut [&mut p, &mut f],
+        |ns| ns[1].repl.stats().seeds >= 1 && converged(ns),
+        CONVERGE_BUDGET,
+    )
+    .unwrap();
+    assert!(
+        total_seeds(&f) >= 1,
+        "the precondition: f was snapshot-seeded"
+    );
+    p.host.crash_now();
+    match promote_f(&sim, &mut f) {
+        Msg::CtrlErr { message } => assert_eq!(
+            message,
+            format!("cannot promote: {}", ping_refusal("0", PING_V2_FINGERPRINT))
+        ),
+        other => panic!("the registry did not survive the re-seed: {other:?}"),
+    }
+}
+
+/// Review focus 3, amendment A1: a switchover onto a follower holding a
+/// Pending job of a foreign shape — the ordinary rolling deploy (upgrade the
+/// follower, switch over, upgrade the old primary). HandedOff is DESIGN §5's
+/// point of no return, so the target does NOT refuse the hand-off: a refusal
+/// there leaves the primary write-stopped and the target a follower, with no
+/// named way out. The switchover completes, and the new primary names the jobs
+/// — its kernel refuses at the write-gate flip (the next test), and that
+/// refusal's fix works from exactly this state.
+#[test]
+fn a_switchover_onto_foreign_pending_jobs_completes_and_the_new_primary_names_them() {
+    let sim = Sim::with_faults(0x5A9E_0705, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    f.db.as_mut()
+        .unwrap()
+        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT)]);
+    enqueue_ping(&mut p);
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+    p.flipped = true;
+    f.flipped = true;
+    let mut cli = CtrlConn::open(
+        &sim,
+        "p:1",
+        &Msg::CtrlSwitchover {
+            to: "f:1".to_string(),
+            secret: None,
+        },
+    )
+    .unwrap();
+    let reply = drive_ctrl(&sim, &mut [&mut p, &mut f], &mut cli, CONVERGE_BUDGET).unwrap();
+    assert!(
+        matches!(reply, Msg::CtrlOk { .. }),
+        "the switchover completes — it is never stranded mid-hand-off: {reply:?}"
+    );
+    assert!(matches!(f.repl.role(), Role::Primary), "f is the primary");
+    assert!(
+        matches!(p.repl.role(), Role::Follower { .. }),
+        "p follows it"
+    );
+    assert_eq!(
+        f.db.as_ref().unwrap().pending_job_shape_refusal().unwrap(),
+        Some(ping_refusal("0", PING_V2_FINGERPRINT)),
+        "and the new primary names the foreign jobs — the refusal its kernel stops on"
+    );
+}
+
+/// Spec §4 at the write gate's opening, through the kernel (amendment A1): a
+/// primary restarted with a witness opens gated, holding a Pending job of a
+/// foreign shape. When the witness answers, the gate opens, and the kernel
+/// refuses by name in `after_repl_step` before it dispatches, migrates or
+/// writes anything. A completed switchover's target reaches this same check,
+/// through `accept_handoff`'s `allow_writes`.
+#[test]
+fn a_write_gate_opening_over_foreign_pending_jobs_stops_the_kernel_by_name() {
+    let sim = Sim::with_faults(0x5A9E_0706, FaultConfig::none());
+    let horizon = 100 * 1_000_000_000;
+    let ph = sim.host("p");
+    {
+        let mut db = Db::open(Box::new(ph.disk()), DbConfig::default(), full_schema()).unwrap();
+        db.transact(|tx| {
+            tx.enqueue(Ping { n: 7 });
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+        db.checkpoint().unwrap();
+    }
+    store_witnesses(&ph.disk(), &["w:1".to_string()]).unwrap();
+    let mut p = spawn_kernel_node(
+        &sim,
+        "p",
+        primary_cfg("p:1"),
+        DbConfig::default(),
+        horizon,
+        true,
+    )
+    .unwrap();
+    // This binary's `ping` has another shape. `kernel_schema`'s kernels mount
+    // `Bump` only, so registering `ping` by hand collides with nothing.
+    p.kernel
+        .as_mut()
+        .unwrap()
+        .app_mut_for_tests()
+        .db_for_tests()
+        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT)]);
+    assert!(
+        !p.kernel.as_ref().unwrap().app().db().writes_allowed(),
+        "the precondition: the kernel opens gated, so Kernel::build's own check did not run"
+    );
+    let mut w = spawn_kernel_node(
+        &sim,
+        "w",
+        follower_cfg("w:1", "p:1"),
+        DbConfig::default(),
+        horizon,
+        true,
+    )
+    .unwrap();
+    let err = krun_until(&sim, &mut [&mut p, &mut w], |_| false, CONVERGE_BUDGET).unwrap_err();
+    assert_eq!(
+        err,
+        format!("p kernel step: {}", ping_refusal("0", PING_V2_FINGERPRINT))
+    );
+    let jobs = p
+        .kernel
+        .as_ref()
+        .unwrap()
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan::<JobRow>()
+        .unwrap();
+    assert_eq!(
+        (jobs.len(), jobs[0].status, jobs[0].attempts),
+        (1, JobStatus::Pending, 0),
+        "the foreign job was never dispatched"
+    );
+}
