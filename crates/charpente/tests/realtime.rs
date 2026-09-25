@@ -934,6 +934,46 @@ fn plant_corrupt_event_row(kernel: &mut Kernel, id: u64) {
     apply_record(kernel, record);
 }
 
+/// GUIDE §11: the envelope holds a row's name and key, so a row whose own
+/// bytes do not decode ends every tail whose scan reaches it, whatever it
+/// subscribes to — and the good rows read in the same batch before it are
+/// withheld: the frame's `id` is the first of them.
+#[test]
+fn an_envelope_corrupt_row_withholds_its_batch_and_ends_every_tail_reaching_it() {
+    let (sim, mut kernel, rows) = mixed_log(
+        0x5A9E_0308,
+        &[("/pong", 0, None), ("/pong", 1, None), ("/pong", 2, None)],
+    );
+    plant_corrupt_event_row(&mut kernel, rows[2].id.raw());
+    let (_, sinks) = run_script(
+        &mut kernel,
+        &sim,
+        vec![
+            Request::new(
+                Method::Get,
+                format!("/pongs?cursor={}", cursor_of(&rows[0])),
+            ),
+            Request::new(
+                Method::Get,
+                format!("/v2/dropped?cursor={}", cursor_of(&rows[0])),
+            ),
+        ],
+    );
+    let handles = sinks.lock().unwrap();
+    assert_eq!(handles.len(), 2);
+    for handle in handles.iter() {
+        let frames = frames_of(handle);
+        assert_eq!(
+            frames.len(),
+            1,
+            "pong 1 is withheld with its batch: {frames:?}"
+        );
+        assert_eq!(frames[0].2, "charpente.error");
+        let body: serde_json::Value = serde_json::from_str(&frames[0].3).unwrap();
+        assert_eq!(body["id"], rows[1].id.raw());
+    }
+}
+
 /// A cursor ON a row whose own bytes do not decode gets a 500 that names the
 /// corruption and the fix, not the retryable storage-failure 500: every retry
 /// reads the same bytes. The envelope holds no app-defined type, so corrupt
@@ -1083,6 +1123,90 @@ fn a_corrupt_event_row_at_the_floor_is_collected_by_retention() {
         .map(|row| row.id.raw())
         .collect();
     assert_eq!(retained, vec![1, 2]);
+}
+
+/// A hand-written event whose `NAME` holds a quote: `Event::NAME` is
+/// hand-writable, so the terminal frames must build their JSON as JSON, not
+/// by pasting the name between quotes.
+#[derive(Serialize)]
+struct Quoted {
+    n: u64,
+}
+
+impl Codec for Quoted {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.n.encode(out);
+    }
+    fn decode(input: &mut &[u8]) -> io::Result<Quoted> {
+        Ok(Quoted {
+            n: u64::decode(input)?,
+        })
+    }
+}
+
+impl Event for Quoted {
+    const NAME: &'static str = "say \"hi\"";
+    const FINGERPRINT: u64 = 0x7E57_0A11;
+}
+
+#[route(SSE "/quoted", public)]
+fn feed_quoted(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscription, ApiError> {
+    let _ = (tx, ctx);
+    Ok(Subscription::of::<Quoted>().cursor(cursor))
+}
+
+#[test]
+fn an_event_name_is_escaped_in_the_terminal_frames() {
+    let sim = Sim::with_faults(0x5A9E_0307, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![feed_quoted]);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let (_, reshaped) = run_script(
+        &mut kernel,
+        &sim,
+        vec![Request::new(Method::Get, "/quoted")],
+    );
+    apply_record(
+        &mut kernel,
+        shaped_emit_record(Quoted::NAME, &[0u8; 8], 0xBAD),
+    );
+    let (_, undecodable) = run_script(
+        &mut kernel,
+        &sim,
+        vec![Request::new(Method::Get, "/quoted")],
+    );
+    apply_record(
+        &mut kernel,
+        shaped_emit_record(Quoted::NAME, &[], Quoted::FINGERPRINT),
+    );
+    run_script(&mut kernel, &sim, Vec::new());
+    for (sinks, frame) in [(reshaped, RESHAPED_FRAME), (undecodable, ERROR_FRAME)] {
+        let frames = frames_of(&sinks.lock().unwrap()[0]);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0].2, frame);
+        let body: serde_json::Value = serde_json::from_str(&frames[0].3)
+            .unwrap_or_else(|e| panic!("the {frame} frame is not JSON ({e}): {}", frames[0].3));
+        assert_eq!(body["event"], Quoted::NAME);
+    }
+}
+
+/// A subscription carrying two event types of one `NAME` could only ever
+/// deliver the first; carrying both is refused by name.
+#[test]
+#[should_panic(
+    expected = "Subscription::and: event \"incident_opened\" is already in this subscription — an \
+                event appears once, and two #[event] types sharing a NAME (the type's snake_case) \
+                would leave the second undeliverable; give the other type its own name (GUIDE \
+                §11, \"Changing an event\")"
+)]
+fn a_subscription_refuses_two_events_of_one_name() {
+    let _ = Subscription::of::<shapes_v1::IncidentOpened>().and::<shapes_v2::IncidentOpened>();
 }
 
 fn realtime_app(sim: &Sim) -> io::Result<App> {

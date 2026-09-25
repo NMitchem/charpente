@@ -3482,10 +3482,10 @@ writing the scope's `authorize`, and the cross-tenant capability — and points
 back here for the emit and subscribe shapes above.
 
 One contract rides along with the `Serialize` derive: every `#[event]` payload must be
-plainly JSON. serde_json refuses a map whose keys do not serialize as a string or a
-number (a `Vec<u8>`, tuple or struct key, say), and it does not refuse a `NaN` or
-infinite float value — it writes `null`, so a client receives `null` where a number
-was. Neither is caught at emit time (the log stores `Codec` bytes; JSON
+plainly JSON. serde_json writes a map key quoted when it serializes as a string, a
+number or a bool, and refuses any other key (a `Vec<u8>`, tuple or struct key, say) and a
+non-finite float key. It does not refuse a `NaN` or infinite float value — it writes
+`null`, so a client receives `null` where a number was. Neither is caught at emit time (the log stores `Codec` bytes; JSON
 encoding happens at delivery). An event that fails to encode fails its own tail and
 never the node: the stream ends with one terminal frame, the same frame a stored event
 whose bytes do not decode gets:
@@ -3506,8 +3506,12 @@ the text names both with their fixes: a change inside a type one of its fields h
 which the fingerprint cannot see (§12) — restore that type's old definition and put the
 new one in a new `#[event]` type under a new name ("Changing an event" below) — or
 corrupt bytes — restore the node from its archive (§15) or re-seed it from its primary
-(§10). A row whose own envelope is corrupt gets the same frame, with `id` naming the first event this tail had
-not yet received and no `event`.
+(§10). A row whose own envelope is corrupt gets the same frame, with `id` naming the
+first event this tail had not yet received and no `event`. The envelope is what holds a
+row's name and key, so such a row ends every tail whose scan reaches it, whatever the
+tail subscribes to or filters on. The frame also arrives in place of the whole batch the
+row was read in (up to 64 rows): the good rows before it in that batch are withheld too,
+and every reconnect from the client's cursor withholds them again.
 
 ### The SSE route and `Subscription`
 
@@ -3583,7 +3587,8 @@ impl Subscription {
 
 `Subscription::of::<Ping>()` names the event type as a Rust type, not a string — a
 typo is a compile error, never a silently-empty subscription. `.and::<Ev2>()` adds a
-second type to the same tail; `.key(...)` narrows delivery to one exact-match value;
+second type to the same tail, and panics, naming the event, if one of its `NAME` is
+already there (see "Changing an event" below); `.key(...)` narrows delivery to one exact-match value;
 `.cursor(...)` takes the resume point the platform already extracted (next) — the
 handler can pass it straight through, as `feed` does above, or clamp it to some
 app-level boundary.
@@ -3810,9 +3815,10 @@ code, and keep the old type in code — and in any subscription that still needs
 for as long as its rows are retained (`DbConfig::event_retention`). A new name is not
 optional: `NAME` is the type's own snake_case, so putting the new type in a new module
 with the *same* type identifier (`mod v2 { struct IncidentOpened { ... } }`) still
-collides on `incident_opened` — nothing stops that pair from compiling or mounting,
-and a subscription carrying both then treats every row of the newer shape as a foreign
-row of the older one. Old rows keep decoding under their own type. Changing the fields
+collides on `incident_opened`. The pair compiles; `App::mount_events` panics on it, and
+so does a subscription carrying both (`.and`, naming the event). A subscription carrying
+only the older type treats every row of the newer shape as a foreign one, and ends at
+the first with `charpente.reshaped`. Old rows keep decoding under their own type. Changing the fields
 in place costs every subscriber positioned before the change one re-sync. What the
 fingerprint cannot see, a change inside a type a field holds, is in §12; a stored row
 such a change breaks ends its tail with `charpente.error` (above), whose text names that

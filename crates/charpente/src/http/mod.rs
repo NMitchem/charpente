@@ -233,7 +233,19 @@ impl Subscription {
         }
     }
 
+    /// Adds another event type. Panics if one of that `NAME` is already
+    /// here: delivery matches a row to the first entry of its name, so a
+    /// second could never be delivered — two `#[event]` types in different
+    /// modules with the same type identifier share a `NAME`.
     pub fn and<Ev: Event + serde::Serialize>(mut self) -> Subscription {
+        assert!(
+            !self.entries.iter().any(|e| e.name == Ev::NAME),
+            "Subscription::and: event \"{}\" is already in this subscription — an event appears \
+             once, and two #[event] types sharing a NAME (the type's snake_case) would leave the \
+             second undeliverable; give the other type its own name (GUIDE §11, \"Changing an \
+             event\")",
+            Ev::NAME
+        );
         self.entries.push(SubEntry {
             name: Ev::NAME,
             encode_json: ev_json::<Ev>,

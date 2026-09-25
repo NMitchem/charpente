@@ -145,6 +145,8 @@ pub fn deliver_unit(tail: &mut Tail, db: &Db) -> io::Result<bool> {
         let Some(entry) = tail.sub.entries.iter().find(|e| e.name == row.name) else {
             continue;
         };
+        // Names are escaped as JSON strings in both terminal frames below:
+        // `Event::NAME` is hand-writable and may hold any character.
         if row.shape != Some(entry.fingerprint) {
             // Never decoded: this binary cannot prove those bytes are its own
             // shape. The tail ends here, the node does not, and every other
@@ -154,8 +156,8 @@ pub fn deliver_unit(tail: &mut Tail, db: &Db) -> io::Result<bool> {
                 seq: row.seq,
                 name: RESHAPED_FRAME,
                 json: format!(
-                    "{{\"event\":\"{}\",\"id\":{},\"fix\":\"re-sync current state through reads, then reconnect without a cursor\"}}",
-                    entry.name,
+                    "{{\"event\":{},\"id\":{},\"fix\":\"re-sync current state through reads, then reconnect without a cursor\"}}",
+                    serde_json::Value::String(entry.name.to_string()),
                     row.id.raw()
                 ),
             });
@@ -169,8 +171,8 @@ pub fn deliver_unit(tail: &mut Tail, db: &Db) -> io::Result<bool> {
                     seq: row.seq,
                     name: ERROR_FRAME,
                     json: format!(
-                        "{{\"event\":\"{}\",\"id\":{},\"error\":{}}}",
-                        entry.name,
+                        "{{\"event\":{},\"id\":{},\"error\":{}}}",
+                        serde_json::Value::String(entry.name.to_string()),
                         row.id.raw(),
                         serde_json::Value::String(e.to_string())
                     ),

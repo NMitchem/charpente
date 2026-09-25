@@ -1292,8 +1292,8 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
   that reports `Full` or `Closed` costs the tail its connection, deterministically and
   immediately: a slow or dead consumer never costs kernel progress, and the client's cursor
   resume is the recovery mechanism, not a server-side retry queue. Event payloads must be
-  plainly JSON — serde_json refuses a map whose keys do not serialize as a string or a
-  number (and writes a non-finite float value as `null`). An event that fails to
+  plainly JSON — serde_json refuses a map key that does not serialize as a string, a number
+  or a bool, and a non-finite float key (and writes a non-finite float value as `null`). An event that fails to
   encode, or whose stored bytes do not decode under its recorded shape (corrupt bytes, or
   a change inside a type one of its fields holds, which the fingerprint cannot see — the
   text names both), ends that subscriber's tail with a terminal `charpente.error` frame
