@@ -432,25 +432,24 @@ fields length-prefixed per the row codec. The shape is the payload type's
 structural fingerprint (§3). The pre-shape `0x02`/`0x03` (the same without the
 shape) still decode, with the shape unknown, and are never written. A
 tenant-scoped table's (`Row::Scope != Unscoped`, tenant-scoping Task 4) put
-and delete carry the
-scope instead: `0x05 [table][scope: u64][row]`, `0x06 [table][scope:
-u64][id]` — chosen by the table's own scopedness, never by the scope's
-value, so a scoped table still uses `0x05`/`0x06` at scope 0 (tenant 0 is a
-legal tenant, not "no scope"); every other table's put/delete stays exactly
-the `0x00`/`0x01` shape above, byte-identical to before tenant scoping. A
-scoped table's `MigratePut` (tenant-scoping Task 6c) is `0x07 [table][scope:
-u64][id: u64][row]` — a NEW tag rather than a widened `0x04`, the same
-choice `0x05`/`0x06` made over `0x00`/`0x01`, so `0x04`'s bytes for an
-unscoped table stay exactly as above. `0x0a` is the next free tag. A binary
-that does not know a tag (older, or a later one it hasn't caught up to)
-refuses it by name rather than misreading a wider record. Table effects are
-the transaction's collapsed write set in (table, scope, id) order —
-intermediate overwrites inside a transaction are observable by no one and
-are not
-logged; enqueues and emits keep call order. Replay resolves table names
-through the `Schema` registry passed to `Db::open`. The enqueue key is the
-job's stable external identity — carried, never interpreted inside the
-deterministic boundary in v0; M1's external-IO surface is what consumes it.
+and delete carry the scope instead: `0x05 [table][scope: u64][row]`,
+`0x06 [table][scope: u64][id]` — chosen by the table's own scopedness, never
+by the scope's value, so a scoped table still uses `0x05`/`0x06` at scope 0
+(tenant 0 is a legal tenant, not "no scope"); every other table's put/delete
+stays exactly the `0x00`/`0x01` shape above, byte-identical to before tenant
+scoping. A scoped table's `MigratePut` (tenant-scoping Task 6c) is
+`0x07 [table][scope: u64][id: u64][row]` — a NEW tag rather than a widened
+`0x04`, the same choice `0x05`/`0x06` made over `0x00`/`0x01`, so `0x04`'s
+bytes for an unscoped table stay exactly as above. `0x0a` is the next free
+tag. A binary that does not know a tag (older, or a later one it hasn't
+caught up to) refuses it by name rather than misreading a wider record.
+Table effects are the transaction's collapsed write set in (table, scope,
+id) order — intermediate overwrites inside a transaction are observable by
+no one and are not logged; enqueues and emits keep call order. Replay
+resolves table names through the `Schema` registry passed to `Db::open`. The
+enqueue key is the job's stable external identity — carried, never
+interpreted inside the deterministic boundary in v0; M1's external-IO
+surface is what consumes it.
 
 **Group commit (M2 sub-project 2, 2026-08-15).** The commit point is a *group*, not a
 transaction. `Db::begin_group` opens one store snapshot and an empty group overlay;
@@ -1009,31 +1008,31 @@ schema's word for that table and refuses a mismatch by name rather than importin
 under the wrong scope. `PROTO_VERSION` is 3 — a message body's shape changing is what
 bumps it: tenant scoping's tag 14 made it 2, payload shapes' `0x08`/`0x09` record tags
 made it 3, and a `Hello` declaring an older version is refused by name. The follower
-buffers the stream and, at `SnapshotEnd`, latches `db_needs_reseed` — `Repl::step`
-cannot replace a `Db` it only borrows, so the CALLER (the kernel arm, T8) runs
-`Repl::run_seed(db, clock)`,
-which consumes the `Db` through `into_seeder`, replays the buffer, `finish`es at the
-horizon + 1 boundary, re-gates writes, and returns the new `Db`; a conn death mid-stream
-never latches, and the next `Hello` restarts the seed from scratch (idempotent —
-`Seeder::new` discards). Stated plainly: v1 seeding holds the full logical snapshot in
-memory on BOTH sides — the primary queues the whole stream when seeding begins, the
-follower buffers it until `SnapshotEnd`. `SnapshotStart` also carries the seed frontier's
-CRC — the primary's `frame_crc` of the record at `applied_seq`, which the follower persists
-(`seed_frontier_seq`/`seed_frontier_crc` meta): a freshly-seeded follower holds none of that
-record's WAL bytes (its own log starts empty at `applied_seq + 1`), so without it `Hello`
-could only send `None`, and a primary that had since lost its own tail above the horizon
-would answer that empty position with a re-seed — silently wiping a converged survivor from
-the now-lossy primary. With the CRC the follower Hellos `(applied_seq, crc)`, so the ladder
-runs its diverged-ahead / resume checks instead; the fallback holds across a restart before
-any frame ships, and fires only while `last_applied` still equals the seed's seq — the CRC
-vouches for that one record alone, and a node whose log vanished after applying past the
-seed honestly sends `None` and re-seeds (finding-1 fix). A seeded-then-promoted primary that
-has to seed others before its first commit chains the same stored frontier into its own
-`SnapshotStart`. Right at M1 scale; incremental streaming is the
-tracked fix before large-store seeding. The durable role file (§2's role semantics, T5) carries its own
-CRC line: a torn role write is a named integrity error, never a parse of whatever bytes
-survived — a torn "follower:p:1" that still parses as a role naming a ghost primary is
-exactly what the T6 harness caught (seed 0x51dacce702b667c8).
+buffers the stream and, at `SnapshotEnd`, latches `db_needs_reseed` — `Repl::step` cannot
+replace a `Db` it only borrows, so the CALLER (the kernel arm, T8) runs
+`Repl::run_seed(db, clock)`, which consumes the `Db` through `into_seeder`, replays the
+buffer, `finish`es at the horizon + 1 boundary, re-gates writes, and returns the new `Db`;
+a conn death mid-stream never latches, and the next `Hello` restarts the seed from scratch
+(idempotent — `Seeder::new` discards). Stated plainly: v1 seeding holds the full logical
+snapshot in memory on BOTH sides — the primary queues the whole stream when seeding
+begins, the follower buffers it until `SnapshotEnd`. `SnapshotStart` also carries the seed
+frontier's CRC — the primary's `frame_crc` of the record at `applied_seq`, which the
+follower persists (`seed_frontier_seq`/`seed_frontier_crc` meta): a freshly-seeded
+follower holds none of that record's WAL bytes (its own log starts empty at
+`applied_seq + 1`), so without it `Hello` could only send `None`, and a primary that had
+since lost its own tail above the horizon would answer that empty position with a re-seed
+— silently wiping a converged survivor from the now-lossy primary. With the CRC the
+follower Hellos `(applied_seq, crc)`, so the ladder runs its diverged-ahead / resume
+checks instead; the fallback holds across a restart before any frame ships, and fires only
+while `last_applied` still equals the seed's seq — the CRC vouches for that one record
+alone, and a node whose log vanished after applying past the seed honestly sends `None`
+and re-seeds (finding-1 fix). A seeded-then-promoted primary that has to seed others
+before its first commit chains the same stored frontier into its own `SnapshotStart`.
+Right at M1 scale; incremental streaming is the tracked fix before large-store seeding.
+The durable role file (§2's role semantics, T5) carries its own CRC line: a torn role
+write is a named integrity error, never a parse of whatever bytes survived — a torn
+"follower:p:1" that still parses as a role naming a ghost primary is exactly what the T6
+harness caught (seed 0x51dacce702b667c8).
 
 **The control plane (v1, implemented).** Admin verbs travel over the replication port as
 control messages in the same protocol (M1 replication T7) — the sim drives them through
@@ -1099,13 +1098,12 @@ established by probing, so a strict node starts, serves reads for the deadline w
 only then stops; and the stop reaches a supervisor on every node shape — under
 `serve::backup` the error returns from the call, and under `serve::serve_replicated` the
 kernel's stop ends the process through `Server::wait` (below) with status 1, so a
-supervisor restarts it and keeps restarting it until a witness answers. **The bound, stated
-so it is not read
-wider: a probe answers "is THIS witness a primary", never "does another primary exist".**
-A node promoted after a switchover chain, never in this node's witness set, is invisible to
-the check — the witness set is the bound on the whole defence, and the M2 backlog's Design C
-(a durable timeline epoch carried on `Hello`) would sharpen the refusal rather than replace
-the probe.
+supervisor restarts it and keeps restarting it until a witness answers. **The bound,
+stated so it is not read wider: a probe answers "is THIS witness a primary", never "does
+another primary exist".** A node promoted after a switchover chain, never in this node's
+witness set, is invisible to the check — the witness set is the bound on the whole
+defence, and the M2 backlog's Design C (a durable timeline epoch carried on `Hello`) would
+sharpen the refusal rather than replace the probe.
 
 **What a `Verifying` node may do as a peer** (M2 interlude, spec `docs/superpowers/specs/
 2026-08-06-verifying-peer-policy-design.md`) narrows the one thing the boot gate above left
@@ -1292,40 +1290,39 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
   that reports `Full` or `Closed` costs the tail its connection, deterministically and
   immediately: a slow or dead consumer never costs kernel progress, and the client's cursor
   resume is the recovery mechanism, not a server-side retry queue. Event payloads must be
-  plainly JSON — serde_json refuses a map key that does not serialize as a string, a number
-  or a bool, and a non-finite float key (and writes a non-finite float value as `null`). An event that fails to
-  encode, or whose stored bytes do not decode under its recorded shape (corrupt bytes, or
-  a change inside a type one of its fields holds, which the fingerprint cannot see — the
-  text names both), ends that subscriber's tail with a terminal `charpente.error` frame
-  that carries no `id:`, so the client's cursor does not advance past it. No delivery path stops the
-  kernel; only the platform's own store failures do.
+  plainly JSON — serde_json refuses a map key that does not serialize as a string, a
+  number or a bool, and a non-finite float key (and writes a non-finite float value as
+  `null`). An event that fails to encode, or whose stored bytes do not decode under its
+  recorded shape (corrupt bytes, or a change inside a type one of its fields holds, which
+  the fingerprint cannot see — the text names both), ends that subscriber's tail with a
+  terminal `charpente.error` frame that carries no `id:`, so the client's cursor does not
+  advance past it. No delivery path stops the kernel; only the platform's own store
+  failures do.
 - **Honesty at the edges.** A cursor below the retention floor, or one naming an event id
   this node never minted (or minted with a different seq — the cross-timeline case), is
   refused at subscribe with a 409 naming the floor or the divergence detail and the fix:
   re-sync current state through reads, then reconnect without a cursor. A tail that falls
   behind retention mid-stream gets the same fact set as a terminal SSE frame —
   `event: charpente.gap` — then its sink closes. A stored event whose recorded shape (§3)
-  is not the subscribed type's is never decoded: the tail gets a terminal `event:
-  charpente.reshaped` frame carrying that row's own `id.seq`, and a subscribe whose
-  cursor sits on such a row — for a name the subscription carries and a key it passes —
-  is refused with a 409 naming the event, both shapes and the same re-sync fix. Sink
-  overflow itself sends nothing (there is no one left to tell); the client that
-  reconnects with `Last-Event-ID` resumes exactly,
-  which is the point. **The seq half does not separate every cross-timeline pair, and
-  the sentence above should not be read as claiming it does.** A local recovery cut that
-  returns the log to the same position lets the replacement record take the SAME seq, so
-  two different events can occupy one `(id, seq)` and the divergence refusal cannot fire
-  (seed 0x17004e6a572d737d, docs/LEDGER.md 2026-09-07 — a misdirected write moved a WAL
-  segment's first frame off offset 0, recovery cut there, and event id 0 was re-minted at
-  seq 1 with new content). This is the gap DECISIONS §6's Design C (a durable timeline
-  epoch) closes; the M2 follow-up backlog carries it, now with a single-node instance
-  rather than only the failover one it was written for. Follower tails read the same
-  materialized table whose ROWS
-  replication keeps byte-identical (§5 — the file they live in is not, property 1), so a
-  subscribe on a follower works with zero app-code changes; a
-  failover honors the DECISIONS §6 bounded-loss window for events exactly as it does for
-  state, and a cursor that crossed timelines gets the divergence refusal, never wrong
-  events.
+  is not the subscribed type's is never decoded: the tail gets a terminal
+  `event: charpente.reshaped` frame carrying that row's own `id.seq`, and a subscribe
+  whose cursor sits on such a row — for a name the subscription carries and a key it
+  passes — is refused with a 409 naming the event, both shapes and the same re-sync fix.
+  Sink overflow itself sends nothing (there is no one left to tell); the client that
+  reconnects with `Last-Event-ID` resumes exactly, which is the point. **The seq half
+  does not separate every cross-timeline pair, and the sentence above should not be read
+  as claiming it does.** A local recovery cut that returns the log to the same position
+  lets the replacement record take the SAME seq, so two different events can occupy one
+  `(id, seq)` and the divergence refusal cannot fire (seed 0x17004e6a572d737d,
+  docs/LEDGER.md 2026-09-07 — a misdirected write moved a WAL segment's first frame off
+  offset 0, recovery cut there, and event id 0 was re-minted at seq 1 with new content).
+  This is the gap DECISIONS §6's Design C (a durable timeline epoch) closes; the M2
+  follow-up backlog carries it, now with a single-node instance rather than only the
+  failover one it was written for. Follower tails read the same materialized table whose
+  ROWS replication keeps byte-identical (§5 — the file they live in is not, property 1),
+  so a subscribe on a follower works with zero app-code changes; a failover honors the
+  DECISIONS §6 bounded-loss window for events exactly as it does for state, and a cursor
+  that crossed timelines gets the divergence refusal, never wrong events.
 
 ## 7. The agent interface
 

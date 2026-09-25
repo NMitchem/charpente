@@ -42,11 +42,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Hand-counted at landing (2026-09-16): the number of `<!-- pinned -->`
-/// blocks in docs/GUIDE.md. Fewer than this is red. 16 at landing
-/// (2026-09-16); 18 with payload shapes' reshaped frame and 409, 19 with its
-/// `charpente.error` frame, 20 with its Pending-job refusal, 21 with its
-/// enqueue refusal (2026-09-24).
+/// Hand-counted: the number of `<!-- pinned -->` blocks in docs/GUIDE.md as
+/// `pinned_blocks` counts them — a marker alone on its line, so GUIDE's
+/// opening prose naming the marker is not one. Fewer than this is red. 14
+/// when the gate landed (2026-09-12); 16 with the route and table
+/// declaration refusals (2026-09-16); 18 with payload shapes' reshaped frame
+/// and 409, 19 with its `charpente.error` frame, 20 with its Pending-job
+/// refusal, 21 with its enqueue refusal (2026-09-24).
 const PINNED_FLOOR: usize = 21;
 
 /// Below this a fragment is not evidence — `usage:` or `id: 1.0` would match

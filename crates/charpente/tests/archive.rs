@@ -6982,7 +6982,7 @@ const CONV_SEGMENT_BYTES: u64 = 1 << 10;
 /// Re-measured 2026-09-24: payload shapes grew enqueue/emit records by 8
 /// bytes. A conv commit (one `Rec` put, one `Ping` emit) went from a 70-byte
 /// frame (16 header + 54 payload) to 78, so a 1 KiB segment holds 13, not 14
-/// (13 × 78 = 1014; 14 × 70 = 980, 15 × 70 = 1050).
+/// (13 × 78 = 1014, 14 × 78 = 1092; 14 × 70 = 980, 15 × 70 = 1050).
 const CONV_RECORDS_PER_SEGMENT: u64 = 13;
 
 /// Rounds per universe, and the writes and archive steps each round gets.
@@ -7225,8 +7225,10 @@ const CONV_DISK_ERROR_DIVISOR: f64 = 16.0;
 ///
 /// Every floor but `CONV_RESTORED_FLOOR` sits BELOW what it now measures. That is
 /// deliberate: a floor is a MINIMUM, and raising one that is not failing is a
-/// separate decision from repairing one that is. Every column here is a
-/// MEASUREMENT, not a target.
+/// separate decision from repairing one that is. Every column here but one is
+/// a MEASUREMENT, not a target. "after payload shapes" holds the floors as that
+/// change left them: `CONV_RESTORED_FLOOR` re-pinned to its measurement, the
+/// other five carried unchanged (the paragraph below).
 ///
 /// **Re-measured 2026-09-24, same bases, for payload shapes.** Every enqueue and
 /// emit record grew by 8 bytes (the shape, DESIGN §2) and every stored `EventRow`

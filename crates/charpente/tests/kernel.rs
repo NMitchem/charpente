@@ -1642,9 +1642,9 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
         // was already GREEN with the classification deleted before payload
         // shapes landed, and payload shapes' 8-byte enqueue/emit growth renamed
         // the universes again. The oldest seed is kept: it is still this
-        // suite's CHARPENTE_SEED replay pin
-        // in .github/workflows/ci.yml, and it still exercises Kernel::build's
-        // drain-id fix (dispatch.rs's "job in the heap is not Pending" assert).
+        // suite's CHARPENTE_SEED replay pin in .github/workflows/ci.yml, and it
+        // still exercises Kernel::build's drain-id fix (dispatch.rs's "job in
+        // the heap is not Pending" assert).
         match exactly_once_holds(&mut app).and_then(|()| tenants_never_see_each_other(&mut app)) {
             Ok(populated) => cover_multi_tenant(sim, &populated),
             Err(msg) => {

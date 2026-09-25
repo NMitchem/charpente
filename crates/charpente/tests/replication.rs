@@ -3155,7 +3155,7 @@ fn a_shipped_batch_that_fails_mid_apply_rolls_back_whole() {
 /// batch: two good records ship in the same `Frames` batch ahead of the
 /// tag-10 one, and neither must land.
 #[test]
-fn a_shipped_record_with_a_scope_era_tag_this_binary_does_not_know_refuses_by_name() {
+fn a_shipped_batch_with_an_effect_tag_this_binary_does_not_know_refuses_whole_by_name() {
     let sim = Sim::with_faults(0x6B00_0004, FaultConfig::none());
     let host_a = sim.host("a");
     let host_b = sim.host("b");

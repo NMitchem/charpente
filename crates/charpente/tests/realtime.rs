@@ -337,9 +337,10 @@ fn shapes_app(sim: &Sim) -> io::Result<App> {
     ]))
 }
 
-/// Pushes `requests` at one instant and steps the kernel until the script is
-/// spent. Every step must succeed: the property these tests pin is that
-/// nothing a subscriber does stops the node.
+/// Pushes `requests` at one instant and steps the kernel a fixed 16 times;
+/// each caller's assertions on its responses and frames are what show its
+/// script was serviced. Every step must succeed: the property these tests pin
+/// is that nothing a subscriber does stops the node.
 fn run_script(
     kernel: &mut Kernel,
     sim: &Sim,
