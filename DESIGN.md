@@ -1180,10 +1180,22 @@ joined thread; `Server::wait` returns its exit code, and `launch` exits with it.
 line — the first line of the kernel's final stderr output (a multi-type foreign-shape jobs
 refusal continues one job type per line after it) — names the stop: `refused to
 start`/`stopped on a refusal` for a `Refusal` (table-gate barrier, witness conflict,
-strict-witness deadline, foreign-shape jobs), `failed to start`/`stopped on a platform IO
+strict-witness deadline, foreign-shape jobs, an unmarked replication refusal, a
+listen-less switchover target), `failed to start`/`stopped on a platform IO
 failure — restart to recover` otherwise. Restarting the same binary does not by itself
 clear a refusal; each names what must change first — a witness answering, a fresh data
 dir, a registered migration step — while a platform IO failure really can clear on retry.
+A fifth line is neither: v0 has no admin-triggered shutdown, so `Kernel::run` returning
+`Ok(())` (`Wake::Shutdown`) under `serve`/`serve_replicated` today only means the request
+channel's `Sender` was dropped without the kernel itself stopping — the HTTP edge thread
+ending first (most likely a panic), or (a latent gap, not yet closed) the edge's own
+`bind`/`local_addr`/`set_nonblocking` failing before a `Server` exists, which races the
+same drop. Either way this prints `charpente kernel stopped: the request channel closed,
+which only happens when the HTTP edge thread ended before the kernel did (most likely a
+panic) — check the edge thread's own panic output above; this is not a clean shutdown, v0
+has none` and exits 1 — a live kernel with no edge left to feed it answers nothing, so this
+is named and non-zero rather than a clean-exit `0` a `Restart=on-failure` supervisor would
+take as "nothing to do here."
 
 ## 6. Queue, cron, realtime — all faces of the log
 

@@ -5367,6 +5367,55 @@ fn krun_until(
     }
 }
 
+/// Like `krun_until`, but returns the raw `io::Error` instead of
+/// `kstep_node`'s stringified wrapper — the one assertion that needs to
+/// inspect the error itself (`Refusal::of`), not just its text (mirrors
+/// `run_until_io_error`'s own reason for existing, one scheduler family
+/// over). No fault handling, and no recoverable-node/survivor
+/// classification (only meant for a `FaultConfig::none()` scenario, same
+/// restriction as `run_until_io_error`): the first node whose `Kernel::step`
+/// errors ends the loop.
+fn krun_until_io_error(
+    sim: &Sim,
+    nodes: &mut [&mut KNode],
+    done: impl Fn(&[&mut KNode]) -> bool,
+    budget: u32,
+) -> io::Result<()> {
+    for _ in 0..budget {
+        if done(nodes) {
+            return Ok(());
+        }
+        let mut worked = false;
+        let mut deadlines: Vec<u64> = Vec::new();
+        for node in nodes.iter_mut() {
+            let kernel = node.kernel.as_mut().expect("kstep on a live node");
+            match kernel.step(&mut node.source)? {
+                Step::Worked => worked = true,
+                Step::Idle { deadline } => {
+                    if let Some(d) = deadline {
+                        deadlines.push(d.as_nanos());
+                    }
+                }
+            }
+        }
+        if worked {
+            continue;
+        }
+        let now = sim.now().as_nanos();
+        let mut next = sim.next_wakeup();
+        for d in deadlines {
+            if d > now {
+                next = Some(next.map_or(d, |x| x.min(d)));
+            }
+        }
+        match next {
+            Some(t) if t > now => sim.clock().sleep(Duration::from_nanos(t - now)),
+            _ => return Ok(()),
+        }
+    }
+    Ok(())
+}
+
 fn klast(node: &KNode) -> Option<u64> {
     node.kernel
         .as_ref()
@@ -8090,5 +8139,56 @@ fn a_write_gate_opening_over_foreign_pending_jobs_stops_the_kernel_by_name() {
         (jobs.len(), jobs[0].status, jobs[0].attempts),
         (1, JobStatus::Pending, 0),
         "the foreign job was never dispatched"
+    );
+}
+
+/// Same scenario as the test above, through `krun_until_io_error` instead of
+/// `krun_until` — the one assertion that needs the raw error, not its text:
+/// the write-gate-opening refusal (`after_repl_step`, kernel/mod.rs) is a
+/// `Refusal`, not an ordinary platform IO failure a restart could clear.
+#[test]
+fn a_write_gate_opening_over_foreign_pending_jobs_is_a_refusal() {
+    let sim = Sim::with_faults(0x5A9E_0708, FaultConfig::none());
+    let horizon = 100 * 1_000_000_000;
+    let ph = sim.host("p");
+    {
+        let mut db = Db::open(Box::new(ph.disk()), DbConfig::default(), full_schema()).unwrap();
+        db.transact(|tx| {
+            tx.enqueue(Ping { n: 7 });
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+        db.checkpoint().unwrap();
+    }
+    store_witnesses(&ph.disk(), &["w:1".to_string()]).unwrap();
+    let mut p = spawn_kernel_node(
+        &sim,
+        "p",
+        primary_cfg("p:1"),
+        DbConfig::default(),
+        horizon,
+        true,
+    )
+    .unwrap();
+    p.kernel
+        .as_mut()
+        .unwrap()
+        .app_mut_for_tests()
+        .db_for_tests()
+        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT)]);
+    let mut w = spawn_kernel_node(
+        &sim,
+        "w",
+        follower_cfg("w:1", "p:1"),
+        DbConfig::default(),
+        horizon,
+        true,
+    )
+    .unwrap();
+    let err =
+        krun_until_io_error(&sim, &mut [&mut p, &mut w], |_| false, CONVERGE_BUDGET).unwrap_err();
+    assert!(
+        charpente_core::db::Refusal::of(&err).is_some(),
+        "the write-gate-opening refusal is a Refusal: {err}"
     );
 }

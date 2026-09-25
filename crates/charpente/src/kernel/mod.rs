@@ -664,7 +664,7 @@ impl Kernel {
                             // claim N done against 0 (or an uncertain number)
                             // durable — and the DUE-HEAP is left stale the
                             // same way, and it is the more consequential of
-                            // the two (fix round M-3): a job this loop's
+                            // the two: a job this loop's
                             // `run_due_into` removed as Done never comes
                             // back, and a `Retried` job's speculative NEW
                             // `due_at` stays in the heap too. Both are safe
@@ -692,7 +692,7 @@ impl Kernel {
                 })();
                 match (drain, group.commit()) {
                     (Ok(()), Ok(())) => {}
-                    // Fix round I-2: deliberately does NOT apply
+                    // Deliberately does NOT apply
                     // `CommitFailure::invalidates` the way `Db::transact` and
                     // the one-job/one-schedule wrappers now do (dispatch.rs's
                     // `run_due`, cron.rs's `tick`). ANY commit failure here
@@ -702,9 +702,9 @@ impl Kernel {
                     // exists to narrow (a checkpoint-arm failure here would
                     // otherwise leave `self.stats`/the due-heap stale, per
                     // the comment above, until the very next commit failed
-                    // anyway — pre-T7 behaviour). Reviewed and accepted (T7
-                    // fix round I-2), not an oversight; the Cron arm below
-                    // answers the identical way for the identical reason.
+                    // anyway). Reviewed and accepted, not an oversight; the
+                    // Cron arm below answers the identical way for the
+                    // identical reason.
                     (Ok(()), Err(failure)) => return Err(failure.error),
                     (Err(e), Ok(())) => return Err(e),
                     (Err(_), Err(failure)) => return Err(failure.error),
@@ -740,7 +740,7 @@ impl Kernel {
                 })();
                 match (drain, group.commit()) {
                     (Ok(()), Ok(())) => {}
-                    // Fix round I-2: same deliberate divergence from
+                    // Same deliberate divergence from
                     // `CommitFailure::invalidates` as the Job arm above, for
                     // the identical reason — see that arm's comment. ANY
                     // commit failure here stops the kernel.
@@ -751,8 +751,13 @@ impl Kernel {
             }
             Ready::Repl => {
                 let repl = self.repl.as_mut().expect("Repl arm only pushed when Some");
-                // A `Refuse`-diverged or fault error bubbles like the job arm's
-                // — restart-and-recover is the only exit (DESIGN §5).
+                // An error bubbles like the job arm's, stopping the kernel
+                // either way — but the two kinds name different fixes
+                // (`kernel_stop_line`, serve.rs): a platform IO failure
+                // clears on a restart, while a `Refusal` (an unmarked
+                // `Msg::Refuse`, a mismatched shape, a listen-less hand-off
+                // target) does not, and its own text says what does (DESIGN
+                // §5).
                 repl.step(self.app.db_mut(), &*self.clock)?;
                 if repl.db_needs_reseed() {
                     // `run_seed` consumes and returns the `Db` (it cannot

@@ -4148,15 +4148,23 @@ usage: <app> [describe [--format json|human]]
 this file and asserts the block above is the constant verbatim, so the two cannot drift
 apart silently again — they did once, when §15 was added.)
 
-A status-1 exit under `launch` comes from one of two distinct moments, and each names
-itself. `build` (`App::open`) can refuse to start — a table-gate barrier from a schema this
-binary cannot open — before any kernel exists at all: `charpente refused to start: ...`.
-Past that point the kernel itself can stop — a Pending job of a foreign shape (§6), a
-migration step this binary has no registration for, a witness conflict, or a
-strict-witness deadline, or a platform IO failure — its own stop line naming which:
-`charpente kernel refused to start`/`stopped on a refusal`/`stopped on a platform IO
-failure`. Either way, the line already printed to stderr names the fix before `launch`
-exits.
+A status-1 exit under `launch` (non-replicated — `launch` only ever calls `serve::serve`,
+never `serve_replicated`, so neither a witness conflict nor a strict-witness deadline can
+happen here; those are `charpente::serve_replicated`-only stops) comes from one of three
+distinct moments. Before any app code runs, the HTTP bind (`TcpListener::bind`) can fail —
+an occupied port, say — and today that is the one rough edge: nothing between the bind and
+`main`'s default `Result` handling names it, so it exits 1 printing the raw `Error: Os {
+code: 48, kind: AddrInUse, ... }` debug form rather than a plain line. `build` (`App::open`)
+can refuse to start — a table-gate barrier from a schema this binary cannot open, or an
+ordinary platform IO failure opening the store — before any kernel exists at all:
+`charpente refused to start: ...`/`charpente failed to start — fix the store/log and
+restart: ...`. Past both of those, the kernel itself can stop — a Pending job of a foreign
+shape (§6), a migration step this binary has no registration for, or a platform IO failure —
+its own stop line naming which: `charpente kernel refused to start`/`stopped on a
+refusal`/`stopped on a platform IO failure`; if the HTTP edge thread ends before the kernel
+does instead (most likely a panic — v0 has no admin-triggered shutdown), the line is
+`charpente kernel stopped: the request channel closed, ...`. Past the bind, the line already
+printed to stderr names the fix before `launch` exits.
 
 ### `charpente describe` — the CLI verb
 

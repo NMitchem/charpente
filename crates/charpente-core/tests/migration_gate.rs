@@ -441,6 +441,11 @@ fn a_rejecting_migration_names_the_row_and_leaves_the_store_untouched() {
         "migrating table \"Widget\" row 2: row 2 has count 2, which this migration \
          deliberately refuses"
     );
+    assert!(
+        Refusal::of(&err).is_some(),
+        "a rejecting migration step is deterministic — a restart re-runs it and fails the \
+         same way, so it is a Refusal, not a platform IO failure: {err}"
+    );
     drop(db);
     // Nothing partially committed: the original v1 schema still opens and
     // every row is intact.
@@ -530,6 +535,134 @@ fn no_adoption_row_refuses_a_foreign_tail_from_an_unversioned_binary() {
         Refusal::of(&err).is_some(),
         "a missing adoption row is a Refusal — no restart clears it, only restoring from a \
          replica or backup does: {err}"
+    );
+}
+
+/// The downgrade comparison inside replay itself (`check_replay_version`,
+/// distinct from `check_schema_gate`'s post-replay walk that
+/// `version_downgrade_refuses_to_open` above exercises): reachable only when
+/// the table's own DATA record is still in the WAL tail (not checkpointed)
+/// when an older binary replays it. Same crash idiom as the upgrade-barrier
+/// test: seed WITHOUT a checkpoint, crash-restart so the unsynced store
+/// reverts while the fsync'd tail survives, then reopen under an older
+/// binary than the tail was written by.
+///
+/// The seed shape (`Widget2Short`) deliberately shares `WidgetV1`'s
+/// FINGERPRINT (0x1111) while encoding one field short of it (`id` only, no
+/// `count`) — same fingerprint, different version, an artificial combination
+/// a real migration would not produce, chosen so this test can tell the
+/// downgrade comparison apart from BOTH of its neighbors. A drifted
+/// fingerprint would let the drift check (below this one) catch a removal of
+/// this one with the same text; a byte-compatible shape (`Widget2` is a true
+/// prefix-superset of `WidgetV1`) would decode cleanly either way and let
+/// `check_schema_gate`'s later, unrelated walk coincidentally reproduce it
+/// (both confirmed by manual mutation while writing this test). Sharing the
+/// fingerprint means only this comparison can catch it; removing it here
+/// falls all the way through to `WidgetV1::decode_row` running out of bytes
+/// reading `count`, a distinct decode error.
+#[test]
+fn replaying_an_uncheckpointed_downgrade_tail_refuses_to_open() {
+    struct Widget2Short {
+        id: Id<Widget2Short>,
+    }
+    impl Row for Widget2Short {
+        type Scope = Unscoped;
+        const TABLE: &'static str = "Widget";
+        const INDEXES: &'static [IndexDef<Widget2Short>] = &[];
+        const VERSION: u32 = 2;
+        const FINGERPRINT: Option<u64> = Some(0x1111);
+        fn id(&self) -> Id<Widget2Short> {
+            self.id
+        }
+        fn encode_row(&self, out: &mut Vec<u8>) {
+            self.id.encode(out);
+        }
+        fn decode_row(bytes: &[u8]) -> io::Result<Widget2Short> {
+            let input = &mut &bytes[..];
+            Ok(Widget2Short {
+                id: Id::decode(input)?,
+            })
+        }
+    }
+
+    let sim = Sim::with_faults(0x2EB7_0007, FaultConfig::none());
+    {
+        let mut db = Db::open(
+            Box::new(sim.disk()),
+            cfg(),
+            Schema::new().table::<Widget2Short>(),
+        )
+        .unwrap();
+        db.transact(|tx| -> Result<(), ()> {
+            tx.put(&Widget2Short {
+                id: Id::from_raw(1),
+            });
+            Ok(())
+        })
+        .unwrap();
+        sim.restart(); // store reverts to nothing; the WAL record survives
+        drop(db);
+    }
+    let err = Db::open(
+        Box::new(sim.disk()),
+        cfg(),
+        Schema::new().table::<WidgetV1>(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "table \"Widget\" is at persisted version 2 but this binary is compiled for version 1 \
+         — the binary is older than the data; run a binary built for at least version 2"
+    );
+    assert!(
+        Refusal::of(&err).is_some(),
+        "a replay-time downgrade is a Refusal — no restart on this binary clears it, only a \
+         newer binary does: {err}"
+    );
+}
+
+/// The fingerprint-drift comparison inside replay itself (`check_replay_version`,
+/// distinct from `check_schema_gate`'s post-replay walk that
+/// `same_version_fingerprint_drift_refuses_to_open` above exercises): same
+/// crash idiom as the downgrade test above, with the reopening binary drifted
+/// instead of behind.
+#[test]
+fn replaying_an_uncheckpointed_drift_tail_refuses_to_open() {
+    let sim = Sim::with_faults(0x2EB7_0023, FaultConfig::none());
+    {
+        let mut db = Db::open(
+            Box::new(sim.disk()),
+            cfg(),
+            Schema::new().table::<WidgetV1>(),
+        )
+        .unwrap();
+        db.transact(|tx| -> Result<(), ()> {
+            tx.put(&WidgetV1 {
+                id: Id::from_raw(1),
+                count: 5,
+            });
+            Ok(())
+        })
+        .unwrap();
+        sim.restart(); // store reverts to nothing; the WAL record survives
+        drop(db);
+    }
+    let err = Db::open(
+        Box::new(sim.disk()),
+        cfg(),
+        Schema::new().table::<WidgetDrifted>(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "table \"Widget\"'s shape changed but its #[table(version = ...)] did not — \
+         persisted fingerprint 0x1111 != compiled fingerprint 0x2222 at version 1; bump the \
+         version and add a TableMigration, or revert the struct change"
+    );
+    assert!(
+        Refusal::of(&err).is_some(),
+        "a replay-time fingerprint drift is a Refusal — no restart clears it, only a version \
+         bump and a TableMigration do: {err}"
     );
 }
 

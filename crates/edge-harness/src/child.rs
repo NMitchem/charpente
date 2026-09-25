@@ -26,6 +26,15 @@ pub struct Bins {
     /// shape as `node`, over a tenant-SCOPED app (`tenant_wire.rs`).
     pub tenant_node: PathBuf,
     pub charpente: PathBuf,
+    /// `examples/invoicing`'s own `main.rs`, the GUIDE demo binary driven by
+    /// `charpente::launch` — unlike `node`/`tenant_node`, which call
+    /// `serve`/`serve_replicated` directly. The only stock binary that can
+    /// catch a defect specific to `launch`'s own code path.
+    pub invoicing: PathBuf,
+    /// Plants a foreign-shape Pending `SendReceipt` row in a data dir before
+    /// `invoicing` ever opens it, so its kernel refuses to start — the
+    /// fixture `seed_foreign_job.rs`'s own doc comment explains.
+    pub seed_foreign_job: PathBuf,
 }
 
 /// How long a freshly spawned process gets to open its port.
@@ -354,10 +363,14 @@ pub fn build_bins() -> io::Result<Bins> {
     let node = locate(&bins, "node")?;
     let tenant_node = locate(&bins, "tenant_node")?;
     let charpente = locate(&bins, "charpente")?;
+    let invoicing = locate(&bins, "invoicing")?;
+    let seed_foreign_job = locate(&bins, "seed_foreign_job")?;
     Ok(Bins {
         node,
         tenant_node,
         charpente,
+        invoicing,
+        seed_foreign_job,
     })
 }
 

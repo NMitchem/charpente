@@ -30,21 +30,31 @@ pub fn launch(
     data_dir: &str,
     build: impl Fn(Box<dyn Disk>, Box<dyn Entropy>) -> io::Result<App>,
 ) -> io::Result<()> {
+    // Unlocked: the `[]` arm's `serve(..)?.wait()` below blocks this thread
+    // on the kernel thread's own `JoinHandle`, and the kernel thread's own
+    // stop line prints through a bare `eprintln!` (serve.rs) — a lock held
+    // here across that wait would never release for it, so the kernel
+    // thread's print blocks forever and `wait` never returns (the exact
+    // zombie spec §5 exists to remove, only quieter: no stop line ever
+    // reaches stderr either). Each `write!` still locks internally, just
+    // for the span of that one call.
     let args: Vec<String> = std::env::args().skip(1).collect();
     match dispatch(
         &args,
         addr,
         data_dir,
         build,
-        &mut io::stdout().lock(),
-        &mut io::stderr().lock(),
+        &mut io::stdout(),
+        &mut io::stderr(),
     )? {
         // Ok(0) falls through to a normal return — the process exits 0
-        // naturally (a clean shutdown, or a describe that printed and
-        // exited fine). A nonzero code exits the process directly: a
-        // describe usage error, a build that could not start (its stderr
-        // line already named above), or a stopped kernel (spec §5), whose
-        // own stop line already named what stopped it and the fix.
+        // naturally. The `[]` (serve) arm never produces 0 (`Server::wait`
+        // doesn't either — see its own doc), so reaching 0 here always means
+        // a describe or restore that printed and exited fine. A nonzero code
+        // exits the process directly: a describe/restore usage error, a
+        // build that could not start (its stderr line already named above),
+        // or a stopped kernel (spec §5), whose own stop line already named
+        // what stopped it and the fix.
         0 => Ok(()),
         code => std::process::exit(code),
     }
@@ -233,7 +243,7 @@ fn restore_verb(
     let _ = std::fs::remove_dir_all(&probe);
 
     let store = FsObjectStore::new(&from);
-    // I-3. `ProdDisk::new` creates the destination root unconditionally, and
+    // `ProdDisk::new` creates the destination root unconditionally, and
     // it does so before `restore` has read a byte of the bucket — so a
     // refusal would leave behind a directory the operator never had, and
     // "nothing in the destination has been touched" would be true about the
@@ -337,7 +347,7 @@ mod tests {
         App::open(disk, Schema::new(), entropy, AppConfig::default())
     }
 
-    /// M-5 (task 7 review round 1): builds successfully (unlike
+    /// Builds successfully (unlike
     /// `refusing_build`/`io_failing_build` below, which fail before `serve`
     /// is ever called) but seeds a Pending job under one shape while
     /// mounting a different one for the same name — the same fixture
@@ -414,10 +424,10 @@ mod tests {
         ))
     }
 
-    /// M-5/M-8. `build` (`App::open`) runs the startup schema gate BEFORE any
+    /// `build` (`App::open`) runs the startup schema gate BEFORE any
     /// kernel exists — a table-gate barrier refuses here, in `dispatch`
     /// itself, not on a kernel thread `wait()` could join. Left to the `?` in
-    /// the `[]` arm this used to bubble all the way to `launch`'s own `?`,
+    /// the `[]` arm, this would bubble all the way to `launch`'s own `?`,
     /// which `main`'s default `Termination` impl prints as the `Debug` form
     /// (`Custom { kind: Other, error: Refusal("...") }`) — the `Refusal(`
     /// wrapper leaking as operator-visible noise instead of a named line.
@@ -471,11 +481,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// M-5: the `[]` arm's `serve::serve(addr, app)?.wait()` (spec §5) is
-    /// otherwise driven by no test — a reversion to the pre-Task-7
+    /// The `[]` arm's `serve::serve(addr, app)?.wait()` (spec §5) is
+    /// otherwise driven by no test — a reversion to the old
     /// `serve(addr, app)?; loop { thread::park() }` would hang this test
-    /// rather than fail it cleanly, but a hang is still noticed (the review's
-    /// own ruling on this fixture) rather than a silent pass.
+    /// rather than fail it cleanly, but a hang is still noticed rather than
+    /// a silent pass.
     #[test]
     fn a_kernel_refusal_inside_the_serve_arm_ends_dispatch_with_its_code() {
         let dir = fresh_data_dir("serve-arm-refusal");
@@ -674,10 +684,11 @@ mod tests {
     }
 
     /// Hard rule 6, made mechanical. GUIDE §13 quotes `LAUNCH_USAGE`
-    /// verbatim as "a pinned usage message", and Task 11 changed the const
-    /// without changing the quote — so the GUIDE printed text the binary no
-    /// longer says. `include_str!` is a compile-time read, not ambient IO,
-    /// and it turns that silent drift into a failing test.
+    /// verbatim as "a pinned usage message", and a docs commit that changes
+    /// the const without changing the quote would leave the GUIDE printing
+    /// text the binary no longer says. `include_str!` is a compile-time
+    /// read, not ambient IO, and it turns that silent drift into a failing
+    /// test.
     ///
     /// The same guard for `RESTORE_USAGE`, whose whole reason to exist is
     /// telling an operator what `--force` destroys: a GUIDE that quotes a
@@ -691,7 +702,7 @@ mod tests {
              update the quoted block to:\n{LAUNCH_USAGE}"
         );
         // Against the CONSTANT, never a copy of it. A hardcoded literal here
-        // was blind in exactly the direction I-1 came from — the constant
+        // was blind in exactly the direction that matters — the constant
         // moving underneath the quote — and verified blind: renaming a word
         // in RESTORE_USAGE left this green. GUIDE §15 quotes the usage line
         // and the flag list, which is RESTORE_USAGE up to its first blank
@@ -707,7 +718,7 @@ mod tests {
         );
     }
 
-    // ------------------------------------- Task 11: the `restore` verb
+    // ------------------------------------------- the `restore` verb
     //
     // Deny-list opt-out for this section's fixtures only, same rationale as
     // `prod.rs`'s module-wide one: `restore` is a production edge path over
@@ -719,7 +730,7 @@ mod tests {
     // without spawning `cargo` inside a test. The bucket underneath is real:
     // a real `Db` on a real `ProdDisk`, archived by the real `Archive`
     // engine through a real `FsObjectStore`. Nothing here is simulated, so
-    // these are also the first end-to-end exercise of Task 11's store.
+    // these are also the first end-to-end exercise of `restore`'s store.
 
     use crate::archive::{Archive, ArchiveConfig};
     use crate::prod::FsObjectStore;
@@ -886,7 +897,7 @@ mod tests {
         std::fs::remove_dir_all(&dest).unwrap();
     }
 
-    /// M-5. `Verdict::Ahead` makes `--force` the NORMAL path for an in-place
+    /// `Verdict::Ahead` makes `--force` the NORMAL path for an in-place
     /// restore — restore, run on, restore again — not an edge case. This is
     /// that exact sequence, run through the verb an operator types.
     #[test]
@@ -979,13 +990,13 @@ mod tests {
                 .contains("nothing in the destination has been touched"),
             "{err}"
         );
-        // I-3. `ProdDisk::new` creates the destination root before `restore`
-        // can read a byte of the bucket, so a refusal used to leave behind a
-        // directory the operator did not have — making "nothing in the
-        // destination has been touched" true about content and incomplete
-        // about the filesystem. `restore_verb` now removes what it created
-        // when it is still empty, so the promise is literally true and this
-        // asserts the strong form.
+        // `ProdDisk::new` creates the destination root before `restore` can
+        // read a byte of the bucket, so a refusal that stopped there alone
+        // would leave behind a directory the operator did not have — making
+        // "nothing in the destination has been touched" true about content
+        // and false about the filesystem. `restore_verb` removes what it
+        // created when it is still empty, so the promise is literally true
+        // and this asserts the strong form.
         assert!(
             !dest.exists(),
             "a refused restore must not leave a directory the operator did not have: {}",
@@ -993,7 +1004,7 @@ mod tests {
         );
     }
 
-    /// I-3's negative space (hard rule 4). The cleanup above removes a
+    /// Negative space (hard rule 4). The cleanup above removes a
     /// destination directory THIS call created — and it must never remove one
     /// holding a partial restore, because the failure's own text tells the
     /// operator to re-run against exactly that directory. The guard is the
@@ -1051,7 +1062,7 @@ mod tests {
         std::fs::remove_dir_all(&dest).unwrap();
     }
 
-    /// I-3's other direction — the one that destroys something. The cleanup
+    /// The other direction — the one that destroys something. The cleanup
     /// removes a destination directory THIS call created; it must never
     /// remove one the OPERATOR created. Nothing saw that until this test:
     /// forcing `dest_was_absent = true` is green across both suites while it
@@ -1117,7 +1128,7 @@ mod tests {
         );
     }
 
-    /// M-5, in the help text itself: an operator who has never read the spec
+    /// In the help text itself: an operator who has never read the spec
     /// must learn from `--help` that re-restoring in place needs `--force`
     /// and what `--force` destroys. Not buried.
     #[test]

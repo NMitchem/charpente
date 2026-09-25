@@ -1343,3 +1343,75 @@ impl Repl {
         *self.pin_floor.lock().expect("uncontended") = floor;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use charpente_core::table::Codec;
+    use charpente_sim::{FaultConfig, Sim};
+
+    use super::*;
+    use crate::{DbConfig, Job, Schema};
+
+    /// A job, so `db.transact` produces one non-empty effects record — no
+    /// `#[table]` needed just to get `last_applied` off `None`.
+    struct Ping {
+        n: u64,
+    }
+    impl Codec for Ping {
+        fn encode(&self, out: &mut Vec<u8>) {
+            self.n.encode(out);
+        }
+        fn decode(input: &mut &[u8]) -> io::Result<Ping> {
+            Ok(Ping {
+                n: u64::decode(input)?,
+            })
+        }
+    }
+    impl Job for Ping {
+        const NAME: &'static str = "repl-test-ping";
+        const FINGERPRINT: u64 = 0x7E57_0009;
+    }
+
+    /// `accept_handoff`'s own no-listen-address guard (its counterpart to
+    /// `do_promote`'s, above): `begin_switchover` only ever targets a live
+    /// session that advertised the exact listen address named, and a
+    /// follower's `Hello` always carries its own `my_listen`, so the two stay
+    /// in lock step through the ordinary flow — this calls the private
+    /// method directly, the smallest oracle for the refusal text.
+    #[test]
+    fn accept_handoff_refuses_a_listenless_follower_by_name() {
+        let sim = Sim::with_faults(0x2EB1_0200, FaultConfig::none());
+        let h = sim.host("f");
+        let mut db = Db::open(Box::new(h.disk()), DbConfig::default(), Schema::new())
+            .expect("Db::open on a fresh sim disk");
+        db.transact(|tx| {
+            tx.enqueue(Ping { n: 1 });
+            Ok::<(), String>(())
+        })
+        .expect("committing one job before the follower gate closes writes");
+        let at_seq = db
+            .last_applied()
+            .expect("the committed job advanced last_applied");
+
+        let cfg = ReplConfig {
+            listen: None,
+            initial_role: Role::Follower {
+                primary: "p:1".to_string(),
+            },
+            peer_secret: None,
+            strict_witnesses: false,
+        };
+        let (mut repl, _notice) = Repl::open(Box::new(h.net()), Box::new(h.disk()), cfg, &mut db)
+            .expect("Repl::open on a fresh role disk");
+
+        let err = repl
+            .accept_handoff(&mut db, at_seq, 0)
+            .expect_err("a listen-less follower must refuse a HandOff");
+        assert_eq!(
+            err.to_string(),
+            "hand-off refused: this follower has no replication listen address and cannot \
+             become a primary"
+        );
+        assert!(Refusal::of(&err).is_some(), "{err}");
+    }
+}

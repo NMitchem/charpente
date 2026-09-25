@@ -700,19 +700,17 @@ fn run_oracle(
                 "--role".to_string(),
                 "follower".to_string(),
                 "--primary".to_string(),
-                // The REPL address, not the HTTP one (review Minor 5 —
-                // this used to be `follower_addr`, the new primary's HTTP
-                // port; a real operator points a follower's `--primary` at
-                // the peer's replication listen address, and the pinned
-                // notice below must embed the port an actual follower
-                // client would dial).
+                // The REPL address, not the HTTP one: a real operator points
+                // a follower's `--primary` at the peer's replication listen
+                // address, and the pinned notice below must embed the port
+                // an actual follower client would dial.
                 follower_repl_addr.clone(),
                 "--secret".to_string(),
                 SECRET.to_string(),
             ],
             &mut scenario,
         );
-        // M-7: `serve_replicated` spawns the kernel thread — which runs
+        // `serve_replicated` spawns the kernel thread — which runs
         // `Repl::open` and then, once probing resolves, the witness conflict
         // — and binds the HTTP port on the main thread CONCURRENTLY (serve.rs
         // does not wait for one before starting the other). Under enough
@@ -730,7 +728,17 @@ fn run_oracle(
                 old_primary_restart = Some(child);
                 Some(path)
             }
-            Err(e) if e.to_string().contains(&expected_notice_line) => {
+            // Both conditions, not just the notice text: `child.rs` folds the
+            // tee'd stderr into EVERY spawn error, including a plain
+            // connect-poll timeout with unrelated stderr content that could
+            // coincidentally contain the notice substring — "exited before
+            // its port" is child.rs's own wording for the race this arm
+            // means to accept, and requiring it too is what stops a
+            // never-bound, never-raced timeout from passing as "raced".
+            Err(e)
+                if e.to_string().contains(&expected_notice_line)
+                    && e.to_string().contains("exited before its port") =>
+            {
                 scenario.record(
                     "negative arm confirmed (raced): the restarted old primary exited before \
                      its port ever opened, but its tee'd stderr already carries the pinned \
@@ -790,8 +798,8 @@ fn run_oracle(
         // the durable role (Primary) wins over config, so nothing about the
         // notice's own printing exits the process.
         //
-        // Since payload-shapes Task 7 ("a stopped kernel ends the process"),
-        // this specific restart DOES exit — just never from the notice. This
+        // Since "a stopped kernel ends the process" landed, this specific
+        // restart DOES exit — just never from the notice. This
         // old primary is durable with a non-empty recorded witness set (it
         // shipped to `follower` before the promote), so on restart it probes
         // that witness before allowing writes (M2 sub-project 0b); the

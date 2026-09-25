@@ -187,3 +187,72 @@ fn a_node_whose_kernel_cannot_start_exits_nonzero_with_its_named_line() {
     let _ = std::fs::remove_dir_all(&data_dir);
     let _ = std::fs::remove_file(&stderr_path);
 }
+
+/// Spec §5 at the process boundary, specifically for `charpente::launch` —
+/// the GUIDE's default `main` (`examples/invoicing/src/main.rs`, `node`'s
+/// and `tenant_node`'s own sibling bin), which `node`/`tenant_node` cannot
+/// stand in for: both call `serve`/`serve_replicated` directly, never
+/// `launch`. `launch` reads argv itself, so the fixture is a data-dir
+/// artifact `seed_foreign_job` plants ahead of time (a foreign-shape Pending
+/// `SendReceipt`), not a CLI flag.
+#[test]
+#[ignore]
+fn a_launch_based_binary_whose_kernel_refuses_exits_nonzero_within_a_bound() {
+    let bins = build_bins().expect("build_bins");
+    let scratch = temp_dir("launch-refuses");
+    let data_dir = scratch.join("data");
+    std::fs::create_dir_all(&data_dir).expect("scratch data dir");
+
+    let seed_status = std::process::Command::new(&bins.seed_foreign_job)
+        .args([
+            "--data-dir".to_string(),
+            data_dir.to_str().unwrap().to_string(),
+        ])
+        .status()
+        .expect("spawn seed_foreign_job");
+    assert!(
+        seed_status.success(),
+        "seed_foreign_job must plant the foreign-shape row cleanly: {seed_status}"
+    );
+
+    let stderr_path = temp_dir("launch-refuses-stderr");
+    // `invoicing`'s `main.rs` takes no argv (the GUIDE demo binary,
+    // deliberately un-parameterized) and resolves its data dir as the
+    // relative "./data" `charpente::launch`'s own second argument names —
+    // `current_dir` is how this test points it at the seeded one. Spawned by
+    // hand, not through `ChildNode::spawn`: that waits for the port, which
+    // this process never opens for long — the whole point is that it exits.
+    let mut child = std::process::Command::new(&bins.invoicing)
+        .current_dir(&scratch)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(
+            std::fs::File::create(&stderr_path).expect("stderr file"),
+        ))
+        .spawn()
+        .expect("spawn invoicing");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "still running 15s after its kernel refused to start — a locked stdio handle \
+                 held across launch's own wait() blocks the kernel thread's stop-line print \
+                 forever, which is the exact zombie spec §5 exists to remove, only quieter: no \
+                 stop line ever reaches stderr either"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(1), "{status}");
+    let stderr = std::fs::read_to_string(&stderr_path).expect("stderr");
+    assert!(
+        stderr.contains("charpente kernel refused to start: 1 Pending \"SendReceipt\""),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = std::fs::remove_file(&stderr_path);
+}

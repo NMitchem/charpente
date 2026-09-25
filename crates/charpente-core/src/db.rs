@@ -124,8 +124,10 @@ pub trait Event: Codec {
 /// cannot succeed. Any OTHER `Refusal` reaching `Io` (a table-gate barrier, a
 /// witness conflict) is still the ordinary durable-but-unacknowledged case —
 /// it names node state a retry cannot fix either, but by definition it was
-/// raised by apply, after the WAL sync (`Refusal::of` finds both kinds;
-/// `JobShapeRefusal::of` finds only this one).
+/// raised by apply, after the WAL sync, never by `Group::stage` itself
+/// (`JobShapeRefusal`'s own doc: staging touches no witness or gate state at
+/// all) — `Refusal::of` finds both kinds; `JobShapeRefusal::of` finds only
+/// this one.
 #[derive(Debug)]
 pub enum TxError<E> {
     App(E),
@@ -161,11 +163,18 @@ pub enum TxError<E> {
 /// guess about — a Pending job of a foreign shape
 /// (`Db::pending_job_shape_refusal`), an enqueue of a mounted job name under
 /// another shape (`Group::stage`, as `TxError::Io`), a table-gate barrier, a
-/// witness conflict, or a strict-witness deadline. Carried inside
-/// `io::Error::other`, so every `io::Result` path is untouched, and read back
-/// with `Refusal::of`: restarting or retrying clears a platform IO failure
-/// and never a refusal, so whoever reports the error must tell the two apart
-/// (payload-shapes spec §5).
+/// witness conflict, a strict-witness deadline, a replicated record decoded
+/// under a mismatched or unscoped shape (`resolve_effect_scope`,
+/// `check_replay_version`), the primary's refusal of a diverged or
+/// unrecognized follower, or a switchover hand-off with nowhere to land.
+/// Carried as an `io::Error`'s inner error — `io::Error::other` at most call
+/// sites, `io::Error::new(io::ErrorKind::InvalidData, ..)` where the site
+/// already has a more specific kind to keep — so every `io::Result` path is
+/// untouched, and read back with `Refusal::of`. The distinction it exists to
+/// carry (DESIGN §7, payload-shapes spec §5): a platform IO failure MAY clear
+/// on a restart; a refusal never does on its own — its own text names what
+/// has to change first — so whoever reports the error must tell the two
+/// apart rather than treat every `io::Result::Err` as transient.
 #[derive(Debug)]
 pub struct Refusal(pub String);
 
@@ -194,11 +203,13 @@ impl Refusal {
 /// The one refusal `Group::stage` itself can produce: an enqueue of a mounted
 /// job name under a foreign shape. A distinct type, not a flag on `Refusal`,
 /// so dispatch (`kernel/dispatch.rs`) can narrow to exactly it — defensively:
-/// `Group::stage` never applies and a witness conflict never touches `Group`
-/// at all, so no OTHER refusal can reach this result in practice, but the
-/// narrowing still names the one case that IS the handler's own deterministic
-/// bug, distinct in kind from a refusal naming node state (payload-shapes
-/// spec §5). Wraps a `Refusal` rather than duplicating its text and
+/// `Group::stage` never applies and never touches witness or gate state
+/// (those surface later, at `commit`, as an ordinary `Refusal` — see
+/// `TxError::Io`'s own doc), so no OTHER refusal can reach THIS result in
+/// practice, but the narrowing still names the one case that IS the
+/// handler's own deterministic bug, distinct in kind from a refusal naming
+/// node state (payload-shapes spec §5). Wraps a `Refusal` rather than
+/// duplicating its text and
 /// `Display`, so `Refusal::of` still finds it.
 #[derive(Debug)]
 pub struct JobShapeRefusal(pub Refusal);
@@ -1994,6 +2005,13 @@ fn check_replay_version(
              restore from a replica or backup"
         ))));
     };
+    // Every caller (both effect arms above) already calls `is_below_compiled`
+    // first and routes a below-compiled record through `put_raw`/`delete_raw`
+    // instead of here, on the exact same `persisted_version < compiled_version`
+    // comparison over the same `versions` map — so this branch never observes
+    // a below-compiled record. Kept for the message text (`upgrade_barrier_msg`
+    // is also the post-replay barrier's producer, db.rs `check_schema_gate`)
+    // and as a fail-closed backstop if that routing ever changes.
     if persisted_version < compiled_version {
         return Err(io::Error::other(Refusal(upgrade_barrier_msg(
             table,
@@ -3049,6 +3067,11 @@ impl Db {
                 rows_exist,
             ) {
                 GateStatus::Current | GateStatus::Adopt => continue,
+                // Unpinned: `Db::open`'s own post-replay walk (`check_schema_gate`)
+                // calls `gate_status` over the same schema and the same just-replayed
+                // state and already returns this same `Refuse` first, so a caller
+                // never reaches a writable `Db` (and this method) with one still
+                // outstanding. Kept as a fail-closed backstop, not a reachable path.
                 GateStatus::Refuse(msg) => return Err(io::Error::other(Refusal(msg))),
                 GateStatus::Migrate { from } => from,
             };
@@ -3136,8 +3159,15 @@ impl Db {
                         .iter()
                         .find(|s| s.from_version == version)
                         .expect("chain verified by migrate_schema");
+                    // A step's `MigrationError` (a decode failure or the
+                    // migration's own deliberate `Reject`) is deterministic
+                    // over the same row's bytes — a restart re-runs the same
+                    // step and fails the same way, so this is a Refusal, not
+                    // a platform IO failure a retry could clear.
                     bytes = (step.apply)(&bytes).map_err(|e| {
-                        io::Error::other(format!("migrating table \"{table}\" row {id}: {e}"))
+                        io::Error::other(Refusal(format!(
+                            "migrating table \"{table}\" row {id}: {e}"
+                        )))
                     })?;
                     version = step.to_version;
                 }
@@ -4023,6 +4053,8 @@ mod tests {
             ),
             "{err}"
         );
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(Refusal::of(&err).is_some(), "{err}");
     }
 
     #[test]
@@ -4041,6 +4073,8 @@ mod tests {
             ),
             "{err}"
         );
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert!(Refusal::of(&err).is_some(), "{err}");
     }
 
     /// `0x0a`, the next free tag: `0x08`/`0x09` are the shaped enqueue/emit.

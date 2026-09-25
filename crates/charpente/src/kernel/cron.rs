@@ -98,8 +98,7 @@ impl CronScheduler {
     /// so a batched drain never re-ticks the SAME entry twice in one loop
     /// (`has_due` reads the cache).
     ///
-    /// **Who undoes a wrong advance, and who doesn't (fix round M-9,
-    /// scoping this doc's old blanket claim):** `tick`'s one-schedule
+    /// **Who undoes a wrong advance, and who doesn't:** `tick`'s one-schedule
     /// wrapper undoes it on a commit failure that invalidates this tick
     /// (`CommitFailure::invalidates`) — see its doc. The kernel's own
     /// batched cron arm (`kernel/mod.rs`'s `Ready::Cron`) never undoes it,
@@ -134,7 +133,7 @@ impl CronScheduler {
         Ok((name, catchup))
     }
 
-    /// The one-schedule wrapper (group-commit T7, C-2; fix round I-2):
+    /// The one-schedule wrapper (group-commit T7, C-2):
     /// `begin_group` + one `tick_into` + `commit` — the shape both existing
     /// direct callers of `tick` (`tests/kernel.rs`) keep compiling against
     /// unchanged. The kernel's own batched cron arm calls `tick_into`

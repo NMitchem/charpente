@@ -855,15 +855,18 @@ pub(crate) fn io_failure_response(e: &io::Error) -> Response {
 
 /// `TxError<ApiError>` -> `Response`, shared by both route flavors: `App`
 /// names the handler's own rejection; `Io`/`NotPrimary`/`Verifying` name the
-/// platform failure and the fix (hard rule 5). `Group::stage` is the only
-/// producer of a `TxError::Io` this path can reach (a job handler's own
-/// transaction never runs on an HTTP route — the kernel dispatches jobs), and
-/// `JobShapeRefusal` is the only refusal it raises, so an `Io` carrying one is
-/// answered with its own text instead of the storage-failure one: nothing was
-/// written, and a retry cannot succeed. Any OTHER `Refusal` here (a table-gate
-/// barrier, a witness conflict) would name node state, not this request, and
-/// must fall through to `io_failure_response` like a genuine commit failure —
-/// which is why this matches `JobShapeRefusal::of`, not `Refusal::of`.
+/// platform failure and the fix (hard rule 5). A `TxError::Io` this path can
+/// reach comes from `begin_group`'s own snapshot (`handle_or_subscribe`), a
+/// `group.commit()` failure, or `Group::stage` (a job handler's own
+/// transaction never runs on an HTTP route — the kernel dispatches jobs, so
+/// only `Group::stage`'s enqueue check, not `Db::pending_job_shape_refusal`'s
+/// startup scan, can raise a refusal here). `JobShapeRefusal` is the only
+/// refusal any of them raises, so an `Io` carrying one is answered with its
+/// own text instead of the storage-failure one: nothing was written, and a
+/// retry cannot succeed. Any OTHER `Refusal` here (a table-gate barrier, a
+/// witness conflict) would name node state, not this request, and must fall
+/// through to `io_failure_response` like a genuine commit failure — which is
+/// why this matches `JobShapeRefusal::of`, not `Refusal::of`.
 fn tx_error_response(err: TxError<ApiError>) -> Response {
     match err {
         TxError::App(e) => e.response(),

@@ -628,8 +628,13 @@ mod tests {
             f.inbox.push_back(encode(&Msg::Refuse {
                 message: "some other refusal".to_string(),
             }));
-            f.step(&net, &mut db, 0)
+            let err = f
+                .step(&net, &mut db, 0)
                 .expect_err("an unmarked refusal must remain node-fatal");
+            assert!(
+                Refusal::of(&err).is_some(),
+                "both the resolving and ship arms wrap a Msg::Refuse as a Refusal: {err}"
+            );
         }
     }
 

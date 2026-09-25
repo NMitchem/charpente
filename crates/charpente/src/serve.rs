@@ -50,9 +50,9 @@ impl Server {
     ///   channel closed without an error (`EDGE_GONE_STOP_LINE`, already
     ///   printed) — v0 has no admin-triggered shutdown, so under
     ///   `serve`/`serve_replicated` this currently only means the HTTP edge
-    ///   thread ended first, most likely a panic (M-4, task 7 review round 1:
-    ///   this used to be `0`, which a `Restart=on-failure` supervisor would
-    ///   not act on for a kernel that can no longer answer anything);
+    ///   thread ended first, most likely a panic (a `Restart=on-failure`
+    ///   supervisor needs a nonzero code to act on a kernel that can no
+    ///   longer answer anything);
     /// - `101` when the thread panicked (the panic message is already printed);
     /// - `0` never happens today. It is reserved for a future admin-triggered
     ///   graceful shutdown, which would need its own line distinguishing it
@@ -68,13 +68,21 @@ impl Server {
 }
 
 /// `Kernel::run` returns `Ok(())` on `Wake::Shutdown` (kernel/mod.rs), which
-/// v0 has no admin-triggered path to under `serve`/`serve_replicated` — the
-/// request channel's `Sender` is otherwise never dropped, so today the only
-/// way to reach it here is the HTTP edge thread ending first (a panic, most
-/// likely: `serve.rs`'s own spawn points are its sole owners). A live kernel
-/// with no edge left to feed it answers nothing, so this is named and
-/// non-zero (M-4, task 7 review round 1) rather than the clean-exit `0` a
-/// `Restart=on-failure` supervisor would take as "nothing to do here."
+/// v0 has no admin-triggered path to under `serve`/`serve_replicated`. The
+/// request channel's `Sender` is dropped two ways: the HTTP edge thread
+/// ending after a successful bind (a panic, most likely — `serve.rs`'s own
+/// spawn points are its sole owners), OR `http_edge`'s own
+/// `bind`/`local_addr`/`set_nonblocking` `?` returning early — the kernel
+/// thread is spawned BEFORE that call in both `serve` and `serve_replicated`,
+/// so a bind failure drops the Sender (and detaches this already-running
+/// thread) before a `Server` ever exists to `wait()` on. That race prints
+/// THIS line from the detached thread if it is scheduled before the process
+/// exits, alongside the process's own exit, which comes from `serve(..)?`'s
+/// propagated bind error instead (GUIDE §13, DESIGN §5) — not from this
+/// thread's discarded return value. Either way a live kernel with no edge
+/// left to feed it answers nothing, so this is named and non-zero rather
+/// than the clean-exit `0` a `Restart=on-failure` supervisor would take as
+/// "nothing to do here."
 const EDGE_GONE_STOP_LINE: &str = "charpente kernel stopped: the request channel closed, which \
      only happens when the HTTP edge thread ended before the kernel did (most likely a panic) — \
      check the edge thread's own panic output above; this is not a clean shutdown, v0 has none";
@@ -665,21 +673,11 @@ mod tests {
             kernel_stop_line(true, &io_failure),
             "charpente kernel stopped on a platform IO failure — restart to recover: disk on fire"
         );
-        // M-6 (task 7 review round 1): a same-file assert that `Refusal::of`
-        // finds a `Refusal` this test just built by hand is tautological —
-        // true by construction, green under any change to the run path,
-        // including a `.map_err` re-wrap at the real gate-opening call site
-        // (`after_repl_step`, kernel/mod.rs) that would silently stop
-        // classifying its refusal as one. The startup call this line shares
-        // its wrapper with (`Kernel::build`) IS pinned end to end
-        // (kernel.rs's foreign-shape-job tests), but nothing drives the
-        // deferred, gate-opening re-run through a real `Kernel::run`/`step`
-        // far enough to observe its OWN error typed as a `Refusal` — that
-        // would need the full witness-gate dance (seed a foreign-shape
-        // Pending row, open gated, answer the witness, drive the gate open)
-        // through the kernel-node harness in replication.rs, which is out of
-        // proportion to what this one assert was worth. Removed rather than
-        // kept for false comfort (review-ruled).
+        // This is `kernel_stop_line`'s own text-formatting oracle, built from
+        // a hand-made `Refusal` — the real gate-opening call site
+        // (`after_repl_step`, kernel/mod.rs) typing its OWN error as a
+        // `Refusal`, through a real `Kernel::step`, is
+        // `replication.rs`'s `a_write_gate_opening_over_foreign_pending_jobs_is_a_refusal`.
 
         // A refusal naming several job types is several lines joined by
         // `\n` (`Db::pending_job_shape_refusal`) — the prefix labels only
@@ -755,7 +753,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// M-5: the OTHER way `wait` returns non-zero from the RUN path — a panic
+    /// The OTHER way `wait` returns non-zero from the RUN path — a panic
     /// inside `Kernel::new`, not an `Err`. A cron interval that overflows
     /// `u64` nanoseconds panics at kernel startup rather than at
     /// `.schedule(...)` (GUIDE §7's timing caveat), so `serve` itself returns
@@ -790,6 +788,100 @@ mod tests {
         let server = serve("127.0.0.1:0", app).unwrap();
         assert_eq!(server.wait(), 101);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Same mounted name as the `receipt` `JobDef` below (fingerprint
+    /// `0x7E57_0704`), a different fingerprint — what a cron tick stages
+    /// when its own binary has drifted from the one that mounted the job.
+    struct DriftedCronReceipt;
+    impl Codec for DriftedCronReceipt {
+        fn encode(&self, _out: &mut Vec<u8>) {}
+        fn decode(_input: &mut &[u8]) -> io::Result<DriftedCronReceipt> {
+            Ok(DriftedCronReceipt)
+        }
+    }
+    impl charpente_core::db::Job for DriftedCronReceipt {
+        const NAME: &'static str = "receipt";
+        const FINGERPRINT: u64 = 0x7E57_0BAD;
+    }
+
+    fn cron_foreign_shape_glue(
+        _tx: &mut Tx,
+        _payload: &[u8],
+        _cap: Option<&charpente_core::db::CrossTenant>,
+    ) -> Result<(), crate::kernel::JobError> {
+        Ok(())
+    }
+
+    /// An app mounting `receipt` at `CronReceipt`'s fingerprint and
+    /// scheduling a 1ms cron that stages `DriftedCronReceipt` under the SAME
+    /// name — nothing is Pending at open, so `Kernel::new` admits it; the
+    /// refusal only arrives once the tick fires.
+    fn cron_foreign_shape_app(root: &std::path::Path) -> App {
+        App::open(
+            Box::new(ProdDisk::new(root).unwrap()),
+            Schema::new(),
+            Box::new(ProdEntropy::new().unwrap()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(vec![crate::kernel::JobDef {
+            name: "receipt",
+            retry: charpente_core::job::RetryPolicy::DEFAULT,
+            cross_tenant: false,
+            fingerprint: 0x7E57_0704,
+            glue: cron_foreign_shape_glue,
+        }])
+        .schedule("drift", std::time::Duration::from_millis(1), || {
+            DriftedCronReceipt
+        })
+    }
+
+    fn cron_foreign_shape_root(tag: &str) -> std::path::PathBuf {
+        let mut suffix = [0u8; 8];
+        ProdEntropy::new().unwrap().fill(&mut suffix);
+        std::env::temp_dir().join(format!(
+            "charpente-serve-cron-foreign-{tag}-{:016x}",
+            u64::from_le_bytes(suffix)
+        ))
+    }
+
+    /// `serve`'s RUN-arm `Err` → `1` (serve.rs, `kernel.run`'s own
+    /// match), distinct from `Kernel::new`'s `Err` → `1` above — a refusal
+    /// that arrives on a live kernel, after a successful start, rather than
+    /// at startup. Two passes over the identical recipe (a fresh store each,
+    /// same mount/schedule): one drives `Kernel::run` directly to observe
+    /// the real error `serve`'s thread only prints and discards, the other
+    /// goes through `serve`/`Server::wait` to pin the process-facing code at
+    /// the site that actually returns it.
+    #[test]
+    fn a_cron_tick_over_a_foreign_shape_stops_the_kernel_on_the_run_path() {
+        let direct_root = cron_foreign_shape_root("direct");
+        let mut kernel = kernel::Kernel::new(
+            cron_foreign_shape_app(&direct_root),
+            Box::new(crate::prod::ProdClock::new()),
+        )
+        .expect("nothing Pending at open — the drifted shape is only staged by the tick");
+        let (_tx, rx) = mpsc::channel::<(Request, kernel::Reply)>();
+        let mut source = ProdSource {
+            rx,
+            stash: None,
+            clock: crate::prod::ProdClock::new(),
+        };
+        let err = kernel
+            .run(&mut source)
+            .expect_err("the 1ms tick stages a foreign shape of a mounted name, failing commit");
+        assert!(Refusal::of(&err).is_some(), "{err}");
+        assert_eq!(
+            kernel_stop_line(true, &err),
+            format!("charpente kernel stopped on a refusal: {err}")
+        );
+        std::fs::remove_dir_all(&direct_root).unwrap();
+
+        let served_root = cron_foreign_shape_root("served");
+        let server = serve("127.0.0.1:0", cron_foreign_shape_app(&served_root)).unwrap();
+        assert_eq!(server.wait(), 1);
+        std::fs::remove_dir_all(&served_root).unwrap();
     }
 
     // #[route] can't be used inside the charpente crate itself (it emits
