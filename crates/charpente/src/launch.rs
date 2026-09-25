@@ -30,14 +30,14 @@ pub fn launch(
     data_dir: &str,
     build: impl Fn(Box<dyn Disk>, Box<dyn Entropy>) -> io::Result<App>,
 ) -> io::Result<()> {
-    // Unlocked: the `[]` arm's `serve(..)?.wait()` below blocks this thread
-    // on the kernel thread's own `JoinHandle`, and the kernel thread's own
-    // stop line prints through a bare `eprintln!` (serve.rs) — a lock held
-    // here across that wait would never release for it, so the kernel
-    // thread's print blocks forever and `wait` never returns (the exact
-    // zombie spec §5 exists to remove, only quieter: no stop line ever
-    // reaches stderr either). Each `write!` still locks internally, just
-    // for the span of that one call.
+    // Unlocked: the `[]` arm's `match serve(..) { Ok(server) => server.wait(),
+    // .. }` below blocks this thread on the kernel thread's own `JoinHandle`,
+    // and the kernel thread's own stop line prints through a bare
+    // `eprintln!` (serve.rs) — a lock held here across that wait would never
+    // release for it, so the kernel thread's print blocks forever and
+    // `wait` never returns (the exact zombie spec §5 exists to remove, only
+    // quieter: no stop line ever reaches stderr either). Each `write!` still
+    // locks internally, just for the span of that one call.
     let args: Vec<String> = std::env::args().skip(1).collect();
     match dispatch(
         &args,
@@ -390,9 +390,10 @@ mod tests {
     /// mounting a different one for the same name — the same fixture
     /// `serve.rs`'s `a_kernel_that_refuses_to_start_ends_wait_with_status_1`
     /// uses, reused here to drive it through `dispatch`'s `[]` arm instead
-    /// of `serve` directly, so `crate::serve::serve(addr, app)?.wait()`
-    /// (launch.rs) is exercised for real: a real bind, a real spawned kernel
-    /// thread that refuses at `Kernel::new`, and a real `.wait()` join.
+    /// of `serve` directly, so its `match crate::serve::serve(addr, app) {
+    /// Ok(server) => server.wait(), .. }` (launch.rs) is exercised for real:
+    /// a real bind, a real spawned kernel thread that refuses at
+    /// `Kernel::new`, and a real `.wait()` join.
     fn build_with_foreign_pending_job(
         disk: Box<dyn Disk>,
         entropy: Box<dyn Entropy>,
@@ -589,11 +590,11 @@ mod tests {
         std::fs::remove_file(&blocker).unwrap();
     }
 
-    /// The `[]` arm's `serve::serve(addr, app)?.wait()` (spec §5) is
-    /// otherwise driven by no test — a reversion to the old
-    /// `serve(addr, app)?; loop { thread::park() }` would hang this test
-    /// rather than fail it cleanly, but a hang is still noticed rather than
-    /// a silent pass.
+    /// The `[]` arm's `match serve::serve(addr, app) { Ok(server) =>
+    /// server.wait(), .. }` (spec §5) is otherwise driven by no test — a
+    /// reversion to the old `serve(addr, app)?; loop { thread::park() }`
+    /// would hang this test rather than fail it cleanly, but a hang is
+    /// still noticed rather than a silent pass.
     #[test]
     fn a_kernel_refusal_inside_the_serve_arm_ends_dispatch_with_its_code() {
         let dir = fresh_data_dir("serve-arm-refusal");

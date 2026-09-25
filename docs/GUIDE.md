@@ -2805,7 +2805,7 @@ Three more, at job-dispatch time rather than macro-expansion time
 dead-letter, and exactly-once effects"):
 
 ```text
-job decode for SendReceipt: <the underlying decode error> — its recorded shape is this binary's, so either a type one of its fields holds changed, which the fingerprint cannot see (GUIDE §12), or the stored payload is corrupt; it retries, then dead-letters — if such a type changed, restore that type's old definition and put the new one in a new #[job] type under a new name (GUIDE §6); if the bytes are corrupt and other rows are damaged too, restore this node from its archive (GUIDE §15)
+job decode for SendReceipt: <the underlying decode error> — its recorded shape is this binary's, so either a type one of its fields holds changed, which the fingerprint cannot see (GUIDE §12), or the stored payload is corrupt; it retries, then dead-letters — if such a type changed, restore that type's old definition and put the new one in a new #[job] type under a new name (GUIDE §6); if the bytes are corrupt and other rows are damaged too, restore this node from its archive (GUIDE §15) or re-seed it from its primary (GUIDE §10)
 handler panicked: <the panic payload>
 job "SendReceipt" is not registered — add it to the jobs![…] list passed to App::mount_jobs (or this log outlived a renamed job type)
 ```
@@ -2815,7 +2815,7 @@ recorded shape is this binary's. A change to its own fields cannot cause
 that, because it is refused before dispatch can start (see "Changing a
 job's fields"), so the cause is one of two, and the text names both: corrupt
 bytes, or a change inside a type one of its fields holds, which the
-fingerprint cannot see (§12). For the second, restore that type's old
+fingerprint cannot see (§12). For a changed type, restore that type's old
 definition, so the Pending rows decode again, and put the new definition in
 a new `#[job]` type under a new name. It retries and then dead-letters like
 any rejection. The second: your `run` method (or
@@ -3487,12 +3487,12 @@ back here for the emit and subscribe shapes above.
 
 One contract rides along with the `Serialize` derive: every `#[event]` payload must be
 plainly JSON. serde_json writes a map key quoted when it serializes as a string, a
-number or a bool, and refuses any other key (a `Vec<u8>`, tuple or struct key, say) and a
-non-finite float key. It does not refuse a `NaN` or infinite float value — it writes
-`null`, so a client receives `null` where a number was. Neither is caught at emit time (the log stores `Codec` bytes; JSON
-encoding happens at delivery). An event that fails to encode fails its own tail and
-never the node: the stream ends with one terminal frame, the same frame a stored event
-whose bytes do not decode gets:
+number or a bool, and refuses any other key (a `Vec<u8>`, tuple or struct key, say) and
+a non-finite float key. It does not refuse a `NaN` or infinite float value — it writes
+`null`, so a client receives `null` where a number was. Neither is caught at emit time
+(the log stores `Codec` bytes; JSON encoding happens at delivery). An event that fails
+to encode fails its own tail and never the node: the stream ends with one terminal
+frame, the same frame a stored event whose bytes do not decode gets:
 
 <!-- pinned -->
 ```text
@@ -3589,11 +3589,11 @@ impl Subscription {
 }
 ```
 
-`Subscription::of::<Ping>()` names the event type as a Rust type, not a string — a
-typo is a compile error, never a silently-empty subscription. `.and::<Ev2>()` adds a
-second type to the same tail, and panics, naming the event, if one of its `NAME` is
-already there (see "Changing an event" below); `.key(...)` narrows delivery to one exact-match value;
-`.cursor(...)` takes the resume point the platform already extracted (next) — the
+`Subscription::of::<Ping>()` names the event type as a Rust type, not a string — a typo
+is a compile error, never a silently-empty subscription. `.and::<Ev2>()` adds a second
+type to the same tail, and panics, naming the event, if one of its `NAME` is already
+there (see "Changing an event" below); `.key(...)` narrows delivery to one exact-match
+value; `.cursor(...)` takes the resume point the platform already extracted (next) — the
 handler can pass it straight through, as `feed` does above, or clamp it to some
 app-level boundary.
 
@@ -3698,6 +3698,16 @@ apart. Resume validation at subscribe time checks, in order:
   gone; re-sync current state through reads, then reconnect without a cursor
   ```
 
+- **Corrupt** — the retained row at that id exists, but its own bytes fail to
+  decode: a 500, not a 409, since retrying reads the same corrupt bytes again
+  rather than a transient fault:
+
+  ```text
+  cursor 8.42 sits on a stored event row that could not be decoded: <the
+  underlying decode error> — the stored bytes are corrupt; restore this node
+  from its archive (GUIDE §15) or re-seed it from its primary (GUIDE §10)
+  ```
+
 - **Diverged** — either the cursor's id is ahead of anything this node has ever
   minted:
 
@@ -3720,9 +3730,12 @@ apart. Resume validation at subscribe time checks, in order:
 - **Reshaped** — the retained row at that id is an event this subscription carries,
   written under a different shape of it (see "Changing an event" below).
 
-Every one of these four named errors ends with the identical fix: re-sync current
+Three of these four named errors end with the identical fix: re-sync current
 state through ordinary reads, then reconnect with no cursor at all — a fresh
-"from now" subscribe never revalidates against history it doesn't have.
+"from now" subscribe never revalidates against history it doesn't have. The
+corrupt-row case does not: reconnecting without a cursor does not un-corrupt
+the stored bytes, so its fix is to restore this node from its archive or
+re-seed it from its primary instead.
 
 ### Delivery: one bounded path, no live/catch-up modes
 
@@ -3813,20 +3826,20 @@ cursor on a foreign row of an event the subscription does not carry, or one its 
 filter excludes, is not refused: the subscription would never deliver that row anyway.
 The node keeps serving throughout, and every other tail is untouched.
 
-**To keep exact resume across a deploy, do not change an existing event's fields.**
-Add a new `#[event]` type under a new name, with the new fields, emit it from the new
-code, and keep the old type in code — and in any subscription that still needs it —
-for as long as its rows are retained (`DbConfig::event_retention`). A new name is not
-optional: `NAME` is the type's own snake_case, so putting the new type in a new module
-with the *same* type identifier (`mod v2 { struct IncidentOpened { ... } }`) still
-collides on `incident_opened`. The pair compiles; `App::mount_events` panics on it, and
-so does a subscription carrying both (`.and`, naming the event). A subscription carrying
-only the older type treats every row of the newer shape as a foreign one, and ends at
-the first with `charpente.reshaped`. Old rows keep decoding under their own type. Changing the fields
-in place costs every subscriber positioned before the change one re-sync. What the
-fingerprint cannot see, a change inside a type a field holds, is in §12; a stored row
-such a change breaks ends its tail with `charpente.error` (above), whose text names that
-cause beside corrupt bytes.
+**To keep exact resume across a deploy, do not change an existing event's fields.** Add
+a new `#[event]` type under a new name, with the new fields, emit it from the new code,
+and keep the old type in code — and in any subscription that still needs it — for as
+long as its rows are retained (`DbConfig::event_retention`). A new name is not optional:
+`NAME` is the type's own snake_case, so putting the new type in a new module with the
+*same* type identifier (`mod v2 { struct IncidentOpened { ... } }`) still collides on
+`incident_opened`. The pair compiles; `App::mount_events` panics on it, and so does a
+subscription carrying both (`.and`, naming the event). A subscription carrying only the
+older type treats every row of the newer shape as a foreign one, and ends at the first
+with `charpente.reshaped`. Old rows keep decoding under their own type. Changing the
+fields in place costs every subscriber positioned before the change one re-sync. What
+the fingerprint cannot see, a change inside a type a field holds, is in §12; a stored
+row such a change breaks ends its tail with `charpente.error` (above), whose text names
+that cause beside corrupt bytes.
 
 ### Testing a tail in sim
 
@@ -4191,8 +4204,8 @@ distinct moments, each with its own line on stderr:
   <the OS error> — free that address, or change the one the app passes to launch`.
 - **The kernel stops on its own account** — a Pending job of a foreign shape (§6), a
   migration step this binary has no registration for, or a platform IO failure — and its
-  stop line names which: `charpente kernel refused to start`/`stopped on a refusal`/`stopped
-  on a platform IO failure`.
+  stop line names which: `charpente kernel refused to start`/`stopped on a
+  refusal`/`stopped on a platform IO failure`.
 - **The HTTP edge thread ends before the kernel does** (most likely a panic — v0 has no
   admin-triggered shutdown): `charpente kernel stopped: the request channel closed, ...`.
 

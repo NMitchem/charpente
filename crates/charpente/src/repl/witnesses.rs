@@ -338,11 +338,20 @@ enum SlotState {
 /// before deciding whether a failure here is rescuable by the other slot.
 fn read_witness_slot(disk: &dyn Disk, slot: u8) -> io::Result<SlotState> {
     let path = witness_path(slot);
-    if !disk.list(&path)?.iter().any(|n| n == &path) {
+    if !disk
+        .list(&path)
+        .map_err(|e| witness_io_error("reading", &path, e))?
+        .iter()
+        .any(|n| n == &path)
+    {
         return Ok(SlotState::Empty);
     }
-    let file = disk.open(&path)?;
-    let len = file.len()?;
+    let file = disk
+        .open(&path)
+        .map_err(|e| witness_io_error("reading", &path, e))?;
+    let len = file
+        .len()
+        .map_err(|e| witness_io_error("reading", &path, e))?;
     // Same carve-out as the single-file design, applied per-file: a 0-byte
     // slot is what `disk.open`'s create-if-absent leaves behind when the
     // first `write_at` never landed (a real IO failure, or a crash before
@@ -356,7 +365,8 @@ fn read_witness_slot(disk: &dyn Disk, slot: u8) -> io::Result<SlotState> {
         return Ok(SlotState::Empty);
     }
     let mut buf = vec![0u8; len as usize];
-    file.read_at(0, &mut buf)?;
+    file.read_at(0, &mut buf)
+        .map_err(|e| witness_io_error("reading", &path, e))?;
     let text = match String::from_utf8(buf) {
         Ok(t) => t,
         Err(_) => return Ok(SlotState::Torn("not valid UTF-8")),
@@ -408,6 +418,21 @@ fn read_witness_slot(disk: &dyn Disk, slot: u8) -> io::Result<SlotState> {
         return Ok(SlotState::Torn("count mismatch"));
     }
     Ok(SlotState::Valid { generation, addrs })
+}
+
+/// Wraps a raw disk-IO failure touching a witness slot file with its name
+/// and a fix (hard rule 5), the same treatment `role.rs` gives the role
+/// file. A torn, wrong-format or duplicate-generation set is already named
+/// by its own detector before it ever reaches here — this only ever sees a
+/// genuine IO failure, which really can clear on a restart, unlike those.
+fn witness_io_error(action: &str, path: &str, e: io::Error) -> io::Error {
+    io::Error::new(
+        e.kind(),
+        format!(
+            "{action} the witness file \"{path}\": {e} — fix the underlying disk problem and \
+             restart"
+        ),
+    )
 }
 
 fn slot_reason(s: &SlotState) -> &'static str {
@@ -472,11 +497,17 @@ pub fn store_witnesses(disk: &dyn Disk, addrs: &[String]) -> io::Result<()> {
     let content = format!("{covered} {:08x}", covered_crc(&covered));
     let bytes = content.as_bytes();
     let path = witness_path(target);
-    let file = disk.open(&path)?;
-    file.write_at(0, bytes)?;
-    file.set_len(bytes.len() as u64)?;
-    file.sync()?;
-    disk.sync_dir(&path)?;
+    let file = disk
+        .open(&path)
+        .map_err(|e| witness_io_error("writing", &path, e))?;
+    file.write_at(0, bytes)
+        .map_err(|e| witness_io_error("writing", &path, e))?;
+    file.set_len(bytes.len() as u64)
+        .map_err(|e| witness_io_error("writing", &path, e))?;
+    file.sync()
+        .map_err(|e| witness_io_error("writing", &path, e))?;
+    disk.sync_dir(&path)
+        .map_err(|e| witness_io_error("writing", &path, e))?;
     Ok(())
 }
 
@@ -609,7 +640,40 @@ pub fn clear_witnesses(disk: &dyn Disk) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use charpente_core::io::Entropy;
     use charpente_sim::{FaultConfig, Sim};
+
+    /// A raw disk-IO failure under `Repl::open`'s call to `open_witnesses`
+    /// must name the witness file and the fix (hard rule 5), not just
+    /// surface the bare OS error. Driven through a real `ProdDisk` (sim
+    /// faults never produce an `IsADirectory`-shaped error): slot 0
+    /// pre-exists as a directory, so it reads back empty (no file by that
+    /// exact name), and `open_witnesses`'s establishing store then fails on
+    /// the real filesystem.
+    #[test]
+    // Builds a real directory to provoke a real filesystem error — the one
+    // thing a `SimDisk` cannot produce.
+    #[allow(clippy::disallowed_methods)]
+    fn a_witness_slot_that_is_a_directory_names_the_file_and_the_fix() {
+        let mut suffix = [0u8; 8];
+        crate::prod::ProdEntropy::new().unwrap().fill(&mut suffix);
+        let root = std::env::temp_dir().join(format!(
+            "charpente-witness-io-{:016x}",
+            u64::from_le_bytes(suffix)
+        ));
+        std::fs::create_dir_all(root.join(witness_path(0))).unwrap();
+        let disk = crate::prod::ProdDisk::new(&root).unwrap();
+
+        let err = open_witnesses(&disk).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("writing the witness file \"witnesses.0\""),
+            "{msg}"
+        );
+        assert!(msg.contains("restart"), "{msg}");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn an_absent_file_is_an_empty_set() {

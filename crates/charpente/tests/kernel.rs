@@ -3120,7 +3120,8 @@ fn a_corrupt_payload_under_its_own_shape_retries_naming_corruption() {
              stored payload is corrupt; it retries, then dead-letters — if such a type \
              changed, restore that type's old definition and put the new one in a new #[job] \
              type under a new name (GUIDE §6); if the bytes are corrupt and other rows are \
-             damaged too, restore this node from its archive (GUIDE §15)"
+             damaged too, restore this node from its archive (GUIDE §15) or re-seed it from \
+             its primary (GUIDE §10)"
         )
     );
 }
@@ -3226,7 +3227,7 @@ fn a_payload_with_trailing_bytes_under_its_own_shape_retries_naming_corruption()
              then dead-letters — if such a type changed, restore that type's old definition \
              and put the new one in a new #[job] type under a new name (GUIDE §6); if the \
              bytes are corrupt and other rows are damaged too, restore this node from its \
-             archive (GUIDE §15)"
+             archive (GUIDE §15) or re-seed it from its primary (GUIDE §10)"
         )
     );
 }
@@ -3366,9 +3367,9 @@ fn job_shape_upgrades_replay_identically_for_the_same_seed() {
     charpente_sim::checks::replays_identically(0x5A9E_0611, |sim: &mut Sim| {
         receipt_upgrade_universe(sim)?;
         let coverage = sim.coverage();
-        if !coverage.keys().any(|k| k.starts_with("shapes:job-")) {
+        if !coverage.contains_key("shapes:job-drained") {
             return Err(format!(
-                "this seed no longer reaches a verdict: {coverage:?}"
+                "this seed no longer reaches the drained-queue verdict: {coverage:?}"
             ));
         }
         Ok(coverage)

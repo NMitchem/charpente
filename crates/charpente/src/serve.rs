@@ -80,10 +80,10 @@ const EDGE_GONE_STOP_LINE: &str = "charpente kernel stopped: the request channel
      only happens when the HTTP edge thread ended before the kernel did (most likely a panic) — \
      check the edge thread's own panic output above; this is not a clean shutdown, v0 has none";
 
-/// The kernel thread's stop line — the first line of the kernel's final
-/// stderr output. A refusal is named as one because restarting the same binary does not by
-/// itself clear it; every refusal's own text names what must change first. A
-/// platform IO failure really can clear on a restart.
+/// The kernel thread's stop line — the first line of the kernel's final stderr
+/// output. A refusal is named as one because restarting the same binary does
+/// not by itself clear it; every refusal's own text names what must change
+/// first. A platform IO failure really can clear on a restart.
 fn kernel_stop_line(started: bool, e: &io::Error) -> String {
     match (started, Refusal::of(e).is_some()) {
         (false, true) => format!("charpente kernel refused to start: {e}"),
@@ -656,9 +656,9 @@ mod tests {
     use charpente_core::table::{Codec, Id, View};
 
     /// The kernel thread's stop line — the first line of the kernel's final
-    /// stderr output — names what stopped it (spec §5): a refusal is named as one, because
-    /// restarting the same binary does not by itself clear it. Each refusal's
-    /// own text carries what must change first.
+    /// stderr output — names what stopped it (spec §5): a refusal is named as
+    /// one, because restarting the same binary does not by itself clear it.
+    /// Each refusal's own text carries what must change first.
     #[test]
     fn every_kernel_stop_line_names_what_stopped_it() {
         let refusal = io::Error::other(charpente_core::db::Refusal(

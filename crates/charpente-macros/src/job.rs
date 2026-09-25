@@ -227,7 +227,8 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                        payload is corrupt; it retries, then dead-letters — if such a type changed, \
                        restore that type's old definition and put the new one in a new #[job] type \
                        under a new name (GUIDE §6); if the bytes are corrupt and other rows are \
-                       damaged too, restore this node from its archive (GUIDE §15)";
+                       damaged too, restore this node from its archive (GUIDE §15) or re-seed it \
+                       from its primary (GUIDE §10)";
 
     Ok(quote! {
         #input

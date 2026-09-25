@@ -106,6 +106,21 @@ fn line_crc(line: &str) -> u32 {
     crc.finish()
 }
 
+/// Wraps a raw disk-IO failure touching the role file with the file's name
+/// and a fix (hard rule 5). A corrupt or unparseable role is already named
+/// by the callers below before it ever reaches here — this only ever sees a
+/// genuine IO failure (permissions, a full disk, a torn mount), which really
+/// can clear on a restart, unlike those.
+fn role_io_error(action: &str, e: io::Error) -> io::Error {
+    io::Error::new(
+        e.kind(),
+        format!(
+            "{action} the role file \"{ROLE_FILE}\": {e} — fix the underlying disk problem and \
+             restart"
+        ),
+    )
+}
+
 /// Writes the durable role file — `<role line>\n<crc32 hex>` — with
 /// `write_at` + `set_len` + `sync` + `sync_dir`: a role flip must survive
 /// any crash before it takes effect (spec §2's three-state switchover
@@ -116,11 +131,16 @@ pub fn store_role(disk: &dyn Disk, role: &Role) -> io::Result<()> {
     let line = role_to_line(role);
     let content = format!("{line}\n{:08x}", line_crc(&line));
     let bytes = content.as_bytes();
-    let file = disk.open(ROLE_FILE)?;
-    file.write_at(0, bytes)?;
-    file.set_len(bytes.len() as u64)?;
-    file.sync()?;
-    disk.sync_dir(ROLE_FILE)?;
+    let file = disk
+        .open(ROLE_FILE)
+        .map_err(|e| role_io_error("writing", e))?;
+    file.write_at(0, bytes)
+        .map_err(|e| role_io_error("writing", e))?;
+    file.set_len(bytes.len() as u64)
+        .map_err(|e| role_io_error("writing", e))?;
+    file.sync().map_err(|e| role_io_error("writing", e))?;
+    disk.sync_dir(ROLE_FILE)
+        .map_err(|e| role_io_error("writing", e))?;
     Ok(())
 }
 
@@ -144,14 +164,22 @@ fn corrupt_role_error(reason: &str) -> io::Error {
 /// Some(mismatch_notice))` where the notice names both roles and, for the
 /// Primary-file/Follower-config case, the demote rule (spec §2).
 pub fn load_role(disk: &dyn Disk, initial: &Role) -> io::Result<(Role, Option<String>)> {
-    if !disk.list(ROLE_FILE)?.iter().any(|name| name == ROLE_FILE) {
+    if !disk
+        .list(ROLE_FILE)
+        .map_err(|e| role_io_error("reading", e))?
+        .iter()
+        .any(|name| name == ROLE_FILE)
+    {
         store_role(disk, initial)?;
         return Ok((initial.clone(), None));
     }
-    let file = disk.open(ROLE_FILE)?;
-    let len = file.len()?;
+    let file = disk
+        .open(ROLE_FILE)
+        .map_err(|e| role_io_error("reading", e))?;
+    let len = file.len().map_err(|e| role_io_error("reading", e))?;
     let mut buf = vec![0u8; len as usize];
-    file.read_at(0, &mut buf)?;
+    file.read_at(0, &mut buf)
+        .map_err(|e| role_io_error("reading", e))?;
     let text = String::from_utf8(buf).map_err(|_| corrupt_role_error("not valid UTF-8"))?;
     let (line, stored_crc) = text
         .split_once('\n')
@@ -170,10 +198,39 @@ pub fn load_role(disk: &dyn Disk, initial: &Role) -> io::Result<(Role, Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use charpente_core::io::Entropy;
     use charpente_sim::{FaultConfig, Sim};
 
     fn disk() -> charpente_sim::SimDisk {
         Sim::with_faults(0x5eed_5eed, FaultConfig::none()).disk()
+    }
+
+    /// A raw disk-IO failure under `Repl::open`'s call to `load_role` must
+    /// name the role file and the fix (hard rule 5), not just surface the
+    /// bare OS error. Driven through a real `ProdDisk` (sim faults never
+    /// produce an `IsADirectory`-shaped error): "role" pre-exists as a
+    /// directory, so `load_role`'s first-boot branch finds no plain file by
+    /// that name and its `store_role` write fails on the real filesystem.
+    #[test]
+    // Builds a real directory to provoke a real filesystem error — the one
+    // thing a `SimDisk` cannot produce.
+    #[allow(clippy::disallowed_methods)]
+    fn a_role_file_that_is_a_directory_names_the_file_and_the_fix() {
+        let mut suffix = [0u8; 8];
+        crate::prod::ProdEntropy::new().unwrap().fill(&mut suffix);
+        let root = std::env::temp_dir().join(format!(
+            "charpente-role-io-{:016x}",
+            u64::from_le_bytes(suffix)
+        ));
+        std::fs::create_dir_all(root.join(ROLE_FILE)).unwrap();
+        let disk = crate::prod::ProdDisk::new(&root).unwrap();
+
+        let err = load_role(&disk, &Role::Primary).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("writing the role file \"role\""), "{msg}");
+        assert!(msg.contains("restart"), "{msg}");
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
