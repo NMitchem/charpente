@@ -966,6 +966,125 @@ fn a_cursor_on_a_corrupt_event_row_is_refused_naming_the_corruption() {
     assert!(sinks.lock().unwrap().is_empty(), "no stream was opened");
 }
 
+/// The retention floor is read from the oldest row's KEY, never its bytes,
+/// so a corrupt row there fails only a tail whose scan reaches it (spec
+/// amendment A11) — here one registered on the empty table, so its first
+/// scan starts at the floor. A tail subscribed without a cursor starts past
+/// the row, never meets it, and flows.
+#[test]
+fn a_corrupt_event_row_at_the_retention_floor_fails_only_the_tail_that_reaches_it() {
+    let sim = Sim::with_faults(0x5A9E_0305, FaultConfig::none());
+    let mut kernel = Kernel::new(shapes_app(&sim).unwrap(), Box::new(sim.clock())).unwrap();
+    let (_, early) = run_script(&mut kernel, &sim, vec![Request::new(Method::Get, "/pongs")]);
+    let mut pong = Vec::new();
+    Pong { n: WireU64(0) }.encode(&mut pong);
+    apply_record(
+        &mut kernel,
+        shaped_emit_record("pong", &pong, <Pong as Event>::FINGERPRINT),
+    );
+    plant_corrupt_event_row(&mut kernel, 0);
+    let (responses, late) = run_script(
+        &mut kernel,
+        &sim,
+        vec![
+            Request::new(Method::Get, "/pongs"),
+            Request::new(Method::Post, "/pong").json(&EmitBody {
+                n: WireU64(1),
+                key: None,
+            }),
+        ],
+    );
+    assert_eq!(
+        statuses(&responses),
+        vec![200, 200],
+        "the node keeps serving"
+    );
+
+    let frames = frames_of(&early.lock().unwrap()[0]);
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert_eq!(frames[0].2, "charpente.error");
+    let body: serde_json::Value = serde_json::from_str(&frames[0].3).unwrap();
+    assert_eq!(body["id"], 0);
+    assert_eq!(
+        body["error"],
+        "event rows from id 0 could not be decoded: row decode: needed 8 bytes for u64, 3 left \
+         — schema drift or corruption — the stored bytes are corrupt; restore this node from \
+         its archive (GUIDE §15) or re-seed it from its primary (GUIDE §10)"
+    );
+
+    let emitted: Vec<EventRow> = kernel
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan_from(1, 8)
+        .unwrap();
+    assert_eq!(
+        frames_of(&late.lock().unwrap()[0]),
+        vec![(
+            1,
+            emitted[0].seq,
+            "pong".to_string(),
+            r#"{"n":"1"}"#.to_string()
+        )],
+        "a tail that starts past the corrupt row never meets it"
+    );
+}
+
+/// Retention's GC reads the floor from keys too, and deletes without decoding,
+/// so a corrupt row at the floor is collected like any other once it falls
+/// out of retention, instead of failing every checkpoint from then on.
+#[test]
+fn a_corrupt_event_row_at_the_floor_is_collected_by_retention() {
+    let sim = Sim::with_faults(0x5A9E_0306, FaultConfig::none());
+    let app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig {
+            db: DbConfig {
+                event_retention: 2,
+                checkpoint_every: 1,
+                ..DbConfig::default()
+            },
+            ..AppConfig::default()
+        },
+    )
+    .unwrap()
+    .mount(routes![emit_pong, feed_pongs]);
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let emit = |n: u64| {
+        Request::new(Method::Post, "/pong").json(&EmitBody {
+            n: WireU64(n),
+            key: None,
+        })
+    };
+    let (responses, _) = run_script(&mut kernel, &sim, vec![emit(0), emit(1)]);
+    assert_eq!(statuses(&responses), vec![200, 200]);
+    plant_corrupt_event_row(&mut kernel, 0);
+    // The third event takes the floor to 1: the checkpoint after this commit
+    // collects the corrupt row 0.
+    let (responses, _) = run_script(&mut kernel, &sim, vec![emit(2)]);
+    assert_eq!(statuses(&responses), vec![200]);
+    let db = kernel.app_mut_for_tests().db_for_tests();
+    db.checkpoint()
+        .expect("a checkpoint over a corrupt row at the floor succeeds");
+    assert_eq!(
+        db.event_floor().unwrap(),
+        1,
+        "the corrupt row was collected"
+    );
+    let retained: Vec<u64> = db
+        .snapshot()
+        .unwrap()
+        .scan_from::<EventRow>(0, 8)
+        .unwrap()
+        .iter()
+        .map(|row| row.id.raw())
+        .collect();
+    assert_eq!(retained, vec![1, 2]);
+}
+
 fn realtime_app(sim: &Sim) -> io::Result<App> {
     Ok(App::open(
         Box::new(sim.disk()),

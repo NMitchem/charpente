@@ -1244,7 +1244,9 @@ non-zero rather than a clean-exit `0` a `Restart=on-failure` supervisor would ta
   followers.
   Retention is count-based: `DbConfig::event_retention` (default 65,536) bounds the table,
   garbage-collected at the existing checkpoint cadence; `Db::event_floor()` reports the
-  smallest id still retained.
+  smallest id still retained. Both read the oldest row's key and never decode a row, so a
+  corrupt row at the floor fails only a tail whose scan reaches it, and GC collects it
+  like any other.
 - **The cursor is the event id, wire-encoded with its committing record's seq: `<id>.<seq>`.**
   Resume from cursor `(c, s)` delivers every matching event with `id > c` — exact by
   construction, since ids are minted at apply in log order. The seq half exists for one

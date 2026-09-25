@@ -1055,8 +1055,12 @@ impl Store {
     /// durable commit just loses the deletion (rows resurface, briefly
     /// over-retained — never lost data, never an under-retention bug), and
     /// the next checkpoint recomputes the same floor from `next_event_id`
-    /// and deletes them again.
+    /// and deletes them again. Decode-free (`delete_raw`): a row GC removes is
+    /// never read, so a corrupt one is collected like any other instead of
+    /// failing every checkpoint from then on. Sound only because `EventRow`
+    /// has no index entries to remove, which the const assert holds.
     pub fn gc_events(&self, floor: u64) -> io::Result<()> {
+        const { assert!(crate::event::EventRow::INDEXES.is_empty()) };
         let mut txn = self.db.begin_write().map_err(redb_err)?;
         txn.set_durability(Durability::None).map_err(redb_err)?;
         {
@@ -1078,7 +1082,7 @@ impl Store {
                 events_materialized: 0,
             };
             for id in ids {
-                writer.delete::<crate::event::EventRow>(UNSCOPED, Id::from_raw(id))?;
+                writer.delete_raw(crate::event::EventRow::TABLE, None, id)?;
             }
         }
         txn.commit().map_err(redb_err)?;
@@ -1841,6 +1845,23 @@ impl Snapshot {
                 .map_or(0, |g| g.value())),
             Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
             Err(e) => Err(redb_err(e)),
+        }
+    }
+
+    /// The smallest stored `EventRow` id, read off the key alone: the row's
+    /// bytes are never decoded, so a corrupt row at the retention floor fails
+    /// only the tail whose scan reaches it, never the floor read every tail
+    /// and every checkpoint makes first. The same range walk `scan_from(0, 1)`
+    /// makes, so the pages it reads are the same.
+    pub fn first_event_id(&self) -> io::Result<Option<u64>> {
+        let rows = match self.txn.open_table(rows_def(crate::event::EventRow::TABLE)) {
+            Ok(rows) => rows,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(unscoped_open_err(crate::event::EventRow::TABLE, e)),
+        };
+        match rows.range(0u64..).map_err(redb_err)?.next() {
+            Some(entry) => Ok(Some(entry.map_err(redb_err)?.0.value())),
+            None => Ok(None),
         }
     }
 

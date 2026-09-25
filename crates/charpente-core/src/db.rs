@@ -2556,11 +2556,7 @@ impl Db {
         let floor = snap
             .next_event_id()?
             .saturating_sub(self.cfg.event_retention);
-        let has_work = floor > 0
-            && snap
-                .scan_from::<EventRow>(0, 1)?
-                .first()
-                .is_some_and(|row| row.id.raw() < floor);
+        let has_work = floor > 0 && snap.first_event_id()?.is_some_and(|first| first < floor);
         drop(snap);
         if has_work {
             store.gc_events(floor)?;
@@ -2590,23 +2586,23 @@ impl Db {
     /// holds nothing (either no emit has ever happened, or `checkpoint`'s GC
     /// has deleted every row up to the tail). Never exceeds `next_event_id`:
     /// GC only ever deletes ids strictly below it. Subscribers compare their
-    /// cursor against this to detect they have fallen off retention.
+    /// cursor against this to detect they have fallen off retention. Read
+    /// from the oldest row's key, never its bytes (`first_event_id`), so a
+    /// corrupt row at the floor fails only a tail that reaches it.
     pub fn event_floor(&self) -> io::Result<u64> {
         let snap = self.snapshot()?;
-        let rows: Vec<EventRow> = snap.scan_from(0, 1)?;
-        match rows.first() {
-            Some(row) => {
+        match snap.first_event_id()? {
+            Some(first) => {
                 // Negative space: every stored event id was minted below the
                 // counter, and GC never touches the counter — so the floor
                 // can never reach, let alone exceed, next_event_id.
                 let next = snap.next_event_id()?;
                 assert!(
-                    row.id.raw() < next,
-                    "event_floor: smallest retained event id {} is not below next_event_id \
-                     {next} — an event exists that the counter never minted",
-                    row.id.raw()
+                    first < next,
+                    "event_floor: smallest retained event id {first} is not below \
+                     next_event_id {next} — an event exists that the counter never minted"
                 );
-                Ok(row.id.raw())
+                Ok(first)
             }
             None => snap.next_event_id(),
         }
