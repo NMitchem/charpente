@@ -16,7 +16,7 @@ use charpente::http::{
 };
 use charpente::kernel::{
     ERROR_FRAME, EventFrame, EventSink, Kernel, RESHAPED_FRAME, RecordedResponses, SimSink,
-    SimSinkHandle, SimSource, SinkHandles, SinkStatus, Step,
+    SimSinkHandle, SimSource, SinkHandles, SinkStatus, Step, TAIL_BATCH_EVENTS,
 };
 use charpente::repl::protocol::{Msg, decode, encode};
 use charpente::repl::role::Role;
@@ -972,6 +972,104 @@ fn an_envelope_corrupt_row_withholds_its_batch_and_ends_every_tail_reaching_it()
         let body: serde_json::Value = serde_json::from_str(&frames[0].3).unwrap();
         assert_eq!(body["id"], rows[1].id.raw());
     }
+}
+
+/// A kernel with one tail registered from a cursor on row 1 of five large
+/// rows, over a cache made cold by a restart: the tail's next scan needs row
+/// 2's page, which nothing since the restart has read.
+fn tail_over_a_cold_cache(seed: u64) -> (Sim, Kernel, SimSource, SinkHandles, Vec<EventRow>) {
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let mut kernel = Kernel::new(shapes_app(&sim).unwrap(), Box::new(sim.clock())).unwrap();
+    for _ in 0..5 {
+        apply_record(&mut kernel, shaped_emit_record("filler", &[0u8; 6000], 0));
+    }
+    let rows: Vec<EventRow> = kernel
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan_from(0, 8)
+        .unwrap();
+    assert_eq!(rows.len(), 5);
+    // Checkpointed, so the reopen replays nothing and reads no event page.
+    kernel
+        .app_mut_for_tests()
+        .db_for_tests()
+        .checkpoint()
+        .unwrap();
+    sim.restart();
+    drop(kernel);
+    let mut kernel = Kernel::new(shapes_app(&sim).unwrap(), Box::new(sim.clock())).unwrap();
+    let mut source = SimSource::new(Box::new(sim.clock()), sim.now().as_nanos() + 10 * SEC);
+    source.push_at(
+        sim.now().as_nanos(),
+        Request::new(
+            Method::Get,
+            format!("/pongs?cursor={}", cursor_of(&rows[1])),
+        ),
+    );
+    let sinks = source.sinks();
+    assert!(matches!(kernel.step(&mut source), Ok(Step::Worked)));
+    assert_eq!(
+        sinks.lock().unwrap().len(),
+        1,
+        "the subscribe registered a tail"
+    );
+    (sim, kernel, source, sinks, rows)
+}
+
+/// The corrupt-row arm fails a tail only for the codec's own `InvalidData`: a
+/// store failure the tail's scan reaches is the platform's, and it stops the
+/// kernel instead of ending one tail with `charpente.error`. Three twins of
+/// one state. With no crash, the step after the subscribe services that tail
+/// and nothing else. With the crash, a probe shows the tail's scan is the
+/// read that reaches the disk (a failed read latches redb, so the probe gets
+/// a twin of its own). And the run under test, whose cached reads before the
+/// scan succeed, stops on exactly the scan's error.
+#[test]
+fn a_store_failure_at_the_tail_scan_stops_the_kernel_not_just_the_tail() {
+    let (_, mut twin, mut twin_source, _, _) = tail_over_a_cold_cache(0x5A9E_0309);
+    assert!(matches!(twin.step(&mut twin_source), Ok(Step::Worked)));
+    assert!(
+        matches!(twin.step(&mut twin_source), Ok(Step::Idle { .. })),
+        "the step after the subscribe is the tail's, and the only one due"
+    );
+
+    let (sim, probe, _, _, rows) = tail_over_a_cold_cache(0x5A9E_0309);
+    sim.crash_disk_now();
+    let scan = probe
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan_from::<EventRow>(rows[2].id.raw(), TAIL_BATCH_EVENTS)
+        .err()
+        .expect("the tail's scan reaches the crashed disk");
+    assert_ne!(scan.kind(), io::ErrorKind::InvalidData, "{scan}");
+
+    let (sim, mut kernel, mut source, sinks, _) = tail_over_a_cold_cache(0x5A9E_0309);
+    sim.crash_disk_now();
+    let db = kernel.app().db();
+    assert_eq!(
+        db.next_event_id().unwrap(),
+        5,
+        "the ready set's read is served from cache"
+    );
+    assert_eq!(db.event_floor().unwrap(), 0, "so is the floor read");
+    let Err(err) = kernel.step(&mut source) else {
+        panic!("a store failure at the tail's scan must stop the kernel");
+    };
+    assert_eq!(
+        err.to_string(),
+        scan.to_string(),
+        "it stopped on the scan's own error"
+    );
+    let handle = sinks.lock().unwrap()[0].clone();
+    assert!(handle.frames().is_empty(), "{:?}", handle.frames());
+    assert!(
+        !handle.closed(),
+        "the tail was not ended as if the row were corrupt"
+    );
 }
 
 /// A cursor ON a row whose own bytes do not decode gets a 500 that names the
@@ -2978,7 +3076,10 @@ fn shapes_workload(sim: &mut Sim) -> Result<(), String> {
         match kernel.run(&mut source) {
             Ok(()) => {
                 let stalled = *stalled.lock().expect("stall flag lock");
-                return shapes_verdict(sim, &rows, &rows[anchor_at], &responses, &sinks, stalled);
+                match shapes_verdict(sim, &rows, &rows[anchor_at], &responses, &sinks, stalled)? {
+                    Adjudged::Settled => return Ok(()),
+                    Adjudged::Retry => sim.restart(),
+                }
             }
             Err(e) if is_fault_fallout(&e.to_string()) => sim.restart(),
             Err(e) => return Err(format!("resume kernel.run failed non-injected: {e}")),
@@ -2997,7 +3098,9 @@ fn shapes_workload(sim: &mut Sim) -> Result<(), String> {
 /// `charpente.reshaped` frame that ends the stream. A strict prefix is legal
 /// only when `stalled`, meaning the sink's stall closure refused a send. A
 /// closed tail is not evidence of that, since the terminal frame closes it
-/// too. Nothing is skipped and nothing is decoded from a foreign row.
+/// too. Nothing is skipped and nothing is decoded from a foreign row. A
+/// subscribe answered 500 with fault fallout — an injected fault reached the
+/// cursor read — is the flagship's retry, not a verdict.
 fn shapes_verdict(
     sim: &Sim,
     rows: &[EventRow],
@@ -3005,7 +3108,7 @@ fn shapes_verdict(
     responses: &RecordedResponses,
     sinks: &SinkHandles,
     stalled: bool,
-) -> Result<(), String> {
+) -> Result<Adjudged, String> {
     let v1 = <shapes_v1::IncidentOpened as Event>::FINGERPRINT;
     let v2 = <shapes_v2::IncidentOpened as Event>::FINGERPRINT;
     let pong = <Pong as Event>::FINGERPRINT;
@@ -3050,6 +3153,9 @@ fn shapes_verdict(
             "expected exactly the subscribe's response, got {responses:?}"
         ));
     };
+    if *status == 500 && is_fault_fallout(&String::from_utf8_lossy(body)) {
+        return Ok(Adjudged::Retry);
+    }
     if foreign(anchor) {
         let expected = reshaped_409(anchor, v2);
         if *status != 409 || error_text(body) != expected {
@@ -3060,7 +3166,7 @@ fn shapes_verdict(
             ));
         }
         sim.cover("shapes:reshaped-409");
-        return Ok(());
+        return Ok(Adjudged::Settled);
     }
     if *status != 200 {
         return Err(format!(
@@ -3120,7 +3226,15 @@ fn shapes_verdict(
     if got.iter().any(|f| f.2 == "incident_opened") {
         sim.cover("shapes:v2-delivered");
     }
-    Ok(())
+    Ok(Adjudged::Settled)
+}
+
+/// What one resume attempt's verdict came to: adjudicated, or fault fallout
+/// the workload retries within its settle budget.
+#[derive(Debug, PartialEq)]
+enum Adjudged {
+    Settled,
+    Retry,
 }
 
 /// The contract `shapes_verdict`'s tag check holds the platform to.
@@ -3171,6 +3285,25 @@ fn a_resume_across_mixed_shapes_is_exact_or_named_under_the_fault_matrix() {
             ("shapes:v2-delivered", SHAPES_V2_DELIVERED_FLOOR)
         ]
     );
+}
+
+/// The floors below are exact counts, so the batch must replay: one universe
+/// run twice from one seed gives the same coverage and the same durable
+/// state. The seed's universe resumes across the shape change and ends in the
+/// named frame, so the replay covers the property's own outcome.
+#[test]
+fn mixed_shape_resumes_replay_identically_for_the_same_seed() {
+    charpente_sim::checks::replays_identically(0x2EB2_5A21, |sim: &mut Sim| {
+        shapes_workload(sim)?;
+        let coverage = sim.coverage();
+        if !coverage.contains_key("shapes:reshaped-frame") {
+            return Err(format!(
+                "this seed no longer reaches the reshaped frame: {coverage:?}"
+            ));
+        }
+        Ok(coverage)
+    })
+    .unwrap();
 }
 
 /// **Measured 2026-09-24** at base `0x2EB2_5A10`, 180 universes, identical
@@ -3225,7 +3358,7 @@ fn a_short_stream_passes_the_shapes_verdict_only_when_a_stall_fired() {
 
     assert_eq!(
         verdict(&full, false),
-        Ok(()),
+        Ok(Adjudged::Settled),
         "the whole resume with no stall is exact"
     );
     let short = verdict(&full[..1], false)
@@ -3236,7 +3369,7 @@ fn a_short_stream_passes_the_shapes_verdict_only_when_a_stall_fired() {
     );
     assert_eq!(
         verdict(&full[..1], true),
-        Ok(()),
+        Ok(Adjudged::Settled),
         "a strict prefix is legal once a stall fired"
     );
     let redelivered =
@@ -3244,6 +3377,24 @@ fn a_short_stream_passes_the_shapes_verdict_only_when_a_stall_fired() {
     assert!(
         redelivered.contains("a refused frame was redelivered or an extra frame was sent"),
         "refused by the stalled-but-full arm, not some other one: {redelivered}"
+    );
+}
+
+/// A subscribe answered 500 because an injected fault reached the cursor
+/// read is fault fallout, the flagship's classification: the attempt is
+/// retried, never adjudicated as a verdict failure.
+#[test]
+fn a_fault_fallout_500_on_the_shapes_subscribe_is_retried_not_a_verdict() {
+    let (sim, _kernel, rows) = mixed_log(0x5A11_0002, &[("/pong", 1, None)]);
+    let body = serde_json::to_vec(&serde_json::json!({
+        "error": "internal storage failure validating the subscribe cursor — retry: injected read error"
+    }))
+    .unwrap();
+    let responses: RecordedResponses = Arc::new(Mutex::new(vec![(500, body)]));
+    let sinks: SinkHandles = Arc::new(Mutex::new(Vec::new()));
+    assert_eq!(
+        shapes_verdict(&sim, &rows, &rows[0], &responses, &sinks, false),
+        Ok(Adjudged::Retry)
     );
 }
 

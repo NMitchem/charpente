@@ -3357,6 +3357,25 @@ fn a_new_job_shape_starts_iff_no_old_shape_is_pending_under_the_fault_matrix() {
     );
 }
 
+/// The floors below are exact counts, so the batch must replay: one universe
+/// run twice from one seed gives the same coverage and the same durable
+/// state. The seed's universe reaches a verdict, so the replay covers the
+/// property's own outcome.
+#[test]
+fn job_shape_upgrades_replay_identically_for_the_same_seed() {
+    charpente_sim::checks::replays_identically(0x5A9E_0611, |sim: &mut Sim| {
+        receipt_upgrade_universe(sim)?;
+        let coverage = sim.coverage();
+        if !coverage.keys().any(|k| k.starts_with("shapes:job-")) {
+            return Err(format!(
+                "this seed no longer reaches a verdict: {coverage:?}"
+            ));
+        }
+        Ok(coverage)
+    })
+    .unwrap();
+}
+
 /// **Measured 2026-09-24** at base `0x5A9E_0600`, 256 universes, identical
 /// across consecutive batches. Each floor is the exact count: a drop is a
 /// finding, not a number to lower. `shapes:job-none-enqueued` (a store the

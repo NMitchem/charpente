@@ -8168,6 +8168,138 @@ fn a_write_gate_opening_over_foreign_pending_jobs_stops_the_kernel_by_name() {
     );
 }
 
+/// A switchover between two kernels onto a target holding a Pending job of a
+/// foreign shape (amendment A1): the hand-off completes and the operator gets
+/// `CtrlOk`, and the target's kernel stops by name the moment its write gate
+/// opens — a `Refusal`, before it dispatches anything. The old primary
+/// follows it.
+#[test]
+fn a_kernel_switchover_onto_foreign_pending_jobs_stops_the_target_by_name() {
+    let sim = Sim::with_faults(0x5A9E_070A, FaultConfig::none());
+    let horizon = 100 * 1_000_000_000;
+    {
+        // Due far past the horizon, so the primary never dispatches it: the
+        // switchover must find it Pending.
+        let mut db = Db::open(
+            Box::new(sim.host("p").disk()),
+            DbConfig::default(),
+            full_schema(),
+        )
+        .unwrap();
+        db.transact(|tx| {
+            tx.enqueue(Ping { n: 7 });
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+        db.transact(|tx| {
+            let mut job = tx
+                .get(Id::<JobRow>::from_raw(0))?
+                .expect("the enqueued ping");
+            job.due_at = u64::MAX / 2;
+            tx.put(&job);
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+        db.checkpoint().unwrap();
+    }
+    let mut p = spawn_kernel_node(
+        &sim,
+        "p",
+        primary_cfg("p:1"),
+        DbConfig::default(),
+        horizon,
+        true,
+    )
+    .unwrap();
+    let mut f = spawn_kernel_node(
+        &sim,
+        "f",
+        follower_cfg("f:1", "p:1"),
+        DbConfig::default(),
+        horizon,
+        true,
+    )
+    .unwrap();
+    // This binary's `ping` has another shape. `kernel_schema`'s kernels mount
+    // `Bump` only, so registering `ping` by hand collides with nothing.
+    f.kernel
+        .as_mut()
+        .unwrap()
+        .app_mut_for_tests()
+        .db_for_tests()
+        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT)]);
+    krun_until(&sim, &mut [&mut p, &mut f], kconverged, CONVERGE_BUDGET).unwrap();
+
+    let mut cli = CtrlConn::open(
+        &sim,
+        "p:1",
+        &Msg::CtrlSwitchover {
+            to: "f:1".to_string(),
+            secret: None,
+        },
+    )
+    .unwrap();
+    let mut refused: Option<io::Error> = None;
+    let mut reply = None;
+    for _ in 0..CONVERGE_BUDGET {
+        let mut worked = false;
+        let mut deadlines = Vec::new();
+        for (node, is_target) in [(&mut p, false), (&mut f, true)] {
+            if is_target && refused.is_some() {
+                continue;
+            }
+            match node.kernel.as_mut().unwrap().step(&mut node.source) {
+                Ok(Step::Worked) => worked = true,
+                Ok(Step::Idle { deadline }) => deadlines.extend(deadline.map(|d| d.as_nanos())),
+                Err(e) if is_target => refused = Some(e),
+                Err(e) => panic!("the old primary's kernel stopped: {e}"),
+            }
+        }
+        if let Some(msg) = cli.poll().unwrap() {
+            reply = Some(msg);
+            break;
+        }
+        if !worked {
+            let now = sim.now().as_nanos();
+            let next = deadlines
+                .into_iter()
+                .chain(sim.next_wakeup())
+                .filter(|&d| d > now)
+                .min()
+                .expect("quiescent before the switchover's reply");
+            sim.clock().sleep(Duration::from_nanos(next - now));
+        }
+    }
+    assert!(
+        matches!(reply, Some(Msg::CtrlOk { .. })),
+        "the switchover completes — it is never stranded mid-hand-off: {reply:?}"
+    );
+    let err = refused.expect("the target's kernel stopped when its write gate opened");
+    assert!(
+        charpente_core::db::Refusal::of(&err).is_some(),
+        "the stop is a Refusal: {err}"
+    );
+    assert_eq!(err.to_string(), ping_refusal("0", PING_V2_FINGERPRINT));
+    let target = f.kernel.as_ref().unwrap();
+    assert!(target.is_primary(), "the target is the primary");
+    assert!(
+        !p.kernel.as_ref().unwrap().is_primary(),
+        "the old primary follows it"
+    );
+    let jobs = target
+        .app()
+        .db()
+        .snapshot()
+        .unwrap()
+        .scan::<JobRow>()
+        .unwrap();
+    assert_eq!(
+        (jobs.len(), jobs[0].status, jobs[0].attempts),
+        (1, JobStatus::Pending, 0),
+        "the foreign job was never dispatched"
+    );
+}
+
 /// Same scenario as the test above, through `krun_until_io_error` instead of
 /// `krun_until` — the one assertion that needs the raw error, not its text:
 /// the write-gate-opening refusal (`after_repl_step`, kernel/mod.rs) is a
