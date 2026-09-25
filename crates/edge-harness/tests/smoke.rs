@@ -193,9 +193,9 @@ fn a_node_whose_kernel_cannot_start_exits_nonzero_with_its_named_line() {
 /// and `tenant_node`'s own sibling bin), which `node`/`tenant_node` cannot
 /// stand in for: both call `serve`/`serve_replicated` directly, never
 /// `launch`. `launch` reads no argv of its own, so the fixture is a data-dir
-/// artifact `seed_foreign_job` (this crate's own bin, `src/bin/
-/// seed_foreign_job.rs`) plants ahead of time (a foreign-shape Pending
-/// `SendReceipt`), not a CLI flag.
+/// artifact `seed_foreign_job` (an invoicing example target, `examples/
+/// invoicing/examples/seed_foreign_job.rs`) plants ahead of time (a
+/// foreign-shape Pending `SendReceipt`), not a CLI flag.
 ///
 /// `invoicing`'s `main.rs` binds a fixed `0.0.0.0:8080` with no override, so
 /// this asserts more than "exit 1 and the refusal text somewhere in

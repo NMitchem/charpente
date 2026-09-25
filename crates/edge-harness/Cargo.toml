@@ -8,13 +8,3 @@ publish = false
 
 [lints]
 workspace = true
-
-# `charpente` here for exactly one bin (`src/bin/seed_foreign_job.rs`) — a
-# standalone seeding process this crate builds and then drives as just
-# another external binary, matching `invoicing`/`node`/`charpente` in
-# `Bins`. The rig's own library and every test stay dependency-free
-# (`src/lib.rs`'s module doc, `tests/open_fence.rs`'s F1 round 2 note): no
-# `[dev-dependencies]` entry, and nothing under `src/` besides this one bin
-# imports `charpente` or any other workspace crate.
-[dependencies]
-charpente.workspace = true

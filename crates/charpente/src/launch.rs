@@ -506,6 +506,38 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A data dir `ProdDisk::new` cannot create (its parent is a regular
+    /// file) gets the same named platform line and exit 1 as a failing
+    /// `build`, and `build` never runs. `ProdEntropy::new`'s sibling arm has
+    /// no deterministic trigger: it opens the fixed path `/dev/urandom`.
+    #[test]
+    fn a_data_dir_that_cannot_be_created_exits_one_with_the_platform_wording() {
+        let blocker = fresh_data_dir("disk-new-failure");
+        std::fs::write(&blocker, b"a regular file, not a directory").unwrap();
+        let data_dir = blocker.join("data");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = dispatch(
+            &[],
+            "127.0.0.1:0",
+            data_dir.to_str().unwrap(),
+            |_: Box<dyn Disk>, _: Box<dyn Entropy>| -> io::Result<App> {
+                panic!("build must not run when the data dir cannot be created")
+            },
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(code, 1);
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "charpente failed to start — fix the store/log and restart: Not a directory (os \
+             error 20)\n"
+        );
+        std::fs::remove_file(&blocker).unwrap();
+    }
+
     /// The `[]` arm's `serve::serve(addr, app)?.wait()` (spec §5) is
     /// otherwise driven by no test — a reversion to the old
     /// `serve(addr, app)?; loop { thread::park() }` would hang this test

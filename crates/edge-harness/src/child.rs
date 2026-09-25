@@ -32,9 +32,9 @@ pub struct Bins {
     /// catch a defect specific to `launch`'s own code path.
     pub invoicing: PathBuf,
     /// Plants a foreign-shape Pending `SendReceipt` row in a data dir before
-    /// `invoicing` ever opens it, so its kernel refuses to start — built from
-    /// this crate's own `src/bin/seed_foreign_job.rs`, whose doc comment
-    /// explains (the one bin here that links `charpente`; see `lib.rs`).
+    /// `invoicing` ever opens it, so its kernel refuses to start — the
+    /// invoicing example target `examples/invoicing/examples/
+    /// seed_foreign_job.rs`, whose doc comment explains.
     pub seed_foreign_job: PathBuf,
 }
 
@@ -332,37 +332,21 @@ fn unique_tag() -> String {
 }
 
 /// Builds every binary the rig drives, once per process (release): the
-/// invoicing `node`/`tenant_node`/`main` bins, the `charpente` CLI, and this
-/// crate's own `seed_foreign_job`. Located exactly like `charpente-cli/src/
-/// describe.rs`'s `--message-format=json` scan — reimplemented rather than
-/// shared, since this crate takes no dependency on `charpente-cli` to get it.
+/// invoicing `node`/`tenant_node`/`main` bins, the `charpente` CLI, and the
+/// invoicing example `seed_foreign_job`. Located exactly like `charpente-cli/
+/// src/describe.rs`'s `--message-format=json` scan — reimplemented rather
+/// than shared, since this crate depends on nothing else in the workspace.
 pub fn build_bins() -> io::Result<Bins> {
     let root = workspace_root();
-    let output = Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "-p",
-            "invoicing",
-            "-p",
-            "charpente-cli",
-            "-p",
-            "edge-harness",
-            "--bins",
-            "--message-format=json",
-        ])
-        .current_dir(&root)
-        .output()?;
-
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "cargo build --release -p invoicing -p charpente-cli -p edge-harness --bins failed:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let bins = find_bins(&stdout);
+    let mut bins =
+        cargo_build_release(&root, &["-p", "invoicing", "-p", "charpente-cli", "--bins"])?;
+    // A separate invocation: an example pulls in invoicing's dev-dependencies,
+    // and resolving those in the same build as the bins could unify their
+    // features into the bins under test.
+    bins.extend(cargo_build_release(
+        &root,
+        &["-p", "invoicing", "--example", "seed_foreign_job"],
+    )?);
     let node = locate(&bins, "node")?;
     let tenant_node = locate(&bins, "tenant_node")?;
     let charpente = locate(&bins, "charpente")?;
@@ -377,14 +361,36 @@ pub fn build_bins() -> io::Result<Bins> {
     })
 }
 
+/// `cargo build --release <selection> --message-format=json` from `root`,
+/// returning every executable artifact it reports as `(target name, path)`.
+fn cargo_build_release(root: &Path, selection: &[&str]) -> io::Result<Vec<(String, String)>> {
+    let output = Command::new("cargo")
+        .args(["build", "--release"])
+        .args(selection)
+        .arg("--message-format=json")
+        .current_dir(root)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "cargo build --release {} failed:\n{}",
+            selection.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(find_bins(&String::from_utf8_lossy(&output.stdout)))
+}
+
 fn locate(bins: &[(String, String)], name: &str) -> io::Result<PathBuf> {
     bins.iter()
         .find(|(n, _)| n == name)
         .map(|(_, exe)| PathBuf::from(exe))
         .ok_or_else(|| {
             io::Error::other(format!(
-                "build_bins: no '{name}' binary in the release build output — expected it from \
-                 `-p invoicing -p charpente-cli --bins`"
+                "build_bins: no '{name}' executable in the release build output — expected it \
+                 from `-p invoicing -p charpente-cli --bins` or `-p invoicing --example \
+                 seed_foreign_job`"
             ))
         })
 }
