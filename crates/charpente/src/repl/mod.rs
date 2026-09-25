@@ -1061,7 +1061,7 @@ impl Repl {
             if let Some(f) = &self.follower {
                 f.refuse(msg.clone());
             }
-            return Err(io::Error::other(msg));
+            return Err(io::Error::other(Refusal(msg)));
         }
         self.clear_stale_witnesses()?;
         store_role(&*self.role_disk, &Role::Primary)?;

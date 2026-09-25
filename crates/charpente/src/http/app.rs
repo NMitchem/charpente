@@ -7,7 +7,9 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use charpente_core::db::{CrossTenant, Db, DbConfig, Group, Job, Refusal, Schema, Tx, TxError};
+use charpente_core::db::{
+    CrossTenant, Db, DbConfig, Group, Job, JobShapeRefusal, Schema, Tx, TxError,
+};
 use charpente_core::io::{Disk, Entropy};
 use charpente_core::table::{Id, View};
 use charpente_macros::table;
@@ -853,13 +855,19 @@ pub(crate) fn io_failure_response(e: &io::Error) -> Response {
 
 /// `TxError<ApiError>` -> `Response`, shared by both route flavors: `App`
 /// names the handler's own rejection; `Io`/`NotPrimary`/`Verifying` name the
-/// platform failure and the fix (hard rule 5). An `Io` carrying a `Refusal`
-/// is answered with the refusal's own text instead of the storage-failure
-/// one: nothing was written, and a retry cannot succeed.
+/// platform failure and the fix (hard rule 5). `Group::stage` is the only
+/// producer of a `TxError::Io` this path can reach (a job handler's own
+/// transaction never runs on an HTTP route — the kernel dispatches jobs), and
+/// `JobShapeRefusal` is the only refusal it raises, so an `Io` carrying one is
+/// answered with its own text instead of the storage-failure one: nothing was
+/// written, and a retry cannot succeed. Any OTHER `Refusal` here (a table-gate
+/// barrier, a witness conflict) would name node state, not this request, and
+/// must fall through to `io_failure_response` like a genuine commit failure —
+/// which is why this matches `JobShapeRefusal::of`, not `Refusal::of`.
 fn tx_error_response(err: TxError<ApiError>) -> Response {
     match err {
         TxError::App(e) => e.response(),
-        TxError::Io(e) if Refusal::of(&e).is_some() => Response::error(500, &e.to_string()),
+        TxError::Io(e) if JobShapeRefusal::of(&e).is_some() => Response::error(500, &e.to_string()),
         TxError::Io(e) => io_failure_response(&e),
         TxError::NotPrimary { primary } => Response::error(
             421,

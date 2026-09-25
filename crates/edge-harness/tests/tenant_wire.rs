@@ -101,9 +101,10 @@ const SCOPED_RECORD_REFUSAL: &str = "record decode: table \"Doc\" is not tenant-
 
 /// The stop line `serve.rs` wraps it in — asserted too, so this oracle
 /// distinguishes "the node refused and stopped" from "the text appeared
-/// somewhere in a log while the node carried on applying".
-const KERNEL_STOPPED: &str = "charpente kernel stopped on a platform IO failure — restart to \
-     recover: ";
+/// somewhere in a log while the node carried on applying". A restart cannot
+/// fix a mixed-version record (payload-shapes spec §5), so this is a
+/// `Refusal`, not a platform IO failure.
+const KERNEL_STOPPED: &str = "charpente kernel stopped on a refusal: ";
 
 fn alpha(id: u64) -> String {
     format!("alpha-{id}")
@@ -529,6 +530,33 @@ fn an_older_follower_refuses_a_scoped_record_by_name() {
     )
     .expect("spawn primary");
 
+    // Spawned BEFORE the scoped write exists anywhere to ship: `ChildNode::spawn`
+    // only waits for this node's OWN port to accept a connection, and a
+    // stopped kernel now ends the process (spec §5) — if the legacy follower
+    // connected to the primary and refused the scoped record fast enough to
+    // exit between two of `spawn`'s 20ms polls, `spawn` would see "node
+    // exited before its port ever accepted a connection" and fail the test
+    // on a race, not on this arm's claim. Spawning it first means it opens
+    // its port and settles into an ordinary (nothing yet to refuse) follower
+    // before the write that dooms it is ever sent.
+    let legacy = spawn_tenant_node(
+        &bins,
+        &mut scenario,
+        "tenant-legacy-follower",
+        &[
+            "--legacy-unscoped",
+            "--repl-listen",
+            &free_addr(),
+            "--role",
+            "follower",
+            "--primary",
+            &primary_repl,
+            "--secret",
+            SECRET,
+        ],
+    )
+    .expect("spawn legacy follower");
+
     let mut a = Http::new(primary.addr.clone());
     let token_a = login(&mut a, "org-1").expect("tenant A login");
     create_doc(&mut a, ORG_A, DOC_IDS[0], &alpha(DOC_IDS[0])).expect("tenant A write");
@@ -550,24 +578,6 @@ fn an_older_follower_refuses_a_scoped_record_by_name() {
         ],
     )
     .expect("spawn control follower");
-
-    let legacy = spawn_tenant_node(
-        &bins,
-        &mut scenario,
-        "tenant-legacy-follower",
-        &[
-            "--legacy-unscoped",
-            "--repl-listen",
-            &free_addr(),
-            "--role",
-            "follower",
-            "--primary",
-            &primary_repl,
-            "--secret",
-            SECRET,
-        ],
-    )
-    .expect("spawn legacy follower");
 
     // The control, on the SAME bytes: a follower built from the same schema
     // applies the scoped record and serves the row. Without this arm, the
@@ -604,9 +614,11 @@ fn an_older_follower_refuses_a_scoped_record_by_name() {
     );
     scenario.record("the legacy follower refused the scoped record by name and stopped");
 
-    // Negative space: nothing was misread into its store either. Its kernel
-    // is gone by construction, so a named non-200 is the expected answer;
-    // what must never happen is the row appearing.
+    // Negative space: nothing was misread into its store either. The refusal
+    // stops the kernel and now ends the process (payload-shapes spec §5), so
+    // this connection typically fails outright (the `Err` arm below); a
+    // request that raced the exit can still land a named non-200. Either
+    // way, what must never happen is the row appearing.
     let mut legacy_client = Http::new(legacy.addr.clone());
     match legacy_client.get("/legacy/docs") {
         Ok(resp) => {

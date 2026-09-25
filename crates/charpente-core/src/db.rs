@@ -118,9 +118,14 @@ pub trait Event: Codec {
 /// or a platform IO failure. The distinction is load-bearing — `App` means
 /// nothing was written; `Io` after the WAL sync means the record is durable
 /// but unacknowledged and will resurface on recovery. An `Io` carrying a
-/// `Refusal` (`Refusal::of`) is not a platform failure at all: the
-/// transaction was refused before anything was written — an enqueue of a
-/// mounted job name under another shape — and a retry cannot succeed.
+/// `JobShapeRefusal` (`JobShapeRefusal::of`) is the one exception, not a
+/// platform failure at all: `Group::stage` refused an enqueue of a mounted
+/// job name under another shape before anything was written, and a retry
+/// cannot succeed. Any OTHER `Refusal` reaching `Io` (a table-gate barrier, a
+/// witness conflict) is still the ordinary durable-but-unacknowledged case —
+/// it names node state a retry cannot fix either, but by definition it was
+/// raised by apply, after the WAL sync (`Refusal::of` finds both kinds;
+/// `JobShapeRefusal::of` finds only this one).
 #[derive(Debug)]
 pub enum TxError<E> {
     App(E),
@@ -186,15 +191,15 @@ impl Refusal {
     }
 }
 
-/// The one refusal a job handler's own transaction can produce: `Group::stage`
-/// refusing an enqueue of a mounted job name under a foreign shape. A
-/// distinct type, not a flag on `Refusal`, so dispatch (`kernel/dispatch.rs`)
-/// can tell it apart from every OTHER refusal that can reach a job's
-/// transaction — a table-gate barrier or a witness conflict must still stop
-/// the kernel, because unlike this one, no restart or retry fixes them
-/// either, and only this one is the handler's OWN deterministic bug (payload-
-/// shapes spec §5, R23-a). Wraps a `Refusal` rather than duplicating its text
-/// and `Display`, so `Refusal::of` still finds it.
+/// The one refusal `Group::stage` itself can produce: an enqueue of a mounted
+/// job name under a foreign shape. A distinct type, not a flag on `Refusal`,
+/// so dispatch (`kernel/dispatch.rs`) can narrow to exactly it — defensively:
+/// `Group::stage` never applies and a witness conflict never touches `Group`
+/// at all, so no OTHER refusal can reach this result in practice, but the
+/// narrowing still names the one case that IS the handler's own deterministic
+/// bug, distinct in kind from a refusal naming node state (payload-shapes
+/// spec §5). Wraps a `Refusal` rather than duplicating its text and
+/// `Display`, so `Refusal::of` still finds it.
 #[derive(Debug)]
 pub struct JobShapeRefusal(pub Refusal);
 
@@ -1916,21 +1921,21 @@ fn resolve_effect_scope(
         (true, Some(scope)) => Ok(scope),
         (true, None) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
+            Refusal(format!(
                 "record decode: table \"{table}\" is tenant-scoped (Row::Scope != Unscoped) \
                  but this {kind} effect carries no scope (tag 0x00/0x01) — the record was \
                  written for an unscoped shape of this table; restore from a replica or \
                  backup, or replay under the schema that wrote it"
-            ),
+            )),
         )),
         (false, Some(scope)) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
+            Refusal(format!(
                 "record decode: table \"{table}\" is not tenant-scoped (Row::Scope = \
                  Unscoped) but this {kind} effect carries scope {scope} (tag 0x05/0x06) — \
                  the record was written for a scoped shape of this table; restore from a \
                  replica or backup, or replay under the schema that wrote it"
-            ),
+            )),
         )),
     }
 }

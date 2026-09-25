@@ -12,6 +12,7 @@
 use std::collections::VecDeque;
 use std::io;
 
+use charpente_core::db::Refusal;
 use charpente_core::engine::REHELLO_MARKER;
 use charpente_core::io::{Conn, Net};
 use charpente_core::log::frame_crc;
@@ -241,7 +242,9 @@ impl Follower {
                     return Ok(());
                 }
                 // A diverged/other refusal is the operator's re-seed signal.
-                Msg::Refuse { message } => return Err(io::Error::other(message.clone())),
+                Msg::Refuse { message } => {
+                    return Err(io::Error::other(Refusal(message.clone())));
+                }
                 // Any ship message proves `to` is a primary: Repl demotes this
                 // node to Follower(to) after this step (the message applies
                 // normally below — apply_shipped is idempotent under crash, so
@@ -350,7 +353,7 @@ impl Follower {
                 self.disconnect(now);
                 Ok(())
             }
-            Msg::Refuse { message } => Err(io::Error::other(message)),
+            Msg::Refuse { message } => Err(io::Error::other(Refusal(message))),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(

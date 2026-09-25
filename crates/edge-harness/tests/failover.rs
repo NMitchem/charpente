@@ -681,7 +681,14 @@ fn run_oracle(
         // ---- demote/re-seed refusal must print on stderr (role.rs).     --
         let old_addr = free_addr();
         let old_repl_addr = free_addr();
-        let old_primary = ChildNode::spawn(
+        let expected_notice = format!(
+            "role file says primary, but config says follower of {follower_repl_addr} — the \
+             durable role file always wins over config, never the reverse; demoting a primary \
+             requires a fresh data dir (re-seed) — a demoted primary's log may have diverged, \
+             and re-seeding is the only safe rejoin"
+        );
+        let expected_notice_line = format!("charpente replication: {expected_notice}");
+        let spawn_result = ChildNode::spawn(
             node_bin,
             &[
                 "--addr".to_string(),
@@ -704,66 +711,97 @@ fn run_oracle(
                 SECRET.to_string(),
             ],
             &mut scenario,
-        )
-        .map_err(|e| {
-            format!("restarting the old primary (pointed at the new primary) failed: {e}")
-        })?;
-        let stderr_path = old_primary.stderr_log().to_path_buf();
-        old_primary_restart = Some(old_primary);
-
-        let expected_notice = format!(
-            "role file says primary, but config says follower of {follower_repl_addr} — the \
-             durable role file always wins over config, never the reverse; demoting a primary \
-             requires a fresh data dir (re-seed) — a demoted primary's log may have diverged, \
-             and re-seeding is the only safe rejoin"
         );
-        // `Repl::open`'s notice is printed from the kernel thread, which
-        // races the HTTP listener binding `ChildNode::spawn` waits on
-        // (`serve.rs`'s `serve_replicated` binds the HTTP port synchronously
-        // BEFORE the kernel thread necessarily finishes `Repl::open`) — poll
-        // the tee'd stderr log rather than reading it once immediately.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let stderr_contents = loop {
-            let contents = std::fs::read_to_string(&stderr_path).unwrap_or_default();
-            if contents.contains(&expected_notice) || Instant::now() >= deadline {
-                break contents;
+        // M-7: `serve_replicated` spawns the kernel thread — which runs
+        // `Repl::open` and then, once probing resolves, the witness conflict
+        // — and binds the HTTP port on the main thread CONCURRENTLY (serve.rs
+        // does not wait for one before starting the other). Under enough
+        // contention the kernel can print this notice, and even stop, before
+        // the bind ever completes, so `ChildNode::spawn` reports "exited
+        // before its port ever accepted a connection" instead of handing
+        // back a live node. `child.rs` folds the tee'd stderr into that
+        // error; if it already carries the exact pinned notice this arm
+        // asserts, the race landed on the same conclusion as the normal
+        // path, just discovered a different way — accept it rather than
+        // fail a scenario the process itself already confirmed.
+        let stderr_path = match spawn_result {
+            Ok(child) => {
+                let path = child.stderr_log().to_path_buf();
+                old_primary_restart = Some(child);
+                Some(path)
             }
-            std::thread::sleep(Duration::from_millis(20));
+            Err(e) if e.to_string().contains(&expected_notice_line) => {
+                scenario.record(
+                    "negative arm confirmed (raced): the restarted old primary exited before \
+                     its port ever opened, but its tee'd stderr already carries the pinned \
+                     demote/re-seed refusal byte-exact",
+                );
+                None
+            }
+            Err(e) => {
+                return Err(format!(
+                    "restarting the old primary (pointed at the new primary) failed: {e}"
+                ));
+            }
         };
-        if !stderr_contents.contains(&expected_notice) {
-            return Err(format!(
-                "the restarted old primary's stderr never printed the pinned demote/re-seed \
-                 notice within {:?} — expected to contain {expected_notice:?}, got {:?} (file: \
-                 {})",
-                Duration::from_secs(5),
-                stderr_contents,
-                stderr_path.display()
-            ));
+
+        if let Some(stderr_path) = stderr_path {
+            // `Repl::open`'s notice is printed from the kernel thread, which
+            // races the HTTP listener binding `ChildNode::spawn` waits on
+            // (`serve.rs`'s `serve_replicated` binds the HTTP port
+            // synchronously BEFORE the kernel thread necessarily finishes
+            // `Repl::open`) — poll the tee'd stderr log rather than reading
+            // it once immediately.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let stderr_contents = loop {
+                let contents = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+                if contents.contains(&expected_notice) || Instant::now() >= deadline {
+                    break contents;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            if !stderr_contents.contains(&expected_notice) {
+                return Err(format!(
+                    "the restarted old primary's stderr never printed the pinned demote/re-seed \
+                     notice within {:?} — expected to contain {expected_notice:?}, got {:?} \
+                     (file: {})",
+                    Duration::from_secs(5),
+                    stderr_contents,
+                    stderr_path.display()
+                ));
+            }
+            // Prefixed by `serve.rs`'s `eprintln!("charpente replication: {notice}")`.
+            if !stderr_contents.contains(&expected_notice_line) {
+                return Err(format!(
+                    "the demote/re-seed notice was present but not on the \"charpente \
+                     replication: \" line `serve_replicated` is documented to print it on: \
+                     {stderr_contents:?}"
+                ));
+            }
+            scenario.record(
+                "negative arm confirmed: the restarted old primary's stderr prints the pinned \
+                 demote/re-seed refusal byte-exact",
+            );
         }
-        // Prefixed by `serve.rs`'s `eprintln!("charpente replication: {notice}")`.
-        if !stderr_contents.contains(&format!("charpente replication: {expected_notice}")) {
-            return Err(format!(
-                "the demote/re-seed notice was present but not on the \"charpente replication: \
-                 \" line `serve_replicated` is documented to print it on: {stderr_contents:?}"
-            ));
-        }
-        scenario.record(
-            "negative arm confirmed: the restarted old primary's stderr prints the pinned \
-             demote/re-seed refusal byte-exact",
-        );
         // RULED (Noah, 2026-07-26 — see task-12-report.md): the brief's
         // literal text additionally claimed the restarted old primary
-        // "exits nonzero". It doesn't, and this is a brief error, not a
-        // product bug — GUIDE.md:2379-2382 is the accurate spec ("a
-        // mismatch between the two is surfaced on stderr ... config never
-        // silently re-roles a node"; no exit is documented). Confirmed
-        // against the stock build: `Repl::open` does NOT error, and
-        // `serve_replicated` does not exit on this notice — the durable
-        // role (Primary) wins over config, so the process keeps running as
-        // a live primary, printing the notice as the operator's cue to
-        // intervene, never a self-enforced refusal. This assertion is
-        // therefore scoped to what the stock build actually does (the
-        // notice, byte-exact) and asserts no exit code.
+        // "exits nonzero". At the time this was ruled a brief error, not a
+        // product bug: `Repl::open` does NOT error on the notice itself, and
+        // the durable role (Primary) wins over config, so nothing about the
+        // notice's own printing exits the process.
+        //
+        // Since payload-shapes Task 7 ("a stopped kernel ends the process"),
+        // this specific restart DOES exit — just never from the notice. This
+        // old primary is durable with a non-empty recorded witness set (it
+        // shipped to `follower` before the promote), so on restart it probes
+        // that witness before allowing writes (M2 sub-project 0b); the
+        // follower now answers as a primary, which is the witness conflict,
+        // a `Refusal` that stops the kernel (spec §5) once probing resolves.
+        // This assertion is scoped to what fires immediately at open (the
+        // notice, byte-exact) and does not wait out the probe or assert an
+        // exit code — `failover_resurrected_primary_does_not_accept_writes`
+        // below is what pins the witness-conflict exit on this same shape of
+        // restart.
         //
         // This restart used a config that CONTRADICTS the role file
         // (`--role follower`), which is what produces the notice at all —
@@ -1262,9 +1300,9 @@ fn run_resurrection_oracle(
         };
         // Prefixed by `serve.rs`'s kernel-stopped line: the refusal bubbles
         // out of `Kernel::run`, it is not an in-process notice. A witness
-        // conflict is a `Refusal` (payload-shapes spec §5, R23-a) — a restart
-        // cannot fix it, unlike a platform IO failure — so it gets the
-        // "stopped on a refusal" line, not the platform-IO-failure one.
+        // conflict is a `Refusal` (payload-shapes spec §5) — a restart cannot
+        // fix it, unlike a platform IO failure — so it gets the "stopped on a
+        // refusal" line, not the platform-IO-failure one.
         if !stderr_contents.contains(&format!("charpente kernel stopped on a refusal: {matched}")) {
             return Err(format!(
                 "the witness refusal was present but not on the \"charpente kernel stopped on a \
@@ -1313,10 +1351,10 @@ fn run_resurrection_oracle(
                 String::from_utf8_lossy(&new_write.body)
             ));
         }
-        // id 99 was refused on the old primary twice and written nowhere
-        // else, so it must exist nowhere. This is the acked-write-loss claim
-        // in its observable form: nothing was accepted that a later
-        // fresh-data-dir re-seed would then destroy.
+        // id 99 was refused on the old primary (phase A's witness-gate 503)
+        // and written nowhere else, so it must exist nowhere. This is the
+        // acked-write-loss claim in its observable form: nothing was
+        // accepted that a later fresh-data-dir re-seed would then destroy.
         let leaked = follower_http
             .get("/customers/99")
             .map_err(|e| format!("cross-check GET on the promoted primary failed: {e}"))?;

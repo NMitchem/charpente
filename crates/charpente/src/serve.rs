@@ -26,7 +26,11 @@ use crate::kernel;
 use crate::repl::{self, Repl};
 
 /// A running server: the HTTP edge, and the kernel thread it feeds. v0 has no
-/// graceful shutdown. `wait` is how a binary learns the kernel stopped.
+/// graceful shutdown. `wait` is how a binary learns the kernel stopped —
+/// dropping this without calling it is the old `serve(addr, app)?;` + park
+/// pattern, which never learns a stopped kernel should end the process
+/// (spec §5), so discarding it unused is a warning under `-D warnings`.
+#[must_use]
 pub struct Server {
     addr: SocketAddr,
     kernel: std::thread::JoinHandle<i32>,
@@ -39,10 +43,20 @@ impl Server {
 
     /// Blocks until the kernel thread ends, and returns the exit code the
     /// process should end with:
-    /// - `1` when the kernel stopped on an error (its stderr line is already
-    ///   printed, naming the refusal or IO failure and the fix);
+    /// - `1` when the kernel stopped on an error (its stop line is already
+    ///   printed — the first line of its stderr output, naming the refusal or
+    ///   IO failure and the fix; a multi-type foreign-shape jobs refusal
+    ///   continues one job type per line after it), OR when the request
+    ///   channel closed without an error (`EDGE_GONE_STOP_LINE`, already
+    ///   printed) — v0 has no admin-triggered shutdown, so under
+    ///   `serve`/`serve_replicated` this currently only means the HTTP edge
+    ///   thread ended first, most likely a panic (M-4, task 7 review round 1:
+    ///   this used to be `0`, which a `Restart=on-failure` supervisor would
+    ///   not act on for a kernel that can no longer answer anything);
     /// - `101` when the thread panicked (the panic message is already printed);
-    /// - `0` on a clean shutdown.
+    /// - `0` never happens today. It is reserved for a future admin-triggered
+    ///   graceful shutdown, which would need its own line distinguishing it
+    ///   from the edge-gone case above before reusing this code.
     ///
     /// Serve with `std::process::exit(serve(addr, app)?.wait())`: a kernel that
     /// stopped must end the process, or a supervisor sees a live process
@@ -53,9 +67,22 @@ impl Server {
     }
 }
 
-/// The kernel thread's last stderr line. A refusal is named as one, because
-/// restarting the same binary clears an IO failure and never a refusal; every
-/// refusal's own text names its fix.
+/// `Kernel::run` returns `Ok(())` on `Wake::Shutdown` (kernel/mod.rs), which
+/// v0 has no admin-triggered path to under `serve`/`serve_replicated` — the
+/// request channel's `Sender` is otherwise never dropped, so today the only
+/// way to reach it here is the HTTP edge thread ending first (a panic, most
+/// likely: `serve.rs`'s own spawn points are its sole owners). A live kernel
+/// with no edge left to feed it answers nothing, so this is named and
+/// non-zero (M-4, task 7 review round 1) rather than the clean-exit `0` a
+/// `Restart=on-failure` supervisor would take as "nothing to do here."
+const EDGE_GONE_STOP_LINE: &str = "charpente kernel stopped: the request channel closed, which \
+     only happens when the HTTP edge thread ended before the kernel did (most likely a panic) — \
+     check the edge thread's own panic output above; this is not a clean shutdown, v0 has none";
+
+/// The kernel thread's stop line — the first line of its stderr output. A
+/// refusal is named as one because restarting the same binary does not by
+/// itself clear it; every refusal's own text names what must change first. A
+/// platform IO failure really can clear on a restart.
 fn kernel_stop_line(started: bool, e: &io::Error) -> String {
     match (started, Refusal::of(e).is_some()) {
         (false, true) => format!("charpente kernel refused to start: {e}"),
@@ -90,7 +117,10 @@ pub fn serve(addr: &str, app: App) -> io::Result<Server> {
             clock,
         };
         match kernel.run(&mut source) {
-            Ok(()) => 0,
+            Ok(()) => {
+                eprintln!("{EDGE_GONE_STOP_LINE}");
+                1
+            }
             Err(e) => {
                 eprintln!("{}", kernel_stop_line(true, &e));
                 1
@@ -155,7 +185,10 @@ pub fn serve_replicated(
             clock,
         };
         match kernel.run(&mut source) {
-            Ok(()) => 0,
+            Ok(()) => {
+                eprintln!("{EDGE_GONE_STOP_LINE}");
+                1
+            }
             Err(e) => {
                 eprintln!("{}", kernel_stop_line(true, &e));
                 1
@@ -606,10 +639,10 @@ mod tests {
     use charpente_core::io::Entropy;
     use charpente_core::table::{Codec, Id, View};
 
-    /// The kernel thread's last stderr line names what stopped it (spec §5):
-    /// a refusal is named as one, because restarting the same binary clears
-    /// an IO failure and never a refusal. Each refusal's own text carries its
-    /// fix.
+    /// The kernel thread's stop line — the first line of its stderr output —
+    /// names what stopped it (spec §5): a refusal is named as one, because
+    /// restarting the same binary does not by itself clear it. Each refusal's
+    /// own text carries what must change first.
     #[test]
     fn every_kernel_stop_line_names_what_stopped_it() {
         let refusal = io::Error::other(charpente_core::db::Refusal(
@@ -632,13 +665,21 @@ mod tests {
             kernel_stop_line(true, &io_failure),
             "charpente kernel stopped on a platform IO failure — restart to recover: disk on fire"
         );
-        // The RUN path (`started: true`) must be told apart from a platform
-        // IO failure by TYPE — `Refusal::of` is the oracle `kernel_stop_line`
-        // itself consults — not by reading its own formatted string back,
-        // which would pass even if the line's wording and the classification
-        // drifted apart.
-        assert!(charpente_core::db::Refusal::of(&refusal).is_some());
-        assert!(charpente_core::db::Refusal::of(&io_failure).is_none());
+        // M-6 (task 7 review round 1): a same-file assert that `Refusal::of`
+        // finds a `Refusal` this test just built by hand is tautological —
+        // true by construction, green under any change to the run path,
+        // including a `.map_err` re-wrap at the real gate-opening call site
+        // (`after_repl_step`, kernel/mod.rs) that would silently stop
+        // classifying its refusal as one. The startup call this line shares
+        // its wrapper with (`Kernel::build`) IS pinned end to end
+        // (kernel.rs's foreign-shape-job tests), but nothing drives the
+        // deferred, gate-opening re-run through a real `Kernel::run`/`step`
+        // far enough to observe its OWN error typed as a `Refusal` — that
+        // would need the full witness-gate dance (seed a foreign-shape
+        // Pending row, open gated, answer the witness, drive the gate open)
+        // through the kernel-node harness in replication.rs, which is out of
+        // proportion to what this one assert was worth. Removed rather than
+        // kept for false comfort (review-ruled).
 
         // A refusal naming several job types is several lines joined by
         // `\n` (`Db::pending_job_shape_refusal`) — the prefix labels only
@@ -655,8 +696,8 @@ mod tests {
 
     /// Spec §5: a kernel that refuses to start ends the process — `wait`
     /// returns 1 — rather than parking behind an edge that answers 500. The
-    /// refusal is Task 6's: a Pending job enqueued under one shape, mounted
-    /// under another.
+    /// refusal is payload-shapes spec §5's: a Pending job enqueued under one
+    /// shape, mounted under another.
     #[test]
     fn a_kernel_that_refuses_to_start_ends_wait_with_status_1() {
         struct Receipt {
@@ -711,6 +752,44 @@ mod tests {
             .unwrap();
         let server = serve("127.0.0.1:0", app).unwrap();
         assert_eq!(server.wait(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// M-5: the OTHER way `wait` returns non-zero from the RUN path — a panic
+    /// inside `Kernel::new`, not an `Err`. A cron interval that overflows
+    /// `u64` nanoseconds panics at kernel startup rather than at
+    /// `.schedule(...)` (GUIDE §7's timing caveat), so `serve` itself returns
+    /// `Ok` and the panic only surfaces once `wait` joins the thread.
+    #[test]
+    fn a_cron_interval_overflow_panics_the_kernel_thread_and_wait_returns_101() {
+        let mut suffix = [0u8; 8];
+        ProdEntropy::new().unwrap().fill(&mut suffix);
+        let root = std::env::temp_dir().join(format!(
+            "charpente-serve-cron-overflow-{:016x}",
+            u64::from_le_bytes(suffix)
+        ));
+        struct Never;
+        impl charpente_core::db::Job for Never {
+            const NAME: &'static str = "never";
+            const FINGERPRINT: u64 = 0x7E57_0703;
+        }
+        impl Codec for Never {
+            fn encode(&self, _out: &mut Vec<u8>) {}
+            fn decode(_input: &mut &[u8]) -> io::Result<Never> {
+                Ok(Never)
+            }
+        }
+        let app = App::open(
+            Box::new(ProdDisk::new(&root).unwrap()),
+            Schema::new(),
+            Box::new(ProdEntropy::new().unwrap()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .schedule("overflow", std::time::Duration::MAX, || Never);
+        let server = serve("127.0.0.1:0", app).unwrap();
+        assert_eq!(server.wait(), 101);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     // #[route] can't be used inside the charpente crate itself (it emits

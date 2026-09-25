@@ -2008,6 +2008,100 @@ fn diverged_follower_is_refused_by_name() {
     );
 }
 
+/// Like `scheduler_round`'s step loop, but returns the raw `io::Error`
+/// instead of `step_node`'s stringified wrapper — the one assertion that
+/// needs to inspect the error itself (`Refusal::of`), not just its text.
+/// No fault handling (only meant for a `FaultConfig::none()` scenario): the
+/// first node whose `step` errors ends the loop.
+fn run_until_io_error(sim: &Sim, nodes: &mut [&mut Node], budget: u32) -> io::Result<()> {
+    for _ in 0..budget {
+        let now = sim.now().as_nanos();
+        for node in nodes.iter_mut() {
+            node.repl.pump_io(now);
+        }
+        let mut worked = false;
+        for node in nodes.iter_mut() {
+            let has_work = match &node.db {
+                Some(db) => node.repl.has_work(db, now),
+                None => false,
+            };
+            if has_work {
+                let db = node.db.as_mut().expect("checked Some above");
+                node.repl.step(db, &node.clock)?;
+                worked = true;
+            }
+        }
+        if worked {
+            continue;
+        }
+        let mut next = sim.next_wakeup();
+        for node in nodes.iter() {
+            if let Some(d) = node.repl.next_deadline(now)
+                && d > now
+            {
+                next = Some(next.map_or(d, |x| x.min(d)));
+            }
+        }
+        match next {
+            Some(t) if t > now => sim.clock().sleep(Duration::from_nanos(t - now)),
+            _ => return Ok(()), // quiescent, no error — the caller decides what that means
+        }
+    }
+    Ok(())
+}
+
+/// A diverged follower's OWN `Repl::step` error is a `Refusal` (payload-
+/// shapes spec §5): restarting the follower on the same data dir cannot fix
+/// a forked timeline, only a fresh-data-dir re-seed can (GUIDE §10), so it
+/// must be told apart from a platform IO failure the same way the primary's
+/// symmetric refusal already is. `run_until`'s `String` (as
+/// `diverged_follower_is_refused_by_name` uses) throws the `io::Error` away
+/// before a test could ask `Refusal::of` about it, so this drives the same
+/// fork scenario through `run_until_io_error` instead, which keeps it.
+#[test]
+fn a_diverged_followers_own_step_error_is_a_refusal() {
+    let sim = Sim::with_faults(0x2EB1_0006, FaultConfig::none());
+    let mut p = spawn_node(&sim, "p", primary_cfg("p:1"), DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+
+    for i in 0..10u64 {
+        commit_widget(&sim, &mut p, i).unwrap();
+    }
+    run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
+
+    // Fork the follower exactly as `diverged_follower_is_refused_by_name`
+    // does: a wrongly-promoted node accepting a write the primary never had.
+    sim.partition("p", "f");
+    {
+        let fdb = f.db.as_mut().unwrap();
+        fdb.allow_writes();
+        fdb.transact(|tx| {
+            tx.put(&Widget {
+                id: Id::from_raw(999),
+                kind: 0,
+                weight: 1,
+            });
+            Ok::<(), io::Error>(())
+        })
+        .expect("the forking write commits locally");
+    }
+    sim.repair("p", "f");
+    recover_node(&sim, &mut f).unwrap();
+
+    let err = run_until_io_error(&sim, &mut [&mut p, &mut f], CONVERGE_BUDGET)
+        .expect_err("a diverged rejoin must surface as an error, never a merge");
+    assert!(
+        err.to_string()
+            .contains("diverged: the follower is ahead at seq"),
+        "the step error must be the same divergence refusal: {err}"
+    );
+    assert!(
+        charpente_core::db::Refusal::of(&err).is_some(),
+        "a diverged follower's own step error must be a Refusal — a restart on the same data \
+         dir cannot fix it, only a fresh-data-dir re-seed can: {err}"
+    );
+}
+
 // -------------------------------------------- property: seeded-follower frontier
 
 /// Durably flips one byte of the highest-seq WAL frame's stored CRC on a host,
@@ -7392,6 +7486,47 @@ fn strict_witnesses_stops_the_node_instead_of_serving_reads_it_cannot_write_to()
     assert!(
         !p.db.as_ref().unwrap().writes_allowed(),
         "a strict stop must never leave the node writable"
+    );
+}
+
+/// The sibling above only ever sees the deadline-miss error through
+/// `run_until`'s `String` (`step_node` formats it as `"p step: {e}"`), which
+/// throws the `io::Error` away before a test could ask `Refusal::of` about
+/// it. Payload-shapes spec §5 requires this stop to be told apart from a
+/// platform IO failure the same way every other named stop already is — a
+/// restart cannot resolve a still-unreached witness any faster, only
+/// starting the witness (or clearing `strict_witnesses`) can (the deadline
+/// message's own remedy) — so this drives the identical scenario through
+/// `run_until_io_error` instead, which keeps the raw error.
+#[test]
+fn a_strict_witness_deadlines_own_step_error_is_a_refusal() {
+    let sim = Sim::with_faults(0x2EB1_0122, FaultConfig::none());
+    let mut cfg = primary_cfg("p:1");
+    cfg.strict_witnesses = true;
+    let mut p = spawn_node(&sim, "p", cfg, DbConfig::default()).unwrap();
+    let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
+    ship_then_crash_the_primary(&sim, &mut p, &mut f);
+    f.host.crash_now();
+    recover_node(&sim, &mut p).unwrap();
+    assert!(!p.db.as_ref().unwrap().writes_allowed(), "gated at open");
+
+    // Unlike the sibling test, there is no need to stop halfway to check
+    // read service — that behaviour is already pinned there. `sim`'s clock is
+    // virtual: the scheduler's quiescent branch sleeps straight to the next
+    // deadline, so reaching WITNESS_DEADLINE_NANOS costs a handful of loop
+    // iterations, not real time.
+    let err = run_until_io_error(&sim, &mut [&mut p], 100_000)
+        .expect_err("past the deadline a strict node must stop with an error");
+    assert!(
+        err.to_string()
+            .contains("witness verification did not resolve within 30s"),
+        "must be the same deadline refusal as the sibling test: {err}"
+    );
+    assert!(
+        charpente_core::db::Refusal::of(&err).is_some(),
+        "a strict witness deadline's own step error must be a Refusal — a restart cannot \
+         resolve a still-unreached witness any faster, only starting the witness (or clearing \
+         strict_witnesses) can: {err}"
     );
 }
 

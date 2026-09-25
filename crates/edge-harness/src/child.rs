@@ -82,7 +82,14 @@ impl ChildNode {
         if let Err(e) = wait_for_port_or_exit(&mut child, &addr, SPAWN_TIMEOUT) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(e);
+            // The tee'd stderr is the only diagnostic left once the
+            // `ChildNode` never gets constructed — fold it into the error so
+            // a caller that races an early, self-explaining exit (a startup
+            // refusal that stops the process before the port ever opens,
+            // spec §5) can tell that apart from a genuine hang or crash
+            // without a second file read of its own.
+            let stderr = std::fs::read_to_string(&stderr_log).unwrap_or_default();
+            return Err(io::Error::other(format!("{e}\nstderr: {stderr}")));
         }
 
         scenario.record(format!(

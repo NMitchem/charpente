@@ -3,7 +3,7 @@
 //! write.
 use std::io;
 
-use charpente_core::db::{Db, DbConfig, Schema};
+use charpente_core::db::{Db, DbConfig, Refusal, Schema};
 use charpente_core::io::Disk;
 use charpente_core::migration::{MigrationError, SchemaVersion, TableMigration, schema_version_id};
 use charpente_core::table::{Codec, Id, IndexDef, Row, RowShape, Unscoped, View};
@@ -236,6 +236,11 @@ fn same_version_fingerprint_drift_refuses_to_open() {
          persisted fingerprint 0x1111 != compiled fingerprint 0x2222 at version 1; bump the \
          version and add a TableMigration, or revert the struct change"
     );
+    assert!(
+        Refusal::of(&err).is_some(),
+        "a fingerprint-drift barrier is a Refusal — no restart clears it, only a version bump \
+         and a TableMigration do: {err}"
+    );
 }
 
 #[test]
@@ -260,6 +265,11 @@ fn version_downgrade_refuses_to_open() {
         err.to_string(),
         "table \"Widget\" is at persisted version 2 but this binary is compiled for version 1 \
          — the binary is older than the data; run a binary built for at least version 2"
+    );
+    assert!(
+        Refusal::of(&err).is_some(),
+        "a version-downgrade barrier is a Refusal — no restart clears it, only a newer binary \
+         does: {err}"
     );
 }
 
@@ -302,6 +312,11 @@ fn upgrade_barrier_refuses_a_foreign_tail_and_old_binary_recovery_clears_it() {
         "table \"Widget\" has unrecovered writes from the previous binary (persisted version \
          1, this binary is compiled for version 2) — run the previous binary once to a clean \
          shutdown, then upgrade (spec §2's upgrade barrier)"
+    );
+    assert!(
+        Refusal::of(&err).is_some(),
+        "the upgrade barrier is a Refusal — no restart on this binary clears it, only running \
+         the previous binary once to a clean shutdown does: {err}"
     );
     // The remedy: one old-binary open replays + checkpoints (spec §2's
     // checkpoint-at-open-after-replay)...
@@ -459,6 +474,11 @@ fn missing_chain_link_refuses_by_name() {
          1, compiled version is 2; register Schema::migration::<Step>(\"Widget\") for the \
          version-1 step, or this data cannot be opened by this binary"
     );
+    assert!(
+        Refusal::of(&err).is_some(),
+        "a missing chain link is a Refusal — no restart clears it, only registering the step \
+         does: {err}"
+    );
 }
 
 #[test]
@@ -505,6 +525,11 @@ fn no_adoption_row_refuses_a_foreign_tail_from_an_unversioned_binary() {
         "replaying a record for versioned table \"Widget\" with no adoption row on record — \
          this log was not written by an adoption-aware binary, or is corrupt; restore from a \
          replica or backup"
+    );
+    assert!(
+        Refusal::of(&err).is_some(),
+        "a missing adoption row is a Refusal — no restart clears it, only restoring from a \
+         replica or backup does: {err}"
     );
 }
 
@@ -584,6 +609,11 @@ fn caseb_rebuild_before_migration_barriers_then_the_remedy_clears_it() {
         "table \"Widget\" has unrecovered writes from the previous binary (persisted version \
          1, this binary is compiled for version 2) — run the previous binary once to a clean \
          shutdown, then upgrade (spec §2's upgrade barrier)"
+    );
+    assert!(
+        Refusal::of(&err).is_some(),
+        "a full-rebuild upgrade barrier is a Refusal — no restart on this binary clears it, \
+         only running the previous binary once to a clean shutdown does: {err}"
     );
     // The remedy: one old-binary open recovers+checkpoints from the WAL...
     drop(

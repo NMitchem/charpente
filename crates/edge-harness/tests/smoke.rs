@@ -184,4 +184,6 @@ fn a_node_whose_kernel_cannot_start_exits_nonzero_with_its_named_line() {
         ),
         "{stderr}"
     );
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let _ = std::fs::remove_file(&stderr_path);
 }

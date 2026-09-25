@@ -9,6 +9,7 @@
 
 use std::io;
 
+use charpente_core::db::Refusal;
 use charpente_core::io::{Disk, Entropy};
 
 use crate::archive::restore::{RestoreOpts, restore};
@@ -41,10 +42,9 @@ pub fn launch(
         // Ok(0) falls through to a normal return — the process exits 0
         // naturally (a clean shutdown, or a describe that printed and
         // exited fine). A nonzero code exits the process directly: a
-        // describe usage error, or — now that the `[]` serve arm waits on
-        // the kernel and returns its exit code instead of parking forever
-        // (spec §5) — a stopped kernel, whose stderr line already named
-        // what stopped it and the fix.
+        // describe usage error, a build that could not start (its stderr
+        // line already named above), or a stopped kernel (spec §5), whose
+        // own stop line already named what stopped it and the fix.
         0 => Ok(()),
         code => std::process::exit(code),
     }
@@ -73,7 +73,27 @@ pub(crate) fn dispatch(
     let Some(verb) = args.first() else {
         let disk = ProdDisk::new(data_dir)?;
         let entropy = ProdEntropy::new()?;
-        let app = build(Box::new(disk), Box::new(entropy))?;
+        // `build` (`App::open`) runs the startup schema gate before any kernel
+        // exists — a table-gate barrier refuses HERE, not on the kernel
+        // thread. Left to bubble through this function's own `?`, it would
+        // reach `main`'s default `Termination` impl and print the `Debug`
+        // form (`Custom { kind: Other, error: Refusal("...") }`), leaking the
+        // `Refusal` wrapper as operator-visible noise instead of the plain
+        // named line every other stop already gets (spec §5).
+        let app = match build(Box::new(disk), Box::new(entropy)) {
+            Ok(app) => app,
+            Err(e) if Refusal::of(&e).is_some() => {
+                let _ = writeln!(err, "charpente refused to start: {e}");
+                return Ok(1);
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    err,
+                    "charpente failed to start — fix the store/log and restart: {e}"
+                );
+                return Ok(1);
+            }
+        };
         // A stopped kernel ends the process with its code (spec §5), rather
         // than parking forever behind an edge that can only answer 500.
         return Ok(crate::serve::serve(addr, app)?.wait());
@@ -310,12 +330,169 @@ mod tests {
     use super::*;
     use crate::Schema;
     use crate::http::AppConfig;
+    use charpente_core::db::Tx;
+    use charpente_core::table::Codec;
 
     fn tiny_app(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> io::Result<App> {
         App::open(disk, Schema::new(), entropy, AppConfig::default())
     }
 
+    /// M-5 (task 7 review round 1): builds successfully (unlike
+    /// `refusing_build`/`io_failing_build` below, which fail before `serve`
+    /// is ever called) but seeds a Pending job under one shape while
+    /// mounting a different one for the same name — the same fixture
+    /// `serve.rs`'s `a_kernel_that_refuses_to_start_ends_wait_with_status_1`
+    /// uses, reused here to drive it through `dispatch`'s `[]` arm instead
+    /// of `serve` directly, so `crate::serve::serve(addr, app)?.wait()`
+    /// (launch.rs) is exercised for real: a real bind, a real spawned kernel
+    /// thread that refuses at `Kernel::new`, and a real `.wait()` join.
+    fn build_with_foreign_pending_job(
+        disk: Box<dyn Disk>,
+        entropy: Box<dyn Entropy>,
+    ) -> io::Result<App> {
+        struct ForeignShapeReceipt {
+            invoice: u64,
+        }
+        impl Codec for ForeignShapeReceipt {
+            fn encode(&self, out: &mut Vec<u8>) {
+                self.invoice.encode(out);
+            }
+            fn decode(input: &mut &[u8]) -> io::Result<ForeignShapeReceipt> {
+                Ok(ForeignShapeReceipt {
+                    invoice: u64::decode(input)?,
+                })
+            }
+        }
+        impl charpente_core::db::Job for ForeignShapeReceipt {
+            const NAME: &'static str = "receipt";
+            const FINGERPRINT: u64 = 0x7E57_0701; // the shape ENQUEUED
+        }
+        fn noop_glue(
+            _tx: &mut Tx,
+            _payload: &[u8],
+            _cap: Option<&charpente_core::db::CrossTenant>,
+        ) -> Result<(), crate::kernel::JobError> {
+            Ok(())
+        }
+        let mut app =
+            App::open(disk, Schema::new(), entropy, AppConfig::default())?.mount_jobs(vec![
+                crate::kernel::JobDef {
+                    name: "receipt",
+                    retry: charpente_core::job::RetryPolicy::DEFAULT,
+                    cross_tenant: false,
+                    fingerprint: 0x7E57_0702, // the shape MOUNTED — different
+                    glue: noop_glue,
+                },
+            ]);
+        app.db_mut()
+            .transact(|tx| {
+                tx.enqueue(ForeignShapeReceipt { invoice: 1 });
+                Ok::<(), io::Error>(())
+            })
+            .expect("enqueue on a freshly opened writable node cannot fail");
+        Ok(app)
+    }
+
     const MISSING_DATA_DIR: &str = "/does/not/exist/charpente-launch-test-data-dir";
+
+    fn refusing_build(_disk: Box<dyn Disk>, _entropy: Box<dyn Entropy>) -> io::Result<App> {
+        Err(io::Error::other(Refusal(
+            "test fixture: refuses to open".to_string(),
+        )))
+    }
+
+    fn io_failing_build(_disk: Box<dyn Disk>, _entropy: Box<dyn Entropy>) -> io::Result<App> {
+        Err(io::Error::other("disk on fire"))
+    }
+
+    fn fresh_data_dir(tag: &str) -> std::path::PathBuf {
+        let mut suffix = [0u8; 8];
+        ProdEntropy::new().unwrap().fill(&mut suffix);
+        std::env::temp_dir().join(format!(
+            "charpente-launch-test-{tag}-{:016x}",
+            u64::from_le_bytes(suffix)
+        ))
+    }
+
+    /// M-5/M-8. `build` (`App::open`) runs the startup schema gate BEFORE any
+    /// kernel exists — a table-gate barrier refuses here, in `dispatch`
+    /// itself, not on a kernel thread `wait()` could join. Left to the `?` in
+    /// the `[]` arm this used to bubble all the way to `launch`'s own `?`,
+    /// which `main`'s default `Termination` impl prints as the `Debug` form
+    /// (`Custom { kind: Other, error: Refusal("...") }`) — the `Refusal(`
+    /// wrapper leaking as operator-visible noise instead of a named line.
+    #[test]
+    fn a_build_refusal_exits_one_with_a_named_line_instead_of_a_debug_leak() {
+        let dir = fresh_data_dir("build-refusal");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = dispatch(
+            &[],
+            "127.0.0.1:0",
+            dir.to_str().unwrap(),
+            refusing_build,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(code, 1);
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "charpente refused to start: test fixture: refuses to open\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The other half: a `build` failure that is NOT a `Refusal` (an ordinary
+    /// platform IO failure) gets the platform wording, not the refusal one —
+    /// the same distinction `kernel_stop_line` draws for the kernel's own
+    /// stops (spec §5).
+    #[test]
+    fn a_build_io_failure_exits_one_with_the_platform_wording() {
+        let dir = fresh_data_dir("build-io-failure");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = dispatch(
+            &[],
+            "127.0.0.1:0",
+            dir.to_str().unwrap(),
+            io_failing_build,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(code, 1);
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "charpente failed to start — fix the store/log and restart: disk on fire\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// M-5: the `[]` arm's `serve::serve(addr, app)?.wait()` (spec §5) is
+    /// otherwise driven by no test — a reversion to the pre-Task-7
+    /// `serve(addr, app)?; loop { thread::park() }` would hang this test
+    /// rather than fail it cleanly, but a hang is still noticed (the review's
+    /// own ruling on this fixture) rather than a silent pass.
+    #[test]
+    fn a_kernel_refusal_inside_the_serve_arm_ends_dispatch_with_its_code() {
+        let dir = fresh_data_dir("serve-arm-refusal");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = dispatch(
+            &[],
+            "127.0.0.1:0",
+            dir.to_str().unwrap(),
+            build_with_foreign_pending_job,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(code, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn describe_returns_zero_and_prints_the_human_header() {
@@ -546,7 +723,7 @@ mod tests {
 
     use crate::archive::{Archive, ArchiveConfig};
     use crate::prod::FsObjectStore;
-    use crate::{Db, Id, Tx, job, table};
+    use crate::{Db, Id, job, table};
     use std::path::PathBuf;
 
     const BUCKET_PREFIX: &str = "node-a-archive";

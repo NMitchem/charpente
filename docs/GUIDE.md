@@ -3084,7 +3084,7 @@ fn run_follower(app: App) -> std::io::Result<()> {
         peer_secret: Some("shared-with-every-follower".to_string()),
         strict_witnesses: false,
     };
-    // HTTP on 8080, replication on 9090; exits when the kernel stops.
+    // HTTP on 8080, replication on 9091; exits when the kernel stops.
     std::process::exit(
         serve::serve_replicated("0.0.0.0:8080", app, Box::new(ProdDisk::new("./data")?), cfg)?
             .wait(),
@@ -4148,9 +4148,15 @@ usage: <app> [describe [--format json|human]]
 this file and asserts the block above is the constant verbatim, so the two cannot drift
 apart silently again — they did once, when §15 was added.)
 
-When the kernel stops — a platform IO failure, or a named refusal such as a table-gate
-barrier or a Pending job of a foreign shape (§6) — `launch` exits the process with status 1
-after its stderr line names what stopped it and the fix.
+A status-1 exit under `launch` comes from one of two distinct moments, and each names
+itself. `build` (`App::open`) can refuse to start — a table-gate barrier from a schema this
+binary cannot open — before any kernel exists at all: `charpente refused to start: ...`.
+Past that point the kernel itself can stop — a Pending job of a foreign shape (§6), a
+migration step this binary has no registration for, a witness conflict, or a
+strict-witness deadline, or a platform IO failure — its own stop line naming which:
+`charpente kernel refused to start`/`stopped on a refusal`/`stopped on a platform IO
+failure`. Either way, the line already printed to stderr names the fix before `launch`
+exits.
 
 ### `charpente describe` — the CLI verb
 

@@ -1176,11 +1176,14 @@ to `run_seed`, and `put` the rebuilt one back, adjacent so no other code observe
 slot.
 
 **A stopped kernel ends the process.** `serve`/`serve_replicated` run the kernel on a
-joined thread; `Server::wait` returns its exit code, and `launch` exits with it. The last
-stderr line names the stop — `refused to start`/`stopped on a refusal` for a `Refusal`
-(table-gate barrier, witness conflict, strict-witness deadline, foreign-shape jobs),
-`failed to start`/`stopped on a platform IO failure — restart to recover` otherwise —
-because a restart clears an IO failure and never a refusal.
+joined thread; `Server::wait` returns its exit code, and `launch` exits with it. The stop
+line — the first line of the kernel's final stderr output (a multi-type foreign-shape jobs
+refusal continues one job type per line after it) — names the stop: `refused to
+start`/`stopped on a refusal` for a `Refusal` (table-gate barrier, witness conflict,
+strict-witness deadline, foreign-shape jobs), `failed to start`/`stopped on a platform IO
+failure — restart to recover` otherwise. Restarting the same binary does not by itself
+clear a refusal; each names what must change first — a witness answering, a fresh data
+dir, a registered migration step — while a platform IO failure really can clear on retry.
 
 ## 6. Queue, cron, realtime — all faces of the log
 
