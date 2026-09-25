@@ -2450,7 +2450,7 @@ fn an_unencodable_event_fails_its_tail_not_the_node() {
     assert_eq!(statuses(&responses), vec![200], "the node keeps serving");
 }
 
-/// A field type whose `Serialize` always fails (fix round 1, I-1): `#[event]`
+/// A field type whose `Serialize` always fails: `#[event]`
 /// only requires `Codec`/`Wire`/`Serialize` on its fields (charpente-macros
 /// event.rs), and `Wire` is an open `pub trait`, so a hand-written field type
 /// can make `Subscription::of`'s REAL encoder fail on its own bytes — not
@@ -2500,7 +2500,7 @@ fn feed_poisoned(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subsc
     Ok(Subscription::of::<PoisonedEvent>().cursor(cursor))
 }
 
-/// I-1: the same `charpente.error` frame `an_unencodable_event_…` pins, but
+/// The same `charpente.error` frame `an_unencodable_event_…` pins, but
 /// reached through a REAL `#[event]`/`Subscription::of` encoder (`ev_json`,
 /// http/mod.rs) rather than `FailingFeed`'s hand-built stub — this is what
 /// pins the JSON-encode failure text GUIDE §11 quotes

@@ -753,8 +753,8 @@ impl Kernel {
                 let repl = self.repl.as_mut().expect("Repl arm only pushed when Some");
                 // An error bubbles like the job arm's, stopping the kernel
                 // either way — but the two kinds name different fixes
-                // (`kernel_stop_line`, serve.rs): a platform IO failure
-                // clears on a restart, while a `Refusal` (an unmarked
+                // (`kernel_stop_line`, serve.rs): a platform IO failure MAY
+                // clear on a restart, while a `Refusal` (an unmarked
                 // `Msg::Refuse`, a mismatched shape, a listen-less hand-off
                 // target) does not, and its own text says what does (DESIGN
                 // §5).

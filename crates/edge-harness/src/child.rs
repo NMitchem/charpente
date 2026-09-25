@@ -32,8 +32,9 @@ pub struct Bins {
     /// catch a defect specific to `launch`'s own code path.
     pub invoicing: PathBuf,
     /// Plants a foreign-shape Pending `SendReceipt` row in a data dir before
-    /// `invoicing` ever opens it, so its kernel refuses to start — the
-    /// fixture `seed_foreign_job.rs`'s own doc comment explains.
+    /// `invoicing` ever opens it, so its kernel refuses to start — built from
+    /// this crate's own `src/bin/seed_foreign_job.rs`, whose doc comment
+    /// explains (the one bin here that links `charpente`; see `lib.rs`).
     pub seed_foreign_job: PathBuf,
 }
 
@@ -331,10 +332,10 @@ fn unique_tag() -> String {
 }
 
 /// Builds every binary the rig drives, once per process (release): the
-/// invoicing `node` bin and the `charpente` CLI. Located exactly like
-/// `charpente-cli/src/describe.rs`'s `--message-format=json` scan —
-/// reimplemented rather than shared, since this crate depends on nothing
-/// else in the workspace.
+/// invoicing `node`/`tenant_node`/`main` bins, the `charpente` CLI, and this
+/// crate's own `seed_foreign_job`. Located exactly like `charpente-cli/src/
+/// describe.rs`'s `--message-format=json` scan — reimplemented rather than
+/// shared, since this crate takes no dependency on `charpente-cli` to get it.
 pub fn build_bins() -> io::Result<Bins> {
     let root = workspace_root();
     let output = Command::new("cargo")
@@ -345,6 +346,8 @@ pub fn build_bins() -> io::Result<Bins> {
             "invoicing",
             "-p",
             "charpente-cli",
+            "-p",
+            "edge-harness",
             "--bins",
             "--message-format=json",
         ])
@@ -353,7 +356,7 @@ pub fn build_bins() -> io::Result<Bins> {
 
     if !output.status.success() {
         return Err(io::Error::other(format!(
-            "cargo build --release -p invoicing -p charpente-cli --bins failed:\n{}",
+            "cargo build --release -p invoicing -p charpente-cli -p edge-harness --bins failed:\n{}",
             String::from_utf8_lossy(&output.stderr)
         )));
     }

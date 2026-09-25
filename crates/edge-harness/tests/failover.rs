@@ -798,9 +798,10 @@ fn run_oracle(
         // the durable role (Primary) wins over config, so nothing about the
         // notice's own printing exits the process.
         //
-        // Since "a stopped kernel ends the process" landed, this specific
-        // restart DOES exit — just never from the notice. This
-        // old primary is durable with a non-empty recorded witness set (it
+        // This specific restart DOES exit — just never from the notice: a
+        // stopped kernel ends the process (payload-shapes spec §5) no
+        // matter what stopped it. This old primary is durable with a
+        // non-empty recorded witness set (it
         // shipped to `follower` before the promote), so on restart it probes
         // that witness before allowing writes (M2 sub-project 0b); the
         // follower now answers as a primary, which is the witness conflict,
@@ -1322,9 +1323,9 @@ fn run_resurrection_oracle(
              to demote itself, and gives both remedies",
         );
 
-        // The refusal stopped the kernel, and a stopped kernel now ends the
+        // The refusal stopped the kernel, and a stopped kernel ends the
         // process (payload-shapes spec §5): an operator's supervisor sees the
-        // exit, where it used to see a live process answering every request
+        // exit rather than a live process silently answering every request
         // 500. Phase A still carries the attribution; this pins what an
         // operator sees afterwards.
         let status = old_primary

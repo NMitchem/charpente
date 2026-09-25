@@ -121,13 +121,17 @@ pub trait Event: Codec {
 /// `JobShapeRefusal` (`JobShapeRefusal::of`) is the one exception, not a
 /// platform failure at all: `Group::stage` refused an enqueue of a mounted
 /// job name under another shape before anything was written, and a retry
-/// cannot succeed. Any OTHER `Refusal` reaching `Io` (a table-gate barrier, a
-/// witness conflict) is still the ordinary durable-but-unacknowledged case —
-/// it names node state a retry cannot fix either, but by definition it was
-/// raised by apply, after the WAL sync, never by `Group::stage` itself
-/// (`JobShapeRefusal`'s own doc: staging touches no witness or gate state at
-/// all) — `Refusal::of` finds both kinds; `JobShapeRefusal::of` finds only
-/// this one.
+/// cannot succeed. `Group::stage` also checks the write gate directly, but
+/// that surfaces as `NotPrimary`/`Verifying` below, never as a `Refusal`.
+/// The only ordinary `Refusal` an `Io` here can carry is
+/// `resolve_effect_scope`'s or `check_replay_version`'s — a replicated
+/// record decoded under a mismatched or unscoped shape — raised by apply,
+/// after the WAL sync, same as any other `Io`. Every OTHER `Refusal` (a
+/// table-gate barrier, a witness conflict, a strict-witness deadline) never
+/// reaches `TxError` at all: those come from `Db::open`/`migrate_schema` and
+/// `Repl::step`, all outside any transaction. `Refusal::of` finds both
+/// `Refusal` and the `JobShapeRefusal` wrapper; `JobShapeRefusal::of` finds
+/// only the latter.
 #[derive(Debug)]
 pub enum TxError<E> {
     App(E),
@@ -200,17 +204,16 @@ impl Refusal {
     }
 }
 
-/// The one refusal `Group::stage` itself can produce: an enqueue of a mounted
-/// job name under a foreign shape. A distinct type, not a flag on `Refusal`,
-/// so dispatch (`kernel/dispatch.rs`) can narrow to exactly it — defensively:
-/// `Group::stage` never applies and never touches witness or gate state
-/// (those surface later, at `commit`, as an ordinary `Refusal` — see
-/// `TxError::Io`'s own doc), so no OTHER refusal can reach THIS result in
-/// practice, but the narrowing still names the one case that IS the
-/// handler's own deterministic bug, distinct in kind from a refusal naming
-/// node state (payload-shapes spec §5). Wraps a `Refusal` rather than
-/// duplicating its text and
-/// `Display`, so `Refusal::of` still finds it.
+/// The one refusal `Group::stage` itself can produce: an enqueue of a
+/// mounted job name under a foreign shape. A distinct type, not a flag on
+/// `Refusal`, so dispatch (`kernel/dispatch.rs`) can narrow to exactly it —
+/// defensively: `Group::stage` also checks the write gate, but that surfaces
+/// as `NotPrimary`/`Verifying` (`TxError`'s own variants), never a
+/// `Refusal`, so this is the only `Refusal` `Group::stage` can raise at all
+/// — the narrowing still names the one case that IS the handler's own
+/// deterministic bug, distinct in kind from a refusal naming node state
+/// (payload-shapes spec §5). Wraps a `Refusal` rather than duplicating its
+/// text and `Display`, so `Refusal::of` still finds it.
 #[derive(Debug)]
 pub struct JobShapeRefusal(pub Refusal);
 

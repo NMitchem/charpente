@@ -81,8 +81,33 @@ pub(crate) fn dispatch(
     err: &mut dyn io::Write,
 ) -> io::Result<i32> {
     let Some(verb) = args.first() else {
-        let disk = ProdDisk::new(data_dir)?;
-        let entropy = ProdEntropy::new()?;
+        // Same leak `build`'s own match below exists to close (GUIDE §13):
+        // left to bubble through this function's `?`, either failure would
+        // reach `main`'s default `Termination` impl and print the raw
+        // `Debug` form instead of a named, fixable line — and unlike
+        // `build`'s errors, neither of these two is ever a `Refusal` (a
+        // disk root that cannot be created, `/dev/urandom` that cannot be
+        // opened — both are platform IO, never a shape the app rejected).
+        let disk = match ProdDisk::new(data_dir) {
+            Ok(disk) => disk,
+            Err(e) => {
+                let _ = writeln!(
+                    err,
+                    "charpente failed to start — fix the store/log and restart: {e}"
+                );
+                return Ok(1);
+            }
+        };
+        let entropy = match ProdEntropy::new() {
+            Ok(entropy) => entropy,
+            Err(e) => {
+                let _ = writeln!(
+                    err,
+                    "charpente failed to start — fix the store/log and restart: {e}"
+                );
+                return Ok(1);
+            }
+        };
         // `build` (`App::open`) runs the startup schema gate before any kernel
         // exists — a table-gate barrier refuses HERE, not on the kernel
         // thread. Left to bubble through this function's own `?`, it would

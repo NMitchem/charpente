@@ -813,7 +813,7 @@ mod tests {
         Ok(())
     }
 
-    /// An app mounting `receipt` at `CronReceipt`'s fingerprint and
+    /// An app mounting `receipt` at the real `0x7E57_0704` fingerprint and
     /// scheduling a 1ms cron that stages `DriftedCronReceipt` under the SAME
     /// name — nothing is Pending at open, so `Kernel::new` admits it; the
     /// refusal only arrives once the tick fires.
@@ -870,7 +870,7 @@ mod tests {
         };
         let err = kernel
             .run(&mut source)
-            .expect_err("the 1ms tick stages a foreign shape of a mounted name, failing commit");
+            .expect_err("the 1ms tick stages a foreign shape of a mounted name, failing staging");
         assert!(Refusal::of(&err).is_some(), "{err}");
         assert_eq!(
             kernel_stop_line(true, &err),

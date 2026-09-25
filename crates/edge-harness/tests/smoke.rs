@@ -192,9 +192,21 @@ fn a_node_whose_kernel_cannot_start_exits_nonzero_with_its_named_line() {
 /// the GUIDE's default `main` (`examples/invoicing/src/main.rs`, `node`'s
 /// and `tenant_node`'s own sibling bin), which `node`/`tenant_node` cannot
 /// stand in for: both call `serve`/`serve_replicated` directly, never
-/// `launch`. `launch` reads argv itself, so the fixture is a data-dir
-/// artifact `seed_foreign_job` plants ahead of time (a foreign-shape Pending
+/// `launch`. `launch` reads no argv of its own, so the fixture is a data-dir
+/// artifact `seed_foreign_job` (this crate's own bin, `src/bin/
+/// seed_foreign_job.rs`) plants ahead of time (a foreign-shape Pending
 /// `SendReceipt`), not a CLI flag.
+///
+/// `invoicing`'s `main.rs` binds a fixed `0.0.0.0:8080` with no override, so
+/// this asserts more than "exit 1 and the refusal text somewhere in
+/// stderr": it also rules out `AddrInUse` explicitly. Without that, a port
+/// already taken by something else on the machine could exit 1 via the
+/// bind's own `?`-propagated error — a failure with nothing to do with the
+/// kernel refusal this test exists to prove, and NOT proof the fix below
+/// held. `serve` spawns the kernel thread before the bind (concurrent with
+/// it, not after), so a taken port does not even guarantee the refusal text
+/// stays absent from stderr; the point of the extra assert is that the test
+/// cannot pass on the strength of a coincidence either way.
 #[test]
 #[ignore]
 fn a_launch_based_binary_whose_kernel_refuses_exits_nonzero_within_a_bound() {
@@ -249,6 +261,11 @@ fn a_launch_based_binary_whose_kernel_refuses_exits_nonzero_within_a_bound() {
     };
     assert_eq!(status.code(), Some(1), "{status}");
     let stderr = std::fs::read_to_string(&stderr_path).expect("stderr");
+    assert!(
+        !stderr.contains("AddrInUse"),
+        "invoicing's fixed 0.0.0.0:8080 was already taken, so this exit proves a bind failure, \
+         not the kernel refusal this test exists to prove — free the port and rerun: {stderr}"
+    );
     assert!(
         stderr.contains("charpente kernel refused to start: 1 Pending \"SendReceipt\""),
         "{stderr}"

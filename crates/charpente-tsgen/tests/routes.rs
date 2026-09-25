@@ -129,10 +129,10 @@ fn the_no_auto_resume_rule_is_in_the_thrown_errors_message_not_only_a_comment() 
     // Hard rule 5: the message must be true for EVERY path that raises it.
     // `validate_subscribe` (charpente/src/kernel/mod.rs) answers 409 for a
     // cursor below the retention floor — "events that old are gone" — for the
-    // two divergence cases, and for a cursor sitting on a reshaped row. The
-    // message used to assert "the history behind that cursor came from
-    // another primary" for all three, naming a cause that is false on the
-    // retention path (task 9a review, finding 3).
+    // two divergence cases, and for a cursor sitting on a reshaped row.
+    // Naming a single cause ("the history behind that cursor came from
+    // another primary") for all three would be false on the retention path,
+    // so the message spells out all three explicitly instead.
     assert!(
         body.contains("retention floor")
             && body.contains("divergence")

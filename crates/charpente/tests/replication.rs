@@ -3147,8 +3147,8 @@ fn a_shipped_batch_that_fails_mid_apply_rolls_back_whole() {
 /// one past payload shapes' `0x09` (shaped emit). This test's own doc
 /// comment predicted exactly this collision when it was written against tag
 /// 7 (Task 6b): "so this stays true whichever tag a later task (6c or
-/// beyond) claims next" — Task 6c claimed 7, so this moved to 8; payload
-/// shapes claimed 8 and 9, so it moved to 10. Proves the unknown-tag refusal
+/// beyond) claims next" — tag 10 is simply one past the highest tag any
+/// mounted feature claims today. Proves the unknown-tag refusal
 /// is wired through the REAL `apply_shipped` path, not just
 /// `decode_record`'s own unit test (`db::tests::decode_refuses_unknown_
 /// tags`) — and, like the sibling test above, that it refuses the WHOLE
@@ -8190,5 +8190,11 @@ fn a_write_gate_opening_over_foreign_pending_jobs_is_a_refusal() {
     assert!(
         charpente_core::db::Refusal::of(&err).is_some(),
         "the write-gate-opening refusal is a Refusal: {err}"
+    );
+    assert!(
+        err.to_string()
+            .contains(&ping_refusal("0", PING_V2_FINGERPRINT)),
+        "the raw error's own text must still be the named foreign-shape refusal, not just any \
+         Refusal: {err}"
     );
 }

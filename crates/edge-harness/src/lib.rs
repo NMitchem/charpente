@@ -3,9 +3,14 @@
 //! REAL built binaries (`examples/invoicing/src/bin/node.rs`, the `charpente`
 //! CLI) over REAL TCP with process- and connection-level faults, proving
 //! things the simulator's virtual IO cannot: real hyper framing, real
-//! signals, real socket close semantics. It depends on nothing else in the
-//! workspace at runtime — it drives built binaries as external processes,
-//! never links against `charpente`.
+//! signals, real socket close semantics. The rig itself — this library and
+//! every test — depends on nothing else in the workspace at runtime: it
+//! drives built binaries as external processes, never links against
+//! `charpente`. The one exception is `src/bin/seed_foreign_job.rs`, a
+//! standalone seeding process (not part of the rig's own code) that opens a
+//! data dir directly to plant a fixture row `smoke.rs` needs ahead of time
+//! — built once by `build_bins` and then driven exactly like `invoicing`/
+//! `node`/`charpente`: a spawned external process, not a link.
 //!
 //! ## The honesty contract (spec §4.4)
 //!
