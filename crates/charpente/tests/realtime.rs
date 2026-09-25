@@ -789,10 +789,12 @@ fn a_pre_shape_event_is_foreign_on_both_paths_even_when_its_bytes_would_decode()
     );
 }
 
-/// Spec §6.5: the shape matches but the bytes do not decode — corruption, not
-/// a reshape. The frame has no `id:` on the wire (serve.rs's `encode_frame`),
-/// so the client's cursor stays before the row, and each reconnect fails at
-/// the same row, the way a corrupt table row answers 500 on every read.
+/// Spec §6.5 (amendment A14): the shape matches but the bytes do not decode,
+/// so the text names both causes the fingerprint leaves open — corrupt bytes,
+/// or a change inside a type a field holds — and both fixes. The frame has no
+/// `id:` on the wire (serve.rs's `encode_frame`), so the client's cursor stays
+/// before the row, and each reconnect fails at the same row, the way a corrupt
+/// table row answers 500 on every read.
 #[test]
 fn a_corrupt_payload_under_a_matching_shape_fails_its_tail_by_name() {
     let (sim, mut kernel, rows) = mixed_log(0x5A9E_0301, &[("/pong", 0, None)]);
@@ -805,8 +807,11 @@ fn a_corrupt_payload_under_a_matching_shape_fails_its_tail_by_name() {
     let expected_error = format!(
         "event incident_opened failed to decode although its recorded shape matches this \
          binary ({v2:#x}): row decode: needed 8 bytes for u64, 0 left — schema drift or \
-         corruption — the stored bytes are corrupt, not a shape change; restore this node \
-         from its archive (GUIDE §15) or re-seed it from its primary (GUIDE §10)"
+         corruption — either a type one of its fields holds changed, which the fingerprint \
+         cannot see (GUIDE §12), or the stored bytes are corrupt; if such a type changed, \
+         restore that type's old definition and put the new one in a new #[event] type under \
+         a new name (GUIDE §11); otherwise restore this node from its archive (GUIDE §15) or \
+         re-seed it from its primary (GUIDE §10)"
     );
     for _ in 0..2 {
         let (_, sinks) = run_script(
@@ -840,8 +845,8 @@ fn a_corrupt_payload_under_a_matching_shape_fails_its_tail_by_name() {
     assert_eq!(statuses(&responses), vec![200], "the node keeps serving");
 }
 
-/// `ev_json` checks trailing bytes now: a matching shape with bytes left over
-/// is corruption too, never a silent short decode.
+/// `ev_json` checks trailing bytes: a matching shape with bytes left over is a
+/// named decode failure too, never a silent short decode.
 #[test]
 fn leftover_bytes_under_a_matching_shape_fail_the_tail_by_name() {
     let (sim, mut kernel, rows) = mixed_log(0x5A9E_0302, &[("/pong", 0, None)]);
@@ -868,9 +873,12 @@ fn leftover_bytes_under_a_matching_shape_fail_the_tail_by_name() {
         body["error"],
         format!(
             "event incident_opened failed to decode although its recorded shape matches this \
-             binary ({v2:#x}): 8 bytes left over after the payload — the stored bytes are \
-             corrupt, not a shape change; restore this node from its archive (GUIDE §15) or \
-             re-seed it from its primary (GUIDE §10)"
+             binary ({v2:#x}): 8 bytes left over after the payload — either a type one of its \
+             fields holds changed, which the fingerprint cannot see (GUIDE §12), or the stored \
+             bytes are corrupt; if such a type changed, restore that type's old definition and \
+             put the new one in a new #[event] type under a new name (GUIDE §11); otherwise \
+             restore this node from its archive (GUIDE §15) or re-seed it from its primary \
+             (GUIDE §10)"
         )
         .as_str()
     );
@@ -883,13 +891,7 @@ fn leftover_bytes_under_a_matching_shape_fail_the_tail_by_name() {
 #[test]
 fn a_corrupt_event_row_fails_its_tail_not_the_node() {
     let (sim, mut kernel, rows) = mixed_log(0x5A9E_0303, &[("/pong", 0, None), ("/pong", 1, None)]);
-    let mut record = Vec::new();
-    1u32.encode(&mut record);
-    record.push(4);
-    "charpente.events".to_string().encode(&mut record);
-    rows[1].id.raw().encode(&mut record);
-    vec![0xFFu8; 3].encode(&mut record);
-    apply_record(&mut kernel, record);
+    plant_corrupt_event_row(&mut kernel, rows[1].id.raw());
     let (_, sinks) = run_script(
         &mut kernel,
         &sim,
@@ -917,6 +919,51 @@ fn a_corrupt_event_row_fails_its_tail_not_the_node() {
         )
         .as_str()
     );
+}
+
+/// Overwrites stored event row `id` with 3 bytes no `EventRow` decodes, through
+/// a shipped `0x04` migrate-put — the decode-free raw write — so the counter
+/// still says the row exists.
+fn plant_corrupt_event_row(kernel: &mut Kernel, id: u64) {
+    let mut record = Vec::new();
+    1u32.encode(&mut record);
+    record.push(4);
+    "charpente.events".to_string().encode(&mut record);
+    id.encode(&mut record);
+    vec![0xFFu8; 3].encode(&mut record);
+    apply_record(kernel, record);
+}
+
+/// A cursor ON a row whose own bytes do not decode gets a 500 that names the
+/// corruption and the fix, not the retryable storage-failure 500: every retry
+/// reads the same bytes. The envelope holds no app-defined type, so corrupt
+/// bytes are its only cause.
+#[test]
+fn a_cursor_on_a_corrupt_event_row_is_refused_naming_the_corruption() {
+    let (sim, mut kernel, rows) = mixed_log(0x5A9E_0304, &[("/pong", 0, None), ("/pong", 1, None)]);
+    plant_corrupt_event_row(&mut kernel, rows[1].id.raw());
+    let (responses, sinks) = run_script(
+        &mut kernel,
+        &sim,
+        vec![Request::new(
+            Method::Get,
+            format!("/pongs?cursor={}", cursor_of(&rows[1])),
+        )],
+    );
+    let responses = responses.lock().unwrap().clone();
+    assert_eq!(responses.len(), 1, "{responses:?}");
+    assert_eq!(responses[0].0, 500);
+    assert_eq!(
+        error_text(&responses[0].1),
+        format!(
+            "cursor {} sits on a stored event row that could not be decoded: row decode: \
+             needed 8 bytes for u64, 3 left — schema drift or corruption — the stored bytes \
+             are corrupt; restore this node from its archive (GUIDE §15) or re-seed it from \
+             its primary (GUIDE §10)",
+            cursor_of(&rows[1])
+        )
+    );
+    assert!(sinks.lock().unwrap().is_empty(), "no stream was opened");
 }
 
 fn realtime_app(sim: &Sim) -> io::Result<App> {

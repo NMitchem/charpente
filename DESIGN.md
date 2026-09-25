@@ -666,6 +666,9 @@ A payload is decoded only under the shape it was written with: delivery refuses 
 foreign-shape event by name and ends that one tail, and a node refuses to dispatch while
 a Pending job of a type it mounts carries a foreign shape (§6). There is no per-row
 versioned decode — the migrations spec rejected it twice — and no override (MANIFESTO §8).
+The fingerprint hashes type tokens, not definitions, so a change inside a type a field
+holds keeps it (GUIDE §12). A decode failure under a matching fingerprint is therefore
+reported naming both causes — that change, or corrupt bytes — with both fixes.
 
 **The gate, the barrier, and the seven refusals.** A built-in table,
 `charpente.schema_versions`, records each versioned table's last-known `(version,
@@ -1291,9 +1294,10 @@ non-zero rather than a clean-exit `0` a `Restart=on-failure` supervisor would ta
   resume is the recovery mechanism, not a server-side retry queue. Event payloads must be
   plainly JSON — serde_json refuses a map whose keys do not serialize as a string or a
   number (and writes a non-finite float value as `null`). An event that fails to
-  encode, or whose stored bytes are corrupt, ends that subscriber's tail with a
-  terminal `charpente.error` frame that carries no
-  `id:`, so the client's cursor does not advance past it. No delivery path stops the
+  encode, or whose stored bytes do not decode under its recorded shape (corrupt bytes, or
+  a change inside a type one of its fields holds, which the fingerprint cannot see — the
+  text names both), ends that subscriber's tail with a terminal `charpente.error` frame
+  that carries no `id:`, so the client's cursor does not advance past it. No delivery path stops the
   kernel; only the platform's own store failures do.
 - **Honesty at the edges.** A cursor below the retention floor, or one naming an event id
   this node never minted (or minted with a different seq — the cross-timeline case), is

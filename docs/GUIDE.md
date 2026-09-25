@@ -1478,11 +1478,12 @@ is no window where the effects are durable but the Done-mark isn't, or
 vice versa: exactly-once state effects, structurally.
 
 On `Err(JobError::App(msg))` — your handler's own rejection, a panic inside
-it (absorbed as `"handler panicked: <payload>"`), or a corrupt payload
-(corrupt stored bytes: `"job decode for <Name>: <e> — the stored payload is
-corrupt …"`; a Pending job of another shape is refused before dispatch can
-start, and this binary refuses to enqueue one — see "Changing a job's
-fields") — that attempt's own effects never committed, and a *second*
+it (absorbed as `"handler panicked: <payload>"`), or a payload that does not
+decode under its own recorded shape (`"job decode for <Name>: <e> — its
+recorded shape is this binary's, so either …"`: corrupt bytes, or a change
+inside a type one of its fields holds, §12; a Pending job of another shape is
+refused before dispatch can start, and this binary refuses to enqueue one —
+see "Changing a job's fields") — that attempt's own effects never committed, and a *second*
 transaction records the failure: `attempts` increments, `last_error` gets
 the message, and:
 
@@ -2796,16 +2797,20 @@ Three more, at job-dispatch time rather than macro-expansion time
 dead-letter, and exactly-once effects"):
 
 ```text
-job decode for SendReceipt: <the underlying decode error> — the stored payload is corrupt (its recorded shape is this binary's, so this is not a shape change); it retries, then dead-letters — if other rows are damaged too, restore this node from its archive (GUIDE §15)
+job decode for SendReceipt: <the underlying decode error> — its recorded shape is this binary's, so either a type one of its fields holds changed, which the fingerprint cannot see (GUIDE §12), or the stored payload is corrupt; it retries, then dead-letters — if such a type changed, restore that type's old definition and put the new one in a new #[job] type under a new name (GUIDE §6); if the bytes are corrupt and other rows are damaged too, restore this node from its archive (GUIDE §15)
 handler panicked: <the panic payload>
 job "SendReceipt" is not registered — add it to the jobs![…] list passed to App::mount_jobs (or this log outlived a renamed job type)
 ```
 
 The first: a Pending job's stored payload failed to decode although its
-recorded shape is this binary's — corrupt bytes, not a shape change,
-because a shape change is refused before dispatch can start (see
-"Changing a job's fields"). It retries and then dead-letters like any
-rejection. The second: your `run` method (or
+recorded shape is this binary's. A change to its own fields cannot cause
+that, because it is refused before dispatch can start (see "Changing a
+job's fields"), so the cause is one of two, and the text names both: corrupt
+bytes, or a change inside a type one of its fields holds, which the
+fingerprint cannot see (§12). For the second, restore that type's old
+definition, so the Pending rows decode again, and put the new definition in
+a new `#[job]` type under a new name. It retries and then dead-letters like
+any rejection. The second: your `run` method (or
 something it called) panicked; charpente absorbs it as an ordinary handler
 rejection (an attempt, counted against retry budget) rather than crashing
 the kernel thread — fix the panic like any other bug in `run`. The third: a
@@ -3479,7 +3484,7 @@ infinite float value — it writes `null`, so a client receives `null` where a n
 was. Neither is caught at emit time (the log stores `Codec` bytes; JSON
 encoding happens at delivery). An event that fails to encode fails its own tail and
 never the node: the stream ends with one terminal frame, the same frame a stored event
-whose bytes are corrupt gets:
+whose bytes do not decode gets:
 
 <!-- pinned -->
 ```text
@@ -3491,9 +3496,13 @@ The frame has no `id:` line, so the client's `Last-Event-ID` stays before the ev
 and every reconnect ends at the same row, the way a corrupt table row answers 500 on
 every read. The `error` text names the event and the fix: for an encode failure,
 `event <name> failed JSON encoding: <serde_json's message> — every #[event] payload
-must be plainly JSON (GUIDE §11); fix the emitting code`; for corrupt bytes, restore
-the node from its archive (§15) or re-seed it from its primary (§10). A row whose own
-envelope is corrupt gets the same frame, with `id` naming the first event this tail had
+must be plainly JSON (GUIDE §11); fix the emitting code`. A payload that fails to
+decode although its recorded shape matches this binary has two possible causes, and
+the text names both with their fixes: a change inside a type one of its fields holds,
+which the fingerprint cannot see (§12) — restore that type's old definition and put the
+new one in a new `#[event]` type under a new name ("Changing an event" below) — or
+corrupt bytes — restore the node from its archive (§15) or re-seed it from its primary
+(§10). A row whose own envelope is corrupt gets the same frame, with `id` naming the first event this tail had
 not yet received and no `event`.
 
 ### The SSE route and `Subscription`
@@ -3801,7 +3810,9 @@ collides on `incident_opened` — nothing stops that pair from compiling or moun
 and a subscription carrying both then treats every row of the newer shape as a foreign
 row of the older one. Old rows keep decoding under their own type. Changing the fields
 in place costs every subscriber positioned before the change one re-sync. What the
-fingerprint cannot see, a change inside a type a field holds, is in §12.
+fingerprint cannot see, a change inside a type a field holds, is in §12; a stored row
+such a change breaks ends its tail with `charpente.error` (above), whose text names that
+cause beside corrupt bytes.
 
 ### Testing a tail in sim
 
@@ -3946,8 +3957,12 @@ remember to bump `version`).
 its type, not the type's definition. A change inside a type a field holds — a new
 variant on an enum, a field added to a nested struct — leaves the fingerprint
 unchanged, for tables and for `#[event]`/`#[job]` payloads alike (§6, §11). Such a
-change is exactly as dangerous as a field change and nothing catches it: treat an edit
-to any type a row or payload contains as an edit to that row or payload itself.
+change is exactly as dangerous as a field change: stored bytes either misdecode
+silently or fail to decode where they are read. A payload's decode failure under a
+matching fingerprint is reported as a `charpente.error` frame (§11) or a retried, then
+dead-lettered job (§6), and its text names both possible causes — this one, or corrupt
+bytes — because the fingerprint cannot tell them apart. Treat an edit to any type a row
+or payload contains as an edit to that row or payload itself.
 
 ### Worked example: adding a field
 
@@ -5116,9 +5131,11 @@ which carries four kinds:
   were skipped.
 - `reshaped` (§11, "Changing an event") — the server met a stored event written under
   a different shape of its type and will not decode it.
-- `error` (§11) — a stored event is corrupt or does not encode as JSON. Its `detail`
-  names the server-side fix (§11): restore or re-seed the node for corrupt bytes, or
-  fix the emitting code for an encode failure.
+- `error` (§11) — a stored event does not decode (corrupt bytes, or a change inside a
+  type one of its fields holds) or does not encode as JSON. Its `detail` names the
+  server-side fix (§11): for a decode failure, restore the changed type and give the new
+  shape its own event type, or restore or re-seed the node; for an encode failure, fix
+  the emitting code.
 
 None of `gap`, `reshaped` or `error` may be auto-resumed from: re-sync current state
 through reads, then subscribe again with no cursor. `onEnd` is deliberately not a

@@ -3022,9 +3022,10 @@ fn dispatch_asserts_it_never_decodes_a_foreign_shape() {
     let _ = dispatcher.run_due(db, 0);
 }
 
-/// Spec §4: a payload whose recorded shape IS this binary's but whose bytes
-/// do not decode is corruption, not a shape change — it keeps the retry path,
-/// and its message names corruption, byte-exact. Planted as a shipped `0x08`
+/// Spec §4 (amendment A14): a payload whose recorded shape IS this binary's
+/// but whose bytes do not decode keeps the retry path, and its message names
+/// both causes the fingerprint leaves open — corrupt bytes, or a change inside
+/// a type a field holds — and both fixes, byte-exact. Planted as a shipped `0x08`
 /// record: v1 bytes under v2's tag, the one thing the typed API never writes.
 #[test]
 fn a_corrupt_payload_under_its_own_shape_retries_naming_corruption() {
@@ -3053,9 +3054,12 @@ fn a_corrupt_payload_under_its_own_shape_retries_naming_corruption() {
         job.last_error.as_deref(),
         Some(
             "job decode for SendReceipt: row decode: needed 4 bytes for u32, 0 left — schema \
-             drift or corruption — the stored payload is corrupt (its recorded shape is this \
-             binary's, so this is not a shape change); it retries, then dead-letters — if \
-             other rows are damaged too, restore this node from its archive (GUIDE §15)"
+             drift or corruption — its recorded shape is this binary's, so either a type one \
+             of its fields holds changed, which the fingerprint cannot see (GUIDE §12), or the \
+             stored payload is corrupt; it retries, then dead-letters — if such a type \
+             changed, restore that type's old definition and put the new one in a new #[job] \
+             type under a new name (GUIDE §6); if the bytes are corrupt and other rows are \
+             damaged too, restore this node from its archive (GUIDE §15)"
         )
     );
 }
@@ -3120,7 +3124,7 @@ fn a_refusal_over_two_job_types_and_mixed_shapes_is_one_line_per_type() {
     assert!(charpente::core::db::Refusal::of(&err).is_some());
 }
 
-/// The glue's other corruption message, byte-exact: a payload under this
+/// The glue's other decode-failure message, byte-exact: a payload under this
 /// binary's own shape that decodes with bytes left over.
 #[test]
 fn a_payload_with_trailing_bytes_under_its_own_shape_retries_naming_corruption() {
@@ -3154,10 +3158,13 @@ fn a_payload_with_trailing_bytes_under_its_own_shape_retries_naming_corruption()
     assert_eq!(
         job.last_error.as_deref(),
         Some(
-            "job decode: 1 trailing bytes after a SendReceipt payload — the stored payload is \
-             corrupt (its recorded shape is this binary's, so this is not a shape change); it \
-             retries, then dead-letters — if other rows are damaged too, restore this node \
-             from its archive (GUIDE §15)"
+            "job decode: 1 trailing bytes after a SendReceipt payload — its recorded shape is \
+             this binary's, so either a type one of its fields holds changed, which the \
+             fingerprint cannot see (GUIDE §12), or the stored payload is corrupt; it retries, \
+             then dead-letters — if such a type changed, restore that type's old definition \
+             and put the new one in a new #[job] type under a new name (GUIDE §6); if the \
+             bytes are corrupt and other rows are damaged too, restore this node from its \
+             archive (GUIDE §15)"
         )
     );
 }

@@ -127,9 +127,10 @@ export type Result<T, E> =
  * `reshaped` is DESIGN §6's terminal `charpente.reshaped` frame: the server
  * met an event written under a different shape of its type and will not
  * decode it (GUIDE §11, "Changing an event"). `error` is `charpente.error`: a
- * stored event is corrupt or does not encode as JSON, and its detail names
- * the server-side fix (GUIDE §11). Neither may be resumed from: re-sync,
- * then subscribe without a cursor.
+ * stored event does not decode (corrupt bytes, or a change inside a type one
+ * of its fields holds) or does not encode as JSON, and its detail names the
+ * server-side fix (GUIDE §11). Neither may be resumed from: re-sync, then
+ * subscribe without a cursor.
  *
  * `closed` is the ordinary end of the response body.
  *

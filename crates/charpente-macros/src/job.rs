@@ -217,6 +217,17 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
     } else {
         quote! { job.run(tx) }
     };
+    // The glue decodes only a row whose recorded shape is this type's (the
+    // dispatcher asserts it first), so a decode failure has two possible
+    // causes — corrupt bytes, or a change inside a type a field holds, which
+    // the fingerprint hashes by name and cannot see (GUIDE §12) — and the
+    // text names both, with both fixes.
+    let undecodable = "its recorded shape is this binary's, so either a type one of its fields \
+                       holds changed, which the fingerprint cannot see (GUIDE §12), or the stored \
+                       payload is corrupt; it retries, then dead-letters — if such a type changed, \
+                       restore that type's old definition and put the new one in a new #[job] type \
+                       under a new name (GUIDE §6); if the bytes are corrupt and other rows are \
+                       damaged too, restore this node from its archive (GUIDE §15)";
 
     Ok(quote! {
         #input
@@ -253,13 +264,13 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                     let input = &mut &payload[..];
                     let job = <#name as ::charpente::core::table::Codec>::decode(input)
                         .map_err(|e| ::charpente::kernel::JobError::App(::std::format!(
-                            "job decode for {}: {e} — the stored payload is corrupt (its recorded shape is this binary's, so this is not a shape change); it retries, then dead-letters — if other rows are damaged too, restore this node from its archive (GUIDE §15)", #name_str
+                            "job decode for {}: {e} — {}", #name_str, #undecodable
                         )))?;
                     if !input.is_empty() {
                         return ::std::result::Result::Err(::charpente::kernel::JobError::App(
                             ::std::format!(
-                                "job decode: {} trailing bytes after a {} payload — the stored payload is corrupt (its recorded shape is this binary's, so this is not a shape change); it retries, then dead-letters — if other rows are damaged too, restore this node from its archive (GUIDE §15)",
-                                input.len(), #name_str,
+                                "job decode: {} trailing bytes after a {} payload — {}",
+                                input.len(), #name_str, #undecodable,
                             ),
                         ));
                     }

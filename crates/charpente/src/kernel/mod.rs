@@ -961,9 +961,10 @@ impl Kernel {
 /// timeline, distinguished only by the message's `{detail}`); and if the row
 /// is one this subscription would deliver (a name it carries, a key it
 /// passes), it must not be one this binary refuses to decode (checked third —
-/// payload-shapes spec §3). No cursor at
-/// all always succeeds, positioned to tail from now. Returns the tail's
-/// starting `next_id` on success.
+/// payload-shapes spec §3). A retained row at the cursor whose own bytes do
+/// not decode is answered 500 by name. No cursor at all always succeeds,
+/// positioned to tail from now. Returns the tail's starting `next_id` on
+/// success.
 fn validate_subscribe(db: &Db, sub: &Subscription) -> Result<u64, Response> {
     let next_event_id = db.next_event_id().map_err(io_500)?;
     let Some(cursor) = sub.cursor else {
@@ -981,7 +982,23 @@ fn validate_subscribe(db: &Db, sub: &Subscription) -> Result<u64, Response> {
         ));
     }
     let snap = db.snapshot().map_err(io_500)?;
-    let rows: Vec<EventRow> = snap.scan_from(cursor.id, 1).map_err(io_500)?;
+    // A row whose own bytes do not decode reads the same on every retry, so
+    // it is named rather than answered with `io_500`'s "retry". The envelope
+    // holds no app-defined type: corrupt bytes are its only cause.
+    let rows: Vec<EventRow> = snap.scan_from(cursor.id, 1).map_err(|e| {
+        if e.kind() != io::ErrorKind::InvalidData {
+            return io_500(e);
+        }
+        Response::error(
+            500,
+            &format!(
+                "cursor {} sits on a stored event row that could not be decoded: {e} — the \
+                 stored bytes are corrupt; restore this node from its archive (GUIDE §15) or \
+                 re-seed it from its primary (GUIDE §10)",
+                cursor.wire()
+            ),
+        )
+    })?;
     match rows.first() {
         Some(row) if row.id.raw() == cursor.id => {
             if row.seq != cursor.seq {

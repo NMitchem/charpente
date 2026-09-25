@@ -261,25 +261,31 @@ impl Subscription {
 }
 
 /// Only ever called on a row whose recorded shape is `Ev::FINGERPRINT`
-/// (`deliver_unit` checks first), so a decode failure here — a short read or
-/// bytes left over — is corrupt storage, not a shape change, and says so.
+/// (`deliver_unit` checks first). A decode failure here — a short read or
+/// bytes left over — therefore has two possible causes, and the text names
+/// both with their fixes: corrupt stored bytes, or a change inside a type one
+/// of the fields holds, which the fingerprint hashes by name and cannot see
+/// (GUIDE §12).
 fn ev_json<Ev: Event + serde::Serialize>(bytes: &[u8]) -> io::Result<String> {
-    let corrupt = |detail: String| {
+    let undecodable = |detail: String| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "event {} failed to decode although its recorded shape matches this binary \
-                 ({:#x}): {detail} — the stored bytes are corrupt, not a shape change; restore \
-                 this node from its archive (GUIDE §15) or re-seed it from its primary (GUIDE §10)",
+                 ({:#x}): {detail} — either a type one of its fields holds changed, which the \
+                 fingerprint cannot see (GUIDE §12), or the stored bytes are corrupt; if such a \
+                 type changed, restore that type's old definition and put the new one in a new \
+                 #[event] type under a new name (GUIDE §11); otherwise restore this node from \
+                 its archive (GUIDE §15) or re-seed it from its primary (GUIDE §10)",
                 Ev::NAME,
                 Ev::FINGERPRINT
             ),
         )
     };
     let mut input = bytes;
-    let ev = Ev::decode(&mut input).map_err(|e| corrupt(e.to_string()))?;
+    let ev = Ev::decode(&mut input).map_err(|e| undecodable(e.to_string()))?;
     if !input.is_empty() {
-        return Err(corrupt(format!(
+        return Err(undecodable(format!(
             "{} bytes left over after the payload",
             input.len()
         )));
