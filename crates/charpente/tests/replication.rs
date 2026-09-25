@@ -7869,8 +7869,9 @@ fn ping_refusal(ids: &str, compiled: u64) -> String {
     format!(
         "1 Pending \"ping\" job(s) (ids {ids}) were enqueued under a different shape of ping \
          (recorded {:#x}; this binary {compiled:#x}) — this binary will not decode them; run \
-         the previous binary until they are Done or Dead, then upgrade, or restore ping's old \
-         fields and give the new shape its own #[job] type (GUIDE §6)",
+         the binary that enqueued them until they are Done or Dead, then deploy this one, or \
+         restore ping's old fields and give the new shape its own #[job] type under a new name \
+         (GUIDE §6)",
         <Ping as Job>::FINGERPRINT
     )
 }

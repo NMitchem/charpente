@@ -11,11 +11,13 @@ use charpente_core::table::{Id, Snapshot, View};
 
 /// Why a job run did not complete. The App/Io split mirrors `TxError` and is
 /// load-bearing: `App` is the handler's own rejection (or an absorbed panic,
-/// or a corrupt payload) — a real attempt that feeds retry budget and lands
-/// in the row's `last_error`. `Io` is a platform fault surfaced through the
-/// handler's reads — NOT an attempt: the job stays Pending, nothing is
-/// recorded, the error bubbles (restart-and-recover). Folding Io into the
-/// retry path would let injected faults Dead-letter healthy jobs.
+/// a payload that does not decode, or the handler's transaction refused for
+/// enqueueing another shape of a mounted job) — a real attempt that feeds
+/// retry budget and lands in the row's `last_error`. `Io` is a platform fault
+/// surfaced through the handler's reads — NOT an attempt: the job stays
+/// Pending, nothing is recorded, the error bubbles (restart-and-recover).
+/// Folding Io into the retry path would let injected faults Dead-letter
+/// healthy jobs.
 pub enum JobError {
     App(String),
     Io(io::Error),
@@ -160,11 +162,13 @@ impl Dispatcher {
     /// committing on its own (group-commit T7, C-2) — the shared half of
     /// `run_due`'s one-job wrapper and the kernel's batched job-arm drain.
     /// `Ok(outcome)` covers handler success and handler failure (retry/dead
-    /// — both are now STAGED records, not yet durable); `Err` is a PLATFORM
-    /// failure (`TxError::Io`, or an `Io` the handler's own reads surfaced):
-    /// the heap entry is restored to its ORIGINAL `(due_at, id)` before
-    /// returning, and the job stays Pending in the store either way, since
-    /// nothing this call staged has been committed.
+    /// — both are now STAGED records, not yet durable), and a handler whose
+    /// own transaction `Group::stage` refused with a `JobShapeRefusal` is
+    /// that kind of failure: an attempt, like a panic. `Err` is a PLATFORM
+    /// failure (any other `TxError::Io`, or an `Io` the handler's own reads
+    /// surfaced): the heap entry is restored to its ORIGINAL `(due_at, id)`
+    /// before returning, and the job stays Pending in the store either way,
+    /// since nothing this call staged has been committed.
     ///
     /// **Contract for a caller sharing `group` across several jobs** (the
     /// kernel's batched drain): an `Err` return here does NOT mean `group`

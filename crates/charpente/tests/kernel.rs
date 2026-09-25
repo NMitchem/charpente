@@ -2620,8 +2620,9 @@ fn receipt_refusal(ids: &[u64], recorded: &str) -> String {
     format!(
         "{} Pending \"SendReceipt\" job(s) (ids {}) were enqueued under a different shape of \
          SendReceipt (recorded {recorded}; this binary {:#x}) — this binary will not decode \
-         them; run the previous binary until they are Done or Dead, then upgrade, or restore \
-         SendReceipt's old fields and give the new shape its own #[job] type (GUIDE §6)",
+         them; run the binary that enqueued them until they are Done or Dead, then deploy this \
+         one, or restore SendReceipt's old fields and give the new shape its own #[job] type \
+         under a new name (GUIDE §6)",
         ids.len(),
         listed.join(", "),
         <receipt_v2::SendReceipt as Job>::FINGERPRINT
@@ -2849,6 +2850,66 @@ fn an_enqueue_of_another_shape_of_a_mounted_job_is_refused_by_name() {
         .filter(|r| r.name == "SendReceipt")
         .count();
     assert_eq!(receipts, 0, "nothing was written");
+}
+
+/// The job-shape registry is filled at `mount_jobs`, not at kernel start, so
+/// a transaction through the App before any kernel exists — a seed script, a
+/// fixture — is refused the same way: it never leaves a Pending row this
+/// binary would then refuse to start over, with a fix aimed at another binary.
+#[test]
+fn an_enqueue_of_another_shape_before_any_kernel_is_refused_by_name() {
+    let sim = Sim::with_faults(0x5A9E_060F, FaultConfig::none());
+    let mut app = receipts_app(&sim, true).unwrap();
+    let db = app.db_for_tests();
+    match db.transact(|tx| {
+        tx.enqueue(receipt_v1::SendReceipt { invoice: 1 });
+        Ok::<(), std::io::Error>(())
+    }) {
+        Err(TxError::Io(e)) => {
+            assert!(charpente_core::db::JobShapeRefusal::of(&e).is_some(), "{e}");
+            assert_eq!(e.to_string(), enqueue_refusal());
+        }
+        other => panic!("the pre-kernel enqueue of another shape committed: {other:?}"),
+    }
+    assert!(
+        db.snapshot().unwrap().scan::<JobRow>().unwrap().is_empty(),
+        "nothing was written"
+    );
+}
+
+/// The platform's own `SessionSweep` is mounted by `App::open`, not by an
+/// app's `mount_jobs`, and its shape is registered there too: another shape
+/// under its name is refused like any mounted job's.
+#[test]
+fn the_platform_session_sweep_shape_is_registered_at_open() {
+    struct ForeignSweep;
+    impl Codec for ForeignSweep {
+        fn encode(&self, _out: &mut Vec<u8>) {}
+        fn decode(_input: &mut &[u8]) -> std::io::Result<ForeignSweep> {
+            Ok(ForeignSweep)
+        }
+    }
+    impl Job for ForeignSweep {
+        const NAME: &'static str = "SessionSweep";
+        const FINGERPRINT: u64 = 0x7E57_0B0B;
+    }
+    let sim = Sim::with_faults(0x5A9E_0610, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap();
+    match app.db_for_tests().transact(|tx| {
+        tx.enqueue(ForeignSweep);
+        Ok::<(), std::io::Error>(())
+    }) {
+        Err(TxError::Io(e)) => {
+            assert!(charpente_core::db::JobShapeRefusal::of(&e).is_some(), "{e}")
+        }
+        other => panic!("another shape of SessionSweep committed: {other:?}"),
+    }
 }
 
 /// The control: an enqueue of a job type this binary does not mount at all is
@@ -3112,8 +3173,9 @@ fn a_refusal_over_two_job_types_and_mixed_shapes_is_one_line_per_type() {
     let count_up_line = format!(
         "1 Pending \"CountUp\" job(s) (ids 3) were enqueued under a different shape of CountUp \
          (recorded 0xbad; this binary {:#x}) — this binary will not decode them; run the \
-         previous binary until they are Done or Dead, then upgrade, or restore CountUp's old \
-         fields and give the new shape its own #[job] type (GUIDE §6)",
+         binary that enqueued them until they are Done or Dead, then deploy this one, or \
+         restore CountUp's old fields and give the new shape its own #[job] type under a new \
+         name (GUIDE §6)",
         <CountUp as Job>::FINGERPRINT
     );
     let receipt_line = receipt_refusal(

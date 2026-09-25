@@ -2704,9 +2704,11 @@ impl Db {
 
     /// Registers each mounted job type's payload shape so
     /// `pending_job_shape_refusal` can name a Pending row this binary would
-    /// decode under a foreign shape. `Kernel::build` calls it with the
-    /// mounted `JobDef`s. Re-registering the same pair is a no-op; one name
-    /// under two shapes is impossible past `mount_jobs`' duplicate refusal.
+    /// decode under a foreign shape, and `Group::stage` can refuse an enqueue
+    /// under another shape of a mounted name. `App::mount_jobs` calls it with
+    /// the `JobDef`s it mounts. Re-registering the same pair is a no-op; one
+    /// name under two shapes is impossible past `mount_jobs`' duplicate
+    /// refusal.
     pub fn register_job_shapes(&mut self, shapes: &[(&'static str, u64)]) {
         let registry = &mut self.engine.machine_mut().schema.job_shapes;
         for &(name, fingerprint) in shapes {
@@ -2772,9 +2774,9 @@ impl Db {
                 format!(
                     "{} Pending \"{name}\" job(s) (ids {}) were enqueued under a different shape \
                      of {name} (recorded {}; this binary {:#x}) — this binary will not decode \
-                     them; run the previous binary until they are Done or Dead, then upgrade, or \
-                     restore {name}'s old fields and give the new shape its own #[job] type \
-                     (GUIDE §6)",
+                     them; run the binary that enqueued them until they are Done or Dead, then \
+                     deploy this one, or restore {name}'s old fields and give the new shape its \
+                     own #[job] type under a new name (GUIDE §6)",
                     ids.len(),
                     listed.join(", "),
                     recorded.join(", "),

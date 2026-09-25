@@ -608,12 +608,14 @@ committed record's log entry after `f` returned `Ok`. That second case is
 genuinely ambiguous — the record may already be durable and will reappear
 after the next recovery even though the caller was told the commit failed —
 so treat `TxError::Io` as "unknown," never as "definitely didn't happen."
-The one exception is an `Io` carrying a `Refusal`
-(`charpente::core::db::Refusal::of`): the transaction was refused before
-anything was written, and a retry cannot succeed — today, an enqueue under
-another shape of a job name this binary mounts (§6, "Changing a job's
-fields"). The HTTP layer answers it with a 500 carrying the refusal's own
-text.
+The one exception is an `Io` carrying a `JobShapeRefusal`
+(`charpente::core::db::JobShapeRefusal::of`): an enqueue under another shape
+of a job name this binary mounts (§6, "Changing a job's fields"), refused
+before anything was written, so a retry cannot succeed. The HTTP layer
+answers it with a 500 carrying the refusal's own text. The broader
+`Refusal::of` is not that predicate: it also matches a refusal apply raises
+after the log sync (a replicated record decoded under a mismatched shape),
+whose record may already be durable.
 `NotPrimary { primary }` fires only when `f` had at least one effect to
 write and this node has been marked a read-only follower
 (`Db::forbid_writes`, DESIGN §5) — reads and effect-free transactions never
@@ -1519,7 +1521,7 @@ opening, a completed switchover), and `promote` checks before it changes anythin
 
 <!-- pinned -->
 ```text
-<n> Pending "<job>" job(s) (ids <ids>) were enqueued under a different shape of <job> (recorded <recorded>; this binary <fingerprint>) — this binary will not decode them; run the previous binary until they are Done or Dead, then upgrade, or restore <job>'s old fields and give the new shape its own #[job] type (GUIDE §6)
+<n> Pending "<job>" job(s) (ids <ids>) were enqueued under a different shape of <job> (recorded <recorded>; this binary <fingerprint>) — this binary will not decode them; run the binary that enqueued them until they are Done or Dead, then deploy this one, or restore <job>'s old fields and give the new shape its own #[job] type under a new name (GUIDE §6)
 ```
 
 At most five ids are listed, then `…`. A job enqueued before shapes were recorded reads
@@ -1534,16 +1536,17 @@ nothing decodes bytes it cannot prove are its own shape.
   on its own (DESIGN §5 calls the hand-off its point of no return), so a refusal there
   would leave neither node writable. The switchover completes. The new primary's kernel
   then stops at the moment it becomes writable, with the refusal above, and its fix works
-  from there: run the previous binary on that node, now the primary, until the jobs are
-  Done or Dead. The old primary follows it throughout.
+  from there: run the binary that enqueued the jobs on that node, now the primary, until
+  they are Done or Dead. The old primary follows it throughout.
 
 Done and Dead rows are never decoded again and never refuse anything. A Pending row of a
 job type this binary does not mount keeps the "not registered" path above.
 
 This binary never writes a foreign-shape row itself. `NAME` is the type's bare identifier,
 so two `#[job]` types can share one: a route that still enqueues `v1::SendReceipt` in a
-binary that mounts `v2::SendReceipt`, say. An enqueue under another shape of a mounted name
-refuses its whole transaction before anything is written:
+binary that mounts `v2::SendReceipt`, say. From `App::mount_jobs` on — whether or not a
+kernel exists yet — an enqueue under another shape of a mounted name refuses its whole
+transaction before anything is written:
 
 <!-- pinned -->
 ```text
@@ -1558,13 +1561,14 @@ commits and takes the "not registered" path.
 
 There are two ways through a shape change:
 
-- **Drain first.** Run the old binary until every Pending job of the type is Done or Dead
-  (each reaches one within its retry policy), then deploy. In a replicated pair, drain on
-  the primary before a switchover onto an upgraded follower, or that follower stops as
-  described above.
+- **Drain first.** Run the binary that enqueued them — the old one after an upgrade, the
+  newer one after a rollback — until every Pending job of the type is Done or Dead (each
+  reaches one within its retry policy), then deploy. In a replicated pair, drain on the
+  primary before a switchover onto a follower running another shape, or that follower
+  stops as described above.
 - **A new type.** Leave the old type's fields alone, put the new fields in a new `#[job]`
-  type, mount both, and switch enqueues to the new one. The new type needs a new
-  identifier: `NAME` is the type's own identifier, and `mount_jobs` panics on two jobs of
+  type under a new name, mount both, and switch enqueues to the new one. The name is not
+  optional: `NAME` is the type's own identifier, and `mount_jobs` panics on two jobs of
   one name. The old type keeps dispatching its rows, because their shape is still its
   own; remove it once none are Pending.
 
@@ -5397,8 +5401,8 @@ A successful restore prints what it rebuilt and exits 0:
 restored generation 7 into "./data"
   frontier      seq 41203
   segments      12
-  pending jobs  4 — these WILL dispatch when this node starts (unless one was enqueued
-  under a job shape this binary does not compile, which refuses the start by name — GUIDE
+  pending jobs  4 — these WILL dispatch when this node starts (unless one is of a job type
+  this binary mounts, enqueued under another shape, which refuses the start by name — GUIDE
   §6), so restore can re-fire mail and third-party calls that already ran (idempotency keys
   are what make that exactly-once-observable)
 ```

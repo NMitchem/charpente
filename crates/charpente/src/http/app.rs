@@ -227,15 +227,16 @@ impl App {
     /// always replay logins, minted keys, and schedules. The built-in daily
     /// session-expiry sweep (auth T6) is seeded the same unconditional way:
     /// its `#[job]` def and cron entry land in `job_defs`/`cron_entries`
-    /// before any app-level `mount_jobs`/`schedule` call, so every app gets
-    /// it with no opt-in.
+    /// before any app-level `mount_jobs`/`schedule` call, and its payload
+    /// shape is registered with the `Db` as `mount_jobs` registers every other
+    /// job's, so every app gets it with no opt-in.
     pub fn open(
         disk: Box<dyn Disk>,
         schema: Schema,
         entropy: Box<dyn Entropy>,
         config: AppConfig,
     ) -> io::Result<App> {
-        let db = Db::open(
+        let mut db = Db::open(
             disk,
             config.db.clone(),
             schema
@@ -243,12 +244,14 @@ impl App {
                 .table::<ApiKey>()
                 .table::<CronRow>(),
         )?;
+        let sweep = <SessionSweep as JobEntry>::def();
+        db.register_job_shapes(&[(sweep.name, sweep.fingerprint)]);
         Ok(App {
             db: Some(db),
             entropy,
             config,
             router: Router::new(),
-            job_defs: vec![<SessionSweep as JobEntry>::def()],
+            job_defs: vec![sweep],
             // No platform events to seed: the built-in surface emits none.
             event_defs: Vec::new(),
             cron_entries: vec![sweep::platform_cron_entry()],
@@ -273,8 +276,13 @@ impl App {
     }
 
     /// Registers `#[job]` descriptors (mount-time duplicate-name panic — each
-    /// job type is mounted once, like routes).
+    /// job type is mounted once, like routes), and each one's payload shape
+    /// with the `Db` (`Db::register_job_shapes`) in the same step, so the
+    /// enqueue refusal holds for every transaction through this App — before
+    /// any kernel exists, too — and the startup refusal knows the shapes.
     pub fn mount_jobs(mut self, defs: Vec<JobDef>) -> App {
+        let shapes: Vec<(&'static str, u64)> =
+            defs.iter().map(|d| (d.name, d.fingerprint)).collect();
         for def in defs {
             assert!(
                 !self.job_defs.iter().any(|d| d.name == def.name),
@@ -283,6 +291,7 @@ impl App {
             );
             self.job_defs.push(def);
         }
+        self.db_mut().register_job_shapes(&shapes);
         self
     }
 

@@ -742,20 +742,23 @@ mod tests {
             Box::new(ProdEntropy::new().unwrap()),
             AppConfig::default(),
         )
-        .unwrap()
-        .mount_jobs(vec![crate::kernel::JobDef {
-            name: "receipt",
-            retry: charpente_core::job::RetryPolicy::DEFAULT,
-            cross_tenant: false,
-            fingerprint: 0x7E57_0702,
-            glue: noop_glue,
-        }]);
+        .unwrap();
+        // Seeded before `mount_jobs`, as the binary that enqueued it would
+        // have: once `receipt` is mounted under another shape, the enqueue
+        // itself is refused.
         app.db_mut()
             .transact(|tx| {
                 tx.enqueue(Receipt { invoice: 1 });
                 Ok::<(), io::Error>(())
             })
             .unwrap();
+        let app = app.mount_jobs(vec![crate::kernel::JobDef {
+            name: "receipt",
+            retry: charpente_core::job::RetryPolicy::DEFAULT,
+            cross_tenant: false,
+            fingerprint: 0x7E57_0702,
+            glue: noop_glue,
+        }]);
         let server = serve("127.0.0.1:0", app).unwrap();
         assert_eq!(server.wait(), 1);
         std::fs::remove_dir_all(root).unwrap();

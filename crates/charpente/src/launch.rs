@@ -323,9 +323,9 @@ fn restore_verb(
         "  pending jobs  0".to_string()
     } else {
         format!(
-            "  pending jobs  {} — these WILL dispatch when this node starts (unless one was \
-             enqueued under a job shape this binary does not compile, which refuses the start \
-             by name — GUIDE §6), so restore can re-fire mail and third-party calls that \
+            "  pending jobs  {} — these WILL dispatch when this node starts (unless one is of \
+             a job type this binary mounts, enqueued under another shape, which refuses the \
+             start by name — GUIDE §6), so restore can re-fire mail and third-party calls that \
              already ran (idempotency keys are what make that exactly-once-observable)",
             report.pending_jobs
         )
@@ -421,23 +421,23 @@ mod tests {
         ) -> Result<(), crate::kernel::JobError> {
             Ok(())
         }
-        let mut app =
-            App::open(disk, Schema::new(), entropy, AppConfig::default())?.mount_jobs(vec![
-                crate::kernel::JobDef {
-                    name: "receipt",
-                    retry: charpente_core::job::RetryPolicy::DEFAULT,
-                    cross_tenant: false,
-                    fingerprint: 0x7E57_0702, // the shape MOUNTED — different
-                    glue: noop_glue,
-                },
-            ]);
+        let mut app = App::open(disk, Schema::new(), entropy, AppConfig::default())?;
+        // Seeded before `mount_jobs`, as the binary that enqueued it would
+        // have: once `receipt` is mounted under another shape, the enqueue
+        // itself is refused.
         app.db_mut()
             .transact(|tx| {
                 tx.enqueue(ForeignShapeReceipt { invoice: 1 });
                 Ok::<(), io::Error>(())
             })
             .expect("enqueue on a freshly opened writable node cannot fail");
-        Ok(app)
+        Ok(app.mount_jobs(vec![crate::kernel::JobDef {
+            name: "receipt",
+            retry: charpente_core::job::RetryPolicy::DEFAULT,
+            cross_tenant: false,
+            fingerprint: 0x7E57_0702, // the shape MOUNTED — different
+            glue: noop_glue,
+        }]))
     }
 
     const MISSING_DATA_DIR: &str = "/does/not/exist/charpente-launch-test-data-dir";

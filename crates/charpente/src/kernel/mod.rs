@@ -223,11 +223,7 @@ impl Kernel {
         repl: Option<Repl>,
         archive: Option<(Archive, Box<dyn ObjectStore>)>,
     ) -> io::Result<Kernel> {
-        let defs = app.take_job_defs();
-        let shapes: Vec<(&'static str, u64)> =
-            defs.iter().map(|d| (d.name, d.fingerprint)).collect();
-        app.db_mut().register_job_shapes(&shapes);
-        let mut dispatcher = Dispatcher::new(defs);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs());
         let mut cron = CronScheduler::new(app.take_cron_entries());
         let now = clock.now().as_nanos();
         let was_writable = app.db_mut().writes_allowed();
