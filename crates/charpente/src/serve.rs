@@ -44,15 +44,15 @@ impl Server {
     /// Blocks until the kernel thread ends, and returns the exit code the
     /// process should end with:
     /// - `1` when the kernel stopped on an error (its stop line is already
-    ///   printed — the first line of its stderr output, naming the refusal or
-    ///   IO failure and the fix; a multi-type foreign-shape jobs refusal
-    ///   continues one job type per line after it), OR when the request
-    ///   channel closed without an error (`EDGE_GONE_STOP_LINE`, already
-    ///   printed) — v0 has no admin-triggered shutdown, so under
-    ///   `serve`/`serve_replicated` this currently only means the HTTP edge
-    ///   thread ended first, most likely a panic (a `Restart=on-failure`
-    ///   supervisor needs a nonzero code to act on a kernel that can no
-    ///   longer answer anything);
+    ///   printed — the first line of the kernel's final stderr output,
+    ///   naming the refusal or IO failure and the fix; a multi-type
+    ///   foreign-shape jobs refusal continues one job type per line after
+    ///   it), OR when the request channel closed without an error
+    ///   (`EDGE_GONE_STOP_LINE`, already printed) — v0 has no admin-triggered
+    ///   shutdown, so under `serve`/`serve_replicated` that only means the
+    ///   HTTP edge thread ended first, most likely a panic (a
+    ///   `Restart=on-failure` supervisor needs a nonzero code to act on a
+    ///   kernel that can no longer answer anything);
     /// - `101` when the thread panicked (the panic message is already printed);
     /// - `0` never happens today. It is reserved for a future admin-triggered
     ///   graceful shutdown, which would need its own line distinguishing it
@@ -69,26 +69,19 @@ impl Server {
 
 /// `Kernel::run` returns `Ok(())` on `Wake::Shutdown` (kernel/mod.rs), which
 /// v0 has no admin-triggered path to under `serve`/`serve_replicated`. The
-/// request channel's `Sender` is dropped two ways: the HTTP edge thread
-/// ending after a successful bind (a panic, most likely — `serve.rs`'s own
-/// spawn points are its sole owners), OR `http_edge`'s own
-/// `bind`/`local_addr`/`set_nonblocking` `?` returning early — the kernel
-/// thread is spawned BEFORE that call in both `serve` and `serve_replicated`,
-/// so a bind failure drops the Sender (and detaches this already-running
-/// thread) before a `Server` ever exists to `wait()` on. That race prints
-/// THIS line from the detached thread if it is scheduled before the process
-/// exits, alongside the process's own exit, which comes from `serve(..)?`'s
-/// propagated bind error instead (GUIDE §13, DESIGN §5) — not from this
-/// thread's discarded return value. Either way a live kernel with no edge
-/// left to feed it answers nothing, so this is named and non-zero rather
-/// than the clean-exit `0` a `Restart=on-failure` supervisor would take as
-/// "nothing to do here."
+/// request channel's `Sender` belongs to the HTTP edge thread alone
+/// (`http_edge`), and the kernel thread is spawned only after the listener
+/// is bound (`bind_http`), so the channel closes one way: that edge thread
+/// ended first — a panic, most likely. A live kernel with no edge left to
+/// feed it answers nothing, so this is named and non-zero rather than the
+/// clean-exit `0` a `Restart=on-failure` supervisor would take as "nothing
+/// to do here."
 const EDGE_GONE_STOP_LINE: &str = "charpente kernel stopped: the request channel closed, which \
      only happens when the HTTP edge thread ended before the kernel did (most likely a panic) — \
      check the edge thread's own panic output above; this is not a clean shutdown, v0 has none";
 
-/// The kernel thread's stop line — the first line of its stderr output. A
-/// refusal is named as one because restarting the same binary does not by
+/// The kernel thread's stop line — the first line of the kernel's final
+/// stderr output. A refusal is named as one because restarting the same binary does not by
 /// itself clear it; every refusal's own text names what must change first. A
 /// platform IO failure really can clear on a restart.
 fn kernel_stop_line(started: bool, e: &io::Error) -> String {
@@ -104,8 +97,11 @@ fn kernel_stop_line(started: bool, e: &io::Error) -> String {
     }
 }
 
+/// `Err` only when the HTTP listener cannot be bound: the bind runs before
+/// the kernel thread exists, so a failed one leaves nothing running.
 pub fn serve(addr: &str, app: App) -> io::Result<Server> {
     let body_cap = app.config().body_cap;
+    let listener = bind_http(addr)?;
     let (kernel_tx, kernel_rx) = mpsc::channel::<(Request, kernel::Reply)>();
 
     // The kernel: one thread owning the App — requests, due jobs, and cron
@@ -136,7 +132,7 @@ pub fn serve(addr: &str, app: App) -> io::Result<Server> {
         }
     });
 
-    http_edge(addr, body_cap, kernel_tx, kernel)
+    Ok(http_edge(listener, body_cap, kernel_tx, kernel))
 }
 
 /// A replicated node: the same HTTP edge, but the kernel thread opens a `Repl`
@@ -144,7 +140,9 @@ pub fn serve(addr: &str, app: App) -> io::Result<Server> {
 /// `Kernel::with_replication`. A follower serves reads and answers writes with
 /// 421; a primary ships its log. `repl_cfg.listen` is the replication port
 /// (distinct from the HTTP `addr`); a startup role/config mismatch is surfaced
-/// on stderr, config never overriding the durable role (DESIGN §5).
+/// on stderr, config never overriding the durable role (DESIGN §5). `Err`
+/// only when the HTTP listener cannot be bound, before any kernel thread
+/// exists — as for `serve`.
 pub fn serve_replicated(
     addr: &str,
     app: App,
@@ -152,6 +150,7 @@ pub fn serve_replicated(
     repl_cfg: repl::ReplConfig,
 ) -> io::Result<Server> {
     let body_cap = app.config().body_cap;
+    let listener = bind_http(addr)?;
     let (kernel_tx, kernel_rx) = mpsc::channel::<(Request, kernel::Reply)>();
 
     let kernel = std::thread::spawn(move || -> i32 {
@@ -170,9 +169,10 @@ pub fn serve_replicated(
                 repl
             }
             Err(e) => {
-                eprintln!(
-                    "charpente replication failed to start — fix the role file and restart: {e}"
-                );
+                // Each `Repl::open` error names its own fix: a corrupt role
+                // file, a listen address that cannot be bound, an empty peer
+                // secret.
+                eprintln!("charpente replication failed to start: {e}");
                 return 1;
             }
         };
@@ -204,13 +204,14 @@ pub fn serve_replicated(
         }
     });
 
-    http_edge(addr, body_cap, kernel_tx, kernel)
+    Ok(http_edge(listener, body_cap, kernel_tx, kernel))
 }
 
 /// A backup node: replication only, no HTTP edge. Runs `Kernel::with_replication`
 /// on the CURRENT thread against `EmptySource` (no requests ever arrive), so it
 /// follows the primary, keeps its own durable copy, and can be promoted later.
-/// Blocks until the kernel returns (an IO failure — restart to recover).
+/// Blocks until the kernel returns: `Err` on a platform IO failure or a named
+/// `Refusal` (`Refusal::of`).
 pub fn backup(app: App, repl_disk: Box<dyn Disk>, repl_cfg: repl::ReplConfig) -> io::Result<()> {
     let clock = crate::prod::ProdClock::new();
     let mut app = app;
@@ -274,19 +275,26 @@ pub fn archive(app: App, store: Box<dyn ObjectStore>, cfg: ArchiveConfig) -> io:
     kernel.run(&mut source)
 }
 
-/// Binds the HTTP listener and spawns the hyper accept loop feeding `kernel_tx`.
-/// Shared by `serve` and `serve_replicated` — the edge is identical; only the
-/// kernel thread differs.
-fn http_edge(
-    addr: &str,
-    body_cap: usize,
-    kernel_tx: mpsc::Sender<(Request, kernel::Reply)>,
-    kernel: std::thread::JoinHandle<i32>,
-) -> io::Result<Server> {
+/// Binds the HTTP listener, ready for `http_edge`. `serve` and
+/// `serve_replicated` call it BEFORE spawning the kernel thread, so a bind
+/// failure returns before any kernel exists: nothing is left running
+/// detached, and the caller names the failure (`launch` does).
+fn bind_http(addr: &str) -> io::Result<(std::net::TcpListener, SocketAddr)> {
     let listener = std::net::TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
     listener.set_nonblocking(true)?;
+    Ok((listener, local))
+}
 
+/// Spawns the hyper accept loop over the already-bound listener, feeding
+/// `kernel_tx`. Shared by `serve` and `serve_replicated` — the edge is
+/// identical; only the kernel thread differs.
+fn http_edge(
+    (listener, local): (std::net::TcpListener, SocketAddr),
+    body_cap: usize,
+    kernel_tx: mpsc::Sender<(Request, kernel::Reply)>,
+    kernel: std::thread::JoinHandle<i32>,
+) -> Server {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_io()
@@ -341,10 +349,10 @@ fn http_edge(
         });
     });
 
-    Ok(Server {
+    Server {
         addr: local,
         kernel,
-    })
+    }
 }
 
 /// Frames buffered per SSE connection before the kernel's drop-on-full
@@ -647,8 +655,8 @@ mod tests {
     use charpente_core::io::Entropy;
     use charpente_core::table::{Codec, Id, View};
 
-    /// The kernel thread's stop line — the first line of its stderr output —
-    /// names what stopped it (spec §5): a refusal is named as one, because
+    /// The kernel thread's stop line — the first line of the kernel's final
+    /// stderr output — names what stopped it (spec §5): a refusal is named as one, because
     /// restarting the same binary does not by itself clear it. Each refusal's
     /// own text carries what must change first.
     #[test]

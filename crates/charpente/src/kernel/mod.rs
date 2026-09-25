@@ -279,9 +279,11 @@ impl Kernel {
 
     /// The event loop (DESIGN §1 same-shape rule): identical code under
     /// `serve()` and under the sim; only the `RequestSource` impl differs.
-    /// Returns `Ok(())` on source `Shutdown`; `Err` on platform IO failure
-    /// (poisoned engine — restart to recover). Thin wrapper over `step`: it
-    /// owns the park, `step` owns the decision.
+    /// Returns `Ok(())` on source `Shutdown`; `Err` on a platform IO failure
+    /// or a named `Refusal` (`Refusal::of`) — the jobs refusal at a write-gate
+    /// opening, a witness or migration refusal, a cron enqueue refused by
+    /// name. Thin wrapper over `step`: it owns the park, `step` owns the
+    /// decision.
     pub fn run(&mut self, source: &mut dyn RequestSource) -> io::Result<()> {
         // The role-aware schema gate (spec §2): single-node and primary
         // kernels migrate before serving anything; followers skip (their

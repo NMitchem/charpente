@@ -295,8 +295,18 @@ impl Repl {
             Role::HandingOff { to } => db.forbid_writes(to.clone()),
         }
 
+        // Named here because the bind's own error names neither the address
+        // nor what to change.
         let listener = match &cfg.listen {
-            Some(addr) => Some(net.listen(addr)?),
+            Some(addr) => Some(net.listen(addr).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "could not bind the replication listen address {addr}: {e} — free that \
+                         address, or configure this node to listen on another"
+                    ),
+                )
+            })?),
             None => None,
         };
 

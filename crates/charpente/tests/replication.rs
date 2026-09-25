@@ -7893,6 +7893,31 @@ fn promote_f(sim: &Sim, f: &mut Node) -> Msg {
         .unwrap()
 }
 
+/// `serve_replicated` prints `Repl::open`'s error as its stop line, so a
+/// replication listen address that cannot be bound names itself and the fix.
+#[test]
+fn a_replication_listen_address_already_bound_is_named_with_its_fix() {
+    let sim = Sim::with_faults(0x5A9E_0709, FaultConfig::none());
+    let h = sim.host("p");
+    let _held = h.net().listen("p:1").unwrap();
+    let mut db = Db::open(Box::new(h.disk()), DbConfig::default(), make_schema()).unwrap();
+    let err = match Repl::open(
+        Box::new(h.net()),
+        Box::new(h.disk()),
+        primary_cfg("p:1"),
+        &mut db,
+    ) {
+        Ok(_) => panic!("Repl::open listened on an address already bound"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+    assert_eq!(
+        err.to_string(),
+        "could not bind the replication listen address p:1: \"p:1\" already has a simulated \
+         listener — free that address, or configure this node to listen on another"
+    );
+}
+
 /// Spec §4 at promote, amendment A1: refused BY NAME before the durable role
 /// flips, so the node stays a follower. Promoting first and stopping after
 /// would leave a durable primary that refuses to start on every restart.

@@ -710,12 +710,11 @@ fn run_oracle(
             ],
             &mut scenario,
         );
-        // `serve_replicated` spawns the kernel thread — which runs
-        // `Repl::open` and then, once probing resolves, the witness conflict
-        // — and binds the HTTP port on the main thread CONCURRENTLY (serve.rs
-        // does not wait for one before starting the other). Under enough
+        // `serve_replicated` binds the HTTP port, then spawns the kernel
+        // thread — which runs `Repl::open` and then, once probing resolves,
+        // the witness conflict, and whose stop ends the process. Under enough
         // contention the kernel can print this notice, and even stop, before
-        // the bind ever completes, so `ChildNode::spawn` reports "exited
+        // `ChildNode::spawn`'s first connect lands, so it reports "exited
         // before its port ever accepted a connection" instead of handing
         // back a live node. `child.rs` folds the tee'd stderr into that
         // error; if it already carries the exact pinned notice this arm
@@ -755,11 +754,10 @@ fn run_oracle(
 
         if let Some(stderr_path) = stderr_path {
             // `Repl::open`'s notice is printed from the kernel thread, which
-            // races the HTTP listener binding `ChildNode::spawn` waits on
-            // (`serve.rs`'s `serve_replicated` binds the HTTP port
-            // synchronously BEFORE the kernel thread necessarily finishes
-            // `Repl::open`) — poll the tee'd stderr log rather than reading
-            // it once immediately.
+            // `serve_replicated` spawns only after the HTTP port is bound, so
+            // the port `ChildNode::spawn` waits on can accept before the
+            // kernel thread has run `Repl::open` at all — poll the tee'd
+            // stderr log rather than reading it once immediately.
             let deadline = Instant::now() + Duration::from_secs(5);
             let stderr_contents = loop {
                 let contents = std::fs::read_to_string(&stderr_path).unwrap_or_default();

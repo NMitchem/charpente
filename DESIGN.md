@@ -1189,20 +1189,16 @@ failure — restart to recover` otherwise. Restarting the same binary does not b
 clear a refusal; each names what must change first — a witness answering, a fresh data
 dir, a registered migration step — while a platform IO failure really can clear on retry.
 A fifth line is neither: v0 has no admin-triggered shutdown, so `Kernel::run` returning
-`Ok(())` (`Wake::Shutdown`) under `serve`/`serve_replicated` today only means the request
-channel's `Sender` was dropped without the kernel itself stopping — the HTTP edge thread
-ending first (most likely a panic), or (a latent gap, not yet closed) the edge's own
-`bind`/`local_addr`/`set_nonblocking` failing before a `Server` exists, which races the
-same drop. The first case prints `charpente kernel stopped: the request channel closed,
-which only happens when the HTTP edge thread ended before the kernel did (most likely a
-panic) — check the edge thread's own panic output above; this is not a clean shutdown, v0
-has none`, and the kernel thread's own return value supplies the exit code, 1. The second
-(a bind failure) prints the SAME line from the detached kernel thread only if it gets
-scheduled before the process exits — but the exit code there comes from `serve(..)?`'s own
-propagated bind error instead (GUIDE §13), not from this thread's discarded return value.
-Either way a live kernel with no edge left to feed it answers nothing, so this is named and
-non-zero rather than a clean-exit `0` a `Restart=on-failure` supervisor would take as
-"nothing to do here."
+`Ok(())` (`Wake::Shutdown`) under `serve`/`serve_replicated` only means the HTTP edge
+thread, the request channel's one sender, ended first (most likely a panic). It prints
+`charpente kernel stopped: the request channel closed, which only happens when the HTTP
+edge thread ended before the kernel did (most likely a panic) — check the edge thread's own
+panic output above; this is not a clean shutdown, v0 has none`, with exit code 1: a live
+kernel with no edge left to feed it answers nothing, so this is named and non-zero rather
+than a clean-exit `0` a `Restart=on-failure` supervisor would take as "nothing to do here."
+The HTTP bind runs before the kernel thread is spawned, so a bind failure is `serve`'s own
+`Err`, with no kernel left running behind it; `launch` names it (`charpente failed to start
+— could not bind <addr>: ...`, GUIDE §13).
 
 ## 6. Queue, cron, realtime — all faces of the log
 

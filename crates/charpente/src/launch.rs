@@ -111,10 +111,10 @@ pub(crate) fn dispatch(
         // `build` (`App::open`) runs the startup schema gate before any kernel
         // exists — a table-gate barrier refuses HERE, not on the kernel
         // thread. Left to bubble through this function's own `?`, it would
-        // reach `main`'s default `Termination` impl and print the `Debug`
-        // form (`Custom { kind: Other, error: Refusal("...") }`), leaking the
-        // `Refusal` wrapper as operator-visible noise instead of the plain
-        // named line every other stop already gets (spec §5).
+        // reach `main`'s default `Termination` impl and print the raw `Debug`
+        // form (`Error: Custom { kind: Other, error: "..." }`) with no label
+        // saying it is a refusal, instead of the plain named line every
+        // other stop gets (spec §5).
         let app = match build(Box::new(disk), Box::new(entropy)) {
             Ok(app) => app,
             Err(e) if Refusal::of(&e).is_some() => {
@@ -131,7 +131,19 @@ pub(crate) fn dispatch(
         };
         // A stopped kernel ends the process with its code (spec §5), rather
         // than parking forever behind an edge that can only answer 500.
-        return Ok(crate::serve::serve(addr, app)?.wait());
+        // `serve` binds before any kernel exists, so its only `Err` is the
+        // bind's, with nothing left running behind it.
+        return match crate::serve::serve(addr, app) {
+            Ok(server) => Ok(server.wait()),
+            Err(e) => {
+                let _ = writeln!(
+                    err,
+                    "charpente failed to start — could not bind {addr}: {e} — free that \
+                     address, or change the one the app passes to launch"
+                );
+                Ok(1)
+            }
+        };
     };
 
     if verb == "restore" {
@@ -453,9 +465,9 @@ mod tests {
     /// kernel exists — a table-gate barrier refuses here, in `dispatch`
     /// itself, not on a kernel thread `wait()` could join. Left to the `?` in
     /// the `[]` arm, this would bubble all the way to `launch`'s own `?`,
-    /// which `main`'s default `Termination` impl prints as the `Debug` form
-    /// (`Custom { kind: Other, error: Refusal("...") }`) — the `Refusal(`
-    /// wrapper leaking as operator-visible noise instead of a named line.
+    /// which `main`'s default `Termination` impl prints as the raw `Debug`
+    /// form (`Error: Custom { kind: Other, error: "..." }`) — unlabelled, not
+    /// the named line every other stop gets.
     #[test]
     fn a_build_refusal_exits_one_with_a_named_line_instead_of_a_debug_leak() {
         let dir = fresh_data_dir("build-refusal");
@@ -476,6 +488,45 @@ mod tests {
             String::from_utf8(err).unwrap(),
             "charpente refused to start: test fixture: refuses to open\n"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `serve` binds the HTTP port before any kernel thread exists, so an
+    /// occupied port is a failed start with its own named line and exit 1 —
+    /// not `main`'s raw `Debug` print of the bind error, and not a kernel
+    /// left running behind a port it never got.
+    #[test]
+    // The occupied port is a real listener: `serve`'s bind is real too.
+    #[allow(clippy::disallowed_types)]
+    fn an_occupied_port_exits_one_with_a_named_bind_line() {
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = holder.local_addr().unwrap().to_string();
+        let dir = fresh_data_dir("occupied-port");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = dispatch(
+            &[],
+            &addr,
+            dir.to_str().unwrap(),
+            tiny_app,
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(code, 1);
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+        let err = String::from_utf8(err).unwrap();
+        assert!(
+            err.starts_with(&format!(
+                "charpente failed to start — could not bind {addr}: "
+            )),
+            "{err}"
+        );
+        assert!(
+            err.ends_with(" — free that address, or change the one the app passes to launch\n"),
+            "{err}"
+        );
+        drop(holder);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

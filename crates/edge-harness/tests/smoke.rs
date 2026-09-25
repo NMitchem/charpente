@@ -179,8 +179,8 @@ fn a_node_whose_kernel_cannot_start_exits_nonzero_with_its_named_line() {
     let stderr = std::fs::read_to_string(&stderr_path).expect("stderr");
     assert!(
         stderr.contains(
-            "charpente replication failed to start — fix the role file and restart: role file \
-             failed its integrity check (crc mismatch)"
+            "charpente replication failed to start: role file failed its integrity check (crc \
+             mismatch)"
         ),
         "{stderr}"
     );
@@ -198,15 +198,12 @@ fn a_node_whose_kernel_cannot_start_exits_nonzero_with_its_named_line() {
 /// foreign-shape Pending `SendReceipt`), not a CLI flag.
 ///
 /// `invoicing`'s `main.rs` binds a fixed `0.0.0.0:8080` with no override, so
-/// this asserts more than "exit 1 and the refusal text somewhere in
-/// stderr": it also rules out `AddrInUse` explicitly. Without that, a port
-/// already taken by something else on the machine could exit 1 via the
-/// bind's own `?`-propagated error — a failure with nothing to do with the
-/// kernel refusal this test exists to prove, and NOT proof the fix below
-/// held. `serve` spawns the kernel thread before the bind (concurrent with
-/// it, not after), so a taken port does not even guarantee the refusal text
-/// stays absent from stderr; the point of the extra assert is that the test
-/// cannot pass on the strength of a coincidence either way.
+/// this asserts more than "exit 1": it rules out `launch`'s bind-failure line
+/// explicitly. A port already taken by something else on the machine exits 1
+/// through that line before any kernel exists (`serve` binds first) — a
+/// failure with nothing to do with the kernel refusal this test exists to
+/// prove, and NOT proof the fix below held — so the test names that cause
+/// rather than passing or failing on it by coincidence.
 #[test]
 #[ignore]
 fn a_launch_based_binary_whose_kernel_refuses_exits_nonzero_within_a_bound() {
@@ -251,10 +248,12 @@ fn a_launch_based_binary_whose_kernel_refuses_exits_nonzero_within_a_bound() {
             let _ = child.kill();
             let _ = child.wait();
             panic!(
-                "still running 15s after its kernel refused to start — a locked stdio handle \
-                 held across launch's own wait() blocks the kernel thread's stop-line print \
-                 forever, which is the exact zombie spec §5 exists to remove, only quieter: no \
-                 stop line ever reaches stderr either"
+                "still running 15s after launch — either its kernel refused to start and a \
+                 locked stdio handle held across launch's own wait() blocks the kernel \
+                 thread's stop-line print forever (the exact zombie spec §5 exists to remove, \
+                 only quieter: no stop line ever reaches stderr either), or no refusal was \
+                 raised at all — seed_foreign_job planted no foreign-shape row, or the kernel \
+                 started over it — and the node is simply serving"
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -262,7 +261,7 @@ fn a_launch_based_binary_whose_kernel_refuses_exits_nonzero_within_a_bound() {
     assert_eq!(status.code(), Some(1), "{status}");
     let stderr = std::fs::read_to_string(&stderr_path).expect("stderr");
     assert!(
-        !stderr.contains("AddrInUse"),
+        !stderr.contains("could not bind"),
         "invoicing's fixed 0.0.0.0:8080 was already taken, so this exit proves a bind failure, \
          not the kernel refusal this test exists to prove — free the port and rerun: {stderr}"
     );

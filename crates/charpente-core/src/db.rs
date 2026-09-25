@@ -179,12 +179,20 @@ pub enum TxError<E> {
 /// on a restart; a refusal never does on its own — its own text names what
 /// has to change first — so whoever reports the error must tell the two
 /// apart rather than treat every `io::Result::Err` as transient.
-#[derive(Debug)]
 pub struct Refusal(pub String);
 
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// The bare text's own `Debug`, so an `io::Error` carrying a refusal prints
+/// under `main`'s `Error: …` exactly as one carrying the text alone does: the
+/// marker is for `Refusal::of`, not for the operator.
+impl fmt::Debug for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
     }
 }
 
@@ -214,12 +222,18 @@ impl Refusal {
 /// deterministic bug, distinct in kind from a refusal naming node state
 /// (payload-shapes spec §5). Wraps a `Refusal` rather than duplicating its
 /// text and `Display`, so `Refusal::of` still finds it.
-#[derive(Debug)]
 pub struct JobShapeRefusal(pub Refusal);
 
 impl fmt::Display for JobShapeRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.0, f)
+    }
+}
+
+/// `Refusal`'s `Debug`, for the same reason.
+impl fmt::Debug for JobShapeRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
     }
 }
 
@@ -3688,6 +3702,27 @@ impl Seeder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An `io::Error` carrying a refusal prints, under `Debug`, exactly what
+    /// one carrying the bare text does — `main`'s `Error: …` line for a
+    /// binary that returns one (GUIDE §10's `run_backup`) shows the text, not
+    /// the wrapper type the kernel's stop line tells refusals apart with.
+    #[test]
+    fn a_refusal_debugs_as_its_bare_text() {
+        let text = "the refusal names \"its\" own fix";
+        let bare = format!("{:?}", io::Error::other(text.to_string()));
+        assert_eq!(
+            format!("{:?}", io::Error::other(Refusal(text.to_string()))),
+            bare
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                io::Error::other(JobShapeRefusal(Refusal(text.to_string())))
+            ),
+            bare
+        );
+    }
 
     fn effects_fixture() -> TxEffects {
         let mut effects = TxEffects::default();
