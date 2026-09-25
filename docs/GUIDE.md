@@ -2571,6 +2571,10 @@ charpente-sim [realtime]: re-basing 0x000000002eb20001 -> 0x00000000a11ce001 und
   measured at the pinned base)
 ```
 
+Like `CHARPENTE_SEED`, it takes hex with or without `0x`, and `_` separators
+are ignored, so a base copied from the source as written (`0x2EB2_5A10`) works
+as is; a value that is not hex panics naming the variable it was read from.
+
 Floors and `require:` keys are skipped under the override, for the reason the
 floor's own panic text gives: they are rates measured AT a base, so evaluating
 them somewhere else compares against a denominator that was never taken there.

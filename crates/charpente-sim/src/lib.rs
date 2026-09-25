@@ -1565,7 +1565,7 @@ pub fn run_universes_from_in(
 ) {
     let test_file = test_name(file);
     if let Ok(seed_var) = std::env::var("CHARPENTE_SEED") {
-        let seed = parse_seed(&seed_var);
+        let seed = parse_seed("CHARPENTE_SEED", &seed_var);
         eprintln!("charpente-sim [{test_file}]: replaying seed {seed:#018x}");
         let outcome = run_one(package, test_file, seed, &f);
         eprintln!(
@@ -1637,14 +1637,17 @@ fn failure_report(package: &str, test_file: &str, seed: u64, msg: &str) -> Strin
     )
 }
 
-fn parse_seed(raw: &str) -> u64 {
+/// `var` is the variable `raw` was read from, so a bad value is named where
+/// it was set. Separators are accepted because pinned bases are written with
+/// them (`0x2EB2_5A10`): a base copied from the source parses as written.
+fn parse_seed(var: &str, raw: &str) -> u64 {
     let hex = raw
         .strip_prefix("0x")
         .or_else(|| raw.strip_prefix("0X"))
-        .unwrap_or(raw);
-    u64::from_str_radix(hex, 16).unwrap_or_else(|_| {
-        panic!("CHARPENTE_SEED must be a hex seed like 0xdeadbeef — got \"{raw}\"")
-    })
+        .unwrap_or(raw)
+        .replace('_', "");
+    u64::from_str_radix(&hex, 16)
+        .unwrap_or_else(|_| panic!("{var} must be a hex seed like 0xdeadbeef — got \"{raw}\""))
 }
 
 // The single sanctioned wall-clock read in the workspace: universes must be
@@ -1775,7 +1778,7 @@ pub fn run_universes_swarm_with_in(
 ) {
     let test_file = test_name(file);
     if let Ok(seed_var) = std::env::var("CHARPENTE_SEED") {
-        let seed = parse_seed(&seed_var);
+        let seed = parse_seed("CHARPENTE_SEED", &seed_var);
         eprintln!(
             "charpente-sim [{test_file}]: replaying seed {seed:#018x} — coverage requirements skipped under CHARPENTE_SEED"
         );
@@ -1807,7 +1810,7 @@ pub fn run_universes_swarm_with_in(
     // and they are untouched. Same precedent as CHARPENTE_SEED above.
     let rebased = std::env::var("CHARPENTE_BASE_SEED")
         .ok()
-        .map(|v| parse_seed(&v));
+        .map(|v| parse_seed("CHARPENTE_BASE_SEED", &v));
     let (base, require, floors) = match rebased {
         Some(b) => {
             eprintln!(
@@ -2214,6 +2217,27 @@ mod tests {
             ),
             "{report}"
         );
+    }
+
+    #[test]
+    fn a_seed_parses_with_or_without_its_prefix_and_separators() {
+        let parsed: Vec<u64> = ["0x5A9E_0600", "0X5a9e0600", "5a9e_06_00", "0x_5A9E0600"]
+            .iter()
+            .map(|raw| parse_seed("CHARPENTE_BASE_SEED", raw))
+            .collect();
+        assert_eq!(parsed, [0x5A9E_0600; 4]);
+    }
+
+    #[test]
+    fn a_seed_that_is_not_hex_panics_naming_the_variable_it_came_from() {
+        for var in ["CHARPENTE_SEED", "CHARPENTE_BASE_SEED"] {
+            let payload = std::panic::catch_unwind(|| parse_seed(var, "0xnope"))
+                .expect_err("a non-hex seed panics");
+            assert_eq!(
+                payload.downcast_ref::<String>().map(String::as_str),
+                Some(format!("{var} must be a hex seed like 0xdeadbeef — got \"0xnope\"").as_str()),
+            );
+        }
     }
 
     #[test]
