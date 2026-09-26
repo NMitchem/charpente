@@ -223,9 +223,12 @@ Sub-projects, in dependency order:
    `--mutants` clean over its sim properties. Findings ledgered as testimony, as the
    helpdesk write-up was. The 0.1.0 publish now waits on two platform fixes this build
    found: (1) `#[event]` payload evolution is unguarded, and a delivery-time decode
-   failure stops the whole node with an error naming neither the event nor a fix; (2) a
-   job cannot open a tenant scope the way GUIDE §16 documents, and `authorize` sees
-   neither the operation nor the caller kind.
+   failure stops the whole node with an error naming neither the event nor a fix — **fixed
+   2026-09-25** (spec `docs/superpowers/specs/2026-09-24-payload-shapes-design.md`: every
+   payload records its shape and is never decoded under another; delivery fails a tail,
+   never the node; a stopped kernel ends the process); (2) a job cannot open a tenant
+   scope the way GUIDE §16 documents, and `authorize` sees neither the operation nor the
+   caller kind.
 4. **Claims audit** [shipped 2026-09-22; spec
    `docs/superpowers/specs/2026-09-21-claims-audit-design.md`]. The bare-metal Linux BENCH
    run owed since 2026-08-15 lands, or the README scaling paragraph is rewritten to what
@@ -242,12 +245,14 @@ build passes on the bar in sub-project 3; (c) every number in README.md and MANI
 that is a claim about charpente is in docs/BENCH.md or absent, and every other figure
 cites its source or carries no digits (held by `claims_census`).
 
-## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, each with the trigger that reopens it
+## After launch (v1.x) — five from M2, one from DECISIONS §6, one from M3's claims audit, three from M3's payload-shapes fix, each with the trigger that reopens it
 
 None of these is debt. Each was weighed against the thesis on 2026-09-13 (the Linux run on
 2026-09-21) — does it make the reviewer catch more, or a stranger's first hour shorter —
 and none does. They are listed with their triggers so that "is it time yet" has a
-mechanical answer.
+mechanical answer. The payload-shapes three were deferred on 2026-09-24 by the spec that
+shipped detection and refusal (its §1 and §8): a foreign shape is already refused by name,
+so each waits for its trigger.
 
 | Item | Trigger |
 |---|---|
@@ -258,6 +263,9 @@ mechanical answer.
 | **Own LSM storage engine** | DECISIONS §7's triggers, unchanged. Trigger (c) — post-launch adoption — is after M3 by definition, which is why the engine cannot gate it. |
 | **Design C timeline epoch** (DECISIONS §6's sharpening step short of consensus) | The first loss-window finding that the bounded, named window does not cover. |
 | **Bare-metal Linux BENCH run** (owed since 2026-08-15) | A Linux box Noah runs docs/BENCH.md's protocol on. Resizes README's scaling paragraph, which since 2026-09-21 states the laptop figure and says no bare-metal run exists. |
+| **Versioned migrations for event and job payloads** (payload-shapes spec §8, approach B) | The first app that needs exact resume, or a Pending job, to survive a shape change it cannot express as a new type. |
+| **A deep fingerprint** — every `Codec` type carries its own shape constant, so a new variant on a nested enum changes the fingerprint of every table and payload that holds it | The first nested-type change that misdecodes in a real app or a docs-only build. |
+| **A commit-time shape lock** — a committed fingerprint file plus a check verb | The first shape change that reaches a deploy unnoticed. Apps on the generated TS client already get a CI signal for event payload changes from `check-client`'s staleness diff. |
 
 **Hosted control plane — off the roadmap.** "If this becomes a company: managed replicas,
 backups, failover, metrics; the binary stays fully self-hostable" is a business decision,

@@ -70,6 +70,9 @@ both persist for a while: queued jobs, retained events up to `event_retention`),
 the durability exposure is smaller (bounded by queue depth / retention count, not
 "forever" the way table rows are) and the mechanism below is table-shaped enough that
 extending it is a follow-up, not free — recorded here so it isn't silently dropped.
+**Discharged for detection and refusal** by `2026-09-24-payload-shapes-design.md`:
+every payload records its shape and nothing decodes under a foreign one. Rewriting
+payloads stays deferred; PLAN.md's after-launch table carries it with its trigger.
 Mixed-version rolling upgrades — the digest check refuses a mismatch loudly; it does
 not enable serving reads from a stale-schema follower while the primary is ahead.
 Lazy/versioned per-row decode — rejected (2026-07-16) in favor of eager rewrite, and

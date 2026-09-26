@@ -3989,7 +3989,8 @@ silently or fail to decode where they are read. A payload's decode failure under
 matching fingerprint is reported as a `charpente.error` frame (§11) or a retried, then
 dead-lettered job (§6), and its text names both possible causes — this one, or corrupt
 bytes — because the fingerprint cannot tell them apart. Treat an edit to any type a row
-or payload contains as an edit to that row or payload itself.
+or payload contains as an edit to that row or payload itself. A deep fingerprint is on
+PLAN.md's after-launch list with its trigger.
 
 ### Worked example: adding a field
 

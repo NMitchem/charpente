@@ -5505,3 +5505,125 @@ are testimony with no schedule. Whether the app repository goes to GitHub as a l
 artifact is Noah's call; the bundle stays beside the run directory until then.
 Next are the two pre-publish platform fixes named above, then the real publish, then M3
 sub-project 5, the launch run.
+
+## 2026-09-25 — payload shapes: every emit and enqueue records its shape, nothing decodes under another, and a stopped kernel ends the process
+
+**Why.** The third docs-only build (2026-09-24 entry) found C-1: `#[event]` payload
+evolution was unguarded, a delivery-time decode failure was whole-node-fatal, and the
+error named neither the event nor a fix. Noah made it a precondition of the 0.1.0 publish.
+Spec `docs/superpowers/specs/2026-09-24-payload-shapes-design.md` (880bded, amendments
+through A14), plan `docs/superpowers/plans/2026-09-24-payload-shapes.md` (dda95dd).
+
+**Shipped.** T1, shape tags: b7bce1d, eabae43 — every emit and enqueue records its
+payload's fingerprint (log tags 0x08 job / 0x09 event, trailing shape u64 le);
+`EventRow`/`JobRow.shape` (0 bytes → `None`, 8 → `Some`); `PROTO_VERSION` 3; 0x02/0x03
+still decode (shape `None`), never written. T2, reshaped delivery: 461ca50, ccd555e,
+4611fe8, 897f4de — a foreign-shape event row ends its tail with the terminal
+`charpente.reshaped` frame; a cursor on one gets a named 409. T3, corrupt/unencodable:
+9bf497b, 715a0de — a `charpente.error` frame (no `id:`), the tail fails, never the node.
+T4, events property: c4dafba, 1d91dff, 4af3440 —
+`a_resume_across_mixed_shapes_is_exact_or_named_under_the_fault_matrix`. T5, TS client:
+c88bb3c, 663897e — `StreamEnd` gains `reshaped` and `error`. T6, jobs: e3e36b9, 61856a1 —
+refuse dispatch over a Pending job of a foreign shape (at start, at every write-gate
+opening, before promote's flip; never at the hand-off, A1 revised); refuse an enqueue of
+another shape of a mounted job name at the write; dispatch asserts it. Property
+`a_new_job_shape_starts_iff_no_old_shape_is_pending_under_the_fault_matrix`. T7, process
+exit: b515982, f2eacee, f7e2cc9, 40d4eab, d2b59e4, 8a11a00 — `Server::wait` returns the
+exit code; stop lines name a Refusal vs an IO failure; refusal sites marked across
+db.rs/repl; a `launch` node whose kernel stops now EXITS — this also closes the statuspage
+testimony item "a launch node whose kernel stops answers 500 forever and never exits"
+(2026-09-24 entry). Final review wave: a7d020f, 8ed4f1e, 6b290f7, f88b1c0, e449567,
+fa89d20, 3efcc4b, 56d3a67, 475c45d — spec amendment A14: a decode failure under a matching
+fingerprint names both causes. Mutation-found tests: 25f5b9a (a commit failure through
+`App::handle` answers `io_failure_response`'s full text), ae4728e (the job-shape refusal's
+five-id elision boundary).
+
+**Seeds.** Events property: base `0x2EB2_5A10`, N=180; floors (exact, measured twice)
+reshaped-frame 11, reshaped-409 52, v2-delivered 42; fault `subscriber_stall` required
+(2). Jobs property: base `0x5A9E_0600`, N=256; refused 40 / drained 115 / none-enqueued
+77; `job-refused-after-crash` 14 (floored). Fresh bases `0x51A10001`, `0x51A10002`,
+`0x51A10003` on `ae4728e`: 1308 universes total (3×256 kernel + 3×180 realtime) — kernel
+237/240/237 reached a verdict, 19/16/19 gave up; realtime 147/139/147 reached a verdict,
+33/41/33 gave up; 0 failures. `CHARPENTE_BASE_SEED` skips `require:`/`floor:`, so these
+runs are evidence about failures only, never coverage. Task 1 census: ci.yml's live kernel
+pin `0xe653f43924f17fe8` was already defanged at the parent (green with its guard
+deleted); re-pinned to `0xe2d97275c15cc087` (10,000-universe batch, base
+`0x577d39b752d077c7`): red with the guard deleted, green restored; ci.yml and kernel.rs
+updated. R5's floor move: archive.rs `CONV_RESTORED_FLOOR` 217 → 213 and
+`CONV_RECORDS_PER_SEGMENT` 13 — the 4 lost `archive:restored` are exactly
+`verify_never_read_cleanly` 16 → 20, a fault give-up arm; the scoped base moved up at
+every floor. Pinned in this work: `0x6dddee7d1c0b1946` (the jobs property's pre-wiring
+red), and the new tests' own seeds `0x2EB7_0007`, `0x2EB7_0023`, `0x2EB1_0200`,
+`0x5A9E_0708`, `0x5A9E_0612`, `0x5A9E_0613`.
+
+**Mutants.** On `475c45d`, scoped by test binary (raw cargo-mutants, `--jobs 2`): tail.rs
+20 — 18 caught / 0 missed / 2 unviable (tail.rs:119's `InvalidData` guard, MISSED on
+`8a11a00`, now caught); `validate_subscribe` 18 — 15 caught / 1 missed (pre-existing
+guard, see follow-ups) / 2 unviable; `after_repl_step` + `refuse_foreign_pending_jobs` 4 —
+4 caught (the `delete !` timeout under scoping was caught under the full suite); `ev_json`
++ `Subscription::and` 4 — 3 caught / 0 missed / 1 unviable; `do_promote` 1/1; `serve` 7/7;
+`run_due_into` 6 — 4 caught / 1 missed (proven equivalent, below) / 1 unviable;
+`tx_error_response` + `mount_jobs` 4 — 2 caught (after 25f5b9a) / 0 / 2 unviable; launch
+`dispatch` 11 — 10 caught / 1 missed (pre-existing); `parse_seed` 2/2; db.rs
+`decode_record`/`encode_record` 13 — 12 caught / 0 / 1 unviable (verb, core+sim); event.rs
++ job.rs 18 — 7 caught / 0 / 11 unviable (verb, core+sim). db.rs's own new functions
+(verb, `--test-package charpente`, `--timeout 1800`, on 25f5b9a): 13 — 11 caught / 1
+unviable / 1 missed (`db.rs:2764 > → >=`), killed by ae4728e (re-run on ae4728e: 1/1
+caught by `a_refusal_with_exactly_five_ids_lists_all_of_them`). Hand mutations (Tasks
+2/3/5/6): T2 mutations 1-3 red; T3 M-6 red; T6 mutation 3 (the tempting target-side
+`accept_handoff` check) red; NOT run — the guard-deleting hand mutations of T4 Step 3 and
+T6 Step 6 (1, 2, 4, 5), because the tool-permission classifier refused that class of edit
+("Security Test Removal"); they await Noah. Proven-equivalent survivor, NOT excluded:
+`dispatch.rs:269` `JobShapeRefusal::of(&e).is_some()` → `true` — `Group::stage`'s only
+`TxError::Io` exit always carries a `JobShapeRefusal`, the guard is defensive (a future
+Refusal on this path must stop the kernel); `.cargo/mutants.toml` is unchanged, still 2
+entries — a third exclusion is Noah's call (below), not an automatic add. Caveat: the
+scoped runs above are raw cargo-mutants per test binary, not the `charpente test
+--mutants` verb, and the two hand guard-deletion classes were not run at all, for the
+reason given.
+
+**A10.** Measured: serde_json encodes a non-finite float as `null` (`Ok`), while a
+bytes-keyed map refuses with "key must be a string" — so `charpente.error` fires for the
+map-key case, not for NaN.
+
+**Gate** on `ae4728e`, CI's job list, every step EXIT 0: fmt clean; clippy clean; `cargo
+check -p charpente-core`; `cargo publish --workspace --dry-run --no-verify`; `cargo test
+--workspace --no-fail-fast` 87 of 87 `test result: ok`, 0 FAILED; the four replay pins
+(`0x8bee1752811ae873` and `0xff159ed76d2806e4` in release, `0x348270b38f166529` and
+`0xe2d97275c15cc087`); the bench passthrough guard; the TS gate (`npm ci`, `check-client`,
+samples, `npm run check`, `npm run test` 19 pass 0 fail); edge-harness smoke `--ignored` 3
+ok. Plus the docs-only check of this record commit: `cargo build -p guide-examples` clean;
+`cargo test -p guide-examples --no-fail-fast` 8 of 8 `test result: ok`, 0 FAILED, EXIT=0.
+
+**Open, deliberately.** (1) Flagship
+`reconnecting_client_misses_nothing_under_the_fault_matrix` red at fresh base
+`0x9C4177E3`, `CHARPENTE_SEED=0xb247eceae0daf689` — a harness defect latent since
+`eb8e711`: the round loop never checks `sim.gave_up()` after the divergence probe records
+a give-up, so retention GC deletes the row and the stale mismatch returns as a hard `Err`;
+not a platform bug, the branch only renamed the universe. Fix recipe in
+`.superpowers/sdd/2026-09-24-payload-shapes/n1-diagnosis.md`. (2) ctl.rs
+`promote_against_a_dead_port_exits_2_with_the_connect_message` has a TOCTOU: binds `:0`,
+drops, connects — a released ephemeral port can be re-bound by a sibling (seen red once in
+this work's gates, 5/5 green alone). (3) The re-pinned CI seed `0xe2d97275c15cc087`'s
+teeth live only in a one-off mutation run — a test that rebuilds the universe and asserts
+the fallout arm was taken would pin it. (4) `charpente test --sim`'s
+`--seed`/`--master-seed` flag parser (`harness.rs parse_hex`) still rejects `_`
+separators, though the env vars now accept them. (5) Pre-existing survivors outside this
+diff: `kernel/mod.rs:1001` `row.id.raw() == cursor.id` → `true` (`validate_subscribe`,
+1ec91bc); `launch.rs:160` `flag == "--format"` → `true` (dd4e466). (6) The raw
+cargo-mutants limitation: `--cargo-test-arg` applies to the mutated package's build, so a
+core file cannot be scoped to charpente's test binaries — two `--test-package` flags ran
+only the first package's suites in the baseline (18s), and with one `--test-package
+charpente` on a core file the baseline ran `cargo test --package=charpente-core` while the
+mutant ran charpente's, so the baseline never proved the judging suite green (seen
+2026-09-25 on `ae4728e`). (7) Fault-matrix coverage for the promote / switchover /
+gate-opening job refusals is fault-free-seeds-only today; a kernel-level switchover test
+landed in fa89d20. (8) The event-side analogue of the enqueue refusal (emit of a same-name
+event of another shape) was judged acceptable: graceful and named, and `mount_events`
+already refuses a mounted pair. Noah's calls: (a) allow the guard-deletion hand mutations,
+or accept the tool runs as the evidence; (b) the `dispatch.rs:269` survivor — a third
+exclusion or a restructure; (c) whether fingerprint canonicalization — the token string
+`quote!(#ty).to_string()` depends on how a type is spelled, so `Vec<u8>` vs
+`std::vec::Vec<u8>` fingerprint differently, true for tables too — is settled before
+0.1.0. Next: C-2 (a job cannot open a tenant scope the way GUIDE §16 documents), then the
+publish, then M3 sub-project 5.
