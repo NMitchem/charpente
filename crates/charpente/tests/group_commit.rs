@@ -236,6 +236,46 @@ fn handle_or_subscribe_still_commits_exactly_one_request() {
     assert_eq!(hits[0].count, 1, "the write actually landed durably");
 }
 
+/// A request whose commit fails at the WAL append is a storage failure, not
+/// a refusal, so the one-request wrapper must answer it with
+/// `io_failure_response`'s text: the client is told the write may or may not
+/// have committed, and to retry after recovery. Answering the bare disk error
+/// instead drops both facts. Driven through `App::handle` and not the kernel,
+/// because the kernel's batched tail calls `io_failure_response` itself and
+/// never reaches `tx_error_response`.
+#[test]
+fn a_commit_failure_answers_the_storage_failure_text_not_the_bare_error() {
+    let seed = 0x60C1_000A;
+    let sim = Sim::with_faults(seed, FaultConfig::none());
+    let armed = Arc::new(AtomicBool::new(false));
+    let mut app = App::open(
+        Box::new(OneShotWalFaultDisk {
+            inner: sim.disk(),
+            armed: armed.clone(),
+        }),
+        Schema::new().table::<Hit>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(hit_routes());
+    armed.store(true, Ordering::SeqCst);
+
+    let response = app.handle(Request::new(Method::Post, "/hit/1"));
+
+    assert!(
+        !armed.load(Ordering::SeqCst),
+        "seed {seed:#x}: the armed append fault never fired, so nothing below was tested"
+    );
+    assert_eq!(response.status, 500, "seed {seed:#x}");
+    assert_eq!(
+        String::from_utf8(response.body).unwrap(),
+        "{\"error\":\"internal storage failure — the request may or may not have committed; \
+         retry after the server recovers: simulated write failure (injected)\"}",
+        "seed {seed:#x}"
+    );
+}
+
 // --------------------------------------------------- pre-batching disk trace
 //
 // Neither `run_one_at_a_time_universe` nor `disk_trace_string()` exists
