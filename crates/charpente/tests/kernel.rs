@@ -2685,6 +2685,41 @@ fn a_long_refusal_lists_five_ids_and_counts_them_all() {
     );
 }
 
+/// Exactly five: the elision threshold, so the fifth id is still listed and
+/// no `…` is appended.
+#[test]
+fn a_refusal_with_exactly_five_ids_lists_all_of_them() {
+    let sim = old_binary_leaves_pending_receipts(0x5A9E_0612, 5);
+    let err = match Kernel::new(receipts_app(&sim, true).unwrap(), Box::new(sim.clock())) {
+        Ok(_) => panic!("the v2 kernel started over five Pending v1 receipts"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.to_string(),
+        receipt_refusal(
+            &[0, 1, 2, 3, 4],
+            &format!("{:#x}", <receipt_v1::SendReceipt as Job>::FINGERPRINT)
+        )
+    );
+}
+
+/// One past the threshold: the sixth id is dropped and `…` takes its place.
+#[test]
+fn a_refusal_with_six_ids_elides_the_sixth() {
+    let sim = old_binary_leaves_pending_receipts(0x5A9E_0613, 6);
+    let err = match Kernel::new(receipts_app(&sim, true).unwrap(), Box::new(sim.clock())) {
+        Ok(_) => panic!("the v2 kernel started over six Pending v1 receipts"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.to_string(),
+        receipt_refusal(
+            &[0, 1, 2, 3, 4, 5],
+            &format!("{:#x}", <receipt_v1::SendReceipt as Job>::FINGERPRINT)
+        )
+    );
+}
+
 /// The control: when every v1 job is Done, v2 starts. Done and Dead rows are
 /// never decoded again.
 #[test]
