@@ -88,6 +88,15 @@ jobs:
       # If this proves flaky on a shared runner, tighten `known_noisy` at the test site rather
       # than deleting the line; a guard removed for noise is a guard that never fires.
       - run: cargo test -p bench-harness --lib -- kernel_bench::tests::passthrough_records_nothing_and_recording_records_something --exact --ignored
+      # The launch-exit guards, with --ignored — added 2026-09-27. A launch-based node
+      # whose kernel stops must exit nonzero with its named line, not park behind an HTTP
+      # edge that answers 500 forever; that hang shipped once. Both tests are `#[ignore]`d
+      # because they spawn real processes over real TCP, so `cargo test --workspace` above
+      # lists them as "ignored" and runs nothing — the same condition the three blocks above
+      # describe. Named --exact so no other ignored edge test rides along. Marginal cost
+      # measured locally: 4 s, most of it the release build of the invoicing and
+      # charpente-cli bins (charpente itself is already warm from the release replay pins).
+      - run: cargo test -p edge-harness --test smoke -- a_launch_based_binary_whose_kernel_refuses_exits_nonzero_within_a_bound a_node_whose_kernel_cannot_start_exits_nonzero_with_its_named_line --exact --ignored
 
   # The TypeScript client gate (TS-codegen spec §4/§7). Three checks, each of which
   # fails for a different reason, and none of which the Rust suite above can perform.
