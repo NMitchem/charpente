@@ -704,16 +704,10 @@ struct Canon {
 /// toolchain that printed `Vec<u8>` where another printed `Vec < u8 >`, or
 /// `std::string` where another printed `std :: string`, cannot move it.
 ///
-/// The brief's original draft of `Canon` also had `nested: Option<Vec<Vec<u8>>>`,
-/// `pair: (u32, String)` and `fixed: [u8; 4]`, to cover the `>>` glue and a
-/// `(`…`)`/`[`…`]` group in an integration-level golden. `#[table(global)]`
-/// refuses all three at compile time (E0277: `Codec` is implemented only for
-/// the concrete `Vec<u8>`, never a generic `Vec<T>`, and never for tuples or
-/// arrays), matching the brief's stated fallback: those fields are dropped
-/// here, and `>>` gluing plus a `(`…`)`/`[`…`]` group are covered instead by
+/// This golden pins `::`-qualified paths and bare generics; nested generics
+/// and `(`…`)`/`[`…`]` groups are pinned instead by
 /// `compute_hashes_the_rendered_tokens_not_a_printer` in
-/// `crates/charpente-macros/src/fingerprint.rs`, which calls `compute`
-/// directly on `syn::Type`s that never need a `Codec` impl.
+/// `crates/charpente-macros/src/fingerprint.rs`.
 #[test]
 fn a_fingerprint_hashes_charpentes_own_token_rendering_not_the_compilers() {
     use charpente::core::table::Row;
