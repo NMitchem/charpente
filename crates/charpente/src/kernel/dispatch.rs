@@ -164,11 +164,13 @@ impl Dispatcher {
     /// `Ok(outcome)` covers handler success and handler failure (retry/dead
     /// — both are now STAGED records, not yet durable), and a handler whose
     /// own transaction `Group::stage` refused with a `JobShapeRefusal` is
-    /// that kind of failure: an attempt, like a panic. `Err` is a PLATFORM
-    /// failure (any other `TxError::Io`, or an `Io` the handler's own reads
-    /// surfaced): the heap entry is restored to its ORIGINAL `(due_at, id)`
-    /// before returning, and the job stays Pending in the store either way,
-    /// since nothing this call staged has been committed.
+    /// that kind of failure: an attempt, like a panic. A non-shape `Io` out
+    /// of the attempt's `Group::stage` is a dispatcher invariant, not a
+    /// return: it panics — the kernel stops — rather than reaching this
+    /// signature. `Err` is a PLATFORM failure — an `Io` the handler's own
+    /// reads surfaced: the heap entry is restored to its ORIGINAL
+    /// `(due_at, id)` before returning, and the job stays Pending in the
+    /// store either way, since nothing this call staged has been committed.
     ///
     /// **Contract for a caller sharing `group` across several jobs** (the
     /// kernel's batched drain): an `Err` return here does NOT mean `group`
