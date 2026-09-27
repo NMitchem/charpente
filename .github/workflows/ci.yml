@@ -94,8 +94,12 @@ jobs:
       # because they spawn real processes over real TCP, so `cargo test --workspace` above
       # lists them as "ignored" and runs nothing — the same condition the three blocks above
       # describe. Named --exact so no other ignored edge test rides along. Marginal cost
-      # measured locally: 4 s, most of it the release build of the invoicing and
-      # charpente-cli bins (charpente itself is already warm from the release replay pins).
+      # measured locally: 4 s warm-cache — charpente itself is already warm from the
+      # release replay pins, and invoicing/charpente-cli add no third-party dependency
+      # charpente does not already build in release. That 4 s does not cover a cold
+      # rust-cache entry (the first run after this lands, and any cache miss): it still
+      # pays the first-time release compile of invoicing's, charpente-cli's and
+      # charpente-tsgen's own code, none of which any earlier step here builds in release.
       - run: cargo test -p edge-harness --test smoke -- a_launch_based_binary_whose_kernel_refuses_exits_nonzero_within_a_bound a_node_whose_kernel_cannot_start_exits_nonzero_with_its_named_line --exact --ignored
 
   # The TypeScript client gate (TS-codegen spec §4/§7). Three checks, each of which
