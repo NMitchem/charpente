@@ -214,14 +214,14 @@ impl Refusal {
 
 /// The one refusal `Group::stage` itself can produce: an enqueue of a
 /// mounted job name under a foreign shape. A distinct type, not a flag on
-/// `Refusal`, so dispatch (`kernel/dispatch.rs`) can narrow to exactly it —
-/// defensively: `Group::stage` also checks the write gate, but that surfaces
-/// as `NotPrimary`/`Verifying` (`TxError`'s own variants), never a
-/// `Refusal`, so this is the only `Refusal` `Group::stage` can raise at all
-/// — the narrowing still names the one case that IS the handler's own
-/// deterministic bug, distinct in kind from a refusal naming node state
-/// (payload-shapes spec §5). Wraps a `Refusal` rather than duplicating its
-/// text and `Display`, so `Refusal::of` still finds it.
+/// `Refusal`, because dispatch (`kernel/dispatch.rs`) asserts that every
+/// `Io` error out of `Group::stage` is this refusal — `Group::stage` also
+/// checks the write gate, but that surfaces as `NotPrimary`/`Verifying`
+/// (`TxError`'s own variants), never a `Refusal`, so this is the only
+/// `Refusal` `Group::stage` can raise at all, and it names the one case that
+/// IS the handler's own deterministic bug, distinct in kind from a refusal
+/// naming node state (payload-shapes spec §5). Wraps a `Refusal` rather than
+/// duplicating its text and `Display`, so `Refusal::of` still finds it.
 pub struct JobShapeRefusal(pub Refusal);
 
 impl fmt::Display for JobShapeRefusal {

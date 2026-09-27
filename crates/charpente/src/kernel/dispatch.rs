@@ -255,18 +255,19 @@ impl Dispatcher {
             Ok(())
         });
 
-        // The handler's own transaction refused by name — it enqueued
-        // another shape of a mounted job name — is the handler's
-        // deterministic bug, like a panic: an attempt, never a platform
-        // fault, since no restart could clear it. `JobShapeRefusal`
-        // specifically, not `Refusal` generally, and defensively so:
-        // `Group::stage` (the only producer of this `TxError::Io`) never
-        // applies, so a table-gate barrier or a witness conflict cannot
-        // actually reach here — but if node state ever did produce a
-        // `Refusal` on this path, it must still stop the kernel rather than
-        // dead-letter as an attempt (payload-shapes spec §5).
+        // `Group::stage`'s only `TxError::Io` exit is its enqueue refusal: this
+        // handler's transaction enqueued another shape of a mounted job name.
+        // That is the handler's own deterministic bug, like a panic — an
+        // attempt, never a platform fault, since no restart could clear it.
+        // Asserted, not handled (hard rule 4): a second `Io` exit in `stage`
+        // must be classified here on purpose, not dead-lettered by default.
         let attempt = match attempt {
-            Err(TxError::Io(e)) if JobShapeRefusal::of(&e).is_some() => {
+            Err(TxError::Io(e)) => {
+                assert!(
+                    JobShapeRefusal::of(&e).is_some(),
+                    "dispatcher invariant: Group::stage returned an io error that is not its \
+                     job-shape refusal — classify it in dispatch before it can reach a job: {e}"
+                );
                 Err(TxError::App(JobError::App(e.to_string())))
             }
             other => other,
