@@ -3,6 +3,8 @@
 //! sequence, computed at expansion time (spec §1). A deliberate, exact
 //! duplicate of `charpente_core::migration::fnv1a_hash` — proc-macros run in
 //! the host compiler and cannot call core's compiled code.
+use proc_macro2::{Delimiter, TokenStream, TokenTree};
+use quote::ToTokens;
 use syn::Type;
 
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -16,16 +18,49 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// NUL-separated fold so ("ab","c") cannot collide with ("a","bc").
+/// NUL-separated fold so ("ab","c") cannot collide with ("a","bc"). Each type
+/// is rendered by `render`, not by `TokenStream`'s `Display`: that printer's
+/// spacing is the compiler's and is documented as subject to change, and
+/// these hashes are persisted.
 pub(crate) fn compute(field_idents: &[syn::Ident], field_types: &[Type]) -> u64 {
     let mut buf = String::new();
     for (ident, ty) in field_idents.iter().zip(field_types) {
         buf.push_str(&ident.to_string());
         buf.push('\0');
-        buf.push_str(&quote::quote!(#ty).to_string());
+        let mut words = Vec::new();
+        render(ty.to_token_stream(), &mut words);
+        buf.push_str(&words.join(" "));
         buf.push('\0');
     }
     fnv1a(buf.as_bytes())
+}
+
+/// Every token as its own word: an identifier, one punctuation character, a
+/// literal's source text, or a group's delimiters around its contents. An
+/// invisible (`Delimiter::None`) group contributes only its contents.
+fn render(tokens: TokenStream, words: &mut Vec<String>) {
+    for tree in tokens {
+        match tree {
+            TokenTree::Group(g) => {
+                let (open, close) = match g.delimiter() {
+                    Delimiter::Parenthesis => ("(", ")"),
+                    Delimiter::Brace => ("{", "}"),
+                    Delimiter::Bracket => ("[", "]"),
+                    Delimiter::None => ("", ""),
+                };
+                if !open.is_empty() {
+                    words.push(open.to_string());
+                }
+                render(g.stream(), words);
+                if !close.is_empty() {
+                    words.push(close.to_string());
+                }
+            }
+            TokenTree::Ident(i) => words.push(i.to_string()),
+            TokenTree::Punct(p) => words.push(p.as_char().to_string()),
+            TokenTree::Literal(l) => words.push(l.to_string()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -51,5 +86,17 @@ mod tests {
             compute(&idents, &[parse_quote!(u32)]),
             compute(&idents, &[parse_quote!(u64)])
         );
+    }
+
+    #[test]
+    fn compute_hashes_the_rendered_tokens_not_a_printer() {
+        let idents: Vec<syn::Ident> = vec![parse_quote!(a), parse_quote!(b)];
+        let types: Vec<Type> = vec![
+            parse_quote!(std::collections::BTreeMap<String, Vec<(u8, [u16; 2])>>),
+            parse_quote!(&'static str),
+        ];
+        let expected = "a\0std : : collections : : BTreeMap < String , Vec < ( u8 , [ u16 ; 2 ] ) > >\0\
+                        b\0& ' static str\0";
+        assert_eq!(compute(&idents, &types), fnv1a(expected.as_bytes()));
     }
 }

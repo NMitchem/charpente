@@ -651,7 +651,9 @@ identity, no indexes, no redb registration) and `impl TableMigration for Current
 type Prev = PriorStruct; fn migrate(prev) -> Result<Self, MigrationError>; }`; the macro
 emits a const assert requiring the impl, so a bump without one is a missing-trait-impl error
 at the struct, not a runtime surprise. Every version also carries a structural fingerprint —
-a hand-rolled, fixed 64-bit FNV-1a over its `(field_name, type_name)` sequence, computed at
+a hand-rolled, fixed 64-bit FNV-1a over its `(field_name, type tokens)` sequence — the
+tokens rendered by the macro itself, one space between them, never by the compiler's
+printer, whose spacing is not stable across toolchains — computed at
 macro-expansion time and exposed as `Row::FINGERPRINT: Option<u64>` — that catches the hole
 compile-time checking cannot: a same-shape struct edited without bumping `version`.
 `Row::FINGERPRINT` defaults to `None`; a hand-written `Row` impl (the platform's own

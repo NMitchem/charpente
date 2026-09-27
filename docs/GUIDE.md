@@ -3981,9 +3981,13 @@ backstop for the one hole compile-time checking cannot close (nothing forces you
 remember to bump `version`).
 
 **What the fingerprint cannot see.** It hashes each field's name and the *tokens* of
-its type, not the type's definition. A change inside a type a field holds — a new
-variant on an enum, a field added to a nested struct — leaves the fingerprint
-unchanged, for tables and for `#[event]`/`#[job]` payloads alike (§6, §11). Such a
+its type, not the type's definition.
+The tokens are hashed as written, rendered by charpente itself with one space between
+tokens: `Vec<u8>` and `std::vec::Vec<u8>` are different shapes to it, so respelling a
+field's type is a shape change, and a compiler upgrade never is.
+A change inside a type a field holds — a new variant on an enum, a field added to a
+nested struct — leaves the fingerprint unchanged, for tables and for
+`#[event]`/`#[job]` payloads alike (§6, §11). Such a
 change is exactly as dangerous as a field change: stored bytes either misdecode
 silently or fail to decode where they are read. A payload's decode failure under a
 matching fingerprint is reported as a `charpente.error` frame (§11) or a retried, then

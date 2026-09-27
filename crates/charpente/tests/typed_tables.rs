@@ -690,6 +690,43 @@ fn bare_table_stays_version_one_and_now_fingerprinted() {
     assert!(Org::FINGERPRINT.is_some());
 }
 
+#[charpente::table(global)]
+struct Canon {
+    id: charpente::core::table::Id<Canon>,
+    bytes: Vec<u8>,
+    spelled: std::string::String,
+}
+
+/// A fingerprint is a function of a field's type tokens as written, rendered
+/// by charpente itself with one space between tokens, and never of the
+/// compiler's printer, whose spacing rustc does not keep stable. So the
+/// expected value is recomputed here from spelled-out canonical text: a
+/// toolchain that printed `Vec<u8>` where another printed `Vec < u8 >`, or
+/// `std::string` where another printed `std :: string`, cannot move it.
+///
+/// The brief's original draft of `Canon` also had `nested: Option<Vec<Vec<u8>>>`,
+/// `pair: (u32, String)` and `fixed: [u8; 4]`, to cover the `>>` glue and a
+/// `(`…`)`/`[`…`]` group in an integration-level golden. `#[table(global)]`
+/// refuses all three at compile time (E0277: `Codec` is implemented only for
+/// the concrete `Vec<u8>`, never a generic `Vec<T>`, and never for tuples or
+/// arrays), matching the brief's stated fallback: those fields are dropped
+/// here, and `>>` gluing plus a `(`…`)`/`[`…`]` group are covered instead by
+/// `compute_hashes_the_rendered_tokens_not_a_printer` in
+/// `crates/charpente-macros/src/fingerprint.rs`, which calls `compute`
+/// directly on `syn::Type`s that never need a `Codec` impl.
+#[test]
+fn a_fingerprint_hashes_charpentes_own_token_rendering_not_the_compilers() {
+    use charpente::core::table::Row;
+    let canonical = "id\0charpente : : core : : table : : Id < Canon >\0\
+                     bytes\0Vec < u8 >\0\
+                     spelled\0std : : string : : String\0";
+    assert_eq!(
+        Canon::FINGERPRINT,
+        Some(charpente::core::migration::fnv1a_hash(canonical.as_bytes())),
+        "the fingerprint must be FNV-1a over `name\\0<tokens joined by one space>\\0` per field"
+    );
+}
+
 // -------------------------------------------------------- scoped_by (Task 3, tenant scoping)
 
 #[charpente::table(scoped_by = Org)]
