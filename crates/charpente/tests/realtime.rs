@@ -1570,20 +1570,22 @@ impl Client {
     ///
     /// `sync_ledger` scans forward from `next_scan_id` and never revisits an id,
     /// so a ledger entry is a snapshot of what the store held at the moment it
-    /// was scanned — and a snapshot sees COMMITTED state, which is not DURABLE
-    /// state. The platform only promises durability for acked writes
-    /// (MANIFESTO §5: the log is the one place things become true, and a record
-    /// that never landed durably never became true), and DESIGN's delivery rule
-    /// is commit-triggered by design — "a commit simply advances
-    /// `next_event_id`, which makes tails ready". So a crash may legitimately
-    /// discard an event this ledger recorded, after which a replacement record
-    /// re-mints the SAME id, and — when the cut returned the log to the same
-    /// position — the same seq, with different content.
+    /// was scanned. A commit is append → sync → apply, so nothing the store
+    /// holds was ever unsynced — but a synced event can still leave this node's
+    /// timeline. On one node, durable corruption (`bit_flip`,
+    /// `misdirected_write`) of a frame above the store's checkpoint horizon is
+    /// cut at recovery like a torn tail: the sanctioned single-node
+    /// media-corruption window (`durable_corruption_fired`'s doc). On a
+    /// replicated node, a failover can also lose it inside the replication loss
+    /// window. Either way a replacement record may then re-mint the SAME id,
+    /// and — when the cut returned the log to the same position — the same seq,
+    /// with different content.
     ///
     /// That is not a delivery defect and must not be reported as one
     /// (seed 0x17004e6a572d737d, docs/LEDGER.md 2026-09-07, where a misdirected
     /// write moved `wal/…0.log`'s first frame from offset 0 to 1024, so recovery
-    /// cut at 0 and event id 0 was re-minted at seq 1 with new content).
+    /// cut at 0 and event id 0 was re-minted at seq 1 with new content; and
+    /// seed 0xb247eceae0daf689, where a `bit_flip` cut an acked event at id 3).
     ///
     /// Called ONLY on the drain-error path, so a passing universe pays no extra
     /// disk ops and its injected-fault schedule is untouched.
@@ -1602,8 +1604,8 @@ impl Client {
                 // advances on commit — retention GC deletes rows without ever
                 // rewinding it — so a recorded id at-or-above the store's
                 // current `next_event_id` is one the store has rolled back
-                // PAST: that event was committed but never durable, and this
-                // node's timeline no longer contains it. It can never be
+                // PAST: this node's timeline no longer contains that event,
+                // for one of the two reasons above. It can never be
                 // delivered and this universe cannot adjudicate it.
                 //
                 // An absent id BELOW `next_event_id` is the retention case and
@@ -1755,9 +1757,12 @@ impl Client {
     /// `sync_and_drain`, with the one outcome that is NOT this property's
     /// subject filtered out: a drain error whose cause is that the store no
     /// longer holds what the ledger recorded. See `diverged_ledger_entry` —
-    /// the ledger snapshot was of committed, not durable, state, and the
-    /// platform is entitled to discard it. Returns `true` when the universe
-    /// gave up and the caller should stop absorbing.
+    /// the recorded event left this node's timeline through durable
+    /// corruption above the checkpoint horizon or a failover inside the
+    /// replication loss window, windows the platform names. Returns `true`
+    /// when the universe gave up; every caller's loop must then end the
+    /// universe, because a later round can let retention collect the
+    /// diverged row and turn the same drain error into a hard failure.
     ///
     /// The probe runs ONLY after a drain error, so the common path is
     /// unchanged and no passing universe's fault schedule moves.
@@ -1768,8 +1773,10 @@ impl Client {
                 Some((id, recorded, stored)) => {
                     sim.give_up(format!(
                         "ledger diverged at event id {id}: recorded {recorded} when scanned, \
-                         store now holds {stored} — a crash discarded a committed-but-not-durable \
-                         event and a replacement re-minted this id, so nothing here adjudicates \
+                         store now holds {stored} — this node's timeline no longer holds the \
+                         recorded event (durable corruption cut it above the checkpoint \
+                         horizon, or a failover lost it inside the replication loss window) \
+                         and any row now at this id is a re-mint, so nothing here adjudicates \
                          delivery ({e})"
                     ));
                     Ok(true)
@@ -2152,6 +2159,12 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
                 client.current_handle = None;
                 break;
             }
+            // Below the `run_result` check, not above it: that failure was
+            // observed before `absorb` gave up, and a failure outranks a
+            // give-up. A fallout `break` above reaches the epoch-top check.
+            if sim.gave_up().is_some() {
+                return Ok(client.trace);
+            }
         }
     }
 
@@ -2249,6 +2262,11 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
                 rolled_back = client.diverged_ledger_entry(kernel.app().db());
             }
         }
+        // The loop-top check never runs after the LAST attempt, whose give-up
+        // would otherwise fall through to the unsettled verdict below.
+        if sim.gave_up().is_some() {
+            return Ok(client.trace);
+        }
     }
 
     if !client.settled() {
@@ -2264,9 +2282,10 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
         if let Some((id, recorded, stored)) = rolled_back {
             sim.give_up(format!(
                 "ledger id {id} is behind this node's timeline: recorded {recorded} \
-                 when scanned, store now says {stored} — a committed-but-not-durable \
-                 event the platform is entitled to discard, so it can never be \
-                 delivered and nothing here adjudicates ({})",
+                 when scanned, store now says {stored} — this node's timeline no longer \
+                 holds the recorded event (durable corruption cut it above the \
+                 checkpoint horizon), so it can never be delivered and nothing here \
+                 adjudicates ({})",
                 client.unsettled_report()
             ));
             return Ok(client.trace);
@@ -2352,6 +2371,37 @@ fn a_universe_that_never_booted_a_node_gives_up_rather_than_reporting_a_miss() {
         reason.contains("there was no node to catch up from"),
         "and it must be THIS give-up — no settle attempt ever ran cleanly — rather than \
          some unrelated cause that happens to keep the test green: {reason}"
+    );
+}
+
+/// Seed `0xb247eceae0daf689` (base `0x9C4177E3`). A durable, acked event is
+/// destroyed by `bit_flip` above the store's checkpoint horizon, recovery cuts
+/// there, and the next emit re-mints its id with other content. The drain
+/// probe classifies that correctly as a give-up in the first round after the
+/// restart; the universe must END there. Carrying on let retention collect the
+/// diverged row, after which the probe could no longer see the divergence and
+/// the stale frame came back as a hard failure.
+#[test]
+fn a_diverged_ledger_gives_up_at_first_detection_and_stops() {
+    const SEED: u64 = 0xb247_ecea_e0da_f689;
+    let mut state = SEED;
+    let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+    let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+    charpente_sim::sample_extended_fields(SEED, &mut cfg);
+    let mut sim = Sim::with_faults(SEED, cfg);
+
+    let result = realtime_workload(&mut sim);
+    assert!(
+        result.is_ok(),
+        "a universe whose probe found a diverged ledger must give up, not fail: {:?}",
+        result.err()
+    );
+    let reason = sim
+        .gave_up()
+        .expect("the divergence must be RECORDED as a give-up");
+    assert!(
+        reason.contains("ledger diverged at event id 3"),
+        "and it must be THIS give-up, the divergence at id 3: {reason}"
     );
 }
 
@@ -3952,6 +4002,11 @@ fn drive_client_to_settled(
             })?;
             client.absorb(sim, kernel.app().db(), &[], None, &node.sinks)?;
         }
+        // Every caller checks again on return: each ends in a `settled()`
+        // verdict that a gave-up client cannot meet.
+        if sim.gave_up().is_some() {
+            return Ok(());
+        }
         if nodes[target].recoveries > recoveries_before {
             client.need_subscribe = true;
             client.current_handle = None;
@@ -3983,6 +4038,9 @@ fn multi_node_realtime_universe(sim: &mut Sim) -> Result<(), String> {
 
     // ---------------------------------------------------- Phase 1: follower-tail
     drive_client_to_settled(sim, &mut [&mut p, &mut f], 1, &mut client, path)?;
+    if sim.gave_up().is_some() {
+        return Ok(());
+    }
     for _ in 0..6u32 {
         let (route, body) = pick_emit(sim);
         let (status, resp_body) = rt_drive_request(
@@ -4001,6 +4059,9 @@ fn multi_node_realtime_universe(sim: &mut Sim) -> Result<(), String> {
             ));
         }
         drive_client_to_settled(sim, &mut [&mut p, &mut f], 1, &mut client, path)?;
+        if sim.gave_up().is_some() {
+            return Ok(());
+        }
     }
     if !client.settled() {
         return Err(client.unsettled_report());
@@ -4092,6 +4153,9 @@ fn multi_node_realtime_universe(sim: &mut Sim) -> Result<(), String> {
     client.need_subscribe = true;
     client.current_handle = None;
     drive_client_to_settled(sim, &mut [&mut f], 0, &mut client, path)?;
+    if sim.gave_up().is_some() {
+        return Ok(());
+    }
     if !client.settled() {
         return Err(client.unsettled_report());
     }
@@ -4958,6 +5022,10 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
                 client.current_handle = None;
                 break;
             }
+            // Placed as in `realtime_workload`'s round loop, for its reason.
+            if sim.gave_up().is_some() {
+                return Ok(client.trace);
+            }
         }
     }
 
@@ -5033,6 +5101,11 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
                 rolled_back = client.diverged_ledger_entry(kernel.app().db());
             }
         }
+        // The loop-top check never runs after the LAST attempt, whose give-up
+        // would otherwise fall through to the unsettled verdict below.
+        if sim.gave_up().is_some() {
+            return Ok(client.trace);
+        }
     }
 
     if !client.settled() {
@@ -5042,9 +5115,10 @@ fn scoped_realtime_workload(sim: &mut Sim) -> Result<ScopedTrace, String> {
         if let Some((id, recorded, stored)) = rolled_back {
             sim.give_up(format!(
                 "ledger id {id} is behind this node's timeline: recorded {recorded} \
-                 when scanned, store now says {stored} — a committed-but-not-durable \
-                 event the platform is entitled to discard, so it can never be \
-                 delivered and nothing here adjudicates ({})",
+                 when scanned, store now says {stored} — this node's timeline no longer \
+                 holds the recorded event (durable corruption cut it above the \
+                 checkpoint horizon), so it can never be delivered and nothing here \
+                 adjudicates ({})",
                 client.unsettled_report()
             ));
             return Ok(client.trace);
