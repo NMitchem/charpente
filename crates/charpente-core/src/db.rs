@@ -214,14 +214,20 @@ impl Refusal {
 
 /// The one refusal `Group::stage` itself can produce: an enqueue of a
 /// mounted job name under a foreign shape. A distinct type, not a flag on
-/// `Refusal`, because dispatch (`kernel/dispatch.rs`) asserts that every
-/// `Io` error out of `Group::stage` is this refusal — `Group::stage` also
-/// checks the write gate, but that surfaces as `NotPrimary`/`Verifying`
+/// `Refusal`, because the ATTEMPT's stage (`kernel/dispatch.rs`,
+/// `run_due_into`'s first `group.stage` — the handler's own transaction)
+/// asserts that every `Io` error out of it is this refusal; the
+/// failure-record stage that follows carries no such assert. `Group::stage`
+/// also checks the write gate, but that surfaces as `NotPrimary`/`Verifying`
 /// (`TxError`'s own variants), never a `Refusal`, so this is the only
 /// `Refusal` `Group::stage` can raise at all, and it names the one case that
 /// IS the handler's own deterministic bug, distinct in kind from a refusal
-/// naming node state (payload-shapes spec §5). Wraps a `Refusal` rather than
-/// duplicating its text and `Display`, so `Refusal::of` still finds it.
+/// naming node state (payload-shapes spec §5). A second caller relies on the
+/// same distinct type: `http/app.rs`'s `tx_error_response` (~line 882)
+/// answers a request's own enqueue refusal with a 500 carrying this text,
+/// instead of the generic storage-failure response. Wraps a `Refusal`
+/// rather than duplicating its text and `Display`, so `Refusal::of` still
+/// finds it.
 pub struct JobShapeRefusal(pub Refusal);
 
 impl fmt::Display for JobShapeRefusal {
@@ -240,7 +246,8 @@ impl fmt::Debug for JobShapeRefusal {
 impl std::error::Error for JobShapeRefusal {}
 
 impl JobShapeRefusal {
-    /// `Some` only for THIS refusal — dispatch's one narrow question.
+    /// `Some` only for THIS refusal — the narrow question both callers ask:
+    /// dispatch's attempt stage and the request path's `tx_error_response`.
     pub fn of(e: &io::Error) -> Option<&JobShapeRefusal> {
         e.get_ref()
             .and_then(|inner| inner.downcast_ref::<JobShapeRefusal>())

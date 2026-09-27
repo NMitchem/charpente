@@ -1,5 +1,5 @@
 //! Shared by `#[table]`, `#[row_shape]`, `#[event]` and `#[job]`: the
-//! structural fingerprint over a struct's `(field_name, type_name)`
+//! structural fingerprint over a struct's `(field_name, type tokens)`
 //! sequence, computed at expansion time (spec §1). A deliberate, exact
 //! duplicate of `charpente_core::migration::fnv1a_hash` — proc-macros run in
 //! the host compiler and cannot call core's compiled code.
@@ -86,6 +86,35 @@ mod tests {
             compute(&idents, &[parse_quote!(u32)]),
             compute(&idents, &[parse_quote!(u64)])
         );
+    }
+
+    #[test]
+    fn render_flattens_invisible_groups_and_keeps_braces() {
+        use proc_macro2::{Group, Ident, Punct, Spacing, Span};
+
+        // `Vec < (None-group: u8) >` — the invisible group around `u8` must
+        // contribute only its contents, not a pair of delimiter words.
+        let none_group = TokenTree::Group(Group::new(
+            Delimiter::None,
+            TokenStream::from(TokenTree::Ident(Ident::new("u8", Span::call_site()))),
+        ));
+        let vec_stream: TokenStream = vec![
+            TokenTree::Ident(Ident::new("Vec", Span::call_site())),
+            TokenTree::Punct(Punct::new('<', Spacing::Alone)),
+            none_group,
+            TokenTree::Punct(Punct::new('>', Spacing::Alone)),
+        ]
+        .into_iter()
+        .collect();
+        let mut words = Vec::new();
+        render(vec_stream, &mut words);
+        assert_eq!(words, vec!["Vec", "<", "u8", ">"]);
+
+        // A brace group (unlike `None`) renders its own delimiter words.
+        let brace_group = TokenTree::Group(Group::new(Delimiter::Brace, TokenStream::new()));
+        let mut brace_words = Vec::new();
+        render(TokenStream::from(brace_group), &mut brace_words);
+        assert_eq!(brace_words, vec!["{", "}"]);
     }
 
     #[test]

@@ -167,10 +167,16 @@ impl Dispatcher {
     /// that kind of failure: an attempt, like a panic. A non-shape `Io` out
     /// of the attempt's `Group::stage` is a dispatcher invariant, not a
     /// return: it panics — the kernel stops — rather than reaching this
-    /// signature. `Err` is a PLATFORM failure — an `Io` the handler's own
-    /// reads surfaced: the heap entry is restored to its ORIGINAL
-    /// `(due_at, id)` before returning, and the job stays Pending in the
-    /// store either way, since nothing this call staged has been committed.
+    /// signature. `Err` is a PLATFORM failure, one of three: an `Io` the
+    /// handler's own reads surfaced; the failure-record stage's own
+    /// read/IO error, once the handler attempt has already failed at the
+    /// App level; or one of the `NotPrimary`/`Verifying` BUG arms — a
+    /// job/cron transaction hitting either, which the write gate makes
+    /// unreachable and which fail loudly rather than retry silently if the
+    /// gate is ever wrong. Every one of these restores the heap entry to
+    /// its ORIGINAL `(due_at, id)` before returning, and the job stays
+    /// Pending in the store either way, since nothing this call staged has
+    /// been committed.
     ///
     /// **Contract for a caller sharing `group` across several jobs** (the
     /// kernel's batched drain): an `Err` return here does NOT mean `group`

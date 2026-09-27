@@ -2161,7 +2161,9 @@ fn realtime_workload(sim: &mut Sim) -> Result<Vec<(u64, &'static str, String)>, 
             }
             // Below the `run_result` check, not above it: that failure was
             // observed before `absorb` gave up, and a failure outranks a
-            // give-up. A fallout `break` above reaches the epoch-top check.
+            // give-up. A fallout `break` above reaches the next loop-top
+            // check: the epoch loop's on every epoch but the last, and the
+            // settle loop's on the last, once the epoch loop has ended.
             if sim.gave_up().is_some() {
                 return Ok(client.trace);
             }
@@ -2402,6 +2404,15 @@ fn a_diverged_ledger_gives_up_at_first_detection_and_stops() {
     assert!(
         reason.contains("ledger diverged at event id 3"),
         "and it must be THIS give-up, the divergence at id 3: {reason}"
+    );
+    assert!(
+        reason.contains("durable corruption cut it above the checkpoint horizon"),
+        "and it must name THIS cause, not just the id: {reason}"
+    );
+    assert!(
+        durable_corruption_fired(&sim),
+        "this universe's divergence is excused only because durable corruption fired — \
+         if it didn't, this give-up would be masking a real miss"
     );
 }
 
