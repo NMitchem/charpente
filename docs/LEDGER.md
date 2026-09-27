@@ -5627,3 +5627,117 @@ exclusion or a restructure; (c) whether fingerprint canonicalization — the tok
 `std::vec::Vec<u8>` fingerprint differently, true for tables too — is settled before
 0.1.0. Next: C-2 (a job cannot open a tenant scope the way GUIDE §16 documents), then the
 publish, then M3 sub-project 5.
+
+## 2026-09-27 — pre-publish follow-ups: N-1, a compiler-independent fingerprint, the dispatch invariant, the launch guards in CI, and the six hand mutations
+
+**Why.** The payload-shapes close-out (2026-09-25 entry) left five items on Noah's list.
+Read against MANIFESTO, DESIGN, DECISIONS and CLAUDE.md, four were already decided and
+were unfinished work, not open calls: none touches a DECISIONS entry. The fifth, running
+the guard-deleting hand mutations the tool-permission classifier had refused, needed
+Noah's permission, and he gave it. Plan `docs/superpowers/plans/2026-09-27-prepublish-followups.md`
+(a90a406).
+
+**Shipped.**
+- **N-1: a give-up ends its universe** (6354cd8). The seed is `0xb247eceae0daf689`.
+  - *The bug:* both realtime round loops kept running after the drain probe recorded a
+    give-up, so retention collected the diverged row and the stale frame came back as a
+    hard failure.
+  - *The fix:* each round loop now returns at its first give-up, after the round's own
+    `run_result` check, so a same-round non-injected error still outranks the give-up.
+  - *The class sweep:* the settle loops' last attempt, and the replicated
+    `drive_client_to_settled` with its three callers. Neither has a failing seed: the
+    replicated stop is very likely unreachable today (the follower applies
+    append → sync → apply, under `no_media_corruption`), so it is recorded as an unpinned
+    guard.
+  - *The pin* `a_diverged_ledger_gives_up_at_first_detection_and_stops` failed before the
+    fix with `content mismatch at event id 3`. It now asserts the give-up's reason, the
+    corrected cause text, and `durable_corruption_fired` (3dc7b80).
+  - *The corrected cause:* the give-up texts no longer say "a crash discarded a
+    committed-but-not-durable event". On a single node, append → sync → apply means a
+    ledgered event can only be lost to durable corruption above the checkpoint horizon.
+    This supersedes the justification at this file's 2026-09-07 entry, ~line 3785.
+  - *Measurements:* realtime 41 of 41. At fresh bases `0x9C4177E3`, `0x51A70927`,
+    `0xB0C40927` and `0x7E110927`: 1024 universes, 5 gave up, 0 failed. No floor moved.
+- **The fingerprint is charpente's own rendering of the type tokens** (0ba945e, 607868a).
+  - *The problem:* `fingerprint.rs` hashed `quote!(#ty).to_string()`, the compiler's
+    `TokenStream` `Display`, whose spacing the Rust docs call subject to change.
+    Fingerprints are persisted.
+  - *The fix:* `render` emits one word per token, joined by one space.
+  - *What moved:* the two renderings differ only on `::`-qualified paths, lifetimes, and
+    paren or bracket groups (`> >` was already identical). No pinned or shipped
+    fingerprint uses any of those, so **none moved**. The final review confirmed this by
+    recomputing ApiKey, CronRow and Session by hand.
+  - *0ba945e's subject is wrong:* it says "every fingerprint re-pinned once", which came
+    from the plan's template. History is not rewritten; this entry is the correction.
+  - *Tests:* the golden in `typed_tables.rs` (red: compiled 2743192748921556719 vs
+    canonical 9661301404636599285), plus macro unit tests for nested generics, groups, and
+    invisible and brace groups (3dc7b80, red-proven by a spurious expected word).
+  - *Docs:* GUIDE §12 now states the contract: a respelling is a shape change; a compiler
+    upgrade never is. DESIGN §3 says the same.
+- **Dispatch asserts the job-shape invariant** (6d8fb24, 2145d0b, 3dc7b80).
+  - `Group::stage`'s only `TxError::Io` exit is the job-shape refusal, so the guard at
+    `dispatch.rs:269` was always true, and its `→ true` mutant was a proven-equivalent
+    survivor.
+  - It is now an `assert!` outside the handler's `catch_unwind`. A kernel-thread panic
+    exits 101.
+  - `cargo mutants --list` showed 2 guard mutants before and 0 after. `.cargo/mutants.toml`
+    is unchanged at 2 entries. The fault matrix cannot reach the assert: injected read
+    faults arrive as `App(JobError::Io)`, and write faults hit `commit`, outside
+    `run_due_into`.
+  - `run_due_into`'s rustdoc now lists every `Err` cause.
+- **CI runs the two process-level launch-exit guards** (0a4b3aa, 51ad377).
+  - The tests are `a_launch_based_binary_whose_kernel_refuses_exits_nonzero_within_a_bound`
+    and `a_node_whose_kernel_cannot_start_exits_nonzero_with_its_named_line`, run with
+    `--exact --ignored`.
+  - The measured 4 s is **warm-cache**. A cold rust-cache entry also pays the first-time
+    release compile of `invoicing`, `charpente-cli` and `charpente-tsgen`; they add no
+    third-party dependency, which was verified by diffing Cargo.lock closures.
+- **The six hand mutations, run at 0a4b3aa** in a detached worktree with its own target
+  dir, with controls green and the tree clean after every restore. All six went red:
+  1. `deliver_unit`'s shape check: a `charpente.error` frame where a `charpente.reshaped`
+     frame was expected (seed `0xc7e7d70cd35aa681`).
+  2. `validate_subscribe`'s reshaped 409: "a cursor on foreign row 1 must be refused 409 …
+     got 200" (seed `0xe4341011a2dd9e0d`).
+  3. `seed_schema` wiping `job_shapes`: "the registry did not survive the re-seed".
+  4. `after_repl_step`'s refusal line: the kernel ran out of budget instead of stopping by
+     name.
+  5. `do_promote`'s check moved after `store_role`: "and still a follower on disk".
+  6. The dispatch `assert_eq!`: "test did not panic as expected".
+
+**Noah's calls from 2026-09-25, closed.**
+- (a) The guard-deletion hand mutations: run, all red.
+- (b) `dispatch.rs:269`: restructured, no exclusion added.
+- (c) Fingerprint canonicalization: done before 0.1.0. Type spelling still matters, now as
+  a stated public contract (GUIDE §12).
+
+**Gate.**
+- At 51ad377: fmt, clippy, `cargo check -p charpente-core` and the publish dry-run all
+  passed.
+- `cargo test --workspace --no-fail-fast`: 86 of 87 `test result: ok`. The one red is
+  `ctl.rs` `promote_against_a_dead_port_exits_2_with_the_connect_message` ("Connection
+  reset by peer"). That is the known ephemeral-port TOCTOU (follow-up (2) of the
+  2026-09-25 entry), its second sighting; it passed 5 of 5 alone, and this work touched
+  nothing in `charpente-cli`.
+- At 3dc7b80, ci.yml's four seed pins, the passthrough guard and the new launch-guard line
+  all passed locally.
+- Fresh seeds: `kernel_jobs_are_exactly_once_under_the_fault_matrix` at bases
+  `0x3E7A0927` and `0xD15C0927` gave 512 universes, 0 gave up, 0 failed.
+- sim-fixture, 1000 universes per test with master seed `0x5fd1e5b2df1839ee`: 4552
+  verdicts, 1448 gave up, no failures. Replayed at the pre-branch 35a5813 with the same
+  master seed, the summary is byte-identical, as predicted. The give-up rate is
+  sim-fixture's own.
+
+**Follow-ups.**
+1. The two single-node settle-phase give-ups now name durable corruption as their cause,
+   but nothing checks it. Gating them on `durable_corruption_fired` would tighten the
+   oracle, and needs a batch measurement. The shared divergence probe stays ungated,
+   because the replicated workload reaches it.
+2. A give-up return skips that round's non-ledger checks: `absorb`'s early return, and
+   `scoped_key_oracle`'s cross-tenant scan. This predates this work.
+3. The runner does not print give-up reasons, so the 5 fresh-base give-ups above are
+   unattributed.
+4. The `ctl.rs` TOCTOU (second sighting).
+
+**Next.** C-2, the job-tenancy spec `docs/superpowers/specs/2026-09-27-job-tenancy-design.md`
+(94c64b6, approach D approved in chat), awaits Noah's review of the written spec. Then its
+plan, then the publish, then M3 sub-project 5.
