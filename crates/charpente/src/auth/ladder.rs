@@ -87,7 +87,7 @@ impl From<io::Error> for AuthReject {
 /// `charpente_session` cookie always goes down the hash path (`ApiKey` then
 /// `Session`) even if its value happens to contain two dots; only a
 /// `Bearer` token is ever judged as a JWT.
-pub enum Presented {
+pub(crate) enum Presented {
     Bearer(String),
     Cookie(String),
     None,
@@ -97,7 +97,7 @@ pub enum Presented {
 /// resolved from `Authorization: Bearer <t>` or the `charpente_session`
 /// cookie (`bearer_or_cookie`), tagged with its source so the two-dot
 /// JWT-shape check applies to a bearer only.
-pub fn resolve(
+pub(crate) fn resolve(
     tx: &mut Tx,
     presented: &Presented,
     oidc: Option<&OidcVerifier>,

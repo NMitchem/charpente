@@ -5669,10 +5669,11 @@ impl Tenant for Org {
     type Who = Principal;
     type Error = ApiError;
 
-    /// Runs once per `tx.scope::<Org>(…)` that has a principal to ask about,
-    /// and it is the app's own policy — the platform never derives a tenant
-    /// from a subject, a header or a row field. It is only ever asked about a
-    /// real principal: a caller with no credential gets §5's 401, and a
+    /// Runs once per credentialed `tx.scope::<Org>(…)` on an `auth` or plain
+    /// `public` route — never on one declared `public(Org)` — and it is the
+    /// app's own policy: the platform never derives a tenant from a subject,
+    /// a header or a row field. It is only ever asked about a real
+    /// principal: a caller with no credential gets §5's 401, and a
     /// `public(Org)` route admits without asking.
     fn authorize(_tx: &Tx, who: &Principal, scope: Id<Org>) -> Result<(), ApiError> {
         if who.subject() == format!("org:{}", scope.raw()) {

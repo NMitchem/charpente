@@ -1,0 +1,31 @@
+error[E0603]: function `resolve` is private
+  --> tests/compile_fail/principal_is_read_only_to_an_app.rs:23:30
+   |
+23 |     let _ = charpente::auth::resolve(
+   |                              ^^^^^^^ private function
+   |
+note: the function `resolve` is defined here
+  --> $WORKSPACE/crates/charpente/src/auth/mod.rs
+   |
+   | pub(crate) use ladder::{Presented, resolve};
+   |                                    ^^^^^^^
+
+error[E0603]: enum `Presented` is private
+  --> tests/compile_fail/principal_is_read_only_to_an_app.rs:25:27
+   |
+25 |         &charpente::auth::Presented::Bearer("x".to_string()),
+   |                           ^^^^^^^^^  ------ tuple variant `Bearer` is not publicly re-exported
+   |                           |
+   |                           private enum
+   |
+note: the enum `Presented` is defined here
+  --> $WORKSPACE/crates/charpente/src/auth/mod.rs
+   |
+   | pub(crate) use ladder::{Presented, resolve};
+   |                         ^^^^^^^^^
+
+error[E0616]: field `subject` of struct `Principal` is private
+  --> tests/compile_fail/principal_is_read_only_to_an_app.rs:22:10
+   |
+22 |     held.subject = "forged".to_string();
+   |          ^^^^^^^ private field

@@ -65,7 +65,7 @@ a route flag is `auth`, `public`, `cross_tenant` or `emits(Ev, …)` — write `
 anonymous access to that scope (GUIDE §16, unchanged). `auth` is unchanged. `public`
 composes with `cross_tenant` and with `emits(...)` exactly as a bare route did.
 
-**Superseded 2026-09-2x** by `2026-09-27-job-tenancy-design.md` §3–§4: `authorize` takes
+**Superseded 2026-09-28** by `2026-09-27-job-tenancy-design.md` §3–§4: `authorize` takes
 `&Principal`, so there is no `None` to admit. A caller with no credential at a scope line
 gets a named 401, unless the route declares `public(Org)`.
 
@@ -247,7 +247,7 @@ or the test says so.
 - **RBAC / permissions.** Unchanged from the tenant-scoping spec's non-goal.
 - **Any change to `Tenant::authorize`'s `Option<&Principal>`.** Anonymous scope access
   stays the app's declared policy.
-  **Superseded 2026-09-2x** by `2026-09-27-job-tenancy-design.md` §2 R2: the parameter is
+  **Superseded 2026-09-28** by `2026-09-27-job-tenancy-design.md` §2 R2: the parameter is
   `&Principal`, and `Principal`'s fields are `pub(crate)`.
 - **Any `describe` schema change.** The two booleans keep their names and wire
   shape; only their prose reading moves.

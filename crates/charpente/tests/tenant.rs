@@ -1003,7 +1003,7 @@ fn two_tenant_db(seed: u64) -> (Sim, Db) {
     for tenant in TENANTS {
         for id in own_ids(tenant) {
             transact_admitted(&mut db, |tx, admission| -> Result<(), String> {
-                tx.admit_scope::<Firm>(Id::<Firm>::from_raw(tenant), admission)
+                tx.admit_scope(Id::<Firm>::from_raw(tenant), admission)
                     .put(&ledger_row(tenant, id));
                 Ok(())
             })
@@ -1414,7 +1414,7 @@ fn tenant_zero_is_a_real_tenant_to_a_cross_tenant_read() {
 // ------------------------------------------ the statuspage regression (oracle 3)
 
 /// Job-tenancy spec §9 item 3. The statuspage experiment's tenant policy, in
-/// the shape of `6037704:src/lib.rs:31-59`: `authorize` ADMITS `None`,
+/// the shape of `6037704:src/lib.rs:31-59`: `authorize` admitted `None`,
 /// because its public page, its public feed and its jobs all opened an org
 /// with `open_scope(org, None)`. Its finding I-1: the same policy made every
 /// `auth` write one word away from an anonymous write. Flip `open_incident`

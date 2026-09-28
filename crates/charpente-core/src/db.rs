@@ -1334,10 +1334,14 @@ impl<'a> Tx<'a> {
     /// because an inherent method shadows an extension trait's method of the
     /// same name, and the app-facing spelling is the one with the `Ctx`.
     ///
-    /// `who` is whoever the app is asking about: `tx.scope` passes the
-    /// request's principal, and nothing else can. A caller with no principal
-    /// has no business here. It enters by a declaration (`admit_scope`), or
-    /// not at all.
+    /// `open_scope` is generic over `Who` (this trait's own `type Who`), so
+    /// this rule is about the platform's own path, `Who = Principal`: `who`
+    /// is whoever the app is asking about, `tx.scope` passes the request's
+    /// principal and nothing else can, and a caller with no principal has no
+    /// business here — it enters by a declaration (`admit_scope`), or not at
+    /// all. A scope type with a different `Who` (a `Who = str` asker, say)
+    /// names its own caller its own way; operator code with no principal at
+    /// all is an ordinary `who` for one of those.
     ///
     /// # Panics
     ///
