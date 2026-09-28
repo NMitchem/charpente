@@ -81,6 +81,14 @@ pub struct JobRow {
     /// decodes unchanged: `last_error` before it is tagged, and nothing
     /// follows it (payload-shapes spec §2).
     pub shape: Option<u64>,
+    /// The tenant a `#[job(scoped_by = …)]` job was enqueued in, from the
+    /// record's `0x0a` tag. `None` for a `global` job (`0x08`) and for a row
+    /// applied from a pre-shape record. Encoded after `shape`, and only when
+    /// `Some`. A scoped row always has a shape, because only `0x0a` writes a
+    /// scope, so every row written before this field existed decodes
+    /// unchanged. `Some(0)` is tenant 0: presence, not value (job-tenancy
+    /// spec §6).
+    pub scope: Option<u64>,
 }
 
 // Manual impl: core cannot use the #[table] macro (macros depend on core).
@@ -105,6 +113,15 @@ impl Row for JobRow {
         if let Some(shape) = self.shape {
             shape.encode(out);
         }
+        if let Some(scope) = self.scope {
+            assert!(
+                self.shape.is_some(),
+                "JobRow {}: a tenant scope is encoded after the shape, so a scoped row must \
+                 carry one — only tag 0x0a writes a scope, and 0x0a always carries the shape",
+                self.id.raw()
+            );
+            scope.encode(out);
+        }
     }
 
     fn decode_row(bytes: &[u8]) -> io::Result<JobRow> {
@@ -117,15 +134,17 @@ impl Row for JobRow {
         let attempts = u32::decode(input)?;
         let due_at = u64::decode(input)?;
         let last_error = Option::<String>::decode(input)?;
-        let shape = match input.len() {
-            0 => None,
-            8 => Some(u64::decode(input)?),
+        let (shape, scope) = match input.len() {
+            0 => (None, None),
+            8 => (Some(u64::decode(input)?), None),
+            16 => (Some(u64::decode(input)?), Some(u64::decode(input)?)),
             n => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "row decode: {n} bytes after a JobRow's last_error — a shape is 8 bytes \
-                         or absent, so the stored row is corrupt"
+                        "row decode: {n} bytes after a JobRow's last_error — the shape and the \
+                         tenant scope after it are 8 bytes each, present or absent, so the \
+                         stored row is corrupt"
                     ),
                 ));
             }
@@ -140,6 +159,7 @@ impl Row for JobRow {
             due_at,
             last_error,
             shape,
+            scope,
         })
     }
 }
@@ -160,6 +180,7 @@ mod tests {
             due_at: 99,
             last_error: Some("boom".into()),
             shape: Some(0xFEED),
+            scope: None,
         };
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
@@ -171,6 +192,7 @@ mod tests {
         assert_eq!((back.attempts, back.due_at), (3, 99));
         assert_eq!(back.last_error.as_deref(), Some("boom"));
         assert_eq!(back.shape, row.shape);
+        assert_eq!(back.scope, row.scope);
     }
 
     /// A row written before `shape` existed ends exactly after its
@@ -188,6 +210,7 @@ mod tests {
             due_at: 0,
             last_error: None,
             shape: None,
+            scope: None,
         };
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
@@ -216,6 +239,7 @@ mod tests {
             due_at: 0,
             last_error: None,
             shape: Some(0xFEED),
+            scope: None,
         };
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
@@ -225,9 +249,90 @@ mod tests {
             .expect("3 bytes where a shape should be");
         assert_eq!(
             err.to_string(),
-            "row decode: 3 bytes after a JobRow's last_error — a shape is 8 bytes or absent, \
-             so the stored row is corrupt"
+            "row decode: 3 bytes after a JobRow's last_error — the shape and the tenant scope \
+             after it are 8 bytes each, present or absent, so the stored row is corrupt"
         );
+    }
+
+    /// Job-tenancy spec §6 and Review Focus 2: a scoped row carries its tenant
+    /// after its shape, and tenant 0 round-trips as `Some(0)`, never as "no
+    /// tenant". The unscoped row is the control: its bytes end at the shape.
+    #[test]
+    fn a_scoped_job_row_roundtrips_its_tenant_zero_included() {
+        let row = |scope| JobRow {
+            id: Id::from_raw(7),
+            name: "file".into(),
+            payload: vec![1, 2],
+            key: None,
+            status: JobStatus::Pending,
+            attempts: 0,
+            due_at: 0,
+            last_error: None,
+            shape: Some(0xFEED),
+            scope,
+        };
+        let mut unscoped = Vec::new();
+        row(None).encode_row(&mut unscoped);
+        for scope in [Some(0), Some(7)] {
+            let mut bytes = Vec::new();
+            row(scope).encode_row(&mut bytes);
+            assert_eq!(
+                bytes.len(),
+                unscoped.len() + 8,
+                "the tenant is eight more bytes"
+            );
+            assert_eq!(JobRow::decode_row(&bytes).unwrap().scope, scope);
+        }
+        assert_eq!(JobRow::decode_row(&unscoped).unwrap().scope, None);
+    }
+
+    /// A tear inside the tenant is named like a tear inside the shape.
+    #[test]
+    fn a_torn_job_row_scope_is_a_named_decode_error() {
+        let row = JobRow {
+            id: Id::from_raw(7),
+            name: "file".into(),
+            payload: vec![1, 2],
+            key: None,
+            status: JobStatus::Pending,
+            attempts: 0,
+            due_at: 0,
+            last_error: None,
+            shape: Some(0xFEED),
+            scope: Some(3),
+        };
+        let mut bytes = Vec::new();
+        row.encode_row(&mut bytes);
+        bytes.truncate(bytes.len() - 5);
+        let err = JobRow::decode_row(&bytes)
+            .err()
+            .expect("11 bytes where a shape and a scope should be");
+        assert_eq!(
+            err.to_string(),
+            "row decode: 11 bytes after a JobRow's last_error — the shape and the tenant scope \
+             after it are 8 bytes each, present or absent, so the stored row is corrupt"
+        );
+    }
+
+    /// Negative space (hard rule 4): the tail is positional, so a scope with
+    /// no shape before it would decode as a shape. The encoder refuses to
+    /// write one.
+    #[test]
+    #[should_panic(expected = "a scoped row must carry one")]
+    fn a_scope_without_a_shape_is_refused_at_encode() {
+        let row = JobRow {
+            id: Id::from_raw(7),
+            name: "file".into(),
+            payload: vec![],
+            key: None,
+            status: JobStatus::Pending,
+            attempts: 0,
+            due_at: 0,
+            last_error: None,
+            shape: None,
+            scope: Some(3),
+        };
+        row.encode_row(&mut Vec::new());
     }
 
     #[test]

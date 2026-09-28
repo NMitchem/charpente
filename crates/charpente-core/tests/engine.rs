@@ -501,6 +501,7 @@ fn an_unscoped_table_still_writes_a_bare_u64_key() {
         due_at: 0,
         last_error: None,
         shape: None,
+        scope: None,
     };
     let mut expected_bytes = Vec::new();
     row.encode_row(&mut expected_bytes);
@@ -1155,6 +1156,7 @@ fn an_unscoped_put_with_a_nonzero_scope_panics() {
                 due_at: 0,
                 last_error: None,
                 shape: None,
+                scope: None,
             },
         )
     });

@@ -130,6 +130,43 @@ fn a_pre_shape_record_materializes_with_no_shape() {
     assert_eq!(events[0].shape, None);
 }
 
+/// Job-tenancy spec §6, Review Focus 2 and 4. A shipped record carrying the
+/// scoped enqueue tag `0x0a`, applied the way a follower, a restore and a
+/// replay all apply one, materializes a `JobRow` whose `scope` is the
+/// record's. Tenant 0 comes through as `Some(0)`, and the `0x08` enqueue
+/// beside it as `None`.
+#[test]
+fn a_shipped_scoped_enqueue_materializes_with_its_scope_tenant_zero_included() {
+    let sim = Sim::with_faults(0x607, FaultConfig::none());
+    let mut db = Db::open(Box::new(sim.disk()), DbConfig::default(), Schema::new()).unwrap();
+    let mut record = Vec::new();
+    3u32.encode(&mut record);
+    for (payload, scope) in [(1u8, Some(0u64)), (2, Some(7)), (3, None)] {
+        record.push(if scope.is_some() { 10 } else { 8 });
+        "ping".to_string().encode(&mut record);
+        vec![payload].encode(&mut record);
+        None::<String>.encode(&mut record);
+        0x5E4Du64.encode(&mut record);
+        if let Some(scope) = scope {
+            scope.encode(&mut record);
+        }
+    }
+    let seq = db.last_applied().map_or(0, |s| s + 1);
+    db.apply_shipped(&[(seq, record)]).unwrap();
+    let rows = db.snapshot().unwrap().scan::<JobRow>().unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.payload.clone(), r.shape, r.scope))
+            .collect::<Vec<_>>(),
+        vec![
+            (vec![1], Some(0x5E4D), Some(0)),
+            (vec![2], Some(0x5E4D), Some(7)),
+            (vec![3], Some(0x5E4D), None),
+        ],
+        "each row carries its record's tenant; tenant 0 is Some(0), not None"
+    );
+}
+
 #[test]
 fn emits_materialize_event_rows_in_call_order_with_monotonic_ids() {
     let sim = Sim::with_faults(0x601, FaultConfig::none());

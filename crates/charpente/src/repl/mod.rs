@@ -40,9 +40,10 @@ pub mod witnesses;
 /// and checked against the peer's (spec §5's version-mismatch surface).
 /// Bumps whenever a message body's shape changes — tenant-scoping's
 /// `ScopedSnapshotRows` (tag 14) made it 2; payload shapes' `0x08`/`0x09`
-/// record tags make it 3, so a version-2 binary is refused at Hello rather
-/// than at its first shaped frame.
-pub const PROTO_VERSION: u8 = 3;
+/// record tags made it 3; job tenancy's `0x0a` scoped enqueue makes it 4, so
+/// a version-3 binary is refused at Hello rather than at its first scoped
+/// job.
+pub const PROTO_VERSION: u8 = 4;
 
 /// The hard ceiling on one encoded `Msg` on the wire: one `MAX_RECORD_BYTES`
 /// frame (16 MiB) plus envelope overhead (spec Global Constraints).

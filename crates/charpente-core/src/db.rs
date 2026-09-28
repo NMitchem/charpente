@@ -12,16 +12,21 @@
 //! `0x06 [table][scope: u64 le][id: u64 le]` scoped delete,
 //! `0x07 [table][scope: u64 le][id: u64 le][row]` scoped migrate-put,
 //! `0x08 [job][payload][key: Option<String>][shape: u64 le]` shaped enqueue,
-//! `0x09 [event][payload][key: Option<String>][shape: u64 le]` shaped emit —
-//! strings and byte fields length-prefixed per the `Codec` layout; `0x0a` is
+//! `0x09 [event][payload][key: Option<String>][shape: u64 le]` shaped emit,
+//! `0x0a [job][payload][key: Option<String>][shape: u64 le][scope: u64 le]`
+//! scoped enqueue, for a `#[job(scoped_by = …)]` job (job-tenancy spec §6) —
+//! strings and byte fields length-prefixed per the `Codec` layout; `0x0b` is
 //! the next free tag. `0x02`/`0x03` (the same without the shape) still
 //! decode, with the shape unknown, and are never written — `TxEffects` holds
 //! a bare shape, so a shapeless enqueue or emit cannot be represented.
 //! `0x05`/`0x06`/`0x07` are the ONLY tags that carry a
 //! scope, chosen by the table's own `Row::Scope`, not by the scope value
 //! (tenant 0 is a legal tenant, so a scoped table's records always use
-//! `0x05`/`0x06`/`0x07`, never `0x00`/`0x01`/`0x04`, even at scope 0). A
-//! binary that does not know a tag refuses it by name (`decode_record`'s
+//! `0x05`/`0x06`/`0x07`, never `0x00`/`0x01`/`0x04`, even at scope 0).
+//! A scoped enqueue is `0x0a` rather than a widened `0x08` for the same
+//! reason, and the same presence-not-value rule chooses it: an enqueue
+//! carrying `Some(0)` is `0x0a`.
+//! A binary that does not know a tag refuses it by name (`decode_record`'s
 //! unknown-tag error) rather than misreading a wider record. `0x07` is a
 //! NEW tag rather than a widened `0x04`, the same choice `0x05`/`0x06` made
 //! over `0x00`/`0x01` (tenant-scoping Task 6b): a follower on an older
@@ -492,13 +497,15 @@ enum Effect {
         id: u64,
     },
     // `shape`: `None` for the pre-shape tags `0x02`/`0x03`, `Some` for
-    // `0x08`/`0x09` — the wire presence, like `scope` above. `None` is
-    // foreign to every check downstream (payload-shapes spec §2).
+    // `0x08`/`0x09`/`0x0a` — the wire presence, like `scope` above. `None` is
+    // foreign to every check downstream (payload-shapes spec §2). `scope`:
+    // `Some` exactly for `0x0a`, the scoped enqueue (job-tenancy spec §6).
     Enqueue {
         job: String,
         payload: Vec<u8>,
         key: Option<String>,
         shape: Option<u64>,
+        scope: Option<u64>,
     },
     Emit {
         event: String,
@@ -537,6 +544,19 @@ type GroupOverlay = BTreeMap<&'static str, BTreeMap<(u64, u64), Option<Vec<u8>>>
 /// constant.
 const UNSCOPED: u64 = 0;
 
+/// One buffered enqueue. `shape` is bare because a shapeless enqueue cannot
+/// be represented (payload-shapes amendment A2). `scope` is the tenant a
+/// `#[job(scoped_by = …)]` job was enqueued in, `None` for a `global` job:
+/// presence, not value, selects tag `0x0a`, so `Some(0)` is tenant 0
+/// (job-tenancy spec §6).
+struct Enqueue {
+    job: &'static str,
+    payload: Vec<u8>,
+    key: Option<String>,
+    shape: u64,
+    scope: Option<u64>,
+}
+
 /// A transaction's buffered effects: the collapsed per-table overlay
 /// (`None` = tombstone) plus enqueues and emits in call order. `scoped_tables`
 /// names which of `overlay`'s tables `encode_record` must tag `0x05`/`0x06`
@@ -553,9 +573,9 @@ const UNSCOPED: u64 = 0;
 struct TxEffects {
     overlay: GroupOverlay,
     scoped_tables: BTreeSet<&'static str>,
-    // The shape is a bare `u64`, so a shapeless enqueue or emit cannot be
+    enqueues: Vec<Enqueue>,
+    // The emit shape is a bare `u64`, so a shapeless emit cannot be
     // represented (payload-shapes amendment A2).
-    enqueues: Vec<(&'static str, Vec<u8>, Option<String>, u64)>,
     emits: Vec<(&'static str, Vec<u8>, Option<String>, u64)>,
     migrate_puts: Vec<(&'static str, Option<u64>, u64, Vec<u8>)>,
 }
@@ -622,12 +642,22 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
             }
         }
     }
-    for (job, payload, key, shape) in &effects.enqueues {
-        out.push(8);
+    for Enqueue {
+        job,
+        payload,
+        key,
+        shape,
+        scope,
+    } in &effects.enqueues
+    {
+        out.push(if scope.is_some() { 10 } else { 8 });
         encode_bytes(job.as_bytes(), &mut out);
         encode_bytes(payload, &mut out);
         key.encode(&mut out);
         shape.encode(&mut out);
+        if let Some(scope) = scope {
+            scope.encode(&mut out);
+        }
     }
     for (event, payload, key, shape) in &effects.emits {
         out.push(9);
@@ -676,6 +706,7 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 payload: Vec::<u8>::decode(input)?,
                 key: Option::<String>::decode(input)?,
                 shape: None,
+                scope: None,
             },
             3 => Effect::Emit {
                 event: String::decode(input)?,
@@ -710,12 +741,20 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
                 payload: Vec::<u8>::decode(input)?,
                 key: Option::<String>::decode(input)?,
                 shape: Some(u64::decode(input)?),
+                scope: None,
             },
             9 => Effect::Emit {
                 event: String::decode(input)?,
                 payload: Vec::<u8>::decode(input)?,
                 key: Option::<String>::decode(input)?,
                 shape: Some(u64::decode(input)?),
+            },
+            10 => Effect::Enqueue {
+                job: String::decode(input)?,
+                payload: Vec::<u8>::decode(input)?,
+                key: Option::<String>::decode(input)?,
+                shape: Some(u64::decode(input)?),
+                scope: Some(u64::decode(input)?),
             },
             other => {
                 return Err(io::Error::new(
@@ -874,9 +913,13 @@ impl<'a> Tx<'a> {
     pub fn enqueue<J: Job>(&mut self, job: J) {
         let mut payload = Vec::new();
         job.encode(&mut payload);
-        self.effects
-            .enqueues
-            .push((J::NAME, payload, None, J::FINGERPRINT));
+        self.effects.enqueues.push(Enqueue {
+            job: J::NAME,
+            payload,
+            key: None, // `Some(key)` in enqueue_keyed
+            shape: J::FINGERPRINT,
+            scope: None,
+        });
     }
 
     /// Enqueues with an idempotency key: the job's stable identity to the world
@@ -891,9 +934,13 @@ impl<'a> Tx<'a> {
         );
         let mut payload = Vec::new();
         job.encode(&mut payload);
-        self.effects
-            .enqueues
-            .push((J::NAME, payload, Some(key), J::FINGERPRINT));
+        self.effects.enqueues.push(Enqueue {
+            job: J::NAME,
+            payload,
+            key: Some(key),
+            shape: J::FINGERPRINT,
+            scope: None,
+        });
     }
 
     pub fn emit<Ev: Event>(&mut self, event: Ev) {
@@ -1860,8 +1907,15 @@ impl StateMachine for TableMachine {
                         payload,
                         key,
                         shape,
+                        scope,
                     } => {
-                        new_ids.push(w.materialize_job(job, payload, key.as_deref(), *shape)?);
+                        new_ids.push(w.materialize_job(
+                            job,
+                            payload,
+                            key.as_deref(),
+                            *shape,
+                            *scope,
+                        )?);
                     }
                     Effect::Emit {
                         event,
@@ -3435,7 +3489,10 @@ impl<'a> Group<'a> {
         // here, before a record exists, is what makes dispatch's shape
         // assert an invariant (payload-shapes spec §4).
         let job_shapes = &self.db.engine.machine().schema.job_shapes;
-        for (name, _, _, shape) in &effects.enqueues {
+        for Enqueue {
+            job: name, shape, ..
+        } in &effects.enqueues
+        {
             if let Some(&mounted) = job_shapes.get(*name)
                 && mounted != *shape
             {
@@ -3815,9 +3872,13 @@ mod tests {
             .entry("org")
             .or_default()
             .insert((UNSCOPED, 1), Some(vec![9]));
-        effects
-            .enqueues
-            .push(("send_receipt", vec![10, 0], None, 0x5E4D));
+        effects.enqueues.push(Enqueue {
+            job: "send_receipt",
+            payload: vec![10, 0],
+            key: None,
+            shape: 0x5E4D,
+            scope: None,
+        });
         effects
             .emits
             .push(("invoice_finalized", vec![7], None, 0xE7E7));
@@ -3849,7 +3910,8 @@ mod tests {
                     job: "send_receipt".into(),
                     payload: vec![10, 0],
                     key: None,
-                    shape: Some(0x5E4D)
+                    shape: Some(0x5E4D),
+                    scope: None
                 },
                 Effect::Emit {
                     event: "invoice_finalized".into(),
@@ -3933,13 +3995,20 @@ mod tests {
     #[test]
     fn keyed_enqueue_roundtrips() {
         let mut effects = TxEffects::default();
-        effects.enqueues.push((
-            "send_receipt",
-            vec![1],
-            Some("receipt:10".to_string()),
-            0x5E4D,
-        ));
-        effects.enqueues.push(("ping", vec![2], None, 0x9196));
+        effects.enqueues.push(Enqueue {
+            job: "send_receipt",
+            payload: vec![1],
+            key: Some("receipt:10".to_string()),
+            shape: 0x5E4D,
+            scope: None,
+        });
+        effects.enqueues.push(Enqueue {
+            job: "ping",
+            payload: vec![2],
+            key: None,
+            shape: 0x9196,
+            scope: None,
+        });
         let decoded = decode_record(&encode_record(&effects)).unwrap();
         assert_eq!(
             decoded,
@@ -3948,13 +4017,15 @@ mod tests {
                     job: "send_receipt".into(),
                     payload: vec![1],
                     key: Some("receipt:10".into()),
-                    shape: Some(0x5E4D)
+                    shape: Some(0x5E4D),
+                    scope: None
                 },
                 Effect::Enqueue {
                     job: "ping".into(),
                     payload: vec![2],
                     key: None,
-                    shape: Some(0x9196)
+                    shape: Some(0x9196),
+                    scope: None
                 },
             ]
         );
@@ -3980,7 +4051,8 @@ mod tests {
                     job: "ping".into(),
                     payload: vec![7],
                     key: None,
-                    shape: None
+                    shape: None,
+                    scope: None
                 },
                 Effect::Emit {
                     event: "pong".into(),
@@ -3997,9 +4069,13 @@ mod tests {
     #[test]
     fn shaped_enqueue_and_emit_bytes_are_pinned() {
         let mut effects = TxEffects::default();
-        effects
-            .enqueues
-            .push(("ping", vec![7], None, 0x0102_0304_0506_0708));
+        effects.enqueues.push(Enqueue {
+            job: "ping",
+            payload: vec![7],
+            key: None,
+            shape: 0x0102_0304_0506_0708,
+            scope: None,
+        });
         effects
             .emits
             .push(("pong", vec![9], None, 0x1112_1314_1516_1718));
@@ -4020,13 +4096,68 @@ mod tests {
                     job: "ping".into(),
                     payload: vec![7],
                     key: None,
-                    shape: Some(0x0102_0304_0506_0708)
+                    shape: Some(0x0102_0304_0506_0708),
+                    scope: None
                 },
                 Effect::Emit {
                     event: "pong".into(),
                     payload: vec![9],
                     key: None,
                     shape: Some(0x1112_1314_1516_1718)
+                },
+            ]
+        );
+    }
+
+    /// Job-tenancy spec §6 and Review Focus 2: the scoped enqueue, pinned as
+    /// literal bytes. It is the `0x08` layout under tag `0x0a`, plus the
+    /// tenant as eight little-endian bytes, at tenant 0, because presence
+    /// and not value selects the tag. An unscoped enqueue in the same record
+    /// is still `0x08`, byte for byte, with nothing after its shape.
+    #[test]
+    fn scoped_enqueue_bytes_are_pinned_with_tenant_zero() {
+        let mut effects = TxEffects::default();
+        effects.enqueues.push(Enqueue {
+            job: "ping",
+            payload: vec![7],
+            key: None,
+            shape: 0x0102_0304_0506_0708,
+            scope: Some(0),
+        });
+        effects.enqueues.push(Enqueue {
+            job: "ping",
+            payload: vec![9],
+            key: None,
+            shape: 0x0102_0304_0506_0708,
+            scope: None,
+        });
+        assert_eq!(
+            encode_record(&effects),
+            vec![
+                2, 0, 0, 0, // two effects
+                10, 4, 0, 0, 0, b'p', b'i', b'n', b'g', 1, 0, 0, 0, 7, 0, // scoped enqueue
+                8, 7, 6, 5, 4, 3, 2, 1, // its shape
+                0, 0, 0, 0, 0, 0, 0, 0, // its tenant: 0, a real tenant
+                8, 4, 0, 0, 0, b'p', b'i', b'n', b'g', 1, 0, 0, 0, 9, 0, // unscoped enqueue
+                8, 7, 6, 5, 4, 3, 2, 1, // its shape, and nothing after it
+            ]
+        );
+        assert_eq!(
+            decode_record(&encode_record(&effects)).unwrap(),
+            vec![
+                Effect::Enqueue {
+                    job: "ping".into(),
+                    payload: vec![7],
+                    key: None,
+                    shape: Some(0x0102_0304_0506_0708),
+                    scope: Some(0),
+                },
+                Effect::Enqueue {
+                    job: "ping".into(),
+                    payload: vec![9],
+                    key: None,
+                    shape: Some(0x0102_0304_0506_0708),
+                    scope: None,
                 },
             ]
         );
@@ -4192,14 +4323,14 @@ mod tests {
         assert!(Refusal::of(&err).is_some(), "{err}");
     }
 
-    /// `0x0a`, the next free tag: `0x08`/`0x09` are the shaped enqueue/emit.
+    /// `0x0b`, the next free tag: `0x0a` is the scoped enqueue.
     #[test]
     fn decode_refuses_unknown_tags() {
         let mut out = Vec::new();
         1u32.encode(&mut out);
-        out.push(10);
+        out.push(11);
         let err = decode_record(&out).unwrap_err();
-        assert!(err.to_string().contains("unknown effect tag 10"), "{err}");
+        assert!(err.to_string().contains("unknown effect tag 11"), "{err}");
     }
 
     #[test]

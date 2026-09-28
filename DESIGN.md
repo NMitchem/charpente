@@ -426,7 +426,9 @@ loud again).
 **Record payload (v0, implemented).** A committed transaction's effects:
 `[n: u32]` then n tagged effects — put `0x00 [table][row]`, delete
 `0x01 [table][id]`, enqueue `0x08 [job][payload][key: Option<String>][shape: u64]`,
-emit `0x09 [event][payload][key: Option<String>][shape: u64]`, migrate-put
+emit `0x09 [event][payload][key: Option<String>][shape: u64]`, scoped enqueue
+`0x0a [job][payload][key: Option<String>][shape: u64][scope: u64]` (a
+`#[job(scoped_by = …)]` job's tenant, spec 2026-09-27-job-tenancy §6), migrate-put
 `0x04 [table][id: u64][row]` (§3's `MigratePut`, below), strings and byte
 fields length-prefixed per the row codec. The shape is the payload type's
 structural fingerprint (§3). The pre-shape `0x02`/`0x03` (the same without the
@@ -440,9 +442,13 @@ stays exactly the `0x00`/`0x01` shape above, byte-identical to before tenant
 scoping. A scoped table's `MigratePut` (tenant-scoping Task 6c) is
 `0x07 [table][scope: u64][id: u64][row]` — a NEW tag rather than a widened
 `0x04`, the same choice `0x05`/`0x06` made over `0x00`/`0x01`, so `0x04`'s
-bytes for an unscoped table stay exactly as above. `0x0a` is the next free
-tag. A binary that does not know a tag (older, or a later one it hasn't
-caught up to) refuses it by name rather than misreading a wider record.
+bytes for an unscoped table stay exactly as above. The scoped enqueue is a
+new tag rather than a widened `0x08` for the same reason, chosen by presence
+and never by the tenant's value, so tenant 0 is `0x0a` too; its `JobRow`
+carries the tenant as a trailing `scope`, absent for every other row. `0x0b`
+is the next free tag. A binary that does not know a tag (older, or a later
+one it hasn't caught up to) refuses it by name rather than misreading a
+wider record.
 Table effects are the transaction's collapsed write set in (table, scope,
 id) order — intermediate overwrites inside a transaction are observable by
 no one and are not logged; enqueues and emits keep call order. Replay
@@ -1016,9 +1022,10 @@ Vec<(u64, Vec<u8>)> }` (tag 5, unchanged since before tenant scoping), a scoped 
 rather than a widened tag 5, so tag 5's bytes for an unscoped table stay exactly what an
 older binary already expects); the receiving side checks the message against its own
 schema's word for that table and refuses a mismatch by name rather than importing a row
-under the wrong scope. `PROTO_VERSION` is 3 — a message body's shape changing is what
+under the wrong scope. `PROTO_VERSION` is 4 — a message body's shape changing is what
 bumps it: tenant scoping's tag 14 made it 2, payload shapes' `0x08`/`0x09` record tags
-made it 3, and a `Hello` declaring an older version is refused by name. The follower
+made it 3, job tenancy's `0x0a` made it 4, and a `Hello` declaring an older version is
+refused by name. The follower
 buffers the stream and, at `SnapshotEnd`, latches `db_needs_reseed` — `Repl::step` cannot
 replace a `Db` it only borrows, so the CALLER (the kernel arm, T8) runs
 `Repl::run_seed(db, clock)`, which consumes the `Db` through `into_seeder`, replays the
