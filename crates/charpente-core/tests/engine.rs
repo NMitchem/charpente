@@ -520,10 +520,10 @@ fn an_unscoped_table_still_writes_a_bare_u64_key() {
 struct TestOrg;
 
 /// The scope's membership check, as core sees it: `Tenant` is the hook, and
-/// `Tx::open_scope` is the only route to a scoped row. `Who = str` rather
-/// than a struct so the associated type's `?Sized` is exercised somewhere;
-/// `Error = io::Error` so a refusal composes with the `?` the staged
-/// closures below already use.
+/// `Tx::open_scope` (or, for the operator, `Tx::admit_scope`) is the only
+/// route to a scoped row. `Who = str` rather than a struct so the associated
+/// type's `?Sized` is exercised somewhere; `Error = io::Error` so a refusal
+/// composes with the `?` the staged closures below already use.
 impl Tenant for TestOrg {
     type Who = str;
     type Error = io::Error;

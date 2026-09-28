@@ -803,14 +803,15 @@ impl<'a> Tx<'a> {
     }
 
     /// Stages a row on a SCOPED table under `scope` — the primitive
-    /// `ScopedTx::put` delegates to once `Tenant::authorize` has passed.
+    /// `ScopedTx::put` delegates to once its scope was entered, either by
+    /// `Tenant::authorize` passing or by the operator's `TenantAdmission`.
     ///
-    /// PRIVATE, and the whole seam is: `ScopedTx` is the only caller and
-    /// `Tx::open_scope` is `ScopedTx`'s only constructor, so naming a tenant
-    /// requires that tenant's own check to have run. A `pub` version of this
-    /// method is reachable from every handler holding a bare `&mut Tx`, which
-    /// makes spec §7's exit criterion 1 false however the wrappers are
-    /// written.
+    /// PRIVATE, and the whole seam is: `ScopedTx` is the only caller, and
+    /// `Tx::open_scope`/`Tx::admit_scope` are `ScopedTx`'s only constructors,
+    /// so naming a tenant requires either that tenant's own check or the
+    /// operator's admission to have run. A `pub` version of this method is
+    /// reachable from every handler holding a bare `&mut Tx`, which makes
+    /// spec §7's exit criterion 1 false however the wrappers are written.
     ///
     /// `scope: Id<S>` with `R: Row<Scope = S>`, not a bare `u64`: "this scope
     /// value belongs to this table's tenant type" stays a compile error at the
@@ -1123,9 +1124,10 @@ impl View for Tx<'_> {
 /// The scope-taking reads: `View`'s four methods, bounded to ONE tenant of
 /// ONE scoped table, over the same txn -> group -> snapshot order. PRIVATE,
 /// like `put_in`/`delete_in`: `ScopedTx` below is the only caller, and
-/// `Tx::open_scope` is `ScopedTx`'s only constructor, so naming a tenant
-/// requires that tenant's own `Tenant::authorize` to have passed. `Id<S>`
-/// with `R: Row<Scope = S>` — see `put_in`.
+/// `Tx::open_scope`/`Tx::admit_scope` are `ScopedTx`'s only constructors, so
+/// naming a tenant requires either that tenant's own `Tenant::authorize` to
+/// have passed, or the operator's admission in its place. `Id<S>` with
+/// `R: Row<Scope = S>` — see `put_in`.
 ///
 /// Each asserts `row_is_scoped::<R>()` for the same reason
 /// `Snapshot::get_scoped` does (hard rule 4): the type system rules out a
@@ -1369,10 +1371,13 @@ impl<'a> Tx<'a> {
 }
 
 /// A transaction narrowed to one tenant of one scope type — the only handle
-/// an app has on a scoped table (spec §1). `Tx::open_scope` is the only
-/// constructor and it runs `S::authorize` before it hands one back, so there
-/// is no second way to reach a scoped row and no way to reach one without the
-/// app's own membership check having run.
+/// an app has on a scoped table (spec §1). `Tx::open_scope` and
+/// `Tx::admit_scope` are its only two constructors (job-tenancy spec §3): the
+/// former runs `S::authorize` before handing one back, the latter takes a
+/// `TenantAdmission` that only a `Group` mints — the operator's standing, not
+/// a handler's. Either way there is no second way to reach a scoped row and
+/// no way to reach one without the tenant's own membership check, or the
+/// operator's admission in its place, having run.
 ///
 /// Two lifetimes, not one. `'t` is the borrow of the transaction; `'a` is
 /// the transaction's own borrow of the snapshot it reads from. They cannot
