@@ -1116,7 +1116,7 @@ impl charpente::Tenant for Org {
     type Error = ApiError;
     fn authorize(
         _tx: &Tx,
-        _who: Option<&charpente::auth::Principal>,
+        _who: &charpente::auth::Principal,
         _scope: Id<Org>,
     ) -> Result<(), ApiError> {
         Ok(())

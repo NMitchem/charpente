@@ -26,7 +26,7 @@ struct OrgB {
 impl Tenant for OrgA {
     type Who = Principal;
     type Error = ApiError;
-    fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<OrgA>) -> Result<(), ApiError> {
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<OrgA>) -> Result<(), ApiError> {
         Ok(())
     }
 }
@@ -34,7 +34,7 @@ impl Tenant for OrgA {
 impl Tenant for OrgB {
     type Who = Principal;
     type Error = ApiError;
-    fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<OrgB>) -> Result<(), ApiError> {
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<OrgB>) -> Result<(), ApiError> {
         Ok(())
     }
 }

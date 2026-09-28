@@ -887,10 +887,13 @@ Every request gets a `Ctx`, built inside the same transaction as your
 handler, carrying:
 
 - `ctx.principal() -> Option<&Principal>` — the authenticated identity, if
-  any: `Principal { subject: String, via: Via }`, where `via` names which
-  rung authenticated it (`Via::Session(id)`, `Via::ApiKey(id)`, or
-  `Via::Oidc`). This is the surface to read `subject` from on any `auth`
-  route, whatever the credential kind.
+  any. `principal.subject()` is the subject the credential was minted for,
+  and `principal.via()` names which rung authenticated it
+  (`Via::Session(id)`, `Via::ApiKey(id)`, or `Via::Oidc`). Read the subject
+  from here on any `auth` route, whatever the credential kind. A `Principal`
+  is read-only to your code: its fields are private, so the only principals
+  are the ones the ladder produced, and `Tenant::authorize` can trust the one
+  it is handed.
 - `ctx.session() -> Option<&Session>` — a compatibility accessor: the
   `Session` row, but only when the principal authenticated `via` a session
   (bearer or cookie); `None` for an API-key or OIDC principal.
@@ -967,8 +970,8 @@ fn whoami(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
     Ok(ctx
         .principal()
         .expect("auth routes always have a principal")
-        .subject
-        .clone())
+        .subject()
+        .to_string())
 }
 
 #[route(POST "/logout", auth)]
@@ -980,7 +983,7 @@ fn logout(tx: &mut Tx, ctx: &Ctx) -> Result<&'static str, ApiError> {
 // Mint an API key for the caller's own subject; revoke by deleting the row.
 #[route(POST "/keys", auth)]
 fn mint_key(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
-    let subject = ctx.principal().expect("auth route").subject.clone();
+    let subject = ctx.principal().expect("auth route").subject().to_string();
     Ok(ctx.create_api_key(tx, subject))
 }
 
@@ -1035,11 +1038,12 @@ OIDC JWKS key <kid> has alg "RS384" — only "RS256" is supported; fix or remove
 OIDC JWKS key <kid> is invalid: modulus "n" is not valid base64url: <detail>
 ```
 
-A verified token yields a `Principal` with `via: Via::Oidc` and `subject` =
-the token's `sub` claim — ephemeral, no row, nothing to revoke but a short
-`exp`. `exp`/`nbf` are checked against the request clock with a 60-second skew
-tolerance. Each failed check is its own named 401 (the `iss`/`aud` ones name
-presented-vs-configured; `<presented>`/`<configured>` are the actual values):
+A verified token yields a `Principal` whose `via()` is `Via::Oidc` and whose
+`subject()` is the token's `sub` claim — ephemeral, no row, nothing to revoke
+but a short `exp`. `exp`/`nbf` are checked against the request clock with a
+60-second skew tolerance. Each failed check is its own named 401 (the
+`iss`/`aud` ones name presented-vs-configured; `<presented>`/`<configured>`
+are the actual values):
 
 <!-- pinned -->
 ```text
@@ -1077,7 +1081,7 @@ The scope line applies three rules, in order:
 3. Otherwise the caller has no credential, and the request is answered 401, by name.
    Nothing below the scope line runs.
 
-An `auth` route never reaches rule 3, because the `auth` gate refused the anonymous caller
+An `auth` request never reaches rule 3, because the `auth` gate refused the anonymous caller
 before your handler ran. So your `authorize` is only ever asked about a real principal. A
 `public(Org)` route that opens a *different* scope type gets rules 2 and 3 for it, and the
 401 names `public(Org)` as the route's stance.
@@ -5665,18 +5669,19 @@ impl Tenant for Org {
     type Who = Principal;
     type Error = ApiError;
 
-    /// Runs once per `tx.scope::<Org>(…)`, and it is the app's own policy —
-    /// the platform never derives a tenant from a subject, a header or a row
-    /// field. A caller with no credential never reaches it: `tx.scope`
-    /// answers that caller 401, unless the route declared `public(Org)` (§5),
-    /// and then it admits without asking.
-    fn authorize(_tx: &Tx, who: Option<&Principal>, scope: Id<Org>) -> Result<(), ApiError> {
-        match who {
-            Some(p) if p.subject == format!("org:{}", scope.raw()) => Ok(()),
-            _ => Err(ApiError::BadRequest(format!(
+    /// Runs once per `tx.scope::<Org>(…)` that has a principal to ask about,
+    /// and it is the app's own policy — the platform never derives a tenant
+    /// from a subject, a header or a row field. It is only ever asked about a
+    /// real principal: a caller with no credential gets §5's 401, and a
+    /// `public(Org)` route admits without asking.
+    fn authorize(_tx: &Tx, who: &Principal, scope: Id<Org>) -> Result<(), ApiError> {
+        if who.subject() == format!("org:{}", scope.raw()) {
+            Ok(())
+        } else {
+            Err(ApiError::BadRequest(format!(
                 "not a member of org {}",
                 scope.raw()
-            ))),
+            )))
         }
     }
 }
@@ -5747,13 +5752,14 @@ struct Org {
 impl Tenant for Org {
     type Who = Principal;
     type Error = ApiError;
-    fn authorize(_tx: &Tx, who: Option<&Principal>, scope: Id<Org>) -> Result<(), ApiError> {
-        match who {
-            Some(p) if p.subject == format!("operator:{}", scope.raw()) => Ok(()),
-            _ => Err(ApiError::BadRequest(format!(
+    fn authorize(_tx: &Tx, who: &Principal, scope: Id<Org>) -> Result<(), ApiError> {
+        if who.subject() == format!("operator:{}", scope.raw()) {
+            Ok(())
+        } else {
+            Err(ApiError::BadRequest(format!(
                 "not an operator of org {}",
                 scope.raw()
-            ))),
+            )))
         }
     }
 }
@@ -5868,11 +5874,11 @@ error[E0277]: `Org` is used as a tenant scope but has no `Tenant` impl
 9 | #[table(scoped_by = Org)]
   |                     ^^^ no `impl Tenant for Org`
   |
-  = note: a scoped table needs the app's own membership check; add:
+  = note: a tenant scope needs the app's own membership check; add:
           impl Tenant for Org {
               type Who = Principal;
               type Error = ApiError;
-              fn authorize(tx: &Tx, who: Option<&Principal>, scope: Id<Self>) -> Result<(), ApiError> { … }
+              fn authorize(tx: &Tx, who: &Principal, scope: Id<Self>) -> Result<(), ApiError> { … }
           }
 ```
 
@@ -5925,7 +5931,7 @@ struct Org {
 impl Tenant for Org {
     type Who = Principal;
     type Error = ApiError;
-    fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<Org>) -> Result<(), ApiError> {
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
         Ok(())
     }
 }
@@ -6071,7 +6077,7 @@ struct Org {
 impl Tenant for Org {
     type Who = Principal;
     type Error = ApiError;
-    fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<Org>) -> Result<(), ApiError> {
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
         // Refuses everyone: the seed below never asks.
         Err(ApiError::Unauthorized)
     }

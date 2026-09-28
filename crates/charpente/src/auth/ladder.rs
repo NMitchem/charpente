@@ -22,10 +22,27 @@ use crate::http::Session;
 /// The authenticated identity for a request. `subject` is whatever
 /// `create_session`/`create_api_key` was called with, or an OIDC token's
 /// `sub` claim; `via` names which ladder rung produced it.
+///
+/// The fields are `pub(crate)`, so every `Principal` is one the resolution
+/// ladder produced (job-tenancy spec §2 R2). This is what makes
+/// `Tenant::authorize`'s `who` unforgeable: a handler reads a principal and
+/// never builds one.
 #[derive(Debug, Clone)]
 pub struct Principal {
-    pub subject: String,
-    pub via: Via,
+    pub(crate) subject: String,
+    pub(crate) via: Via,
+}
+
+impl Principal {
+    /// The subject the credential was minted for, or the OIDC `sub` claim.
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    /// The ladder rung that authenticated this request.
+    pub fn via(&self) -> Via {
+        self.via
+    }
 }
 
 /// Which ladder rung authenticated this request. `Session`/`ApiKey` carry

@@ -26,7 +26,7 @@ impl Tenant for Org {
     type Error = charpente::http::ApiError;
     fn authorize(
         _tx: &Tx,
-        _who: Option<&Principal>,
+        _who: &Principal,
         _scope: Id<Org>,
     ) -> Result<(), charpente::http::ApiError> {
         Ok(())

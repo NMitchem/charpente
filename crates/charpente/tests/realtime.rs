@@ -4610,7 +4610,7 @@ impl Tenant for Org {
     /// declared `public(Org)`. This property is about the platform's key
     /// derivation, not the app's membership check — `charpente/tests/tenant.rs`
     /// owns the refusing case.
-    fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<Org>) -> Result<(), ApiError> {
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
         Ok(())
     }
 }

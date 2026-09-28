@@ -67,7 +67,7 @@ impl charpente::Tenant for ScopedOrg {
 
     fn authorize(
         _tx: &charpente::Tx,
-        _who: Option<&charpente::auth::Principal>,
+        _who: &charpente::auth::Principal,
         _scope: Id<ScopedOrg>,
     ) -> Result<(), charpente::http::ApiError> {
         Ok(())
@@ -7363,7 +7363,7 @@ impl charpente::Tenant for ConvOrg {
     /// `charpente/tests/tenant.rs` owns the refusing case.
     fn authorize(
         _tx: &charpente::Tx,
-        _who: Option<&str>,
+        _who: &str,
         _scope: Id<ConvOrg>,
     ) -> Result<(), std::convert::Infallible> {
         Ok(())
@@ -8258,7 +8258,7 @@ fn archive_convergence_universe(sim: &mut Sim, mode: ConvMode) -> Result<(), Str
                     // seq-to-id correspondence is untouched.
                     if mode == ConvMode::Scoped {
                         let tenant = CONV_TENANTS[(id % 2) as usize];
-                        tx.open_scope(Id::<ConvOrg>::from_raw(tenant), None)?
+                        tx.open_scope(Id::<ConvOrg>::from_raw(tenant), "operator")?
                             .put(&ConvLedger {
                                 id: Id::from_raw(id / 2),
                                 bucket: ((id / 2) % 3) as u32,

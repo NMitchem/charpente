@@ -528,9 +528,9 @@ impl Tenant for TestOrg {
     type Who = str;
     type Error = io::Error;
 
-    fn authorize(_tx: &Tx, who: Option<&str>, _scope: Id<TestOrg>) -> Result<(), io::Error> {
+    fn authorize(_tx: &Tx, who: &str, _scope: Id<TestOrg>) -> Result<(), io::Error> {
         match who {
-            Some("stranger") => Err(io::Error::other("not a member of this org")),
+            "stranger" => Err(io::Error::other("not a member of this org")),
             _ => Ok(()),
         }
     }
@@ -1964,7 +1964,7 @@ fn a_scoped_write_survives_crash_restart_replay_under_its_own_scope() {
 
     let mut db = Db::open(Box::new(sim.disk()), cfg.clone(), schema()).unwrap();
     db.transact(|tx| -> Result<(), io::Error> {
-        tx.open_scope(Id::<TestOrg>::from_raw(0), None)?
+        tx.open_scope(Id::<TestOrg>::from_raw(0), "member")?
             .put(&Ticket {
                 id: Id::from_raw(5),
                 n: 42,
@@ -2007,7 +2007,7 @@ fn a_followers_apply_shipped_lands_a_scoped_write_under_its_own_scope() {
     let mut primary = Db::open(Box::new(sim.disk()), DbConfig::default(), schema()).unwrap();
     primary
         .transact(|tx| -> Result<(), io::Error> {
-            tx.open_scope(Id::<TestOrg>::from_raw(0), None)?
+            tx.open_scope(Id::<TestOrg>::from_raw(0), "member")?
                 .put(&Ticket {
                     id: Id::from_raw(9),
                     n: 7,
@@ -2413,7 +2413,7 @@ fn one_tenants_staged_row_is_invisible_to_another_in_the_same_batch() {
     let mut group = db.begin_group().unwrap();
     group
         .stage(|tx| -> Result<(), io::Error> {
-            tx.open_scope(a, None)?.put(&Ticket {
+            tx.open_scope(a, "member")?.put(&Ticket {
                 id: Id::from_raw(7),
                 n: 11,
             });
@@ -2425,7 +2425,7 @@ fn one_tenants_staged_row_is_invisible_to_another_in_the_same_batch() {
     // the two levels the merge conflates, read here from B's side.
     group
         .stage(|tx| -> Result<(), io::Error> {
-            let mut tx = tx.open_scope(b, None)?;
+            let mut tx = tx.open_scope(b, "member")?;
             tx.put(&Ticket {
                 id: Id::from_raw(7),
                 n: 22,
@@ -2446,7 +2446,7 @@ fn one_tenants_staged_row_is_invisible_to_another_in_the_same_batch() {
     // And from A's side, with both tenants' rows now in the group overlay.
     group
         .stage(|tx| -> Result<(), io::Error> {
-            let tx = tx.open_scope(a, None)?;
+            let tx = tx.open_scope(a, "member")?;
             assert_eq!(
                 tx.get(Id::<Ticket>::from_raw(7))?.map(|t| t.n),
                 Some(11),
@@ -2522,7 +2522,7 @@ fn one_tenants_staged_tombstone_cannot_delete_another_tenants_row_from_its_read(
     let mut group = db.begin_group().unwrap();
     group
         .stage(|tx| -> Result<(), io::Error> {
-            tx.open_scope(a, None)?.put(&Ticket {
+            tx.open_scope(a, "member")?.put(&Ticket {
                 id: Id::from_raw(7),
                 n: 11,
             });
@@ -2531,7 +2531,7 @@ fn one_tenants_staged_tombstone_cannot_delete_another_tenants_row_from_its_read(
         .unwrap();
     group
         .stage(|tx| -> Result<(), io::Error> {
-            let mut tx = tx.open_scope(b, None)?;
+            let mut tx = tx.open_scope(b, "member")?;
             tx.delete::<Ticket>(Id::from_raw(7));
             assert!(
                 tx.scan::<Ticket>()?.is_empty(),
@@ -2543,7 +2543,7 @@ fn one_tenants_staged_tombstone_cannot_delete_another_tenants_row_from_its_read(
         .unwrap();
     group
         .stage(|tx| -> Result<(), io::Error> {
-            let tx = tx.open_scope(a, None)?;
+            let tx = tx.open_scope(a, "member")?;
             assert_eq!(
                 tx.get(Id::<Ticket>::from_raw(7))?.map(|t| t.n),
                 Some(11),
@@ -2595,7 +2595,7 @@ fn a_refused_scope_hands_back_the_apps_own_error_and_no_handle() {
 
     let refused = db
         .transact(|tx| {
-            tx.open_scope(Id::<TestOrg>::from_raw(1), Some("stranger"))?
+            tx.open_scope(Id::<TestOrg>::from_raw(1), "stranger")?
                 .put(&Ticket {
                     id: Id::from_raw(7),
                     n: 11,
@@ -2641,13 +2641,13 @@ fn a_second_scope_on_one_transaction_is_a_contract_violation() {
         // The first handle's borrow of `tx` ends with this block, which is
         // what lets a second `open_scope` be reached at all.
         {
-            tx.open_scope(Id::<TestOrg>::from_raw(1), None)?
+            tx.open_scope(Id::<TestOrg>::from_raw(1), "member")?
                 .put(&Ticket {
                     id: Id::from_raw(7),
                     n: 11,
                 });
         }
-        let _second = tx.open_scope(Id::<TestOrg>::from_raw(2), None)?;
+        let _second = tx.open_scope(Id::<TestOrg>::from_raw(2), "member")?;
         Ok::<(), io::Error>(())
     });
 }
@@ -2663,7 +2663,7 @@ impl Tenant for AuditOrg {
     type Who = str;
     type Error = io::Error;
 
-    fn authorize(_tx: &Tx, _who: Option<&str>, scope: Id<AuditOrg>) -> Result<(), io::Error> {
+    fn authorize(_tx: &Tx, _who: &str, scope: Id<AuditOrg>) -> Result<(), io::Error> {
         AUDITED_SCOPES.lock().unwrap().push(scope.raw());
         Ok(())
     }
@@ -2692,9 +2692,9 @@ fn a_refused_second_scope_never_reaches_the_apps_authorize() {
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = db.transact(|tx| {
             {
-                let _first = tx.open_scope(Id::<AuditOrg>::from_raw(1), None)?;
+                let _first = tx.open_scope(Id::<AuditOrg>::from_raw(1), "member")?;
             }
-            let _second = tx.open_scope(Id::<AuditOrg>::from_raw(2), None)?;
+            let _second = tx.open_scope(Id::<AuditOrg>::from_raw(2), "member")?;
             Ok::<(), io::Error>(())
         });
     }))
@@ -2731,12 +2731,12 @@ fn reopening_the_same_scope_is_allowed() {
 
     db.transact(|tx| {
         let scope = Id::<TestOrg>::from_raw(1);
-        tx.open_scope(scope, None)?.put(&Ticket {
+        tx.open_scope(scope, "member")?.put(&Ticket {
             id: Id::from_raw(7),
             n: 11,
         });
         assert_eq!(
-            tx.open_scope(scope, None)?
+            tx.open_scope(scope, "member")?
                 .get(Id::<Ticket>::from_raw(7))?
                 .map(|t| t.n),
             Some(11),
@@ -2763,7 +2763,7 @@ impl Tenant for AdmitOrg {
     type Who = str;
     type Error = io::Error;
 
-    fn authorize(_tx: &Tx, _who: Option<&str>, _scope: Id<AdmitOrg>) -> Result<(), io::Error> {
+    fn authorize(_tx: &Tx, _who: &str, _scope: Id<AdmitOrg>) -> Result<(), io::Error> {
         ADMIT_ORG_AUTHORIZE_CALLS.fetch_add(1, Ordering::Relaxed);
         Err(io::Error::other(
             "AdmitOrg refuses everyone it is asked about",
@@ -2868,7 +2868,7 @@ fn an_opened_then_admitted_second_tenant_is_the_same_violation() {
     let admission = group.tenant_admission();
     let _ = group.stage(|tx| {
         {
-            let _first = tx.open_scope(Id::<TestOrg>::from_raw(1), None)?;
+            let _first = tx.open_scope(Id::<TestOrg>::from_raw(1), "member")?;
         }
         let _second = tx.admit_scope(Id::<TestOrg>::from_raw(2), &admission);
         Ok::<(), io::Error>(())

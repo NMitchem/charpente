@@ -65,8 +65,8 @@ impl Tenant for Org {
     type Who = Principal;
     type Error = ApiError;
 
-    fn authorize(_tx: &Tx, who: Option<&Principal>, scope: Id<Org>) -> Result<(), ApiError> {
-        let subject = who.map_or("", |p| p.subject.as_str());
+    fn authorize(_tx: &Tx, who: &Principal, scope: Id<Org>) -> Result<(), ApiError> {
+        let subject = who.subject();
         if subject == format!("org-{}", scope.raw()) {
             Ok(())
         } else {

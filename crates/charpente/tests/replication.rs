@@ -1191,11 +1191,7 @@ impl charpente::Tenant for SeedOrg {
     /// Always allows: this property is about the seed path carrying the
     /// scope, not about the app's membership check —
     /// `charpente/tests/tenant.rs` owns the refusing case.
-    fn authorize(
-        _tx: &charpente::Tx,
-        _who: Option<&str>,
-        _scope: Id<SeedOrg>,
-    ) -> Result<(), io::Error> {
+    fn authorize(_tx: &charpente::Tx, _who: &str, _scope: Id<SeedOrg>) -> Result<(), io::Error> {
         Ok(())
     }
 }
@@ -1226,7 +1222,7 @@ fn commit_scoped(sim: &Sim, node: &mut Node, i: u64) -> Result<(), String> {
             return Ok(());
         };
         let r = db.transact(|tx| {
-            tx.open_scope(Id::<SeedOrg>::from_raw(tenant), None)?
+            tx.open_scope(Id::<SeedOrg>::from_raw(tenant), "operator")?
                 .put(&SeedLedger {
                     id: Id::from_raw(id),
                     bucket: (id % 3) as u32,

@@ -1404,7 +1404,7 @@ impl Tenant for Org {
     /// the declaration (job-tenancy spec §4). This property is about the
     /// platform's isolation guarantee, not the app's membership check —
     /// `charpente/tests/tenant.rs` owns the refusing case.
-    fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<Org>) -> Result<(), ApiError> {
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
         Ok(())
     }
 }
@@ -2102,7 +2102,7 @@ fn sweep_login(tx: &mut Tx, subject: String, ctx: &Ctx) -> Result<String, ApiErr
 #[route(GET "/sweep-whoami", auth)]
 fn sweep_whoami(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
     let _ = tx;
-    Ok(ctx.principal().expect("auth route").subject.clone())
+    Ok(ctx.principal().expect("auth route").subject().to_string())
 }
 
 /// Auth T6: the platform's built-in daily session-expiry sweep. Every `App`

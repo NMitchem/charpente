@@ -1,0 +1,9 @@
+error[E0451]: fields `subject` and `via` of struct `Principal` are private
+  --> tests/compile_fail/principal_cannot_be_forged.rs:14:9
+   |
+13 |     let forged = Principal {
+   |                  --------- in this type
+14 |         subject: "operator:1".to_string(),
+   |         ^^^^^^^ private field
+15 |         via: Via::Oidc,
+   |         ^^^ private field

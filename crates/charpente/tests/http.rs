@@ -61,7 +61,7 @@ fn whoami(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
     let _ = tx;
     // ctx.principal() (not ctx.session()) so this route answers for any
     // ladder rung — session, API key, or (T5) OIDC.
-    Ok(ctx.principal().expect("auth route").subject.clone())
+    Ok(ctx.principal().expect("auth route").subject().to_string())
 }
 
 #[route(POST "/logout", auth)]

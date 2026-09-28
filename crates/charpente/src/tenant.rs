@@ -43,10 +43,9 @@ use crate::http::{ApiError, Ctx};
 /// `Tenant` for a scope type is what earns it — there is nothing to write
 /// here directly.
 ///
-/// `who` is `None` only for a direct `Tx::open_scope(scope, None)` call.
-/// `tx.scope` never passes `None`: rule 3 answers a caller with no credential
-/// with a 401 instead (`Scoped::scope`). So an `authorize` that admits `None`
-/// admits exactly those direct calls.
+/// `authorize` is asked only about a real principal: `tx.scope`'s rule 3
+/// answers a caller with no credential with a 401, and a route declared
+/// `public(S)` admits without asking (`Scoped::scope`).
 ///
 /// It is a named trait rather than the bound spelled out at each use because
 /// `#[table(scoped_by = Org)]`'s const assert names it
@@ -57,11 +56,11 @@ use crate::http::{ApiError, Ctx};
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is used as a tenant scope but has no `Tenant` impl",
     label = "no `impl Tenant for {Self}`",
-    note = "a scoped table needs the app's own membership check; add:\n\
+    note = "a tenant scope needs the app's own membership check; add:\n\
             impl Tenant for {Self} {{\n    \
             type Who = Principal;\n    \
             type Error = ApiError;\n    \
-            fn authorize(tx: &Tx, who: Option<&Principal>, scope: Id<Self>) -> Result<(), ApiError> {{ … }}\n\
+            fn authorize(tx: &Tx, who: &Principal, scope: Id<Self>) -> Result<(), ApiError> {{ … }}\n\
             }}"
 )]
 pub trait TenantScope: Tenant<Who = Principal, Error = ApiError> {}
@@ -95,9 +94,9 @@ impl<'a> Scoped<'a> for Tx<'a> {
     ///    about that principal, and its refusal is the answer.
     /// 3. Otherwise, the named 401, and nothing below the scope line runs.
     ///
-    /// An `auth` route never reaches rule 3, because `build_ctx` refused the
-    /// anonymous caller before the handler ran. So the platform never asks
-    /// `authorize` about nobody.
+    /// An `auth` request never reaches rule 3, because `build_ctx` refused
+    /// the anonymous caller before the handler ran. So the platform never
+    /// asks `authorize` about nobody.
     fn scope<S: TenantScope>(
         &mut self,
         scope: Id<S>,
@@ -107,7 +106,7 @@ impl<'a> Scoped<'a> for Tx<'a> {
             return Ok(self.admit_scope(scope, admission));
         }
         match ctx.principal() {
-            Some(principal) => self.open_scope(scope, Some(principal)),
+            Some(principal) => self.open_scope(scope, principal),
             None => Err(ctx.anonymous_scope::<S>()),
         }
     }

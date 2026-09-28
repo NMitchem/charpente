@@ -739,7 +739,7 @@ impl charpente::Tenant for Org {
 
     fn authorize(
         _tx: &charpente::Tx,
-        _who: Option<&charpente::auth::Principal>,
+        _who: &charpente::auth::Principal,
         _scope: charpente::core::table::Id<Org>,
     ) -> Result<(), charpente::http::ApiError> {
         Ok(())

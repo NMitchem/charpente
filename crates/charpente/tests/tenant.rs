@@ -28,8 +28,8 @@ use charpente::http::{
 };
 use charpente::wire::WireU64;
 use charpente::{
-    CrossTenant, Db, DbConfig, Schema, Scoped, ScopedTx, Snapshot, Tenant, Tx, TxError, event,
-    route, routes, table,
+    CrossTenant, Db, DbConfig, Schema, Scoped, ScopedTx, Snapshot, Tenant, TenantAdmission, Tx,
+    TxError, event, route, routes, table,
 };
 use charpente_core::io::Entropy;
 use charpente_core::log::WalConfig;
@@ -60,10 +60,10 @@ const ADMITTED: u64 = 1;
 const REFUSED: u64 = 2;
 
 thread_local! {
-    /// The subject of every call into `Org::authorize`, in order — `"<nobody>"`
-    /// for a call with no principal. So a test asserts that the check ran at
-    /// all AND whom it was asked about: a status code alone would also pass if
-    /// the platform refused for its own reasons and never asked the app.
+    /// The subject of every call into `Org::authorize`, in order. So a test
+    /// asserts that the check ran at all AND whom it was asked about: a
+    /// status code alone would also pass if the platform refused for its own
+    /// reasons and never asked the app.
     ///
     /// Thread-local, not a static (job-tenancy amendment A4): seven tests read
     /// these, `cargo test` runs them on parallel threads of one binary, and a
@@ -93,12 +93,8 @@ impl Tenant for Org {
     type Who = Principal;
     type Error = ApiError;
 
-    fn authorize(_tx: &Tx, who: Option<&Principal>, scope: Id<Org>) -> Result<(), ApiError> {
-        AUTHORIZE_CALLS.with(|calls| {
-            calls
-                .borrow_mut()
-                .push(who.map_or_else(|| "<nobody>".to_string(), |p| p.subject.clone()))
-        });
+    fn authorize(_tx: &Tx, who: &Principal, scope: Id<Org>) -> Result<(), ApiError> {
+        AUTHORIZE_CALLS.with(|calls| calls.borrow_mut().push(who.subject().to_string()));
         if scope.raw() == ADMITTED {
             Ok(())
         } else {
@@ -545,7 +541,9 @@ impl Tenant for Firm {
     type Who = Principal;
     type Error = ApiError;
 
-    fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<Firm>) -> Result<(), ApiError> {
+    /// Never called: the swarm is operator code, and opens its tenants with
+    /// an admission (spec §7).
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Firm>) -> Result<(), ApiError> {
         Ok(())
     }
 }
@@ -770,11 +768,11 @@ fn bounded_reads(stx: &ScopedTx<'_, '_, Firm>, tenant: u64) -> Result<usize, Str
 fn oracle(sim: &Sim, db: &mut Db) -> Result<(), String> {
     let mut visible = [0usize; TENANTS.len()];
     for (i, tenant) in TENANTS.iter().copied().enumerate() {
-        let verdict = db.transact(|tx| -> Result<usize, String> {
-            let stx = tx
-                .open_scope(Id::<Firm>::from_raw(tenant), None)
-                .map_err(|e| format!("Firm::authorize refused tenant {tenant}: {e:?}"))?;
-            bounded_reads(&stx, tenant)
+        let verdict = transact_admitted(db, |tx, admission| -> Result<usize, String> {
+            bounded_reads(
+                &tx.admit_scope(Id::<Firm>::from_raw(tenant), admission),
+                tenant,
+            )
         });
         match verdict {
             Ok(n) => visible[i] = n,
@@ -843,11 +841,11 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
                         break;
                     }
                 };
+                let admission = g.tenant_admission();
                 let mut stage_failed = false;
                 for tenant in TENANTS {
                     match g.stage(|tx| -> Result<(), String> {
-                        tx.open_scope(Id::<Firm>::from_raw(tenant), None)
-                            .map_err(|e| format!("Firm::authorize refused: {e:?}"))?
+                        tx.admit_scope(Id::<Firm>::from_raw(tenant), &admission)
                             .put(&ledger_row(tenant, id));
                         Ok(())
                     }) {
@@ -901,9 +899,8 @@ fn tenant_universe(sim: &mut Sim) -> Result<(), String> {
                 let tenant = TENANTS[(step as usize) % TENANTS.len()];
                 let ids = own_ids(tenant);
                 let id = ids[(entropy.next_u64() % ids.len() as u64) as usize];
-                match db.transact(|tx| -> Result<(), String> {
-                    tx.open_scope(Id::<Firm>::from_raw(tenant), None)
-                        .map_err(|e| format!("Firm::authorize refused: {e:?}"))?
+                match transact_admitted(&mut db, |tx, admission| -> Result<(), String> {
+                    tx.admit_scope(Id::<Firm>::from_raw(tenant), admission)
                         .put(&ledger_row(tenant, id));
                     Ok(())
                 }) {
@@ -1005,9 +1002,8 @@ fn two_tenant_db(seed: u64) -> (Sim, Db) {
     let mut db = Db::open(Box::new(sim.disk()), ledger_cfg(), ledger_schema()).unwrap();
     for tenant in TENANTS {
         for id in own_ids(tenant) {
-            db.transact(|tx| -> Result<(), String> {
-                tx.open_scope(Id::<Firm>::from_raw(tenant), None)
-                    .map_err(|e| format!("{e:?}"))?
+            transact_admitted(&mut db, |tx, admission| -> Result<(), String> {
+                tx.admit_scope::<Firm>(Id::<Firm>::from_raw(tenant), admission)
                     .put(&ledger_row(tenant, id));
                 Ok(())
             })
@@ -1015,6 +1011,27 @@ fn two_tenant_db(seed: u64) -> (Sim, Db) {
         }
     }
     (sim, db)
+}
+
+/// `Db::transact`, with the operator's admission (job-tenancy spec §7): the
+/// same begin_group -> stage -> commit sequence and the same commit rule,
+/// line for line. So the swarm writes the bytes it wrote when these sites
+/// said `open_scope(…, None)`, and Task 1's coverage baseline measures that.
+fn transact_admitted<T, E>(
+    db: &mut Db,
+    f: impl FnOnce(&mut Tx, &TenantAdmission) -> Result<T, E>,
+) -> Result<T, TxError<E>> {
+    let mut g = db.begin_group().map_err(TxError::Io)?;
+    let admission = g.tenant_admission();
+    let out = g.stage(|tx| f(tx, &admission))?;
+    let staged = !g.is_empty();
+    if let Err(failure) = g.commit() {
+        let reported_elsewhere = db.poisoned() || db.store_failed();
+        if failure.invalidates(0, staged) || !reported_elsewhere {
+            return Err(TxError::Io(failure.error));
+        }
+    }
+    Ok(out)
 }
 
 /// Naive victim (a): a `scan` whose range bound was dropped.
@@ -1186,7 +1203,7 @@ struct Team {
 impl Tenant for Team {
     type Who = Principal;
     type Error = ApiError;
-    fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<Team>) -> Result<(), ApiError> {
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Team>) -> Result<(), ApiError> {
         Ok(())
     }
 }
@@ -1304,13 +1321,14 @@ fn a_cross_tenant_read_sees_staged_writes_and_tombstones_per_tenant() {
 
     let db = app.db_for_tests();
     let mut group = db.begin_group().unwrap();
-    // The operator path to the token: `Group` is the only constructor, which
+    // The operator path to both tokens: `Group` is the only constructor, which
     // is exactly why a handler cannot mint one (`CrossTenant`).
     let cap = group.cross_tenant_cap();
+    let admission = group.tenant_admission();
     let seen: Vec<(u64, u64)> = group
         .stage(|tx| {
             {
-                let mut scoped = tx.open_scope(Id::<Team>::from_raw(2), None)?;
+                let mut scoped = tx.admit_scope(Id::<Team>::from_raw(2), &admission);
                 scoped.delete::<Note>(Id::from_raw(1));
                 scoped.put(&Note {
                     id: Id::from_raw(5),
@@ -1365,10 +1383,11 @@ fn tenant_zero_is_a_real_tenant_to_a_cross_tenant_read() {
     let db = app.db_for_tests();
     let mut group = db.begin_group().unwrap();
     let cap = group.cross_tenant_cap();
+    let admission = group.tenant_admission();
     let seen: Vec<(u64, u64)> = group
         .stage(|tx| {
             {
-                let mut scoped = tx.open_scope(Id::<Team>::from_raw(0), None)?;
+                let mut scoped = tx.admit_scope(Id::<Team>::from_raw(0), &admission);
                 scoped.put(&Note {
                     id: Id::from_raw(7),
                     text: "staged for tenant zero".to_string(),
@@ -1401,7 +1420,8 @@ fn tenant_zero_is_a_real_tenant_to_a_cross_tenant_read() {
 /// `auth` write one word away from an anonymous write. Flip `open_incident`
 /// from `auth` to `public`, and any anonymous caller opens incidents in any
 /// org. Under the three rules the flipped route meets rule 3, and the store
-/// is unchanged.
+/// is unchanged. The `None` arm that made I-1 possible is gone with the
+/// `Option` (spec §3): the platform never asks about nobody.
 mod statuspage {
     use charpente::auth::Principal;
     use charpente::http::{ApiError, Ctx};
@@ -1418,16 +1438,13 @@ mod statuspage {
         type Who = Principal;
         type Error = ApiError;
 
-        fn authorize(_tx: &Tx, who: Option<&Principal>, scope: Id<Org>) -> Result<(), ApiError> {
-            let Some(principal) = who else {
-                return Ok(());
-            };
-            if principal.subject == format!("operator:{}", scope.raw()) {
+        fn authorize(_tx: &Tx, who: &Principal, scope: Id<Org>) -> Result<(), ApiError> {
+            if who.subject() == format!("operator:{}", scope.raw()) {
                 Ok(())
             } else {
                 Err(ApiError::BadRequest(format!(
                     "{} is not an operator of org {}",
-                    principal.subject,
+                    who.subject(),
                     scope.raw()
                 )))
             }

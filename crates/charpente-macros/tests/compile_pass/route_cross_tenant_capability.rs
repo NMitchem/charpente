@@ -26,7 +26,7 @@ struct Invoice {
 impl Tenant for Org {
     type Who = Principal;
     type Error = ApiError;
-    fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<Org>) -> Result<(), ApiError> {
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
         Ok(())
     }
 }

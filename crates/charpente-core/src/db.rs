@@ -804,12 +804,13 @@ impl<'a> Tx<'a> {
 
     /// Stages a row on a SCOPED table under `scope` — the primitive
     /// `ScopedTx::put` delegates to once its scope was entered, either by
-    /// `Tenant::authorize` passing or by the operator's `TenantAdmission`.
+    /// `Tenant::authorize` passing or by a `TenantAdmission` — the
+    /// operator's, or the platform's on a `public(S)` route.
     ///
     /// PRIVATE, and the whole seam is: `ScopedTx` is the only caller, and
     /// `Tx::open_scope`/`Tx::admit_scope` are `ScopedTx`'s only constructors,
-    /// so naming a tenant requires either that tenant's own check or the
-    /// operator's admission to have run. A `pub` version of this method is
+    /// so naming a tenant requires either that tenant's own check or one of
+    /// those admissions to have run. A `pub` version of this method is
     /// reachable from every handler holding a bare `&mut Tx`, which makes
     /// spec §7's exit criterion 1 false however the wrappers are written.
     ///
@@ -1126,8 +1127,9 @@ impl View for Tx<'_> {
 /// like `put_in`/`delete_in`: `ScopedTx` below is the only caller, and
 /// `Tx::open_scope`/`Tx::admit_scope` are `ScopedTx`'s only constructors, so
 /// naming a tenant requires either that tenant's own `Tenant::authorize` to
-/// have passed, or the operator's admission in its place. `Id<S>` with
-/// `R: Row<Scope = S>` — see `put_in`.
+/// have passed, or an admission in its place — the operator's, or the
+/// platform's on a `public(S)` route. `Id<S>` with `R: Row<Scope = S>` — see
+/// `put_in`.
 ///
 /// Each asserts `row_is_scoped::<R>()` for the same reason
 /// `Snapshot::get_scoped` does (hard rule 4): the type system rules out a
@@ -1268,10 +1270,11 @@ fn assert_scoped<R: Row>(method: &str, unscoped_alternative: &str) {
 /// `charpente::TenantScope` (`Who = Principal`, `Error = ApiError`), which is
 /// blanket-implemented for every such impl and carries the house diagnostic.
 ///
-/// The platform calls `authorize` in exactly one place — `Tx::open_scope`,
-/// below — and never DERIVES a scope: the tenant is named by the app at the
-/// one `tx.scope::<S>(…)` line and nowhere else, and no key is ever parsed
-/// back into one (the standing `emit_keyed` ruling, DESIGN.md §6). The one
+/// The platform calls `authorize` in exactly one place, `Tx::open_scope`
+/// below, and only with a principal — and never DERIVES a scope: the tenant
+/// is named by the app at the one `tx.scope::<S>(…)` line and nowhere else,
+/// and no key is ever parsed back into one (the standing `emit_keyed`
+/// ruling, DESIGN.md §6). The one
 /// thing it does read off a scope is its decimal form, as the subscription
 /// key `ScopedTx::emit` attaches (`ScopedTx::event_key`, spec §4) — rendering
 /// out, never resolving in.
@@ -1282,12 +1285,11 @@ pub trait Tenant: Sized + 'static {
     /// The refusal an app returns; `open_scope` returns it unchanged.
     type Error;
 
-    /// `who` is `None` only for a direct `open_scope(scope, None)` call: the
-    /// platform's `tx.scope` answers a caller with no credential with a 401
-    /// and never asks about nobody (job-tenancy spec §4). An `authorize`
-    /// that admits `None` admits exactly those direct calls; refuse it
-    /// unless that is intended.
-    fn authorize(tx: &Tx<'_>, who: Option<&Self::Who>, scope: Id<Self>) -> Result<(), Self::Error>;
+    /// Asked only about a real `who`: there is no `None` to pass
+    /// (job-tenancy spec §3). A way into a scope with no one to ask about is
+    /// declared instead: `Tx::admit_scope`, whose `TenantAdmission` only a
+    /// `Group` mints.
+    fn authorize(tx: &Tx<'_>, who: &Self::Who, scope: Id<Self>) -> Result<(), Self::Error>;
 }
 
 impl<'a> Tx<'a> {
@@ -1332,11 +1334,10 @@ impl<'a> Tx<'a> {
     /// because an inherent method shadows an extension trait's method of the
     /// same name, and the app-facing spelling is the one with the `Ctx`.
     ///
-    /// `who` is `None` for a direct `open_scope(scope, None)` call — an
-    /// `authorize` that admits `None` has declared anonymous access to that
-    /// scope; refuse it unless that is intended. `None` is not a bypass:
-    /// `S::authorize` runs either way, and what it does with `None` is the
-    /// app's own policy.
+    /// `who` is whoever the app is asking about: `tx.scope` passes the
+    /// request's principal, and nothing else can. A caller with no principal
+    /// has no business here. It enters by a declaration (`admit_scope`), or
+    /// not at all.
     ///
     /// # Panics
     ///
@@ -1347,7 +1348,7 @@ impl<'a> Tx<'a> {
     pub fn open_scope<S: Tenant>(
         &mut self,
         scope: Id<S>,
-        who: Option<&S::Who>,
+        who: &S::Who,
     ) -> Result<ScopedTx<'_, 'a, S>, S::Error> {
         self.enter_scope(scope, |tx| S::authorize(tx, who, scope))
     }
@@ -1377,10 +1378,11 @@ impl<'a> Tx<'a> {
 /// an app has on a scoped table (spec §1). `Tx::open_scope` and
 /// `Tx::admit_scope` are its only two constructors (job-tenancy spec §3): the
 /// former runs `S::authorize` before handing one back, the latter takes a
-/// `TenantAdmission` that only a `Group` mints — the operator's standing, not
-/// a handler's. Either way there is no second way to reach a scoped row and
-/// no way to reach one without the tenant's own membership check, or the
-/// operator's admission in its place, having run.
+/// `TenantAdmission` that only a `Group` mints — the operator's standing, or
+/// the platform's own on a `public(S)` route, never a handler's. Either way
+/// there is no second way to reach a scoped row and no way to reach one
+/// without the tenant's own membership check, or one of those admissions in
+/// its place, having run.
 ///
 /// Two lifetimes, not one. `'t` is the borrow of the transaction; `'a` is
 /// the transaction's own borrow of the snapshot it reads from. They cannot

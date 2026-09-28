@@ -77,7 +77,7 @@ fn create_key(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
 #[route(GET "/me", auth)]
 fn whoami(tx: &mut Tx, ctx: &Ctx) -> Result<String, ApiError> {
     let _ = tx;
-    Ok(ctx.principal().expect("auth route").subject.clone())
+    Ok(ctx.principal().expect("auth route").subject().to_string())
 }
 
 // ------------------------------------------------------------------ rig
