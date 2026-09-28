@@ -1294,17 +1294,20 @@ and the `JobEntry` glue `jobs![...]` collects — the same shape `#[table]`
 derives for rows (§2), minus the primary key. `Job::FINGERPRINT` is a
 structural fingerprint of the payload's fields (§12's helper), recorded
 beside every enqueue; a Pending job is decoded only by a binary whose
-`FINGERPRINT` matches (see "Changing a job's fields" below). Bare `#[job]`
-takes `RetryPolicy::DEFAULT` (5 attempts, 30s base backoff); `#[job(retry(max
-= <int>, backoff = "<n><unit>"))]` overrides either or both — `backoff` is a
-bare number plus a unit, one of `ms`, `s`, `m`, `h`.
+`FINGERPRINT` matches (see "Changing a job's fields" below). A job says which
+tenancy it has. Every job in this guide until §16 writes `#[job(global)]`: it
+belongs to no tenant. `#[job(global)]` takes `RetryPolicy::DEFAULT` (5
+attempts, 30s base backoff), and `#[job(global, retry(max = <int>, backoff =
+"<n><unit>"))]` overrides either or both. `backoff` is a bare number plus a
+unit, one of `ms`, `s`, `m`, `h`. The words `global`, `cross_tenant` (§16) and
+`retry(...)` may come in any order, each at most once.
 
 ```rust
 use charpente::core::job::RetryPolicy;
 use charpente::kernel::JobError;
 use charpente::{Job, Tx, job};
 
-#[job]
+#[job(global)]
 struct Basic {}
 
 impl Basic {
@@ -1313,7 +1316,7 @@ impl Basic {
     }
 }
 
-#[job(retry(max = 3, backoff = "10s"))]
+#[job(global, retry(max = 3, backoff = "10s"))]
 struct Custom {}
 
 impl Custom {
@@ -1347,7 +1350,7 @@ struct Counter {
     hits: u64,
 }
 
-#[job]
+#[job(global)]
 struct CountUp {
     slot: u64,
 }
@@ -1383,7 +1386,7 @@ struct Counter {
     hits: u64,
 }
 
-#[job(retry(max = 3, backoff = "10s"))]
+#[job(global, retry(max = 3, backoff = "10s"))]
 struct CountUp {
     slot: u64,
 }
@@ -1444,7 +1447,7 @@ struct Invoice {
     finalized: bool,
 }
 
-#[job]
+#[job(global)]
 struct SendReminder {
     invoice: u64,
 }
@@ -1585,14 +1588,14 @@ struct Foo {}
 //  \"10s\"))]`"
 
 // backoff with no unit suffix
-#[job(retry(max = 3, backoff = "10"))]
+#[job(global, retry(max = 3, backoff = "10"))]
 struct Bar {}
 // "backoff \"10\" has no unit — write `#[job]` or `#[job(retry(max =
 //  <int>, backoff = \"<n><unit>\"))]` (unit is one of ms, s, m, h) — e.g.
 //  `#[job(retry(max = 3, backoff = \"10s\"))]`"
 
 // enums and unions cannot be job payloads
-#[job]
+#[job(global)]
 enum Baz {
     A,
 }
@@ -1626,7 +1629,7 @@ struct DigestState {
     sent: u64,
 }
 
-#[job]
+#[job(global)]
 struct SendDigest {}
 
 impl SendDigest {
@@ -1664,7 +1667,7 @@ use charpente::prod::{ProdDisk, ProdEntropy};
 use charpente::{Schema, Tx, job};
 use std::time::Duration;
 
-#[job]
+#[job(global)]
 struct Tick {}
 
 impl Tick {
@@ -1759,7 +1762,7 @@ struct AppClock {
 
 const APP_CLOCK_ID: u64 = 0;
 
-#[job]
+#[job(global)]
 struct AdvanceDay {}
 
 impl AdvanceDay {
@@ -1829,7 +1832,7 @@ struct NoteBody {
     text: String,
 }
 
-#[job]
+#[job(global)]
 struct SendDigest {}
 
 impl SendDigest {
@@ -2305,7 +2308,7 @@ struct Counter {
 
 // A job payload never crosses HTTP, so it has no `Wire` requirement — this
 // stays a bare `u64`.
-#[job]
+#[job(global)]
 struct CountUp {
     slot: u64,
 }
@@ -2783,6 +2786,8 @@ backoff "10" has no unit — write `#[job]` or `#[job(retry(max = <int>, backoff
 unknown retry field `jitter` — write `#[job]` or `#[job(retry(max = <int>, backoff = "<n><unit>"))]` (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff = "10s"))]`
 `max` given twice — write it once
 `backoff` given twice — write it once
+`global` given twice — write it once
+`retry(...)` given twice — write it once
 backoff "12xs": "12x" is not a whole number — write `#[job]` or `#[job(retry(max = <int>, backoff = "<n><unit>"))]` (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff = "10s"))]`
 backoff "99999999999999h" overflows u64 milliseconds — write `#[job]` or `#[job(retry(max = <int>, backoff = "<n><unit>"))]` (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff = "10s"))]`
 #[job] applies to structs — enums and unions cannot be job payloads
@@ -2795,7 +2800,8 @@ Anything other than bare `#[job]` or `#[job(retry(max = <int>, backoff =
 it names the two accepted forms directly, so the fix is always "match one
 of those two shapes." The rest are that same message with more specific
 context prepended: a backoff string missing its unit, an unrecognized field
-name inside `retry(...)`, `max`/`backoff` written twice, a backoff whose
+name inside `retry(...)`, `global`, `retry(...)`, `max` or `backoff` written
+twice, a backoff whose
 number doesn't parse, or one so large it overflows `u64` milliseconds once
 converted to it. The last three are the same struct-shape checks `#[table]`
 makes (§2): only structs, only non-generic, only named fields.
@@ -5818,7 +5824,7 @@ fn admin_revenue(tx: &mut Tx, cap: &CrossTenant) -> Result<WireU64, ApiError> {
 
 /// The job half of the same declaration: `run` takes the token after `tx`.
 /// The flag composes with `retry(...)` — they share one attribute.
-#[job(cross_tenant, retry(max = 2, backoff = "5s"))]
+#[job(global, cross_tenant, retry(max = 2, backoff = "5s"))]
 struct Rollup {
     day: u64,
 }

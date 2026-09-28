@@ -5455,7 +5455,7 @@ impl ObjectStore for CutStore {
     }
 }
 
-#[job]
+#[job(global)]
 struct Resurrect {
     slot: u64,
 }

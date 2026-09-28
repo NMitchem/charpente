@@ -593,8 +593,8 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   cross-tenant result cannot be handed to code expecting one tenant's data. Naming a tenant
   needs no capability: a point read already supplies the scope. A route declares exactly
   one of `auth`/`public`; neither is a compile error naming both.
-- **Jobs.** `#[job]` structs with typed payloads and typed retry policy. Enqueue sites and
-  handler signatures are checked against each other.
+- **Jobs.** `#[job(global)]` structs with typed payloads and typed retry policy. Enqueue
+  sites and handler signatures are checked against each other.
 - **Events.** `#[event]` structs; `tx.emit(...)` is typed; subscribers (server-side and
   client-side codegen) consume typed streams off the log. An event payload is itself a
   wire type (it is exactly the JSON a subscriber receives), so `#[event]` derives `Wire`

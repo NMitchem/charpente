@@ -30,7 +30,7 @@ pub struct NoteAdded {
 /// the job was dispatched, reported success, and did nothing. A property that
 /// cannot tell that apart from a real run is one-sided, and the whole point of
 /// `charpente test --mutants` is to name it.
-#[job]
+#[job(global)]
 pub struct BumpCounter {
     pub note: Id<FixtureCounter>,
 }

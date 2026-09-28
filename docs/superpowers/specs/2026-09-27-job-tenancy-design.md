@@ -1,7 +1,9 @@
 # Job tenancy — design
 
-**Date:** 2026-09-27. **Status:** approach D approved in chat (Noah); spec of record for the
-plan. **Predecessor:** M3 sub-project 3's verdict (PASS, fix before publish; record
+**Date:** 2026-09-27. **Status:** approach D approved in chat (Noah, 2026-09-27); the written
+spec, §14 included, approved 2026-09-27; spec of record for the plan
+`docs/superpowers/plans/2026-09-27-job-tenancy.md`.
+**Predecessor:** M3 sub-project 3's verdict (PASS, fix before publish; record
 `docs/experiments/2026-09-statuspage/`). This is the second of the two pre-publish platform
 fixes, PLAN.md M3 item 3 (2): "a job cannot open a tenant scope the way GUIDE §16 documents,
 and `authorize` sees neither the operation nor the caller kind". The first, C-1, shipped as
@@ -520,3 +522,30 @@ One item touches DECISIONS.md text.
 R3's reading of §13 needs no sign-off. The stance is still a required choice whose absence is
 a compile error naming every answer, and R3 records why `public(Org)` is one of those
 answers, not an optional word.
+
+## Amendments (implementation plan)
+
+- **A1 — the bare `#[job]` refusal lands with `scoped_by`, not before it.** Spec §11 accepts the job words as no-ops, sweeps `global` onto every `#[job]`, and then refuses the bare form. The refusal's text tells the reader to write `#[job(scoped_by = Org)]`, so the refusal lands in the same commit that makes that advice work (Task 6). Task 1 accepts `global`, sweeps it, and proves the sweep with a grep. Task 6's refusal is where the compiler proves it.
+- **A2 — `Who = str` scope types keep `open_scope` and pass a name.** Four test scope types implement core's generic `Tenant` with `Who = str`, not the platform's `TenantScope`:
+  - `ConvOrg` (`charpente/tests/archive.rs`);
+  - `SeedOrg` (`charpente/tests/replication.rs`);
+  - `TestOrg` and `AuditOrg` (`charpente-core/tests/engine.rs`).
+
+  Their `open_scope(…, None)` calls become `open_scope(…, "operator")`, or `"member"` in engine.rs (A6). Their `authorize` still runs and still writes nothing. §7's form applies to `Who = Principal` sites: `tenant.rs`'s six. So spec §7's "eight platform-test sites" are six moved to `admit_scope` and two kept on `open_scope` with a name. Core's `Tenant` stays generic over `Who` (spec §2 R2), so these calls remain the honest spelling at that layer.
+- **A3 — `build_ctx` takes the route's `Stance`.** `Stance` is private to `charpente::http` and holds three things:
+  - the method word (`SSE` for a stream route) and the pattern;
+  - whether the route said `auth`;
+  - for a `public(S)` route, `S`'s `PublicScope` and the `TenantAdmission` minted for it.
+
+  It is built in two steps. `Declared::of(route)` copies the route's declaration out of the router. `.admitted(&group)` then mints the admission, for a `public(S)` route only.
+  - The split exists for the drift probe, which must stop borrowing the router before `App::begin_group` borrows the whole `App`. That is why the probe already reads `found.cross_tenant` first.
+  - The request path and the probe build it the same way, so the probe honours `public(S)` exactly as a request does (spec §4).
+- **A4 — `tenant.rs`'s counters become thread-locals.** Oracle 2 has seven tests that read them, and `cargo test` runs them on parallel threads of one binary. A request is handled on the thread that called `App::handle`, so a thread-local counts exactly one test's requests. `AUTHORIZE_CALLS` now records the subject of each call, so test (e) can assert *which* principal was asked about.
+- **A5 — oracle 4 correlates replies by body.** Every write route returns its request's nonce, so a 200 names the request that produced it. The 401s carry fixed text and no nonce. "Wrote nothing" is therefore checked on the store and the job queue, where every row and job carries its nonce, and on the 200s. It is not checked by matching each 401 to its request.
+- **A6 — core's `engine.rs` fixtures pass `"member"` where they passed `None`, and `"stranger"` where they passed `Some("stranger")`.**
+- **A7 — Tasks 3 and 4 split spec §11's "land together" group.** Task 3 lands the stances, the three rules and the 401 while `authorize` still takes `Option<&Principal>`; rule 2 passes `Some`. Task 4 then lands the signature and `Principal`'s privacy. Both commits are green. The split lets a reviewer judge the semantic change apart from the compile-forced migration. In the commit between them, nothing the platform does passes `None`; only direct `open_scope(…, None)` calls still can.
+- **A8 — the NoJobTenant pinned block quotes the diagnostic's template.** The block uses `<job>` and `<scope>` placeholders, because the attribute source spells `{J}` and `{Self}` and `doc_truth` matches source text. GUIDE §16 also shows the rendered rustc output, unpinned; the `.stderr` fixture pins that. The 401 pinned block quotes oracle 3's concrete instance, which its test pins byte-exact. `PINNED_FLOOR` goes 21 → 22 (Task 3) → 24 (Task 6).
+- **A9 — the fingerprint pins are computed, then verified at base.** `SessionSweep` (`before: u64`) is FNV-1a over `"before\0u64\0"` = `0x7e72_9c20_6b79_cbad`. `kernel.rs`'s `CountUp` (`slot: u64`) is FNV-1a over `"slot\0u64\0"` = `0x766b_8ba4_18db_4d08`. Task 1 runs the pin at `d363baf` before changing anything. If it fails there, the literal is wrong, not the code: stop and report.
+- **A10 — oracle 4's stripped replays are on all three routes.** A stripped replay on the `public(Shop)` route legitimately succeeds, so the oracle refuses a stripped write only on `auth` and plain `public`. That is exactly spec §9 item 4's "not declared `public(Org)`".
+- **A11 — `Stance` records `auth` too.** The drift probe does not enforce `auth`. An `auth` stream route that opens a scope therefore meets rule 3 under the probe, and the probe's `Err` quotes the rule-3 text. With `auth` recorded, that text names the route's real stance.
+- **A12 — Task 2 lands `TenantAdmission` and `Tx::admit_scope` before §11's second group.** Both are additive and neither is compile-forced, so the operator path exists before any caller needs it and every commit stays green.

@@ -25,7 +25,7 @@ struct Counter {
     hits: u64,
 }
 
-#[job(retry(max = 3, backoff = "10s"))]
+#[job(global, retry(max = 3, backoff = "10s"))]
 struct CountUp {
     slot: u64,
 }
@@ -79,7 +79,7 @@ fn job_macro_derives_codec_name_retry_and_glue() {
     assert_eq!((counters[0].id.raw(), counters[0].hits), (4, 1));
 }
 
-#[job(retry(max = 2, backoff = "10s"))]
+#[job(global, retry(max = 2, backoff = "10s"))]
 struct AlwaysFails {}
 
 impl AlwaysFails {
@@ -88,7 +88,7 @@ impl AlwaysFails {
     }
 }
 
-#[job(retry(max = 2, backoff = "10s"))]
+#[job(global, retry(max = 2, backoff = "10s"))]
 struct Panics {}
 
 impl Panics {
@@ -103,7 +103,7 @@ mod receipt_v1 {
     use charpente::kernel::JobError;
     use charpente::{Tx, job};
 
-    #[job]
+    #[job(global)]
     pub struct SendReceipt {
         pub invoice: u64,
     }
@@ -121,7 +121,7 @@ mod receipt_v2 {
     use charpente::{Tx, job};
 
     /// v1 plus a field.
-    #[job]
+    #[job(global)]
     pub struct SendReceipt {
         pub invoice: u64,
         pub copies: u32,
@@ -147,6 +147,22 @@ fn a_jobs_fingerprint_follows_its_fields_not_its_name() {
         <AlwaysFails as Job>::FINGERPRINT,
         <Panics as Job>::FINGERPRINT
     );
+}
+
+/// Job-tenancy spec §6 and §9 item 7: a `global` job's fingerprint is exactly
+/// the fold a bare `#[job]` computed, so no Pending job of an existing type
+/// changes shape when its declaration gains `global`. `SessionSweep` is the
+/// platform's own job, whose shape a release must never move (its doc comment
+/// says why). The literals are FNV-1a over charpente's own rendering —
+/// `"before\0u64\0"` and `"slot\0u64\0"` — and were run green at `d363baf`,
+/// before any job said `global`.
+#[test]
+fn a_global_jobs_fingerprint_is_the_bare_jobs_fingerprint() {
+    assert_eq!(
+        <charpente::auth::SessionSweep as Job>::FINGERPRINT,
+        0x7e72_9c20_6b79_cbad
+    );
+    assert_eq!(<CountUp as Job>::FINGERPRINT, 0x766b_8ba4_18db_4d08);
 }
 
 fn quiet_kernel_app(seed: u64) -> (Sim, App) {
@@ -319,7 +335,7 @@ fn panicking_handler_is_absorbed_into_the_retry_path() {
     );
 }
 
-#[job]
+#[job(global)]
 struct ReadFaults {}
 
 impl ReadFaults {
@@ -1349,7 +1365,7 @@ fn crash_config() -> AppConfig {
     }
 }
 
-#[job(retry(max = 3, backoff = "5s"))]
+#[job(global, retry(max = 3, backoff = "5s"))]
 struct Flaky {
     roll: u64,
 }
@@ -3003,7 +3019,7 @@ fn an_enqueue_of_an_unmounted_job_type_keeps_the_not_registered_path() {
 
 /// A job whose handler still enqueues the v1 shape of a job name this binary
 /// mounts at v2.
-#[job(retry(max = 1, backoff = "10s"))]
+#[job(global, retry(max = 1, backoff = "10s"))]
 struct ForwardsReceipt {}
 
 impl ForwardsReceipt {

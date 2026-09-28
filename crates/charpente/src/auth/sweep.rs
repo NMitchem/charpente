@@ -27,7 +27,7 @@ pub const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(86_400);
 /// are Done or Dead, then deploy this one; or restore the old fields and give
 /// the new shape its own `#[job]` type under a new name — an app author could
 /// apply only the first to the platform's own job.
-#[job]
+#[job(global)]
 pub struct SessionSweep {
     pub before: u64,
 }

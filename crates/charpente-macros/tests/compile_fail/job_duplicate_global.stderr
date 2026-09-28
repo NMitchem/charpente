@@ -1,0 +1,5 @@
+error: `global` given twice — write it once
+ --> tests/compile_fail/job_duplicate_global.rs:6:15
+  |
+6 | #[job(global, global)]
+  |               ^^^^^^

@@ -854,7 +854,7 @@ mod tests {
         value: u64,
     }
 
-    #[job]
+    #[job(global)]
     struct RestoreDeliver {
         slot: u64,
     }

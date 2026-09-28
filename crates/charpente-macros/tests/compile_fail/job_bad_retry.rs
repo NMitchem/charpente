@@ -7,7 +7,7 @@
 // routes through ACCEPTED_FORMS, so that's what this case pins.
 use charpente::job;
 
-#[job(retry(count = 3))]
+#[job(global, retry(count = 3))]
 struct BadJob {
     x: u64,
 }

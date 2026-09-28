@@ -1,5 +1,5 @@
 error: unknown retry field `count` — write `#[job]`, `#[job(cross_tenant)]` or `#[job([cross_tenant, ]retry(max = <int>, backoff = "<n><unit>"))]` (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff = "10s"))]`
-  --> tests/compile_fail/job_bad_retry.rs:10:13
+  --> tests/compile_fail/job_bad_retry.rs:10:21
    |
-10 | #[job(retry(count = 3))]
-   |             ^^^^^
+10 | #[job(global, retry(count = 3))]
+   |                     ^^^^^

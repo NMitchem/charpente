@@ -16,7 +16,7 @@ use charpente::{Id, Tx, View, event, job};
 /// job has no `Ctx`/session of its own (GUIDE §6) — `finalize_invoice`
 /// carries the caller's org key through so `ReceiptSent` can be emitted
 /// keyed to the same org `InvoiceFinalized` was.
-#[job]
+#[job(global)]
 pub struct SendReceipt {
     pub invoice: Id<Invoice>,
     pub org: String,
@@ -79,7 +79,7 @@ pub struct ReceiptSent {
 /// `#[job]` payload, which never crosses HTTP (jobs run in-process; only
 /// their effects are observable), so it has no `Wire` requirement — unlike
 /// `ReceiptSent` above, which is an `#[event]` and does cross the wire.
-#[job]
+#[job(global)]
 pub struct SendOverdueReminder {
     pub invoice: u64,
     pub day: u64,
@@ -104,7 +104,7 @@ impl SendOverdueReminder {
 /// (GUIDE §7: "catch-up fires once, never backfills") means a tick after
 /// downtime still only advances the day counter by one, which is exactly
 /// the brief's "missed days are not backfilled" requirement — for free.
-#[job]
+#[job(global)]
 pub struct AdvanceDay {}
 
 impl AdvanceDay {

@@ -788,7 +788,7 @@ fn a_read_batched_behind_a_failed_write_is_not_acked_with_its_data() {
 /// A no-op job: its handler writes nothing, so its ONLY effect is its own
 /// Done-mark — one record per job, deterministically, which is what makes
 /// `syncs_in_job_arm == 1` a meaningful assertion below (T7 pre-flight §11).
-#[job]
+#[job(global)]
 struct NoOp {}
 
 impl NoOp {
@@ -886,7 +886,7 @@ fn forty_due_jobs_cost_one_fsync() {
 /// — a read-modify-write, so two of these against the SAME row in one batch
 /// is the twin that discriminates a working group overlay from a bare
 /// snapshot (T7 Step 3b, C-6).
-#[job]
+#[job(global)]
 struct BumpHit {
     id: u64,
 }
@@ -1427,7 +1427,7 @@ fn a_failed_batchs_participants_are_invalidated_by_what_they_saw() {
 /// needs (task-8-preflight.md C-1): three same-instant jobs, one panicking,
 /// so the other two's isolation is provable against real siblings rather
 /// than a solo run.
-#[job]
+#[job(global)]
 struct MaybeBoom {
     id: u64,
     boom: bool,
@@ -2014,7 +2014,7 @@ struct Tick {
     n: WireU64,
 }
 
-#[job]
+#[job(global)]
 struct QuietJob {}
 
 impl QuietJob {

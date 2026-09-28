@@ -1,6 +1,7 @@
-//! `#[job]` / `#[job([cross_tenant, ]retry(max = N, backoff = "30s"))]`
-//! (DESIGN.md §6, spec
-//! 2026-07-02-queue-cron-design.md): turns a struct into a typed job
+//! `#[job(global[, cross_tenant][, retry(max = N, backoff = "30s")])]`, the
+//! words in any order, each at most once (DESIGN.md §6, specs
+//! 2026-07-02-queue-cron-design.md and 2026-09-27-job-tenancy-design.md §5):
+//! turns a struct into a typed job
 //! payload — a field-wise `Codec` impl (mirrors `#[table]`'s row codec, minus
 //! the id: a job payload has no primary key), `impl Job` carrying the name,
 //! the payload's structural fingerprint (`fingerprint::compute`) and the
@@ -62,50 +63,83 @@ impl Parse for RetryField {
     }
 }
 
-impl Parse for JobArgs {
-    fn parse(input: ParseStream) -> syn::Result<JobArgs> {
-        if input.is_empty() {
-            return Ok(JobArgs::default());
-        }
-        let mut cross_tenant = false;
-        let mut kw: Ident = input
+/// One word of the attribute, parsed one at a time so each can come at most
+/// once and in any order — `#[table]`'s `TableArg` is the precedent, for the
+/// same reason: a declaration repeated is a typo or a bad merge, never an
+/// override.
+enum JobArg {
+    Global(proc_macro2::Span),
+    CrossTenant(proc_macro2::Span),
+    Retry(proc_macro2::Span, Vec<RetryField>),
+}
+
+impl Parse for JobArg {
+    fn parse(input: ParseStream) -> syn::Result<JobArg> {
+        let ident: Ident = input
             .parse()
             .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
-        if kw == "cross_tenant" {
-            cross_tenant = true;
+        match ident.to_string().as_str() {
+            "global" => Ok(JobArg::Global(ident.span())),
+            "cross_tenant" => Ok(JobArg::CrossTenant(ident.span())),
+            "retry" => {
+                // Peeked, so `retry` without its parentheses gets the house
+                // message rather than syn's "expected parentheses".
+                if !input.peek(syn::token::Paren) {
+                    return Err(Error::new(ident.span(), ACCEPTED_FORMS));
+                }
+                let content;
+                parenthesized!(content in input);
+                let fields = content.parse_terminated(RetryField::parse, Token![,])?;
+                Ok(JobArg::Retry(ident.span(), fields.into_iter().collect()))
+            }
+            _ => Err(Error::new(ident.span(), ACCEPTED_FORMS)),
+        }
+    }
+}
+
+impl Parse for JobArgs {
+    fn parse(input: ParseStream) -> syn::Result<JobArgs> {
+        // `global` changes nothing in expansion yet: it is read only to refuse
+        // a repeat. Task 6 of the job-tenancy plan makes it one of the two
+        // required answers.
+        let mut global: Option<proc_macro2::Span> = None;
+        let mut cross_tenant: Option<proc_macro2::Span> = None;
+        let mut retry: Option<Vec<RetryField>> = None;
+        while !input.is_empty() {
+            match input.parse::<JobArg>()? {
+                JobArg::Global(span) => {
+                    if global.is_some() {
+                        return Err(Error::new(span, "`global` given twice — write it once"));
+                    }
+                    global = Some(span);
+                }
+                JobArg::CrossTenant(span) => {
+                    if cross_tenant.is_some() {
+                        return Err(Error::new(
+                            span,
+                            "`cross_tenant` given twice — write it once",
+                        ));
+                    }
+                    cross_tenant = Some(span);
+                }
+                JobArg::Retry(span, fields) => {
+                    if retry.is_some() {
+                        return Err(Error::new(span, "`retry(...)` given twice — write it once"));
+                    }
+                    retry = Some(fields);
+                }
+            }
             if input.is_empty() {
-                let defaults = JobArgs::default();
-                return Ok(JobArgs {
-                    cross_tenant,
-                    ..defaults
-                });
+                break;
             }
             input
                 .parse::<Token![,]>()
                 .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
-            kw = input
-                .parse()
-                .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
-            if kw == "cross_tenant" {
-                return Err(Error::new(
-                    kw.span(),
-                    "`cross_tenant` given twice — write it once",
-                ));
-            }
-        }
-        if kw != "retry" {
-            return Err(Error::new(kw.span(), ACCEPTED_FORMS));
-        }
-        let content;
-        parenthesized!(content in input);
-        let fields = content.parse_terminated(RetryField::parse, Token![,])?;
-        if !input.is_empty() {
-            return Err(Error::new(input.span(), ACCEPTED_FORMS));
         }
 
         let mut max = None;
         let mut backoff_millis = None;
-        for field in fields {
+        for field in retry.unwrap_or_default() {
             match field {
                 RetryField::Max(lit) => {
                     if max.is_some() {
@@ -128,7 +162,7 @@ impl Parse for JobArgs {
         Ok(JobArgs {
             max: max.unwrap_or(defaults.max),
             backoff_millis: backoff_millis.unwrap_or(defaults.backoff_millis),
-            cross_tenant,
+            cross_tenant: cross_tenant.is_some(),
         })
     }
 }

@@ -129,7 +129,7 @@ fn widget_feed(tx: &mut Tx, ctx: &Ctx, cursor: Option<Cursor>) -> Result<Subscri
         .cursor(cursor))
 }
 
-#[job]
+#[job(global)]
 struct Ping {
     n: u64,
 }
@@ -1146,7 +1146,7 @@ fn admin_plain(tx: &mut Tx) -> Result<WireU64, ApiError> {
 /// The job half of the same declaration (spec §3): a background rollup that
 /// enumerates every tenant declares the capability exactly as a route does,
 /// and its `run` takes the token the dispatcher minted.
-#[job(cross_tenant)]
+#[job(global, cross_tenant)]
 struct Rollup {
     day: u64,
 }

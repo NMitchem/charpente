@@ -33,7 +33,7 @@ impl Tenant for Org {
     }
 }
 
-#[job(cross_tenant, retry(max = 2, backoff = "5s"))]
+#[job(global, cross_tenant, retry(max = 2, backoff = "5s"))]
 struct Rollup {
     day: u64,
 }
@@ -49,7 +49,7 @@ impl Rollup {
 
 /// `#[job]` with no flag still calls `run(tx)`: the argument is added only by
 /// the declaration, so every existing job keeps its signature.
-#[job]
+#[job(global)]
 struct Plain {
     n: u64,
 }

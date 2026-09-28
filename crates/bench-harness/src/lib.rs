@@ -47,7 +47,7 @@ pub struct SlotBumped {
     pub slot: WireU64,
 }
 
-#[job]
+#[job(global)]
 pub struct Bump {
     pub slot: u64,
 }

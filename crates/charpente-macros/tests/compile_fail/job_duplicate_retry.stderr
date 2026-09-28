@@ -1,0 +1,5 @@
+error: `retry(...)` given twice — write it once
+ --> tests/compile_fail/job_duplicate_retry.rs:5:47
+  |
+5 | #[job(global, retry(max = 1, backoff = "1s"), retry(max = 2, backoff = "2s"))]
+  |                                               ^^^^^
