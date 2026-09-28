@@ -2747,6 +2747,134 @@ fn reopening_the_same_scope_is_allowed() {
     .unwrap();
 }
 
+// ----------------------------------------- job-tenancy Task 2: the admission
+
+/// Entries into `AdmitOrg::authorize`. Its own counter rather than
+/// `AUDITED_SCOPES`: `a_refused_second_scope_never_reaches_the_apps_authorize`
+/// clears and asserts that one, and tests run on parallel threads.
+static ADMIT_ORG_AUTHORIZE_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// A scope type whose membership check refuses everyone it is asked about, so
+/// an admission that asked it would fail twice over — the call would be
+/// counted, and the scope refused.
+struct AdmitOrg;
+
+impl Tenant for AdmitOrg {
+    type Who = str;
+    type Error = io::Error;
+
+    fn authorize(_tx: &Tx, _who: Option<&str>, _scope: Id<AdmitOrg>) -> Result<(), io::Error> {
+        ADMIT_ORG_AUTHORIZE_CALLS.fetch_add(1, Ordering::Relaxed);
+        Err(io::Error::other(
+            "AdmitOrg refuses everyone it is asked about",
+        ))
+    }
+}
+
+/// Job-tenancy spec §7: the operator opens a tenant with a `TenantAdmission`
+/// minted from a `Group`. No `authorize` runs — the operator has no principal
+/// to ask about and already holds the store — and the handle it gets is
+/// bounded to that tenant exactly as an authorized one is.
+#[test]
+fn an_admitted_scope_asks_no_authorize_and_writes_inside_its_tenant() {
+    let sim = Sim::with_faults(0x7F00_0005, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Ticket>(),
+    )
+    .unwrap();
+
+    let mut group = db.begin_group().unwrap();
+    let admission = group.tenant_admission();
+    group
+        .stage(|tx| {
+            let _ = tx.admit_scope(Id::<AdmitOrg>::from_raw(9), &admission);
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+    group
+        .stage(|tx| {
+            tx.admit_scope(Id::<TestOrg>::from_raw(3), &admission)
+                .put(&Ticket {
+                    id: Id::from_raw(7),
+                    n: 11,
+                });
+            Ok::<(), io::Error>(())
+        })
+        .unwrap();
+    group.commit().unwrap();
+
+    assert_eq!(
+        ADMIT_ORG_AUTHORIZE_CALLS.load(Ordering::Relaxed),
+        0,
+        "an admission is not a question: AdmitOrg::authorize refuses everyone, and it was \
+         never asked"
+    );
+    let snap = db.snapshot().unwrap();
+    assert_eq!(
+        snap.get_scoped::<Ticket>(3, Id::from_raw(7))
+            .unwrap()
+            .map(|t| t.n),
+        Some(11),
+        "the admitted write landed in tenant 3"
+    );
+    assert!(
+        snap.get_scoped::<Ticket>(0, Id::from_raw(7))
+            .unwrap()
+            .is_none(),
+        "and nowhere else — tenant 0 is a tenant, not a default"
+    );
+}
+
+/// The one-scope contract (spec §8 of the tenant-scoping spec) is the same
+/// contract whichever way the scope was entered, because `open_scope` and
+/// `admit_scope` share one body (job-tenancy spec §3).
+#[test]
+#[should_panic(expected = "a transaction opens ONE tenant scope")]
+fn an_admitted_second_tenant_is_the_same_one_scope_violation() {
+    let sim = Sim::with_faults(0x7F00_0006, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Ticket>(),
+    )
+    .unwrap();
+    let mut group = db.begin_group().unwrap();
+    let admission = group.tenant_admission();
+    let _ = group.stage(|tx| {
+        {
+            let _first = tx.admit_scope(Id::<TestOrg>::from_raw(1), &admission);
+        }
+        let _second = tx.admit_scope(Id::<TestOrg>::from_raw(2), &admission);
+        Ok::<(), io::Error>(())
+    });
+}
+
+/// And across the two constructors: a tenant opened by membership, then a
+/// different one admitted, is the same violation — neither path is a way
+/// around the other's contract.
+#[test]
+#[should_panic(expected = "a transaction opens ONE tenant scope")]
+fn an_opened_then_admitted_second_tenant_is_the_same_violation() {
+    let sim = Sim::with_faults(0x7F00_0007, FaultConfig::none());
+    let mut db = Db::open(
+        Box::new(sim.disk()),
+        DbConfig::default(),
+        Schema::new().table::<Ticket>(),
+    )
+    .unwrap();
+    let mut group = db.begin_group().unwrap();
+    let admission = group.tenant_admission();
+    let _ = group.stage(|tx| {
+        {
+            let _first = tx.open_scope(Id::<TestOrg>::from_raw(1), None)?;
+        }
+        let _second = tx.admit_scope(Id::<TestOrg>::from_raw(2), &admission);
+        Ok::<(), io::Error>(())
+    });
+}
+
 /// F1 mechanism (no child process — see `crates/edge-harness/tests/
 /// open_fence.rs` for the printed-output oracle, which needs one).
 /// `Store::open`'s `IN_OPEN_FENCE` thread-local must clear on EVERY exit

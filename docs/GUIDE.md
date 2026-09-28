@@ -5932,10 +5932,65 @@ word with no `authorize` on the path (replication seeding, the archive and
 token. Whoever holds the `Db` holds the store, with the same standing as
 whoever holds the data directory: an operator, not a request.
 
-**So: code outside a handler that wants the guarantee should go through a
-transaction and `tx.scope::<Org>(org, ctx)?` exactly as a handler does.** Do not
-build an app-internal helper that takes a raw scope and reads through
-`Db::snapshot`; that is the one shape that looks tenant-aware and is not.
+**Operator code that must act inside one tenant** — seeding, a test oracle, an admin
+step in `main` — does not take a scope on its own word either. It begins a group, mints
+a `TenantAdmission` from it, and opens the tenant with `admit_scope`:
+
+```rust
+use charpente::auth::Principal;
+use charpente::http::ApiError;
+use charpente::{Db, Id, Tenant, Tx, TxError, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<Org>) -> Result<(), ApiError> {
+        // Refuses everyone: the seed below never asks.
+        Err(ApiError::Unauthorized)
+    }
+}
+
+#[table(scoped_by = Org)]
+struct Memo {
+    id: Id<Memo>,
+    text: String,
+}
+
+/// Seeds one tenant's first memo. `db.begin_group()` is the operator's
+/// handle, and the admission it mints is what `admit_scope` asks for.
+fn seed(db: &mut Db, org: Id<Org>) -> std::io::Result<()> {
+    let mut group = db.begin_group()?;
+    let admission = group.tenant_admission();
+    let staged = group.stage(|tx| {
+        tx.admit_scope::<Org>(org, &admission).put(&Memo {
+            id: Id::from_raw(1),
+            text: "welcome".to_string(),
+        });
+        Ok::<(), std::io::Error>(())
+    });
+    // `commit` on every path: a group dropped with staged writes panics.
+    group.commit().map_err(|failure| failure.error)?;
+    match staged {
+        Ok(()) => Ok(()),
+        Err(TxError::App(e)) | Err(TxError::Io(e)) => Err(e),
+        Err(other) => Err(std::io::Error::other(format!("{other:?}"))),
+    }
+}
+```
+
+No `authorize` runs there. The operator has no principal to ask about, and already
+holds the store. The admission carries the seal `CrossTenant` carries: its field is
+private and `Group::tenant_admission` is its only constructor. So a handler, which holds
+a `Tx` and a `Ctx` and never a `Group`, cannot mint one; `TenantAdmission(())` is
+`error[E0423]`. The one-scope rule is the same contract whichever way a scope was
+entered. Do not build an app-internal helper that takes a raw scope and reads through
+`Db::snapshot`: that is the one shape that looks tenant-aware and is not.
 
 ### Deliberately not built
 

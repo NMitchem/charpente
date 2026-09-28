@@ -1610,6 +1610,9 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   (`Vec<(Id<Org>, Invoice)>`, never `Vec<Invoice>`), and `charpente describe` lists every
   route and job that declared it — an inventory, not a grep. That is a capability, not an
   escape hatch on a guarantee (DECISIONS §11).
+  The operator acts inside one tenant with a `TenantAdmission` minted from a `Group`
+  (`Tx::admit_scope`), sealed the way `CrossTenant` is. No `authorize` runs, because the
+  operator has no principal and already holds the store (DECISIONS §12).
   **Two limits travel with it, documented rather than engineered around.** The subscription
   key is the scope's decimal id, so two DIFFERENT scope types sharing a raw id share a key —
   an app with more than one scope type keys its subscriptions per scope type as well. And

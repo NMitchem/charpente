@@ -8,8 +8,8 @@ extern crate self as charpente;
 
 pub use charpente_core as core;
 pub use charpente_core::db::{
-    AllTenants, CrossTenant, Db, DbConfig, Event, Job, Schema, ScopedTx, Seeder, Tenant, Tx,
-    TxError,
+    AllTenants, CrossTenant, Db, DbConfig, Event, Job, Schema, ScopedTx, Seeder, Tenant,
+    TenantAdmission, Tx, TxError,
 };
 pub use charpente_core::table::{Id, Snapshot, View};
 pub use charpente_macros::{Wire, event, job, route, row_shape, table};

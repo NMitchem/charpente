@@ -1288,40 +1288,17 @@ pub trait Tenant: Sized + 'static {
 }
 
 impl<'a> Tx<'a> {
-    /// Opens a tenant scope: the ONLY constructor of `ScopedTx`, and the only
-    /// route to the six scope-taking primitives above, which are private.
-    /// `S::authorize` gates every handle, always — a handler cannot reach a tenant's
-    /// rows without the app's own membership check having passed, which is
-    /// what makes "one auditable line per handler" structural rather than
-    /// conventional (spec §1).
-    ///
-    /// Apps call `tx.scope::<Org>(org, ctx)?` (`charpente::Scoped`), which
-    /// maps `ctx.principal()` to `who` and delegates here. The name differs
-    /// because an inherent method shadows an extension trait's method of the
-    /// same name, and the app-facing spelling is the one with the `Ctx`.
-    ///
-    /// `who` is `None` for an unauthenticated request and for a direct
-    /// `open_scope(scope, None)` call — an `authorize` that admits `None` has
-    /// declared anonymous access to that scope; refuse it unless that is
-    /// intended. `None` is not a bypass: `S::authorize` runs either way, and
-    /// what it does with `None` is the app's own policy.
-    ///
-    /// # Panics
-    ///
-    /// A transaction opens ONE scope (spec §8). A second `open_scope` naming
-    /// a different tenant — including one reached through `ScopedTx`'s
-    /// `DerefMut` — is a contract violation, not a cross-tenant write.
-    /// Re-opening the SAME scope is a no-op.
-    pub fn open_scope<S: Tenant>(
+    /// The one body both scope constructors share (job-tenancy spec §3). The
+    /// one-scope contract is checked FIRST, because it is decidable without
+    /// asking anyone: a second tenant on this transaction gets no handle
+    /// whatever `admit` would answer, so the app's `authorize` — and any
+    /// audit entry or side effect it performs — is never invoked for a scope
+    /// no handle is issued for.
+    fn enter_scope<S: Tenant, E>(
         &mut self,
         scope: Id<S>,
-        who: Option<&S::Who>,
-    ) -> Result<ScopedTx<'_, 'a, S>, S::Error> {
-        // The contract check precedes `authorize`, because it is decidable
-        // without asking the app: a second tenant on this transaction gets no
-        // handle whatever the app would answer, so the app's `authorize` — and
-        // any audit entry or side effect it performs — is never invoked for a
-        // scope no handle is issued for.
+        admit: impl FnOnce(&Tx<'a>) -> Result<(), E>,
+    ) -> Result<ScopedTx<'_, 'a, S>, E> {
         let opening = (TypeId::of::<S>(), std::any::type_name::<S>(), scope.raw());
         if let Some(prev) = self.opened_scope {
             assert!(
@@ -1335,9 +1312,59 @@ impl<'a> Tx<'a> {
                 opening.2
             );
         }
-        S::authorize(self, who, scope)?;
+        admit(self)?;
         self.opened_scope = Some(opening);
         Ok(ScopedTx { tx: self, scope })
+    }
+
+    /// Opens a tenant scope on a member's word: `S::authorize` runs, and its
+    /// refusal is returned unchanged. With `admit_scope` below, the only
+    /// constructors of `ScopedTx` — the only route to the six scope-taking
+    /// primitives above, which are private.
+    ///
+    /// Apps call `tx.scope::<Org>(org, ctx)?` (`charpente::Scoped`), which
+    /// maps the request to `who` and delegates here. The name differs
+    /// because an inherent method shadows an extension trait's method of the
+    /// same name, and the app-facing spelling is the one with the `Ctx`.
+    ///
+    /// `who` is `None` for a direct `open_scope(scope, None)` call — an
+    /// `authorize` that admits `None` has declared anonymous access to that
+    /// scope; refuse it unless that is intended. `None` is not a bypass:
+    /// `S::authorize` runs either way, and what it does with `None` is the
+    /// app's own policy.
+    ///
+    /// # Panics
+    ///
+    /// A transaction opens ONE scope (spec §8). A second `open_scope` or
+    /// `admit_scope` naming a different tenant — including one reached
+    /// through `ScopedTx`'s `DerefMut` — is a contract violation, not a
+    /// cross-tenant write. Re-opening the SAME scope is a no-op.
+    pub fn open_scope<S: Tenant>(
+        &mut self,
+        scope: Id<S>,
+        who: Option<&S::Who>,
+    ) -> Result<ScopedTx<'_, 'a, S>, S::Error> {
+        self.enter_scope(scope, |tx| S::authorize(tx, who, scope))
+    }
+
+    /// Opens a tenant scope on the operator's word, with no
+    /// `Tenant::authorize` (job-tenancy spec §7): the `TenantAdmission` is
+    /// the proof that the holder of a `Group` — whoever holds the `Db` —
+    /// admitted this transaction, and there is no principal to ask about.
+    /// The one-scope contract and the handle are exactly `open_scope`'s: the
+    /// two share one body.
+    ///
+    /// # Panics
+    ///
+    /// As `open_scope`: a second, different tenant on one transaction.
+    pub fn admit_scope<S: Tenant>(
+        &mut self,
+        scope: Id<S>,
+        admission: &TenantAdmission,
+    ) -> ScopedTx<'_, 'a, S> {
+        let TenantAdmission(()) = admission;
+        let Ok(scoped) = self.enter_scope(scope, |_| Ok::<(), std::convert::Infallible>(()));
+        scoped
     }
 }
 
@@ -1491,6 +1518,32 @@ impl<'a> Group<'a> {
     /// it takes a `&Group` because that is a handle a handler never has.
     pub fn cross_tenant_cap(&self) -> CrossTenant {
         CrossTenant(())
+    }
+}
+
+// ------------------------------------------------------- admission
+
+/// Proof that the operator admitted this transaction into one tenant —
+/// `Tx::admit_scope`'s argument (job-tenancy spec §3, §7).
+///
+/// Sealed exactly as `CrossTenant` is, and for the same reason: its field is
+/// private and `Group::tenant_admission` is the only constructor, and a
+/// handler holds `&mut Tx` and `&Ctx`, never a `Group`. Whoever holds the
+/// `Db` a group borrows is the operator, who already reaches every tenant
+/// through `Db::snapshot` (ruling R48); the admission makes that standing
+/// explicit at a scope line instead of leaving it an exception to the
+/// guarantee.
+///
+/// `Clone` for `CrossTenant`'s reason: holding one at all is the admission,
+/// so a copy widens nothing.
+#[derive(Clone)]
+pub struct TenantAdmission(());
+
+impl<'a> Group<'a> {
+    /// Mints the admission `Tx::admit_scope` takes. The only constructor;
+    /// see `TenantAdmission`.
+    pub fn tenant_admission(&self) -> TenantAdmission {
+        TenantAdmission(())
     }
 }
 
