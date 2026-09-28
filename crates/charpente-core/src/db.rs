@@ -972,10 +972,15 @@ impl<'a> Tx<'a> {
     /// `describe`'s `cross_tenant=true`, answers "what reaches every tenant
     /// here", by reads and by fan-out. The job runs in `scope` exactly as if
     /// it had been enqueued from inside it.
-    pub fn enqueue_in<S: Tenant, J: Job<Scope = S>>(
+    ///
+    /// The job is taken in argument position (`impl Job`) so that `S` is the
+    /// only nameable type parameter: `NoJobTenant`'s note teaches
+    /// `tx.enqueue_in::<Org>(scope, job, cap)`, which a second named parameter
+    /// would make E0107 (job-tenancy spec amendment A13).
+    pub fn enqueue_in<S: Tenant>(
         &mut self,
         scope: Id<S>,
-        job: J,
+        job: impl Job<Scope = S>,
         cap: &CrossTenant,
     ) {
         let CrossTenant(()) = cap;
@@ -1648,7 +1653,7 @@ impl<'a> Group<'a> {
 /// one per request for a route declared `public(S)` and keeps it private in
 /// that request's `Ctx`, so `tx.scope::<S>` admits by the declaration; and
 /// the dispatcher, which mints one per job run and hands a scoped job's glue
-/// a `JobScope` that opens only the tenant its row carries.
+/// a `JobScope` that opens only the tenant id its row carries.
 ///
 /// Sealed exactly as `CrossTenant` is, and for the same reason: its field is
 /// private and `Group::tenant_admission` is the only constructor, and a

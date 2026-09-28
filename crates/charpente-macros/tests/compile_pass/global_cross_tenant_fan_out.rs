@@ -1,6 +1,9 @@
 // The declared fan-out (job-tenancy spec §2 R5): a cron-scheduled
 // `global, cross_tenant` sweep reads every tenant and enqueues a scoped job
-// into each tenant it names, and so does a `cross_tenant` route.
+// into each tenant it names, and so does a `cross_tenant` route. The route
+// writes `tx.enqueue_in::<Org>(scope, job, cap)` exactly as the `NoJobTenant`
+// note teaches it, so the taught spelling is compiled, not only the inferred
+// one the sweep uses.
 use charpente::auth::Principal;
 use charpente::core::io::{Disk, Entropy};
 use charpente::http::{ApiError, App, AppConfig};
@@ -61,8 +64,9 @@ impl MaintenanceSweep {
 #[route(POST "/admin/sweep", auth, cross_tenant)]
 fn sweep_now(tx: &mut Tx, cap: &CrossTenant) -> Result<(), ApiError> {
     let windows = tx.across_tenants::<Org>(cap).scan::<Window>()?;
-    for (org, window) in windows {
-        tx.enqueue_in(org, ApplyWindow { window: window.id.raw() }, cap);
+    for (scope, window) in windows {
+        let job = ApplyWindow { window: window.id.raw() };
+        tx.enqueue_in::<Org>(scope, job, cap);
     }
     Ok(())
 }

@@ -187,9 +187,10 @@ mod scoped_jobs {
         type Who = Principal;
         type Error = ApiError;
         /// Never asked: every test here enqueues through the operator path or
-        /// a declared fan-out, and a job has no principal.
+        /// a declared fan-out, and a job has no principal. A panic, so every
+        /// test in this module checks that rather than assuming it.
         fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Desk>) -> Result<(), ApiError> {
-            Ok(())
+            panic!("a job has no principal — Desk::authorize is never asked")
         }
     }
 
@@ -200,7 +201,7 @@ mod scoped_jobs {
     }
 
     /// Writes one row in its tenant. An even `n` also hands its tenant a
-    /// scoped follow-up, and enqueues a global tally beside it.
+    /// scoped follow-up, keyed, and enqueues a global tally beside it.
     #[job(scoped_by = Desk)]
     pub struct File {
         pub n: u64,
@@ -213,7 +214,7 @@ mod scoped_jobs {
                 note: self.n,
             });
             if self.n.is_multiple_of(2) {
-                tx.enqueue(Stamp { n: self.n });
+                tx.enqueue_keyed(format!("stamp:{}", self.n), Stamp { n: self.n });
                 // `run` holds `&mut ScopedTx`, so the global deref is `**`.
                 (**tx).enqueue(Tally { n: self.n });
             }
@@ -400,9 +401,9 @@ mod scoped_jobs {
         assert_eq!((row.status, row.scope), (JobStatus::Dead, Some(7)));
     }
 
-    /// A scoped job's follow-up inherits its tenant through
-    /// `ScopedTx::enqueue`; a global job it enqueues through the deref carries
-    /// none.
+    /// A scoped job's follow-up inherits its tenant, and keeps its key,
+    /// through `ScopedTx::enqueue_keyed`; a global job it enqueues through the
+    /// deref carries none.
     #[test]
     fn a_scoped_jobs_follow_ups_carry_its_tenant_and_a_global_one_none() {
         let (_sim, mut app) = desk_app(0x5C0B_0003);
@@ -416,18 +417,23 @@ mod scoped_jobs {
         );
 
         let snap = db.snapshot().unwrap();
-        let rows: Vec<(String, Option<u64>, JobStatus)> = snap
+        let rows: Vec<(String, Option<String>, Option<u64>, JobStatus)> = snap
             .scan::<JobRow>()
             .unwrap()
             .into_iter()
-            .map(|r| (r.name, r.scope, r.status))
+            .map(|r| (r.name, r.key, r.scope, r.status))
             .collect();
         assert_eq!(
             rows,
             vec![
-                ("File".to_string(), Some(3), JobStatus::Done),
-                ("Stamp".to_string(), Some(3), JobStatus::Done),
-                ("Tally".to_string(), None, JobStatus::Done),
+                ("File".to_string(), None, Some(3), JobStatus::Done),
+                (
+                    "Stamp".to_string(),
+                    Some("stamp:2".to_string()),
+                    Some(3),
+                    JobStatus::Done
+                ),
+                ("Tally".to_string(), None, None, JobStatus::Done),
             ]
         );
         assert_eq!(

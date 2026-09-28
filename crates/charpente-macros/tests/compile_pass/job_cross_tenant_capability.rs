@@ -1,4 +1,4 @@
-// `#[job(cross_tenant)]` — the job half of spec §3's declared capability.
+// `#[job(global, cross_tenant)]` — the job half of spec §3's declared capability.
 // A declared job's `run` takes the token after `tx`; the glue `#[job]` emits
 // passes the one the dispatcher minted, so a background rollup can enumerate
 // every tenant for the same reason a declared route can.
@@ -47,7 +47,7 @@ impl Rollup {
     }
 }
 
-/// `#[job]` with no flag still calls `run(tx)`: the argument is added only by
+/// A job without `cross_tenant` still calls `run(tx)`: the argument is added only by
 /// the declaration, so every existing job keeps its signature.
 #[job(global)]
 struct Plain {

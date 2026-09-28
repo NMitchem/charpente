@@ -160,7 +160,8 @@ macro_rules! events {
 pub struct JobInfo {
     pub name: &'static str,
     pub retry: RetryInfo,
-    /// `#[job(cross_tenant)]` — see `RouteInfo::cross_tenant`. The inventory
+    /// `cross_tenant` on a job (`#[job(global, cross_tenant)]`, say) — see
+    /// `RouteInfo::cross_tenant`. The inventory
     /// covers both surfaces that receive a `Tx`, or it covers neither.
     pub cross_tenant: bool,
     pub builtin: bool,

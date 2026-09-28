@@ -234,7 +234,7 @@ pub trait UnscopedJob: Job + sealed::NotScopedJob {} // J::Scope: NoJobTenant<J>
 impl Tx<'_> {
     pub fn enqueue<J: UnscopedJob>(&mut self, job: J);
     pub fn enqueue_keyed<J: UnscopedJob>(&mut self, key: impl Into<String>, job: J);
-    pub fn enqueue_in<S: Tenant, J: Job<Scope = S>>(&mut self, scope: Id<S>, job: J, cap: &CrossTenant);
+    pub fn enqueue_in<S: Tenant>(&mut self, scope: Id<S>, job: impl Job<Scope = S>, cap: &CrossTenant); // A13
 }
 impl<S: 'static> ScopedTx<'_, '_, S> {  // shadows Tx::enqueue*, as ScopedTx::emit shadows emit
     pub fn enqueue<J: Job<Scope = S>>(&mut self, job: J);
@@ -269,8 +269,10 @@ the table marker's note gains a job case:
 `fn(&mut Tx, &[u8], Option<&CrossTenant>, Option<JobScope<'_>>) -> Result<(), JobError>`.
 `charpente::kernel::JobScope` holds the carried id and a `&TenantAdmission`, both private.
 Only the dispatcher constructs one, and its one method,
-`open<S: TenantScope>(self, tx: &'t mut Tx<'a>) -> ScopedTx<'t, 'a, S>`, opens that id. So a
-glue, generated or hand-written, can open only its enqueuer's tenant. `run_due_into` mints
+`open<S: TenantScope>(self, tx: &'t mut Tx<'a>) -> ScopedTx<'t, 'a, S>`, opens that id as
+the scope type its caller names. So a glue, generated or hand-written, can open only the
+tenant id its row carries; the generated glue opens it as the job's own `scoped_by` type, the
+one the row's fingerprint was checked against. `run_due_into` mints
 `group.tenant_admission()` beside `cap` (`dispatch.rs:201-203`). After the shape assert
 (`:229-238`) it asserts `row.scope.is_some() == def.scoped_by.is_some()`, which is hard rule
 4: §6's fingerprint mixing makes a mismatch unreachable. A scoped job's glue decodes as
@@ -549,3 +551,4 @@ answers, not an optional word.
 - **A10 — oracle 4's stripped replays are on all three routes.** A stripped replay on the `public(Shop)` route legitimately succeeds, so the oracle refuses a stripped write only on `auth` and plain `public`. That is exactly spec §9 item 4's "not declared `public(Org)`".
 - **A11 — `Stance` records `auth` too.** The drift probe does not enforce `auth`. An `auth` stream route that opens a scope therefore meets rule 3 under the probe, and the probe's `Err` quotes the rule-3 text. With `auth` recorded, that text names the route's real stance.
 - **A12 — Task 2 lands `TenantAdmission` and `Tx::admit_scope` before §11's second group.** Both are additive and neither is compile-forced, so the operator path exists before any caller needs it and every commit stays green.
+- **A13 — `enqueue_in` takes the job as `impl Job<Scope = S>`.** Spec §5 wrote `enqueue_in<S: Tenant, J: Job<Scope = S>>`, under which the `NoJobTenant` note's own fix, `tx.enqueue_in::<Org>(scope, job, cap)`, is E0107 (two type parameters, one supplied). With the job in argument position, `S` is the only nameable parameter and the taught spelling compiles; a compile-pass fixture now calls it exactly as taught.

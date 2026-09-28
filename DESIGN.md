@@ -598,7 +598,7 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   (tenant-scoping spec §3): the kernel mints a `CrossTenant` token for a route that declared
   it, `#[route]` fills the handler's `cap` argument from it, and `Tx::across_tenants::<S>
   (cap)` requires one — so a handler on a route that did not declare it cannot compile the
-  call, and `#[job(cross_tenant)]` says the same for a background rollup (whose `run` then
+  call, and `#[job(…, cross_tenant)]` says the same for a background rollup (whose `run` then
   takes the token after `tx`). The rows come back PAIRED WITH THEIR SCOPE —
   `AllTenants::scan` yields `Vec<(Id<Org>, Invoice)>`, never `Vec<Invoice>` — so a
   cross-tenant result cannot be handed to code expecting one tenant's data. Naming a tenant
@@ -1642,7 +1642,7 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   and `migrate_schema`'s watermark all carry the scope, and a binary compiled against the
   unscoped shape of a scoped table refuses the record **by name** rather than misreading it.
   Enumerating every tenant is possible and **declared, never silent**:
-  `#[route(…, cross_tenant)]` / `#[job(cross_tenant)]` mint the `CrossTenant` token
+  `#[route(…, cross_tenant)]` / `#[job(…, cross_tenant)]` mint the `CrossTenant` token
   `Tx::across_tenants::<S>(cap)` requires, rows come back paired with their scope
   (`Vec<(Id<Org>, Invoice)>`, never `Vec<Invoice>`), and `charpente describe` lists every
   route and job that declared it — an inventory, not a grep. That is a capability, not an

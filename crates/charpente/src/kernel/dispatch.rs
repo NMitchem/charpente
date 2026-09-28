@@ -64,10 +64,10 @@ impl fmt::Debug for JobError {
 pub struct JobDef {
     pub name: &'static str,
     pub retry: RetryPolicy,
-    /// `#[job(cross_tenant)]` — the same declared capability a route carries
-    /// (spec §3), for the background rollups that need it. `describe` lists
-    /// it beside the route flag, so the cross-tenant inventory covers jobs
-    /// too.
+    /// `cross_tenant` on a job (`#[job(global, cross_tenant)]`, say) — the
+    /// same declared capability a route carries (spec §3), for the background
+    /// rollups that need it. `describe` lists it beside the route flag, so the
+    /// cross-tenant inventory covers jobs too.
     pub cross_tenant: bool,
     /// `#[job(scoped_by = Org)]` — the scope type's last path segment, as
     /// `describe` lists it; `None` for a `global` job. Dispatch asserts that
@@ -95,15 +95,19 @@ pub type JobGlue =
 /// The tenant a scoped job was enqueued in, handed to its glue by the
 /// dispatcher and by nothing else (job-tenancy spec §5). Its fields are
 /// private and it has no public constructor, so a glue, generated or
-/// hand-written, can open exactly the tenant its row carries and no other.
+/// hand-written, can open only the tenant id its row carries. `open` takes
+/// the scope type from its caller, so what holds that id to the job's own
+/// scope type is the glue: the generated one opens it as the job's
+/// `scoped_by` type, the one the row's fingerprint was checked against, while
+/// a hand-written glue names its own.
 pub struct JobScope<'j> {
     id: u64,
     admission: &'j TenantAdmission,
 }
 
 impl JobScope<'_> {
-    /// Opens the enqueuer's tenant on the job's transaction, by the
-    /// dispatcher's admission. No `authorize` runs: a job has no principal.
+    /// Opens the enqueuer's tenant id, as scope type `S`, on the job's
+    /// transaction, by the dispatcher's admission. No `authorize` runs: a job has no principal.
     /// Its authority is its enqueuer's, who was either inside this tenant or
     /// declared `cross_tenant` to name it.
     pub fn open<'t, 'a, S: TenantScope>(self, tx: &'t mut Tx<'a>) -> ScopedTx<'t, 'a, S> {

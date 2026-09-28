@@ -165,7 +165,7 @@ the oracle, and the oracle is the product.
   scoped table refuses the record by name rather than misreading it. Realtime is the same mechanism rather than a second
   one: `emit` inside a scope is keyed by the scope. Enumerating every tenant is a
   **declared capability**, not an escape hatch — `#[route(…, cross_tenant)]` /
-  `#[job(cross_tenant)]` mint the token `Tx::across_tenants` requires, rows come back
+  `#[job(…, cross_tenant)]` mint the token `Tx::across_tenants` requires, rows come back
   paired with their scope, and `charpente describe` turns "audit the cross-tenant reads"
   into a mechanical inventory (DECISIONS §11). The flagship oracle is
   `every_scoped_read_returns_only_its_own_tenants_rows` — all four read paths, two tenants
