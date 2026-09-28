@@ -1282,10 +1282,11 @@ pub trait Tenant: Sized + 'static {
     /// The refusal an app returns; `open_scope` returns it unchanged.
     type Error;
 
-    /// `who` is `None` for an unauthenticated request and for a direct
-    /// `open_scope(scope, None)` call — an `authorize` that admits `None` has
-    /// declared anonymous access to that scope; refuse it unless that is
-    /// intended.
+    /// `who` is `None` only for a direct `open_scope(scope, None)` call: the
+    /// platform's `tx.scope` answers a caller with no credential with a 401
+    /// and never asks about nobody (job-tenancy spec §4). An `authorize`
+    /// that admits `None` admits exactly those direct calls; refuse it
+    /// unless that is intended.
     fn authorize(tx: &Tx<'_>, who: Option<&Self::Who>, scope: Id<Self>) -> Result<(), Self::Error>;
 }
 
@@ -1325,7 +1326,9 @@ impl<'a> Tx<'a> {
     /// primitives above, which are private.
     ///
     /// Apps call `tx.scope::<Org>(org, ctx)?` (`charpente::Scoped`), which
-    /// maps the request to `who` and delegates here. The name differs
+    /// delegates here with the request's principal as `who` — or to
+    /// `admit_scope` on a route declared `public(S)`, or to a 401 for a
+    /// caller with no credential (job-tenancy spec §4). The name differs
     /// because an inherent method shadows an extension trait's method of the
     /// same name, and the app-facing spelling is the one with the `Ctx`.
     ///
@@ -1528,8 +1531,13 @@ impl<'a> Group<'a> {
 
 // ------------------------------------------------------- admission
 
-/// Proof that the operator admitted this transaction into one tenant —
-/// `Tx::admit_scope`'s argument (job-tenancy spec §3, §7).
+/// Proof that the operator, or a route's `public(S)` declaration, admitted
+/// this transaction into one tenant — `Tx::admit_scope`'s argument
+/// (job-tenancy spec §3, §4, §7).
+///
+/// Holders: the operator, through a `Group`; and the platform, which mints
+/// one per request for a route declared `public(S)` and keeps it private in
+/// that request's `Ctx`, so `tx.scope::<S>` admits by the declaration.
 ///
 /// Sealed exactly as `CrossTenant` is, and for the same reason: its field is
 /// private and `Group::tenant_admission` is the only constructor, and a

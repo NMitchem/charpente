@@ -1,4 +1,4 @@
-error: `create_agent` declares neither `auth` nor `public` — a route says which callers reach it: write `#[route(POST "/agents/:id", auth)]` to require a principal (`ctx.principal()` is `Some`), or `#[route(POST "/agents/:id", public)]` to serve anonymous callers. Neither is the default.
+error: `create_agent` declares neither `auth` nor `public` — a route says which callers reach it: write `#[route(POST "/agents/:id", auth)]` to require a principal (`ctx.principal()` is `Some`), `#[route(POST "/agents/:id", public)]` to serve anonymous callers, or `#[route(POST "/agents/:id", public(Org))]` to also let every caller act inside the `Org` tenant it opens. None is the default.
   --> tests/compile_fail/helpdesk_route_neither_auth_nor_public.rs:46:14
    |
 46 | #[route(POST "/agents/:id")]

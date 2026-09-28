@@ -2822,6 +2822,7 @@ impl RouteDef for FailingFeed {
             method: Method::Get,
             pattern: "/feed-failing",
             auth: false,
+            public_scope: None,
             cross_tenant: false,
             name: "FailingFeed",
             glue: RouteGlue::Sse(failing_feed_glue),
@@ -4605,9 +4606,10 @@ impl Tenant for Org {
     type Who = Principal;
     type Error = ApiError;
 
-    /// Always allows: this property is about the platform's key derivation,
-    /// not the app's membership check — `charpente/tests/tenant.rs` owns the
-    /// refusing case.
+    /// Always allows, and the scoped routes below do not ask: they are
+    /// declared `public(Org)`. This property is about the platform's key
+    /// derivation, not the app's membership check — `charpente/tests/tenant.rs`
+    /// owns the refusing case.
     fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<Org>) -> Result<(), ApiError> {
         Ok(())
     }
@@ -4621,17 +4623,17 @@ struct ScopedEmitBody {
 
 /// The shape spec §1 prescribes: one `scope()` line, and every effect below it
 /// — reads, writes, and now emits — bounded to that tenant.
-#[route(POST "/scoped-ping", public)]
+#[route(POST "/scoped-ping", public(Org))]
 fn emit_scoped_ping(tx: &mut Tx, body: ScopedEmitBody, ctx: &Ctx) -> Result<(), ApiError> {
     let mut tx = tx.scope::<Org>(Id::from_raw(body.org.0), ctx)?;
     tx.emit(Ping { n: body.n });
     Ok(())
 }
 
-/// The subscriber half of the same mechanism: opening the scope both runs the
-/// app's `authorize` for the subscriber and yields the very key the emitter
-/// used, so the two sides cannot drift into two encodings.
-#[route(SSE "/scoped-feed/:org", public, emits(Ping))]
+/// The subscriber half of the same mechanism: opening the scope admits the
+/// subscriber by the route's `public(Org)` declaration and yields the very key
+/// the emitter used, so the two sides cannot drift into two encodings.
+#[route(SSE "/scoped-feed/:org", public(Org), emits(Ping))]
 fn scoped_feed(
     tx: &mut Tx,
     org: Id<Org>,
@@ -4851,13 +4853,13 @@ fn scoped_key_oracle(
 
 /// The naive victim, as a route rather than a core mutation so it can sit in
 /// the suite permanently. It opens the scope exactly as `emit_scoped_ping`
-/// does — `authorize` still runs, the row-level tenant bound still holds —
-/// and then reaches past `ScopedTx::emit` through the `DerefMut` to
+/// does — the declaration still admits, and the row-level tenant bound still
+/// holds — and then reaches past `ScopedTx::emit` through the `DerefMut` to
 /// `Tx::emit_keyed` with a FIXED key. That is precisely what `event_key`
 /// returning a constant produces, and it is the direction that LEAKS: the
 /// unkeyed `(*tx).emit(…)` naive fix fails closed instead (Task 11's commit
 /// message), so it is not the interesting victim.
-#[route(POST "/leaky-ping", public)]
+#[route(POST "/leaky-ping", public(Org))]
 fn emit_leaky_ping(tx: &mut Tx, body: ScopedEmitBody, ctx: &Ctx) -> Result<(), ApiError> {
     let mut tx = tx.scope::<Org>(Id::from_raw(body.org.0), ctx)?;
     tx.emit_keyed(SCOPED_TENANT_A_KEY.to_string(), Ping { n: body.n });

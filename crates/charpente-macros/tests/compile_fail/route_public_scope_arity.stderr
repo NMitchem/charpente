@@ -1,0 +1,23 @@
+error: `public(...)` names exactly one tenant scope type — write `public(Org)`, or plain `public` if anonymous callers enter no tenant here
+ --> tests/compile_fail/route_public_scope_arity.rs:8:19
+  |
+8 | #[route(GET "/a", public())]
+  |                   ^^^^^^
+
+error: `public(...)` names exactly one tenant scope type — write `public(Org)`, or plain `public` if anonymous callers enter no tenant here
+  --> tests/compile_fail/route_public_scope_arity.rs:14:19
+   |
+14 | #[route(GET "/b", public(Org, Team))]
+   |                   ^^^^^^
+
+error: `auth` and `public` on one route — a route is one or the other; drop one
+  --> tests/compile_fail/route_public_scope_arity.rs:20:25
+   |
+20 | #[route(GET "/c", auth, public(Org))]
+   |                         ^^^^^^
+
+error: `public` given twice — write it once
+  --> tests/compile_fail/route_public_scope_arity.rs:26:27
+   |
+26 | #[route(GET "/d", public, public(Org))]
+   |                           ^^^^^^

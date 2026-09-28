@@ -2,6 +2,8 @@
 //! literal beating a `:param` at the same position, and mount-time conflict
 //! detection — misrouting is a contract violation caught before traffic.
 
+use std::any::TypeId;
+
 use charpente_core::db::Tx;
 
 use crate::http::app::Ctx;
@@ -37,6 +39,10 @@ pub struct Route {
     pub method: Method,
     pub pattern: &'static str,
     pub auth: bool,
+    /// `public(Org)`: `Some` exactly when the route declared a public tenant
+    /// scope. Read by `stage_or_subscribe`, which mints the request's
+    /// `TenantAdmission` for this route only, and listed by `describe`.
+    pub public_scope: Option<PublicScope>,
     /// `#[route(…, cross_tenant)]` — the declared capability to enumerate a
     /// scoped table across every tenant (spec §3). Carried on the route so
     /// `charpente describe` can list every endpoint that can, and read by
@@ -88,6 +94,20 @@ pub struct Route {
 pub struct EmittedEvent {
     pub event: &'static str,
     pub payload: &'static str,
+}
+
+/// `#[route(…, public(Org))]` — the tenant scope every caller of this route,
+/// credentialed or not, may act inside (job-tenancy spec §4). `Scoped::scope`
+/// admits a scope of exactly this type by the declaration, with no
+/// `Tenant::authorize`; any other scope type the handler opens meets the
+/// membership check as on any route.
+#[derive(Clone, Copy, Debug)]
+pub struct PublicScope {
+    /// The scope type's last path segment, as the macro's refusals render it.
+    pub name: &'static str,
+    /// The scope type's `TypeId`, behind a fn pointer like `response` and
+    /// `error`, so a `Route` stays plain `'static` data and fn pointers.
+    pub type_id: fn() -> TypeId,
 }
 
 /// Implemented by the marker struct `#[route]` emits next to each handler,
@@ -264,6 +284,7 @@ mod tests {
             method,
             pattern,
             auth: false,
+            public_scope: None,
             cross_tenant: false,
             name,
             glue: RouteGlue::Http(ok),

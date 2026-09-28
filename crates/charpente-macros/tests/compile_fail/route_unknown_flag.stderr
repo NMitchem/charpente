@@ -1,4 +1,4 @@
-error: a route flag is `auth`, `public`, `cross_tenant` or `emits(Ev, …)` — write `#[route(GET "/path", auth)]`, `#[route(GET "/path", public)]`, or `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`
+error: a route flag is `auth`, `public`, `public(<Scope>)`, `cross_tenant` or `emits(Ev, …)` — write `#[route(GET "/path", auth)]`, `#[route(GET "/path", public)]`, `#[route(GET "/orgs/:org/status", public(Org))]`, or `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`
   --> tests/compile_fail/route_unknown_flag.rs:11:27
    |
 11 | #[route(GET "/x", public, cached)]

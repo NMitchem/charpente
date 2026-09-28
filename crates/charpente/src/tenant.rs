@@ -17,7 +17,8 @@
 //! The guarantee is about the typed surface the framework hands app logic. A
 //! handler and a job receive a `Tx`; through a `Tx`, a scoped table is
 //! unreachable without `tx.scope::<Org>(org, ctx)?`, which runs that tenant's
-//! own `authorize` before it hands back anything that can read or write. That
+//! own `authorize` — or, on a route declared `public(Org)`, admits by that
+//! declaration — before it hands back anything that can read or write. That
 //! is the property a reviewer can check by reading one line per handler, and
 //! it is enforced by the compiler rather than by convention.
 //!
@@ -42,10 +43,10 @@ use crate::http::{ApiError, Ctx};
 /// `Tenant` for a scope type is what earns it — there is nothing to write
 /// here directly.
 ///
-/// `who` is `None` for an unauthenticated request and for a direct
-/// `Tx::open_scope(scope, None)` call — an `authorize` that admits `None` has
-/// declared anonymous access to that scope; refuse it unless that is
-/// intended.
+/// `who` is `None` only for a direct `Tx::open_scope(scope, None)` call.
+/// `tx.scope` never passes `None`: rule 3 answers a caller with no credential
+/// with a 401 instead (`Scoped::scope`). So an `authorize` that admits `None`
+/// admits exactly those direct calls.
 ///
 /// It is a named trait rather than the bound spelled out at each use because
 /// `#[table(scoped_by = Org)]`'s const assert names it
@@ -86,15 +87,28 @@ pub trait Scoped<'a> {
 }
 
 impl<'a> Scoped<'a> for Tx<'a> {
-    /// The whole body: map the request context to the `who` core's `Tenant`
-    /// hook asks about, and delegate. `authorize` runs inside `open_scope`,
-    /// the only constructor of `ScopedTx` — this trait supplies the `Ctx`,
-    /// not the check.
+    /// The three rules, in order (job-tenancy spec §4):
+    ///
+    /// 1. The route declared `public(S)` for this `S`: admitted by that
+    ///    declaration, and no `authorize` runs, whoever the caller is.
+    /// 2. A principal is present: `open_scope` runs `S::authorize` once,
+    ///    about that principal, and its refusal is the answer.
+    /// 3. Otherwise, the named 401, and nothing below the scope line runs.
+    ///
+    /// An `auth` route never reaches rule 3, because `build_ctx` refused the
+    /// anonymous caller before the handler ran. So the platform never asks
+    /// `authorize` about nobody.
     fn scope<S: TenantScope>(
         &mut self,
         scope: Id<S>,
         ctx: &Ctx,
     ) -> Result<ScopedTx<'_, 'a, S>, ApiError> {
-        self.open_scope(scope, ctx.principal())
+        if let Some(admission) = ctx.public_admission::<S>() {
+            return Ok(self.admit_scope(scope, admission));
+        }
+        match ctx.principal() {
+            Some(principal) => self.open_scope(scope, Some(principal)),
+            None => Err(ctx.anonymous_scope::<S>()),
+        }
     }
 }

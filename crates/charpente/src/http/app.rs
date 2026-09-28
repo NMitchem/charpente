@@ -1,6 +1,7 @@
 //! The app kernel: sessions inside the commit point (DESIGN §8), and `App` —
 //! the owner of the `Db` that turns each request into one transaction.
 
+use std::any::TypeId;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::io;
@@ -8,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use charpente_core::db::{
-    CrossTenant, Db, DbConfig, Group, Job, JobShapeRefusal, Schema, Tx, TxError,
+    CrossTenant, Db, DbConfig, Group, Job, JobShapeRefusal, Schema, TenantAdmission, Tx, TxError,
 };
 use charpente_core::io::{Disk, Entropy};
 use charpente_core::table::{Id, View};
@@ -19,7 +20,7 @@ use crate::auth::{
     ApiKey, AuthReject, OidcConfig, OidcVerifier, Presented, Principal, Via, hash_token, resolve,
 };
 use crate::describe::EventDef;
-use crate::http::router::{RouteGlue, RouteMatch, Router};
+use crate::http::router::{PublicScope, RouteGlue, RouteMatch, Router};
 use crate::http::{ApiError, Cursor, Request, Response, Route, Subscription, hex};
 use crate::kernel::JobDef;
 use crate::kernel::JobEntry;
@@ -91,6 +92,11 @@ pub struct Ctx {
     /// route, which is why `cap()` is an `Option`: an undeclared route
     /// carries no capability, not a dormant one.
     cap: Option<CrossTenant>,
+    /// The matched route's stance (job-tenancy spec §4): the admission a
+    /// `public(S)` route carries, and the site and declaration rule 3's 401
+    /// quotes. Private, and never exposed — a handler cannot reach the
+    /// admission, only `Scoped::scope` can.
+    stance: Stance,
 }
 
 impl Ctx {
@@ -109,6 +115,48 @@ impl Ctx {
     /// route to the token.
     pub fn cap(&self) -> Option<&CrossTenant> {
         self.cap.as_ref()
+    }
+
+    /// Rule 1 of `Scoped::scope` (job-tenancy spec §4): the admission this
+    /// request carries when its route declared `public(S)` for exactly this
+    /// `S`. `None` otherwise, including on a `public(Org)` route that opens
+    /// some other scope type, which then meets rules 2 and 3 like any route.
+    pub(crate) fn public_admission<S: 'static>(&self) -> Option<&TenantAdmission> {
+        match &self.stance.public {
+            Some((declared, admission)) if (declared.type_id)() == TypeId::of::<S>() => {
+                Some(admission)
+            }
+            _ => None,
+        }
+    }
+
+    /// Rule 3's refusal: a caller with no credential reached a scope line
+    /// that its route did not declare `public(S)` for. Names the contract,
+    /// the site, and both fixes, the caller's and the author's (hard rule 5).
+    pub(crate) fn anonymous_scope<S>(&self) -> ApiError {
+        let Stance {
+            method,
+            pattern,
+            auth,
+            public,
+        } = &self.stance;
+        let declared = match public {
+            Some((scope, _)) => format!("public({})", scope.name),
+            None if *auth => "auth".to_string(),
+            None => "public".to_string(),
+        };
+        // The last path segment, as `decode_body` renders a type.
+        let scope = std::any::type_name::<S>()
+            .rsplit("::")
+            .next()
+            .unwrap_or("the scope type");
+        ApiError::AnonymousScope(format!(
+            "authentication required — `{method} {pattern}` is declared `{declared}` and \
+             opened the tenant scope `{scope}` for a caller with no credential; only a route \
+             declared `public({scope})` admits one. Send \"Authorization: Bearer <token>\" or \
+             the charpente_session cookie, or, if every caller may act inside this tenant \
+             here, declare `#[route({method} \"{pattern}\", public({scope}))]`"
+        ))
     }
 
     /// Compatibility accessor: the `Session` row, only when the principal
@@ -170,6 +218,58 @@ impl Ctx {
              mint per request"
         );
     }
+}
+
+/// A matched route's declaration, copied out of the router: the half of a
+/// `Stance` that needs no `Group` (job-tenancy amendment A3). It is split
+/// from `Stance` so the drift probe can read it before `App::begin_group`
+/// borrows the whole `App`, the reason the probe already reads
+/// `cross_tenant` first.
+#[derive(Clone, Copy)]
+struct Declared {
+    /// `SSE` for a stream route, else the HTTP method: the word the route was
+    /// declared with, which the 401's site and its fix both quote.
+    method: &'static str,
+    pattern: &'static str,
+    auth: bool,
+    public_scope: Option<PublicScope>,
+}
+
+impl Declared {
+    fn of(route: &Route) -> Declared {
+        Declared {
+            method: match route.glue {
+                RouteGlue::Sse(_) => "SSE",
+                RouteGlue::Http(_) => route.method.name(),
+            },
+            pattern: route.pattern,
+            auth: route.auth,
+            public_scope: route.public_scope,
+        }
+    }
+
+    /// Mints the admission for a `public(S)` route, and only for one.
+    fn admitted(self, group: &Group) -> Stance {
+        Stance {
+            method: self.method,
+            pattern: self.pattern,
+            auth: self.auth,
+            public: self
+                .public_scope
+                .map(|scope| (scope, group.tenant_admission())),
+        }
+    }
+}
+
+/// What `Scoped::scope` reads off the route to apply its three rules.
+struct Stance {
+    method: &'static str,
+    pattern: &'static str,
+    /// Recorded for the 401's text only (amendment A11): the drift probe
+    /// does not enforce `auth`, so an `auth` stream route that opens a scope
+    /// meets rule 3 there, and its text must name the real stance.
+    auth: bool,
+    public: Option<(PublicScope, TenantAdmission)>,
 }
 
 // ---------------------------------------------------------------- app
@@ -524,7 +624,11 @@ impl App {
     /// Three deliberate departures from a real request, all so the probe can
     /// reach EVERY stream route rather than only the trivially reachable
     /// ones: `auth` is not enforced (no credential is presented and none is
-    /// demanded, so an `auth` stream route is probeable); each `:param` is
+    /// demanded, so an `auth` stream route is probeable) — unless it opens a
+    /// tenant scope: with no principal, `tx.scope` meets rule 3 exactly as a
+    /// request would, and the probe reports the route as not probeable,
+    /// quoting that 401. A `public(S)` route's admission is minted for the
+    /// probe as it is for a request; each `:param` is
     /// fed the literal `"0"`, which parses for every `FromParam` the
     /// platform ships (`u64`, `String`, `Id<T>`); and the fresh-token slot
     /// is a fixed literal rather than an `Entropy` draw, so probing cannot
@@ -552,10 +656,12 @@ impl App {
         // than hardcoded to `None`, so probing a declared stream route gives
         // its handler the same `Ctx` a request would.
         let declares_cross_tenant = found.cross_tenant;
+        let declared = Declared::of(found);
         let (mut group, _) = self
             .begin_group()
             .map_err(|e| format!("route `{route}`: the probe could not open a group: {e}"))?;
         let cap = declares_cross_tenant.then(|| group.cross_tenant_cap());
+        let stance = declared.admitted(&group);
         let staged = group.stage(|tx| {
             let ctx = build_ctx(
                 tx,
@@ -566,6 +672,7 @@ impl App {
                 session_ttl,
                 None,
                 cap,
+                stance,
             )?;
             glue(tx, &ctx, &captures, None)
         });
@@ -731,6 +838,10 @@ impl<'a> StagedDispatch<'a> {
         // cross-tenant listing an inventory rather than a hint (spec §3,
         // `CrossTenant`).
         let cap = route.cross_tenant.then(|| group.cross_tenant_cap());
+        // Beside the capability, for the same reason: a `public(S)` route's
+        // admission is minted from the `Group`, which a handler never holds
+        // (job-tenancy spec §4).
+        let stance = Declared::of(route).admitted(group);
         let glue = route.glue;
         let cursor = match glue {
             RouteGlue::Sse(_) => match extract_cursor(&request) {
@@ -759,6 +870,7 @@ impl<'a> StagedDispatch<'a> {
                         session_ttl,
                         oidc,
                         cap.clone(),
+                        stance,
                     )?;
                     glue(tx, &ctx, &captures, &request.body)
                 });
@@ -775,6 +887,7 @@ impl<'a> StagedDispatch<'a> {
                         session_ttl,
                         oidc,
                         cap.clone(),
+                        stance,
                     )?;
                     glue(tx, &ctx, &captures, cursor)
                 });
@@ -802,9 +915,10 @@ pub enum Handled {
 /// `resolve` itself never produces this: it returns `Ok(None)` for "nothing
 /// presented"), and builds the `Ctx` the handler sees. `oidc` is the mounted
 /// verifier (spec §3) — `None` until `App::with_oidc` runs.
-// One more independent request fact than clippy's limit, each already its
-// own argument: the declared capability joins the credential, the auth gate,
-// the fresh token, the clock reading, the TTL and the verifier. Bundling
+// Two more independent request facts than clippy's limit, each already its
+// own argument: the declared capability and the route's stance join the
+// credential, the auth gate, the fresh token, the clock reading, the TTL and
+// the verifier. Bundling
 // them into a struct would name no concept the kernel otherwise has —
 // `crate::repl::session`'s ladder carries the same allow for the same
 // reason.
@@ -818,6 +932,7 @@ fn build_ctx(
     session_ttl: u64,
     oidc: Option<&OidcVerifier>,
     cap: Option<CrossTenant>,
+    stance: Stance,
 ) -> Result<Ctx, ApiError> {
     let principal = resolve(tx, presented, oidc, now).map_err(|reject| match reject {
         AuthReject::Unrecognized => ApiError::UnrecognizedCredential,
@@ -843,6 +958,7 @@ fn build_ctx(
         session_ttl,
         created: Cell::new(false),
         cap,
+        stance,
     })
 }
 

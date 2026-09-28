@@ -139,8 +139,8 @@ snapshot shipper. A TypeScript client generator has since shipped too
 ([docs/GUIDE.md](docs/GUIDE.md) §14) — SSE only, no WebSocket transport — and so has
 tenant scoping, where a tenant is a typed key prefix enforced by the compiler rather than
 a `where` clause anyone can forget ([docs/GUIDE.md](docs/GUIDE.md) §16), and since
-2026-09-16 the platform asks: a route says `auth` or `public`, a table says `scoped_by` or
-`global`, and neither is a default. What is *not* built, so you don't have to go looking:
+2026-09-16 the platform asks: a route says `auth`, `public` or `public(Org)`, a table says
+`scoped_by` or `global`, and neither is a default. What is *not* built, so you don't have to go looking:
 no blob store and no WebSockets.
 
 ## Try it

@@ -673,10 +673,12 @@ call covered in §4.
 ### The `#[route]` argument convention
 
 `#[route(METHOD "/path/:param", ...)]` goes on a free function (`METHOD` is
-one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `SSE`; exactly one of `, auth`
-/ `, public` follows the path — a route says which callers reach it, and a
-route that says neither is a compile error naming both; `auth` is covered
-under Sessions below). The macro checks the
+one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `SSE`; exactly one of `, auth`,
+`, public` or `, public(Org)` follows the path — a route says which callers
+reach it, and `public(Org)` adds that every caller may act inside the `Org`
+tenant it opens (see "A route's stance" below); a route that says none is a
+compile error naming all three; `auth` is covered under Sessions below). The
+macro checks the
 function's argument list against the path and emits the glue that extracts,
 decodes, and dispatches to it:
 
@@ -925,7 +927,9 @@ request's credential into a `Principal`, in this order:
 
 `#[route(METHOD "/path", auth)]` rejects the request before your handler runs
 when the principal is `None`. With `public`, the route always runs and
-`ctx.principal()` is whatever the ladder resolved (possibly `None`) — but a
+`ctx.principal()` is whatever the ladder resolved (possibly `None`) — though a
+handler that then opens a tenant scope with no principal gets a 401 of its
+own, unless the route declared `public(Org)` (below) — but a
 *presented* credential is still resolved and rejected even on a public
 route, so a garbage bearer never reaches a handler.
 
@@ -1051,6 +1055,45 @@ OIDC token has audience "<presented>" but this server is configured for audience
 The replication port has its own peer-authentication secret, unrelated to
 this request-side auth — see §10.
 
+### A route's stance, and who reaches a tenant
+
+Every route declares one of three stances after its path, and the stance decides what
+`tx.scope::<Org>(org, ctx)?` (§16) does for each caller:
+
+| Stance | Who reaches the handler | What the scope line does |
+|---|---|---|
+| `auth` | a caller with a credential | runs `Org::authorize` once, about that principal |
+| `public` | every caller | with a credential, the same; with none, the 401 below |
+| `public(Org)` | every caller | admits every caller into the `Org` tenant it names; no `authorize` runs |
+
+The scope line applies three rules, in order:
+
+1. If the route declared `public(S)` for this very `S`, the scope is admitted by that
+   declaration. No `authorize` runs, whoever the caller is. A credentialed caller whose
+   membership check would refuse is admitted too: the route said every caller may act
+   here.
+2. Otherwise, with a principal present, `S::authorize` runs once, about that principal,
+   and its `Err` is the handler's `Err`.
+3. Otherwise the caller has no credential, and the request is answered 401, by name.
+   Nothing below the scope line runs.
+
+An `auth` route never reaches rule 3, because the `auth` gate refused the anonymous caller
+before your handler ran. So your `authorize` is only ever asked about a real principal. A
+`public(Org)` route that opens a *different* scope type gets rules 2 and 3 for it, and the
+401 names `public(Org)` as the route's stance.
+
+The rule-3 401, for a `POST /orgs/:org/incidents` declared plain `public`:
+
+<!-- pinned -->
+```text
+authentication required — `POST /orgs/:org/incidents` is declared `public` and opened the tenant scope `Org` for a caller with no credential; only a route declared `public(Org)` admits one. Send "Authorization: Bearer <token>" or the charpente_session cookie, or, if every caller may act inside this tenant here, declare `#[route(POST "/orgs/:org/incidents", public(Org))]`
+```
+
+The site is the word the route was declared with (`SSE` for a stream) and its pattern;
+the scope is the type's own name. Both fixes are there: the caller's (send a credential)
+and the author's (declare the tenant public, if that really is the policy). §16's "Who
+reaches a tenant" shows the three side by side.
+
 ### `ApiError` and status mapping
 
 A handler rejects with `ApiError`; `From<io::Error> for ApiError` converts
@@ -1064,8 +1107,11 @@ value:
 - The 401 family → 401. Auth rejections, produced before your handler runs
   (the resolution ladder, above): `Unauthorized` (no credential),
   `UnrecognizedCredential`, `SessionExpired`, and `Oidc(..)` (one per failed
-  OIDC check). Their exact, named texts are in the auth section above — you
-  rarely construct these yourself; the `auth` gate and the ladder emit them.
+  OIDC check); and, at the scope line inside it, `AnonymousScope(..)`, a
+  scope line reached with no credential on a route that did not declare that
+  tenant public (above). Their exact, named texts are in the auth and stance
+  sections above — you rarely construct these yourself; the `auth` gate, the
+  ladder and `tx.scope` emit them.
 - `NotFound` → 404. Fixed message `"not found"` — the same text an
   unmatched path gets from the router directly.
 - `Internal(String)` → 500. Carries `e.to_string()` when it arrived via
@@ -1242,7 +1288,7 @@ first is the one every route meets once:
 
 <!-- pinned -->
 ```text
-`<handler>` declares neither `auth` nor `public` — a route says which callers reach it: write `#[route(<method> "<path>", auth)]` to require a principal (`ctx.principal()` is `Some`), or `#[route(<method> "<path>", public)]` to serve anonymous callers. Neither is the default.
+`<handler>` declares neither `auth` nor `public` — a route says which callers reach it: write `#[route(<method> "<path>", auth)]` to require a principal (`ctx.principal()` is `Some`), `#[route(<method> "<path>", public)]` to serve anonymous callers, or `#[route(<method> "<path>", public(Org))]` to also let every caller act inside the `Org` tenant it opens. None is the default.
 `auth` and `public` on one route — a route is one or the other; drop one
 `public` given twice — write it once
 ```
@@ -2738,7 +2784,7 @@ fields on a table with durable data; add new fields, or write a v1 schema
 ### `#[route]` argument-convention violations (`charpente-macros/src/route.rs`, compile time)
 
 ```text
-`<handler>` declares neither `auth` nor `public` — a route says which callers reach it: write `#[route(<method> "<path>", auth)]` to require a principal (`ctx.principal()` is `Some`), or `#[route(<method> "<path>", public)]` to serve anonymous callers. Neither is the default.
+`<handler>` declares neither `auth` nor `public` — a route says which callers reach it: write `#[route(<method> "<path>", auth)]` to require a principal (`ctx.principal()` is `Some`), `#[route(<method> "<path>", public)]` to serve anonymous callers, or `#[route(<method> "<path>", public(Org))]` to also let every caller act inside the `Org` tenant it opens. None is the default.
 `auth` and `public` on one route — a route is one or the other; drop one
 `public` given twice — write it once
 a #[route] handler's first argument must be `tx: &mut Tx` — `ping` is missing it
@@ -2747,7 +2793,8 @@ this argument must be named `id` to match :id in "/notes/:id" — got `key`
 route path must start with '/' — got "notes"
 unknown method PUSH — one of GET, POST, PUT, PATCH, DELETE, SSE
 the route path must be a string literal — e.g. #[route(GET "/notes/:id", auth)]
-a route flag is `auth`, `public`, `cross_tenant` or `emits(Ev, …)` — write `#[route(GET "/path", auth)]`, `#[route(GET "/path", public)]`, or `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`
+a route flag is `auth`, `public`, `public(<Scope>)`, `cross_tenant` or `emits(Ev, …)` — write `#[route(GET "/path", auth)]`, `#[route(GET "/path", public)]`, `#[route(GET "/orgs/:org/status", public(Org))]`, or `#[route(SSE "/path", emits(NoteAdded, NoteRemoved))]`
+`public(...)` names exactly one tenant scope type — write `public(Org)`, or plain `public` if anonymous callers enter no tenant here
 emits(...) applies to SSE routes only — a plain route returns one response, not a stream of events; drop emits(...) or make this `#[route(SSE "…")]`
 emits(...) must name at least one #[event] type — write `emits(NoteAdded, NoteRemoved)`, or drop it
 emits takes a parenthesized list of #[event] types — write `emits(NoteAdded, NoteRemoved)`
@@ -2758,7 +2805,7 @@ emits takes a parenthesized list of #[event] types — write `emits(NoteAdded, N
 `NoteAdded` is named twice in emits(...) — a stream declares each event type once, and a repeat would put the same member in a generated client's union twice; write it once
 #[route] handlers are free functions — no `self`
 empty :param name in "/notes/:"
-write `#[route(METHOD "/path", auth | public)]` — e.g. #[route(GET "/notes/:id", auth)]
+write `#[route(METHOD "/path", auth | public | public(<Scope>))]` — e.g. #[route(GET "/notes/:id", auth)]
 ```
 
 §5's "What `#[route]` rejects" pins the first three and walks through the
@@ -2766,7 +2813,8 @@ next three with full examples. The rest, in order: the path literal
 doesn't start with `/`; the method name isn't one of
 `GET`/`POST`/`PUT`/`PATCH`/`DELETE`/`SSE`; the path isn't a string literal
 at all (e.g. a `const`); a flag after the path is none of `auth`, `public`,
-`cross_tenant`, `emits(...)`; `emits(...)` is on a route that isn't a
+`public(<Scope>)`, `cross_tenant`, `emits(...)`; `public(...)` names no scope
+type, or more than one; `emits(...)` is on a route that isn't a
 stream (only an SSE route has events to declare — see §11); `emits()` names
 nothing at all; `emits` was written without its parentheses; `auth` or
 `emits(...)` appears twice on the same route (a flag is a yes/no and a route
@@ -3457,7 +3505,7 @@ bare `tx.emit` for events only an unkeyed (global) subscription should tail.
 
 Inside a tenant scope you do not choose. `tx.emit` on a `ScopedTx` — the handle
 `tx.scope::<Org>(org, ctx)?` returns — is *itself* keyed, with the scope's own
-key, so a transaction that had to pass `authorize` to reach a tenant's rows
+key, so a transaction that had to be admitted to reach a tenant's rows
 cannot hand that tenant's event to another tenant's subscription:
 
 ```rust,ignore
@@ -3469,7 +3517,7 @@ The subscriber side uses the same `event_key`, so the two sides cannot drift
 into two spellings of one tenant:
 
 ```rust,ignore
-#[route(SSE "/feed/:org", public, emits(NoteAdded))]
+#[route(SSE "/feed/:org", auth, emits(NoteAdded))]
 fn feed(tx: &mut Tx, org: Id<Org>, ctx: &Ctx, cursor: Option<Cursor>)
     -> Result<Subscription, ApiError>
 {
@@ -5577,8 +5625,8 @@ Multi-tenancy here is a property of the *types*, not a rule everyone has to
 remember. A scoped table's key is the `(scope, id)` composite and every one of
 its secondary-index entries carries the same prefix, so a tenant is a key
 prefix rather than a `where` clause; and the only way a handler or a job can
-reach one of those rows is a handle that the app's own membership check had to
-hand back. A scoped read attempted on a bare `Tx` is a compile error, not a 500
+reach one of those rows is a handle that the app's own membership check — or
+the route's own `public(Org)` declaration — had to hand back. A scoped read attempted on a bare `Tx` is a compile error, not a 500
 and not a leak. (What that guarantee does *not* cover — an operator holding the
 `Db` — is the last subsection here, and it is a boundary, not an oversight.)
 
@@ -5591,6 +5639,9 @@ The shape of an app that uses it:
   none — a bare `#[table]` does not compile;
 - exactly one line per handler, `let tx = tx.scope::<Org>(org, ctx)?;`, after
   which everything reads and writes inside that tenant.
+- each route that opens a scope says who may: `auth` or `public`, where the
+  membership check decides for each principal, or `public(Org)`, where every
+  caller may by declaration (§5, "A route's stance").
 
 ### Declaring a scope and a scoped table
 
@@ -5616,8 +5667,9 @@ impl Tenant for Org {
 
     /// Runs once per `tx.scope::<Org>(…)`, and it is the app's own policy —
     /// the platform never derives a tenant from a subject, a header or a row
-    /// field. `who` is `None` for an unauthenticated request: an `authorize`
-    /// that admits `None` has declared anonymous access to that scope.
+    /// field. A caller with no credential never reaches it: `tx.scope`
+    /// answers that caller 401, unless the route declared `public(Org)` (§5),
+    /// and then it admits without asking.
     fn authorize(_tx: &Tx, who: Option<&Principal>, scope: Id<Org>) -> Result<(), ApiError> {
         match who {
             Some(p) if p.subject == format!("org:{}", scope.raw()) => Ok(()),
@@ -5668,6 +5720,75 @@ Three things that fall out of that, worth stating plainly:
 - **Ids stay globally unique and app-minted.** The key prefix is what separates
   tenants, not id re-use, so two tenants may hold the same `Id<Memo>` and the
   same `#[index]` value without colliding.
+
+### Who reaches a tenant: membership or declaration
+
+A tenant is entered one of two ways, and never on an anonymous caller's word:
+
+- **By membership.** On an `auth` or `public` route, `tx.scope` runs your `authorize`
+  about the caller's principal. A caller with no credential gets the 401 from §5, not a
+  call to `authorize` with nobody in it.
+- **By declaration.** `public(Org)` on the route says every caller may act inside the org
+  the handler opens. `tx.scope::<Org>` then admits without asking. The operator path in
+  "Where the guarantee stops" below is the other declared way in.
+
+```rust
+use charpente::auth::Principal;
+use charpente::http::{ApiError, Ctx};
+use charpente::wire::WireU64;
+use charpente::{Id, Scoped, Tenant, Tx, route, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, who: Option<&Principal>, scope: Id<Org>) -> Result<(), ApiError> {
+        match who {
+            Some(p) if p.subject == format!("operator:{}", scope.raw()) => Ok(()),
+            _ => Err(ApiError::BadRequest(format!(
+                "not an operator of org {}",
+                scope.raw()
+            ))),
+        }
+    }
+}
+
+#[table(scoped_by = Org)]
+struct Incident {
+    id: Id<Incident>,
+    title: String,
+}
+
+/// Operators only: `Org::authorize` runs once, about the caller.
+#[route(POST "/orgs/:org/incidents/:id", auth)]
+fn open_incident(
+    tx: &mut Tx,
+    org: Id<Org>,
+    id: Id<Incident>,
+    title: String,
+    ctx: &Ctx,
+) -> Result<WireU64, ApiError> {
+    let mut tx = tx.scope::<Org>(org, ctx)?;
+    tx.put(&Incident { id, title });
+    Ok(WireU64(id.raw()))
+}
+
+/// The public status page: every caller, with a credential or without,
+/// reads inside the org it names, and no `authorize` runs.
+#[route(GET "/orgs/:org/status", public(Org))]
+fn status_page(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(WireU64(tx.scan::<Incident>()?.len() as u64))
+}
+```
+
+Flip `open_incident` to plain `public` and it still refuses every anonymous write: the
+scope line is rule 3, whatever `authorize` would have said about nobody.
 
 ### What a `ScopedTx` gives you
 

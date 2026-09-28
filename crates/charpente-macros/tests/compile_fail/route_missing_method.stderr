@@ -1,4 +1,4 @@
-error: write `#[route(METHOD "/path", auth | public)]` — e.g. #[route(GET "/notes/:id", auth)]
+error: write `#[route(METHOD "/path", auth | public | public(<Scope>))]` — e.g. #[route(GET "/notes/:id", auth)]
   --> tests/compile_fail/route_missing_method.rs:10:9
    |
 10 | #[route("/x", auth)]

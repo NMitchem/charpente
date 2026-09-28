@@ -7,6 +7,11 @@
 //! auditable line per handler actually calls the app back, and that its
 //! refusal is what the client gets.
 //!
+//! Job tenancy (docs/superpowers/specs/2026-09-27-job-tenancy-design.md §4,
+//! oracles 2 and 3) adds the route's stance: `public(Org)` admits by
+//! declaration with no `authorize`, and a caller with no credential at any
+//! other scope line gets a named 401 instead of a call about nobody.
+//!
 //! It also carries the sub-project's flagship swarm property (hard rule 3):
 //! across the full fault matrix, and after every recovery, every scoped read
 //! returns ONLY its own tenant's rows — `get`, `scan`, `scan_from` and
@@ -15,14 +20,16 @@
 //! is the fault-injection oracle they shipped without, and the two naive
 //! victims below it are what make its greenness mean something.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::{Cell, RefCell};
 
 use charpente::auth::Principal;
-use charpente::http::{ApiError, App, AppConfig, Ctx, Method, Request, Response};
+use charpente::http::{
+    ApiError, App, AppConfig, Ctx, Cursor, Method, Request, Response, Subscription,
+};
 use charpente::wire::WireU64;
 use charpente::{
-    CrossTenant, Db, DbConfig, Schema, Scoped, ScopedTx, Snapshot, Tenant, Tx, TxError, route,
-    routes, table,
+    CrossTenant, Db, DbConfig, Schema, Scoped, ScopedTx, Snapshot, Tenant, Tx, TxError, event,
+    route, routes, table,
 };
 use charpente_core::io::Entropy;
 use charpente_core::log::WalConfig;
@@ -52,22 +59,46 @@ struct Org {
 const ADMITTED: u64 = 1;
 const REFUSED: u64 = 2;
 
-/// Counts entries into `authorize`, so the test can assert the check ran at
-/// all — an assertion on the status code alone would also pass if the platform
-/// refused for its own reasons and never asked the app.
-static AUTHORIZE_CALLS: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// The subject of every call into `Org::authorize`, in order — `"<nobody>"`
+    /// for a call with no principal. So a test asserts that the check ran at
+    /// all AND whom it was asked about: a status code alone would also pass if
+    /// the platform refused for its own reasons and never asked the app.
+    ///
+    /// Thread-local, not a static (job-tenancy amendment A4): seven tests read
+    /// these, `cargo test` runs them on parallel threads of one binary, and a
+    /// request is handled on the thread that called `App::handle`.
+    static AUTHORIZE_CALLS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 
-/// Counts handler bodies that got PAST `scope()`. This is the "no scoped read
-/// happened" half: a refusal that still let the body run would leave this
-/// nonzero even with the response mapped to 401.
-static BODIES_ENTERED: AtomicU64 = AtomicU64::new(0);
+    /// Handler bodies that got PAST `scope()`. The "no scoped read happened"
+    /// half: a refusal that still let the body run would leave this nonzero
+    /// even with the response mapped to an error.
+    static BODIES_ENTERED: Cell<u64> = const { Cell::new(0) };
+}
+
+fn reset_counters() {
+    AUTHORIZE_CALLS.with(|calls| calls.borrow_mut().clear());
+    BODIES_ENTERED.with(|n| n.set(0));
+}
+
+fn authorize_calls() -> Vec<String> {
+    AUTHORIZE_CALLS.with(|calls| calls.borrow().clone())
+}
+
+fn bodies_entered() -> u64 {
+    BODIES_ENTERED.with(Cell::get)
+}
 
 impl Tenant for Org {
     type Who = Principal;
     type Error = ApiError;
 
-    fn authorize(_tx: &Tx, _who: Option<&Principal>, scope: Id<Org>) -> Result<(), ApiError> {
-        AUTHORIZE_CALLS.fetch_add(1, Ordering::Relaxed);
+    fn authorize(_tx: &Tx, who: Option<&Principal>, scope: Id<Org>) -> Result<(), ApiError> {
+        AUTHORIZE_CALLS.with(|calls| {
+            calls
+                .borrow_mut()
+                .push(who.map_or_else(|| "<nobody>".to_string(), |p| p.subject.clone()))
+        });
         if scope.raw() == ADMITTED {
             Ok(())
         } else {
@@ -88,10 +119,11 @@ struct Memo {
 /// The shape spec §1 prescribes: one `scope()` line, everything below it
 /// bounded to that tenant. Returns the tenant's row count BEFORE the write, so
 /// a body that ran when it should not have is visible in the response too.
-#[route(POST "/memo/:org", public)]
-fn write_memo(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError> {
+/// Shared by the stance twins below, so they differ in their declaration and
+/// nothing else.
+fn memo_write(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError> {
     let mut tx = tx.scope::<Org>(org, ctx)?;
-    BODIES_ENTERED.fetch_add(1, Ordering::Relaxed);
+    BODIES_ENTERED.with(|n| n.set(n.get() + 1));
     let before = tx.scan::<Memo>()?.len() as u64;
     tx.put(&Memo {
         id: Id::from_raw(7),
@@ -100,12 +132,92 @@ fn write_memo(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError>
     Ok(WireU64(before))
 }
 
+/// Members only: rule 2, with the `auth` gate in front of it.
+#[route(POST "/memo/:org", auth)]
+fn write_memo(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    memo_write(tx, org, ctx)
+}
+
+/// Every caller reaches the handler; the membership check decides the
+/// tenant (rule 2), and a caller with no credential gets rule 3's 401.
+#[route(POST "/memo-public/:org", public)]
+fn write_memo_public(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    memo_write(tx, org, ctx)
+}
+
+/// Every caller may act inside the org it names: rule 1, no membership check.
+#[route(POST "/memo-open/:org", public(Org))]
+fn write_memo_open(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    memo_write(tx, org, ctx)
+}
+
+/// Declared `public(Org)`, but it opens `Team`: the declaration names one scope
+/// type and admits that type only.
+#[route(POST "/memo-team/:team", public(Org))]
+fn write_team_memo(tx: &mut Tx, team: Id<Team>, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let tx = tx.scope::<Team>(team, ctx)?;
+    BODIES_ENTERED.with(|n| n.set(n.get() + 1));
+    Ok(WireU64(tx.scope().raw()))
+}
+
 /// Reads one tenant's rows back, so the refused tenant's emptiness is checked
 /// on the store and not only on the counters.
-#[route(GET "/memo/:org", public)]
+#[route(GET "/memo/:org", auth)]
 fn count_memos(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError> {
     let tx = tx.scope::<Org>(org, ctx)?;
     Ok(WireU64(tx.scan::<Memo>()?.len() as u64))
+}
+
+#[event]
+struct MemoNoted {
+    n: WireU64,
+}
+
+/// A stream route that opens a scope. Driven through `App::handle`, which has
+/// no sink for a subscription, so the only answers it can give a test are its
+/// errors — which is all rule 3 needs.
+#[route(SSE "/memo-feed/:org", public, emits(MemoNoted))]
+fn memo_feed(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(Subscription::of::<MemoNoted>()
+        .key(tx.event_key())
+        .cursor(cursor))
+}
+
+#[route(SSE "/memo-feed-open/:org", public(Org), emits(MemoNoted))]
+fn memo_feed_open(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(Subscription::of::<MemoNoted>()
+        .key(tx.event_key())
+        .cursor(cursor))
+}
+
+#[route(SSE "/memo-feed-auth/:org", auth, emits(MemoNoted))]
+fn memo_feed_auth(
+    tx: &mut Tx,
+    org: Id<Org>,
+    ctx: &Ctx,
+    cursor: Option<Cursor>,
+) -> Result<Subscription, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(Subscription::of::<MemoNoted>()
+        .key(tx.event_key())
+        .cursor(cursor))
+}
+
+#[route(POST "/memo-login", public)]
+fn memo_login(tx: &mut Tx, subject: String, ctx: &Ctx) -> Result<String, ApiError> {
+    Ok(ctx.create_session(tx, subject))
 }
 
 fn memo_app(seed: u64) -> (Sim, App) {
@@ -117,16 +229,48 @@ fn memo_app(seed: u64) -> (Sim, App) {
         AppConfig::default(),
     )
     .unwrap()
-    .mount(routes![write_memo, count_memos]);
+    .mount(routes![
+        memo_login,
+        write_memo,
+        write_memo_public,
+        write_memo_open,
+        write_team_memo,
+        count_memos,
+        memo_feed,
+        memo_feed_open,
+        memo_feed_auth
+    ]);
     (sim, app)
+}
+
+/// Logs `subject` in and returns its bearer token. The login is one write
+/// record, which the `last_applied` assertions below count.
+fn login(app: &mut App, subject: &str) -> String {
+    let response = app.handle(Request::new(Method::Post, "/memo-login").json(&subject));
+    assert_eq!(response.status, 200, "{}", body_text(&response));
+    serde_json::from_slice(&response.body).unwrap()
+}
+
+fn as_user(request: Request, token: &str) -> Request {
+    request.header("Authorization", format!("Bearer {token}"))
+}
+
+/// The `error` field of the `{"error": …}` envelope every non-200 carries.
+fn error_text(response: &Response) -> String {
+    let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    body["error"]
+        .as_str()
+        .expect("a non-200 body is an error envelope")
+        .to_string()
 }
 
 fn body_text(response: &Response) -> String {
     String::from_utf8(response.body.clone()).unwrap()
 }
 
-/// A refusing `authorize` is what the client gets, and nothing below the
-/// `scope()` line runs.
+/// Oracle 2 (e). A refusing `authorize` is what the client gets, and nothing
+/// below the `scope()` line runs — now on `auth` routes, where the caller is
+/// always a principal, so the assertion can name WHICH principal was asked.
 ///
 /// Four of its assertions go RED if the `S::authorize(...)?` call disappears
 /// from `Tx::open_scope`, the single place it runs — this one from the app's
@@ -137,25 +281,31 @@ fn body_text(response: &Response) -> String {
 #[test]
 fn a_refusing_authorize_is_the_answer_and_nothing_below_the_scope_line_runs() {
     let (_sim, mut app) = memo_app(0x7E4A_1701);
-    AUTHORIZE_CALLS.store(0, Ordering::Relaxed);
-    BODIES_ENTERED.store(0, Ordering::Relaxed);
+    let token = login(&mut app, "alice");
+    reset_counters();
 
     // Positive control first: the admitted tenant proves the route works, so a
     // 400 below is the membership verdict and not a broken handler.
-    let admitted = app.handle(Request::new(Method::Post, format!("/memo/{ADMITTED}")));
+    let admitted = app.handle(as_user(
+        Request::new(Method::Post, format!("/memo/{ADMITTED}")),
+        &token,
+    ));
     assert_eq!(admitted.status, 200, "{}", body_text(&admitted));
     assert_eq!(
-        AUTHORIZE_CALLS.load(Ordering::Relaxed),
-        1,
-        "opening a scope must call the app's own authorize, exactly once"
+        authorize_calls(),
+        vec!["alice".to_string()],
+        "opening a scope must call the app's own authorize, exactly once, about the caller"
     );
     assert_eq!(
-        BODIES_ENTERED.load(Ordering::Relaxed),
+        bodies_entered(),
         1,
         "an admitted tenant's handler body runs"
     );
 
-    let refused = app.handle(Request::new(Method::Post, format!("/memo/{REFUSED}")));
+    let refused = app.handle(as_user(
+        Request::new(Method::Post, format!("/memo/{REFUSED}")),
+        &token,
+    ));
     assert_eq!(
         refused.status,
         400,
@@ -168,13 +318,14 @@ fn a_refusing_authorize_is_the_answer_and_nothing_below_the_scope_line_runs() {
         "the client gets the refusal `authorize` returned, byte for byte"
     );
     assert_eq!(
-        AUTHORIZE_CALLS.load(Ordering::Relaxed),
-        2,
-        "the refused request must have ASKED the app — a platform-side refusal \
-         that never called authorize would pass a status-code assertion alone"
+        authorize_calls(),
+        vec!["alice".to_string(), "alice".to_string()],
+        "the refused request must have ASKED the app, about this principal — a \
+         platform-side refusal that never called authorize would pass a status-code \
+         assertion alone"
     );
     assert_eq!(
-        BODIES_ENTERED.load(Ordering::Relaxed),
+        bodies_entered(),
         1,
         "no handler body ran past the refused `scope()` line"
     );
@@ -182,7 +333,10 @@ fn a_refusing_authorize_is_the_answer_and_nothing_below_the_scope_line_runs() {
     // And on the store: the refused tenant has no rows, so no scoped write or
     // read reached it. Asked through the ADMITTED tenant's own scope, since
     // asking through the refused one is (correctly) impossible.
-    let admitted_rows = app.handle(Request::new(Method::Get, format!("/memo/{ADMITTED}")));
+    let admitted_rows = app.handle(as_user(
+        Request::new(Method::Get, format!("/memo/{ADMITTED}")),
+        &token,
+    ));
     assert_eq!(admitted_rows.status, 200, "{}", body_text(&admitted_rows));
     assert_eq!(
         body_text(&admitted_rows),
@@ -191,8 +345,183 @@ fn a_refusing_authorize_is_the_answer_and_nothing_below_the_scope_line_runs() {
     );
     assert_eq!(
         app.db().last_applied(),
+        Some(1),
+        "exactly two write records, the login and the admitted memo: the refused \
+         request appended nothing"
+    );
+}
+
+/// Oracle 2 (a), spec §4 rule 3. A caller with no credential on a plain
+/// `public` route reaches the handler, but not the tenant: the scope line
+/// answers the named 401, no `authorize` runs (there is no principal to ask
+/// about), and nothing below the line runs or writes.
+#[test]
+fn an_anonymous_caller_on_a_plain_public_route_that_opens_a_scope_gets_the_named_401() {
+    let (_sim, mut app) = memo_app(0x7E4A_1702);
+    reset_counters();
+    let refused = app.handle(Request::new(
+        Method::Post,
+        format!("/memo-public/{ADMITTED}"),
+    ));
+    assert_eq!(refused.status, 401, "{}", body_text(&refused));
+    assert_eq!(
+        error_text(&refused),
+        "authentication required — `POST /memo-public/:org` is declared `public` and opened \
+         the tenant scope `Org` for a caller with no credential; only a route declared \
+         `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
+         charpente_session cookie, or, if every caller may act inside this tenant here, \
+         declare `#[route(POST \"/memo-public/:org\", public(Org))]`"
+    );
+    assert_eq!(
+        authorize_calls(),
+        Vec::<String>::new(),
+        "rule 3 refuses before any membership check — authorize is never asked about nobody"
+    );
+    assert_eq!(bodies_entered(), 0, "nothing below the scope line ran");
+    assert_eq!(app.db().last_applied(), None, "and nothing was written");
+}
+
+/// Oracle 2 (d), rule 2 on a plain `public` route: a caller WITH a credential
+/// is asked about exactly once, as on an `auth` route. The control for (a):
+/// the 401 there is about the missing credential, not about the route.
+#[test]
+fn a_credentialed_caller_on_a_plain_public_route_is_asked_about_once() {
+    let (_sim, mut app) = memo_app(0x7E4A_1704);
+    let token = login(&mut app, "alice");
+    reset_counters();
+    let admitted = app.handle(as_user(
+        Request::new(Method::Post, format!("/memo-public/{ADMITTED}")),
+        &token,
+    ));
+    assert_eq!(admitted.status, 200, "{}", body_text(&admitted));
+    assert_eq!(authorize_calls(), vec!["alice".to_string()]);
+    assert_eq!(bodies_entered(), 1);
+}
+
+/// Oracle 2 (g). Rule 3 on a stream: the site in the 401 is the word the
+/// route was declared with, `SSE`, not the `GET` it is served on — the fix it
+/// quotes must be an attribute the author can paste.
+#[test]
+fn an_anonymous_subscriber_that_opens_a_scope_gets_the_401_naming_the_stream() {
+    let (_sim, mut app) = memo_app(0x7E4A_1707);
+    reset_counters();
+    let refused = app.handle(Request::new(Method::Get, format!("/memo-feed/{ADMITTED}")));
+    assert_eq!(refused.status, 401, "{}", body_text(&refused));
+    assert_eq!(
+        error_text(&refused),
+        "authentication required — `SSE /memo-feed/:org` is declared `public` and opened the \
+         tenant scope `Org` for a caller with no credential; only a route declared \
+         `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
+         charpente_session cookie, or, if every caller may act inside this tenant here, \
+         declare `#[route(SSE \"/memo-feed/:org\", public(Org))]`"
+    );
+    assert_eq!(authorize_calls(), Vec::<String>::new());
+}
+
+/// Oracle 2 (b), rule 1: a `public(Org)` route admits a caller with no
+/// credential into the org it names, and asks no membership check.
+#[test]
+fn public_scope_admits_an_anonymous_caller_with_no_authorize() {
+    let (_sim, mut app) = memo_app(0x7E4A_1703);
+    reset_counters();
+    let admitted = app.handle(Request::new(Method::Post, format!("/memo-open/{ADMITTED}")));
+    assert_eq!(admitted.status, 200, "{}", body_text(&admitted));
+    assert_eq!(
+        authorize_calls(),
+        Vec::<String>::new(),
+        "rule 1: the declaration admits, and no membership check runs"
+    );
+    assert_eq!(bodies_entered(), 1);
+    assert_eq!(
+        app.db().last_applied(),
         Some(0),
-        "exactly one write record: the refused request appended nothing"
+        "the admitted write committed"
+    );
+}
+
+/// Oracle 2 (c), rule 1 before rule 2, and Review Focus 5: on `public(Org)`
+/// the declaration beats the membership check. A credentialed caller whose
+/// `authorize` WOULD refuse this tenant is admitted with zero calls, and the
+/// same caller on the route's `auth` twin is refused by the app's own error.
+#[test]
+fn public_scope_admits_a_credentialed_caller_its_membership_check_would_refuse() {
+    let (_sim, mut app) = memo_app(0x7E4A_1705);
+    let token = login(&mut app, "alice");
+    reset_counters();
+
+    let control = app.handle(as_user(
+        Request::new(Method::Post, format!("/memo/{REFUSED}")),
+        &token,
+    ));
+    assert_eq!(control.status, 400, "{}", body_text(&control));
+    assert_eq!(
+        error_text(&control),
+        "org 2 is not one of this principal's orgs"
+    );
+    assert_eq!(authorize_calls(), vec!["alice".to_string()]);
+    assert_eq!(bodies_entered(), 0);
+
+    reset_counters();
+    let admitted = app.handle(as_user(
+        Request::new(Method::Post, format!("/memo-open/{REFUSED}")),
+        &token,
+    ));
+    assert_eq!(admitted.status, 200, "{}", body_text(&admitted));
+    assert_eq!(
+        authorize_calls(),
+        Vec::<String>::new(),
+        "the route said every caller may act in this org, so nobody's membership is asked — \
+         not even a principal's"
+    );
+    assert_eq!(bodies_entered(), 1);
+}
+
+/// Oracle 2 (f). `public(Org)` admits `Org` scopes only. The route below opens
+/// `Team`, so an anonymous caller meets rule 3, and the 401 names the stance
+/// the route really declared.
+#[test]
+fn public_scope_for_one_scope_type_does_not_admit_another() {
+    let (_sim, mut app) = memo_app(0x7E4A_1706);
+    reset_counters();
+    let refused = app.handle(Request::new(Method::Post, "/memo-team/5"));
+    assert_eq!(refused.status, 401, "{}", body_text(&refused));
+    assert_eq!(
+        error_text(&refused),
+        "authentication required — `POST /memo-team/:team` is declared `public(Org)` and \
+         opened the tenant scope `Team` for a caller with no credential; only a route \
+         declared `public(Team)` admits one. Send \"Authorization: Bearer <token>\" or the \
+         charpente_session cookie, or, if every caller may act inside this tenant here, \
+         declare `#[route(POST \"/memo-team/:team\", public(Team))]`"
+    );
+    assert_eq!(bodies_entered(), 0);
+}
+
+/// Spec §4: the `emits(...)` drift probe meets the three rules exactly as a
+/// request does. A `public(Org)` stream is probeable, because the probe mints
+/// the admission a request would. The probe presents no credential and does
+/// not enforce `auth`, so on a plain `public` or an `auth` stream the scope
+/// line is rule 3, and the probe's refusal quotes the route's real stance
+/// (amendment A11).
+#[test]
+fn the_drift_probe_meets_the_three_rules_as_a_request_does() {
+    let (_sim, mut app) = memo_app(0x7E4A_1708);
+    assert_eq!(
+        app.subscription_event_names("memo_feed_open"),
+        Ok(vec!["memo_noted"])
+    );
+    let public = app.subscription_event_names("memo_feed").unwrap_err();
+    assert!(
+        public.contains(
+            "`SSE /memo-feed/:org` is declared `public` and opened the tenant scope `Org`"
+        ),
+        "{public}"
+    );
+    let auth = app.subscription_event_names("memo_feed_auth").unwrap_err();
+    assert!(
+        auth.contains(
+            "`SSE /memo-feed-auth/:org` is declared `auth` and opened the tenant scope `Org`"
+        ),
+        "{auth}"
     );
 }
 
@@ -200,13 +529,9 @@ fn a_refusing_authorize_is_the_answer_and_nothing_below_the_scope_line_runs() {
 
 /// The swarm property's own scope type, deliberately NOT `Org`.
 ///
-/// Two mechanical reasons, neither stylistic. `Org::authorize` admits exactly
-/// one tenant (`ADMITTED`) and must keep refusing `REFUSED`, so it cannot
-/// host the N >= 2 writable tenants a leak is only expressible with. And
-/// `AUTHORIZE_CALLS`/`BODIES_ENTERED` are process-wide statics that the unit
-/// test above resets and then asserts are exactly 1 — a swarm running
-/// thousands of `Org::authorize` calls on another thread of the same test
-/// binary would make that assertion flake.
+/// `Org::authorize` admits exactly one tenant (`ADMITTED`) and must keep
+/// refusing `REFUSED`, so it cannot host the N >= 2 writable tenants a leak
+/// is only expressible with.
 ///
 /// `Firm` admits every tenant: this property is about the row BOUND, not
 /// about the membership check, which the unit test above owns.
@@ -883,7 +1208,7 @@ struct NoteRow {
     note: Id<Note>,
 }
 
-#[route(PUT "/note/:team/:id", public)]
+#[route(PUT "/note/:team/:id", public(Team))]
 fn write_note(tx: &mut Tx, team: Id<Team>, id: Id<Note>, ctx: &Ctx) -> Result<WireU64, ApiError> {
     let mut tx = tx.scope::<Team>(team, ctx)?;
     tx.put(&Note {
@@ -895,7 +1220,7 @@ fn write_note(tx: &mut Tx, team: Id<Team>, id: Id<Note>, ctx: &Ctx) -> Result<Wi
 
 /// One tenant's view, for the contrast the assertion needs: the same table,
 /// read through a scope, must still see only its own tenant.
-#[route(GET "/note/:team", public)]
+#[route(GET "/note/:team", public(Team))]
 fn count_notes(tx: &mut Tx, team: Id<Team>, ctx: &Ctx) -> Result<WireU64, ApiError> {
     let tx = tx.scope::<Team>(team, ctx)?;
     Ok(WireU64(tx.scan::<Note>()?.len() as u64))
@@ -1065,4 +1390,110 @@ fn tenant_zero_is_a_real_tenant_to_a_cross_tenant_read() {
          scope 0 is a tenant like any other"
     );
     group.commit().unwrap();
+}
+
+// ------------------------------------------ the statuspage regression (oracle 3)
+
+/// Job-tenancy spec §9 item 3. The statuspage experiment's tenant policy, in
+/// the shape of `6037704:src/lib.rs:31-59`: `authorize` ADMITS `None`,
+/// because its public page, its public feed and its jobs all opened an org
+/// with `open_scope(org, None)`. Its finding I-1: the same policy made every
+/// `auth` write one word away from an anonymous write. Flip `open_incident`
+/// from `auth` to `public`, and any anonymous caller opens incidents in any
+/// org. Under the three rules the flipped route meets rule 3, and the store
+/// is unchanged.
+mod statuspage {
+    use charpente::auth::Principal;
+    use charpente::http::{ApiError, Ctx};
+    use charpente::wire::WireU64;
+    use charpente::{Id, Scoped, Tenant, Tx, route, table};
+
+    #[table(global)]
+    pub struct Org {
+        pub id: Id<Org>,
+        pub name: String,
+    }
+
+    impl Tenant for Org {
+        type Who = Principal;
+        type Error = ApiError;
+
+        fn authorize(_tx: &Tx, who: Option<&Principal>, scope: Id<Org>) -> Result<(), ApiError> {
+            let Some(principal) = who else {
+                return Ok(());
+            };
+            if principal.subject == format!("operator:{}", scope.raw()) {
+                Ok(())
+            } else {
+                Err(ApiError::BadRequest(format!(
+                    "{} is not an operator of org {}",
+                    principal.subject,
+                    scope.raw()
+                )))
+            }
+        }
+    }
+
+    #[table(scoped_by = Org)]
+    pub struct Incident {
+        pub id: Id<Incident>,
+        pub title: String,
+    }
+
+    #[derive(charpente::Wire, serde::Serialize, serde::Deserialize)]
+    pub struct OpenIncidentBody {
+        pub title: String,
+    }
+
+    /// `6037704:src/incidents.rs:335-357`'s route, with I-1's one-word edit
+    /// (`auth` became `public`) and its body reduced to the write.
+    #[route(POST "/orgs/:org/incidents", public)]
+    pub fn open_incident(
+        tx: &mut Tx,
+        org: Id<Org>,
+        body: OpenIncidentBody,
+        ctx: &Ctx,
+    ) -> Result<WireU64, ApiError> {
+        let mut tx = tx.scope::<Org>(org, ctx)?;
+        tx.put(&Incident {
+            id: Id::from_raw(1),
+            title: body.title,
+        });
+        Ok(WireU64(1))
+    }
+}
+
+#[test]
+fn statuspage_i1_an_incident_route_flipped_to_public_refuses_every_anonymous_write() {
+    let sim = Sim::with_faults(0x7E4A_1709, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<statuspage::Incident>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![statuspage::open_incident]);
+
+    let refused = app.handle(Request::new(Method::Post, "/orgs/1/incidents").json(
+        &statuspage::OpenIncidentBody {
+            title: "database down".to_string(),
+        },
+    ));
+    assert_eq!(refused.status, 401, "{}", body_text(&refused));
+    // This literal is also GUIDE §5's pinned rule-3 block: doc_truth finds
+    // the guide's text here.
+    assert_eq!(
+        error_text(&refused),
+        "authentication required — `POST /orgs/:org/incidents` is declared `public` and \
+         opened the tenant scope `Org` for a caller with no credential; only a route declared \
+         `public(Org)` admits one. Send \"Authorization: Bearer <token>\" or the \
+         charpente_session cookie, or, if every caller may act inside this tenant here, \
+         declare `#[route(POST \"/orgs/:org/incidents\", public(Org))]`"
+    );
+    assert_eq!(
+        app.db().last_applied(),
+        None,
+        "the store is unchanged: no incident, and no record of one"
+    );
 }

@@ -1399,10 +1399,11 @@ impl Tenant for Org {
     type Who = Principal;
     type Error = ApiError;
 
-    /// Always allows: this property is about the platform's isolation
-    /// guarantee, not the app's membership check — `charpente/tests/tenant.rs`
-    /// owns the refusing case. The check that matters here is that reaching a
-    /// scoped row required coming through this function at all.
+    /// Always allows, and `post` does not even ask: it is declared
+    /// `public(Org)`, so the swarm's credential-free clients enter any tenant by
+    /// the declaration (job-tenancy spec §4). This property is about the
+    /// platform's isolation guarantee, not the app's membership check —
+    /// `charpente/tests/tenant.rs` owns the refusing case.
     fn authorize(_tx: &Tx, _who: Option<&Principal>, _scope: Id<Org>) -> Result<(), ApiError> {
         Ok(())
     }
@@ -1448,7 +1449,7 @@ struct Post {
 /// The only scoped write in the swarm, and the shape spec §1 prescribes:
 /// one `scope()` line, every table access below it bounded to that tenant by
 /// construction.
-#[route(POST "/post", public)]
+#[route(POST "/post", public(Org))]
 fn post(tx: &mut Tx, body: Post, ctx: &Ctx) -> Result<WireU64, ApiError> {
     let tenant = body.tenant.0;
     let id = body.id.0;

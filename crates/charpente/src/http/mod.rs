@@ -9,7 +9,9 @@ mod app;
 mod router;
 
 pub use app::{App, AppConfig, Ctx, Handled, Session, StagedDispatch};
-pub use router::{EmittedEvent, Glue, Route, RouteDef, RouteGlue, RouteMatch, Router, SubGlue};
+pub use router::{
+    EmittedEvent, Glue, PublicScope, Route, RouteDef, RouteGlue, RouteMatch, Router, SubGlue,
+};
 
 /// Not public API: the kernel's batched commit-failure tail needs the exact
 /// 500 the single-request path produces (group-commit T6).
@@ -353,6 +355,10 @@ pub enum ApiError {
     /// per-check 401 text lives on `OidcReject` itself (spec §6); this
     /// variant is the one mapping seam from `AuthReject::Oidc`.
     Oidc(OidcReject),
+    /// No credential presented, at a tenant scope line the route did not
+    /// declare `public(S)` for (job-tenancy spec §4, rule 3). The text is
+    /// built by `Ctx`, because it quotes the route's site and stance.
+    AnonymousScope(String),
     NotFound,
     Internal(String),
 }
@@ -407,6 +413,7 @@ impl ApiError {
             ),
             ApiError::SessionExpired => Response::error(401, "session expired — log in again"),
             ApiError::Oidc(reject) => Response::error(401, &reject.to_string()),
+            ApiError::AnonymousScope(msg) => Response::error(401, msg),
             ApiError::NotFound => Response::error(404, "not found"),
             ApiError::Internal(msg) => Response::error(500, msg),
         }

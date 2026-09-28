@@ -564,7 +564,8 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   `impl Tenant` with its own `authorize`; `scoped_by` without one is a compile error at the
   struct. The six scope-taking primitives on `Tx` are private to `charpente-core`, so the
   ONE way to reach a scoped row is `tx.scope::<Org>(org, ctx)?` — the single auditable line
-  per handler — which runs the app's `authorize` before it returns the `ScopedTx` that
+  per handler — which runs the app's `authorize` (or, on a route declared `public(Org)`,
+  admits by that declaration) before it returns the `ScopedTx` that
   `get`/`scan`/`scan_from`/`scan_by`/`put`/`delete` live on. Both the marker
   (`NoTenant`) and the trait `View` actually bounds on (`UnscopedRow`) are sealed, so an app
   cannot re-open a scoped table with one orphan-legal line; a scoped read on a bare `Tx` is an
@@ -577,7 +578,7 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   referencing a field that no longer exists — the mechanism below is for what Rust
   cannot see: a same-length field swap or retype that recompiles clean and misdecodes on
   disk.
-- **Routes (v0 implemented).** `#[route(METHOD "/path/:param", auth | public[, cross_tenant])]` —
+- **Routes (v0 implemented).** `#[route(METHOD "/path/:param", auth | public | public(Org)[, cross_tenant])]` —
   handler args: `tx: &mut Tx`, one per `:param` (same name, path order), at most one JSON
   body arg, optional `cap: &CrossTenant` (see below), optional trailing `ctx: &Ctx`
   (session access); return `Result<T: Serialize, ApiError>`.
@@ -592,7 +593,11 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   `AllTenants::scan` yields `Vec<(Id<Org>, Invoice)>`, never `Vec<Invoice>` — so a
   cross-tenant result cannot be handed to code expecting one tenant's data. Naming a tenant
   needs no capability: a point read already supplies the scope. A route declares exactly
-  one of `auth`/`public`; neither is a compile error naming both.
+  one of `auth`, `public` or `public(Org)`; none is a compile error naming all three.
+  `public(Org)` declares that every caller, credentialed or not, may act inside the `Org`
+  tenant the handler opens, with no `authorize` (spec 2026-09-27-job-tenancy §4). On any
+  other route, a scope line reached with no credential is a named 401, so `authorize` is
+  only ever asked about a real principal.
 - **Jobs.** `#[job(global)]` structs with typed payloads and typed retry policy. Enqueue
   sites and handler signatures are checked against each other.
 - **Events.** `#[event]` structs; `tx.emit(...)` is typed; subscribers (server-side and
@@ -1592,7 +1597,11 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   `#[table(scoped_by = Org)]` makes `(scope, id)` the row key and prefixes every index
   entry, and the scope-taking primitives are private, so a scoped row is reachable only
   through `tx.scope::<Org>(org, ctx)?` — which runs the app's own `Tenant::authorize`
-  first, and whose refusal is the app's own `ApiError`. A table that declares neither
+  first, and whose refusal is the app's own `ApiError`. A tenant is entered by membership
+  (a principal, through `authorize`) or by declaration (`public(Org)` on the route, or the
+  operator's `TenantAdmission`), never by an anonymous `None`. A caller with no credential
+  at a scope line its route did not declare `public(Org)` for gets a named 401 (spec
+  2026-09-27-job-tenancy §4). A table that declares neither
   `scoped_by` nor `global` does not compile: which tables are tenant data is the app's
   declaration at every struct, never the platform's inference (default-secure,
   2026-09-16; the field-type inference was weighed and rejected — the membership table
