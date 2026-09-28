@@ -17,7 +17,7 @@ use std::io;
 use charpente_core::db::{Db, DbConfig, Event, Job, Schema, Tx};
 use charpente_core::event::EventRow;
 use charpente_core::job::{JobRow, JobStatus};
-use charpente_core::table::{Codec, View};
+use charpente_core::table::{Codec, Unscoped, View};
 use charpente_sim::{FaultConfig, Sim};
 
 struct Ping;
@@ -30,6 +30,7 @@ impl Codec for Ping {
 impl Job for Ping {
     const NAME: &'static str = "ping";
     const FINGERPRINT: u64 = 0x7E57_0009;
+    type Scope = Unscoped;
 }
 
 struct TestEvent {

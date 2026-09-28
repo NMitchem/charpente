@@ -49,8 +49,9 @@ use std::path::{Path, PathBuf};
 /// declaration refusals (2026-09-16); 18 with payload shapes' reshaped frame
 /// and 409, 19 with its `charpente.error` frame, 20 with its Pending-job
 /// refusal, 21 with its enqueue refusal (2026-09-24); 22 with job tenancy's
-/// rule-3 401 (2026-09-28).
-const PINNED_FLOOR: usize = 22;
+/// rule-3 401 (2026-09-28); 24 with job tenancy's bare-`#[job]` refusal and
+/// `NoJobTenant` note blocks (2026-09-28).
+const PINNED_FLOOR: usize = 24;
 
 /// Below this a fragment is not evidence — `usage:` or `id: 1.0` would match
 /// almost any corpus. Long enough that a coincidental hit is implausible,

@@ -1,0 +1,47 @@
+error[E0277]: `Org` is used as a tenant scope but has no `Tenant` impl
+  --> tests/compile_fail/job_scoped_by_missing_tenant_scope.rs:13:19
+   |
+13 | #[job(scoped_by = Org)]
+   |                   ^^^ no `impl Tenant for Org`
+   |
+help: the trait `TenantScope` is not implemented for `Org`
+  --> tests/compile_fail/job_scoped_by_missing_tenant_scope.rs:7:1
+   |
+ 7 | #[table(global)]
+   | ^^^^^^^^^^^^^^^^
+   = note: a tenant scope needs the app's own membership check; add:
+           impl Tenant for Org {
+               type Who = Principal;
+               type Error = ApiError;
+               fn authorize(tx: &Tx, who: &Principal, scope: Id<Self>) -> Result<(), ApiError> { … }
+           }
+note: required by a bound in `__charpente_assert_tenant_scope`
+  --> tests/compile_fail/job_scoped_by_missing_tenant_scope.rs:13:1
+   |
+13 | #[job(scoped_by = Org)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `__charpente_assert_tenant_scope`
+   = note: this error originates in the attribute macro `table` which comes from the expansion of the attribute macro `job` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `Org` is used as a tenant scope but has no `Tenant` impl
+  --> tests/compile_fail/job_scoped_by_missing_tenant_scope.rs:13:19
+   |
+13 | #[job(scoped_by = Org)]
+   |                   ^^^ no `impl Tenant for Org`
+   |
+help: the trait `TenantScope` is not implemented for `Org`
+  --> tests/compile_fail/job_scoped_by_missing_tenant_scope.rs:7:1
+   |
+ 7 | #[table(global)]
+   | ^^^^^^^^^^^^^^^^
+   = note: a tenant scope needs the app's own membership check; add:
+           impl Tenant for Org {
+               type Who = Principal;
+               type Error = ApiError;
+               fn authorize(tx: &Tx, who: &Principal, scope: Id<Self>) -> Result<(), ApiError> { … }
+           }
+note: required by a bound in `JobScope::<'_>::open`
+  --> $WORKSPACE/crates/charpente/src/kernel/dispatch.rs
+   |
+   |     pub fn open<'t, 'a, S: TenantScope>(self, tx: &'t mut Tx<'a>) -> ScopedTx<'t, 'a, S> {
+   |                            ^^^^^^^^^^^ required by this bound in `JobScope::<'_>::open`
+   = note: this error originates in the attribute macro `table` (in Nightly builds, run with -Z macro-backtrace for more info)

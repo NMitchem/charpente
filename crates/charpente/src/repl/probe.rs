@@ -373,7 +373,7 @@ mod tests {
     use std::rc::Rc;
 
     use charpente_core::io::Listener;
-    use charpente_core::table::Codec;
+    use charpente_core::table::{Codec, Unscoped};
 
     use super::*;
     use crate::repl::role::Role;
@@ -407,6 +407,7 @@ mod tests {
     impl Job for Ping {
         const NAME: &'static str = "probe-test-ping";
         const FINGERPRINT: u64 = 0x7E57_0008;
+        type Scope = Unscoped;
     }
 
     /// A db with one committed record, so `last_applied` is `Some` — needed

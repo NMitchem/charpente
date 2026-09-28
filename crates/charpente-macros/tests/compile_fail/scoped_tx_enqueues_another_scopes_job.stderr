@@ -1,0 +1,18 @@
+error[E0271]: type mismatch resolving `<Rebuild as Job>::Scope == Org`
+  --> tests/compile_fail/scoped_tx_enqueues_another_scopes_job.rs:49:16
+   |
+49 |     tx.enqueue(Rebuild {});
+   |        ------- ^^^^^^^^^^ type mismatch resolving `<Rebuild as Job>::Scope == Org`
+   |        |
+   |        required by a bound introduced by this call
+   |
+note: expected this to be `Org`
+  --> tests/compile_fail/scoped_tx_enqueues_another_scopes_job.rs:37:19
+   |
+37 | #[job(scoped_by = Team)]
+   |                   ^^^^
+note: required by a bound in `ScopedTx::<'_, 'a, S>::enqueue`
+  --> $WORKSPACE/crates/charpente-core/src/db.rs
+   |
+   |     pub fn enqueue<J: Job<Scope = S>>(&mut self, job: J) {
+   |                           ^^^^^^^^^ required by this bound in `ScopedTx::<'_, 'a, S>::enqueue`

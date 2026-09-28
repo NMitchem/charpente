@@ -378,7 +378,7 @@ mod tests {
     use crate::Schema;
     use crate::http::AppConfig;
     use charpente_core::db::Tx;
-    use charpente_core::table::Codec;
+    use charpente_core::table::{Codec, Unscoped};
 
     fn tiny_app(disk: Box<dyn Disk>, entropy: Box<dyn Entropy>) -> io::Result<App> {
         App::open(disk, Schema::new(), entropy, AppConfig::default())
@@ -414,11 +414,13 @@ mod tests {
         impl charpente_core::db::Job for ForeignShapeReceipt {
             const NAME: &'static str = "receipt";
             const FINGERPRINT: u64 = 0x7E57_0701; // the shape ENQUEUED
+            type Scope = Unscoped;
         }
         fn noop_glue(
             _tx: &mut Tx,
             _payload: &[u8],
             _cap: Option<&charpente_core::db::CrossTenant>,
+            _scope: Option<crate::kernel::JobScope<'_>>,
         ) -> Result<(), crate::kernel::JobError> {
             Ok(())
         }
@@ -436,6 +438,7 @@ mod tests {
             name: "receipt",
             retry: charpente_core::job::RetryPolicy::DEFAULT,
             cross_tenant: false,
+            scoped_by: None,
             fingerprint: 0x7E57_0702, // the shape MOUNTED — different
             glue: noop_glue,
         }]))

@@ -608,8 +608,15 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   tenant the handler opens, with no `authorize` (spec 2026-09-27-job-tenancy §4). On any
   other route, a scope line reached with no credential is a named 401, so `authorize` is
   only ever asked about a real principal.
-- **Jobs.** `#[job(global)]` structs with typed payloads and typed retry policy. Enqueue
-  sites and handler signatures are checked against each other.
+- **Jobs.** `#[job(global)]` or `#[job(scoped_by = Org)]` structs, with typed payloads and
+  a typed retry policy. Neither tenancy is the default, and a bare `#[job]` is a compile
+  error naming both. A `global` job's `run` takes `&mut Tx`; a scoped job's takes the
+  `ScopedTx` of the tenant it was enqueued in, which the dispatcher reopens from the tenant
+  its record carries (§6). A scoped job is enqueued only from inside its tenant
+  (`ScopedTx::enqueue`) or by a declared fan-out (`Tx::enqueue_in` with a `CrossTenant`).
+  `Tx::enqueue` and cron take `global` jobs only, and a scoped job at either is an
+  unsatisfied bound whose text names the fix. Enqueue sites and handler signatures are
+  checked against each other (spec 2026-09-27-job-tenancy §5).
 - **Events.** `#[event]` structs; `tx.emit(...)` is typed; subscribers (server-side and
   client-side codegen) consume typed streams off the log. An event payload is itself a
   wire type (it is exactly the JSON a subscriber receives), so `#[event]` derives `Wire`
@@ -1220,15 +1227,20 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
 
 - **Queue.** `tx.enqueue(job)`/`enqueue_keyed(key, job)` writes the job into the committing
   log record; apply materializes a `JobRow` (§4). Post-commit, the kernel dispatcher runs
-  due jobs inline on the kernel thread: a `#[job]` handler is `fn run(self, tx: &mut Tx) ->
-  Result<(), JobError>` — itself a transaction. `Ok` commits its effects and the job's
+  due jobs inline on the kernel thread: a `global` job's handler is `fn run(self, tx: &mut
+  Tx) -> Result<(), JobError>` — itself a transaction — and a `scoped_by = Org` job's takes
+  `&mut ScopedTx<Org>` instead. The enqueue records the tenant (record tag `0x0a`,
+  `JobRow.scope`), and the dispatcher reopens exactly that tenant with its own
+  `TenantAdmission` through a `JobScope` only it constructs, so a scoped job runs where it
+  was enqueued, retries included. `Ok` commits its effects and the job's
   Done-mark atomically in one record: exactly-once state effects, structurally. `Err`
   aborts that transaction and a second commits the failure record — attempts, doubling
   backoff, Dead at the policy's `max`, last_error carried (typed `RetryPolicy` on the
   `#[job]` item; handler panics are absorbed into the same path). At-least-once execution
   plus idempotency-key observability is the framing M1's external-effect handlers need; v0
   handlers are pure state and don't need it yet. Every enqueue records the payload type's
-  structural fingerprint (§3). The kernel refuses to dispatch while a Pending job of a
+  structural fingerprint (§3). A scoped job's fingerprint also covers its `scoped_by`, so a
+  change of tenancy is refused like a change of fields. The kernel refuses to dispatch while a Pending job of a
   mounted type carries another shape, naming the job, its ids and both shapes. It checks at
   startup and wherever its write gate opens, and `promote` checks before its durable flip.
   A switchover is never refused at the hand-off, which is the primary's point of no return
@@ -1241,7 +1253,9 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
   fields without renaming it: of the refusal's two fixes, an app author could apply only
   the drain to it, never the restore of its old fields.
 - **Cron.** Schedules are rows; a due tick is one transaction that advances `next_due` and
-  enqueues through the normal path — a recurring enqueuer, inheriting retry and
+  enqueues through the normal path — on a bare `Tx`, so a schedule takes `global` jobs
+  only; a sweep that acts per tenant is a `global, cross_tenant` job that fans out with
+  `enqueue_in` — a recurring enqueuer, inheriting retry and
   observability for free. Catch-up fires once per wake, never backfills. In simulation,
   virtual time makes "run this monthly job 120 times" a subsecond test.
 - **Realtime.** `tx.emit(event)`/`tx.emit_keyed(key, event)` writes a typed event into the
@@ -1612,13 +1626,16 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   (a principal, through `authorize`) or by declaration (`public(Org)` on the route, or the
   operator's `TenantAdmission`), never by an anonymous `None`. A caller with no credential
   at a scope line its route did not declare `public(Org)` for gets a named 401 (spec
-  2026-09-27-job-tenancy §4). A table that declares neither
+  2026-09-27-job-tenancy §4). A job acts inside a tenant only by declaring
+  `#[job(scoped_by = Org)]`, and then only inside the tenant its enqueuer opened or its
+  fan-out named. A table that declares neither
   `scoped_by` nor `global` does not compile: which tables are tenant data is the app's
   declaration at every struct, never the platform's inference (default-secure,
   2026-09-16; the field-type inference was weighed and rejected — the membership table
   must be `global` and must hold `Id<Org>`). The platform never *derives* a
-  scope: the tenant is named by the app at that one line and nowhere else, and no key is
-  ever parsed back into one. Realtime is the same mechanism rather than a second one —
+  scope: the tenant is named by the app at that one line, or for a fan-out in
+  `enqueue_in`'s argument, and nowhere else; a scoped job's record carries that name, and
+  no key is ever parsed back into one. Realtime is the same mechanism rather than a second one —
   `emit` inside a scope is `emit_keyed` with the scope's key (§6), which retires
   `emit_keyed`'s hand-rolled scoping key as the stopgap it was. The composite key travels
   the whole way down: WAL effects, replication, the archive, `restore`, snapshot seeding

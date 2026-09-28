@@ -1,0 +1,31 @@
+error[E0277]: `NotifySubscribers` is a tenant-scoped job (`#[job(scoped_by = Org)]`) and a bare `Tx` names no tenant to run it in
+  --> tests/compile_fail/scoped_job_enqueued_on_bare_tx.rs:49:16
+   |
+49 |     tx.enqueue(NotifySubscribers { incident: id.raw() });
+   |        ------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `NotifySubscribers` is scoped by `Org`
+   |        |
+   |        required by a bound introduced by this call
+   |
+help: the trait `NoJobTenant<NotifySubscribers>` is not implemented for `Org`
+  --> tests/compile_fail/scoped_job_enqueued_on_bare_tx.rs:14:1
+   |
+14 | #[table(global)]
+   | ^^^^^^^^^^^^^^^^
+   = note: enqueue it from inside the tenant it acts in, and it runs in that tenant:
+               let mut tx = tx.scope::<Org>(scope, ctx)?;
+               tx.enqueue(job);
+           or fan it out from a `cross_tenant` route or job, naming the tenant:
+               tx.enqueue_in::<Org>(scope, job, cap);
+           cron (`App::schedule`) enqueues on a bare `Tx`, so it schedules `global` jobs only
+help: the trait `NoJobTenant<J>` is implemented for `Unscoped`
+  --> $WORKSPACE/crates/charpente-core/src/table.rs
+   |
+   | impl<J> NoJobTenant<J> for Unscoped {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `NotifySubscribers` to implement `UnscopedJob`
+note: required by a bound in `Tx::<'a>::enqueue`
+  --> $WORKSPACE/crates/charpente-core/src/db.rs
+   |
+   |     pub fn enqueue<J: UnscopedJob>(&mut self, job: J) {
+   |                       ^^^^^^^^^^^ required by this bound in `Tx::<'a>::enqueue`
+   = note: this error originates in the attribute macro `table` (in Nightly builds, run with -Z macro-backtrace for more info)

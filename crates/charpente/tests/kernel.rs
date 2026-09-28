@@ -66,9 +66,9 @@ fn job_macro_derives_codec_name_retry_and_glue() {
     let mut payload = Vec::new();
     charpente_core::table::Codec::encode(&CountUp { slot: 4 }, &mut payload);
     app.db_for_tests()
-        // `None`: `CountUp` declares no `cross_tenant`, so its glue is handed
-        // no token — the dispatcher passes one only for a declared job.
-        .transact(|tx| (def.glue)(tx, &payload, None))
+        // `None, None`: `CountUp` declares no `cross_tenant` and is `global`,
+        // so its glue is handed neither a token nor a tenant.
+        .transact(|tx| (def.glue)(tx, &payload, None, None))
         .unwrap();
     let counters = app
         .db_for_tests()
@@ -163,6 +163,433 @@ fn a_global_jobs_fingerprint_is_the_bare_jobs_fingerprint() {
         0x7e72_9c20_6b79_cbad
     );
     assert_eq!(<CountUp as Job>::FINGERPRINT, 0x766b_8ba4_18db_4d08);
+}
+
+// ------------------------------------------------ job tenancy: scoped jobs
+
+/// Job-tenancy spec §5–§6 and Review Focus 1–3. A `#[job(scoped_by = …)]` job
+/// runs in the tenant it was enqueued from (tenant 0 included), keeps that
+/// tenant through every retry, hands it to its own follow-ups, lands in the
+/// tenant a fan-out names, and a deploy that changes a job's tenancy is
+/// refused by name over the rows it left Pending.
+mod scoped_jobs {
+    use super::*;
+    use charpente::http::ApiError;
+    use charpente::{CrossTenant, ScopedTx};
+
+    #[table(global)]
+    pub struct Desk {
+        pub id: Id<Desk>,
+        pub name: String,
+    }
+
+    impl Tenant for Desk {
+        type Who = Principal;
+        type Error = ApiError;
+        /// Never asked: every test here enqueues through the operator path or
+        /// a declared fan-out, and a job has no principal.
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Desk>) -> Result<(), ApiError> {
+            Ok(())
+        }
+    }
+
+    #[table(scoped_by = Desk)]
+    pub struct Filed {
+        pub id: Id<Filed>,
+        pub note: u64,
+    }
+
+    /// Writes one row in its tenant. An even `n` also hands its tenant a
+    /// scoped follow-up, and enqueues a global tally beside it.
+    #[job(scoped_by = Desk)]
+    pub struct File {
+        pub n: u64,
+    }
+
+    impl File {
+        fn run(self, tx: &mut ScopedTx<'_, '_, Desk>) -> Result<(), JobError> {
+            tx.put(&Filed {
+                id: Id::from_raw(self.n),
+                note: self.n,
+            });
+            if self.n.is_multiple_of(2) {
+                tx.enqueue(Stamp { n: self.n });
+                // `run` holds `&mut ScopedTx`, so the global deref is `**`.
+                (**tx).enqueue(Tally { n: self.n });
+            }
+            Ok(())
+        }
+    }
+
+    #[job(scoped_by = Desk)]
+    pub struct Stamp {
+        pub n: u64,
+    }
+
+    impl Stamp {
+        fn run(self, tx: &mut ScopedTx<'_, '_, Desk>) -> Result<(), JobError> {
+            tx.put(&Filed {
+                id: Id::from_raw(self.n + 100),
+                note: self.n,
+            });
+            Ok(())
+        }
+    }
+
+    #[job(global)]
+    pub struct Tally {
+        pub n: u64,
+    }
+
+    impl Tally {
+        fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+            tx.put(&Counter {
+                id: Id::from_raw(self.n),
+                hits: 1,
+            });
+            Ok(())
+        }
+    }
+
+    /// Always fails, naming the tenant its `run` was handed, so every
+    /// attempt's `last_error` records which tenant that attempt ran in.
+    #[job(scoped_by = Desk, retry(max = 3, backoff = "1s"))]
+    pub struct Jam {
+        pub n: u64,
+    }
+
+    impl Jam {
+        fn run(self, tx: &mut ScopedTx<'_, '_, Desk>) -> Result<(), JobError> {
+            Err(JobError::app(format!(
+                "job {} jammed in desk {}",
+                self.n,
+                tx.scope().raw()
+            )))
+        }
+    }
+
+    /// The declared fan-out (spec §2 R5): one `File` into each desk it names.
+    #[job(global, cross_tenant)]
+    pub struct Sweep {}
+
+    impl Sweep {
+        fn run(self, tx: &mut Tx, cap: &CrossTenant) -> Result<(), JobError> {
+            for desk in [0, 4] {
+                tx.enqueue_in(Id::<Desk>::from_raw(desk), File { n: 11 }, cap);
+            }
+            Ok(())
+        }
+    }
+
+    fn desk_app(seed: u64) -> (Sim, App) {
+        let sim = Sim::with_faults(seed, FaultConfig::none());
+        let app = App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Filed>().table::<Counter>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(jobs![File, Stamp, Tally, Jam, Sweep]);
+        (sim, app)
+    }
+
+    /// The operator path (spec §7): enqueue `job` inside `desk`, as a seed or
+    /// an admin step would.
+    fn enqueue_in_desk<J: Job<Scope = Desk>>(db: &mut Db, desk: u64, job: J) {
+        let mut group = db.begin_group().unwrap();
+        let admission = group.tenant_admission();
+        group
+            .stage(|tx| {
+                tx.admit_scope(Id::<Desk>::from_raw(desk), &admission)
+                    .enqueue(job);
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+        group.commit().unwrap();
+    }
+
+    /// Runs every job due at `now`, follow-ups included, until none is left,
+    /// and returns how many ran.
+    fn drain(dispatcher: &mut Dispatcher, db: &mut Db, now: u64) -> usize {
+        let mut ran = 0;
+        loop {
+            dispatcher.note_enqueued(db.drain_enqueued());
+            if !dispatcher.has_due(now) {
+                return ran;
+            }
+            dispatcher.run_due(db, now).unwrap();
+            ran += 1;
+        }
+    }
+
+    /// Review Focus 2: two desks enqueue the same job with the same payload,
+    /// and each runs in its own desk. Desk 0 is a desk, not "no desk".
+    #[test]
+    fn a_scoped_job_runs_in_its_enqueuers_tenant_tenant_zero_included() {
+        let (_sim, mut app) = desk_app(0x5C0B_0001);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        let db = app.db_for_tests();
+        enqueue_in_desk(db, 0, File { n: 1 });
+        enqueue_in_desk(db, 5, File { n: 1 });
+        assert_eq!(drain(&mut dispatcher, db, 0), 2);
+
+        let snap = db.snapshot().unwrap();
+        let rows: Vec<(Option<u64>, JobStatus)> = snap
+            .scan::<JobRow>()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.scope, r.status))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(Some(0), JobStatus::Done), (Some(5), JobStatus::Done)],
+            "each row carries its enqueuer's tenant; tenant 0 is Some(0)"
+        );
+        for desk in [0, 5] {
+            assert_eq!(
+                snap.get_scoped::<Filed>(desk, Id::from_raw(1))
+                    .unwrap()
+                    .map(|f| f.note),
+                Some(1),
+                "desk {desk}'s job wrote inside desk {desk}"
+            );
+        }
+        assert!(
+            snap.scan_scoped::<Filed>(3).unwrap().is_empty(),
+            "and nothing landed in a desk that enqueued nothing"
+        );
+    }
+
+    /// Review Focus 3: the failure record re-puts the row it read, so every
+    /// retry runs in the same tenant, through to Dead. Were `scope` dropped
+    /// there, the next attempt would trip the dispatch assert and stop the node.
+    #[test]
+    fn a_failing_scoped_job_keeps_its_tenant_through_every_retry_to_dead() {
+        let (_sim, mut app) = desk_app(0x5C0B_0002);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        let db = app.db_for_tests();
+        enqueue_in_desk(db, 7, Jam { n: 1 });
+        dispatcher.note_enqueued(db.drain_enqueued());
+        let mut now = 1_000;
+        for attempt in 1..=3u32 {
+            let outcome = dispatcher.run_due(db, now).unwrap();
+            let row = db.snapshot().unwrap().scan::<JobRow>().unwrap().remove(0);
+            assert_eq!(
+                row.scope,
+                Some(7),
+                "attempt {attempt} kept the row's tenant"
+            );
+            assert_eq!(
+                row.last_error.as_deref(),
+                Some("job 1 jammed in desk 7"),
+                "attempt {attempt} ran in desk 7"
+            );
+            match outcome {
+                JobOutcome::Retried {
+                    attempts, due_at, ..
+                } => {
+                    assert_eq!(attempts, attempt);
+                    now = due_at;
+                }
+                JobOutcome::Dead { attempts, .. } => assert_eq!((attempts, attempt), (3, 3)),
+                JobOutcome::Done { .. } => panic!("Jam never succeeds"),
+            }
+        }
+        let row = db.snapshot().unwrap().scan::<JobRow>().unwrap().remove(0);
+        assert_eq!((row.status, row.scope), (JobStatus::Dead, Some(7)));
+    }
+
+    /// A scoped job's follow-up inherits its tenant through
+    /// `ScopedTx::enqueue`; a global job it enqueues through the deref carries
+    /// none.
+    #[test]
+    fn a_scoped_jobs_follow_ups_carry_its_tenant_and_a_global_one_none() {
+        let (_sim, mut app) = desk_app(0x5C0B_0003);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        let db = app.db_for_tests();
+        enqueue_in_desk(db, 3, File { n: 2 });
+        assert_eq!(
+            drain(&mut dispatcher, db, 0),
+            3,
+            "File, then its Stamp and its Tally"
+        );
+
+        let snap = db.snapshot().unwrap();
+        let rows: Vec<(String, Option<u64>, JobStatus)> = snap
+            .scan::<JobRow>()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.name, r.scope, r.status))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("File".to_string(), Some(3), JobStatus::Done),
+                ("Stamp".to_string(), Some(3), JobStatus::Done),
+                ("Tally".to_string(), None, JobStatus::Done),
+            ]
+        );
+        assert_eq!(
+            snap.get_scoped::<Filed>(3, Id::from_raw(102))
+                .unwrap()
+                .map(|f| f.note),
+            Some(2),
+            "the follow-up wrote in desk 3"
+        );
+        assert!(
+            snap.get_scoped::<Filed>(0, Id::from_raw(102))
+                .unwrap()
+                .is_none(),
+            "and not in tenant 0"
+        );
+        assert_eq!(
+            snap.get(Id::<Counter>::from_raw(2))
+                .unwrap()
+                .map(|c| c.hits),
+            Some(1),
+            "the global tally ran, in no tenant"
+        );
+    }
+
+    /// Spec §2 R5: a declared fan-out lands each job in the tenant it names,
+    /// tenant 0 included, and each runs there.
+    #[test]
+    fn a_declared_fan_out_lands_each_job_in_the_tenant_it_names() {
+        let (_sim, mut app) = desk_app(0x5C0B_0005);
+        let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+        let db = app.db_for_tests();
+        db.transact(|tx| {
+            tx.enqueue(Sweep {});
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+        assert_eq!(
+            drain(&mut dispatcher, db, 0),
+            3,
+            "the sweep, then one File per desk"
+        );
+
+        let snap = db.snapshot().unwrap();
+        let scopes: Vec<(String, Option<u64>)> = snap
+            .scan::<JobRow>()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.name, r.scope))
+            .collect();
+        assert_eq!(
+            scopes,
+            vec![
+                ("Sweep".to_string(), None),
+                ("File".to_string(), Some(0)),
+                ("File".to_string(), Some(4)),
+            ]
+        );
+        for desk in [0, 4] {
+            assert!(
+                snap.get_scoped::<Filed>(desk, Id::from_raw(11))
+                    .unwrap()
+                    .is_some(),
+                "the fan-out's job ran in desk {desk}"
+            );
+        }
+    }
+
+    mod ledger_v1 {
+        use charpente::kernel::JobError;
+        use charpente::{Tx, job};
+
+        #[job(global)]
+        pub struct Reconcile {
+            pub n: u64,
+        }
+
+        impl Reconcile {
+            fn run(self, _tx: &mut Tx) -> Result<(), JobError> {
+                let _ = self.n;
+                Ok(())
+            }
+        }
+    }
+
+    mod ledger_v2 {
+        use super::Desk;
+        use charpente::kernel::JobError;
+        use charpente::{ScopedTx, job};
+
+        /// v1 with its tenancy changed, and nothing else.
+        #[job(scoped_by = Desk)]
+        pub struct Reconcile {
+            pub n: u64,
+        }
+
+        impl Reconcile {
+            fn run(self, _tx: &mut ScopedTx<'_, '_, Desk>) -> Result<(), JobError> {
+                let _ = self.n;
+                Ok(())
+            }
+        }
+    }
+
+    /// Review Focus 1: the first thing an existing app does after upgrading is
+    /// move a job from `global` to `scoped_by`, over Pending rows enqueued
+    /// with no tenant. The new binary must refuse to start over them, by
+    /// name, with the tenancy half of the fix. It must never dispatch one
+    /// into no tenant, and never trip the dispatch assert.
+    #[test]
+    fn a_job_that_gains_scoped_by_is_refused_at_startup_over_its_pending_rows() {
+        let v1 = <ledger_v1::Reconcile as Job>::FINGERPRINT;
+        let v2 = <ledger_v2::Reconcile as Job>::FINGERPRINT;
+        assert_ne!(
+            v1, v2,
+            "scoped_by is mixed into the fingerprint (spec §6): a tenancy change is a shape \
+             change"
+        );
+        let sim = Sim::with_faults(0x5C0B_0004, FaultConfig::none());
+        let open = |defs: Vec<JobDef>| {
+            App::open(
+                Box::new(sim.disk()),
+                Schema::new(),
+                Box::new(sim.entropy()),
+                AppConfig::default(),
+            )
+            .unwrap()
+            .mount_jobs(defs)
+        };
+        let mut old = open(jobs![ledger_v1::Reconcile]);
+        old.db_for_tests()
+            .transact(|tx| {
+                tx.enqueue(ledger_v1::Reconcile { n: 1 });
+                tx.enqueue(ledger_v1::Reconcile { n: 2 });
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+        sim.restart();
+        drop(old);
+
+        let err = match Kernel::new(open(jobs![ledger_v2::Reconcile]), Box::new(sim.clock())) {
+            Ok(_) => panic!(
+                "the kernel started over two Pending rows enqueued with no tenant, which it \
+                 would then have dispatched into none"
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "2 Pending \"Reconcile\" job(s) (ids 0, 1) were enqueued under a different shape \
+                 of Reconcile (recorded {v1:#x}; this binary {v2:#x}) — this binary will not \
+                 decode them; run the binary that enqueued them until they are Done or Dead, \
+                 then deploy this one, or restore Reconcile's old fields and its \
+                 `global`/`scoped_by` declaration and give the new shape its own #[job] type \
+                 under a new name (GUIDE §6)"
+            )
+        );
+        assert!(
+            charpente::core::db::Refusal::of(&err).is_some(),
+            "a refusal, not an IO failure"
+        );
+    }
 }
 
 fn quiet_kernel_app(seed: u64) -> (Sim, App) {
@@ -2638,8 +3065,8 @@ fn receipt_refusal(ids: &[u64], recorded: &str) -> String {
         "{} Pending \"SendReceipt\" job(s) (ids {}) were enqueued under a different shape of \
          SendReceipt (recorded {recorded}; this binary {:#x}) — this binary will not decode \
          them; run the binary that enqueued them until they are Done or Dead, then deploy this \
-         one, or restore SendReceipt's old fields and give the new shape its own #[job] type \
-         under a new name (GUIDE §6)",
+         one, or restore SendReceipt's old fields and its `global`/`scoped_by` declaration and \
+         give the new shape its own #[job] type under a new name (GUIDE §6)",
         ids.len(),
         listed.join(", "),
         <receipt_v2::SendReceipt as Job>::FINGERPRINT
@@ -2944,6 +3371,7 @@ fn the_platform_session_sweep_shape_is_registered_at_open() {
     impl Job for ForeignSweep {
         const NAME: &'static str = "SessionSweep";
         const FINGERPRINT: u64 = 0x7E57_0B0B;
+        type Scope = Unscoped;
     }
     let sim = Sim::with_faults(0x5A9E_0610, FaultConfig::none());
     let mut app = App::open(
@@ -3227,8 +3655,8 @@ fn a_refusal_over_two_job_types_and_mixed_shapes_is_one_line_per_type() {
         "1 Pending \"CountUp\" job(s) (ids 3) were enqueued under a different shape of CountUp \
          (recorded 0xbad; this binary {:#x}) — this binary will not decode them; run the \
          binary that enqueued them until they are Done or Dead, then deploy this one, or \
-         restore CountUp's old fields and give the new shape its own #[job] type under a new \
-         name (GUIDE §6)",
+         restore CountUp's old fields and its `global`/`scoped_by` declaration and give the new \
+         shape its own #[job] type under a new name (GUIDE §6)",
         <CountUp as Job>::FINGERPRINT
     );
     let receipt_line = receipt_refusal(

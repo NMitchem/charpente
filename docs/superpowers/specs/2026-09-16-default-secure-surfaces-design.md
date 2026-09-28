@@ -255,6 +255,8 @@ or the test says so.
   `App::mount` check because there is nothing left to check by then.
 - **A `#[job]` change.** Jobs have no caller; `cross_tenant` on a job is already a
   declaration. Nothing here touches `job.rs`.
+  **Superseded 2026-09-28** by `2026-09-27-job-tenancy-design.md` §5: a job declares
+  `global` or `scoped_by = Org`, and neither is the default.
 
 ## §9 Exit criteria
 

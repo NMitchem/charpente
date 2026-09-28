@@ -653,7 +653,7 @@ mod tests {
     use crate::wire::{TypeSchema, Wire};
     use charpente_core::db::{Event, Schema, Tx};
     use charpente_core::io::Entropy;
-    use charpente_core::table::{Codec, Id, View};
+    use charpente_core::table::{Codec, Id, Unscoped, View};
 
     /// The kernel thread's stop line — the first line of the kernel's final
     /// stderr output — names what stopped it (spec §5): a refusal is named as
@@ -722,11 +722,13 @@ mod tests {
         impl charpente_core::db::Job for Receipt {
             const NAME: &'static str = "receipt";
             const FINGERPRINT: u64 = 0x7E57_0701;
+            type Scope = Unscoped;
         }
         fn noop_glue(
             _tx: &mut Tx,
             _payload: &[u8],
             _cap: Option<&charpente_core::db::CrossTenant>,
+            _scope: Option<crate::kernel::JobScope<'_>>,
         ) -> Result<(), crate::kernel::JobError> {
             Ok(())
         }
@@ -756,6 +758,7 @@ mod tests {
             name: "receipt",
             retry: charpente_core::job::RetryPolicy::DEFAULT,
             cross_tenant: false,
+            scoped_by: None,
             fingerprint: 0x7E57_0702,
             glue: noop_glue,
         }]);
@@ -781,6 +784,7 @@ mod tests {
         impl charpente_core::db::Job for Never {
             const NAME: &'static str = "never";
             const FINGERPRINT: u64 = 0x7E57_0703;
+            type Scope = Unscoped;
         }
         impl Codec for Never {
             fn encode(&self, _out: &mut Vec<u8>) {}
@@ -814,12 +818,14 @@ mod tests {
     impl charpente_core::db::Job for DriftedCronReceipt {
         const NAME: &'static str = "receipt";
         const FINGERPRINT: u64 = 0x7E57_0BAD;
+        type Scope = Unscoped;
     }
 
     fn cron_foreign_shape_glue(
         _tx: &mut Tx,
         _payload: &[u8],
         _cap: Option<&charpente_core::db::CrossTenant>,
+        _scope: Option<crate::kernel::JobScope<'_>>,
     ) -> Result<(), crate::kernel::JobError> {
         Ok(())
     }
@@ -840,6 +846,7 @@ mod tests {
             name: "receipt",
             retry: charpente_core::job::RetryPolicy::DEFAULT,
             cross_tenant: false,
+            scoped_by: None,
             fingerprint: 0x7E57_0704,
             glue: cron_foreign_shape_glue,
         }])

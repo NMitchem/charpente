@@ -5,9 +5,13 @@ use std::fmt;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use charpente_core::db::{CrossTenant, Db, Group, JobShapeRefusal, Tx, TxError};
+use charpente_core::db::{
+    CrossTenant, Db, Group, JobShapeRefusal, ScopedTx, TenantAdmission, Tx, TxError,
+};
 use charpente_core::job::{JobRow, JobStatus, RetryPolicy};
 use charpente_core::table::{Id, Snapshot, View};
+
+use crate::tenant::TenantScope;
 
 /// Why a job run did not complete. The App/Io split mirrors `TxError` and is
 /// load-bearing: `App` is the handler's own rejection (or an absorbed panic,
@@ -65,6 +69,10 @@ pub struct JobDef {
     /// it beside the route flag, so the cross-tenant inventory covers jobs
     /// too.
     pub cross_tenant: bool,
+    /// `#[job(scoped_by = Org)]` — the scope type's last path segment, as
+    /// `describe` lists it; `None` for a `global` job. Dispatch asserts that
+    /// a row carries a tenant exactly when this is `Some`.
+    pub scoped_by: Option<&'static str>,
     /// `Job::FINGERPRINT` — the payload shape this binary compiled. Dispatch
     /// asserts a row's recorded shape equals it before the glue decodes
     /// (payload-shapes spec §4).
@@ -78,9 +86,30 @@ pub struct JobDef {
 
 /// The glue signature `#[job]` generates: decode the payload, call the
 /// payload's `run`, hand back its verdict. Named, like `http::Glue`, so the
-/// field above stays under clippy's type-complexity threshold rather than
-/// spelling a four-part fn pointer inline.
-pub type JobGlue = fn(&mut Tx, &[u8], Option<&CrossTenant>) -> Result<(), JobError>;
+/// field above stays under clippy's type-complexity threshold. The last
+/// argument is `Some` exactly for a scoped job: the tenant its row carries,
+/// which only the dispatcher can construct.
+pub type JobGlue =
+    fn(&mut Tx, &[u8], Option<&CrossTenant>, Option<JobScope<'_>>) -> Result<(), JobError>;
+
+/// The tenant a scoped job was enqueued in, handed to its glue by the
+/// dispatcher and by nothing else (job-tenancy spec §5). Its fields are
+/// private and it has no public constructor, so a glue, generated or
+/// hand-written, can open exactly the tenant its row carries and no other.
+pub struct JobScope<'j> {
+    id: u64,
+    admission: &'j TenantAdmission,
+}
+
+impl JobScope<'_> {
+    /// Opens the enqueuer's tenant on the job's transaction, by the
+    /// dispatcher's admission. No `authorize` runs: a job has no principal.
+    /// Its authority is its enqueuer's, who was either inside this tenant or
+    /// declared `cross_tenant` to name it.
+    pub fn open<'t, 'a, S: TenantScope>(self, tx: &'t mut Tx<'a>) -> ScopedTx<'t, 'a, S> {
+        tx.admit_scope(Id::from_raw(self.id), self.admission)
+    }
+}
 
 /// Implemented by the marker impl `#[job]` emits, so `jobs![a, b]` collects
 /// descriptors explicitly.
@@ -209,6 +238,10 @@ impl Dispatcher {
         // Minted before the group is borrowed mutably, exactly as the
         // request path mints it — see `CrossTenant`.
         let cap = group.cross_tenant_cap();
+        // Beside it, for the same reason: a scoped job's tenant is opened with
+        // the dispatcher's admission (job-tenancy spec §5), minted from the
+        // `Group` no glue ever holds.
+        let admission = group.tenant_admission();
         let attempt = group.stage(|tx| {
             let mut row = tx
                 .get(Id::<JobRow>::from_raw(id))?
@@ -244,8 +277,27 @@ impl Dispatcher {
                     .map_or_else(|| "none".to_string(), |shape| format!("{shape:#x}")),
                 def.fingerprint
             );
+            // The fingerprint mixes the declaration in (spec §6), so a row of
+            // this shape was enqueued by a type with this tenancy, and the
+            // enqueue family writes a tenant exactly for a scoped type. A
+            // mismatch is unreachable — asserted, not handled (hard rule 4).
+            assert_eq!(
+                row.scope.is_some(),
+                def.scoped_by.is_some(),
+                "dispatcher invariant: job {id} (\"{}\") carries tenant {:?} but this binary \
+                 declares it {} — the fingerprint mixes the declaration in, so a row of this \
+                 shape cannot disagree with it",
+                row.name,
+                row.scope,
+                def.scoped_by
+                    .map_or_else(|| "global".to_string(), |s| format!("scoped_by = {s}"))
+            );
+            let scope = row.scope.map(|id| JobScope {
+                id,
+                admission: &admission,
+            });
             match catch_unwind(AssertUnwindSafe(|| {
-                (def.glue)(tx, &row.payload, def.cross_tenant.then_some(&cap))
+                (def.glue)(tx, &row.payload, def.cross_tenant.then_some(&cap), scope)
             })) {
                 Ok(result) => result?,
                 Err(payload) => {

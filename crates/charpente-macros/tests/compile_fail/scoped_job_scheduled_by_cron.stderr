@@ -1,0 +1,29 @@
+error[E0277]: `MaintenanceSweep` is a tenant-scoped job (`#[job(scoped_by = Org)]`) and a bare `Tx` names no tenant to run it in
+  --> tests/compile_fail/scoped_job_scheduled_by_cron.rs:36:10
+   |
+36 |         .schedule("maintenance-sweep", Duration::from_secs(3600), || {
+   |          ^^^^^^^^ `MaintenanceSweep` is scoped by `Org`
+   |
+help: the trait `NoJobTenant<MaintenanceSweep>` is not implemented for `Org`
+  --> tests/compile_fail/scoped_job_scheduled_by_cron.rs:11:1
+   |
+11 | #[table(global)]
+   | ^^^^^^^^^^^^^^^^
+   = note: enqueue it from inside the tenant it acts in, and it runs in that tenant:
+               let mut tx = tx.scope::<Org>(scope, ctx)?;
+               tx.enqueue(job);
+           or fan it out from a `cross_tenant` route or job, naming the tenant:
+               tx.enqueue_in::<Org>(scope, job, cap);
+           cron (`App::schedule`) enqueues on a bare `Tx`, so it schedules `global` jobs only
+help: the trait `NoJobTenant<J>` is implemented for `Unscoped`
+  --> $WORKSPACE/crates/charpente-core/src/table.rs
+   |
+   | impl<J> NoJobTenant<J> for Unscoped {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `MaintenanceSweep` to implement `UnscopedJob`
+note: required by a bound in `charpente::http::App::schedule`
+  --> $WORKSPACE/crates/charpente/src/http/app.rs
+   |
+   |     pub fn schedule<J: UnscopedJob + 'static>(
+   |                        ^^^^^^^^^^^ required by this bound in `App::schedule`
+   = note: this error originates in the attribute macro `table` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -1,0 +1,7 @@
+error: `NotifySubscribers` declares no tenancy — a job says which: write `#[job(scoped_by = Org)]` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `#[job(global)]` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
+  --> tests/compile_fail/statuspage_job_no_tenancy.rs:11:1
+   |
+11 | #[job]
+   | ^^^^^^
+   |
+   = note: this error originates in the attribute macro `job` (in Nightly builds, run with -Z macro-backtrace for more info)

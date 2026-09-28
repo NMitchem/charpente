@@ -481,7 +481,7 @@ to the store. On `Err`, nothing happened at all: no log position consumed,
 nothing written.
 
 ```rust
-use charpente::core::table::Codec;
+use charpente::core::table::{Codec, Unscoped};
 use charpente::{Db, Id, Job, Tx, TxError, View, event, table};
 use std::io;
 
@@ -514,6 +514,8 @@ impl Job for SendReceipt {
     // computes it from the fields; by hand, change it whenever the fields
     // change.
     const FINGERPRINT: u64 = 0x5E4D_0001;
+    // A global job: it belongs to no tenant (§6, §16).
+    type Scope = Unscoped;
     // `RETRY` defaults to `RetryPolicy::DEFAULT` — retry/backoff and cron
     // are covered in a later section.
 }
@@ -1344,13 +1346,16 @@ and the `JobEntry` glue `jobs![...]` collects — the same shape `#[table]`
 derives for rows (§2), minus the primary key. `Job::FINGERPRINT` is a
 structural fingerprint of the payload's fields (§12's helper), recorded
 beside every enqueue; a Pending job is decoded only by a binary whose
-`FINGERPRINT` matches (see "Changing a job's fields" below). A job says which
-tenancy it has. Every job in this guide until §16 writes `#[job(global)]`: it
-belongs to no tenant. `#[job(global)]` takes `RetryPolicy::DEFAULT` (5
-attempts, 30s base backoff), and `#[job(global, retry(max = <int>, backoff =
-"<n><unit>"))]` overrides either or both. `backoff` is a bare number plus a
-unit, one of `ms`, `s`, `m`, `h`. The words `global`, `cross_tenant` (§16) and
-`retry(...)` may come in any order, each at most once.
+`FINGERPRINT` matches (see "Changing a job's fields" below).
+
+A job says which tenancy it has, and neither is the default: `#[job(global)]`
+belongs to no tenant, and `#[job(scoped_by = Org)]` acts inside one (below, and
+§16). A bare `#[job]` is a compile error naming both. Either form takes
+`RetryPolicy::DEFAULT` (5 attempts, 30s base backoff), and adding `retry(max =
+<int>, backoff = "<n><unit>")` overrides either or both. `backoff` is a bare
+number plus a unit, one of `ms`, `s`, `m`, `h`. The words `global` or
+`scoped_by`, `cross_tenant` (§16) and `retry(...)` may come in any order, each
+at most once.
 
 ```rust
 use charpente::core::job::RetryPolicy;
@@ -1384,7 +1389,10 @@ fn retry_policies() -> (RetryPolicy, RetryPolicy) {
 
 `#[job]` does not derive a handler — you write one yourself, an inherent
 method with exactly this shape: `fn run(self, tx: &mut Tx) -> Result<(),
-JobError>`. It runs as its own transaction, so it reads and writes through
+JobError>`. That is a `global` job's. A `scoped_by = Org` job's `run` takes
+`tx: &mut ScopedTx<'_, '_, Org>` instead (next subsection), and `cross_tenant`
+adds `cap: &CrossTenant` after `tx` in either form. It runs as its own
+transaction, so it reads and writes through
 `tx` exactly like a route handler or the closure in §4's `db.transact`.
 `JobError: From<io::Error>` (mapping to `JobError::Io`), so `?` works on
 `tx` reads the same way it does with `ApiError`:
@@ -1416,6 +1424,95 @@ impl CountUp {
     }
 }
 ```
+
+### A job inside a tenant: `scoped_by`
+
+A job that acts inside one tenant says so, and then it runs in the tenant it was
+enqueued from. It is enqueued from inside that tenant's scope: `tx.enqueue` on the
+`ScopedTx` a handler's `tx.scope::<Org>(org, ctx)?` returns. The enqueue records the
+tenant beside the job, and when the job runs, its `run` receives that tenant's
+`ScopedTx`. No `authorize` runs for it: a job has no principal, and its authority is
+its enqueuer's, who was inside the tenant already. Its retries run in the same tenant,
+and a follow-up it enqueues through its own `ScopedTx` inherits the tenant too.
+
+```rust
+use charpente::auth::Principal;
+use charpente::http::{ApiError, Ctx};
+use charpente::kernel::JobError;
+use charpente::{Id, Scoped, ScopedTx, Tenant, Tx, View, job, route, table};
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, who: &Principal, scope: Id<Org>) -> Result<(), ApiError> {
+        if who.subject() == format!("org:{}", scope.raw()) {
+            Ok(())
+        } else {
+            Err(ApiError::BadRequest(format!(
+                "not a member of org {}",
+                scope.raw()
+            )))
+        }
+    }
+}
+
+#[table(scoped_by = Org)]
+struct Invoice {
+    id: Id<Invoice>,
+    receipts: u32,
+}
+
+#[table(global)]
+struct Mailer {
+    id: Id<Mailer>,
+    sent: u64,
+}
+
+#[job(scoped_by = Org)]
+struct SendReceipt {
+    invoice: u64,
+}
+
+impl SendReceipt {
+    fn run(self, tx: &mut ScopedTx<'_, '_, Org>) -> Result<(), JobError> {
+        // Inside the org it was enqueued in, exactly as the handler was.
+        if let Some(mut inv) = tx.get(Id::<Invoice>::from_raw(self.invoice))? {
+            inv.receipts += 1;
+            tx.put(&inv);
+        }
+        // A global table, through the deref: `run` holds `&mut ScopedTx`,
+        // so it is `**tx` here where a handler writes `*tx`.
+        let sent = (**tx).get(Id::<Mailer>::from_raw(0))?.map_or(0, |m| m.sent);
+        (**tx).put(&Mailer {
+            id: Id::from_raw(0),
+            sent: sent + 1,
+        });
+        Ok(())
+    }
+}
+
+#[route(POST "/orgs/:org/invoices/:id/receipt", auth)]
+fn send_receipt(tx: &mut Tx, org: Id<Org>, id: Id<Invoice>, ctx: &Ctx) -> Result<(), ApiError> {
+    let mut tx = tx.scope::<Org>(org, ctx)?;
+    tx.get(id)?.ok_or(ApiError::NotFound)?;
+    tx.enqueue(SendReceipt { invoice: id.raw() }); // runs in this org
+    Ok(())
+}
+```
+
+`ScopedTx::enqueue` takes a job scoped by that same type, so a job scoped by another type
+is a type error (E0271: rustc cannot resolve the job's `Scope` to `Org`, and points at the
+`Team` its `#[job]` names). So is a `global` job: it is enqueued inside a scope through
+the explicit deref, `(*tx).enqueue(job)` in a handler and `(**tx).enqueue(job)` in a
+scoped job's `run`. A scoped job on a bare `Tx`, where no tenant is named, is refused with
+the note shown in "What `#[job]` rejects". Cron takes `global` jobs only (§7), because a
+tick has no tenant. A sweep that must act in every tenant fans out instead (§7).
 
 ### Registering jobs: `jobs![...]` and `mount_jobs`
 
@@ -1479,7 +1576,9 @@ From inside any transaction — a route handler, a job handler, a cron tick
 `charpente.jobs` table. `tx.enqueue_keyed(key, job)` does the same, plus
 carries a key: the job's stable identity to the world **outside** the log
 (the idempotency key an at-least-once external effect needs downstream —
-M1's external-IO surface consumes it). Inside the deterministic boundary
+M1's external-IO surface consumes it). On a bare `Tx` these take `global`
+jobs. A `scoped_by` job is enqueued the same two ways on its tenant's
+`ScopedTx` (above). Inside the deterministic boundary
 the key means nothing in v0 — it is carried, never indexed or deduped on,
 because exactly-once state effects here are structural (below), not
 key-based. An empty key is a contract panic: `"contract: an idempotency
@@ -1574,8 +1673,13 @@ opening, a completed switchover), and `promote` checks before it changes anythin
 
 <!-- pinned -->
 ```text
-<n> Pending "<job>" job(s) (ids <ids>) were enqueued under a different shape of <job> (recorded <recorded>; this binary <fingerprint>) — this binary will not decode them; run the binary that enqueued them until they are Done or Dead, then deploy this one, or restore <job>'s old fields and give the new shape its own #[job] type under a new name (GUIDE §6)
+<n> Pending "<job>" job(s) (ids <ids>) were enqueued under a different shape of <job> (recorded <recorded>; this binary <fingerprint>) — this binary will not decode them; run the binary that enqueued them until they are Done or Dead, then deploy this one, or restore <job>'s old fields and its `global`/`scoped_by` declaration and give the new shape its own #[job] type under a new name (GUIDE §6)
 ```
+
+A job's tenancy is part of its shape. `scoped_by` is fingerprinted with the fields, so
+moving a job between `global` and `scoped_by`, or between two scope types, is refused the
+same way. A deploy therefore never hands a row enqueued with no tenant to a scoped `run`,
+or one enqueued in a tenant to a global one.
 
 At most five ids are listed, then `…`. A job enqueued before shapes were recorded reads
 `recorded none — enqueued before job shapes were tagged`, and it is refused the same way:
@@ -1629,20 +1733,51 @@ What the fingerprint cannot see, a change inside a type a field holds, is in §1
 
 ### What `#[job]` rejects
 
+Every rejection is a compile error naming the contract and the fix. The first is the
+one every job meets once, and the next three are its neighbours:
+
+<!-- pinned -->
+```text
+`<job>` declares no tenancy — a job says which: write `#[job(scoped_by = Org)]` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `#[job(global)]` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
+`global` and `scoped_by = <scope>` on one job — a job is one or the other; drop one
+`global` given twice — write it once
+`scoped_by` given twice — write it once
+```
+
+A `scoped_by` job enqueued where no tenant is named — `tx.enqueue` on a bare `Tx`, or
+`App::schedule` — is an unsatisfied bound, and rustc prints this note with your job and
+scope in place of `<job>` and `<scope>` (§16 shows it rendered):
+
+<!-- pinned -->
+```text
+`<job>` is a tenant-scoped job (`#[job(scoped_by = <scope>)]`) and a bare `Tx` names no tenant to run it in
+enqueue it from inside the tenant it acts in, and it runs in that tenant:
+    let mut tx = tx.scope::<<scope>>(scope, ctx)?;
+    tx.enqueue(job);
+or fan it out from a `cross_tenant` route or job, naming the tenant:
+    tx.enqueue_in::<<scope>>(scope, job, cap);
+cron (`App::schedule`) enqueues on a bare `Tx`, so it schedules `global` jobs only
+```
+
+The rest are about the attribute's syntax and the struct's shape:
+
 ```rust,ignore
-// unrecognized retry syntax
+// a word the attribute does not recognise
 #[job(bogus)]
 struct Foo {}
-// "write `#[job]` or `#[job(retry(max = <int>, backoff = \"<n><unit>\"))]`
-//  (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff =
-//  \"10s\"))]`"
+// "a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant`
+//  and `retry(max = <int>, backoff = \"<n><unit>\")` (unit is one of ms, s, m,
+//  h), in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff =
+//  \"10s\"))]` or `#[job(global, cross_tenant)]`"
 
 // backoff with no unit suffix
 #[job(global, retry(max = 3, backoff = "10"))]
 struct Bar {}
-// "backoff \"10\" has no unit — write `#[job]` or `#[job(retry(max =
-//  <int>, backoff = \"<n><unit>\"))]` (unit is one of ms, s, m, h) — e.g.
-//  `#[job(retry(max = 3, backoff = \"10s\"))]`"
+// "backoff \"10\" has no unit — a job declares `global` or `scoped_by =
+//  <Type>`, and may add `cross_tenant` and `retry(max = <int>, backoff =
+//  \"<n><unit>\")` (unit is one of ms, s, m, h), in any order — e.g.
+//  `#[job(scoped_by = Org, retry(max = 3, backoff = \"10s\"))]` or
+//  `#[job(global, cross_tenant)]`"
 
 // enums and unions cannot be job payloads
 #[job(global)]
@@ -1658,6 +1793,12 @@ Cron rides the same kernel loop as HTTP requests and jobs (§5, §6) — a
 schedule is a row, and a due tick is one transaction that advances the
 schedule and enqueues a job through the exact same path `tx.enqueue` uses:
 a recurring enqueuer, inheriting retry and observability for free.
+
+A tick has no tenant, so `App::schedule` takes `global` jobs only; a `scoped_by` job there
+is the §6 compile error. A sweep that must act in every tenant is a `global, cross_tenant`
+job: it reads every tenant through the `CrossTenant` it declared, and fans a `scoped_by`
+job out into each tenant it names with `tx.enqueue_in(org, job, cap)`. Each fanned-out job
+then runs in its own tenant, exactly as if enqueued from inside it.
 
 ### Registering a schedule: `App::schedule`
 
@@ -1747,6 +1888,85 @@ interval"` — but unlike the duplicate-name panic, not synchronously at the
 and the conversion only happens at kernel startup. For a `serve()`-based
 app that startup runs on the spawned kernel thread, so `serve` has already
 returned `Ok` when the panic takes the kernel down.
+
+A sweep that acts in every tenant, as the introduction describes: the schedule enqueues a
+`global, cross_tenant` job, and that job fans a `scoped_by` job out into each tenant it
+names.
+
+```rust
+use charpente::auth::Principal;
+use charpente::http::{ApiError, App, AppConfig};
+use charpente::kernel::JobError;
+use charpente::prod::{ProdDisk, ProdEntropy};
+use charpente::{CrossTenant, Id, Schema, ScopedTx, Tenant, Tx, job, jobs, table};
+use std::time::Duration;
+
+#[table(global)]
+struct Org {
+    id: Id<Org>,
+    name: String,
+}
+
+impl Tenant for Org {
+    type Who = Principal;
+    type Error = ApiError;
+    fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Org>) -> Result<(), ApiError> {
+        // Never asked by the sweep: a job has no principal.
+        Err(ApiError::Unauthorized)
+    }
+}
+
+#[table(scoped_by = Org)]
+struct Window {
+    id: Id<Window>,
+    applied: bool,
+}
+
+/// Acts inside one org, the one the sweep named when it fanned this out.
+#[job(scoped_by = Org)]
+struct ApplyWindow {
+    window: u64,
+}
+
+impl ApplyWindow {
+    fn run(self, tx: &mut ScopedTx<'_, '_, Org>) -> Result<(), JobError> {
+        if let Some(mut w) = tx.get(Id::<Window>::from_raw(self.window))? {
+            w.applied = true;
+            tx.put(&w);
+        }
+        Ok(())
+    }
+}
+
+/// Reads every org's windows and fans one `ApplyWindow` into each window's org.
+#[job(global, cross_tenant)]
+struct MaintenanceSweep {}
+
+impl MaintenanceSweep {
+    fn run(self, tx: &mut Tx, cap: &CrossTenant) -> Result<(), JobError> {
+        let windows = tx.across_tenants::<Org>(cap).scan::<Window>()?;
+        for (org, window) in windows {
+            if !window.applied {
+                tx.enqueue_in(org, ApplyWindow { window: window.id.raw() }, cap);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn build_app(data_dir: &str) -> std::io::Result<App> {
+    Ok(App::open(
+        Box::new(ProdDisk::new(data_dir)?),
+        Schema::new().table::<Window>(),
+        Box::new(ProdEntropy::new()?),
+        AppConfig::default(),
+    )?
+    .mount_jobs(jobs![ApplyWindow, MaintenanceSweep])
+    .schedule("maintenance-sweep", Duration::from_secs(3600), || {
+        MaintenanceSweep {}
+    }))
+}
+```
 
 ### Ticks are transactions
 
@@ -2830,33 +3050,38 @@ argument list didn't parse as `METHOD "/path"` to begin with. Every one of
 these is a compile error at the `#[route]` call site — fix the signature or
 the pattern and it's gone.
 
-### `#[job]` retry-syntax and shape violations (`charpente-macros/src/job.rs`, compile time)
+### `#[job]` tenancy, retry-syntax and shape violations (`charpente-macros/src/job.rs`, compile time)
 
 ```text
-write `#[job]` or `#[job(retry(max = <int>, backoff = "<n><unit>"))]` (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff = "10s"))]`
-backoff "10" has no unit — write `#[job]` or `#[job(retry(max = <int>, backoff = "<n><unit>"))]` (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff = "10s"))]`
-unknown retry field `jitter` — write `#[job]` or `#[job(retry(max = <int>, backoff = "<n><unit>"))]` (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff = "10s"))]`
+`NotifySubscribers` declares no tenancy — a job says which: write `#[job(scoped_by = Org)]` if it acts inside one tenant (it is enqueued from inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), or `#[job(global)]` if it belongs to no tenant (the only kind cron can schedule). Neither is the default.
+`global` and `scoped_by = Org` on one job — a job is one or the other; drop one
+`global` given twice — write it once
+`scoped_by` given twice — write it once
+`cross_tenant` given twice — write it once
+`retry(...)` given twice — write it once
+a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant` and `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]` or `#[job(global, cross_tenant)]`
+backoff "10" has no unit — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant` and `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]` or `#[job(global, cross_tenant)]`
+unknown retry field `jitter` — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant` and `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]` or `#[job(global, cross_tenant)]`
 `max` given twice — write it once
 `backoff` given twice — write it once
-`global` given twice — write it once
-`retry(...)` given twice — write it once
-backoff "12xs": "12x" is not a whole number — write `#[job]` or `#[job(retry(max = <int>, backoff = "<n><unit>"))]` (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff = "10s"))]`
-backoff "99999999999999h" overflows u64 milliseconds — write `#[job]` or `#[job(retry(max = <int>, backoff = "<n><unit>"))]` (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff = "10s"))]`
+backoff "12xs": "12x" is not a whole number — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant` and `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]` or `#[job(global, cross_tenant)]`
+backoff "99999999999999h" overflows u64 milliseconds — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant` and `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]` or `#[job(global, cross_tenant)]`
 #[job] applies to structs — enums and unions cannot be job payloads
 #[job] structs cannot be generic — a job is one concrete payload shape; make `Baz` non-generic
 #[job] needs named fields — `Baz` must be a braced struct
 ```
 
-Anything other than bare `#[job]` or `#[job(retry(max = <int>, backoff =
-"<n><unit>"))]` (unit one of `ms`, `s`, `m`, `h`) hits the first message —
-it names the two accepted forms directly, so the fix is always "match one
-of those two shapes." The rest are that same message with more specific
-context prepended: a backoff string missing its unit, an unrecognized field
-name inside `retry(...)`, `global`, `retry(...)`, `max` or `backoff` written
-twice, a backoff whose
-number doesn't parse, or one so large it overflows `u64` milliseconds once
-converted to it. The last three are the same struct-shape checks `#[table]`
-makes (§2): only structs, only non-generic, only named fields.
+The first is the one every job meets: a job declares its tenancy, and a bare `#[job]`
+names both answers. The next five refuse a word given twice or both tenancies at once.
+Anything else the attribute does not recognise hits the accepted-forms message, which
+lists every word. Four of the lines after it are that message with more specific context
+prepended: a backoff string missing its unit, an unrecognized field inside `retry(...)`,
+a backoff whose number doesn't parse, or one so large it overflows `u64` milliseconds;
+between them, `max` or `backoff` written twice inside `retry(...)` is refused like the
+words above. The last three are the struct-shape checks `#[table]` makes (§2): only
+structs, only non-generic, only named fields. A scoped job enqueued where no tenant is
+named, or scheduled by cron, is a trait-bound error rather than a macro one; §6 pins its
+note.
 
 Three more, at job-dispatch time rather than macro-expansion time
 (`charpente/src/kernel/dispatch.rs` — covered behaviorally in §6's "Retry,
@@ -4043,6 +4268,8 @@ its type, not the type's definition.
 The tokens are hashed as written, rendered by charpente itself with one space between
 tokens: `Vec<u8>` and `std::vec::Vec<u8>` are different shapes to it, so respelling a
 field's type is a shape change, and a compiler upgrade never is.
+A job's `scoped_by` path is fingerprinted the same way, as written, so a change of a
+job's tenancy is a shape change (§6).
 A change inside a type a field holds — a new variant on an enum, a field added to a
 nested struct — leaves the fingerprint unchanged, for tables and for
 `#[event]`/`#[job]` payloads alike (§6, §11). Such a
@@ -5646,6 +5873,9 @@ The shape of an app that uses it:
 - each route that opens a scope says who may: `auth` or `public`, where the
   membership check decides for each principal, or `public(Org)`, where every
   caller may by declaration (§5, "A route's stance").
+- `#[job(scoped_by = Org)]` on every job that acts inside one tenant, and
+  `#[job(global)]` on every job that belongs to none. A scoped job's `run`
+  receives the `ScopedTx` of the tenant it was enqueued from.
 
 ### Declaring a scope and a scoped table
 
@@ -5847,8 +6077,8 @@ runs two transactions.
 
 ### The compile errors, so you recognize them
 
-Both are rendered below with rustc's own `help:` chains trimmed away, leaving
-the message line and the `note:` that carries the fix. Both are pinned
+Each is rendered below with rustc's own `help:` chains trimmed away, leaving
+the message line and the `note:` that carries the fix. Each is pinned
 byte-for-byte by the compile-fail matrix in
 `crates/charpente-macros/tests/compile_fail/`.
 
@@ -5861,9 +6091,10 @@ error[E0277]: `Invoice` is a tenant-scoped table (`#[table(scoped_by = Org)]`) a
 31 |     Ok(tx.scan::<Invoice>()?)
    |           ----   ^^^^^^^ `Invoice` is scoped by `Org`
    |
-   = note: open the tenant scope first; `Org`'s own `Tenant::authorize` runs there, once per handler:
+   = note: open the tenant scope first — in a handler, `Org`'s own `Tenant::authorize` runs there for a credentialed caller:
                let tx = tx.scope::<Org>(scope, ctx)?;
                tx.scan::<Invoice>()?
+           in a job, declare `#[job(scoped_by = Org)]` and read through the `ScopedTx` its `run` receives
 ```
 
 `scoped_by` naming a type with no membership check:
@@ -5883,11 +6114,29 @@ error[E0277]: `Org` is used as a tenant scope but has no `Tenant` impl
           }
 ```
 
-There is no one-line way out of either. The marker the message hangs on
+A scoped job enqueued on a bare `Tx`:
+
+```text
+error[E0277]: `NotifySubscribers` is a tenant-scoped job (`#[job(scoped_by = Org)]`) and a bare `Tx` names no tenant to run it in
+  --> src/incidents.rs:49:16
+   |
+49 |     tx.enqueue(NotifySubscribers { incident: id.raw() });
+   |        ------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `NotifySubscribers` is scoped by `Org`
+   |
+   = note: enqueue it from inside the tenant it acts in, and it runs in that tenant:
+               let mut tx = tx.scope::<Org>(scope, ctx)?;
+               tx.enqueue(job);
+           or fan it out from a `cross_tenant` route or job, naming the tenant:
+               tx.enqueue_in::<Org>(scope, job, cap);
+           cron (`App::schedule`) enqueues on a bare `Tx`, so it schedules `global` jobs only
+```
+
+There is no one-line way out of any of them. The marker the message hangs on
 (`NoTenant`) and the trait `View` actually bounds on (`UnscopedRow`) are both
 sealed by a supertrait no other crate can name, so `impl UnscopedRow for
 Invoice {}` — orphan-legal, and the obvious workaround — is itself a compile
-error telling you to open the scope. The six scope-taking primitives underneath
+error telling you to open the scope. The job pair, `NoJobTenant` and
+`UnscopedJob`, is sealed the same way. The six scope-taking primitives underneath
 (`get_in`, `scan_in`, `scan_by_in`, `scan_from_in`, `put_in`, `delete_in`) are
 private to the core, so there is no back door on a bare `Tx` either.
 
@@ -5980,10 +6229,16 @@ Four properties make this a capability rather than an escape hatch:
   contains private fields`.
 - **The result carries the tenant.** `AllTenants::scan` yields
   `Vec<(Id<Org>, Ledger)>`, never `Vec<Ledger>`, so a cross-tenant answer cannot
-  be handed to code expecting one tenant's data without a visible `.map`. It is
-  also read-only: there is no `put` or `delete` on the cross-tenant handle.
+  be handed to code expecting one tenant's data without a visible `.map`. The
+  handle itself is read-only: there is no `put` or `delete` on it. The one thing
+  a declared route or job does beyond reading is fan out:
+  `tx.enqueue_in::<Org>(org, job, cap)` enqueues a `scoped_by = Org` job into the
+  org it names, where it runs as if enqueued from inside (§7). So the capability
+  is reads, plus fan-out enqueue, and `describe`'s `cross_tenant=true` inventory
+  covers both.
 - **It is enumerable.** Because the declaration lives on the route, `charpente
-  describe` (§13) lists every endpoint and job that can read across tenants —
+  describe` (§13) lists every endpoint and job that can read across tenants or
+  fan out into them —
   an inventory, not a grep someone has to remember to run:
 
   ```text
@@ -6048,8 +6303,9 @@ consequences you may meet:
 ### Where the guarantee stops
 
 **The guarantee is about the typed surface the framework hands your app.** A
-route handler and a job receive a `Tx`; through a `Tx`, a scoped table is
-unreachable without `tx.scope::<Org>(org, ctx)?`. That is the property a
+route handler receives a `Tx`, and a scoped job the `ScopedTx` of the tenant it
+was enqueued in; through a `Tx`, a scoped table is unreachable without
+`tx.scope::<Org>(org, ctx)?`. That is the property a
 reviewer checks by reading one line per handler, and the compiler enforces it.
 
 It is **not** a sandbox around the process. Your own `main` builds the `App` it
@@ -6060,6 +6316,8 @@ word with no `authorize` on the path (replication seeding, the archive and
 token. Whoever holds the `Db` holds the store, with the same standing as
 whoever holds the data directory: an operator, not a request.
 
+**Code outside a handler never takes a scope on its own word.** A job declares
+`#[job(scoped_by = Org)]` and runs in the tenant its enqueuer opened (§6).
 **Operator code that must act inside one tenant** — seeding, a test oracle, an admin
 step in `main` — does not take a scope on its own word either. It begins a group, mints
 a `TenantAdmission` from it, and opens the tenant with `admit_scope`:

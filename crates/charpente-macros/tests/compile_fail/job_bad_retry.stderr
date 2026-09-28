@@ -1,4 +1,4 @@
-error: unknown retry field `count` — write `#[job]`, `#[job(cross_tenant)]` or `#[job([cross_tenant, ]retry(max = <int>, backoff = "<n><unit>"))]` (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff = "10s"))]`
+error: unknown retry field `count` — a job declares `global` or `scoped_by = <Type>`, and may add `cross_tenant` and `retry(max = <int>, backoff = "<n><unit>")` (unit is one of ms, s, m, h), in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = "10s"))]` or `#[job(global, cross_tenant)]`
   --> tests/compile_fail/job_bad_retry.rs:10:21
    |
 10 | #[job(global, retry(count = 3))]

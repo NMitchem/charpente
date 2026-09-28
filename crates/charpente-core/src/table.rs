@@ -368,10 +368,12 @@ pub trait Row: Sized + 'static {
     message = "`{R}` is a tenant-scoped table (`#[table(scoped_by = {Self})]`) and a bare `Tx` \
                names no tenant",
     label = "`{R}` is scoped by `{Self}`",
-    note = "open the tenant scope first; `{Self}`'s own `Tenant::authorize` runs there, \
-            once per handler:\n    \
+    note = "open the tenant scope first — in a handler, `{Self}`'s own `Tenant::authorize` runs \
+            there for a credentialed caller:\n    \
             let tx = tx.scope::<{Self}>(scope, ctx)?;\n    \
-            tx.scan::<{R}>()?"
+            tx.scan::<{R}>()?\n\
+            in a job, declare `#[job(scoped_by = {Self})]` and read through the `ScopedTx` its \
+            `run` receives"
 )]
 pub trait NoTenant<R>: sealed::NotATenant {}
 
@@ -384,6 +386,7 @@ impl<R> NoTenant<R> for Unscoped {}
 mod sealed {
     pub trait NotATenant {}
     pub trait NotScoped {}
+    pub trait NotScopedJob {}
 }
 
 impl sealed::NotATenant for Unscoped {}
@@ -407,6 +410,45 @@ impl<R: Row> sealed::NotScoped for R where R::Scope: NoTenant<R> {}
 pub trait UnscopedRow: Row + sealed::NotScoped {}
 
 impl<R: Row> UnscopedRow for R where R::Scope: NoTenant<R> {}
+
+/// The job twin of `NoTenant` (job-tenancy spec §5): `Unscoped` implements it
+/// for every job type, and no other scope type implements it at all. It
+/// carries the refusal for a `#[job(scoped_by = …)]` job enqueued where no
+/// tenant is named — `Tx::enqueue` on a bare `Tx`, or a cron schedule — and it
+/// hangs on a trait the SCOPE type implements or not for `NoTenant`'s reason:
+/// an associated-type mismatch cannot carry a custom diagnostic. `{J}` puts
+/// the job's name in the text, as `{R}` puts the row's.
+///
+/// SEALED by `NotATenant`, the same seal, and `UnscopedJob` below by its own:
+/// either one alone would leave the other as a one-line, orphan-legal opt-out
+/// (`impl NoJobTenant<Notify> for Org {}`, or `impl UnscopedJob for Notify {}`).
+#[diagnostic::on_unimplemented(
+    message = "`{J}` is a tenant-scoped job (`#[job(scoped_by = {Self})]`) and a bare `Tx` \
+               names no tenant to run it in",
+    label = "`{J}` is scoped by `{Self}`",
+    note = "enqueue it from inside the tenant it acts in, and it runs in that tenant:\n    \
+            let mut tx = tx.scope::<{Self}>(scope, ctx)?;\n    \
+            tx.enqueue(job);\n\
+            or fan it out from a `cross_tenant` route or job, naming the tenant:\n    \
+            tx.enqueue_in::<{Self}>(scope, job, cap);\n\
+            cron (`App::schedule`) enqueues on a bare `Tx`, so it schedules `global` jobs only"
+)]
+pub trait NoJobTenant<J>: sealed::NotATenant {}
+
+impl<J> NoJobTenant<J> for Unscoped {}
+
+/// `UnscopedJob`'s seal, derived from `Job::Scope` by the same condition
+/// `UnscopedJob` uses, so the seal admits exactly the jobs the bound admits.
+impl<J: crate::db::Job> sealed::NotScopedJob for J where J::Scope: NoJobTenant<J> {}
+
+/// A job with no tenant: exactly the `Job`s whose `Scope` is `Unscoped`,
+/// derived from `Job::Scope` as `UnscopedRow` is from `Row::Scope`. This is
+/// the bound on `Tx::enqueue`, `Tx::enqueue_keyed` and `App::schedule`, so a
+/// scoped job at any of them is an unsatisfied bound whose text names the fix,
+/// not a job that runs in no tenant. Sealed for `UnscopedRow`'s reason.
+pub trait UnscopedJob: crate::db::Job + sealed::NotScopedJob {}
+
+impl<J: crate::db::Job> UnscopedJob for J where J::Scope: NoJobTenant<J> {}
 
 /// Read access to UNSCOPED table state — implemented by `Snapshot` (reads
 /// outside transactions) and `Tx` (reads inside one, which also see the

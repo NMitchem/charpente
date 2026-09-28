@@ -19,13 +19,14 @@
 //! the next free tag. `0x02`/`0x03` (the same without the shape) still
 //! decode, with the shape unknown, and are never written — `TxEffects` holds
 //! a bare shape, so a shapeless enqueue or emit cannot be represented.
-//! `0x05`/`0x06`/`0x07` are the ONLY tags that carry a
-//! scope, chosen by the table's own `Row::Scope`, not by the scope value
-//! (tenant 0 is a legal tenant, so a scoped table's records always use
-//! `0x05`/`0x06`/`0x07`, never `0x00`/`0x01`/`0x04`, even at scope 0).
-//! A scoped enqueue is `0x0a` rather than a widened `0x08` for the same
-//! reason, and the same presence-not-value rule chooses it: an enqueue
-//! carrying `Some(0)` is `0x0a`.
+//! `0x05`/`0x06`/`0x07` and `0x0a` are the ONLY tags that carry a
+//! scope. A table effect's is chosen by the table's own `Row::Scope`, not by
+//! the scope value (tenant 0 is a legal tenant, so a scoped table's records
+//! always use `0x05`/`0x06`/`0x07`, never `0x00`/`0x01`/`0x04`, even at
+//! scope 0). A scoped enqueue is `0x0a` rather than a widened `0x08` for the
+//! same reason, chosen by the job's own `Job::Scope` through the enqueue
+//! family, and the same presence-not-value rule applies: an enqueue carrying
+//! `Some(0)` is `0x0a`.
 //! A binary that does not know a tag refuses it by name (`decode_record`'s
 //! unknown-tag error) rather than misreading a wider record. `0x07` is a
 //! NEW tag rather than a widened `0x04`, the same choice `0x05`/`0x06` made
@@ -49,7 +50,7 @@ use crate::io::{Disk, File};
 use crate::job::JobRow;
 use crate::log::{MAX_RECORD_BYTES, WalConfig, parse_segment_name, segment_name};
 use crate::table::{
-    Codec, Id, IndexDef, Row, RowShape, Snapshot, Store, UnscopedRow, View, Writer,
+    Codec, Id, IndexDef, Row, RowShape, Snapshot, Store, UnscopedJob, UnscopedRow, View, Writer,
 };
 
 // ---------------------------------------------------------------- config
@@ -104,6 +105,12 @@ pub trait Job: Codec {
     /// must state one, or a hand-written job would opt out of the check
     /// silently.
     const FINGERPRINT: u64;
+    /// The tenant scope type a `#[job(scoped_by = Org)]` job runs in, or
+    /// `Unscoped` for a `#[job(global)]` one (job-tenancy spec §5). No
+    /// default, for `FINGERPRINT`'s reason: a hand-written impl states it,
+    /// or it would slip past the enqueue family's bounds unseen. `'static`
+    /// because `push_enqueue` compares it by `TypeId`.
+    type Scope: 'static;
     const RETRY: crate::job::RetryPolicy = crate::job::RetryPolicy::DEFAULT;
 }
 
@@ -910,37 +917,69 @@ impl<'a> Tx<'a> {
         self.effects.migrate_puts.push((table, scope, id, row));
     }
 
-    pub fn enqueue<J: Job>(&mut self, job: J) {
+    /// The one body of the enqueue family (job-tenancy spec §5–§6). `scope`
+    /// is the tenant a scoped job runs in, and `None` for a `global` one.
+    /// The public methods' bounds decide which, and this asserts that they
+    /// agree with the job's own declaration, so a scoped job is never
+    /// written without its tenant and a global one never with one (hard
+    /// rule 4).
+    fn push_enqueue<J: Job>(&mut self, scope: Option<u64>, key: Option<String>, job: J) {
+        assert_eq!(
+            scope.is_some(),
+            TypeId::of::<J::Scope>() != TypeId::of::<crate::table::Unscoped>(),
+            "contract: job \"{}\" was enqueued with tenant {scope:?}, but a scoped job carries \
+             its tenant and a global one none — the enqueue family's bounds guarantee this, so \
+             reaching here is a platform bug",
+            J::NAME
+        );
+        if let Some(key) = &key {
+            assert!(
+                !key.is_empty(),
+                "contract: an idempotency key names the job's external identity — it cannot be \
+                 empty"
+            );
+        }
         let mut payload = Vec::new();
         job.encode(&mut payload);
         self.effects.enqueues.push(Enqueue {
             job: J::NAME,
             payload,
-            key: None, // `Some(key)` in enqueue_keyed
+            key,
             shape: J::FINGERPRINT,
-            scope: None,
+            scope,
         });
+    }
+
+    /// Enqueues a `global` job into this transaction's record. A
+    /// `#[job(scoped_by = Org)]` job does not compile here: it names a
+    /// tenant, and a bare `Tx` names none (`NoJobTenant`'s note says where to
+    /// enqueue it instead).
+    pub fn enqueue<J: UnscopedJob>(&mut self, job: J) {
+        self.push_enqueue(None, None, job);
     }
 
     /// Enqueues with an idempotency key: the job's stable identity to the world
     /// OUTSIDE the log (consumed by M1's external-IO surface). Inside the
     /// deterministic boundary the key means nothing — exactly-once state effects
     /// are structural, so the platform neither indexes nor dedupes on it.
-    pub fn enqueue_keyed<J: Job>(&mut self, key: impl Into<String>, job: J) {
-        let key = key.into();
-        assert!(
-            !key.is_empty(),
-            "contract: an idempotency key names the job's external identity — it cannot be empty"
-        );
-        let mut payload = Vec::new();
-        job.encode(&mut payload);
-        self.effects.enqueues.push(Enqueue {
-            job: J::NAME,
-            payload,
-            key: Some(key),
-            shape: J::FINGERPRINT,
-            scope: None,
-        });
+    pub fn enqueue_keyed<J: UnscopedJob>(&mut self, key: impl Into<String>, job: J) {
+        self.push_enqueue(None, Some(key.into()), job);
+    }
+
+    /// The declared fan-out (job-tenancy spec §2 R5): enqueues a scoped job
+    /// into the tenant `scope` names, from a route or job that declared
+    /// `cross_tenant`. The token is the declaration, so one inventory,
+    /// `describe`'s `cross_tenant=true`, answers "what reaches every tenant
+    /// here", by reads and by fan-out. The job runs in `scope` exactly as if
+    /// it had been enqueued from inside it.
+    pub fn enqueue_in<S: Tenant, J: Job<Scope = S>>(
+        &mut self,
+        scope: Id<S>,
+        job: J,
+        cap: &CrossTenant,
+    ) {
+        let CrossTenant(()) = cap;
+        self.push_enqueue(Some(scope.raw()), None, job);
     }
 
     pub fn emit<Ev: Event>(&mut self, event: Ev) {
@@ -1537,6 +1576,23 @@ impl<'a, S: 'static> ScopedTx<'_, 'a, S> {
         let key = self.event_key();
         self.tx.emit_keyed(key, event);
     }
+
+    /// Enqueues a job scoped by this tenant's type; it runs in this tenant
+    /// (job-tenancy spec §5). This shadows `Tx::enqueue` the way `emit`
+    /// shadows `Tx::emit`. A `global` job enqueued inside a scope is written
+    /// `(*tx).enqueue(job)` in a handler that owns its `ScopedTx`, and
+    /// `(**tx).enqueue(job)` in a scoped job's `run`, which holds
+    /// `&mut ScopedTx`.
+    pub fn enqueue<J: Job<Scope = S>>(&mut self, job: J) {
+        let scope = self.scope.raw();
+        self.tx.push_enqueue(Some(scope), None, job);
+    }
+
+    /// `enqueue`, with `Tx::enqueue_keyed`'s idempotency key.
+    pub fn enqueue_keyed<J: Job<Scope = S>>(&mut self, key: impl Into<String>, job: J) {
+        let scope = self.scope.raw();
+        self.tx.push_enqueue(Some(scope), Some(key.into()), job);
+    }
 }
 
 impl<'a, S> std::ops::Deref for ScopedTx<'_, 'a, S> {
@@ -1588,9 +1644,11 @@ impl<'a> Group<'a> {
 /// this transaction into one tenant — `Tx::admit_scope`'s argument
 /// (job-tenancy spec §3, §4, §7).
 ///
-/// Holders: the operator, through a `Group`; and the platform, which mints
+/// Holders: the operator, through a `Group`; the platform, which mints
 /// one per request for a route declared `public(S)` and keeps it private in
-/// that request's `Ctx`, so `tx.scope::<S>` admits by the declaration.
+/// that request's `Ctx`, so `tx.scope::<S>` admits by the declaration; and
+/// the dispatcher, which mints one per job run and hands a scoped job's glue
+/// a `JobScope` that opens only the tenant its row carries.
 ///
 /// Sealed exactly as `CrossTenant` is, and for the same reason: its field is
 /// private and `Group::tenant_admission` is the only constructor, and a
@@ -2908,8 +2966,9 @@ impl Db {
                     "{} Pending \"{name}\" job(s) (ids {}) were enqueued under a different shape \
                      of {name} (recorded {}; this binary {:#x}) — this binary will not decode \
                      them; run the binary that enqueued them until they are Done or Dead, then \
-                     deploy this one, or restore {name}'s old fields and give the new shape its \
-                     own #[job] type under a new name (GUIDE §6)",
+                     deploy this one, or restore {name}'s old fields and its \
+                     `global`/`scoped_by` declaration and give the new shape its own #[job] type \
+                     under a new name (GUIDE §6)",
                     ids.len(),
                     listed.join(", "),
                     recorded.join(", "),

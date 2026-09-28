@@ -18,17 +18,45 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// NUL-separated fold so ("ab","c") cannot collide with ("a","bc"). Each type
-/// is rendered by `render`, not by `TokenStream`'s `Display`: that printer's
-/// spacing is the compiler's and is documented as subject to change, and
-/// these hashes are persisted.
-pub(crate) fn compute(field_idents: &[syn::Ident], field_types: &[Type]) -> u64 {
+/// The NUL-separated field fold `compute` hashes (see `compute`).
+fn fold(field_idents: &[syn::Ident], field_types: &[Type]) -> String {
     let mut buf = String::new();
     for (ident, ty) in field_idents.iter().zip(field_types) {
         buf.push_str(&ident.to_string());
         buf.push('\0');
         let mut words = Vec::new();
         render(ty.to_token_stream(), &mut words);
+        buf.push_str(&words.join(" "));
+        buf.push('\0');
+    }
+    buf
+}
+
+/// NUL-separated fold so ("ab","c") cannot collide with ("a","bc"). Each type
+/// is rendered by `render`, not by `TokenStream`'s `Display`: that printer's
+/// spacing is the compiler's and is documented as subject to change, and
+/// these hashes are persisted.
+pub(crate) fn compute(field_idents: &[syn::Ident], field_types: &[Type]) -> u64 {
+    fnv1a(fold(field_idents, field_types).as_bytes())
+}
+
+/// A job's fingerprint (job-tenancy spec §6). A `global` job's is exactly
+/// `compute`'s, so no job changes shape by declaring `global`. A `scoped_by`
+/// job's is the same fold followed by `#scoped_by\0<path tokens>\0`, so a
+/// change of tenancy is a change of shape, which the Pending-shape refusal
+/// names. No identifier begins with `#`, so no field list can produce the
+/// suffix. `cross_tenant` is not mixed in, because it changes neither the
+/// stored bytes nor decode.
+pub(crate) fn compute_job(
+    field_idents: &[syn::Ident],
+    field_types: &[Type],
+    scoped_by: Option<&syn::Path>,
+) -> u64 {
+    let mut buf = fold(field_idents, field_types);
+    if let Some(path) = scoped_by {
+        buf.push_str("#scoped_by\0");
+        let mut words = Vec::new();
+        render(path.to_token_stream(), &mut words);
         buf.push_str(&words.join(" "));
         buf.push('\0');
     }
@@ -127,5 +155,25 @@ mod tests {
         let expected = "a\0std : : collections : : BTreeMap < String , Vec < ( u8 , [ u16 ; 2 ] ) > >\0\
                         b\0& ' static str\0";
         assert_eq!(compute(&idents, &types), fnv1a(expected.as_bytes()));
+    }
+
+    /// Spec §6: `global` is the bare fold, and `scoped_by` appends exactly
+    /// `#scoped_by\0<path>\0`. The literal pins the operands, not only that
+    /// the two differ.
+    #[test]
+    fn a_scoped_jobs_fingerprint_mixes_its_scope_and_a_global_ones_does_not() {
+        let idents: Vec<syn::Ident> = vec![parse_quote!(n)];
+        let types: Vec<Type> = vec![parse_quote!(u64)];
+        let org: syn::Path = parse_quote!(Org);
+        let team: syn::Path = parse_quote!(Team);
+        assert_eq!(compute_job(&idents, &types, None), compute(&idents, &types));
+        assert_eq!(
+            compute_job(&idents, &types, Some(&org)),
+            fnv1a(b"n\0u64\0#scoped_by\0Org\0")
+        );
+        assert_ne!(
+            compute_job(&idents, &types, Some(&org)),
+            compute_job(&idents, &types, Some(&team))
+        );
     }
 }

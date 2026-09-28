@@ -1,12 +1,14 @@
-//! `#[job(global[, cross_tenant][, retry(max = N, backoff = "30s")])]`, the
-//! words in any order, each at most once (DESIGN.md §6, specs
-//! 2026-07-02-queue-cron-design.md and 2026-09-27-job-tenancy-design.md §5):
+//! `#[job(global | scoped_by = Org[, cross_tenant][, retry(max = N, backoff = "30s")])]`,
+//! the words in any order, each at most once, and exactly one of `global` /
+//! `scoped_by` (DESIGN.md §6, specs 2026-07-02-queue-cron-design.md and
+//! 2026-09-27-job-tenancy-design.md §5):
 //! turns a struct into a typed job
 //! payload — a field-wise `Codec` impl (mirrors `#[table]`'s row codec, minus
 //! the id: a job payload has no primary key), `impl Job` carrying the name,
-//! the payload's structural fingerprint (`fingerprint::compute`) and the
-//! retry policy, and the `JobEntry` glue `jobs![]` collects. Errors name
-//! the accepted forms (hard rule 5).
+//! the payload's structural fingerprint (`fingerprint::compute_job`, which
+//! mixes in `scoped_by`), the scope type and the retry policy, and the
+//! `JobEntry` glue `jobs![]` collects. Errors name the accepted forms (hard
+//! rule 5).
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -14,11 +16,18 @@ use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
 use syn::{Data, DeriveInput, Error, Fields, Ident, LitInt, LitStr, Token, parenthesized};
 
-const ACCEPTED_FORMS: &str = "write `#[job]`, `#[job(cross_tenant)]` or \
-     `#[job([cross_tenant, ]retry(max = <int>, backoff = \"<n><unit>\"))]` \
-     (unit is one of ms, s, m, h) — e.g. `#[job(retry(max = 3, backoff = \"10s\"))]`";
+const ACCEPTED_FORMS: &str = "a job declares `global` or `scoped_by = <Type>`, and may add \
+     `cross_tenant` and `retry(max = <int>, backoff = \"<n><unit>\")` (unit is one of ms, s, \
+     m, h), in any order — e.g. `#[job(scoped_by = Org, retry(max = 3, backoff = \"10s\"))]` \
+     or `#[job(global, cross_tenant)]`";
 
 // ---------------------------------------------------------------- args
+
+/// A job's answer to "which tenant does this act in" (job-tenancy spec §5).
+pub(crate) enum Tenancy {
+    Global,
+    ScopedBy(syn::Path),
+}
 
 pub(crate) struct JobArgs {
     pub max: u32,
@@ -27,6 +36,9 @@ pub(crate) struct JobArgs {
     /// (tenant-scoping spec §3), for the background rollups that need it.
     /// A declared job's `run` is called with the token as a second argument.
     pub cross_tenant: bool,
+    /// `global` or `scoped_by = Org`. `None` only while parsing: `expand`
+    /// refuses a job that gave neither, by name, before anything else.
+    pub tenancy: Option<Tenancy>,
 }
 
 impl Default for JobArgs {
@@ -35,6 +47,7 @@ impl Default for JobArgs {
             max: 5,
             backoff_millis: 30_000,
             cross_tenant: false,
+            tenancy: None,
         }
     }
 }
@@ -69,6 +82,7 @@ impl Parse for RetryField {
 /// override.
 enum JobArg {
     Global(proc_macro2::Span),
+    ScopedBy(proc_macro2::Span, syn::Path),
     CrossTenant(proc_macro2::Span),
     Retry(proc_macro2::Span, Vec<RetryField>),
 }
@@ -80,6 +94,15 @@ impl Parse for JobArg {
             .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
         match ident.to_string().as_str() {
             "global" => Ok(JobArg::Global(ident.span())),
+            "scoped_by" => {
+                input
+                    .parse::<Token![=]>()
+                    .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
+                let path: syn::Path = input
+                    .parse()
+                    .map_err(|e| Error::new(e.span(), ACCEPTED_FORMS))?;
+                Ok(JobArg::ScopedBy(ident.span(), path))
+            }
             "cross_tenant" => Ok(JobArg::CrossTenant(ident.span())),
             "retry" => {
                 // Peeked, so `retry` without its parentheses gets the house
@@ -99,10 +122,8 @@ impl Parse for JobArg {
 
 impl Parse for JobArgs {
     fn parse(input: ParseStream) -> syn::Result<JobArgs> {
-        // `global` changes nothing in expansion yet: it is read only to refuse
-        // a repeat. Task 6 of the job-tenancy plan makes it one of the two
-        // required answers.
         let mut global: Option<proc_macro2::Span> = None;
+        let mut scoped_by: Option<syn::Path> = None;
         let mut cross_tenant: Option<proc_macro2::Span> = None;
         let mut retry: Option<Vec<RetryField>> = None;
         while !input.is_empty() {
@@ -111,7 +132,19 @@ impl Parse for JobArgs {
                     if global.is_some() {
                         return Err(Error::new(span, "`global` given twice — write it once"));
                     }
+                    if let Some(path) = &scoped_by {
+                        return Err(Error::new(span, global_and_scoped_by(path)));
+                    }
                     global = Some(span);
+                }
+                JobArg::ScopedBy(span, path) => {
+                    if scoped_by.is_some() {
+                        return Err(Error::new(span, "`scoped_by` given twice — write it once"));
+                    }
+                    if global.is_some() {
+                        return Err(Error::new(span, global_and_scoped_by(&path)));
+                    }
+                    scoped_by = Some(path);
                 }
                 JobArg::CrossTenant(span) => {
                     if cross_tenant.is_some() {
@@ -163,6 +196,11 @@ impl Parse for JobArgs {
             max: max.unwrap_or(defaults.max),
             backoff_millis: backoff_millis.unwrap_or(defaults.backoff_millis),
             cross_tenant: cross_tenant.is_some(),
+            tenancy: match (global, scoped_by) {
+                (_, Some(path)) => Some(Tenancy::ScopedBy(path)),
+                (Some(_), None) => Some(Tenancy::Global),
+                (None, None) => None,
+            },
         })
     }
 }
@@ -199,11 +237,36 @@ fn parse_backoff(lit: &LitStr) -> syn::Result<u64> {
     })
 }
 
+/// `global` and `scoped_by` on one job, reported at whichever came second.
+/// Names the scope by its last segment, as the other tenancy refusals do.
+fn global_and_scoped_by(path: &syn::Path) -> String {
+    format!(
+        "`global` and `scoped_by = {}` on one job — a job is one or the other; drop one",
+        crate::route::scope_name(path)
+    )
+}
+
 // ---------------------------------------------------------------- expand
 
 pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStream> {
     let name = &input.ident;
     let name_str = name.to_string();
+
+    let Some(tenancy) = &args.tenancy else {
+        // Spanned at the attribute, as `#[table]`'s neither-refusal is: the
+        // fix is a word the attribute lacks, so there is no token to point
+        // at inside it.
+        return Err(Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "`{name_str}` declares no tenancy — a job says which: write \
+                 `#[job(scoped_by = Org)]` if it acts inside one tenant (it is enqueued from \
+                 inside that tenant's scope, and its `run` receives that tenant's `ScopedTx`), \
+                 or `#[job(global)]` if it belongs to no tenant (the only kind cron can \
+                 schedule). Neither is the default."
+            ),
+        ));
+    };
 
     if !input.generics.params.is_empty() {
         return Err(Error::new(
@@ -232,24 +295,83 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
         .map(|f| f.ident.clone().expect("named fields have idents"))
         .collect();
     let field_types: Vec<_> = fields.named.iter().map(|f| f.ty.clone()).collect();
-    let fingerprint = crate::fingerprint::compute(&field_idents, &field_types);
+    let scoped_path = match tenancy {
+        Tenancy::Global => None,
+        Tenancy::ScopedBy(path) => Some(path),
+    };
+    let fingerprint = crate::fingerprint::compute_job(&field_idents, &field_types, scoped_path);
 
     let max = args.max;
     let backoff_millis = args.backoff_millis;
     let cross_tenant = args.cross_tenant;
-    // A declared job's `run` takes the token; an undeclared one's does not,
-    // so `#[job]` alone still calls `run(tx)` exactly as before. `expect` is
-    // an invariant: the dispatcher passes the token from the SAME
+    // A declared job's `run` takes the token; an undeclared one's does not.
+    // `expect` is an invariant: the dispatcher passes the token from the SAME
     // `JobDef.cross_tenant` this expansion sets.
-    let run_call = if cross_tenant {
-        quote! {
-            job.run(tx, cap.expect(
-                "job declares cross_tenant but the dispatcher passed no CrossTenant — \
-                 the flag on JobDef and the token come from the same expansion"
-            ))
+    let cap_expect = quote! {
+        cap.expect(
+            "job declares cross_tenant but the dispatcher passed no CrossTenant — \
+             the flag on JobDef and the token come from the same expansion"
+        )
+    };
+    // A `global` job's glue is today's. A scoped job's opens the tenant the
+    // dispatcher's `JobScope` carries, then calls `run` through a fn-pointer
+    // binding rather than a method call (job-tenancy spec §5): `job.run(&mut
+    // tx)` would deref-coerce `&mut ScopedTx` to `&mut Tx`, so a scoped job
+    // whose `run` takes a bare `Tx` would compile and run in no tenant. The
+    // binding makes that a compile error, pinned by
+    // `compile_fail/scoped_job_run_takes_bare_tx.rs`.
+    let (scope_ty, tenant_scope_assert, scoped_by_name, run_call) = match tenancy {
+        Tenancy::Global => {
+            let call = if cross_tenant {
+                quote! { job.run(tx, #cap_expect) }
+            } else {
+                quote! { job.run(tx) }
+            };
+            (
+                quote! { ::charpente::core::table::Unscoped },
+                quote! {},
+                quote! { ::std::option::Option::None },
+                quote! {
+                    let _ = scope; // a global job is handed no tenant
+                    #call
+                },
+            )
         }
-    } else {
-        quote! { job.run(tx) }
+        Tenancy::ScopedBy(path) => {
+            let scope_name = crate::route::scope_name(path);
+            let (cap_ty, cap_arg) = if cross_tenant {
+                (
+                    quote! { , &::charpente::CrossTenant },
+                    quote! { , #cap_expect },
+                )
+            } else {
+                (quote! {}, quote! {})
+            };
+            (
+                quote! { #path },
+                quote! {
+                    const _: () = {
+                        const fn __charpente_assert_tenant_scope<T: ::charpente::TenantScope>() {}
+                        __charpente_assert_tenant_scope::<#path>();
+                    };
+                },
+                quote! { ::std::option::Option::Some(#scope_name) },
+                quote! {
+                    let scope = scope.expect(
+                        "job declares scoped_by but the dispatcher passed no JobScope — the \
+                         dispatcher asserts a row carries a tenant exactly when JobDef.scoped_by \
+                         is set"
+                    );
+                    let mut tx = scope.open::<#path>(tx);
+                    let run: fn(
+                        #name,
+                        &mut ::charpente::ScopedTx<'_, '_, #path>
+                        #cap_ty
+                    ) -> ::std::result::Result<(), ::charpente::kernel::JobError> = #name::run;
+                    run(job, &mut tx #cap_arg)
+                },
+            )
+        }
     };
     // The glue decodes only a row whose recorded shape is this type's (the
     // dispatcher asserts it first), so a decode failure has two possible
@@ -266,6 +388,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
 
     Ok(quote! {
         #input
+        #tenant_scope_assert
 
         impl ::charpente::core::table::Codec for #name {
             fn encode(&self, out: &mut ::std::vec::Vec<u8>) {
@@ -282,6 +405,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
         impl ::charpente::core::db::Job for #name {
             const NAME: &'static str = #name_str;
             const FINGERPRINT: u64 = #fingerprint;
+            type Scope = #scope_ty;
             const RETRY: ::charpente::core::job::RetryPolicy = ::charpente::core::job::RetryPolicy {
                 max: #max,
                 backoff: ::std::time::Duration::from_millis(#backoff_millis),
@@ -294,6 +418,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                     tx: &mut ::charpente::Tx,
                     payload: &[u8],
                     cap: ::std::option::Option<&::charpente::CrossTenant>,
+                    scope: ::std::option::Option<::charpente::kernel::JobScope<'_>>,
                 ) -> ::std::result::Result<(), ::charpente::kernel::JobError> {
                     let _ = cap; // an undeclared job is handed None and uses none of it
                     let input = &mut &payload[..];
@@ -315,6 +440,7 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                     name: <#name as ::charpente::core::db::Job>::NAME,
                     retry: <#name as ::charpente::core::db::Job>::RETRY,
                     cross_tenant: #cross_tenant,
+                    scoped_by: #scoped_by_name,
                     fingerprint: <#name as ::charpente::core::db::Job>::FINGERPRINT,
                     glue: __charpente_job_glue,
                 }

@@ -13,7 +13,7 @@ use charpente_core::event::EventRow;
 use charpente_core::io::{Disk, Entropy};
 use charpente_core::job::JobRow;
 use charpente_core::log::{Wal, WalConfig};
-use charpente_core::table::{Codec, Id, Row, Snapshot, Store};
+use charpente_core::table::{Codec, Id, Row, Snapshot, Store, Unscoped};
 use charpente_sim::{FaultConfig, Sim, run_universes_swarm};
 
 #[table(global)]
@@ -49,6 +49,7 @@ impl Codec for SendReceipt {
 impl Job for SendReceipt {
     const NAME: &'static str = "send_receipt";
     const FINGERPRINT: u64 = 0x7E57_0001;
+    type Scope = Unscoped;
 }
 
 struct InvoiceFinalized {
@@ -328,6 +329,7 @@ impl Codec for Ping {
 impl Job for Ping {
     const NAME: &'static str = "ping";
     const FINGERPRINT: u64 = 0x7E57_0003;
+    type Scope = Unscoped;
 }
 
 #[test]
@@ -376,6 +378,7 @@ impl Codec for Audit {
 impl Job for Audit {
     const NAME: &'static str = "audit";
     const FINGERPRINT: u64 = 0x7E57_0004;
+    type Scope = Unscoped;
 }
 
 fn property_schema() -> Schema {

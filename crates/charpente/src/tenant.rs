@@ -15,10 +15,11 @@
 //! # What the guarantee covers (ruling R48)
 //!
 //! The guarantee is about the typed surface the framework hands app logic. A
-//! handler and a job receive a `Tx`; through a `Tx`, a scoped table is
-//! unreachable without `tx.scope::<Org>(org, ctx)?`, which runs that tenant's
-//! own `authorize` — or, on a route declared `public(Org)`, admits by that
-//! declaration — before it hands back anything that can read or write. That
+//! handler receives a `Tx`, and a scoped job the `ScopedTx` of the tenant it
+//! was enqueued in; through a `Tx`, a scoped table is unreachable without
+//! `tx.scope::<Org>(org, ctx)?`, which runs that tenant's own `authorize` —
+//! or, on a route declared `public(Org)`, admits by that declaration —
+//! before it hands back anything that can read or write. That
 //! is the property a reviewer can check by reading one line per handler, and
 //! it is enforced by the compiler rather than by convention.
 //!
@@ -28,9 +29,16 @@
 //! the caller's word with no `authorize` on the path, and those reads stay
 //! public because replication seeding and the archive are built on them.
 //! Whoever holds the `Db` holds the store, with the same standing as whoever
-//! holds the data directory: an operator, not a request. Code outside a
-//! handler that wants the guarantee should go through a transaction and
-//! `tx.scope::<Org>(org, ctx)?` like a handler does.
+//! holds the data directory: an operator, not a request.
+//!
+//! Code outside a handler never takes a scope on its own word. A job declares
+//! `#[job(scoped_by = Org)]` and runs in the tenant its enqueuer opened;
+//! operator code that must act inside one tenant — seeding, a test oracle —
+//! opens it with a `TenantAdmission` minted from a `Group` (`Tx::admit_scope`),
+//! the seal `CrossTenant` already carries, which is the operator's standing
+//! made explicit rather than an exception to the guarantee. *(Corrected
+//! 2026-09-27, job-tenancy spec: the earlier remedy named a `Ctx` that no code
+//! outside a handler holds.)*
 
 use charpente_core::db::{ScopedTx, Tenant, Tx};
 use charpente_core::table::Id;

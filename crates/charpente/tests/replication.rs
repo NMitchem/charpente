@@ -65,6 +65,7 @@ impl Codec for Ping {
 impl Job for Ping {
     const NAME: &'static str = "ping";
     const FINGERPRINT: u64 = 0x7E57_0006;
+    type Scope = Unscoped;
 }
 
 fn make_schema() -> Schema {
@@ -7899,8 +7900,8 @@ fn ping_refusal(ids: &str, compiled: u64) -> String {
         "1 Pending \"ping\" job(s) (ids {ids}) were enqueued under a different shape of ping \
          (recorded {:#x}; this binary {compiled:#x}) — this binary will not decode them; run \
          the binary that enqueued them until they are Done or Dead, then deploy this one, or \
-         restore ping's old fields and give the new shape its own #[job] type under a new name \
-         (GUIDE §6)",
+         restore ping's old fields and its `global`/`scoped_by` declaration and give the new \
+         shape its own #[job] type under a new name (GUIDE §6)",
         <Ping as Job>::FINGERPRINT
     )
 }

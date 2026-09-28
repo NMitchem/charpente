@@ -22,7 +22,7 @@
 //! seed_foreign_job --data-dir D
 //! ```
 
-use charpente::core::table::Codec;
+use charpente::core::table::{Codec, Unscoped};
 use charpente::prod::ProdDisk;
 use charpente::{Db, DbConfig, Job, Schema};
 
@@ -43,6 +43,7 @@ impl Job for FakeSendReceipt {
     // real `SendReceipt` — the mismatch, not the specific value, is what
     // `refuse_foreign_pending_jobs` acts on.
     const FINGERPRINT: u64 = 0xF0F0_F0F0_F0F0_F0F0;
+    type Scope = Unscoped;
 }
 
 fn main() -> std::io::Result<()> {

@@ -10,7 +10,7 @@ use charpente::http::{
 };
 use charpente::wire::WireU64;
 use charpente::{Schema, Tx, Wire as WireDerive, event, route, routes, table};
-use charpente_core::table::Id;
+use charpente_core::table::{Id, Unscoped};
 use charpente_sim::{FaultConfig, Sim};
 use rsa::traits::PublicKeyParts;
 use rsa::{BigUint, Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
@@ -1144,6 +1144,7 @@ impl Codec for Ping {
 impl Job for Ping {
     const NAME: &'static str = "ping";
     const FINGERPRINT: u64 = 0x7E57_0005;
+    type Scope = Unscoped;
 }
 
 #[route(POST "/items", public)]

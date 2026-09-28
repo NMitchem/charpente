@@ -27,6 +27,9 @@ Three rulings are already in force and are not reopened here:
    id, typically), carried but never interpreted inside the deterministic boundary." A
    platform that derived the tenant itself would contradict a ruling in force one subsystem
    over.
+   **Read 2026-09-28** under `2026-09-27-job-tenancy-design.md` ruling R10: the platform
+   carries an app-named `Id<S>` and hands it back as the same type — a job's tenant, named
+   at its enqueuer's `tx.scope` line or in `enqueue_in`'s argument — and never derives one.
 
 ### What the tree actually looks like today
 

@@ -227,7 +227,7 @@ fn arg_name(pat: &PatType) -> Option<String> {
 
 /// A scope path's last segment — `Org` for `public(crate::tenancy::Org)` — as
 /// `PublicScope.name` carries it and the refusals render it.
-fn scope_name(path: &syn::Path) -> String {
+pub(crate) fn scope_name(path: &syn::Path) -> String {
     path.segments
         .last()
         .expect("syn parses a path with at least one segment")

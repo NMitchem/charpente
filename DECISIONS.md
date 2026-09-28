@@ -324,8 +324,13 @@ name only.
 
 **What an app is told, and where.** DESIGN §8 states the boundary in its limits paragraph;
 `crates/charpente/src/tenant.rs`'s module doc states it at the code; GUIDE §16 states it to
-app authors, with the remedy: code outside a handler that wants the guarantee should go
-through a transaction and `tx.scope::<Org>(org, ctx)?` exactly as a handler does.
+app authors, with the remedy: code outside a handler never takes a scope on its own word. A
+job declares `#[job(scoped_by = Org)]` and runs in the tenant its enqueuer opened; operator
+code that must act inside one tenant — seeding, a test oracle — opens it with a
+`TenantAdmission` minted from a `Group`, the seal `CrossTenant` already carries, which is the
+operator's standing made explicit rather than an exception to the guarantee. *(Corrected
+2026-09-27, job-tenancy spec: the earlier remedy named a `Ctx` that no code outside a handler
+holds.)*
 
 **The question that held this open, and its answer.** Should a future release put the raw
 reads behind a named, `describe`-visible operator capability — the §11 shape applied one

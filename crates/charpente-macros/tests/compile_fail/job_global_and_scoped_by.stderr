@@ -1,0 +1,11 @@
+error: `global` and `scoped_by = Org` on one job — a job is one or the other; drop one
+ --> tests/compile_fail/job_global_and_scoped_by.rs:5:15
+  |
+5 | #[job(global, scoped_by = Org)]
+  |               ^^^^^^^^^
+
+error: `global` and `scoped_by = Org` on one job — a job is one or the other; drop one
+ --> tests/compile_fail/job_global_and_scoped_by.rs:8:24
+  |
+8 | #[job(scoped_by = Org, global)]
+  |                        ^^^^^^

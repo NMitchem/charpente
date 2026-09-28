@@ -42,7 +42,10 @@ pub mod witnesses;
 /// `ScopedSnapshotRows` (tag 14) made it 2; payload shapes' `0x08`/`0x09`
 /// record tags made it 3; job tenancy's `0x0a` scoped enqueue makes it 4, so
 /// a version-3 binary is refused at Hello rather than at its first scoped
-/// job.
+/// job. The same change reaches a follower a second way: `JobRow`'s row codec
+/// gained a trailing `scope`, and seeding ships platform table rows, so a
+/// version-3 follower would also meet a scoped row's 16-byte tail, which its
+/// decoder calls corrupt.
 pub const PROTO_VERSION: u8 = 4;
 
 /// The hard ceiling on one encoded `Msg` on the wire: one `MAX_RECORD_BYTES`
@@ -1357,7 +1360,7 @@ impl Repl {
 
 #[cfg(test)]
 mod tests {
-    use charpente_core::table::Codec;
+    use charpente_core::table::{Codec, Unscoped};
     use charpente_sim::{FaultConfig, Sim};
 
     use super::*;
@@ -1381,6 +1384,7 @@ mod tests {
     impl Job for Ping {
         const NAME: &'static str = "repl-test-ping";
         const FINGERPRINT: u64 = 0x7E57_0009;
+        type Scope = Unscoped;
     }
 
     /// `accept_handoff`'s own no-listen-address guard (its counterpart to

@@ -75,11 +75,12 @@ pub struct JobRow {
     /// The last failure's message (handler error or absorbed panic) — the
     /// dead-letter record's substance (hard rule 5).
     pub last_error: Option<String>,
-    /// The enqueuing type's `Job::FINGERPRINT`, from the record's `0x08`
-    /// tag; `None` for a row applied from a pre-shape `0x02` record. Encoded
-    /// LAST and only when `Some`, so a row written before this field existed
-    /// decodes unchanged: `last_error` before it is tagged, and nothing
-    /// follows it (payload-shapes spec §2).
+    /// The enqueuing type's `Job::FINGERPRINT`, from the record's `0x08` or
+    /// `0x0a` tag; `None` for a row applied from a pre-shape `0x02` record.
+    /// Encoded after `last_error` and only when `Some`, so a row written
+    /// before this field existed decodes unchanged: `last_error` before it is
+    /// tagged, and only `scope` below can follow it (payload-shapes spec §2,
+    /// job-tenancy spec §6).
     pub shape: Option<u64>,
     /// The tenant a `#[job(scoped_by = …)]` job was enqueued in, from the
     /// record's `0x0a` tag. `None` for a `global` job (`0x08`) and for a row

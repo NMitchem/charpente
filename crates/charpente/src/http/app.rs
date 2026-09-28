@@ -9,10 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use charpente_core::db::{
-    CrossTenant, Db, DbConfig, Group, Job, JobShapeRefusal, Schema, TenantAdmission, Tx, TxError,
+    CrossTenant, Db, DbConfig, Group, JobShapeRefusal, Schema, TenantAdmission, Tx, TxError,
 };
 use charpente_core::io::{Disk, Entropy};
-use charpente_core::table::{Id, View};
+use charpente_core::table::{Id, UnscopedJob, View};
 use charpente_macros::table;
 
 use crate::auth::sweep::{self, SessionSweep};
@@ -429,7 +429,10 @@ impl App {
 
     /// Registers a cron schedule (mount-time duplicate-name panic — each
     /// name is scheduled once). `make` builds the job enqueued on each tick.
-    pub fn schedule<J: Job + 'static>(
+    /// A schedule enqueues on a bare `Tx`, so it takes `global` jobs only; a
+    /// sweep that acts per tenant is a `global, cross_tenant` job that fans
+    /// out with `Tx::enqueue_in` (GUIDE §7).
+    pub fn schedule<J: UnscopedJob + 'static>(
         mut self,
         name: &'static str,
         every: Duration,

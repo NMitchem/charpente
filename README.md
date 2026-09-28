@@ -43,13 +43,18 @@ struct Invoice {
     state: InvoiceState,
 }
 
+#[job(scoped_by = Org)]
+struct SendReceipt {
+    invoice: Id<Invoice>,
+}
+
 #[route(POST "/orgs/:org/invoices/:id/finalize", auth)]
 fn finalize(tx: &mut Tx, org: Id<Org>, id: Id<Invoice>, ctx: &Ctx) -> Result<Invoice, ApiError> {
     let mut tx = tx.scope::<Org>(org, ctx)?;                // the one auditable line
     let mut inv = tx.get(id)?.ok_or(ApiError::NotFound)?;   // typed row, no SQL string
     inv.state = InvoiceState::Final;
     tx.put(&inv);
-    tx.enqueue(SendReceipt { invoice: id });   // job enqueued IN the same transaction
+    tx.enqueue(SendReceipt { invoice: id });   // job enqueued IN the same transaction; it runs in this org
     tx.emit(InvoiceFinalized { invoice: id }); // realtime event, same transaction
     Ok(inv)
 }
@@ -59,8 +64,8 @@ Note what's absent: no connection pool, no ORM session, no message-broker client
 `await` on a network hop between your logic and your data. The transaction is a pure
 function over state; external effects (the receipt email) run post-commit via the durable
 queue, exactly-once-observable via idempotency keys. Note also what's declared: the route
-says `auth`, the table says which tenant owns its rows, and a route or table that says
-neither does not compile.
+says `auth`, the table says which tenant owns its rows, the job says it acts inside that
+tenant, and a route, table or job that says none of this does not compile.
 
 ## Why now
 
@@ -139,8 +144,8 @@ snapshot shipper. A TypeScript client generator has since shipped too
 ([docs/GUIDE.md](docs/GUIDE.md) §14) — SSE only, no WebSocket transport — and so has
 tenant scoping, where a tenant is a typed key prefix enforced by the compiler rather than
 a `where` clause anyone can forget ([docs/GUIDE.md](docs/GUIDE.md) §16), and since
-2026-09-16 the platform asks: a route says `auth`, `public` or `public(Org)`, a table says
-`scoped_by` or `global`, and neither is a default. What is *not* built, so you don't have to go looking:
+2026-09-16 the platform asks: a route says `auth`, `public` or `public(Org)`, a table and a
+job say `scoped_by` or `global`, and none is a default. What is *not* built, so you don't have to go looking:
 no blob store and no WebSockets.
 
 ## Try it
