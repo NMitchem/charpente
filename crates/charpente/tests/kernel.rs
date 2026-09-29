@@ -2222,6 +2222,11 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
             Err(e) => return Err(format!("final open failed non-injected: {e}")),
         }
     }
+    // A universe that adjudicated nothing gives up; it does not pass.
+    sim.give_up(
+        "the final check never ran: 8 reopens in a row hit injected faults, so the last \
+         round's jobs were never adjudicated",
+    );
     Ok(())
 }
 
