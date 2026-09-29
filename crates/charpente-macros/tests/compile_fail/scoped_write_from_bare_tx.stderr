@@ -1,0 +1,29 @@
+error[E0277]: `Invoice` is a tenant-scoped table (`#[table(scoped_by = Org)]`) and a bare `Tx` names no tenant
+  --> tests/compile_fail/scoped_write_from_bare_tx.rs:32:12
+   |
+32 |     tx.put(&Invoice { id, total: 0 });
+   |        --- ^^^^^^^^^^^^^^^^^^^^^^^^^ `Invoice` is scoped by `Org`
+   |        |
+   |        required by a bound introduced by this call
+   |
+help: the trait `NoTenant<Invoice>` is not implemented for `Org`
+  --> tests/compile_fail/scoped_write_from_bare_tx.rs:10:1
+   |
+10 | #[table(global)]
+   | ^^^^^^^^^^^^^^^^
+   = note: open the tenant scope first — in a handler, `Org`'s own `Tenant::authorize` runs there for a credentialed caller:
+               let tx = tx.scope::<Org>(scope, ctx)?;
+               tx.scan::<Invoice>()?
+           in a job, declare `#[job(scoped_by = Org)]` and read through the `ScopedTx` its `run` receives
+help: the trait `NoTenant<R>` is implemented for `Unscoped`
+  --> $WORKSPACE/crates/charpente-core/src/table.rs
+   |
+   | impl<R> NoTenant<R> for Unscoped {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `Invoice` to implement `WritableRow`
+note: required by a bound in `Tx::<'a>::put`
+  --> $WORKSPACE/crates/charpente-core/src/db.rs
+   |
+   |     pub fn put<R: WritableRow>(&mut self, row: &R) {
+   |                   ^^^^^^^^^^^ required by this bound in `Tx::<'a>::put`
+   = note: this error originates in the attribute macro `table` (in Nightly builds, run with -Z macro-backtrace for more info)

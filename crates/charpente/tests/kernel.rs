@@ -596,6 +596,191 @@ mod scoped_jobs {
             "a refusal, not an IO failure"
         );
     }
+
+    // -------------------------- tenancy that disagrees with the declaration
+    //
+    // Job-tenancy final review M4. App code cannot write a job row (the
+    // `job_row_*` compile-fail fixtures), so the dispatcher's tenancy
+    // assert is reached only by rows the enqueue family itself writes under
+    // a declaration that disagrees with the one mounted: a hand-written
+    // `impl Job` copying a mounted job's `NAME` and `FINGERPRINT` under the
+    // other tenancy, or a hand-written `JobDef` whose `scoped_by`
+    // contradicts its own `#[job]`. `Group::stage` refuses such an enqueue,
+    // and startup refuses a Pending row that already disagrees; neither
+    // reaches the assert, which panics outside the glue's `catch_unwind`.
+
+    /// Copies `File`'s `NAME` and `FINGERPRINT` under `global`, so
+    /// `Tx::enqueue` takes it and writes a "File" row with no tenant.
+    struct UntenantedFile {
+        n: u64,
+    }
+
+    impl Codec for UntenantedFile {
+        fn encode(&self, out: &mut Vec<u8>) {
+            self.n.encode(out);
+        }
+        fn decode(input: &mut &[u8]) -> std::io::Result<UntenantedFile> {
+            Ok(UntenantedFile {
+                n: u64::decode(input)?,
+            })
+        }
+    }
+
+    impl Job for UntenantedFile {
+        const NAME: &'static str = "File";
+        const FINGERPRINT: u64 = <File as Job>::FINGERPRINT;
+        type Scope = Unscoped;
+    }
+
+    /// `File`'s descriptor with its `scoped_by` erased: the hand-written
+    /// `JobDef` that contradicts its own `#[job]`.
+    fn file_def_declared_global() -> JobDef {
+        let mut def = <File as JobEntry>::def();
+        def.scoped_by = None;
+        def
+    }
+
+    fn only_jobs_app(sim: &Sim, defs: Vec<JobDef>) -> App {
+        App::open(
+            Box::new(sim.disk()),
+            Schema::new().table::<Filed>(),
+            Box::new(sim.entropy()),
+            AppConfig::default(),
+        )
+        .unwrap()
+        .mount_jobs(defs)
+    }
+
+    /// An enqueue with no tenant under a mounted `scoped_by` job's name and
+    /// shape is refused before a record exists: nothing is written, nothing
+    /// is queued, and the dispatcher never sees a row it would open no
+    /// tenant for.
+    #[test]
+    fn an_untenanted_enqueue_of_a_scoped_jobs_name_is_refused_by_name() {
+        let (_sim, mut app) = desk_app(0x5C0B_00F1);
+        let db = app.db_for_tests();
+        let err = match db.transact(|tx| {
+            tx.enqueue(UntenantedFile { n: 1 });
+            Ok::<(), std::io::Error>(())
+        }) {
+            Err(TxError::Io(e)) => e,
+            Err(other) => panic!("expected the stage refusal, got {other:?}"),
+            Ok(()) => panic!("a no-tenant \"File\" row reached the store"),
+        };
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "job \"File\" was enqueued with no tenant, but this binary mounts File as \
+                 `scoped_by = Desk` under the same shape ({:#x}) — a hand-written `impl Job` or \
+                 `JobDef` contradicts File's #[job]; the transaction was refused and nothing \
+                 was written, so a retry cannot succeed — enqueue the mounted type, give the \
+                 other type its own name, or mount File as its #[job] declares it (GUIDE §6)",
+                <File as Job>::FINGERPRINT
+            )
+        );
+        assert!(
+            charpente::core::db::JobShapeRefusal::of(&err).is_some(),
+            "the stage refusal, which dispatch counts as an attempt and a route answers \
+             with its own text"
+        );
+        assert!(db.snapshot().unwrap().scan::<JobRow>().unwrap().is_empty());
+        assert!(db.drain_enqueued().is_empty());
+    }
+
+    /// The other direction, from a hand-written `JobDef`: `File` is mounted
+    /// as `global`, so its own tenant-carrying enqueue is refused, by name,
+    /// at the first enqueue rather than at dispatch.
+    #[test]
+    fn a_jobdef_that_contradicts_its_job_refuses_its_tenant_carrying_enqueue() {
+        let sim = Sim::with_faults(0x5C0B_00F2, FaultConfig::none());
+        let mut app = only_jobs_app(&sim, vec![file_def_declared_global()]);
+        let db = app.db_for_tests();
+        let mut group = db.begin_group().unwrap();
+        let admission = group.tenant_admission();
+        let staged = group.stage(|tx| {
+            tx.admit_scope(Id::<Desk>::from_raw(1), &admission)
+                .enqueue(File { n: 1 });
+            Ok::<(), std::io::Error>(())
+        });
+        group.commit().unwrap();
+        let err = match staged {
+            Err(TxError::Io(e)) => e,
+            Err(other) => panic!("expected the stage refusal, got {other:?}"),
+            Ok(()) => panic!("a tenant-carrying \"File\" row reached the store"),
+        };
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "job \"File\" was enqueued with a tenant, but this binary mounts File as \
+                 `global` under the same shape ({:#x}) — a hand-written `impl Job` or `JobDef` \
+                 contradicts File's #[job]; the transaction was refused and nothing was \
+                 written, so a retry cannot succeed — enqueue the mounted type, give the other \
+                 type its own name, or mount File as its #[job] declares it (GUIDE §6)",
+                <File as Job>::FINGERPRINT
+            )
+        );
+        assert!(db.snapshot().unwrap().scan::<JobRow>().unwrap().is_empty());
+        assert!(db.drain_enqueued().is_empty());
+    }
+
+    /// Rows that already disagree — enqueued while nothing named "File" was
+    /// mounted, so no stage check could see them — are refused by name when
+    /// the kernel starts, in both directions, instead of reaching the
+    /// dispatcher's assert and stopping the node at every restart.
+    #[test]
+    fn pending_rows_whose_tenancy_disagrees_are_refused_at_startup_by_name() {
+        let sim = Sim::with_faults(0x5C0B_00F3, FaultConfig::none());
+        let mut before = only_jobs_app(&sim, vec![]);
+        before
+            .db_for_tests()
+            .transact(|tx| {
+                tx.enqueue(UntenantedFile { n: 1 });
+                tx.enqueue(UntenantedFile { n: 2 });
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+        sim.restart();
+        drop(before);
+        let err = match Kernel::new(only_jobs_app(&sim, jobs![File]), Box::new(sim.clock())) {
+            Ok(_) => panic!("the kernel started over \"File\" rows that carry no tenant"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.to_string(),
+            "2 Pending \"File\" job(s) (ids 0, 1) carry no tenant, but this binary declares \
+             File `scoped_by = Desk` — the enqueue family writes a tenant exactly for a \
+             `scoped_by` job, so something that contradicts File's #[job] wrote these rows: a \
+             hand-written `impl Job` or `JobDef`, or a raw store write; this binary will not \
+             dispatch them; mount File as its #[job] declares it, or restore the store from a \
+             replica or backup taken before these rows were written (GUIDE §6)"
+        );
+        assert!(
+            charpente::core::db::Refusal::of(&err).is_some(),
+            "a refusal, not an IO failure"
+        );
+
+        let sim = Sim::with_faults(0x5C0B_00F4, FaultConfig::none());
+        let mut before = only_jobs_app(&sim, vec![]);
+        enqueue_in_desk(before.db_for_tests(), 3, File { n: 1 });
+        sim.restart();
+        drop(before);
+        let err = match Kernel::new(
+            only_jobs_app(&sim, vec![file_def_declared_global()]),
+            Box::new(sim.clock()),
+        ) {
+            Ok(_) => panic!("the kernel started over a \"File\" row whose tenant it would drop"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.to_string(),
+            "1 Pending \"File\" job(s) (ids 0) carry a tenant, but this binary declares File \
+             `global` — the enqueue family writes a tenant exactly for a `scoped_by` job, so \
+             something that contradicts File's #[job] wrote these rows: a hand-written `impl \
+             Job` or `JobDef`, or a raw store write; this binary will not dispatch them; mount \
+             File as its #[job] declares it, or restore the store from a replica or backup \
+             taken before these rows were written (GUIDE §6)"
+        );
+    }
 }
 
 fn quiet_kernel_app(seed: u64) -> (Sim, App) {
@@ -3213,24 +3398,30 @@ fn a_retried_pending_job_still_refuses_and_a_dead_one_does_not() {
         Ok::<(), std::io::Error>(())
     })
     .unwrap();
-    db.transact(|tx| {
-        let mut dead = tx
-            .get(Id::<JobRow>::from_raw(0))?
-            .expect("the first receipt");
-        dead.status = JobStatus::Dead;
-        dead.attempts = 5;
-        dead.last_error = Some("the mail relay refused it".to_string());
-        tx.put(&dead);
-        let mut retried = tx
-            .get(Id::<JobRow>::from_raw(1))?
-            .expect("the second receipt");
-        retried.attempts = 2;
-        retried.due_at = 60 * SEC;
-        retried.last_error = Some("the mail relay timed out".to_string());
-        tx.put(&retried);
-        Ok::<(), std::io::Error>(())
-    })
-    .unwrap();
+    // Job rows are the platform's: the operator writes these states with the
+    // `TenantAdmission` its `Group` mints, the dispatcher's own path.
+    let mut group = db.begin_group().unwrap();
+    let admission = group.tenant_admission();
+    group
+        .stage(|tx| {
+            let mut dead = tx
+                .get(Id::<JobRow>::from_raw(0))?
+                .expect("the first receipt");
+            dead.status = JobStatus::Dead;
+            dead.attempts = 5;
+            dead.last_error = Some("the mail relay refused it".to_string());
+            tx.settle_job(&dead, &admission);
+            let mut retried = tx
+                .get(Id::<JobRow>::from_raw(1))?
+                .expect("the second receipt");
+            retried.attempts = 2;
+            retried.due_at = 60 * SEC;
+            retried.last_error = Some("the mail relay timed out".to_string());
+            tx.settle_job(&retried, &admission);
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+    group.commit().unwrap();
     sim.restart();
     drop(app);
     let err = match Kernel::new(receipts_app(&sim, true).unwrap(), Box::new(sim.clock())) {

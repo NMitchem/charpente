@@ -7959,7 +7959,7 @@ fn a_promote_over_foreign_pending_jobs_is_refused_and_the_node_stays_a_follower(
     let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
     f.db.as_mut()
         .unwrap()
-        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT)]);
+        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT, None)]);
     enqueue_ping(&mut p);
     run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
     p.host.crash_now();
@@ -7990,7 +7990,7 @@ fn a_promote_over_same_shape_pending_jobs_succeeds() {
     let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
     f.db.as_mut()
         .unwrap()
-        .register_job_shapes(&[("ping", <Ping as Job>::FINGERPRINT)]);
+        .register_job_shapes(&[("ping", <Ping as Job>::FINGERPRINT, None)]);
     enqueue_ping(&mut p);
     run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
     p.host.crash_now();
@@ -8015,19 +8015,23 @@ fn promote_over_a_foreign_finished_ping(seed: u64, status: JobStatus) {
     let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
     f.db.as_mut()
         .unwrap()
-        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT)]);
+        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT, None)]);
     enqueue_ping(&mut p);
-    p.db.as_mut()
-        .unwrap()
-        .transact(|tx| {
+    // Job rows are the platform's: the operator writes the finished state
+    // with the `TenantAdmission` its `Group` mints, the dispatcher's own path.
+    let mut group = p.db.as_mut().unwrap().begin_group().unwrap();
+    let admission = group.tenant_admission();
+    group
+        .stage(|tx| {
             let mut job = tx
                 .get(Id::<JobRow>::from_raw(0))?
                 .expect("the enqueued ping");
             job.status = status;
-            tx.put(&job);
+            tx.settle_job(&job, &admission);
             Ok::<(), io::Error>(())
         })
         .unwrap();
+    group.commit().unwrap();
     run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
     p.host.crash_now();
     assert!(matches!(promote_f(&sim, &mut f), Msg::CtrlOk { .. }));
@@ -8057,7 +8061,7 @@ fn a_promote_after_a_snapshot_reseed_still_refuses_foreign_pending_jobs() {
     let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), seeding_db_cfg()).unwrap();
     f.db.as_mut()
         .unwrap()
-        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT)]);
+        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT, None)]);
     run_until(
         &sim,
         &mut [&mut p, &mut f],
@@ -8094,7 +8098,7 @@ fn a_switchover_onto_foreign_pending_jobs_completes_and_the_new_primary_names_th
     let mut f = spawn_node(&sim, "f", follower_cfg("f:1", "p:1"), DbConfig::default()).unwrap();
     f.db.as_mut()
         .unwrap()
-        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT)]);
+        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT, None)]);
     enqueue_ping(&mut p);
     run_until(&sim, &mut [&mut p, &mut f], converged, CONVERGE_BUDGET).unwrap();
     p.flipped = true;
@@ -8162,7 +8166,7 @@ fn a_write_gate_opening_over_foreign_pending_jobs_stops_the_kernel_by_name() {
         .unwrap()
         .app_mut_for_tests()
         .db_for_tests()
-        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT)]);
+        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT, None)]);
     assert!(
         !p.kernel.as_ref().unwrap().app().db().writes_allowed(),
         "the precondition: the kernel opens gated, so Kernel::build's own check did not run"
@@ -8221,15 +8225,19 @@ fn a_kernel_switchover_onto_foreign_pending_jobs_stops_the_target_by_name() {
             Ok::<(), io::Error>(())
         })
         .unwrap();
-        db.transact(|tx| {
-            let mut job = tx
-                .get(Id::<JobRow>::from_raw(0))?
-                .expect("the enqueued ping");
-            job.due_at = u64::MAX / 2;
-            tx.put(&job);
-            Ok::<(), io::Error>(())
-        })
-        .unwrap();
+        let mut group = db.begin_group().unwrap();
+        let admission = group.tenant_admission();
+        group
+            .stage(|tx| {
+                let mut job = tx
+                    .get(Id::<JobRow>::from_raw(0))?
+                    .expect("the enqueued ping");
+                job.due_at = u64::MAX / 2;
+                tx.settle_job(&job, &admission);
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
+        group.commit().unwrap();
         db.checkpoint().unwrap();
     }
     let mut p = spawn_kernel_node(
@@ -8257,7 +8265,7 @@ fn a_kernel_switchover_onto_foreign_pending_jobs_stops_the_target_by_name() {
         .unwrap()
         .app_mut_for_tests()
         .db_for_tests()
-        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT)]);
+        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT, None)]);
     krun_until(&sim, &mut [&mut p, &mut f], kconverged, CONVERGE_BUDGET).unwrap();
 
     let mut cli = CtrlConn::open(
@@ -8363,7 +8371,7 @@ fn a_write_gate_opening_over_foreign_pending_jobs_is_a_refusal() {
         .unwrap()
         .app_mut_for_tests()
         .db_for_tests()
-        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT)]);
+        .register_job_shapes(&[("ping", PING_V2_FINGERPRINT, None)]);
     let mut w = spawn_kernel_node(
         &sim,
         "w",

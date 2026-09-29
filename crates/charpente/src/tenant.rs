@@ -32,8 +32,11 @@
 //! holds the data directory: an operator, not a request.
 //!
 //! Code outside a handler never takes a scope on its own word. A job declares
-//! `#[job(scoped_by = Org)]` and runs in the tenant its enqueuer opened;
-//! operator code that must act inside one tenant — seeding, a test oracle —
+//! `#[job(scoped_by = Org)]` and runs in the tenant its enqueuer opened or its
+//! fan-out named, and nothing else decides which: no app code can write the
+//! job row that carries that tenant (`JobRow`'s scope is `PlatformOwned`, so
+//! `Tx::put`/`Tx::delete` refuse it; the dispatcher settles one through
+//! `Tx::settle_job`); operator code that must act inside one tenant — seeding, a test oracle —
 //! opens it with a `TenantAdmission` minted from a `Group` (`Tx::admit_scope`),
 //! the seal `CrossTenant` already carries, which is the operator's standing
 //! made explicit rather than an exception to the guarantee. *(Corrected

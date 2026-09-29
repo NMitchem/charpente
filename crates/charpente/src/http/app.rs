@@ -345,7 +345,7 @@ impl App {
                 .table::<CronRow>(),
         )?;
         let sweep = <SessionSweep as JobEntry>::def();
-        db.register_job_shapes(&[(sweep.name, sweep.fingerprint)]);
+        db.register_job_shapes(&[(sweep.name, sweep.fingerprint, sweep.scoped_by)]);
         Ok(App {
             db: Some(db),
             entropy,
@@ -377,12 +377,15 @@ impl App {
 
     /// Registers `#[job]` descriptors (mount-time duplicate-name panic — each
     /// job type is mounted once, like routes), and each one's payload shape
-    /// with the `Db` (`Db::register_job_shapes`) in the same step, so the
-    /// enqueue refusal holds for every transaction through this App — before
-    /// any kernel exists, too — and the startup refusal knows the shapes.
+    /// and declared tenancy with the `Db` (`Db::register_job_shapes`) in the
+    /// same step, so the enqueue refusal holds for every transaction through
+    /// this App — before any kernel exists, too — and the startup refusal
+    /// knows both.
     pub fn mount_jobs(mut self, defs: Vec<JobDef>) -> App {
-        let shapes: Vec<(&'static str, u64)> =
-            defs.iter().map(|d| (d.name, d.fingerprint)).collect();
+        let shapes: Vec<(&'static str, u64, Option<&'static str>)> = defs
+            .iter()
+            .map(|d| (d.name, d.fingerprint, d.scoped_by))
+            .collect();
         for def in defs {
             assert!(
                 !self.job_defs.iter().any(|d| d.name == def.name),

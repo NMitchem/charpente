@@ -1432,7 +1432,8 @@ enqueued from. It is enqueued from inside that tenant's scope: `tx.enqueue` on t
 `ScopedTx` a handler's `tx.scope::<Org>(org, ctx)?` returns. The enqueue records the
 tenant beside the job, and when the job runs, its `run` receives that tenant's
 `ScopedTx`. No `authorize` runs for it: a job has no principal, and its authority is
-its enqueuer's, who was inside the tenant already. Its retries run in the same tenant,
+its enqueuer's, who was inside the tenant already — and nobody else's, since no app code
+can write the row that carries it (below). Its retries run in the same tenant,
 and a follow-up it enqueues through its own `ScopedTx` inherits the tenant too.
 
 ```rust
@@ -1513,6 +1514,37 @@ the explicit deref, `(*tx).enqueue(job)` in a handler and `(**tx).enqueue(job)` 
 scoped job's `run`. A scoped job on a bare `Tx`, where no tenant is named, is refused with
 the note shown in "What `#[job]` rejects". Cron takes `global` jobs only (§7), because a
 tick has no tenant. A sweep that must act in every tenant fans out instead (§7).
+
+**Job rows are the platform's.** The tenant a job runs in is the one its row carries, and
+the dispatcher opens it without asking anyone, so no app code writes a job row. A
+transaction reads the queue like any other table (`tx.get::<JobRow>`, `tx.scan::<JobRow>()`,
+as §8's oracles do), but `tx.put` or `tx.delete` of a `JobRow` does not compile. Only the
+enqueue family creates a job row, and only the dispatcher settles one. There is no
+app-side cancel either: a job runs until it is Done or Dead. rustc prints this, with your
+row type in place of `<row>`:
+
+<!-- pinned -->
+```text
+`<row>` rows are the platform's, and app code cannot write them
+job rows are the platform's: only the enqueue family writes one, so a job runs in the tenant its enqueuer opened or its fan-out named, and no app code cancels one — to run a job, enqueue it:
+    tx.enqueue(job);
+for a `global` job; for a `scoped_by` job, inside the tenant it acts in:
+    let mut tx = tx.scope::<Org>(scope, ctx)?;
+    tx.enqueue(job);
+or from a `cross_tenant` route or job, naming the tenant:
+    tx.enqueue_in::<Org>(scope, job, cap);
+```
+
+The seal is on the table's name as well as its type, because apply routes a write by
+table name. A hand-written `Row` whose `TABLE` is `"charpente.jobs"` fails to build at
+each write the binary can reach, and rustc names the call site. It is a
+post-monomorphization error, so `cargo build` and `cargo test` report it, and `cargo
+check` does not:
+
+<!-- pinned -->
+```text
+this Row's TABLE is "charpente.jobs", the platform's job queue — job rows are the platform's: only the enqueue family writes one, because the dispatcher runs a job in the tenant its row names; give this table a name of its own, and run a job by enqueueing it (`tx.enqueue`, `ScopedTx::enqueue`, or `tx.enqueue_in` from a `cross_tenant` route or job)
+```
 
 ### Registering jobs: `jobs![...]` and `mount_jobs`
 
@@ -1715,6 +1747,21 @@ A route answers it with a 500 carrying that text, never the retryable storage-fa
 dead-letters, with the text as its `last_error`. In a cron schedule's enqueue it stops the
 kernel. An enqueue of a job type this binary does not mount at all is not refused here: it
 commits and takes the "not registered" path.
+
+Tenancy has a twin of both refusals. `#[job]` fingerprints `scoped_by`, but a
+hand-written `impl Job` can copy a mounted job's `NAME` and `FINGERPRINT` under the other
+tenancy, and a hand-written `JobDef` can mount a job under the wrong one. Either would
+hand the dispatcher a row with a tenant for a `global` job, or with none for a `scoped_by`
+one. So an enqueue whose tenant presence disagrees with the mounted declaration refuses
+its transaction the same way, and a Pending row that already disagrees is refused
+wherever the shape refusal runs. `<presence>` is `a tenant` or `no tenant`, and
+`<declaration>` is `` `global` `` or `` `scoped_by = Org` ``:
+
+<!-- pinned -->
+```text
+job "<job>" was enqueued with <presence>, but this binary mounts <job> as <declaration> under the same shape (<shape>) — a hand-written `impl Job` or `JobDef` contradicts <job>'s #[job]; the transaction was refused and nothing was written, so a retry cannot succeed — enqueue the mounted type, give the other type its own name, or mount <job> as its #[job] declares it (GUIDE §6)
+<n> Pending "<job>" job(s) (ids <ids>) carry <presence>, but this binary declares <job> <declaration> — the enqueue family writes a tenant exactly for a `scoped_by` job, so something that contradicts <job>'s #[job] wrote these rows: a hand-written `impl Job` or `JobDef`, or a raw store write; this binary will not dispatch them; mount <job> as its #[job] declares it, or restore the store from a replica or backup taken before these rows were written (GUIDE §6)
+```
 
 There are two ways through a shape change:
 
@@ -5872,8 +5919,10 @@ Multi-tenancy here is a property of the *types*, not a rule everyone has to
 remember. A scoped table's key is the `(scope, id)` composite and every one of
 its secondary-index entries carries the same prefix, so a tenant is a key
 prefix rather than a `where` clause; and the only way a handler or a job can
-reach one of those rows is a handle that the app's own membership check — or
-the route's own `public(Org)` declaration — had to hand back. A scoped read attempted on a bare `Tx` is a compile error, not a 500
+reach one of those rows is a handle that the app's own membership check — or a
+declaration: the route's own `public(Org)`, or the `cross_tenant` fan-out that
+enqueued the job — had to hand back. A job's handle is its enqueuer's because no
+app code can write the job row that carries its tenant (§6). A scoped read attempted on a bare `Tx` is a compile error, not a 500
 and not a leak. (What that guarantee does *not* cover — an operator holding the
 `Db` — is the last subsection here, and it is a boundary, not an oversight.)
 
@@ -6154,7 +6203,11 @@ Invoice {}` — orphan-legal, and the obvious workaround — is itself a compile
 error telling you to open the scope. The job pair, `NoJobTenant` and
 `UnscopedJob`, is sealed the same way. The six scope-taking primitives underneath
 (`get_in`, `scan_in`, `scan_by_in`, `scan_from_in`, `put_in`, `delete_in`) are
-private to the core, so there is no back door on a bare `Tx` either.
+private to the core, so there is no back door on a bare `Tx` either. Nor is there
+one through the job queue: a scoped job runs in the tenant its row carries, and
+`tx.put` or `tx.delete` of a `JobRow` does not compile (§6, "Job rows are the
+platform's"). So a bare `Tx` cannot move a job into another tenant, forge one
+there, or cancel one there.
 
 ### Realtime: one mechanism, not two
 
@@ -6338,7 +6391,9 @@ token. Whoever holds the `Db` holds the store, with the same standing as
 whoever holds the data directory: an operator, not a request.
 
 **Code outside a handler never takes a scope on its own word.** A job declares
-`#[job(scoped_by = Org)]` and runs in the tenant its enqueuer opened (§6).
+`#[job(scoped_by = Org)]` and runs in the tenant its enqueuer opened or its fan-out
+named (§6). Nothing else decides which, because no app code can write the job row that
+carries that tenant.
 **Operator code that must act inside one tenant** — seeding, a test oracle, an admin
 step in `main` — does not take a scope on its own word either. It begins a group, mints
 a `TenantAdmission` from it, and opens the tenant with `admit_scope`:

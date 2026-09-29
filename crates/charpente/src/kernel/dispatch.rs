@@ -70,8 +70,12 @@ pub struct JobDef {
     /// cross-tenant inventory covers jobs too.
     pub cross_tenant: bool,
     /// `#[job(scoped_by = Org)]` — the scope type's last path segment, as
-    /// `describe` lists it; `None` for a `global` job. Dispatch asserts that
-    /// a row carries a tenant exactly when this is `Some`.
+    /// `describe` lists it; `None` for a `global` job. `App::mount_jobs`
+    /// registers it beside `fingerprint`: `Group::stage` refuses an enqueue
+    /// whose tenant presence disagrees with it, startup refuses a Pending row
+    /// that does, and dispatch asserts that a row carries a tenant exactly
+    /// when this is `Some`. A hand-written `JobDef` that contradicts its own
+    /// `#[job]` is therefore refused at the first enqueue, not at dispatch.
     pub scoped_by: Option<&'static str>,
     /// `Job::FINGERPRINT` — the payload shape this binary compiled. Dispatch
     /// asserts a row's recorded shape equals it before the glue decodes
@@ -244,7 +248,9 @@ impl Dispatcher {
         let cap = group.cross_tenant_cap();
         // Beside it, for the same reason: a scoped job's tenant is opened with
         // the dispatcher's admission (job-tenancy spec §5), minted from the
-        // `Group` no glue ever holds.
+        // `Group` no glue ever holds. The same admission is the token
+        // `Tx::settle_job` takes, so the dispatcher's two job-row writes (the
+        // Done mark and the failure record) are ones no app code can make.
         let admission = group.tenant_admission();
         let attempt = group.stage(|tx| {
             let mut row = tx
@@ -281,16 +287,24 @@ impl Dispatcher {
                     .map_or_else(|| "none".to_string(), |shape| format!("{shape:#x}")),
                 def.fingerprint
             );
-            // The fingerprint mixes the declaration in (spec §6), so a row of
-            // this shape was enqueued by a type with this tenancy, and the
-            // enqueue family writes a tenant exactly for a scoped type. A
-            // mismatch is unreachable — asserted, not handled (hard rule 4).
+            // Unreachable, by three refusals that run before a row can get
+            // here (hard rule 4 — asserted, not handled; the backstop, since
+            // this panics outside the glue's `catch_unwind` and stops the
+            // kernel): app code cannot write a job row (`Tx::put`/`delete`
+            // refuse `JobRow` and any row borrowing its table name, so only
+            // the enqueue family and `Tx::settle_job` write one);
+            // `Group::stage` refuses an enqueue whose tenant presence
+            // disagrees with the mounted declaration, which a hand-written
+            // `impl Job` or `JobDef` could otherwise produce; and the startup
+            // refusal (`Db::pending_job_shape_refusal`) names a Pending row
+            // that disagrees before dispatch starts.
             assert_eq!(
                 row.scope.is_some(),
                 def.scoped_by.is_some(),
                 "dispatcher invariant: job {id} (\"{}\") carries tenant {:?} but this binary \
-                 declares it {} — the fingerprint mixes the declaration in, so a row of this \
-                 shape cannot disagree with it",
+                 declares it {} — app code cannot write a job row, Group::stage refuses an \
+                 enqueue that disagrees with the mounted declaration, and startup refuses a \
+                 Pending row that does, so a row reaching dispatch cannot disagree with it",
                 row.name,
                 row.scope,
                 def.scoped_by
@@ -315,7 +329,7 @@ impl Dispatcher {
             }
             row.status = JobStatus::Done;
             row.last_error = None;
-            tx.put(&row);
+            tx.settle_job(&row, &admission);
             Ok(())
         });
 
@@ -414,7 +428,7 @@ impl Dispatcher {
                             due_at: row.due_at,
                         }
                     };
-                    tx.put(&row);
+                    tx.settle_job(&row, &admission);
                     Ok::<_, io::Error>(outcome)
                 });
                 match staged.map_err(|e| match e {

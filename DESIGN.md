@@ -616,7 +616,17 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   (`ScopedTx::enqueue`) or by a declared fan-out (`Tx::enqueue_in` with a `CrossTenant`).
   `Tx::enqueue` and cron take `global` jobs only, and a scoped job at either is an
   unsatisfied bound whose text names the fix. Enqueue sites and handler signatures are
-  checked against each other (spec 2026-09-27-job-tenancy §5).
+  checked against each other (spec 2026-09-27-job-tenancy §5). **Job rows are the
+  platform's to write, and every transaction's to read**, because the dispatcher opens
+  the tenant a row carries without asking anyone: `JobRow`'s `Row::Scope` is the sealed
+  `PlatformOwned`, so `Tx::put`/`Tx::delete` of one is an unsatisfied bound naming the
+  enqueue family; a hand-written `Row` that borrows the `charpente.jobs` name fails to
+  build at each reachable write (a `const` check, reported by `cargo build`, not `cargo
+  check`); and the dispatcher's Done mark and failure record go through
+  `Tx::settle_job`, which takes a `TenantAdmission` only a `Group` mints. An enqueue whose
+  tenant presence disagrees with the mounted declaration (a hand-written `impl Job` or
+  `JobDef`) is refused by name, and so is a Pending row that disagrees, before dispatch
+  starts (job-tenancy final review C1, M4).
 - **Events.** `#[event]` structs; `tx.emit(...)` is typed; subscribers (server-side and
   client-side codegen) consume typed streams off the log. An event payload is itself a
   wire type (it is exactly the JSON a subscriber receives), so `#[event]` derives `Wire`
@@ -1232,7 +1242,9 @@ The HTTP bind runs before the kernel thread is spawned, so a bind failure is `se
   `&mut ScopedTx<Org>` instead. The enqueue records the tenant (record tag `0x0a`,
   `JobRow.scope`), and the dispatcher reopens exactly that tenant with its own
   `TenantAdmission` through a `JobScope` only it constructs, so a scoped job runs where it
-  was enqueued, retries included. `Ok` commits its effects and the job's
+  was enqueued, retries included. The row is the platform's to write: its Done mark and
+  failure record go through `Tx::settle_job` with that same admission, and app code
+  cannot write a `JobRow` at all (§3's Jobs bullet). `Ok` commits its effects and the job's
   Done-mark atomically in one record: exactly-once state effects, structurally. `Err`
   aborts that transaction and a second commits the failure record — attempts, doubling
   backoff, Dead at the policy's `max`, last_error carried (typed `RetryPolicy` on the
@@ -1628,7 +1640,8 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   at a scope line its route did not declare `public(Org)` for gets a named 401 (spec
   2026-09-27-job-tenancy §4). A job acts inside a tenant only by declaring
   `#[job(scoped_by = Org)]`, and then only inside the tenant its enqueuer opened or its
-  fan-out named. A table that declares neither
+  fan-out named, because no app code can write the job row that carries that tenant
+  (§3's Jobs bullet). A table that declares neither
   `scoped_by` nor `global` does not compile: which tables are tenant data is the app's
   declaration at every struct, never the platform's inference (default-secure,
   2026-09-16; the field-type inference was weighed and rejected — the membership table

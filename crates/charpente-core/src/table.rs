@@ -295,6 +295,21 @@ pub trait RowShape: Sized {
 /// Marker for a table whose rows are not tenant-scoped. The default.
 pub struct Unscoped;
 
+/// The scope marker of a platform table: `charpente.jobs`, whose rows the
+/// dispatcher trusts for a job's tenant (job-tenancy spec §6). Keyed like
+/// `Unscoped`, by bare id, and read like it (`NoTenant` holds, so `View`
+/// reads it). What it withholds is the write: `Tx::put`/`Tx::delete` bound
+/// `R: WritableRow`, which a row of this scope fails, by name. Only the
+/// enqueue family and the dispatcher's `Tx::settle_job` write a job row.
+///
+/// `#[doc(hidden)]` so rustc's "the trait is implemented for" hint under
+/// `NoTenant`'s diagnostic keeps naming `Unscoped` alone: this is not a
+/// scope an app table can take. Sealing another platform table is its
+/// `type Scope = PlatformOwned` plus its name in `db.rs`'s
+/// `PLATFORM_TABLES`.
+#[doc(hidden)]
+pub struct PlatformOwned;
+
 /// A table row. Implemented by `#[table]`, not by hand.
 pub trait Row: Sized + 'static {
     /// The tenant scope this row is partitioned by, or `Unscoped`.
@@ -337,8 +352,9 @@ pub trait Row: Sized + 'static {
 
 // ---------------------------------------------------------------- View
 
-/// The scope marker of a table with no tenant: `Unscoped` implements it for
-/// every row type, and no other scope type implements it at all.
+/// The scope marker of a table with no tenant: `Unscoped` and `PlatformOwned`
+/// implement it for every row type, and no other scope type implements it at
+/// all.
 ///
 /// It exists to carry the error text below, and its shape is that text's
 /// shape. `#[diagnostic::on_unimplemented]` fires for an UNIMPLEMENTED
@@ -364,6 +380,7 @@ pub trait Row: Sized + 'static {
 /// compiles on a bare `Tx`. Spec §7's exit criterion 1 is a compile error, so
 /// neither the marker that carries it nor the bound that names it can be an
 /// opt-out.
+///
 #[diagnostic::on_unimplemented(
     message = "`{R}` is a tenant-scoped table (`#[table(scoped_by = {Self})]`) and a bare `Tx` \
                names no tenant",
@@ -379,17 +396,37 @@ pub trait NoTenant<R>: sealed::NotATenant {}
 
 impl<R> NoTenant<R> for Unscoped {}
 
+impl<R> NoTenant<R> for PlatformOwned {}
+
 /// The seals. Private, so both supertrait obligations are unsatisfiable
-/// outside this crate however the orphan rules fall: the only scope type that
-/// will ever carry `NotATenant` is `Unscoped`, and the only rows that will
-/// ever carry `NotScoped` are the ones whose own `Row::Scope` earns it.
+/// outside this crate however the orphan rules fall: the only scope types that
+/// will ever carry `NotATenant` are `Unscoped` and `PlatformOwned`, the only
+/// one that will ever carry `AppOwned` is `Unscoped`, and the only rows that
+/// will ever carry `NotScoped` or `Writable` are the ones whose own
+/// `Row::Scope` earns it.
 mod sealed {
-    pub trait NotATenant {}
+    pub trait NotATenant: Owned {}
     pub trait NotScoped {}
     pub trait NotScopedJob {}
+    pub trait AppOwned {}
+    pub trait Writable {}
+    /// Who writes a table with no tenant: `Unscoped` for an app's own,
+    /// `PlatformOwned` for the platform's. Always `Self`; see `WritableRow`
+    /// for why it is asked through this projection.
+    pub trait Owned {
+        type Owner;
+    }
 }
 
 impl sealed::NotATenant for Unscoped {}
+impl sealed::NotATenant for PlatformOwned {}
+impl sealed::Owned for Unscoped {
+    type Owner = Unscoped;
+}
+impl sealed::Owned for PlatformOwned {
+    type Owner = PlatformOwned;
+}
+impl sealed::AppOwned for Unscoped {}
 
 /// `UnscopedRow`'s seal, derived from `Row::Scope` by the same blanket
 /// condition `UnscopedRow` itself uses — so the seal admits exactly the rows
@@ -410,6 +447,61 @@ impl<R: Row> sealed::NotScoped for R where R::Scope: NoTenant<R> {}
 pub trait UnscopedRow: Row + sealed::NotScoped {}
 
 impl<R: Row> UnscopedRow for R where R::Scope: NoTenant<R> {}
+
+/// The owner marker of a table app code may write: `Unscoped` implements it
+/// for every row type, and `PlatformOwned` never does. It carries the refusal
+/// for a write to a platform table through a bare `Tx` (`Tx::put`,
+/// `Tx::delete`), and it hangs on the owner type for `NoTenant`'s reason: an
+/// associated-type mismatch cannot carry a custom diagnostic.
+///
+/// Job rows are the platform's because the dispatcher trusts `JobRow.scope`
+/// for the tenant a scoped job runs in: a row that app code could write would
+/// run a job in any tenant, with no principal and no declaration (job-tenancy
+/// final review C1). SEALED by `AppOwned`, which only `Unscoped` carries.
+#[diagnostic::on_unimplemented(
+    message = "`{R}` rows are the platform's, and app code cannot write them",
+    label = "`{R}` is written only by the platform",
+    note = "job rows are the platform's: only the enqueue family writes one, so a job runs in \
+            the tenant its enqueuer opened or its fan-out named, and no app code cancels one — \
+            to run a job, enqueue it:\n    \
+            tx.enqueue(job);\n\
+            for a `global` job; for a `scoped_by` job, inside the tenant it acts in:\n    \
+            let mut tx = tx.scope::<Org>(scope, ctx)?;\n    \
+            tx.enqueue(job);\n\
+            or from a `cross_tenant` route or job, naming the tenant:\n    \
+            tx.enqueue_in::<Org>(scope, job, cap);"
+)]
+pub trait AppWritable<R>: sealed::AppOwned {}
+
+impl<R> AppWritable<R> for Unscoped {}
+
+/// `WritableRow`'s seal, derived by the same condition `WritableRow` uses.
+impl<R: Row> sealed::Writable for R
+where
+    R::Scope: NoTenant<R>,
+    <R::Scope as sealed::Owned>::Owner: AppWritable<R>,
+{
+}
+
+/// A row a bare `Tx` may write: an `UnscopedRow` whose table is the app's
+/// own. This is `Tx::put`'s and `Tx::delete`'s bound, the write half of the
+/// seal `PlatformOwned` describes; reads keep `View`'s `UnscopedRow`, so a
+/// transaction still reads `JobRow`. Sealed for `UnscopedRow`'s reason.
+///
+/// `AppWritable` is asked of the scope's `Owner`, a projection through
+/// `NoTenant`'s own seal, rather than of the scope type directly. A scoped
+/// row fails `NoTenant` first; the projection then has nothing to resolve,
+/// so rustc prints `NoTenant`'s one diagnostic and never a second saying the
+/// row is the platform's. A platform row passes `NoTenant` and fails
+/// `AppWritable`, whose text is the one it gets.
+pub trait WritableRow: UnscopedRow + sealed::Writable {}
+
+impl<R: Row> WritableRow for R
+where
+    R::Scope: NoTenant<R>,
+    <R::Scope as sealed::Owned>::Owner: AppWritable<R>,
+{
+}
 
 /// The job twin of `NoTenant` (job-tenancy spec §5): `Unscoped` implements it
 /// for every job type, and no other scope type implements it at all. It
@@ -659,8 +751,12 @@ pub const UNSCOPED: u64 = 0;
 /// monomorphized type, so this same call always resolves to the same
 /// compile-time-knowable answer for a given `R`, and optimizes to a constant
 /// in release builds exactly as `R::VERSION`/`R::FINGERPRINT` do.
+///
+/// `PlatformOwned` is keyed exactly as `Unscoped` is: it seals writes, not
+/// the key, so `charpente.jobs` stores byte-identically to before the seal.
 pub(crate) fn row_is_scoped<R: Row>() -> bool {
-    std::any::TypeId::of::<R::Scope>() != std::any::TypeId::of::<Unscoped>()
+    let scope = std::any::TypeId::of::<R::Scope>();
+    scope != std::any::TypeId::of::<Unscoped>() && scope != std::any::TypeId::of::<PlatformOwned>()
 }
 
 #[cfg(test)]

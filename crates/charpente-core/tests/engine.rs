@@ -454,14 +454,27 @@ fn submit_batch_advances_last_applied_to_the_last_frame_that_actually_applied() 
 /// Task 2 (tenant scoping): `Row::Scope` defaults every existing table to
 /// `Unscoped`, byte-identically. `engine.rs` has no `#[table]` type of its
 /// own to test against (`#[table]` emits `::charpente::` paths and core
-/// cannot depend on that crate), so this uses `JobRow` — one of core's own
-/// hand-written `Row` impls (DESIGN §3) — as the stand-in the brief's
-/// `Widget` comment calls for ("any existing #[table] type in the test
-/// module works here").
+/// cannot depend on that crate), so this uses `SchemaVersion` — one of
+/// core's own hand-written `Row` impls (DESIGN §3) — as the stand-in the
+/// brief's `Widget` comment calls for ("any existing #[table] type in the
+/// test module works here"). It used `JobRow` until the job-tenancy write
+/// seal gave that table `PlatformOwned`; the next test pins what that kept.
 #[test]
 fn an_ordinary_table_is_unscoped_by_default() {
     fn assert_unscoped<R: Row<Scope = Unscoped>>() {}
-    assert_unscoped::<JobRow>();
+    assert_unscoped::<SchemaVersion>();
+}
+
+/// The job-tenancy write seal takes writes away from `JobRow` and nothing
+/// else: a transaction still reads it through `View` (`UnscopedRow`, which
+/// GUIDE §8's oracles and the dispatcher's own scan rely on), and it still
+/// stores under the bare `u64` key (`an_unscoped_table_still_writes_a_bare_u64_key`
+/// below). That `Tx::put`/`Tx::delete` refuse it is pinned by the
+/// `job_row_*` compile-fail fixtures in `charpente-macros`.
+#[test]
+fn a_job_row_is_still_read_through_view() {
+    fn assert_readable<R: charpente_core::table::UnscopedRow>() {}
+    assert_readable::<JobRow>();
 }
 
 // `scoped_key`'s ordering property is pinned by `table.rs`'s own

@@ -50,7 +50,8 @@ use crate::io::{Disk, File};
 use crate::job::JobRow;
 use crate::log::{MAX_RECORD_BYTES, WalConfig, parse_segment_name, segment_name};
 use crate::table::{
-    Codec, Id, IndexDef, Row, RowShape, Snapshot, Store, UnscopedJob, UnscopedRow, View, Writer,
+    Codec, Id, IndexDef, Row, RowShape, Snapshot, Store, UnscopedJob, UnscopedRow, View,
+    WritableRow, Writer,
 };
 
 // ---------------------------------------------------------------- config
@@ -132,8 +133,8 @@ pub trait Event: Codec {
 /// but unacknowledged and will resurface on recovery. An `Io` carrying a
 /// `JobShapeRefusal` (`JobShapeRefusal::of`) is the one exception, not a
 /// platform failure at all: `Group::stage` refused an enqueue of a mounted
-/// job name under another shape before anything was written, and a retry
-/// cannot succeed. `Group::stage` also checks the write gate directly, but
+/// job name under another shape, or under the other tenancy, before anything
+/// was written, and a retry cannot succeed. `Group::stage` also checks the write gate directly, but
 /// that surfaces as `NotPrimary`/`Verifying` below, never as a `Refusal`.
 /// The only ordinary `Refusal` an `Io` here can carry is
 /// `resolve_effect_scope`'s or `check_replay_version`'s — a replicated
@@ -225,7 +226,9 @@ impl Refusal {
 }
 
 /// The one refusal `Group::stage` itself can produce: an enqueue of a
-/// mounted job name under a foreign shape. A distinct type, not a flag on
+/// mounted job name under a foreign shape, or under the same shape with the
+/// other tenancy (a tenant for a `global` job, none for a `scoped_by` one).
+/// A distinct type, not a flag on
 /// `Refusal`, because the ATTEMPT's stage (`kernel/dispatch.rs`,
 /// `run_due_into`'s first `group.stage` — the handler's own transaction)
 /// asserts that every `Io` error out of it is this refusal; the
@@ -360,13 +363,14 @@ pub struct SealedSegment {
 pub struct Schema {
     tables: BTreeMap<&'static str, TableOps>,
     migrations: BTreeMap<&'static str, Vec<crate::migration::MigrationStep>>,
-    /// `Job::NAME` → `Job::FINGERPRINT` for every job type this binary
-    /// mounts (`Db::register_job_shapes`). Here rather than on `Db` because a
-    /// snapshot re-seed rebuilds the `Db` from its schema, and a registry
-    /// kept anywhere else would come back empty (spec amendment A4). Not part
-    /// of `schema_digest_of`: job shapes are refused at promote, never
-    /// compared in Hello (spec §8).
-    job_shapes: BTreeMap<&'static str, u64>,
+    /// `Job::NAME` → (`Job::FINGERPRINT`, its declared tenancy: the
+    /// `scoped_by` scope's name, or `None` for a `global` job) for every job
+    /// type this binary mounts (`Db::register_job_shapes`). Here rather than
+    /// on `Db` because a snapshot re-seed rebuilds the `Db` from its schema,
+    /// and a registry kept anywhere else would come back empty (spec
+    /// amendment A4). Not part of `schema_digest_of`: job shapes are refused
+    /// at promote, never compared in Hello (spec §8).
+    job_shapes: BTreeMap<&'static str, (u64, Option<&'static str>)>,
 }
 
 impl Schema {
@@ -789,6 +793,51 @@ fn decode_record(payload: &[u8]) -> io::Result<Vec<Effect>> {
 
 // ---------------------------------------------------------------- tx
 
+/// The tables only the platform writes, by name. `JobRow`'s own type is
+/// refused by `Tx::put`'s bound (`table::PlatformOwned`), but apply routes a
+/// record's effect by TABLE NAME, so any other `Row` whose `TABLE` borrows
+/// one of these would write rows the dispatcher trusts. The app-facing
+/// writes (`Tx::put`/`delete`, `ScopedTx::put`/`delete`) refuse such a type
+/// in a `const` block. That refusal is a post-monomorphization error: `cargo
+/// build` and `cargo test` report it at the app's call site, and `cargo
+/// check`, which never monomorphizes, does not. No binary that performs the
+/// write can be built. Sealing another platform table is its name here plus
+/// its `type Scope = PlatformOwned`.
+const PLATFORM_TABLES: [&str; 1] = [JobRow::TABLE];
+
+const fn is_platform_table(table: &str) -> bool {
+    let table = table.as_bytes();
+    let mut i = 0;
+    while i < PLATFORM_TABLES.len() {
+        let name = PLATFORM_TABLES[i].as_bytes();
+        if name.len() == table.len() {
+            let mut j = 0;
+            while j < name.len() && name[j] == table[j] {
+                j += 1;
+            }
+            if j == name.len() {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `PLATFORM_TABLES`' refusal, evaluated in a `const` block per written row
+/// type, so it fails the build rather than a request.
+const fn refuse_platform_table(table: &str) {
+    if is_platform_table(table) {
+        panic!(
+            "this Row's TABLE is \"charpente.jobs\", the platform's job queue — job rows are the \
+             platform's: only the enqueue family writes one, because the dispatcher runs a job \
+             in the tenant its row names; give this table a name of its own, and run a job by \
+             enqueueing it (`tx.enqueue`, `ScopedTx::enqueue`, or `tx.enqueue_in` from a \
+             `cross_tenant` route or job)"
+        );
+    }
+}
+
 /// The transaction handle: reads see this transaction's own buffered
 /// writes first, then the enclosing group's accumulated writes (`group`,
 /// below), then the store snapshot the group began from — a three-level
@@ -825,12 +874,17 @@ impl<'a> Tx<'a> {
         }
     }
 
-    /// Stages a row on an UNSCOPED table. `R: UnscopedRow` is the write
+    /// Stages a row on an UNSCOPED table. `R: WritableRow` is the write
     /// half of spec §1's compile-time property: a scoped row cannot be
     /// staged under `UNSCOPED` because it cannot reach this method at all,
     /// which is a stronger statement than any assertion here could make.
     /// Scoped writes go through `put_in` (or, in an app, `ScopedTx::put`).
-    pub fn put<R: UnscopedRow>(&mut self, row: &R) {
+    ///
+    /// The same bound refuses a platform row (`JobRow`), and the `const`
+    /// block refuses any other row type whose `TABLE` borrows a platform
+    /// table's name (`PLATFORM_TABLES`).
+    pub fn put<R: WritableRow>(&mut self, row: &R) {
+        const { refuse_platform_table(R::TABLE) };
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
         self.effects
@@ -840,12 +894,38 @@ impl<'a> Tx<'a> {
             .insert((UNSCOPED, row.id().raw()), Some(bytes));
     }
 
-    pub fn delete<R: UnscopedRow>(&mut self, id: Id<R>) {
+    /// `put`'s tombstone, under the same two refusals.
+    pub fn delete<R: WritableRow>(&mut self, id: Id<R>) {
+        const { refuse_platform_table(R::TABLE) };
         self.effects
             .overlay
             .entry(R::TABLE)
             .or_default()
             .insert((UNSCOPED, id.raw()), None);
+    }
+
+    /// The dispatcher's write of a job's outcome: the Done mark, or the
+    /// failure record that retries or dead-letters it. Outside the enqueue
+    /// family this is the only write of a job row: `Tx::put` and `Tx::delete`
+    /// refuse `JobRow` at compile time, because the dispatcher opens the
+    /// tenant a row's `scope` names without asking anyone, and a row app
+    /// code could write would run a job in any tenant.
+    ///
+    /// It takes a `TenantAdmission`, which only a `Group` mints. A handler
+    /// holds `&mut Tx` and `&Ctx`, never a `Group`, and a job's glue holds a
+    /// `JobScope` whose admission is private, so no app code can call this.
+    /// Operator code that holds a `Group` can: it is trusted by that
+    /// standing (job-tenancy spec §3, §7), since whoever holds the `Db`
+    /// already holds the store.
+    pub fn settle_job(&mut self, row: &JobRow, admission: &TenantAdmission) {
+        let TenantAdmission(()) = admission;
+        let mut bytes = Vec::new();
+        row.encode_row(&mut bytes);
+        self.effects
+            .overlay
+            .entry(JobRow::TABLE)
+            .or_default()
+            .insert((UNSCOPED, row.id.raw()), Some(bytes));
     }
 
     /// Stages a row on a SCOPED table under `scope` — the primitive
@@ -1042,9 +1122,9 @@ fn merge_overlay_rows<R: Row>(
             }
         } else {
             // Negative space (hard rule 4): an unscoped table's overlay is
-            // written only by `Tx::put`/`Tx::delete` (both `R: UnscopedRow`)
-            // and by the SchemaVersion adoption row, all of which stage
-            // `UNSCOPED`. A skip here would turn a staging bug into a
+            // written only by `Tx::put`/`Tx::delete` (both `R: WritableRow`),
+            // `Tx::settle_job` and the SchemaVersion adoption row, all of
+            // which stage `UNSCOPED`. A skip here would turn a staging bug into a
             // silently missing row instead of a loud one.
             assert_eq!(
                 entry_scope,
@@ -1541,11 +1621,15 @@ impl<'a, S: 'static> ScopedTx<'_, 'a, S> {
         self.tx.scan_from_in(self.scope, from_id, limit)
     }
 
+    /// Stages a row of this tenant. The `const` block is `Tx::put`'s: a row
+    /// type whose `TABLE` borrows a platform table's name is refused here too.
     pub fn put<R: Row<Scope = S>>(&mut self, row: &R) {
+        const { refuse_platform_table(R::TABLE) };
         self.tx.put_in(self.scope, row)
     }
 
     pub fn delete<R: Row<Scope = S>>(&mut self, id: Id<R>) {
+        const { refuse_platform_table(R::TABLE) };
         self.tx.delete_in(self.scope, id)
     }
 
@@ -1759,7 +1843,7 @@ fn merge_overlay_all_scopes<R: Row>(
     // `tenant_zero_is_a_real_tenant_to_a_cross_tenant_read`.
     //
     // The staging bug the assertion was reaching for cannot happen anyway:
-    // `Tx::put`/`Tx::delete` take `R: UnscopedRow`, so a scoped row "cannot
+    // `Tx::put`/`Tx::delete` take `R: WritableRow`, so a scoped row "cannot
     // reach this method at all, which is a stronger statement than any
     // assertion here could make" (`Tx::put`'s own doc, above).
     for (&(scope, id), entry) in overlay {
@@ -2386,6 +2470,12 @@ enum WriteGate {
     Verifying(Vec<String>),
 }
 
+/// A job's declared tenancy as the tenancy refusals render it: `global`, or
+/// `scoped_by = Org` with the scope's name as `JobDef.scoped_by` carries it.
+fn declared_tenancy(scoped_by: Option<&str>) -> String {
+    scoped_by.map_or_else(|| "`global`".to_string(), |s| format!("`scoped_by = {s}`"))
+}
+
 /// The composed deterministic core: WAL + store + schema. One `Db` is the
 /// single writer; `transact` takes `&mut self`, so transactions are
 /// serializable because two cannot exist at once.
@@ -2898,22 +2988,23 @@ impl Db {
         matches!(self.gate, WriteGate::Verifying(_))
     }
 
-    /// Registers each mounted job type's payload shape so
-    /// `pending_job_shape_refusal` can name a Pending row this binary would
-    /// decode under a foreign shape, and `Group::stage` can refuse an enqueue
-    /// under another shape of a mounted name. `App::mount_jobs` calls it with
-    /// the `JobDef`s it mounts. Re-registering the same pair is a no-op; one
-    /// name under two shapes is impossible past `mount_jobs`' duplicate
-    /// refusal.
-    pub fn register_job_shapes(&mut self, shapes: &[(&'static str, u64)]) {
+    /// Registers each mounted job type's payload shape and declared tenancy
+    /// (`(name, fingerprint, scoped_by)`, `scoped_by` as `JobDef` carries it)
+    /// so `pending_job_shape_refusal` can name a Pending row this binary
+    /// would decode under a foreign shape or dispatch into the wrong tenancy,
+    /// and `Group::stage` can refuse an enqueue that disagrees with a mounted
+    /// name on either. `App::mount_jobs` calls it with the `JobDef`s it
+    /// mounts. Re-registering the same triple is a no-op; one name under two
+    /// is impossible past `mount_jobs`' duplicate refusal.
+    pub fn register_job_shapes(&mut self, shapes: &[(&'static str, u64, Option<&'static str>)]) {
         let registry = &mut self.engine.machine_mut().schema.job_shapes;
-        for &(name, fingerprint) in shapes {
-            let prev = registry.insert(name, fingerprint);
+        for &(name, fingerprint, scoped_by) in shapes {
+            let prev = registry.insert(name, (fingerprint, scoped_by));
             assert!(
-                prev.is_none_or(|p| p == fingerprint),
+                prev.is_none_or(|p| p == (fingerprint, scoped_by)),
                 "job \"{name}\" registered under two shapes ({:#x} and {fingerprint:#x}) — \
                  mount_jobs refuses a duplicate name, so this is a platform bug",
-                prev.unwrap_or_default()
+                prev.unwrap_or_default().0
             );
         }
     }
@@ -2924,42 +3015,51 @@ impl Db {
     /// switchover), and before a promote flips the role. `Some(refusal)`
     /// names every Pending job of a registered type whose recorded shape is
     /// not the one this binary compiled — a row with no recorded shape
-    /// included — one line per job type. Done and Dead rows are never
-    /// decoded again and are ignored; a Pending row of an UNREGISTERED name
-    /// keeps its own path (dispatch's "not registered" dead-letter).
+    /// included — one line per job type; then every Pending job of the
+    /// compiled shape whose tenant presence disagrees with the declaration
+    /// this binary mounts (job-tenancy final review M4), one line per job
+    /// type, since the dispatcher would open no tenant for a scoped job or
+    /// one for a global job. Done and Dead rows are never decoded again and
+    /// are ignored; a Pending row of an UNREGISTERED name keeps its own path
+    /// (dispatch's "not registered" dead-letter).
     pub fn pending_job_shape_refusal(&self) -> io::Result<Option<String>> {
         const LISTED_IDS: usize = 5;
         let registry = &self.engine.machine().schema.job_shapes;
         if registry.is_empty() {
             return Ok(None);
         }
+        let listed = |ids: &[u64]| {
+            let mut listed: Vec<String> = ids.iter().take(LISTED_IDS).map(u64::to_string).collect();
+            if ids.len() > LISTED_IDS {
+                listed.push("…".to_string());
+            }
+            listed.join(", ")
+        };
         let mut foreign: BTreeMap<&'static str, (Vec<u64>, BTreeSet<Option<u64>>)> =
             BTreeMap::new();
+        let mut mistenanted: BTreeMap<&'static str, Vec<u64>> = BTreeMap::new();
         for job in self.snapshot()?.scan::<JobRow>()? {
             if job.status != crate::job::JobStatus::Pending {
                 continue;
             }
-            let Some((&name, &compiled)) = registry.get_key_value(job.name.as_str()) else {
+            let Some((&name, &(compiled, scoped_by))) = registry.get_key_value(job.name.as_str())
+            else {
                 continue;
             };
-            if job.shape == Some(compiled) {
-                continue;
+            if job.shape != Some(compiled) {
+                let (ids, recorded) = foreign.entry(name).or_default();
+                ids.push(job.id.raw());
+                recorded.insert(job.shape);
+            } else if job.scope.is_some() != scoped_by.is_some() {
+                mistenanted.entry(name).or_default().push(job.id.raw());
             }
-            let (ids, recorded) = foreign.entry(name).or_default();
-            ids.push(job.id.raw());
-            recorded.insert(job.shape);
         }
-        if foreign.is_empty() {
+        if foreign.is_empty() && mistenanted.is_empty() {
             return Ok(None);
         }
-        let lines: Vec<String> = foreign
+        let mut lines: Vec<String> = foreign
             .into_iter()
             .map(|(name, (ids, recorded))| {
-                let mut listed: Vec<String> =
-                    ids.iter().take(LISTED_IDS).map(u64::to_string).collect();
-                if ids.len() > LISTED_IDS {
-                    listed.push("…".to_string());
-                }
                 let recorded: Vec<String> = recorded
                     .into_iter()
                     .map(|shape| match shape {
@@ -2975,12 +3075,31 @@ impl Db {
                      `global`/`scoped_by` declaration and give the new shape its own #[job] type \
                      under a new name (GUIDE §6)",
                     ids.len(),
-                    listed.join(", "),
+                    listed(&ids),
                     recorded.join(", "),
-                    registry[name]
+                    registry[name].0
                 )
             })
             .collect();
+        lines.extend(mistenanted.into_iter().map(|(name, ids)| {
+            let scoped_by = registry[name].1;
+            format!(
+                "{} Pending \"{name}\" job(s) (ids {}) carry {}, but this binary declares {name} \
+                 {} — the enqueue family writes a tenant exactly for a `scoped_by` job, so \
+                 something that contradicts {name}'s #[job] wrote these rows: a hand-written \
+                 `impl Job` or `JobDef`, or a raw store write; this binary will not dispatch \
+                 them; mount {name} as its #[job] declares it, or restore the store from a \
+                 replica or backup taken before these rows were written (GUIDE §6)",
+                ids.len(),
+                listed(&ids),
+                if scoped_by.is_some() {
+                    "no tenant"
+                } else {
+                    "a tenant"
+                },
+                declared_tenancy(scoped_by)
+            )
+        }));
         Ok(Some(lines.join("\n")))
     }
 
@@ -3547,19 +3666,28 @@ impl<'a> Group<'a> {
                 });
             }
         }
-        // A mounted job name has one shape. `NAME` is the bare type
-        // identifier, so a second `#[job]` type of the same name enqueues
-        // under a shape no dispatch of this binary can decode; refusing it
-        // here, before a record exists, is what makes dispatch's shape
-        // assert an invariant (payload-shapes spec §4).
+        // A mounted job name has one shape and one tenancy. `NAME` is the
+        // bare type identifier, so a second `#[job]` type of the same name
+        // enqueues under a shape no dispatch of this binary can decode;
+        // refusing it here, before a record exists, is what makes dispatch's
+        // shape assert an invariant (payload-shapes spec §4). A hand-written
+        // `impl Job` can also copy a mounted job's `NAME` and `FINGERPRINT`
+        // under the other tenancy, and a hand-written `JobDef` can mount one
+        // under the wrong one, so tenant presence is refused here too — the
+        // half of dispatch's tenancy assert that the write seal and the
+        // startup refusal do not cover (job-tenancy final review M4).
         let job_shapes = &self.db.engine.machine().schema.job_shapes;
         for Enqueue {
-            job: name, shape, ..
+            job: name,
+            shape,
+            scope,
+            ..
         } in &effects.enqueues
         {
-            if let Some(&mounted) = job_shapes.get(*name)
-                && mounted != *shape
-            {
+            let Some(&(mounted, scoped_by)) = job_shapes.get(*name) else {
+                continue;
+            };
+            if mounted != *shape {
                 return Err(TxError::Io(io::Error::other(JobShapeRefusal(Refusal(
                     format!(
                         "job \"{name}\" was enqueued under a different shape of {name} than this \
@@ -3567,6 +3695,24 @@ impl<'a> Group<'a> {
                      types share the name {name}; the transaction was refused and nothing was \
                      written, so a retry cannot succeed — enqueue the mounted type, or give the \
                      other type its own name (GUIDE §6)"
+                    ),
+                )))));
+            }
+            if scope.is_some() != scoped_by.is_some() {
+                return Err(TxError::Io(io::Error::other(JobShapeRefusal(Refusal(
+                    format!(
+                        "job \"{name}\" was enqueued with {}, but this binary mounts {name} as {} \
+                         under the same shape ({shape:#x}) — a hand-written `impl Job` or \
+                         `JobDef` contradicts {name}'s #[job]; the transaction was refused and \
+                         nothing was written, so a retry cannot succeed — enqueue the mounted \
+                         type, give the other type its own name, or mount {name} as its #[job] \
+                         declares it (GUIDE §6)",
+                        if scope.is_some() {
+                            "a tenant"
+                        } else {
+                            "no tenant"
+                        },
+                        declared_tenancy(scoped_by)
                     ),
                 )))));
             }
