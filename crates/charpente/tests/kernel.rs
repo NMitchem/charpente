@@ -4201,8 +4201,11 @@ mod job_tenancy {
         job_writers: BTreeSet<u64>,
         /// A fanned-out `Restock` has written its row.
         fanned: bool,
-        /// Scoped jobs still Pending. A round ends in a restart, so any of
-        /// these found finished at the next pass ran after a crash.
+        /// Scoped jobs still Pending. Every round ends in `Sim::restart`, a
+        /// power cycle, so any of these found finished at the next pass ran
+        /// after a restart: a later process rebuilt it from its durable
+        /// record, tenant included. Whether the armed crash fired is not part
+        /// of the claim.
         pending_scoped: BTreeSet<u64>,
         /// Jobs that are Done or Dead.
         finished: BTreeSet<u64>,
@@ -4238,7 +4241,7 @@ mod job_tenancy {
         never_stripped(table, shop, marker)
     }
 
-    /// THE ORACLE, shared by the property and its three naive victims below.
+    /// THE ORACLE, shared by the property and its four naive victims below.
     ///
     /// For every job row: a scoped job carries the tenant its marker names,
     /// a global one carries none, and a failed attempt's `last_error` names
@@ -4257,7 +4260,10 @@ mod job_tenancy {
                 if !matches!(row.name.as_str(), "Fulfil" | "Notify" | "Restock") {
                     if row.scope.is_some() {
                         return Err(format!(
-                            "job {id} (\"{}\") is global but carries tenant {:?}",
+                            "tenant leak: job {id} (\"{}\") is global but carries tenant {:?} — \
+                             a global job runs in no tenant, so its row carries none; \
+                             `Tx::enqueue` records none, so this tenant came from the enqueue \
+                             record's codec or from the row it materialized",
                             row.name, row.scope
                         ));
                     }
@@ -4279,8 +4285,9 @@ mod job_tenancy {
                     && *error != jammed(marker, shop)
                 {
                     return Err(format!(
-                        "tenant leak: job {id} (\"Fulfil\") recorded \"{error}\", but every \
+                        "tenant leak: job {id} (\"{}\") recorded \"{error}\", but every \
                          attempt runs in shop {shop}: \"{}\"",
+                        row.name,
                         jammed(marker, shop)
                     ));
                 }
@@ -4359,9 +4366,10 @@ mod job_tenancy {
     /// the two refusals a stripped request can meet. Any other 4xx is a
     /// finding: a member's request is admitted, and a stripped one is
     /// answered 401, so a 400 means `authorize` was asked about someone it
-    /// should never have been asked about. A 5xx is fault fallout, since
-    /// injected IO answers 500 (`ApiError::Internal`), and the durable image
-    /// is where a wrong write would show.
+    /// should never have been asked about. A 5xx must be fault fallout,
+    /// classified by its body as every other fallible step here is: injected
+    /// IO answers 500 with the IO error's text in the body, and the durable
+    /// image is where a wrong write would show. Any other status is a finding.
     fn check_response(sim: &Sim, status: u16, body: &[u8]) -> Result<(), String> {
         match status {
             200 => {
@@ -4393,7 +4401,13 @@ mod job_tenancy {
                  stripped one is answered 401: {}",
                 String::from_utf8_lossy(body)
             )),
-            _ => Ok(()),
+            500..=599 if is_fault_fallout(&String::from_utf8_lossy(body)) => Ok(()),
+            _ => Err(format!(
+                "a {status} no request here should meet — a reply is a 200, a stripped \
+                 request's 401, or a 5xx whose body is fault fallout, and this one is none of \
+                 them: {}",
+                String::from_utf8_lossy(body)
+            )),
         }
     }
 
@@ -4491,6 +4505,11 @@ mod job_tenancy {
                 Err(e) => return Err(format!("final open failed non-injected: {e}")),
             }
         }
+        // A universe that adjudicated nothing gives up; it does not pass.
+        sim.give_up(
+            "the final check never ran: 8 reopens in a row hit injected faults, so the last \
+             round's jobs were never adjudicated",
+        );
         Ok(())
     }
 
@@ -4651,6 +4670,41 @@ mod job_tenancy {
                     "tenant leak: job 0 (\"Restock\") carries tenant Some(0) but was enqueued \
                      from shop 2 (marker {m:#x}) — a scoped job runs in the tenant it was \
                      enqueued from"
+                )
+            );
+        }
+    }
+
+    /// Victim 4, the write a credential-free request should never have made:
+    /// shop 1's order carrying a stripped `/shop/peek` nonce, as a scope line
+    /// that admitted an anonymous caller would leave it. The control carries a
+    /// stripped `/shop/walkin` nonce, which `public(Shop)` admits.
+    #[test]
+    fn the_oracle_names_a_credential_free_write_through_a_route_that_refuses_one() {
+        for (route, leaks) in [(ROUTE_WALKIN, false), (ROUTE_PEEK, true)] {
+            let n = nonce(6, route, true);
+            let (_sim, mut app) = victim_app(0x70B5_0104);
+            operator_writes(app.db_for_tests(), |tx, admission| {
+                tx.admit_scope(Id::<Shop>::from_raw(1), admission)
+                    .put(&Order {
+                        id: Id::from_raw(n % IDS),
+                        marker: marker(1, n),
+                    });
+            });
+            let verdict = jobs_stay_in_their_tenant(app.db_for_tests());
+            if !leaks {
+                assert!(verdict.is_ok(), "the control: {:?}", verdict.err());
+                continue;
+            }
+            let err = verdict
+                .err()
+                .expect("a credential-free write through `public` must fail the oracle");
+            assert_eq!(
+                err,
+                format!(
+                    "Order in shop 1 carries nonce {n:#x}, a credential-free request to \
+                     /shop/peek — only a route declared `public(Shop)` admits one, so that \
+                     request had to be refused with nothing written"
                 )
             );
         }
