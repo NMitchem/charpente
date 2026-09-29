@@ -3878,3 +3878,776 @@ fn job_shape_upgrades_replay_identically_for_the_same_seed() {
 const RECEIPT_REFUSED_FLOOR: u64 = 40;
 const RECEIPT_REFUSED_AFTER_CRASH_FLOOR: u64 = 14;
 const RECEIPT_DRAINED_FLOOR: u64 = 115;
+
+// ------------------------------------------ job tenancy under the fault matrix
+
+/// Job-tenancy spec §9 item 4: tenant isolation, extended to jobs. The
+/// workload has its own tables, jobs and base seed, so no existing universe
+/// is re-keyed (spec §9 item 7).
+///
+/// Every row and job payload carries a content-derived marker (the
+/// `ledger_marker` idiom): `shop << 32 | nonce`, with
+/// `nonce = seq << 3 | route << 1 | stripped`. So a row found under the wrong
+/// shop, a job run in the wrong shop, and a credential-free write that
+/// should have been refused are each detectable by content alone.
+mod job_tenancy {
+    use super::*;
+    use charpente::auth::{ApiKey, hash_token};
+    use charpente::{CrossTenant, ScopedTx, TenantAdmission};
+    use charpente_core::db::Group;
+
+    /// Shops in play, and the row-id space they share. Ids COLLIDE across
+    /// shops: a leak is only expressible when two shops hold the same id.
+    const SHOPS: u64 = 4;
+    const IDS: u64 = 5;
+
+    const ROUTE_ORDER: u64 = 0; // `auth`
+    const ROUTE_WALKIN: u64 = 1; // `public(Shop)`
+    const ROUTE_PEEK: u64 = 2; // plain `public`
+    const PATHS: [&str; 3] = ["/shop/order", "/shop/walkin", "/shop/peek"];
+
+    fn nonce(seq: u64, route: u64, stripped: bool) -> u64 {
+        (seq << 3) | (route << 1) | u64::from(stripped)
+    }
+
+    fn marker(shop: u64, nonce: u64) -> u64 {
+        (shop << 32) | nonce
+    }
+
+    fn marker_shop(marker: u64) -> u64 {
+        marker >> 32
+    }
+
+    fn marker_nonce(marker: u64) -> u64 {
+        marker & 0xFFFF_FFFF
+    }
+
+    fn nonce_route(nonce: u64) -> u64 {
+        (nonce >> 1) & 3
+    }
+
+    fn nonce_stripped(nonce: u64) -> bool {
+        nonce & 1 == 1
+    }
+
+    fn key_of(shop: u64) -> String {
+        format!("ck_shop_{shop}")
+    }
+
+    fn subject_of(shop: u64) -> String {
+        format!("shop-{shop}")
+    }
+
+    /// What a failing `Fulfil` records. It names the shop its `run` was
+    /// handed, so every retry's `last_error` says which tenant that attempt
+    /// ran in.
+    fn jammed(marker: u64, shop: u64) -> String {
+        format!("fulfil {marker:#x} jammed in shop {shop}")
+    }
+
+    /// A scope type needs no table of its own: `Org` above is the precedent.
+    struct Shop;
+
+    impl Tenant for Shop {
+        type Who = Principal;
+        type Error = ApiError;
+        /// Membership: a shop's own key, and no other.
+        fn authorize(_tx: &Tx, who: &Principal, scope: Id<Shop>) -> Result<(), ApiError> {
+            if who.subject() == subject_of(scope.raw()) {
+                Ok(())
+            } else {
+                Err(ApiError::BadRequest(format!(
+                    "{} is not a member of shop {}",
+                    who.subject(),
+                    scope.raw()
+                )))
+            }
+        }
+    }
+
+    /// Written by a route, inside the shop the request named.
+    #[table(scoped_by = Shop)]
+    struct Order {
+        id: Id<Order>,
+        marker: u64,
+    }
+
+    /// Written by `Fulfil`, in the shop its row carries.
+    #[table(scoped_by = Shop)]
+    struct Shipment {
+        id: Id<Shipment>,
+        marker: u64,
+    }
+
+    /// Written by `Notify`, a scoped follow-up `Fulfil` enqueues.
+    #[table(scoped_by = Shop)]
+    struct Notice {
+        id: Id<Notice>,
+        marker: u64,
+    }
+
+    /// Written by `Restock`, which the cron sweep fans out.
+    #[table(scoped_by = Shop)]
+    struct Restocked {
+        id: Id<Restocked>,
+        marker: u64,
+    }
+
+    #[derive(WireDerive, Serialize, Deserialize)]
+    struct Place {
+        shop: WireU64,
+        nonce: WireU64,
+    }
+
+    /// Every route's body: open the named shop, write a marked order, and
+    /// enqueue its fulfilment inside the shop.
+    fn place(tx: &mut Tx, body: Place, ctx: &Ctx) -> Result<WireU64, ApiError> {
+        let (shop, nonce) = (body.shop.0, body.nonce.0);
+        let mut tx = tx.scope::<Shop>(Id::from_raw(shop), ctx)?;
+        let marker = marker(shop, nonce);
+        tx.put(&Order {
+            id: Id::from_raw(nonce % IDS),
+            marker,
+        });
+        tx.enqueue(Fulfil { marker });
+        Ok(WireU64(nonce))
+    }
+
+    #[route(POST "/shop/order", auth)]
+    fn order(tx: &mut Tx, body: Place, ctx: &Ctx) -> Result<WireU64, ApiError> {
+        place(tx, body, ctx)
+    }
+
+    #[route(POST "/shop/walkin", public(Shop))]
+    fn walkin(tx: &mut Tx, body: Place, ctx: &Ctx) -> Result<WireU64, ApiError> {
+        place(tx, body, ctx)
+    }
+
+    #[route(POST "/shop/peek", public)]
+    fn peek(tx: &mut Tx, body: Place, ctx: &Ctx) -> Result<WireU64, ApiError> {
+        place(tx, body, ctx)
+    }
+
+    /// Fails every attempt for a fifth of its nonces, so retries, and the
+    /// death that ends them, run under the fault matrix. Hands a third of its
+    /// nonces a scoped follow-up.
+    #[job(scoped_by = Shop, retry(max = 2, backoff = "1s"))]
+    struct Fulfil {
+        marker: u64,
+    }
+
+    impl Fulfil {
+        fn run(self, tx: &mut ScopedTx<'_, '_, Shop>) -> Result<(), JobError> {
+            let nonce = marker_nonce(self.marker);
+            if nonce.is_multiple_of(5) {
+                return Err(JobError::app(jammed(self.marker, tx.scope().raw())));
+            }
+            tx.put(&Shipment {
+                id: Id::from_raw(nonce % IDS),
+                marker: self.marker,
+            });
+            if nonce.is_multiple_of(3) {
+                tx.enqueue(Notify {
+                    marker: self.marker,
+                });
+            }
+            Ok(())
+        }
+    }
+
+    #[job(scoped_by = Shop)]
+    struct Notify {
+        marker: u64,
+    }
+
+    impl Notify {
+        fn run(self, tx: &mut ScopedTx<'_, '_, Shop>) -> Result<(), JobError> {
+            tx.put(&Notice {
+                id: Id::from_raw(marker_nonce(self.marker) % IDS),
+                marker: self.marker,
+            });
+            Ok(())
+        }
+    }
+
+    #[job(scoped_by = Shop)]
+    struct Restock {
+        marker: u64,
+    }
+
+    impl Restock {
+        fn run(self, tx: &mut ScopedTx<'_, '_, Shop>) -> Result<(), JobError> {
+            tx.put(&Restocked {
+                id: Id::from_raw(marker_nonce(self.marker) % IDS),
+                marker: self.marker,
+            });
+            Ok(())
+        }
+    }
+
+    /// The declared fan-out (spec §2 R5), on cron: one `Restock` into each
+    /// shop holding an order, naming the shop the order was found under.
+    #[job(global, cross_tenant)]
+    struct Sweep {}
+
+    impl Sweep {
+        fn run(self, tx: &mut Tx, cap: &CrossTenant) -> Result<(), JobError> {
+            let orders = tx.across_tenants::<Shop>(cap).scan::<Order>()?;
+            let mut named = BTreeSet::new();
+            for (shop, order) in orders {
+                if named.insert(shop.raw()) {
+                    tx.enqueue_in(
+                        shop,
+                        Restock {
+                            marker: order.marker,
+                        },
+                        cap,
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn shop_app(sim: &Sim) -> std::io::Result<App> {
+        Ok(App::open(
+            Box::new(sim.disk()),
+            Schema::new()
+                .table::<Order>()
+                .table::<Shipment>()
+                .table::<Notice>()
+                .table::<Restocked>(),
+            Box::new(sim.entropy()),
+            crash_config(),
+        )?
+        .mount(routes![order, walkin, peek])
+        .mount_jobs(jobs![Fulfil, Notify, Restock, Sweep])
+        .schedule("shop-sweep", Duration::from_secs(30), || Sweep {}))
+    }
+
+    /// One API key per shop, whose subject is that shop's member. Put every
+    /// round: the puts are idempotent, and a round's requests must not
+    /// depend on an earlier round having committed.
+    fn seed_keys(db: &mut Db) -> Result<(), String> {
+        db.transact(|tx| {
+            for shop in 0..SHOPS {
+                tx.put(&ApiKey {
+                    id: Id::from_raw(shop),
+                    key_hash: hash_token(&key_of(shop)),
+                    subject: subject_of(shop),
+                    created_at: 0,
+                });
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .map_err(|e| match e {
+            TxError::Io(e) => e.to_string(),
+            other => format!("seeding keys: {other:?}"),
+        })
+    }
+
+    /// The operator's read (job-tenancy spec §7): one group, its admission,
+    /// and reads only, so the group commits nothing. This goes through
+    /// `ScopedTx`'s own bounds, not the snapshot's raw-scope reads, so the
+    /// oracle reads the way an app does.
+    ///
+    /// `f` is handed the group, not one `Tx`, because a transaction opens ONE
+    /// scope (spec §8): each shop's reads are a `stage` of their own. Every
+    /// stage reads the group's one snapshot, so the job rows and every
+    /// shop's rows are a single image, and a stage that writes nothing
+    /// leaves the group as it found it.
+    fn admitted_read<T>(
+        db: &mut Db,
+        f: impl FnOnce(&mut Group<'_>, &TenantAdmission) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut group = db.begin_group().map_err(|e| e.to_string())?;
+        let admission = group.tenant_admission();
+        let out = f(&mut group, &admission)?;
+        assert!(
+            group.is_empty(),
+            "the oracle staged {} record(s): it reads, and a read that writes changes the image \
+             it is judging",
+            group.len()
+        );
+        group
+            .commit()
+            .map_err(|failure| failure.error.to_string())?;
+        Ok(out)
+    }
+
+    /// One read-only stage's failure, as the oracle reports it: its own
+    /// message, or the IO error's text for `is_fault_fallout` to classify.
+    fn staged(e: TxError<String>) -> String {
+        match e {
+            TxError::App(msg) => msg,
+            TxError::Io(e) => e.to_string(),
+            TxError::NotPrimary { .. } | TxError::Verifying { .. } => {
+                unreachable!("this workload never gates writes")
+            }
+        }
+    }
+
+    /// What one oracle pass saw, for the coverage keys. Every field is an
+    /// OBSERVED outcome on the durable image, never what the workload
+    /// scheduled.
+    #[derive(Default)]
+    struct Seen {
+        /// Shops holding a row that some job wrote.
+        job_writers: BTreeSet<u64>,
+        /// A fanned-out `Restock` has written its row.
+        fanned: bool,
+        /// Scoped jobs still Pending. A round ends in a restart, so any of
+        /// these found finished at the next pass ran after a crash.
+        pending_scoped: BTreeSet<u64>,
+        /// Jobs that are Done or Dead.
+        finished: BTreeSet<u64>,
+    }
+
+    /// A stripped request's nonce may appear in the store only when it came
+    /// through `public(Shop)`. Anywhere else, the request had to be refused
+    /// with nothing written.
+    fn never_stripped(what: &str, shop: u64, marker: u64) -> Result<(), String> {
+        let nonce = marker_nonce(marker);
+        let route = nonce_route(nonce);
+        if nonce_stripped(nonce) && route != ROUTE_WALKIN {
+            return Err(format!(
+                "{what} in shop {shop} carries nonce {nonce:#x}, a credential-free request to {} \
+                 — only a route declared `public(Shop)` admits one, so that request had to be \
+                 refused with nothing written",
+                PATHS[route as usize]
+            ));
+        }
+        Ok(())
+    }
+
+    /// A row lies in the shop its marker names, and was not written by a
+    /// request that should have been refused.
+    fn lies_in(table: &str, shop: u64, id: u64, marker: u64) -> Result<(), String> {
+        if marker_shop(marker) != shop {
+            return Err(format!(
+                "tenant leak: {table} id {id} under shop {shop} carries shop {}'s marker \
+                 {marker:#x} — a row lies in the tenant its writer was in",
+                marker_shop(marker)
+            ));
+        }
+        never_stripped(table, shop, marker)
+    }
+
+    /// THE ORACLE, shared by the property and its three naive victims below.
+    ///
+    /// For every job row: a scoped job carries the tenant its marker names,
+    /// a global one carries none, and a failed attempt's `last_error` names
+    /// the tenant that attempt ran in. For every shop, read through the
+    /// operator's admission: each row of all four tables lies in the shop
+    /// its marker names. A stripped request's nonce appears nowhere it
+    /// should have been refused.
+    fn jobs_stay_in_their_tenant(db: &mut Db) -> Result<Seen, String> {
+        admitted_read(db, |group, admission| {
+            let mut seen = Seen::default();
+            let jobs = group
+                .stage(|tx| tx.scan::<JobRow>().map_err(|e| e.to_string()))
+                .map_err(staged)?;
+            for row in jobs {
+                let id = row.id.raw();
+                if !matches!(row.name.as_str(), "Fulfil" | "Notify" | "Restock") {
+                    if row.scope.is_some() {
+                        return Err(format!(
+                            "job {id} (\"{}\") is global but carries tenant {:?}",
+                            row.name, row.scope
+                        ));
+                    }
+                    continue;
+                }
+                let marker = u64::decode(&mut &row.payload[..]).map_err(|e| e.to_string())?;
+                let shop = marker_shop(marker);
+                if row.scope != Some(shop) {
+                    return Err(format!(
+                        "tenant leak: job {id} (\"{}\") carries tenant {:?} but was enqueued from \
+                         shop {shop} (marker {marker:#x}) — a scoped job runs in the tenant it \
+                         was enqueued from",
+                        row.name, row.scope
+                    ));
+                }
+                never_stripped(&format!("job {id} (\"{}\")", row.name), shop, marker)?;
+                if let Some(error) = &row.last_error
+                    && error.starts_with("fulfil ")
+                    && *error != jammed(marker, shop)
+                {
+                    return Err(format!(
+                        "tenant leak: job {id} (\"Fulfil\") recorded \"{error}\", but every \
+                         attempt runs in shop {shop}: \"{}\"",
+                        jammed(marker, shop)
+                    ));
+                }
+                match row.status {
+                    JobStatus::Pending => {
+                        seen.pending_scoped.insert(id);
+                    }
+                    JobStatus::Done | JobStatus::Dead => {
+                        seen.finished.insert(id);
+                    }
+                }
+            }
+            for shop in 0..SHOPS {
+                group
+                    .stage(|tx| {
+                        let stx = tx.admit_scope(Id::<Shop>::from_raw(shop), admission);
+                        for o in stx.scan::<Order>().map_err(|e| e.to_string())? {
+                            lies_in("Order", shop, o.id.raw(), o.marker)?;
+                        }
+                        let shipments = stx.scan::<Shipment>().map_err(|e| e.to_string())?;
+                        for s in &shipments {
+                            lies_in("Shipment", shop, s.id.raw(), s.marker)?;
+                        }
+                        let notices = stx.scan::<Notice>().map_err(|e| e.to_string())?;
+                        for n in &notices {
+                            lies_in("Notice", shop, n.id.raw(), n.marker)?;
+                        }
+                        let restocked = stx.scan::<Restocked>().map_err(|e| e.to_string())?;
+                        for r in &restocked {
+                            lies_in("Restocked", shop, r.id.raw(), r.marker)?;
+                        }
+                        if !(shipments.is_empty() && notices.is_empty() && restocked.is_empty()) {
+                            seen.job_writers.insert(shop);
+                        }
+                        seen.fanned |= !restocked.is_empty();
+                        Ok(())
+                    })
+                    .map_err(staged)?;
+            }
+            Ok(seen)
+        })
+    }
+
+    /// Credits the coverage keys from what one pass saw. `carried` is the
+    /// previous pass's `pending_scoped`.
+    fn credit(sim: &Sim, seen: &Seen, carried: &BTreeSet<u64>) {
+        // A single-shop universe cannot detect a job leak at all: every row
+        // legitimately belongs to the only shop (tenant spec §5).
+        if seen.job_writers.len() > 1 {
+            sim.cover("tenant:job_multi_tenant_write");
+        }
+        if seen.fanned {
+            sim.cover("tenant:job_fan_out");
+        }
+        if carried.iter().any(|id| seen.finished.contains(id)) {
+            sim.cover("tenant:job_run_after_crash");
+        }
+    }
+
+    const UNAUTHORIZED: &str = "authentication required — send \"Authorization: Bearer \
+                                <token>\" or the charpente_session cookie";
+
+    /// Task 3's anonymous-scope 401 for the plain-`public` route, spelled out
+    /// rather than taken from the product's `format!`.
+    const PEEK_REFUSED: &str = "authentication required — `POST /shop/peek` is declared \
+                                `public` and opened the tenant scope `Shop` for a caller with \
+                                no credential; only a route declared `public(Shop)` admits \
+                                one. Send \"Authorization: Bearer <token>\" or the \
+                                charpente_session cookie, or, if every caller may act inside \
+                                this tenant here, declare `#[route(POST \"/shop/peek\", \
+                                public(Shop))]`";
+
+    /// Every reply, as the wire saw it. A 200 names its request's nonce, so a
+    /// credential-free request that was admitted where it must be refused is
+    /// caught here even when it wrote nothing durable. A 401 must be one of
+    /// the two refusals a stripped request can meet. Any other 4xx is a
+    /// finding: a member's request is admitted, and a stripped one is
+    /// answered 401, so a 400 means `authorize` was asked about someone it
+    /// should never have been asked about. A 5xx is fault fallout, since
+    /// injected IO answers 500 (`ApiError::Internal`), and the durable image
+    /// is where a wrong write would show.
+    fn check_response(sim: &Sim, status: u16, body: &[u8]) -> Result<(), String> {
+        match status {
+            200 => {
+                let WireU64(nonce) = serde_json::from_slice::<WireU64>(body)
+                    .map_err(|e| format!("a 200 whose body is not a nonce: {e}"))?;
+                let route = nonce_route(nonce);
+                if nonce_stripped(nonce) && route != ROUTE_WALKIN {
+                    return Err(format!(
+                        "{} admitted a caller with no credential: 200 for nonce {nonce:#x} — \
+                         only a route declared `public(Shop)` admits one",
+                        PATHS[route as usize]
+                    ));
+                }
+                Ok(())
+            }
+            401 => {
+                let body: serde_json::Value =
+                    serde_json::from_slice(body).map_err(|e| e.to_string())?;
+                let text = body["error"].as_str().unwrap_or_default();
+                if text == UNAUTHORIZED || text == PEEK_REFUSED {
+                    sim.cover("tenant:anonymous_refused");
+                    Ok(())
+                } else {
+                    Err(format!("a 401 no stripped request should meet: {text}"))
+                }
+            }
+            400..=499 => Err(format!(
+                "a {status} no request here should meet — a member's request is admitted and a \
+                 stripped one is answered 401: {}",
+                String::from_utf8_lossy(body)
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// One universe: `kernel_workload`'s shape. Three rounds, each of which
+    /// crashes the disk at a random point, reopens, runs the oracle, seeds
+    /// the keys, scripts paired requests, runs the kernel (dispatch and cron
+    /// included) and restarts. A quiet final pass then runs the oracle once
+    /// more.
+    fn job_tenancy_universe(sim: &mut Sim) -> Result<(), String> {
+        let entropy = sim.entropy();
+        let mut seq = 0u64;
+        let mut carried = BTreeSet::new();
+        for _round in 0..3 {
+            sim.crash_disk_after(64 + entropy.next_u64() % 768);
+            let mut app = match shop_app(sim) {
+                Ok(app) => app,
+                Err(e) if is_fault_fallout(&e.to_string()) => {
+                    sim.restart();
+                    continue;
+                }
+                Err(e) => return Err(format!("open failed non-injected: {e}")),
+            };
+            match jobs_stay_in_their_tenant(app.db_for_tests()) {
+                Ok(seen) => {
+                    credit(sim, &seen, &carried);
+                    carried = seen.pending_scoped;
+                }
+                Err(msg) if is_fault_fallout(&msg) => {
+                    sim.restart();
+                    continue;
+                }
+                Err(msg) => return Err(msg),
+            }
+            if let Err(e) = seed_keys(app.db_for_tests()) {
+                if !is_fault_fallout(&e) {
+                    return Err(format!("seeding keys failed non-injected: {e}"));
+                }
+                sim.restart();
+                continue;
+            }
+
+            let base = sim.now().as_nanos();
+            let mut source = SimSource::new(Box::new(sim.clock()), base + 400 * SEC);
+            for i in 0..(1 + entropy.next_u64() % 6) {
+                let shop = entropy.next_u64() % SHOPS;
+                let route = entropy.next_u64() % 3;
+                // The credentialed request, then its stripped replay a
+                // nanosecond later: every write is also tried with no
+                // credential at all.
+                for stripped in [false, true] {
+                    let mut request =
+                        Request::new(Method::Post, PATHS[route as usize]).json(&Place {
+                            shop: WireU64(shop),
+                            nonce: WireU64(nonce(seq, route, stripped)),
+                        });
+                    if !stripped {
+                        request =
+                            request.header("Authorization", format!("Bearer {}", key_of(shop)));
+                    }
+                    source.push_at(base + i * SEC + u64::from(stripped), request);
+                }
+                seq += 1;
+            }
+            let responses = source.responses();
+            let run = (|| -> Result<(), std::io::Error> {
+                let mut kernel = Kernel::new(app, Box::new(sim.clock()))?;
+                let out = kernel.run(&mut source);
+                if kernel.stats().jobs_retried > 0 {
+                    sim.cover("job:retried");
+                }
+                out
+            })();
+            for (status, body) in responses.lock().unwrap().iter() {
+                check_response(sim, *status, body)?;
+            }
+            if let Err(e) = run
+                && !is_fault_fallout(&e.to_string())
+            {
+                return Err(format!("kernel stopped non-injected: {e}"));
+            }
+            sim.restart();
+        }
+
+        for _attempt in 0..8 {
+            match shop_app(sim) {
+                Ok(mut app) => match jobs_stay_in_their_tenant(app.db_for_tests()) {
+                    Ok(seen) => {
+                        credit(sim, &seen, &carried);
+                        return Ok(());
+                    }
+                    Err(msg) if is_fault_fallout(&msg) => sim.restart(),
+                    Err(msg) => return Err(msg),
+                },
+                Err(e) if is_fault_fallout(&e.to_string()) => sim.restart(),
+                Err(e) => return Err(format!("final open failed non-injected: {e}")),
+            }
+        }
+        Ok(())
+    }
+
+    /// Job-tenancy spec §9 item 4. A fixed base, like every permanent swarm
+    /// property here. N was set by timing one batch (Step 3): the commit and
+    /// the LEDGER state it.
+    #[test]
+    fn every_job_runs_in_the_tenant_it_was_enqueued_from() {
+        run_universes_swarm_with!(
+            0x70B5_0001,
+            256,
+            |_cfg: &mut FaultConfig| {},
+            job_tenancy_universe,
+            require: [
+                "tenant:job_multi_tenant_write",
+                "tenant:job_run_after_crash",
+                "tenant:job_fan_out",
+                "tenant:anonymous_refused",
+                "job:retried",
+            ]
+        );
+    }
+
+    /// Determinism: the workload replays to the same durable state from the
+    /// same seed, so its seeds are repro lines and not merely labels.
+    #[test]
+    fn the_job_tenancy_workload_replays_identically_for_the_same_seed() {
+        let trace = |seed: u64| {
+            let mut sim = Sim::new(seed);
+            let result = job_tenancy_universe(&mut sim);
+            assert_eq!(result, Ok(()), "seed {seed:#x}");
+            (sim.durable_fingerprint(), sim.now())
+        };
+        for seed in [0x70B5_5EED, 0x0BAD_70B5_0BAD_70B5] {
+            assert_eq!(trace(seed), trace(seed));
+        }
+    }
+
+    // ------------------------------------------------ the naive victims
+
+    /// A fault-free store for a victim and its control: the same app, the
+    /// same seed.
+    fn victim_app(seed: u64) -> (Sim, App) {
+        let sim = Sim::with_faults(seed, FaultConfig::none());
+        let app = shop_app(&sim).unwrap();
+        (sim, app)
+    }
+
+    /// Operator writes, committed as one group.
+    fn operator_writes(db: &mut Db, f: impl FnOnce(&mut Tx, &TenantAdmission)) {
+        let mut group = db.begin_group().unwrap();
+        let admission = group.tenant_admission();
+        group
+            .stage(|tx| {
+                f(tx, &admission);
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+        group.commit().unwrap();
+    }
+
+    /// Victim 1, the row a broken enqueue writes: shop 1's job carried
+    /// shop 2's tenant. The control enqueues the same job in shop 1.
+    #[test]
+    fn the_oracle_names_a_job_row_carrying_another_shops_tenant() {
+        let m = marker(1, nonce(7, ROUTE_ORDER, false));
+        for (enqueued_in, leaks) in [(1, false), (2, true)] {
+            let (_sim, mut app) = victim_app(0x70B5_0101);
+            operator_writes(app.db_for_tests(), |tx, admission| {
+                tx.admit_scope(Id::<Shop>::from_raw(enqueued_in), admission)
+                    .enqueue(Fulfil { marker: m });
+            });
+            let verdict = jobs_stay_in_their_tenant(app.db_for_tests());
+            if !leaks {
+                assert!(verdict.is_ok(), "the control: {:?}", verdict.err());
+                continue;
+            }
+            let err = verdict
+                .err()
+                .expect("a job in the wrong shop must fail the oracle");
+            assert_eq!(
+                err,
+                format!(
+                    "tenant leak: job 0 (\"Fulfil\") carries tenant Some(2) but was enqueued \
+                     from shop 1 (marker {m:#x}) — a scoped job runs in the tenant it was \
+                     enqueued from"
+                )
+            );
+        }
+    }
+
+    /// Victim 2, what a dispatcher that opens tenant 0 for every job
+    /// leaves behind: shop 3's shipment, written under shop 0. The control
+    /// writes it under shop 3.
+    #[test]
+    fn the_oracle_names_a_job_written_row_under_tenant_zero() {
+        let m = marker(3, nonce(4, ROUTE_WALKIN, false));
+        for (written_in, leaks) in [(3, false), (0, true)] {
+            let (_sim, mut app) = victim_app(0x70B5_0102);
+            operator_writes(app.db_for_tests(), |tx, admission| {
+                tx.admit_scope(Id::<Shop>::from_raw(written_in), admission)
+                    .put(&Shipment {
+                        id: Id::from_raw(4),
+                        marker: m,
+                    });
+            });
+            let verdict = jobs_stay_in_their_tenant(app.db_for_tests());
+            if !leaks {
+                assert!(verdict.is_ok(), "the control: {:?}", verdict.err());
+                continue;
+            }
+            let err = verdict
+                .err()
+                .expect("a row in the wrong shop must fail the oracle");
+            assert_eq!(
+                err,
+                format!(
+                    "tenant leak: Shipment id 4 under shop 0 carries shop 3's marker {m:#x} — \
+                     a row lies in the tenant its writer was in"
+                )
+            );
+        }
+    }
+
+    /// Victim 3, a fan-out that lands every enqueue in the first tenant:
+    /// shop 2's restock is enqueued into shop 0 and then really dispatched,
+    /// so its row is written there too. The oracle must name the job row,
+    /// which it reads first. The control fans the job into shop 2 and runs
+    /// it the same way.
+    #[test]
+    fn the_oracle_names_a_fan_out_landed_in_the_first_tenant() {
+        let m = marker(2, nonce(9, ROUTE_PEEK, false));
+        for (fanned_into, leaks) in [(2, false), (0, true)] {
+            let (_sim, mut app) = victim_app(0x70B5_0103);
+            let mut dispatcher = Dispatcher::new(app.take_job_defs_for_tests());
+            let db = app.db_for_tests();
+            operator_writes(db, |tx, admission| {
+                tx.admit_scope(Id::<Shop>::from_raw(fanned_into), admission)
+                    .enqueue(Restock { marker: m });
+            });
+            dispatcher.note_enqueued(db.drain_enqueued());
+            assert!(matches!(
+                dispatcher.run_due(db, 0).unwrap(),
+                JobOutcome::Done { .. }
+            ));
+            let verdict = jobs_stay_in_their_tenant(db);
+            if !leaks {
+                let seen = verdict.expect("the control");
+                assert!(seen.fanned, "the control's restock ran and wrote its row");
+                continue;
+            }
+            let err = verdict
+                .err()
+                .expect("a fan-out into the wrong shop must fail the oracle");
+            assert_eq!(
+                err,
+                format!(
+                    "tenant leak: job 0 (\"Restock\") carries tenant Some(0) but was enqueued \
+                     from shop 2 (marker {m:#x}) — a scoped job runs in the tenant it was \
+                     enqueued from"
+                )
+            );
+        }
+    }
+}
