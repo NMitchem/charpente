@@ -1367,7 +1367,7 @@ Charpente treats the coding agent as the primary developer persona:
   `#[table(scoped_by = …)]`, carried straight from the registry's own `TableOps::scoped`,
   the same value `Db::table_scoped` already exposes to the archive/replication callers),
   routes (method, pattern, name,
-  whether it declared `auth` (`false` is a declared `public`, never an omission),
+  whether it declared `auth` (`false` is a declared `public`, never an omission), **the scope a `public(Org)` route admits every caller to (`public_scope`, a type name or `null`)**,
   **whether it declared `cross_tenant`** — which is what turns
   "audit the cross-tenant reads" into a mechanical inventory — whether it's an SSE stream,
   **plus, since the TS-client-codegen
@@ -1380,7 +1380,7 @@ Charpente treats the coding agent as the primary developer persona:
   stream route that has not adopted the declaration**), **`events` — every `#[event]` type
   registered with `mount_events(events![…])` as `EventInfo { name, payload, keyed }`,
   sorted by event name (`keyed` is always `false`: `emit` vs `emit_keyed` is a call-site
-  choice, so nothing static can know it)**, jobs (name, retry policy, `cross_tenant`), cron
+  choice, so nothing static can know it)**, jobs (name, retry policy, **`scoped_by`, the scope type a job acts in or `null`**, `cross_tenant`), cron
   (name, interval), and config, each serialized in registry order (routes/jobs/cron) or
   sorted-name order (tables — `Db::describe_tables`'s `BTreeMap` walk; events — by name);
   field order is
@@ -1645,7 +1645,7 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   `#[route(…, cross_tenant)]` / `#[job(…, cross_tenant)]` mint the `CrossTenant` token
   `Tx::across_tenants::<S>(cap)` requires, rows come back paired with their scope
   (`Vec<(Id<Org>, Invoice)>`, never `Vec<Invoice>`), and `charpente describe` lists every
-  route and job that declared it — an inventory, not a grep. That is a capability, not an
+  route and job that declared it — an inventory, not a grep — beside each route's `public_scope` and each job's `scoped_by`. That is a capability, not an
   escape hatch on a guarantee (DECISIONS §11).
   The operator acts inside one tenant with a `TenantAdmission` minted from a `Group`
   (`Tx::admit_scope`), sealed the way `CrossTenant` is. No `authorize` runs, because the

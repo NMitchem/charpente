@@ -462,6 +462,7 @@ fn a_stream_route_with_a_path_param_takes_it_before_opts() {
         pattern: "/orgs/:org_id/feed",
         name: "org_feed",
         auth: false,
+        public_scope: None,
         cross_tenant: false,
         stream: true,
         params: vec![ParamInfo {
@@ -574,6 +575,7 @@ fn a_stream_routes_union_name_colliding_with_a_wire_type_panics_by_name() {
         pattern: "/order-feed",
         name: "order",
         auth: false,
+        public_scope: None,
         cross_tenant: false,
         stream: true,
         params: Vec::new(),
@@ -617,6 +619,7 @@ fn plain_route(name: &'static str, pattern: &'static str) -> RouteInfo {
         pattern,
         name,
         auth: false,
+        public_scope: None,
         cross_tenant: false,
         stream: false,
         params: Vec::new(),

@@ -284,6 +284,7 @@ mod contract {
         pattern: String,
         name: String,
         auth: bool,
+        public_scope: Option<String>,
         cross_tenant: bool,
         stream: bool,
         params: Vec<ParamInfo>,
@@ -371,6 +372,7 @@ mod contract {
     struct JobInfo {
         name: String,
         retry: RetryInfo,
+        scoped_by: Option<String>,
         cross_tenant: bool,
         builtin: bool,
     }
@@ -451,6 +453,7 @@ mod contract {
             pattern: leak(r.pattern),
             name: leak(r.name),
             auth: r.auth,
+            public_scope: r.public_scope.map(leak),
             cross_tenant: r.cross_tenant,
             stream: r.stream,
             params: r
@@ -497,6 +500,7 @@ mod contract {
                 max: j.retry.max,
                 backoff_nanos: j.retry.backoff_nanos,
             },
+            scoped_by: j.scoped_by.map(leak),
             cross_tenant: j.cross_tenant,
             builtin: j.builtin,
         }
@@ -607,12 +611,12 @@ mod tests {
       ],
       "routes": [
         { "method": "POST", "pattern": "/widgets/:id", "name": "create_widget",
-          "auth": true, "stream": false, "cross_tenant": false,
+          "auth": true, "public_scope": null, "stream": false, "cross_tenant": false,
           "params": [{ "name": "id", "schema": { "Id": "Widget" } }],
           "request": { "Ref": "CreateWidget" }, "response": { "Ref": "WidgetView" },
           "error": "String", "emits": [] },
         { "method": "GET", "pattern": "/feed", "name": "feed", "auth": false,
-          "stream": true, "cross_tenant": true,
+          "public_scope": "Org", "stream": true, "cross_tenant": true,
           "params": [], "request": null, "response": "Null",
           "error": "String",
           "emits": [{ "event": "widget_added", "payload": "WidgetAdded" }] }
@@ -654,7 +658,7 @@ mod tests {
         { "name": "WidgetView", "schema": { "Struct": { "fields": [] } } }
       ],
       "jobs": [{ "name": "SendMail", "retry": { "max": 3, "backoff_nanos": 1000 },
-                 "cross_tenant": true, "builtin": false }],
+                 "scoped_by": "Org", "cross_tenant": true, "builtin": false }],
       "cron": [{ "name": "charpente.session_sweep", "interval_nanos": 60000000000,
                  "builtin": true }],
       "config": { "body_cap": 1024, "session_ttl": 3600, "store_path": "/tmp/x",

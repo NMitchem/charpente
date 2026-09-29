@@ -4407,8 +4407,8 @@ does not compile without one.
 
 `charpente describe` renders the full shape of a mounted `App` — every table (with its
 version, structural fingerprint, indexes, migration chain, and whether it's tenant-scoped),
-every route (method, pattern, name, whether it requires auth, whether it's an SSE stream),
-every registered event (name, payload type — §11), every job (name, retry policy), every cron entry
+every route (method, pattern, name, whether it requires auth, the tenant scope it admits every caller to if it is declared `public(Org)`, whether it declared `cross_tenant`, whether it's an SSE stream),
+every registered event (name, payload type — §11), every job (name, retry policy, the tenant scope it acts in if it is `scoped_by`, whether it declared `cross_tenant`), every cron entry
 (name, interval), and the app's config — as one JSON (or human-readable) document. It is a pure walk of the app's own registries (DESIGN §7): no
 disk writes beyond the ephemeral describe run itself, no socket, no kernel loop. This is
 the "what exists" query an agent would otherwise burn context reconstructing by reading
@@ -4695,6 +4695,7 @@ memorizing a list:
       "pattern": "/login",
       "name": "login",
       "auth": false,
+      "public_scope": null,
       "cross_tenant": false,
       "stream": false,
       "params": [],
@@ -4710,6 +4711,7 @@ memorizing a list:
       "pattern": "/customers/:id",
       "name": "create_customer",
       "auth": true,
+      "public_scope": null,
       "cross_tenant": false,
       "stream": false,
       "params": [
@@ -4736,6 +4738,7 @@ memorizing a list:
       "pattern": "/customers/:id",
       "name": "get_customer",
       "auth": true,
+      "public_scope": null,
       "cross_tenant": false,
       "stream": false,
       "params": [
@@ -4760,6 +4763,7 @@ memorizing a list:
       "pattern": "/customers",
       "name": "list_customers",
       "auth": true,
+      "public_scope": null,
       "cross_tenant": false,
       "stream": false,
       "params": [],
@@ -4779,6 +4783,7 @@ memorizing a list:
       "pattern": "/invoices/:id",
       "name": "create_invoice",
       "auth": true,
+      "public_scope": null,
       "cross_tenant": false,
       "stream": false,
       "params": [
@@ -4805,6 +4810,7 @@ memorizing a list:
       "pattern": "/invoices/:id",
       "name": "get_invoice",
       "auth": true,
+      "public_scope": null,
       "cross_tenant": false,
       "stream": false,
       "params": [
@@ -4829,6 +4835,7 @@ memorizing a list:
       "pattern": "/invoices",
       "name": "list_invoices",
       "auth": true,
+      "public_scope": null,
       "cross_tenant": false,
       "stream": false,
       "params": [],
@@ -4848,6 +4855,7 @@ memorizing a list:
       "pattern": "/invoices/:id/finalize",
       "name": "finalize_invoice",
       "auth": true,
+      "public_scope": null,
       "cross_tenant": false,
       "stream": false,
       "params": [
@@ -4872,6 +4880,7 @@ memorizing a list:
       "pattern": "/invoices/:id/record-payment",
       "name": "record_payment",
       "auth": true,
+      "public_scope": null,
       "cross_tenant": false,
       "stream": false,
       "params": [
@@ -4896,6 +4905,7 @@ memorizing a list:
       "pattern": "/events/feed",
       "name": "events_feed",
       "auth": true,
+      "public_scope": null,
       "cross_tenant": false,
       "stream": true,
       "params": [],
@@ -4911,6 +4921,7 @@ memorizing a list:
       "pattern": "/keys",
       "name": "create_key",
       "auth": true,
+      "public_scope": null,
       "cross_tenant": false,
       "stream": false,
       "params": [],
@@ -4926,6 +4937,7 @@ memorizing a list:
       "pattern": "/keys/:id",
       "name": "revoke_key",
       "auth": true,
+      "public_scope": null,
       "cross_tenant": false,
       "stream": false,
       "params": [
@@ -5218,6 +5230,7 @@ memorizing a list:
         "max": 5,
         "backoff_nanos": 30000000000
       },
+      "scoped_by": null,
       "cross_tenant": false,
       "builtin": true
     },
@@ -5227,6 +5240,7 @@ memorizing a list:
         "max": 5,
         "backoff_nanos": 30000000000
       },
+      "scoped_by": null,
       "cross_tenant": false,
       "builtin": false
     },
@@ -5236,6 +5250,7 @@ memorizing a list:
         "max": 5,
         "backoff_nanos": 30000000000
       },
+      "scoped_by": null,
       "cross_tenant": false,
       "builtin": false
     },
@@ -5245,6 +5260,7 @@ memorizing a list:
         "max": 5,
         "backoff_nanos": 30000000000
       },
+      "scoped_by": null,
       "cross_tenant": false,
       "builtin": false
     }
@@ -6245,19 +6261,24 @@ Four properties make this a capability rather than an escape hatch:
   $ charpente describe --format human
   ...
   routes:
-    GET /admin/revenue name=admin_revenue auth=true cross_tenant=true stream=false
+    GET /admin/revenue name=admin_revenue auth=true public_scope=none cross_tenant=true stream=false
       params=[] request=... response=... error=... emits=[]
-    GET /memos/:org name=count_memos auth=true cross_tenant=false stream=false
+    GET /memos/:org name=count_memos auth=true public_scope=none cross_tenant=false stream=false
       params=[...] request=... response=... error=... emits=[]
   ...
   jobs:
-    Rollup max=2 backoff_nanos=5000000000 cross_tenant=true builtin=false
+    Rollup max=2 backoff_nanos=5000000000 scoped_by=none cross_tenant=true builtin=false
   ```
 
   (Each route prints a second, indented line of type info, and the dump also
   carries `tables:`, `events:` and `cron:` sections — elided here.) The JSON
   form carries the same `"cross_tenant": true` on both `routes` and `jobs`,
   which is what makes "audit the cross-tenant reads" a machine check.
+  The same dump carries the other two tenancy declarations beside it: a route's
+  `public_scope` names the tenant a `public(Org)` route admits every caller to, and
+  `none` otherwise, while a job's `scoped_by` names the tenant it acts in. So "who
+  reaches a tenant without a membership check" and "what acts inside one" are
+  inventories too, in JSON as a name or `null`.
 
   The elided `tables:` section carries the matching signal for the table
   itself: `Ledger`'s entry reports `scoped=true` (`Org`'s own entry, and every

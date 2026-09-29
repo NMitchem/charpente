@@ -82,6 +82,13 @@ pub struct RouteInfo {
     pub pattern: &'static str,
     pub name: &'static str,
     pub auth: bool,
+    /// `#[route(…, public(Org))]`: the tenant scope this route admits every
+    /// caller to, with no `authorize` (job-tenancy spec §4), by the scope
+    /// type's name. `None` for `auth` and plain `public`. Beside `auth`
+    /// because together they answer "who reaches what here": `auth=false`
+    /// with `None` is plain public, and with `Some` it admits everyone to
+    /// that tenant.
+    pub public_scope: Option<&'static str>,
     /// `#[route(…, cross_tenant)]`: this endpoint declared the capability to
     /// enumerate a scoped table across every tenant (spec §3). Beside `auth`
     /// because it is the second thing an audit asks of a route, and here
@@ -160,6 +167,9 @@ macro_rules! events {
 pub struct JobInfo {
     pub name: &'static str,
     pub retry: RetryInfo,
+    /// `#[job(scoped_by = Org)]`: the tenant scope this job acts in, by the
+    /// scope type's name; `None` for a `global` job (job-tenancy spec §8).
+    pub scoped_by: Option<&'static str>,
     /// `cross_tenant` on a job (`#[job(global, cross_tenant)]`, say) — see
     /// `RouteInfo::cross_tenant`. The inventory
     /// covers both surfaces that receive a `Tx`, or it covers neither.
@@ -274,6 +284,7 @@ fn route_info(route: &Route) -> RouteInfo {
         pattern: route.pattern,
         name: route.name,
         auth: route.auth,
+        public_scope: route.public_scope.map(|s| s.name),
         cross_tenant: route.cross_tenant,
         stream: matches!(route.glue, RouteGlue::Sse(_)),
         params: route
@@ -303,6 +314,7 @@ fn job_info(def: &JobDef) -> JobInfo {
             max: def.retry.max,
             backoff_nanos: nanos(def.retry.backoff),
         },
+        scoped_by: def.scoped_by,
         cross_tenant: def.cross_tenant,
         // The platform sweep JOB's name is `SessionSweep` (the `#[job]`
         // struct's own `Job::NAME`) — distinct from the CRON entry's name
@@ -374,8 +386,14 @@ pub fn to_human(c: &Contract) -> String {
     for r in &c.routes {
         writeln!(
             out,
-            "  {} {} name={} auth={} cross_tenant={} stream={}",
-            r.method, r.pattern, r.name, r.auth, r.cross_tenant, r.stream
+            "  {} {} name={} auth={} public_scope={} cross_tenant={} stream={}",
+            r.method,
+            r.pattern,
+            r.name,
+            r.auth,
+            r.public_scope.unwrap_or("none"),
+            r.cross_tenant,
+            r.stream
         )
         .unwrap();
         // Task 5: a route's type info (params/request/response/error/emits)
@@ -421,8 +439,13 @@ pub fn to_human(c: &Contract) -> String {
     for j in &c.jobs {
         writeln!(
             out,
-            "  {} max={} backoff_nanos={} cross_tenant={} builtin={}",
-            j.name, j.retry.max, j.retry.backoff_nanos, j.cross_tenant, j.builtin
+            "  {} max={} backoff_nanos={} scoped_by={} cross_tenant={} builtin={}",
+            j.name,
+            j.retry.max,
+            j.retry.backoff_nanos,
+            j.scoped_by.unwrap_or("none"),
+            j.cross_tenant,
+            j.builtin
         )
         .unwrap();
     }

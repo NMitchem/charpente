@@ -14,7 +14,8 @@ use charpente::http::{ApiError, App, AppConfig, Ctx, Cursor, EmittedEvent, Subsc
 use charpente::kernel::JobError;
 use charpente::wire::{TypeSchema, WireU64};
 use charpente::{
-    CrossTenant, Schema, Tx, View, Wire, event, events, job, jobs, route, routes, table,
+    CrossTenant, Schema, Scoped, ScopedTx, Tx, View, Wire, event, events, job, jobs, route, routes,
+    table,
 };
 use charpente_core::table::Id;
 use charpente_sim::{FaultConfig, Sim};
@@ -243,6 +244,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/widgets",
       "name": "create_widget",
       "auth": false,
+      "public_scope": null,
       "cross_tenant": false,
       "stream": false,
       "params": [],
@@ -262,6 +264,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/widgets",
       "name": "list_widgets",
       "auth": false,
+      "public_scope": null,
       "cross_tenant": false,
       "stream": false,
       "params": [],
@@ -281,6 +284,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/orgs/:org/widgets/:id",
       "name": "get_org_widget",
       "auth": false,
+      "public_scope": null,
       "cross_tenant": false,
       "stream": false,
       "params": [
@@ -309,6 +313,7 @@ const GOLDEN: &str = r#"{
       "pattern": "/widgets/feed",
       "name": "widget_feed",
       "auth": false,
+      "public_scope": null,
       "cross_tenant": false,
       "stream": true,
       "params": [],
@@ -441,6 +446,7 @@ const GOLDEN: &str = r#"{
         "max": 5,
         "backoff_nanos": 30000000000
       },
+      "scoped_by": null,
       "cross_tenant": false,
       "builtin": true
     },
@@ -450,6 +456,7 @@ const GOLDEN: &str = r#"{
         "max": 5,
         "backoff_nanos": 30000000000
       },
+      "scoped_by": null,
       "cross_tenant": false,
       "builtin": false
     }
@@ -507,7 +514,7 @@ fn to_human_pins_a_known_routes_type_line() {
     let out = charpente::describe::to_human(&fixture_app().describe());
     assert!(
         out.contains(
-            "  POST /widgets name=create_widget auth=false cross_tenant=false stream=false\n    \
+            "  POST /widgets name=create_widget auth=false public_scope=none cross_tenant=false stream=false\n    \
              params=[] request=Some(Ref(\"CreateWidget\")) response=Ref(\"WidgetView\") \
              error=Ref(\"ApiError\") emits=[]\n"
         ),
@@ -945,7 +952,7 @@ fn to_human_pins_a_stream_routes_emits() {
     let out = charpente::describe::to_human(&fixture_app().describe());
     assert!(
         out.contains(
-            "  GET /widgets/feed name=widget_feed auth=false cross_tenant=false stream=true\n    \
+            "  GET /widgets/feed name=widget_feed auth=false public_scope=none cross_tenant=false stream=true\n    \
              params=[] request=None response=Null error=Ref(\"ApiError\") \
              emits=[widget_added->WidgetAdded, widget_removed->WidgetRemoved]\n"
         ),
@@ -1143,6 +1150,16 @@ fn admin_plain(tx: &mut Tx) -> Result<WireU64, ApiError> {
     Ok(WireU64(tx.scan::<Widget>()?.len() as u64))
 }
 
+/// `public(Org)` (job-tenancy spec §4): every caller may act inside the org
+/// this handler opens, with no `authorize`. `describe` must name the scope,
+/// or the audit "who reaches a tenant without a membership check" is a grep
+/// again.
+#[route(GET "/orgs/:org/ledger", public(Org))]
+fn org_ledger(tx: &mut Tx, org: Id<Org>, ctx: &Ctx) -> Result<WireU64, ApiError> {
+    let tx = tx.scope::<Org>(org, ctx)?;
+    Ok(WireU64(tx.scan::<Ledger>()?.len() as u64))
+}
+
 /// The job half of the same declaration (spec §3): a background rollup that
 /// enumerates every tenant declares the capability exactly as a route does,
 /// and its `run` takes the token the dispatcher minted.
@@ -1158,6 +1175,20 @@ impl Rollup {
     }
 }
 
+/// A job that acts inside one org (job-tenancy spec §5): `describe` names
+/// the scope it acts in.
+#[job(scoped_by = Org)]
+struct Reconcile {
+    day: u64,
+}
+
+impl Reconcile {
+    fn run(self, tx: &mut ScopedTx<'_, '_, Org>) -> Result<(), JobError> {
+        let _ = (self.day, tx.scan::<Ledger>()?);
+        Ok(())
+    }
+}
+
 fn capability_app() -> App {
     let sim = Sim::with_faults(0x2EC2_0002, FaultConfig::none());
     App::open(
@@ -1167,8 +1198,8 @@ fn capability_app() -> App {
         AppConfig::default(),
     )
     .unwrap()
-    .mount(routes![admin_revenue, admin_plain])
-    .mount_jobs(jobs![Rollup, Ping])
+    .mount(routes![admin_revenue, admin_plain, org_ledger])
+    .mount_jobs(jobs![Rollup, Ping, Reconcile])
 }
 
 /// What turns "audit the cross-tenant reads" from a grep someone must
@@ -1182,7 +1213,7 @@ fn describe_names_exactly_the_cross_tenant_routes() {
     let all: Vec<&str> = c.routes.iter().map(|r| r.name).collect();
     assert_eq!(
         all,
-        vec!["admin_revenue", "admin_plain"],
+        vec!["admin_revenue", "admin_plain", "org_ledger"],
         "the floor: both routes are mounted, so the filter below is not vacuous"
     );
 
@@ -1208,7 +1239,12 @@ fn describe_names_exactly_the_cross_tenant_routes() {
     let jobs: Vec<(&str, bool)> = c.jobs.iter().map(|j| (j.name, j.cross_tenant)).collect();
     assert_eq!(
         jobs,
-        vec![("SessionSweep", false), ("Rollup", true), ("Ping", false)]
+        vec![
+            ("SessionSweep", false),
+            ("Rollup", true),
+            ("Ping", false),
+            ("Reconcile", false)
+        ]
     );
 }
 
@@ -1220,16 +1256,69 @@ fn to_human_carries_the_cross_tenant_flag() {
     let out = charpente::describe::to_human(&capability_app().describe());
     assert!(
         out.contains(
-            "  GET /admin/revenue name=admin_revenue auth=false cross_tenant=true stream=false\n"
+            "  GET /admin/revenue name=admin_revenue auth=false public_scope=none cross_tenant=true stream=false\n"
         ),
         "{out}"
     );
     assert!(
         out.contains(
-            "  GET /admin/plain name=admin_plain auth=false cross_tenant=false stream=false\n"
+            "  GET /admin/plain name=admin_plain auth=false public_scope=none cross_tenant=false stream=false\n"
         ),
         "{out}"
     );
+}
+
+/// Job-tenancy spec §8: `describe` names, by type, the scope a `public(S)`
+/// route admits every caller to and the scope a `scoped_by` job acts in.
+/// The `None`s are the floor: without them, a field that always said "Org"
+/// would pass.
+#[test]
+fn describe_names_every_public_scope_route_and_scoped_job() {
+    let c = capability_app().describe();
+    let routes: Vec<(&str, bool, Option<&str>)> = c
+        .routes
+        .iter()
+        .map(|r| (r.name, r.auth, r.public_scope))
+        .collect();
+    assert_eq!(
+        routes,
+        vec![
+            ("admin_revenue", false, None),
+            ("admin_plain", false, None),
+            ("org_ledger", false, Some("Org")),
+        ],
+        "`auth=false public_scope=none` is plain public; `public_scope=Org` admits every \
+         caller to Org"
+    );
+    let jobs: Vec<(&str, Option<&str>)> = c.jobs.iter().map(|j| (j.name, j.scoped_by)).collect();
+    assert_eq!(
+        jobs,
+        vec![
+            ("SessionSweep", None),
+            ("Rollup", None),
+            ("Ping", None),
+            ("Reconcile", Some("Org")),
+        ]
+    );
+}
+
+/// The human dump carries both, in spec §8's positions: `public_scope`
+/// after `auth`, and `scoped_by` after the retry policy.
+#[test]
+fn to_human_carries_public_scope_and_scoped_by() {
+    let out = charpente::describe::to_human(&capability_app().describe());
+    for line in [
+        "  GET /orgs/:org/ledger name=org_ledger auth=false public_scope=Org cross_tenant=false \
+         stream=false\n",
+        "  GET /admin/plain name=admin_plain auth=false public_scope=none cross_tenant=false \
+         stream=false\n",
+        "  Reconcile max=5 backoff_nanos=30000000000 scoped_by=Org cross_tenant=false \
+         builtin=false\n",
+        "  Rollup max=5 backoff_nanos=30000000000 scoped_by=none cross_tenant=true \
+         builtin=false\n",
+    ] {
+        assert!(out.contains(line), "missing {line:?} in:\n{out}");
+    }
 }
 
 // ------------------------------------------------------------- table scope
