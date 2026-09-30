@@ -356,6 +356,13 @@ pub struct SealedSegment {
     pub layout_end: u64,
 }
 
+/// A mounted job's declared tenancy, as `Db::register_job_shapes` takes it:
+/// `None` for a `global` job, or the `scoped_by` scope's name (as
+/// `JobDef.scoped_by` and `describe` spell it) with its `TypeId`
+/// (`JobDef.scope_type`). The `TypeId` is compared in memory only and never
+/// recorded, so it may differ between builds without touching the log.
+pub type DeclaredTenancy = Option<(&'static str, TypeId)>;
+
 /// The set of tables a `Db` can replay log records into. Every `#[table]`
 /// type the application writes must be registered — replay works on raw
 /// record bytes and needs the typed codecs to maintain indexes.
@@ -363,14 +370,13 @@ pub struct SealedSegment {
 pub struct Schema {
     tables: BTreeMap<&'static str, TableOps>,
     migrations: BTreeMap<&'static str, Vec<crate::migration::MigrationStep>>,
-    /// `Job::NAME` → (`Job::FINGERPRINT`, its declared tenancy: the
-    /// `scoped_by` scope's name, or `None` for a `global` job) for every job
-    /// type this binary mounts (`Db::register_job_shapes`). Here rather than
+    /// `Job::NAME` → (`Job::FINGERPRINT`, its `DeclaredTenancy`) for every
+    /// job type this binary mounts (`Db::register_job_shapes`). Here rather than
     /// on `Db` because a snapshot re-seed rebuilds the `Db` from its schema,
     /// and a registry kept anywhere else would come back empty (spec
     /// amendment A4). Not part of `schema_digest_of`: job shapes are refused
     /// at promote, never compared in Hello (spec §8).
-    job_shapes: BTreeMap<&'static str, (u64, Option<&'static str>)>,
+    job_shapes: BTreeMap<&'static str, (u64, DeclaredTenancy)>,
 }
 
 impl Schema {
@@ -565,7 +571,21 @@ struct Enqueue {
     payload: Vec<u8>,
     key: Option<String>,
     shape: u64,
-    scope: Option<u64>,
+    scope: Option<EnqueuedTenant>,
+}
+
+/// The tenant a scoped job was enqueued in: the id the record carries, and
+/// the scope type it was opened or named as, which the record does not. A
+/// tenant id names a tenant only together with its type, and the dispatcher
+/// opens a row's id as the type its MOUNTED job declares, so `Group::stage`
+/// refuses an enqueue whose job's scope type is not that one (job-tenancy
+/// final review N1). In memory only: the record format is unchanged.
+struct EnqueuedTenant {
+    id: u64,
+    /// `TypeId::of::<J::Scope>()`, compared with the mounted declaration's.
+    scope_type: TypeId,
+    /// `type_name::<J::Scope>()`, for the refusal's text only.
+    scope_name: &'static str,
 }
 
 /// A transaction's buffered effects: the collapsed per-table overlay
@@ -666,8 +686,8 @@ fn encode_record(effects: &TxEffects) -> Vec<u8> {
         encode_bytes(payload, &mut out);
         key.encode(&mut out);
         shape.encode(&mut out);
-        if let Some(scope) = scope {
-            scope.encode(&mut out);
+        if let Some(tenant) = scope {
+            tenant.id.encode(&mut out);
         }
     }
     for (event, payload, key, shape) in &effects.emits {
@@ -1026,7 +1046,11 @@ impl<'a> Tx<'a> {
             payload,
             key,
             shape: J::FINGERPRINT,
-            scope,
+            scope: scope.map(|id| EnqueuedTenant {
+                id,
+                scope_type: TypeId::of::<J::Scope>(),
+                scope_name: std::any::type_name::<J::Scope>(),
+            }),
         });
     }
 
@@ -2994,22 +3018,37 @@ impl Db {
     }
 
     /// Registers each mounted job type's payload shape and declared tenancy
-    /// (`(name, fingerprint, scoped_by)`, `scoped_by` as `JobDef` carries it)
+    /// (`(name, fingerprint, scoped_by)`, where `scoped_by` is `JobDef`'s
+    /// scope name paired with its `scope_type`, `None` for a `global` job)
     /// so `pending_job_shape_refusal` can name a Pending row this binary
     /// would decode under a foreign shape or dispatch into the wrong tenancy,
     /// and `Group::stage` can refuse an enqueue that disagrees with a mounted
-    /// name on either. `App::mount_jobs` calls it with the `JobDef`s it
-    /// mounts. Re-registering the same triple is a no-op; one name under two
-    /// is impossible past `mount_jobs`' duplicate refusal.
-    pub fn register_job_shapes(&mut self, shapes: &[(&'static str, u64, Option<&'static str>)]) {
+    /// name on shape, on tenant presence, or on scope type. `App::mount_jobs`
+    /// calls it with the `JobDef`s it mounts. Re-registering the same
+    /// declaration is a no-op.
+    pub fn register_job_shapes(&mut self, shapes: &[(&'static str, u64, DeclaredTenancy)]) {
         let registry = &mut self.engine.machine_mut().schema.job_shapes;
         for &(name, fingerprint, scoped_by) in shapes {
-            let prev = registry.insert(name, (fingerprint, scoped_by));
+            let Some((prev_fingerprint, prev_scoped_by)) =
+                registry.insert(name, (fingerprint, scoped_by))
+            else {
+                continue;
+            };
             assert!(
-                prev.is_none_or(|p| p == (fingerprint, scoped_by)),
-                "job \"{name}\" registered under two shapes ({:#x} and {fingerprint:#x}) — \
-                 mount_jobs refuses a duplicate name, so this is a platform bug",
-                prev.unwrap_or_default().0
+                (prev_fingerprint, prev_scoped_by) == (fingerprint, scoped_by),
+                "job \"{name}\" registered with two declarations (shape {prev_fingerprint:#x}, \
+                 {}; then shape {fingerprint:#x}, {}{}) — a job name has one shape and one \
+                 tenancy, and `App::mount_jobs` refuses a duplicate name, so a second \
+                 `register_job_shapes` call named it again; register each job name once",
+                declared_tenancy(prev_scoped_by.map(|(scope, _)| scope)),
+                declared_tenancy(scoped_by.map(|(scope, _)| scope)),
+                if prev_fingerprint == fingerprint
+                    && prev_scoped_by.map(|(scope, _)| scope) == scoped_by.map(|(scope, _)| scope)
+                {
+                    ", a different scope type of the same name"
+                } else {
+                    ""
+                }
             );
         }
     }
@@ -3056,6 +3095,9 @@ impl Db {
                 ids.push(job.id.raw());
                 recorded.insert(job.shape);
             } else if job.scope.is_some() != scoped_by.is_some() {
+                // Presence is all a row can disagree on: it records a tenant
+                // id and never its scope type, which only `Group::stage`
+                // sees (job-tenancy final review N1).
                 mistenanted.entry(name).or_default().push(job.id.raw());
             }
         }
@@ -3087,7 +3129,7 @@ impl Db {
             })
             .collect();
         lines.extend(mistenanted.into_iter().map(|(name, ids)| {
-            let scoped_by = registry[name].1;
+            let scoped_by = registry[name].1.map(|(scope, _)| scope);
             format!(
                 "{} Pending \"{name}\" job(s) (ids {}) carry {}, but this binary declares {name} \
                  {} — the enqueue family writes a tenant exactly for a `scoped_by` job, so \
@@ -3680,7 +3722,15 @@ impl<'a> Group<'a> {
         // under the other tenancy, and a hand-written `JobDef` can mount one
         // under the wrong one, so tenant presence is refused here too — the
         // half of dispatch's tenancy assert that the write seal and the
-        // startup refusal do not cover (job-tenancy final review M4).
+        // startup refusal do not cover (job-tenancy final review M4). And the
+        // scope TYPE: the record keeps a tenant id and not its type, and the
+        // dispatcher opens that id as the type the mounted job declares, so
+        // a stand-in enqueued in another scope type's tenant (an `impl Job`
+        // copying `NAME` and `FINGERPRINT`, or a `#[job]` whose `scoped_by`
+        // path spells another type alike, which the fingerprint cannot tell
+        // apart) would run in the same id of the declared type, not in the
+        // tenant it was enqueued in. This is the only place both types are
+        // known (job-tenancy final review N1).
         let job_shapes = &self.db.engine.machine().schema.job_shapes;
         for Enqueue {
             job: name,
@@ -3717,7 +3767,31 @@ impl<'a> Group<'a> {
                         } else {
                             "no tenant"
                         },
-                        declared_tenancy(scoped_by)
+                        declared_tenancy(scoped_by.map(|(scope, _)| scope))
+                    ),
+                )))));
+            }
+            if let (Some(tenant), Some((declared, declared_type))) = (scope, scoped_by)
+                && tenant.scope_type != declared_type
+            {
+                // The last path segment, as `decode_body` renders a type.
+                let enqueued = tenant
+                    .scope_name
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(tenant.scope_name);
+                return Err(TxError::Io(io::Error::other(JobShapeRefusal(Refusal(
+                    format!(
+                        "job \"{name}\" was enqueued in a `{enqueued}` tenant, but this binary \
+                         mounts {name} as `scoped_by = {declared}` under the same shape \
+                         ({shape:#x}), so it would run in `{declared}` {}, not in the tenant it \
+                         was enqueued in — a type standing in for {name}'s #[job] was \
+                         enqueued: a hand-written `impl Job`, or a #[job] whose \
+                         `scoped_by` spells another scope type the same way; the transaction was \
+                         refused and nothing was written, so a retry cannot succeed — enqueue the \
+                         mounted {name} from a `{declared}` scope, or give the other type its \
+                         own name (GUIDE §6)",
+                        tenant.id
                     ),
                 )))));
             }
@@ -4337,7 +4411,13 @@ mod tests {
             payload: vec![7],
             key: None,
             shape: 0x0102_0304_0506_0708,
-            scope: Some(0),
+            // The scope type is in memory only: the bytes below carry the
+            // tenant id and nothing about its type (final review N1).
+            scope: Some(EnqueuedTenant {
+                id: 0,
+                scope_type: TypeId::of::<u8>(),
+                scope_name: "u8",
+            }),
         });
         effects.enqueues.push(Enqueue {
             job: "ping",

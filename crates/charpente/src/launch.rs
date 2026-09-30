@@ -439,6 +439,7 @@ mod tests {
             retry: charpente_core::job::RetryPolicy::DEFAULT,
             cross_tenant: false,
             scoped_by: None,
+            scope_type: std::any::TypeId::of::<charpente_core::table::Unscoped>(),
             fingerprint: 0x7E57_0702, // the shape MOUNTED — different
             glue: noop_glue,
         }]))

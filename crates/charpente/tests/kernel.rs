@@ -176,6 +176,7 @@ mod scoped_jobs {
     use super::*;
     use charpente::http::ApiError;
     use charpente::{CrossTenant, ScopedTx};
+    use std::any::TypeId;
 
     #[table(global)]
     pub struct Desk {
@@ -780,6 +781,176 @@ mod scoped_jobs {
              File as its #[job] declares it, or restore the store from a replica or backup \
              taken before these rows were written (GUIDE §6)"
         );
+    }
+
+    // ------------------------------ a tenant id enqueued under another type
+    //
+    // Job-tenancy final review N1. A row records a tenant id and not its
+    // scope type, and the dispatcher opens that id as the type the MOUNTED
+    // job declares. So a stand-in for `File` enqueued inside a `Board`
+    // tenant would run `File` in the `Desk` of the same id, which nobody
+    // opened or named. Tenant presence agrees, and the fingerprint cannot
+    // tell the two apart, so `Group::stage` compares the scope types.
+
+    /// A second scope type. `Board` 13 and `Desk` 13 share an id and nothing
+    /// else.
+    pub struct Board;
+
+    impl Tenant for Board {
+        type Who = Principal;
+        type Error = ApiError;
+        fn authorize(_tx: &Tx, _who: &Principal, _scope: Id<Board>) -> Result<(), ApiError> {
+            panic!("a job has no principal — Board::authorize is never asked")
+        }
+    }
+
+    /// Copies `File`'s `NAME` and `FINGERPRINT` under `Board`.
+    struct BoardFile {
+        n: u64,
+    }
+
+    impl Codec for BoardFile {
+        fn encode(&self, out: &mut Vec<u8>) {
+            self.n.encode(out);
+        }
+        fn decode(input: &mut &[u8]) -> std::io::Result<BoardFile> {
+            Ok(BoardFile {
+                n: u64::decode(input)?,
+            })
+        }
+    }
+
+    impl Job for BoardFile {
+        const NAME: &'static str = "File";
+        const FINGERPRINT: u64 = <File as Job>::FINGERPRINT;
+        type Scope = Board;
+    }
+
+    /// No hand-written impl: a `#[job]` whose `scoped_by` path is spelled
+    /// `Desk` and names `Board`. The fingerprint hashes the path as written,
+    /// so it is `File`'s.
+    mod spelled_alike {
+        use super::Board as Desk;
+        use charpente::kernel::JobError;
+        use charpente::{ScopedTx, job};
+
+        #[job(scoped_by = Desk)]
+        pub struct File {
+            pub n: u64,
+        }
+
+        impl File {
+            fn run(self, _tx: &mut ScopedTx<'_, '_, Desk>) -> Result<(), JobError> {
+                Ok(())
+            }
+        }
+    }
+
+    /// Enqueues `job` inside `board` through the operator path and returns
+    /// the stage's refusal.
+    fn refused_in_board<J: Job<Scope = Board>>(db: &mut Db, board: u64, job: J) -> std::io::Error {
+        let mut group = db.begin_group().unwrap();
+        let admission = group.tenant_admission();
+        let staged = group.stage(|tx| {
+            tx.admit_scope(Id::<Board>::from_raw(board), &admission)
+                .enqueue(job);
+            Ok::<(), std::io::Error>(())
+        });
+        group.commit().unwrap();
+        match staged {
+            Err(TxError::Io(e)) => e,
+            Err(other) => panic!("expected the stage refusal, got {other:?}"),
+            Ok(()) => panic!("a \"File\" row enqueued in a Board tenant reached the store"),
+        }
+    }
+
+    #[test]
+    fn a_stand_in_enqueued_in_another_scope_types_tenant_is_refused_by_name() {
+        let (_sim, mut app) = desk_app(0x5C0B_00F5);
+        let db = app.db_for_tests();
+        let err = refused_in_board(db, 13, BoardFile { n: 7 });
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "job \"File\" was enqueued in a `Board` tenant, but this binary mounts File as \
+                 `scoped_by = Desk` under the same shape ({:#x}), so it would run in `Desk` 13, \
+                 not in the tenant it was enqueued in — a type standing in for File's #[job] \
+                 was enqueued: a hand-written `impl Job`, or a #[job] whose \
+                 `scoped_by` spells another scope type the same way; the transaction was \
+                 refused and nothing was written, so a retry cannot succeed — enqueue the \
+                 mounted File from a `Desk` scope, or give the other type its own name \
+                 (GUIDE §6)",
+                <File as Job>::FINGERPRINT
+            )
+        );
+        assert!(
+            charpente::core::db::JobShapeRefusal::of(&err).is_some(),
+            "the stage refusal, which dispatch counts as an attempt and a route answers \
+             with its own text"
+        );
+        assert!(db.snapshot().unwrap().scan::<JobRow>().unwrap().is_empty());
+        assert!(db.drain_enqueued().is_empty());
+
+        // The mounted `File`, enqueued in `Desk` 13 itself, is not refused:
+        // the check is on the scope type, not on the id or the name.
+        enqueue_in_desk(db, 13, File { n: 7 });
+        let rows: Vec<(String, Option<u64>)> = db
+            .snapshot()
+            .unwrap()
+            .scan::<JobRow>()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.name, r.scope))
+            .collect();
+        assert_eq!(rows, vec![("File".to_string(), Some(13))]);
+    }
+
+    #[test]
+    fn a_job_whose_scoped_by_spells_another_type_alike_is_refused_by_name() {
+        assert_eq!(
+            <spelled_alike::File as Job>::FINGERPRINT,
+            <File as Job>::FINGERPRINT,
+            "the fingerprint hashes `scoped_by` as spelled, so it cannot see this"
+        );
+        let (_sim, mut app) = desk_app(0x5C0B_00F6);
+        let db = app.db_for_tests();
+        let err = refused_in_board(db, 14, spelled_alike::File { n: 8 });
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "job \"File\" was enqueued in a `Board` tenant, but this binary mounts File as \
+                 `scoped_by = Desk` under the same shape ({:#x}), so it would run in `Desk` 14, \
+                 not in the tenant it was enqueued in — a type standing in for File's #[job] \
+                 was enqueued: a hand-written `impl Job`, or a #[job] whose \
+                 `scoped_by` spells another scope type the same way; the transaction was \
+                 refused and nothing was written, so a retry cannot succeed — enqueue the \
+                 mounted File from a `Desk` scope, or give the other type its own name \
+                 (GUIDE §6)",
+                <File as Job>::FINGERPRINT
+            )
+        );
+        assert!(db.snapshot().unwrap().scan::<JobRow>().unwrap().is_empty());
+        assert!(db.drain_enqueued().is_empty());
+    }
+
+    /// `register_job_shapes` is public, so a second direct call can name a
+    /// mounted job again; its panic names both declarations, including the
+    /// case where only the scope type differs (final review Mn1).
+    #[test]
+    #[should_panic(
+        expected = "job \"Twice\" registered with two declarations (shape 0x1, \
+                               `scoped_by = Desk`; then shape 0x1, `scoped_by = Desk`, a \
+                               different scope type of the same name) — a job name has one \
+                               shape and one tenancy, and `App::mount_jobs` refuses a \
+                               duplicate name, so a second `register_job_shapes` call named \
+                               it again; register each job name once"
+    )]
+    fn a_job_name_registered_under_two_declarations_panics_naming_both() {
+        let sim = Sim::with_faults(0x5C0B_00F7, FaultConfig::none());
+        let mut app = only_jobs_app(&sim, vec![]);
+        let db = app.db_for_tests();
+        db.register_job_shapes(&[("Twice", 0x1, Some(("Desk", TypeId::of::<Desk>())))]);
+        db.register_job_shapes(&[("Twice", 0x1, Some(("Desk", TypeId::of::<Board>())))]);
     }
 }
 

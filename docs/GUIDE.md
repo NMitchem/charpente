@@ -1433,7 +1433,8 @@ enqueued from. It is enqueued from inside that tenant's scope: `tx.enqueue` on t
 tenant beside the job, and when the job runs, its `run` receives that tenant's
 `ScopedTx`. No `authorize` runs for it: a job has no principal, and its authority is
 its enqueuer's, who was inside the tenant already — and nobody else's, since no app code
-can write the row that carries it (below). Its retries run in the same tenant,
+can write the row that carries it, and an enqueue inside a tenant of another scope type is
+refused (both below). Its retries run in the same tenant,
 and a follow-up it enqueues through its own `ScopedTx` inherits the tenant too.
 
 ```rust
@@ -1762,6 +1763,27 @@ wherever the shape refusal runs. `<presence>` is `a tenant` or `no tenant`, and
 job "<job>" was enqueued with <presence>, but this binary mounts <job> as <declaration> under the same shape (<shape>) — a hand-written `impl Job` or `JobDef` contradicts <job>'s #[job]; the transaction was refused and nothing was written, so a retry cannot succeed — enqueue the mounted type, give the other type its own name, or mount <job> as its #[job] declares it (GUIDE §6)
 <n> Pending "<job>" job(s) (ids <ids>) carry <presence>, but this binary declares <job> <declaration> — the enqueue family writes a tenant exactly for a `scoped_by` job, so something that contradicts <job>'s #[job] wrote these rows: a hand-written `impl Job` or `JobDef`, or a raw store write; this binary will not dispatch them; mount <job> as its #[job] declares it, or restore the store from a replica or backup taken before these rows were written (GUIDE §6)
 ```
+
+Presence is not the whole of a tenant. A row records the tenant's id and not the scope type
+it is an id of, and the dispatcher opens that id as the type the mounted job declares. The
+fingerprint cannot tell two scope types apart either: it hashes the `scoped_by` path as it
+is spelled, so a `#[job(scoped_by = Desk)]` in a module that says `use super::Board as
+Desk;` fingerprints exactly like the real `Desk` one, and a hand-written `impl Job` can copy
+both constants under any `type Scope`. Enqueued inside a `Board` tenant, either would run
+the mounted job in the `Desk` with the same id, a tenant nothing opened or named for it. So an
+enqueue whose job's scope type is not the one the mounted job declares refuses its
+transaction the same way. `<scope>` is the enqueuing job's scope type and `<declared>` the
+mounted one's, by their last path segments; `<id>` is the tenant id:
+
+<!-- pinned -->
+```text
+job "<job>" was enqueued in a `<scope>` tenant, but this binary mounts <job> as `scoped_by = <declared>` under the same shape (<shape>), so it would run in `<declared>` <id>, not in the tenant it was enqueued in — a type standing in for <job>'s #[job] was enqueued: a hand-written `impl Job`, or a #[job] whose `scoped_by` spells another scope type the same way; the transaction was refused and nothing was written, so a retry cannot succeed — enqueue the mounted <job> from a `<declared>` scope, or give the other type its own name (GUIDE §6)
+```
+
+This one has no startup twin, because a row carries no type to compare. The check runs
+where both types are known, at the enqueue, in a binary that mounts the job. A row that a
+binary which did not mount that job name enqueued is dispatched, by the next binary that
+does, in the scope type that binary declares.
 
 There are two ways through a shape change:
 
@@ -5928,7 +5950,8 @@ prefix rather than a `where` clause; and the only way a handler or a job can
 reach one of those rows is a handle that the app's own membership check — or a
 declaration: the route's own `public(Org)`, or the `cross_tenant` fan-out that
 enqueued the job — had to hand back. A job's handle is its enqueuer's because no
-app code can write the job row that carries its tenant (§6). A scoped read attempted on a bare `Tx` is a compile error, not a 500
+app code can write the job row that carries its tenant, and an enqueue inside a tenant of
+another scope type is refused (§6). A scoped read attempted on a bare `Tx` is a compile error, not a 500
 and not a leak. (What that guarantee does *not* cover — an operator holding the
 `Db`, and the platform's own job queue and event log, which any transaction can read
 across every tenant — is "Where the guarantee stops" below, and it is a boundary, not an
@@ -6405,13 +6428,17 @@ tenant id it runs in; an event's payload and its `key`, which for an emit inside
 is that tenant's id. Those reads stay open, because the dispatcher and §8's sim oracles
 are built on them; what is sealed is *writing* a job row (§6). So a route that exposes
 either table — an admin job list, an activity feed built on `scan` rather than a
-`Subscription` — must filter by its own scope before it answers: keep the job rows whose
-`scope` is the tenant it opened, and the event rows whose `key` is its `tx.event_key()`.
+`Subscription` — must filter by its own scope before it answers. A raw id is shared across
+scope types, so keep the job rows of jobs declared `scoped_by` the route's own scope type
+(the row's `name` is the job; `describe` lists each job's `scoped_by`) whose `scope` is the
+id of the tenant it opened, and the event rows whose `key` is its `tx.event_key()`, which
+has the subscription key's limit when an app has more than one scope type (§16,
+"Realtime").
 
 **Code outside a handler never takes a scope on its own word.** A job declares
 `#[job(scoped_by = Org)]` and runs in the tenant its enqueuer opened or its fan-out
 named (§6). Nothing else decides which, because no app code can write the job row that
-carries that tenant.
+carries that tenant, and an enqueue inside a tenant of another scope type is refused.
 **Operator code that must act inside one tenant** — seeding, a test oracle, an admin
 step in `main` — does not take a scope on its own word either. It begins a group, mints
 a `TenantAdmission` from it, and opens the tenant with `admit_scope`:

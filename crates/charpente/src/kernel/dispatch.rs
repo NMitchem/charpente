@@ -1,5 +1,6 @@
 //! Job dispatch types. The Dispatcher itself lands with the due-heap task.
 
+use std::any::TypeId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
@@ -71,12 +72,22 @@ pub struct JobDef {
     pub cross_tenant: bool,
     /// `#[job(scoped_by = Org)]` — the scope type's last path segment, as
     /// `describe` lists it; `None` for a `global` job. `App::mount_jobs`
-    /// registers it beside `fingerprint`: `Group::stage` refuses an enqueue
-    /// whose tenant presence disagrees with it, startup refuses a Pending row
-    /// that does, and dispatch asserts that a row carries a tenant exactly
-    /// when this is `Some`. A hand-written `JobDef` that contradicts its own
-    /// `#[job]` is therefore refused at the first enqueue, not at dispatch.
+    /// registers it beside `fingerprint` and `scope_type`: `Group::stage`
+    /// refuses an enqueue whose tenant presence disagrees with it, startup
+    /// refuses a Pending row that does, and dispatch asserts that a row
+    /// carries a tenant exactly when this is `Some`. A hand-written `JobDef`
+    /// that contradicts its own `#[job]` is therefore refused at the first
+    /// enqueue, not at dispatch.
     pub scoped_by: Option<&'static str>,
+    /// `TypeId::of::<J::Scope>()`: the scope type a `scoped_by` job's row
+    /// names a tenant of (`Unscoped` for a `global` job). A row records a
+    /// tenant id and not its type, and this job's glue opens the id as this
+    /// type, so `Group::stage` refuses a scoped enqueue whose job's scope
+    /// type is any other: a stand-in copying this job's `NAME` and
+    /// `FINGERPRINT`, or a `#[job]` whose `scoped_by` path spells another
+    /// type the same way, enqueued in that type's tenant (job-tenancy final
+    /// review N1).
+    pub scope_type: TypeId,
     /// `Job::FINGERPRINT` — the payload shape this binary compiled. Dispatch
     /// asserts a row's recorded shape equals it before the glue decodes
     /// (payload-shapes spec §4).
@@ -102,8 +113,8 @@ pub type JobGlue =
 /// hand-written, can open only the tenant id its row carries. `open` takes
 /// the scope type from its caller, so what holds that id to the job's own
 /// scope type is the glue: the generated one opens it as the job's
-/// `scoped_by` type, the one the row's fingerprint was checked against, while
-/// a hand-written glue names its own.
+/// `scoped_by` type, which is `JobDef.scope_type`, the type `Group::stage`
+/// held the enqueuer's to; a hand-written glue names its own.
 pub struct JobScope<'j> {
     id: u64,
     admission: &'j TenantAdmission,
@@ -297,7 +308,9 @@ impl Dispatcher {
             // disagrees with the mounted declaration, which a hand-written
             // `impl Job` or `JobDef` could otherwise produce; and the startup
             // refusal (`Db::pending_job_shape_refusal`) names a Pending row
-            // that disagrees before dispatch starts.
+            // that disagrees before dispatch starts. The scope TYPE is not
+            // checkable here, since the row records none: `Group::stage`
+            // refuses an enqueue under any type but `def.scope_type`.
             assert_eq!(
                 row.scope.is_some(),
                 def.scoped_by.is_some(),
@@ -334,7 +347,8 @@ impl Dispatcher {
         });
 
         // `Group::stage`'s only `TxError::Io` exit is its enqueue refusal: this
-        // handler's transaction enqueued another shape of a mounted job name.
+        // handler's transaction enqueued a mounted job name under another
+        // shape, another tenancy, or another scope type than the one mounted.
         // That is the handler's own deterministic bug, like a panic — an
         // attempt, never a platform fault, since no restart could clear it.
         // Asserted, not handled (hard rule 4): a second `Io` exit in `stage`

@@ -626,7 +626,13 @@ platform is one dependency, not two (plus `serde` for your own wire types — GU
   `Tx::settle_job`, which takes a `TenantAdmission` only a `Group` mints. An enqueue whose
   tenant presence disagrees with the mounted declaration (a hand-written `impl Job` or
   `JobDef`) is refused by name, and so is a Pending row that disagrees, before dispatch
-  starts (job-tenancy final review C1, M4).
+  starts (job-tenancy final review C1, M4). So is an enqueue in a tenant of another scope
+  type than the mounted job declares (`JobDef.scope_type`, a `TypeId`): a row records a
+  tenant id and not its type, and the fingerprint hashes the `scoped_by` path as spelled, so
+  a stand-in copying `NAME` and `FINGERPRINT`, or a `#[job]` whose path spells another type
+  alike, would otherwise run the job in the same id of the declared type. The check needs
+  both types, so it runs at enqueue only; a row enqueued by a binary that did not mount the
+  name has no type to check when a later binary that does dispatches it (final review N1).
 - **Events.** `#[event]` structs; `tx.emit(...)` is typed; subscribers (server-side and
   client-side codegen) consume typed streams off the log. An event payload is itself a
   wire type (it is exactly the JSON a subscriber receives), so `#[event]` derives `Wire`
@@ -1640,8 +1646,8 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   at a scope line its route did not declare `public(Org)` for gets a named 401 (spec
   2026-09-27-job-tenancy §4). A job acts inside a tenant only by declaring
   `#[job(scoped_by = Org)]`, and then only inside the tenant its enqueuer opened or its
-  fan-out named, because no app code can write the job row that carries that tenant
-  (§3's Jobs bullet). A table that declares neither
+  fan-out named, because no app code can write the job row that carries that tenant and
+  an enqueue in a tenant of any other scope type is refused (§3's Jobs bullet). A table that declares neither
   `scoped_by` nor `global` does not compile: which tables are tenant data is the app's
   declaration at every struct, never the platform's inference (default-secure,
   2026-09-16; the field-type inference was weighed and rejected — the membership table
@@ -1679,7 +1685,9 @@ hand-rolled, and lives in `charpente`, never inside the deterministic `charpente
   scoped job, its tenant id; an event's payload and its `key`, which inside a scope is the
   tenant's id. The dispatcher and the sim oracles are built on those reads, so they stay
   open; what is sealed is writing a job row (§3's Jobs bullet). A route that exposes either
-  table must filter by its own scope before it answers.
+  table must filter by its own scope before it answers — for a job row, by the job (its
+  `name`, whose `scoped_by` names the scope type) as well as its tenant id, since two scope
+  types can share a raw id.
   Out of scope and staying out: nested scopes, cross-tenant writes in one transaction,
   platform-derived tenancy, and forced retrofitting of existing tables. API-key
   scopes/permissions are subject-only in v1 — this feature answers *which tenant*, never

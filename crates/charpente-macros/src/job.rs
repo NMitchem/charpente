@@ -441,6 +441,9 @@ pub(crate) fn expand(args: JobArgs, input: DeriveInput) -> syn::Result<TokenStre
                     retry: <#name as ::charpente::core::db::Job>::RETRY,
                     cross_tenant: #cross_tenant,
                     scoped_by: #scoped_by_name,
+                    scope_type: ::std::any::TypeId::of::<
+                        <#name as ::charpente::core::db::Job>::Scope,
+                    >(),
                     fingerprint: <#name as ::charpente::core::db::Job>::FINGERPRINT,
                     glue: __charpente_job_glue,
                 }

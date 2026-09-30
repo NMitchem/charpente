@@ -52,8 +52,8 @@ use std::path::{Path, PathBuf};
 /// rule-3 401 (2026-09-28); 24 with job tenancy's bare-`#[job]` refusal and
 /// `NoJobTenant` note blocks (2026-09-28); 27 with its write seal's note, its
 /// borrowed-table-name refusal and its two tenancy-mismatch refusals (one
-/// block, 2026-09-29).
-const PINNED_FLOOR: usize = 27;
+/// block, 2026-09-29); 28 with its scope-type refusal (2026-09-29).
+const PINNED_FLOOR: usize = 28;
 
 /// Below this a fragment is not evidence — `usage:` or `id: 1.0` would match
 /// almost any corpus. Long enough that a coincidental hit is implausible,
