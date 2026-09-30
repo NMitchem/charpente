@@ -3195,6 +3195,59 @@ fn a_write_through_another_row_type_of_a_registered_table_is_refused_before_the_
     );
 }
 
+/// `Gizmo`'s fingerprint and layout under another `VERSION`: the identity is
+/// the pair, so a version alone that is not the registered one is refused,
+/// though these bytes would decode.
+struct GizmoAtVersion2 {
+    id: Id<GizmoAtVersion2>,
+    n: u32,
+}
+
+impl Row for GizmoAtVersion2 {
+    type Scope = Unscoped;
+    const TABLE: &'static str = Gizmo::TABLE;
+    const INDEXES: &'static [IndexDef<GizmoAtVersion2>] = &[];
+    const VERSION: u32 = 2;
+    const FINGERPRINT: Option<u64> = Gizmo::FINGERPRINT;
+
+    fn id(&self) -> Id<GizmoAtVersion2> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.n.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<GizmoAtVersion2> {
+        let input = &mut &bytes[..];
+        let id = Id::decode(input)?;
+        let n = u32::decode(input)?;
+        Ok(GizmoAtVersion2 { id, n })
+    }
+}
+
+#[test]
+fn a_write_through_a_row_type_of_another_version_is_refused_too() {
+    let (text, states, reopened) = attempt_alias_write(
+        0x5A17_000C,
+        || Schema::new().table::<Gizmo>(),
+        |tx| {
+            tx.put(&GizmoAtVersion2 {
+                id: Id::from_raw(1),
+                n: 1,
+            });
+            Ok(())
+        },
+    );
+    assert_eq!(
+        (text, states, reopened),
+        (
+            identity_refusal(Gizmo::TABLE, (1, "0x6a2d0001"), (2, "0x6a2d0001")),
+            [(None, false), (None, false)],
+            Ok(())
+        )
+    );
+}
+
 /// The same refusal through `ScopedTx::put`, the scoped write.
 #[test]
 fn a_scoped_write_through_another_row_type_of_a_registered_table_is_refused_too() {
