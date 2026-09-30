@@ -131,11 +131,13 @@ pub trait Event: Codec {
 /// Why a transaction did not return `Ok`: the application's own rejection,
 /// or a platform IO failure. The distinction is load-bearing — `App` means
 /// nothing was written; `Io` after the WAL sync means the record is durable
-/// but unacknowledged and will resurface on recovery. An `Io` carrying a
-/// `JobShapeRefusal` (`JobShapeRefusal::of`) is the one exception, not a
-/// platform failure at all: `Group::stage` refused an enqueue of a mounted
-/// job name under another shape, or under the other tenancy, before anything
-/// was written, and a retry cannot succeed. `Group::stage` also checks the write gate directly, but
+/// but unacknowledged and will resurface on recovery. An `Io` carrying one of
+/// `Group::stage`'s two refusals, a `JobShapeRefusal` or a
+/// `TableShapeRefusal` (each type's own `of`), is the exception, not a
+/// platform failure at all: `Group::stage` refused, before anything was
+/// written, an enqueue of a mounted job name under another shape or the other
+/// tenancy, or a write under the other scope shape of a registered table
+/// name, and a retry cannot succeed. `Group::stage` also checks the write gate directly, but
 /// that surfaces as `NotPrimary`/`Verifying` below, never as a `Refusal`.
 /// The only ordinary `Refusal` an `Io` here can carry is
 /// `resolve_effect_scope`'s or `check_replay_version`'s — a replicated
@@ -143,9 +145,8 @@ pub trait Event: Codec {
 /// after the WAL sync, same as any other `Io`. Every OTHER `Refusal` (a
 /// table-gate barrier, a witness conflict, a strict-witness deadline) never
 /// reaches `TxError` at all: those come from `Db::open`/`migrate_schema` and
-/// `Repl::step`, all outside any transaction. `Refusal::of` finds both
-/// `Refusal` and the `JobShapeRefusal` wrapper; `JobShapeRefusal::of` finds
-/// only the latter.
+/// `Repl::step`, all outside any transaction. `Refusal::of` finds `Refusal`
+/// and both wrappers; each wrapper's `of` finds only itself.
 #[derive(Debug)]
 pub enum TxError<E> {
     App(E),
@@ -180,7 +181,8 @@ pub enum TxError<E> {
 /// A named refusal: the platform declining to proceed on state it will not
 /// guess about — a Pending job of a foreign shape
 /// (`Db::pending_job_shape_refusal`), an enqueue of a mounted job name under
-/// another shape (`Group::stage`, as `TxError::Io`), a table-gate barrier, a
+/// another shape or a write under the other scope shape of a registered table
+/// name (`Group::stage`, as `TxError::Io`), a table-gate barrier, a
 /// witness conflict, a strict-witness deadline, a replicated record decoded
 /// under a mismatched or unscoped shape (`resolve_effect_scope`,
 /// `check_replay_version`), the primary's refusal of a diverged or
@@ -213,30 +215,33 @@ impl fmt::Debug for Refusal {
 impl std::error::Error for Refusal {}
 
 impl Refusal {
-    /// `Some` when `e` carries a `Refusal` — a bare one, or the
-    /// `JobShapeRefusal` special case, so every caller that only needs "is
-    /// this a refusal at all" (`kernel_stop_line`, spec §5) sees both without
-    /// knowing the second type exists.
+    /// `Some` when `e` carries a `Refusal` — a bare one, or one of
+    /// `Group::stage`'s `JobShapeRefusal`/`TableShapeRefusal` special cases,
+    /// so every caller that only needs "is this a refusal at all"
+    /// (`kernel_stop_line`, spec §5) sees all three without knowing the
+    /// wrappers exist.
     pub fn of(e: &io::Error) -> Option<&Refusal> {
         e.get_ref().and_then(|inner| {
             inner
                 .downcast_ref::<Refusal>()
                 .or_else(|| inner.downcast_ref::<JobShapeRefusal>().map(|j| &j.0))
+                .or_else(|| inner.downcast_ref::<TableShapeRefusal>().map(|t| &t.0))
         })
     }
 }
 
-/// The one refusal `Group::stage` itself can produce: an enqueue of a
+/// One of the two refusals `Group::stage` itself can produce
+/// (`TableShapeRefusal` is the other): an enqueue of a
 /// mounted job name under a foreign shape, or under the same shape with the
 /// other tenancy (a tenant for a `global` job, none for a `scoped_by` one).
 /// A distinct type, not a flag on
 /// `Refusal`, because the ATTEMPT's stage (`kernel/dispatch.rs`,
 /// `run_due_into`'s first `group.stage` — the handler's own transaction)
-/// asserts that every `Io` error out of it is this refusal; the
+/// asserts that every `Io` error out of it is one of the two; the
 /// failure-record stage that follows carries no such assert. `Group::stage`
 /// also checks the write gate, but that surfaces as `NotPrimary`/`Verifying`
-/// (`TxError`'s own variants), never a `Refusal`, so this is the only
-/// `Refusal` `Group::stage` can raise at all, and it names the one case that
+/// (`TxError`'s own variants), never a `Refusal`, so these two are the only
+/// `Refusal`s `Group::stage` can raise at all, and each names a case that
 /// IS the handler's own deterministic bug, distinct in kind from a refusal
 /// naming node state (payload-shapes spec §5). A second caller relies on the
 /// same distinct type: `http/app.rs`'s `tx_error_response` (~line 882)
@@ -267,6 +272,41 @@ impl JobShapeRefusal {
     pub fn of(e: &io::Error) -> Option<&JobShapeRefusal> {
         e.get_ref()
             .and_then(|inner| inner.downcast_ref::<JobShapeRefusal>())
+    }
+}
+
+/// `Group::stage`'s other refusal: a write whose scope shape is not the one
+/// the `Schema` registered for its table name — a scoped `Row` whose `TABLE`
+/// is an unscoped table's, or the reverse. `Schema::table` registers one type
+/// per name, so the writer is a second, unregistered type. Refused before the
+/// record exists; apply would refuse it too (`resolve_effect_scope`), but
+/// after the WAL sync, where the record is durable and every restart replays
+/// it into the same refusal. Its own type for `JobShapeRefusal`'s reason: the
+/// attempt stage in `kernel/dispatch.rs` and `http/app.rs`'s
+/// `tx_error_response` both classify it, as the handler's own deterministic
+/// bug with nothing written.
+pub struct TableShapeRefusal(pub Refusal);
+
+impl fmt::Display for TableShapeRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+/// `Refusal`'s `Debug`, for the same reason.
+impl fmt::Debug for TableShapeRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for TableShapeRefusal {}
+
+impl TableShapeRefusal {
+    /// `Some` only for THIS refusal, as `JobShapeRefusal::of`.
+    pub fn of(e: &io::Error) -> Option<&TableShapeRefusal> {
+        e.get_ref()
+            .and_then(|inner| inner.downcast_ref::<TableShapeRefusal>())
     }
 }
 
@@ -605,6 +645,10 @@ struct EnqueuedTenant {
 struct TxEffects {
     overlay: GroupOverlay,
     scoped_tables: BTreeSet<&'static str>,
+    // The tables an app `Tx::put`/`Tx::delete` wrote, so `Group::stage` sees
+    // an unscoped write to a scoped table even beside a scoped write to it,
+    // which `scoped_tables` alone cannot show. The encoding never reads it.
+    unscoped_tables: BTreeSet<&'static str>,
     enqueues: Vec<Enqueue>,
     // The emit shape is a bare `u64`, so a shapeless emit cannot be
     // represented (payload-shapes amendment A2).
@@ -908,6 +952,7 @@ impl<'a> Tx<'a> {
         const { refuse_platform_table(R::TABLE) };
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
+        self.effects.unscoped_tables.insert(R::TABLE);
         self.effects
             .overlay
             .entry(R::TABLE)
@@ -918,6 +963,7 @@ impl<'a> Tx<'a> {
     /// `put`'s tombstone, under the same two refusals.
     pub fn delete<R: WritableRow>(&mut self, id: Id<R>) {
         const { refuse_platform_table(R::TABLE) };
+        self.effects.unscoped_tables.insert(R::TABLE);
         self.effects
             .overlay
             .entry(R::TABLE)
@@ -2247,7 +2293,10 @@ fn downgrade_msg(table: &str, persisted: u32, compiled: u32) -> String {
 /// disagreement is a schema/log mismatch: the record was written for a
 /// different shape of this table than the one this binary has registered,
 /// and applying it anyway would silently write under the wrong scope (or
-/// none) rather than refuse (hard rule 5).
+/// none) rather than refuse (hard rule 5). This binary's own writes never
+/// reach it disagreeing: `Group::stage` refuses those before the record
+/// exists (`TableShapeRefusal`), so here it names a record from elsewhere,
+/// shipped or written by another binary.
 fn resolve_effect_scope(
     table: &str,
     table_scoped: bool,
@@ -3725,6 +3774,45 @@ impl<'a> Group<'a> {
                 return Err(TxError::Verifying {
                     unreached: unreached.clone(),
                 });
+            }
+        }
+        // A table name has one scope shape, the one its registered `Row`
+        // declares. A second `Row` type with the same `TABLE` and the other
+        // shape writes a record apply refuses (`resolve_effect_scope`) after
+        // the WAL sync, where the refusal is durable and poisons every
+        // restart; an unscoped write beside a scoped one to a scoped table is
+        // worse, encoded under the table's one tag and applied into tenant 0
+        // without an error. Refused here, before a record exists, it costs
+        // only this transaction. An unregistered name is apply's to refuse.
+        let schema = &self.db.engine.machine().schema;
+        for table in effects.overlay.keys() {
+            let Some(ops) = schema.tables.get(table) else {
+                continue;
+            };
+            let (other_shape, registered, written) = if ops.scoped {
+                (
+                    effects.unscoped_tables.contains(table),
+                    "tenant-scoped (Row::Scope != Unscoped)",
+                    "unscoped",
+                )
+            } else {
+                (
+                    effects.scoped_tables.contains(table),
+                    "unscoped (Row::Scope = Unscoped)",
+                    "tenant-scoped",
+                )
+            };
+            if other_shape {
+                return Err(TxError::Io(io::Error::other(TableShapeRefusal(Refusal(
+                    format!(
+                        "table \"{table}\" is registered {registered}, but this transaction \
+                         wrote it {written} — a second Row type declares TABLE = \"{table}\" \
+                         with the other scope shape, and a table keeps one shape for its whole \
+                         life; the transaction was refused and nothing was written, so a retry \
+                         cannot succeed — give the Row type this transaction wrote a table name \
+                         of its own"
+                    ),
+                )))));
             }
         }
         // A mounted job name has one shape and one tenancy. `NAME` is the

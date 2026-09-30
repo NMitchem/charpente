@@ -4003,6 +4003,168 @@ fn a_job_handler_enqueuing_another_shape_of_a_mounted_job_dead_letters_by_name()
     );
 }
 
+/// A hand-written unscoped `Row` whose `TABLE` is `Ledger`'s, a table this
+/// file registers `scoped_by = Org`.
+struct LedgerViaUnscopedDoor {
+    id: Id<LedgerViaUnscopedDoor>,
+    marker: u64,
+}
+
+impl Row for LedgerViaUnscopedDoor {
+    type Scope = Unscoped;
+    const TABLE: &'static str = <Ledger as Row>::TABLE;
+    const INDEXES: &'static [IndexDef<LedgerViaUnscopedDoor>] = &[];
+
+    fn id(&self) -> Id<LedgerViaUnscopedDoor> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.marker.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> std::io::Result<LedgerViaUnscopedDoor> {
+        let input = &mut &bytes[..];
+        Ok(LedgerViaUnscopedDoor {
+            id: Id::decode(input)?,
+            marker: u64::decode(input)?,
+        })
+    }
+}
+
+#[job(global, retry(max = 1, backoff = "10s"))]
+struct WritesLedgerUnscoped {}
+
+impl WritesLedgerUnscoped {
+    fn run(self, tx: &mut Tx) -> Result<(), JobError> {
+        tx.put(&LedgerViaUnscopedDoor {
+            id: Id::from_raw(1),
+            marker: 7,
+        });
+        Ok(())
+    }
+}
+
+/// `Group::stage` refuses a write whose scope shape is not the one the
+/// `Schema` registered for its table name, before the record exists. In a
+/// job handler's own transaction that is the handler's deterministic bug, as
+/// the job-shape refusal is: an attempt that dead-letters with the refusal as
+/// its `last_error`. Refused at apply instead, it was a durable poison that
+/// stopped the kernel on every restart.
+#[test]
+fn a_job_writing_another_scope_shape_of_a_registered_table_dead_letters_by_name() {
+    let sim = Sim::with_faults(0x5A17_0004, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Ledger>().table::<Counter>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount_jobs(jobs![WritesLedgerUnscoped, CountUp]);
+    app.db_for_tests()
+        .transact(|tx| {
+            tx.enqueue(WritesLedgerUnscoped {});
+            tx.enqueue(CountUp { slot: 3 });
+            Ok::<(), std::io::Error>(())
+        })
+        .unwrap();
+    let mut kernel = Kernel::new(app, Box::new(sim.clock())).unwrap();
+    let ran = kernel.run(&mut SimSource::new(Box::new(sim.clock()), SEC));
+    let mut app = kernel.into_app();
+    let db = app.db_for_tests();
+    let rows = db.snapshot().unwrap().scan::<JobRow>().unwrap();
+    let settled = |name: &str| {
+        rows.iter()
+            .find(|r| r.name == name)
+            .map(|r| (r.status, r.attempts, r.last_error.clone()))
+    };
+    assert_eq!(
+        (
+            ran.map_err(|e| e.to_string()),
+            db.poisoned(),
+            settled("WritesLedgerUnscoped"),
+            settled("CountUp"),
+        ),
+        (
+            Ok(()),
+            false,
+            Some((
+                JobStatus::Dead,
+                1,
+                Some(
+                    "table \"Ledger\" is registered tenant-scoped (Row::Scope != Unscoped), but \
+                     this transaction wrote it unscoped — a second Row type declares TABLE = \
+                     \"Ledger\" with the other scope shape, and a table keeps one shape for its \
+                     whole life; the transaction was refused and nothing was written, so a \
+                     retry cannot succeed — give the Row type this transaction wrote a table \
+                     name of its own"
+                        .to_string()
+                )
+            )),
+            Some((JobStatus::Done, 0, None)),
+        )
+    );
+    assert_eq!(
+        db.snapshot()
+            .unwrap()
+            .get(Id::<Counter>::from_raw(3))
+            .unwrap()
+            .map(|c| c.hits),
+        Some(1),
+        "the kernel kept running the other job"
+    );
+}
+
+#[route(POST "/ledger-alias", public)]
+fn write_ledger_alias(tx: &mut Tx) -> Result<(), ApiError> {
+    tx.put(&LedgerViaUnscopedDoor {
+        id: Id::from_raw(1),
+        marker: 7,
+    });
+    Ok(())
+}
+
+/// The same refusal on a request: nothing was written and a retry cannot
+/// succeed, so the 500 carries the refusal's own text, as it does for the
+/// job-shape refusal, never the storage-failure text that says the write may
+/// have committed.
+#[test]
+fn a_request_writing_another_scope_shape_of_a_registered_table_is_refused_by_name() {
+    let sim = Sim::with_faults(0x5A17_0005, FaultConfig::none());
+    let mut app = App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Ledger>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )
+    .unwrap()
+    .mount(routes![write_ledger_alias]);
+    let before = app.db_for_tests().last_applied();
+    let response = app.handle(Request::new(Method::Post, "/ledger-alias"));
+    let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    let db = app.db_for_tests();
+    assert_eq!(
+        (
+            response.status,
+            body["error"].as_str(),
+            db.last_applied() == before,
+            db.poisoned()
+        ),
+        (
+            500,
+            Some(
+                "table \"Ledger\" is registered tenant-scoped (Row::Scope != Unscoped), but this \
+                 transaction wrote it unscoped — a second Row type declares TABLE = \"Ledger\" \
+                 with the other scope shape, and a table keeps one shape for its whole life; the \
+                 transaction was refused and nothing was written, so a retry cannot succeed — \
+                 give the Row type this transaction wrote a table name of its own"
+            ),
+            true,
+            false
+        )
+    );
+}
+
 /// A cron schedule's enqueue has no attempt to absorb it into: the refused
 /// tick stops the kernel, carrying the same refusal.
 #[test]

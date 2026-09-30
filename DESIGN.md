@@ -955,6 +955,20 @@ impl) — without the read arm such a node would 500 indefinitely with
 measurement: no store over the 1 GiB bound was built to prove the symptom, by
 design.
 
+**Refused before the record exists (implemented).** Apply-poison is for failures the log
+cannot take back, so a write the compiled `Schema` already says apply will refuse is refused
+earlier. A write whose scope shape disagrees with its table name's registered `Row` — a scoped
+`Row` whose `TABLE` is an unscoped table's, or the reverse — used to reach
+`resolve_effect_scope`'s refusal at apply, after the WAL sync: the record was durable, the
+engine poisoned, and every restart replayed it into the same refusal. An unscoped write beside
+a scoped one to the same scoped table was worse: the record carries one tag per table, so both
+went out scoped and the unscoped row landed in tenant 0 with no error. `Group::stage` now
+refuses both by name before the record exists (`TableShapeRefusal`), as it refuses an enqueue
+under a foreign job shape; a job handler's transaction that hits it is an attempt, and a
+request gets a 500 with its text. Apply's refusal stays for records from elsewhere: shipped,
+or written by another binary. Not covered, and still refused only at apply: a write to a table
+name the `Schema` does not register at all, and a same-scope alias whose row layout differs.
+
 **Snapshots & reads.** MVCC snapshots at log positions; read-only queries (and follower
 reads) run against snapshots without touching the write path.
 

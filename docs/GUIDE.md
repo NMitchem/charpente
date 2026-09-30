@@ -612,11 +612,16 @@ committed record's log entry after `f` returned `Ok`. That second case is
 genuinely ambiguous — the record may already be durable and will reappear
 after the next recovery even though the caller was told the commit failed —
 so treat `TxError::Io` as "unknown," never as "definitely didn't happen."
-The one exception is an `Io` carrying a `JobShapeRefusal`
-(`charpente::core::db::JobShapeRefusal::of`): an enqueue under another shape
-of a job name this binary mounts (§6, "Changing a job's fields"), refused
-before anything was written, so a retry cannot succeed. The HTTP layer
-answers it with a 500 carrying the refusal's own text. The broader
+The exceptions are an `Io` carrying one of `Group::stage`'s two refusals,
+each read with its own `of`. A `JobShapeRefusal`
+(`charpente::core::db::JobShapeRefusal::of`) is an enqueue under another shape
+of a job name this binary mounts (§6, "Changing a job's fields"). A
+`TableShapeRefusal` (`charpente::core::db::TableShapeRefusal::of`) is a write
+under the other scope shape of a registered table name: a scoped `Row` whose
+`TABLE` is an unscoped table's, or the reverse. Both are refused before
+anything was written, so a retry cannot succeed. The HTTP layer answers
+either with a 500 carrying the refusal's own text, and in a job handler
+either is an attempt, retried and then dead-lettered. The broader
 `Refusal::of` is not that predicate: it also matches a refusal apply raises
 after the log sync (a replicated record decoded under a mismatched shape),
 whose record may already be durable.

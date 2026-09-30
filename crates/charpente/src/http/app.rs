@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use charpente_core::db::{
-    CrossTenant, Db, DbConfig, Group, JobShapeRefusal, Schema, TenantAdmission, Tx, TxError,
+    CrossTenant, Db, DbConfig, Group, JobShapeRefusal, Schema, TableShapeRefusal, TenantAdmission,
+    Tx, TxError,
 };
 use charpente_core::io::{Disk, Entropy};
 use charpente_core::table::{Id, UnscopedJob, View};
@@ -1029,18 +1030,23 @@ pub(crate) fn io_failure_response(e: &io::Error) -> Response {
 /// reach comes from `begin_group`'s own snapshot (`handle_or_subscribe`), a
 /// `group.commit()` failure, or `Group::stage` (a job handler's own
 /// transaction never runs on an HTTP route — the kernel dispatches jobs, so
-/// only `Group::stage`'s enqueue check, not `Db::pending_job_shape_refusal`'s
-/// startup scan, can raise a refusal here). `JobShapeRefusal` is the only
-/// refusal any of them raises, so an `Io` carrying one is answered with its
-/// own text instead of the storage-failure one: nothing was written, and a
-/// retry cannot succeed. Any OTHER `Refusal` here (a table-gate barrier, a
-/// witness conflict) would name node state, not this request, and must fall
-/// through to `io_failure_response` like a genuine commit failure — which is
-/// why this matches `JobShapeRefusal::of`, not `Refusal::of`.
+/// only `Group::stage`'s own checks, not `Db::pending_job_shape_refusal`'s
+/// startup scan, can raise a refusal here). `Group::stage`'s two refusals,
+/// `JobShapeRefusal` and `TableShapeRefusal`, are the only ones any of them
+/// raises, so an `Io` carrying either is answered with its own text instead
+/// of the storage-failure one: nothing was written, and a retry cannot
+/// succeed. Any OTHER `Refusal` here (a table-gate barrier, a witness
+/// conflict) would name node state, not this request, and must fall through
+/// to `io_failure_response` like a genuine commit failure — which is why this
+/// matches the two wrappers' own `of`, not `Refusal::of`.
 fn tx_error_response(err: TxError<ApiError>) -> Response {
     match err {
         TxError::App(e) => e.response(),
-        TxError::Io(e) if JobShapeRefusal::of(&e).is_some() => Response::error(500, &e.to_string()),
+        TxError::Io(e)
+            if JobShapeRefusal::of(&e).is_some() || TableShapeRefusal::of(&e).is_some() =>
+        {
+            Response::error(500, &e.to_string())
+        }
         TxError::Io(e) => io_failure_response(&e),
         TxError::NotPrimary { primary } => Response::error(
             421,
