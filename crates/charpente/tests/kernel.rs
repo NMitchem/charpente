@@ -1507,8 +1507,8 @@ fn kernel_stops_after_a_request_poisons_the_engine() {
 // follow-up, progress.md line 238 / spec §4.5). `Db::poisoned()` reflected
 // only APPLY-side poison: the engine's "a durable record failed to apply"
 // flag and its WAL's fsyncgate flag (`engine.rs`'s `poisoned()`). redb has a
-// SECOND, independent poison of its own — `CheckedBackend` (redb 4.1.0
-// `cached_file.rs:121`) sets `io_failed` on ANY backend error (read, write,
+// SECOND, independent poison of its own — `CheckedBackend` (redb 4.3.0
+// `cached_file.rs:128`) sets `io_failed` on ANY backend error (read, write,
 // set_len, sync_data) and every later backend op then returns
 // `StorageError::PreviousIo`, "Previous I/O error occurred. Please close and
 // re-open the database." Nothing mapped that latch onto `Db::poisoned()`, and

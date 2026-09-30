@@ -1068,10 +1068,12 @@ fn regression_store_bricked_by_creation_crash() {
 /// to `resize(old_len)` — the crash-collapse states where the store file's
 /// length disagrees with its durable header's layout (an unsynced `set_len`
 /// drops while the header god-page write survives, or a torn tail write
-/// extends the file past the layout). redb 4.1.0 panics at open on both
-/// (page_manager.rs:231 / :257) instead of returning Err; Store::open must
-/// convert that into an open failure so Db::open discards and rebuilds from
-/// the WAL. Found by the kernel flagship swarm, seed 0x64622c74f8660a09.
+/// extends the file past the layout). redb 4.1.0 panicked at open on both
+/// (page_manager.rs:231 / :257) and Store::open fenced the panic; redb 4.3.0
+/// returns `StorageError::Corrupted`, and Db::open discards and rebuilds from
+/// the WAL either way. Found by the kernel flagship swarm, seed
+/// 0x64622c74f8660a09, under 4.1.0 (4.3.0's `grow()` syncs an extension
+/// before any header records it, so the crash model no longer makes these).
 fn mangled_store_len_recovers(resize: impl Fn(u64) -> u64) {
     let (sim, mut db) = quiet_db(0x0DD5_12E5);
     db.transact(|tx| {
@@ -1106,15 +1108,16 @@ fn mangled_store_len_recovers(resize: impl Fn(u64) -> u64) {
     );
 }
 
-/// File shorter than the header's layout: redb 4.1.0 asserts at
-/// page_manager.rs:231 before its own repair path can run.
+/// File shorter than the header's layout: redb 4.3.0's "File truncated below
+/// stored layout" (4.1.0 asserted at page_manager.rs:231).
 #[test]
 fn store_shorter_than_header_layout_is_discarded_and_rebuilt() {
     mangled_store_len_recovers(|len| len - 4096);
 }
 
-/// File longer than the header's layout but not page-aligned: redb 4.1.0
-/// recalculates the layout, then asserts exact equality at page_manager.rs:257.
+/// File longer than the header's layout but not page-aligned: redb 4.3.0's
+/// "File length does not correspond to a valid region layout" (4.1.0
+/// recalculated the layout, then asserted equality at page_manager.rs:257).
 #[test]
 fn store_longer_than_header_layout_is_discarded_and_rebuilt() {
     mangled_store_len_recovers(|len| len + 100);
@@ -1572,7 +1575,7 @@ fn store_discard_erases_the_horizon_but_the_breadcrumb_still_refuses_the_corrupt
     // THE BUG: discard the store (the exact proxy the landed discard/
     // rebuild regressions use elsewhere in this file -- production reaches
     // the identical applied_seq=None state via Db::open's Store::open-failed
-    // discard-and-rebuild branch, e.g. the M0 page_manager fence). Horizon
+    // discard-and-rebuild branch, e.g. a store redb refuses to open). Horizon
     // collapses to None UNLESS a breadcrumb outside the store supplies it.
     sim.disk().remove(&cfg.store_path).unwrap();
     match Db::open(Box::new(sim.disk()), cfg, app_schema()) {

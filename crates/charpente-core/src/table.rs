@@ -602,7 +602,9 @@ fn rows_def(table: &str) -> TableDefinition<'_, u64, &'static [u8]> {
 /// test needs neither a `Store` nor a `Sim`.
 ///
 /// Verified against redb 4.1.0's own `Key`/`Value` impls
-/// (`~/.cargo/registry/.../redb-4.1.0/src/types.rs`) before choosing this
+/// (`~/.cargo/registry/.../redb-4.1.0/src/types.rs`), and re-read for 4.3.0
+/// (its array `compare` is unchanged, and the new `Key::separator` returns
+/// the left key whole for a fixed-width element type), before choosing this
 /// over `&[u8]`: `[u8; 16]` gets `Key`/`Value` via the blanket
 /// `impl<const N, T: Key> Key for [T; N]` / `impl<const N, T: Value> Value
 /// for [T; N]` with `T = u8` (`u8: Key + Value` via the `le_impl!` macro,
