@@ -2875,7 +2875,7 @@ fn alias_refusal(table: &str, registered: &str, written: &str) -> String {
          — a second Row type declares TABLE = \"{table}\" with the other scope shape, and a \
          table keeps one shape for its whole life; the transaction was refused and nothing was \
          written, so a retry cannot succeed — give the Row type this transaction wrote a table \
-         name of its own"
+         name of its own (a #[table] type's table name is its struct name)"
     )
 }
 
@@ -3047,6 +3047,175 @@ fn an_unscoped_write_beside_a_scoped_one_on_the_same_name_is_refused_too() {
             Refusal::of(&err).is_some()
         ),
         (true, true)
+    );
+}
+
+/// A write to a table name the `Schema` never registered. Apply cannot
+/// decode a row of a table it does not know, so after the WAL sync this was a
+/// durable poison too.
+#[test]
+fn a_write_to_an_unregistered_table_is_refused_before_the_record_exists() {
+    let (text, states, reopened) = attempt_alias_write(0x5A17_0007, Schema::new, |tx| {
+        tx.put(&Widget {
+            id: Id::from_raw(1),
+            n: 1,
+        });
+        Ok(())
+    });
+    assert_eq!(
+        (text, states, reopened),
+        (
+            "table \"test.widget\" is not registered in the Schema, but this transaction wrote \
+             it — every table a transaction writes must be registered, or apply cannot decode \
+             its rows; the transaction was refused and nothing was written, so a retry cannot \
+             succeed — register its Row type with .table::<T>() in the Schema passed to \
+             Db::open or App::open"
+                .to_string(),
+            [(None, false), (None, false)],
+            Ok(())
+        )
+    );
+}
+
+/// A registered table whose `Row` carries a fingerprint, for the
+/// type-identity refusal below.
+struct Gizmo {
+    id: Id<Gizmo>,
+    n: u32,
+}
+
+impl Row for Gizmo {
+    type Scope = Unscoped;
+    const TABLE: &'static str = "test.gizmo";
+    const INDEXES: &'static [IndexDef<Gizmo>] = &[];
+    const FINGERPRINT: Option<u64> = Some(0x6A2D_0001);
+
+    fn id(&self) -> Id<Gizmo> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.n.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<Gizmo> {
+        let input = &mut &bytes[..];
+        let id = Id::decode(input)?;
+        let n = u32::decode(input)?;
+        Ok(Gizmo { id, n })
+    }
+}
+
+/// A hand-written `Row` on `Gizmo`'s table with the same scope shape, no
+/// fingerprint, and a shorter layout: apply decodes its bytes as a `Gizmo`.
+struct GizmoIdOnly {
+    id: Id<GizmoIdOnly>,
+}
+
+impl Row for GizmoIdOnly {
+    type Scope = Unscoped;
+    const TABLE: &'static str = Gizmo::TABLE;
+    const INDEXES: &'static [IndexDef<GizmoIdOnly>] = &[];
+
+    fn id(&self) -> Id<GizmoIdOnly> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<GizmoIdOnly> {
+        let input = &mut &bytes[..];
+        Ok(GizmoIdOnly {
+            id: Id::decode(input)?,
+        })
+    }
+}
+
+/// The scoped twin: a `Row` on `Ticket`'s scoped table with a fingerprint
+/// `Ticket` does not have, and a shorter layout.
+struct TicketIdOnly {
+    id: Id<TicketIdOnly>,
+}
+
+impl Row for TicketIdOnly {
+    type Scope = TestOrg;
+    const TABLE: &'static str = Ticket::TABLE;
+    const INDEXES: &'static [IndexDef<TicketIdOnly>] = &[];
+    const FINGERPRINT: Option<u64> = Some(0x6A2D_0002);
+
+    fn id(&self) -> Id<TicketIdOnly> {
+        self.id
+    }
+    fn encode_row(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+    }
+    fn decode_row(bytes: &[u8]) -> io::Result<TicketIdOnly> {
+        let input = &mut &bytes[..];
+        Ok(TicketIdOnly {
+            id: Id::decode(input)?,
+        })
+    }
+}
+
+/// The type-identity refusal, spelled out independently of the product's
+/// `format!`. Each side is `(version, fingerprint)`.
+fn identity_refusal(table: &str, registered: (u32, &str), written: (u32, &str)) -> String {
+    format!(
+        "table \"{table}\" is registered as version {}, fingerprint {}, but this transaction \
+         wrote it through a Row type of version {}, fingerprint {} — a second Row type declares \
+         TABLE = \"{table}\" with another row layout, and apply decodes every row of a table \
+         with its registered type; the transaction was refused and nothing was written, so a \
+         retry cannot succeed — give the Row type this transaction wrote a table name of its \
+         own (a #[table] type's table name is its struct name)",
+        registered.0, registered.1, written.0, written.1
+    )
+}
+
+/// Same scope shape, another layout: a write through a second `Row` type of a
+/// registered table. Apply decoded it with the registered type and failed,
+/// after the WAL sync; it is refused before the record exists.
+#[test]
+fn a_write_through_another_row_type_of_a_registered_table_is_refused_before_the_record_exists() {
+    let (text, states, reopened) = attempt_alias_write(
+        0x5A17_0008,
+        || Schema::new().table::<Gizmo>(),
+        |tx| {
+            tx.put(&GizmoIdOnly {
+                id: Id::from_raw(1),
+            });
+            Ok(())
+        },
+    );
+    assert_eq!(
+        (text, states, reopened),
+        (
+            identity_refusal(Gizmo::TABLE, (1, "0x6a2d0001"), (1, "none")),
+            [(None, false), (None, false)],
+            Ok(())
+        )
+    );
+}
+
+/// The same refusal through `ScopedTx::put`, the scoped write.
+#[test]
+fn a_scoped_write_through_another_row_type_of_a_registered_table_is_refused_too() {
+    let (text, states, reopened) = attempt_alias_write(
+        0x5A17_0009,
+        || Schema::new().table::<Ticket>(),
+        |tx| {
+            tx.open_scope(Id::<TestOrg>::from_raw(1), "member")?
+                .put(&TicketIdOnly {
+                    id: Id::from_raw(1),
+                });
+            Ok(())
+        },
+    );
+    assert_eq!(
+        (text, states, reopened),
+        (
+            identity_refusal(Ticket::TABLE, (1, "none"), (1, "0x6a2d0002")),
+            [(None, false), (None, false)],
+            Ok(())
+        )
     );
 }
 

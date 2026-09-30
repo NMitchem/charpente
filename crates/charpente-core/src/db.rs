@@ -136,8 +136,9 @@ pub trait Event: Codec {
 /// `TableShapeRefusal` (each type's own `of`), is the exception, not a
 /// platform failure at all: `Group::stage` refused, before anything was
 /// written, an enqueue of a mounted job name under another shape or the other
-/// tenancy, or a write under the other scope shape of a registered table
-/// name, and a retry cannot succeed. `Group::stage` also checks the write gate directly, but
+/// tenancy, or a write the `Schema` disagrees with about its table (not
+/// registered, or registered under another scope shape or `Row` type), and a
+/// retry cannot succeed. `Group::stage` also checks the write gate directly, but
 /// that surfaces as `NotPrimary`/`Verifying` below, never as a `Refusal`.
 /// The only ordinary `Refusal` an `Io` here can carry is
 /// `resolve_effect_scope`'s or `check_replay_version`'s — a replicated
@@ -181,8 +182,8 @@ pub enum TxError<E> {
 /// A named refusal: the platform declining to proceed on state it will not
 /// guess about — a Pending job of a foreign shape
 /// (`Db::pending_job_shape_refusal`), an enqueue of a mounted job name under
-/// another shape or a write under the other scope shape of a registered table
-/// name (`Group::stage`, as `TxError::Io`), a table-gate barrier, a
+/// another shape or a write the `Schema` disagrees with about its table
+/// (`Group::stage`, as `TxError::Io`), a table-gate barrier, a
 /// witness conflict, a strict-witness deadline, a replicated record decoded
 /// under a mismatched or unscoped shape (`resolve_effect_scope`,
 /// `check_replay_version`), the primary's refusal of a diverged or
@@ -275,13 +276,17 @@ impl JobShapeRefusal {
     }
 }
 
-/// `Group::stage`'s other refusal: a write whose scope shape is not the one
-/// the `Schema` registered for its table name — a scoped `Row` whose `TABLE`
-/// is an unscoped table's, or the reverse. `Schema::table` registers one type
-/// per name, so the writer is a second, unregistered type. Refused before the
-/// record exists; apply would refuse it too (`resolve_effect_scope`), but
-/// after the WAL sync, where the record is durable and every restart replays
-/// it into the same refusal. Its own type for `JobShapeRefusal`'s reason: the
+/// `Group::stage`'s other refusal: a write the `Schema` disagrees with about
+/// its table. Three cases: a table name the `Schema` does not register; a
+/// scoped `Row` whose `TABLE` is an unscoped table's, or the reverse; and a
+/// `Row` type whose `(VERSION, FINGERPRINT)` is not the registered type's — two
+/// `#[table] struct Invoice` in different modules both declare `TABLE =
+/// "Invoice"`. `Schema::table` registers one type per name, so in the last two
+/// the writer is a second, unregistered type. Refused before the record
+/// exists; apply would refuse each too (the `Schema` lookup,
+/// `resolve_effect_scope`, the registered type's `decode_row`), but after the
+/// WAL sync, where the record is durable and every restart replays it into
+/// the same refusal. Its own type for `JobShapeRefusal`'s reason: the
 /// attempt stage in `kernel/dispatch.rs` and `http/app.rs`'s
 /// `tx_error_response` both classify it, as the handler's own deterministic
 /// bug with nothing written.
@@ -500,7 +505,11 @@ impl Schema {
     /// `site` names the caller for the refusal below — this lookup runs
     /// from log-record apply, `Db`/`Seeder::table_scoped` (archive export,
     /// repl seeding, archive restore) and `Seeder::rows` (seed/restore
-    /// import), none of which share one honest description.
+    /// import), none of which share one honest description. This binary's own
+    /// writes never reach apply's lookup unregistered: `Group::stage` refuses
+    /// them before the record exists (`TableShapeRefusal`), so at apply the
+    /// refusal names a log from elsewhere — another binary's, or shipped —
+    /// replayed under a `Schema` that no longer has the table.
     fn ops(&self, table: &str, site: &str) -> io::Result<&TableOps> {
         self.tables.get(table).ok_or_else(|| {
             io::Error::new(
@@ -649,6 +658,10 @@ struct TxEffects {
     // an unscoped write to a scoped table even beside a scoped write to it,
     // which `scoped_tables` alone cannot show. The encoding never reads it.
     unscoped_tables: BTreeSet<&'static str>,
+    // `(TABLE, VERSION, FINGERPRINT)` of every `Row` type an app put wrote,
+    // so `Group::stage` can refuse a second type of a registered table's
+    // name. Nor does the encoding read this.
+    written_as: BTreeSet<(&'static str, u32, Option<u64>)>,
     enqueues: Vec<Enqueue>,
     // The emit shape is a bare `u64`, so a shapeless emit cannot be
     // represented (payload-shapes amendment A2).
@@ -954,6 +967,9 @@ impl<'a> Tx<'a> {
         row.encode_row(&mut bytes);
         self.effects.unscoped_tables.insert(R::TABLE);
         self.effects
+            .written_as
+            .insert((R::TABLE, R::VERSION, R::FINGERPRINT));
+        self.effects
             .overlay
             .entry(R::TABLE)
             .or_default()
@@ -1023,6 +1039,9 @@ impl<'a> Tx<'a> {
         let mut bytes = Vec::new();
         row.encode_row(&mut bytes);
         self.effects.scoped_tables.insert(R::TABLE);
+        self.effects
+            .written_as
+            .insert((R::TABLE, R::VERSION, R::FINGERPRINT));
         self.effects
             .overlay
             .entry(R::TABLE)
@@ -3735,6 +3754,13 @@ impl<'a> Group<'a> {
     /// panicking or rejected handler structurally unable to corrupt the
     /// batch: the group is never touched until `f` has already returned
     /// `Ok`.
+    ///
+    /// Before the record exists it also refuses, as `TxError::Io`, what apply
+    /// would refuse only after the WAL sync: an enqueue of a mounted job name
+    /// under another shape or tenancy (`JobShapeRefusal`), and a write the
+    /// `Schema` disagrees with about its table (`TableShapeRefusal`): a name
+    /// it does not register, the other scope shape, or a `Row` type whose
+    /// `(VERSION, FINGERPRINT)` is not the registered one's.
     pub fn stage<T, E>(
         &mut self,
         f: impl FnOnce(&mut Tx) -> Result<T, E>,
@@ -3776,18 +3802,31 @@ impl<'a> Group<'a> {
                 });
             }
         }
-        // A table name has one scope shape, the one its registered `Row`
-        // declares. A second `Row` type with the same `TABLE` and the other
-        // shape writes a record apply refuses (`resolve_effect_scope`) after
-        // the WAL sync, where the refusal is durable and poisons every
-        // restart; an unscoped write beside a scoped one to a scoped table is
-        // worse, encoded under the table's one tag and applied into tenant 0
-        // without an error. Refused here, before a record exists, it costs
-        // only this transaction. An unregistered name is apply's to refuse.
+        // Every table a transaction writes is registered, in the scope shape
+        // and under the `Row` type the `Schema` registered for its name.
+        // Apply decodes a record's rows with the registered type, so a write
+        // the `Schema` disagrees with is a record apply refuses after the WAL
+        // sync (an unregistered name, `resolve_effect_scope`, a row that does
+        // not decode), where the refusal is durable and poisons every restart.
+        // An unscoped write beside a scoped one to a scoped table is worse,
+        // encoded under the table's one tag and applied into tenant 0 without
+        // an error. Refused here, before a record exists, each costs only this
+        // transaction. A delete carries only an id and apply decodes the
+        // stored row with the registered type, so a delete is checked for its
+        // table and shape but not its writer's type.
         let schema = &self.db.engine.machine().schema;
         for table in effects.overlay.keys() {
             let Some(ops) = schema.tables.get(table) else {
-                continue;
+                return Err(TxError::Io(io::Error::other(TableShapeRefusal(Refusal(
+                    format!(
+                        "table \"{table}\" is not registered in the Schema, but this \
+                         transaction wrote it — every table a transaction writes must be \
+                         registered, or apply cannot decode its rows; the transaction was \
+                         refused and nothing was written, so a retry cannot succeed — register \
+                         its Row type with .table::<T>() in the Schema passed to Db::open or \
+                         App::open"
+                    ),
+                )))));
             };
             let (other_shape, registered, written) = if ops.scoped {
                 (
@@ -3810,7 +3849,32 @@ impl<'a> Group<'a> {
                          with the other scope shape, and a table keeps one shape for its whole \
                          life; the transaction was refused and nothing was written, so a retry \
                          cannot succeed — give the Row type this transaction wrote a table name \
-                         of its own"
+                         of its own (a #[table] type's table name is its struct name)"
+                    ),
+                )))));
+            }
+        }
+        let shape = |fingerprint: Option<u64>| {
+            fingerprint.map_or_else(|| "none".to_string(), |f| format!("{f:#x}"))
+        };
+        for &(table, version, fingerprint) in &effects.written_as {
+            let ops = schema
+                .tables
+                .get(table)
+                .expect("every written table was checked registered above");
+            if (version, fingerprint) != (ops.version, ops.fingerprint) {
+                return Err(TxError::Io(io::Error::other(TableShapeRefusal(Refusal(
+                    format!(
+                        "table \"{table}\" is registered as version {}, fingerprint {}, but \
+                         this transaction wrote it through a Row type of version {version}, \
+                         fingerprint {} — a second Row type declares TABLE = \"{table}\" with \
+                         another row layout, and apply decodes every row of a table with its \
+                         registered type; the transaction was refused and nothing was written, so \
+                         a retry cannot succeed — give the Row type this transaction wrote a table \
+                         name of its own (a #[table] type's table name is its struct name)",
+                        ops.version,
+                        shape(ops.fingerprint),
+                        shape(fingerprint)
                     ),
                 )))));
             }

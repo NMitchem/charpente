@@ -18,8 +18,8 @@ use crate::tenant::TenantScope;
 /// Why a job run did not complete. The App/Io split mirrors `TxError` and is
 /// load-bearing: `App` is the handler's own rejection (or an absorbed panic,
 /// a payload that does not decode, or the handler's transaction refused for
-/// enqueueing another shape of a mounted job or for writing a registered
-/// table under the other scope shape) — a real attempt that feeds
+/// enqueueing another shape of a mounted job or for writing a table the
+/// `Schema` disagrees with) — a real attempt that feeds
 /// retry budget and lands in the row's `last_error`. `Io` is a platform fault
 /// surfaced through the handler's reads — NOT an attempt: the job stays
 /// Pending, nothing is recorded, the error bubbles (restart-and-recover).
@@ -351,12 +351,13 @@ impl Dispatcher {
         // `Group::stage`'s only `TxError::Io` exits are its two refusals: this
         // handler's transaction enqueued a mounted job name under another
         // shape, another tenancy, or another scope type than the one mounted
-        // (`JobShapeRefusal`), or wrote a registered table name under the
-        // other scope shape (`TableShapeRefusal`). Either is the handler's own
-        // deterministic bug, like a panic — an attempt, never a platform
-        // fault, since no restart could clear it. Asserted, not handled (hard
-        // rule 4): a third `Io` exit in `stage` must be classified here on
-        // purpose, not dead-lettered by default.
+        // (`JobShapeRefusal`), or wrote a table the `Schema` disagrees with:
+        // unregistered, or registered under another scope shape or `Row` type
+        // (`TableShapeRefusal`). Either is the handler's own deterministic
+        // bug, like a panic — an attempt, never a platform fault, since no
+        // restart could clear it. Asserted, not handled (hard rule 4): a third
+        // `Io` exit in `stage` must be classified here on purpose, not
+        // dead-lettered by default.
         let attempt = match attempt {
             Err(TxError::Io(e)) => {
                 assert!(

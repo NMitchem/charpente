@@ -957,17 +957,26 @@ design.
 
 **Refused before the record exists (implemented).** Apply-poison is for failures the log
 cannot take back, so a write the compiled `Schema` already says apply will refuse is refused
-earlier. A write whose scope shape disagrees with its table name's registered `Row` — a scoped
-`Row` whose `TABLE` is an unscoped table's, or the reverse — used to reach
-`resolve_effect_scope`'s refusal at apply, after the WAL sync: the record was durable, the
-engine poisoned, and every restart replayed it into the same refusal. An unscoped write beside
-a scoped one to the same scoped table was worse: the record carries one tag per table, so both
-went out scoped and the unscoped row landed in tenant 0 with no error. `Group::stage` now
-refuses both by name before the record exists (`TableShapeRefusal`), as it refuses an enqueue
-under a foreign job shape; a job handler's transaction that hits it is an attempt, and a
-request gets a 500 with its text. Apply's refusal stays for records from elsewhere: shipped,
-or written by another binary. Not covered, and still refused only at apply: a write to a table
-name the `Schema` does not register at all, and a same-scope alias whose row layout differs.
+earlier. Apply decodes a record's rows with the type the `Schema` registered for each table
+name, and three kinds of write disagree with it: a table name the `Schema` does not register
+at all; a write whose scope shape is not the registered `Row`'s — a scoped `Row` whose `TABLE`
+is an unscoped table's, or the reverse; and a write through a second `Row` type of a
+registered name whose `(VERSION, FINGERPRINT)` is not the registered type's. The last is easy
+to reach, because a `#[table]` type's `TABLE` is its bare struct name, so two
+`#[table] struct Invoice` in different modules share one. Each used to reach a refusal at
+apply, after the WAL sync — the `Schema` lookup, `resolve_effect_scope`, or the registered
+type's `decode_row` — where the record was durable, the engine poisoned, and every restart
+replayed it into the same refusal. An unscoped write beside a scoped one to the same scoped
+table was worse: the record carries one tag per table, so both went out scoped and the
+unscoped row landed in tenant 0 with no error. `Group::stage` now refuses all of them by name
+before the record exists (`TableShapeRefusal`), as it refuses an enqueue under a foreign job
+shape; a job handler's transaction that hits it is an attempt, and a request gets a 500 with
+its text. A delete is checked for its table and scope shape but not its writer's type: it
+carries only an id, and apply decodes the stored row, which has the registered layout, with
+the registered type. Apply's refusals stay for records from elsewhere: shipped, or written by
+another binary and replayed under a `Schema` that disagrees. The type identity is
+`(VERSION, FINGERPRINT)`, so two hand-written `Row` types that both leave `FINGERPRINT` at
+`None` at the same version are one identity to it, whatever their layouts.
 
 **Snapshots & reads.** MVCC snapshots at log positions; read-only queries (and follower
 reads) run against snapshots without touching the write path.

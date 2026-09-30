@@ -617,9 +617,13 @@ each read with its own `of`. A `JobShapeRefusal`
 (`charpente::core::db::JobShapeRefusal::of`) is an enqueue under another shape
 of a job name this binary mounts (§6, "Changing a job's fields"). A
 `TableShapeRefusal` (`charpente::core::db::TableShapeRefusal::of`) is a write
-under the other scope shape of a registered table name: a scoped `Row` whose
-`TABLE` is an unscoped table's, or the reverse. Both are refused before
-anything was written, so a retry cannot succeed. The HTTP layer answers
+the `Schema` disagrees with about its table: a table it does not register
+(add `.table::<T>()`), a scoped `Row` whose `TABLE` is an unscoped table's or
+the reverse, or a second `Row` type of a registered name with another
+`(VERSION, FINGERPRINT)`. A `#[table]` type's table name is its struct name,
+so two `#[table] struct Invoice` in different modules collide this way; give
+one another name. Either refusal comes before anything was written, so a
+retry cannot succeed. The HTTP layer answers
 either with a 500 carrying the refusal's own text, and in a job handler
 either is an attempt, retried and then dead-lettered. The broader
 `Refusal::of` is not that predicate: it also matches a refusal apply raises
