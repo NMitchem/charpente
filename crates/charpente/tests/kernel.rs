@@ -2416,6 +2416,74 @@ fn exactly_once_holds(app: &mut App) -> Result<(), String> {
     Ok(())
 }
 
+/// DESIGN §4's named refusal, reached by the crash model alone. One injected
+/// crash tears a redb page write inside a dropped `set_len` extension, redb
+/// asserts at open, and the open-fence turns that panic into an open error. A
+/// checkpoint has already compacted the log past seq 0, so `Db::open` refuses
+/// to rebuild the store rather than silently lose the records below it. The
+/// fix it names is a restore, and neither workload here has a restore rig, so
+/// the universe adjudicated nothing. It gives up under its own key, apart from
+/// the reopen-budget give-up.
+///
+/// All three conditions must hold, and a partial match still fails. The shared
+/// classifier stays blind to this text on purpose: `checks.rs` pins it
+/// `Unrelated`, and replication's own arm is the precedent for handling it in
+/// the workload. Found in `job_tenancy_universe` by seeds `0x3252300b37ab3e88`
+/// (final open) and `0x5b24d7f5e5947edd` (round open), both pinned there.
+/// `kernel_workload` has the code-identical gap, and no seed has reached it
+/// yet.
+fn store_bricked_below_a_compacted_log(sim: &Sim, e: &str) -> bool {
+    e.contains("cannot be rebuilt from the log alone")
+        && e.contains("panicked at open")
+        && sim.coverage().get("fault:crash").copied().unwrap_or(0) > 0
+}
+
+/// The give-up for `store_bricked_below_a_compacted_log`. The caller returns
+/// straight after it: a give-up is terminal for the universe.
+fn give_up_on_a_bricked_store(sim: &Sim, site: &str, e: &str) {
+    sim.cover("kernel:gave-up:store-bricked-after-compaction");
+    sim.give_up(format!(
+        "the {site} open met DESIGN §4's named refusal: an injected crash left a store redb \
+         cannot open, and the log is compacted past seq 0, so Db::open will not rebuild it \
+         from the log alone. The fix it names is a restore, and this workload has no restore \
+         rig, so nothing was adjudicated: {e}"
+    ));
+}
+
+/// The arm's negative space: it excuses only a full match. Each condition is
+/// dropped in turn, and each partial match must still read as a failure. The
+/// two seed pins in `mod job_tenancy` hold the positive side.
+#[test]
+fn a_partial_match_of_the_bricked_store_refusal_is_not_excused() {
+    let refusal = "table store cannot open (table store (redb) panicked at open — treating the \
+                   store as unopenable: assertion `left == right` failed) and the log is \
+                   compacted to seq 84 — the records below the store's last checkpoint no \
+                   longer exist locally, so the store cannot be rebuilt from the log alone; \
+                   restore this node from a replica or backup, or widen \
+                   DbConfig::retain_segments (DESIGN §4)";
+    let sim = Sim::with_faults(0xB41C_0001, FaultConfig::none());
+    assert!(
+        !store_bricked_below_a_compacted_log(&sim, refusal),
+        "no crash fired in this universe, so the crash model cannot have bricked the store"
+    );
+    sim.crash_disk_now();
+    assert!(store_bricked_below_a_compacted_log(&sim, refusal));
+    assert!(
+        !store_bricked_below_a_compacted_log(
+            &sim,
+            &refusal.replace("panicked at open", "returned an error at open")
+        ),
+        "a store that failed to open without the fence engaging is not this mechanism"
+    );
+    assert!(
+        !store_bricked_below_a_compacted_log(
+            &sim,
+            &refusal.replace("cannot be rebuilt from the log alone", "was rebuilt")
+        ),
+        "without the compacted-log refusal, Db::open would have rebuilt the store"
+    );
+}
+
 fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
     let entropy = sim.entropy();
     for _round in 0..3 {
@@ -2423,7 +2491,12 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
         let mut app = match kernel_crash_app(sim) {
             Ok(app) => app,
             Err(e) => {
-                if !is_fault_fallout(&e.to_string()) {
+                let e = e.to_string();
+                if !is_fault_fallout(&e) {
+                    if store_bricked_below_a_compacted_log(sim, &e) {
+                        give_up_on_a_bricked_store(sim, "round", &e);
+                        return Ok(());
+                    }
                     return Err(format!("open failed non-injected: {e}"));
                 }
                 sim.restart();
@@ -2575,6 +2648,10 @@ fn kernel_workload(sim: &mut Sim) -> Result<(), String> {
                 }
             },
             Err(e) if is_fault_fallout(&e.to_string()) => sim.restart(),
+            Err(e) if store_bricked_below_a_compacted_log(sim, &e.to_string()) => {
+                give_up_on_a_bricked_store(sim, "final", &e.to_string());
+                return Ok(());
+            }
             Err(e) => return Err(format!("final open failed non-injected: {e}")),
         }
     }
@@ -4790,6 +4867,10 @@ mod job_tenancy {
                     sim.restart();
                     continue;
                 }
+                Err(e) if store_bricked_below_a_compacted_log(sim, &e.to_string()) => {
+                    give_up_on_a_bricked_store(sim, "round", &e.to_string());
+                    return Ok(());
+                }
                 Err(e) => return Err(format!("open failed non-injected: {e}")),
             };
             match jobs_stay_in_their_tenant(app.db_for_tests()) {
@@ -4864,6 +4945,10 @@ mod job_tenancy {
                     Err(msg) => return Err(msg),
                 },
                 Err(e) if is_fault_fallout(&e.to_string()) => sim.restart(),
+                Err(e) if store_bricked_below_a_compacted_log(sim, &e.to_string()) => {
+                    give_up_on_a_bricked_store(sim, "final", &e.to_string());
+                    return Ok(());
+                }
                 Err(e) => return Err(format!("final open failed non-injected: {e}")),
             }
         }
@@ -4892,6 +4977,93 @@ mod job_tenancy {
                 "tenant:anonymous_refused",
                 "job:retried",
             ]
+        );
+    }
+
+    /// Seed `0x3252300b37ab3e88` (base `0xF1C2_0001`). One injected crash tore
+    /// a redb page write inside a dropped `set_len` extension, which left a
+    /// sub-page file length that redb 4.1.0 asserts on at open. Round 2's
+    /// clean-shutdown checkpoint had already compacted the log to seq 84. So
+    /// the final open meets DESIGN §4's named refusal, and the universe gives
+    /// up under its own key instead of failing.
+    ///
+    /// The assertions pin the REASON and the site, not just "gave up": a
+    /// re-keyed fault stream renames every universe, and a bare outcome check
+    /// would stay green on whatever give-up the renamed universe happened to
+    /// reach.
+    #[test]
+    fn a_store_bricked_below_a_compacted_log_at_the_final_open_gives_up_by_name() {
+        const SEED: u64 = 0x3252_300b_37ab_3e88;
+        // Reconstruct this universe exactly as the swarm runner derives it.
+        let mut state = SEED;
+        let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+        let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+        charpente_sim::sample_extended_fields(SEED, &mut cfg);
+        let mut sim = Sim::with_faults(SEED, cfg);
+
+        let result = job_tenancy_universe(&mut sim);
+        assert!(
+            result.is_ok(),
+            "a store bricked below a compacted log is DESIGN §4's named refusal, not a \
+             failure of this property: {:?}",
+            result.err()
+        );
+        let reason = sim
+            .gave_up()
+            .expect("and it must be RECORDED as a give-up: nothing was adjudicated");
+        assert!(
+            reason.starts_with("the final open met DESIGN §4's named refusal"),
+            "and it must be THIS give-up, at the final open: {reason}"
+        );
+        assert!(
+            reason.contains("the log is compacted to seq 84"),
+            "and it must be THIS universe's refusal, compacted to seq 84: {reason}"
+        );
+        assert_eq!(
+            sim.coverage()
+                .get("kernel:gave-up:store-bricked-after-compaction"),
+            Some(&1),
+            "and it must count under its own key, apart from the reopen-budget give-up"
+        );
+    }
+
+    /// Seed `0x5b24d7f5e5947edd` (base `0xF1C2_0005`). The same mechanism as
+    /// the pin above, reached at the round-loop open instead: one injected
+    /// crash dropped two `set_len` extensions and left a sub-page file length
+    /// inside them, and the log was already compacted to seq 26.
+    #[test]
+    fn a_store_bricked_below_a_compacted_log_at_a_round_open_gives_up_by_name() {
+        const SEED: u64 = 0x5b24_d7f5_e594_7edd;
+        // Reconstruct this universe exactly as the swarm runner derives it.
+        let mut state = SEED;
+        let cfg_seed = charpente_sim::rng::splitmix64(&mut state);
+        let mut cfg = FaultConfig::swarm(&mut charpente_sim::rng::Rng::new(cfg_seed));
+        charpente_sim::sample_extended_fields(SEED, &mut cfg);
+        let mut sim = Sim::with_faults(SEED, cfg);
+
+        let result = job_tenancy_universe(&mut sim);
+        assert!(
+            result.is_ok(),
+            "a store bricked below a compacted log is DESIGN §4's named refusal, not a \
+             failure of this property: {:?}",
+            result.err()
+        );
+        let reason = sim
+            .gave_up()
+            .expect("and it must be RECORDED as a give-up: nothing was adjudicated");
+        assert!(
+            reason.starts_with("the round open met DESIGN §4's named refusal"),
+            "and it must be THIS give-up, at a round open: {reason}"
+        );
+        assert!(
+            reason.contains("the log is compacted to seq 26"),
+            "and it must be THIS universe's refusal, compacted to seq 26: {reason}"
+        );
+        assert_eq!(
+            sim.coverage()
+                .get("kernel:gave-up:store-bricked-after-compaction"),
+            Some(&1),
+            "and it must count under its own key, apart from the reopen-budget give-up"
         );
     }
 
