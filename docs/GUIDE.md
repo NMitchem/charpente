@@ -2447,6 +2447,20 @@ adjudicated the property and **90** did not. It is a real measurement from
 and it means 70% of that property's universes prove nothing — which was
 invisible before the split was printed, and is the entire reason it is.
 
+### A fault-free tail for an end-of-universe check
+
+A check that runs at the end of a universe — a checkpoint, a graceful close, a
+byte comparison of two nodes' files — does IO, and the universe's
+`FaultConfig` still applies to it. "No fault has fired so far" is a fact about
+the past: the check's own fsync can still draw an injected failure. Call
+`sim.quiesce_disk_faults()` first. It disarms any pending crash countdown and
+turns off every disk fault on every disk (injected read, write, sync and
+directory-barrier errors, misdirected writes, restart bit flips) for the rest of
+the universe. Each skipped roll draws nothing, so a universe that never calls it
+replays exactly as before. After it, an error in the check is a real failure,
+not fallout to classify. Network and object-store faults are untouched, and a
+restart still collapses unsynced writes as a power cycle does.
+
 ### The checkers
 
 `charpente_sim::checks` ships six reusable oracles — reach for these

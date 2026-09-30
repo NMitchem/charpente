@@ -784,6 +784,12 @@ fn assert_bytes_identical(sim: &Sim, mut p: Node, mut f: Node) -> Result<(), Str
         sim.cover("repl:fingerprint-skipped-grouping");
         return Ok(());
     }
+    // "Quiet" above is a fact about the past: the universe's FaultConfig would
+    // still roll faults on the checkpoint, close and reads below, and one did
+    // (seed 0xd609e4dde8a4008f: an injected fsync failure in this checkpoint,
+    // reported as a failure). Stop them, so the comparison runs on a fault-free
+    // tail and any error in it is a real failure.
+    sim.quiesce_disk_faults();
     for n in [&mut p, &mut f] {
         n.db.as_mut()
             .expect("quiet universe: db live")

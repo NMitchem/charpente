@@ -426,6 +426,10 @@ struct State {
     /// single-node universe ever populates this map, so the frozen global
     /// world above is untouched by this task (the replay contract).
     hosts: BTreeMap<String, HostWorld>,
+    /// Set by `Sim::quiesce_disk_faults`: every later disk-fault roll is
+    /// skipped without drawing. False for the whole of every universe that
+    /// never calls it, so those replay exactly as before.
+    disk_faults_off: bool,
 }
 
 impl State {
@@ -593,6 +597,7 @@ impl Sim {
                     coverage: BTreeMap::new(),
                     gave_up: None,
                     hosts: BTreeMap::new(),
+                    disk_faults_off: false,
                 }),
             }),
         }
@@ -725,6 +730,27 @@ impl Sim {
         self.world.lock().disk.crash_countdown = Some(ops);
     }
 
+    /// Ends disk fault injection for the rest of this universe, on every disk
+    /// (the global one and every host's): pending crash countdowns are
+    /// disarmed, and from here on no injected read, write, sync or
+    /// directory-barrier error, misdirected write or restart bit flip fires.
+    /// Each skipped roll draws nothing, and a universe that never calls this
+    /// is unchanged. For an end-of-universe oracle whose own IO must not be
+    /// perturbed: a universe in which no fault has fired so far is "quiet"
+    /// only about its past, and the oracle's checkpoint, close and reads would
+    /// otherwise still roll this universe's `FaultConfig`. A restart after
+    /// this still power-cycles: unsynced writes and directory entries collapse
+    /// under the crash model as usual. Network and object-store faults are
+    /// untouched.
+    pub fn quiesce_disk_faults(&self) {
+        let mut guard = self.world.lock();
+        guard.disk_faults_off = true;
+        guard.disk.crash_countdown = None;
+        for host in guard.hosts.values_mut() {
+            host.disk.crash_countdown = None;
+        }
+    }
+
     pub fn crash_disk_now(&self) {
         let mut guard = self.world.lock();
         if !guard.disk.crashed {
@@ -746,6 +772,7 @@ impl Sim {
             disk,
             faults,
             coverage,
+            disk_faults_off,
             ..
         } = &mut *guard;
         // Bit-level corruption of already-durable bytes (the bitrot model),
@@ -756,7 +783,10 @@ impl Sim {
         // Zero-draw fast path: off by default, so every seed that predates
         // this fault axis replays with the exact same rng sequence (the
         // frozen replay contract).
-        if self.world.cfg.bit_flip > 0.0 && faults.chance(self.world.cfg.bit_flip) {
+        if !*disk_faults_off
+            && self.world.cfg.bit_flip > 0.0
+            && faults.chance(self.world.cfg.bit_flip)
+        {
             let names: Vec<String> = disk
                 .files
                 .iter()
@@ -907,7 +937,10 @@ impl SimHost {
         guard.host_mut(&self.name); // asserts the invariant; borrow ends immediately
         {
             let State {
-                hosts, coverage, ..
+                hosts,
+                coverage,
+                disk_faults_off,
+                ..
             } = &mut *guard;
             let host = hosts.get_mut(&self.name).expect("checked above");
             let HostWorld { disk, faults, .. } = host;
@@ -915,7 +948,7 @@ impl SimHost {
             // crash collapse — see `Sim::restart`'s doc for the full model;
             // this is that same roll, scoped to this host's files and faults
             // stream.
-            if cfg.bit_flip > 0.0 && faults.chance(cfg.bit_flip) {
+            if !*disk_faults_off && cfg.bit_flip > 0.0 && faults.chance(cfg.bit_flip) {
                 let names: Vec<String> = disk
                     .files
                     .iter()
@@ -1065,9 +1098,10 @@ impl Disk for SimDisk {
     fn sync_dir(&self, prefix: &str) -> io::Result<()> {
         let mut guard = self.world.lock();
         guard.disk_op(&self.world.cfg, &self.host)?;
-        if guard
-            .dir_faults_of(&self.host)
-            .chance(self.world.cfg.sync_error)
+        if !guard.disk_faults_off
+            && guard
+                .dir_faults_of(&self.host)
+                .chance(self.world.cfg.sync_error)
         {
             guard.cover("fault:sync_error");
             // Same contract as File::sync: a failed barrier leaves the
@@ -1133,7 +1167,10 @@ impl File for SimFile {
 
     fn read_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
         self.op(|state, cfg, path| {
-            if cfg.read_error > 0.0 && state.faults_of(&self.host).chance(cfg.read_error) {
+            if !state.disk_faults_off
+                && cfg.read_error > 0.0
+                && state.faults_of(&self.host).chance(cfg.read_error)
+            {
                 state.cover("fault:read_error");
                 // Transient: the disk itself is fine, so a later read of the
                 // same bytes may succeed — unlike a write/sync fault, this
@@ -1161,7 +1198,7 @@ impl File for SimFile {
             if data.is_empty() {
                 return Ok(());
             }
-            if state.faults_of(&self.host).chance(cfg.write_error) {
+            if !state.disk_faults_off && state.faults_of(&self.host).chance(cfg.write_error) {
                 state.cover("fault:write_error");
                 return Err(io::Error::other(
                     "simulated disk write error (injected fault)",
@@ -1175,7 +1212,8 @@ impl File for SimFile {
             // check precedes the roll, so out-of-scope writes consume no
             // draws — a zero-draw fast path in both dimensions.
             let mut target_offset = offset;
-            if cfg.misdirected_write > 0.0
+            if !state.disk_faults_off
+                && cfg.misdirected_write > 0.0
                 && path.starts_with(&cfg.corruption_scope)
                 && state.faults_of(&self.host).chance(cfg.misdirected_write)
             {
@@ -1203,7 +1241,7 @@ impl File for SimFile {
 
     fn sync(&self) -> io::Result<()> {
         self.op(|state, cfg, path| {
-            if state.faults_of(&self.host).chance(cfg.sync_error) {
+            if !state.disk_faults_off && state.faults_of(&self.host).chance(cfg.sync_error) {
                 state.cover("fault:sync_error");
                 // Real fsync failure semantics: nothing can be assumed. The
                 // buffer stays volatile; a later crash collapses it as usual.
@@ -2118,6 +2156,59 @@ mod tests {
         // Everything after the crash fails too.
         assert!(file.len().is_err());
         assert!(disk.open("g").is_err());
+    }
+
+    #[test]
+    fn quiesce_disk_faults_ends_every_disk_fault_on_every_disk() {
+        let mut cfg = FaultConfig::none();
+        cfg.write_error = 1.0;
+        cfg.sync_error = 1.0;
+        cfg.read_error = 1.0;
+        cfg.misdirected_write = 1.0;
+        cfg.bit_flip = 1.0;
+        cfg.corruption_scope = String::new();
+        let sim = Sim::with_faults(0x5145_0001, cfg);
+        let host = sim.host("h");
+        let (global, hosted) = (sim.disk(), host.disk());
+        // The control: at these rates every roll fires on both disks.
+        for disk in [&global, &hosted] {
+            let file = disk.open("f").unwrap();
+            assert!(file.write_at(0, b"x").is_err());
+            assert!(file.sync().is_err());
+            assert!(disk.sync_dir("").is_err());
+        }
+        sim.crash_disk_after(0);
+        host.crash_after(0);
+
+        sim.quiesce_disk_faults();
+        let fault_keys = |sim: &Sim| -> Vec<(&'static str, u64)> {
+            sim.coverage()
+                .into_iter()
+                .filter(|(k, _)| k.starts_with("fault:"))
+                .collect()
+        };
+        let before = fault_keys(&sim);
+        for disk in [&global, &hosted] {
+            let file = disk.open("f").unwrap();
+            file.write_at(0, b"abcdefgh").unwrap(); // the armed countdowns are gone
+            file.sync().unwrap();
+            disk.sync_dir("").unwrap();
+            let mut buf = [0u8; 8];
+            file.read_at(0, &mut buf).unwrap();
+            assert_eq!(&buf, b"abcdefgh", "the write landed where it was aimed");
+        }
+        sim.restart();
+        host.restart();
+        for disk in [&global, &hosted] {
+            let mut buf = [0u8; 8];
+            disk.open("f").unwrap().read_at(0, &mut buf).unwrap();
+            assert_eq!(&buf, b"abcdefgh", "no bit flipped at restart");
+        }
+        assert_eq!(
+            fault_keys(&sim),
+            before,
+            "no disk fault fired after quiescing"
+        );
     }
 
     #[test]
